@@ -781,6 +781,102 @@ fn inline_run_impl(module: &mut IrModule, size_optimized: bool, always_inline_on
         // most once into a given caller. This permits one profitable
         // specialization while avoiding repeated medium-body expansion.
         let mut size_inlined_large_callees: FxHashSet<String> = FxHashSet::default();
+        // ── Phase 0: mandatory always_inline drain ───────────────────────
+        // `__always_inline` is GCC's FORCE contract, not a scheduling
+        // preference: the call must never survive (`extern __gnu_inline__
+        // __always_inline__` wrappers — the kernel's whole fortify-string
+        // family — have no out-of-line body, so one surviving call is a
+        // hard undefined-symbol link error).  The contract cannot be left
+        // to the economics below: the ordinary fixpoint inlines ONE site
+        // per round under a 200-round cap, and always_inline callees that
+        // replicate through macro dispatchers (each inlined clone
+        // re-entering the same dispatcher) burn rounds faster than the
+        // queue drains — integrity_audit.o's single fortify_memset_chk site
+        // was starved exactly so and the vmlinux link died on the undefined
+        // extern.
+        //
+        // Three laws make the phase sound:
+        //   * priority: sites present at phase entry — every block whose
+        //     label is <= the module-wide label maximum snapshot, since
+        //     cloned blocks always take labels strictly above
+        //     `global_max_block_id` — are drained before any clone-born
+        //     site, so the contract never queues behind churn;
+        //   * termination: each entry site is consumed by its own inlining
+        //     (|entry sites| steps), and clone-born sites share one bounded
+        //     work counter (2x entry sites + 16), so a recursive dispatcher
+        //     chain cannot chase the phase forever;
+        //   * no budget gate: a mandatory inline is not an allocation
+        //     decision, and phase successes do not touch the economics
+        //     budgets the ordinary passes then spend purely on profit.
+        let entry_max_label = global_max_block_id;
+        let entry_always_inline_sites = find_inline_call_sites(
+            &module.functions[func_idx],
+            &callee_map,
+            &skip_list,
+            caller_has_section,
+        )
+        .into_iter()
+        .filter(|s| {
+            callee_map
+                .get(&s.callee_name)
+                .is_some_and(|d| d.is_always_inline)
+        })
+        .count();
+        let mut phase0_budget = 2 * entry_always_inline_sites + 16;
+        while phase0_budget > 0 {
+            let sites = find_inline_call_sites(
+                &module.functions[func_idx],
+                &callee_map,
+                &skip_list,
+                caller_has_section,
+            );
+            let is_mandatory = |s: &InlineCallSite| {
+                callee_map
+                    .get(&s.callee_name)
+                    .is_some_and(|d| d.is_always_inline)
+            };
+            // Original-label sites first; clone-born sites only once the
+            // last original is gone.  Splits preserve the continuation's
+            // label (see inline_call_site), so every surviving entry site
+            // stays entry-class for the whole drain.  Among clone-born
+            // sites, lowest program order first: churn from an inlined
+            // dispatcher always splices at positions strictly AFTER the
+            // pre-call remainder of the drained block, so position order
+            // drains those leftovers before any churn can overtake them.
+            let site = sites
+                .iter()
+                .find(|s| {
+                    is_mandatory(s)
+                        && module.functions[func_idx].blocks[s.block_idx].label.0 <= entry_max_label
+                })
+                .or_else(|| {
+                    sites
+                        .iter()
+                        .filter(|s| is_mandatory(s))
+                        .min_by_key(|s| (s.block_idx, s.inst_idx))
+                })
+                .cloned();
+            let Some(site) = site else { break };
+            let callee_data = &callee_map[&site.callee_name];
+            if !inline_call_site(
+                &mut module.functions[func_idx],
+                &site,
+                callee_data,
+                &mut global_max_block_id,
+            ) {
+                break;
+            }
+            phase0_budget -= 1;
+            total_inlined += 1;
+            module.functions[func_idx].has_inlined_calls = true;
+            if debug_inline {
+                eprintln!(
+                    "[INLINE] Phase-0 drained always_inline '{}' in '{}'",
+                    site.callee_name, module.functions[func_idx].name
+                );
+            }
+        }
+
         // Iterate to handle chains of inlined calls (A calls B calls C, all small inline).
         // Limit iterations to prevent infinite loops from recursive inline functions.
         let max_rounds = 200;
@@ -3547,9 +3643,47 @@ fn inline_call_site(
     // Now split the caller's block at the call site:
     // Block before call -> instructions before the call + branch to callee entry
     // Block after call (merge block) -> instructions after the call + original terminator
-
+    //
+    // LABEL PRESERVATION (Phase-0 fairness): when the split block's label is
+    // PRIVATE — no other block branches to it and no LabelAddr exists — the
+    // MERGE block keeps the original label and the pre-call remainder takes
+    // the fresh one.  Every pre-existing call after the call site therefore
+    // stays in an entry-labeled block, which is what makes the Phase-0
+    // always_inline drain's entry-class test (label <= entry snapshot)
+    // robust against chains of inlined splits: without this, a replicating
+    // dispatcher inlined earlier in the same block would push surviving
+    // contract sites into a fresh-labeled continuation and queue them
+    // behind the churn it spawns (Review-AI finding 8, same-block
+    // interleaving).  A visible external reference (loop back-edge, computed
+    // goto) must keep landing in the PRE-CALL part, so the label stays
+    // there and the merge block takes the fresh id — the historical shape.
     let call_block_idx = site.block_idx;
     let call_inst_idx = site.inst_idx;
+
+    let split_label = caller.blocks[call_block_idx].label;
+    // NOTE: the split block's own (original) terminator participates: a
+    // self-loop `B: ...; goto B` whose body contains the call must NOT be
+    // private — after the splice the original terminator lives in the
+    // merge block, and keeping the label there would retarget the latch
+    // edge to the merge itself, skipping the pre-call work and the whole
+    // inlined body (sha256_transform segfault: its schedule loop is one
+    // self-latching block around inlined helpers).
+    let label_is_private = caller.blocks.iter().all(|b| match &b.terminator {
+        Terminator::Branch(t) => *t != split_label,
+        Terminator::CondBranch {
+            true_label,
+            false_label,
+            ..
+        } => *true_label != split_label && *false_label != split_label,
+        Terminator::Switch { cases, default, .. } => {
+            *default != split_label && !cases.iter().any(|(_, t)| *t == split_label)
+        }
+        _ => true,
+    }) && !caller.blocks.iter().any(|b| {
+        b.instructions
+            .iter()
+            .any(|inst| matches!(inst, Instruction::LabelAddr { .. }))
+    });
 
     // Save instructions after the call and the terminator
     let after_call_instructions: Vec<Instruction> = caller.blocks[call_block_idx]
@@ -3603,8 +3737,31 @@ fn inline_call_site(
     merge_instructions.extend(after_call_instructions);
     merge_spans.extend(after_call_spans);
 
+    // Label assignment per the privacy analysis above: private label =>
+    // merge keeps it, pre-call remainder takes the fresh id; externally
+    // referenced label => historical shape (merge takes the fresh id).
+    let (merge_label, precall_label) = if label_is_private {
+        (split_label, merge_block_id)
+    } else {
+        (merge_block_id, split_label)
+    };
+    caller.blocks[call_block_idx].label = precall_label;
+
+    // The callee's return blocks were branched to the FRESH merge id; when
+    // the merge kept the split block's label, those edges must follow the
+    // merge's ACTUAL label or every return re-enters the pre-call block
+    // (an infinite loop — the second half of the sha256_transform
+    // segfault).
+    if merge_label != merge_block_id {
+        for block in inlined_blocks.iter_mut() {
+            if matches!(block.terminator, Terminator::Branch(t) if t == merge_block_id) {
+                block.terminator = Terminator::Branch(merge_label);
+            }
+        }
+    }
+
     let merge_block = BasicBlock {
-        label: merge_block_id,
+        label: merge_label,
         instructions: merge_instructions,
         source_spans: merge_spans,
         terminator: original_terminator,
@@ -4681,5 +4838,349 @@ mod value_reference_tests {
             });
         let (referenced, asm) = collect_value_referenced_functions(&module);
         assert!(function_referenced_as_value("callee", &referenced, &asm));
+    }
+}
+
+#[cfg(test)]
+mod phase0_drain_tests {
+    use super::*;
+    use crate::common::types::EightbyteClass;
+    use crate::ir::reexports::{
+        BasicBlock, BlockId, CallInfo, Instruction, IrBinOp, IrConst, IrFunction, IrModule,
+        IrParam, Operand, Terminator, Value,
+    };
+
+    fn param0() -> Operand {
+        Operand::Value(Value(0))
+    }
+
+    fn void_call(callee: &str, arg: Operand) -> Instruction {
+        Instruction::Call {
+            func: callee.to_string(),
+            info: CallInfo {
+                args: vec![arg],
+                arg_types: vec![IrType::I32],
+                return_type: IrType::Void,
+                num_fixed_args: 1,
+                ..crate::ir::reexports::CallInfo::default()
+            },
+        }
+    }
+
+    /// The scheduler-starvation shape behind kernel integrity_audit.o's
+    /// surviving `fortify_memset_chk` call (F12): an always_inline callee
+    /// that REPLICATES its own call sites through macro dispatchers (each
+    /// inlined clone re-entering the same dispatcher — modeled by two
+    /// self-calls, net +1 site per inline) sits in front of a plain
+    /// always_inline callee in block order.  The economics passes inline
+    /// ONE site per round under a 200-round cap, so the replicator burns
+    /// every round and the plain callee's contract call survives — a hard
+    /// undefined-symbol link error for `extern __gnu_inline__` wrappers.
+    /// Phase 0 must drain the entry sites BEFORE the churn can matter.
+    #[test]
+    fn phase0_drains_contract_sites_despite_replicating_dispatchers() {
+        let mut replicator = IrFunction::new("replicator".to_string(), IrType::Void, vec![], false);
+        replicator.is_static = true;
+        replicator.is_always_inline = true;
+        replicator.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::BinOp {
+                    dest: Value(1),
+                    op: IrBinOp::Add,
+                    lhs: param0(),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::I32,
+                },
+                // Two self-calls: every inlining of this body leaves ONE
+                // more replicator site behind than it consumed.
+                void_call("replicator", Operand::Value(Value(1))),
+                void_call("replicator", Operand::Value(Value(1))),
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        let _ = replicator.next_value_id;
+
+        let mut fortify_like =
+            IrFunction::new("fortify_like".to_string(), IrType::I32, vec![], false);
+        fortify_like.is_static = true;
+        fortify_like.is_always_inline = true;
+        // 8 adds: above the tiny threshold, so the old selector never
+        // reached it once the replicator's tiny sites monopolized rounds.
+        let mut insts = Vec::new();
+        for i in 1..=8u32 {
+            insts.push(Instruction::BinOp {
+                dest: Value(i),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(i - 1)),
+                rhs: Operand::Const(IrConst::I32(1)),
+                ty: IrType::I32,
+            });
+        }
+        fortify_like.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: insts,
+            terminator: Terminator::Return(Some(Operand::Value(Value(8)))),
+            source_spans: Vec::new(),
+        });
+
+        let mut caller = IrFunction::new("f".to_string(), IrType::Void, vec![], false);
+        caller.next_value_id = 10;
+        caller.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Copy {
+                    dest: Value(0),
+                    src: Operand::Const(IrConst::I32(7)),
+                },
+                void_call("replicator", param0()),
+            ],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        caller.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![Instruction::Call {
+                func: "fortify_like".to_string(),
+                info: CallInfo {
+                    dest: Some(Value(9)),
+                    args: vec![param0()],
+                    arg_types: vec![IrType::I32],
+                    return_type: IrType::I32,
+                    num_fixed_args: 1,
+                    ..crate::ir::reexports::CallInfo::default()
+                },
+            }],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+
+        let mut module = IrModule::new();
+        module.functions = vec![caller, replicator, fortify_like];
+
+        super::inline_run(&mut module, false);
+
+        let caller = &module.functions[0];
+        let survives = caller.blocks.iter().any(|b| {
+            b.instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Call { func, .. } if func == "fortify_like"))
+        });
+        assert!(
+            !survives,
+            "always_inline contract site survived the inliner: \
+             Phase 0 must drain entry sites before clone churn"
+        );
+    }
+
+    /// SAME-BLOCK interleaving (Review-AI finding 8): when the replicating
+    /// dispatcher drains FIRST, the split historically moved the surviving
+    /// contract call (later in the SAME block) into a fresh-labeled merge
+    /// block, demoting it to clone-born class — the churn then starved it
+    /// under the shared budget.  inline_call_site now lets the merge block
+    /// KEEP the split block's label whenever that label is private, so the
+    /// contract site stays entry-class for the whole drain.
+    #[test]
+    fn phase0_survives_contract_site_after_same_block_dispatcher_split() {
+        let mut replicator = IrFunction::new("replicator".to_string(), IrType::Void, vec![], false);
+        replicator.is_static = true;
+        replicator.is_always_inline = true;
+        replicator.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                void_call("replicator", param0()),
+                void_call("replicator", param0()),
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+
+        let mut fortify_like =
+            IrFunction::new("fortify_like".to_string(), IrType::I32, vec![], false);
+        fortify_like.is_static = true;
+        fortify_like.is_always_inline = true;
+        let mut insts = Vec::new();
+        for i in 1..40 {
+            insts.push(Instruction::BinOp {
+                dest: Value(i),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(i - 1)),
+                rhs: Operand::Const(IrConst::I32(1)),
+                ty: IrType::I32,
+            });
+        }
+        fortify_like.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: insts,
+            terminator: Terminator::Return(Some(Operand::Value(Value(8)))),
+            source_spans: Vec::new(),
+        });
+
+        let mut caller = IrFunction::new("f".to_string(), IrType::Void, vec![], false);
+        caller.next_value_id = 10;
+        caller.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                void_call("replicator", param0()),
+                Instruction::Call {
+                    func: "fortify_like".to_string(),
+                    info: CallInfo {
+                        dest: Some(Value(9)),
+                        args: vec![param0()],
+                        arg_types: vec![IrType::I32],
+                        return_type: IrType::I32,
+                        num_fixed_args: 1,
+                        ..crate::ir::reexports::CallInfo::default()
+                    },
+                },
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+
+        let mut module = IrModule::new();
+        module.functions = vec![caller, replicator, fortify_like];
+
+        super::inline_run(&mut module, false);
+
+        let caller = &module.functions[0];
+        let survives = caller.blocks.iter().any(|b| {
+            b.instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Call { func, .. } if func == "fortify_like"))
+        });
+        assert!(
+            !survives,
+            "contract site after a same-block replicator split was starved: \
+             the merge block must keep the split block's label (entry class)"
+        );
+    }
+
+    /// LABEL-PRESERVING SPLIT — structural invariants (the sha256_transform
+    /// segfault class).  When a private-label block is split by an inline:
+    ///   1. the merge block KEEPS the split block's label (the Phase-0
+    ///      entry-class test stays sound and external flow is preserved);
+    ///   2. every cloned return block branches to the merge block's ACTUAL
+    ///      label — the return edges are wired to the fresh id at build
+    ///      time and must be re-pointed, or returns re-enter the pre-call
+    ///      block and the caller loops forever.
+    ///   3. no block may branch to the pre-call block's fresh label except
+    ///      the pre-call -> clone-entry edge itself.
+    #[test]
+    fn label_preserving_split_keeps_label_and_retargets_returns() {
+        // Callee with TWO return paths => cloned return blocks with
+        // Branch(merge_block_id) edges.
+        let mut two_way = IrFunction::new("two_way".to_string(), IrType::I32, vec![], false);
+        two_way.is_static = true;
+        two_way.is_always_inline = true;
+        two_way.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Const(IrConst::I32(1)),
+                true_label: BlockId(1),
+                false_label: BlockId(2),
+            },
+            source_spans: Vec::new(),
+        });
+        for lbl in [1u32, 2u32] {
+            two_way.blocks.push(BasicBlock {
+                label: BlockId(lbl),
+                instructions: vec![],
+                terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(7)))),
+                source_spans: Vec::new(),
+            });
+        }
+
+        // Caller: ONE block, no branches at all => label 0 is private.
+        let mut caller = IrFunction::new("f".to_string(), IrType::I32, vec![], false);
+        caller.next_value_id = 10;
+        caller.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Copy {
+                    dest: Value(0),
+                    src: Operand::Const(IrConst::I32(7)),
+                },
+                Instruction::Call {
+                    func: "two_way".to_string(),
+                    info: CallInfo {
+                        dest: Some(Value(9)),
+                        args: vec![param0()],
+                        arg_types: vec![IrType::I32],
+                        return_type: IrType::I32,
+                        num_fixed_args: 1,
+                        ..crate::ir::reexports::CallInfo::default()
+                    },
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(9)))),
+            source_spans: Vec::new(),
+        });
+
+        let mut module = IrModule::new();
+        module.functions = vec![caller, two_way];
+
+        super::inline_run(&mut module, false);
+
+        let caller = &module.functions[0];
+        // (1) the original label survives on the block carrying the
+        // original terminator.
+        let merge = caller
+            .blocks
+            .iter()
+            .find(|b| {
+                matches!(
+                    b.terminator,
+                    Terminator::Return(Some(Operand::Value(Value(9))))
+                )
+            })
+            .expect("merge block with original terminator");
+        assert_eq!(
+            merge.label,
+            BlockId(0),
+            "private split label must stay on the merge block, blocks: {:?}",
+            caller.blocks.iter().map(|b| b.label).collect::<Vec<_>>()
+        );
+        // (2) both cloned return blocks branch to that label.
+        let ret_targets: Vec<BlockId> = caller
+            .blocks
+            .iter()
+            .filter_map(|b| match b.terminator {
+                Terminator::Branch(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        // 1 pre-call -> clone-entry edge + 2 cloned return edges.
+        assert_eq!(
+            ret_targets.len(),
+            3,
+            "pre-call edge plus two cloned return edges expected, got {ret_targets:?}"
+        );
+        let to_merge = ret_targets.iter().filter(|t| **t == BlockId(0)).count();
+        assert_eq!(
+            to_merge, 2,
+            "both cloned return edges must target the merge label (BlockId 0), got {ret_targets:?}"
+        );
+        // (3) the fresh pre-call label (whatever it is) receives edges only
+        // from the pre-call block itself: no block OTHER than pre-call
+        // branches to it.  Pre-call's own edge targets the clone entry, so
+        // the fresh label must appear as a branch target ZERO times.
+        let precall_fresh = caller.blocks[0].label;
+        assert_ne!(
+            precall_fresh,
+            BlockId(0),
+            "pre-call block must carry the fresh label"
+        );
+        let fresh_inbound = caller
+            .blocks
+            .iter()
+            .filter(|b| matches!(b.terminator, Terminator::Branch(t) if t == precall_fresh))
+            .count();
+        assert_eq!(
+            fresh_inbound, 0,
+            "nothing may branch to the pre-call block's fresh label"
+        );
     }
 }

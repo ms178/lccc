@@ -126,6 +126,16 @@ pub struct Preprocessor {
     /// the macros expanded on that line. Populated during preprocessing and
     /// passed to the SourceManager for diagnostic rendering.
     macro_expansion_info: Vec<crate::common::source::MacroExpansionInfo>,
+    /// Make-dependency tracking (-MD/-MMD/-M/-MM): every file the
+    /// preprocessor actually opened, in first-open order, paired with a
+    /// "resolved inside a system directory" verdict (GCC's -MMD/-MM omit
+    /// system-directory headers; -MD/-M list them).  kbuild's fixdep greps
+    /// these .d files for CONFIG_* tokens to drive config-flip rebuilds —
+    /// headers missing from deps silently starve rebuilds and surface as
+    /// undefined-symbol link errors far away from the cause.
+    pub(super) dep_files: Vec<(PathBuf, bool)>,
+    /// Dedup set for dep_files (first-open order preserved by the Vec).
+    pub(super) dep_seen: FxHashSet<PathBuf>,
 }
 
 impl Preprocessor {
@@ -156,6 +166,8 @@ impl Preprocessor {
             include_guard_macros: FxHashMap::default(),
             directive_expanding: FxHashSet::default(),
             macro_expansion_info: Vec::new(),
+            dep_files: Vec::new(),
+            dep_seen: FxHashSet::default(),
         };
         pp.define_predefined_macros();
         define_builtin_macros(&mut pp.macros);
@@ -879,6 +891,13 @@ impl Preprocessor {
     /// Take macro expansion metadata collected during preprocessing.
     /// This metadata maps preprocessed output line numbers to the macros
     /// that were expanded on each line, for use in diagnostic rendering.
+    /// Take the collected make-dependency file list (first-open order,
+    /// deduped, each with its system-directory verdict), leaving the
+    /// preprocessor with an empty list.
+    pub fn take_dep_files(&mut self) -> Vec<(PathBuf, bool)> {
+        std::mem::take(&mut self.dep_files)
+    }
+
     pub fn take_macro_expansion_info(&mut self) -> Vec<crate::common::source::MacroExpansionInfo> {
         std::mem::take(&mut self.macro_expansion_info)
     }
@@ -961,6 +980,11 @@ impl Preprocessor {
     /// is discarded (macros/typedefs persist in the preprocessor state).
     pub fn preprocess_force_include(&mut self, content: &str, resolved_path: &str) {
         let resolved = PathBuf::from(resolved_path);
+
+        // GCC lists -include files in make dependencies even when a guard
+        // or #pragma once skips reprocessing (the file WAS opened), as a
+        // user-directory dependency.
+        self.record_dep_file(resolved.clone(), false);
 
         // Check for #pragma once (path and device/inode identity).
         if self.is_pragma_once_file(&resolved) {

@@ -4559,6 +4559,7 @@ fn generate_function(
     cg.state().current_program_point = 0;
 
     for (block_idx, block) in func.blocks.iter().enumerate() {
+        cg.begin_home_write_block(block.label);
         if Some(block.label) != entry_label {
             cg.state().reg_cache.invalidate_all();
             cg.flush_pending_vec_store();
@@ -5470,6 +5471,25 @@ pub(super) fn generate_instruction(
     // inside the dispatch arms (the inline-memcpy/memset Call arms return
     // early with the result value already materialised).
     let defined_dest = inst.dest();
+    // Diagnostic ([IRW], env-gated): watch instructions mentioning specific
+    // value ids (`CCC_DEBUG_IR_VALS=312,384`), or every instruction
+    // (`CCC_DEBUG_IR_VALS=ALL`). Cache the watch list once: the driver
+    // cannot change the environment mid-process (same exactness argument
+    // as the emit-side tracer family), and this fires per instruction.
+    if let Some((all, watch)) = ir_watch() {
+        let hit = all || watch.iter().any(|id| Some(*id) == inst.dest().map(|d| d.0)) || {
+            let mut h = false;
+            inst.for_each_used_value(|id| {
+                if watch.contains(&id) {
+                    h = true;
+                }
+            });
+            h
+        };
+        if hit {
+            eprintln!("[IRW] {:?}", inst);
+        }
+    }
     match inst {
         // GNU C nested-function support (static chain / trampoline /
         // non-local goto). x86-only; the trait defaults fail closed on
@@ -6251,6 +6271,32 @@ fn generate_store(
     cg.emit_store(val, ptr, ty);
 }
 
+/// The `CCC_DEBUG_IR_VALS` watch configuration, cached once (the driver
+/// cannot change the environment mid-process — same exactness argument as
+/// the emit-side tracer family). `Some((all, ids))`: `all` is the `ALL`
+/// watch-everything form; `ids` are the individually watched value ids.
+fn ir_watch() -> Option<(bool, crate::common::fx_hash::FxHashSet<u32>)> {
+    static WATCH: std::sync::LazyLock<Option<(bool, crate::common::fx_hash::FxHashSet<u32>)>> =
+        std::sync::LazyLock::new(|| {
+            let raw = std::env::var("CCC_DEBUG_IR_VALS").ok()?;
+            let mut all = false;
+            let mut set = crate::common::fx_hash::FxHashSet::default();
+            for part in raw.split(',') {
+                if part.trim().eq_ignore_ascii_case("all") {
+                    all = true;
+                } else if let Ok(id) = part.trim().parse::<u32>() {
+                    set.insert(id);
+                }
+            }
+            if all || !set.is_empty() {
+                Some((all, set))
+            } else {
+                None
+            }
+        });
+    WATCH.clone()
+}
+
 fn generate_terminator(
     cg: &mut dyn ArchCodegen,
     term: &Terminator,
@@ -6260,12 +6306,25 @@ fn generate_terminator(
     // PF-15: a terminator ends the compare's adjacency window — flush any
     // deferred widening moves before control flow leaves the block.
     cg.flush_pending_widen();
+    // Diagnostic ([IRW], env-gated): watch terminators mentioning the watched
+    // value ids. Terminators bypass generate_instruction, so the
+    // instruction-side watcher never sees them — the acpi_pci_irq_lookup
+    // triage needed exactly this (the refusing Switch operand never printed).
+    if let Some((all, watch)) = ir_watch() {
+        let hit = all || term.used_values().iter().any(|id| watch.contains(&id));
+        if hit {
+            eprintln!("[IRW-term] {:?}", term);
+        }
+    }
     match term {
         Terminator::Return(val) => {
             cg.emit_return(val.as_ref(), frame_size);
+            cg.set_home_fallthrough(false);
         }
         Terminator::Branch(label) => {
             cg.emit_branch_to_block(*label);
+            cg.record_branch_edge(*label);
+            cg.set_home_fallthrough(false);
         }
         Terminator::CondBranch {
             cond,
@@ -6274,10 +6333,34 @@ fn generate_terminator(
         } => {
             crate::pgo::set_cond_fallthrough(crate::pgo::cond_fallthrough(block_label));
             cg.emit_cond_branch_blocks(cond, *true_label, *false_label);
+            // Both exits leave the register state unchanged (a flags test
+            // writes no GP home): the same state flows into each edge.
+            cg.record_branch_edge(*true_label);
+            cg.record_branch_edge(*false_label);
+            // The fallthrough edge is ARCHITECTURAL, not a courtesy: the
+            // emitted shape is `jcc <true>; jmp <false>` (possibly inverted),
+            // so the next emitted block is entered by physical fallthrough
+            // ONLY when it is one of the two targets. Unconditionally
+            // claiming fallthrough let the pre-branch state leak into an
+            // unrelated successor's entry join (kernel acpi_pci_irq_lookup:
+            // `CondBranch ->52/:55` followed by a `Branch ->56` block made
+            // the join of 56 — reachable from 52/55 only through other
+            // edges — absorb a clobbered state that belongs to no path
+            // into 56, and the refinement refused the loop phi's switch
+            // operand). When the next block IS a target, the flag is
+            // load-bearing: it is the jcc's physical fallthrough.
+            let falls_into_next = cg
+                .state_ref()
+                .next_block_label
+                .is_some_and(|next| next == *true_label || next == *false_label);
+            cg.set_home_fallthrough(falls_into_next);
             crate::pgo::set_cond_fallthrough(None);
         }
         Terminator::IndirectBranch { target, .. } => {
             cg.emit_indirect_branch(target);
+            // Computed Goto: every label is a potential target.
+            cg.poison_home_write_state();
+            cg.set_home_fallthrough(false);
         }
         Terminator::Switch {
             val,
@@ -6287,10 +6370,17 @@ fn generate_terminator(
         } => {
             crate::pgo::set_switch_hint(crate::pgo::switch_hint(block_label));
             cg.emit_switch(val, cases, default, *ty);
-            crate::pgo::set_switch_hint(None);
+            // The dispatcher's register effects are already reflected in
+            // the state; every case edge carries that same state.
+            for (_, target) in cases {
+                cg.record_branch_edge(*target);
+            }
+            cg.record_branch_edge(*default);
+            cg.set_home_fallthrough(false);
         }
         Terminator::Unreachable => {
             cg.emit_unreachable();
+            cg.set_home_fallthrough(false);
         }
     }
 }

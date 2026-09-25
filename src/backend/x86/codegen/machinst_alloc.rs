@@ -619,8 +619,12 @@ fn non_gpr_type(ty: Option<&IrType>) -> bool {
 /// window's program-point span (invisible to operand-level interference).
 fn window_busy_regs(ctx: &WindowCtx<'_>) -> FxHashSet<u8> {
     let (w0, w1) = ctx.window_span;
+    let watch = super::emit::ws_watch_reg();
     let mut busy = FxHashSet::default();
     for (&r, spans) in ctx.reg_busy {
+        if watch == Some(r) {
+            eprintln!("[WS-busy] r{} spans={:?} window=({}, {})", r, spans, w0, w1);
+        }
         if spans.iter().any(|&(s, e)| s <= w1 && e >= w0) {
             busy.insert(r);
         }
@@ -634,12 +638,144 @@ fn window_busy_regs(ctx: &WindowCtx<'_>) -> FxHashSet<u8> {
 /// replays it through the default path (correct, slower). `insts` is
 /// consumed: successful allocation rewrites it into the final, vreg-free
 /// sequence with reload/store traffic inserted.
+/// Classification of a window's LAST write to one physical register,
+/// computed post-emission for the write-state dataflow (S11): a
+/// `Precolor` write re-established the register's resident value's home
+/// (the register provably holds that value after the window); a
+/// `ScratchOrClobber` write put window scratch, an ABI-fixed value, or a
+/// call-clobber pattern into the register (the resident value is gone).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowWriteKind {
+    Precolor,
+    ScratchOrClobber,
+}
+
+/// Per-register LAST-write classification for a window that contains no
+/// allocated vregs: every destination-position register write is a
+/// pre-colored definition, and only the architecture-implied writes
+/// (Cqto/Div → rax:rdx, XorRdx → rdx, call clobbers, Raw barriers) are
+/// scratch/clobber events. Used directly by the flush for the fast path
+/// and as the base classifier inside `allocate_window`.
+pub(crate) fn window_last_writes_core(insts: &[MachInst]) -> FxHashMap<u8, WindowWriteKind> {
+    let mut last: FxHashMap<u8, (usize, WindowWriteKind)> = FxHashMap::default();
+    let mut record = |r: u8,
+                      idx: usize,
+                      kind: WindowWriteKind,
+                      last: &mut FxHashMap<u8, (usize, WindowWriteKind)>| {
+        last.entry(r)
+            .and_modify(|(i, k)| {
+                if idx > *i || (idx == *i && kind == WindowWriteKind::Precolor) {
+                    *i = idx;
+                    *k = kind;
+                }
+            })
+            .or_insert((idx, kind));
+    };
+    for (idx, inst) in insts.iter().enumerate() {
+        let mut dsts: Vec<MachReg> = Vec::new();
+        inst.dst_write_regs(&mut dsts);
+        for r in &dsts {
+            if let MachReg::Phys(p) = r {
+                record(p.0, idx, WindowWriteKind::Precolor, &mut last);
+            }
+        }
+        // Implicit writes beyond destination positions.
+        match inst {
+            MachInst::Cqto { .. } | MachInst::Div { .. } => {
+                record(0, idx, WindowWriteKind::ScratchOrClobber, &mut last);
+                record(16, idx, WindowWriteKind::ScratchOrClobber, &mut last);
+            }
+            MachInst::XorRdx => {
+                record(16, idx, WindowWriteKind::ScratchOrClobber, &mut last);
+            }
+            MachInst::Raw(text) => {
+                let mut written: Vec<u8> = Vec::new();
+                raw_written_regs(text, &mut written);
+                for r in written {
+                    record(r, idx, WindowWriteKind::ScratchOrClobber, &mut last);
+                }
+            }
+            MachInst::Call { .. } | MachInst::CallTyped { .. } => {
+                // SysV integer caller-clobber set (rax is not a home; the
+                // six argument registers and r10/r11 are). CallTyped's
+                // embedded save/restore pair PRESERVES every register in
+                // `caller_saves` across the call — the pre-call state
+                // remains the register's truth for those, so no event is
+                // recorded for them (kernel calculate_imbalance: a saved
+                // r11 would otherwise be misclassified as clobbered and
+                // poison a sound alias read downstream).  CallTyped's
+                // embedded ret-move targets its own dst AFTER the call —
+                // the dst-position scan above only sees operand
+                // positions, so classify the ret home as a Precolor write
+                // at this index explicitly (recorded after the clobbers,
+                // and the equal-index rule prefers Precolor).
+                let saved: FxHashSet<u8> = match inst {
+                    MachInst::CallTyped { caller_saves, .. } => {
+                        caller_saves.iter().map(|(p, _)| p.0).collect()
+                    }
+                    _ => FxHashSet::default(),
+                };
+                for r in [14u8, 15, 16, 12, 13, 10, 11] {
+                    if !saved.contains(&r) {
+                        record(r, idx, WindowWriteKind::ScratchOrClobber, &mut last);
+                    }
+                }
+                if let MachInst::CallTyped { ret: Some(rm), .. } = inst {
+                    if let MachOperand::Reg(MachReg::Phys(p)) = &rm.dst {
+                        record(p.0, idx, WindowWriteKind::Precolor, &mut last);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    last.into_iter().map(|(r, (_, k))| (r, k)).collect()
+}
+
+/// Registers a Raw escape-hatch line can possibly have written: the
+/// conservative whole-pool clobber is only justified for names the text
+/// actually mentions.  All register references in the emitted AT&T text
+/// are spelled `%<name>` (memory operands, sub-registers like `%r11d`
+/// and `%r11b` included — every size spelling carries the 64-bit name
+/// as its prefix), so a `%<name64>` substring match is an EXACT
+/// over-approximation of the registers the line touches.  A name that
+/// does not appear means the line provably did not write that register
+/// (kernel calculate_imbalance: a Raw scratch line poisoned a
+/// neighbouring home's exact Def).
+fn raw_written_regs(text: &str, out: &mut Vec<u8>) {
+    for r in MACHINST_ALLOCATABLE_GPRS {
+        // rax (0) and rcx (7) are function scratch — never main-RA homed,
+        // so no write-state is tracked for them (and phys_reg_name has no
+        // spelling for their IDs).
+        if r.0 == 0 || r.0 == 7 {
+            continue;
+        }
+        if text.contains(&format!("%{}", super::emit::phys_reg_name(*r))) {
+            out.push(r.0);
+        }
+    }
+    if super::isel::apx_enabled() {
+        for r in 40u8..=55u8 {
+            if text.contains(&format!(
+                "%{}",
+                super::emit::phys_reg_name(crate::backend::regalloc::PhysReg(r))
+            )) {
+                out.push(r);
+            }
+        }
+    }
+}
+
 pub(crate) fn allocate_window(
     mut insts: Vec<MachInst>,
     ctx: &WindowCtx<'_>,
-) -> Option<Vec<MachInst>> {
+) -> Option<(
+    Vec<MachInst>,
+    FxHashMap<u8, WindowWriteKind>,
+    FxHashMap<u8, u32>,
+)> {
     if insts.is_empty() {
-        return Some(insts);
+        return Some((insts, FxHashMap::default(), FxHashMap::default()));
     }
 
     // ── Phase 1: scan ────────────────────────────────────────────────
@@ -659,7 +795,10 @@ pub(crate) fn allocate_window(
         return None;
     }
     if scan.infos.is_empty() {
-        return Some(insts); // nothing to allocate
+        // Nothing to allocate: no rewrites, no inserted traffic — the core
+        // classifier's view is exact.
+        let writes = window_last_writes_core(&insts);
+        return Some((insts, writes, FxHashMap::default())); // nothing to allocate
     }
 
     // ── Phase 2: admission checks & classification ───────────────────
@@ -712,7 +851,8 @@ pub(crate) fn allocate_window(
     // has-unresolvable gate, exactly as before.
 
     if reg_needed.is_empty() {
-        return Some(insts);
+        let writes = window_last_writes_core(&insts);
+        return Some((insts, writes, FxHashMap::default()));
     }
 
     // ── Phase 3: interval allocation ────────────────────────────────
@@ -778,13 +918,39 @@ pub(crate) fn allocate_window(
         .ok()?;
 
     // ── Phase 4: rewrite + reload/store insertion ────────────────────
+    // Pre-rewrite destination registers, captured before the rewrite
+    // replaces Vregs: a post-rewrite Phys dst that was ALREADY Phys is a
+    // pre-colored definition of its home value; one that was a Vreg is a
+    // window-scratch write.
+    let pre_rewrite_dsts: Vec<Vec<(MachReg, Option<u32>)>> = {
+        let mut v = Vec::with_capacity(insts.len());
+        for inst in &insts {
+            let mut regs: Vec<MachReg> = Vec::new();
+            inst.dst_write_regs(&mut regs);
+            v.push(
+                regs.into_iter()
+                    .map(|r| {
+                        let vreg = match r {
+                            MachReg::Vreg(id) => Some(id),
+                            _ => None,
+                        };
+                        (r, vreg)
+                    })
+                    .collect(),
+            );
+        }
+        v
+    };
     for inst in insts.iter_mut() {
         rewrite_inst(inst, &assignments);
     }
 
-    // Reloads (arriving vregs) and stores (live-out defs), inserted from the
-    // back so earlier indices stay valid.
-    let mut inserts: Vec<(usize, MachInst)> = Vec::new();
+    // Reloads (arriving vregs) and stores (live-out defs), inserted from
+    // the back so earlier indices stay valid.  Each insert carries the IR
+    // vreg it serves (None for the store-back, which writes a slot): the
+    // post-emission write classifier resolves a reload into the vreg's
+    // OWN home as a group-member definition, not scratch.
+    let mut inserts: Vec<(usize, MachInst, Option<u32>)> = Vec::new();
     for (id, e) in &reg_needed {
         let Some(&r) = assignments.get(id) else {
             continue;
@@ -798,7 +964,11 @@ pub(crate) fn allocate_window(
         // above) references before it — the slot holds the value.
         let arriving = e.def.is_none();
         if arriving {
-            inserts.push((e.first, arriving_reload(slot, reg, size, ctx.types.get(id))));
+            inserts.push((
+                e.first,
+                arriving_reload(slot, reg, size, ctx.types.get(id)),
+                Some(*id),
+            ));
         }
 
         // Live-out AND window-written: the window's reads alone never
@@ -829,16 +999,156 @@ pub(crate) fn allocate_window(
                     dst: MachOperand::StackSlot(slot),
                     size,
                 },
+                None,
             ));
         }
     }
 
-    inserts.sort_by_key(|(idx, _)| *idx);
-    for (idx, ins) in inserts.into_iter().rev() {
+    inserts.sort_by_key(|(idx, _, _)| *idx);
+    // Origin tags aligned with the final sequence: Core = the resolved
+    // instruction at pre-insertion index ci; Inserted(Option<vreg>) =
+    // allocator-inserted traffic serving that vreg (reload) or none
+    // (store-back).
+    #[derive(Clone, Copy)]
+    enum Origin {
+        Core,
+        Inserted(Option<u32>),
+    }
+    let mut origin: Vec<Origin> = insts.iter().map(|_| Origin::Core).collect();
+    // MUST mirror the insts insertion above exactly (same reverse order):
+    // both vectors grow through index insertion, so any deviation in
+    // insertion order desynchronizes the tags from the instructions. With
+    // two reloads at indices 0 and 1, forward insertion yields
+    // [Ins2372, Ins834, Core, Core] while the instructions are
+    // [Ins2372, Core, Ins834, Core] — the core relay `→Phys(home)` then
+    // inherits the OTHER vreg's inserted-traffic tag and is classified
+    // ScratchOrClobber instead of Precolor (kernel do_setlink: the loop
+    // phi's home refresh read back as a clobber and refused the latch's
+    // fused compare). Found by red-team diffing the traced overlay event
+    // (`r4 Clobber writer=Some(834)`) against the hand-derived stream.
+    for (idx, _, v) in inserts.iter().rev() {
+        origin.insert((*idx).min(origin.len()), Origin::Inserted(*v));
+    }
+    for (idx, ins, _) in inserts.into_iter().rev() {
         insts.insert(idx.min(insts.len()), ins);
     }
 
-    Some(insts)
+    // Post-emission per-register last-write classification (S11
+    // write-state dataflow): pre-colored dsts that were not overwritten
+    // by later scratch traffic or implicit clobbers are Def events for
+    // their home values; everything else is a Clobber.
+    let mut last: FxHashMap<u8, (usize, WindowWriteKind)> = FxHashMap::default();
+    let mut vreg_last: FxHashMap<u8, (usize, Option<u32>)> = FxHashMap::default();
+    for (fi, (inst, o)) in insts.iter().zip(origin.iter()).enumerate() {
+        let is_core = matches!(o, Origin::Core);
+        let inserted_vreg = match o {
+            Origin::Core => None,
+            Origin::Inserted(v) => *v,
+        };
+        let mut dsts: Vec<MachReg> = Vec::new();
+        inst.dst_write_regs(&mut dsts);
+        for r in &dsts {
+            let MachReg::Phys(p) = r else { continue };
+            let core_idx = fi
+                - origin[..fi]
+                    .iter()
+                    .filter(|c| matches!(c, Origin::Inserted(_)))
+                    .count();
+            let pre = pre_rewrite_dsts.get(core_idx);
+            let was_precolored =
+                pre.is_some_and(|pre| pre.iter().any(|(m, vr)| *m == *r && vr.is_none()));
+            let kind = if is_core && was_precolored {
+                WindowWriteKind::Precolor
+            } else {
+                WindowWriteKind::ScratchOrClobber
+            };
+            // The IR value whose write landed in this register (a
+            // pre-rewrite Vreg dst): the flush resolves it against
+            // reg_assignments — a Vreg whose OWN home is this register is
+            // a group-member DEFINITION, not scratch (kernel
+            // calculate_imbalance: windows routinely realize the next
+            // lineage member of a dead-inside-the-window home).
+            let vreg_writer = if is_core {
+                pre.and_then(|pre| {
+                    pre.iter()
+                        .find_map(|(m, vr)| if *m == *r { *vr } else { None })
+                })
+            } else {
+                // An inserted reload materializes its vreg — into the
+                // vreg's own home when the allocator reused it (a
+                // group-member definition).
+                inserted_vreg
+            };
+            vreg_last
+                .entry(p.0)
+                .and_modify(|(i, w)| {
+                    if fi >= *i {
+                        *i = fi;
+                        *w = vreg_writer;
+                    }
+                })
+                .or_insert((fi, vreg_writer));
+            last.entry(p.0)
+                .and_modify(|(i, k)| {
+                    if fi >= *i {
+                        *i = fi;
+                        *k = kind;
+                    }
+                })
+                .or_insert((fi, kind));
+        }
+        if !is_core {
+            continue;
+        }
+        // Implicit writes (same law as the core classifier).
+        match inst {
+            MachInst::Cqto { .. } | MachInst::Div { .. } => {
+                for r in [0u8, 16] {
+                    last.insert(r, (fi, WindowWriteKind::ScratchOrClobber));
+                }
+            }
+            MachInst::XorRdx => {
+                last.insert(16, (fi, WindowWriteKind::ScratchOrClobber));
+            }
+            MachInst::Raw(text) => {
+                let mut written: Vec<u8> = Vec::new();
+                raw_written_regs(text, &mut written);
+                for r in written {
+                    last.insert(r, (fi, WindowWriteKind::ScratchOrClobber));
+                }
+            }
+            MachInst::Call { .. } | MachInst::CallTyped { .. } => {
+                // Same save-aware law as the core classifier: registers in
+                // CallTyped's caller_saves are preserved by the embedded
+                // restore — their pre-call state stays true, so they keep
+                // whatever event preceded the call.
+                let saved: FxHashSet<u8> = match inst {
+                    MachInst::CallTyped { caller_saves, .. } => {
+                        caller_saves.iter().map(|(p, _)| p.0).collect()
+                    }
+                    _ => FxHashSet::default(),
+                };
+                for r in [14u8, 15, 16, 12, 13, 10, 11] {
+                    if !saved.contains(&r) {
+                        last.insert(r, (fi, WindowWriteKind::ScratchOrClobber));
+                    }
+                }
+                if let MachInst::CallTyped { ret: Some(rm), .. } = inst {
+                    if let MachOperand::Reg(MachReg::Phys(p)) = &rm.dst {
+                        last.insert(p.0, (fi, WindowWriteKind::Precolor));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let writes = last.into_iter().map(|(r, (_, k))| (r, k)).collect();
+    let vreg_writers: FxHashMap<u8, u32> = vreg_last
+        .into_iter()
+        .filter_map(|(r, (_, w))| w.map(|v| (r, v)))
+        .collect();
+
+    Some((insts, writes, vreg_writers))
 }
 
 /// Rewrite every assigned vreg inside one instruction.
@@ -1095,7 +1405,7 @@ mod tests {
                 size: OpSize::S64,
             },
         ];
-        let out = allocate_window(insts, &c).expect("allocation must succeed");
+        let (out, _writes, _vw) = allocate_window(insts, &c).expect("allocation must succeed");
         assert_no_vregs(&out);
         // mov slot(lhs)→scratch; alu imm,scratch; store scratch→slot(dest)
         assert_eq!(out.len(), 3, "expected mov/alu/store, got {out:?}");
@@ -1158,7 +1468,7 @@ mod tests {
                 size: OpSize::S64,
             },
         ];
-        let out = allocate_window(insts, &c).expect("allocation must succeed");
+        let (out, _writes, _vw) = allocate_window(insts, &c).expect("allocation must succeed");
         assert_no_vregs(&out);
         assert!(
             out.len() == 3,
@@ -1230,7 +1540,7 @@ mod tests {
                 size: OpSize::S64,
             },
         ];
-        let out = allocate_window(insts, &c).expect("allocation must succeed");
+        let (out, _writes, _vw) = allocate_window(insts, &c).expect("allocation must succeed");
         assert_no_vregs(&out);
         // reload(20) + mov + cmp — no trailing store.
         assert_eq!(out.len(), 3, "dead value must not be stored back: {out:?}");
@@ -1267,7 +1577,7 @@ mod tests {
                 offset: 0,
             },
         }];
-        let out = allocate_window(insts, &c).expect("allocation must succeed");
+        let (out, _writes, _vw) = allocate_window(insts, &c).expect("allocation must succeed");
         assert_no_vregs(&out);
         // Both bases are simultaneously live (the Mov128 reads both): the
         // two reloads must name distinct registers.
@@ -1344,7 +1654,7 @@ mod tests {
                 size: OpSize::S64,
             },
         ];
-        let out = allocate_window(insts, &c).expect("allocation must succeed");
+        let (out, _writes, _vw) = allocate_window(insts, &c).expect("allocation must succeed");
         assert_no_vregs(&out);
         let reload = out.iter().find_map(|i| match i {
             MachInst::Mov {
@@ -1396,7 +1706,7 @@ mod tests {
                 size: OpSize::S64,
             },
         ];
-        let out = allocate_window(insts, &c).expect("allocation must succeed");
+        let (out, _writes, _vw) = allocate_window(insts, &c).expect("allocation must succeed");
         assert_no_vregs(&out);
         let scratch = out.iter().find_map(|i| match i {
             MachInst::Mov {
@@ -1438,7 +1748,7 @@ mod tests {
                 size: OpSize::S64,
             },
         ];
-        let out = allocate_window(insts, &c).expect("allocation must succeed");
+        let (out, _writes, _vw) = allocate_window(insts, &c).expect("allocation must succeed");
         assert_no_vregs(&out);
         let scratch = out.iter().find_map(|i| match i {
             MachInst::Mov {
@@ -1680,7 +1990,7 @@ mod tests {
             dst: MachOperand::Reg(phys(2)),
             size: OpSize::S64,
         }];
-        let out = allocate_window(insts, &c).expect("promotion must allocate");
+        let (out, _writes, _vw) = allocate_window(insts, &c).expect("promotion must allocate");
         assert_no_vregs(&out);
         // Reload inserted before the Mov, at the value's own width (S32 for
         // a small slot — never S64: that would read the neighbour's bytes).
@@ -1759,7 +2069,7 @@ mod tests {
             dst: MachOperand::Reg(phys(2)),
             size: OpSize::S64,
         }];
-        let out = allocate_window(insts, &c).expect("allocation must succeed");
+        let (out, _writes, _vw) = allocate_window(insts, &c).expect("allocation must succeed");
         let reload = out.iter().find_map(|i| match i {
             MachInst::Mov {
                 src: MachOperand::StackSlot(_),
@@ -1806,7 +2116,7 @@ mod tests {
             dst: MachOperand::Reg(phys(2)),
             size: OpSize::S64,
         }];
-        let out = allocate_window(insts, &c).expect("allocation must succeed");
+        let (out, _writes, _vw) = allocate_window(insts, &c).expect("allocation must succeed");
         let matches = out.iter().any(|i| {
             matches!(
                 i,
@@ -1845,7 +2155,7 @@ mod tests {
             dst: MachOperand::Reg(phys(2)),
             size: OpSize::S64,
         }];
-        let out = allocate_window(insts, &c).expect("allocation must succeed");
+        let (out, _writes, _vw) = allocate_window(insts, &c).expect("allocation must succeed");
         let matches = out.iter().any(|i| {
             matches!(
                 i,
@@ -1860,6 +2170,70 @@ mod tests {
         assert!(
             matches,
             "I8 arriving reload must be movsbq (full-register def), got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn origin_tags_stay_aligned_with_reverse_inserted_reloads() {
+        // Two arriving vregs consumed by relay copies into pre-colored
+        // destinations (the kernel do_setlink loop-phi shape: slot →
+        // window scratch → phi home). The reload for the second vreg
+        // inserts at index 1; the Origin tags MUST grow through the same
+        // reverse insertion as the instructions, or the first relay copy
+        // inherits the second vreg's inserted-traffic tag and its
+        // pre-colored home write is classified ScratchOrClobber with a
+        // foreign writer — the flush overlay then records a Clobber for a
+        // register whose resident value is still live (S11 red-team find,
+        // net/core/rtnetlink.c do_setlink).
+        let (mut slots, mut types, mut uses, busy) = base_maps();
+        slots.insert(7, StackSlot(-24));
+        slots.insert(9, StackSlot(-28));
+        types.insert(7, IrType::I64);
+        types.insert(9, IrType::I64);
+        uses.insert(7, 1);
+        uses.insert(9, 1);
+        let empty = FxHashSet::default();
+        let c = WindowCtx {
+            slots: &slots,
+            small_slots: &empty,
+            types: &types,
+            total_uses: &uses,
+            alloca_values: &empty,
+            reg_busy: &busy,
+            window_span: (0, 15),
+        };
+        let insts = vec![
+            MachInst::Mov {
+                src: MachOperand::Reg(vreg(7)),
+                dst: MachOperand::Reg(phys(2)),
+                size: OpSize::S64,
+            },
+            MachInst::Mov {
+                src: MachOperand::Reg(vreg(9)),
+                dst: MachOperand::Reg(phys(3)),
+                size: OpSize::S64,
+            },
+        ];
+        let (_out, writes, vreg_writers) =
+            allocate_window(insts, &c).expect("allocation must succeed");
+        // Both relay destinations were pre-colored BEFORE the rewrite: the
+        // pre-rewrite dst registers carry no vreg, so their writes are
+        // definitions of their home values — never scratch.
+        assert_eq!(
+            writes.get(&2),
+            Some(&WindowWriteKind::Precolor),
+            "relay dst Phys(2) must classify Precolor, got: {writes:?}"
+        );
+        assert_eq!(
+            writes.get(&3),
+            Some(&WindowWriteKind::Precolor),
+            "relay dst Phys(3) must classify Precolor, got: {writes:?}"
+        );
+        // The misalignment signature: the first relay would carry the
+        // SECOND vreg's inserted tag (vreg_writers[2] = 9).
+        assert!(
+            !vreg_writers.contains_key(&2) && !vreg_writers.contains_key(&3),
+            "core relay dsts must not be tagged as inserted vreg writes, got: {vreg_writers:?}"
         );
     }
 }

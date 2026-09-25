@@ -57,6 +57,12 @@ pub struct Lowerer {
     /// Set of function names declared with __attribute__((error("..."))) or __attribute__((warning("..."))).
     /// Calls to these functions should be treated as unreachable (they are compile-time assertion traps).
     pub(super) error_functions: FxHashSet<String>,
+    /// `__attribute__((__diagnose_as(__builtin_NAME, ...)))` declarations:
+    /// function name -> builtin name.  A call that survives inlining folds
+    /// to the builtin (GCC semantics); without this the extern declaration
+    /// is referenced but never defined and the kernel link fails on the
+    /// fortify-string family (__fortify_strlen et al).
+    pub(super) diagnose_as_builtins: FxHashMap<String, String>,
     /// Set of function names declared with __attribute__((noreturn)) or _Noreturn.
     /// After calls to these functions, emit Unreachable to avoid generating dead epilogue code.
     pub(super) noreturn_functions: FxHashSet<String>,
@@ -221,6 +227,7 @@ impl Lowerer {
             defined_functions: FxHashSet::default(),
             static_functions: FxHashSet::default(),
             error_functions: FxHashSet::default(),
+            diagnose_as_builtins: FxHashMap::default(),
             noreturn_functions: FxHashSet::default(),
             fastcall_functions: FxHashSet::default(),
             regparm_functions: FxHashMap::default(),
@@ -777,6 +784,16 @@ impl Lowerer {
         for decl in &tu.decls {
             match decl {
                 ExternalDecl::FunctionDef(func) => {
+                    // __diagnose_as on a DEFINITION (the fortify-string
+                    // family defines and declares in one shape).
+                    if let Some(ref da) = func.attrs.diagnose_as {
+                        if std::env::var_os("CCC_DBG_DA").is_some() {
+                            eprintln!("[DA-def] {} -> {}", func.name, da);
+                        }
+                        self.diagnose_as_builtins
+                            .entry(func.name.clone())
+                            .or_insert_with(|| da.clone());
+                    }
                     if func.attrs.is_constructor() && !self.module.constructors.contains(&func.name)
                     {
                         self.module.constructors.push(func.name.clone());
@@ -822,6 +839,14 @@ impl Lowerer {
                                     target.clone(),
                                     declarator.attrs.is_weak(),
                                 ));
+                            }
+                        }
+                        // Collect __attribute__((__diagnose_as(__builtin_X)))
+                        // declarations (kernel fortify-string family).
+                        if let Some(ref da) = declarator.attrs.diagnose_as {
+                            if !declarator.name.is_empty() {
+                                self.diagnose_as_builtins
+                                    .insert(declarator.name.clone(), da.clone());
                             }
                         }
                         // Collect __attribute__((symver("..."))) declarations

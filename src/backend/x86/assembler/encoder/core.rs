@@ -1121,6 +1121,31 @@ fn is_known_addr_name(n: &str) -> bool {
         || is_debug_reg(n)
 }
 
+/// Port-I/O families whose DX-indirect memory form GAS accepts
+/// (`inl (%dx), %eax`).  Everything else must not use `%dx` as a base.
+fn is_port_io_mnemonic(mnemonic: &str) -> bool {
+    matches!(
+        mnemonic.to_ascii_lowercase().as_str(),
+        "in" | "inb"
+            | "inw"
+            | "inl"
+            | "out"
+            | "outb"
+            | "outw"
+            | "outl"
+            | "ins"
+            | "insb"
+            | "insw"
+            | "insd"
+            | "insl"
+            | "outs"
+            | "outsb"
+            | "outsw"
+            | "outsd"
+            | "outsl"
+    )
+}
+
 pub(crate) fn validate_mem_operand(mnemonic: &str, mem: &MemoryOperand) -> Result<(), String> {
     let bad = || {
         format!(
@@ -1139,7 +1164,25 @@ pub(crate) fn validate_mem_operand(mnemonic: &str, mem: &MemoryOperand) -> Resul
             let last = mem.index.is_none() && mem.scale.is_none();
             return Err(bad_name(n, last));
         }
-        let ok = n == "rip" || is_reg32(n) || is_reg64(n);
+        // Port-I/O DX-indirect form: GAS admits `(%dx)` ONLY for the
+        // IN/INS/OUT/OUTS families — the encoding has no ModRM at all (DX
+        // is implicit in the opcode), so this is not general addressing —
+        // and rejects `%dx` as an address base everywhere else.  The
+        // port encoders (system.rs encode_in/encode_out) map the memory
+        // form to the same implicit-DX opcodes as the register form; the
+        // memory operand must be EXACTLY DX-indirect (no index/scale,
+        // no displacement), which is checked here once, centrally.
+        let ok = n == "rip"
+            || is_reg32(n)
+            || is_reg64(n)
+            || (n == "dx"
+                && mem.index.is_none()
+                && mem.scale.is_none()
+                && matches!(
+                    mem.displacement,
+                    Displacement::None | Displacement::Integer(0)
+                )
+                && is_port_io_mnemonic(mnemonic));
         if !ok {
             return Err(bad());
         }

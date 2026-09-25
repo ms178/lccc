@@ -62,7 +62,7 @@
 //! The pass never invents values, never widens a type, and is idempotent.
 //! Pass name for `CCC_DISABLE_PASSES`: `"cvp"`.
 
-use crate::common::fx_hash::FxHashMap;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 use crate::common::types::IrType;
 use crate::ir::analysis::{
@@ -234,6 +234,93 @@ fn truth_set(op: IrCmpOp, c: i128, bits: u32) -> Set {
         IrCmpOp::Sge => signed_interval(cs, smax, bits),
     };
     normalize(raw)
+}
+
+/// True when `op` provably evaluates to a never-null address at runtime:
+/// the address of a defined symbol, a frame alloca, a code label, or the
+/// stack pointer — possibly through Copy residue left by earlier passes.
+/// C11 gives every object a distinct, non-null address (6.5.3.2, 7.19),
+/// and frame/stack addresses derive from %rsp, so comparing any of them
+/// against NULL has a compile-time answer.  Deliberately NOT covered:
+/// casts (an inttoptr round-trip can re-enter 0), GEPs (offset arithmetic
+/// on a null base is C undefined behavior, but the IR-level value is not
+/// provably non-null without UB reasoning), and GetStaticChain (zero for
+/// functions without a static chain).
+fn never_null_address(
+    func: &IrFunction,
+    defs: &FxHashMap<Value, (usize, usize)>,
+    defined_syms: &FxHashSet<String>,
+    op: &Operand,
+    depth: u8,
+) -> bool {
+    let Operand::Value(v) = op else {
+        return false;
+    };
+    let Some(&(bi, ii)) = defs.get(v) else {
+        return false;
+    };
+    match &func.blocks[bi].instructions[ii] {
+        // GlobalAddr is never-null ONLY for a symbol this module defines
+        // (or strongly externs): an ELF weak-undefined symbol resolves to
+        // address zero at static-link time, and `&weak_opt == 0` is a real
+        // configuration-idiom.  The caller passes the module's
+        // defined-nonweak set (see defined_nonweak_symbols).
+        Instruction::GlobalAddr { name, .. } => defined_syms.contains(name),
+        Instruction::Alloca { .. }
+        | Instruction::DynAlloca { .. }
+        | Instruction::LabelAddr { .. }
+        | Instruction::StackSave { .. } => true,
+        Instruction::Copy { src, .. } if depth > 0 => {
+            never_null_address(func, defs, defined_syms, src, depth - 1)
+        }
+        _ => false,
+    }
+}
+
+fn is_null_const(op: &Operand) -> bool {
+    matches!(op, Operand::Const(k) if k.to_i128() == Some(0))
+}
+
+/// The compile-time verdict of comparing a never-null address against
+/// NULL.  Pointer comparisons are unsigned by ABI, so every unsigned
+/// predicate has an answer; signed predicates on pointers never occur
+/// from C lowering and stay unfolded by choice.
+///
+/// Truth table for `p OP 0` with p != 0 guaranteed (the never-null law):
+///   Eq  -> false   (p is not 0)
+///   Ne  -> true
+///   Ult -> false   (no unsigned value is < 0)
+///   Ule -> false   (p u<= 0 would force p == 0, excluded)
+///   Ugt -> true    (every nonzero unsigned value is > 0)
+///   Uge -> true    (every value is u>= 0)
+///
+/// The swapped direction `0 OP p` is canonicalized with `swap_op` BEFORE
+/// the table lookup — `0 u< p` is true while `p u< 0` is false, so a
+/// shared table without canonicalization answers two of the four
+/// ordering cases backwards.
+fn null_compare_verdict(
+    func: &IrFunction,
+    defs: &FxHashMap<Value, (usize, usize)>,
+    defined_syms: &FxHashSet<String>,
+    op: IrCmpOp,
+    lhs: &Operand,
+    rhs: &Operand,
+) -> Option<bool> {
+    if never_null_address(func, defs, defined_syms, lhs, 4) && is_null_const(rhs) {
+        return match op {
+            IrCmpOp::Eq | IrCmpOp::Ult | IrCmpOp::Ule => Some(false),
+            IrCmpOp::Ne | IrCmpOp::Ugt | IrCmpOp::Uge => Some(true),
+            _ => None,
+        };
+    }
+    if never_null_address(func, defs, defined_syms, rhs, 4) && is_null_const(lhs) {
+        return match swap_op(op) {
+            IrCmpOp::Eq | IrCmpOp::Ult | IrCmpOp::Ule => Some(false),
+            IrCmpOp::Ne | IrCmpOp::Ugt | IrCmpOp::Uge => Some(true),
+            _ => None,
+        };
+    }
+    None
 }
 
 fn swap_op(op: IrCmpOp) -> IrCmpOp {
@@ -515,12 +602,15 @@ fn decide_bool(
     stack: &[Fact],
     func: &IrFunction,
     defs: &FxHashMap<Value, (usize, usize)>,
+    defined_syms: &FxHashSet<String>,
     cond: &Operand,
 ) -> Option<bool> {
+    #[allow(clippy::too_many_arguments)]
     fn go(
         stack: &[Fact],
         func: &IrFunction,
         defs: &FxHashMap<Value, (usize, usize)>,
+        defined_syms: &FxHashSet<String>,
         cond: &Operand,
         depth: u8,
     ) -> Option<bool> {
@@ -540,16 +630,19 @@ fn decide_bool(
                 }
                 let &(bi, ii) = defs.get(v)?;
                 match &func.blocks[bi].instructions[ii] {
-                    Instruction::Copy { src, .. } => go(stack, func, defs, src, depth - 1),
+                    Instruction::Copy { src, .. } => {
+                        go(stack, func, defs, defined_syms, src, depth - 1)
+                    }
                     Instruction::Cmp {
                         op, lhs, rhs, ty, ..
-                    } => decide_pred(stack, canonical_pred(*op, lhs, rhs, *ty)?),
+                    } => decide_pred(stack, canonical_pred(*op, lhs, rhs, *ty)?)
+                        .or_else(|| null_compare_verdict(func, defs, defined_syms, *op, lhs, rhs)),
                     _ => None,
                 }
             }
         }
     }
-    go(stack, func, defs, cond, 16)
+    go(stack, func, defs, defined_syms, cond, 16)
 }
 
 fn bool_const(b: bool) -> Operand {
@@ -564,11 +657,12 @@ fn decided_select_arm(
     stack: &[Fact],
     func: &IrFunction,
     defs: &FxHashMap<Value, (usize, usize)>,
+    defined_syms: &FxHashSet<String>,
     selects: &FxHashMap<Value, (Operand, Operand, Operand)>,
 ) -> Option<Operand> {
     if let Operand::Value(v) = op {
         if let Some((cond, true_val, false_val)) = selects.get(v) {
-            if let Some(t) = decide_bool(stack, func, defs, cond) {
+            if let Some(t) = decide_bool(stack, func, defs, defined_syms, cond) {
                 return Some(if t { *true_val } else { *false_val });
             }
         }
@@ -585,9 +679,51 @@ fn remove_phi_incoming(func: &mut IrFunction, target: usize, pred_label: BlockId
     }
 }
 
-/// Run correlated value propagation on one function.  Returns the number of
-/// folded instructions and terminators.
+/// Symbols whose address is provably non-null at static-link time: every
+/// data global this module DEFINES (extern declarations excluded — a weak
+/// undefined symbol resolves to address zero and `&weak_opt == 0` is a
+/// real idiom), plus every function with a body in this module.  Weak
+/// spellings are excluded even when a definition exists (preemption and
+/// the weak-undef-to-zero binding make the null comparison meaningful).
+/// GCC folds non-weak addresses the same way; weak guards it keeps.
+pub fn defined_nonweak_symbols(module: &crate::ir::reexports::IrModule) -> FxHashSet<String> {
+    let mut set: FxHashSet<String> = FxHashSet::default();
+    for g in &module.globals {
+        if g.is_weak {
+            continue;
+        }
+        if g.is_extern && !g.is_common {
+            continue;
+        }
+        set.insert(g.name.clone());
+    }
+    for f in &module.functions {
+        if !f.is_declaration && !f.is_weak {
+            set.insert(f.name.clone());
+        }
+    }
+    // A weak extern-declaration attribute wins over any set membership
+    // above (name spelled weak somewhere in this TU = the guard is real).
+    for (name, is_weak, _) in &module.symbol_attrs {
+        if *is_weak {
+            set.remove(name);
+        }
+    }
+    set
+}
+
+/// Run correlated value propagation with NO module knowledge: the
+/// never-null-address law abstains on every GlobalAddr (weak-safe
+/// default).  Tests and pass-external callers use this;
+/// the pass driver uses [`run_function_with_symbols`].
 pub fn run_function(func: &mut IrFunction) -> usize {
+    run_function_with_symbols(func, &FxHashSet::default())
+}
+
+/// Run correlated value propagation on one function with the module's
+/// defined-nonweak symbol set (see [`defined_nonweak_symbols`]).
+pub fn run_function_with_symbols(func: &mut IrFunction, defined_syms: &FxHashSet<String>) -> usize {
+    let defined_syms = defined_syms;
     let n = func.blocks.len();
     if n < 2 {
         return 0;
@@ -606,10 +742,15 @@ pub fn run_function(func: &mut IrFunction) -> usize {
     let mut selects: FxHashMap<Value, (Operand, Operand, Operand)> = FxHashMap::default();
     for (bi, b) in func.blocks.iter().enumerate() {
         for (ii, inst) in b.instructions.iter().enumerate() {
+            // `defs` covers EVERY value definition, not just compares: the
+            // never-null-address law must see the GlobalAddr/Alloca/LabelAddr
+            // producer behind a null test.  Consumers that only care about
+            // compares guard with `if let Instruction::Cmp`, so the wider
+            // map is behavior-identical for them.
+            if let Some(dest) = inst.dest() {
+                defs.insert(dest, (bi, ii));
+            }
             match inst {
-                Instruction::Cmp { dest, .. } => {
-                    defs.insert(*dest, (bi, ii));
-                }
                 Instruction::Copy { dest, src } => {
                     copies.insert(*dest, *src);
                 }
@@ -675,7 +816,8 @@ pub fn run_function(func: &mut IrFunction) -> usize {
                         let mut new_inst = func.blocks[blk].instructions[i].clone();
                         let mut n = 0usize;
                         new_inst.for_each_operand_mut(|op| {
-                            if let Some(arm) = decided_select_arm(op, &stack, func, &defs, &selects)
+                            if let Some(arm) =
+                                decided_select_arm(op, &stack, func, &defs, defined_syms, &selects)
                             {
                                 *op = arm;
                                 n += 1;
@@ -711,7 +853,9 @@ pub fn run_function(func: &mut IrFunction) -> usize {
                 let mut new_term = func.blocks[blk].terminator.clone();
                 let mut n = 0usize;
                 new_term.for_each_operand_mut(|op| {
-                    if let Some(arm) = decided_select_arm(op, &stack, func, &defs, &selects) {
+                    if let Some(arm) =
+                        decided_select_arm(op, &stack, func, &defs, defined_syms, &selects)
+                    {
                         *op = arm;
                         n += 1;
                     }
@@ -732,6 +876,7 @@ pub fn run_function(func: &mut IrFunction) -> usize {
                         ty,
                     } => canonical_pred(*op, lhs, rhs, *ty)
                         .and_then(|p| decide_pred(&stack, p))
+                        .or_else(|| null_compare_verdict(func, &defs, defined_syms, *op, lhs, rhs))
                         .map(|t| Instruction::Copy {
                             dest: *dest,
                             src: bool_const(t),
@@ -742,9 +887,11 @@ pub fn run_function(func: &mut IrFunction) -> usize {
                         true_val,
                         false_val,
                         ..
-                    } => decide_bool(&stack, func, &defs, cond).map(|t| Instruction::Copy {
-                        dest: *dest,
-                        src: if t { *true_val } else { *false_val },
+                    } => decide_bool(&stack, func, &defs, defined_syms, cond).map(|t| {
+                        Instruction::Copy {
+                            dest: *dest,
+                            src: if t { *true_val } else { *false_val },
+                        }
                     }),
                     Instruction::UnaryOp {
                         dest,
@@ -783,13 +930,15 @@ pub fn run_function(func: &mut IrFunction) -> usize {
                     cond,
                     true_label,
                     false_label,
-                } if true_label != false_label => decide_bool(&stack, func, &defs, cond).map(|t| {
-                    if t {
-                        (*true_label, *false_label)
-                    } else {
-                        (*false_label, *true_label)
-                    }
-                }),
+                } if true_label != false_label => {
+                    decide_bool(&stack, func, &defs, defined_syms, cond).map(|t| {
+                        if t {
+                            (*true_label, *false_label)
+                        } else {
+                            (*false_label, *true_label)
+                        }
+                    })
+                }
                 _ => None,
             };
             if let Some((keep, drop)) = decided {
@@ -919,7 +1068,7 @@ mod tests {
             ),
         ];
         f.next_value_id = 5;
-        assert_eq!(run_function(&mut f), 2);
+        assert_eq!(run_function_with_symbols(&mut f, &bench_syms()), 2);
         assert!(matches!(
             f.blocks[1].instructions[0],
             Instruction::UnaryOp {
@@ -941,7 +1090,11 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(run_function(&mut f), 0, "specialization is idempotent");
+        assert_eq!(
+            run_function_with_symbols(&mut f, &bench_syms()),
+            0,
+            "specialization is idempotent"
+        );
     }
 
     #[test]
@@ -993,6 +1146,190 @@ mod tests {
             bits: 32,
         };
         assert_eq!(decide_pred(&stack, narrow), None);
+    }
+
+    /// The symbol set the null-compare tests compile against: the pinned
+    /// global is defined in the test module's "TU".
+    fn bench_syms() -> FxHashSet<String> {
+        let mut set = FxHashSet::default();
+        set.insert("bench_data".to_string());
+        set
+    }
+
+    fn global_addr_null_compare_case(op: IrCmpOp, swap: bool) -> IrFunction {
+        // b0: v0 = &global; v1 = (v0 OP NULL); br v1, b1, b2
+        let lhs = if swap {
+            Operand::Const(IrConst::I64(0))
+        } else {
+            Operand::Value(Value(0))
+        };
+        let rhs = if swap {
+            Operand::Value(Value(0))
+        } else {
+            Operand::Const(IrConst::I64(0))
+        };
+        let mut f = IrFunction::new("nullcmp".to_string(), IrType::U64, vec![], false);
+        f.blocks = vec![
+            mk(
+                0,
+                vec![
+                    Instruction::GlobalAddr {
+                        dest: Value(0),
+                        name: "bench_data".to_string(),
+                    },
+                    Instruction::Cmp {
+                        dest: Value(1),
+                        op,
+                        lhs,
+                        rhs,
+                        ty: IrType::U64,
+                    },
+                ],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(1)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            mk(
+                1,
+                vec![],
+                Terminator::Return(Some(Operand::Const(IrConst::I64(1)))),
+            ),
+            mk(
+                2,
+                vec![],
+                Terminator::Return(Some(Operand::Const(IrConst::I64(2)))),
+            ),
+        ];
+        f.next_value_id = 3;
+        f
+    }
+
+    /// EXPECTED[op] for `p OP NULL` with p provably never null.
+    fn expected_verdict(op: IrCmpOp) -> bool {
+        match op {
+            IrCmpOp::Eq | IrCmpOp::Ult | IrCmpOp::Ule => false,
+            IrCmpOp::Ne | IrCmpOp::Ugt | IrCmpOp::Uge => true,
+            _ => unreachable!("test only covers unsigned/eq predicates"),
+        }
+    }
+
+    #[test]
+    fn null_compare_matrix_all_12_cases() {
+        // The full truth table: 6 unsigned/eq predicates x both operand
+        // directions.  Regression: Ule/Ugt were answered backwards for
+        // `p OP NULL`, and the swapped direction reused the un-swapped
+        // table (2 of 4 ordering cases inverted).  A wrong fold here is a
+        // straight miscompile of `if (p > NULL)` style code.
+        for op in [
+            IrCmpOp::Eq,
+            IrCmpOp::Ne,
+            IrCmpOp::Ult,
+            IrCmpOp::Ule,
+            IrCmpOp::Ugt,
+            IrCmpOp::Uge,
+        ] {
+            for swap in [false, true] {
+                let want = expected_verdict(if swap { swap_op(op) } else { op });
+                let mut f = global_addr_null_compare_case(op, swap);
+                run_function_with_symbols(&mut f, &bench_syms());
+                let ok = matches!(
+                    f.blocks[0].instructions[1],
+                    Instruction::Copy {
+                        src: Operand::Const(IrConst::I32(c)),
+                        ..
+                    } if c == want as i32
+                );
+                assert!(
+                    ok,
+                    "{op:?} swap={swap}: expected fold to {want}, IR: {:?}",
+                    f.blocks[0].instructions[1]
+                );
+                // The guard must prune to the arm the verdict selects.
+                let want_block = if want { BlockId(1) } else { BlockId(2) };
+                assert!(
+                    matches!(f.blocks[0].terminator, Terminator::Branch(t) if t == want_block),
+                    "{op:?} swap={swap}: guard must prune to block {want_block:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn global_addr_never_null_folds_eq_null_compare_and_prunes_guard() {
+        // &global == NULL is always false (C11 6.5.3.2: every object has a
+        // distinct non-null address), so the compare folds to 0 and the
+        // guard prunes to the false edge.
+        let mut f = global_addr_null_compare_case(IrCmpOp::Eq, false);
+        let n = run_function_with_symbols(&mut f, &bench_syms());
+        assert!(
+            n >= 1,
+            "null-compare against &global must fold (folded {n})"
+        );
+        assert!(matches!(
+            f.blocks[0].instructions[1],
+            Instruction::Copy {
+                src: Operand::Const(IrConst::I32(0)),
+                ..
+            }
+        ));
+        // The guard is now decidable and must have pruned to the false edge.
+        assert!(matches!(
+            f.blocks[0].terminator,
+            Terminator::Branch(BlockId(2))
+        ));
+    }
+
+    #[test]
+    fn global_addr_null_law_reaches_through_gvn_copy_residue() {
+        // v0 = &global; v2 = copy v0; v3 = (v2 == NULL) — the copy chain
+        // (GVN residue) must not hide the never-null fact.
+        let mut f = global_addr_null_compare_case(IrCmpOp::Eq, false);
+        f.blocks[0].instructions.insert(
+            1,
+            Instruction::Copy {
+                dest: Value(3),
+                src: Operand::Value(Value(0)),
+            },
+        );
+        f.blocks[0].instructions[2] = Instruction::Cmp {
+            dest: Value(1),
+            op: IrCmpOp::Eq,
+            lhs: Operand::Value(Value(3)),
+            rhs: Operand::Const(IrConst::I64(0)),
+            ty: IrType::U64,
+        };
+        f.next_value_id = 4;
+        run_function_with_symbols(&mut f, &bench_syms());
+        assert!(matches!(
+            f.blocks[0].instructions[2],
+            Instruction::Copy {
+                src: Operand::Const(IrConst::I32(0)),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn runtime_value_null_compare_stays_untouched() {
+        // A null test on a function PARAMETER has no compile-time verdict;
+        // the law must not fold it (soundness of the never-null premise).
+        let mut f = global_addr_null_compare_case(IrCmpOp::Eq, false);
+        f.blocks[0].instructions[0] = Instruction::Cmp {
+            dest: Value(1),
+            op: IrCmpOp::Eq,
+            lhs: Operand::Value(Value(4)), // undefined/param-ish value
+            rhs: Operand::Const(IrConst::I64(0)),
+            ty: IrType::U64,
+        };
+        f.next_value_id = 5;
+        let n = run_function_with_symbols(&mut f, &bench_syms());
+        assert_eq!(n, 0, "no fold without a never-null producer");
+        assert!(matches!(
+            f.blocks[0].instructions[0],
+            Instruction::Cmp { .. }
+        ));
     }
 
     fn mk(id: u32, insts: Vec<Instruction>, term: Terminator) -> BasicBlock {
@@ -1066,7 +1403,7 @@ mod tests {
             ),
         ];
         f.next_value_id = 5;
-        let n = run_function(&mut f);
+        let n = run_function_with_symbols(&mut f, &bench_syms());
         assert_eq!(n, 2, "one instruction use, one terminator use");
         assert!(matches!(
             f.blocks[1].instructions[0],
@@ -1079,7 +1416,11 @@ mod tests {
             f.blocks[2].terminator,
             Terminator::Return(Some(Operand::Value(Value(0))))
         ));
-        assert_eq!(run_function(&mut f), 0, "idempotent");
+        assert_eq!(
+            run_function_with_symbols(&mut f, &bench_syms()),
+            0,
+            "idempotent"
+        );
     }
 
     #[test]
@@ -1119,7 +1460,7 @@ mod tests {
             ),
         ];
         f.next_value_id = 31;
-        let n = run_function(&mut f);
+        let n = run_function_with_symbols(&mut f, &bench_syms());
         assert_eq!(n, 2, "edge fact resolves through the copy");
         assert!(matches!(
             f.blocks[1].instructions[0],
@@ -1132,7 +1473,11 @@ mod tests {
             f.blocks[2].terminator,
             Terminator::Return(Some(Operand::Value(Value(0))))
         ));
-        assert_eq!(run_function(&mut f), 0, "idempotent");
+        assert_eq!(
+            run_function_with_symbols(&mut f, &bench_syms()),
+            0,
+            "idempotent"
+        );
     }
 
     #[test]
@@ -1163,7 +1508,11 @@ mod tests {
             ),
         ];
         f.next_value_id = 5;
-        assert_eq!(run_function(&mut f), 0, "merge decides nothing");
+        assert_eq!(
+            run_function_with_symbols(&mut f, &bench_syms()),
+            0,
+            "merge decides nothing"
+        );
         assert!(matches!(
             f.blocks[3].instructions[0],
             Instruction::BinOp {
@@ -1209,7 +1558,11 @@ mod tests {
             ),
         ];
         f.next_value_id = 6;
-        assert_eq!(run_function(&mut f), 0, "phi incomings are never rewritten");
+        assert_eq!(
+            run_function_with_symbols(&mut f, &bench_syms()),
+            0,
+            "phi incomings are never rewritten"
+        );
         if let Instruction::Phi { incoming, .. } = &f.blocks[1].instructions[0] {
             assert_eq!(incoming, &vec![(Operand::Value(Value(3)), BlockId(0))]);
         } else {
@@ -1281,7 +1634,7 @@ mod tests {
             ),
         ];
         f.next_value_id = 8;
-        let n = run_function(&mut f);
+        let n = run_function_with_symbols(&mut f, &bench_syms());
         assert_eq!(n, 3, "S2 arm, b3 use, b4 use");
         assert!(matches!(
             f.blocks[1].instructions[1],
@@ -1298,7 +1651,11 @@ mod tests {
             f.blocks[4].terminator,
             Terminator::Return(Some(Operand::Const(IrConst::I64(7))))
         ));
-        assert_eq!(run_function(&mut f), 0, "idempotent");
+        assert_eq!(
+            run_function_with_symbols(&mut f, &bench_syms()),
+            0,
+            "idempotent"
+        );
     }
 
     #[test]
@@ -1351,7 +1708,7 @@ mod tests {
             ),
         ];
         f.next_value_id = 5;
-        let n = run_function(&mut f);
+        let n = run_function_with_symbols(&mut f, &bench_syms());
         // guard cmp, select, second cmp, branch, plus the correlated-select
         // use rewrite of `ret s` in b3 (the guard is false there, so s is v).
         assert_eq!(n, 5, "guard cmp, select, second cmp, branch, ret use");
@@ -1377,7 +1734,11 @@ mod tests {
             f.blocks[3].terminator,
             Terminator::Return(Some(Operand::Value(Value(0))))
         ));
-        assert_eq!(run_function(&mut f), 0, "idempotent");
+        assert_eq!(
+            run_function_with_symbols(&mut f, &bench_syms()),
+            0,
+            "idempotent"
+        );
     }
 
     #[test]
@@ -1441,7 +1802,7 @@ mod tests {
             mk(5, vec![], Terminator::Return(Some(Operand::Value(v)))),
         ];
         f.next_value_id = 5;
-        let n = run_function(&mut f);
+        let n = run_function_with_symbols(&mut f, &bench_syms());
         // b1 is on the false edge of (v != 0): v == 0 there, so its own
         // re-test folds to false and its branch becomes `br b2`; b3's phi
         // loses the b1 incoming.  b3 is then reached only from b0 with
@@ -1506,7 +1867,7 @@ mod tests {
             ),
         ];
         f.next_value_id = 4;
-        assert_eq!(run_function(&mut f), 3);
+        assert_eq!(run_function_with_symbols(&mut f, &bench_syms()), 3);
         let val = |b: usize| match &f.blocks[b].instructions[0] {
             Instruction::Copy {
                 src: Operand::Const(IrConst::I32(k)),

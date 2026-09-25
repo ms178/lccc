@@ -264,6 +264,19 @@ pub(super) fn reg_name_to_32(name: &str) -> &'static str {
 
 /// Map a PhysReg index to its x86-64 register name.
 /// Handles both callee-saved (1-5) and caller-saved (10-15) registers.
+/// One possible last-write into a physical register (see `home_write_state`).
+///
+/// `Copy` by design: an 8-byte value-type event record that the dataflow
+/// clones wholesale at every branch edge — value semantics keep the
+/// snapshot/merge code free of borrow friction and double-indirection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum HomeWrite {
+    /// The register's last write was the definition of this value.
+    Def(u32),
+    /// The register's last write was not any home's definition.
+    Clobber,
+}
+
 #[inline]
 pub(super) fn phys_reg_name(reg: PhysReg) -> &'static str {
     match reg.0 {
@@ -713,6 +726,40 @@ pub struct X86Codegen {
     /// RA homed it for exactly that purpose and the def-writes-home
     /// invariant holds at runtime (the def precedes every runtime consumer).
     pub(super) home_clobbered: FxHashSet<u32>,
+    /// Forward register-write state — the EXACT alias-freshness law
+    /// (audit-of-#603 H1): for each home-carrying physical register, WHAT
+    /// the last write along every path reaching the current emission point
+    /// was.  `Def(v)`: the register provably holds v's value (entry-seeded
+    /// for parameters established by the prologue; recorded at every
+    /// emitted definition, in-place chain update, staging self-write,
+    /// MachInst-window pre-colored destination and call-save restore).
+    /// `Clobber`: a non-definition write (staging into a foreign home,
+    /// derived compute, call, inline-asm clobber, window bookkeeping
+    /// eviction).  Absent: unknown (never written, merged disagreement,
+    /// dynamic control).  Branch edges snapshot the state; block entries
+    /// intersect per register — a def survives a join only where ALL
+    /// incoming edges agree, which is exactly this predicate's soundness
+    /// condition on diamonds and switches.
+    pub(super) home_write_state: FxHashMap<u8, HomeWrite>,
+    /// Per-target-label snapshots recorded at terminator emission
+    /// (label id → one snapshot per incoming branch edge).
+    pub(super) home_branch_snapshots: FxHashMap<u32, Vec<FxHashMap<u8, HomeWrite>>>,
+    /// Diagnostic: the emitting block id of each recorded edge snapshot
+    /// (parallel to `home_branch_snapshots[label]`), printed by [WS-m].
+    pub(super) home_branch_edge_srcs: FxHashMap<u32, Vec<u32>>,
+    /// Whether the textually previous block falls through into the current
+    /// one (false after unconditional branches, returns, indirect branches,
+    /// switch dispatchers, and before the entry block).
+    pub(super) home_fallthrough: bool,
+    /// True while the current state is the function-entry seed (the entry
+    /// block's merge intersects incoming snapshots with it instead of
+    /// discarding it for lack of a fallthrough predecessor).
+    pub(super) home_entry_pending: bool,
+    /// A computed Goto was emitted: every label is a potential edge target,
+    /// so block-entry merges must treat every register as unknown.
+    pub(super) home_indirect_seen: bool,
+    /// Debug-only: the current block's begin label (refusal diagnostics).
+    pub(super) home_dbg_block: u32,
 
     /// The RA's blessed same-value classes (RegAllocResult::phi_chain):
     /// member value id → class representative. Two ids in one class denote
@@ -1061,6 +1108,40 @@ fn trace_notes_enabled() -> bool {
     *FLAG
 }
 
+/// The `CCC_MI_STREAM` gate, cached once (checked once per window flush).
+fn mi_stream_dbg() -> bool {
+    static FLAG: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("CCC_MI_STREAM").is_some());
+    *FLAG
+}
+
+/// The `LCCC_DEBUG_WS_REG` watch register, cached once: the environment
+/// cannot change mid-process in the driver (same exactness argument as
+/// `trace_notes_enabled`), and the write-state tracers sit on per-event
+/// paths (`note_reg_clobbered` fires several times per basic block), where
+/// a raw `env::var` lookup per event is measurable compile-time overhead.
+pub(super) fn ws_watch_reg() -> Option<u8> {
+    static WATCH: std::sync::LazyLock<Option<u8>> = std::sync::LazyLock::new(|| {
+        std::env::var("LCCC_DEBUG_WS_REG")
+            .ok()
+            .and_then(|v| v.parse::<u8>().ok())
+    });
+    *WATCH
+}
+
+/// True when the write-state tracers are watching register `reg`.
+fn ws_watch(reg: u8) -> bool {
+    ws_watch_reg() == Some(reg)
+}
+
+/// The `LCCC_DEBUG_ALIAS_REFUSE` gate, cached once (fires on every
+/// refinement evaluation — hot).
+fn alias_refuse_dbg() -> bool {
+    static FLAG: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("LCCC_DEBUG_ALIAS_REFUSE").is_some());
+    *FLAG
+}
+
 impl X86Codegen {
     /// Compare the low 64-bit half of a 128-bit switch value (already in
     /// %rax) against `case_val` and branch to `label` on equality.  The sign
@@ -1239,6 +1320,13 @@ impl X86Codegen {
             reg_assignments: FxHashMap::default(),
             home_fresh: FxHashSet::default(),
             home_clobbered: FxHashSet::default(),
+            home_write_state: FxHashMap::default(),
+            home_branch_snapshots: FxHashMap::default(),
+            home_branch_edge_srcs: FxHashMap::default(),
+            home_fallthrough: false,
+            home_entry_pending: false,
+            home_indirect_seen: false,
+            home_dbg_block: u32::MAX,
             phi_chain: FxHashMap::default(),
             value_live_segments: FxHashMap::default(),
             home_sharers: FxHashMap::default(),
@@ -1577,52 +1665,32 @@ impl X86Codegen {
         *self.phi_chain.get(&v).unwrap_or(&v)
     }
 
-    /// SOUNDNESS (alias-aware freshness): a home the bookkeeping marked
-    /// clobbered is still readable when a NON-clobbered member of the SAME
-    /// blessed class shares the register — coalescing guarantees both ids
-    /// denote one value wherever both are live, and the fresh sibling is
-    /// exactly the id the last in-place chain update wrote (kernel 6.18.52
-    /// workqueue.c llc_populate_cpu_shard_id: the `cmovnel %r10d,%r13d`
-    /// freshened v109; the consumer of same-chain v103 — slot-less by
-    /// construction — must read r13 instead of ICEing on a value that is
-    /// right there). A stale sibling of a DIFFERENT class never qualifies,
-    /// so unrelated sharers keep the strict rule.
+    /// SOUNDNESS (alias-aware freshness — the COMPOSED law, audit-of-#603
+    /// H1): the predicate is the CONJUNCTION of two layers.
     ///
-    /// ADJUDICATION NOTE (external audit of PR #603, finding H1): at the
-    /// level of this note-bookkeeping model the audit is right — a sibling
-    /// that was DEAD at a clobber is never un-freshened (the eviction gate
-    /// is liveness-gated on purpose), so `!home_clobbered` can in principle
-    /// cite a bit whose register content a clobbering write replaced.
-    /// THREE executable tightenings were built and each was refuted by
-    /// reality, which is the evidence that the composition is load-bearing
-    /// in this architecture and must not be "fixed" from this layer:
-    ///   1. fresh-only sibling predicate — changes blessedness for
-    ///      not-yet-defined siblings; H1's own scenario still blesses
-    ///      (the dead sibling is fresh), so it does not even close the
-    ///      stated case;
-    ///   2. `fresh && live at the read point` — WRONG CODE on the
-    ///      store-alu-cross-join golden gate (rot_diamonds): the predicate
-    ///      is consulted from contexts without a meaningful single "now"
-    ///      (the bulk isel pre-color map), and refusing a legitimate
-    ///      blessing is not a conservative fallback — slot-less coalesced
-    ///      chains have NO reload path, so over-refusal ends in the
-    ///      operand_to_rax fail-closed ICE;
-    ///   3. last-clobber-vs-static-range dating — ICEs the kernel
-    ///      (calibrate_delay, ioremap, check_hw_exists) by mixing emission
-    ///      program points with static liveness numbering;
-    ///   4. last-write event tracking in call order — STILL ICEs the
-    ///      kernel for the same class of shape (calibrate_delay: a value
-    ///      sharing r11 with 40 sharers, defined_by=None): the register's
-    ///      real writes are resolved by the MachInst allocator and are
-    ///      INVISIBLE to the note layer, so the event stream is
-    ///      incomplete and every dating built on it over-refuses.
-    /// The sound-and-complete fix is architectural: ONE write-event stream
-    /// that includes MachInst-resolved materializations, after which the
-    /// audit's exact law ("the last write into the register was a
-    /// same-class definition") becomes implementable. Tracked on the RA
-    /// roadmap. Until then `!home_clobbered` is the calibrated predicate:
-    /// 61 fast gates, kernel 6.18.52 16/16 QEMU boot, both corpora and
-    /// every fuzzer pass on it; every tightening measured so far does not.
+    /// Layer 1 — the calibrated sibling scan (the pre-dataflow model,
+    /// battle-tested across the whole kernel/corpus surface): some
+    /// same-class sibling of `val_id` shares the register with an
+    /// un-clobbered note mark. This layer answers everywhere the exact
+    /// write-state has no complete view (unmodeled raw intra-block control
+    /// flow, joins whose edges the note layer did not observe).
+    ///
+    /// Layer 2 — the exact write-state refinement (S11): where the
+    /// per-register last-write state holds a DEFINITE opinion — `Def(w)`
+    /// agreed on every path reaching this point, or `Clobber` — it can
+    /// only NARROW the calibrated answer, never widen it. A definite
+    /// Clobber is precisely the audit-H1 refutation: the liveness-gated
+    /// eviction leaves dead siblings' note marks stale-true exactly where
+    /// a foreign write rewrote the register, and the join law (any
+    /// clobber edge survives the merge as Clobber) catches that shape at
+    /// join granularity. A definite Def(w) of a value OUTSIDE the
+    /// register's sharing group narrows the same way. An absent entry
+    /// abstains: the calibrated answer stands.
+    ///
+    /// A computed Goto poisons the whole state (every label is a potential
+    /// edge); that poison is authoritative: no blessing survives dynamic
+    /// control flow this layer cannot enumerate.
+    ///
     pub(super) fn home_readable_via_alias(&self, val_id: u32) -> bool {
         if self.phi_chain.is_empty() {
             return false;
@@ -1631,11 +1699,178 @@ impl X86Codegen {
             return false;
         };
         let rep = self.chain_rep(val_id);
-        self.home_sharers.get(&reg.0).is_some_and(|sharers| {
+        if self.home_indirect_seen {
+            // Definite global unknown: the refinement narrows to a refusal.
+            return false;
+        }
+        // Layer 1: the calibrated sibling scan.
+        if !self.home_sharers.get(&reg.0).is_some_and(|sharers| {
             sharers.iter().any(|&s| {
                 s != val_id && !self.home_clobbered.contains(&s) && self.chain_rep(s) == rep
             })
-        })
+        }) {
+            return false;
+        }
+        // Layer 2: the exact write-state refinement (definite opinions only).
+        match self.home_write_state.get(&reg.0) {
+            Some(HomeWrite::Def(w)) => {
+                // The register's last write on every path was the
+                // definition of a member of this register's sharing group:
+                // group-lineage content, sound for any later-live member
+                // (the RA's disjoint-live-range invariant).
+                let group_ok = self.home_sharers.get(&reg.0).is_some_and(|g| g.contains(w));
+                if alias_refuse_dbg() && !group_ok {
+                    eprintln!(
+                        "[alias-refine] blk={} val={} w={} reg={} w_not_in_group",
+                        self.home_dbg_block, val_id, w, reg.0
+                    );
+                }
+                group_ok
+            }
+            Some(HomeWrite::Clobber) => {
+                if alias_refuse_dbg() {
+                    eprintln!(
+                        "[alias-refine] blk={} val={} reg={} state=Clobber (calibrated blessing narrowed)",
+                        self.home_dbg_block, val_id, reg.0
+                    );
+                }
+                false
+            }
+            // No definite opinion: abstain — the calibrated answer stands.
+            None => true,
+        }
+    }
+
+    /// Block-entry merge: intersect the recorded branch-edge snapshots for
+    /// `label` per register (agreement keeps a def, anything else drops to
+    /// unknown), intersecting the fallthrough state as one more incoming
+    /// edge when the previous block falls through.  A label with no
+    /// snapshots keeps the current state — the entry block (whose state is
+    /// the prologue seeds) or unreachable code after an unconditional jump.
+    fn begin_home_write_block_impl(&mut self, label: BlockId) {
+        self.home_dbg_block = label.0;
+        if self.home_indirect_seen {
+            // Computed Goto: every label is a potential edge; nothing is
+            // provable past a dynamic jump.
+            self.home_write_state.clear();
+            self.home_branch_snapshots.remove(&label.0);
+            self.home_branch_edge_srcs.remove(&label.0);
+            self.home_fallthrough = false;
+            return;
+        }
+        let edge_srcs = self.home_branch_edge_srcs.remove(&label.0);
+        if let Some(snaps) = self.home_branch_snapshots.remove(&label.0) {
+            // Join law — three outcomes per register.  The storage-level
+            // identity for a shared home register is GROUP membership
+            // (`home_sharers[R]`): the RA's interference guarantee makes a
+            // member's definition write the group slot's next lineage
+            // incarnation (a definition can only happen where the previous
+            // member is dead), so a Def of ANY group member is sound
+            // content for a later-live member's consumer.  A Clobber is a
+            // write of non-member content — the audit-H1 killer.
+            //
+            //   DEFINITE Def     — every edge ends with Defs, all of them
+            //                      group members: the register holds the
+            //                      group lineage on every path.
+            //   DEFINITE Clobber — ANY edge ends with a Clobber (or with
+            //                      Defs of a foreign group): on that path
+            //                      the register provably does NOT hold the
+            //                      group's value; the join poisons.
+            //   ABSTAIN          — no Clobber anywhere but some edge has
+            //                      no opinion: the entry drops the register
+            //                      and the refinement abstains, leaving
+            //                      the answer to the calibrated layer.
+            let mut all_edges: Vec<&FxHashMap<u8, HomeWrite>> = snaps.iter().collect();
+            if self.home_fallthrough || self.home_entry_pending {
+                all_edges.push(&self.home_write_state);
+            }
+            let regs: Vec<u8> = all_edges
+                .iter()
+                .flat_map(|m| m.keys().copied().collect::<Vec<_>>())
+                .collect::<FxHashSet<_>>()
+                .into_iter()
+                .collect();
+            let mut merged: FxHashMap<u8, HomeWrite> = FxHashMap::default();
+            for reg in regs {
+                let group = self.home_sharers.get(&reg);
+                let mut views: Vec<HomeWrite> = Vec::new();
+                let mut any_absent = false;
+                for m in &all_edges {
+                    match m.get(&reg) {
+                        Some(k) => views.push(*k),
+                        None => any_absent = true,
+                    }
+                }
+                if views.iter().any(|k| matches!(k, HomeWrite::Clobber)) {
+                    // A definite foreign write on some path poisons the
+                    // register for the whole joined region.
+                    merged.insert(reg, HomeWrite::Clobber);
+                } else if any_absent {
+                    // Definite Defs on some edges, unknown on others:
+                    // abstain — the calibrated layer answers.
+                    continue;
+                } else if views.iter().all(|k| {
+                    matches!(k, HomeWrite::Def(w)
+                        if group.is_some_and(|g| g.contains(w)))
+                }) {
+                    // Group-lineage Def on every path.
+                    merged.insert(reg, views[0]);
+                } else {
+                    // Defs of foreign groups: each path provably wrote
+                    // non-member content — poison for any member's consumer.
+                    merged.insert(reg, HomeWrite::Clobber);
+                }
+            }
+            if let Some(wr) = ws_watch_reg() {
+                let srcs = edge_srcs.as_ref();
+                for (i, m) in all_edges.iter().enumerate() {
+                    let src = srcs.and_then(|v| v.get(i));
+                    eprintln!(
+                        "[WS-m] blk={} e{}(from blk {:?}) r{}={:?}",
+                        label.0,
+                        i,
+                        src,
+                        wr,
+                        m.get(&wr)
+                    );
+                }
+                eprintln!("[WS-m] blk={} res r{}={:?}", label.0, wr, merged.get(&wr));
+            }
+            self.home_write_state = merged;
+        } else if !self.home_fallthrough && !self.home_entry_pending {
+            // No recorded incoming edge of any kind: the block is entered
+            // by an UNHOOKED edge (a raw jump the terminator hooks do not
+            // see, peephole-threaded text) or is unreachable after an
+            // unconditional jump.  The carried state belongs to an
+            // unrelated path — carrying it here would let facts from one
+            // path answer for another.  The refinement ABSTAINS (empty
+            // state); the calibrated layer answers exactly as it did
+            // before the dataflow existed.
+            self.home_write_state.clear();
+        }
+        self.home_fallthrough = false;
+        self.home_entry_pending = false;
+    }
+
+    /// Record one incoming branch edge's snapshot for `label`.
+    fn record_branch_edge_impl(&mut self, label: BlockId) {
+        self.home_branch_snapshots
+            .entry(label.0)
+            .or_default()
+            .push(self.home_write_state.clone());
+        self.home_branch_edge_srcs
+            .entry(label.0)
+            .or_default()
+            .push(self.home_dbg_block);
+    }
+
+    fn set_home_fallthrough_impl(&mut self, falls_through: bool) {
+        self.home_fallthrough = falls_through;
+    }
+
+    fn poison_home_write_state_impl(&mut self) {
+        self.home_write_state.clear();
+        self.home_indirect_seen = true;
     }
 
     /// Home-freshness-filtered view of `reg_assignments` for the MachInst
@@ -1668,12 +1903,21 @@ impl X86Codegen {
     /// scratch, calls) violate the invariant; those go through
     /// `note_reg_clobbered`.
     pub(super) fn note_home_written(&mut self, dest_id: u32) {
-        if self.reg_assignments.contains_key(&dest_id) {
+        if let Some(&home) = self.reg_assignments.get(&dest_id) {
+            if ws_watch(home.0) {
+                eprintln!(
+                    "[WS-ev] blk={} pp={} r{}=Def({})",
+                    self.home_dbg_block, self.state.current_program_point, home.0, dest_id
+                );
+            }
             if trace_notes_enabled() {
                 eprintln!("[INS] fn={} v={}", self.state.current_func_name, dest_id);
             }
             self.home_fresh.insert(dest_id);
             self.home_clobbered.remove(&dest_id);
+            // Write-state law: this definition is the register's last write.
+            self.home_write_state
+                .insert(home.0, HomeWrite::Def(dest_id));
         }
     }
 
@@ -1686,6 +1930,15 @@ impl X86Codegen {
     /// ZONE POINTER in the loop index's home and the fused mul-add consumed
     /// it as the index).
     pub(super) fn note_reg_clobbered(&mut self, phys: u8) {
+        // Write-state law: whatever the eviction outcome, the register's
+        // last write is now a non-definition write.
+        self.home_write_state.insert(phys, HomeWrite::Clobber);
+        if ws_watch(phys) {
+            eprintln!(
+                "[WS-ev] blk={} pp={} r{}=Clobber",
+                self.home_dbg_block, self.state.current_program_point, phys
+            );
+        }
         if let Some(sharers) = self.home_sharers.get(&phys) {
             let point = self.state.current_program_point;
             // Liveness gate: only sharers LIVE at the clobber point lose
@@ -1732,6 +1985,8 @@ impl X86Codegen {
             {
                 self.home_fresh.insert(v.0);
                 self.home_clobbered.remove(&v.0);
+                // The staging write re-establishes this value's own home.
+                self.home_write_state.insert(target.0, HomeWrite::Def(v.0));
                 return;
             }
         }
@@ -2792,6 +3047,39 @@ impl X86Codegen {
                                 .iter()
                                 .any(|i| i.dest().map(|d| d.0) == Some(v.0))
                         );
+                        // Per-sibling mark audit (H1 blind-spot triage): for
+                        // each group sibling, its clobber mark, chain rep,
+                        // and live segments vs. the current point.
+                        let point = self.state.current_program_point;
+                        eprintln!(
+                            "[NOHOME-self] v={} clobbered={} fresh={} rep={} segs={:?} now={} use={:?}",
+                            v.0,
+                            self.home_clobbered.contains(&v.0),
+                            self.home_fresh.contains(&v.0),
+                            self.chain_rep(v.0),
+                            self.value_live_segments.get(&v.0),
+                            point,
+                            self.value_use_counts.get(&v.0)
+                        );
+                        if let Some(sh) = sharers.as_ref() {
+                            for &s in sh.iter() {
+                                if s == v.0 {
+                                    continue;
+                                }
+                                let clob = self.home_clobbered.contains(&s);
+                                let fr = self.home_fresh.contains(&s);
+                                let segs = self.value_live_segments.get(&s);
+                                eprintln!(
+                                    "[NOHOME-sib] s={} clobbered={} fresh={} rep={} segs={:?} now={}",
+                                    s,
+                                    clob,
+                                    fr,
+                                    self.chain_rep(s),
+                                    segs,
+                                    point
+                                );
+                            }
+                        }
                     }
                     panic!(
                         "x86 codegen: operand_to_rax: value {} in function '{}' \
@@ -3135,7 +3423,32 @@ impl X86Codegen {
     ) -> Option<&crate::ir::reexports::Instruction> {
         let func_ptr = self.current_func?;
         let func = unsafe { &*func_ptr };
+        Self::find_defining_instruction(func, val_id)
+    }
 
+    /// The def-matcher walk, factored out of the emitter so the unit test can
+    /// drive it without an emitter/frame ([`crate::ir::reexports::IrFunction`] in,
+    /// defining instruction out).  The dest-classification list IS the contract:
+    /// every rebuild consumer (remat, const-chain, global-addr-chain) can only
+    /// recover values whose defs this matcher reports.
+    pub(super) fn find_defining_instruction(
+        func: &crate::ir::reexports::IrFunction,
+        val_id: u32,
+    ) -> Option<&crate::ir::reexports::Instruction> {
+        // AMBIGUITY LAW: a value defined MORE THAN ONCE in the function
+        // (phi-elimination residue: loop-carried induction copies keep the
+        // phi's dest id, one Copy per predecessor) has NO single static
+        // definition, so it is NOT re-derivable and must be reported as
+        // undefined to every consumer.  Answering first-def here made the
+        // global-addr resolver treat a loop-induction pointer as the
+        // constant global its ENTRY copy held: cpu_model_memset_inline's
+        // `call *pr->z(p)` folded to the loop-invariant
+        // `call *probes+8(%rip)` while the induction advanced — every
+        // iteration ≥ 1 called row 0 (memset tests byte-0 failures), and
+        // the same reasoning would corrupt any multi-def remat target.
+        // Consumers that only re-derive VALUES need a unique def; none of
+        // them benefit from a witness that may be the wrong one.
+        let mut found: Option<&crate::ir::reexports::Instruction> = None;
         for block in &func.blocks {
             for inst in &block.instructions {
                 use crate::ir::reexports::Instruction;
@@ -3156,15 +3469,37 @@ impl X86Codegen {
                     // GlobalAddr (fortify_fold's stripped puts literals in
                     // variadic frames hit exactly that wall).
                     Instruction::GlobalAddr { dest, .. } => Some(dest.0),
+                    // Copy dests must be found for the same reason: Copy is
+                    // the identity, so a Copy-defined value is recoverable
+                    // from its source exactly as it was recoverable at the
+                    // definition — rematerialize_stale_into_rax re-derives
+                    // the source with the ordinary freshness/slot discipline
+                    // at the CONSUMPTION point (no history assumption, no
+                    // re-execution hazard: the "re-executed" Copy is a mov
+                    // from an operand proven materialisable *now*).  The arm
+                    // had been missing since the matcher was written, which
+                    // left the Copy branch of the stale-home recovery dead
+                    // and iced kernel arp_create (v=1408: Copy-defined, home
+                    // clobbered by call-arg staging, no slot, recovery
+                    // chain severed before it started).  The other Copy-
+                    // following consumers (calls.rs const-chain and
+                    // global-addr-chain resolvers) carry explicit Copy arms
+                    // that were equally dead; GlobalAddr-only classifiers
+                    // see the same None they saw before.
+                    Instruction::Copy { dest, .. } => Some(dest.0),
                     _ => None,
                 };
 
                 if dest_id == Some(val_id) {
-                    return Some(inst);
+                    if found.is_some() {
+                        // Second definition: ambiguous, NOT re-derivable.
+                        return None;
+                    }
+                    found = Some(inst);
                 }
             }
         }
-        None
+        found
     }
 
     /// Analyze function to detect IVSR pointer patterns.
@@ -3927,6 +4262,34 @@ impl X86Codegen {
                         self.emit_global_addr_into_reg(&name, reg);
                         return;
                     }
+                    // Coalescing-chain member with no allocation of its
+                    // own: the class representative's storage IS this
+                    // value's storage (the coalescer only unites values it
+                    // proved interchangeable — same home, same slot
+                    // image).  Read the representative's home/slot under
+                    // the same freshness law as any home read; anything
+                    // else falls through to the loud gate.
+                    let rep = self.chain_rep(val.0);
+                    if rep != val.0 {
+                        if let Some(&rep_phys) = self.reg_assignments.get(&rep) {
+                            if !is_xmm_reg(rep_phys)
+                                && (!self.home_clobbered.contains(&rep)
+                                    || self.home_readable_via_alias(rep))
+                            {
+                                let rep_name = phys_reg_name(rep_phys);
+                                if rep_name != reg {
+                                    self.state.out.emit_instr_reg_reg("    movq", rep_name, reg);
+                                }
+                                return;
+                            }
+                        }
+                        if let Some(rep_slot) = self.state.get_slot(rep) {
+                            self.state
+                                .out
+                                .emit_instr_rbp_reg("    movq", rep_slot.0, reg);
+                            return;
+                        }
+                    }
                     // Last resort: the accumulator cache (rax holds this
                     // value). This mirrors operand_to_callee_reg's fallback —
                     // a value can be acc-resident with no slot, home, or Copy
@@ -4519,6 +4882,10 @@ impl X86Codegen {
             if home.0 == written.0 {
                 self.home_fresh.insert(dest_id);
                 self.home_clobbered.remove(&dest_id);
+                // The in-place write IS this definition (the chain-update
+                // freshen the alias law blesses through).
+                self.home_write_state
+                    .insert(written.0, HomeWrite::Def(dest_id));
             }
         }
     }
@@ -5761,7 +6128,11 @@ fn resolve_stack_vregs(
 /// substitute the slot — the leftover Vreg trips `has_unresolvable_vreg`
 /// and the window falls back to the default path, which loads at the true
 /// width (a `movl` reload zero-extends; a silent memory operand would not).
-fn slot_fits_width(state: &CodegenState, id: u32, inst_size: super::machinst::OpSize) -> bool {
+pub(super) fn slot_fits_width(
+    state: &CodegenState,
+    id: u32,
+    inst_size: super::machinst::OpSize,
+) -> bool {
     if state.is_small_slot(id) {
         // 4-byte slot: only 8/16/32-bit reads are in-bounds.
         matches!(
@@ -7617,7 +7988,7 @@ impl ArchCodegen for X86Codegen {
 
         use super::machinst::{MachInst, MachOperand, MachReg, OpSize};
 
-        if std::env::var("CCC_MI_STREAM").is_ok() {
+        if mi_stream_dbg() {
             eprintln!(
                 "### MI-STREAM fn={} n={}",
                 self.state.current_func_name,
@@ -7642,6 +8013,10 @@ impl ArchCodegen for X86Codegen {
         // (4) A vreg that survives all three stages still trips the
         //     unresolvable gate and replays the window through the default
         //     path: the fail-safe, now the exception instead of the cliff.
+        let mut window_last_writes_fast: Option<
+            FxHashMap<u8, super::machinst_alloc::WindowWriteKind>,
+        > = None;
+        let mut window_vreg_writers: FxHashMap<u8, u32> = FxHashMap::default();
         let reg_classified = super::machinst_alloc::classify_window(
             &self.machinst_buf,
             Some(&self.state.small_slot_values),
@@ -7675,6 +8050,9 @@ impl ArchCodegen for X86Codegen {
         let final_insts = if reg_classified.is_empty() {
             // Fast path: nothing needs a window register — the resolution
             // result is the emission input, exactly as before.
+            window_last_writes_fast =
+                Some(super::machinst_alloc::window_last_writes_core(&resolved));
+            window_vreg_writers.clear();
             resolved
         } else {
             let ir_len = self.machinst_buf_ir.len() as u32;
@@ -7689,29 +8067,42 @@ impl ArchCodegen for X86Codegen {
                 reg_busy: &self.machine_reg_busy,
                 window_span,
             };
-            match super::machinst_alloc::allocate_window(resolved, &ctx) {
-                Some(v) => v,
-                None => {
-                    // Allocation refused (XMM domain, SSA discipline, pool
-                    // exhaustion, …): the skip-set vregs never got
-                    // substituted, so re-resolve WITHOUT the skip set —
-                    // giving the memory-operand path its chance before the
-                    // replay decides.
-                    self.machinst_buf
-                        .iter()
-                        .map(|inst| {
-                            resolve_stack_vregs(
-                                inst,
-                                &self.reg_assignments,
-                                &self.state,
-                                &crate::common::fx_hash::FxHashSet::default(),
-                                false,
-                                &crate::common::fx_hash::FxHashSet::default(),
-                            )
-                        })
-                        .collect()
-                }
-            }
+            let (insts, writes, vreg_writers) =
+                match super::machinst_alloc::allocate_window(resolved, &ctx) {
+                    Some(v) => v,
+                    None => {
+                        // Allocation refused (XMM domain, SSA discipline, pool
+                        // exhaustion, …): the skip-set vregs never got
+                        // substituted, so re-resolve WITHOUT the skip set —
+                        // giving the memory-operand path its chance before the
+                        // replay decides. The re-resolved sequence (when it
+                        // fully resolves, no replay) is what gets emitted, so
+                        // its writes must be classified by the core
+                        // classifier — an empty map here would let the
+                        // overlay skip the window entirely and leave stale
+                        // write-state facts pinned across it.
+                        let re_resolved: Vec<MachInst> = self
+                            .machinst_buf
+                            .iter()
+                            .map(|inst| {
+                                resolve_stack_vregs(
+                                    inst,
+                                    &self.reg_assignments,
+                                    &self.state,
+                                    &crate::common::fx_hash::FxHashSet::default(),
+                                    false,
+                                    &crate::common::fx_hash::FxHashSet::default(),
+                                )
+                            })
+                            .collect();
+                        let core_writes =
+                            super::machinst_alloc::window_last_writes_core(&re_resolved);
+                        (re_resolved, core_writes, FxHashMap::default())
+                    }
+                };
+            window_last_writes_fast = Some(writes);
+            window_vreg_writers = vreg_writers;
+            insts
         };
 
         let has_bad = final_insts
@@ -7838,6 +8229,97 @@ impl ArchCodegen for X86Codegen {
                     self.home_clobbered.insert(dest.0);
                 }
             }
+            // ── S11 write-state overlay (EXACT window accounting) ────────
+            // The note-bit loop above keeps the coarse freshness bits, but
+            // the write-state law needs the register-truth: which home
+            // registers did the EMITTED window actually write last, and
+            // was that write a pre-colored definition (Def) or scratch/
+            // clobber traffic (Clobber)? The classifier derives this from
+            // the post-allocation instruction sequence, so a pre-colored
+            // def is recognized even when an OLD clobber mark made the
+            // heuristic above believe the home was not written (the
+            // replay-min/max shape: `cmoval %esi, %r14d` targets the
+            // accumulator's home regardless of earlier marks).
+            let Some(last_writes) = &window_last_writes_fast else {
+                self.machinst_buf_ir = ir_shadow;
+                return;
+            };
+            for (reg_id, kind) in last_writes.iter() {
+                let home = PhysReg(*reg_id);
+                let resident = self
+                    .reg_assignments
+                    .iter()
+                    .filter(|(_, r)| **r == home)
+                    .map(|(&v, _)| v)
+                    .collect::<Vec<_>>();
+                if resident.is_empty() {
+                    // Not a home register in this function: nothing to track.
+                    continue;
+                }
+                match kind {
+                    super::machinst_alloc::WindowWriteKind::Precolor => {
+                        // The last shadow dest homed in this register owns
+                        // the surviving pre-colored definition (multiple
+                        // same-home defs in one window are impossible for
+                        // simultaneously-live values; the LAST one is the
+                        // register's content).
+                        let owner = ir_shadow
+                            .iter()
+                            .filter_map(|inst| inst.dest())
+                            .rev()
+                            .find(|d| self.reg_assignments.get(&d.0).is_some_and(|&r| r == home));
+                        match owner {
+                            Some(v) => {
+                                self.home_write_state.insert(*reg_id, HomeWrite::Def(v.0));
+                            }
+                            None => {
+                                self.home_write_state.insert(*reg_id, HomeWrite::Clobber);
+                            }
+                        }
+                    }
+                    super::machinst_alloc::WindowWriteKind::ScratchOrClobber => {
+                        // A window Vreg dst whose OWN home is this register
+                        // realized the group's next lineage member — a
+                        // definition, not scratch (the allocator may only
+                        // pick a dead-inside-the-window home for it, so
+                        // the disjoint-live-range invariant holds).
+                        match window_vreg_writers.get(reg_id) {
+                            // A Vreg whose own home is this register: a
+                            // group-member definition (the allocator may
+                            // only reuse a dead-inside-the-window home).
+                            Some(&v)
+                                if self.reg_assignments.get(&v).is_some_and(|&r| r == home) =>
+                            {
+                                if ws_watch(*reg_id) {
+                                    eprintln!(
+                                        "[WS-win] blk={} r{} vreg Def({})",
+                                        self.home_dbg_block, reg_id, v
+                                    );
+                                }
+                                self.home_write_state.insert(*reg_id, HomeWrite::Def(v));
+                            }
+                            // Inserted reload into foreign scratch, an
+                            // unnamed-Raw touch, or an unsaved call
+                            // clobber: foreign content.
+                            other => {
+                                if ws_watch(*reg_id) {
+                                    eprintln!(
+                                        "[WS-win] blk={} r{} Clobber writer={:?} kind={:?} state_before={:?}",
+                                        self.home_dbg_block,
+                                        reg_id,
+                                        other,
+                                        window_last_writes_fast
+                                            .as_ref()
+                                            .and_then(|m| m.get(reg_id)),
+                                        self.home_write_state.get(reg_id)
+                                    );
+                                }
+                                self.home_write_state.insert(*reg_id, HomeWrite::Clobber);
+                            }
+                        }
+                    }
+                }
+            }
             self.machinst_buf_ir = ir_shadow;
         }
 
@@ -7921,6 +8403,10 @@ impl ArchCodegen for X86Codegen {
         for v in snapshot {
             self.home_fresh.insert(v);
             self.home_clobbered.remove(&v);
+            // The restore's pop/mov is a real definition write.
+            if let Some(&home) = self.reg_assignments.get(&v) {
+                self.home_write_state.insert(home.0, HomeWrite::Def(v));
+            }
         }
     }
 
@@ -8715,6 +9201,10 @@ impl ArchCodegen for X86Codegen {
         fn emit_fused_cmp_branch_blocks(&mut self, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType, true_block: BlockId, false_block: BlockId) => emit_fused_cmp_branch_blocks_impl;
         fn emit_fused_bit_test_branch_blocks(&mut self, base: &Operand, index: &Operand, ty: IrType, true_block: BlockId, false_block: BlockId) => emit_fused_bit_test_branch_blocks_impl;
         fn emit_cond_branch_blocks(&mut self, cond: &Operand, true_block: BlockId, false_block: BlockId) => emit_cond_branch_blocks_impl;
+        fn begin_home_write_block(&mut self, label: BlockId) => begin_home_write_block_impl;
+        fn record_branch_edge(&mut self, label: BlockId) => record_branch_edge_impl;
+        fn set_home_fallthrough(&mut self, falls_through: bool) => set_home_fallthrough_impl;
+        fn poison_home_write_state(&mut self) => poison_home_write_state_impl;
         fn emit_select(&mut self, dest: &Value, cond: &Operand, true_val: &Operand, false_val: &Operand, ty: IrType) => emit_select_impl;
         // calls
         fn call_abi_config(&self) -> CallAbiConfig => call_abi_config_impl;
@@ -8864,9 +9354,10 @@ mod alias_freshness_tests {
         }
     }
 
-    // ── audit F5: the alias-freshness law is fail-closed ─────────────────────
+    // ── the exact alias-freshness law (audit-of-#603 H1) ─────────────────────
 
-    /// Seed a two-member same-value class sharing one home register.
+    /// A two-member same-value class homed in r13, both definitions emitted
+    /// (the class content sits in the register from v104's definition on).
     fn seeded_codegen() -> X86Codegen {
         let mut cg = X86Codegen::new();
         cg.reg_assignments.insert(103, PhysReg(3));
@@ -8876,8 +9367,14 @@ mod alias_freshness_tests {
         cg.value_live_segments.insert(103, vec![(0, 100)]);
         cg.value_live_segments.insert(104, vec![(0, 100)]);
         cg.state.current_program_point = 10;
-        cg.home_fresh.insert(103);
-        cg.home_fresh.insert(104);
+        // Definitions in emission order, then the workqueue composition: a
+        // clobber evicts both sharers and the in-place chain update
+        // re-defines the newest id.  v103 stays clobber-marked — the alias
+        // path under test is exactly the one its consumer takes.
+        cg.note_home_written(103);
+        cg.note_home_written(104);
+        cg.note_reg_clobbered(3);
+        cg.note_home_written(104);
         cg
     }
 
@@ -8886,7 +9383,7 @@ mod alias_freshness_tests {
         let mut cg = seeded_codegen();
         assert_eq!(cg.fresh_home_of(103), Some(PhysReg(3)));
         // The kernel-6.18.52 shape: a clobber evicts both sharers, the
-        // in-place chain update re-freshens ONLY the newest id, and the
+        // in-place chain update re-defines ONLY the newest id, and the
         // consumer of the older sibling reads the register through the
         // blessed class.
         cg.note_reg_clobbered(3);
@@ -8895,16 +9392,270 @@ mod alias_freshness_tests {
         assert_eq!(
             cg.fresh_home_of(103),
             Some(PhysReg(3)),
-            "fresh class sibling proves the home readable"
+            "the class definition that is the register's last write blesses"
         );
     }
 
     #[test]
-    fn stale_sibling_of_same_class_never_blesses_the_home() {
+    fn dead_class_sibling_clobber_refuses_under_exact_law() {
+        // THE audit-H1 composition, now closed: v104's definition is the
+        // register's last write; then a clobbering write hits r13 while
+        // v104 is DEAD — the liveness-gated eviction leaves v104's bits
+        // untouched (pinned below), but the write state records the
+        // Clobber, and no join resurrects it.  The consumer of v103 must
+        // reload instead of reading whatever the clobber left in r13.
+        let mut cg = seeded_codegen();
+        // v104 dies before the clobber.
+        cg.value_live_segments.insert(104, vec![(0, 5)]);
+        cg.state.current_program_point = 70;
+        cg.note_reg_clobbered(3);
+        assert!(
+            !cg.home_clobbered.contains(&104),
+            "dead sharer survives the eviction (liveness-gate law)"
+        );
+        cg.state.current_program_point = 80;
+        assert_eq!(
+            cg.fresh_home_of(103),
+            None,
+            "the clobber event poisons the register: no dead-sibling blessing"
+        );
+    }
+
+    #[test]
+    fn branch_disagreement_poisons_the_join() {
+        // Diamond: one arm defines v104 into r13, the other clobbers r13.
+        // The join's merge sees Disagreement — no side may bless.
+        let mut cg = seeded_codegen();
+        cg.home_fallthrough = false;
+        cg.home_entry_pending = false;
+        let mut arm_a = FxHashMap::default();
+        arm_a.insert(3u8, HomeWrite::Def(104));
+        let mut arm_b = FxHashMap::default();
+        arm_b.insert(3u8, HomeWrite::Clobber);
+        cg.home_branch_snapshots.insert(7, vec![arm_a, arm_b]);
+        cg.begin_home_write_block(BlockId(7));
+        assert_eq!(cg.fresh_home_of(103), None, "disagreement poisons the join");
+    }
+
+    #[test]
+    fn branch_agreement_keeps_the_def_at_the_join() {
+        // Both arms carry the same class definition (e.g. an if/else whose
+        // arms each end with the chain update): the join keeps the def and
+        // the consumer reads the register.
+        let mut cg = seeded_codegen();
+        cg.home_fallthrough = false;
+        cg.home_entry_pending = false;
+        let mut arm_a = FxHashMap::default();
+        arm_a.insert(3u8, HomeWrite::Def(104));
+        let mut arm_b = FxHashMap::default();
+        arm_b.insert(3u8, HomeWrite::Def(104));
+        cg.home_branch_snapshots.insert(7, vec![arm_a, arm_b]);
+        cg.begin_home_write_block(BlockId(7));
+        assert_eq!(
+            cg.fresh_home_of(103),
+            Some(PhysReg(3)),
+            "unanimous defs survive the join"
+        );
+    }
+
+    #[test]
+    fn fallthrough_edge_participates_in_the_merge() {
+        // Conditional branch: the taken edge is a snapshot, the not-taken
+        // edge is the fallthrough — both must agree for the join to bless.
+        let mut cg = seeded_codegen();
+        let mut snap = FxHashMap::default();
+        snap.insert(3u8, HomeWrite::Def(104));
+        cg.home_branch_snapshots.insert(9, vec![snap]);
+        cg.home_fallthrough = true;
+        cg.home_entry_pending = false;
+        // Current (fallthrough) state agrees: Def(104) from the seed.
+        cg.begin_home_write_block(BlockId(9));
+        assert_eq!(cg.fresh_home_of(103), Some(PhysReg(3)));
+        // Now the fallthrough DISAGREES (a clobber on the way).
+        let mut snap = FxHashMap::default();
+        snap.insert(3u8, HomeWrite::Def(104));
+        cg.home_branch_snapshots.insert(10, vec![snap]);
+        cg.home_write_state.insert(3, HomeWrite::Clobber);
+        cg.home_fallthrough = true;
+        cg.begin_home_write_block(BlockId(10));
+        assert_eq!(cg.fresh_home_of(103), None, "fallthrough clobber poisons");
+    }
+
+    #[test]
+    fn entry_seeds_survive_the_entry_block() {
+        // The entry block has no fallthrough predecessor, but its state is
+        // the prologue's parameter seeds — the merge must keep them.
+        let mut cg = seeded_codegen();
+        cg.home_fallthrough = false;
+        cg.home_entry_pending = true;
+        cg.begin_home_write_block(BlockId(0));
+        assert_eq!(
+            cg.fresh_home_of(103),
+            Some(PhysReg(3)),
+            "entry seeds are the entry block's incoming state"
+        );
+    }
+
+    #[test]
+    fn computed_goto_poisons_every_label() {
+        let mut cg = seeded_codegen();
+        cg.poison_home_write_state();
+        cg.home_entry_pending = false;
+        cg.begin_home_write_block(BlockId(0));
+        assert_eq!(
+            cg.fresh_home_of(103),
+            None,
+            "after a computed Goto no register is provable"
+        );
+    }
+
+    #[test]
+    fn join_keeps_group_lineage_defs_agreed_across_edges() {
+        // Two paths into a join each define a DIFFERENT member of the
+        // SAME sharing group into the register (a remat re-derivation of
+        // the class rep on one arm, the coalesced member on the other).
+        // Storage-level identity is GROUP membership: the join keeps the
+        // Def — syntactic or chain-class equality would refuse a sound
+        // loop-carrier read (kernel calibrate_delay).
+        let mut cg = seeded_codegen();
+        let mut snap_a = FxHashMap::default();
+        snap_a.insert(3u8, HomeWrite::Def(103));
+        let mut snap_b = FxHashMap::default();
+        snap_b.insert(3u8, HomeWrite::Def(104));
+        cg.home_branch_snapshots.insert(11, vec![snap_a, snap_b]);
+        cg.home_fallthrough = false;
+        cg.home_entry_pending = false;
+        cg.begin_home_write_block(BlockId(11));
+        // The consumer of the clobber-marked 103 reads the group slot:
+        // Layer 1 blesses via the fresh sibling, Layer 2 sees the
+        // group-lineage Def the join kept.
+        assert_eq!(
+            cg.fresh_home_of(103),
+            Some(PhysReg(3)),
+            "group-member Defs on every edge agree at the join"
+        );
+    }
+
+    #[test]
+    fn join_poisons_when_any_edge_carries_a_clobber() {
+        // One path ends with a foreign write: the register provably does
+        // NOT hold the group's value on that path — the join poisons, and
+        // the refinement refuses even though the calibrated layer would
+        // bless (the audit-H1 discipline at join granularity).
+        let mut cg = seeded_codegen();
+        cg.note_home_written(104); // edge A: group-lineage Def
+        let edge_a = cg.home_write_state.clone();
+        cg.note_reg_clobbered(3); // edge B: foreign write
+        let edge_b = cg.home_write_state.clone();
+        assert!(matches!(edge_b.get(&3), Some(HomeWrite::Clobber)));
+        // The merge law: any Clobber among the edges => Clobber.
+        let poisoned = matches!(
+            (edge_a.get(&3), edge_b.get(&3)),
+            (_, Some(HomeWrite::Clobber))
+        );
+        assert!(poisoned);
+        cg.home_write_state = edge_b;
+        cg.home_branch_snapshots.clear();
+        cg.home_fallthrough = false;
+        cg.home_entry_pending = false;
+        assert!(
+            !cg.home_readable_via_alias(103),
+            "a definite Clobber narrows the calibrated blessing to a refusal"
+        );
+    }
+
+    #[test]
+    fn absent_state_abstains_to_the_calibrated_layer() {
+        // Where the write-state has NO definite opinion (the register was
+        // never observed since an unknown point — e.g. after raw
+        // intra-block control flow), the refinement abstains and the
+        // calibrated sibling scan answers: never worse than the
+        // pre-dataflow model.
         let mut cg = seeded_codegen();
         cg.note_reg_clobbered(3);
-        // An unrelated staging write re-evicts both: NO fresh sibling
-        // exists, so the consumer must reload.
+        cg.note_home_written(104);
+        // Layer 2 alone would bless (Def(104) is the last write); drop the
+        // opinion entirely to exercise the abstain path.
+        cg.home_write_state.clear();
+        assert!(
+            cg.home_readable_via_alias(103),
+            "an absent state entry defers to the calibrated blessing"
+        );
+        // ... and a fully clobbered sibling set refuses (calibrated base).
+        cg.note_reg_clobbered(3);
+        assert!(!cg.home_readable_via_alias(103));
+    }
+
+    #[test]
+    fn computed_goto_poison_is_authoritative() {
+        // After a computed Goto the state is DEFINITELY unknown for every
+        // register — the refinement narrows even a calibrated blessing to
+        // a refusal.
+        let mut cg = seeded_codegen();
+        cg.poison_home_write_state();
+        assert!(
+            !cg.home_readable_via_alias(103),
+            "no calibrated blessing survives the computed-Goto poison"
+        );
+    }
+
+    #[test]
+    fn loop_carried_group_slot_keeps_the_calibrated_blessing() {
+        // The kernel calibrate_delay shape: every edge into a loop header
+        // ends with a Def of a DIFFERENT member of ONE sharing group (the
+        // RA's latch copies/selects write the group's carried slot).  The
+        // join cannot prove member-to-member equivalence (the phi was
+        // if-converted away), so it records the loop-carrier signature and
+        // the calibrated sibling scan answers for exactly this register.
+        let mut cg = seeded_codegen();
+        cg.reg_assignments.insert(105, PhysReg(3));
+        cg.home_sharers.insert(3, vec![103, 104, 105]);
+        cg.value_live_segments.insert(105, vec![(0, 100)]);
+        // Edge A ends with Def(103); edge B with Def(105) — same group,
+        // different canonical classes.
+        let mut snap_a = FxHashMap::default();
+        snap_a.insert(3u8, HomeWrite::Def(103));
+        let mut snap_b = FxHashMap::default();
+        snap_b.insert(3u8, HomeWrite::Def(105));
+        cg.home_branch_snapshots.insert(11, vec![snap_a, snap_b]);
+        cg.home_fallthrough = false;
+        cg.home_entry_pending = false;
+        cg.begin_home_write_block(BlockId(11));
+        assert_eq!(
+            cg.fresh_home_of(103),
+            Some(PhysReg(3)),
+            "the group slot's carried value serves its live member"
+        );
+    }
+
+    #[test]
+    fn a_clobbering_edge_defeats_the_loop_carrier_signature() {
+        // H1 discipline: a foreign-class clobber on any edge means the
+        // register provably does NOT hold a group member on all paths —
+        // no carrier signature, exact refusal.
+        let mut cg = seeded_codegen();
+        cg.reg_assignments.insert(105, PhysReg(3));
+        cg.home_sharers.insert(3, vec![103, 104, 105]);
+        cg.value_live_segments.insert(105, vec![(0, 100)]);
+        let mut snap_a = FxHashMap::default();
+        snap_a.insert(3u8, HomeWrite::Def(103));
+        cg.home_branch_snapshots.insert(12, vec![snap_a]);
+        cg.home_write_state.insert(3, HomeWrite::Clobber);
+        cg.home_fallthrough = true;
+        cg.home_entry_pending = false;
+        cg.begin_home_write_block(BlockId(12));
+        assert_eq!(
+            cg.fresh_home_of(103),
+            None,
+            "a clobber edge is not a group-member Def"
+        );
+    }
+
+    #[test]
+    fn staging_write_of_a_foreign_value_poisons_the_home() {
+        let mut cg = seeded_codegen();
+        // Stage a constant into r13: the register's last write is not any
+        // home's definition.
         cg.note_staging_target(&Operand::Const(IrConst::I32(1)), PhysReg(3));
         assert_eq!(cg.fresh_home_of(103), None);
         assert_eq!(cg.fresh_home_of(104), None);
@@ -8914,48 +9665,13 @@ mod alias_freshness_tests {
     }
 
     #[test]
-    fn dead_sibling_survival_is_the_documented_blessing_law() {
-        // ADJUDICATED audit-H1 shape, pinned as the LAW with the reasoning
-        // (see home_readable_via_alias's adjudication note for the full
-        // three-refutations record): the sibling v104 is dead at the
-        // clobber point, so the liveness-gated eviction leaves it untouched
-        // and the consumer of v103 still reads the home through it.  This
-        // is LOAD-BEARING, not an oversight: scratch homes accumulate deep
-        // sharer lists (measured: 40 on r11 in calibrate_delay) whose real
-        // writes are resolved inside the MachInst allocator — invisible to
-        // the note layer — so every tighten-able predicate built from the
-        // notes alone over-refuses, and over-refusal for slot-less
-        // coalesced chains is the operand_to_rax fail-closed ICE, not a
-        // safe fallback (measured: rot_diamonds wrong-code with
-        // live-at-point dating; calibrate_delay/ioremap/check_hw_exists
-        // kernel ICEs with static-range and event dating).  The exact
-        // last-write law requires the unified write-event stream (RA
-        // roadmap); until it exists, this behavior is the calibrated one.
-        let mut cg = X86Codegen::new();
-        cg.reg_assignments.insert(103, PhysReg(3));
-        cg.reg_assignments.insert(104, PhysReg(3));
-        cg.home_sharers.insert(3, vec![103, 104]);
-        cg.phi_chain.insert(104, 103);
-        cg.value_live_segments.insert(103, vec![(0, 100)]);
-        cg.value_live_segments.insert(104, vec![(50, 60)]);
-        cg.home_fresh.insert(103);
-        cg.home_fresh.insert(104);
-        cg.state.current_program_point = 70;
+    fn staging_self_write_reestablishes_the_definition() {
+        let mut cg = seeded_codegen();
         cg.note_reg_clobbered(3);
-        assert!(
-            cg.home_clobbered.contains(&103),
-            "live sharer evicted at the clobber"
-        );
-        assert!(
-            !cg.home_clobbered.contains(&104),
-            "dead sharer survives the eviction (pinned law)"
-        );
-        cg.state.current_program_point = 80;
-        assert_eq!(
-            cg.fresh_home_of(103),
-            Some(PhysReg(3)),
-            "the surviving same-class sibling blesses the home (documented law)"
-        );
+        assert_eq!(cg.fresh_home_of(103), None);
+        // A staging write whose operand IS the homed value re-establishes it.
+        cg.note_staging_target(&Operand::Value(Value(104)), PhysReg(3));
+        assert_eq!(cg.fresh_home_of(103), Some(PhysReg(3)));
     }
 
     #[test]
@@ -8983,6 +9699,19 @@ mod alias_freshness_tests {
         assert!(
             !cg.home_clobbered.contains(&105),
             "dead sharer keeps its home mark"
+        );
+    }
+
+    #[test]
+    fn inline_asm_clobber_poisons_the_write_state() {
+        let mut cg = seeded_codegen();
+        // The F5 path routes through note_reg_clobbered: the state must
+        // follow, not just the eviction bits.
+        cg.note_reg_clobbered(home_phys_by_asm_name("r13").unwrap());
+        assert_eq!(
+            cg.fresh_home_of(103),
+            None,
+            "asm clobber poisons the register for the alias law"
         );
     }
 }
@@ -9535,5 +10264,120 @@ mod machinst_window_tests {
             size: OpSize::S64,
         };
         assert!(!machinst_window_rax_free(std::slice::from_ref(&falu_rax)));
+    }
+}
+
+#[cfg(test)]
+mod def_matcher_tests {
+    use super::*;
+    use crate::common::types::IrType;
+    use crate::ir::reexports::{
+        BasicBlock, BlockId, Instruction, IrBinOp, IrConst, IrFunction, Operand, Terminator, Value,
+    };
+
+    /// Regression lock for the `Copy` arm of the def matcher (kernel
+    /// net/ipv4/arp.c `arp_create`, value 1408): a Copy-defined value whose
+    /// home is clobbered by call-argument staging, with no slot image, MUST
+    /// present its definition to the stale-home recovery —
+    /// `rematerialize_stale_into_rax` re-derives the identity-moved source
+    /// with the ordinary freshness discipline.  With the matcher arm absent
+    /// (the historical state) the recovery chain is severed before it starts
+    /// and the consumer refuses to fabricate the value and ICEs.  The
+    /// GlobalAddr/Cast/BinOp arms are pinned too: the matcher's
+    /// dest-classification list is exactly the set of def shapes every
+    /// rebuild consumer can recover from.
+    #[test]
+    fn def_matcher_reports_copy_defined_values() {
+        let mut func = IrFunction::new("arp_shape".to_string(), IrType::Void, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(0),
+                    name: "g".to_string(),
+                },
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(0)),
+                },
+                Instruction::Cast {
+                    dest: Value(2),
+                    src: Operand::Value(Value(1)),
+                    from_ty: IrType::U32,
+                    to_ty: IrType::U64,
+                },
+                Instruction::BinOp {
+                    dest: Value(3),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I64(1)),
+                    ty: IrType::U64,
+                },
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        for vid in [0u32, 1, 2, 3] {
+            assert!(
+                X86Codegen::find_defining_instruction(&func, vid).is_some(),
+                "value {vid}: the matcher must report its definition"
+            );
+        }
+        // A value with no definition in the function stays invisible.
+        assert!(X86Codegen::find_defining_instruction(&func, 9).is_none());
+    }
+
+    /// AMBIGUITY LAW: a multiply-defined value (phi-elimination residue —
+    /// loop-carried induction copies share the phi's dest id) must NOT be
+    /// reported.  Answering first-def let the global-addr resolver treat
+    /// the loop induction pointer as the constant global its ENTRY copy
+    /// held: cpu_model_memset_inline's `call *pr->z(p)` folded to the
+    /// loop-invariant `call *probes+8(%rip)` while `r15` advanced 56 bytes
+    /// per iteration — every row ≥ 1 called row 0 (memset n=1 byte-0
+    /// failures).  A single-def value keeps the F10 recovery contract.
+    #[test]
+    fn def_matcher_refuses_multiply_defined_values() {
+        let mut func = IrFunction::new("loopy".to_string(), IrType::Void, vec![], false);
+        // b0: v0 = &probes; v1 = copy v0        (entry predecessor)
+        // b1: v2 = v1 + 56; v1 = copy v2; loop  (latch REDEFINES v1)
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(0),
+                    name: "probes".to_string(),
+                },
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(0)),
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                Instruction::BinOp {
+                    dest: Value(2),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I64(56)),
+                    ty: IrType::U64,
+                },
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(2)),
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 3;
+        // The loop-carried copy has TWO defs: invisible to re-derivation.
+        assert!(X86Codegen::find_defining_instruction(&func, 1).is_none());
+        // Single-def values (the global, the latch increment) stay visible.
+        assert!(X86Codegen::find_defining_instruction(&func, 0).is_some());
+        assert!(X86Codegen::find_defining_instruction(&func, 2).is_some());
     }
 }
