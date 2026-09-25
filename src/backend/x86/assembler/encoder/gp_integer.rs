@@ -982,8 +982,17 @@ impl super::InstructionEncoder {
                     self.bytes.push(0x66);
                 }
                 self.emit_rex_unary(size, &dst.name);
-                self.bytes.push(0x81);
-                self.bytes.push(self.modrm(3, alu_op, dst_num));
+                if is_accum(&dst.name) {
+                    // Accumulator short form with a relocated immediate:
+                    // `add $(_GLOBAL_OFFSET_TABLE_ - .), %eax` is `05
+                    // disp32`, not `81 /0` — one byte shorter, exactly what
+                    // GAS 2.47 emits for the kernel's GOT-base idiom.
+                    self.bytes
+                        .push(if size == 1 { 0x04 } else { 0x05 } + alu_op * 8);
+                } else {
+                    self.bytes.push(0x81);
+                    self.bytes.push(self.modrm(3, alu_op, dst_num));
+                }
                 // Use instruction-relative offset; elf_writer_common adds section base.
                 self.add_relocation(sym, R_X86_64_32S, addend);
                 self.bytes.extend_from_slice(&[0; 4]);
@@ -1008,8 +1017,14 @@ impl super::InstructionEncoder {
                     self.bytes.push(0x66);
                 }
                 self.emit_rex_unary(size, &dst.name);
-                self.bytes.push(0x81);
-                self.bytes.push(self.modrm(3, alu_op, dst_num));
+                if is_accum(&dst.name) {
+                    // Accumulator short form (see the Symbol arm above).
+                    self.bytes
+                        .push(if size == 1 { 0x04 } else { 0x05 } + alu_op * 8);
+                } else {
+                    self.bytes.push(0x81);
+                    self.bytes.push(self.modrm(3, alu_op, dst_num));
+                }
                 self.add_diff_relocation(sym, diff, R_X86_64_PC32, 0);
                 self.bytes.extend_from_slice(&[0; 4]);
                 Ok(())
@@ -1508,6 +1523,7 @@ impl super::InstructionEncoder {
         if ops.len() != 1 {
             return Err("unary op requires 1 operand".to_string());
         }
+
         // inc (op_ext=0) and dec (op_ext=1) use FE/FF, not F6/F7
         let base_opcode = if op_ext <= 1 {
             if size == 1 { 0xFE } else { 0xFF }
@@ -1770,6 +1786,33 @@ impl super::InstructionEncoder {
         if self.apx_nf && op_ext == 2 {
             return Err("{nf} unsupported for `not'".to_string());
         }
+        // A two-operand div/idiv WITHOUT decorators maps to the LEGACY
+        // unary with the implicit accumulator checked against the second
+        // operand (GAS 2.47: `div %ecx, %eax` = `f7 f1`; `div %cl, %bl`
+        // and `idiv %ecx, %edx` are `operand type mismatch`; `mul` has no
+        // two-operand form at all). neg/not keep the NDD promotion.
+        if ops.len() == 2 && !self.apx_wants_evex() && matches!(op_ext, 6 | 7) {
+            if matches!(op_ext, 4) {
+                return Err("number of operands mismatch".to_string());
+            }
+            let acc = match size {
+                1 => "al",
+                2 => "ax",
+                4 => "eax",
+                _ => "rax",
+            };
+            match &ops[1] {
+                Operand::Register(r) if r.name.eq_ignore_ascii_case(acc) => {
+                    return self.encode_unary_rm(std::slice::from_ref(&ops[0]), op_ext, size);
+                }
+                _ => {
+                    return Err(format!(
+                        "operand type mismatch for `{}'",
+                        if op_ext == 6 { "div" } else { "idiv" }
+                    ));
+                }
+            }
+        }
         let nf = self.apx_nf;
         let base_opcode = if op_ext <= 1 {
             if size == 1 { 0xFE } else { 0xFF }
@@ -1781,13 +1824,26 @@ impl super::InstructionEncoder {
         match ops {
             [Operand::Register(src), Operand::Register(ndd)] => {
                 let num = reg_num(&src.name).ok_or("bad register")?;
-                self.emit_apx_evex_rr(size, "", &src.name, Some(&ndd.name), nf)?;
+                // IDIV's promoted two-operand form keeps ND=0: vvvv carries
+                // the dividend's high half as a SOURCE (the destination is
+                // the implicit rDX:rA pair) — `idiv %ecx, %eax` is
+                // `62 f4 7c 0c f7 f9`-shaped (NF=1, ND=0), unlike neg/inc
+                // whose vvvv is a true new destination (GAS 2.47).
+                if matches!(op_ext, 6 | 7) {
+                    self.emit_apx_evex_rr_nd0(size, "", &src.name, &ndd.name, nf)?;
+                } else {
+                    self.emit_apx_evex_rr(size, "", &src.name, Some(&ndd.name), nf)?;
+                }
                 self.bytes.push(base_opcode);
                 self.bytes.push(self.modrm(3, op_ext, num));
                 Ok(())
             }
             [Operand::Memory(mem), Operand::Register(ndd)] => {
-                self.emit_apx_evex_rm(size, "", mem, Some(&ndd.name), nf)?;
+                if matches!(op_ext, 6 | 7) {
+                    self.emit_apx_evex_rm_nd0(size, "", mem, &ndd.name, nf)?;
+                } else {
+                    self.emit_apx_evex_rm(size, "", mem, Some(&ndd.name), nf)?;
+                }
                 self.bytes.push(base_opcode);
                 self.encode_modrm_mem(op_ext, mem)
             }
@@ -2323,6 +2379,12 @@ impl super::InstructionEncoder {
             Operand::Indirect(inner) => match inner.as_ref() {
                 Operand::Register(reg) => {
                     let num = reg_num(&reg.name).ok_or("bad register")?;
+                    // 16-bit targets take the operand-size prefix (`call
+                    // *%ax` = 66 ff d0; without it the same bytes decode as
+                    // the 64-bit `call *%rax` — GAS 2.47 byte-verified).
+                    if is_reg16(&reg.name) {
+                        self.bytes.push(0x66);
+                    }
                     self.emit_rex_unary(4, &reg.name);
                     self.bytes.push(0xFF);
                     self.bytes.push(self.modrm(3, 4, num));
@@ -2380,6 +2442,13 @@ impl super::InstructionEncoder {
                 match inner.as_ref() {
                     Operand::Register(reg) => {
                         let num = reg_num(&reg.name).ok_or("bad register")?;
+                        // 16-bit targets take the operand-size prefix
+                        // (`call *%ax` = 66 ff d0; without it the same
+                        // bytes decode as the 64-bit `call *%rax` —
+                        // GAS 2.47 byte-verified).
+                        if is_reg16(&reg.name) {
+                            self.bytes.push(0x66);
+                        }
                         self.emit_rex_unary(4, &reg.name);
                         self.bytes.push(0xFF);
                         self.bytes.push(self.modrm(3, 2, num));
@@ -2564,7 +2633,14 @@ impl super::InstructionEncoder {
         }
         match &ops[0] {
             Operand::Memory(mem) => {
-                self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x01]);
+                // Prefix order: legacy F3 first, then REX immediately before
+                // the opcode (GAS 2.47: `f3 42 0f ae`, NOT `42 f3 ...`). The
+                // REX bit is mandatory when an r8-r15 base/index is present
+                // (r12 index without REX.X silently re-decodes as base-only
+                // addressing); W is NOT set — the instruction is m64-only.
+                self.bytes.push(0xF3);
+                self.emit_rex_rm(0, "", mem);
+                self.bytes.extend_from_slice(&[0x0F, 0x01]);
                 self.encode_modrm_mem(5, mem) // /5
             }
             _ => Err("rstorssp requires a memory operand".to_string()),
@@ -2577,7 +2653,10 @@ impl super::InstructionEncoder {
         }
         match &ops[0] {
             Operand::Memory(mem) => {
-                self.bytes.extend_from_slice(&[0xF3, 0x0F, 0xAE]);
+                // Prefix order as in rstorssp: F3, then REX, then opcode.
+                self.bytes.push(0xF3);
+                self.emit_rex_rm(0, "", mem);
+                self.bytes.extend_from_slice(&[0x0F, 0xAE]);
                 self.encode_modrm_mem(6, mem) // /6
             }
             _ => Err("clrssbsy requires a memory operand".to_string()),

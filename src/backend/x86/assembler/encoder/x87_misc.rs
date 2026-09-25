@@ -597,7 +597,10 @@ impl super::InstructionEncoder {
         if ops.len() < 1 || ops.len() > 3 {
             return Err("shift requires 1-3 operands".to_string());
         }
-        // Size comes from the destination (last register).
+        // Size comes from the destination (last non-%cl register, since the
+        // central suffix inference now routes suffixed forms elsewhere this
+        // only serves memory-only spellings) — GAS 2.47 defaults a
+        // memory-only shift to 32 bits (`shl (%rax)` = `d1 20`).
         let size = ops
             .iter()
             .rev()
@@ -605,7 +608,7 @@ impl super::InstructionEncoder {
                 Operand::Register(r) if r.name != "cl" => Some(infer_reg_size(&r.name)),
                 _ => None,
             })
-            .unwrap_or(8);
+            .unwrap_or(4);
         let op_name = match shift_op {
             4 => "shl",
             5 => "shr",
@@ -634,9 +637,14 @@ impl super::InstructionEncoder {
         if ops.len() != 1 && ops.len() != 2 {
             return Err("unary op requires 1 or 2 operands".to_string());
         }
+        // GAS 2.47 size law: the register operand decides; a memory-only
+        // form defaults to 32 bits (`neg (%rax)` assembles to `f7 18`, NOT
+        // `48 f7 18`, with the "no register operands" warning — byte-verified
+        // against the 2.47 oracle). The old 64-bit default silently widened
+        // every suffixless memory unary, legacy and {nf} alike.
         let size = match ops.last() {
             Some(Operand::Register(r)) => infer_reg_size(&r.name),
-            _ => 8,
+            _ => 4,
         };
         if size == 2 && !self.apx_wants_evex() && ops.len() == 1 {
             self.bytes.push(0x66);
