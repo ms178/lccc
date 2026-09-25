@@ -73,6 +73,387 @@ impl Driver {
         Some(AlignControl::Custom { align, max_skip })
     }
 
+    /// Reset the x86-64 arch-IMPLIED ISA surface to the x86-64 baseline
+    /// (SSE2-only: every optional `enable_*` feature off).  Called at every
+    /// `-march=` — the new profile must REPLACE the previous arch's set, not
+    /// union onto it (GCC: `-march=x86-64-v3 -march=x86-64` leaves `__BMI__`,
+    /// `__MOVBE__` and `__AVX__` all absent).  Explicit decisions are NOT
+    /// lost: the sticky `*_explicitly_disabled` denials and `no_sse` are
+    /// resolve-time state and survive, and the recorded explicit flags are
+    /// replayed after the profile lands (see
+    /// [`Driver::replay_x86_explicit_isa_flags`]).
+    fn reset_x86_arch_implied_isa(&mut self) {
+        self.enable_sse3 = false;
+        self.enable_ssse3 = false;
+        self.enable_sse4_1 = false;
+        self.enable_sse4_2 = false;
+        self.enable_avx = false;
+        self.enable_avx2 = false;
+        self.enable_aes = false;
+        self.enable_pclmul = false;
+        self.enable_f16c = false;
+        self.enable_fma = false;
+        self.enable_bmi = false;
+        self.enable_bmi2 = false;
+        self.enable_lzcnt = false;
+        self.enable_popcnt = false;
+        self.enable_movbe = false;
+        self.enable_rdrnd = false;
+        self.enable_avx512f = false;
+        self.enable_avx512cd = false;
+        self.enable_avx512dq = false;
+        self.enable_avx512bw = false;
+        self.enable_avx512vl = false;
+        self.enable_avx512ifma = false;
+        self.enable_avx512vbmi = false;
+        self.enable_avx512vbmi2 = false;
+        self.enable_avx512vnni = false;
+        self.enable_avx512bitalg = false;
+        self.enable_avx512vpopcntdq = false;
+        self.enable_avx512bf16 = false;
+        self.enable_avx512fp16 = false;
+        self.enable_avx512er = false;
+        self.enable_avx512pf = false;
+        self.enable_avx512vp2intersect = false;
+        self.enable_avxvnni = false;
+        self.enable_avxifma = false;
+        self.enable_avxneconvert = false;
+        self.enable_avx10_1 = false;
+        self.enable_avx10_2 = false;
+        self.enable_gfni = false;
+        self.enable_vaes = false;
+        self.enable_vpclmulqdq = false;
+        self.enable_avxvnniint8 = false;
+        self.enable_avxvnniint16 = false;
+        self.enable_sha512 = false;
+        self.enable_sm3 = false;
+        self.enable_sm4 = false;
+        self.enable_movrs = false;
+        self.enable_user_msr = false;
+        self.enable_apxf = false;
+        self.enable_amx_tile = false;
+        self.enable_amx_int8 = false;
+        self.enable_amx_bf16 = false;
+        self.enable_cmpccxadd = false;
+    }
+
+    /// Re-apply the recorded explicit x86 ISA flags, in command-line order,
+    /// AFTER a `-march=` profile has landed.  This is what makes an explicit
+    /// `-m*`/`-mno-*` decision override the final arch in BOTH directions
+    /// (GCC, measured on gcc 14.2: `-mno-bmi -march=x86-64-v3` → `__BMI__`
+    /// absent; `-mbmi -march=x86-64` → `__BMI__` defined) while a later
+    /// `-march=` still REPLACES the arch-implied set.  Recording happens in
+    /// the main argument loop only, so a replay cannot duplicate entries.
+    fn replay_x86_explicit_isa_flags(&mut self) {
+        let recorded = self.x86_explicit_isa_args.clone();
+        for arg in &recorded {
+            self.apply_x86_isa_mflag(arg);
+        }
+    }
+
+    /// Apply one explicit x86 ISA `-m`/`-mno-` flag.  Returns `true` when
+    /// `arg` is one of the flags owned here; the caller (the main argument
+    /// loop) then records it for [`Driver::replay_x86_explicit_isa_flags`].
+    /// This is the SINGLE implementation of every ISA flag's effect — the
+    /// immediate application and the post-`-march=` replay run the same
+    /// code, so they cannot drift.  Non-ISA `-m` flags (`-mcmodel=`,
+    /// `-mtune=`, `-mno-red-zone`, `-mno-80387`, `-mgeneral-regs-only`,
+    /// `-malign-data=`, `-mharden-sls=`, the AVX10 not-implemented errors,
+    /// ...) return `false` and stay with the main match: they have no
+    /// arch-set interaction.
+    fn apply_x86_isa_mflag(&mut self, arg: &str) -> bool {
+        match arg {
+            "-mno-sse" | "-mno-sse2" => {
+                // Sticky disable: later `-march=native` / CPU profiles must
+                // not revive SSE. GCC keeps `-mno-sse` in either flag order
+                // (kernel decompressor: `-mno-sse` then Cachy `-march=native`).
+                self.no_sse = true;
+                self.sse_explicitly_disabled = true;
+                // No xmm state at all, so every VEX form is forbidden too.
+                self.avx_explicitly_disabled = true;
+                self.fma_explicitly_disabled = true;
+                self.sse41_explicitly_disabled = true;
+                self.enable_sse3 = false;
+                self.enable_ssse3 = false;
+                self.enable_sse4_1 = false;
+                self.enable_sse4_2 = false;
+                self.enable_avx = false;
+                self.enable_avx2 = false;
+            }
+            "-mno-avx2" => {
+                self.enable_avx2 = false;
+                // AVX2 is the 256-bit integer class — a strict subset
+                // of the VEX encoding. Denying it removes `ymm` code
+                // but NOT the VEX.128 world: `-march=x86-64-v3
+                // -mno-avx2` (the AVX1+FMA target class, GCC's
+                // `-march=corei7-avx` relatives) keeps `vmovsd`,
+                // `vaddsd` and every scalar FMA family. Killing
+                // `avx` here (the pre-fix behavior) made `-mno-avx2
+                // -mfma` decline the FMA fold entirely: two `xorpd`
+                // and a libm call where GCC emits one `vfnmsub132sd`.
+                self.avx2_explicitly_disabled = true;
+                self.enable_avxvnni = false;
+                self.enable_avxvnniint8 = false;
+                self.enable_avxvnniint16 = false;
+            }
+            "-mno-avx" => {
+                self.enable_avx = false;
+                self.enable_avx2 = false;
+                // `vfmadd*` is VEX-encoded: no AVX means no FMA3 either
+                // (GCC rejects -mfma -mno-avx for the same reason).
+                self.avx_explicitly_disabled = true;
+                self.fma_explicitly_disabled = true;
+                self.enable_avxvnni = false;
+                self.enable_vaes = false;
+                self.enable_vpclmulqdq = false;
+            }
+            "-mno-sse3" | "-mno-ssse3" | "-mno-sse4" | "-mno-sse4.1" => {
+                // SSE4.1 ⊃ SSSE3 ⊃ SSE3 and AVX ⊃ SSE4.2 ⊃ SSE4.1, so
+                // denying any of these denies SSE4.1 *and* AVX/FMA.
+                self.sse41_explicitly_disabled = true;
+                self.avx_explicitly_disabled = true;
+                self.fma_explicitly_disabled = true;
+                self.enable_sse3 = false;
+                self.enable_ssse3 = false;
+                self.enable_sse4_1 = false;
+                self.enable_sse4_2 = false;
+                self.enable_avx = false;
+                self.enable_avx2 = false;
+            }
+            "-mno-sse4.2" => {
+                // AVX implies SSE4.2, so denying SSE4.2 denies AVX/FMA;
+                // SSE4.1 stays legal (GCC: -mno-sse4.2 keeps -msse4.1).
+                self.avx_explicitly_disabled = true;
+                self.fma_explicitly_disabled = true;
+                self.enable_sse4_2 = false;
+                self.enable_avx = false;
+                self.enable_avx2 = false;
+            }
+            // Positive SIMD feature flags: define corresponding macros.
+            // -mavx2 implies -mavx implies -msse4.2 implies -msse4.1 implies
+            // -mssse3 implies -msse3 (matching GCC's implication chain).
+            "-maes" => self.enable_aes = true,
+            "-mpclmul" => self.enable_pclmul = true,
+            "-mf16c" => self.enable_f16c = true,
+            "-mfma" => {
+                // FMA3 exists only in the VEX encoding — there is no
+                // legacy-SSE FMA — so -mfma implies -mavx and its full
+                // prerequisite chain, exactly like GCC's one-directional
+                // implication (oracle, gcc 14.2 -Q --help=target:
+                // `-march=x86-64 -mfma` reports avx, sse4.1, sse4.2 all
+                // ENABLED with avx2 still disabled; `-mavx` alone leaves
+                // fma disabled). Later-flag-wins keeps both directions:
+                // a later -mno-avx/-mno-sse4.1/-mno-sse still kills the
+                // chain (their arms set the denial flags the ceiling
+                // consults), and -mfma after -mno-sse re-enables the
+                // vector file (gcc: -mno-sse -mfma -> sse enabled;
+                // -mfma -mno-sse -> everything off).
+                self.no_sse = false;
+                self.sse_explicitly_disabled = false;
+                self.sse41_explicitly_disabled = false;
+                self.avx_explicitly_disabled = false;
+                self.enable_avx = true;
+                self.enable_sse4_2 = true;
+                self.enable_sse4_1 = true;
+                self.enable_ssse3 = true;
+                self.enable_sse3 = true;
+                self.enable_fma = true;
+                self.fma_explicitly_disabled = false;
+                // FMA ⇒ AVX ⊃ SSE4.2 ⇒ POPCNT (GCC, measured on
+                // gcc 14.2: `-mfma -march=x86-64` defines `__POPCNT__`).
+                self.enable_popcnt = true;
+            }
+            // Last-explicit ISA decision wins (GCC): a later `-mbmi`
+            // lifts an earlier `-mno-bmi` sticky denial.
+            "-mbmi" => {
+                self.enable_bmi = true;
+                self.bmi_explicitly_disabled = false;
+            }
+            "-mbmi2" => {
+                self.enable_bmi2 = true;
+                self.bmi2_explicitly_disabled = false;
+            }
+            "-mlzcnt" => {
+                // Last-explicit ISA decision wins (GCC): a later
+                // `-mlzcnt` lifts an earlier `-mno-lzcnt` sticky denial.
+                self.enable_lzcnt = true;
+                self.lzcnt_explicitly_disabled = false;
+            }
+            "-mpopcnt" => {
+                // Last-explicit ISA decision wins (GCC): a later
+                // `-mpopcnt` lifts an earlier `-mno-popcnt` sticky
+                // denial.
+                self.enable_popcnt = true;
+                self.popcnt_explicitly_disabled = false;
+            }
+            "-mmovbe" => {
+                self.enable_movbe = true;
+                self.movbe_explicitly_disabled = false;
+            }
+            "-mrdrnd" => self.enable_rdrnd = true,
+            // AVX-512 / AVX10 feature flags (completeness; backend coverage
+            // is partial and runtime dispatch must verify the host).
+            "-mavx512f" => self.enable_avx512f = true,
+            "-mavx512cd" => self.enable_avx512cd = true,
+            "-mavx512dq" => self.enable_avx512dq = true,
+            "-mavx512bw" => self.enable_avx512bw = true,
+            "-mavx512vl" => self.enable_avx512vl = true,
+            "-mavx512ifma" => self.enable_avx512ifma = true,
+            "-mavx512vbmi" => self.enable_avx512vbmi = true,
+            "-mavx512vbmi2" => self.enable_avx512vbmi2 = true,
+            "-mavx512vnni" => self.enable_avx512vnni = true,
+            "-mavx512bitalg" => self.enable_avx512bitalg = true,
+            "-mavx512vpopcntdq" => self.enable_avx512vpopcntdq = true,
+            "-mavx512bf16" => self.enable_avx512bf16 = true,
+            "-mavx512fp16" => self.enable_avx512fp16 = true,
+            "-mavx512er" => self.enable_avx512er = true,
+            "-mavx512pf" => self.enable_avx512pf = true,
+            "-mavx512vp2intersect" => self.enable_avx512vp2intersect = true,
+            "-mavxvnni" => self.enable_avxvnni = true,
+            "-mavxifma" => self.enable_avxifma = true,
+            "-mavxneconvert" => self.enable_avxneconvert = true,
+            "-mgfni" => self.enable_gfni = true,
+            "-mavxvnniint8" => self.enable_avxvnniint8 = true,
+            "-mavxvnniint16" => self.enable_avxvnniint16 = true,
+            "-msha512" => self.enable_sha512 = true,
+            "-msm3" => self.enable_sm3 = true,
+            "-msm4" => self.enable_sm4 = true,
+            "-mmovrs" => self.enable_movrs = true,
+            "-muser_msr" => self.enable_user_msr = true,
+            // APX Foundation: extra GPRs r16–r31, NDD 3-operand ALU.
+            // Off by default — emitting it on a non-APX host (Raptor Lake,
+            // i7-14700KF, …) is #UD. `-march=raptorlake` must never imply this.
+            "-mapx" | "-mapxf" => self.enable_apxf = true,
+            "-mno-apx" | "-mno-apxf" => self.enable_apxf = false,
+            "-mamx-tile" => self.enable_amx_tile = true,
+            "-mamx-int8" => self.enable_amx_int8 = true,
+            "-mamx-bf16" => self.enable_amx_bf16 = true,
+            "-mcmpccxadd" => self.enable_cmpccxadd = true,
+            "-mno-avxvnniint8" => self.enable_avxvnniint8 = false,
+            "-mno-avxvnniint16" => self.enable_avxvnniint16 = false,
+            "-mno-sha512" => self.enable_sha512 = false,
+            "-mno-sm3" => self.enable_sm3 = false,
+            "-mno-sm4" => self.enable_sm4 = false,
+            "-mno-movrs" => self.enable_movrs = false,
+            "-mno-user_msr" => self.enable_user_msr = false,
+            "-mno-amx-tile" => self.enable_amx_tile = false,
+            "-mno-amx-int8" => self.enable_amx_int8 = false,
+            "-mno-amx-bf16" => self.enable_amx_bf16 = false,
+            "-mno-cmpccxadd" => self.enable_cmpccxadd = false,
+            "-mvaes" => self.enable_vaes = true,
+            "-mvpclmulqdq" => self.enable_vpclmulqdq = true,
+            "-mno-aes" => self.enable_aes = false,
+            "-mno-pclmul" => self.enable_pclmul = false,
+            "-mno-f16c" => self.enable_f16c = false,
+            "-mno-fma" => {
+                self.enable_fma = false;
+                self.fma_explicitly_disabled = true;
+            }
+            "-mno-bmi" => {
+                self.enable_bmi = false;
+                // Sticky denial: the absent-march baseline is x86-64-v3,
+                // which carries BMI1; only this explicit denial removes
+                // the class from a default build (GCC keeps the denial
+                // sticky across a later `-march=native` probe too).
+                self.bmi_explicitly_disabled = true;
+            }
+            "-mno-bmi2" => {
+                self.enable_bmi2 = false;
+                self.bmi2_explicitly_disabled = true;
+            }
+            "-mno-lzcnt" => {
+                self.enable_lzcnt = false;
+                // Sticky denial: the absent-march baseline is x86-64-v3,
+                // which carries ABM (LZCNT/TZCNT); only this explicit
+                // denial removes it from a default build.
+                self.lzcnt_explicitly_disabled = true;
+            }
+            "-mno-popcnt" => {
+                self.enable_popcnt = false;
+                // Sticky denial: the absent-march baseline is x86-64-v3,
+                // which carries POPCNT (since v2); only this explicit
+                // denial removes it from a default build.
+                self.popcnt_explicitly_disabled = true;
+            }
+            "-mno-movbe" => {
+                self.enable_movbe = false;
+                self.movbe_explicitly_disabled = true;
+            }
+            "-mno-rdrnd" => self.enable_rdrnd = false,
+            "-mno-avx512f" => self.enable_avx512f = false,
+            "-mno-avx512cd" => self.enable_avx512cd = false,
+            "-mno-avx512dq" => self.enable_avx512dq = false,
+            "-mno-avx512bw" => self.enable_avx512bw = false,
+            "-mno-avx512vl" => self.enable_avx512vl = false,
+            "-mno-avx512vnni" => self.enable_avx512vnni = false,
+            "-mno-avx10.1" => self.enable_avx10_1 = false,
+            "-mno-avx10.2" => self.enable_avx10_2 = false,
+            "-mno-gfni" => self.enable_gfni = false,
+            "-mno-vaes" => self.enable_vaes = false,
+            "-mno-vpclmulqdq" => self.enable_vpclmulqdq = false,
+            "-mavx2" => {
+                // Explicit ISA enable wins over a prior `-mno-sse` (GCC).
+                self.no_sse = false;
+                self.sse_explicitly_disabled = false;
+                self.sse41_explicitly_disabled = false;
+                self.avx_explicitly_disabled = false;
+                self.avx2_explicitly_disabled = false;
+                self.enable_x86_avx2_profile();
+                // SSE4.2 ⇒ POPCNT (GCC: the Nehalem bundle — `-mavx2
+                // -march=x86-64` defines `__POPCNT__`; measured on
+                // gcc 14.2). AVX2 ⊃ AVX ⊃ SSE4.2, so the explicit flag
+                // carries the implied integer feature too.
+                self.enable_popcnt = true;
+            }
+            "-mavx" => {
+                self.no_sse = false;
+                self.sse_explicitly_disabled = false;
+                self.sse41_explicitly_disabled = false;
+                self.avx_explicitly_disabled = false;
+                self.enable_avx = true;
+                self.enable_sse4_2 = true;
+                self.enable_sse4_1 = true;
+                self.enable_ssse3 = true;
+                self.enable_sse3 = true;
+                // AVX ⊃ SSE4.2 ⇒ POPCNT (GCC, measured on gcc 14.2:
+                // `-mavx -march=x86-64` defines `__POPCNT__`).
+                self.enable_popcnt = true;
+            }
+            "-msse4.2" => {
+                self.sse41_explicitly_disabled = false;
+                self.enable_sse4_2 = true;
+                self.enable_sse4_1 = true;
+                self.enable_ssse3 = true;
+                self.enable_sse3 = true;
+                // SSE4.2 ⇒ POPCNT (GCC, measured on gcc 14.2: `-msse4.2
+                // -march=x86-64` defines `__POPCNT__`; SSE4.1 does NOT).
+                self.enable_popcnt = true;
+            }
+            "-msse4.1" | "-msse4" => {
+                self.sse41_explicitly_disabled = false;
+                self.enable_sse4_1 = true;
+                self.enable_ssse3 = true;
+                self.enable_sse3 = true;
+            }
+            "-mssse3" => {
+                self.enable_ssse3 = true;
+                self.enable_sse3 = true;
+            }
+            "-msse3" => {
+                self.enable_sse3 = true;
+            }
+            // Baseline x86-64 ISA flags. SSE2/MMX are the x86-64 default,
+            // but `-msse`/`-msse2` after `-mno-sse` must re-enable SSE
+            // (GCC last-explicit-ISA-flag wins; `-march=native` does not).
+            "-msse2" | "-msse" => {
+                self.no_sse = false;
+                self.sse_explicitly_disabled = false;
+            }
+            _ => return false,
+        }
+        true
+    }
+
     fn enable_x86_avx_profile(&mut self) {
         // Explicit `-mno-sse` is sticky against `-march=` CPU profiles (GCC).
         // Do not set AVX/SSE feature bits either: `avx2_enabled` would otherwise
@@ -676,6 +1057,17 @@ impl Driver {
         let mut explicit_language: Option<String> = None;
         let mut i = 0;
         while i < args.len() {
+            // x86 ISA flags are routed through the shared applicator FIRST:
+            // the same code path serves the `-march=` replace-and-replay
+            // contract (an explicit flag's effect must be reproducible on
+            // top of ANY later arch set), and recording here — the single
+            // call site — keeps the replay log and the immediate effect
+            // from ever drifting apart.
+            if args[i].starts_with("-m") && self.apply_x86_isa_mflag(&args[i]) {
+                self.x86_explicit_isa_args.push(args[i].clone());
+                i += 1;
+                continue;
+            }
             match args[i].as_str() {
                 // Output file
                 "-o" => {
@@ -1052,23 +1444,6 @@ impl Driver {
                         self.target = Target::X86_64;
                     }
                 }
-                "-mno-sse" | "-mno-sse2" => {
-                    // Sticky disable: later `-march=native` / CPU profiles must
-                    // not revive SSE. GCC keeps `-mno-sse` in either flag order
-                    // (kernel decompressor: `-mno-sse` then Cachy `-march=native`).
-                    self.no_sse = true;
-                    self.sse_explicitly_disabled = true;
-                    // No xmm state at all, so every VEX form is forbidden too.
-                    self.avx_explicitly_disabled = true;
-                    self.fma_explicitly_disabled = true;
-                    self.sse41_explicitly_disabled = true;
-                    self.enable_sse3 = false;
-                    self.enable_ssse3 = false;
-                    self.enable_sse4_1 = false;
-                    self.enable_sse4_2 = false;
-                    self.enable_avx = false;
-                    self.enable_avx2 = false;
-                }
                 "-mno-mmx" | "-mno-3dnow" => {}
                 // ── Kernel -m flags with per-flag semantic justification ──
                 // (The blanket -mno-* fallback below covers pure ISA-disable
@@ -1108,268 +1483,15 @@ impl Driver {
                     );
                 }
                 "-mharden-sls=none" => {}
-                "-mno-avx2" => {
-                    self.enable_avx2 = false;
-                    // AVX2 is the 256-bit integer class — a strict subset
-                    // of the VEX encoding. Denying it removes `ymm` code
-                    // but NOT the VEX.128 world: `-march=x86-64-v3
-                    // -mno-avx2` (the AVX1+FMA target class, GCC's
-                    // `-march=corei7-avx` relatives) keeps `vmovsd`,
-                    // `vaddsd` and every scalar FMA family. Killing
-                    // `avx` here (the pre-fix behavior) made `-mno-avx2
-                    // -mfma` decline the FMA fold entirely: two `xorpd`
-                    // and a libm call where GCC emits one `vfnmsub132sd`.
-                    self.avx2_explicitly_disabled = true;
-                    self.enable_avxvnni = false;
-                    self.enable_avxvnniint8 = false;
-                    self.enable_avxvnniint16 = false;
-                }
-                "-mno-avx" => {
-                    self.enable_avx = false;
-                    self.enable_avx2 = false;
-                    // `vfmadd*` is VEX-encoded: no AVX means no FMA3 either
-                    // (GCC rejects -mfma -mno-avx for the same reason).
-                    self.avx_explicitly_disabled = true;
-                    self.fma_explicitly_disabled = true;
-                    self.enable_avxvnni = false;
-                    self.enable_vaes = false;
-                    self.enable_vpclmulqdq = false;
-                }
-                "-mno-sse3" | "-mno-ssse3" | "-mno-sse4" | "-mno-sse4.1" => {
-                    // SSE4.1 ⊃ SSSE3 ⊃ SSE3 and AVX ⊃ SSE4.2 ⊃ SSE4.1, so
-                    // denying any of these denies SSE4.1 *and* AVX/FMA.
-                    self.sse41_explicitly_disabled = true;
-                    self.avx_explicitly_disabled = true;
-                    self.fma_explicitly_disabled = true;
-                    self.enable_sse3 = false;
-                    self.enable_ssse3 = false;
-                    self.enable_sse4_1 = false;
-                    self.enable_sse4_2 = false;
-                    self.enable_avx = false;
-                    self.enable_avx2 = false;
-                }
-                "-mno-sse4.2" => {
-                    // AVX implies SSE4.2, so denying SSE4.2 denies AVX/FMA;
-                    // SSE4.1 stays legal (GCC: -mno-sse4.2 keeps -msse4.1).
-                    self.avx_explicitly_disabled = true;
-                    self.fma_explicitly_disabled = true;
-                    self.enable_sse4_2 = false;
-                    self.enable_avx = false;
-                    self.enable_avx2 = false;
-                }
-                // Positive SIMD feature flags: define corresponding macros.
-                // -mavx2 implies -mavx implies -msse4.2 implies -msse4.1 implies
-                // -mssse3 implies -msse3 (matching GCC's implication chain).
-                "-maes" => self.enable_aes = true,
-                "-mpclmul" => self.enable_pclmul = true,
-                "-mf16c" => self.enable_f16c = true,
-                "-mfma" => {
-                    // FMA3 exists only in the VEX encoding — there is no
-                    // legacy-SSE FMA — so -mfma implies -mavx and its full
-                    // prerequisite chain, exactly like GCC's one-directional
-                    // implication (oracle, gcc 14.2 -Q --help=target:
-                    // `-march=x86-64 -mfma` reports avx, sse4.1, sse4.2 all
-                    // ENABLED with avx2 still disabled; `-mavx` alone leaves
-                    // fma disabled). Later-flag-wins keeps both directions:
-                    // a later -mno-avx/-mno-sse4.1/-mno-sse still kills the
-                    // chain (their arms set the denial flags the ceiling
-                    // consults), and -mfma after -mno-sse re-enables the
-                    // vector file (gcc: -mno-sse -mfma -> sse enabled;
-                    // -mfma -mno-sse -> everything off).
-                    self.no_sse = false;
-                    self.sse_explicitly_disabled = false;
-                    self.sse41_explicitly_disabled = false;
-                    self.avx_explicitly_disabled = false;
-                    self.enable_avx = true;
-                    self.enable_sse4_2 = true;
-                    self.enable_sse4_1 = true;
-                    self.enable_ssse3 = true;
-                    self.enable_sse3 = true;
-                    self.enable_fma = true;
-                    self.fma_explicitly_disabled = false;
-                }
-                // Last-explicit ISA decision wins (GCC): a later `-mbmi`
-                // lifts an earlier `-mno-bmi` sticky denial.
-                "-mbmi" => {
-                    self.enable_bmi = true;
-                    self.bmi_explicitly_disabled = false;
-                }
-                "-mbmi2" => {
-                    self.enable_bmi2 = true;
-                    self.bmi2_explicitly_disabled = false;
-                }
-                "-mlzcnt" => {
-                    // Last-explicit ISA decision wins (GCC): a later
-                    // `-mlzcnt` lifts an earlier `-mno-lzcnt` sticky denial.
-                    self.enable_lzcnt = true;
-                    self.lzcnt_explicitly_disabled = false;
-                }
-                "-mpopcnt" => {
-                    // Last-explicit ISA decision wins (GCC): a later
-                    // `-mpopcnt` lifts an earlier `-mno-popcnt` sticky
-                    // denial.
-                    self.enable_popcnt = true;
-                    self.popcnt_explicitly_disabled = false;
-                }
-                "-mmovbe" => {
-                    self.enable_movbe = true;
-                    self.movbe_explicitly_disabled = false;
-                }
-                "-mrdrnd" => self.enable_rdrnd = true,
-                // AVX-512 / AVX10 feature flags (completeness; backend coverage
-                // is partial and runtime dispatch must verify the host).
-                "-mavx512f" => self.enable_avx512f = true,
-                "-mavx512cd" => self.enable_avx512cd = true,
-                "-mavx512dq" => self.enable_avx512dq = true,
-                "-mavx512bw" => self.enable_avx512bw = true,
-                "-mavx512vl" => self.enable_avx512vl = true,
-                "-mavx512ifma" => self.enable_avx512ifma = true,
-                "-mavx512vbmi" => self.enable_avx512vbmi = true,
-                "-mavx512vbmi2" => self.enable_avx512vbmi2 = true,
-                "-mavx512vnni" => self.enable_avx512vnni = true,
-                "-mavx512bitalg" => self.enable_avx512bitalg = true,
-                "-mavx512vpopcntdq" => self.enable_avx512vpopcntdq = true,
-                "-mavx512bf16" => self.enable_avx512bf16 = true,
-                "-mavx512fp16" => self.enable_avx512fp16 = true,
-                "-mavx512er" => self.enable_avx512er = true,
-                "-mavx512pf" => self.enable_avx512pf = true,
-                "-mavx512vp2intersect" => self.enable_avx512vp2intersect = true,
-                "-mavxvnni" => self.enable_avxvnni = true,
-                "-mavxifma" => self.enable_avxifma = true,
-                "-mavxneconvert" => self.enable_avxneconvert = true,
+                // AVX10 is a hard error (not silently ignored): requesting
+                // code generation the backend cannot produce must fail.
                 "-mavx10.1" | "-mavx10.1-256" | "-mavx10.1-512" | "-mavx10.2" | "-mavx10.2-256"
                 | "-mavx10.2-512" => {
                     return Err("AVX10 code generation is not implemented".to_string());
                 }
-                "-mgfni" => self.enable_gfni = true,
-                "-mavxvnniint8" => self.enable_avxvnniint8 = true,
-                "-mavxvnniint16" => self.enable_avxvnniint16 = true,
-                "-msha512" => self.enable_sha512 = true,
-                "-msm3" => self.enable_sm3 = true,
-                "-msm4" => self.enable_sm4 = true,
-                "-mmovrs" => self.enable_movrs = true,
-                "-muser_msr" => self.enable_user_msr = true,
-                // APX Foundation: extra GPRs r16–r31, NDD 3-operand ALU.
-                // Off by default — emitting it on a non-APX host (Raptor Lake,
-                // i7-14700KF, …) is #UD. `-march=raptorlake` must never imply this.
-                "-mapx" | "-mapxf" => self.enable_apxf = true,
-                "-mno-apx" | "-mno-apxf" => self.enable_apxf = false,
-                "-mamx-tile" => self.enable_amx_tile = true,
-                "-mamx-int8" => self.enable_amx_int8 = true,
-                "-mamx-bf16" => self.enable_amx_bf16 = true,
-                "-mcmpccxadd" => self.enable_cmpccxadd = true,
-                "-mno-avxvnniint8" => self.enable_avxvnniint8 = false,
-                "-mno-avxvnniint16" => self.enable_avxvnniint16 = false,
-                "-mno-sha512" => self.enable_sha512 = false,
-                "-mno-sm3" => self.enable_sm3 = false,
-                "-mno-sm4" => self.enable_sm4 = false,
-                "-mno-movrs" => self.enable_movrs = false,
-                "-mno-user_msr" => self.enable_user_msr = false,
-                "-mno-amx-tile" => self.enable_amx_tile = false,
-                "-mno-amx-int8" => self.enable_amx_int8 = false,
-                "-mno-amx-bf16" => self.enable_amx_bf16 = false,
-                "-mno-cmpccxadd" => self.enable_cmpccxadd = false,
-                "-mvaes" => self.enable_vaes = true,
-                "-mvpclmulqdq" => self.enable_vpclmulqdq = true,
-                "-mno-aes" => self.enable_aes = false,
-                "-mno-pclmul" => self.enable_pclmul = false,
-                "-mno-f16c" => self.enable_f16c = false,
-                "-mno-fma" => {
-                    self.enable_fma = false;
-                    self.fma_explicitly_disabled = true;
-                }
-                "-mno-bmi" => {
-                    self.enable_bmi = false;
-                    // Sticky denial: the absent-march baseline is x86-64-v3,
-                    // which carries BMI1; only this explicit denial removes
-                    // the class from a default build (GCC keeps the denial
-                    // sticky across a later `-march=native` probe too).
-                    self.bmi_explicitly_disabled = true;
-                }
-                "-mno-bmi2" => {
-                    self.enable_bmi2 = false;
-                    self.bmi2_explicitly_disabled = true;
-                }
-                "-mno-lzcnt" => {
-                    self.enable_lzcnt = false;
-                    // Sticky denial: the absent-march baseline is x86-64-v3,
-                    // which carries ABM (LZCNT/TZCNT); only this explicit
-                    // denial removes it from a default build.
-                    self.lzcnt_explicitly_disabled = true;
-                }
-                "-mno-popcnt" => {
-                    self.enable_popcnt = false;
-                    // Sticky denial: the absent-march baseline is x86-64-v3,
-                    // which carries POPCNT (since v2); only this explicit
-                    // denial removes it from a default build.
-                    self.popcnt_explicitly_disabled = true;
-                }
-                "-mno-movbe" => {
-                    self.enable_movbe = false;
-                    self.movbe_explicitly_disabled = true;
-                }
-                "-mno-rdrnd" => self.enable_rdrnd = false,
-                "-mno-avx512f" => self.enable_avx512f = false,
-                "-mno-avx512cd" => self.enable_avx512cd = false,
-                "-mno-avx512dq" => self.enable_avx512dq = false,
-                "-mno-avx512bw" => self.enable_avx512bw = false,
-                "-mno-avx512vl" => self.enable_avx512vl = false,
-                "-mno-avx512vnni" => self.enable_avx512vnni = false,
-                "-mno-avx10.1" => self.enable_avx10_1 = false,
-                "-mno-avx10.2" => self.enable_avx10_2 = false,
-                "-mno-gfni" => self.enable_gfni = false,
-                "-mno-vaes" => self.enable_vaes = false,
                 "-mxsave" | "-mxsaveopt" | "-mxsavec" | "-mno-xsave" | "-mno-xsaveopt"
                 | "-mno-xsavec" => {}
-                "-mno-vpclmulqdq" => self.enable_vpclmulqdq = false,
-                "-mavx2" => {
-                    // Explicit ISA enable wins over a prior `-mno-sse` (GCC).
-                    self.no_sse = false;
-                    self.sse_explicitly_disabled = false;
-                    self.sse41_explicitly_disabled = false;
-                    self.avx_explicitly_disabled = false;
-                    self.avx2_explicitly_disabled = false;
-                    self.enable_x86_avx2_profile();
-                }
-                "-mavx" => {
-                    self.no_sse = false;
-                    self.sse_explicitly_disabled = false;
-                    self.sse41_explicitly_disabled = false;
-                    self.avx_explicitly_disabled = false;
-                    self.enable_avx = true;
-                    self.enable_sse4_2 = true;
-                    self.enable_sse4_1 = true;
-                    self.enable_ssse3 = true;
-                    self.enable_sse3 = true;
-                }
-                "-msse4.2" => {
-                    self.sse41_explicitly_disabled = false;
-                    self.enable_sse4_2 = true;
-                    self.enable_sse4_1 = true;
-                    self.enable_ssse3 = true;
-                    self.enable_sse3 = true;
-                }
-                "-msse4.1" | "-msse4" => {
-                    self.sse41_explicitly_disabled = false;
-                    self.enable_sse4_1 = true;
-                    self.enable_ssse3 = true;
-                    self.enable_sse3 = true;
-                }
-                "-mssse3" => {
-                    self.enable_ssse3 = true;
-                    self.enable_sse3 = true;
-                }
-                "-msse3" => {
-                    self.enable_sse3 = true;
-                }
-                // Baseline x86-64 ISA flags. SSE2/MMX are the x86-64 default,
-                // but `-msse`/`-msse2` after `-mno-sse` must re-enable SSE
-                // (GCC last-explicit-ISA-flag wins; `-march=native` does not).
                 "-mmmx" => {}
-                "-msse2" | "-msse" => {
-                    self.no_sse = false;
-                    self.sse_explicitly_disabled = false;
-                }
                 "-m3dnow" => return Err("3DNow! is unsupported".to_string()),
                 "-mgeneral-regs-only" => {
                     self.general_regs_only = true;
@@ -1403,6 +1525,12 @@ impl Driver {
                         // An explicit profile is the code-generation ceiling
                         // (GCC-exact); only the absent-flag default is v3.
                         self.x86_march_explicit = true;
+                        // A later `-march=` REPLACES the arch-implied set
+                        // (GCC: `-march=x86-64-v3 -march=x86-64` leaves
+                        // `__BMI__`/`__MOVBE__`/`__AVX__` absent — measured,
+                        // gcc 14.2 `-dM -E`); the recorded explicit flags
+                        // are replayed on top of the new profile below.
+                        self.reset_x86_arch_implied_isa();
                     }
                     match self.target {
                         Target::Riscv64 => self.riscv_march = Some(march.to_string()),
@@ -1571,6 +1699,15 @@ impl Driver {
                                 self.target.triple()
                             ));
                         }
+                    }
+                    // Explicit ISA decisions land on top of the FINAL arch
+                    // set, in command-line order (GCC: explicit flags
+                    // override the arch in BOTH directions; among
+                    // explicits, later wins).  Measured on gcc 14.2:
+                    // `-mno-bmi -march=x86-64-v3` → `__BMI__` absent;
+                    // `-mbmi -march=x86-64` → `__BMI__` defined.
+                    if matches!(self.target, Target::X86_64 | Target::I686) {
+                        self.replay_x86_explicit_isa_flags();
                     }
                 }
                 arg if arg.starts_with("-mtune=") => {
@@ -2910,6 +3047,99 @@ mod cli_tests {
         assert!(d3.parse_cli_args(&args3).is_ok());
         assert!(d3.resolved_bmi1());
         assert!(d3.resolved_bmi2());
+    }
+
+    /// A second `-march=` REPLACES the first arch's set (GCC-exact, measured
+    /// on gcc 14.2 `-dM -E`: `-march=x86-64-v3 -march=x86-64` leaves
+    /// `__BMI__`, `__MOVBE__` and `__AVX__` all absent).  Before the
+    /// replace-and-replay contract the profile functions only ever ADDED,
+    /// so the first `-march=`'s enables survived the second as a union.
+    #[test]
+    fn second_march_replaces_the_first_arch_set() {
+        let mut d = Driver::new();
+        let args: Vec<String> = ["ccc", "-march=x86-64-v3", "-march=x86-64", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(d.parse_cli_args(&args).is_ok());
+        assert!(!d.resolved_bmi1(), "the v1 ceiling must replace, not union");
+        assert!(!d.resolved_movbe());
+        assert!(!d.resolved_popcnt());
+        assert!(!d.enable_avx, "the SIMD half replaces too");
+
+        // The replacement composes with explicit flags recorded between
+        // the two -march=: the replay lands on the FINAL arch set.
+        let mut d2 = Driver::new();
+        let args2: Vec<String> = ["ccc", "-march=x86-64-v3", "-mavx", "-march=x86-64", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(d2.parse_cli_args(&args2).is_ok());
+        assert!(d2.enable_avx, "explicit -mavx survives the later -march=");
+        assert!(!d2.resolved_bmi1(), "the arch-implied BMI still dies");
+    }
+
+    /// GCC explicit-ISA semantics, order-independent (measured on gcc 14.2):
+    /// `-mno-bmi -march=x86-64-v3` leaves `__BMI__` ABSENT (the explicit
+    /// denial overrides the final arch set in either flag order).  This
+    /// refutes the "GCC is strictly last-wins and re-enables BMI1" reading:
+    /// the model is explicit-mask-over-arch, not last-wins.
+    #[test]
+    fn mno_bmi_stays_denied_under_a_later_march_in_either_order() {
+        for flags in [
+            ["ccc", "-mno-bmi", "-march=x86-64-v3", "x.c"],
+            ["ccc", "-march=x86-64-v3", "-mno-bmi", "x.c"],
+        ] {
+            let mut d = Driver::new();
+            let args: Vec<String> = flags.iter().map(|s| s.to_string()).collect();
+            assert!(d.parse_cli_args(&args).is_ok());
+            assert!(!d.resolved_bmi1(), "{flags:?}: BMI1 must stay denied");
+            assert!(d.resolved_bmi2(), "{flags:?}: BMI2 is untouched");
+            assert!(d.resolved_movbe(), "{flags:?}: MOVBE is untouched");
+        }
+    }
+
+    /// GCC explicit-ISA semantics (measured on gcc 14.2): `-mbmi
+    /// -march=x86-64` DEFINES `__BMI__` — an explicit enable survives a
+    /// lower arch, exactly as an explicit denial survives a higher one.
+    #[test]
+    fn mbmi_survives_a_lower_march() {
+        let mut d = Driver::new();
+        let args: Vec<String> = ["ccc", "-mbmi", "-march=x86-64", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(d.parse_cli_args(&args).is_ok());
+        assert!(d.resolved_bmi1(), "explicit -mbmi survives -march=x86-64");
+        assert!(!d.resolved_bmi2(), "BMI2 was never enabled");
+    }
+
+    /// SSE4.2 ⇒ POPCNT — the Nehalem bundle (measured on gcc 14.2:
+    /// `-msse4.2 -march=x86-64`, `-mavx -march=x86-64`,
+    /// `-mavx2 -march=x86-64` and `-mfma -march=x86-64` all define
+    /// `__POPCNT__`; `-msse4.1` does NOT).
+    #[test]
+    fn sse42_family_implies_popcnt() {
+        for flag in ["-msse4.2", "-mavx", "-mavx2", "-mfma"] {
+            let mut d = Driver::new();
+            let args: Vec<String> = ["ccc", flag, "-march=x86-64", "x.c"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            assert!(d.parse_cli_args(&args).is_ok());
+            assert!(
+                d.resolved_popcnt(),
+                "{flag}: the SSE4.2 family must carry POPCNT (GCC Nehalem bundle)"
+            );
+        }
+        // SSE4.1 does NOT imply POPCNT.
+        let mut d = Driver::new();
+        let args: Vec<String> = ["ccc", "-msse4.1", "-march=x86-64", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(d.parse_cli_args(&args).is_ok());
+        assert!(!d.resolved_popcnt(), "SSE4.1 alone must not carry POPCNT");
     }
 
     /// BMI is an INTEGER class: `-mno-sse` denies the xmm world but leaves

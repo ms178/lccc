@@ -14,6 +14,20 @@ pub(crate) enum EvexSae {
 /// rounding/sae for `vpaddd'`). Match on this constant, not a literal.
 pub(crate) const SAE_UNSUPPORTED: &str = "unsupported static rounding/sae";
 
+/// GAS 2.47 rejects a leading `{sae}`/`{r*-sae}` on an imm8-first form with
+/// a POSITIONAL message (the token must sit after the immediates), not the
+/// per-mnemonic `unsupported static rounding/sae`. The EVEX imm8 helpers
+/// return this constant and the dispatcher's `r()` wrapper attaches the
+/// mnemonic, matching GAS verbatim:
+/// `` `vshufpd': RC/SAE operand must follow immediate operands ``.
+pub(crate) const SAE_AFTER_IMM: &str = "RC/SAE operand must follow immediate operands";
+
+/// Mixed-width vector registers on a packed EVEX form (GAS 2.47:
+/// `register type mismatch for `vaddps''`). Sentinel returned by the
+/// shared binary path; the dispatcher's `r()` wrapper attaches the
+/// mnemonic, mirroring the SAE_UNSUPPORTED mechanism.
+pub(crate) const REG_TYPE_MISMATCH: &str = "register type mismatch";
+
 /// Packed-convert width behavior: same-width (`vcvtps2dq`), 2:1
 /// narrowing (`vcvtpd2ps`: VEX dest is always xmm, AT&T mem-src to xmm
 /// is ambiguous) or 1:2 widening (`vcvtps2pd`: VEX src is always xmm).
@@ -75,6 +89,32 @@ pub(crate) fn vcvt_params(mnemonic: &str) -> Option<VcvtParams> {
         "vcvtpd2qq" => Some(p(None, 1, 1, 1, 0x7B, VcvtKind::Same, 8)),
         "vcvttpd2qq" => Some(p(None, 1, 1, 1, 0x7A, VcvtKind::Same, 8)),
         "vcvtqq2pd" => Some(p(None, 1, 2, 1, 0xE6, VcvtKind::Same, 8)),
+        // Unsigned-integer converts (AVX512DQ/F + VL; EVEX-only). Same
+        // width classes as their signed siblings, verified against GAS
+        // 2.47 (`scripts/distill_evex_opcodes.py`):
+        //   vcvtps2uqq %xmm,%xmm / %ymm,%zmm / %zmm->none: WIDENING.
+        "vcvtps2uqq" => Some(p(None, 1, 1, 0, 0x79, VcvtKind::Wide, 4)),
+        "vcvttps2uqq" => Some(p(None, 1, 1, 0, 0x78, VcvtKind::Wide, 4)),
+        //   vcvtpd2uqq keeps the lane count: xmm->xmm / ymm->ymm / zmm->zmm.
+        "vcvtpd2uqq" => Some(p(None, 1, 1, 1, 0x79, VcvtKind::Same, 8)),
+        "vcvttpd2uqq" => Some(p(None, 1, 1, 1, 0x78, VcvtKind::Same, 8)),
+        //   float32 -> uint32 keeps the lane count.
+        "vcvtps2udq" => Some(p(None, 1, 0, 0, 0x79, VcvtKind::Same, 4)),
+        "vcvttps2udq" => Some(p(None, 1, 0, 0, 0x78, VcvtKind::Same, 4)),
+        //   float64 -> uint32 halves it: zmm/m512 -> ymm.
+        "vcvtpd2udq" => Some(p(None, 1, 0, 1, 0x79, VcvtKind::Narrow, 8)),
+        "vcvttpd2udq" => Some(p(None, 1, 0, 1, 0x78, VcvtKind::Narrow, 8)),
+        //   uint32 -> float32 same width (F2 prefix).
+        "vcvtudq2ps" => Some(p(None, 1, 3, 0, 0x7A, VcvtKind::Same, 4)),
+        //   uint64 -> float32 halves it (F2 prefix).
+        "vcvtuqq2ps" => Some(p(None, 1, 3, 1, 0x7A, VcvtKind::Narrow, 8)),
+        //   uint32 -> float64 widens (F3 prefix).
+        "vcvtudq2pd" => Some(p(None, 1, 2, 0, 0x7A, VcvtKind::Wide, 4)),
+        //   uint64 -> float64 same width (F3 prefix).
+        "vcvtuqq2pd" => Some(p(None, 1, 2, 1, 0x7A, VcvtKind::Same, 8)),
+        // F16C half-float widen (EVEX.66.0F38.W0 13 — GAS emits 62 f2):
+        // xmm->xmm/ymm, ymm->zmm; memory source tuple N=2 (the ph element).
+        "vcvtph2ps" => Some(p(None, 2, 1, 0, 0x13, VcvtKind::Wide, 2)),
         _ => None,
     }
 }
@@ -540,6 +580,11 @@ impl super::InstructionEncoder {
             // false-accept e.g. `vcvttps2dq {rz-sae}` (GAS rejects).
             (1, 0x5D | 0x5F | 0xC2) => EvexSae::Sae, // min/max/vcmp
             (2, 0x96..=0x9F) | (2, 0xA6..=0xAF) | (2, 0xB6..=0xBF) => EvexSae::Er, // FMA + fmaddsub
+            // vscalef{ps,pd,ss,sd}: the only SAE-capable member of the
+            // AVX512F/DQ scalar-control family that reaches the binary
+            // path. Bare `{sae}` is rejected (GAS: `unsupported static
+            // rounding/sae`), `{r*-sae}` accepted.
+            (2, 0x2C | 0x2D) => EvexSae::Er,
             _ => EvexSae::None,
         }
     }
@@ -672,9 +717,63 @@ impl super::InstructionEncoder {
         w: u8,
         opcode: u8,
     ) -> Result<(), String> {
+        self.encode_evex_binary_impl(ops, map, pp, w, opcode, None)
+    }
+
+    /// Scalar EVEX binary (vgetexpss/sd): the memory tuple is ELEMENT-sized
+    /// (N = 4 for ss, 8 for sd — read from W), not Full VL. Everything else
+    /// matches the packed path.
+    pub(crate) fn encode_evex_binary_scalar(
+        &mut self,
+        ops: &[Operand],
+        map: u8,
+        pp: u8,
+        w: u8,
+        opcode: u8,
+    ) -> Result<(), String> {
+        self.encode_evex_binary_impl(ops, map, pp, w, opcode, Some(if w == 1 { 8 } else { 4 }))
+    }
+
+    fn encode_evex_binary_impl(
+        &mut self,
+        ops: &[Operand],
+        map: u8,
+        pp: u8,
+        w: u8,
+        opcode: u8,
+        scalar_tuple_n: Option<u32>,
+    ) -> Result<(), String> {
         let (ops, sae) = Self::peel_evex_sae(ops);
         if ops.len() != 3 {
             return Err("EVEX binary op requires 3 operands".to_string());
+        }
+        // Same-width rule: every vector REGISTER operand must agree on
+        // xmm/ymm/zmm (sentinel — the dispatcher attaches the mnemonic).
+        // Without it a mixed spelling silently encodes with the widest
+        // operand's L'L and a truncated register field.
+        {
+            let width = |name: &str| -> Option<u8> {
+                if is_zmm(name) {
+                    Some(2)
+                } else if is_ymm(name) {
+                    Some(1)
+                } else if is_xmm(name) {
+                    Some(0)
+                } else {
+                    None
+                }
+            };
+            let mut widths: Vec<u8> = Vec::with_capacity(3);
+            for op in ops {
+                if let Operand::Register(r) = op
+                    && let Some(vw) = width(&r.name)
+                {
+                    widths.push(vw);
+                }
+            }
+            if widths.windows(2).any(|p| p[0] != p[1]) {
+                return Err(REG_TYPE_MISMATCH.to_string());
+            }
         }
         let vl_ll = Self::evex_ll(ops);
         let (sae_bcst, ll) = Self::apply_evex_sae(sae, Self::evex_sae_class(map, opcode), vl_ll)?;
@@ -699,7 +798,10 @@ impl super::InstructionEncoder {
                 Ok(())
             }
             (Operand::Memory(mem), Operand::Register(vvvv), Operand::Register(dst)) => {
-                let (mem_bcst, scale_n) = Self::evex_mem_scale(mem, vl_ll, 1);
+                let (mem_bcst, scale_n) = match scalar_tuple_n {
+                    Some(n) if mem.broadcast.is_none() => (false, n),
+                    _ => Self::evex_mem_scale(mem, vl_ll, 1),
+                };
                 bcst |= mem_bcst;
                 let dst_num = self.emit_evex_memop(
                     &dst.name,
@@ -752,17 +854,21 @@ impl super::InstructionEncoder {
         mnemonic: &str,
     ) -> Result<(), String> {
         let (ops, sae) = Self::peel_evex_sae(ops);
-        // Convert ER is mnemonic-gated (GAS 2.47): embedded rounding is
-        // accepted exactly when the conversion can round. Truncating
-        // converts (vcvtt*) and exact widenings (vcvtps2pd, vcvtdq2pd)
-        // reject it; the other 8 packed converts accept {r*-sae} but
-        // never bare {sae} (EvexSae::Er models both).
-        let sae_class =
-            if mnemonic.starts_with("vcvtt") || matches!(mnemonic, "vcvtps2pd" | "vcvtdq2pd") {
-                EvexSae::None
-            } else {
-                EvexSae::Er
-            };
+        // Convert ER/SAE classes (GAS 2.47, probed per mnemonic):
+        //  * truncating `vcvtt*` accept ONLY bare `{sae}` (suppress-all);
+        //    `{r*-sae}` is `unsupported static rounding/sae`;
+        //  * the exact integer->FP widenings (vcvtps2pd, vcvtdq2pd,
+        //    vcvtudq2pd) accept neither — no rounding mode exists;
+        //  * everything else (fp->int non-truncating, fp->fp, int->fp
+        //    with rounding like vcvtqq2pd/vcvtuqq2pd) is Er-class:
+        //    `{r*-sae}` accepted, bare `{sae}` rejected.
+        let sae_class = if mnemonic.starts_with("vcvtt") {
+            EvexSae::Sae
+        } else if matches!(mnemonic, "vcvtps2pd" | "vcvtdq2pd" | "vcvtudq2pd") {
+            EvexSae::None
+        } else {
+            EvexSae::Er
+        };
         let (sae_bcst, sae_ll) = Self::apply_evex_sae(sae, sae_class, 0)?;
         check_vcvt_shape(mnemonic, ops)?;
         let params =
@@ -1045,6 +1151,14 @@ impl super::InstructionEncoder {
         w: u8,
         opcode: u8,
     ) -> Result<(), String> {
+        // Imm8-first forms reject a leading RC/SAE token positionally
+        // (GAS 2.47: `'{m}': RC/SAE operand must follow immediate
+        // operands`); there is no legal SAE placement on the 2-op+imm8
+        // forms at all.
+        let (ops, head_sae) = Self::peel_evex_sae(ops);
+        if head_sae.is_some() {
+            return Err(SAE_AFTER_IMM.to_string());
+        }
         if ops.len() != 3 {
             return Err("EVEX imm2 op requires 3 operands (imm, src, dst)".to_string());
         }
@@ -1235,10 +1349,21 @@ impl super::InstructionEncoder {
         }
     }
 
-    /// EVEX 3-source + imm8, AT&T ($imm, src2, src1, dst) with optional mask on dst.
-    /// vpternlogd/q (0F3A 25), vpalignr (0F3A 0F), vpclmulqdq (0F3A 44),
-    /// vinserti32x4/i64x2 (0F3A 38), vpshld*/vpshrd* (0F3A 70-73).
-    /// GAS convention: ModRM.reg = dest, r/m = src2, vvvv = src1.
+    /// EVEX 3-source + imm8 (AT&T: imm, src2, src1, dst) — vpternlog,
+    /// vpalignr, vpclmulqdq, vinsert*, vpshld/shrd, and the AVX512DQ/F
+    /// scalar-control family (vgetmantss/sd, vfixupimm*, vrange*,
+    /// vreducess/sd, vrndscaless/sd).
+    ///
+    /// Decorator placement for the imm8 forms is positional (GAS 2.47):
+    /// the RC/SAE token sits AFTER the immediate, BEFORE src1 — a leading
+    /// token is the positional error `'{m}': RC/SAE operand must follow
+    /// immediate operands`, and the post-immediate token is SAE-only
+    /// (bare `{sae}`; `{r*-sae}` there is `unsupported static
+    /// rounding/sae`).
+    ///
+    /// Memory tuples: vector forms transfer Full VL; the scalar-control
+    /// forms (opcodes 0x27/0x51/0x55/0x57/0x0A/0x0B) are element-sized
+    /// (N=4 for ss, 8 for sd — read from W).
     pub(crate) fn encode_evex_3src_imm(
         &mut self,
         ops: &[Operand],
@@ -1246,7 +1371,63 @@ impl super::InstructionEncoder {
         pp: u8,
         w: u8,
         opcode: u8,
+        allow_mixed: bool,
     ) -> Result<(), String> {
+        // Same-width rule: every vector REGISTER operand must agree on
+        // xmm/ymm/zmm (GAS 2.47 byte-probed on vpternlogd: mixed →
+        // `register type mismatch'); the sentinel is attached by the
+        // dispatcher's r() wrapper.
+        {
+            let width = |name: &str| -> Option<u8> {
+                if is_zmm(name) {
+                    Some(2)
+                } else if is_ymm(name) {
+                    Some(1)
+                } else if is_xmm(name) {
+                    Some(0)
+                } else {
+                    None
+                }
+            };
+            let mut widths: Vec<u8> = Vec::with_capacity(4);
+            for op in ops {
+                if let Operand::Register(r) = op
+                    && let Some(vw) = width(&r.name)
+                {
+                    widths.push(vw);
+                }
+            }
+            if !allow_mixed && widths.windows(2).any(|p| p[0] != p[1]) {
+                return Err(REG_TYPE_MISMATCH.to_string());
+            }
+        }
+
+        // Head-position decorator on an imm8-first form: GAS reports the
+        // placement, not the decorator.
+        let (ops, head_sae) = Self::peel_evex_sae(ops);
+        if head_sae.is_some() {
+            return Err(SAE_AFTER_IMM.to_string());
+        }
+        // Post-immediate `{sae}` (AT&T: `vgetmantsd $imm, {sae}, %s2, %s1,
+        // %dst`): legal bare form on the scalar-control mnemonics; a
+        // rounding token there is rejected by the class rule below. The
+        // token sits at index 1, so the operand window is rebuilt around
+        // it (a suffix slice would drop the immediate instead).
+        let owned;
+        let (ops, sae) = match ops.get(1) {
+            Some(Operand::Label(s)) if evex_sae_rounding(s).is_some() && ops.len() == 5 => {
+                let sae = evex_sae_rounding(s);
+                owned = [
+                    ops[0].clone(),
+                    ops[2].clone(),
+                    ops[3].clone(),
+                    ops[4].clone(),
+                ];
+                (&owned[..], sae)
+            }
+            _ => (ops, None),
+        };
+        let (sae_bcst, _) = Self::apply_evex_sae(sae, EvexSae::Sae, 0)?;
         if ops.len() != 4 {
             return Err("EVEX 3src-imm op requires 4 operands (imm, src2, src1, dst)".to_string());
         }
@@ -1269,7 +1450,7 @@ impl super::InstructionEncoder {
                     ll,
                     z,
                     aaa,
-                    false,
+                    sae_bcst,
                 )?;
                 self.bytes.push(opcode);
                 self.bytes.push(self.modrm(3, dst_num, src2_num));
@@ -1283,16 +1464,24 @@ impl super::InstructionEncoder {
                 Operand::Register(dst),
             ) => {
                 // vinserti32x4/i64x2 (38) N=16; vinserti32x8/i64x4 (3A) N=32;
-                // everything else is Full VL (or {1toN} broadcast).
+                // scalar-control forms (27/51/55/57/0A/0B) are element-sized
+                // (ss N=4, sd N=8, read from W); everything else Full VL.
                 let tuple_n = match opcode {
                     0x38 => 16u32,
                     0x3A => 32,
+                    0x27 | 0x51 | 0x55 | 0x57 | 0x0A | 0x0B => {
+                        if w == 1 {
+                            8
+                        } else {
+                            4
+                        }
+                    }
                     _ => Self::evex_vl_bytes(ll),
                 };
                 let (mem_bcst, scale_n) = if mem.broadcast.is_some() {
                     Self::evex_mem_scale(mem, ll, 1)
                 } else {
-                    (false, tuple_n)
+                    (sae_bcst, tuple_n)
                 };
                 let dst_num = self.emit_evex_memop(
                     &dst.name,
@@ -1617,6 +1806,8 @@ impl super::InstructionEncoder {
                 let n = match opcode {
                     0x5A | 0x1A => 16u32,
                     0x5B | 0x1B => 32,
+                    // vbroadcasti32x2/vbroadcastf32x2 load one 64-bit pair.
+                    0x59 => 8,
                     _ => [16u32, 32, 64][ll as usize],
                 };
                 self.encode_evex_mem(dst_num, mem, n)
@@ -2378,11 +2569,21 @@ impl super::InstructionEncoder {
         opcode: u8,
         has_66: bool,
     ) -> Result<(), String> {
+        self.encode_avx_2op_38_pp(ops, opcode, if has_66 { 1 } else { 0 })
+    }
+
+    /// pp-generalized 0F38 2-op (pp: 0=NP, 1=66, 2=F3, 3=F2) — vcvtph2ps
+    /// is F3-prefixed, which the bool form cannot express.
+    pub(crate) fn encode_avx_2op_38_pp(
+        &mut self,
+        ops: &[Operand],
+        opcode: u8,
+        pp: u8,
+    ) -> Result<(), String> {
         if ops.len() != 2 {
             return Err("AVX 2-op requires 2 operands".to_string());
         }
         let l = self.vex_l_from_ops(ops);
-        let pp = if has_66 { 1 } else { 0 };
 
         match (&ops[0], &ops[1]) {
             (Operand::Register(src), Operand::Register(dst))
@@ -2565,6 +2766,7 @@ impl super::InstructionEncoder {
         load_op: u8,
         store_op: u8,
         pp: u8,
+        mnemonic: &str,
     ) -> Result<(), String> {
         match ops.len() {
             2 => {
@@ -2588,18 +2790,14 @@ impl super::InstructionEncoder {
                         self.bytes.push(store_op);
                         self.encode_modrm_mem(src_num, mem)
                     }
-                    (Operand::Register(src), Operand::Register(dst))
-                        if is_xmm_or_ymm(&src.name) && is_xmm_or_ymm(&dst.name) =>
-                    {
-                        // reg-reg: use load form
-                        let src_num = reg_num(&src.name).ok_or("bad register")?;
-                        let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                        let r = needs_vex_ext(&dst.name);
-                        let b = needs_vex_ext(&src.name);
-                        self.emit_vex(r, false, b, 1, 0, 0, 0, pp);
-                        self.bytes.push(load_op);
-                        self.bytes.push(self.modrm(3, dst_num, src_num));
-                        Ok(())
+                    // GAS 2.47: vmovss/vmovsd have NO two-register
+                    // spelling (`vmovss %xmm6, %xmm7` is `operand type
+                    // mismatch` — a register-to-register scalar move must
+                    // use the 3-operand merge form or vmovaps). Formerly
+                    // accepted here with the load encoding — a false
+                    // accept, now rejected verbatim.
+                    (Operand::Register(_), Operand::Register(_)) => {
+                        Err(format!("operand type mismatch for `{mnemonic}'"))
                     }
                     _ => Err("unsupported AVX scalar mov 2-op operands".to_string()),
                 }
@@ -2928,6 +3126,494 @@ impl super::InstructionEncoder {
                 Ok(())
             }
             _ => Err("unsupported AVX 3-op+imm8 operands".to_string()),
+        }
+    }
+
+    /// VPERMIL2PS/PD — the FMA4-era five-operand VEX form
+    /// (VEX.NDS.66.0F3A 48/49 /r ib; opcode 0x48 = ps, 0x49 = pd — the
+    /// W bit does NOT select ps/pd here).
+    ///
+    /// AT&T shape: `$sel, src1, src2, src3, dst`. Three fields carry
+    /// three of the four register sources — ModRM.reg = dst, r/m =
+    /// src2, vvvv = src3 — so one source rides the imm8: GAS 2.47
+    /// packs `imm8 = (slotless_reg << 4) | sel` where slotless_reg is
+    /// src1 for the register/memory-src2 forms, and src2 when src1 is
+    /// the memory operand (then r/m = that memory and W = 1 — the same
+    /// memory-in-first-source signal the XOP 4-op forms pin with V'=1).
+    /// All byte patterns probed against GAS 2.47, including the ymm
+    /// (L=1) forms and `constant doesn't fit in 4 bits` for sel > 15.
+    pub(crate) fn encode_vpermil2(
+        &mut self,
+        ops: &[Operand],
+        opcode: u8,
+        mnemonic: &str,
+    ) -> Result<(), String> {
+        if ops.len() > 5 {
+            return Err("spurious operands; (5 operands/instruction max)".to_string());
+        }
+        if ops.len() != 5 {
+            return Err(format!("number of operands mismatch for `{mnemonic}'"));
+        }
+        let sel = match &ops[0] {
+            Operand::Immediate(ImmediateValue::Integer(v)) => {
+                if !(0..=15).contains(v) {
+                    return Err(format!("constant doesn't fit in 4 bits for `{mnemonic}'"));
+                }
+                *v as u8
+            }
+            _ => return Err(format!("operand type mismatch for `{mnemonic}'")),
+        };
+        // Width agreement across every vector register operand; L = width.
+        let width_of = |op: &Operand| -> Option<u8> {
+            match op {
+                Operand::Register(r) if is_xmm(&r.name) => Some(0),
+                Operand::Register(r) if is_ymm(&r.name) => Some(1),
+                _ => None,
+            }
+        };
+        let widths: Vec<u8> = ops[1..].iter().filter_map(width_of).collect();
+        if widths.iter().any(|w| *w != widths[0]) {
+            return Err(format!("register type mismatch for `{mnemonic}'"));
+        }
+        let l = widths.first().copied().unwrap_or(0);
+        let dst_name = match &ops[4] {
+            Operand::Register(r) => &r.name,
+            _ => return Err(format!("operand type mismatch for `{mnemonic}'")),
+        };
+        let dst_num = reg_num(dst_name).ok_or("bad register")?;
+        let r = needs_vex_ext(dst_name);
+        let src3 = match &ops[3] {
+            Operand::Register(v) => v,
+            _ => return Err(format!("operand type mismatch for `{mnemonic}'")),
+        };
+        let vvvv_num = reg_num(&src3.name).ok_or("bad register")?;
+        let vvvv_enc = vvvv_num | (if needs_vex_ext(&src3.name) { 8 } else { 0 });
+        match (&ops[1], &ops[2]) {
+            (Operand::Register(src1), Operand::Register(src2)) => {
+                // imm8[7:4] carries the FULL 4-bit register id
+                // (reg_num is the low 3 bits; the extension bit is 8).
+                let slotless = reg_num(&src1.name).ok_or("bad register")?
+                    | (if needs_vex_ext(&src1.name) { 8 } else { 0 });
+                let b = needs_vex_ext(&src2.name);
+                self.emit_vex(r, false, b, 3, 0, vvvv_enc, l, 1);
+                self.bytes.push(opcode);
+                self.bytes
+                    .push(self.modrm(3, dst_num, reg_num(&src2.name).ok_or("bad register")?));
+                self.bytes.push((slotless << 4) | sel);
+                Ok(())
+            }
+            (Operand::Register(src1), Operand::Memory(mem)) => {
+                // imm8[7:4] carries the FULL 4-bit register id
+                // (reg_num is the low 3 bits; the extension bit is 8).
+                let slotless = reg_num(&src1.name).ok_or("bad register")?
+                    | (if needs_vex_ext(&src1.name) { 8 } else { 0 });
+                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
+                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                self.emit_vex(r, x, b_ext, 3, 0, vvvv_enc, l, 1);
+                self.bytes.push(opcode);
+                let rc = self.relocations.len();
+                self.encode_modrm_mem(dst_num, mem)?;
+                self.bytes.push((slotless << 4) | sel);
+                self.adjust_rip_reloc_addend(rc, 1);
+                Ok(())
+            }
+            (Operand::Memory(mem), Operand::Register(src2)) => {
+                let slotless = reg_num(&src2.name).ok_or("bad register")?
+                    | (if needs_vex_ext(&src2.name) { 8 } else { 0 });
+                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
+                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                // W = 1: memory in the FIRST source position (GAS 2.47).
+                self.emit_vex(r, x, b_ext, 3, 1, vvvv_enc, l, 1);
+                self.bytes.push(opcode);
+                let rc = self.relocations.len();
+                self.encode_modrm_mem(dst_num, mem)?;
+                self.bytes.push((slotless << 4) | sel);
+                self.adjust_rip_reloc_addend(rc, 1);
+                Ok(())
+            }
+            _ => Err(format!("operand type mismatch for `{mnemonic}'")),
+        }
+    }
+
+    /// EVEX expand/compress (AVX512F: vexpandp*/vcompressp*, EVEX.66.0F
+    /// W0/W1 88/8A). AT&T `(src, dst)` for BOTH directions, but the
+    /// register always sits in ModRM.reg: expand puts the DESTINATION in
+    /// reg (`vexpandps (%rax), %xmm2` — r/m = memory source), compress
+    /// puts the SOURCE in reg (`vcompressps %xmm2, (%rax)` — r/m = the
+    /// memory destination). Half-memory tuples (GAS 2.47 disp8 probed:
+    /// `vexpandps 16(%rax), %xmm2` scales by N=8? — see tuple_div below),
+    /// no {1toN} broadcast, {k}{z} allowed on the destination.
+    pub(crate) fn encode_evex_expandcompress(
+        &mut self,
+        ops: &[Operand],
+        w: u8,
+        opcode: u8,
+        is_compress: bool,
+    ) -> Result<(), String> {
+        let (ops, sae) = Self::peel_evex_sae(ops);
+        if ops.len() != 2 {
+            return Err("EVEX expand/compress requires 2 operands".to_string());
+        }
+        // Reject `{sae}`/RC with the per-family GAS message (none exists).
+        Self::apply_evex_sae(sae, EvexSae::None, 0)?;
+        let (aaa, z) = Self::evex_mask_info(&ops[1]);
+        // EVEX.LL comes from the REGISTER operand: the destination for
+        // expand, the source for compress (probed: `vcompresspd %ymm2,
+        // (%rax)` encodes LL=ymm).
+        let reg_i = if is_compress { 0 } else { 1 };
+        let ll = Self::evex_ll(std::slice::from_ref(&ops[reg_i]));
+        // Half-mem tuple: N = VL/2 at every VL → tuple_div = 2.
+        let tuple_div = 2;
+        match (&ops[0], &ops[1]) {
+            (Operand::Register(src), Operand::Register(dst)) => {
+                let (a, b) = if is_compress {
+                    self.emit_evex_mod3(&src.name, &dst.name, None, 2, w, 1, ll, z, aaa, false)?
+                } else {
+                    self.emit_evex_mod3(&dst.name, &src.name, None, 2, w, 1, ll, z, aaa, false)?
+                };
+                self.bytes.push(opcode);
+                self.bytes.push(self.modrm(3, a, b));
+                Ok(())
+            }
+            (Operand::Register(src), Operand::Memory(mem)) if is_compress => {
+                let src_num =
+                    self.emit_evex_memop(&src.name, mem, None, 2, w, 1, ll, z, aaa, false)?;
+                self.bytes.push(opcode);
+                let (_, scale_n) = Self::evex_mem_scale(mem, ll, tuple_div);
+                self.encode_evex_mem(src_num, mem, scale_n)
+            }
+            (Operand::Memory(mem), Operand::Register(dst)) if !is_compress => {
+                let dst_num =
+                    self.emit_evex_memop(&dst.name, mem, None, 2, w, 1, ll, z, aaa, false)?;
+                self.bytes.push(opcode);
+                let (_, scale_n) = Self::evex_mem_scale(mem, ll, tuple_div);
+                self.encode_evex_mem(dst_num, mem, scale_n)
+            }
+            _ => Err("operand type mismatch".to_string()),
+        }
+    }
+
+    /// EVEX k-register compare/test (AVX512F/BW vptestm*). AT&T
+    /// `(src1, src2, dst-k)`: vvvv = src1, r/m = src2 (register or memory
+    /// — {1toN} broadcast allowed on the memory), ModRM.reg = the K
+    /// destination. The k-destination may carry an input mask (`%k3{%k5}`
+    /// → EVEX.aaa=5); `{z}` there is rejected (byte-probed GAS REJECT).
+    pub(crate) fn encode_evex_ktest(
+        &mut self,
+        ops: &[Operand],
+        pp: u8,
+        w: u8,
+        opcode: u8,
+    ) -> Result<(), String> {
+        if ops.len() != 3 {
+            return Err("EVEX ktest requires 3 operands".to_string());
+        }
+        let dst = match &ops[2] {
+            Operand::Register(r) => r,
+            _ => return Err("operand type mismatch".to_string()),
+        };
+        let base = dst.name.split('{').next().unwrap_or(&dst.name).to_string();
+        if !base.starts_with('k') {
+            return Err("operand type mismatch".to_string());
+        }
+        if reg_num(&base).is_none() {
+            return Err("operand type mismatch".to_string());
+        }
+        let (aaa, z) = Self::evex_mask_info(&ops[2]);
+        if z {
+            // {z} on an opmask destination: GAS rejects the spelling.
+            return Err("operand type mismatch".to_string());
+        }
+        let ll = Self::evex_ll(&[ops[0].clone(), ops[1].clone()]);
+        // Slot assignment (GAS 2.47 byte-probed: `vptestmd %xmm1, %xmm2,
+        // %k3` = `62 f2 6d 08 27 d9` — vvvv = xmm2, r/m = xmm1): the
+        // FIRST-listed source rides r/m, the SECOND rides vvvv.
+        match (&ops[0], &ops[1]) {
+            (Operand::Register(src1), Operand::Register(src2)) => {
+                let (dst_num, rm_num) = self.emit_evex_mod3(
+                    &base,
+                    &src1.name,
+                    Some(&src2.name),
+                    2,
+                    w,
+                    pp,
+                    ll,
+                    z,
+                    aaa,
+                    false,
+                )?;
+                self.bytes.push(opcode);
+                self.bytes.push(self.modrm(3, dst_num, rm_num));
+                Ok(())
+            }
+            (Operand::Memory(mem), Operand::Register(src2)) => {
+                // The memory source takes r/m (Intel src2 = AT&T
+                // first-listed); vvvv = the second-listed register.
+                // `vptestmd %xmm1, (%rax), %k3` is GAS-rejected.
+                let (bcst, scale_n) = Self::evex_mem_scale(mem, ll, 1);
+                let dst_num =
+                    self.emit_evex_memop(&base, mem, Some(&src2.name), 2, w, pp, ll, z, aaa, bcst)?;
+                self.bytes.push(opcode);
+                self.encode_evex_mem(dst_num, mem, scale_n)
+            }
+            (Operand::Register(_), Operand::Memory(_)) => Err("operand type mismatch".to_string()),
+            _ => Err("operand type mismatch".to_string()),
+        }
+    }
+
+    /// EVEX down-conversion (AVX512F/DQ/BW vpmov*): EVEX.F3.0F38.W0
+    /// 10–35. AT&T `(src, dst reg|mem{k}{z})`: ModRM.reg = the wide
+    /// SOURCE, r/m = the narrow destination, EVEX.L'L encodes the SOURCE
+    /// width, memory tuple N = source-lanes × dst-elem (byte-verified:
+    /// vpmovwb zmm → 32, ymm → 16; vpmovdb xmm → 4 — i.e. VL/lanes…
+    /// constant div = 4/dst_elem at every VL).
+    pub(crate) fn encode_evex_narrow(
+        &mut self,
+        ops: &[Operand],
+        opcode: u8,
+        dst_elem: u32,
+        src_is_q: bool,
+    ) -> Result<(), String> {
+        let (ops, sae) = Self::peel_evex_sae(ops);
+        if ops.len() != 2 {
+            return Err("EVEX narrow requires 2 operands".to_string());
+        }
+        Self::apply_evex_sae(sae, EvexSae::None, 0)?;
+        let src = match &ops[0] {
+            Operand::Register(r)
+                if is_xmm(&r.name)
+                    || is_ymm(&r.name)
+                    || r.name.to_lowercase().starts_with("zmm") =>
+            {
+                r
+            }
+            _ => return Err("operand type mismatch".to_string()),
+        };
+        let src_ll = Self::evex_ll(&[ops[0].clone()]);
+        let (aaa, z) = Self::evex_mask_info(&ops[1]);
+        let tuple_div = match dst_elem {
+            1 => 4,
+            2 => 2,
+            _ => 1,
+        };
+        // Destination-width rule (GAS 2.47 byte-probed): the narrow
+        // result keeps the source lane count, so the destination register
+        // class is fixed by the mnemonic pair — `vpmovqd %zmm1, %xmm2`
+        // (8 dwords = 32 bytes) is `operand size mismatch`, as is any
+        // other off-class spelling.
+        if let Operand::Register(dst) = &ops[1] {
+            let src_lanes: u32 = match (src_ll, src_is_q) {
+                (0b00, false) => 4,
+                (0b01, false) => 8,
+                (0b10, false) => 16,
+                (0b00, true) => 2,
+                (0b01, true) => 4,
+                _ => 8,
+            };
+            let dst_bytes = src_lanes * dst_elem;
+            let dst_ok = if dst_bytes <= 16 {
+                is_xmm(&dst.name)
+            } else {
+                is_ymm(&dst.name)
+            };
+            if !dst_ok {
+                return Err("operand size mismatch".to_string());
+            }
+        }
+        match &ops[1] {
+            Operand::Register(dst) => {
+                let (src_num, dst_num) = self
+                    .emit_evex_mod3(&src.name, &dst.name, None, 2, 0, 2, src_ll, z, aaa, false)?;
+                self.bytes.push(opcode);
+                self.bytes.push(self.modrm(3, src_num, dst_num));
+                Ok(())
+            }
+            Operand::Memory(mem) => {
+                let src_num =
+                    self.emit_evex_memop(&src.name, mem, None, 2, 0, 2, src_ll, z, aaa, false)?;
+                self.bytes.push(opcode);
+                let (_, scale_n) = Self::evex_mem_scale(mem, src_ll, tuple_div);
+                self.encode_evex_mem(src_num, mem, scale_n)
+            }
+            _ => Err("operand type mismatch".to_string()),
+        }
+    }
+
+    /// EVEX vcvtps2ph (AVX512F: EVEX.66.0F3A.W0 1D /r ib) — the imm8-first
+    /// convert: `$imm, src(zmm|ymm|xmm), dst(ymm|xmm|mem{k}{z})`. EVEX.L'L
+    /// encodes the SOURCE width (narrowing); mem destination tuple
+    /// N = source-lanes × 2 → constant tuple_div = 2 (byte-verified zmm
+    /// → 32). A leading `{sae}` token is the positional imm8-first error.
+    pub(crate) fn encode_evex_vcvtps2ph(&mut self, ops: &[Operand]) -> Result<(), String> {
+        if ops.len() != 3 {
+            return Err("number of operands mismatch for `vcvtps2ph'".to_string());
+        }
+        let (ops, sae) = Self::peel_evex_sae(ops);
+        if sae.is_some() {
+            return Err(SAE_AFTER_IMM.to_string());
+        }
+        let imm = match &ops[0] {
+            Operand::Immediate(ImmediateValue::Integer(v)) => *v as u8,
+            _ => return Err("operand type mismatch for `vcvtps2ph'".to_string()),
+        };
+        let src = match &ops[1] {
+            Operand::Register(r) => r,
+            _ => return Err("operand type mismatch for `vcvtps2ph'".to_string()),
+        };
+        let src_ll = Self::evex_ll(&[ops[1].clone()]);
+        let (aaa, z) = Self::evex_mask_info(&ops[2]);
+        // Slot placement (GAS 2.47, byte-probed): ModRM.reg = SOURCE,
+        // r/m = destination for BOTH the register and memory forms.
+        match &ops[2] {
+            Operand::Register(dst) => {
+                let (src_num, dst_num) = self
+                    .emit_evex_mod3(&src.name, &dst.name, None, 3, 0, 1, src_ll, z, aaa, false)?;
+                self.bytes.push(0x1D);
+                self.bytes.push(self.modrm(3, src_num, dst_num));
+                self.bytes.push(imm);
+                Ok(())
+            }
+            Operand::Memory(mem) => {
+                let src_num =
+                    self.emit_evex_memop(&src.name, mem, None, 3, 0, 1, src_ll, z, aaa, false)?;
+                self.bytes.push(0x1D);
+                let (_, scale_n) = Self::evex_mem_scale(mem, src_ll, 2);
+                self.encode_evex_mem(src_num, mem, scale_n)?;
+                self.bytes.push(imm);
+                Ok(())
+            }
+            _ => Err("operand type mismatch for `vcvtps2ph'".to_string()),
+        }
+    }
+
+    /// AVX512F 3src+imm shuffles (vshuff32x4/vshuff64x2/vshufi32x4/
+    /// vshufi64x2): no xmm forms exist in AVX512F (the 128-bit spellings
+    /// are AVX512VL and GAS 2.47 rejects them standalone with `operand
+    /// size mismatch` — mirrored here for line parity), ymm imm8 caps at
+    /// 3, zmm at 7 (GAS: same `operand size mismatch` wording on
+    /// overflow — byte-probed).
+    pub(crate) fn encode_evex_shuffle32x4(
+        &mut self,
+        ops: &[Operand],
+        w: u8,
+        opcode: u8,
+        mnemonic: &str,
+    ) -> Result<(), String> {
+        let xmm = ops
+            .iter()
+            .any(|op| matches!(op, Operand::Register(r) if is_xmm(&r.name)));
+        if xmm {
+            return Err(format!("operand size mismatch for `{mnemonic}'"));
+        }
+        // imm8 takes the full byte range (GAS 2.47 accepts $-1..$255,
+        // rejects $256 with `operand type mismatch` — byte-probed).
+        if let Some(Operand::Immediate(ImmediateValue::Integer(v))) = ops.first() {
+            if !(-128..=255).contains(v) {
+                return Err(format!("operand type mismatch for `{mnemonic}'"));
+            }
+        }
+        self.encode_evex_3src_imm(ops, 3, 1, w, opcode, false)
+    }
+
+    /// VEX vcvtps2ph (F16C: VEX.128/256.66.0F3A.W0 1D /r ib — GAS 2.47
+    /// byte-verified pp=66, NOT F2): `$imm, src(xmm|ymm), dst(xmm|mem)`.
+    /// The register source rides ModRM.reg for the memory-destination
+    /// form (`vcvtps2ph $4, %xmm1, (%rax)` = `c4 e3 79 1d 08 04`); vvvv
+    /// unused; L from the source; zmm has no VEX form (routes EVEX).
+    pub(crate) fn encode_avx_vcvtps2ph(&mut self, ops: &[Operand]) -> Result<(), String> {
+        if ops.len() != 3 {
+            return Err("number of operands mismatch for `vcvtps2ph'".to_string());
+        }
+        let imm = match &ops[0] {
+            Operand::Immediate(ImmediateValue::Integer(v)) => *v as u8,
+            _ => return Err("operand type mismatch for `vcvtps2ph'".to_string()),
+        };
+        let src = match &ops[1] {
+            Operand::Register(r) if is_xmm(&r.name) || is_ymm(&r.name) => r,
+            _ => return Err("operand type mismatch for `vcvtps2ph'".to_string()),
+        };
+        let src_num = reg_num(&src.name).ok_or("bad register")?;
+        let l = self.vex_l_from_ops(&ops[1..]);
+        match &ops[2] {
+            Operand::Register(dst) if is_xmm(&dst.name) => {
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                let r = needs_vex_ext(&dst.name);
+                let b = needs_vex_ext(&src.name);
+                self.emit_vex(r, false, b, 3, 0, 0, l, 1);
+                self.bytes.push(0x1D);
+                // Byte-probed: ModRM.reg = the SOURCE, r/m = destination.
+                self.bytes.push(self.modrm(3, src_num, dst_num));
+                self.bytes.push(imm);
+                Ok(())
+            }
+            Operand::Memory(mem) => {
+                let r = needs_vex_ext(&src.name);
+                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
+                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                self.emit_vex(r, x, b_ext, 3, 0, 0, l, 1);
+                self.bytes.push(0x1D);
+                let rc = self.relocations.len();
+                self.encode_modrm_mem(src_num, mem)?;
+                self.bytes.push(imm);
+                self.adjust_rip_reloc_addend(rc, 1);
+                Ok(())
+            }
+            _ => Err("operand type mismatch for `vcvtps2ph'".to_string()),
+        }
+    }
+
+    /// EVEX scalar moves with opmask support (vmovss: EVEX.LIG.F3.0F.W0,
+    /// vmovsd: EVEX.LIG.F2.0F.W1; opcodes 10 = load/merge, 11 = store).
+    /// GAS 2.47 byte-verified shapes:
+    ///  * merge `vmovss %xmm4, %xmm5, %xmm6{%k7}{z}` — standard binary
+    ///    placement (r/m = 1st-listed, vvvv = 2nd, reg = dst);
+    ///  * load `vmovss (%rax), %xmm6{%k7}` — unary, mask on dst;
+    ///  * store `vmovss %xmm6, (%rax){%k7}` — REVERSED: the register
+    ///    source rides ModRM.reg, the memory is r/m;
+    ///  * two-register masked spelling `vmovss %xmm6, %xmm7{%k7}` is
+    ///    `operand type mismatch`.
+    pub(crate) fn encode_evex_scalarmov(
+        &mut self,
+        ops: &[Operand],
+        pp: u8,
+        w: u8,
+    ) -> Result<(), String> {
+        match ops.len() {
+            3 => {
+                let (src1, src2, dst) = match (&ops[0], &ops[1], &ops[2]) {
+                    (Operand::Register(a), Operand::Register(b), Operand::Register(d)) => {
+                        (&a.name, &b.name, &d.name)
+                    }
+                    _ => return Err("operand type mismatch".to_string()),
+                };
+                let (aaa, z) = Self::evex_mask_info(&ops[2]);
+                let (dst_num, rm_num) =
+                    self.emit_evex_mod3(dst, src1, Some(src2), 1, w, pp, 0, z, aaa, false)?;
+                self.bytes.push(0x10);
+                self.bytes.push(self.modrm(3, dst_num, rm_num));
+                Ok(())
+            }
+            2 => match (&ops[0], &ops[1]) {
+                (Operand::Memory(mem), Operand::Register(dst)) => {
+                    let (aaa, z) = Self::evex_mask_info(&ops[1]);
+                    let dst_num =
+                        self.emit_evex_memop(&dst.name, mem, None, 1, w, pp, 0, z, aaa, false)?;
+                    self.bytes.push(0x10);
+                    self.encode_evex_mem(dst_num, mem, 1)
+                }
+                (Operand::Register(src), Operand::Memory(mem)) => {
+                    let (aaa, z) = Self::evex_mask_info(&ops[1]);
+                    let src_num =
+                        self.emit_evex_memop(&src.name, mem, None, 1, w, pp, 0, z, aaa, false)?;
+                    self.bytes.push(0x11);
+                    self.encode_evex_mem(src_num, mem, 1)
+                }
+                (Operand::Register(_), Operand::Register(_)) => {
+                    Err("operand type mismatch".to_string())
+                }
+                _ => Err("operand type mismatch".to_string()),
+            },
+            _ => Err("operand type mismatch".to_string()),
         }
     }
 

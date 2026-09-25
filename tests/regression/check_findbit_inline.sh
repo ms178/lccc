@@ -27,6 +27,10 @@ SRC=$(dirname "$0")/../benchmark/programs/linux_find_bit.c
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 GCC=${GCC_BIN:-gcc}
+# Host-gcc include path: a missing system header must surface as a
+# compile failure here, not as a silent floor failure.
+GCCINC=$("$GCC" -print-file-name=include 2>/dev/null)
+[ -d "$GCCINC" ] && GCCINC="-I$GCCINC" || GCCINC=""
 # The runtime differential is a correctness check: a broken reference
 # build must FAIL, not silently skip (explicit opt-out only).
 ALLOW_GCC_SKIP=${LCCC_ALLOW_GCC_SKIP:-0}
@@ -38,9 +42,12 @@ check_cfg() {
   CFG=$1
   WANT_CALLS=$2
   WHY=$3
-  "$CCC" $CFG -S "$SRC" -o "$TMP/fb.s" 2>/dev/null \
+  "$CCC" $GCCINC $CFG -S "$SRC" -o "$TMP/fb.s" 2>/dev/null \
     || { bad "$CFG: lccc compile"; return; }
-  CALLS=$(grep -c 'call linux_find_next_andnot_bit' "$TMP/fb.s" || true)
+  # ANCHORED census (leading whitespace + `call` + whitespace + symbol):
+  # a comment or symbol merely CONTAINING the substring would deflate
+  # `grep -c` to 0 and silently pass a "must be 0" style check.
+  CALLS=$(grep -cE '^[[:space:]]*call[[:space:]]+linux_find_next_andnot_bit' "$TMP/fb.s" || true)
   [ "$CALLS" -eq "$WANT_CALLS" ] \
     || bad "$CFG: $CALLS outlined calls (want $WANT_CALLS: $WHY)"
   TZ=$(grep -cE '^[[:space:]]*tzcnt[lq]' "$TMP/fb.s" || true)
@@ -51,10 +58,10 @@ check_cfg() {
     || bad "$CFG: & ~addr2 arm did not fold to andn (got $ANDN)"
 
   # Bit-exact runtime differential vs the host C compiler.
-  "$CCC" $CFG "$SRC" -o "$TMP/l.x" 2>/dev/null \
+  "$CCC" $GCCINC $CFG "$SRC" -o "$TMP/l.x" 2>/dev/null \
     || { bad "$CFG: lccc link"; return; }
   L=$("$TMP/l.x"; echo "rc=$?")
-  if "$GCC" $CFG "$SRC" -o "$TMP/g.x" 2>/dev/null; then
+  if "$GCC" $GCCINC $CFG "$SRC" -o "$TMP/g.x" 2>/dev/null; then
     G=$("$TMP/g.x"; echo "rc=$?")
     [ "$G" = "$L" ] || bad "$CFG: runtime differs (gcc=[$G] lccc=[$L])"
   else

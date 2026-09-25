@@ -108,6 +108,12 @@ pub const R_386_32: u32 = 1;
 pub const R_386_PC32: u32 = 2;
 pub const R_386_GOT32: u32 = 3;
 pub const R_386_PLT32: u32 = 4;
+/// Relaxable 32-bit GOT offset (`movl sym@GOT(%reg), %reg` against a
+/// PIC-compiled local symbol; binutils 2.47 `include/elf/i386.h`).  The
+/// encoder does not select it yet, but the GOT-base symbol classifier is
+/// written at the ABI-type level, so the constant is declared with the
+/// rest of the family rather than spelled numerically in one consumer.
+pub const R_386_GOT32X: u32 = 43;
 /// 16-bit absolute (word16). Kernel realmode code stores 16-bit segment
 /// values (`.word (to), real_mode_seg` in realmode.h LJMPW_RM); the kernel's
 /// relocs tool distinguishes R_386_16-against-segment-symbol (legal, recorded
@@ -201,11 +207,38 @@ impl InstructionEncoder {
             }
         }
         pfx.sort_by_key(|&b| b == 0xF0);
-        for b in pfx {
-            self.bytes.push(b);
+        let body_prefix_count = pfx.len();
+        for b in &pfx {
+            self.bytes.push(*b);
         }
 
         let result = self.encode_mnemonic(instr);
+
+        // Canonical legacy-prefix order (GAS 2.47, byte-verified):
+        // `lock xacquire adcw $100,(%ecx)` -> `66 f2 f0 83 11 64` — the
+        // body's 0x66 size override comes FIRST, before the F2/F3/F0 run.
+        // The run was pushed before the body (which then pushed 0x66 for
+        // 16-bit operands), so hoist the body's leading 0x66/0x67 bytes in
+        // front of the group-1 run, shifting body relocations. (The x86-64
+        // wrapper instead splices group1 after the body; this wrapper
+        // pre-pushes because .code16 inversion below rewrites the whole
+        // run — same canonical result, different mechanism.)
+        if result.is_ok() && body_prefix_count > 0 {
+            let mut at = start_len + body_prefix_count;
+            while at < self.bytes.len() && matches!(self.bytes[at], 0x66 | 0x67) {
+                at += 1;
+            }
+            if at > start_len + body_prefix_count {
+                let moved: Vec<u8> = self.bytes[start_len + body_prefix_count..at].to_vec();
+                self.bytes.drain(start_len + body_prefix_count..at);
+                for (i, b) in moved.iter().enumerate() {
+                    self.bytes.insert(start_len + i, *b);
+                }
+                // The hoist permutes bytes WITHIN one instruction: total
+                // length and every displacement/immediate offset are
+                // unchanged, so relocation offsets need no adjustment.
+            }
+        }
 
         // ── Operand segment override, spliced ONCE at the single choke
         // point. ───────────────────────────────────────────────────────────
@@ -432,6 +465,28 @@ impl InstructionEncoder {
 
     /// Main mnemonic dispatch.
     fn encode_mnemonic(&mut self, instr: &Instruction) -> Result<(), String> {
+        // ── Shared VEX/EVEX/XOP encoding core ────────────────────────────
+        //
+        // The 32-bit and 64-bit vector instruction sets are byte-identical
+        // except for the GP-register model (no REX, no r8–r15) and the
+        // relocation classes. Vector-only instructions (no GP register
+        // operand) therefore have ONE correct encoding, and keeping a
+        // second copy of the VEX/EVEX dispatch here is how the S07–S14
+        // families (EVEX converts, vpcmov/LWP XOP, masked shuffles, …)
+        // drifted out of the i686 assembler in the first place.
+        //
+        // Delegation rule: mnemonic starts with `v` (every VEX/EVEX/XOP/LWP
+        // ISA), the mnemonic is not in the GP-touching set below, and no
+        // operand names a GP register. Memory operands are fine: i686
+        // addressing (eax..edi bases, SIB) is encoded identically by the
+        // x86-64 core — its REX logic never fires for register ids < 8.
+        // Relocations translate R_X86_64_* → R_386_* with identical
+        // semantics (PC32→PC32, PLT32→PLT32, ABS 32/32S→32); the RIP-based
+        // GOT classes cannot occur in 32-bit code and are rejected loudly.
+        if let Some(result) = self.delegate_vector_to_x64(instr) {
+            return result;
+        }
+
         // GAS accepts (and ignores) a `.s` suffix on any instruction
         // mnemonic, in 32-bit mode too — except on standalone prefixes,
         // which it rejects. Same rule as the x86-64 encoder.
@@ -2029,6 +2084,210 @@ impl InstructionEncoder {
             )),
         }
     }
+
+    /// Vector-only mnemonics that READ or WRITE a GP register. Their i686
+    /// spellings use the 32-bit register file with no REX, so they keep the
+    /// local REX-free encoders; everything else `v*` delegates to the
+    /// shared x86-64 VEX/EVEX/XOP core. (vmovd/vmovq/vmovw are NOT here:
+    /// their vector-only spellings delegate like everything else, and
+    /// their GP spellings are caught by the operand check below — the
+    /// x86-64 GP forms are r64-based and invalid in .code32 anyway.)
+    const GP_VECTOR_MNEMONICS: [&str; 18] = [
+        "vpinsrb",
+        "vpinsrw",
+        "vpinsrd",
+        "vpinsrq",
+        "vpextrb",
+        "vpextrw",
+        "vpextrd",
+        "vpextrq",
+        "vextractps",
+        "vmovmskps",
+        "vmovmskpd",
+        "vpmovmskb",
+        "vcvtsi2ss",
+        "vcvtsi2sd",
+        "vcvttss2si",
+        "vcvttsd2si",
+        "vcvtss2si",
+        "vcvtsd2si",
+    ];
+
+    /// Delegate a vector-only instruction to the shared x86-64 VEX/EVEX/
+    /// XOP encoding core. `None` = keep the local i686 path.
+    fn delegate_vector_to_x64(&mut self, instr: &Instruction) -> Option<Result<(), String>> {
+        // Case-insensitive matching: the x86-64 core normalizes mnemonic
+        // case (`VPCMOV`, `vPcMoV` spellings all encode identically, per
+        // the GAS 2.47 uppercase testsuite lines), so the delegation
+        // gate must decide on the lowercased form too. The ORIGINAL
+        // spelling is passed through to the x64 core untouched.
+        let lower = instr.mnemonic.to_ascii_lowercase();
+        let stem = lower.strip_suffix(".s").unwrap_or(&lower);
+        // XOP/LWP (vpcmov, vpperm, vprot*, vph*, vpmac*, lwpins/lwpval)
+        // delegate unconditionally: the 0x8F encoding carries its own
+        // extension bits (no REX anywhere), so the GP register model is
+        // irrelevant and lwpins' GP destination encodes identically for
+        // eax..edi (ids < 8). LWP on i686 would otherwise find no local
+        // arm at all. (Note lwpins/lwpval do not carry the `v` prefix.)
+        if X86InstructionEncoder::is_xop_mnemonic(stem) {
+            return Some(self.encode_via_x64(instr));
+        }
+        if !stem.starts_with('v') {
+            return None;
+        }
+        // Suffixed GP-touching spellings (vcvtsi2ssl, vcvtsd2siq, …): the
+        // stem before the size suffix decides.
+        let stem_base = stem.strip_suffix(".s").unwrap_or(stem);
+        let stem_base = stem_base.trim_end_matches(['b', 'w', 'l', 'q']);
+        if Self::GP_VECTOR_MNEMONICS.contains(&stem)
+            || Self::GP_VECTOR_MNEMONICS.contains(&stem_base)
+        {
+            return None;
+        }
+        // Defense in depth: a GP register DATA operand keeps the REX-free
+        // local encoders even if the mnemonic list above misses a spelling
+        // — a wrongly-delegated GP operand would silently encode through
+        // the x86-64 register table. Memory BASE/INDEX registers do NOT
+        // qualify: i686 addressing (eax..edi, all ids < 8) is encoded
+        // byte-identically by the shared core (no REX ever fires).
+        if instr
+            .operands
+            .iter()
+            .any(|op| matches!(op, Operand::Register(r) if is_gp_reg_name(&r.name)))
+        {
+            return None;
+        }
+
+        let mut x64 = X86InstructionEncoder::new();
+        Some(self.encode_via_x64_encoder(instr, &mut x64))
+    }
+
+    /// Encode `instr` with a fresh x86-64 core and splice the bytes and
+    /// translated relocations into this encoder.
+    fn encode_via_x64(&mut self, instr: &Instruction) -> Result<(), String> {
+        let mut x64 = X86InstructionEncoder::new();
+        self.encode_via_x64_encoder(instr, &mut x64)
+    }
+
+    fn encode_via_x64_encoder(
+        &mut self,
+        instr: &Instruction,
+        x64: &mut X86InstructionEncoder,
+    ) -> Result<(), String> {
+        match x64.encode_mnemonic(instr) {
+            Err(e) => Err(e),
+            Ok(()) => {
+                self.bytes.extend_from_slice(&x64.bytes);
+                for r in &x64.relocations {
+                    let Ok(reloc_type) = translate_x64_reloc(r.reloc_type) else {
+                        return Err(format!(
+                            "internal error: vector instruction produced 64-bit-only relocation type {}",
+                            r.reloc_type
+                        ));
+                    };
+                    self.relocations.push(Relocation {
+                        offset: self.offset + r.offset,
+                        symbol: r.symbol.clone(),
+                        reloc_type,
+                        addend: r.addend,
+                        diff_symbol: r.diff_symbol.clone(),
+                    });
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Translate an x86-64 relocation class produced by the shared vector core
+/// into its identical-semantics R_386_* class. The RIP-relative GOT/TLS
+/// families have no 32-bit spelling (there is no `%rip` addressing in
+/// .code32), so reaching them here is an invariant violation, not something
+/// to silently downgrade. Constants are spelled numerically with their ABI
+/// names because the 64-bit constants live in the x86-64 encoder module and
+/// `match` patterns would read bare identifiers as bindings.
+fn translate_x64_reloc(t: u32) -> Result<u32, String> {
+    match t {
+        // R_X86_64_PC32 = 2, R_X86_64_PLT32 = 4 — same numbers in R_386.
+        2 | 4 => Ok(t),
+        // R_X86_64_32 = 10, R_X86_64_32S = 11 → R_386_32.
+        10 | 11 => Ok(R_386_32),
+        // R_X86_64_16 = 12 → R_386_16.
+        12 => Ok(R_386_16),
+        other => Err(format!(
+            "internal error: vector instruction produced 64-bit-only relocation type {other}"
+        )),
+    }
+}
+
+/// (The memory base/index registers are deliberately NOT considered here:
+/// the shared core encodes i686 addressing byte-identically, so only GP
+/// register DATA operands force the local path.)
+fn is_gp_reg_name(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    matches!(
+        n.as_str(),
+        "eax"
+            | "ebx"
+            | "ecx"
+            | "edx"
+            | "esi"
+            | "edi"
+            | "esp"
+            | "ebp"
+            | "ax"
+            | "bx"
+            | "cx"
+            | "dx"
+            | "si"
+            | "di"
+            | "sp"
+            | "bp"
+            | "al"
+            | "bl"
+            | "cl"
+            | "dl"
+            | "ah"
+            | "bh"
+            | "ch"
+            | "dh"
+            | "sil"
+            | "dil"
+            | "spl"
+            | "bpl"
+            | "r8d"
+            | "r9d"
+            | "r10d"
+            | "r11d"
+            | "r12d"
+            | "r13d"
+            | "r14d"
+            | "r15d"
+            | "r8w"
+            | "r9w"
+            | "r10w"
+            | "r11w"
+            | "r12w"
+            | "r13w"
+            | "r14w"
+            | "r15w"
+            | "r8b"
+            | "r9b"
+            | "r10b"
+            | "r11b"
+            | "r12b"
+            | "r13b"
+            | "r14b"
+            | "r15b"
+            | "r8"
+            | "r9"
+            | "r10"
+            | "r11"
+            | "r12"
+            | "r13"
+            | "r14"
+            | "r15"
+    )
 }
 
 #[cfg(test)]

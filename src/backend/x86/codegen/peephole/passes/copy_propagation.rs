@@ -737,6 +737,67 @@ mod tests {
     }
 
     #[test]
+    fn lock_cmpxchg_between_copy_and_consumer_keeps_the_copy() {
+        // F7 (audit of PR #607): `cmpxchgq` IMPLICITLY REWRITES %rax when
+        // the comparison fails (the accumulator is reloaded from memory),
+        // and the `lock ` prefix must not hide that from the implicit-write
+        // oracle.  A 32-bit consumer after the lock window cannot be
+        // retargeted to the copy's source: it reads the CURRENT %eax,
+        // which the failing cmpxchg just replaced.  The identity must be
+        // retired at the implicit write, not carried across it.  This is
+        // now reachable through NARROW consumers (the new low-32
+        // propagation), far more common than the 64-bit readers above —
+        // exactly the shape a future edit to `implicit_write_refs` would
+        // silently break.
+        let out = propagate(concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movl %ebx, %eax\n",
+            "    lock cmpxchgq %rbx, (%rdi)\n",
+            "    cmpl %eax, %esi\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("cmpl %eax, %esi"), "{out}");
+        assert!(!out.contains("cmpl %ebx, %esi"), "{out}");
+    }
+
+    #[test]
+    fn plain_cmpxchg_between_copy_and_consumer_keeps_the_copy() {
+        // The un-prefixed spelling of the same contract (the implicit
+        // RAX write is identical without `lock`).
+        let out = propagate(concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movl %ebx, %eax\n",
+            "    cmpxchgq %rbx, (%rdi)\n",
+            "    cmpl %eax, %esi\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("cmpl %eax, %esi"), "{out}");
+        assert!(!out.contains("cmpl %ebx, %esi"), "{out}");
+    }
+
+    #[test]
+    fn consumer_before_the_implicit_write_still_retargets() {
+        // Positive control: a 32-bit consumer BEFORE the lock window reads
+        // the pre-window %eax, which the movl identity still describes, so
+        // the retarget to %ebx is correct and must fire.
+        let out = propagate(concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movl %ebx, %eax\n",
+            "    cmpl %eax, %esi\n",
+            "    lock cmpxchgq %rbx, (%rdi)\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("cmpl %ebx, %esi"), "{out}");
+        assert!(!out.contains("cmpl %eax, %esi"), "{out}");
+    }
+
+    #[test]
     fn address_use_keeps_the_copy() {
         // N2(a)/(d): a base/index reference is a 64-bit read.
         let out = propagate(concat!(
