@@ -142,6 +142,12 @@ some callees become completely unreferenced and can be removed. Without this
 cleanup, dead functions may reference undefined external symbols and cause
 linker errors.
 
+Phase 11a (dead global stores) runs immediately before it: stores to
+never-loaded static globals are deleted (with a DCE chaser), leaving the
+globals unreferenced for Phase 11 to remove. Both run after 11e
+(const-array promotion) — evidence-consuming passes run before
+evidence-deleting ones, so a dead escape store still blocks promotion.
+
 ---
 
 ## Dirty Tracking and Iteration Strategy

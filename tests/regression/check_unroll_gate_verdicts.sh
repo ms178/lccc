@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Persist-gate verdict pins for the four C-level probe nests.
+# Persist-gate verdict pins for the six C-level probe nests.
 #
 # WHY THIS EXISTS
 #
 # The unit tests in `loop_unroll.rs` (G1-G18) pin the gate's verdicts on
-# synthetic IR fixtures. These four pins cover the same decisions END TO
+# synthetic IR fixtures. These six pins cover the same decisions END TO
 # END from C sources: they catch frontend/canonicalization drift that moves
 # a bound across the gate's rule boundary (e.g. if-conversion routing a
 # goto through a Select instead of a multi-entry phi) as well as gate
@@ -17,6 +17,8 @@
 #   unroll_gate_runtime_limit.c   veto arm=dynamic-bound + rolled (jumps stay)
 #   unroll_gate_iv_decided_limit.c veto arm=dynamic-bound + rolled (jumps stay)
 #   unroll_gate_folded_limit.c    SILENT (allow) + fully unrolled (no jumps)
+#   unroll_gate_reset_bound.c     SILENT (allow) + fully unrolled (no jumps)
+#   unroll_gate_latchset_bound.c  SILENT (allow) + fully unrolled (no jumps)
 #
 # The goto case pins no jump count: its `if (c)` forward branch survives in
 # every shape, so a jump count cannot discriminate rolled from unrolled
@@ -84,19 +86,26 @@ expect_veto goto_bound goto_bound no
 expect_veto runtime_limit runtime_limit yes
 expect_veto iv_decided_limit iv_decided_limit yes
 
-if compile_probe folded_limit folded_limit; then
-    if grep -q "veto fn=folded_limit " "$work/folded_limit.trace"; then
-        bad "folded_limit: gate vetoed the foldable nest (must allow)"
+expect_allow() {
+    local stem=$1 fn=$2
+    compile_probe "$stem" "$fn" || return 0
+    if grep -q "veto fn=$fn " "$work/$stem.trace"; then
+        bad "$stem: gate vetoed the foldable nest (must allow)"
     else
-        ok "folded_limit: gate silent (allow)"
+        ok "$stem: gate silent (allow)"
     fi
-    n=$(jumps_in_fn folded_limit folded_limit)
+    local n
+    n=$(jumps_in_fn "$stem" "$fn")
     if [[ "$n" -eq 0 ]]; then
-        ok "folded_limit: nest fully cascades (0 jumps)"
+        ok "$stem: nest fully cascades (0 jumps)"
     else
-        bad "folded_limit: nest not fully unrolled ($n jumps survive)"
+        bad "$stem: nest not fully unrolled ($n jumps survive)"
     fi
-fi
+}
+
+expect_allow folded_limit folded_limit
+expect_allow reset_bound reset_bound
+expect_allow latchset_bound latchset_bound
 
 echo
 echo "unroll-gate-verdicts gate: PASS=$pass FAIL=$fail"

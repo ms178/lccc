@@ -2508,6 +2508,11 @@ fn try_complete_unroll_two_block(
     // loop whose init became `Add(const, const)` after an outer complete
     // unroll is handled in the SAME fixpoint round instead of waiting for a
     // later folding pass (or never, when unroll is the last loop pass).
+    // Multi-entry safe by construction: `collect_header_phis` below refuses
+    // loops whose phis are not exactly [preheader, latch] before any
+    // mutation, so the last-wins pick only ever observes single-entry loops
+    // on paths that reach a rewrite.  Do not relax that check without
+    // revisiting this pick.
     let mut iv_init_op: Option<Operand> = None;
     for inst in &func.blocks[header].instructions {
         if let Instruction::Phi { dest, incoming, .. } = inst {
@@ -3067,7 +3072,11 @@ fn try_partial_unroll_two_block(
     }
 
     // Constant IV init from the preheader edge (resolved through the same
-    // const-chain evaluator as the complete unrollers).
+    // const-chain evaluator as the complete unrollers).  Multi-entry safe
+    // by construction: `collect_header_phis` below refuses loops whose phis
+    // are not exactly [preheader, latch] before any mutation, so the
+    // last-wins pick only ever observes single-entry loops on paths that
+    // reach a rewrite.  Do not relax that check without revisiting this pick.
     let mut iv_init_op: Option<Operand> = None;
     for inst in &func.blocks[header].instructions {
         if let Instruction::Phi { dest, incoming, .. } = inst {

@@ -43,6 +43,16 @@
 //! * `Cmp value-vs-constant` whose truth set contains / is disjoint from the
 //!   fact set → canonical boolean constant (`IrConst::I32(0|1)`, as SCCP).
 //! * `Select` whose condition is a known boolean → the selected arm.
+//! * A *use* of `S = select C,A,B` in a block where `C` is a known boolean
+//!   → the selected arm (pure rename, no code motion: the arm dominates `S`
+//!   which dominates the use).  This is the select-before-branch order that
+//!   jump-threading cannot see — the select dominates the branch, so no
+//!   predecessor edge predicts it — and lets DCE + sinking delete selects
+//!   duplicated across correlated diamonds (libm `trunc`: the inlined
+//!   round-to-even select feeds both arms of `if (x >= 0)` on its own
+//!   condition).  Phi incomings are never rewritten (edge-flavored facts);
+//!   `IsConstant` operands are skipped so `__builtin_constant_p` keeps its
+//!   `-O0` answer under optimization.
 //! * `CondBranch` whose condition is known → `Branch`, with the dropped
 //!   successor's phi incomings for this block removed.  Removing edges can
 //!   only enlarge dominance, so facts computed before the edit stay valid
@@ -296,6 +306,7 @@ impl Fact {
 fn edge_facts(
     func: &IrFunction,
     defs: &FxHashMap<Value, (usize, usize)>,
+    copies: &FxHashMap<Value, Operand>,
     from: usize,
     to_label: BlockId,
 ) -> Vec<Fact> {
@@ -327,7 +338,34 @@ fn edge_facts(
                     vec![(0, 0)]
                 },
             });
-            if let Some(&(bi, ii)) = defs.get(cv) {
+            // Resolve copies (GVN/CSE residue between a compare and its
+            // branch) to the compared value: a copy preserves every bit, so
+            // the truth established for the branch condition holds identically
+            // for the compare's destination, and the predicate fact (when the
+            // compare canonicalizes) holds for the predicate.  Without this a
+            // `br (copy-of-cmp)` edge carries no usable fact — the float
+            // compares never canonicalize, so the value fact is their ONLY
+            // channel (libm `trunc`: `br %6`, `%6 = copy %30`, `%30` the
+            // `x >= 0.0` compare feeding the inlined select).
+            let mut resolved = *cv;
+            for _ in 0..16 {
+                match copies.get(&resolved) {
+                    Some(Operand::Value(v)) => resolved = *v,
+                    _ => break,
+                }
+            }
+            if resolved != *cv {
+                out.push(Fact {
+                    value: resolved,
+                    bits: BOOL_BITS,
+                    set: if truth {
+                        vec![(1, umax(BOOL_BITS))]
+                    } else {
+                        vec![(0, 0)]
+                    },
+                });
+            }
+            if let Some(&(bi, ii)) = defs.get(&resolved) {
                 if let Instruction::Cmp {
                     ref op,
                     ref lhs,
@@ -397,6 +435,7 @@ fn edge_facts(
 fn block_entry_facts(
     func: &IrFunction,
     defs: &FxHashMap<Value, (usize, usize)>,
+    copies: &FxHashMap<Value, Operand>,
     preds: &[u32],
     blk: usize,
 ) -> Vec<Fact> {
@@ -406,7 +445,7 @@ fn block_entry_facts(
     let label = func.blocks[blk].label;
     let mut acc: Option<Vec<Fact>> = None;
     for &p in preds {
-        let ef = edge_facts(func, defs, p as usize, label);
+        let ef = edge_facts(func, defs, copies, p as usize, label);
         acc = Some(match acc {
             None => ef,
             Some(prev) => {
@@ -517,6 +556,26 @@ fn bool_const(b: bool) -> Operand {
     Operand::Const(IrConst::I32(b as i32))
 }
 
+/// If `op` uses a select whose condition the fact stack decides, the selected
+/// arm; otherwise `None`.  The arm is dominated by the select which dominates
+/// the use, so the rename never moves code and the arm is always available.
+fn decided_select_arm(
+    op: &Operand,
+    stack: &[Fact],
+    func: &IrFunction,
+    defs: &FxHashMap<Value, (usize, usize)>,
+    selects: &FxHashMap<Value, (Operand, Operand, Operand)>,
+) -> Option<Operand> {
+    if let Operand::Value(v) = op {
+        if let Some((cond, true_val, false_val)) = selects.get(v) {
+            if let Some(t) = decide_bool(stack, func, defs, cond) {
+                return Some(if t { *true_val } else { *false_val });
+            }
+        }
+    }
+    None
+}
+
 /// Remove `pred_label` from the phi incomings of block `target`.
 fn remove_phi_incoming(func: &mut IrFunction, target: usize, pred_label: BlockId) {
     for inst in &mut func.blocks[target].instructions {
@@ -541,11 +600,27 @@ pub fn run_function(func: &mut IrFunction) -> usize {
     // Value → definition maps used by predicate and zero-equivalence queries.
     let mut defs: FxHashMap<Value, (usize, usize)> = FxHashMap::default();
     let mut casts: FxHashMap<Value, (Operand, IrType, IrType)> = FxHashMap::default();
+    // Copy chains (branch conditions through GVN residue) and select triples
+    // (correlated-select use rewriting).  Both keyed by SSA dest (unique).
+    let mut copies: FxHashMap<Value, Operand> = FxHashMap::default();
+    let mut selects: FxHashMap<Value, (Operand, Operand, Operand)> = FxHashMap::default();
     for (bi, b) in func.blocks.iter().enumerate() {
         for (ii, inst) in b.instructions.iter().enumerate() {
             match inst {
                 Instruction::Cmp { dest, .. } => {
                     defs.insert(*dest, (bi, ii));
+                }
+                Instruction::Copy { dest, src } => {
+                    copies.insert(*dest, *src);
+                }
+                Instruction::Select {
+                    dest,
+                    cond,
+                    true_val,
+                    false_val,
+                    ..
+                } => {
+                    selects.insert(*dest, (*cond, *true_val, *false_val));
                 }
                 Instruction::Cast {
                     dest,
@@ -562,7 +637,7 @@ pub fn run_function(func: &mut IrFunction) -> usize {
 
     // Entry facts per block, computed on the pristine CFG.
     let entry_facts: Vec<Vec<Fact>> = (0..n)
-        .map(|b| block_entry_facts(func, &defs, preds.row(b), b))
+        .map(|b| block_entry_facts(func, &defs, &copies, preds.row(b), b))
         .collect();
 
     let mut changes = 0usize;
@@ -574,6 +649,78 @@ pub fn run_function(func: &mut IrFunction) -> usize {
     while let Some(&mut (blk, ref mut next)) = work.last_mut() {
         if *next == 0 {
             // First visit: fold inside this block under the active facts.
+            //
+            // Correlated-select USE rewriting runs BEFORE definition
+            // folding: once a select folds to `Copy(arm)` its triple is
+            // gone from the instruction stream, and uses rewritten here
+            // directly (rather than via the copy) converge in one visit.
+            // Phi incomings are edge-flavored, never block facts: skipped.
+            // `IsConstant` operands are skipped so `__builtin_constant_p`
+            // keeps its `-O0` answer under optimization.
+            if !selects.is_empty() {
+                let mut i = 0;
+                while i < func.blocks[blk].instructions.len() {
+                    let skip = matches!(
+                        func.blocks[blk].instructions[i],
+                        Instruction::Phi { .. }
+                            | Instruction::UnaryOp {
+                                op: crate::ir::reexports::IrUnaryOp::IsConstant,
+                                ..
+                            }
+                    );
+                    if !skip {
+                        // Clone-rewrite-writeback: decide_bool borrows
+                        // `func` immutably, so the rewrite computes on an
+                        // owned clone and the slot is only touched after.
+                        let mut new_inst = func.blocks[blk].instructions[i].clone();
+                        let mut n = 0usize;
+                        new_inst.for_each_operand_mut(|op| {
+                            if let Some(arm) = decided_select_arm(op, &stack, func, &defs, &selects)
+                            {
+                                *op = arm;
+                                n += 1;
+                            }
+                        });
+                        if n > 0 {
+                            // A rewritten select's own triple changed:
+                            // refresh its map entry so later blocks rewrite
+                            // to the current arm in the same visit.  (A stale
+                            // arm would still be value-correct at every
+                            // dominated use by SSA immutability — the old arm
+                            // equals the new one wherever this block's facts
+                            // hold, which is everywhere the select's uses
+                            // are — but freshness converges in one visit
+                            // instead of two and keeps the map truthful.)
+                            if let Instruction::Select {
+                                dest,
+                                cond,
+                                true_val,
+                                false_val,
+                                ..
+                            } = &new_inst
+                            {
+                                selects.insert(*dest, (*cond, *true_val, *false_val));
+                            }
+                            func.blocks[blk].instructions[i] = new_inst;
+                            changes += n;
+                        }
+                    }
+                    i += 1;
+                }
+                // Terminator operands (branch conditions, return values).
+                let mut new_term = func.blocks[blk].terminator.clone();
+                let mut n = 0usize;
+                new_term.for_each_operand_mut(|op| {
+                    if let Some(arm) = decided_select_arm(op, &stack, func, &defs, &selects) {
+                        *op = arm;
+                        n += 1;
+                    }
+                });
+                if n > 0 {
+                    func.blocks[blk].terminator = new_term;
+                    changes += n;
+                }
+            }
             let mut i = 0;
             while i < func.blocks[blk].instructions.len() {
                 let repl = match &func.blocks[blk].instructions[i] {
@@ -867,6 +1014,293 @@ mod tests {
         }
     }
 
+    fn add1(d: u32, lhs: Operand) -> Instruction {
+        Instruction::BinOp {
+            dest: Value(d),
+            op: crate::ir::reexports::IrBinOp::Add,
+            lhs,
+            rhs: Operand::Const(IrConst::I64(1)),
+            ty: IrType::U64,
+        }
+    }
+
+    fn sel(d: u32, cond: u32, t: Operand, f: Operand) -> Instruction {
+        Instruction::Select {
+            dest: Value(d),
+            cond: Operand::Value(Value(cond)),
+            true_val: t,
+            false_val: f,
+            ty: IrType::U64,
+        }
+    }
+
+    #[test]
+    fn select_use_under_correlated_branch_rewrites_to_known_arm() {
+        // The select-before-branch order: b0 computes `s = select c,63,v0`
+        // then branches on `c`; both arms use `s` and each sees its arm.
+        // b1 covers an instruction operand, b2 a terminator (ret) operand.
+        let v0 = Operand::Value(Value(0));
+        let mut f = IrFunction::new("t".to_string(), IrType::U64, vec![], false);
+        f.blocks = vec![
+            mk(
+                0,
+                vec![
+                    cmp0(1, IrCmpOp::Eq),
+                    sel(3, 1, Operand::Const(IrConst::I64(63)), v0),
+                ],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(1)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            mk(
+                1,
+                vec![add1(4, Operand::Value(Value(3)))],
+                Terminator::Return(Some(Operand::Value(Value(4)))),
+            ),
+            mk(
+                2,
+                vec![],
+                Terminator::Return(Some(Operand::Value(Value(3)))),
+            ),
+        ];
+        f.next_value_id = 5;
+        let n = run_function(&mut f);
+        assert_eq!(n, 2, "one instruction use, one terminator use");
+        assert!(matches!(
+            f.blocks[1].instructions[0],
+            Instruction::BinOp {
+                lhs: Operand::Const(IrConst::I64(63)),
+                ..
+            }
+        ));
+        assert!(matches!(
+            f.blocks[2].terminator,
+            Terminator::Return(Some(Operand::Value(Value(0))))
+        ));
+        assert_eq!(run_function(&mut f), 0, "idempotent");
+    }
+
+    #[test]
+    fn select_use_behind_copy_branch_condition_rewrites() {
+        // GVN residue between the compare and its branch (`br %6`,
+        // `%6 = copy %30`) must not hide the edge fact: the float
+        // compares never canonicalize, so the resolved value fact on
+        // the compare destination is their only channel (libm trunc).
+        let v0 = Operand::Value(Value(0));
+        let mut f = IrFunction::new("t".to_string(), IrType::U64, vec![], false);
+        f.blocks = vec![
+            mk(
+                0,
+                vec![
+                    cmp0(30, IrCmpOp::Eq),
+                    sel(3, 30, Operand::Const(IrConst::I64(63)), v0),
+                    Instruction::Copy {
+                        dest: Value(6),
+                        src: Operand::Value(Value(30)),
+                    },
+                ],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(6)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            mk(
+                1,
+                vec![add1(4, Operand::Value(Value(3)))],
+                Terminator::Return(Some(Operand::Value(Value(4)))),
+            ),
+            mk(
+                2,
+                vec![],
+                Terminator::Return(Some(Operand::Value(Value(3)))),
+            ),
+        ];
+        f.next_value_id = 31;
+        let n = run_function(&mut f);
+        assert_eq!(n, 2, "edge fact resolves through the copy");
+        assert!(matches!(
+            f.blocks[1].instructions[0],
+            Instruction::BinOp {
+                lhs: Operand::Const(IrConst::I64(63)),
+                ..
+            }
+        ));
+        assert!(matches!(
+            f.blocks[2].terminator,
+            Terminator::Return(Some(Operand::Value(Value(0))))
+        ));
+        assert_eq!(run_function(&mut f), 0, "idempotent");
+    }
+
+    #[test]
+    fn select_use_under_unknown_branch_is_kept() {
+        // A merge dominated by neither edge decides nothing: the use of
+        // the select in b3 keeps the select.
+        let v0 = Operand::Value(Value(0));
+        let mut f = IrFunction::new("t".to_string(), IrType::U64, vec![], false);
+        f.blocks = vec![
+            mk(
+                0,
+                vec![
+                    cmp0(1, IrCmpOp::Eq),
+                    sel(3, 1, Operand::Const(IrConst::I64(63)), v0),
+                ],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(1)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            mk(1, vec![], Terminator::Branch(BlockId(3))),
+            mk(2, vec![], Terminator::Branch(BlockId(3))),
+            mk(
+                3,
+                vec![add1(4, Operand::Value(Value(3)))],
+                Terminator::Return(Some(Operand::Value(Value(4)))),
+            ),
+        ];
+        f.next_value_id = 5;
+        assert_eq!(run_function(&mut f), 0, "merge decides nothing");
+        assert!(matches!(
+            f.blocks[3].instructions[0],
+            Instruction::BinOp {
+                lhs: Operand::Value(Value(3)),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn phi_incoming_of_decided_select_is_kept() {
+        // Phi incomings are edge-flavored, never block facts: even in a
+        // block whose facts decide the select's condition, an incoming
+        // naming the select is left alone (conservative and documented).
+        let v0 = Operand::Value(Value(0));
+        let mut f = IrFunction::new("t".to_string(), IrType::U64, vec![], false);
+        f.blocks = vec![
+            mk(
+                0,
+                vec![
+                    cmp0(1, IrCmpOp::Eq),
+                    sel(3, 1, Operand::Const(IrConst::I64(63)), v0),
+                ],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(1)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            mk(
+                1,
+                vec![Instruction::Phi {
+                    dest: Value(5),
+                    incoming: vec![(Operand::Value(Value(3)), BlockId(0))],
+                    ty: IrType::U64,
+                }],
+                Terminator::Return(Some(Operand::Value(Value(5)))),
+            ),
+            mk(
+                2,
+                vec![],
+                Terminator::Return(Some(Operand::Const(IrConst::I64(0)))),
+            ),
+        ];
+        f.next_value_id = 6;
+        assert_eq!(run_function(&mut f), 0, "phi incomings are never rewritten");
+        if let Instruction::Phi { incoming, .. } = &f.blocks[1].instructions[0] {
+            assert_eq!(incoming, &vec![(Operand::Value(Value(3)), BlockId(0))]);
+        } else {
+            panic!("phi survived");
+        }
+    }
+
+    #[test]
+    fn nested_select_arms_rewrite_to_fresh_arms_in_one_visit() {
+        // S2's own arm is rewritten under b1's facts before any later
+        // block reads S2's triple: uses in b3/b4 see the fresh arm in
+        // the SAME run (no second fixpoint iteration needed).
+        // b0: c = cmp eq v0,0; S1 = select c,63,v0; br c,b1,b2
+        // b1: d2 = cmp ne v0,v0 (undecidable: keeps def-folds out);
+        //     S2 = select d2,S1,7; br d2,b3,b4
+        // b3: ret S2  (→ 63)   b4: ret S2  (→ 7)   b2: ret 0
+        let v0 = Operand::Value(Value(0));
+        let mut f = IrFunction::new("t".to_string(), IrType::U64, vec![], false);
+        f.blocks = vec![
+            mk(
+                0,
+                vec![
+                    cmp0(1, IrCmpOp::Eq),
+                    sel(3, 1, Operand::Const(IrConst::I64(63)), v0),
+                ],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(1)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            mk(
+                1,
+                vec![
+                    Instruction::Cmp {
+                        dest: Value(6),
+                        op: IrCmpOp::Ne,
+                        lhs: Operand::Value(Value(0)),
+                        rhs: Operand::Value(Value(0)),
+                        ty: IrType::U64,
+                    },
+                    sel(
+                        7,
+                        6,
+                        Operand::Value(Value(3)),
+                        Operand::Const(IrConst::I64(7)),
+                    ),
+                ],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(6)),
+                    true_label: BlockId(3),
+                    false_label: BlockId(4),
+                },
+            ),
+            mk(
+                2,
+                vec![],
+                Terminator::Return(Some(Operand::Const(IrConst::I64(0)))),
+            ),
+            mk(
+                3,
+                vec![],
+                Terminator::Return(Some(Operand::Value(Value(7)))),
+            ),
+            mk(
+                4,
+                vec![],
+                Terminator::Return(Some(Operand::Value(Value(7)))),
+            ),
+        ];
+        f.next_value_id = 8;
+        let n = run_function(&mut f);
+        assert_eq!(n, 3, "S2 arm, b3 use, b4 use");
+        assert!(matches!(
+            f.blocks[1].instructions[1],
+            Instruction::Select {
+                true_val: Operand::Const(IrConst::I64(63)),
+                ..
+            }
+        ));
+        assert!(matches!(
+            f.blocks[3].terminator,
+            Terminator::Return(Some(Operand::Const(IrConst::I64(63))))
+        ));
+        assert!(matches!(
+            f.blocks[4].terminator,
+            Terminator::Return(Some(Operand::Const(IrConst::I64(7))))
+        ));
+        assert_eq!(run_function(&mut f), 0, "idempotent");
+    }
+
     #[test]
     fn full_function_folds_guard_and_branch() {
         // b0: c = cmp eq v, 0 ; br c, b1, b2
@@ -918,7 +1352,9 @@ mod tests {
         ];
         f.next_value_id = 5;
         let n = run_function(&mut f);
-        assert_eq!(n, 4, "guard cmp, select, second cmp, branch");
+        // guard cmp, select, second cmp, branch, plus the correlated-select
+        // use rewrite of `ret s` in b3 (the guard is false there, so s is v).
+        assert_eq!(n, 5, "guard cmp, select, second cmp, branch, ret use");
         assert!(matches!(
             f.blocks[2].instructions[0],
             Instruction::Copy {
@@ -936,6 +1372,10 @@ mod tests {
         assert!(matches!(
             f.blocks[2].terminator,
             Terminator::Branch(BlockId(3))
+        ));
+        assert!(matches!(
+            f.blocks[3].terminator,
+            Terminator::Return(Some(Operand::Value(Value(0))))
         ));
         assert_eq!(run_function(&mut f), 0, "idempotent");
     }
