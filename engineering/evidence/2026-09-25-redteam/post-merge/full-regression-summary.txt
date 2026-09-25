@@ -1,0 +1,5 @@
+
+================================================================
+regression suite: PASS=760 FAIL=0 SKIP=8 (AB-diff failures: 0)
+================================================================
+boot gate: SKIP (KERNEL_DIR not set or tree not prepared)

@@ -1,0 +1,6607 @@
+{
+  "aggregate_lccc_vs_best_reference": null,
+  "aggregate_lccc_vs_gcc": null,
+  "benchmarks": [
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "gcc": {
+          "binary_bytes": 15992,
+          "child_cpu_s": 0.06017699999999998,
+          "command": [
+            "/usr/bin/gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/arith_loop_gcc",
+            "/home/user/lccc/tests/benchmark/programs/arith_loop.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "52de2f1694990a48b162d5f99ba3cce886c68f7d92008eb2d5c4ea016b0ac049",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 2388,
+          "wall_s": 0.149561694
+        },
+        "lccc": {
+          "binary_bytes": 7024,
+          "child_cpu_s": 0.04905100000000001,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/arith_loop_lccc",
+            "/home/user/lccc/tests/benchmark/programs/arith_loop.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "52de2f1694990a48b162d5f99ba3cce886c68f7d92008eb2d5c4ea016b0ac049",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1959,
+          "wall_s": 0.049378906
+        }
+      },
+      "correctness": {
+        "gcc": {
+          "matches_baseline": true,
+          "output": "arith_loop result: 1335433016",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "arith_loop result: 1335433016",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "32-variable arithmetic loop / register pressure",
+      "name": "arith_loop",
+      "ratios_from_lccc": {},
+      "ratios_to_gcc": {},
+      "rounds": [
+        {
+          "order": [
+            "lccc",
+            "gcc"
+          ],
+          "round": 0,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 0.10378700000000002,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/arith_loop_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "arith_loop result: 1335433016",
+              "wall_s": 0.104377593
+            },
+            "lccc": {
+              "child_cpu_s": 0.10497299999999998,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/arith_loop_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "arith_loop result: 1335433016",
+              "wall_s": 0.105638896
+            }
+          }
+        }
+      ],
+      "runs": {
+        "gcc": [
+          {
+            "child_cpu_s": 0.10378700000000002,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/arith_loop_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "arith_loop result: 1335433016",
+            "wall_s": 0.104377593
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.10497299999999998,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/arith_loop_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "arith_loop result: 1335433016",
+            "wall_s": 0.105638896
+          }
+        ]
+      },
+      "runtime": {
+        "gcc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        },
+        "lccc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/arith_loop.c",
+      "source_sha256": "52de2f1694990a48b162d5f99ba3cce886c68f7d92008eb2d5c4ea016b0ac049",
+      "tags": [
+        "synthetic",
+        "regalloc",
+        "integer"
+      ],
+      "warmups": {},
+      "warnings": []
+    },
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "gcc": {
+          "binary_bytes": 15984,
+          "child_cpu_s": 0.08338300000000004,
+          "command": [
+            "/usr/bin/gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/fib_gcc",
+            "/home/user/lccc/tests/benchmark/programs/fib.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "a320028fc9dbb98e358ab7dfc35b5210a8d7683cfe5c894df7966fbc9d9c92df",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 2204,
+          "wall_s": 0.090657833
+        },
+        "lccc": {
+          "binary_bytes": 6000,
+          "child_cpu_s": 0.03955500000000001,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/fib_lccc",
+            "/home/user/lccc/tests/benchmark/programs/fib.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "a320028fc9dbb98e358ab7dfc35b5210a8d7683cfe5c894df7966fbc9d9c92df",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 928,
+          "wall_s": 0.040131225
+        }
+      },
+      "correctness": {
+        "gcc": {
+          "matches_baseline": true,
+          "output": "fib(40) = 102334155",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "fib(40) = 102334155",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "recursive Fibonacci / recurrence recognition",
+      "name": "fib",
+      "ratios_from_lccc": {},
+      "ratios_to_gcc": {},
+      "rounds": [
+        {
+          "order": [
+            "gcc",
+            "lccc"
+          ],
+          "round": 0,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 0.23484800000000006,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/fib_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "fib(40) = 102334155",
+              "wall_s": 0.236813552
+            },
+            "lccc": {
+              "child_cpu_s": 0.0025839999999999197,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/fib_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "fib(40) = 102334155",
+              "wall_s": 0.003031886
+            }
+          }
+        }
+      ],
+      "runs": {
+        "gcc": [
+          {
+            "child_cpu_s": 0.23484800000000006,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/fib_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "fib(40) = 102334155",
+            "wall_s": 0.236813552
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.0025839999999999197,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/fib_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "fib(40) = 102334155",
+            "wall_s": 0.003031886
+          }
+        ]
+      },
+      "runtime": {
+        "gcc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        },
+        "lccc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/fib.c",
+      "source_sha256": "a320028fc9dbb98e358ab7dfc35b5210a8d7683cfe5c894df7966fbc9d9c92df",
+      "tags": [
+        "synthetic",
+        "calls",
+        "recursion"
+      ],
+      "warmups": {},
+      "warnings": []
+    },
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "gcc": {
+          "binary_bytes": 16064,
+          "child_cpu_s": 0.0813259999999999,
+          "command": [
+            "/usr/bin/gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/matmul_gcc",
+            "/home/user/lccc/tests/benchmark/programs/matmul.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "927478b18ee0aa0d118eea4d2a9d6bb1251fdf3c64c2619ab578463beba99560",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1825,
+          "wall_s": 0.139718006
+        },
+        "lccc": {
+          "binary_bytes": 6696,
+          "child_cpu_s": 0.05324300000000004,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/matmul_lccc",
+            "/home/user/lccc/tests/benchmark/programs/matmul.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "927478b18ee0aa0d118eea4d2a9d6bb1251fdf3c64c2619ab578463beba99560",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1499,
+          "wall_s": 0.054694113
+        }
+      },
+      "correctness": {
+        "gcc": {
+          "matches_baseline": true,
+          "output": "matmul C[128][128] = 19019.7480",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "matmul C[128][128] = 19019.7480",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "dense matrix multiply / FP and cache",
+      "name": "matmul",
+      "ratios_from_lccc": {},
+      "ratios_to_gcc": {},
+      "rounds": [
+        {
+          "order": [
+            "gcc",
+            "lccc"
+          ],
+          "round": 0,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 0.008190999999999948,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/matmul_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "matmul C[128][128] = 19019.7480",
+              "wall_s": 0.010442078
+            },
+            "lccc": {
+              "child_cpu_s": 0.007242000000000082,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/matmul_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "matmul C[128][128] = 19019.7480",
+              "wall_s": 0.008572761
+            }
+          }
+        }
+      ],
+      "runs": {
+        "gcc": [
+          {
+            "child_cpu_s": 0.008190999999999948,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/matmul_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "matmul C[128][128] = 19019.7480",
+            "wall_s": 0.010442078
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.007242000000000082,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/matmul_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "matmul C[128][128] = 19019.7480",
+            "wall_s": 0.008572761
+          }
+        ]
+      },
+      "runtime": {
+        "gcc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        },
+        "lccc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/matmul.c",
+      "source_sha256": "927478b18ee0aa0d118eea4d2a9d6bb1251fdf3c64c2619ab578463beba99560",
+      "tags": [
+        "synthetic",
+        "fp",
+        "loop"
+      ],
+      "warmups": {},
+      "warnings": []
+    },
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "gcc": {
+          "binary_bytes": 16064,
+          "child_cpu_s": 0.06310899999999986,
+          "command": [
+            "/usr/bin/gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/qsort_gcc",
+            "/home/user/lccc/tests/benchmark/programs/qsort.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "4b7916c27962da3a9cf71ce75b09910467449ce727a1fb2d3dbf75f5f011641a",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1519,
+          "wall_s": 0.066069052
+        },
+        "lccc": {
+          "binary_bytes": 6152,
+          "child_cpu_s": 0.05327800000000005,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/qsort_lccc",
+            "/home/user/lccc/tests/benchmark/programs/qsort.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "4b7916c27962da3a9cf71ce75b09910467449ce727a1fb2d3dbf75f5f011641a",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1062,
+          "wall_s": 0.053898593
+        }
+      },
+      "correctness": {
+        "gcc": {
+          "matches_baseline": true,
+          "output": "qsort: arr[500000] = 1071022847",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "qsort: arr[500000] = 1071022847",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "quicksort via libc / branches",
+      "name": "qsort",
+      "ratios_from_lccc": {},
+      "ratios_to_gcc": {},
+      "rounds": [
+        {
+          "order": [
+            "gcc",
+            "lccc"
+          ],
+          "round": 0,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 0.14885100000000007,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/qsort_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "qsort: arr[500000] = 1071022847",
+              "wall_s": 0.149359641
+            },
+            "lccc": {
+              "child_cpu_s": 0.13837699999999997,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/qsort_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "qsort: arr[500000] = 1071022847",
+              "wall_s": 0.138987262
+            }
+          }
+        }
+      ],
+      "runs": {
+        "gcc": [
+          {
+            "child_cpu_s": 0.14885100000000007,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/qsort_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "qsort: arr[500000] = 1071022847",
+            "wall_s": 0.149359641
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.13837699999999997,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/qsort_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "qsort: arr[500000] = 1071022847",
+            "wall_s": 0.138987262
+          }
+        ]
+      },
+      "runtime": {
+        "gcc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        },
+        "lccc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/qsort.c",
+      "source_sha256": "4b7916c27962da3a9cf71ce75b09910467449ce727a1fb2d3dbf75f5f011641a",
+      "tags": [
+        "synthetic",
+        "branch",
+        "library"
+      ],
+      "warmups": {},
+      "warnings": []
+    },
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "gcc": {
+          "binary_bytes": 16072,
+          "child_cpu_s": 0.06060600000000016,
+          "command": [
+            "/usr/bin/gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/sieve_gcc",
+            "/home/user/lccc/tests/benchmark/programs/sieve.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "2fd99e297a95711800c1bf4b2facd7e5e09efa740b113c86837e3d0cd22f069b",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1601,
+          "wall_s": 0.068688183
+        },
+        "lccc": {
+          "binary_bytes": 6264,
+          "child_cpu_s": 0.07052099999999983,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/sieve_lccc",
+            "/home/user/lccc/tests/benchmark/programs/sieve.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "2fd99e297a95711800c1bf4b2facd7e5e09efa740b113c86837e3d0cd22f069b",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1166,
+          "wall_s": 0.070990633
+        }
+      },
+      "correctness": {
+        "gcc": {
+          "matches_baseline": true,
+          "output": "primes up to 10000000: 664579",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "primes up to 10000000: 664579",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "sieve of Eratosthenes / stores",
+      "name": "sieve",
+      "ratios_from_lccc": {},
+      "ratios_to_gcc": {},
+      "rounds": [
+        {
+          "order": [
+            "gcc",
+            "lccc"
+          ],
+          "round": 0,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 0.04764999999999975,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/sieve_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "primes up to 10000000: 664579",
+              "wall_s": 0.063175998
+            },
+            "lccc": {
+              "child_cpu_s": 0.04903100000000005,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/sieve_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "primes up to 10000000: 664579",
+              "wall_s": 0.054578498
+            }
+          }
+        }
+      ],
+      "runs": {
+        "gcc": [
+          {
+            "child_cpu_s": 0.04764999999999975,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/sieve_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "primes up to 10000000: 664579",
+            "wall_s": 0.063175998
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.04903100000000005,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/sieve_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "primes up to 10000000: 664579",
+            "wall_s": 0.054578498
+          }
+        ]
+      },
+      "runtime": {
+        "gcc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        },
+        "lccc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/sieve.c",
+      "source_sha256": "2fd99e297a95711800c1bf4b2facd7e5e09efa740b113c86837e3d0cd22f069b",
+      "tags": [
+        "synthetic",
+        "memory",
+        "loop"
+      ],
+      "warmups": {},
+      "warnings": []
+    },
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "gcc": {
+          "binary_bytes": 15960,
+          "child_cpu_s": 0.06950600000000007,
+          "command": [
+            "/usr/bin/gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/tce_sum_gcc",
+            "/home/user/lccc/tests/benchmark/programs/tce_sum.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "57ddb14e5fd945998d614fbe2bba64a9861b8a0f5153ce4fcd84a15348991eee",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1339,
+          "wall_s": 0.082043048
+        },
+        "lccc": {
+          "binary_bytes": 5888,
+          "child_cpu_s": 0.03438199999999991,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/tce_sum_lccc",
+            "/home/user/lccc/tests/benchmark/programs/tce_sum.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "57ddb14e5fd945998d614fbe2bba64a9861b8a0f5153ce4fcd84a15348991eee",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 854,
+          "wall_s": 0.038130202
+        }
+      },
+      "correctness": {
+        "gcc": {
+          "matches_baseline": true,
+          "output": "sum(10000000) = 50000005000000",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "sum(10000000) = 50000005000000",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "tail-recursive accumulator / TCE",
+      "name": "tce_sum",
+      "ratios_from_lccc": {},
+      "ratios_to_gcc": {},
+      "rounds": [
+        {
+          "order": [
+            "lccc",
+            "gcc"
+          ],
+          "round": 0,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 0.0027770000000000294,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/tce_sum_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "sum(10000000) = 50000005000000",
+              "wall_s": 0.003034116
+            },
+            "lccc": {
+              "child_cpu_s": 0.0029969999999999164,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/tce_sum_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "sum(10000000) = 50000005000000",
+              "wall_s": 0.006815762
+            }
+          }
+        }
+      ],
+      "runs": {
+        "gcc": [
+          {
+            "child_cpu_s": 0.0027770000000000294,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/tce_sum_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "sum(10000000) = 50000005000000",
+            "wall_s": 0.003034116
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.0029969999999999164,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/tce_sum_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "sum(10000000) = 50000005000000",
+            "wall_s": 0.006815762
+          }
+        ]
+      },
+      "runtime": {
+        "gcc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        },
+        "lccc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/tce_sum.c",
+      "source_sha256": "57ddb14e5fd945998d614fbe2bba64a9861b8a0f5153ce4fcd84a15348991eee",
+      "tags": [
+        "synthetic",
+        "calls",
+        "tce"
+      ],
+      "warmups": {},
+      "warnings": []
+    },
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "gcc": {
+          "binary_bytes": 16336,
+          "child_cpu_s": 0.1215010000000003,
+          "command": [
+            "/usr/bin/gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/nbody_gcc",
+            "/home/user/lccc/tests/benchmark/programs/nbody.c",
+            "-lm"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "45db2f21add3645a945f1a6635d642f1aad5caecfa4c7b47da4943331a321837",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 2059,
+          "wall_s": 0.154280111
+        },
+        "lccc": {
+          "binary_bytes": 8136,
+          "child_cpu_s": 0.2928599999999999,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/nbody_lccc",
+            "/home/user/lccc/tests/benchmark/programs/nbody.c",
+            "-lm"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "45db2f21add3645a945f1a6635d642f1aad5caecfa4c7b47da4943331a321837",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 2756,
+          "wall_s": 0.312040428
+        }
+      },
+      "correctness": {
+        "gcc": {
+          "matches_baseline": true,
+          "output": "-0.169075164\n-0.169083134",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "-0.169075164\n-0.169083134",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "N-body simulation / FP structs",
+      "name": "nbody",
+      "ratios_from_lccc": {},
+      "ratios_to_gcc": {},
+      "rounds": [
+        {
+          "order": [
+            "gcc",
+            "lccc"
+          ],
+          "round": 0,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 0.300265,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/nbody_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134",
+              "wall_s": 0.323578603
+            },
+            "lccc": {
+              "child_cpu_s": 0.40578299999999956,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/nbody_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134",
+              "wall_s": 0.406285719
+            }
+          }
+        }
+      ],
+      "runs": {
+        "gcc": [
+          {
+            "child_cpu_s": 0.300265,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/nbody_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134",
+            "wall_s": 0.323578603
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.40578299999999956,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/nbody_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134",
+            "wall_s": 0.406285719
+          }
+        ]
+      },
+      "runtime": {
+        "gcc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        },
+        "lccc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/nbody.c",
+      "source_sha256": "45db2f21add3645a945f1a6635d642f1aad5caecfa4c7b47da4943331a321837",
+      "tags": [
+        "synthetic",
+        "fp",
+        "struct"
+      ],
+      "warmups": {},
+      "warnings": []
+    },
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "gcc": {
+          "binary_bytes": 20248,
+          "child_cpu_s": 0.1894180000000003,
+          "command": [
+            "/usr/bin/gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/binary_trees_gcc",
+            "/home/user/lccc/tests/benchmark/programs/binary_trees.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "f8c94eefaa86a1eb2cf249663ed3cf517b59d782d0f6fe6ea285e800a14c3a77",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 8193,
+          "wall_s": 0.190295721
+        },
+        "lccc": {
+          "binary_bytes": 6704,
+          "child_cpu_s": 0.09109900000000026,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/binary_trees_lccc",
+            "/home/user/lccc/tests/benchmark/programs/binary_trees.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "f8c94eefaa86a1eb2cf249663ed3cf517b59d782d0f6fe6ea285e800a14c3a77",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1568,
+          "wall_s": 0.091494396
+        }
+      },
+      "correctness": {
+        "gcc": {
+          "matches_baseline": true,
+          "output": "stretch tree of depth 19\t check: 1048575\n262144\t trees of depth 4\t check: 8126464\n65536\t trees of depth 6\t check: 8323072\n16384\t trees of depth 8\t check: 8372224\n4096\t trees of depth 10\t check: 8384512\n1024\t trees of depth 12\t check: 8387584\n256\t trees of depth 14\t check: 8388352\n64\t trees of depth 16\t check: 8388544\n16\t trees of depth 18\t check: 8388592\nlong lived tree of depth 18\t check: 524287",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "stretch tree of depth 19\t check: 1048575\n262144\t trees of depth 4\t check: 8126464\n65536\t trees of depth 6\t check: 8323072\n16384\t trees of depth 8\t check: 8372224\n4096\t trees of depth 10\t check: 8384512\n1024\t trees of depth 12\t check: 8387584\n256\t trees of depth 14\t check: 8388352\n64\t trees of depth 16\t check: 8388544\n16\t trees of depth 18\t check: 8388592\nlong lived tree of depth 18\t check: 524287",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "binary trees / allocation and recursion",
+      "name": "binary_trees",
+      "ratios_from_lccc": {},
+      "ratios_to_gcc": {},
+      "rounds": [
+        {
+          "order": [
+            "lccc",
+            "gcc"
+          ],
+          "round": 0,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 1.4679480000000007,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/binary_trees_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "stretch tree of depth 19\t check: 1048575\n262144\t trees of depth 4\t check: 8126464\n65536\t trees of depth 6\t check: 8323072\n16384\t trees of depth 8\t check: 8372224\n4096\t trees of depth 10\t check: 8384512\n1024\t trees of depth 12\t check: 8387584\n256\t trees of depth 14\t check: 8388352\n64\t trees of depth 16\t check: 8388544\n16\t trees of depth 18\t check: 8388592\nlong lived tree of depth 18\t check: 524287",
+              "wall_s": 1.468493464
+            },
+            "lccc": {
+              "child_cpu_s": 2.1060999999999996,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/binary_trees_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "stretch tree of depth 19\t check: 1048575\n262144\t trees of depth 4\t check: 8126464\n65536\t trees of depth 6\t check: 8323072\n16384\t trees of depth 8\t check: 8372224\n4096\t trees of depth 10\t check: 8384512\n1024\t trees of depth 12\t check: 8387584\n256\t trees of depth 14\t check: 8388352\n64\t trees of depth 16\t check: 8388544\n16\t trees of depth 18\t check: 8388592\nlong lived tree of depth 18\t check: 524287",
+              "wall_s": 2.116500526
+            }
+          }
+        }
+      ],
+      "runs": {
+        "gcc": [
+          {
+            "child_cpu_s": 1.4679480000000007,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/binary_trees_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "stretch tree of depth 19\t check: 1048575\n262144\t trees of depth 4\t check: 8126464\n65536\t trees of depth 6\t check: 8323072\n16384\t trees of depth 8\t check: 8372224\n4096\t trees of depth 10\t check: 8384512\n1024\t trees of depth 12\t check: 8387584\n256\t trees of depth 14\t check: 8388352\n64\t trees of depth 16\t check: 8388544\n16\t trees of depth 18\t check: 8388592\nlong lived tree of depth 18\t check: 524287",
+            "wall_s": 1.468493464
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 2.1060999999999996,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/binary_trees_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "stretch tree of depth 19\t check: 1048575\n262144\t trees of depth 4\t check: 8126464\n65536\t trees of depth 6\t check: 8323072\n16384\t trees of depth 8\t check: 8372224\n4096\t trees of depth 10\t check: 8384512\n1024\t trees of depth 12\t check: 8387584\n256\t trees of depth 14\t check: 8388352\n64\t trees of depth 16\t check: 8388544\n16\t trees of depth 18\t check: 8388592\nlong lived tree of depth 18\t check: 524287",
+            "wall_s": 2.116500526
+          }
+        ]
+      },
+      "runtime": {
+        "gcc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        },
+        "lccc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/binary_trees.c",
+      "source_sha256": "f8c94eefaa86a1eb2cf249663ed3cf517b59d782d0f6fe6ea285e800a14c3a77",
+      "tags": [
+        "synthetic",
+        "allocation",
+        "recursion"
+      ],
+      "warmups": {},
+      "warnings": []
+    },
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "gcc": {
+          "binary_bytes": 16096,
+          "child_cpu_s": 0.08267999999999986,
+          "command": [
+            "/usr/bin/gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/spectral_norm_gcc",
+            "/home/user/lccc/tests/benchmark/programs/spectral_norm.c",
+            "-lm"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "21a48dccebcbc3b9496263f62df260d278051c3cd1a528ed99c8b66bef481e6a",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 2099,
+          "wall_s": 0.085177809
+        },
+        "lccc": {
+          "binary_bytes": 7208,
+          "child_cpu_s": 0.13466299999999976,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/spectral_norm_lccc",
+            "/home/user/lccc/tests/benchmark/programs/spectral_norm.c",
+            "-lm"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "21a48dccebcbc3b9496263f62df260d278051c3cd1a528ed99c8b66bef481e6a",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 2088,
+          "wall_s": 0.135287485
+        }
+      },
+      "correctness": {
+        "gcc": {
+          "matches_baseline": true,
+          "output": "1.274224152",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "1.274224152",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "spectral norm / dense floating point",
+      "name": "spectral_norm",
+      "ratios_from_lccc": {},
+      "ratios_to_gcc": {},
+      "rounds": [
+        {
+          "order": [
+            "lccc",
+            "gcc"
+          ],
+          "round": 0,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 0.21025899999999975,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/spectral_norm_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 0.210765152
+            },
+            "lccc": {
+              "child_cpu_s": 0.4787790000000003,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/spectral_norm_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 0.479333891
+            }
+          }
+        }
+      ],
+      "runs": {
+        "gcc": [
+          {
+            "child_cpu_s": 0.21025899999999975,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/spectral_norm_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 0.210765152
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.4787790000000003,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/spectral_norm_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 0.479333891
+          }
+        ]
+      },
+      "runtime": {
+        "gcc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        },
+        "lccc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/spectral_norm.c",
+      "source_sha256": "21a48dccebcbc3b9496263f62df260d278051c3cd1a528ed99c8b66bef481e6a",
+      "tags": [
+        "synthetic",
+        "fp",
+        "loop"
+      ],
+      "warmups": {},
+      "warnings": []
+    },
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "gcc": {
+          "binary_bytes": 15960,
+          "child_cpu_s": 0.05598999999999954,
+          "command": [
+            "/usr/bin/gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/mandelbrot_gcc",
+            "/home/user/lccc/tests/benchmark/programs/mandelbrot.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "3f9d3a3e0da962e5a1840790ebf46fa09f38cd5e758645c8c65625fa9882555c",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1586,
+          "wall_s": 0.056451631
+        },
+        "lccc": {
+          "binary_bytes": 6328,
+          "child_cpu_s": 0.03279100000000046,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/mandelbrot_lccc",
+            "/home/user/lccc/tests/benchmark/programs/mandelbrot.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "3f9d3a3e0da962e5a1840790ebf46fa09f38cd5e758645c8c65625fa9882555c",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1251,
+          "wall_s": 0.033345682
+        }
+      },
+      "correctness": {
+        "gcc": {
+          "matches_baseline": true,
+          "output": "mandelbrot total iterations: 380863975",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "mandelbrot total iterations: 380863975",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "Mandelbrot / FP branch-heavy inner loop",
+      "name": "mandelbrot",
+      "ratios_from_lccc": {},
+      "ratios_to_gcc": {},
+      "rounds": [
+        {
+          "order": [
+            "lccc",
+            "gcc"
+          ],
+          "round": 0,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 1.1644710000000007,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/mandelbrot_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "mandelbrot total iterations: 380863975",
+              "wall_s": 1.1655259
+            },
+            "lccc": {
+              "child_cpu_s": 1.3986909999999995,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/mandelbrot_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "mandelbrot total iterations: 380863975",
+              "wall_s": 1.40072717
+            }
+          }
+        }
+      ],
+      "runs": {
+        "gcc": [
+          {
+            "child_cpu_s": 1.1644710000000007,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/mandelbrot_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "mandelbrot total iterations: 380863975",
+            "wall_s": 1.1655259
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 1.3986909999999995,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/mandelbrot_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "mandelbrot total iterations: 380863975",
+            "wall_s": 1.40072717
+          }
+        ]
+      },
+      "runtime": {
+        "gcc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        },
+        "lccc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/mandelbrot.c",
+      "source_sha256": "3f9d3a3e0da962e5a1840790ebf46fa09f38cd5e758645c8c65625fa9882555c",
+      "tags": [
+        "synthetic",
+        "fp",
+        "branch"
+      ],
+      "warmups": {},
+      "warnings": []
+    },
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "gcc": {
+          "binary_bytes": 16104,
+          "child_cpu_s": 0.06551499999999955,
+          "command": [
+            "/usr/bin/gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/hash_table_gcc",
+            "/home/user/lccc/tests/benchmark/programs/hash_table.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "1c742684a0ea694fbeb95d249748488e89f9033c64d518cd1fafe27da24a2e5a",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1940,
+          "wall_s": 0.065928158
+        },
+        "lccc": {
+          "binary_bytes": 6560,
+          "child_cpu_s": 0.08436299999999974,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/hash_table_lccc",
+            "/home/user/lccc/tests/benchmark/programs/hash_table.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "1c742684a0ea694fbeb95d249748488e89f9033c64d518cd1fafe27da24a2e5a",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1443,
+          "wall_s": 0.084838712
+        }
+      },
+      "correctness": {
+        "gcc": {
+          "matches_baseline": true,
+          "output": "hash_table sum: 1999998000000",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "hash_table sum: 1999998000000",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "hash table / pointer chasing",
+      "name": "hash_table",
+      "ratios_from_lccc": {},
+      "ratios_to_gcc": {},
+      "rounds": [
+        {
+          "order": [
+            "lccc",
+            "gcc"
+          ],
+          "round": 0,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 11.922711,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/hash_table_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "hash_table sum: 1999998000000",
+              "wall_s": 11.926027003
+            },
+            "lccc": {
+              "child_cpu_s": 14.381860000000001,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/hash_table_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "hash_table sum: 1999998000000",
+              "wall_s": 14.387307303
+            }
+          }
+        }
+      ],
+      "runs": {
+        "gcc": [
+          {
+            "child_cpu_s": 11.922711,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/hash_table_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "hash_table sum: 1999998000000",
+            "wall_s": 11.926027003
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 14.381860000000001,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/hash_table_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "hash_table sum: 1999998000000",
+            "wall_s": 14.387307303
+          }
+        ]
+      },
+      "runtime": {
+        "gcc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        },
+        "lccc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/hash_table.c",
+      "source_sha256": "1c742684a0ea694fbeb95d249748488e89f9033c64d518cd1fafe27da24a2e5a",
+      "tags": [
+        "synthetic",
+        "memory",
+        "branch"
+      ],
+      "warmups": {},
+      "warnings": []
+    },
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "gcc": {
+          "binary_bytes": 16144,
+          "child_cpu_s": 0.0749580000000023,
+          "command": [
+            "/usr/bin/gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/strlen_bench_gcc",
+            "/home/user/lccc/tests/benchmark/programs/strlen_bench.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "175202f59218fa62a3120f9f5202a005f5e234f2cbabd453048d933082e0dd44",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 2308,
+          "wall_s": 0.077189951
+        },
+        "lccc": {
+          "binary_bytes": 7056,
+          "child_cpu_s": 0.14673199999999298,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/strlen_bench_lccc",
+            "/home/user/lccc/tests/benchmark/programs/strlen_bench.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "175202f59218fa62a3120f9f5202a005f5e234f2cbabd453048d933082e0dd44",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1967,
+          "wall_s": 0.147238202
+        }
+      },
+      "correctness": {
+        "gcc": {
+          "matches_baseline": true,
+          "output": "strlen total: 494896800, cmp_sum: 67, found: 2257, copy_sum: 544861400",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "strlen total: 494896800, cmp_sum: 67, found: 2257, copy_sum: 544861400",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "string operations / byte loops",
+      "name": "strlen_bench",
+      "ratios_from_lccc": {},
+      "ratios_to_gcc": {},
+      "rounds": [
+        {
+          "order": [
+            "gcc",
+            "lccc"
+          ],
+          "round": 0,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 0.31768799999999686,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/strlen_bench_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "strlen total: 494896800, cmp_sum: 67, found: 2257, copy_sum: 544861400",
+              "wall_s": 0.31873033
+            },
+            "lccc": {
+              "child_cpu_s": 0.2511080000000021,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/strlen_bench_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "strlen total: 494896800, cmp_sum: 67, found: 2257, copy_sum: 544861400",
+              "wall_s": 0.251515474
+            }
+          }
+        }
+      ],
+      "runs": {
+        "gcc": [
+          {
+            "child_cpu_s": 0.31768799999999686,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/strlen_bench_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "strlen total: 494896800, cmp_sum: 67, found: 2257, copy_sum: 544861400",
+            "wall_s": 0.31873033
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.2511080000000021,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/strlen_bench_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "strlen total: 494896800, cmp_sum: 67, found: 2257, copy_sum: 544861400",
+            "wall_s": 0.251515474
+          }
+        ]
+      },
+      "runtime": {
+        "gcc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        },
+        "lccc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/strlen_bench.c",
+      "source_sha256": "175202f59218fa62a3120f9f5202a005f5e234f2cbabd453048d933082e0dd44",
+      "tags": [
+        "synthetic",
+        "string",
+        "memory"
+      ],
+      "warmups": {},
+      "warnings": []
+    },
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "gcc": {
+          "binary_bytes": 15968,
+          "child_cpu_s": 0.05837600000000265,
+          "command": [
+            "/usr/bin/gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/switch_dispatch_gcc",
+            "/home/user/lccc/tests/benchmark/programs/switch_dispatch.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "6a044523272024b733f4af8e5101d5bf2d72ba9d6e9362798f6149cd9265117a",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1750,
+          "wall_s": 0.058749398
+        },
+        "lccc": {
+          "binary_bytes": 6216,
+          "child_cpu_s": 0.03971599999999853,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/switch_dispatch_lccc",
+            "/home/user/lccc/tests/benchmark/programs/switch_dispatch.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "6a044523272024b733f4af8e5101d5bf2d72ba9d6e9362798f6149cd9265117a",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1184,
+          "wall_s": 0.040023251
+        }
+      },
+      "correctness": {
+        "gcc": {
+          "matches_baseline": true,
+          "output": "switch_dispatch sum: 2023556049379541",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "switch_dispatch sum: 2023556049379541",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "switch lowering / dispatch",
+      "name": "switch_dispatch",
+      "ratios_from_lccc": {},
+      "ratios_to_gcc": {},
+      "rounds": [
+        {
+          "order": [
+            "lccc",
+            "gcc"
+          ],
+          "round": 0,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 0.5425339999999963,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/switch_dispatch_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "switch_dispatch sum: 2023556049379541",
+              "wall_s": 0.543060396
+            },
+            "lccc": {
+              "child_cpu_s": 0.5620819999999966,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/switch_dispatch_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "switch_dispatch sum: 2023556049379541",
+              "wall_s": 0.563479292
+            }
+          }
+        }
+      ],
+      "runs": {
+        "gcc": [
+          {
+            "child_cpu_s": 0.5425339999999963,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/switch_dispatch_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "switch_dispatch sum: 2023556049379541",
+            "wall_s": 0.543060396
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.5620819999999966,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/switch_dispatch_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "switch_dispatch sum: 2023556049379541",
+            "wall_s": 0.563479292
+          }
+        ]
+      },
+      "runtime": {
+        "gcc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        },
+        "lccc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/switch_dispatch.c",
+      "source_sha256": "6a044523272024b733f4af8e5101d5bf2d72ba9d6e9362798f6149cd9265117a",
+      "tags": [
+        "synthetic",
+        "switch",
+        "branch"
+      ],
+      "warmups": {},
+      "warnings": []
+    },
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "gcc": {
+          "binary_bytes": 15960,
+          "child_cpu_s": 0.06602699999999118,
+          "command": [
+            "/usr/bin/gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/struct_copy_gcc",
+            "/home/user/lccc/tests/benchmark/programs/struct_copy.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "b0ca8943fcfed56f7ae9bbd49e7e52a98f9780b4be8151c494fc12b05dcb2bfa",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1830,
+          "wall_s": 0.066448423
+        },
+        "lccc": {
+          "binary_bytes": 6632,
+          "child_cpu_s": 0.07691500000000673,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/struct_copy_lccc",
+            "/home/user/lccc/tests/benchmark/programs/struct_copy.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "b0ca8943fcfed56f7ae9bbd49e7e52a98f9780b4be8151c494fc12b05dcb2bfa",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1598,
+          "wall_s": 0.077231112
+        }
+      },
+      "correctness": {
+        "gcc": {
+          "matches_baseline": true,
+          "output": "struct_copy total: 5600000.00",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "struct_copy total: 5600000.00",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "struct copy / ABI and memory",
+      "name": "struct_copy",
+      "ratios_from_lccc": {},
+      "ratios_to_gcc": {},
+      "rounds": [
+        {
+          "order": [
+            "lccc",
+            "gcc"
+          ],
+          "round": 0,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 0.026423000000001196,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/struct_copy_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "struct_copy total: 5600000.00",
+              "wall_s": 0.026777302
+            },
+            "lccc": {
+              "child_cpu_s": 0.028756000000001336,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/struct_copy_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "struct_copy total: 5600000.00",
+              "wall_s": 0.029582774
+            }
+          }
+        }
+      ],
+      "runs": {
+        "gcc": [
+          {
+            "child_cpu_s": 0.026423000000001196,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/struct_copy_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "struct_copy total: 5600000.00",
+            "wall_s": 0.026777302
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.028756000000001336,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/struct_copy_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "struct_copy total: 5600000.00",
+            "wall_s": 0.029582774
+          }
+        ]
+      },
+      "runtime": {
+        "gcc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        },
+        "lccc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/struct_copy.c",
+      "source_sha256": "b0ca8943fcfed56f7ae9bbd49e7e52a98f9780b4be8151c494fc12b05dcb2bfa",
+      "tags": [
+        "synthetic",
+        "abi",
+        "memory"
+      ],
+      "warmups": {},
+      "warnings": []
+    },
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "gcc": {
+          "binary_bytes": 16024,
+          "child_cpu_s": 0.08433299999999377,
+          "command": [
+            "/usr/bin/gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/loop_patterns_gcc",
+            "/home/user/lccc/tests/benchmark/programs/loop_patterns.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "e56488201b8d9e8fc7ad17ec521f395232d4c66edcaf880876d2adccba28df88",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 2335,
+          "wall_s": 0.08819859
+        },
+        "lccc": {
+          "binary_bytes": 7280,
+          "child_cpu_s": 0.2832909999999984,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/loop_patterns_lccc",
+            "/home/user/lccc/tests/benchmark/programs/loop_patterns.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "e56488201b8d9e8fc7ad17ec521f395232d4c66edcaf880876d2adccba28df88",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 2131,
+          "wall_s": 0.284308133
+        }
+      },
+      "correctness": {
+        "gcc": {
+          "matches_baseline": true,
+          "output": "sum=735339920561088 pos=3064670858719214 max=1147483487 scaled=-736921824307008 dot=3807954538875916160 prefix=492040",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "sum=735339920561088 pos=3064670858719214 max=1147483487 scaled=-736921824307008 dot=3807954538875916160 prefix=492040",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "scalar loop transforms",
+      "name": "loop_patterns",
+      "ratios_from_lccc": {},
+      "ratios_to_gcc": {},
+      "rounds": [
+        {
+          "order": [
+            "gcc",
+            "lccc"
+          ],
+          "round": 0,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 0.08677600000000751,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/loop_patterns_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "sum=735339920561088 pos=3064670858719214 max=1147483487 scaled=-736921824307008 dot=3807954538875916160 prefix=492040",
+              "wall_s": 0.087248527
+            },
+            "lccc": {
+              "child_cpu_s": 0.08033899999999505,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/loop_patterns_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "sum=735339920561088 pos=3064670858719214 max=1147483487 scaled=-736921824307008 dot=3807954538875916160 prefix=492040",
+              "wall_s": 0.080797556
+            }
+          }
+        }
+      ],
+      "runs": {
+        "gcc": [
+          {
+            "child_cpu_s": 0.08677600000000751,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/loop_patterns_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "sum=735339920561088 pos=3064670858719214 max=1147483487 scaled=-736921824307008 dot=3807954538875916160 prefix=492040",
+            "wall_s": 0.087248527
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.08033899999999505,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/loop_patterns_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "sum=735339920561088 pos=3064670858719214 max=1147483487 scaled=-736921824307008 dot=3807954538875916160 prefix=492040",
+            "wall_s": 0.080797556
+          }
+        ]
+      },
+      "runtime": {
+        "gcc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        },
+        "lccc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/loop_patterns.c",
+      "source_sha256": "e56488201b8d9e8fc7ad17ec521f395232d4c66edcaf880876d2adccba28df88",
+      "tags": [
+        "synthetic",
+        "loop",
+        "integer"
+      ],
+      "warmups": {},
+      "warnings": []
+    },
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "gcc": {
+          "binary_bytes": 16168,
+          "child_cpu_s": 0.06506399999999957,
+          "command": [
+            "/usr/bin/gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/fannkuch_gcc",
+            "/home/user/lccc/tests/benchmark/programs/fannkuch.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "67838020f90c6b7ad1733536cc069801f0b9c28be0887754a7ea0b4d96ac72ce",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1889,
+          "wall_s": 0.06641927
+        },
+        "lccc": {
+          "binary_bytes": 6832,
+          "child_cpu_s": 0.1216620000000006,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/fannkuch_lccc",
+            "/home/user/lccc/tests/benchmark/programs/fannkuch.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "67838020f90c6b7ad1733536cc069801f0b9c28be0887754a7ea0b4d96ac72ce",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1592,
+          "wall_s": 0.1224427
+        }
+      },
+      "correctness": {
+        "gcc": {
+          "matches_baseline": true,
+          "output": "556355\nPfannkuchen(11) = 51",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "556355\nPfannkuchen(11) = 51",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "Fannkuch-Redux / permutations",
+      "name": "fannkuch",
+      "ratios_from_lccc": {},
+      "ratios_to_gcc": {},
+      "rounds": [
+        {
+          "order": [
+            "lccc",
+            "gcc"
+          ],
+          "round": 0,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 2.702748999999997,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/fannkuch_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "556355\nPfannkuchen(11) = 51",
+              "wall_s": 2.703642777
+            },
+            "lccc": {
+              "child_cpu_s": 2.9065650000000005,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/fannkuch_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "556355\nPfannkuchen(11) = 51",
+              "wall_s": 2.907539859
+            }
+          }
+        }
+      ],
+      "runs": {
+        "gcc": [
+          {
+            "child_cpu_s": 2.702748999999997,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/fannkuch_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "556355\nPfannkuchen(11) = 51",
+            "wall_s": 2.703642777
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 2.9065650000000005,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/fannkuch_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "556355\nPfannkuchen(11) = 51",
+            "wall_s": 2.907539859
+          }
+        ]
+      },
+      "runtime": {
+        "gcc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        },
+        "lccc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/fannkuch.c",
+      "source_sha256": "67838020f90c6b7ad1733536cc069801f0b9c28be0887754a7ea0b4d96ac72ce",
+      "tags": [
+        "synthetic",
+        "integer",
+        "branch"
+      ],
+      "warmups": {},
+      "warnings": []
+    },
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "gcc": {
+          "binary_bytes": 15992,
+          "child_cpu_s": 0.05809899999999857,
+          "command": [
+            "/usr/bin/gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/ackermann_gcc",
+            "/home/user/lccc/tests/benchmark/programs/ackermann.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "c261e807453e1c04a260c2ad21e1bdf1fb19241b06dbad679715cc78f970bcb4",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1787,
+          "wall_s": 0.058435655
+        },
+        "lccc": {
+          "binary_bytes": 5872,
+          "child_cpu_s": 0.1087970000000027,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/ackermann_lccc",
+            "/home/user/lccc/tests/benchmark/programs/ackermann.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "c261e807453e1c04a260c2ad21e1bdf1fb19241b06dbad679715cc78f970bcb4",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 837,
+          "wall_s": 0.109237378
+        }
+      },
+      "correctness": {
+        "gcc": {
+          "matches_baseline": true,
+          "output": "ackermann(3,11) = 16381",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "ackermann(3,11) = 16381",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "Ackermann / deep recursion",
+      "name": "ackermann",
+      "ratios_from_lccc": {},
+      "ratios_to_gcc": {},
+      "rounds": [
+        {
+          "order": [
+            "gcc",
+            "lccc"
+          ],
+          "round": 0,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 0.1551849999999959,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/ackermann_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "ackermann(3,11) = 16381",
+              "wall_s": 0.162451896
+            },
+            "lccc": {
+              "child_cpu_s": 0.002347000000000321,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/ackermann_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "ackermann(3,11) = 16381",
+              "wall_s": 0.002647521
+            }
+          }
+        }
+      ],
+      "runs": {
+        "gcc": [
+          {
+            "child_cpu_s": 0.1551849999999959,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/ackermann_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "ackermann(3,11) = 16381",
+            "wall_s": 0.162451896
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.002347000000000321,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/ackermann_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "ackermann(3,11) = 16381",
+            "wall_s": 0.002647521
+          }
+        ]
+      },
+      "runtime": {
+        "gcc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        },
+        "lccc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/ackermann.c",
+      "source_sha256": "c261e807453e1c04a260c2ad21e1bdf1fb19241b06dbad679715cc78f970bcb4",
+      "tags": [
+        "synthetic",
+        "recursion",
+        "calls"
+      ],
+      "warmups": {},
+      "warnings": []
+    },
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "gcc": {
+          "binary_bytes": 16000,
+          "child_cpu_s": 0.05581299999999345,
+          "command": [
+            "/usr/bin/gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/constant_recursion_gcc",
+            "/home/user/lccc/tests/benchmark/programs/constant_recursion.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "80a16fc86076fdda1a2f40f278c179a6a262c8d741ff9f76d20b4ea762163fd5",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1789,
+          "wall_s": 0.0560961
+        },
+        "lccc": {
+          "binary_bytes": 5872,
+          "child_cpu_s": 0.07852499999999907,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/constant_recursion_lccc",
+            "/home/user/lccc/tests/benchmark/programs/constant_recursion.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "80a16fc86076fdda1a2f40f278c179a6a262c8d741ff9f76d20b4ea762163fd5",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 850,
+          "wall_s": 0.079328093
+        }
+      },
+      "correctness": {
+        "gcc": {
+          "matches_baseline": true,
+          "output": "constant ackermann: 16381",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "constant ackermann: 16381",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "constant recursive specialization",
+      "name": "constant_recursion",
+      "ratios_from_lccc": {},
+      "ratios_to_gcc": {},
+      "rounds": [
+        {
+          "order": [
+            "gcc",
+            "lccc"
+          ],
+          "round": 0,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 0.15443799999999896,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/constant_recursion_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "constant ackermann: 16381",
+              "wall_s": 0.15493906
+            },
+            "lccc": {
+              "child_cpu_s": 0.002250999999994008,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/constant_recursion_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "constant ackermann: 16381",
+              "wall_s": 0.002528865
+            }
+          }
+        }
+      ],
+      "runs": {
+        "gcc": [
+          {
+            "child_cpu_s": 0.15443799999999896,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/constant_recursion_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "constant ackermann: 16381",
+            "wall_s": 0.15493906
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.002250999999994008,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/constant_recursion_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "constant ackermann: 16381",
+            "wall_s": 0.002528865
+          }
+        ]
+      },
+      "runtime": {
+        "gcc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        },
+        "lccc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/constant_recursion.c",
+      "source_sha256": "80a16fc86076fdda1a2f40f278c179a6a262c8d741ff9f76d20b4ea762163fd5",
+      "tags": [
+        "synthetic",
+        "recursion",
+        "specialization"
+      ],
+      "warmups": {},
+      "warnings": []
+    },
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "gcc": {
+          "binary_bytes": 15952,
+          "child_cpu_s": 0.06555599999999373,
+          "command": [
+            "/usr/bin/gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/bitops_gcc",
+            "/home/user/lccc/tests/benchmark/programs/bitops.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "e1e97ac28dabf06df8859e6812a288f639c7f6f070478ebd6fe834a64ed9f7ea",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1664,
+          "wall_s": 0.067176909
+        },
+        "lccc": {
+          "binary_bytes": 6160,
+          "child_cpu_s": 0.04360000000000497,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/bitops_lccc",
+            "/home/user/lccc/tests/benchmark/programs/bitops.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "e1e97ac28dabf06df8859e6812a288f639c7f6f070478ebd6fe834a64ed9f7ea",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1134,
+          "wall_s": 0.043975502
+        }
+      },
+      "correctness": {
+        "gcc": {
+          "matches_baseline": true,
+          "output": "pop=800020159 clz=49986357 rev=6375100514 pow2=2184481749767",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "pop=800020159 clz=49986357 rev=6375100514 pow2=2184481749767",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "bit manipulation / integer selection",
+      "name": "bitops",
+      "ratios_from_lccc": {},
+      "ratios_to_gcc": {},
+      "rounds": [
+        {
+          "order": [
+            "lccc",
+            "gcc"
+          ],
+          "round": 0,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 0.3392430000000033,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/bitops_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "pop=800020159 clz=49986357 rev=6375100514 pow2=2184481749767",
+              "wall_s": 0.339793818
+            },
+            "lccc": {
+              "child_cpu_s": 0.27909700000000015,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/bitops_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "pop=800020159 clz=49986357 rev=6375100514 pow2=2184481749767",
+              "wall_s": 0.279782404
+            }
+          }
+        }
+      ],
+      "runs": {
+        "gcc": [
+          {
+            "child_cpu_s": 0.3392430000000033,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/bitops_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "pop=800020159 clz=49986357 rev=6375100514 pow2=2184481749767",
+            "wall_s": 0.339793818
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.27909700000000015,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/bitops_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "pop=800020159 clz=49986357 rev=6375100514 pow2=2184481749767",
+            "wall_s": 0.279782404
+          }
+        ]
+      },
+      "runtime": {
+        "gcc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        },
+        "lccc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/bitops.c",
+      "source_sha256": "e1e97ac28dabf06df8859e6812a288f639c7f6f070478ebd6fe834a64ed9f7ea",
+      "tags": [
+        "synthetic",
+        "bit",
+        "integer"
+      ],
+      "warmups": {},
+      "warnings": []
+    },
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "gcc": {
+          "binary_bytes": 16040,
+          "child_cpu_s": 0.04733600000000138,
+          "command": [
+            "/usr/bin/gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/double_reduction_gcc",
+            "/home/user/lccc/tests/benchmark/programs/double_reduction.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "ff939dcabb64e38bfa38b1fa52439ab4eb006fc5cf32811efa85ea1eb92ac21f",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1732,
+          "wall_s": 0.047670434
+        },
+        "lccc": {
+          "binary_bytes": 6544,
+          "child_cpu_s": 0.08361499999999467,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/double_reduction_lccc",
+            "/home/user/lccc/tests/benchmark/programs/double_reduction.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "ff939dcabb64e38bfa38b1fa52439ab4eb006fc5cf32811efa85ea1eb92ac21f",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1412,
+          "wall_s": 0.084085349
+        }
+      },
+      "correctness": {
+        "gcc": {
+          "matches_baseline": true,
+          "output": "201415680",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "201415680",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "two independent accumulators per loop (multi-reduction)",
+      "name": "double_reduction",
+      "ratios_from_lccc": {},
+      "ratios_to_gcc": {},
+      "rounds": [
+        {
+          "order": [
+            "gcc",
+            "lccc"
+          ],
+          "round": 0,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 0.09380900000000025,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/double_reduction_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "201415680",
+              "wall_s": 0.09414575
+            },
+            "lccc": {
+              "child_cpu_s": 0.09221500000000304,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/double_reduction_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "201415680",
+              "wall_s": 0.092776624
+            }
+          }
+        }
+      ],
+      "runs": {
+        "gcc": [
+          {
+            "child_cpu_s": 0.09380900000000025,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/double_reduction_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "201415680",
+            "wall_s": 0.09414575
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.09221500000000304,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/double_reduction_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "201415680",
+            "wall_s": 0.092776624
+          }
+        ]
+      },
+      "runtime": {
+        "gcc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        },
+        "lccc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/double_reduction.c",
+      "source_sha256": "ff939dcabb64e38bfa38b1fa52439ab4eb006fc5cf32811efa85ea1eb92ac21f",
+      "tags": [
+        "synthetic",
+        "vectorize",
+        "integer",
+        "loop"
+      ],
+      "warmups": {},
+      "warnings": []
+    },
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "gcc": {
+          "binary_bytes": 15896,
+          "child_cpu_s": 0.05329600000000312,
+          "command": [
+            "/usr/bin/gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/ascii_case_fold_gcc",
+            "/home/user/lccc/tests/benchmark/programs/ascii_case_fold.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "7a97d5091e4e166a63cb4d6dd80bb35014c4f9ccd77848b60bac357f3211a5dd",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 2085,
+          "wall_s": 0.058217343
+        },
+        "lccc": {
+          "binary_bytes": 6112,
+          "child_cpu_s": 0.06520599999999632,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/ascii_case_fold_lccc",
+            "/home/user/lccc/tests/benchmark/programs/ascii_case_fold.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "7a97d5091e4e166a63cb4d6dd80bb35014c4f9ccd77848b60bac357f3211a5dd",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1179,
+          "wall_s": 0.065593554
+        }
+      },
+      "correctness": {
+        "gcc": {
+          "matches_baseline": true,
+          "output": "",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "ASCII parser case-fold byte loop / branch selection",
+      "name": "ascii_case_fold",
+      "ratios_from_lccc": {},
+      "ratios_to_gcc": {},
+      "rounds": [
+        {
+          "order": [
+            "gcc",
+            "lccc"
+          ],
+          "round": 0,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 0.0029430000000019163,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/ascii_case_fold_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "",
+              "wall_s": 0.003364923
+            },
+            "lccc": {
+              "child_cpu_s": 0.002354999999994334,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/ascii_case_fold_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "",
+              "wall_s": 0.002675049
+            }
+          }
+        }
+      ],
+      "runs": {
+        "gcc": [
+          {
+            "child_cpu_s": 0.0029430000000019163,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/ascii_case_fold_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "",
+            "wall_s": 0.003364923
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.002354999999994334,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/ascii_case_fold_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "",
+            "wall_s": 0.002675049
+          }
+        ]
+      },
+      "runtime": {
+        "gcc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        },
+        "lccc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/ascii_case_fold.c",
+      "source_sha256": "7a97d5091e4e166a63cb4d6dd80bb35014c4f9ccd77848b60bac357f3211a5dd",
+      "tags": [
+        "synthetic",
+        "parser",
+        "branch",
+        "memory"
+      ],
+      "warmups": {},
+      "warnings": []
+    },
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "gcc": {
+          "binary_bytes": 15864,
+          "child_cpu_s": 0.05548499999999734,
+          "command": [
+            "/usr/bin/gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/binary_search_gcc",
+            "/home/user/lccc/tests/benchmark/programs/binary_search.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "e53295433fcba1e277011bd4ae6860e38a1dc27934c36dc9b2de9c6d3d533422",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1477,
+          "wall_s": 0.056886321
+        },
+        "lccc": {
+          "binary_bytes": 5936,
+          "child_cpu_s": 0.04881100000000771,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/binary_search_lccc",
+            "/home/user/lccc/tests/benchmark/programs/binary_search.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "e53295433fcba1e277011bd4ae6860e38a1dc27934c36dc9b2de9c6d3d533422",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1012,
+          "wall_s": 0.049820799
+        }
+      },
+      "correctness": {
+        "gcc": {
+          "matches_baseline": true,
+          "output": "",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "sorted-table binary search / branch-heavy lookup",
+      "name": "binary_search",
+      "ratios_from_lccc": {},
+      "ratios_to_gcc": {},
+      "rounds": [
+        {
+          "order": [
+            "lccc",
+            "gcc"
+          ],
+          "round": 0,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 0.003002999999999645,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/binary_search_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "",
+              "wall_s": 0.003382227
+            },
+            "lccc": {
+              "child_cpu_s": 0.0029200000000031423,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/binary_search_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "",
+              "wall_s": 0.003298633
+            }
+          }
+        }
+      ],
+      "runs": {
+        "gcc": [
+          {
+            "child_cpu_s": 0.003002999999999645,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/binary_search_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "",
+            "wall_s": 0.003382227
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.0029200000000031423,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/binary_search_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "",
+            "wall_s": 0.003298633
+          }
+        ]
+      },
+      "runtime": {
+        "gcc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        },
+        "lccc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/binary_search.c",
+      "source_sha256": "e53295433fcba1e277011bd4ae6860e38a1dc27934c36dc9b2de9c6d3d533422",
+      "tags": [
+        "synthetic",
+        "search",
+        "branch"
+      ],
+      "warmups": {},
+      "warnings": []
+    },
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "gcc": {
+          "binary_bytes": 15832,
+          "child_cpu_s": 0.05128899999999703,
+          "command": [
+            "/usr/bin/gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/ring_fifo_gcc",
+            "/home/user/lccc/tests/benchmark/programs/ring_fifo.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "e5c01f13f9472d27106f37b76e0076f2d3e4cb71109c38344688e4e8f6e6db03",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1257,
+          "wall_s": 0.0599173
+        },
+        "lccc": {
+          "binary_bytes": 5792,
+          "child_cpu_s": 0.042375000000006935,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/ring_fifo_lccc",
+            "/home/user/lccc/tests/benchmark/programs/ring_fifo.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "e5c01f13f9472d27106f37b76e0076f2d3e4cb71109c38344688e4e8f6e6db03",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 881,
+          "wall_s": 0.043503745
+        }
+      },
+      "correctness": {
+        "gcc": {
+          "matches_baseline": true,
+          "output": "",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "masked ring FIFO enqueue/dequeue / dependent loads",
+      "name": "ring_fifo",
+      "ratios_from_lccc": {},
+      "ratios_to_gcc": {},
+      "rounds": [
+        {
+          "order": [
+            "gcc",
+            "lccc"
+          ],
+          "round": 0,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 0.002795999999996468,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/ring_fifo_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "",
+              "wall_s": 0.003212024
+            },
+            "lccc": {
+              "child_cpu_s": 0.0027089999999958536,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/ring_fifo_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "",
+              "wall_s": 0.003109836
+            }
+          }
+        }
+      ],
+      "runs": {
+        "gcc": [
+          {
+            "child_cpu_s": 0.002795999999996468,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/ring_fifo_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "",
+            "wall_s": 0.003212024
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.0027089999999958536,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/ring_fifo_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "",
+            "wall_s": 0.003109836
+          }
+        ]
+      },
+      "runtime": {
+        "gcc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        },
+        "lccc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/ring_fifo.c",
+      "source_sha256": "e5c01f13f9472d27106f37b76e0076f2d3e4cb71109c38344688e4e8f6e6db03",
+      "tags": [
+        "synthetic",
+        "queue",
+        "memory",
+        "branch"
+      ],
+      "warmups": {},
+      "warnings": []
+    },
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "gcc": {
+          "binary_bytes": 16104,
+          "child_cpu_s": 0.0554209999999955,
+          "command": [
+            "/usr/bin/gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/aarch64_select_patterns_gcc",
+            "/home/user/lccc/tests/benchmark/programs/aarch64_select_patterns.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "6359bd459ac5806e318c49bfa8ede04ab50a0611888df1d8250c9a29f11c6a19",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1559,
+          "wall_s": 0.05568343
+        },
+        "lccc": {
+          "binary_bytes": 6208,
+          "child_cpu_s": 0.03047400000000522,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/aarch64_select_patterns_lccc",
+            "/home/user/lccc/tests/benchmark/programs/aarch64_select_patterns.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "6359bd459ac5806e318c49bfa8ede04ab50a0611888df1d8250c9a29f11c6a19",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1048,
+          "wall_s": 0.030930495
+        }
+      },
+      "correctness": {
+        "gcc": {
+          "matches_baseline": true,
+          "output": "25000000 300737027",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "25000000 300737027",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "conditional increment, narrow compare, and select pressure",
+      "name": "aarch64_select_patterns",
+      "ratios_from_lccc": {},
+      "ratios_to_gcc": {},
+      "rounds": [
+        {
+          "order": [
+            "gcc",
+            "lccc"
+          ],
+          "round": 0,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 0.16825899999999905,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/aarch64_select_patterns_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "25000000 300737027",
+              "wall_s": 0.169271631
+            },
+            "lccc": {
+              "child_cpu_s": 0.20624200000000315,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/aarch64_select_patterns_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "25000000 300737027",
+              "wall_s": 0.206579431
+            }
+          }
+        }
+      ],
+      "runs": {
+        "gcc": [
+          {
+            "child_cpu_s": 0.16825899999999905,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/aarch64_select_patterns_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "25000000 300737027",
+            "wall_s": 0.169271631
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.20624200000000315,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/aarch64_select_patterns_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "25000000 300737027",
+            "wall_s": 0.206579431
+          }
+        ]
+      },
+      "runtime": {
+        "gcc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        },
+        "lccc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/aarch64_select_patterns.c",
+      "source_sha256": "6359bd459ac5806e318c49bfa8ede04ab50a0611888df1d8250c9a29f11c6a19",
+      "tags": [
+        "synthetic",
+        "aarch64",
+        "select",
+        "integer"
+      ],
+      "warmups": {},
+      "warnings": []
+    },
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "gcc": {
+          "binary_bytes": 15896,
+          "child_cpu_s": 0.04323300000000074,
+          "command": [
+            "/usr/bin/gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/histogram_gcc",
+            "/home/user/lccc/tests/benchmark/programs/histogram.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "67bef36e96b93d37b36e85f02e991eda19cd759393ec104684edfde54c6a3806",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1685,
+          "wall_s": 0.043436159
+        },
+        "lccc": {
+          "binary_bytes": 5976,
+          "child_cpu_s": 0.06258499999999856,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/histogram_lccc",
+            "/home/user/lccc/tests/benchmark/programs/histogram.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "67bef36e96b93d37b36e85f02e991eda19cd759393ec104684edfde54c6a3806",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1026,
+          "wall_s": 0.062926618
+        }
+      },
+      "correctness": {
+        "gcc": {
+          "matches_baseline": true,
+          "output": "",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "256-bin histogram / indexed increment and reduction",
+      "name": "histogram",
+      "ratios_from_lccc": {},
+      "ratios_to_gcc": {},
+      "rounds": [
+        {
+          "order": [
+            "gcc",
+            "lccc"
+          ],
+          "round": 0,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 0.0022820000000010054,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/histogram_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "",
+              "wall_s": 0.00251252
+            },
+            "lccc": {
+              "child_cpu_s": 0.0023380000000017276,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/histogram_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "",
+              "wall_s": 0.002564488
+            }
+          }
+        }
+      ],
+      "runs": {
+        "gcc": [
+          {
+            "child_cpu_s": 0.0022820000000010054,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/histogram_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "",
+            "wall_s": 0.00251252
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.0023380000000017276,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/histogram_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "",
+            "wall_s": 0.002564488
+          }
+        ]
+      },
+      "runtime": {
+        "gcc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        },
+        "lccc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/histogram.c",
+      "source_sha256": "67bef36e96b93d37b36e85f02e991eda19cd759393ec104684edfde54c6a3806",
+      "tags": [
+        "synthetic",
+        "database",
+        "memory",
+        "integer"
+      ],
+      "warmups": {},
+      "warnings": []
+    },
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "gcc": {
+          "binary_bytes": 16072,
+          "child_cpu_s": 0.056040999999993346,
+          "command": [
+            "/usr/bin/gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/gzip_crc32_gcc",
+            "/home/user/lccc/tests/benchmark/programs/gzip_crc32.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "9f9acac042ab580ce2137a9fb653a5b3db5e7015dbb49254944195ef5eb98f6a",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 2582,
+          "wall_s": 0.056289896
+        },
+        "lccc": {
+          "binary_bytes": 7448,
+          "child_cpu_s": 0.05223000000000155,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/gzip_crc32_lccc",
+            "/home/user/lccc/tests/benchmark/programs/gzip_crc32.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "9f9acac042ab580ce2137a9fb653a5b3db5e7015dbb49254944195ef5eb98f6a",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 2201,
+          "wall_s": 0.052580626
+        }
+      },
+      "correctness": {
+        "gcc": {
+          "matches_baseline": true,
+          "output": "372e56ab",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "372e56ab",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "GNU gzip CRC-32 scalar table loop",
+      "name": "gzip_crc32",
+      "ratios_from_lccc": {},
+      "ratios_to_gcc": {},
+      "rounds": [
+        {
+          "order": [
+            "lccc",
+            "gcc"
+          ],
+          "round": 0,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 0.16916699999999452,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/gzip_crc32_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "372e56ab",
+              "wall_s": 0.169632804
+            },
+            "lccc": {
+              "child_cpu_s": 0.15593400000000202,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/gzip_crc32_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "372e56ab",
+              "wall_s": 0.160890928
+            }
+          }
+        }
+      ],
+      "runs": {
+        "gcc": [
+          {
+            "child_cpu_s": 0.16916699999999452,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/gzip_crc32_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "372e56ab",
+            "wall_s": 0.169632804
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.15593400000000202,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/gzip_crc32_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "372e56ab",
+            "wall_s": 0.160890928
+          }
+        ]
+      },
+      "runtime": {
+        "gcc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        },
+        "lccc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/gzip_crc32.c",
+      "source_sha256": "9f9acac042ab580ce2137a9fb653a5b3db5e7015dbb49254944195ef5eb98f6a",
+      "tags": [
+        "workload",
+        "gzip",
+        "checksum",
+        "memory"
+      ],
+      "warmups": {},
+      "warnings": []
+    },
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "gcc": {
+          "binary_bytes": 16280,
+          "child_cpu_s": 0.06336199999999792,
+          "command": [
+            "/usr/bin/gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/libm_round_family_gcc",
+            "/home/user/lccc/tests/benchmark/programs/libm_round_family.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "b70c5bacd90081c28ea74dc1142f9eacc64278d539f258da5bd1614ebc503668",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 2630,
+          "wall_s": 0.067011232
+        },
+        "lccc": {
+          "binary_bytes": 7320,
+          "child_cpu_s": 0.057825000000001125,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/libm_round_family_lccc",
+            "/home/user/lccc/tests/benchmark/programs/libm_round_family.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "b70c5bacd90081c28ea74dc1142f9eacc64278d539f258da5bd1614ebc503668",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1917,
+          "wall_s": 0.05816632
+        }
+      },
+      "correctness": {
+        "gcc": {
+          "matches_baseline": true,
+          "output": "libm-round-family: 18623110414.500000",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "libm-round-family: 18623110414.500000",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "glibc libm scalar rounding entry points (vroundsd inline)",
+      "name": "libm_round_family",
+      "ratios_from_lccc": {},
+      "ratios_to_gcc": {},
+      "rounds": [
+        {
+          "order": [
+            "gcc",
+            "lccc"
+          ],
+          "round": 0,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 0.25145300000000503,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/libm_round_family_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "libm-round-family: 18623110414.500000",
+              "wall_s": 0.252192954
+            },
+            "lccc": {
+              "child_cpu_s": 0.24291099999999943,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/libm_round_family_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "libm-round-family: 18623110414.500000",
+              "wall_s": 0.243316205
+            }
+          }
+        }
+      ],
+      "runs": {
+        "gcc": [
+          {
+            "child_cpu_s": 0.25145300000000503,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/libm_round_family_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "libm-round-family: 18623110414.500000",
+            "wall_s": 0.252192954
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.24291099999999943,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/libm_round_family_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "libm-round-family: 18623110414.500000",
+            "wall_s": 0.243316205
+          }
+        ]
+      },
+      "runtime": {
+        "gcc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        },
+        "lccc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/libm_round_family.c",
+      "source_sha256": "b70c5bacd90081c28ea74dc1142f9eacc64278d539f258da5bd1614ebc503668",
+      "tags": [
+        "workload",
+        "glibc",
+        "fp",
+        "libm"
+      ],
+      "warmups": {},
+      "warnings": []
+    },
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "gcc": {
+          "binary_bytes": 16104,
+          "child_cpu_s": 0.04255899999999713,
+          "command": [
+            "/usr/bin/gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/tls_seg_access_gcc",
+            "/home/user/lccc/tests/benchmark/programs/tls_seg_access.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "02e6d2bcd07b2e1fc253b53d316d522e7b3d912ae634b6fad2c10dc93a1d4835",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1517,
+          "wall_s": 0.043079567
+        },
+        "lccc": {
+          "binary_bytes": 6344,
+          "child_cpu_s": 0.031147999999994624,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/tls_seg_access_lccc",
+            "/home/user/lccc/tests/benchmark/programs/tls_seg_access.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "02e6d2bcd07b2e1fc253b53d316d522e7b3d912ae634b6fad2c10dc93a1d4835",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1096,
+          "wall_s": 0.031562105
+        }
+      },
+      "correctness": {
+        "gcc": {
+          "matches_baseline": true,
+          "output": "tls-seg-access: 41596549849953",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "tls-seg-access: 41596549849953",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "glibc TLS access shapes (THREAD_SELF/SETMEM, %fs segment)",
+      "name": "tls_seg_access",
+      "ratios_from_lccc": {},
+      "ratios_to_gcc": {},
+      "rounds": [
+        {
+          "order": [
+            "gcc",
+            "lccc"
+          ],
+          "round": 0,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 0.011091000000007512,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/tls_seg_access_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "tls-seg-access: 41596549849953",
+              "wall_s": 0.011454398
+            },
+            "lccc": {
+              "child_cpu_s": 0.011841999999994357,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/tls_seg_access_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "tls-seg-access: 41596549849953",
+              "wall_s": 0.012176154
+            }
+          }
+        }
+      ],
+      "runs": {
+        "gcc": [
+          {
+            "child_cpu_s": 0.011091000000007512,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/tls_seg_access_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "tls-seg-access: 41596549849953",
+            "wall_s": 0.011454398
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.011841999999994357,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/tls_seg_access_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "tls-seg-access: 41596549849953",
+            "wall_s": 0.012176154
+          }
+        ]
+      },
+      "runtime": {
+        "gcc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        },
+        "lccc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/tls_seg_access.c",
+      "source_sha256": "02e6d2bcd07b2e1fc253b53d316d522e7b3d912ae634b6fad2c10dc93a1d4835",
+      "tags": [
+        "workload",
+        "glibc",
+        "tls",
+        "memory"
+      ],
+      "warmups": {},
+      "warnings": []
+    },
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "gcc": {
+          "binary_bytes": 16040,
+          "child_cpu_s": 0.07231300000000118,
+          "command": [
+            "/usr/bin/gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/zlib_ng_adler32_gcc",
+            "/home/user/lccc/tests/benchmark/programs/zlib_ng_adler32.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "bca7938ef542270a06d734bf814b3f1806ab1796e8f53d5c53d1b5ccd6b08486",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1952,
+          "wall_s": 0.072641719
+        },
+        "lccc": {
+          "binary_bytes": 7672,
+          "child_cpu_s": 0.24561300000000585,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/zlib_ng_adler32_lccc",
+            "/home/user/lccc/tests/benchmark/programs/zlib_ng_adler32.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "bca7938ef542270a06d734bf814b3f1806ab1796e8f53d5c53d1b5ccd6b08486",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 2521,
+          "wall_s": 0.246276089
+        }
+      },
+      "correctness": {
+        "gcc": {
+          "matches_baseline": true,
+          "output": "8c331ae0",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "8c331ae0",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "zlib-ng Adler-32 NMAX accumulator",
+      "name": "zlib_ng_adler32",
+      "ratios_from_lccc": {},
+      "ratios_to_gcc": {},
+      "rounds": [
+        {
+          "order": [
+            "gcc",
+            "lccc"
+          ],
+          "round": 0,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 0.03887300000000238,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/zlib_ng_adler32_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "8c331ae0",
+              "wall_s": 0.039312017
+            },
+            "lccc": {
+              "child_cpu_s": 0.039332999999999174,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/zlib_ng_adler32_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "8c331ae0",
+              "wall_s": 0.039824403
+            }
+          }
+        }
+      ],
+      "runs": {
+        "gcc": [
+          {
+            "child_cpu_s": 0.03887300000000238,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/zlib_ng_adler32_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "8c331ae0",
+            "wall_s": 0.039312017
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.039332999999999174,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/zlib_ng_adler32_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "8c331ae0",
+            "wall_s": 0.039824403
+          }
+        ]
+      },
+      "runtime": {
+        "gcc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        },
+        "lccc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/zlib_ng_adler32.c",
+      "source_sha256": "bca7938ef542270a06d734bf814b3f1806ab1796e8f53d5c53d1b5ccd6b08486",
+      "tags": [
+        "workload",
+        "zlib-ng",
+        "checksum",
+        "loop"
+      ],
+      "warmups": {},
+      "warnings": []
+    },
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "gcc": {
+          "binary_bytes": 16120,
+          "child_cpu_s": 0.0770249999999919,
+          "command": [
+            "/usr/bin/gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/expat_xml_scan_gcc",
+            "/home/user/lccc/tests/benchmark/programs/expat_xml_scan.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "a076b1823869765011658d56ec090b22102e2ba7a5bbdf4cd0b6bdd0d774cf35",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 2193,
+          "wall_s": 0.080367262
+        },
+        "lccc": {
+          "binary_bytes": 7200,
+          "child_cpu_s": 0.1876439999999988,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/expat_xml_scan_lccc",
+            "/home/user/lccc/tests/benchmark/programs/expat_xml_scan.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "a076b1823869765011658d56ec090b22102e2ba7a5bbdf4cd0b6bdd0d774cf35",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1864,
+          "wall_s": 0.188584918
+        }
+      },
+      "correctness": {
+        "gcc": {
+          "matches_baseline": true,
+          "output": "626766774715194881",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "626766774715194881",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "Expat UTF-8 XML name-token scan",
+      "name": "expat_xml_scan",
+      "ratios_from_lccc": {},
+      "ratios_to_gcc": {},
+      "rounds": [
+        {
+          "order": [
+            "gcc",
+            "lccc"
+          ],
+          "round": 0,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 0.04099599999999981,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/expat_xml_scan_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "626766774715194881",
+              "wall_s": 0.041329207
+            },
+            "lccc": {
+              "child_cpu_s": 0.05381400000000269,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/expat_xml_scan_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "626766774715194881",
+              "wall_s": 0.054199356
+            }
+          }
+        }
+      ],
+      "runs": {
+        "gcc": [
+          {
+            "child_cpu_s": 0.04099599999999981,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/expat_xml_scan_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "626766774715194881",
+            "wall_s": 0.041329207
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.05381400000000269,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/expat_xml_scan_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "626766774715194881",
+            "wall_s": 0.054199356
+          }
+        ]
+      },
+      "runtime": {
+        "gcc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        },
+        "lccc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/expat_xml_scan.c",
+      "source_sha256": "a076b1823869765011658d56ec090b22102e2ba7a5bbdf4cd0b6bdd0d774cf35",
+      "tags": [
+        "workload",
+        "expat",
+        "parser",
+        "branch"
+      ],
+      "warmups": {},
+      "warnings": []
+    },
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "gcc": {
+          "binary_bytes": 16232,
+          "child_cpu_s": 0.08786500000000075,
+          "command": [
+            "/usr/bin/gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/sqlite_varint_gcc",
+            "/home/user/lccc/tests/benchmark/programs/sqlite_varint.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "11c7e09b1507659fe44e678848c5e489268e4dd4aa385d3a542453caa400e1af",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 2893,
+          "wall_s": 0.090669029
+        },
+        "lccc": {
+          "binary_bytes": 7872,
+          "child_cpu_s": 0.1302209999999988,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/sqlite_varint_lccc",
+            "/home/user/lccc/tests/benchmark/programs/sqlite_varint.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "11c7e09b1507659fe44e678848c5e489268e4dd4aa385d3a542453caa400e1af",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 2547,
+          "wall_s": 0.130540212
+        }
+      },
+      "correctness": {
+        "gcc": {
+          "matches_baseline": true,
+          "output": "deedcdd4edc1c0f1",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "deedcdd4edc1c0f1",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "SQLite 1\u20139 byte varint decoder",
+      "name": "sqlite_varint",
+      "ratios_from_lccc": {},
+      "ratios_to_gcc": {},
+      "rounds": [
+        {
+          "order": [
+            "lccc",
+            "gcc"
+          ],
+          "round": 0,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 0.0272549999999967,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/sqlite_varint_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "deedcdd4edc1c0f1",
+              "wall_s": 0.02769022
+            },
+            "lccc": {
+              "child_cpu_s": 0.053075999999997237,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/sqlite_varint_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "deedcdd4edc1c0f1",
+              "wall_s": 0.053607411
+            }
+          }
+        }
+      ],
+      "runs": {
+        "gcc": [
+          {
+            "child_cpu_s": 0.0272549999999967,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/sqlite_varint_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "deedcdd4edc1c0f1",
+            "wall_s": 0.02769022
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.053075999999997237,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/sqlite_varint_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "deedcdd4edc1c0f1",
+            "wall_s": 0.053607411
+          }
+        ]
+      },
+      "runtime": {
+        "gcc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        },
+        "lccc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/sqlite_varint.c",
+      "source_sha256": "11c7e09b1507659fe44e678848c5e489268e4dd4aa385d3a542453caa400e1af",
+      "tags": [
+        "workload",
+        "sqlite",
+        "branch",
+        "integer"
+      ],
+      "warmups": {},
+      "warnings": []
+    },
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "gcc": {
+          "binary_bytes": 16096,
+          "child_cpu_s": 0.06814899999999824,
+          "command": [
+            "/usr/bin/gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/linux_find_bit_gcc",
+            "/home/user/lccc/tests/benchmark/programs/linux_find_bit.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "bdbeacb05f1c3857f47c7626c041a450ab0badc939ff86f32f67b202bcf4bd5a",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 2020,
+          "wall_s": 0.069104938
+        },
+        "lccc": {
+          "binary_bytes": 6816,
+          "child_cpu_s": 0.0922740000000033,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/linux_find_bit_lccc",
+            "/home/user/lccc/tests/benchmark/programs/linux_find_bit.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "bdbeacb05f1c3857f47c7626c041a450ab0badc939ff86f32f67b202bcf4bd5a",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1617,
+          "wall_s": 0.092623813
+        }
+      },
+      "correctness": {
+        "gcc": {
+          "matches_baseline": true,
+          "output": "0",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "0",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "Linux sparse find_next_andnot_bit",
+      "name": "linux_find_bit",
+      "ratios_from_lccc": {},
+      "ratios_to_gcc": {},
+      "rounds": [
+        {
+          "order": [
+            "lccc",
+            "gcc"
+          ],
+          "round": 0,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 0.01797000000000537,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/linux_find_bit_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "0",
+              "wall_s": 0.018393709
+            },
+            "lccc": {
+              "child_cpu_s": 0.02111699999999672,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/linux_find_bit_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "0",
+              "wall_s": 0.021505689
+            }
+          }
+        }
+      ],
+      "runs": {
+        "gcc": [
+          {
+            "child_cpu_s": 0.01797000000000537,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/linux_find_bit_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "0",
+            "wall_s": 0.018393709
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.02111699999999672,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/linux_find_bit_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "0",
+            "wall_s": 0.021505689
+          }
+        ]
+      },
+      "runtime": {
+        "gcc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        },
+        "lccc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/linux_find_bit.c",
+      "source_sha256": "bdbeacb05f1c3857f47c7626c041a450ab0badc939ff86f32f67b202bcf4bd5a",
+      "tags": [
+        "workload",
+        "linux",
+        "bitmap",
+        "bit"
+      ],
+      "warmups": {},
+      "warnings": []
+    },
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "gcc": {
+          "binary_bytes": 16088,
+          "child_cpu_s": 0.06250300000000664,
+          "command": [
+            "/usr/bin/gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/glibc_memcmp_gcc",
+            "/home/user/lccc/tests/benchmark/programs/glibc_memcmp.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "6fcec75ff20c60106d78db2013a646579ab4262750fe64eee99387f3c16b0870",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 2261,
+          "wall_s": 0.063076465
+        },
+        "lccc": {
+          "binary_bytes": 6920,
+          "child_cpu_s": 0.10025600000000168,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/glibc_memcmp_lccc",
+            "/home/user/lccc/tests/benchmark/programs/glibc_memcmp.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "6fcec75ff20c60106d78db2013a646579ab4262750fe64eee99387f3c16b0870",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1673,
+          "wall_s": 0.100864835
+        }
+      },
+      "correctness": {
+        "gcc": {
+          "matches_baseline": true,
+          "output": "2158787064",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "2158787064",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "glibc aligned-word memcmp path",
+      "name": "glibc_memcmp",
+      "ratios_from_lccc": {},
+      "ratios_to_gcc": {},
+      "rounds": [
+        {
+          "order": [
+            "gcc",
+            "lccc"
+          ],
+          "round": 0,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 0.009310999999996739,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/glibc_memcmp_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "2158787064",
+              "wall_s": 0.009722822
+            },
+            "lccc": {
+              "child_cpu_s": 0.01276200000000216,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/glibc_memcmp_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "2158787064",
+              "wall_s": 0.013034365
+            }
+          }
+        }
+      ],
+      "runs": {
+        "gcc": [
+          {
+            "child_cpu_s": 0.009310999999996739,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/glibc_memcmp_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "2158787064",
+            "wall_s": 0.009722822
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.01276200000000216,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/glibc_memcmp_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "2158787064",
+            "wall_s": 0.013034365
+          }
+        ]
+      },
+      "runtime": {
+        "gcc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        },
+        "lccc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/glibc_memcmp.c",
+      "source_sha256": "6fcec75ff20c60106d78db2013a646579ab4262750fe64eee99387f3c16b0870",
+      "tags": [
+        "workload",
+        "glibc",
+        "memory",
+        "branch"
+      ],
+      "warmups": {},
+      "warnings": []
+    },
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "gcc": {
+          "binary_bytes": 16032,
+          "child_cpu_s": 0.07459099999999808,
+          "command": [
+            "/usr/bin/gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/chacha20_block_gcc",
+            "/home/user/lccc/tests/benchmark/programs/chacha20_block.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "7f0b876dc4bbea778d85e2a30d55046207eb60abe8c5388857bb1207efdac85c",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 2633,
+          "wall_s": 0.075025022
+        },
+        "lccc": {
+          "binary_bytes": 7120,
+          "child_cpu_s": 0.09101400000000126,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/chacha20_block_lccc",
+            "/home/user/lccc/tests/benchmark/programs/chacha20_block.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "7f0b876dc4bbea778d85e2a30d55046207eb60abe8c5388857bb1207efdac85c",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1979,
+          "wall_s": 0.091588764
+        }
+      },
+      "correctness": {
+        "gcc": {
+          "matches_baseline": true,
+          "output": "ff1bc75f6884e79f",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "ff1bc75f6884e79f",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "ChaCha20 20-round ARX block cipher / register pressure",
+      "name": "chacha20_block",
+      "ratios_from_lccc": {},
+      "ratios_to_gcc": {},
+      "rounds": [
+        {
+          "order": [
+            "lccc",
+            "gcc"
+          ],
+          "round": 0,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 0.29297900000000254,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/chacha20_block_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "ff1bc75f6884e79f",
+              "wall_s": 0.293660285
+            },
+            "lccc": {
+              "child_cpu_s": 0.26469500000000323,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/chacha20_block_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "ff1bc75f6884e79f",
+              "wall_s": 0.265737729
+            }
+          }
+        }
+      ],
+      "runs": {
+        "gcc": [
+          {
+            "child_cpu_s": 0.29297900000000254,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/chacha20_block_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "ff1bc75f6884e79f",
+            "wall_s": 0.293660285
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.26469500000000323,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/chacha20_block_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "ff1bc75f6884e79f",
+            "wall_s": 0.265737729
+          }
+        ]
+      },
+      "runtime": {
+        "gcc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        },
+        "lccc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/chacha20_block.c",
+      "source_sha256": "7f0b876dc4bbea778d85e2a30d55046207eb60abe8c5388857bb1207efdac85c",
+      "tags": [
+        "workload",
+        "crypto",
+        "arx",
+        "integer"
+      ],
+      "warmups": {},
+      "warnings": []
+    },
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "gcc": {
+          "binary_bytes": 16032,
+          "child_cpu_s": 0.08234300000000161,
+          "command": [
+            "/usr/bin/gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/sha256_transform_gcc",
+            "/home/user/lccc/tests/benchmark/programs/sha256_transform.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "6f55a89cfd9d59eb9a8e115eef968295ec775fa63d0545dd33517c2fdf06bf5e",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 2570,
+          "wall_s": 0.083196218
+        },
+        "lccc": {
+          "binary_bytes": 7784,
+          "child_cpu_s": 0.1516380000000055,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/sha256_transform_lccc",
+            "/home/user/lccc/tests/benchmark/programs/sha256_transform.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "6f55a89cfd9d59eb9a8e115eef968295ec775fa63d0545dd33517c2fdf06bf5e",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 2673,
+          "wall_s": 0.151986943
+        }
+      },
+      "correctness": {
+        "gcc": {
+          "matches_baseline": true,
+          "output": "054db5f638d89d8b",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "054db5f638d89d8b",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "SHA-256 64-step block transform / rotate and schedule",
+      "name": "sha256_transform",
+      "ratios_from_lccc": {},
+      "ratios_to_gcc": {},
+      "rounds": [
+        {
+          "order": [
+            "lccc",
+            "gcc"
+          ],
+          "round": 0,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 0.26995000000000147,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/sha256_transform_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "054db5f638d89d8b",
+              "wall_s": 0.27067217
+            },
+            "lccc": {
+              "child_cpu_s": 0.3259819999999962,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/sha256_transform_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "054db5f638d89d8b",
+              "wall_s": 0.326396921
+            }
+          }
+        }
+      ],
+      "runs": {
+        "gcc": [
+          {
+            "child_cpu_s": 0.26995000000000147,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/sha256_transform_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "054db5f638d89d8b",
+            "wall_s": 0.27067217
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.3259819999999962,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/sha256_transform_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "054db5f638d89d8b",
+            "wall_s": 0.326396921
+          }
+        ]
+      },
+      "runtime": {
+        "gcc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        },
+        "lccc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/sha256_transform.c",
+      "source_sha256": "6f55a89cfd9d59eb9a8e115eef968295ec775fa63d0545dd33517c2fdf06bf5e",
+      "tags": [
+        "workload",
+        "crypto",
+        "sha256",
+        "integer"
+      ],
+      "warmups": {},
+      "warnings": []
+    },
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "gcc": {
+          "binary_bytes": 15992,
+          "child_cpu_s": 0.0783529999999999,
+          "command": [
+            "/usr/bin/gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/linux_rbtree_gcc",
+            "/home/user/lccc/tests/benchmark/programs/linux_rbtree.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "7c9c5ada20d8e32116ccbc1ca68690e92470ef7348b51842e49ffa2fa0480253",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 2039,
+          "wall_s": 0.078654164
+        },
+        "lccc": {
+          "binary_bytes": 6792,
+          "child_cpu_s": 0.14600500000000238,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/linux_rbtree_lccc",
+            "/home/user/lccc/tests/benchmark/programs/linux_rbtree.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "7c9c5ada20d8e32116ccbc1ca68690e92470ef7348b51842e49ffa2fa0480253",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1686,
+          "wall_s": 0.14639807
+        }
+      },
+      "correctness": {
+        "gcc": {
+          "matches_baseline": true,
+          "output": "7f13e4413fff0000",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "7f13e4413fff0000",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "Linux kernel intrusive Red-Black tree insertion and search",
+      "name": "linux_rbtree",
+      "ratios_from_lccc": {},
+      "ratios_to_gcc": {},
+      "rounds": [
+        {
+          "order": [
+            "gcc",
+            "lccc"
+          ],
+          "round": 0,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 0.01613100000000145,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/linux_rbtree_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "7f13e4413fff0000",
+              "wall_s": 0.016501926
+            },
+            "lccc": {
+              "child_cpu_s": 0.016963000000004058,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/linux_rbtree_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "7f13e4413fff0000",
+              "wall_s": 0.017246619
+            }
+          }
+        }
+      ],
+      "runs": {
+        "gcc": [
+          {
+            "child_cpu_s": 0.01613100000000145,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/linux_rbtree_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "7f13e4413fff0000",
+            "wall_s": 0.016501926
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.016963000000004058,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/linux_rbtree_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "7f13e4413fff0000",
+            "wall_s": 0.017246619
+          }
+        ]
+      },
+      "runtime": {
+        "gcc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        },
+        "lccc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/linux_rbtree.c",
+      "source_sha256": "7c9c5ada20d8e32116ccbc1ca68690e92470ef7348b51842e49ffa2fa0480253",
+      "tags": [
+        "workload",
+        "linux",
+        "rbtree",
+        "tree",
+        "memory"
+      ],
+      "warmups": {},
+      "warnings": []
+    },
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "gcc": {
+          "binary_bytes": 15992,
+          "child_cpu_s": 0.05499600000000271,
+          "command": [
+            "/usr/bin/gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/zstd_count_gcc",
+            "/home/user/lccc/tests/benchmark/programs/zstd_count.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "cf01953477eadbebe46b07ede170a62ff41b62cf947dd12222a04ad93c985be6",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1715,
+          "wall_s": 0.05518028
+        },
+        "lccc": {
+          "binary_bytes": 6424,
+          "child_cpu_s": 0.07373499999999922,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/zstd_count_lccc",
+            "/home/user/lccc/tests/benchmark/programs/zstd_count.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "cf01953477eadbebe46b07ede170a62ff41b62cf947dd12222a04ad93c985be6",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1341,
+          "wall_s": 0.07411665
+        }
+      },
+      "correctness": {
+        "gcc": {
+          "matches_baseline": true,
+          "output": "49750a013cea17bd",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "49750a013cea17bd",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "Zstandard fast unaligned match counting (ZSTD_count / ctz)",
+      "name": "zstd_count",
+      "ratios_from_lccc": {},
+      "ratios_to_gcc": {},
+      "rounds": [
+        {
+          "order": [
+            "gcc",
+            "lccc"
+          ],
+          "round": 0,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 0.011078000000004806,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/zstd_count_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "49750a013cea17bd",
+              "wall_s": 0.011311565
+            },
+            "lccc": {
+              "child_cpu_s": 0.014757999999993388,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/zstd_count_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "49750a013cea17bd",
+              "wall_s": 0.015509838
+            }
+          }
+        }
+      ],
+      "runs": {
+        "gcc": [
+          {
+            "child_cpu_s": 0.011078000000004806,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/zstd_count_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "49750a013cea17bd",
+            "wall_s": 0.011311565
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.014757999999993388,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/zstd_count_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "49750a013cea17bd",
+            "wall_s": 0.015509838
+          }
+        ]
+      },
+      "runtime": {
+        "gcc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        },
+        "lccc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/zstd_count.c",
+      "source_sha256": "cf01953477eadbebe46b07ede170a62ff41b62cf947dd12222a04ad93c985be6",
+      "tags": [
+        "workload",
+        "zstd",
+        "compression",
+        "bit"
+      ],
+      "warmups": {},
+      "warnings": []
+    },
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "gcc": {
+          "binary_bytes": 16160,
+          "child_cpu_s": 0.07719299999999407,
+          "command": [
+            "/usr/bin/gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/lz4_compress_gcc",
+            "/home/user/lccc/tests/benchmark/programs/lz4_compress.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "51b9f8a0ca5f235ca6bcde0a4f981489ffa27ef3ca643a0012be0dd40b4a86cc",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 2320,
+          "wall_s": 0.078563543
+        },
+        "lccc": {
+          "binary_bytes": 7264,
+          "child_cpu_s": 0.16259000000000157,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/lz4_compress_lccc",
+            "/home/user/lccc/tests/benchmark/programs/lz4_compress.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "51b9f8a0ca5f235ca6bcde0a4f981489ffa27ef3ca643a0012be0dd40b4a86cc",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 2121,
+          "wall_s": 0.163434019
+        }
+      },
+      "correctness": {
+        "gcc": {
+          "matches_baseline": true,
+          "output": "00c000180ca81680",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "00c000180ca81680",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "LZ4 fast block compression / 4-byte hash matching",
+      "name": "lz4_compress",
+      "ratios_from_lccc": {},
+      "ratios_to_gcc": {},
+      "rounds": [
+        {
+          "order": [
+            "lccc",
+            "gcc"
+          ],
+          "round": 0,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 0.003779000000001531,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/lz4_compress_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00c000180ca81680",
+              "wall_s": 0.004009949
+            },
+            "lccc": {
+              "child_cpu_s": 0.004354999999996778,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/lz4_compress_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00c000180ca81680",
+              "wall_s": 0.004649543
+            }
+          }
+        }
+      ],
+      "runs": {
+        "gcc": [
+          {
+            "child_cpu_s": 0.003779000000001531,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/lz4_compress_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00c000180ca81680",
+            "wall_s": 0.004009949
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.004354999999996778,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/lz4_compress_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00c000180ca81680",
+            "wall_s": 0.004649543
+          }
+        ]
+      },
+      "runtime": {
+        "gcc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        },
+        "lccc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/lz4_compress.c",
+      "source_sha256": "51b9f8a0ca5f235ca6bcde0a4f981489ffa27ef3ca643a0012be0dd40b4a86cc",
+      "tags": [
+        "workload",
+        "lz4",
+        "compression",
+        "memory"
+      ],
+      "warmups": {},
+      "warnings": []
+    },
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "gcc": {
+          "binary_bytes": 16048,
+          "child_cpu_s": 0.06797700000000617,
+          "command": [
+            "/usr/bin/gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/glibc_strstr_gcc",
+            "/home/user/lccc/tests/benchmark/programs/glibc_strstr.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "17dcd48414c9eb254cc910905113b7ed8a3cedac3c0d41216305484a5a7cd344",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 2162,
+          "wall_s": 0.068177974
+        },
+        "lccc": {
+          "binary_bytes": 6968,
+          "child_cpu_s": 0.1356309999999965,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_t5g0pvv3/glibc_strstr_lccc",
+            "/home/user/lccc/tests/benchmark/programs/glibc_strstr.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "17dcd48414c9eb254cc910905113b7ed8a3cedac3c0d41216305484a5a7cd344",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1849,
+          "wall_s": 0.136093469
+        }
+      },
+      "correctness": {
+        "gcc": {
+          "matches_baseline": true,
+          "output": "000084b751d11348",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "000084b751d11348",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "glibc two-way string search / needle shift table",
+      "name": "glibc_strstr",
+      "ratios_from_lccc": {},
+      "ratios_to_gcc": {},
+      "rounds": [
+        {
+          "order": [
+            "lccc",
+            "gcc"
+          ],
+          "round": 0,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 4.400832999999999,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/glibc_strstr_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "000084b751d11348",
+              "wall_s": 4.402758358
+            },
+            "lccc": {
+              "child_cpu_s": 4.459456000000003,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_t5g0pvv3/glibc_strstr_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "000084b751d11348",
+              "wall_s": 4.46092213
+            }
+          }
+        }
+      ],
+      "runs": {
+        "gcc": [
+          {
+            "child_cpu_s": 4.400832999999999,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/glibc_strstr_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "000084b751d11348",
+            "wall_s": 4.402758358
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 4.459456000000003,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_t5g0pvv3/glibc_strstr_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "000084b751d11348",
+            "wall_s": 4.46092213
+          }
+        ]
+      },
+      "runtime": {
+        "gcc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        },
+        "lccc": {
+          "child_cpu": null,
+          "quality_warnings": [
+            "timing deliberately skipped"
+          ],
+          "raw_wall_s": [],
+          "wall": null
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/glibc_strstr.c",
+      "source_sha256": "17dcd48414c9eb254cc910905113b7ed8a3cedac3c0d41216305484a5a7cd344",
+      "tags": [
+        "workload",
+        "glibc",
+        "string",
+        "search"
+      ],
+      "warmups": {},
+      "warnings": []
+    }
+  ],
+  "compilers": [
+    {
+      "binary_sha256": "39180a95cb8dedb6fb2b3b1a5b9150ad851fda65a13cfacdc73ac2f19388d5c6",
+      "executable": "/home/user/lccc/target/fastbuild/lccc",
+      "flags": [
+        "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "-O2",
+        "-march=x86-64-v3"
+      ],
+      "key": "lccc",
+      "label": "LCCC"
+    },
+    {
+      "binary_sha256": "a23ecab8ff08f09ad8c80602c2c5df7f49e09c25905cb8975902e101bf72635f",
+      "executable": "/usr/bin/gcc",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3"
+      ],
+      "key": "gcc",
+      "label": "GCC"
+    }
+  ],
+  "metadata": {
+    "compiler_versions": {
+      "gcc": "gcc (Debian 14.2.0-19) 14.2.0",
+      "lccc": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0"
+    },
+    "cpu_governors": {},
+    "cpu_models": [
+      "Intel(R) Xeon(R) Processor @ 2.60GHz"
+    ],
+    "git": {
+      "repo": "/home/user/lccc",
+      "revision": "d80c0c74f4e844760b1af9e04642201a876c2300",
+      "status": "M src/passes/dead_statics.rs\n?? engineering/evidence/2026-09-25-redteam/post-merge/\n?? tests/regression/dead_static_aliased_global.c"
+    },
+    "hypervisor_detected": true,
+    "meminfo": "MemTotal:        2032608 kB\nMemFree:         1390704 kB\nMemAvailable:    1766556 kB\nBuffers:            6572 kB\nCached:           476468 kB\nSwapCached:         5836 kB\nActive:           278024 kB\nInactive:         250668 kB\nActive(anon):       7428 kB\nInactive(anon):    38772 kB\nActive(file):     270596 kB\nInactive(file):   211896 kB\nUnevictable:           8 kB\nMlocked:               4 kB\nSwapTotal:       8388604 kB\nSwapFree:        8173332 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:                 0 kB\nWriteback:             0 kB\nAnonPages:         42632 kB\nMapped:            25988 kB\nShmem:               460 kB\nKReclaimable:      50200 kB\nSlab:              68044 kB\nSReclaimable:      50200 kB\nSUnreclaim:        17844 kB\nKernelStack:        2216 kB\nPageTables:         3136 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:     9404908 kB\nCommitted_AS:     589632 kB\nVmallocTotal:   34359738367 kB\nVmallocUsed:        7392 kB\nVmallocChunk:          0 kB\nPercpu:              640 kB\nAnonHugePages:      8192 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:       2048 kB\nHugetlb:               0 kB\nDirectMap4k:       73728 kB\nDirectMap2M:     2023424 kB\nDirectMap1G:     2097152 kB",
+    "pinning": {
+      "allowed_cpus": [
+        0,
+        1
+      ],
+      "applied": true,
+      "cpu": 0,
+      "reason": "taskset pinning",
+      "requested": "auto"
+    },
+    "platform": "Linux-6.1.158+-x86_64-with-glibc2.41",
+    "pmu": {
+      "available": false,
+      "perf_event_paranoid": "2",
+      "perf_path": "/usr/bin/perf",
+      "probed": false,
+      "reason": "not probed"
+    },
+    "python": "3.13.14 (main, Jul 14 2026, 04:45:36) [GCC 14.2.0]",
+    "swap": "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n/swapfile                               file\t\t8388604\t\t215272\t\t-2",
+    "timestamp_utc": "2026-09-25T09:16:25.369929+00:00",
+    "uname": [
+      "Linux",
+      "e2b.local",
+      "6.1.158+",
+      "#1 SMP PREEMPT_DYNAMIC Fri Jul 17 14:31:34 UTC 2026",
+      "x86_64"
+    ],
+    "work_root": {
+      "candidates": [
+        {
+          "free_bytes": 7660175360,
+          "path": "/home/user/lccc"
+        },
+        {
+          "free_bytes": 7660175360,
+          "path": "/var/tmp"
+        },
+        {
+          "free_bytes": 1040613376,
+          "path": "/tmp"
+        }
+      ],
+      "free_bytes": 7660175360,
+      "reason": "largest writable candidate among repository, /var/tmp, /tmp",
+      "selected": "/home/user/lccc"
+    }
+  },
+  "runner_warnings": [],
+  "schema": "lccc-bench-v2",
+  "settings": {
+    "common_cflags": [
+      "-march=x86-64-v3"
+    ],
+    "compiler_order_policy": "randomized independently in every paired round",
+    "opt": "-O2",
+    "outlier_policy": "MAD outliers counted and reported; none are removed",
+    "reps": 1,
+    "seed": 20260810,
+    "skip_perf": true,
+    "timer": "time.perf_counter_ns wall-clock plus resource.RUSAGE_CHILDREN CPU time",
+    "warmup": 0
+  },
+  "unavailable_compilers": {}
+}

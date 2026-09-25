@@ -1,0 +1,97 @@
+{
+  "label": "LZ4 loop idiom unsafe baseline vs scalar, VM screening",
+  "arm_a": {
+    "binary": "/tmp/paired_ab_sfu80bgw/arm_a",
+    "sha256": "33c7e0336774983fd6a559df747f4d2f49e8799d01aa005529b4f8c75e264d11",
+    "env": "CCC_NO_LOOP_IDIOM=1",
+    "warmup": {
+      "rc": 0,
+      "stdout_sha256": "914821ea38264af58a1a47a1c9045fcf50d12758a4618a852e5d1d0e85a74905"
+    }
+  },
+  "arm_b": {
+    "binary": "/tmp/paired_ab_sfu80bgw/arm_b",
+    "sha256": "0a9197187a26ddee65b8723c7e8babb11c5f91928aa1401b0e2cc1d3ba54bbd9",
+    "env": "",
+    "warmup": {
+      "rc": 0,
+      "stdout_sha256": "914821ea38264af58a1a47a1c9045fcf50d12758a4618a852e5d1d0e85a74905"
+    }
+  },
+  "identical_binaries": false,
+  "rounds": 15,
+  "warmup": 2,
+  "arm_a_timings": {
+    "arm": "scalar-no-idiom",
+    "n": 15,
+    "min_ms": 393.248,
+    "median_ms": 405.684,
+    "mean_ms": 408.55,
+    "stdev_ms": 12.996,
+    "samples_ms": [
+      435.966,
+      407.338,
+      395.811,
+      410.114,
+      413.439,
+      401.872,
+      424.66,
+      431.537,
+      399.93,
+      393.248,
+      395.039,
+      405.684,
+      415.342,
+      394.867,
+      403.402
+    ]
+  },
+  "arm_b_timings": {
+    "arm": "unsafe-default",
+    "n": 15,
+    "min_ms": 37.984,
+    "median_ms": 40.315,
+    "mean_ms": 40.122,
+    "stdev_ms": 1.506,
+    "samples_ms": [
+      42.929,
+      39.736,
+      40.669,
+      40.535,
+      40.515,
+      40.478,
+      40.315,
+      40.983,
+      43.463,
+      39.142,
+      39.303,
+      38.588,
+      37.984,
+      38.369,
+      38.824
+    ]
+  },
+  "paired_diffs_ms": [
+    393.037,
+    367.602,
+    355.142,
+    369.578,
+    372.924,
+    361.394,
+    384.345,
+    390.554,
+    356.467,
+    354.106,
+    355.736,
+    367.097,
+    377.359,
+    356.497,
+    364.578
+  ],
+  "median_ratio_b_over_a": 0.09938,
+  "min_ratio_b_over_a": 0.09659,
+  "sign_test_p": 0.0003,
+  "median_and_min_agree": true,
+  "significant": true,
+  "verdict": "scalar-no-idiom SLOWER by 90.06% (median)"
+}

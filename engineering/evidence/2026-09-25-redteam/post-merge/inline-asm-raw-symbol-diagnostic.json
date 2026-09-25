@@ -1,0 +1,64 @@
+{
+  "source": "engineering/evidence/2026-09-25-redteam/post-merge/repro/inline_asm_hardcoded_symbol.c",
+  "note": "Asm template hard-codes a static C symbol without a declared input operand or __attribute__((used)). This was not patched: GCC and Clang also link-fail at -O2; do not claim a supported GNU-C contract.",
+  "results": [
+    {
+      "compiler": "lccc-pre617",
+      "opt": "-O0",
+      "compile_rc": 0,
+      "stderr_excerpt": "",
+      "run_rc": 0,
+      "stdout": "123"
+    },
+    {
+      "compiler": "lccc-current",
+      "opt": "-O0",
+      "compile_rc": 0,
+      "stderr_excerpt": "",
+      "run_rc": 0,
+      "stdout": "123"
+    },
+    {
+      "compiler": "gcc",
+      "opt": "-O0",
+      "compile_rc": 0,
+      "stderr_excerpt": "",
+      "run_rc": 0,
+      "stdout": "123"
+    },
+    {
+      "compiler": "clang-19",
+      "opt": "-O0",
+      "compile_rc": 0,
+      "stderr_excerpt": "",
+      "run_rc": 0,
+      "stdout": "123"
+    },
+    {
+      "compiler": "lccc-pre617",
+      "opt": "-O2",
+      "compile_rc": 0,
+      "stderr_excerpt": "",
+      "run_rc": 0,
+      "stdout": "123"
+    },
+    {
+      "compiler": "lccc-current",
+      "opt": "-O2",
+      "compile_rc": 1,
+      "stderr_excerpt": "ccc: error: undefined symbols:\n  undefined reference to `hidden'\n    referenced from /tmp/ccc_137854_inline_asm_hardcoded_symbol.0.o (in function `main')\n"
+    },
+    {
+      "compiler": "gcc",
+      "opt": "-O2",
+      "compile_rc": 1,
+      "stderr_excerpt": "/usr/bin/ld: /tmp/cchfdTye.o: warning: relocation against `hidden' in read-only section `.text.startup'\n/usr/bin/ld: /tmp/cchfdTye.o: in function `main':\ninline_asm_hardcoded_symbol.c:(.text.startup+0x6): undefined reference to `hidden'\n/usr/bin/ld: warning: creating DT_TEXTREL in a PIE\ncollect2: error: ld returned 1 exit status\n"
+    },
+    {
+      "compiler": "clang-19",
+      "opt": "-O2",
+      "compile_rc": 1,
+      "stderr_excerpt": "/usr/bin/ld: /tmp/inline_asm_hardcoded_symbol-f3d079.o: warning: relocation against `hidden' in read-only section `.text'\n/usr/bin/ld: /tmp/inline_asm_hardcoded_symbol-f3d079.o: in function `main':\ninline_asm_hardcoded_symbol.c:(.text+0x13): undefined reference to `hidden'\n/usr/bin/ld: warning: creating DT_TEXTREL in a PIE\nclang-19: error: linker command failed with exit code 1 (use -v to see invocation)\n"
+    }
+  ]
+}

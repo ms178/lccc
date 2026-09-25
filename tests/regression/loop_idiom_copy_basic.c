@@ -1,4 +1,5 @@
-// Loop-idiom recognition: byte-copy loops become `memcpy` (CCC_LOOP_IDIOM=1).
+// Loop-idiom recognition: static disjoint copies may use memcpy; uncertain
+// names/pointers may use a guarded memmove path with scalar fallback.
 // Differential test: every checksum must match GCC bit-for-bit.
 #include <stdio.h>
 

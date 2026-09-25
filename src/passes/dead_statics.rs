@@ -1545,6 +1545,22 @@ mod tests {
     }
 
     #[test]
+    fn weak_and_strong_aliases_keep_stores_and_static_targets() {
+        for is_weak in [false, true] {
+            let mut m = IrModule::new();
+            m.globals.push(gs_global("out"));
+            // There is no in-TU reader: external readers access the alias.
+            m.aliases.push(("published".into(), "out".into(), is_weak));
+            m.functions
+                .push(gs_writer("w", vec![], Terminator::Return(None), 2));
+            eliminate_dead_global_stores(&mut m);
+            assert_eq!(store_count(&m), 1, "alias store lost (weak={is_weak})");
+            eliminate_dead_static_functions(&mut m);
+            assert_eq!(m.globals.len(), 1, "alias target lost (weak={is_weak})");
+        }
+    }
+
+    #[test]
     fn inline_asm_template_bails() {
         let mut m = IrModule::new();
         m.globals.push(gs_global("g"));
