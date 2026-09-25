@@ -1234,8 +1234,15 @@ impl Lowerer {
     /// and GCC/Clang/ICX keep such selects 32-bit. Keeping the exact scalar
     /// type for register-int widths mirrors the i686 path (where `int` already
     /// maps to the 4-byte target int), so LP64 `int` selects stay I32.
-    /// Unchanged: >8-byte aggregates (I128/F128/vectors), floats (carried by
-    /// bit pattern), and sub-int types (I8/I16 keep their historical widening).
+    /// Binary32/64 floats likewise keep their exact type: an I64-typed select
+    /// over F64 arms is GPR-homed by RA, starving the S05 FP-select blend
+    /// (which needs an XMM dest or XMM false arm) and degrading to GPR cmov
+    /// + movq round-trips on FP data. Exact float slots keep FP merges in
+    /// XMM end to end; bitwise-identical (blends/cmovs select bit patterns,
+    /// never arithmetic values, so NaN payloads survive).
+    /// Unchanged: >8-byte aggregates (I128/F128/vectors), sub-int types
+    /// (I8/I16 keep their historical widening), and pointers (GPR either
+    /// way; no blend applies).
     fn ternary_merge_slot(result_ty: IrType) -> (IrType, usize) {
         let int_ty = crate::common::types::target_int_ir_type();
         let int_size = int_ty.size();
@@ -1248,8 +1255,14 @@ impl Lowerer {
             // the I32 case (I64 already equals int_ty); on i686 both coincide
             // with prior behavior.
             (result_ty, result_ty.size())
+        } else if matches!(result_ty, IrType::F32 | IrType::F64) {
+            // Binary32/64 floats: exact type (see doc comment: keeps FP
+            // merges XMM-homed so S05 blending can fire). Deliberately not
+            // `is_float()`: F128 keeps the wide-aggregate arm above and
+            // decimals keep the historical slot below (both untouched).
+            (result_ty, result_ty.size())
         } else {
-            // Floats, sub-int types, pointers: historical target-int slot.
+            // Sub-int types, pointers: historical target-int slot.
             (int_ty, result_ty.size().max(int_size))
         }
     }

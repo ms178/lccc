@@ -1052,11 +1052,17 @@ pub(super) fn reassociate_fma_accumulator(store: &mut LineStore, infos: &mut [Li
 /// Bases of the VEX arithmetic and logical instructions that write their
 /// destination from their sources alone, in `ss`/`sd`/`ps`/`pd` flavours.
 /// An explicit list: the FMA families read their destination as a role, the
-/// EVEX `vfixupimm*` merges a table into it, and the moves, converts, blends
-/// and inserts each have their own upper-lane story.  None of those is here.
+/// EVEX `vfixupimm*` merges a table into it, and the moves, converts and
+/// inserts each have their own upper-lane story.  None of those is here.
+/// The variable blends (`blendv`) ARE here: a blend reads its mask and both
+/// sources, then writes its destination — a plain output exactly like the
+/// logical ops (`and`/`or`/`xor` differ from a blend only in having no mask
+/// operand).  The blend's low element comes from its sources' low elements
+/// alone, so retargeting the destination changes it in no way; the upper
+/// lane is guarded by the same wide-reader check as every other base here.
 const VEX_PLAIN_OUTPUT_BASES: &[&str] = &[
     "add", "sub", "mul", "div", "min", "max", "sqrt", "rsqrt", "rcp", "round", "xor", "and",
-    "andn", "or",
+    "andn", "or", "blendv",
 ];
 
 /// `Some(true)` when `mn` is a VEX (`v`-prefixed) instruction from
@@ -1108,6 +1114,13 @@ fn vex_plain_output(mn: &str) -> bool {
 ///   `D` wider than that element.  This is the whole upper-bit argument and
 ///   it does not depend on which source the producer merged from, or on
 ///   whether `D` was itself a source.
+/// * Four-operand variable blends (`vblendvps`/`vblendvpd`) retarget like the
+///   three-operand logical ops: the mask is a fourth source read, the dest a
+///   plain output, and the blend's low element comes from its sources' low
+///   elements alone.  VEX reads every source before writing, so the rewrite
+///   is sound even when `D` is itself the mask — the S05 FP-select-into-
+///   return shape, where the mask was just computed into the return
+///   register and the blend result is only copied back out to it.
 /// * The producer's old destination `T` is dead after the copy-out, asked of
 ///   [`FpLiveness`]: the rewrite stops writing it.
 /// * The two lines are adjacent up to nops, in one basic block, neither is
@@ -1129,8 +1142,15 @@ pub(super) fn retarget_vex_result(store: &mut LineStore, infos: &mut [LineInfo])
             continue;
         }
         let ops: Vec<&str> = operand_list(operands).iter().map(|o| o.trim()).collect();
-        // Three operands, or four with a leading immediate (`vroundsd`).
-        let arity_ok = ops.len() == 3 || (ops.len() == 4 && ops[0].starts_with('$'));
+        // Three operands, four with a leading immediate (`vroundsd`), or the
+        // four-operand variable blend (`vblendvps`/`vblendvpd`: mask + two
+        // sources + dest — the mask is a fourth source read, the dest a
+        // plain output; VEX reads every source before writing, so retargeting
+        // the dest is sound even when `D` is itself the mask).
+        let is_var_blend = matches!(mn, "vblendvps" | "vblendvpd");
+        let arity_ok = ops.len() == 3
+            || (ops.len() == 4 && ops[0].starts_with('$'))
+            || (is_var_blend && ops.len() == 4);
         if !arity_ok {
             j += 1;
             continue;
@@ -2269,6 +2289,21 @@ mod tests {
             "    vaddsd %xmm1, %xmm2, %xmm3\n    call f\n    movsd %xmm3, %xmm0\n    ret\n",
         );
         assert_eq!(got.len(), 4, "{got:?}");
+        // A blend is still refused when `D` is read wide later: the copy-out
+        // preserved D's upper lane, the retargeted blend would overwrite it.
+        let got = retarget_only(
+            "    vblendvpd %xmm1, %xmm2, %xmm3, %xmm4\n    movsd %xmm4, %xmm0\n    vaddpd %xmm0, %xmm2, %xmm2\n    ret\n",
+        );
+        assert_eq!(
+            got.len(),
+            4,
+            "a wide reader of %xmm0 keeps the copy-out: {got:?}"
+        );
+        // A blend whose destination is still read afterwards.
+        let got = retarget_only(
+            "    vblendvpd %xmm1, %xmm2, %xmm3, %xmm4\n    movsd %xmm4, %xmm0\n    vaddsd %xmm4, %xmm0, %xmm0\n    ret\n",
+        );
+        assert_eq!(got.len(), 4, "%xmm4 is live: {got:?}");
         // Masked EVEX and %ymm spellings are out of scope.
         let got =
             retarget_only("    vaddsd %xmm1, %xmm2, %xmm3{%k1}\n    movsd %xmm3, %xmm0\n    ret\n");

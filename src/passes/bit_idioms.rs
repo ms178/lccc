@@ -4,9 +4,9 @@
 //! shifts and masks.  Recognizing the complete data-flow graph here lets every
 //! backend select its native instruction without making codegen source-specific.
 
-use crate::common::types::IrType;
+use crate::common::types::{AddressSpace, IrType};
 use crate::ir::reexports::{
-    Instruction, IrBinOp, IrCmpOp, IrConst, IrFunction, IrUnaryOp, Operand,
+    Instruction, IntrinsicOp, IrBinOp, IrCmpOp, IrConst, IrFunction, IrUnaryOp, Operand,
 };
 
 fn const_u64(op: Operand) -> Option<u64> {
@@ -1409,6 +1409,531 @@ fn fits_low_bits(op: Operand, bits: u32, defs: &[Option<Instruction>]) -> bool {
     }
 }
 
+/// Union-punned copysign through memory: `r = mag(a)|sign(b)` spelled with
+/// two address-taken unions, integer and/or, and a reloaded result.
+///
+/// C source shape (musl `copysign`, glibc `s_copysign`, the corpus `copysign`
+/// TU — and any hand-rolled float-bits tweak through a union):
+/// ```c
+/// union d { double f; uint64_t u; } a = {x}, b = {y};
+/// a.u = (a.u & 0x7FFF...) | (b.u & 0x8000...);
+/// return a.f;
+/// ```
+/// In IR (all in one block): two `F64` init stores into distinct allocas, two
+/// `U64`/`I64` loads, two `And`s with the exact `ABS`/`SIGN` masks, one `Or`,
+/// a result store of the or into the magnitude slot, and a final `F64` reload
+/// that flows to the return.  GVN's store forwarding is exact-type-only, so
+/// the float/int type pun survives into the backend, which forwards the slots
+/// into GPRs and emits scalar bit ops plus `movq` bitcasts (9 insns) where
+/// every oracle emits three vector mask ops (4 insns with `ret`).
+///
+/// The rewrite replaces the final reload with
+/// `Intrinsic(CopysignF64, mag_init, sign_init)` and each of the three stores
+/// with a dead `Copy` of its stored value; DCE's mark-and-sweep retires the
+/// orphaned or/ands/loads/copies transitively in its next run.  No new IR
+/// value-numbering facility is needed because every proof below is a complete
+/// local enumeration — anything unexpected bails (fail-closed):
+///
+/// * **Slot identity.** Both slots are `Alloca` dests (distinct allocas are
+///   disjoint objects), non-volatile throughout, default address space.
+/// * **Complete use enumeration.** The magnitude slot is used by EXACTLY four
+///   instructions (init store, int load, result store, float reload) and the
+///   sign slot by EXACTLY two (init store, int load) — operand, address, and
+///   terminator uses all counted, in every block.  No fifth use means no GEP
+///   of either alloca, no escape (call argument, stored pointer, asm use), no
+///   cross-block reader: every access to both objects is one of the matched
+///   ones, in this block, in this order.
+/// * **Single-use chain.** The or, both ands, both int loads, and every
+///   peeled int cast/copy between them have exactly one use — the pattern
+///   use — so nothing outside the pattern anchors the chain and DCE removes
+///   it whole.  (A shared subexpression would stay live next to the new
+///   intrinsic: a regression, hence the bail.)
+/// * **Mask pairing.** The and fed by the magnitude slot's load carries the
+///   `ABS` mask and the and fed by the sign slot's load the `SIGN` mask —
+///   matched by exact `u64` bits, either or-order.  The pairing is what makes
+///   the pattern a copysign; swapped masks are some other computation.
+/// * **Clean window.** Every non-pattern instruction between the first init
+///   store and the reload is side-effect-free (DCE's own predicate) and any
+///   load/store there resolves through copies/casts to a KNOWN alloca that is
+///   neither slot (disjoint object).  Calls — even pure ones, which read
+///   memory — asm, fences, atomics, and unknown-base memory ops all bail, so
+///   no access can observe the deleted stores' values or clobber the slots
+///   mid-pattern.
+/// * **Availability.** Both init values dominate the reload (same block, SSA),
+///   so they are valid intrinsic operands there; the float/int widths match
+///   (`F64` with `U64`/`I64`, `F32` with `U32`/`I32`).
+///
+/// Replacing a store with a dead copy is sound exactly because the enumeration
+/// proves no remaining load observes it: the reload is rewritten to the
+/// intrinsic (same value: `mag|sign` of the inits, bitwise) and no other load
+/// of either slot exists.  Replacements are index-preserving (never
+/// insert/delete), so multiple matches per block stay valid, and consumer
+/// positions never move.  Idempotent: after firing, the reload is gone.
+fn recognize_copysign_mem(func: &mut IrFunction) -> usize {
+    use crate::ir::reexports::Value;
+    // Trigger scan needs defs + use locations; built locally (mirror the main
+    // scan's counting so operand, address, and terminator uses all count).
+    // Terminator uses record `usize::MAX` so they can never match a role.
+    let nvals = func.max_value_id() as usize + 1;
+    let mut defs: Vec<Option<Instruction>> = vec![None; nvals];
+    let mut use_locs: Vec<Vec<(usize, usize)>> = vec![Vec::new(); nvals];
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            if let Some(dest) = inst.dest() {
+                defs[dest.0 as usize] = Some(inst.clone());
+            }
+            crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    use_locs[v.0 as usize].push((bi, ii));
+                }
+            });
+            crate::backend::liveness::for_each_value_use_in_instruction(inst, |v| {
+                use_locs[v.0 as usize].push((bi, ii));
+            });
+        }
+        crate::backend::liveness::for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                use_locs[v.0 as usize].push((bi, usize::MAX));
+            }
+        });
+    }
+
+    struct Match {
+        bi: usize,
+        load_ii: usize,
+        result_store_ii: usize,
+        init1_ii: usize,
+        init2_ii: usize,
+        dest: Value,
+        mag_init: Operand,
+        sign_init: Operand,
+        op: IntrinsicOp,
+    }
+    let mut matches: Vec<Match> = Vec::new();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            let Instruction::Load {
+                dest,
+                ptr,
+                ty,
+                seg_override,
+                volatile,
+            } = inst
+            else {
+                continue;
+            };
+            if *volatile || *seg_override != AddressSpace::Default {
+                continue;
+            }
+            // Float width selects the integer carrier + masks + intrinsic.
+            let (ity_ok, abs_mask, sign_mask, op): (fn(IrType) -> bool, u64, u64, IntrinsicOp) =
+                match ty {
+                    IrType::F64 => (
+                        (|t| matches!(t, IrType::U64 | IrType::I64)) as fn(IrType) -> bool,
+                        0x7FFF_FFFF_FFFF_FFFF,
+                        0x8000_0000_0000_0000,
+                        IntrinsicOp::CopysignF64,
+                    ),
+                    IrType::F32 => (
+                        (|t| matches!(t, IrType::U32 | IrType::I32)) as fn(IrType) -> bool,
+                        0x7FFF_FFFF,
+                        0x8000_0000,
+                        IntrinsicOp::CopysignF32,
+                    ),
+                    _ => continue,
+                };
+            let r = *dest;
+            let p1 = *ptr;
+            // Magnitude slot: an Alloca used by exactly the four pattern
+            // accesses.  Set equality (sorted) pins the roles by program
+            // order: init store < int load < result store < this reload.
+            let alloca_ok = |p: Value| -> bool {
+                matches!(
+                    defs.get(p.0 as usize).and_then(Option::as_ref),
+                    Some(Instruction::Alloca {
+                        volatile: false,
+                        semantic_volatile: false,
+                        ..
+                    })
+                )
+            };
+            if !alloca_ok(p1) {
+                continue;
+            }
+            let mut locs1 = use_locs[p1.0 as usize].clone();
+            if locs1.len() != 4 {
+                continue;
+            }
+            locs1.sort();
+            if locs1[3] != (bi, ii) || locs1.iter().any(|(b, _)| *b != bi) {
+                continue;
+            }
+            let init1_ii = locs1[0].1;
+            let t1_ii = locs1[1].1;
+            let rs_ii = locs1[2].1;
+            // Init store: float-typed value into the magnitude slot.
+            let mag_init = match &block.instructions[init1_ii] {
+                Instruction::Store {
+                    val,
+                    ptr,
+                    ty: sty,
+                    seg_override,
+                    volatile,
+                } if *ptr == p1
+                    && *sty == *ty
+                    && *seg_override == AddressSpace::Default
+                    && !volatile =>
+                {
+                    *val
+                }
+                _ => continue,
+            };
+            // Magnitude int load: same-width integer carrier, single use.
+            let t1 = match &block.instructions[t1_ii] {
+                Instruction::Load {
+                    dest,
+                    ptr,
+                    ty: lty,
+                    seg_override,
+                    volatile,
+                } if *ptr == p1
+                    && ity_ok(*lty)
+                    && *seg_override == AddressSpace::Default
+                    && !volatile
+                    && use_locs[dest.0 as usize].len() == 1 =>
+                {
+                    (*dest, *lty)
+                }
+                _ => continue,
+            };
+            // Result store: the or of the masked halves into the slot.
+            let o = match &block.instructions[rs_ii] {
+                Instruction::Store {
+                    val: Operand::Value(v),
+                    ptr,
+                    ty: sty,
+                    seg_override,
+                    volatile,
+                } if *ptr == p1
+                    && *sty == t1.1
+                    && *seg_override == AddressSpace::Default
+                    && !volatile
+                    && use_locs[v.0 as usize].len() == 1 =>
+                {
+                    *v
+                }
+                _ => continue,
+            };
+            // The or: exact carrier type, arms peeled through int-only
+            // casts/copies (every peeled step single-use).
+            let (a1, a2) = match defs[o.0 as usize].as_ref() {
+                Some(Instruction::BinOp {
+                    op: IrBinOp::Or,
+                    lhs,
+                    rhs,
+                    ty: oty,
+                    ..
+                }) if *oty == t1.1 => (*lhs, *rhs),
+                _ => continue,
+            };
+            // Tracked peel: like `peel` but records every intermediate
+            // value for the single-use proof.
+            let peel_tracked = |mut op: Operand| -> (Operand, Vec<Value>) {
+                let mut chain = Vec::new();
+                for _ in 0..32 {
+                    let Operand::Value(v) = op else { break };
+                    match defs.get(v.0 as usize).and_then(Option::as_ref) {
+                        Some(Instruction::Cast {
+                            src,
+                            from_ty,
+                            to_ty,
+                            ..
+                        }) if from_ty.is_integer() && to_ty.is_integer() => {
+                            chain.push(v);
+                            op = *src;
+                        }
+                        Some(Instruction::Copy { src, .. }) => {
+                            chain.push(v);
+                            op = *src;
+                        }
+                        _ => break,
+                    }
+                }
+                (op, chain)
+            };
+            let (pa1, c1) = peel_tracked(a1);
+            let (pa2, c2) = peel_tracked(a2);
+            if c1
+                .iter()
+                .chain(c2.iter())
+                .any(|v| use_locs[v.0 as usize].len() != 1)
+            {
+                continue;
+            }
+            // Each peeled arm: `And(int_load, exact_mask)`, single-use, with
+            // the (slot, mask) pairing that defines a copysign.
+            let mut mag_and: Option<Value> = None;
+            let mut sign_load: Option<(Value, Value)> = None;
+            for pa in [pa1, pa2] {
+                let Operand::Value(av) = pa else { continue };
+                if use_locs[av.0 as usize].len() != 1 {
+                    continue;
+                }
+                let Some(Instruction::BinOp {
+                    op: IrBinOp::And,
+                    lhs,
+                    rhs,
+                    ty: aty,
+                    ..
+                }) = defs[av.0 as usize].as_ref()
+                else {
+                    continue;
+                };
+                if *aty != t1.1 {
+                    continue;
+                }
+                // One side a single-use int load, the other the exact mask.
+                for (maybe_load, maybe_mask) in [(lhs, rhs), (rhs, lhs)] {
+                    let Operand::Value(lv) = maybe_load else {
+                        continue;
+                    };
+                    if use_locs[lv.0 as usize].len() != 1 {
+                        continue;
+                    }
+                    let Some(Instruction::Load {
+                        dest,
+                        ptr,
+                        ty: lty,
+                        seg_override,
+                        volatile,
+                    }) = defs[lv.0 as usize].as_ref()
+                    else {
+                        continue;
+                    };
+                    if *dest != *lv
+                        || *lty != t1.1
+                        || *seg_override != AddressSpace::Default
+                        || *volatile
+                    {
+                        continue;
+                    }
+                    let Some(bits) = const_u64(*maybe_mask) else {
+                        continue;
+                    };
+                    if *ptr == p1 && bits == abs_mask && *lv == t1.0 {
+                        mag_and = Some(av);
+                    } else if *ptr != p1 && bits == sign_mask {
+                        sign_load = Some((*lv, *ptr));
+                    }
+                }
+            }
+            let (Some(_), Some((t2, p2))) = (mag_and, sign_load) else {
+                continue;
+            };
+            // Sign slot: a second alloca used by exactly its init store +
+            // int load (sorted order pins the roles, as above).
+            if !alloca_ok(p2) {
+                continue;
+            }
+            let mut locs2 = use_locs[p2.0 as usize].clone();
+            if locs2.len() != 2 {
+                continue;
+            }
+            locs2.sort();
+            if locs2[0].0 != bi || locs2[1].0 != bi {
+                continue;
+            }
+            let init2_ii = locs2[0].1;
+            let t2_ii = locs2[1].1;
+            // The enumerated second use must BE t2's definition (a load
+            // of the sign slot); the first the float init store.
+            if !matches!(
+                block.instructions.get(t2_ii),
+                Some(Instruction::Load { dest, ptr, .. }) if *dest == t2 && *ptr == p2
+            ) {
+                continue;
+            }
+            let sign_init = match &block.instructions[init2_ii] {
+                Instruction::Store {
+                    val,
+                    ptr,
+                    ty: sty,
+                    seg_override,
+                    volatile,
+                } if *ptr == p2
+                    && *sty == *ty
+                    && *seg_override == AddressSpace::Default
+                    && !volatile =>
+                {
+                    *val
+                }
+                _ => continue,
+            };
+            // Clean window: every non-pattern instruction from the first
+            // init store to the reload is side-effect-free, and any
+            // load/store there resolves to a KNOWN alloca that is neither
+            // slot.  Calls (even pure ones), asm, fences, atomics, and
+            // unknown-base memory ops all bail — see the fn docs.
+            let mut window_ok = true;
+            let first = init1_ii.min(init2_ii);
+            // Pattern index set for the window check: an in-window
+            // instruction is a pattern member iff its dest (if any) is one
+            // of the chain values, or it is one of the six indexed memops.
+            let mut pattern: Vec<usize> = vec![init1_ii, t1_ii, rs_ii, ii, init2_ii, t2_ii];
+            let in_chain = |v: Value| -> bool {
+                v == o
+                    || v == t1.0
+                    || v == t2
+                    || Some(v) == mag_and
+                    || pa1 == Operand::Value(v)
+                    || pa2 == Operand::Value(v)
+                    || c1.contains(&v)
+                    || c2.contains(&v)
+            };
+            // Alloca-base walker for the window memory check: through
+            // copies and int casts to a known Alloca, else unknown.
+            let base_alloca = |mut op: Operand| -> Option<Value> {
+                for _ in 0..32 {
+                    let Operand::Value(v) = op else { return None };
+                    match defs.get(v.0 as usize).and_then(Option::as_ref) {
+                        Some(Instruction::Alloca { .. }) => return Some(v),
+                        Some(Instruction::Copy { src, .. }) => op = *src,
+                        Some(Instruction::Cast {
+                            src,
+                            from_ty,
+                            to_ty,
+                            ..
+                        }) if from_ty.is_integer() && to_ty.is_integer() => op = *src,
+                        _ => return None,
+                    }
+                }
+                None
+            };
+            for (wi, winst) in block.instructions.iter().enumerate() {
+                if wi < first || wi > ii {
+                    continue;
+                }
+                if pattern.contains(&wi) {
+                    continue;
+                }
+                if let Some(d) = winst.dest() {
+                    if in_chain(d) {
+                        if !pattern.contains(&wi) {
+                            pattern.push(wi);
+                        }
+                        continue;
+                    }
+                }
+                // Non-pattern memory ops: non-volatile, and through a
+                // KNOWN alloca that is neither slot (a disjoint object —
+                // window-safe regardless of DCE's deletability verdict,
+                // which answers a different question and always fires on
+                // stores).  Volatile or unknown-base memops bail.
+                match winst {
+                    Instruction::Load { ptr, volatile, .. }
+                    | Instruction::Store { ptr, volatile, .. } => {
+                        if *volatile {
+                            window_ok = false;
+                            break;
+                        }
+                        match base_alloca(Operand::Value(*ptr)) {
+                            Some(b) if b != p1 && b != p2 => {}
+                            _ => {
+                                window_ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    Instruction::Call { .. } | Instruction::CallIndirect { .. } => {
+                        window_ok = false;
+                        break;
+                    }
+                    _ => {
+                        if crate::passes::dce::has_side_effects(winst) {
+                            window_ok = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !window_ok {
+                continue;
+            }
+            matches.push(Match {
+                bi,
+                load_ii: ii,
+                result_store_ii: rs_ii,
+                init1_ii,
+                init2_ii,
+                dest: r,
+                mag_init,
+                sign_init,
+                op,
+            });
+        }
+    }
+
+    // Apply: index-preserving replacements only (never insert/delete), so
+    // multiple matches per block/function stay valid.  Dead stores become
+    // dead copies of their stored value (DCE retires them with the orphaned
+    // chain); the reload becomes the copysign intrinsic.
+    let mut next_fresh = func.max_value_id().saturating_add(1);
+    let mut changes = 0;
+    for m in &matches {
+        let block = &mut func.blocks[m.bi];
+        // Defense in depth: re-verify the three stores (indices were
+        // validated at match time; replacements are index-preserving so
+        // earlier matches cannot disturb them — skip rather than rewrite
+        // anything unexpected).
+        let mut stored_val = |idx: usize| -> Option<Operand> {
+            match block.instructions.get(idx) {
+                Some(Instruction::Store { val, .. }) => Some(*val),
+                _ => None,
+            }
+        };
+        let (Some(s_rs), Some(s_i1), Some(s_i2)) = (
+            stored_val(m.result_store_ii),
+            stored_val(m.init1_ii),
+            stored_val(m.init2_ii),
+        ) else {
+            continue;
+        };
+        if !matches!(
+            block.instructions.get(m.load_ii),
+            Some(Instruction::Load { dest, .. }) if *dest == m.dest
+        ) {
+            continue;
+        }
+        block.instructions[m.load_ii] = Instruction::Intrinsic {
+            dest: Some(m.dest),
+            op: m.op,
+            dest_ptr: None,
+            args: vec![m.mag_init, m.sign_init],
+        };
+        for (idx, src) in [
+            (m.result_store_ii, s_rs),
+            (m.init1_ii, s_i1),
+            (m.init2_ii, s_i2),
+        ] {
+            block.instructions[idx] = Instruction::Copy {
+                dest: Value(next_fresh),
+                src,
+            };
+            next_fresh = next_fresh.saturating_add(1);
+        }
+        changes += 4;
+    }
+    if next_fresh > func.next_value_id {
+        func.next_value_id = next_fresh;
+    }
+    // No map refresh needed: these maps are local to this pre-pass (the
+    // main scan rebuilds its own afterward), and within this pre-pass each
+    // reload yields at most one match — applied matches are disjoint by
+    // construction (every chain value is single-use, every slot use
+    // enumerated), and replacements preserve indices and use counts.
+    changes
+}
+
 pub(crate) fn recognize_function(
     func: &mut IrFunction,
     enable_bit_reverse: bool,
@@ -1445,7 +1970,9 @@ pub(crate) fn recognize_function(
         });
     }
 
-    let mut changes = 0;
+    // Union-punned copysign first: it mints fresh IDs (written back to
+    // `func.next_value_id`) before the main scan seeds its own counter.
+    let mut changes = recognize_copysign_mem(func);
     let mut next_value_id = func.max_value_id().saturating_add(1);
     // Boolean mux/majority algebra kill switch (same authority contract as
     // the vectorizer's CCC_NO_* gates; A/B for the differential batteries).
@@ -1958,6 +2485,7 @@ pub(crate) fn recognize_function(
 mod tests {
     use super::*;
     use crate::ir::reexports::Value;
+    use crate::ir::reexports::{BasicBlock, BlockId, CallInfo, Terminator};
 
     fn swar_defs(second_mask: i64) -> Vec<Option<Instruction>> {
         let value = |id| Operand::Value(Value(id));
@@ -3780,5 +4308,262 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    fn cs_mk(id: u32, insts: Vec<Instruction>, term: Terminator) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(id),
+            instructions: insts,
+            terminator: term,
+            source_spans: Vec::new(),
+        }
+    }
+
+    fn cs_alloca(d: u32, ty: IrType) -> Instruction {
+        Instruction::Alloca {
+            dest: Value(d),
+            ty,
+            size: 8,
+            align: 8,
+            volatile: false,
+            semantic_volatile: false,
+        }
+    }
+
+    fn cs_store(val: Operand, ptr: u32, ty: IrType) -> Instruction {
+        Instruction::Store {
+            val,
+            ptr: Value(ptr),
+            ty,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        }
+    }
+
+    fn cs_load(d: u32, ptr: u32, ty: IrType) -> Instruction {
+        Instruction::Load {
+            dest: Value(d),
+            ptr: Value(ptr),
+            ty,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        }
+    }
+
+    /// Canonical union-punned copysign: values 0,1 are the float inits;
+    /// 2,3 the slots; 4,5 the int loads; 6,7 the masked ands; 8 the or;
+    /// 9 the float reload. Indices: 0,1 allocas; 2,3 init stores; 4,5 int
+    /// loads; 6,7 ands; 8 or; 9 result store; 10 reload.
+    fn copysign_base(fty: IrType, ity: IrType, mag_mask: u64, sign_mask: u64) -> IrFunction {
+        let v0 = Operand::Value(Value(0));
+        let v1 = Operand::Value(Value(1));
+        let mag = Operand::Const(IrConst::I64(mag_mask as i64));
+        let sign = Operand::Const(IrConst::I64(sign_mask as i64));
+        let mut f = IrFunction::new("t".to_string(), fty, vec![], false);
+        f.blocks = vec![cs_mk(
+            0,
+            vec![
+                cs_alloca(2, fty),
+                cs_alloca(3, fty),
+                cs_store(v0, 2, fty),
+                cs_store(v1, 3, fty),
+                cs_load(4, 2, ity),
+                cs_load(5, 3, ity),
+                Instruction::BinOp {
+                    dest: Value(6),
+                    op: IrBinOp::And,
+                    lhs: Operand::Value(Value(4)),
+                    rhs: mag,
+                    ty: ity,
+                },
+                Instruction::BinOp {
+                    dest: Value(7),
+                    op: IrBinOp::And,
+                    lhs: Operand::Value(Value(5)),
+                    rhs: sign,
+                    ty: ity,
+                },
+                Instruction::BinOp {
+                    dest: Value(8),
+                    op: IrBinOp::Or,
+                    lhs: Operand::Value(Value(6)),
+                    rhs: Operand::Value(Value(7)),
+                    ty: ity,
+                },
+                cs_store(Operand::Value(Value(8)), 2, ity),
+                cs_load(9, 2, fty),
+            ],
+            Terminator::Return(Some(Operand::Value(Value(9)))),
+        )];
+        f.next_value_id = 10;
+        f
+    }
+
+    #[test]
+    fn copysign_mem_f64_becomes_intrinsic() {
+        let mut f = copysign_base(
+            IrType::F64,
+            IrType::U64,
+            0x7FFF_FFFF_FFFF_FFFF,
+            0x8000_0000_0000_0000,
+        );
+        assert_eq!(recognize_copysign_mem(&mut f), 4);
+        assert!(matches!(
+            f.blocks[0].instructions[10],
+            Instruction::Intrinsic {
+                dest: Some(Value(9)),
+                op: IntrinsicOp::CopysignF64,
+                dest_ptr: None,
+                ..
+            }
+        ));
+        if let Instruction::Intrinsic { args, .. } = &f.blocks[0].instructions[10] {
+            assert_eq!(
+                args,
+                &vec![Operand::Value(Value(0)), Operand::Value(Value(1))]
+            );
+        } else {
+            panic!("reload became the intrinsic");
+        }
+        for idx in [9, 2, 3] {
+            assert!(
+                matches!(f.blocks[0].instructions[idx], Instruction::Copy { .. }),
+                "store {idx} became a dead copy"
+            );
+        }
+        assert_eq!(recognize_copysign_mem(&mut f), 0, "idempotent");
+    }
+
+    #[test]
+    fn copysign_mem_f32_becomes_intrinsic() {
+        let mut f = copysign_base(IrType::F32, IrType::U32, 0x7FFF_FFFF, 0x8000_0000);
+        assert_eq!(recognize_copysign_mem(&mut f), 4);
+        assert!(matches!(
+            f.blocks[0].instructions[10],
+            Instruction::Intrinsic {
+                op: IntrinsicOp::CopysignF32,
+                ..
+            }
+        ));
+        assert_eq!(recognize_copysign_mem(&mut f), 0, "idempotent");
+    }
+
+    #[test]
+    fn copysign_mem_either_or_order_fires() {
+        let mut f = copysign_base(
+            IrType::F64,
+            IrType::I64,
+            0x7FFF_FFFF_FFFF_FFFF,
+            0x8000_0000_0000_0000,
+        );
+        // Reversed or arms (+ signed carrier): still a copysign.
+        f.blocks[0].instructions[8] = Instruction::BinOp {
+            dest: Value(8),
+            op: IrBinOp::Or,
+            lhs: Operand::Value(Value(7)),
+            rhs: Operand::Value(Value(6)),
+            ty: IrType::I64,
+        };
+        assert_eq!(recognize_copysign_mem(&mut f), 4);
+    }
+
+    #[test]
+    fn copysign_mem_swapped_masks_rejected() {
+        let mut f = copysign_base(
+            IrType::F64,
+            IrType::U64,
+            0x7FFF_FFFF_FFFF_FFFF,
+            0x8000_0000_0000_0000,
+        );
+        // SIGN on the magnitude slot, ABS on the sign slot: mag(b)|sign(a)
+        // is some other computation, not copysign(a, b).
+        f.blocks[0].instructions[6] = Instruction::BinOp {
+            dest: Value(6),
+            op: IrBinOp::And,
+            lhs: Operand::Value(Value(4)),
+            rhs: Operand::Const(IrConst::I64(i64::MIN)),
+            ty: IrType::U64,
+        };
+        assert_eq!(recognize_copysign_mem(&mut f), 0);
+    }
+
+    #[test]
+    fn copysign_mem_extra_slot_use_rejected() {
+        let mut f = copysign_base(
+            IrType::F64,
+            IrType::U64,
+            0x7FFF_FFFF_FFFF_FFFF,
+            0x8000_0000_0000_0000,
+        );
+        // A fifth use of the magnitude slot (dead load): the enumeration
+        // is no longer complete, so the stores cannot be proven dead.
+        f.blocks[0]
+            .instructions
+            .insert(10, cs_load(10, 2, IrType::U64));
+        f.next_value_id = 11;
+        assert_eq!(recognize_copysign_mem(&mut f), 0);
+    }
+
+    #[test]
+    fn copysign_mem_pure_call_in_window_rejected() {
+        let mut f = copysign_base(
+            IrType::F64,
+            IrType::U64,
+            0x7FFF_FFFF_FFFF_FFFF,
+            0x8000_0000_0000_0000,
+        );
+        // Even a pure call reads memory: fail closed (DCE would allow it).
+        f.blocks[0].instructions.insert(
+            5,
+            Instruction::Call {
+                func: "f".to_string(),
+                info: CallInfo {
+                    is_pure: true,
+                    ..Default::default()
+                },
+            },
+        );
+        assert_eq!(recognize_copysign_mem(&mut f), 0);
+    }
+
+    #[test]
+    fn copysign_mem_volatile_init_rejected() {
+        let mut f = copysign_base(
+            IrType::F64,
+            IrType::U64,
+            0x7FFF_FFFF_FFFF_FFFF,
+            0x8000_0000_0000_0000,
+        );
+        f.blocks[0].instructions[2] = Instruction::Store {
+            val: Operand::Value(Value(0)),
+            ptr: Value(2),
+            ty: IrType::F64,
+            seg_override: AddressSpace::Default,
+            volatile: true,
+        };
+        assert_eq!(recognize_copysign_mem(&mut f), 0);
+    }
+
+    #[test]
+    fn copysign_mem_unrelated_alloca_in_window_ok() {
+        let mut f = copysign_base(
+            IrType::F64,
+            IrType::U64,
+            0x7FFF_FFFF_FFFF_FFFF,
+            0x8000_0000_0000_0000,
+        );
+        // Traffic to a disjoint object inside the window is harmless.
+        f.blocks[0]
+            .instructions
+            .insert(5, cs_load(12, 11, IrType::U64));
+        f.blocks[0].instructions.insert(
+            5,
+            cs_store(Operand::Const(IrConst::I64(0)), 11, IrType::U64),
+        );
+        f.blocks[0]
+            .instructions
+            .insert(5, cs_alloca(11, IrType::U64));
+        f.next_value_id = 13;
+        assert_eq!(recognize_copysign_mem(&mut f), 4);
     }
 }

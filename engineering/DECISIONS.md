@@ -1850,7 +1850,7 @@ geomean Ir mine/ref **0.99953**; zlib_ng_adler32 **0.98548 (−1.45%)**;
 every other program exactly 1.00000 or within ±0.002% (≤14 Ir in one-off
 setup, hot loops identical, I1/LLi/branch events identical). Heavy fire
 sites strlen_bench and binary_trees Ir 1.00000. (Tables:
-`results/callgrind-20260912-gla-default-on-o2.md`.) -O0 heavy Callgrind is
+`results/callgrind-20260912-gla-default-on-o2.md` (wiped: ephemeral worktree table, never preserved).) -O0 heavy Callgrind is
 impractical (>15.9 B Ir × ~30 instrumentation) and Debug-tier static
 deltas above cover it.
 
@@ -2022,7 +2022,7 @@ remats).
 **Runtime / performance evidence:** Callgrind -O2 31-program fast corpus
 rerun on the rebase: geomean Ir mine/ref **0.99952**, zlib_ng_adler32
 **0.98548 (−1.45 %)**, every other program 1.00000 or within ±0.002 %
-with I1/LLi/branch events unchanged (`results/callgrind-a361f26-o2.md`).
+with I1/LLi/branch events unchanged (`results/callgrind-a361f26-o2.md`, wiped: ephemeral worktree table, never preserved).
 Valgrind clean on the compiler while firing and on the resulting
 trampoline/adler binaries. Differential fuzz with the gate forced on:
 phi_cfg 1000/1000, x86-64 differential 600/600, i686 m32 1000 seeds

@@ -2640,17 +2640,6 @@ pub(crate) fn run_passes(
         }
     }
 
-    // Phase 11: Dead static function elimination.
-    // After all optimizations, remove internal-linkage (static) functions that are
-    // never referenced by any other function or global initializer. This is critical
-    // for `static inline` functions from headers: after intra-procedural optimizations
-    // eliminate dead code paths (e.g., `if (1 || expr)` removes the else branch),
-    // some static inline callees may become completely unreferenced and can be removed.
-    // Without this, the dead functions may reference undefined external symbols
-    // (e.g., kernel's `___siphash_aligned` calling `__siphash_aligned` which doesn't
-    // exist on x86 where CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS is set).
-    dead_statics::eliminate_dead_static_functions(module);
-
     // Phase 11b: Vector temp promotion. Runs on the final IR (after inlining and
     // the optimization loop) so every vector intrinsic chain is seen whole. This
     // removes the temp alloca + Memcpy that vector intrinsic lowering introduces
@@ -2688,6 +2677,39 @@ pub(crate) fn run_passes(
         const_array_promote::run(module);
         module.for_each_function(dce::eliminate_dead_code);
     }
+
+    // Phase 11a: Dead global stores. Delete stores to never-loaded static
+    // globals (TU-closed DSE: `out[i] = ...` with no reader in the TU), with
+    // a DCE chaser on touched functions; the Phase 11 pass below then removes
+    // globals left unreferenced. Pass name for CCC_DISABLE_PASSES:
+    // "globaldse".
+    //
+    // ORDER: after 11e (constarr), not before 11b. Evidence-consuming
+    // passes run before evidence-deleting ones: a dead `keep = a` escape
+    // store is constarr's proof that the address escapes, and deleting it
+    // first would let constarr promote an escaping array (the
+    // const-array-promote escape-shape gate pins the rejection). Deleting
+    // the dead escape store AFTER constarr has refused keeps both the
+    // rejection and the deletion.
+    if !pass_disabled(&disabled, "globaldse") {
+        dead_statics::eliminate_dead_global_stores(module);
+    }
+
+    // Phase 11: Dead static function elimination.
+    // After all optimizations, remove internal-linkage (static) functions that are
+    // never referenced by any other function or global initializer. This is critical
+    // for `static inline` functions from headers: after intra-procedural optimizations
+    // eliminate dead code paths (e.g., `if (1 || expr)` removes the else branch),
+    // some static inline callees may become completely unreferenced and can be removed.
+    // Without this, the dead functions may reference undefined external symbols
+    // (e.g., kernel's `___siphash_aligned` calling `__siphash_aligned` which doesn't
+    // exist on x86 where CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS is set).
+    //
+    // ORDER: runs after 11e alongside 11a (moved as a pair — 11a's deleted
+    // stores leave globals unreferenced for this pass to remove). The 11b-e
+    // passes are function-local transforms with no reachability dependence,
+    // so nothing between the old and new positions observes the move.
+    dead_statics::eliminate_dead_static_functions(module);
 
     // Phase 11f: FMA operand-negation peel. LAST IR transform: after every
     // vectorizer (their SLP matchers must not see the Signed variants) and

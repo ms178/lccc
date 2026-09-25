@@ -495,7 +495,7 @@ fn dump_dead_instructions(func: &IrFunction, live: &[u8], block_off: &[u32]) {
 /// that is why the historically missing `PgoCounterInc` never caused a
 /// deletion; it is now listed anyway so the predicate is truthful.)
 #[inline]
-fn has_side_effects(inst: &Instruction) -> bool {
+pub(crate) fn has_side_effects(inst: &Instruction) -> bool {
     // Calls first: a pure/const call is droppable when its result is unused —
     // EXCEPT for sret returns. The observable result of an sret call is the
     // memory write through the hidden sret pointer, not the (always unused)
