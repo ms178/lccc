@@ -1,6 +1,7 @@
-// Loop-idiom near misses: these loops must stay loops (CCC_LOOP_IDIOM=1)
-// yet remain correct. Differential test vs GCC; the no-rewrite decision
-// itself is pinned by tests/regression/check_loop_idiom.sh.
+// Loop-idiom near misses: same-object and multi-state loops stay scalar.
+// Parameter-rooted loops may use a guarded fast path but MUST retain the
+// original scalar copy for forward overlap. Differential test vs GCC;
+// check_loop_idiom.sh pins the compile-time decisions.
 #include <stdio.h>
 
 unsigned char G1[512], G2[512];
@@ -28,7 +29,7 @@ static void copysum(void) {
     sum = s;
 }
 
-// Parameter roots: v1 has no cross-call noalias proof, must not match.
+// Parameter roots: can match only with the forward-smear scalar fallback.
 static void copy_p2p(unsigned char *d, unsigned char *s, unsigned n) {
     for (unsigned i = 0; i < n; i++) d[i] = s[i];
 }

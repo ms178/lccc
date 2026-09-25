@@ -1,0 +1,496 @@
+{
+  "source": "engineering/evidence/2026-09-25-redteam/post-merge/repro/fp_select_copysign.c",
+  "source_sha256": "4496e309ec5a300308f1d2cde7c5a160f44e190869763c110b4169ca4bfa4809",
+  "cases": [
+    {
+      "compiler": "gcc",
+      "opt": "-O0",
+      "flags": [
+        "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "-O0",
+        "-march=x86-64-v3"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "stdout": "bc593e48d9cc3bf5",
+      "run_stderr": ""
+    },
+    {
+      "compiler": "clang19",
+      "opt": "-O0",
+      "flags": [
+        "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "-O0",
+        "-march=x86-64-v3"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "stdout": "bc593e48d9cc3bf5",
+      "run_stderr": ""
+    },
+    {
+      "compiler": "lccc",
+      "opt": "-O0",
+      "flags": [
+        "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "-O0",
+        "-march=x86-64-v3"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "stdout": "bc593e48d9cc3bf5",
+      "run_stderr": ""
+    },
+    {
+      "compiler": "lccc-pre617",
+      "opt": "-O0",
+      "flags": [
+        "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "-O0",
+        "-march=x86-64-v3"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "stdout": "bc593e48d9cc3bf5",
+      "run_stderr": ""
+    },
+    {
+      "compiler": "lccc-no-cvp",
+      "opt": "-O0",
+      "flags": [
+        "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "-O0",
+        "-march=x86-64-v3"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "stdout": "bc593e48d9cc3bf5",
+      "run_stderr": ""
+    },
+    {
+      "compiler": "lccc-no-bit_idioms",
+      "opt": "-O0",
+      "flags": [
+        "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "-O0",
+        "-march=x86-64-v3"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "stdout": "bc593e48d9cc3bf5",
+      "run_stderr": ""
+    },
+    {
+      "compiler": "lccc-no-globaldse",
+      "opt": "-O0",
+      "flags": [
+        "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "-O0",
+        "-march=x86-64-v3"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "stdout": "bc593e48d9cc3bf5",
+      "run_stderr": ""
+    },
+    {
+      "compiler": "gcc",
+      "opt": "-O1",
+      "flags": [
+        "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "-O1",
+        "-march=x86-64-v3"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "stdout": "bc593e48d9cc3bf5",
+      "run_stderr": ""
+    },
+    {
+      "compiler": "clang19",
+      "opt": "-O1",
+      "flags": [
+        "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "-O1",
+        "-march=x86-64-v3"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "stdout": "bc593e48d9cc3bf5",
+      "run_stderr": ""
+    },
+    {
+      "compiler": "lccc",
+      "opt": "-O1",
+      "flags": [
+        "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "-O1",
+        "-march=x86-64-v3"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "stdout": "bc593e48d9cc3bf5",
+      "run_stderr": ""
+    },
+    {
+      "compiler": "lccc-pre617",
+      "opt": "-O1",
+      "flags": [
+        "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "-O1",
+        "-march=x86-64-v3"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "stdout": "bc593e48d9cc3bf5",
+      "run_stderr": ""
+    },
+    {
+      "compiler": "lccc-no-cvp",
+      "opt": "-O1",
+      "flags": [
+        "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "-O1",
+        "-march=x86-64-v3"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "stdout": "bc593e48d9cc3bf5",
+      "run_stderr": ""
+    },
+    {
+      "compiler": "lccc-no-bit_idioms",
+      "opt": "-O1",
+      "flags": [
+        "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "-O1",
+        "-march=x86-64-v3"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "stdout": "bc593e48d9cc3bf5",
+      "run_stderr": ""
+    },
+    {
+      "compiler": "lccc-no-globaldse",
+      "opt": "-O1",
+      "flags": [
+        "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "-O1",
+        "-march=x86-64-v3"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "stdout": "bc593e48d9cc3bf5",
+      "run_stderr": ""
+    },
+    {
+      "compiler": "gcc",
+      "opt": "-O2",
+      "flags": [
+        "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "-O2",
+        "-march=x86-64-v3"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "stdout": "bc593e48d9cc3bf5",
+      "run_stderr": ""
+    },
+    {
+      "compiler": "clang19",
+      "opt": "-O2",
+      "flags": [
+        "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "-O2",
+        "-march=x86-64-v3"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "stdout": "bc593e48d9cc3bf5",
+      "run_stderr": ""
+    },
+    {
+      "compiler": "lccc",
+      "opt": "-O2",
+      "flags": [
+        "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "-O2",
+        "-march=x86-64-v3"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "stdout": "bc593e48d9cc3bf5",
+      "run_stderr": ""
+    },
+    {
+      "compiler": "lccc-pre617",
+      "opt": "-O2",
+      "flags": [
+        "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "-O2",
+        "-march=x86-64-v3"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "stdout": "bc593e48d9cc3bf5",
+      "run_stderr": ""
+    },
+    {
+      "compiler": "lccc-no-cvp",
+      "opt": "-O2",
+      "flags": [
+        "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "-O2",
+        "-march=x86-64-v3"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "stdout": "bc593e48d9cc3bf5",
+      "run_stderr": ""
+    },
+    {
+      "compiler": "lccc-no-bit_idioms",
+      "opt": "-O2",
+      "flags": [
+        "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "-O2",
+        "-march=x86-64-v3"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "stdout": "bc593e48d9cc3bf5",
+      "run_stderr": ""
+    },
+    {
+      "compiler": "lccc-no-globaldse",
+      "opt": "-O2",
+      "flags": [
+        "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "-O2",
+        "-march=x86-64-v3"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "stdout": "bc593e48d9cc3bf5",
+      "run_stderr": ""
+    },
+    {
+      "compiler": "gcc",
+      "opt": "-O3",
+      "flags": [
+        "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "-O3",
+        "-march=x86-64-v3"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "stdout": "bc593e48d9cc3bf5",
+      "run_stderr": ""
+    },
+    {
+      "compiler": "clang19",
+      "opt": "-O3",
+      "flags": [
+        "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "-O3",
+        "-march=x86-64-v3"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "stdout": "bc593e48d9cc3bf5",
+      "run_stderr": ""
+    },
+    {
+      "compiler": "lccc",
+      "opt": "-O3",
+      "flags": [
+        "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "-O3",
+        "-march=x86-64-v3"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "stdout": "bc593e48d9cc3bf5",
+      "run_stderr": ""
+    },
+    {
+      "compiler": "lccc-pre617",
+      "opt": "-O3",
+      "flags": [
+        "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "-O3",
+        "-march=x86-64-v3"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "stdout": "bc593e48d9cc3bf5",
+      "run_stderr": ""
+    },
+    {
+      "compiler": "lccc-no-cvp",
+      "opt": "-O3",
+      "flags": [
+        "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "-O3",
+        "-march=x86-64-v3"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "stdout": "bc593e48d9cc3bf5",
+      "run_stderr": ""
+    },
+    {
+      "compiler": "lccc-no-bit_idioms",
+      "opt": "-O3",
+      "flags": [
+        "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "-O3",
+        "-march=x86-64-v3"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "stdout": "bc593e48d9cc3bf5",
+      "run_stderr": ""
+    },
+    {
+      "compiler": "lccc-no-globaldse",
+      "opt": "-O3",
+      "flags": [
+        "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "-O3",
+        "-march=x86-64-v3"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "stdout": "bc593e48d9cc3bf5",
+      "run_stderr": ""
+    },
+    {
+      "compiler": "gcc",
+      "opt": "-Os",
+      "flags": [
+        "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "-Os",
+        "-march=x86-64-v3"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "stdout": "bc593e48d9cc3bf5",
+      "run_stderr": ""
+    },
+    {
+      "compiler": "clang19",
+      "opt": "-Os",
+      "flags": [
+        "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "-Os",
+        "-march=x86-64-v3"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "stdout": "bc593e48d9cc3bf5",
+      "run_stderr": ""
+    },
+    {
+      "compiler": "lccc",
+      "opt": "-Os",
+      "flags": [
+        "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "-Os",
+        "-march=x86-64-v3"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "stdout": "bc593e48d9cc3bf5",
+      "run_stderr": ""
+    },
+    {
+      "compiler": "lccc-pre617",
+      "opt": "-Os",
+      "flags": [
+        "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "-Os",
+        "-march=x86-64-v3"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "stdout": "bc593e48d9cc3bf5",
+      "run_stderr": ""
+    },
+    {
+      "compiler": "lccc-no-cvp",
+      "opt": "-Os",
+      "flags": [
+        "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "-Os",
+        "-march=x86-64-v3"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "stdout": "bc593e48d9cc3bf5",
+      "run_stderr": ""
+    },
+    {
+      "compiler": "lccc-no-bit_idioms",
+      "opt": "-Os",
+      "flags": [
+        "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "-Os",
+        "-march=x86-64-v3"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "stdout": "bc593e48d9cc3bf5",
+      "run_stderr": ""
+    },
+    {
+      "compiler": "lccc-no-globaldse",
+      "opt": "-Os",
+      "flags": [
+        "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "-Os",
+        "-march=x86-64-v3"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "stdout": "bc593e48d9cc3bf5",
+      "run_stderr": ""
+    }
+  ]
+}

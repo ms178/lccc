@@ -1561,14 +1561,44 @@ pub(crate) fn run_passes(
         // before vectorize. Byte-copy loops become one `memcpy` libcall
         // instead of versioned-vectorize + runtime check + scalar
         // remainder; everything unmatched still flows to the vectorizer.
-        // All targets (a plain call lowers everywhere), -O2+ including
-        // -Os/-Oz (a call is smaller than a loop). Bring-up is opt-in
-        // (`CCC_LOOP_IDIOM=1`); kill-switch `CCC_NO_LOOP_IDIOM`.
+        // All targets, -O2+ including -Os/-Oz. Default-on; the original
+        // loop remains as the fallback when pointer overlap is possible.
         // Pass name for CCC_DISABLE_PASSES: "loop_idiom"
         if iter == 0 && opt_level >= 2 && !pass_disabled(&disabled, "loop_idiom") {
+            let mut aliased_names: crate::common::fx_hash::FxHashSet<String> = module
+                .aliases
+                .iter()
+                .flat_map(|(alias, target, _)| [alias.clone(), target.clone()])
+                .collect();
+            // asm labels may also give two C names the same linker symbol.
+            for (name, label) in &module.asm_labels {
+                aliased_names.insert(name.clone());
+                aliased_names.insert(label.clone());
+            }
+            // A TU's two extern declarations can be aliases in another TU;
+            // weak/common definitions can be coalesced or preempted. Only
+            // strong private definitions have stable distinct object identity
+            // in every link context (including shared libraries).
+            let mut local_globals: crate::common::fx_hash::FxHashSet<String> = module
+                .globals
+                .iter()
+                .filter(|g| g.is_static && !g.is_extern && !g.is_common && !g.is_weak)
+                .map(|g| g.name.clone())
+                .collect();
+            for (name, weak, _) in &module.symbol_attrs {
+                if *weak {
+                    local_globals.remove(name);
+                }
+            }
+            // Arbitrary top-level assembler may define untracked ELF aliases.
+            if !module.toplevel_asm.is_empty() {
+                local_globals.clear();
+            }
             let n = timed_pass!(
                 "loop_idiom",
-                run_on_visited(module, &dirty, &mut changed, loop_idiom::run_function)
+                run_on_visited(module, &dirty, &mut changed, |func| {
+                    loop_idiom::run_function(func, &aliased_names, &local_globals)
+                })
             );
             total_changes += n;
             total_changes_excl_dce += n;

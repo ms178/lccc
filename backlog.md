@@ -15,12 +15,17 @@ there, not here.
 - Deep research: [`engineering/DECISIONS.md`](engineering/DECISIONS.md) (measured
   negative-space, do-not-retry grounds), [`ideas/`](ideas/README.md).
 
-Last triage rebuild: **2026-09-16**, fictional base `8ca2fd4`. The
-numbers below are the 09-11 worst-12 screen (freshest); **re-measure
-against current main before acting** — attribution rule: a ratio is
-only meaningful when both arms ran same-window, same baseline, paired
-kill-switch A/B, ≥ 200 ms/arm, median-and-min agree
-(`scripts/ab_result.py report` / `bench_metrics.py compare --verify`).
+Last broad triage rebuild: **2026-09-16**, fictional base `8ca2fd4`.
+The historical numbers below are from that earlier screen, not the current
+baseline. On **2026-09-25**, `main` at `7ddb770f` was remeasured in 39
+randomized paired, output-checked VM workloads against the candidate and GCC;
+the only changed executable `.text` was LZ4. The sound byte-copy loop-idiom
+fix retains ~10.8× speed over disabling that idiom on a separately scaled
+LZ4 screen, while preserving forward-overlap semantics. See
+[`engineering/evidence/2026-09-25-redteam/loop-idiom-redteam/README.md`](engineering/evidence/2026-09-25-redteam/loop-idiom-redteam/README.md).
+The i7-14700KF target has **not** been measured. Before accepting a new
+runtime improvement, use same-window, same-baseline, output-checked paired
+A/B with ≥ 200 ms/arm and agreeing median/min, not historical ratios.
 
 An item with no reproducer does not belong here.
 
@@ -28,27 +33,40 @@ An item with no reproducer does not belong here.
 
 ## P0 — largest measured gaps
 
-### PF-LZ4-1 · Loop-idiom: byte-copy → `memcpy`, byte-compare → word-compare (~10×)
-Match-extend 9 insns/byte, literal-copy 7 insns/byte; GCC emits
-word-at-a-time compare + `memcpy@PLT`. v1 landed opt-in
-(`CCC_LOOP_IDIOM`) and matches **zero** lz4 loops (v1.1 roadmap W2 09-11:
-single-block → pointer-IV → preheader splitting → `__restrict__` roots;
-the match-copy smear must never match). Done = coverage + lz4 A/B, no
-movement on the other 38. Highest reward in corpus.
+### PF-LZ4-1 · Byte-copy semantics fixed; byte-compare still open
+The default-on v2 copy matcher covers both relevant LZ4 loops. The old
+unconditional `memmove` rewrite was **incorrect** for forward-overlap smear,
+and naively disabling the pass caused a 10.8× scaled-workload slowdown on the
+Xeon VM. A guarded memmove fast path now preserves the scalar overlap loop;
+25 paired rounds against latest `main` show **no significant runtime change**
+(median 0.9946, minimum 1.0057, p=0.2301), and 38 other workload `.text`
+sections are unchanged. The separate word-at-a-time byte-compare proposal
+remains **open**: require a proof against overread and a target i7-14700KF
+paired A/B before shipping. Details: red-team report linked above.
 
-### PF-MB-1 · Mandelbrot hot FP loop refuses vectorization (1.67×)
-54 vs gcc 55 static insns but 1 vs 9 packed-double. Reproducer:
-`tests/benchmark/programs/mandelbrot.c`. Done = refusal triage →
-vectorized loop + A/B.
+### PF-MB-1 · Mandelbrot hot FP loop refuses vectorization (open)
+Current `7ddb770f` VM ratio to GCC is 1.286; candidate and baseline
+executable `.text` match exactly. Additional non-IV recurrences need a legal
+SSA/exit-value proof before widening; the previous 1.67× figure is historical.
+Reproducer: `tests/benchmark/programs/mandelbrot.c`. Done = proven vectorized
+loop plus output-verifying paired A/B on the i7-14700KF.
 
-### PF-FB-1 · `linux_find_bit` loop structure (1.40×)
-`bsfq` idiom present; 176 vs 142 insns — branching shape, not idiom.
-Done = classified diff + fix or RA-bound proof.
+### PF-FB-1 · `linux_find_bit` loop structure (open)
+Current `7ddb770f` VM ratio to GCC is 1.318; candidate and baseline
+executable `.text` match. `bsfq` is present; the remaining gap is branching
+shape, not the loop-copy idiom. The old 1.40× ratio was historical.
+Done = classified general CFG improvement with output-checking and target-CPU
+paired evidence, or a justified bound showing it cannot improve.
 
 ### RA-GLA-04 · GLA Phase 2 — full-identity register remat (sha256 hot)
-Phase 1 shipped (`CCC_RA_GLOBAL_LOCATION=1`); source-less remat default-ON
-(W2 09-11). Next: full remat — register-source spans that
-re-materialise instead of load (expats the RA-PRESSURE-3 boundary).
+Phase 1 shipped (`CCC_RA_GLOBAL_LOCATION=1`); source-less remat is default-ON.
+The checked Phase-2 *spill-gap* experiment was **not** shipped: paired
+`sqlite_varint` and `expat_xml_scan` regressed 1.60% and 4.51% respectively
+on the earlier VM despite a few better static counts. The current-main
+`sha256_transform` VM ratio to GCC is ~1.175, with identical candidate/main
+`.text`; no allocator speedup is claimed. Require post-allocation slot-traffic
+feedback before a small, verified rematerialization change. Next: full remat
+— register-source spans that rematerialize instead of load.
 Oracle targets: `sha256_transform ≤ 1.5×`, epilogue ref-count −50 %.
 Design refs: [`engineering/DECISIONS.md`](engineering/DECISIONS.md)
 RA-GLA-01/02/03. Aligns with **R3** (RA span supply + phi/ORI lowering —

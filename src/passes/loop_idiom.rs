@@ -1,71 +1,40 @@
-//! Loop-idiom recognition: byte-copy loops become a `memcpy` libcall.
+//! Loop-idiom recognition: proven-disjoint byte copies call `memcpy`; other
+//! copy loops retain a scalar fallback behind a safe fast path.
 //!
 //! Real-world C copies bytes in loops everywhere (compressors, codecs, string
 //! routines, network buffers, kernels). A byte-at-a-time loop costs ~7-9
-//! instructions per byte; glibc `memcpy` moves 32+ bytes per instruction with
-//! SIMD. The vectorizer only takes canonical single-level indexed loops —
-//! lz4's literal copy (`*op++ = anchor[i]`, mixed pointer-bump/indexed form,
-//! nested, outer-reused IV) stays scalar at 7 insns/byte and accounts for a
-//! large share of lz4's ~10x gap to GCC (which emits `call memcpy@PLT`).
+//! instructions per byte; glibc's copy routines are highly tuned. The pass
+//! recognizes small counted byte-copy loops (indexed and pointer-bump forms,
+//! including LZ4 literals) before vectorization at -O2 and above.
 //!
-//! This pass matches the counted single-load/single-store byte-copy loop in
-//! its guard-at-top form and replaces the whole loop with one
-//! `Call{memcpy}` in the preheader, computing the loop's exit values
-//! directly (`dst_final = dst_init + n`, `i_final = n`). The dead loop is
-//! removed immediately via `eliminate_unreachable_blocks`.
+//! Legality is deliberately structural: a single-entry/single-exit natural
+//! loop with a zero-based unsigned IV, a loop-invariant count, exactly one
+//! nonvolatile byte load feeding exactly one nonvolatile byte store, and no
+//! trapping or escaping instructions apart from reconstructible IV/pointer
+//! live-outs. Everything else keeps its original loop. See the matcher below
+//! for the full list of fail-closed checks.
 //!
-//! Legality (every guard fails closed — bail keeps the original loop):
+//! A forward scalar loop has *smear* semantics for `src < dst < src+n`:
+//! `memmove` is NOT an unconditional replacement. Only known-disjoint roots
+//! use `memcpy`. Uncertain pointers use unsigned address subtraction to
+//! select a `memmove` fast path for safe addresses, keeping the original
+//! scalar loop for forward overlap and zero length. Roots are disjoint only
+//! when justified by fresh allocations, `restrict` where applicable, or
+//! distinct strong private globals that do not name a linker alias. Extern,
+//! common, weak and arbitrary-asm names cannot prove global disjointness.
+//! A disjoint copy with a nullable pointer parameter guards `memcpy` on
+//! `n > 0` so a zero-trip source loop never calls libc with null pointers.
 //!
-//! - Shape: 2–3 block natural loop, single latch, header preds exactly
-//!   `{preheader, latch}`, single exit edge from the header, no other
-//!   entries/exits/branches/calls/memory ops in the loop. Non-header blocks
-//!   contain exactly one `U8` load + one `U8` store plus `Copy`/`Cast`/`GEP`/
-//!   `Add`-1 plumbing. No volatile, no atomics, no inline asm, no non-header
-//!   phis.
-//! - IV: one integer phi, init const 0, step const `+1`, bound
-//!   loop-invariant and dominating the preheader, header test exactly
-//!   `Ult(iv, bound)`.
-//! - Pointers: load/store addresses are `GEP(base, iv)` (indexed) or a
-//!   header pointer-phi (bump form); the load reads the pre-bump value.
-//!   Bases/inits are loop-invariant and dominate the preheader.
-//! - Coverage: the loaded value's only use is the store (through `Copy`s);
-//!   bumps' only uses are their phis. Nothing else escapes the loop.
-//! - Overlap: the two object roots must differ and both name uniquely
-//!   identified objects (distinct globals, distinct static allocas, or
-//!   global↔alloca) — the same proof `loop_memory_promote::disjoint`
-//!   uses. Same-object or parameter-rooted copies bail (a `dst > src`
-//!   overlap makes the forward loop read smeared bytes, which is neither
-//!   `memcpy` nor `memmove` semantics).
-//! - Exits: every exit phi's loop-edge incoming is the IV (rewritten to the
-//!   bound), a pointer-phi (rewritten to `GEP(init, bound)`), or a
-//!   loop-invariant (kept). Anything else bails.
+//! Guarded rewriting versions the preheader, extends existing exit phis,
+//! creates SSA merge phis for live-out IV/bump pointers and retains the
+//! original scalar loop. A per-pass header set prevents repeatedly versioning
+//! the same fallback. Bound loads that can alias either copy operand cannot
+//! be hoisted. Unsupported CFG/phi/bound forms are rejected before mutation.
 //!
-//! The 0-trip case is exact: `memcpy(d, s, 0)` performs no access, matching
-//! the skipped loop (glibc defines this; LLVM/GCC perform the same
-//! transform). `memcpy` needs no declaration: like the frontend's
-//! `emit_dynamic_memcpy` (VLA path), the backend lowers the plain call and
-//! the default link resolves libc.
-//!
-//! Placement: main loop, iter 0, immediately before `vectorize`, so idiom
-//! loops become one call instead of versioned-vectorize + runtime check +
-//! scalar remainder; everything unmatched still flows to the vectorizer.
-//! A `memcpy` call cannot block outer-loop vectorization that the nested
-//! counted loop it replaced would have allowed (nested loops never
-//! vectorize here), and later passes treat the call conservatively.
-//! Enabled at -O2+ including -Os/-Oz (a call is smaller than a loop).
-//!
-//! Kill-switch: `CCC_NO_LOOP_IDIOM` set (any value) disables the pass.
-//! Opt-in during bring-up: `CCC_LOOP_IDIOM=1` (`true`/`yes`/`on` also
-//! accepted); default-off until the regression suite + corpus A/B + fuzz
-//! validate the guards (loop transforms earned this caution: loop_rotate's
-//! v16 default-enable shipped 16 miscompiles).
-//! Debug: `CCC_DEBUG_LOOP_IDIOM=1` logs matches, rewrites, and bail reasons.
-//!
-//! Phase 2 (not yet implemented): byte-compare loops
-//! (`while (p < end && *p == *q)`) expand to a word-at-a-time loop with the
-//! original byte loop as the tail. That needs a same-object + ordering
-//! range proof (word loads must not over-read the shorter side) and is a
-//! separate matcher + legality argument.
+//! Default-on at -O2+ (also -Os/-Oz); `CCC_NO_LOOP_IDIOM=1` disables the pass.
+//! `CCC_LOOP_IDIOM=1` is a legacy accepted no-op; `CCC_DEBUG_LOOP_IDIOM=1`
+//! logs matches, rewrites, and bail reasons. No byte-compare rewrite is
+//! implemented: widening comparison loads without a range proof can overread.
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
@@ -75,9 +44,16 @@ use crate::ir::reexports::{
 };
 use crate::passes::loop_analysis::{DominanceChecker, find_natural_loops, merge_loops_by_header};
 
-/// Per-function entry point for the dirty-tracking pipeline.
-pub(crate) fn run_function(func: &mut IrFunction) -> usize {
-    recognize_idioms(func)
+/// Per-function entry point for the dirty-tracking pipeline. Two globals
+/// prove disjoint only when *both* are strong private definitions and neither
+/// is an alias; extern declarations may resolve to the same storage in a
+/// different translation unit. Module-level symbol facts are built once.
+pub(crate) fn run_function(
+    func: &mut IrFunction,
+    aliased_names: &FxHashSet<String>,
+    local_globals: &FxHashSet<String>,
+) -> usize {
+    recognize_idioms(func, aliased_names, local_globals)
 }
 
 /// Maximum loops rewritten per function per fixpoint run. Each rewrite
@@ -156,8 +132,8 @@ fn is_byte_type(ty: IrType) -> bool {
 /// `Alloca(id)` for static stack slots, `Param(idx)` for POINTER-typed
 /// function parameters (an integer parameter converted to a pointer names
 /// no object — the frontend erases the conversion — so it is `Other`;
-/// distinct `Param` roots still take memmove unless disjoint by the
-/// freshness rule), `Other` for everything else (dynamic allocas, computed
+/// different `Param` roots need a `restrict` proof to call `memcpy`),
+/// `Other` for everything else (dynamic allocas, computed
 /// pointers, unknowns).
 ///
 /// Leaf typing and chain following come from `crate::ir::provenance` (shared
@@ -175,6 +151,40 @@ enum ObjectRoot {
     Alloca(u32),
     Param(u32),
     Other,
+}
+
+/// Proof for a call to `memcpy`, not merely a guess that two pointer values
+/// have different SSA IDs. In particular, distinct global *names* are not
+/// distinct objects when either is a linker alias. A pointer from a parameter
+/// cannot name a fresh alloca created during the current activation. Two
+/// different pointer parameters require the frontend's restrict contract;
+/// without it the original forward loop can smear overlapped bytes.
+fn roots_proven_disjoint(
+    func: &IrFunction,
+    a: &ObjectRoot,
+    b: &ObjectRoot,
+    aliased_names: &FxHashSet<String>,
+    local_globals: &FxHashSet<String>,
+) -> bool {
+    match (a, b) {
+        (ObjectRoot::Global(a), ObjectRoot::Global(b)) => {
+            a != b
+                && local_globals.contains(a)
+                && local_globals.contains(b)
+                && !aliased_names.contains(a)
+                && !aliased_names.contains(b)
+        }
+        (ObjectRoot::Alloca(a), ObjectRoot::Alloca(b)) => a != b,
+        (ObjectRoot::Global(_), ObjectRoot::Alloca(_))
+        | (ObjectRoot::Alloca(_), ObjectRoot::Global(_))
+        | (ObjectRoot::Param(_), ObjectRoot::Alloca(_))
+        | (ObjectRoot::Alloca(_), ObjectRoot::Param(_)) => true,
+        (ObjectRoot::Param(a), ObjectRoot::Param(b)) if a != b => {
+            func.params.get(*a as usize).is_some_and(|p| p.noalias)
+                || func.params.get(*b as usize).is_some_and(|p| p.noalias)
+        }
+        _ => false,
+    }
 }
 
 fn object_root(
@@ -323,8 +333,12 @@ struct CopyLoop {
     load_is_bump: bool,
     load_base: Value,
     load_init: Value,
-    /// Use memmove instead of memcpy (param roots may alias).
-    use_memmove: bool,
+    /// Preserve the scalar loop for forward overlap (memmove fast path).
+    needs_overlap_guard: bool,
+    /// For a provably disjoint copy with a pointer parameter, the parameter
+    /// may be null on a zero trip. Calling even memcpy(_, null, 0) is not
+    /// universally valid, while the source loop never dereferences it.
+    needs_zero_guard: bool,
 }
 
 fn debug_enabled() -> bool {
@@ -341,12 +355,16 @@ macro_rules! dlog {
     };
 }
 
-pub(crate) fn recognize_idioms(func: &mut IrFunction) -> usize {
+pub(crate) fn recognize_idioms(
+    func: &mut IrFunction,
+    aliased_names: &FxHashSet<String>,
+    local_globals: &FxHashSet<String>,
+) -> usize {
     if std::env::var("CCC_NO_LOOP_IDIOM").is_ok() {
         return 0;
     }
-    // Default-on after P0 validation: single-block Ptr-IV (header==latch)
-    // and 2-3 block forms are proven safe; opt-out via CCC_NO_LOOP_IDIOM.
+    // Default-on. For maybe-overlapping pointers, a guarded fast path keeps
+    // the original scalar loop as the forward-overlap fallback.
     // The old CCC_LOOP_IDIOM=1 opt-in knob is retained as a no-op for
     // compatibility but no longer gates the pass.
     if func.blocks.len() < 3 {
@@ -356,6 +374,9 @@ pub(crate) fn recognize_idioms(func: &mut IrFunction) -> usize {
     // indices shift when the dead loop is removed), innermost-first,
     // bounded (same discipline as loop_rotate).
     let mut total = 0;
+    // A guarded rewrite retains its scalar loop. Do not version it again on
+    // the next fixpoint scan (nor let another matched loop suppress this one).
+    let mut versioned_headers: FxHashSet<BlockId> = FxHashSet::default();
     for _ in 0..MAX_REWRITES_PER_FUNC {
         let cfg = CfgAnalysis::build(func);
         let raw = find_natural_loops(cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
@@ -367,9 +388,14 @@ pub(crate) fn recognize_idioms(func: &mut IrFunction) -> usize {
         sorted.sort_by_key(|lp| lp.body.len());
         let mut progressed = false;
         for lp in sorted {
-            if let Some(matched) = try_match_copy_loop(func, lp, &cfg) {
+            let header_label = func.blocks[lp.header].label;
+            if versioned_headers.contains(&header_label) {
+                continue;
+            }
+            if let Some(matched) = try_match_copy_loop(func, lp, &cfg, aliased_names, local_globals)
+            {
                 dlog!(
-                    "{} loop@{}: MATCH copy (header={} pre={} latch={} exit={} bound={:?} store_bump={} load_bump={})",
+                    "{} loop@{}: MATCH copy (header={} pre={} latch={} exit={} bound={:?} store_bump={} load_bump={} overlap_guard={} zero_guard={})",
                     func.name,
                     lp.header,
                     matched.header,
@@ -379,8 +405,18 @@ pub(crate) fn recognize_idioms(func: &mut IrFunction) -> usize {
                     matched.bound,
                     matched.store_is_bump,
                     matched.load_is_bump,
+                    matched.needs_overlap_guard,
+                    matched.needs_zero_guard,
                 );
-                if rewrite_copy_loop(func, &matched, &lp.body) {
+                let rewritten = if matched.needs_overlap_guard || matched.needs_zero_guard {
+                    rewrite_guarded_copy_loop(func, &matched, &lp.body, &cfg)
+                } else {
+                    rewrite_copy_loop(func, &matched, &lp.body)
+                };
+                if rewritten {
+                    if matched.needs_overlap_guard || matched.needs_zero_guard {
+                        versioned_headers.insert(header_label);
+                    }
                     total += 1;
                     progressed = true;
                     break;
@@ -412,6 +448,8 @@ fn try_match_copy_loop(
     func: &IrFunction,
     lp: &crate::passes::loop_analysis::NaturalLoop,
     cfg: &CfgAnalysis,
+    aliased_names: &FxHashSet<String>,
+    local_globals: &FxHashSet<String>,
 ) -> Option<CopyLoop> {
     let name = func.name.as_str();
     // Shape: 1–3 blocks (header + body/latch). Single-block self-loops
@@ -1107,15 +1145,14 @@ fn try_match_copy_loop(
         }
     }
 
-    // Overlap: same-root copies bail. Distinct roots (including Param and
-    // Other) are allowed — Global/Alloca distinct uses memcpy, Param/Other
-    // uses memmove for safety (may alias). This unlocks LZ4 literal copies
-    // where anchor/op derive from params through outer phis. For Other
-    // roots we must compare the actual init SSA values, not just the enum
-    // (Other==Other would otherwise bail distinct pointers).
+    // A forward loop and memmove differ for dst in (src, src + n): the
+    // loop repeatedly reads bytes it has already overwritten. Even two
+    // distinct parameter names, `Other` roots, or ELF names aliasing the
+    // same object can have that relationship. Do not turn them into an
+    // unconditional memmove; preserve the scalar loop behind a runtime
+    // non-smear guard. Proven-disjoint roots still use plain memcpy.
     let store_root = object_root(&defs, &label_to_idx, preheader_label, store_init);
     let load_root = object_root(&defs, &label_to_idx, preheader_label, load_init);
-    // Same SSA init → same object → bail.
     if store_init == load_init {
         dlog!("{name} loop@{header}: bail (same init {store_init:?})");
         return None;
@@ -1124,43 +1161,11 @@ fn try_match_copy_loop(
         dlog!("{name} loop@{header}: bail (same root {store_root:?})");
         return None;
     }
-    // memcpy for provably-disjoint root pairs (same-init and same-root
-    // copies bailed above).  Distinct-identity Global/Global and
-    // Alloca/Alloca pairs and Global/Alloca pairs are disjoint by object
-    // identity.  (Param,Alloca) pairs are disjoint by FRESHNESS: the
-    // alloca names an object created by this activation while the param
-    // value was formed before this activation existed — or derives from
-    // one that was, through provenance-preserving GEP/Copy/Cast/Add and
-    // `ptr - int` chains.  Nothing else can present a Param root: Mul
-    // and friends, Call, and Load break the trace; a rooted RHS under
-    // `Sub` fails closed (integer laundering); every traced def
-    // dominates the preheader (inits are checked above, and each step
-    // moves to a def dominating the current one), so no inner-loop phi
-    // is reachable and every reachable phi is an outer phi without an
-    // edge from the preheader label (the preheader's sole successor is
-    // the header, checked above) — also `Other`.  A mid-function
-    // `p = &x` reassignment re-roots the SSA chain at the alloca and
-    // either bails or presents Alloca.  Two distinct live objects never
-    // overlap (C17 6.2.4, 6.5.6), so memcpy's no-overlap contract holds.
-    // Deliberately NOT pairs: (Param,Param) — distinct SSA values prove
-    // nothing without `restrict`, which loop_idiom does not track;
-    // (Param,Global) — a caller may legally pass `&global+k` for a plain
-    // `T *p`, and a forward copy corrupts the src-less-than-dst shifted
-    // case; anything `Other` — unknown provenance may alias anything
-    // (this is the LZ4 path: params through outer phis resolve to
-    // `Other` and take memmove, unchanged).  Every non-pair takes
-    // memmove, which subsumes the old trailing Param/Other clauses: any
-    // such pair is outside the match set by construction, so the bare
-    // `!matches!` below is exactly equivalent and cannot drift.
-    let use_memmove = !matches!(
-        (&store_root, &load_root),
-        (ObjectRoot::Global(_), ObjectRoot::Alloca(_))
-            | (ObjectRoot::Alloca(_), ObjectRoot::Global(_))
-            | (ObjectRoot::Global(_), ObjectRoot::Global(_))
-            | (ObjectRoot::Alloca(_), ObjectRoot::Alloca(_))
-            | (ObjectRoot::Param(_), ObjectRoot::Alloca(_))
-            | (ObjectRoot::Alloca(_), ObjectRoot::Param(_))
-    );
+    let needs_overlap_guard =
+        !roots_proven_disjoint(func, &store_root, &load_root, aliased_names, local_globals);
+    let needs_zero_guard = !needs_overlap_guard
+        && (matches!(store_root, ObjectRoot::Param(_))
+            || matches!(load_root, ObjectRoot::Param(_)));
 
     // Bound loads: every header load must be THE bound — resolving
     // through copies to the `Ult` rhs — read through a bare
@@ -1199,8 +1204,14 @@ fn try_match_copy_loop(
                 return None;
             }
         };
-        if bound_root == store_root || bound_root == load_root {
-            dlog!("{name} loop@{header}: bail (bound load aliases copy)");
+        // Hoisting a header load is valid only when its address is provably
+        // independent of BOTH copy operands, not just a different SSA/name:
+        // a parameter may point into the bound global; two global names can
+        // be linker aliases. Failing this test retains the original loop.
+        if !roots_proven_disjoint(func, &bound_root, &store_root, aliased_names, local_globals)
+            || !roots_proven_disjoint(func, &bound_root, &load_root, aliased_names, local_globals)
+        {
+            dlog!("{name} loop@{header}: bail (bound load may alias copy)");
             return None;
         }
     }
@@ -1264,7 +1275,6 @@ fn try_match_copy_loop(
             let mut direct_ok = true;
             inst.for_each_used_value(|v| {
                 if loop_defined(Value(v)) {
-                    let r = resolve_copy(&defs, Value(v));
                     // With a const bound the IV rewrites to a const, which
                     // only fits `Operand` slots; a `Value`-slot use would
                     // be unrewritable. That check lives in the M2 pre-scan
@@ -1272,7 +1282,11 @@ fn try_match_copy_loop(
                     // `Value`-slot walker and aborts pre-mutation — the
                     // matcher cannot distinguish slot kinds without a
                     // fragile hand-rolled walk, so it allows the use here.
-                    if (r == iv_phi || bump_phis.contains_key(&r.0)) && dom.dominates(exit_idx, bi)
+                    // A Copy defined inside the deleted loop does not
+                    // dominate a new fast exit merely because it *resolves*
+                    // to the IV. Only the phi itself can be reconstructed.
+                    if (Value(v) == iv_phi || bump_phis.contains_key(&v))
+                        && dom.dominates(exit_idx, bi)
                     {
                         return;
                     }
@@ -1287,21 +1301,21 @@ fn try_match_copy_loop(
                 return None;
             }
         }
-        // Terminator operands (Return value): same direct-use rule —
-        // the returned IV / bump phi (post-loop value) is rewritable iff
-        // the return block is dominated by the exit.
-        if let Terminator::Return(Some(op)) = &block.terminator {
-            if let Operand::Value(v) = op {
-                if loop_defined(*v) {
-                    let r = resolve_copy(&defs, *v);
-                    if (r == iv_phi || bump_phis.contains_key(&r.0)) && dom.dominates(exit_idx, bi)
-                    {
-                        continue;
-                    }
-                    dlog!("{name} loop@{header}: bail (return escapes)");
-                    return None;
-                }
+        // Canonical walker includes Return, CondBranch, Switch and indirect
+        // branches. The old Return-only check missed a loop value escaping
+        // through a different terminator and deleting its definition.
+        let mut term_escape = None;
+        block.terminator.for_each_used_value(|id| {
+            let v = Value(id);
+            if loop_defined(v)
+                && !((v == iv_phi || bump_phis.contains_key(&id)) && dom.dominates(exit_idx, bi))
+            {
+                term_escape = Some(id);
             }
+        });
+        if let Some(id) = term_escape {
+            dlog!("{name} loop@{header}: bail (terminator escapes v{id})");
+            return None;
         }
     }
 
@@ -1320,7 +1334,8 @@ fn try_match_copy_loop(
         load_is_bump,
         load_base,
         load_init,
-        use_memmove,
+        needs_overlap_guard,
+        needs_zero_guard,
     })
 }
 
@@ -1338,6 +1353,41 @@ fn alloc_value(func: &mut IrFunction) -> Value {
     let v = Value(func.next_value_id);
     func.next_value_id += 1;
     v
+}
+
+/// Both the statically-disjoint rewrite and the guarded fast edge use the
+/// same ABI/side-effect description for the libc copy call.
+fn make_copy_call(
+    func: &mut IrFunction,
+    name: &str,
+    dst: Value,
+    src: Value,
+    len: Operand,
+    size_ty: IrType,
+) -> Instruction {
+    Instruction::Call {
+        func: name.to_string(),
+        info: crate::ir::reexports::CallInfo {
+            dest: Some(alloc_value(func)),
+            args: vec![Operand::Value(dst), Operand::Value(src), len],
+            arg_types: vec![IrType::Ptr, IrType::Ptr, size_ty],
+            return_type: IrType::Ptr,
+            is_variadic: false,
+            num_fixed_args: 3,
+            struct_arg_sizes: vec![None, None, None],
+            struct_arg_aligns: vec![None, None, None],
+            struct_arg_classes: vec![Vec::new(), Vec::new(), Vec::new()],
+            struct_arg_riscv_float_classes: Vec::new(),
+            struct_arg_is_f128_sse: vec![false, false, false],
+            is_sret: false,
+            is_fastcall: false,
+            regparm: None,
+            is_pure: false,
+            is_const: false,
+            ret_eightbyte_classes: Vec::new(),
+            ret_is_f128_sse: false,
+        },
+    }
 }
 
 /// Rewrite a matched copy loop into a preheader `memcpy` call.
@@ -1466,9 +1516,8 @@ fn rewrite_copy_loop(func: &mut IrFunction, m: &CopyLoop, body: &FxHashSet<usize
                 reusable = true;
             }
         } else {
-            // Function argument: available in the preheader. (Param roots
-            // rewrite to memmove; their pointers reuse as args or clone
-            // as ParamRef leaves — treat them uniformly.)
+            // Function argument: available in the preheader. An incoming
+            // argument can be reused or cloned as a ParamRef leaf.
             reusable = true;
         }
         if reusable {
@@ -1666,37 +1715,11 @@ fn rewrite_copy_loop(func: &mut IrFunction, m: &CopyLoop, body: &FxHashSet<usize
         }
     };
 
-    // The `memcpy`/`memmove` call. Shape mirrors the frontend's
-    // `emit_dynamic_memcpy` exactly (plain libc call, no declaration
-    // needed — the default link resolves it). Param-rooted copies use
-    // memmove for safety (distinct params may still alias in C).
-    let call_name = if m.use_memmove { "memmove" } else { "memcpy" };
-    let ret = alloc_value(&mut *func);
-    func.blocks[m.preheader]
-        .instructions
-        .push(Instruction::Call {
-            func: call_name.to_string(),
-            info: crate::ir::reexports::CallInfo {
-                dest: Some(ret),
-                args: vec![Operand::Value(dst), Operand::Value(src), len],
-                arg_types: vec![IrType::Ptr, IrType::Ptr, size_ty],
-                return_type: IrType::Ptr,
-                is_variadic: false,
-                num_fixed_args: 3,
-                struct_arg_sizes: vec![None, None, None],
-                struct_arg_aligns: vec![None, None, None],
-                struct_arg_classes: vec![Vec::new(), Vec::new(), Vec::new()],
-                struct_arg_riscv_float_classes: Vec::new(),
-                struct_arg_is_f128_sse: vec![false, false, false],
-                is_sret: false,
-                is_fastcall: false,
-                regparm: None,
-                is_pure: false,
-                is_const: false,
-                ret_eightbyte_classes: Vec::new(),
-                ret_is_f128_sse: false,
-            },
-        });
+    // Only proven-disjoint roots reach this rewrite. A forward-overlap
+    // scalar loop cannot be replaced by either memcpy or memmove.
+    let call_name = "memcpy";
+    let call = make_copy_call(func, call_name, dst, src, len, size_ty);
+    func.blocks[m.preheader].instructions.push(call);
 
     // Bump-pointer exit values: `GEP(init, bound)` (byte scale, matching
     // the per-iteration `+1`). Always emitted (dead ones fold away);
@@ -1810,32 +1833,432 @@ fn rewrite_copy_loop(func: &mut IrFunction, m: &CopyLoop, body: &FxHashSet<usize
                 }
             });
         }
-        match &mut block.terminator {
-            Terminator::CondBranch { cond, .. } => {
-                if let Operand::Value(v) = cond {
-                    if let Some(new) = repl.get(&v.0) {
-                        *cond = new.clone();
-                    }
+        block.terminator.for_each_operand_mut(|op| {
+            if let Operand::Value(v) = op {
+                if let Some(new) = repl.get(&v.0) {
+                    *op = new.clone();
                 }
             }
-            Terminator::Return(Some(op)) => {
-                if let Operand::Value(v) = op {
-                    if let Some(new) = repl.get(&v.0) {
-                        *op = new.clone();
-                    }
-                }
-            }
-            _ => {}
-        }
+        });
     }
 
     // Retarget the preheader at the exit and drop the dead loop.
     func.blocks[m.preheader].terminator = Terminator::Branch(exit_label);
     let _ = crate::passes::cfg_simplify::eliminate_unreachable_blocks(func);
+    dlog!("{fname} loop@{}: REWROTE to memcpy", m.header);
+    true
+}
+
+/// Version a byte-copy loop when the original loop must remain available:
+/// forward overlap (src < dst < src+n) needs the scalar smear semantics; a
+/// provably disjoint copy with a nullable parameter must skip the libc call
+/// on zero trips, where the source loop never dereferences that parameter.
+///
+/// In unsigned address arithmetic, `delta = dst - src`. If `dst > src`,
+/// `delta >= n` proves non-overlap. If `dst < src`, the wrapped delta may
+/// spuriously send us to the scalar loop (safe); otherwise a forward copy is
+/// equivalent to memmove. For `n == 0`, `n - 1 == UINTPTR_MAX`, so the guard
+/// is false and even null pointers take the zero-trip scalar path without a
+/// library call. Unsigned subtraction avoids C pointer-order/subtraction UB.
+///
+/// The single-header-predecessor exit and preheader-dominating operands are
+/// intentional fail-closed restrictions. We add a fast->exit edge, extend
+/// existing exit phis with the fast values, and create merge phis for any
+/// direct uses of the loop's IV or bump pointers after the exit. The slow
+/// loop/its backedge and their incoming values are left unmodified.
+fn rewrite_guarded_copy_loop(
+    func: &mut IrFunction,
+    m: &CopyLoop,
+    body: &FxHashSet<usize>,
+    cfg: &CfgAnalysis,
+) -> bool {
+    let size_ty = crate::common::types::target_int_ir_type();
+    let guard_ty = match size_ty {
+        IrType::I32 => IrType::U32,
+        IrType::I64 => IrType::U64,
+        _ => return false,
+    };
+    if !matches!(m.ult_ty, IrType::U32 | IrType::U64)
+        || m.ult_ty.size() > size_ty.size()
+        || m.bound_load.is_some()
+        || cfg.preds.row(m.exit) != [m.header as u32]
+    {
+        dlog!(
+            "{} loop@{}: guard declines (bounds/exit)",
+            func.name,
+            m.header
+        );
+        return false;
+    }
+    let header_label = func.blocks[m.header].label;
+    let exit_label = func.blocks[m.exit].label;
+    let dst = if m.store_is_bump {
+        m.store_init
+    } else {
+        m.store_base
+    };
+    let src = if m.load_is_bump {
+        m.load_init
+    } else {
+        m.load_base
+    };
+    let dom = DominanceChecker::new(func.blocks.len(), &cfg.idom);
+    let mut defs: FxHashMap<u32, &Instruction> = FxHashMap::default();
+    let mut def_blocks: FxHashMap<u32, usize> = FxHashMap::default();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for inst in &block.instructions {
+            if let Some(v) = inst.dest() {
+                defs.insert(v.0, inst);
+                def_blocks.insert(v.0, bi);
+            }
+        }
+    }
+    let available = |v: Value| match def_blocks.get(&v.0) {
+        Some(&bi) => !body.contains(&bi) && dom.dominates(bi, m.preheader),
+        None => true, // an incoming parameter, available in every block
+    };
+    if !available(dst) || !available(src) || matches!(&m.bound, Operand::Value(v) if !available(*v))
+    {
+        dlog!(
+            "{} loop@{}: guard declines (operand not in preheader)",
+            func.name,
+            m.header
+        );
+        return false;
+    }
+    // The guarded fast path can merge only the IV and the two copy-pointer
+    // phis. Decline an additional loop-carried value rather than fabricate
+    // its final value on the fast edge.
+    for inst in &func.blocks[m.header].instructions {
+        if let Instruction::Phi { dest, ty, .. } = inst {
+            if *dest == m.iv_phi {
+                if *ty != m.ult_ty {
+                    return false;
+                }
+            } else if !(m.store_is_bump && *dest == m.store_base
+                || m.load_is_bump && *dest == m.load_base)
+                || *ty != IrType::Ptr
+            {
+                return false;
+            }
+        }
+    }
+
+    // Validate every old exit phi before ANY mutation. Its header-edge input
+    // may be an IV, a bump pointer, a constant or a preheader-invariant.
+    // Copy chains are resolved only on this incoming edge; they are not
+    // globally treated as available on the new fast edge.
+    enum FastIncoming {
+        Iv,
+        StoreBump,
+        LoadBump,
+        Invariant(Operand),
+    }
+    let mut exit_incomings = Vec::new();
+    for (pos, inst) in func.blocks[m.exit].instructions.iter().enumerate() {
+        if let Instruction::Phi { incoming, .. } = inst {
+            let mut header_inputs = incoming.iter().filter(|(_, b)| *b == header_label);
+            let Some((op, _)) = header_inputs.next() else {
+                return false;
+            };
+            if header_inputs.next().is_some() || incoming.len() != 1 {
+                return false;
+            }
+            let fast = match op {
+                Operand::Value(v) => {
+                    let resolved = resolve_copy(&defs, *v);
+                    if resolved == m.iv_phi {
+                        FastIncoming::Iv
+                    } else if m.store_is_bump && resolved == m.store_base {
+                        FastIncoming::StoreBump
+                    } else if m.load_is_bump && resolved == m.load_base {
+                        FastIncoming::LoadBump
+                    } else if available(*v) {
+                        // Not merely outside the loop: it must dominate the
+                        // new fast edge, which bypasses the loop header.
+                        FastIncoming::Invariant(op.clone())
+                    } else {
+                        return false;
+                    }
+                }
+                Operand::Const(_) => FastIncoming::Invariant(op.clone()),
+            };
+            exit_incomings.push((pos, fast));
+        }
+    }
+    // The original exit is dominated by the loop header. The new edge must
+    // not bypass a loop-defined value other than the phis merged below;
+    // the matcher already checks non-phi escape via every instruction.
+    let Some(max_label) = func.blocks.iter().map(|b| b.label.0).max() else {
+        return false;
+    };
+    let Some(after_max) = max_label.checked_add(1) else {
+        return false;
+    };
+    let fast_id = func.next_label.max(after_max);
+    let Some(next_label) = fast_id.checked_add(1) else {
+        return false;
+    };
+    // Constants must be representable and carry only the Ult bit width.
+    let const_bound = match &m.bound {
+        Operand::Const(c) => {
+            let Some(raw) = c.to_i64() else { return false };
+            Some(if m.ult_ty == IrType::U32 {
+                raw as u32 as u64
+            } else {
+                raw as u64
+            })
+        }
+        Operand::Value(_) => None,
+    };
+
+    // ---- All bailouts above this line: mutation starts here. ----
+    func.next_label = next_label;
+    let fast_label = BlockId(fast_id);
+    let mut pre_insts = Vec::new();
+    let len = if let Some(n) = const_bound {
+        match size_ty {
+            IrType::I32 => Operand::Const(IrConst::I32(n as i32)),
+            IrType::I64 => Operand::Const(IrConst::I64(n as i64)),
+            _ => unreachable!(),
+        }
+    } else if let Operand::Value(v) = m.bound {
+        let len_val = alloc_value(func);
+        pre_insts.push(Instruction::Cast {
+            dest: len_val,
+            src: Operand::Value(v),
+            from_ty: m.ult_ty,
+            to_ty: size_ty,
+        });
+        Operand::Value(len_val)
+    } else {
+        unreachable!("guarded copy bound was checked above")
+    };
+    let len_unsigned = alloc_value(func);
+    pre_insts.push(Instruction::Cast {
+        dest: len_unsigned,
+        src: len.clone(),
+        from_ty: size_ty,
+        to_ty: guard_ty,
+    });
+    let use_fast = if m.needs_overlap_guard {
+        let dst_int = alloc_value(func);
+        pre_insts.push(Instruction::Cast {
+            dest: dst_int,
+            src: Operand::Value(dst),
+            from_ty: IrType::Ptr,
+            to_ty: guard_ty,
+        });
+        let src_int = alloc_value(func);
+        pre_insts.push(Instruction::Cast {
+            dest: src_int,
+            src: Operand::Value(src),
+            from_ty: IrType::Ptr,
+            to_ty: guard_ty,
+        });
+        let distance = alloc_value(func);
+        pre_insts.push(Instruction::BinOp {
+            dest: distance,
+            op: IrBinOp::Sub,
+            lhs: Operand::Value(dst_int),
+            rhs: Operand::Value(src_int),
+            ty: guard_ty,
+        });
+        let len_minus_one = alloc_value(func);
+        pre_insts.push(Instruction::BinOp {
+            dest: len_minus_one,
+            op: IrBinOp::Sub,
+            lhs: Operand::Value(len_unsigned),
+            rhs: Operand::Const(match guard_ty {
+                IrType::U32 => IrConst::I32(1),
+                IrType::U64 => IrConst::I64(1),
+                _ => unreachable!(),
+            }),
+            ty: guard_ty,
+        });
+        let test = alloc_value(func);
+        pre_insts.push(Instruction::Cmp {
+            dest: test,
+            op: IrCmpOp::Ugt,
+            lhs: Operand::Value(distance),
+            rhs: Operand::Value(len_minus_one),
+            ty: guard_ty,
+        });
+        test
+    } else {
+        // When roots are disjoint but one pointer is nullable, calling
+        // memcpy(_, null, 0) would add UB to a skipped C loop. Zero trips
+        // take the original (zero-iteration) edge; nonzero trips are proven
+        // non-null by the source program's dereferences.
+        let test = alloc_value(func);
+        pre_insts.push(Instruction::Cmp {
+            dest: test,
+            op: IrCmpOp::Ugt,
+            lhs: Operand::Value(len_unsigned),
+            rhs: Operand::Const(match guard_ty {
+                IrType::U32 => IrConst::I32(0),
+                IrType::U64 => IrConst::I64(0),
+                _ => unreachable!(),
+            }),
+            ty: guard_ty,
+        });
+        test
+    };
+    {
+        let pre = &mut func.blocks[m.preheader];
+        if !pre.source_spans.is_empty() {
+            if pre.source_spans.len() == pre.instructions.len() {
+                pre.source_spans
+                    .extend((0..pre_insts.len()).map(|_| crate::common::source::Span::dummy()));
+            } else {
+                pre.source_spans.clear();
+            }
+        }
+        pre.instructions.extend(pre_insts);
+        pre.terminator = Terminator::CondBranch {
+            cond: Operand::Value(use_fast),
+            true_label: fast_label,
+            false_label: header_label,
+        };
+    }
+
+    let mut fast = crate::ir::reexports::BasicBlock {
+        label: fast_label,
+        instructions: Vec::new(),
+        source_spans: Vec::new(),
+        terminator: Terminator::Branch(exit_label),
+    };
+    fast.instructions.push(make_copy_call(
+        func,
+        if m.needs_overlap_guard {
+            "memmove"
+        } else {
+            "memcpy"
+        },
+        dst,
+        src,
+        len,
+        size_ty,
+    ));
+    let mut bump_final: FxHashMap<u32, Value> = FxHashMap::default();
+    if m.store_is_bump {
+        let v = alloc_value(func);
+        fast.instructions.push(Instruction::GetElementPtr {
+            dest: v,
+            base: dst,
+            offset: m.bound.clone(),
+            ty: IrType::Ptr,
+        });
+        bump_final.insert(m.store_base.0, v);
+    }
+    if m.load_is_bump {
+        let v = alloc_value(func);
+        fast.instructions.push(Instruction::GetElementPtr {
+            dest: v,
+            base: src,
+            offset: m.bound.clone(),
+            ty: IrType::Ptr,
+        });
+        bump_final.insert(m.load_base.0, v);
+    }
+
+    // Existing exit phis receive a fast-edge input; slow-edge inputs remain
+    // unchanged. Then merge the loop-header values used directly after the
+    // exit. All resulting phis have exactly the two real predecessors.
+    for (pos, value) in exit_incomings {
+        let fast_op = match value {
+            FastIncoming::Iv => m.bound.clone(),
+            FastIncoming::StoreBump => Operand::Value(bump_final[&m.store_base.0]),
+            FastIncoming::LoadBump => Operand::Value(bump_final[&m.load_base.0]),
+            FastIncoming::Invariant(op) => op,
+        };
+        if let Instruction::Phi { incoming, .. } = &mut func.blocks[m.exit].instructions[pos] {
+            incoming.push((fast_op, fast_label));
+        }
+    }
+    let mut replacements: FxHashMap<u32, Value> = FxHashMap::default();
+    let mut merge_phis = Vec::new();
+    let mut add_merge = |old: Value, ty: IrType, fast_op: Operand, func: &mut IrFunction| {
+        let dest = alloc_value(func);
+        replacements.insert(old.0, dest);
+        merge_phis.push(Instruction::Phi {
+            dest,
+            ty,
+            incoming: vec![(Operand::Value(old), header_label), (fast_op, fast_label)],
+        });
+    };
+    add_merge(m.iv_phi, m.ult_ty, m.bound.clone(), func);
+    if m.store_is_bump {
+        add_merge(
+            m.store_base,
+            IrType::Ptr,
+            Operand::Value(bump_final[&m.store_base.0]),
+            func,
+        );
+    }
+    if m.load_is_bump && (!m.store_is_bump || m.load_base != m.store_base) {
+        add_merge(
+            m.load_base,
+            IrType::Ptr,
+            Operand::Value(bump_final[&m.load_base.0]),
+            func,
+        );
+    }
+    {
+        let exit = &mut func.blocks[m.exit];
+        if !exit.source_spans.is_empty() {
+            if exit.source_spans.len() == exit.instructions.len() {
+                exit.source_spans.splice(
+                    0..0,
+                    (0..merge_phis.len()).map(|_| crate::common::source::Span::dummy()),
+                );
+            } else {
+                exit.source_spans.clear();
+            }
+        }
+        exit.instructions.splice(0..0, merge_phis);
+    }
+    // No loop-defined Copy chain is permitted to escape; only the actual
+    // header phis are renamed. Exit phis retain their header-edge operands.
+    for (bi, block) in func.blocks.iter_mut().enumerate() {
+        if body.contains(&bi) {
+            continue;
+        }
+        for inst in &mut block.instructions {
+            if matches!(inst, Instruction::Phi { .. }) {
+                continue;
+            }
+            inst.for_each_operand_mut(|op| {
+                if let Operand::Value(v) = op {
+                    if let Some(&new) = replacements.get(&v.0) {
+                        *v = new;
+                    }
+                }
+            });
+            inst.for_each_value_use_mut(|v| {
+                if let Some(&new) = replacements.get(&v.0) {
+                    *v = new;
+                }
+            });
+        }
+        block.terminator.for_each_operand_mut(|op| {
+            if let Operand::Value(v) = op {
+                if let Some(&new) = replacements.get(&v.0) {
+                    *v = new;
+                }
+            }
+        });
+    }
+    func.blocks.push(fast);
     dlog!(
-        "{fname} loop@{}: REWROTE to {}",
+        "{} loop@{}: REWROTE with {} guard and scalar fallback",
+        func.name,
         m.header,
-        if m.use_memmove { "memmove" } else { "memcpy" }
+        if m.needs_overlap_guard {
+            "non-smear"
+        } else {
+            "nonzero"
+        }
     );
     true
 }
@@ -1845,6 +2268,13 @@ mod tests {
     use super::*;
     use crate::common::types::AddressSpace;
     use crate::ir::reexports::{BasicBlock, IrParam};
+
+    fn run_function(func: &mut IrFunction) -> usize {
+        // Synthetic D/S GlobalAddr instructions represent private, strong
+        // definitions in these tests; G is intentionally unproven.
+        let local_globals = ["D".to_string(), "S".to_string()].into_iter().collect();
+        super::run_function(func, &FxHashSet::default(), &local_globals)
+    }
 
     fn val(id: u32) -> Operand {
         Operand::Value(Value(id))
@@ -1895,6 +2325,23 @@ mod tests {
             .iter()
             .flat_map(|b| &b.instructions)
             .any(|i| matches!(i, Instruction::Call { func, .. } if func == name))
+    }
+
+    fn assert_guarded_scalar_fallback(f: &IrFunction) {
+        assert!(
+            f.blocks.iter().any(|b| b.label == BlockId(1)),
+            "scalar loop retained"
+        );
+        assert!(
+            matches!(
+                f.blocks[0].terminator,
+                Terminator::CondBranch {
+                    false_label: BlockId(1),
+                    ..
+                }
+            ),
+            "guard must route overlap to the original loop"
+        );
     }
 
     /// Single-block indexed copy over two globals:
@@ -1980,6 +2427,29 @@ mod tests {
     }
 
     #[test]
+    fn global_names_that_alias_cannot_prove_disjoint() {
+        let mut f = self_loop_copy_func(IrType::U8);
+        let aliases: FxHashSet<String> = ["D".to_string(), "S".to_string()].into_iter().collect();
+        let local_globals = aliases.clone();
+        assert_eq!(super::run_function(&mut f, &aliases, &local_globals), 1);
+        assert!(has_call(&f, "memmove"));
+        assert!(!has_call(&f, "memcpy"));
+        assert_guarded_scalar_fallback(&f);
+    }
+
+    #[test]
+    fn extern_global_names_cannot_prove_disjoint() {
+        let mut f = self_loop_copy_func(IrType::U8);
+        assert_eq!(
+            super::run_function(&mut f, &FxHashSet::default(), &FxHashSet::default()),
+            1
+        );
+        assert!(has_call(&f, "memmove"));
+        assert!(!has_call(&f, "memcpy"));
+        assert_guarded_scalar_fallback(&f);
+    }
+
+    #[test]
     fn self_loop_i8_copy_rewrites() {
         // Pins the U8 -> byte-type (I8|U8) widening: signed bytes match too.
         let mut f = self_loop_copy_func(IrType::I8);
@@ -1989,9 +2459,9 @@ mod tests {
     }
 
     #[test]
-    fn self_loop_param_copy_rewrites_to_memmove() {
-        // Same single-block shape, but over two pointer params: distinct
-        // params may still alias in C, so the rewrite must be memmove.
+    fn self_loop_param_copy_keeps_scalar_overlap_fallback() {
+        // Two params may overlap in the forward-smear direction. A fast
+        // memmove alone is not equivalent: the original loop must remain.
         let mut f = IrFunction::new(
             "self_loop_pcopy".into(),
             IrType::I32,
@@ -2024,7 +2494,8 @@ mod tests {
             .push(block(2, vec![], Terminator::Return(Some(i32c(0)))));
         let n = run_function(&mut f);
         assert_eq!(n, 1, "single-block param copy must rewrite");
-        assert!(has_call(&f, "memmove"), "param roots lower to memmove");
+        assert!(has_call(&f, "memmove"), "non-smear fast path is retained");
+        assert_guarded_scalar_fallback(&f);
         assert!(
             !has_call(&f, "memcpy"),
             "param roots must never lower to memcpy"
@@ -2200,6 +2671,16 @@ mod tests {
     }
 
     #[test]
+    fn distinct_restrict_params_are_disjoint() {
+        let mut f = self_loop_copy_with_bases(param_def(1, 0), param_def(2, 1), 2);
+        f.params[0].noalias = true;
+        assert_eq!(run_function(&mut f), 1);
+        assert!(has_call(&f, "memcpy"));
+        assert!(!has_call(&f, "memmove"));
+        assert_guarded_scalar_fallback(&f); // n == 0 may have null params
+    }
+
+    #[test]
     fn param_to_alloca_copy_uses_memcpy() {
         // Fresh-object disjointness: the alloca postdates the param value,
         // so no `restrict` is needed for memcpy's no-overlap contract.
@@ -2208,6 +2689,7 @@ mod tests {
         assert_eq!(n, 1, "param->alloca copy must rewrite");
         assert!(has_call(&f, "memcpy"), "disjoint pair lowers to memcpy");
         assert!(!has_call(&f, "memmove"), "no memmove for disjoint pair");
+        assert_guarded_scalar_fallback(&f); // nullable source, zero trip
     }
 
     #[test]
@@ -2218,6 +2700,7 @@ mod tests {
         assert_eq!(n, 1, "alloca->param copy must rewrite");
         assert!(has_call(&f, "memcpy"), "disjoint pair lowers to memcpy");
         assert!(!has_call(&f, "memmove"), "no memmove for disjoint pair");
+        assert_guarded_scalar_fallback(&f); // nullable destination, zero trip
     }
 
     #[test]
@@ -2227,7 +2710,8 @@ mod tests {
         let mut f = self_loop_copy_with_bases(global_def(1, "G"), param_def(2, 0), 1);
         let n = run_function(&mut f);
         assert_eq!(n, 1, "param->global copy must rewrite");
-        assert!(has_call(&f, "memmove"), "maybe-overlap needs memmove");
+        assert!(has_call(&f, "memmove"), "non-smear fast path");
+        assert_guarded_scalar_fallback(&f);
         assert!(!has_call(&f, "memcpy"), "no memcpy for maybe-overlap");
     }
 
@@ -2236,7 +2720,8 @@ mod tests {
         let mut f = self_loop_copy_with_bases(param_def(1, 0), global_def(2, "G"), 1);
         let n = run_function(&mut f);
         assert_eq!(n, 1, "global->param copy must rewrite");
-        assert!(has_call(&f, "memmove"), "maybe-overlap needs memmove");
+        assert!(has_call(&f, "memmove"), "non-smear fast path");
+        assert_guarded_scalar_fallback(&f);
         assert!(!has_call(&f, "memcpy"), "no memcpy for maybe-overlap");
     }
 
@@ -2254,7 +2739,8 @@ mod tests {
         let mut f = self_loop_copy_with_bases(alloca_def(1), param_ty_def(2, 0, IrType::U64), 1);
         let n = run_function(&mut f);
         assert_eq!(n, 1, "laundered-int-param copy must rewrite");
-        assert!(has_call(&f, "memmove"), "unknown provenance needs memmove");
+        assert!(has_call(&f, "memmove"), "non-smear fast path");
+        assert_guarded_scalar_fallback(&f);
         assert!(!has_call(&f, "memcpy"), "no memcpy for unknown provenance");
     }
 
@@ -2268,7 +2754,8 @@ mod tests {
         );
         let n = run_function(&mut f);
         assert_eq!(n, 1, "int-param copy must rewrite");
-        assert!(has_call(&f, "memmove"), "unknown provenance needs memmove");
+        assert!(has_call(&f, "memmove"), "non-smear fast path");
+        assert_guarded_scalar_fallback(&f);
         assert!(!has_call(&f, "memcpy"), "no memcpy for unknown provenance");
     }
 

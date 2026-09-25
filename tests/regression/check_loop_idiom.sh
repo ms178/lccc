@@ -2,10 +2,10 @@
 # ============================================================================
 # check_loop_idiom.sh — pin loop-idiom recognition decisions.
 #
-# The differential tests (loop_idiom_copy_basic/norewrite) pin SEMANTICS.
-# This script pins the DECISIONS, which are compile-time properties:
-#   1. recognised shapes lower to `call memcpy`/`call memmove` (indexed,
-#      bump, exit-value, single-block self-loop, and parameter-rooted forms),
+# Differential tests pin SEMANTICS; this script pins compile-time decisions
+# AND executes the cross-translation-unit alias regression:
+#   1. provably-disjoint private globals lower to `call memcpy`;
+#      uncertain roots retain a scalar loop plus a guarded memmove fast path;
 #   2. near misses keep their loops (same-root, overlap smear, extra
 #      loop-carried state, same-parameter copy),
 #   3. the pass is DEFAULT-ON (no env flag needed); CCC_NO_LOOP_IDIOM=1
@@ -46,22 +46,25 @@ REWRITE='call (memcpy|memmove)'
 # --- must rewrite (one TU per shape: rotating one function must not
 # --- perturb another's text). Default pipeline: no env flag. ---
 cat > "$work/r_indexed.c" <<'EOF'
-unsigned char G1[4096], G2[4096];
-unsigned LEN;
+static unsigned char G1[4096], G2[4096];
+static unsigned LEN;
+void init(unsigned n, unsigned char x) { LEN = n; G1[0] = x; }
 void f(void) { for (unsigned i = 0; i < LEN; i++) G2[i] = G1[i]; }
 EOF
 cat > "$work/r_bump.c" <<'EOF'
-unsigned char A[1024], B[1024];
-unsigned N;
+static unsigned char A[1024], B[1024];
+static unsigned N;
+void init(unsigned n, unsigned char x) { N = n; A[0] = x; }
 void f(void) {
     unsigned char *d = B, *s = A;
     for (unsigned i = 0; i < N; i++) *d++ = *s++;
 }
 EOF
 cat > "$work/r_exit.c" <<'EOF'
-unsigned char A[1024], B[1024];
-unsigned N;
+static unsigned char A[1024], B[1024];
+static unsigned N;
 unsigned char *after;
+void init(unsigned n, unsigned char x) { N = n; A[0] = x; }
 void f(void) {
     unsigned char *d = B;
     for (unsigned i = 0; i < N; i++) *d++ = A[i];
@@ -86,6 +89,21 @@ check r_exit    1 'call memcpy' "$work/r_exit.c"
 check r_selfloop 1 "$REWRITE"   "$work/r_selfloop.c"
 check r_param_move 1 'call memmove' "$work/r_param.c"
 check r_param_nomemcpy 0 'call memcpy' "$work/r_param.c"
+# The conditional call alone is insufficient: assert the old scalar load and
+# store are present too (forward overlap must execute those, not memmove).
+check r_param_scalar 1 'movzbl.*\(' "$work/r_param.c"
+
+# An unresolved GlobalAddr is NOT a private object. With X and Y aliased by
+# another translation unit, the scalar semantics must survive -O2.
+if "$CCC" -O2 -c "$here/loop_idiom_extern_alias/use.c" -o "$work/extern-use.o" \
+    && "$CCC" -O2 -c "$here/loop_idiom_extern_alias/defs.c" -o "$work/extern-defs.o" \
+    && "${HOST_CC:-gcc}" "$work/extern-use.o" "$work/extern-defs.o" -o "$work/extern-alias" \
+    && "$work/extern-alias"; then
+    echo "ok(extern_alias): cross-TU forward smear retained"
+else
+    echo "FAIL(extern_alias): cross-TU globals were treated as disjoint"
+    fail=1
+fi
 
 # --- must NOT rewrite ---
 cat > "$work/n_self.c" <<'EOF'

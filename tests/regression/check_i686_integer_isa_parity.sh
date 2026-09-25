@@ -23,12 +23,21 @@ C
 grep -q 'tzcntl' "$tmp/on.s"
 grep -q 'popcntl' "$tmp/on.s"
 "$CCC" -O2 -m32 -mlzcnt -mpopcnt "$tmp/t.c" -o "$tmp/on"
-set +e
-"$tmp/on"
-st=$?
-set -e
-# ctz(8)+pop(7) == 6: the ABM/SSE4.2 forms compute correctly at runtime.
-[ "$st" -eq 6 ]
+# Some developer hosts can *build* a freestanding i686 ELF but cannot run it:
+# their 32-bit ELF interpreter is absent. Still check assembly, vetoes and
+# predefined macros below; skip only the unavailable runtime assertion. CI
+# with an installed interpreter continues to require the actual exit code.
+interp=$(readelf -l "$tmp/on" | sed -n 's/.*Requesting program interpreter: \([^]]*\)].*/\1/p')
+if [[ -n "$interp" && ! -e "$interp" ]]; then
+    echo "SKIP-RUN: i686 integer ISA binary requires missing $interp; assembly/macro checks continue"
+else
+    set +e
+    "$tmp/on"
+    st=$?
+    set -e
+    # ctz(8)+pop(7) == 6: the ABM/SSE4.2 forms compute correctly at runtime.
+    [ "$st" -eq 6 ]
+fi
 
 # 2. Baseline -m32: broad-compatibility contract — no ABM/SSE4.2 forms.
 "$CCC" -O2 -m32 -S "$tmp/t.c" -o "$tmp/base.s"
