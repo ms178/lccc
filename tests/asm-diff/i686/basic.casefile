@@ -27,3 +27,34 @@ movl 8(,%ebx,1), %eax
 ;;; vphminposuw_ymm reject
 .text
 vphminposuw %ymm0, %ymm1
+
+;;; conditionals_ifdef
+.text
+.set  v, 3
+.ifdef v
+        nop
+.else
+        ud2
+.endif
+back:
+.ifdef back
+        nop
+.endif
+.ifdef forward
+        ud2
+.endif
+forward:
+.ifndef nothere
+        nop
+.endif
+.ifndef v
+        ud2
+.elseif v == 3
+        nop
+.endif
+        ret
+
+;;; globl_undef
+.text
+.globl undefined_unreferenced
+        nop

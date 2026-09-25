@@ -232,6 +232,36 @@ pub fn build_elf_symbol_table(input: &SymbolTableInput) -> Vec<ObjSymbol> {
         }
     }
 
+    // Undefined .globl/.weak declarations with no relocation reference are
+    // still emitted by GAS as UNDEF symbols (measured on GAS 2.47: a bare
+    // `.globl foo` with no definition produces `*UND* foo`).  The same path
+    // carries the `_GLOBAL_OFFSET_TABLE_` global the writer synthesises for
+    // GOT-base-relative relocations — neither is referenced by any
+    // relocation, so the loop above would silently drop both.
+    let emitted: FxHashSet<String> = symbols.iter().map(|s| s.name.clone()).collect();
+    for name in input.global_symbols.keys().chain(input.weak_symbols.keys()) {
+        if emitted.contains(name) || input.sections.contains_key(name) {
+            continue;
+        }
+        symbols.push(ObjSymbol {
+            name: name.clone(),
+            value: 0,
+            size: 0,
+            binding: if input.weak_symbols.contains_key(name) {
+                STB_WEAK
+            } else {
+                STB_GLOBAL
+            },
+            sym_type: input.symbol_types.get(name).copied().unwrap_or(STT_NOTYPE),
+            visibility: input
+                .symbol_visibility
+                .get(name)
+                .copied()
+                .unwrap_or(STV_DEFAULT),
+            section_name: "*UND*".to_string(),
+        });
+    }
+
     symbols
 }
 

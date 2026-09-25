@@ -718,6 +718,21 @@ fn is_mixed_width_mnemonic(m: &str) -> bool {
         "vpclmul",
         "vpdp",
         "vpmadd",
+        // XOP/LWP and the FMA4-era 5-op family: the specific encoders
+        // carry the byte-probed GAS 2.47 diagnostics (register type
+        // mismatch for the ymm-capable vpcmov/vfrcz*/vpermil2*; operand
+        // size mismatch for the xmm-only vpperm/vprot*/vpmac*/vph*/
+        // vpsha*/vpshl*), which the generic rules below would pre-empt
+        // with non-GAS wording.
+        "vpcmov",
+        "vpperm",
+        "vprot",
+        "vpmac",
+        "vph",
+        "vfrcz",
+        "vpsha",
+        "vpshl",
+        "vpermil2",
         "pmadd",
         "psadbw",
         "vpsadbw",
@@ -1037,7 +1052,17 @@ pub(crate) fn validate_operands(mnemonic: &str, ops: &[Operand]) -> Result<(), S
         || mnemonic.starts_with("cfcmov")
         || (mnemonic.starts_with('j') && mnemonic != "jmp" && mnemonic != "jmpq");
     if let Some(sz) = mnemonic_size_suffix(mnemonic) {
-        if !is_cc_mnemonic && !is_mixed_width_mnemonic(mnemonic) && matches!(sz, 1 | 2 | 4 | 8) {
+        // LWP spellings end in letters that LOOK like size suffixes
+        // (`lwpval` → 'l') but are full mnemonic names: the destination
+        // register independently chooses r32/r64 (GAS 2.47 accepts
+        // `lwpval $imm, %ebx, %r15`). The 0x8F family has no suffixed
+        // spellings at all.
+        let is_lwp = mnemonic == "lwpins" || mnemonic == "lwpval";
+        if !is_cc_mnemonic
+            && !is_lwp
+            && !is_mixed_width_mnemonic(mnemonic)
+            && matches!(sz, 1 | 2 | 4 | 8)
+        {
             for op in ops {
                 if let Operand::Register(r) = op {
                     if let RegClass::Gp(w) = reg_class(&r.name) {

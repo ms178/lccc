@@ -151,6 +151,31 @@ impl X86Arch for I686Arch {
         // NOT TLS types.)
         matches!(reloc_type, 14..=19 | 24..=37 | 39..=41)
     }
+    fn needs_got_base_symbol(reloc_type: u32) -> bool {
+        // i386 operator classes that make GAS 2.47 record
+        // `_GLOBAL_OFFSET_TABLE_` (GLOBAL UND NOTYPE) in the symbol table
+        // (measured one @operator per object, `readelf -s`): @GOT
+        // (GOT32 = 3 and GOT32X = 43), @GOTOFF (9), @GOTPC (10), and —
+        // unlike x86-64, where only the GOT-based TLS forms qualify —
+        // EVERY @TLS* operator including the LE ones (@NTPOFF → 17,
+        // @TPOFF → 34, @DTPOFF → 32 all probe GOTSYM on i386).  The set
+        // is therefore the GOT trio plus the whole TLS family except the
+        // `.reloc`-only marker pair (40 DESC_CALL / 41 DESC).  20-23 are
+        // R_386_{16,PC16,8,PC8} field types and 38 is SIZE32 — not in the
+        // class.  Constants not yet named in encoder/mod.rs are spelled
+        // numerically with their ABI names so the classifier stays
+        // type-complete ahead of any emitter that grows.
+        matches!(
+            reloc_type,
+            R_386_GOT32
+                | R_386_GOTOFF
+                | R_386_GOTPC
+                | 14..=19  // TPOFF, IE, GOTIE, LE, GD, LDM
+                | 24..=37  // GD_32..GD_CALL, LDM_32..LDM_POP, LDO_32, IE_32, LE_32, DTPMOD32, DTPOFF32, TPOFF32
+                | 39       // TLS_GOTDESC
+                | R_386_GOT32X
+        )
+    }
     fn supports_deferred_skips() -> bool {
         true
     }

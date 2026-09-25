@@ -217,6 +217,24 @@ pub struct Driver {
     /// without one the code-generation baseline is x86-64-v3 and only
     /// explicit `-mno-*` denials remove subsets.  See `backend::x86::isa`.
     pub(super) x86_march_explicit: bool,
+    /// Explicit x86 ISA `-m`/`-mno-` flags in command-line order, for the
+    /// `-march=` replace-and-replay contract (GCC-exact, measured on the
+    /// host oracle, gcc 14.2 `-dM -E`):
+    ///
+    /// * a later `-march=` REPLACES the arch-implied set (it is not a
+    ///   union — `-march=x86-64-v3 -march=x86-64` leaves `__BMI__`/
+    ///   `__MOVBE__`/`__AVX__` all absent);
+    /// * an explicit `-m*`/`-mno-*` decision overrides the FINAL arch in
+    ///   BOTH directions and in EITHER order (`-mno-bmi -march=v3` →
+    ///   `__BMI__` absent; `-mbmi -march=x86-64` → `__BMI__` defined);
+    /// * among explicit flags, the later one wins.
+    ///
+    /// Each `-march=` therefore resets the enable surface to the baseline
+    /// and replays these recorded flags AFTER applying the profile, so the
+    /// explicit decisions land on top of the final arch set exactly once
+    /// more.  The sticky `*_explicitly_disabled` denials and `no_sse` are
+    /// consulted at resolve time and survive the reset untouched.
+    pub(super) x86_explicit_isa_args: Vec<String>,
     pub(super) skip_rax_setup: bool,
     /// -mno-80387/-mno-fp-ret-in-387: no x87 instructions or x87 FP returns.
     /// Recorded so FP codegen can fail closed on long-double paths.
@@ -523,6 +541,7 @@ impl Driver {
             popcnt_explicitly_disabled: false,
             movbe_explicitly_disabled: false,
             x86_march_explicit: false,
+            x86_explicit_isa_args: Vec::new(),
             skip_rax_setup: false,
             no_x87: false,
             indirect_branch_thunk_inline: false,
@@ -1366,69 +1385,78 @@ impl Driver {
         // Our i686 backend also uses SSE2, so we define them for i686 as well.
         // Projects like stb_image, minimp3, dr_libs use #ifdef __SSE2__ to enable SIMD paths.
         preprocessor.set_sse_macros(self.no_sse);
-        // Define extended SIMD feature macros (__SSE3__, __AVX__, __AVX2__, etc.)
-        // when the corresponding -msse3, -mavx, -mavx2 flags are passed.
-        if !self.no_sse {
-            preprocessor.set_extended_simd_macros(
-                self.enable_sse3,
-                self.enable_ssse3,
-                self.enable_sse4_1,
-                self.enable_sse4_2,
-                self.enable_avx,
-                self.enable_avx2,
-                self.enable_aes,
-                self.enable_pclmul,
-                self.enable_f16c,
-                self.enable_fma,
-                // INTEGER-ISA macros follow the RESOLVED codegen permission
-                // (default x86-64-v3 grant, explicit -march ceiling,
-                // -mno-* denial), not the raw request flags: __BMI__ and
-                // friends must exactly mirror what the backend may emit,
-                // or an #ifdef-guarded intrinsic path could disagree with
-                // the scalar codegen contract.
-                self.resolved_bmi1(),
-                self.resolved_bmi2(),
-                self.resolved_lzcnt(),
-                self.resolved_popcnt(),
-                self.resolved_movbe(),
-                self.enable_rdrnd,
-                self.enable_avx512f,
-                self.enable_avx512cd,
-                self.enable_avx512dq,
-                self.enable_avx512bw,
-                self.enable_avx512vl,
-                self.enable_avx512ifma,
-                self.enable_avx512vbmi,
-                self.enable_avx512vbmi2,
-                self.enable_avx512vnni,
-                self.enable_avx512bitalg,
-                self.enable_avx512vpopcntdq,
-                self.enable_avx512bf16,
-                self.enable_avx512fp16,
-                self.enable_avx512er,
-                self.enable_avx512pf,
-                self.enable_avx512vp2intersect,
-                self.enable_avxvnni,
-                self.enable_avxifma,
-                self.enable_avxneconvert,
-                self.enable_avx10_1,
-                self.enable_avx10_2,
-                self.enable_gfni,
-                self.enable_vaes,
-                self.enable_vpclmulqdq,
-                self.enable_avxvnniint8,
-                self.enable_avxvnniint16,
-                self.enable_sha512,
-                self.enable_sm3,
-                self.enable_sm4,
-                self.enable_movrs,
-                self.enable_amx_tile,
-                self.enable_amx_int8,
-                self.enable_amx_bf16,
-                self.enable_cmpccxadd,
-                self.enable_apxf,
-            );
-        }
+        // Define extended feature macros (__SSE3__, __AVX__, __BMI__, ...).
+        // The SIMD half is gated on the xmm file being open (`x86_isa()`
+        // returns NONE under -mno-sse, and macros must mirror codegen —
+        // every SIMD arg is ANDed with `!no_sse` so a stray enable flag can
+        // never over-report).  The INTEGER half (__BMI__, __BMI2__,
+        // __LZCNT__, __POPCNT__, __MOVBE__, __RDRND__) follows the RESOLVED
+        // integer state with NO -mno-sse gate: integer ISA is legal without
+        // xmm state — lccc's codegen emits `andn` for `-mno-sse -O2`
+        // (measured), and GCC defines `__BMI__` for
+        // `-mno-sse -march=x86-64-v3` — so suppressing the macro there
+        // made the preprocessor lie about the codegen contract (an
+        // #ifdef __BMI__ fallback path would disagree with the emitted
+        // `andnq`).
+        preprocessor.set_extended_simd_macros(
+            !self.no_sse && self.enable_sse3,
+            !self.no_sse && self.enable_ssse3,
+            !self.no_sse && self.enable_sse4_1,
+            !self.no_sse && self.enable_sse4_2,
+            !self.no_sse && self.enable_avx,
+            !self.no_sse && self.enable_avx2,
+            !self.no_sse && self.enable_aes,
+            !self.no_sse && self.enable_pclmul,
+            !self.no_sse && self.enable_f16c,
+            !self.no_sse && self.enable_fma,
+            // INTEGER-ISA macros follow the RESOLVED codegen permission
+            // (default x86-64-v3 grant, explicit -march ceiling,
+            // -mno-* denial), not the raw request flags: __BMI__ and
+            // friends must exactly mirror what the backend may emit,
+            // or an #ifdef-guarded intrinsic path could disagree with
+            // the scalar codegen contract.
+            self.resolved_bmi1(),
+            self.resolved_bmi2(),
+            self.resolved_lzcnt(),
+            self.resolved_popcnt(),
+            self.resolved_movbe(),
+            self.enable_rdrnd,
+            !self.no_sse && self.enable_avx512f,
+            !self.no_sse && self.enable_avx512cd,
+            !self.no_sse && self.enable_avx512dq,
+            !self.no_sse && self.enable_avx512bw,
+            !self.no_sse && self.enable_avx512vl,
+            !self.no_sse && self.enable_avx512ifma,
+            !self.no_sse && self.enable_avx512vbmi,
+            !self.no_sse && self.enable_avx512vbmi2,
+            !self.no_sse && self.enable_avx512vnni,
+            !self.no_sse && self.enable_avx512bitalg,
+            !self.no_sse && self.enable_avx512vpopcntdq,
+            !self.no_sse && self.enable_avx512bf16,
+            !self.no_sse && self.enable_avx512fp16,
+            !self.no_sse && self.enable_avx512er,
+            !self.no_sse && self.enable_avx512pf,
+            !self.no_sse && self.enable_avx512vp2intersect,
+            !self.no_sse && self.enable_avxvnni,
+            !self.no_sse && self.enable_avxifma,
+            !self.no_sse && self.enable_avxneconvert,
+            !self.no_sse && self.enable_avx10_1,
+            !self.no_sse && self.enable_avx10_2,
+            !self.no_sse && self.enable_gfni,
+            !self.no_sse && self.enable_vaes,
+            !self.no_sse && self.enable_vpclmulqdq,
+            !self.no_sse && self.enable_avxvnniint8,
+            !self.no_sse && self.enable_avxvnniint16,
+            !self.no_sse && self.enable_sha512,
+            !self.no_sse && self.enable_sm3,
+            !self.no_sse && self.enable_sm4,
+            !self.no_sse && self.enable_movrs,
+            !self.no_sse && self.enable_amx_tile,
+            !self.no_sse && self.enable_amx_int8,
+            !self.no_sse && self.enable_amx_bf16,
+            !self.no_sse && self.enable_cmpccxadd,
+            self.enable_apxf,
+        );
         // Define _REENTRANT when -pthread is used.
         // GCC and Clang automatically define _REENTRANT=1 when -pthread is passed.
         // Many configure scripts (e.g., iperf3's ax_pthread.m4) check for this macro
@@ -2633,6 +2661,25 @@ impl Driver {
     /// explicit `-mno-*` denial always wins over the default grant.
     /// BMI/LZCNT/POPCNT/MOVBE are integer ISA: they stay legal under
     /// `-mno-sse` (same contract as `enable_x86_v3_profile`).
+    ///
+    /// GCC-exactness of the explicit-flag interaction, measured on the
+    /// host oracle (gcc 14.2, `-dM -E` macro census — the Review-AI claim
+    /// that "GCC is strictly last-wins and re-enables BMI1 under
+    /// `-mno-bmi -march=x86-64-v3`" is FALSE):
+    ///
+    /// | flags | GCC `__BMI__` | LCCC `resolved_bmi1` |
+    /// |---|---|---|
+    /// | `-mno-bmi -march=x86-64-v3` | **absent** (explicit denial is sticky against the arch set) | false |
+    /// | `-march=x86-64-v3 -mno-bmi` | absent (order-independent) | false |
+    /// | `-mbmi -march=x86-64` | **defined** (explicit enable survives a lower arch) | true |
+    /// | `-mno-bmi -mbmi` | defined (later explicit wins) | true |
+    /// | `-march=x86-64-v3 -march=x86-64` | absent (later `-march=` REPLACES the set) | false (post-fix) |
+    ///
+    /// i.e. the model is "explicit mask overrides the final arch, in both
+    /// directions", not plain last-wins.  A second `-march=` REPLACES the
+    /// arch-implied set (the `-march=` arm resets the enable surface and
+    /// replays the recorded explicit flags after applying the profile —
+    /// see `reset_x86_arch_implied_isa` / `replay_x86_explicit_isa_flags`).
     pub(super) fn resolved_bmi1(&self) -> bool {
         self.target == Target::X86_64
             && !self.bmi_explicitly_disabled

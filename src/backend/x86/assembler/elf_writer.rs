@@ -219,6 +219,39 @@ impl X86Arch for X86_64Arch {
         matches!(reloc_type, 16..=23 | 34..=36 | 44 | 45 | 47 | 48 | 50 | 51)
     }
 
+    /// GOT-base computing operator classes on x86-64 (measured against
+    /// GAS 2.47, one @operator per object, `readelf -s` for the symbol):
+    /// @GOTPCREL (9 / relaxable 41-49), @GOT (GOT32 = 3), @GOTTPOFF
+    /// (22 / 44 / 47 / 50), @TLSDESC (34 / 45 / 48 / 51), @TLSGD (19),
+    /// @TLSLD (20), @TPOFF (TPOFF32 = 23), @DTPOFF (DTPOFF32 = 21).
+    /// CODE_5 (46-48) is included at the class level for the same reason
+    /// `is_tls_reloc` includes it.  Exclusions and the `.reloc` finding
+    /// are documented on the trait method.
+    fn needs_got_base_symbol(reloc_type: u32) -> bool {
+        matches!(
+            reloc_type,
+            R_X86_64_GOT32
+                | R_X86_64_GOTPCREL
+                | R_X86_64_TLSGD
+                | R_X86_64_TLSLD
+                | R_X86_64_DTPOFF32
+                | R_X86_64_GOTTPOFF
+                | R_X86_64_TPOFF32
+                | R_X86_64_GOTPC32_TLSDESC
+                | R_X86_64_GOTPCRELX
+                | R_X86_64_REX_GOTPCRELX
+                | R_X86_64_CODE_4_GOTPCRELX
+                | R_X86_64_CODE_4_GOTTPOFF
+                | R_X86_64_CODE_4_GOTPC32_TLSDESC
+                | R_X86_64_CODE_5_GOTPCRELX
+                | R_X86_64_CODE_5_GOTTPOFF
+                | R_X86_64_CODE_5_GOTPC32_TLSDESC
+                | R_X86_64_CODE_6_GOTPCRELX
+                | R_X86_64_CODE_6_GOTTPOFF
+                | R_X86_64_CODE_6_GOTPC32_TLSDESC
+        )
+    }
+
     fn reloc_pc8_internal() -> Option<u32> {
         Some(R_X86_64_PC8_INTERNAL)
     }
