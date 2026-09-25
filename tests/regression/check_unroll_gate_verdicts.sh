@@ -59,8 +59,14 @@ compile_probe() {
 
 jumps_in_fn() {
     local stem=$1 fn=$2
+    # Match any x86 jump: jmp plus all jcc variants (ja, jae, jb, jbe,
+    # je, jne, jl, jle, jg, jge, js, jns, jo, jno, jp, jnp, jc, jnc,
+    # jz, jnz, etc.). The old regex missed js/jns/jp/jnp/jo/jno/jb/jc
+    # and would have let a \"fully unrolled\" nest slip through if it kept
+    # e.g. a parity test. `j[a-z]+` is the complete x86 jump family and
+    # nothing else starts with `j` in AT&T asm.
     sed -n "/^$fn:/,/^.size $fn,/p" "$work/$stem.s" \
-        | grep -cE "^[ \t]*j(mp|b|be|ae|a|e|ne|le|l|ge|g)[ \t]"
+        | grep -cE "^[ \t]*j[a-z]+[ \t]"
 }
 
 expect_veto() {

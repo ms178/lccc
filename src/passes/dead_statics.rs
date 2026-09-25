@@ -70,7 +70,10 @@ pub(crate) fn eliminate_dead_static_functions(module: &mut IrModule) {
 ///   6.7.3p6 UB, and with no loads the UB store is unobservable either way.
 /// * **No name-level escape**: the name appears in no toplevel-asm blob
 ///   ([`toplevel_asm_mentions`]), no global initializer (an init naming it
-///   publishes the address), and no inline-asm `input_symbols`.
+///   publishes the address), no inline-asm `input_symbols`, no
+///   `__attribute__((alias))` alias target/name (the alias publishes the
+///   address cross-TU), and no inline-asm template string (a store whose only
+///   reader is `asm("movl out(%%rip), %0" : "=r"(v))` must be kept).
 /// * **No value-level escape or read**: in every function, each `GlobalAddr`
 ///   naming the global seeds an address set propagated only through
 ///   `GetElementPtr` bases, `Copy`, bitwise-identical `Cast`s (pure renames:
@@ -159,16 +162,54 @@ pub(crate) fn eliminate_dead_global_stores(module: &mut IrModule) {
     }
     // Inline-asm symbol operands publish addresses too.
     let mut asm_named: FxHashSet<String> = FxHashSet::default();
+    // Inline-asm template strings may mention globals textually (e.g.
+    // `asm("movl g(%%rip), %0" : "=r"(v))`). Collect them once.
+    let mut inline_asm_templates: Vec<String> = Vec::new();
     for func in &module.functions {
         if func.is_declaration {
             continue;
         }
         for block in &func.blocks {
             for inst in &block.instructions {
-                if let Instruction::InlineAsm { input_symbols, .. } = inst {
+                if let Instruction::InlineAsm {
+                    input_symbols,
+                    template,
+                    ..
+                } = inst
+                {
                     for s in input_symbols.iter().flatten() {
                         asm_named.insert(String::from(asm_symbol_base(s)));
                     }
+                    if !template.is_empty() {
+                        inline_asm_templates.push(template.clone());
+                    }
+                }
+            }
+        }
+    }
+    // Aliases publish addresses cross-TU: `static int out[4]; extern int
+    // pub_out[4] __attribute__((alias("out")));` — other TUs read `out`
+    // through `pub_out`, so stores to `out` must be kept.
+    let mut alias_named: FxHashSet<String> = FxHashSet::default();
+    for (alias_name, target, _) in &module.aliases {
+        alias_named.insert(alias_name.to_string());
+        alias_named.insert(target.to_string());
+    }
+
+    // F6: collect GlobalAddr definitions once for all functions — O(F*I)
+    // instead of O(G*F*I). Map from global name to list of (func_idx, value).
+    let mut global_addr_defs: FxHashMap<String, Vec<(usize, u32)>> = FxHashMap::default();
+    for (fi, func) in module.functions.iter().enumerate() {
+        if func.is_declaration {
+            continue;
+        }
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::GlobalAddr { dest, name } = inst {
+                    global_addr_defs
+                        .entry(name.clone())
+                        .or_default()
+                        .push((fi, dest.0));
                 }
             }
         }
@@ -194,25 +235,42 @@ pub(crate) fn eliminate_dead_global_stores(module: &mut IrModule) {
         {
             continue;
         }
-        if init_named.contains(&global.name) || asm_named.contains(&global.name) {
+        if init_named.contains(&global.name)
+            || asm_named.contains(&global.name)
+            || alias_named.contains(&global.name)
+        {
             continue;
         }
-        // Flow walk: seed from every GlobalAddr naming this global.
+        if !inline_asm_templates.is_empty()
+            && inline_asm_templates
+                .iter()
+                .any(|t| asm_mentions_symbol(t, global.name.as_str()))
+        {
+            continue;
+        }
+        // Flow walk: seed from every GlobalAddr naming this global (via
+        // pre-collected map, not a per-global full scan).
+        let Some(all_seeds) = global_addr_defs.get(&global.name) else {
+            continue;
+        };
+        // Group seeds by function for locality.
+        let mut seeds_by_func: FxHashMap<usize, Vec<u32>> = FxHashMap::default();
+        for (fi, dest) in all_seeds {
+            seeds_by_func.entry(*fi).or_default().push(*dest);
+        }
+
         let mut stores: Vec<(usize, usize, usize)> = Vec::new();
         let mut bailed = false;
-        for (fi, func) in module.functions.iter().enumerate() {
-            if func.is_declaration {
-                continue;
-            }
+        // Only iterate functions that actually reference this global.
+        for (fi, seeds) in seeds_by_func {
+            let func = &module.functions[fi];
+            // Per-function address set, seeded from this global's GlobalAddrs
+            // in this function.
             let mut addr: FxHashSet<u32> = FxHashSet::default();
             let mut worklist: Vec<u32> = Vec::new();
-            for block in &func.blocks {
-                for inst in &block.instructions {
-                    if let Instruction::GlobalAddr { dest, name } = inst {
-                        if *name == global.name && addr.insert(dest.0) {
-                            worklist.push(dest.0);
-                        }
-                    }
+            for d in seeds {
+                if addr.insert(d) {
+                    worklist.push(d);
                 }
             }
             if worklist.is_empty() {
@@ -223,10 +281,10 @@ pub(crate) fn eliminate_dead_global_stores(module: &mut IrModule) {
                 let Some(uses) = locs.get(v as usize) else {
                     continue;
                 };
-                // Clone the use list: `stores` borrows nothing, but the
-                // double borrow of `module` (uses via `func_uses`, code
-                // via `module.functions`) ends cleaner with owned locs.
-                for &(bi, ii) in &uses.clone() {
+                // No clone: `uses` is a &[ (bi,ii) ] borrowed from func_uses,
+                // and `func` is borrowed immutably from module — no aliasing
+                // conflict, so we can iterate the slice directly.
+                for &(bi, ii) in uses.iter() {
                     if ii == usize::MAX {
                         bailed = true;
                         break;
@@ -257,16 +315,6 @@ pub(crate) fn eliminate_dead_global_stores(module: &mut IrModule) {
                             }
                         }
                         Instruction::Phi { dest, incoming, .. } => {
-                            // Loop-carried address (`p = Phi[base, bump]`):
-                            // one arm derives (that is why this use is
-                            // visited), so add the dest OPTIMISTICALLY —
-                            // the latch arm typically derives from the dest
-                            // itself (`bump = GEP(p)`), a cycle no arm-first
-                            // rule can bootstrap.  Soundness comes from the
-                            // all-definitions verification below, which
-                            // requires EVERY arm in the final set; a phi
-                            // merging a foreign value fails there and bails
-                            // the global (recorded stores discarded).
                             if !incoming
                                 .iter()
                                 .any(|(op, _)| *op == Operand::Value(Value(v)))
@@ -325,10 +373,6 @@ pub(crate) fn eliminate_dead_global_stores(module: &mut IrModule) {
                             }
                             stores.push((fi, bi, ii));
                         }
-                        // Any load through the address is a reader; memcpy
-                        // reads or writes through its endpoints; everything
-                        // else (calls, phis, casts, asm operands, ...) is an
-                        // escape or an unknown — bail.
                         _ => {
                             bailed = true;
                             break;
@@ -339,11 +383,6 @@ pub(crate) fn eliminate_dead_global_stores(module: &mut IrModule) {
                     break;
                 }
             }
-            // All-definitions verification (redefinition rule): every
-            // definition of every set member must derive from this
-            // global's address.  A redefinition from any other value
-            // bails — the use classification cannot see which reaching
-            // def a use reads.
             if !bailed {
                 let defs = &func_uses[fi].def_locs;
                 'verify: for v in addr.iter() {
@@ -403,8 +442,6 @@ pub(crate) fn eliminate_dead_global_stores(module: &mut IrModule) {
         return;
     }
     dead.sort();
-    // Sweep per block (DCE's span discipline: compact spans 1:1 when they
-    // map, else clear stale ones and compact instructions alone).
     let mut idx = 0;
     while idx < dead.len() {
         let (fi, bi, _) = dead[idx];
@@ -414,8 +451,6 @@ pub(crate) fn eliminate_dead_global_stores(module: &mut IrModule) {
             idx += 1;
         }
         in_block.sort();
-        // `retain` closures cannot see their own index: rebuild with an
-        // explicit loop (dead indices ascending).
         let block = &mut module.functions[fi].blocks[bi];
         let original_len = block.instructions.len();
         let has_spans = !block.source_spans.is_empty() && block.source_spans.len() == original_len;
@@ -445,8 +480,6 @@ pub(crate) fn eliminate_dead_global_stores(module: &mut IrModule) {
         }
         debug_assert_eq!(block.instructions.len(), original_len - in_block.len());
     }
-    // DCE chaser on touched functions: the orphaned stored-value and
-    // address chains are pure and disappear in the same pass.
     for (fi, touched) in touched_funcs.iter().enumerate() {
         if *touched {
             crate::passes::dce::eliminate_dead_code(&mut module.functions[fi]);
@@ -756,6 +789,53 @@ fn compute_reachability(
         }
     }
 
+    // F5: inline-asm template strings may mention static symbols textually
+    // (e.g. `asm("movl g(%%rip), %0" : "=r"(v))`). Treat any such mention
+    // as a root, just like toplevel-asm. This closes the same gap in both
+    // dead-static passes; the old pass had the same blind spot.
+    {
+        let mut inline_templates: Vec<&str> = Vec::new();
+        for func in &module.functions {
+            if func.is_declaration {
+                continue;
+            }
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    if let Instruction::InlineAsm { template, .. } = inst {
+                        if !template.is_empty() {
+                            inline_templates.push(template.as_str());
+                        }
+                    }
+                }
+            }
+        }
+        if !inline_templates.is_empty() {
+            for (i, func) in module.functions.iter().enumerate() {
+                if func.is_static
+                    && !func.is_declaration
+                    && !is_marked(&reachable, i)
+                    && inline_templates
+                        .iter()
+                        .any(|t| asm_mentions_symbol(t, func.name.as_str()))
+                {
+                    mark_reachable(i, &mut reachable, &mut worklist);
+                }
+            }
+            for (j, global) in module.globals.iter().enumerate() {
+                let id = n_funcs + j;
+                if global.is_static
+                    && !global.is_extern
+                    && !is_marked(&reachable, id)
+                    && inline_templates
+                        .iter()
+                        .any(|t| asm_mentions_symbol(t, global.name.as_str()))
+                {
+                    mark_reachable(id, &mut reachable, &mut worklist);
+                }
+            }
+        }
+    }
+
     while let Some(sid) = worklist.pop() {
         if sid < n_funcs {
             if let Some(refs) = func_refs.get(sid) {
@@ -861,6 +941,26 @@ fn filter_symbol_attrs(module: &mut IrModule) {
     }
 
     let has_toplevel_asm = !module.toplevel_asm.is_empty();
+    // Collect inline-asm templates for symbol-attrs filtering too: a `.hidden`
+    // for a symbol only mentioned in an inline-asm template must be kept.
+    let inline_templates: Vec<String> = module
+        .functions
+        .iter()
+        .filter(|f| !f.is_declaration)
+        .flat_map(|f| f.blocks.iter())
+        .flat_map(|b| b.instructions.iter())
+        .filter_map(|inst| {
+            if let Instruction::InlineAsm { template, .. } = inst {
+                if !template.is_empty() {
+                    Some(template.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+        .collect();
 
     module.symbol_attrs.retain(|(name, is_weak, visibility)| {
         if *is_weak && visibility.is_none() {
@@ -870,7 +970,10 @@ fn filter_symbol_attrs(module: &mut IrModule) {
         if referenced.contains(n) {
             return true;
         }
-        has_toplevel_asm && toplevel_asm_mentions(&module.toplevel_asm, n)
+        if has_toplevel_asm && toplevel_asm_mentions(&module.toplevel_asm, n) {
+            return true;
+        }
+        !inline_templates.is_empty() && inline_templates.iter().any(|t| asm_mentions_symbol(t, n))
     });
 }
 
@@ -1362,5 +1465,118 @@ mod tests {
         m.functions.push(f);
         eliminate_dead_global_stores(&mut m);
         assert_eq!(store_count(&m), 1, "volatile store: kept");
+    }
+
+    #[test]
+    fn alias_target_bails() {
+        // `static int out[4]; extern int pub_out[4] __attribute__((alias("out")));`
+        // Other TUs read `out` through `pub_out`, so stores must be kept.
+        let mut m = IrModule::new();
+        m.globals.push(gs_global("out"));
+        m.functions
+            .push(gs_writer("w", vec![], Terminator::Return(None), 2));
+        m.aliases
+            .push((String::from("pub_out"), String::from("out"), false));
+        assert_eq!(store_count(&m), 1);
+        eliminate_dead_global_stores(&mut m);
+        assert_eq!(store_count(&m), 1, "alias target: store kept");
+    }
+
+    #[test]
+    fn alias_name_bails() {
+        let mut m = IrModule::new();
+        let g = gs_global("pub_out");
+        m.globals.push(g);
+        let mut f = IrFunction::new(String::from("w"), IrType::Void, vec![], false);
+        f.blocks = vec![gs_block(
+            vec![
+                Instruction::GlobalAddr {
+                    dest: Value(0),
+                    name: String::from("pub_out"),
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(1),
+                    base: Value(0),
+                    offset: Operand::Const(IrConst::I64(0)),
+                    ty: IrType::F64,
+                },
+                Instruction::Store {
+                    val: Operand::Const(IrConst::F64(1.5)),
+                    ptr: Value(1),
+                    ty: IrType::F64,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+            ],
+            Terminator::Return(None),
+        )];
+        f.next_value_id = 2;
+        m.functions.push(f);
+        m.aliases
+            .push((String::from("pub_out"), String::from("out"), false));
+        eliminate_dead_global_stores(&mut m);
+        assert_eq!(store_count(&m), 1, "alias name: store kept");
+    }
+
+    #[test]
+    fn inline_asm_template_bails() {
+        let mut m = IrModule::new();
+        m.globals.push(gs_global("g"));
+        let mut f = IrFunction::new(String::from("w"), IrType::Void, vec![], false);
+        f.blocks = vec![gs_block(
+            vec![
+                Instruction::GlobalAddr {
+                    dest: Value(0),
+                    name: String::from("g"),
+                },
+                Instruction::Store {
+                    val: Operand::Const(IrConst::I32(5)),
+                    ptr: Value(0),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+                Instruction::InlineAsm {
+                    template: String::from("movl g(%%rip), %0"),
+                    outputs: vec![("=r".to_string(), Value(1), None)],
+                    inputs: vec![],
+                    clobbers: vec![],
+                    operand_types: vec![IrType::I32],
+                    goto_labels: vec![],
+                    input_symbols: vec![],
+                    seg_overrides: vec![AddressSpace::Default],
+                },
+            ],
+            Terminator::Return(None),
+        )];
+        f.next_value_id = 2;
+        m.functions.push(f);
+        eliminate_dead_global_stores(&mut m);
+        assert_eq!(
+            store_count(&m),
+            1,
+            "inline-asm template mention: store kept"
+        );
+    }
+
+    #[test]
+    fn inline_asm_template_unrelated_ok() {
+        let mut m = IrModule::new();
+        m.globals.push(gs_global("out"));
+        let mut f = gs_writer("w", vec![], Terminator::Return(None), 2);
+        f.blocks[0].instructions.push(Instruction::InlineAsm {
+            template: String::from("movl other(%%rip), %0"),
+            outputs: vec![("=r".to_string(), Value(2), None)],
+            inputs: vec![],
+            clobbers: vec![],
+            operand_types: vec![IrType::I32],
+            goto_labels: vec![],
+            input_symbols: vec![],
+            seg_overrides: vec![AddressSpace::Default],
+        });
+        f.next_value_id = 3;
+        m.functions.push(f);
+        eliminate_dead_global_stores(&mut m);
+        assert_eq!(store_count(&m), 0, "unrelated inline-asm: store gone");
     }
 }

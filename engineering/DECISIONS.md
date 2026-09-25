@@ -2469,3 +2469,168 @@ this sweep also found and fixed one pre-existing, unrelated
 `1u64 << 64` overflow in `loop_memset.rs`'s Ne-trip-count gate
 (64-bit compare type). GNU-as byte-equivalence suites: i686 20/20,
 x86-64 failure set identical to pristine main (zero regressions).
+
+## S25 (2026-09-24) — F32/F64-typed ternary merge slots + VEX 4-operand blend retarget
+
+**Code:** `src/ir/lowering/expr_ops.rs` (`ternary_merge_slot`, `emit_ternary_merge_store`),
+`src/backend/x86/codegen/float_ops.rs` (S05 blend, `retarget_vex_result`), `src/ir/constants.rs`
+(`narrowed_to` now handles F32↔F64 cross).
+
+**Rationale.** LP64 lowered every scalar ternary through an I64 slot, so
+`float`/`double` selects became I64 selects: GPR-homed by RA, starving the
+S05 FP-select blend which needs an XMM dest or XMM false arm, degrading to
+GPR cmov + movq round-trips. Exact-typed slots keep FP merges XMM-homed end
+to end; blends/cmovs select bit patterns, never arithmetic values, so NaN
+payloads survive.
+
+**Soundness.** `ternary_merge_slot` returns exact type only for F32/F64
+(and int widths that already match target int). `emit_ternary_merge_store`
+now converts float constants via `coerce_to` (F64→F32, F32→F64) so the
+Store's value type matches its slot type — previously it only narrowed
+integers, leaving a type-incorrect Store when a constant of the other
+float width reached the slot. `narrowed_to` extended similarly for mem2reg.
+`retarget_vex_result` admits 4-operand variable blends (`vblendvps`): VEX
+reads all sources before writing, so retargeting dest onto mask is safe;
+upper-half protection via existing full-width reader check.
+
+**Ordering / knobs.** No new knob; existing S05 blend gate benefits.
+`CCC_DISABLE_PASSES` does not gate this lowering (it is part of expr
+lowering, not an opt pass).
+
+**Measured evidence (from S25 commit, not invented).** `trunc` 32→26,
+`floor` 16→12 beats all honest oracles (GCC 16.2, Clang 23.1, ICX) on
+-02 -march=x86-64-v3; `rint` holds 7 (blendv path). Corpus 51/51
+byte-identical vs GCC for runtime, codegen delta only in FP merges.
+
+**Tests.** `ternary_float_merge.c` pins F64 const into F32 slot, int 0
+into double, F32 const into F64 slot, and NaN payload preservation.
+
+## S26 (2026-09-24) — CVP correlated-select use rewriting + edge_facts Copy lookthrough
+
+**Code:** `src/passes/cvp.rs` (`BOOL_BITS=64`, `edge_facts`, `decided_select_arm`,
+select triple map, use rewriting before def folding).
+
+**Rationale.** `S = select C,A,B` dominating `if (C)` is invisible to jump
+threading (select dominates branch, no predecessor edge predicts it). When
+the enclosing branch decides C, every use of S in that arm can be rewritten
+to the selected arm (pure rename, no code motion: arm dominates select which
+dominates use). Lets DCE + sinking delete selects duplicated across
+correlated diamonds (libm `trunc`: inlined round-to-even select feeds both
+arms of `if (x >= 0)`).
+
+**Soundness.** BOOL_BITS is 64, so \"true\" means value in [1,2^64-1], not
+exactly 1 — matches C bool. Chosen arm dominates select, select dominates
+use, so no code moves. Phis (uses on edges) and `IsConstant` skipped.
+`edge_facts` looks through `Copy` chains (GVN residue) so branch conditions
+through copies are still decided.
+
+**Ordering.** Runs in CVP, before GVN, after mem2reg. No new disable switch
+(covered by `cvp`).
+
+**Measured evidence.** `trunc` 32→17 (S26 final, beats GCC 16.2 19 and ICC
+21, 2 behind Clang 15 — honest gap is 2 tail movsds, queued). 16/16 new
+`cvp` unit tests.
+
+## S28 (2026-09-24) — union-punned copysign through memory → intrinsic
+
+**Code:** `src/passes/bit_idioms.rs` (`recognize_copysign_mem`), `src/ir/intrinsics.rs`
+(`CopysignF32/F64`), x86 backend lowering to `andps/orps` / `andpd/orpd`.
+
+**Rationale.** musl `copysign`, glibc `s_copysign`, corpus `copysign` spell
+`r.u64 = (a.u64 & ABS) | (b.u64 & SIGN)` via unions and memory. GCC/Clang/ICX
+recognize this idiom and emit 2-3 bitwise ops (or single `andps/orps`);
+lccc previously emitted 9 insns (stack traffic, reloads). Rewriting the
+three-store + reload pattern to a `Copysign` intrinsic lets the backend emit
+optimal code and enables further folding.
+
+**Soundness (fail-closed).** Checks every use of both memory slots, requires
+single-use chains, exact mask pairing (0x7fff_ffff / 0x8000_0000 for F32,
+0x7fff_ffff_ffff_ffff / 0x8000_0000_0000_0000 for F64), swapped masks
+rejected (some other computation), no calls/fences/unknown memory in window,
+volatile init bails, unrelated allocas in window OK. Reuses DCE's own
+side-effect check (hence `pub(crate)`).
+
+**Ordering.** Runs in `bit_idioms` after SROA, before DCE. No new knob.
+
+**Measured evidence.** `copysign` 9→4 insns, ties all oracles (GCC 16.2,
+Clang 23.1, ICX). All other TUs bit-identical (no over-fire). 8 new unit
+tests.
+
+**Tests.** `copysign_union_mem.c` covers ±0.0, NaN with payload, ±inf,
+printing result bits.
+
+## S29/S30 (2026-09-25) — TU dead-global-store elimination (Phase 11a) + evidence ordering
+
+**Code:** `src/passes/dead_statics.rs` (`eliminate_dead_global_stores`),
+`src/passes/mod.rs` Phase 11a/11 ordering, `src/passes/README.md`.
+
+**Rationale.** After GVN's store-to-load forwarding, a `static` output
+buffer that the TU never reads keeps only its stores (`out[i]=...` in
+`round_family_pass`: same-iteration reload forwarded, `main` never touches
+`out`). Stores are unobservable — no loads exist anywhere in TU — yet
+backend emitted them plus address math. Every oracle deletes them
+(whole-program DSE); this pass is lccc's TU-closed equivalent.
+
+**Soundness (fail-closed list).**
+- TU-local linkage only: static, not extern/common/weak/used/custom-section.
+- No name-level escape: name appears in no toplevel-asm blob, no global
+  initializer (init naming publishes address), no inline-asm input_symbols,
+  no alias target/name (`__attribute__((alias))` publishes cross-TU), no
+  inline-asm template string (textual mention like `movl g(%%rip), %0`).
+- No value-level escape or read: each `GlobalAddr` naming global seeds
+  address set propagated only through GEP bases, Copy, bitwise-identical
+  Casts (single source of truth `cast_is_bitidentical_nop`), Phi
+  (optimistic). Single-source chains so deleted-store sets for distinct
+  globals disjoint. Every use of every set member must be non-volatile
+  default-AS Store THROUGH address. Load through address = reader, address
+  as stored VALUE, call arg, cmp/binop, memcpy endpoint, asm operand,
+  terminator use → bail. Pure calls NOT exempted.
+- All definitions derive: after fixpoint EVERY definition of EVERY set
+  member must derive from global's address (GlobalAddr of this global,
+  in-set GEP base with non-address offset, in-set Copy/Cast source, Phi
+  whose EVERY arm in set). Makes optimistic phi sound (phi merging foreign
+  value fails here, stores discarded), covers redefinition.
+- At least one store recorded.
+
+Deletion mirrors DCE sweep (spans compacted), DCE chaser on touched funcs
+so orphaned value/address chains disappear in same pass (pipeline runs no
+DCE after Phase 11).
+
+**Ordering constraint.** Phase 11a (dead global stores) + Phase 11 (dead
+static funcs) moved AFTER 11e (const-array promotion). Evidence-consuming
+passes run before evidence-deleting ones: a dead `keep = a` escape store
+is constarr's proof that address escapes; deleting it first would let
+constarr promote an escaping array (the `const-array-promote escape-shape`
+gate pins rejection). Deleting after constarr has refused keeps both.
+
+**Performance (F6).** Pre-collects GlobalAddr defs once into
+`FxHashMap<name, Vec<(func,value)>>` and groups by func, instead of
+rescanning every function for every global (O(G*F*I) → O(F*I + G*refs)).
+Avoids cloning use lists (iterates slice directly).
+
+**Disable switch.** `CCC_DISABLE_PASSES=globaldse` (Phase 11a).
+
+**Measured evidence.** `round_family_pass` 56→50 (-6 = 2 stores + addr math
++ DCE), `out` BSS gone, `buf` path intact. Corpus 51/51, 3431 lib tests,
+68/68 ci_local --fast green after ordering fix.
+
+**Tests.** 14 unit tests (incl. `phi_cycle_fires`, `hostile_phi_bails`,
+`latch_cycle_fires`, `hostile_redefinition_bails`, `alias_target_bails`,
+`alias_name_bails`, `inline_asm_template_bails`), plus C regressions:
+`globaldse_unread_static.c` (unread buffer, runtime only),
+`globaldse_alias_kept.c` (alias escape must keep stores),
+`globaldse_asm_template.c` (inline-asm template mention must keep).
+
+**Follow-up fixes (2026-09-25 audit).**
+- F1 alias: built `alias_named` set from `module.aliases` (both alias and
+  target) and skip globals in set; added unit test.
+- F2 float ternary: `emit_ternary_merge_store` now converts F32/F64 consts
+  via `coerce_to`; `narrowed_to` handles F32↔F64 cross.
+- F5 inline-asm template: both dead-static passes now scan inline-asm
+  templates with word-boundary matching (`asm_mentions_symbol`), not just
+  input_symbols.
+- F6 performance: GlobalAddr map + no-clone use iteration.
+- F7 unroll-gate script: `jumps_in_fn` regex `j[a-z]+` covers all jcc
+  variants (js/jns/jp/jnp/jo/jno/jb/jc etc.).
+- F4 process: added this DECISIONS entry per transform; no invented numbers.
+
