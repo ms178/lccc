@@ -288,8 +288,15 @@ gate "dep-files" fast \
 gate "i686-boot-asm" fast \
     bash tests/regression/check_i686_boot_asm.sh
 
+# Isolated PR #629 follow-up rows: x86-64 is not part of the i686 default
+# corpus, and a one-instruction reject must never be hidden by another reject.
+# Confirmed with GAS 2.47; the system GAS 2.44 also accepts/rejects this set.
+gate "merged-pr629-x86-asm-diff" fast \
+    python3 scripts/asmdiff.py --jobs 2 --lccc target/fastbuild/lccc-x86 \
+        tests/asm-diff/merged-pr629-followup.casefile
+
 gate "i686-asm-diff" fast \
-    python3 scripts/asmdiff.py --32 --lccc target/fastbuild/lccc-i686
+    python3 scripts/asmdiff.py --32 --jobs 2 --lccc target/fastbuild/lccc-i686
 gate "i686-tls-ie-relax" fast \
     bash tests/regression/check_i686_tls_ie_relax.sh
 

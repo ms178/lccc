@@ -1,9 +1,10 @@
 //! VEX-encoded instruction support for the i686 integrated assembler.
 //!
-//! Ported from the x86-64 backend's `avx.rs` (the VEX half; AVX-512/EVEX is
-//! deliberately NOT ported — 32-bit code has no zmm registers and the
-//! regression corpus never reaches for it).  Everything is structurally
-//! identical to the x86-64 encoder except:
+//! Local VEX encoders for GP-touching 32-bit forms. Vector-only VEX, XOP and
+//! EVEX forms are delegated to the shared x86-64 encoder (with 32-bit prefix
+//! and relocation handling in i686/mod.rs). EVEX and zmm registers ARE legal
+//! in 32-bit code: GAS 2.47 emits them, and our i686 tests cover them.
+//! These local VEX forms are structurally similar to the x86-64 encoder except:
 //!   * `needs_vex_ext` is constant `false` (there are no r8-r15, so VEX.R/X/B
 //!     are always "unused" = 1).  The branching is kept so the two encoders
 //!     cannot drift.
@@ -53,9 +54,9 @@ impl super::InstructionEncoder {
         let b_bit = if b { 0 } else { 1 };
         let vvvv_inv = (!vvvv) & 0xF;
 
-        // 2-byte VEX is only possible when the operand map is 0F and neither
-        // VEX.W nor the X/B extension bits are needed.
-        if mm == 1 && w == 0 && !x && !b {
+        // C5 is shortest unless `{vex3}` explicitly requests C4. A
+        // `{vex2}` hint still falls back to C4 for map/W/extension cases.
+        if mm == 1 && w == 0 && !x && !b && self.vex_hint != Some(VexHint::Vex3) {
             self.bytes.push(0xC5);
             let byte2 = (r_bit << 7) | (vvvv_inv << 3) | (l << 2) | pp;
             self.bytes.push(byte2);

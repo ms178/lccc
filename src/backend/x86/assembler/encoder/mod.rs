@@ -115,10 +115,8 @@ pub struct InstructionEncoder {
     apx_nf: bool,
     /// APX `{evex}`: force the map-4 EVEX encoding of a legacy insn.
     apx_evex: bool,
-    /// GNU as `{vex}`/`{vex2}`/`{vex3}`: forbid the EVEX encoding (dual-
-    /// encoded mnemonics take their VEX row; EVEX-only shapes are rejected
-    /// with GAS's diagnostics).
-    force_vex: bool,
+    /// Select a VEX/XOP row, including `{vex3}`'s forced C4 prefix.
+    vex_hint: Option<VexHint>,
     /// APX `{rex2}`: force a REX2 prefix even without an EGPR.
     apx_rex2: bool,
     /// APX `{dfv=}` bitmap for CCMP/CTEST (P1.vvvv, not inverted).
@@ -148,6 +146,27 @@ const LOCKABLE_STEMS: [&str; 19] = [
     "xadd",
     "xchg",
 ];
+
+/// A `{vex*}` request must produce an actual VEX (C4/C5) or XOP (8F,
+/// map >= 8) instruction. A leading 8F with map < 8 is the legacy POP
+/// opcode, not XOP; checking the emitted prefix instead of a `v*` name
+/// list also covers legacy VMX mnemonics and future opcode table additions.
+/// 0x67 and segment overrides are the only legacy prefixes legal here.
+pub(crate) fn is_vex_xop_encoding(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    while bytes
+        .get(i)
+        .is_some_and(|b| matches!(*b, 0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x67))
+    {
+        i += 1;
+    }
+    match bytes.get(i).copied() {
+        Some(0xC5) => bytes.len() >= i + 3,
+        Some(0xC4) => bytes.len() >= i + 4,
+        Some(0x8F) => bytes.len() >= i + 4 && bytes[i + 1] & 0x1f >= 8,
+        _ => false,
+    }
+}
 
 /// Mnemonic stem for prefix validation: a trailing size letter and any `.s`
 /// length suffix are stripped (`movb` -> `mov`, `addl.s` -> `add`).
@@ -240,6 +259,23 @@ fn evex_only_mnemonic(mnemonic: &str) -> bool {
             | "vpopcntw"
             | "vpopcntd"
             | "vpopcntq"
+            // AVX-512DQ/BW-only rows also have xmm/ymm spellings. Without
+            // routing them here, low-register forms fall through to the
+            // VEX table and fail, while their zmm forms assemble normally.
+            // All twelve low-register shapes were independently byte-probed
+            // against GAS 2.47 on x86-64 AND i686.
+            | "vpabsq"
+            | "vpandnd"
+            | "vpandnq"
+            | "vpconflictd"
+            | "vpconflictq"
+            | "vpmaxsq"
+            | "vpmaxuq"
+            | "vpminsq"
+            | "vpminuq"
+            | "vpmullq"
+            | "vpsraq"
+            | "vpsravq"
             | "vpcompressd"
             | "vpcompressq"
             | "vpexpandd"
@@ -552,7 +588,7 @@ fn unwrap_indirect(op: &Operand) -> &Operand {
 
 /// True when the operand carries any EVEX decorator (mask/zeroing,
 /// broadcast, SAE/rounding, standalone SAE token).
-fn op_decorated(op: &Operand) -> bool {
+pub(crate) fn op_decorated(op: &Operand) -> bool {
     let op = unwrap_indirect(op);
     match op {
         Operand::Register(r) => r.mask.is_some() || r.zeroing || r.broadcast.is_some(),
@@ -592,10 +628,34 @@ impl InstructionEncoder {
             offset: 0,
             apx_nf: false,
             apx_evex: false,
-            force_vex: false,
+            vex_hint: None,
             apx_rex2: false,
             apx_dfv: 0,
         }
+    }
+
+    /// Set the instruction's encoding selectors for BOTH normal x86-64
+    /// encoding and i686's shared VEX/EVEX/XOP dispatch. The latter calls
+    /// `encode_mnemonic` directly (32-bit addressing has a different wrapper),
+    /// so leaving these assignments solely in `encode` silently ignores hints.
+    pub(crate) fn configure_encoding_hints(&mut self, instr: &Instruction) -> Result<(), String> {
+        self.apx_nf = instr.nf;
+        self.apx_evex = instr.force_evex;
+        self.vex_hint = instr.vex_hint;
+        self.apx_rex2 = instr.force_rex2;
+        self.apx_dfv = instr.dfv;
+        if (self.apx_nf || self.apx_evex) && self.apx_rex2 {
+            return Err("{rex2} cannot be combined with {evex} or {nf}".to_string());
+        }
+        if self.apx_nf && self.vex_hint.is_some() {
+            return Err("{nf} cannot be combined with {vex}/{vex3}".to_string());
+        }
+        if self.apx_rex2 && self.vex_hint.is_some() {
+            let lower = instr.mnemonic.to_ascii_lowercase();
+            let stem = decor_stem(&lower);
+            return Err(format!("rex2 pseudo prefix cannot be used for `{stem}'"));
+        }
+        Ok(())
     }
 
     /// Encode a single instruction and append bytes.
@@ -693,14 +753,7 @@ impl InstructionEncoder {
         if mnemonic_takes_label(&instr.mnemonic) && instr.operands.iter().any(op_decorated) {
             return Err(format!("no EVEX encoding for `{}'", instr.mnemonic));
         }
-        self.apx_nf = instr.nf;
-        self.apx_evex = instr.force_evex;
-        self.force_vex = instr.force_vex;
-        self.apx_rex2 = instr.force_rex2;
-        self.apx_dfv = instr.dfv;
-        if (self.apx_nf || self.apx_evex) && self.apx_rex2 {
-            return Err("{rex2} cannot be combined with {evex} or {nf}".to_string());
-        }
+        self.configure_encoding_hints(instr)?;
 
         // PREFIX ORDER. x86 legacy prefixes come from four groups and, while
         // the hardware accepts any order, the canonical encoding used by GAS,
@@ -930,6 +983,28 @@ impl InstructionEncoder {
                 ));
             }
         }
+        // Reject any path that silently ignored a VEX selector, including
+        // early APX CCMP/CTEST/CFCMOV/IMULZU and legacy VMX `v*` mnemonics.
+        // XOP/LWP (8F map >= 8) is legal under `{vex}`. This postcondition
+        // deliberately avoids duplicating the mnemonic dispatch tables.
+        if result.is_ok()
+            && self.vex_hint.is_some()
+            && !is_vex_xop_encoding(&self.bytes[start_len..])
+        {
+            self.bytes.truncate(start_len);
+            self.relocations.truncate(reloc_base);
+            // GAS reports a size-stripped CCMP name (`ccmpeq` -> `ccmpe`)
+            // but keeps VMX `vmcall`/`vmmcall` intact. Blindly calling
+            // `decor_stem` here would misname those VMX instructions.
+            let lower = instr.mnemonic.to_ascii_lowercase();
+            let name = lower.strip_suffix(".s").unwrap_or(&lower);
+            let name = if name.starts_with("ccmp") {
+                decor_stem(name)
+            } else {
+                name
+            };
+            result = Err(format!("no VEX/XOP encoding for `{name}'"));
+        }
         if result.is_ok() {
             result = self.fixup_rex2_map1(start_len);
         }
@@ -1000,8 +1075,9 @@ impl InstructionEncoder {
         result
     }
 
-    /// Post-encode EVEX-decorator checks (see `encode()` tail).
-    fn check_decorators(&self, mnemonic: &str, ops: &[Operand]) -> Result<(), String> {
+    /// Post-encode EVEX-decorator checks. Also run by i686's shared-vector
+    /// path, whose 32-bit wrapper cannot call x86-64 `encode()` wholesale.
+    pub(crate) fn check_decorators(&self, mnemonic: &str, ops: &[Operand]) -> Result<(), String> {
         let stem = decor_stem(mnemonic);
         let pi = self.prefix_start();
         let evex = self.bytes.get(pi).copied() == Some(0x62);
@@ -2514,8 +2590,16 @@ impl InstructionEncoder {
         //   non-`v' mnemonic (no VEX row at all) -> `no VEX/XOP encoding'
         // Dual-encoded and plain VEX mnemonics fall through to their VEX
         // rows (`{vex} vpdpbusd %ymm3,%ymm1,%ymm2` = `c4 e2 75 50 d3`).
-        if self.force_vex {
-            let stem = decor_stem(mnemonic);
+        if self.vex_hint.is_some() {
+            // EVEX-only vector mnemonics have no AT&T size suffix: the
+            // final `q/w/b` is part of their actual name (GAS says
+            // `vpabsq`, not `vpabs`). Legacy `movq`/`addl` do need their
+            // size suffix stripped for these diagnostics.
+            let stem = if evex_only_mnemonic(mnemonic) {
+                mnemonic
+            } else {
+                decor_stem(mnemonic)
+            };
             let egpr_mem = ops.iter().any(|op| {
                 matches!(op, Operand::Memory(m) if
                     m.base.as_ref().is_some_and(|b| gp_id(&b.name).is_some_and(|id| id >= 16))
@@ -2561,7 +2645,7 @@ impl InstructionEncoder {
         // (try_encode_evex returns None for them), and the encode() EGPR
         // gate rejects anything that silently dropped the EGPR.
         if !has_zmm_or_k
-            && !self.force_vex
+            && self.vex_hint.is_none()
             && ops.iter().any(|op| {
                 matches!(op, Operand::Memory(m) if
                     m.base.as_ref().is_some_and(|b| gp_id(&b.name).is_some_and(|id| id >= 16))
@@ -2582,7 +2666,7 @@ impl InstructionEncoder {
         // must be listed here or their xmm/ymm-only forms never reach the
         // EVEX table and die as `unhandled instruction`.
         let evex_only = evex_only_mnemonic(mnemonic);
-        if (has_zmm_or_k || evex_only || prefer_evex) && !self.force_vex {
+        if (has_zmm_or_k || evex_only || prefer_evex) && self.vex_hint.is_none() {
             if let Some(result) = self.try_encode_evex(mnemonic, ops) {
                 return result;
             }
@@ -6557,5 +6641,107 @@ mod evex_egpr_rm_tests {
         assert_eq!(hex("vmovq %xmm2, %xmm8"), "c5 7a 7e c2");
         assert_eq!(hex("vmovq %xmm6, %xmm15"), "c5 7a 7e fe");
         assert_eq!(hex("vmovq %xmm15, %xmm8"), "c4 41 7a 7e c7");
+    }
+}
+
+#[cfg(test)]
+mod merged_pr629_followup_tests {
+    use super::apx_tests::{fail_msg, fails, hex};
+
+    #[test]
+    fn vex_selector_chooses_prefix_and_requires_a_real_vex_or_xop_row() {
+        // GAS 2.47: only {vex3} forces the extra C4 byte when C5 is legal.
+        assert_eq!(hex("vaddps %xmm1, %xmm2, %xmm3"), "c5 e8 58 d9");
+        assert_eq!(hex("{vex2} vaddps %xmm1, %xmm2, %xmm3"), "c5 e8 58 d9");
+        assert_eq!(hex("{vex3} vaddps %xmm1, %xmm2, %xmm3"), "c4 e1 68 58 d9");
+        // 0F38 always needs C4, even with {vex2}.
+        assert_eq!(hex("{vex2} vpdpbusd %ymm3,%ymm1,%ymm2"), "c4 e2 75 50 d3");
+        assert_eq!(hex("{vex3} vaddps (%eax),%xmm1,%xmm2"), "67 c4 e1 70 58 10");
+        // XOP (8F map >= 8) is genuinely permitted by GAS's VEX selector.
+        assert_eq!(
+            hex("{vex} vpcmov %xmm1,%xmm2,%xmm3,%xmm4"),
+            "8f e8 60 a2 e2 10"
+        );
+        for name in [
+            "vmcall", "vmmcall", "vmlaunch", "vmresume", "vmxoff", "vmfunc",
+        ] {
+            assert_eq!(
+                fail_msg(&format!("{{vex}} {name}")),
+                format!("no VEX/XOP encoding for `{name}'")
+            );
+        }
+        assert_eq!(
+            fail_msg("{vex} ccmpeq %rcx,%rax"),
+            "no VEX/XOP encoding for `ccmpe'"
+        );
+        assert_eq!(
+            fail_msg("{vex} imulzu $2,%ax,%cx"),
+            "no VEX/XOP encoding for `imulzu'"
+        );
+        assert_eq!(
+            fail_msg("{nf} {vex} vpaddd %xmm1,%xmm2,%xmm3"),
+            "{nf} cannot be combined with {vex}/{vex3}"
+        );
+        assert_eq!(
+            fail_msg("{rex2} {vex3} vaddps %xmm1,%xmm2,%xmm3"),
+            "rex2 pseudo prefix cannot be used for `vaddps'"
+        );
+        assert!(fails("{vex} vpbroadcastb %eax,%xmm1")); // EVEX-only GPR row.
+    }
+
+    #[test]
+    fn packed_broadcast_gpr_widths_are_not_interchangeable() {
+        // GAS 2.47: b/w/d take r32 (despite broadcasting fewer bits),
+        // q takes r64. An 8-bit source would otherwise silently encode
+        // another GPR; all four high-byte registers must reject as well.
+        for stem in ["vpbroadcastb", "vpbroadcastw", "vpbroadcastd"] {
+            assert_eq!(
+                fail_msg(&format!("{stem} %ah,%xmm5")),
+                format!("operand type mismatch for `{stem}'")
+            );
+            assert!(fails(&format!("{stem} %al,%xmm5")));
+            assert!(fails(&format!("{stem} %ax,%xmm5")));
+            assert!(fails(&format!("{stem} %rax,%xmm5")));
+        }
+        assert_eq!(hex("vpbroadcastb %eax,%xmm5"), "62 f2 7d 08 7a e8");
+        assert_eq!(hex("vpbroadcastb %r8d,%xmm5"), "62 d2 7d 08 7a e8");
+        assert_eq!(hex("vpbroadcastq %rax,%xmm1"), "62 f2 fd 08 7c c8");
+        assert!(fails("vpbroadcastq %eax,%xmm1"));
+    }
+
+    #[test]
+    fn evex_only_low_register_rows_do_not_fall_through_to_vex() {
+        // EVEX-only opcodes were already implemented for zmm, but the
+        // low-register xmm/ymm spellings did not reach their EVEX table.
+        // Every row's opcode was compared to GAS 2.47 in both modes.
+        let forms = [
+            ("vpabsq %xmm1,%xmm2", "62 f2 fd 08 1f d1"),
+            ("vpandnd %xmm3,%xmm1,%xmm2", "62 f1 75 08 df d3"),
+            ("vpandnq %xmm3,%xmm1,%xmm2", "62 f1 f5 08 df d3"),
+            ("vpconflictd %xmm1,%xmm2", "62 f2 7d 08 c4 d1"),
+            ("vpconflictq %xmm1,%xmm2", "62 f2 fd 08 c4 d1"),
+            ("vpmaxsq %xmm3,%xmm1,%xmm2", "62 f2 f5 08 3d d3"),
+            ("vpmaxuq %xmm3,%xmm1,%xmm2", "62 f2 f5 08 3f d3"),
+            ("vpminsq %xmm3,%xmm1,%xmm2", "62 f2 f5 08 39 d3"),
+            ("vpminuq %xmm3,%xmm1,%xmm2", "62 f2 f5 08 3b d3"),
+            ("vpmullq %xmm3,%xmm1,%xmm2", "62 f2 f5 08 40 d3"),
+            ("vpsraq $1,%xmm1,%xmm2", "62 f1 ed 08 72 e1 01"),
+            ("vpsravq %xmm3,%xmm1,%xmm2", "62 f2 f5 08 46 d3"),
+        ];
+        for (source, bytes) in forms {
+            assert_eq!(hex(source), bytes, "{source}");
+            assert!(fails(&format!("{{vex}} {source}")), "{source}");
+        }
+        assert_eq!(
+            fail_msg("{vex} vpabsq %xmm1,%xmm2"),
+            "no VEX/XOP encoding for `vpabsq'"
+        );
+        // B4/X4 belong in the emitter, not a post-emission byte patch.
+        assert_eq!(hex("vmovdqu8 (%r16),%zmm1"), "62 f9 7f 48 6f 08");
+        assert_eq!(hex("vmovdqu8 (%rax,%r17,4),%zmm1"), "62 f1 7b 48 6f 0c 88");
+        assert_eq!(
+            hex("vmovdqu8 64(%r16,%r17,2),%zmm1"),
+            "62 f9 7b 48 6f 4c 48 01"
+        );
     }
 }

@@ -184,8 +184,10 @@ pub(crate) fn check_vcvt_shape(mnemonic: &str, ops: &[Operand]) -> Result<(), St
 /// Broadcast source/destination validation, shared by the VEX and EVEX
 /// paths (GAS reports the same texts either way): non-broadcastable
 /// sources (`operand type mismatch') and wrong-width destinations
-/// (`operand size mismatch'). GPR sources accept any width (the
-/// per-size matrix is unverified against GAS; follow-up).
+/// (`operand size mismatch'). GAS 2.47 accepts only a 32-bit GPR for
+/// vpbroadcastb/w/d and only a 64-bit GPR for vpbroadcastq. An 8-bit source
+/// such as `%ah` or `%al` is not merely an alias: silently encoding its
+/// register number changes the assembly's operand semantics.
 pub(crate) fn check_broadcast_shape(
     mnemonic: &str,
     ops: &[Operand],
@@ -206,11 +208,11 @@ pub(crate) fn check_broadcast_shape(
         Operand::Memory(_) => true,
         Operand::Register(r) => {
             let vec = vec_width(&r.name);
-            let gpr = is_reg8(&r.name)
-                || is_reg16(&r.name)
-                || is_reg32(&r.name)
-                || is_reg64(&r.name)
-                || is_egpr(&r.name);
+            let gpr = match mnemonic {
+                "vpbroadcastb" | "vpbroadcastw" | "vpbroadcastd" => is_reg32(&r.name),
+                "vpbroadcastq" => is_reg64(&r.name),
+                _ => false,
+            };
             match mnemonic {
                 "vbroadcastss" | "vbroadcastsd" => vec == Some(0),
                 "vbroadcastf128" | "vbroadcasti128" => false,
@@ -324,8 +326,9 @@ impl super::InstructionEncoder {
         let b_bit = if b { 0 } else { 1 };
         let vvvv_inv = (!vvvv) & 0xF;
 
-        // Use 2-byte VEX if possible: mm=1, w=0, x=0, b=0
-        if mm == 1 && w == 0 && !x && !b {
+        // C5 is normally shortest. GAS's explicit `{vex3}` instead asks for
+        // C4 even when C5 could express the same map/W/extension fields.
+        if mm == 1 && w == 0 && !x && !b && self.vex_hint != Some(VexHint::Vex3) {
             self.bytes.push(0xC5);
             let byte2 = (r_bit << 7) | (vvvv_inv << 3) | (l << 2) | pp;
             self.bytes.push(byte2);
@@ -339,10 +342,10 @@ impl super::InstructionEncoder {
         }
     }
 
-    /// Emit EVEX 4-byte prefix.
-    /// Parameters match VEX but with additional EVEX-specific fields.
-    /// ll: 00=128, 01=256, 10=512
-    /// aaa: opmask register number (0 = no masking), z: zeroing mask semantics.
+    /// Emit EVEX 4-byte prefix. B4 (P0[3], not inverted) and X4
+    /// (P1[2], inverted) are APX's extended address/register bits, passed
+    /// with the other prefix fields rather than mutating emitted bytes later.
+    /// ll: 00=128, 01=256, 10=512; aaa: mask register (0 = no mask).
     pub(crate) fn emit_evex(
         &mut self,
         r: bool,
@@ -358,22 +361,29 @@ impl super::InstructionEncoder {
         z: bool,
         aaa: u8,
         bcst: bool,
+        b4: bool,
+        x4: bool,
     ) {
-        let r_bit = if r { 0u8 } else { 1 };
-        let x_bit = if x { 0u8 } else { 1 };
-        let b_bit = if b { 0u8 } else { 1 };
-        let r_prime_bit = if r_prime { 0u8 } else { 1 };
+        let r_bit = u8::from(!r);
+        let x_bit = u8::from(!x);
+        let b_bit = u8::from(!b);
+        let r_prime_bit = u8::from(!r_prime);
         let vvvv_inv = (!vvvv) & 0xF;
-        let v_prime_bit = if v_prime { 0u8 } else { 1 };
+        let v_prime_bit = u8::from(!v_prime);
 
         self.bytes.push(0x62); // EVEX prefix indicator
 
-        // Byte 1: R X B R' 0 0 mm
-        let byte1 = (r_bit << 7) | (x_bit << 6) | (b_bit << 5) | (r_prime_bit << 4) | mm;
+        // Byte 1: R X B R' B4 mmm (B4 is NOT inverted).
+        let byte1 = (r_bit << 7)
+            | (x_bit << 6)
+            | (b_bit << 5)
+            | (r_prime_bit << 4)
+            | (u8::from(b4) << 3)
+            | mm;
         self.bytes.push(byte1);
 
-        // Byte 2: W vvvv 1 pp
-        let byte2 = (w << 7) | (vvvv_inv << 3) | (1 << 2) | pp;
+        // Byte 2: W vvvv X4 pp (X4 is inverted).
+        let byte2 = (w << 7) | (vvvv_inv << 3) | (u8::from(!x4) << 2) | pp;
         self.bytes.push(byte2);
 
         // Byte 3: z L'L b V' aaa
@@ -509,10 +519,9 @@ impl super::InstructionEncoder {
             z,
             aaa,
             bcst,
+            rm_b4,
+            false,
         );
-        if rm_b4 {
-            self.apply_evex_apx_addr(true, false);
-        }
         Ok((d & 7, s & 7))
     }
 
@@ -547,8 +556,9 @@ impl super::InstructionEncoder {
             z,
             aaa,
             bcst,
+            b4,
+            x4,
         );
-        self.apply_evex_apx_addr(b4, x4);
         Ok(d & 7)
     }
 
@@ -572,19 +582,6 @@ impl super::InstructionEncoder {
             b_id.is_some_and(|id| id >= 16),
             x_id.is_some_and(|id| id >= 16),
         )
-    }
-
-    fn apply_evex_apx_addr(&mut self, b4: bool, x4: bool) {
-        let n = self.bytes.len();
-        if n < 4 || self.bytes[n - 4] != 0x62 {
-            return;
-        }
-        if b4 {
-            self.bytes[n - 3] |= 1 << 3;
-        }
-        if x4 {
-            self.bytes[n - 2] &= !0x04;
-        }
     }
 
     fn evex_sae_class(map: u8, opcode: u8) -> EvexSae {
@@ -1321,6 +1318,8 @@ impl super::InstructionEncoder {
                     z,
                     aaa,
                     false,
+                    false,
+                    false,
                 );
                 self.bytes.push(opcode);
                 self.bytes.push(self.modrm(3, ext, src_id & 7));
@@ -1349,8 +1348,9 @@ impl super::InstructionEncoder {
                     z,
                     aaa,
                     mem_bcst,
+                    b4,
+                    x4,
                 );
-                self.apply_evex_apx_addr(b4, x4);
                 self.bytes.push(opcode);
                 self.encode_evex_mem(ext, mem, scale_n)?;
                 self.bytes.push(*imm as u8);
@@ -1888,6 +1888,8 @@ impl super::InstructionEncoder {
                     z,
                     aaa,
                     false,
+                    false,
+                    false,
                 );
                 self.bytes.push(opcode);
                 self.bytes.push(self.modrm(3, ext, src_id & 7));
@@ -1917,8 +1919,9 @@ impl super::InstructionEncoder {
                     z,
                     aaa,
                     bcst,
+                    b4,
+                    x4,
                 );
-                self.apply_evex_apx_addr(b4, x4);
                 self.bytes.push(opcode);
                 self.encode_evex_mem(ext, mem, scale_n)?;
                 self.bytes.push(*imm as u8);
@@ -5212,8 +5215,9 @@ impl super::InstructionEncoder {
             false,
             aaa,
             false,
+            b4,
+            false,
         );
-        self.apply_evex_apx_addr(b4, false);
         self.bytes.push(opcode);
         self.encode_evex_mem(dst_id & 7, mem, if w != 0 { 8 } else { 4 })
     }

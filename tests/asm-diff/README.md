@@ -43,17 +43,16 @@ a false failure.
 
 ## Status
 
-All 728 cases pass against GNU as 2.47. Across the 9,918 distinct
-instructions in the corpus, the per-instruction differential reports:
-
-```
-ok      = 9,695   byte-identical to GNU as
-BETTER  =   160   shorter than GNU as, verified to decode identically
-reject  =    63   deliberate reject list; both assemblers refuse
-```
-
-There are no unexplained differences: every case is either byte-identical, a
-machine-verified improvement, or an intentional rejection.
+On the merged PR #629 follow-up, `asmdiff.py` against **GAS 2.47** passes
+**1,045 x86-64** and **91 i686** isolated cases with zero failures. The
+follow-up adds 90 and 63 one-instruction groups respectively; each negative
+input is independent, so another rejection cannot hide a false acceptance.
+The i686 corpus also passes the installed GAS 2.44 oracle (91/91).
+Re-run `asmdiff.py` for exact current counts; older per-instruction summary
+statistics were measured on a smaller corpus and are not claimed here.
+A successful group means byte/relocation/symbol parity (or deliberate
+rejection); the existing `betterok` groups permit only verified same-semantics
+shorter forms, not arbitrary byte differences.
 
 `insndiff.py` synthesises any numeric local label an instruction refers to, so
 `jmp 1f` is compared as a real jump rather than being rejected by the oracle
