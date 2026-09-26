@@ -6982,13 +6982,19 @@ impl X86Codegen {
                 // Pack d0..d3 into the low four i32 lanes, convert the full
                 // XMM payload to four F64 lanes, and form 1.0 / denom.  All
                 // scratch is confined to xmm0/ymm0 and xmm1/ymm1; the scalar
-                // allocator deliberately reserves those families.
+                // allocator deliberately reserves those families. Use VEX for
+                // the entire pack: legacy movd/pinsrd in this AVX2 loop cause
+                // an AVX/SSE transition on every iteration. The VEX.128
+                // upper-zero rule is safe here: only the low 128 bits feed
+                // vcvtdq2pd, which fully overwrites ymm0 before its next read.
                 self.operand_to_eax(&args[1]);
-                self.state.emit("    movd %eax, %xmm0");
+                self.state.emit("    vmovd %eax, %xmm0");
                 for (lane, denom) in args[2..5].iter().enumerate() {
                     self.operand_to_eax(denom);
-                    self.state
-                        .emit_fmt(format_args!("    pinsrd ${}, %eax, %xmm0", lane + 1));
+                    self.state.emit_fmt(format_args!(
+                        "    vpinsrd ${}, %eax, %xmm0, %xmm0",
+                        lane + 1
+                    ));
                 }
                 self.state.dirty_upper_ymm = true;
                 self.state.emit("    vcvtdq2pd %xmm0, %ymm0");

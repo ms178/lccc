@@ -465,6 +465,15 @@ impl super::InstructionEncoder {
 
     /// EVEX prefix for a register r/m operand (ModRM.mod = 11).
     /// `vvvv` is the NDS/NDD register, or `None` for unused (encoded 1111).
+    ///
+    /// The r/m +16 extension bit DIFFERS BY REGISTER CLASS (GAS 2.47
+    /// `build_apx_evex_prefix`, binutils `OP_EX`/`print_register`):
+    /// a VECTOR register (xmm/ymm/zmm 16-31) extends r/m through EVEX.X
+    /// (P0 bit 6, inverted), but a GPR (EGPR r16-r31) extends through
+    /// rex2.B (P0 bit 3, SET, NON-inverted) with X unused/inactive.
+    /// Using the vector bit for a GPR mis-encodes `vcvtsi2sdq %r21,...`
+    /// as `%rbp` and `vextractps $1,%xmm16,%r20d` as `%esp` — silent
+    /// register corruption. reg (R'/R) and vvvv (V') are class-uniform.
     pub(crate) fn emit_evex_mod3(
         &mut self,
         dst: &str,
@@ -481,10 +490,14 @@ impl super::InstructionEncoder {
         let d = Self::evex_id(dst)?;
         let s = Self::evex_id(src)?;
         let (vvvv_enc, v_prime) = Self::evex_vvvv_bits(vvvv)?;
-        // APX map-4 lives in apx.rs (NDD/NF/EGPR). AVX-512 uses X = r/m bit4.
+        // APX map-4 lives in apx.rs (NDD/NF/EGPR). Vector r/m +16 uses
+        // X = r/m bit4 (inverted); GPR r/m +16 uses rex2.B (bit3, set).
+        let src_is_gpr = is_gpr_name(src);
+        let x = !src_is_gpr && (s & 16) != 0;
+        let rm_b4 = src_is_gpr && (s & 16) != 0;
         self.emit_evex(
             (d & 8) != 0,
-            (s & 16) != 0,
+            x,
             (s & 8) != 0,
             (d & 16) != 0,
             map,
@@ -497,6 +510,9 @@ impl super::InstructionEncoder {
             aaa,
             bcst,
         );
+        if rm_b4 {
+            self.apply_evex_apx_addr(true, false);
+        }
         Ok((d & 7, s & 7))
     }
 
@@ -955,6 +971,34 @@ impl super::InstructionEncoder {
         w: u8,
         opcode: u8,
     ) -> Result<(), String> {
+        self.encode_evex_unary_impl(ops, map, pp, w, opcode, None)
+    }
+
+    /// Fixed-element-tuple unary (e.g. `vmovddup`: Tuple1 64-bit, N=8).
+    /// GAS 2.47 scales the EVEX disp8 by the ELEMENT size, not the vector
+    /// length: `vmovddup -1024(%rdx),%xmm30` = disp8 0x80 (-128×8), while
+    /// the full-VL model would need -64×16 and mis-address by 512 bytes.
+    pub(crate) fn encode_evex_unary_tuple1(
+        &mut self,
+        ops: &[Operand],
+        map: u8,
+        pp: u8,
+        w: u8,
+        opcode: u8,
+        n: u32,
+    ) -> Result<(), String> {
+        self.encode_evex_unary_impl(ops, map, pp, w, opcode, Some(n))
+    }
+
+    fn encode_evex_unary_impl(
+        &mut self,
+        ops: &[Operand],
+        map: u8,
+        pp: u8,
+        w: u8,
+        opcode: u8,
+        tuple_n: Option<u32>,
+    ) -> Result<(), String> {
         let (ops, sae) = Self::peel_evex_sae(ops);
         if ops.len() != 2 {
             return Err("EVEX unary op requires 2 operands".to_string());
@@ -986,7 +1030,13 @@ impl super::InstructionEncoder {
                 Ok(())
             }
             (Operand::Memory(mem), Operand::Register(dst)) => {
-                let (mem_bcst, scale_n) = Self::evex_mem_scale(mem, vl_ll, tuple_div);
+                let (mem_bcst, scale_n) = match tuple_n {
+                    // Fixed element tuple (vmovddup Tuple1): N is the element
+                    // size regardless of VL; {1toN} broadcast does not exist
+                    // (already rejected by the scalar-broadcast decorator law).
+                    Some(n) => (false, n),
+                    None => Self::evex_mem_scale(mem, vl_ll, tuple_div),
+                };
                 bcst |= mem_bcst;
                 let dst_num =
                     self.emit_evex_memop(&dst.name, mem, None, map, w, pp, ll, z, aaa, bcst)?;
@@ -2894,8 +2944,55 @@ impl super::InstructionEncoder {
                 }
             }
             3 => {
-                // 3-operand merge form (VEX.NDS)
-                self.encode_avx_scalar_3op(ops, load_op, pp)
+                // 3-operand merge form (VEX.NDS). Both opcode directions
+                // encode the same instruction: 0F 10 (reg=dst, r/m=src2)
+                // and 0F 11 (reg=src2, r/m=dst). GAS 2.47 picks the one
+                // whose r/m needs no VEX.B extension so the 2-byte C5
+                // form stays reachable (`vmovss %xmm15,%xmm6,%xmm2` =
+                // `c5 4a 11 fa`, NOT `c4 c1 4a 10 d7`); when neither
+                // (or both) qualify it keeps the 0F 10 load direction
+                // (`vmovss %xmm15,%xmm6,%xmm8` = `c4 41 4a 10 c7`).
+                match (&ops[0], &ops[1], &ops[2]) {
+                    (Operand::Register(src), Operand::Register(vvvv), Operand::Register(dst))
+                        if is_xmm(&src.name) && is_xmm(&vvvv.name) && is_xmm(&dst.name) =>
+                    {
+                        let src_num = reg_num(&src.name).ok_or("bad register")?;
+                        let vvvv_num = reg_num(&vvvv.name).ok_or("bad register")?;
+                        let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                        let vvvv_enc = vvvv_num | u8::from(needs_vex_ext(&vvvv.name)) * 8;
+                        if !needs_vex_ext(&dst.name) && needs_vex_ext(&src.name) {
+                            // Store direction: reg=src2 (VEX.R), r/m=dst (no B).
+                            self.emit_vex(
+                                needs_vex_ext(&src.name),
+                                false,
+                                false,
+                                1,
+                                0,
+                                vvvv_enc,
+                                0,
+                                pp,
+                            );
+                            self.bytes.push(store_op);
+                            self.bytes.push(self.modrm(3, src_num, dst_num));
+                        } else {
+                            // Load direction (default, matches GAS tie-break).
+                            self.emit_vex(
+                                needs_vex_ext(&dst.name),
+                                false,
+                                needs_vex_ext(&src.name),
+                                1,
+                                0,
+                                vvvv_enc,
+                                0,
+                                pp,
+                            );
+                            self.bytes.push(load_op);
+                            self.bytes.push(self.modrm(3, dst_num, src_num));
+                        }
+                        Ok(())
+                    }
+                    _ => self.encode_avx_scalar_3op(ops, load_op, pp),
+                }
             }
             _ => Err("AVX scalar mov requires 2 or 3 operands".to_string()),
         }
@@ -4006,17 +4103,38 @@ impl super::InstructionEncoder {
                 self.bytes.push(self.modrm(3, src_num, dst_num));
                 Ok(())
             }
-            // XMM -> XMM: VEX.128.F3.0F 7E /r
+            // XMM -> XMM: two rows encode it — VEX.128.F3.0F 7E (reg=dst,
+            // r/m=src) and VEX.128.66.0F D6 (reg=src, r/m=dst, the SSE2
+            // swapped row). GAS 2.47 picks the row whose r/m needs no VEX.B
+            // extension, keeping the 2-byte C5 form reachable:
+            // `vmovq %xmm15,%xmm6` = `c5 79 d6 fe` (D6 row), while
+            // `vmovq %xmm2,%xmm8` = `c5 7a 7e c2` (7E row, dst rides R).
+            // When both need B (xmm15 -> xmm8) it keeps the 7E row.
             (Operand::Register(src), Operand::Register(dst))
                 if is_xmm_or_ymm(&src.name) && is_xmm_or_ymm(&dst.name) =>
             {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                let r = needs_vex_ext(&dst.name);
-                let b = needs_vex_ext(&src.name);
-                self.emit_vex(r, false, b, 1, 0, 0, 0, 2);
-                self.bytes.push(0x7E);
-                self.bytes.push(self.modrm(3, dst_num, src_num));
+                if !needs_vex_ext(&dst.name) && needs_vex_ext(&src.name) {
+                    // 66/D6 row: reg=src (VEX.R), r/m=dst (no B), pp=66.
+                    self.emit_vex(needs_vex_ext(&src.name), false, false, 1, 0, 0, 0, 1);
+                    self.bytes.push(0xD6);
+                    self.bytes.push(self.modrm(3, src_num, dst_num));
+                } else {
+                    // F3/7E row (default, matches GAS tie-break).
+                    self.emit_vex(
+                        needs_vex_ext(&dst.name),
+                        false,
+                        needs_vex_ext(&src.name),
+                        1,
+                        0,
+                        0,
+                        0,
+                        2,
+                    );
+                    self.bytes.push(0x7E);
+                    self.bytes.push(self.modrm(3, dst_num, src_num));
+                }
                 Ok(())
             }
             // mem -> XMM: VEX.128.F3.0F 7E /r

@@ -23,9 +23,19 @@ the only changed executable `.text` was LZ4. The sound byte-copy loop-idiom
 fix retains ~10.8× speed over disabling that idiom on a separately scaled
 LZ4 screen, while preserving forward-overlap semantics. See
 [`engineering/evidence/2026-09-25-redteam/loop-idiom-redteam/README.md`](engineering/evidence/2026-09-25-redteam/loop-idiom-redteam/README.md).
+On **2026-09-26**, follow-up work was based on upstream `e5bc1911`. A
+41-workload randomized three-arm Xeon-VM screen found changed executable
+`.text` only in `spectral_norm`; the paired 15-round focused result is
+candidate/current-main **0.0361** (240 ms / 6.60 s), with exact benchmark
+output agreement. The fix replaces the AVX2 strict-reciprocal lane pack's
+legacy SSE instructions with VEX forms. The newly added match-rich LZ4 and
+scaled find-bit arms reveal gaps hidden by the original short/no-match inputs.
+The evidence and remaining P0 limitations are in
+[`engineering/evidence/2026-09-26-followups/README.md`](engineering/evidence/2026-09-26-followups/README.md).
 The i7-14700KF target has **not** been measured. Before accepting a new
-runtime improvement, use same-window, same-baseline, output-checked paired
-A/B with ≥ 200 ms/arm and agreeing median/min, not historical ratios.
+**target-hardware** runtime improvement, use same-window, same-baseline,
+output-checked paired A/B with ≥ 200 ms/arm and agreeing median/min, not
+historical ratios.
 
 An item with no reproducer does not belong here.
 
@@ -33,40 +43,59 @@ An item with no reproducer does not belong here.
 
 ## P0 — largest measured gaps
 
+### PF-SN-1 · AVX2 strict-reciprocal pack, target confirmation pending
+Current main `e5bc1911` emits legacy `movd`/`pinsrd` immediately before
+`vcvtdq2pd`/`vdivpd`. The follow-up replaces these with VEX forms **only
+when AVX2 is available**; a focused 15-round, output-checked Xeon-VM screen
+found candidate/main 0.0361 (240 ms vs 6.60 s), and a 41-workload scan found
+changed `.text` only in `spectral_norm`. This is a reproducible VM result,
+**not** an i7-14700KF timing. Target P-core validation is pending; use the
+runner and evidence linked above. Negative-trip, repeated-vector, scalar-tail,
+changing-sign divisor, and XMM-disabled tests protect semantics.
+
 ### PF-LZ4-1 · Byte-copy semantics fixed; byte-compare still open
 The default-on v2 copy matcher covers both relevant LZ4 loops. The old
 unconditional `memmove` rewrite was **incorrect** for forward-overlap smear,
 and naively disabling the pass caused a 10.8× scaled-workload slowdown on the
-Xeon VM. A guarded memmove fast path now preserves the scalar overlap loop;
-25 paired rounds against latest `main` show **no significant runtime change**
-(median 0.9946, minimum 1.0057, p=0.2301), and 38 other workload `.text`
-sections are unchanged. The separate word-at-a-time byte-compare proposal
-remains **open**: require a proof against overread and a target i7-14700KF
-paired A/B before shipping. Details: red-team report linked above.
+Xeon VM. A guarded memmove fast path now preserves the scalar overlap loop.
+The original input executed **zero** match extensions in an instrumented
+12,288-pass run; its near-parity time is *not* evidence for byte-compare parity.
+A separately registered match-rich arm exercises 49,299 long matches in
+24 passes. On current main, the 9-round scaled Xeon-VM LCCC/GCC 14 ratio is
+~1.29; candidate/main `.text` is identical, so the byte-compare gap remains
+**open**. Widening a compare without proving **both** operand ranges valid
+can overread near an object boundary. No speculative widening or incorrect
+copy rewrite shipped. Require sanitizer/page-edge and overlap tests, a range
+proof, all four oracles, and an output-checked target i7 paired A/B.
 
-### PF-MB-1 · Mandelbrot hot FP loop refuses vectorization (open)
-Current `7ddb770f` VM ratio to GCC is 1.286; candidate and baseline
-executable `.text` match exactly. Additional non-IV recurrences need a legal
-SSA/exit-value proof before widening; the previous 1.67× figure is historical.
-Reproducer: `tests/benchmark/programs/mandelbrot.c`. Done = proven vectorized
-loop plus output-verifying paired A/B on the i7-14700KF.
+### PF-MB-1 · Mandelbrot hot scalar FP loop (open)
+Current `e5bc1911` 9-round Xeon-VM ratio to GCC 14 is ~1.30; candidate and
+main `.text` match. GCC 16, Clang 23.1, ICC, and ICX oracles **also use scalar
+FP instructions** in the compared main loop; static AVX-instruction counts
+do not prove vectorization. Further cross-pixel widening needs legal SSA/exit
+proof, and scalar loop/scheduling improvements require paired measurements.
+Reproducer: `tests/benchmark/programs/mandelbrot.c`. Done = output-verifying
+paired A/B with a proven general change on the i7-14700KF.
 
 ### PF-FB-1 · `linux_find_bit` loop structure (open)
-Current `7ddb770f` VM ratio to GCC is 1.318; candidate and baseline
-executable `.text` match. `bsfq` is present; the remaining gap is branching
-shape, not the loop-copy idiom. The old 1.40× ratio was historical.
-Done = classified general CFG improvement with output-checking and target-CPU
-paired evidence, or a justified bound showing it cannot improve.
+Current `e5bc1911` scaled 9-round Xeon-VM ratio to GCC 14 is ~1.40;
+candidate/main `.text` matches. `bsfq` is present; the open question is
+branch/index structure, not the loop-copy idiom. A 21-round output-checked,
+one-instruction assembly splice removing an apparently redundant post-`andn`
+`test` gave median no-test/original 1.013 on this VM; **not** a win, so no
+peephole was shipped. Done = classified, semantics-proven general CFG change
+with output-checking and target-CPU paired evidence, or a justified bound.
 
 ### RA-GLA-04 · GLA Phase 2 — full-identity register remat (sha256 hot)
 Phase 1 shipped (`CCC_RA_GLOBAL_LOCATION=1`); source-less remat is default-ON.
 The checked Phase-2 *spill-gap* experiment was **not** shipped: paired
 `sqlite_varint` and `expat_xml_scan` regressed 1.60% and 4.51% respectively
-on the earlier VM despite a few better static counts. The current-main
-`sha256_transform` VM ratio to GCC is ~1.175, with identical candidate/main
-`.text`; no allocator speedup is claimed. Require post-allocation slot-traffic
-feedback before a small, verified rematerialization change. Next: full remat
-— register-source spans that rematerialize instead of load.
+on an earlier VM despite a few better static counts. On current `e5bc1911`,
+`sha256_transform` is ~1.18× GCC 14 on the 9-round Xeon-VM screen;
+candidate/main `.text` is identical and its runtime ratio's interval spans
+1.0. **No allocator speedup or regression is established.** Require
+post-allocation slot-traffic feedback and a small, verified general change
+before reconsidering full register-source-spanning remat.
 Oracle targets: `sha256_transform ≤ 1.5×`, epilogue ref-count −50 %.
 Design refs: [`engineering/DECISIONS.md`](engineering/DECISIONS.md)
 RA-GLA-01/02/03. Aligns with **R3** (RA span supply + phi/ORI lowering —

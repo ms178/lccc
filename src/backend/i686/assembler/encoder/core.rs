@@ -1411,6 +1411,7 @@ mod i686_encoding_helper_tests {
             operands: vec![Operand::Memory(mem), Operand::Register(register("eax"))],
             nf: false,
             force_evex: false,
+            force_vex: false,
             force_rex2: false,
             dfv: 0,
         };

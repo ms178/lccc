@@ -115,6 +115,10 @@ pub struct InstructionEncoder {
     apx_nf: bool,
     /// APX `{evex}`: force the map-4 EVEX encoding of a legacy insn.
     apx_evex: bool,
+    /// GNU as `{vex}`/`{vex2}`/`{vex3}`: forbid the EVEX encoding (dual-
+    /// encoded mnemonics take their VEX row; EVEX-only shapes are rejected
+    /// with GAS's diagnostics).
+    force_vex: bool,
     /// APX `{rex2}`: force a REX2 prefix even without an EGPR.
     apx_rex2: bool,
     /// APX `{dfv=}` bitmap for CCMP/CTEST (P1.vvvv, not inverted).
@@ -214,6 +218,200 @@ fn label_to_disp(s: &str) -> Displacement {
         }
     }
     Displacement::Symbol(s.to_string())
+}
+
+/// Mnemonics with NO VEX encoding (EVEX is the only form). Shared by
+/// the EVEX routing and the {vex} rejection gate.
+fn evex_only_mnemonic(mnemonic: &str) -> bool {
+    matches!(
+        mnemonic,
+        "vpternlogd"
+            | "vpternlogq"
+            | "vpcmpb"
+            | "vpcmpub"
+            | "vpcmpw"
+            | "vpcmpuw"
+            | "vpcmpd"
+            | "vpcmpud"
+            | "vpcmpq"
+            | "vpcmpuq"
+            | "vpshufbitqmb"
+            | "vpopcntb"
+            | "vpopcntw"
+            | "vpopcntd"
+            | "vpopcntq"
+            | "vpcompressd"
+            | "vpcompressq"
+            | "vpexpandd"
+            | "vpexpandq"
+            | "vpshldw"
+            | "vpshrdw"
+            | "vpshldd"
+            | "vpshrdd"
+            | "vpshldq"
+            | "vpshrdq"
+            // AVX512DQ/F scalar-control family (EVEX-only per SDM).
+            | "valignd"
+            | "valignq"
+            | "vblendmps"
+            | "vblendmpd"
+            | "vpblendmd"
+            | "vpblendmq"
+            | "vgetexpps"
+            | "vgetexppd"
+            | "vgetexpss"
+            | "vgetexpsd"
+            | "vplzcntd"
+            | "vplzcntq"
+            | "vpmultishiftqb"
+            | "vprolvd"
+            | "vprolvq"
+            | "vprorvd"
+            | "vprorvq"
+            | "vgetmantps"
+            | "vgetmantpd"
+            | "vgetmantss"
+            | "vgetmantsd"
+            | "vfixupimmps"
+            | "vfixupimmpd"
+            | "vfixupimmss"
+            | "vfixupimmsd"
+            | "vrangeps"
+            | "vrangepd"
+            | "vrangess"
+            | "vrangesd"
+            | "vreduceps"
+            | "vreducepd"
+            | "vreducess"
+            | "vreducesd"
+            | "vrndscaleps"
+            | "vrndscalepd"
+            | "vrndscaless"
+            | "vrndscalesd"
+            | "vscalefps"
+            | "vscalefpd"
+            | "vscalefss"
+            | "vscalefsd"
+            // AVX512F reciprocal/sqrt-14 + expand/compress (EVEX-only).
+            | "vrcp14ps"
+            | "vrcp14pd"
+            | "vrsqrt14ps"
+            | "vrsqrt14pd"
+            | "vexpandps"
+            | "vexpandpd"
+            | "vcompressps"
+            | "vcompresspd"
+            // AVX512F/DQ/BW vptestm* + vpmov* (EVEX-only).
+            | "vptestmd"
+            | "vptestmq"
+            | "vptestnmd"
+            | "vptestnmq"
+            | "vptestmb"
+            | "vptestmw"
+            | "vptestnmb"
+            | "vptestnmw"
+            // AVX512F 3src+imm shuffles + vdbpsadbw (EVEX-only).
+            | "vshuff32x4"
+            | "vshuff64x2"
+            | "vshufi32x4"
+            | "vshufi64x2"
+            | "vdbpsadbw"
+            // Variable vpermq/vpermpd EVEX forms + AVX512BW blends/
+            // shifts + EVEX dup forms (EVEX-only spellings).
+            | "vpblendmb"
+            | "vpblendmw"
+            | "vpsllvw"
+            | "vpsrlvw"
+            | "vpsravw"
+            | "vbroadcasti32x2"
+            // Unsigned packed converts (EVEX-only per SDM+GAS 2.47).
+            | "vcvtps2uqq"
+            | "vcvttps2uqq"
+            | "vcvtpd2uqq"
+            | "vcvttpd2uqq"
+            | "vcvtps2udq"
+            | "vcvttps2udq"
+            | "vcvtpd2udq"
+            | "vcvttpd2udq"
+            | "vcvtudq2ps"
+            | "vcvtuqq2ps"
+            | "vcvtudq2pd"
+            | "vcvtuqq2pd"
+            | "vpermi2d"
+            | "vpermt2d"
+            | "vpermi2q"
+            | "vpermt2q"
+            | "vpermi2ps"
+            | "vpermt2ps"
+            | "vpermi2pd"
+            | "vpermt2pd"
+            | "vpermi2b"
+            | "vpermt2b"
+            | "vpermi2w"
+            | "vpermt2w"
+            | "vpermb"
+            | "vpermw"
+            | "vprold"
+            | "vprord"
+            | "vprolq"
+            | "vprorq"
+            | "vpmovusdb"
+            | "vpmovdb"
+            | "vpmovdw"
+            | "vpmovwb"
+            | "vpmovusdw"
+            | "vpmovusqb"
+            | "vpmovusqw"
+            | "vpmovsqb"
+            | "vpmovsqw"
+            | "vpmovqb"
+            | "vpmovqw"
+            | "vpmovqd"
+            | "vpmovsdb"
+            | "vpmovswb"
+            | "vpmovuswb"
+            | "vpmovsdw"
+            | "vpmovsqd"
+            | "vpmovusqd"
+            | "vinserti32x4"
+            | "vinserti64x2"
+            | "vinserti32x8"
+            | "vinserti64x4"
+            | "vextracti32x4"
+            | "vextracti64x2"
+            | "vextracti32x8"
+            | "vextracti64x4"
+            | "vbroadcasti32x4"
+            | "vbroadcasti64x2"
+            | "vbroadcasti32x8"
+            | "vbroadcasti64x4"
+            | "vbroadcastf32x4"
+            | "vbroadcastf32x8"
+            | "vbroadcastf64x2"
+            | "vbroadcastf64x4"
+            | "vmovdqu8"
+            | "vmovdqu16"
+            | "vmovdqu32"
+            | "vmovdqu64"
+            | "vmovdqa64"
+            | "vmovdqa32"
+            | "vcvtsd2usi"
+            | "vcvtss2usi"
+            | "vcvttsd2usi"
+            | "vcvttss2usi"
+            | "vcvtusi2sd"
+            | "vcvtusi2ss"
+            | "vcvtusi2sdl"
+            | "vcvtusi2sdq"
+            | "vcvtusi2ssl"
+            | "vcvtusi2ssq"
+            | "vcvtps2qq"
+            | "vcvttps2qq"
+            | "vcvtpd2qq"
+            | "vcvttpd2qq"
+            | "vcvtqq2pd"
+            | "vcvtqq2ps"
+    )
 }
 
 /// Mnemonic as GAS names it in decorator diagnostics: one size suffix
@@ -394,6 +592,7 @@ impl InstructionEncoder {
             offset: 0,
             apx_nf: false,
             apx_evex: false,
+            force_vex: false,
             apx_rex2: false,
             apx_dfv: 0,
         }
@@ -496,6 +695,7 @@ impl InstructionEncoder {
         }
         self.apx_nf = instr.nf;
         self.apx_evex = instr.force_evex;
+        self.force_vex = instr.force_vex;
         self.apx_rex2 = instr.force_rex2;
         self.apx_dfv = instr.dfv;
         if (self.apx_nf || self.apx_evex) && self.apx_rex2 {
@@ -1154,7 +1354,26 @@ impl InstructionEncoder {
             "vmovsd" => r(self.encode_evex_scalarmov(ops, 3, 1, "vmovsd")),
             // VEX-native AVX2 dup/shuffles with EVEX.0F forms (EVEX.F2/F3.
             // 0F.W 12/16): full unary machinery (mem, {k}{z}; no broadcast).
-            "vmovddup" => r(self.encode_evex_unary(ops, 1, 3, 1, 0x12)),
+            // vmovddup's memory tuple is length-dependent (GAS 2.47, Intel
+            // SDM: the xmm form's operand is m64 — Tuple1, N=8 — while the
+            // ymm/zmm forms read the full vector, N=32/64):
+            //   `vmovddup -1024(%rdx),%xmm30` = disp8 0x80  (-128*8)
+            //   `vmovddup -1024(%rdx),%ymm30` = disp8 0xe0  (-32*32)
+            //   `vmovddup 128(%rdx),%xmm1{%k7}` = disp8 0x10 (16*8)
+            "vmovddup" => {
+                let n = if ops.iter().any(|op| {
+                    matches!(op, Operand::Register(r) if r.name.to_lowercase().starts_with("zmm"))
+                }) {
+                    64
+                } else if ops.iter().any(|op| {
+                    matches!(op, Operand::Register(r) if r.name.to_lowercase().starts_with("ymm"))
+                }) {
+                    32
+                } else {
+                    8
+                };
+                r(self.encode_evex_unary_tuple1(ops, 1, 3, 1, 0x12, n))
+            }
             "vmovshdup" => r(self.encode_evex_unary(ops, 1, 2, 0, 0x16)),
             "vmovsldup" => r(self.encode_evex_unary(ops, 1, 2, 0, 0x12)),
             // AVX512DQ vbroadcasti32x2 (EVEX.66.0F38.W0 59): register
@@ -2275,17 +2494,80 @@ impl InstructionEncoder {
         // xmm/ymm0–15 stay on the VEX path (shorter). Without the high-reg
         // check, xmm16 would wrap into the 3-bit VEX/ModRM fields as xmm0.
         let has_zmm_or_k = ops.iter().any(operand_needs_evex);
-        // An EGPR memory address (r16-r31 base/index) is only encodable
-        // with an EVEX or REX2 prefix. AVX mnemonics must take the EVEX
-        // arm so the B4/X4 bits are emitted (`vcvtsd2si 8(%r20),%rax`);
-        // non-AVX mnemonics fall through to their APX/REX2 arms below,
-        // and the encode() EGPR gate rejects anything that silently
-        // dropped the EGPR.
+        // Dual-encoded VEX/EVEX mnemonics (AVX-VNNI ∩ AVX512-VNNI, plus the
+        // AVX-IFMA ∩ AVX512-IFMA pair): GAS 2.47 emits the EVEX row by
+        // default even when the VEX form is the same length or shorter
+        // (`vpdpbusd %ymm3,%ymm1,%ymm2` = `62 f2 75 28 50 d3`, byte-probed;
+        // the INT8 variants vpdpbssd/bsud/wssud have no EVEX form and stay
+        // VEX). The {vex} hint (handled below) still forces the VEX row
+        // (`{vex} vpmadd52huq %ymm3,%ymm1,%ymm2` = `c4 e2 f5 b5 d3`).
+        let prefer_evex = matches!(
+            mnemonic,
+            "vpdpbusd" | "vpdpwssd" | "vpmadd52luq" | "vpmadd52huq"
+        );
+        // {vex}/{vex2}/{vex3} (GAS 2.47): the EVEX encoding is forbidden.
+        // Anything only EVEX can express is rejected, in GAS's order:
+        //   zmm / EGPR memory / xmm-ymm 16-31  -> `unsupported instruction'
+        //   write mask or {z} (without zmm)   -> `unsupported masking'
+        //   broadcast {1toN}                  -> `unknown vector operation'
+        //   EVEX-only mnemonic, VEX-fitting regs -> `no VEX/XOP encoding'
+        //   non-`v' mnemonic (no VEX row at all) -> `no VEX/XOP encoding'
+        // Dual-encoded and plain VEX mnemonics fall through to their VEX
+        // rows (`{vex} vpdpbusd %ymm3,%ymm1,%ymm2` = `c4 e2 75 50 d3`).
+        if self.force_vex {
+            let stem = decor_stem(mnemonic);
+            let egpr_mem = ops.iter().any(|op| {
+                matches!(op, Operand::Memory(m) if
+                    m.base.as_ref().is_some_and(|b| gp_id(&b.name).is_some_and(|id| id >= 16))
+                    || m.index.as_ref().is_some_and(|i| gp_id(&i.name).is_some_and(|id| id >= 16)))
+            });
+            let has_zmm = ops
+                .iter()
+                .any(|op| matches!(op, Operand::Register(r) if is_zmm(&r.name)));
+            let high_vec = ops
+                .iter()
+                .any(|op| matches!(op, Operand::Register(r) if needs_evex_rprime(&r.name)));
+            let vex_family = mnemonic.starts_with('v') && !matches!(mnemonic, "verr" | "verw");
+            if has_zmm || egpr_mem || high_vec {
+                return Err(format!("unsupported instruction `{stem}'"));
+            }
+            let masked = ops.iter().any(|op| op_decor(op).0 || op_decor(op).1);
+            if masked {
+                return Err(format!("unsupported masking for `{stem}'"));
+            }
+            let membcst = ops
+                .iter()
+                .any(|op| matches!(op, Operand::Memory(m) if m.broadcast.is_some()));
+            if membcst {
+                // GAS reports the raw decorator token.
+                let tok = ops
+                    .iter()
+                    .find_map(|op| match op {
+                        Operand::Memory(m) => m.broadcast.map(|n| format!("{{1to{n}}}")),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "{1toN}".to_string());
+                return Err(format!("unknown vector operation: `{tok}'"));
+            }
+            if evex_only_mnemonic(mnemonic) || !vex_family {
+                return Err(format!("no VEX/XOP encoding for `{stem}'"));
+            }
+        }
+        // An EGPR feature — a memory address (r16-r31 base/index) OR a GPR
+        // data operand >= r16 — is only encodable with an EVEX or REX2
+        // prefix. AVX mnemonics must take the EVEX arm so the B4/X4 bits
+        // are emitted (`vcvtsd2si 8(%r20),%rax`, `vpinsrd $1,%r22d,...`);
+        // non-AVX mnemonics fall through to their APX/REX2 arms below
+        // (try_encode_evex returns None for them), and the encode() EGPR
+        // gate rejects anything that silently dropped the EGPR.
         if !has_zmm_or_k
+            && !self.force_vex
             && ops.iter().any(|op| {
                 matches!(op, Operand::Memory(m) if
                     m.base.as_ref().is_some_and(|b| gp_id(&b.name).is_some_and(|id| id >= 16))
                     || m.index.as_ref().is_some_and(|i| gp_id(&i.name).is_some_and(|id| id >= 16)))
+                    || matches!(op, Operand::Register(r) if
+                        gp_id(&r.name).is_some_and(|id| id >= 16))
             })
         {
             if let Some(result) = self.try_encode_evex(mnemonic, ops) {
@@ -2299,199 +2581,8 @@ impl InstructionEncoder {
         // family (probed: GAS 2.47 has no VEX spelling for any of them)
         // must be listed here or their xmm/ymm-only forms never reach the
         // EVEX table and die as `unhandled instruction`.
-        let evex_only = matches!(
-            mnemonic,
-            "vpternlogd"
-                | "vpternlogq"
-                | "vpcmpb"
-                | "vpcmpub"
-                | "vpcmpw"
-                | "vpcmpuw"
-                | "vpcmpd"
-                | "vpcmpud"
-                | "vpcmpq"
-                | "vpcmpuq"
-                | "vpshufbitqmb"
-                | "vpopcntb"
-                | "vpopcntw"
-                | "vpopcntd"
-                | "vpopcntq"
-                | "vpcompressd"
-                | "vpcompressq"
-                | "vpexpandd"
-                | "vpexpandq"
-                | "vpshldw"
-                | "vpshrdw"
-                | "vpshldd"
-                | "vpshrdd"
-                | "vpshldq"
-                | "vpshrdq"
-                // AVX512DQ/F scalar-control family (EVEX-only per SDM).
-                | "valignd"
-                | "valignq"
-                | "vblendmps"
-                | "vblendmpd"
-                | "vpblendmd"
-                | "vpblendmq"
-                | "vgetexpps"
-                | "vgetexppd"
-                | "vgetexpss"
-                | "vgetexpsd"
-                | "vplzcntd"
-                | "vplzcntq"
-                | "vpmultishiftqb"
-                | "vprolvd"
-                | "vprolvq"
-                | "vprorvd"
-                | "vprorvq"
-                | "vgetmantps"
-                | "vgetmantpd"
-                | "vgetmantss"
-                | "vgetmantsd"
-                | "vfixupimmps"
-                | "vfixupimmpd"
-                | "vfixupimmss"
-                | "vfixupimmsd"
-                | "vrangeps"
-                | "vrangepd"
-                | "vrangess"
-                | "vrangesd"
-                | "vreduceps"
-                | "vreducepd"
-                | "vreducess"
-                | "vreducesd"
-                | "vrndscaleps"
-                | "vrndscalepd"
-                | "vrndscaless"
-                | "vrndscalesd"
-                | "vscalefps"
-                | "vscalefpd"
-                | "vscalefss"
-                | "vscalefsd"
-                // AVX512IFMA (EVEX-only).
-                | "vpmadd52luq"
-                | "vpmadd52huq"
-                // AVX512F reciprocal/sqrt-14 + expand/compress (EVEX-only).
-                | "vrcp14ps"
-                | "vrcp14pd"
-                | "vrsqrt14ps"
-                | "vrsqrt14pd"
-                | "vexpandps"
-                | "vexpandpd"
-                | "vcompressps"
-                | "vcompresspd"
-                // AVX512F/DQ/BW vptestm* + vpmov* (EVEX-only).
-                | "vptestmd"
-                | "vptestmq"
-                | "vptestnmd"
-                | "vptestnmq"
-                | "vptestmb"
-                | "vptestmw"
-                | "vptestnmb"
-                | "vptestnmw"
-                // AVX512F 3src+imm shuffles + vdbpsadbw (EVEX-only).
-                | "vshuff32x4"
-                | "vshuff64x2"
-                | "vshufi32x4"
-                | "vshufi64x2"
-                | "vdbpsadbw"
-                // Variable vpermq/vpermpd EVEX forms + AVX512BW blends/
-                // shifts + EVEX dup forms (EVEX-only spellings).
-                | "vpblendmb"
-                | "vpblendmw"
-                | "vpsllvw"
-                | "vpsrlvw"
-                | "vpsravw"
-                | "vbroadcasti32x2"
-                // Unsigned packed converts (EVEX-only per SDM+GAS 2.47).
-                | "vcvtps2uqq"
-                | "vcvttps2uqq"
-                | "vcvtpd2uqq"
-                | "vcvttpd2uqq"
-                | "vcvtps2udq"
-                | "vcvttps2udq"
-                | "vcvtpd2udq"
-                | "vcvttpd2udq"
-                | "vcvtudq2ps"
-                | "vcvtuqq2ps"
-                | "vcvtudq2pd"
-                | "vcvtuqq2pd"
-                | "vpermi2d"
-                | "vpermt2d"
-                | "vpermi2q"
-                | "vpermt2q"
-                | "vpermi2ps"
-                | "vpermt2ps"
-                | "vpermi2pd"
-                | "vpermt2pd"
-                | "vpermi2b"
-                | "vpermt2b"
-                | "vpermi2w"
-                | "vpermt2w"
-                | "vpermb"
-                | "vpermw"
-                | "vprold"
-                | "vprord"
-                | "vprolq"
-                | "vprorq"
-                | "vpmovusdb"
-                | "vpmovdb"
-                | "vpmovdw"
-                | "vpmovwb"
-                | "vpmovusdw"
-                | "vpmovusqb"
-                | "vpmovusqw"
-                | "vpmovsqb"
-                | "vpmovsqw"
-                | "vpmovqb"
-                | "vpmovqw"
-                | "vpmovqd"
-                | "vpmovsdb"
-                | "vpmovswb"
-                | "vpmovuswb"
-                | "vpmovsdw"
-                | "vpmovsqd"
-                | "vpmovusqd"
-                | "vinserti32x4"
-                | "vinserti64x2"
-                | "vinserti32x8"
-                | "vinserti64x4"
-                | "vextracti32x4"
-                | "vextracti64x2"
-                | "vextracti32x8"
-                | "vextracti64x4"
-                | "vbroadcasti32x4"
-                | "vbroadcasti64x2"
-                | "vbroadcasti32x8"
-                | "vbroadcasti64x4"
-                | "vbroadcastf32x4"
-                | "vbroadcastf32x8"
-                | "vbroadcastf64x2"
-                | "vbroadcastf64x4"
-                | "vmovdqu8"
-                | "vmovdqu16"
-                | "vmovdqu32"
-                | "vmovdqu64"
-                | "vmovdqa64"
-                | "vmovdqa32"
-                | "vcvtsd2usi"
-                | "vcvtss2usi"
-                | "vcvttsd2usi"
-                | "vcvttss2usi"
-                | "vcvtusi2sd"
-                | "vcvtusi2ss"
-                | "vcvtusi2sdl"
-                | "vcvtusi2sdq"
-                | "vcvtusi2ssl"
-                | "vcvtusi2ssq"
-                | "vcvtps2qq"
-                | "vcvttps2qq"
-                | "vcvtpd2qq"
-                | "vcvttpd2qq"
-                | "vcvtqq2pd"
-                | "vcvtqq2ps"
-        );
-        if has_zmm_or_k || evex_only {
+        let evex_only = evex_only_mnemonic(mnemonic);
+        if (has_zmm_or_k || evex_only || prefer_evex) && !self.force_vex {
             if let Some(result) = self.try_encode_evex(mnemonic, ops) {
                 return result;
             }
@@ -3518,7 +3609,9 @@ impl InstructionEncoder {
                 Ok(())
             }
             "enclv" => {
-                self.bytes.extend_from_slice(&[0x0F, 0x01, 0xE0]);
+                // ENCLV is 0F 01 C0 (Intel SDM Table 4-1; GAS 2.47:
+                // `enclv` = 0f01c0). 0F 01 E0 would decode as SMSW %eax.
+                self.bytes.extend_from_slice(&[0x0F, 0x01, 0xC0]);
                 Ok(())
             }
             // User interrupts (UINTR).
@@ -4220,6 +4313,12 @@ impl InstructionEncoder {
             "vpdpwuuds" => self.encode_avx_3op_38_pp(ops, 0xD3, 0),
             "vpdpwssd" => self.encode_avx_3op_38_pp(ops, 0x52, 1),
             "vpdpwssds" => self.encode_avx_3op_38_pp(ops, 0x53, 1),
+            // AVX-IFMA VEX rows (VEX.128/256.66.0F38.W1 B4/B5): reachable
+            // via the {vex} hint — the default prefers the AVX512-IFMA EVEX
+            // row (GAS 2.47: `{vex} vpmadd52huq %ymm3,%ymm1,%ymm2` =
+            // `c4 e2 f5 b5 d3`, plain = `62 f2 f5 28 b5 d3`).
+            "vpmadd52luq" => self.encode_avx_3op_38_pp_w1(ops, 0xB4, 1),
+            "vpmadd52huq" => self.encode_avx_3op_38_pp_w1(ops, 0xB5, 1),
             // GFNI: binutils/GCC emit the legacy SSE forms for 128-bit
             // (66 0F38/0F3A); VEX forms exist in the ISA but binutils 2.44
             // neither assembles nor disassembles them. Match GNU as exactly.
@@ -5787,13 +5886,16 @@ mod encoding_opt_tests {
     #[test]
     fn vex_mem_source_forms() {
         // Gap-sweep batch 2: every byte verified against GAS 2.47.
-        // VNNI memory sources deliberately stay VEX (6B) where GAS 2.47
-        // defaults to EVEX (7B); GAS accepts the VEX spelling explicitly.
-        assert_eq!(hex("vpdpbusd (%rax), %xmm1, %xmm2"), "c4 e2 71 50 10");
+        // Dual-encoded VNNI rows (vpdpbusd/vpdpwssd) default to the EVEX
+        // encoding like GAS 2.47 on BOTH x86-64 and i686 (byte-probed;
+        // clang/gcc/icc agree); the {vex} hint forces the 6-byte VEX row.
+        // The INT8 variants (vpdpbusds) have no EVEX form and stay VEX.
+        assert_eq!(hex("vpdpbusd (%rax), %xmm1, %xmm2"), "62 f2 75 08 50 10");
         assert_eq!(
             hex("vpdpbusd 0x20(%rax), %ymm1, %ymm2"),
-            "c4 e2 75 50 50 20"
+            "62 f2 75 28 50 50 01"
         );
+        assert_eq!(hex("{vex} vpdpbusd (%rax), %xmm1, %xmm2"), "c4 e2 71 50 10");
         assert_eq!(hex("vpdpbusds (%rax), %xmm1, %xmm2"), "c4 e2 71 51 10");
         // Variable-shift count from memory (r/m = count, vvvv = data).
         assert_eq!(hex("vpslld (%rax), %xmm6, %xmm7"), "c5 c9 f2 38");
@@ -6370,5 +6472,90 @@ mod encoding_opt_tests {
         // Suffixed {sae} never parses; the standalone spelling does.
         assert!(fails("vaddss %xmm0, %xmm1, %xmm2{sae}"));
         assert!(fails("vmaxss %xmm0, %xmm1, %xmm2{sae}"));
+    }
+}
+
+#[cfg(test)]
+mod evex_egpr_rm_tests {
+    use super::apx_tests::{fails, hex};
+
+    /// GPR r/m >= r16 in EVEX mod=3 extends through rex2.B (P0 bit 3,
+    /// SET, non-inverted) — never the vector X bit (P0 bit 6, inverted).
+    /// The vector bit silently mis-encodes %r21 as %rbp (both probe as
+    /// 0x21 vs GAS's 0x69 in P0). Every byte below is GAS 2.47-probed.
+    #[test]
+    fn evex_gpr_rm_high_uses_rex2_b() {
+        assert_eq!(hex("vcvtsi2sdq %r21, %xmm29, %xmm30"), "62 69 97 00 2a f5");
+        assert_eq!(hex("vcvtsi2sdq %r29, %xmm29, %xmm30"), "62 49 97 00 2a f5");
+        assert_eq!(hex("vextractps $1, %xmm16, %r20d"), "62 eb 7d 08 17 c4 01");
+        assert_eq!(hex("vpextrd $1, %xmm20, %r21d"), "62 eb 7d 08 16 e5 01");
+        assert_eq!(
+            hex("vpinsrq $1, %r22, %xmm3, %xmm4"),
+            "62 fb e5 08 22 e6 01"
+        );
+        assert_eq!(hex("vmovq %r20, %xmm21"), "62 e9 fd 08 6e ec");
+        assert_eq!(hex("vpbroadcastq %r31, %zmm5"), "62 da fd 48 7c ef");
+        assert_eq!(hex("vcvtsd2si %xmm29, %r21"), "62 81 ff 08 2d ed");
+    }
+
+    /// Control: GPR r/m r8-r15 uses only B3 (P0 bit 5, inverted); these
+    /// were always correct and must stay byte-identical.
+    #[test]
+    fn evex_gpr_rm_r8_15_uses_b3_only() {
+        assert_eq!(hex("vcvtsi2sdq %r9, %xmm1, %xmm2"), "c4 c1 f3 2a d1");
+        assert_eq!(hex("vcvtsi2sd %r13d, %xmm1, %xmm2"), "c4 c1 73 2a d5");
+        assert_eq!(hex("vpextrq $1, %xmm3, %r15"), "c4 c3 f9 16 df 01");
+    }
+
+    /// vmovddup's memory tuple: xmm = Tuple1 m64 (N=8), ymm/zmm = Full
+    /// (N=32/64). GAS 2.47: `vmovddup -1024(%rdx),%xmm30` = disp8 0x80.
+    #[test]
+    fn evex_vmovddup_tuple_lengths() {
+        assert_eq!(hex("vmovddup -1024(%rdx), %xmm30"), "62 61 ff 08 12 72 80");
+        assert_eq!(hex("vmovddup -1024(%rdx), %ymm30"), "62 61 ff 28 12 72 e0");
+        assert_eq!(
+            hex("vmovddup 128(%rdx), %xmm1{%k7}"),
+            "62 f1 ff 0f 12 4a 10"
+        );
+        assert_eq!(
+            hex("vmovddup 16(%rdx), %ymm1{%k7}"),
+            "62 f1 ff 2f 12 8a 10 00 00 00"
+        );
+        assert_eq!(hex("vmovddup 64(%rdx), %zmm1"), "62 f1 ff 48 12 4a 01");
+    }
+
+    /// {vex}/{vex2}/{vex3} forbid the EVEX encoding (GAS 2.47): dual
+    /// mnemonics fall to their VEX rows; EVEX-only shapes are rejected
+    /// with GAS's diagnostics.
+    #[test]
+    fn vex_hint_forces_vex_and_rejects_evex_only() {
+        assert_eq!(hex("{vex} vpdpbusd %ymm3, %ymm1, %ymm2"), "c4 e2 75 50 d3");
+        assert_eq!(
+            hex("{vex} vpmadd52huq %ymm3, %ymm1, %ymm2"),
+            "c4 e2 f5 b5 d3"
+        );
+        assert_eq!(hex("vpdpbusd %ymm3, %ymm1, %ymm2"), "62 f2 75 28 50 d3");
+        assert_eq!(hex("vpmadd52huq %ymm3, %ymm1, %ymm2"), "62 f2 f5 28 b5 d3");
+        assert!(fails("{vex} vpdpbusd %zmm3, %zmm1, %zmm2"));
+        assert!(fails("{vex} vpdpbusd %ymm3, %ymm1, %ymm2{%k7}"));
+        assert!(fails("{vex} vpdpbusd %ymm20, %ymm1, %ymm2"));
+        assert!(fails("{vex} vpdpbusd 8(%r20), %ymm1, %ymm2"));
+        assert!(fails("{vex} vmovdqu8 %ymm1, %ymm2"));
+        assert!(fails("{vex} movl %eax, %ebx"));
+        assert!(fails("{vex} addl $1, %eax"));
+    }
+
+    /// VEX move direction: swap to the mirrored opcode (0F 11 store /
+    /// 66-D6) when only that keeps VEX.B clear, reaching 2-byte C5.
+    #[test]
+    fn vex_move_direction_prefers_c5() {
+        assert_eq!(hex("vmovss %xmm15, %xmm6, %xmm2"), "c5 4a 11 fa");
+        assert_eq!(hex("vmovss %xmm2, %xmm6, %xmm15"), "c5 4a 10 fa");
+        assert_eq!(hex("vmovss %xmm15, %xmm6, %xmm8"), "c4 41 4a 10 c7");
+        assert_eq!(hex("vmovsd %xmm15, %xmm6, %xmm2"), "c5 4b 11 fa");
+        assert_eq!(hex("vmovq %xmm15, %xmm6"), "c5 79 d6 fe");
+        assert_eq!(hex("vmovq %xmm2, %xmm8"), "c5 7a 7e c2");
+        assert_eq!(hex("vmovq %xmm6, %xmm15"), "c5 7a 7e fe");
+        assert_eq!(hex("vmovq %xmm15, %xmm8"), "c4 41 7a 7e c7");
     }
 }

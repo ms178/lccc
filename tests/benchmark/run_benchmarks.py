@@ -131,6 +131,12 @@ BENCHMARKS: tuple[Benchmark, ...] = (
               ("sqlite_varint.c",), ("workload", "sqlite", "branch", "integer")),
     Benchmark("linux_find_bit", "Linux sparse find_next_andnot_bit",
               ("linux_find_bit.c",), ("workload", "linux", "bitmap", "bit")),
+    # The original ~15 ms runtime is dominated by process-launch/scheduler
+    # noise on constrained hosts. Preserve it for continuity, and keep a
+    # separately output-checked long-running arm for performance decisions.
+    Benchmark("linux_find_bit_scaled", "Linux sparse find_next_andnot_bit / scaled",
+              ("linux_find_bit.c",), ("workload", "linux", "bitmap", "bit"),
+              120, ("-DPASSES=65536",)),
     Benchmark("glibc_memcmp", "glibc aligned-word memcmp path",
               ("glibc_memcmp.c",), ("workload", "glibc", "memory", "branch")),
     Benchmark("chacha20_block", "ChaCha20 20-round ARX block cipher / register pressure",
@@ -143,6 +149,12 @@ BENCHMARKS: tuple[Benchmark, ...] = (
               ("zstd_count.c",), ("workload", "zstd", "compression", "bit")),
     Benchmark("lz4_compress", "LZ4 fast block compression / 4-byte hash matching",
               ("lz4_compress.c",), ("workload", "lz4", "compression", "memory")),
+    # The default LZ4 input reaches no four-byte matches: its byte-compare
+    # extension loop cannot be evaluated by timing that arm. This separately
+    # output-checked input runs long matches for >200 ms on the screening VM.
+    Benchmark("lz4_match_extend", "LZ4 repeat-rich input / byte match extension",
+              ("lz4_compress.c",), ("workload", "lz4", "compression", "byte-compare"),
+              120, ("-DMATCH_RICH=1", "-DPASSES=2048")),
     Benchmark("glibc_strstr", "glibc two-way string search / needle shift table",
               ("glibc_strstr.c",), ("workload", "glibc", "string", "search")),
 )

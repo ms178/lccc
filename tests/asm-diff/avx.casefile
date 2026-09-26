@@ -1215,3 +1215,26 @@ vgatherqps %xmm12, (%r13, %ymm14, 2),%xmm11
 vpgatherqd %xmm12, (%r13, %ymm14, 2),%xmm11
 vgatherqps %xmm12, (%r13,%xmm14,2),%xmm11
 vgatherdps %ymm5,(%r13,%ymm4,2),%ymm6
+
+;;; vex_move_direction — GAS 2.47 picks the opcode direction whose r/m
+;;; needs no VEX.B, keeping 2-byte C5 reachable: vmovss/vmovsd 3-op swap
+;;; to 0F 11 when dst<=7 && src2>=8; vmovq xmm,xmm swaps to 66/D6.
+vmovss %xmm15, %xmm6, %xmm2
+vmovss %xmm8, %xmm6, %xmm2
+vmovss %xmm2, %xmm6, %xmm15
+vmovss %xmm15, %xmm6, %xmm8
+vmovss %xmm1, %xmm6, %xmm2
+vmovss %xmm15, %xmm6, %xmm7
+vmovsd %xmm15, %xmm6, %xmm2
+vmovsd %xmm8, %xmm6, %xmm2
+vmovsd %xmm2, %xmm6, %xmm15
+vmovsd %xmm15, %xmm6, %xmm8
+vmovq %xmm15, %xmm6
+vmovq %xmm2, %xmm8
+vmovq %xmm6, %xmm15
+vmovq %xmm15, %xmm8
+vmovq %xmm1, %xmm2
+vmovq %xmm15, %xmm15
+vmovss %xmm15, %xmm6, %xmm2
+vmovsd %xmm8, %xmm15, %xmm2
+vmovss %xmm2, %xmm15, %xmm8
