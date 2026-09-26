@@ -490,11 +490,11 @@ impl X86Codegen {
                 } else {
                     self.state.emit("    movd %xmm0, %eax");
                 }
-                self.state.reg_cache.set_acc(dest.0, false);
+                self.state.park_acc(dest.0, false);
             }
             _ => {
                 // Integer types are already in rax
-                self.state.reg_cache.set_acc(dest.0, false);
+                self.state.park_acc(dest.0, false);
             }
         }
 
@@ -603,11 +603,11 @@ impl X86Codegen {
                 } else {
                     self.state.emit("    movd %xmm0, %eax");
                 }
-                self.state.reg_cache.set_acc(dest.0, false);
+                self.state.park_acc(dest.0, false);
             }
             _ => {
                 // Integer types are already in rax
-                self.state.reg_cache.set_acc(dest.0, false);
+                self.state.park_acc(dest.0, false);
             }
         }
 
@@ -1070,7 +1070,7 @@ impl X86Codegen {
                         "    {} (%{}), {}",
                         load_instr, p_name, dest_reg
                     ));
-                    self.state.reg_cache.set_acc(dest.0, false);
+                    self.state.park_acc(dest.0, false);
                     self.store_rax_to(dest);
                     return;
                 }
@@ -1089,7 +1089,7 @@ impl X86Codegen {
         if !ty.is_float()
             && !matches!(ty, IrType::I128 | IrType::U128 | IrType::F128)
             && !self.state.is_alloca(ptr.0)
-            && self.state.reg_cache.acc_has(ptr.0, false)
+            && self.state.acc_has_verified(ptr.0, false)
         {
             let load_instr = self.mov_load_for_value(ty, dest.0);
             let use_32bit_dest = matches!(load_instr, "movl" | "movzbl" | "movzwl");
@@ -1126,7 +1126,7 @@ impl X86Codegen {
             };
             self.state
                 .emit_fmt(format_args!("    {} (%rax), {}", load_instr, dest_reg));
-            self.state.reg_cache.set_acc(dest.0, false);
+            self.state.park_acc(dest.0, false);
             self.store_rax_to(dest);
             return;
         }

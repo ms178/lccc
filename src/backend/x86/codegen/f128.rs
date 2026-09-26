@@ -229,7 +229,7 @@ impl X86Codegen {
             self.state.emit("    subq $8, %rsp");
             self.state.emit("    fstpl (%rsp)");
             self.state.emit("    popq %rax");
-            self.state.reg_cache.set_acc(dest.0, false);
+            self.state.park_acc(dest.0, false);
             self.state.f128_direct_slots.insert(dest.0);
         } else {
             self.state.emit("    subq $8, %rsp");

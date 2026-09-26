@@ -1534,8 +1534,7 @@ impl X86Codegen {
                     self.state.out.emit_cmp_zero_mem_sized(slot.0, mnem);
                     return true;
                 }
-                if self.state.reg_cache.acc_has(v.0, false)
-                    || self.state.reg_cache.acc_has(v.0, true)
+                if self.state.acc_has_verified(v.0, false) || self.state.acc_has_verified(v.0, true)
                 {
                     self.state.emit("    testq %rax, %rax");
                     return true;
@@ -1584,7 +1583,7 @@ impl X86Codegen {
             self.state.reg_cache.invalidate_sec();
             return true;
         }
-        if self.state.reg_cache.acc_has(val_id, false) {
+        if self.state.acc_has_verified(val_id, false) {
             self.state.emit("    movq %rax, %rcx");
             self.state.emit("    orq %rdx, %rcx");
             self.state.reg_cache.invalidate_sec();
@@ -1633,7 +1632,7 @@ impl X86Codegen {
             self.state
                 .out
                 .emit_instr_rbp_reg("    orq", slot.0 + 8, "rax");
-        } else if self.state.reg_cache.acc_has(val_id, false) {
+        } else if self.state.acc_has_verified(val_id, false) {
             // rax = lo, rdx = hi (the i128 accumulator-pair invariant).
             self.state.emit("    orq %rdx, %rax");
         } else {
