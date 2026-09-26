@@ -20,6 +20,75 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 /// discharge the obligation and one process-wide lock does.
 static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+/// The one lock that serializes every test flipping the backend tri-state
+/// override atomics (`COMMUTED_ACC_OVERRIDE` in copy_coalescing,
+/// `HIDDEN_READ_COPY_CHAIN_OVERRIDE` in liveness). Same reasoning as
+/// `ENV_LOCK`: the flags are process-global state read by codegen walks on
+/// the shared test thread pool, so a flip window must be mutually
+/// exclusive — module-local locks serialized each module against itself
+/// and nothing else.
+static BACKEND_FLAG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+pub(crate) fn backend_flag_lock() -> MutexGuard<'static, ()> {
+    BACKEND_FLAG_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        // A poisoned lock means a test panicked while holding it. The
+        // window's `Drop` restores the flag regardless, so the state is
+        // not left inconsistent and the remaining tests should still run.
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+thread_local! {
+    /// Flag-window nesting depth for THIS thread. `Mutex` is not reentrant,
+    /// and nesting is a real shape (a precise-mode pin held across asserts
+    /// while a conservative-mode window scopes the second compute), so
+    /// depth 0 takes the lock and every deeper level inherits it — the
+    /// same contract as `ENV_WINDOW_DEPTH` above.
+    static FLAG_WINDOW_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Serialized tri-state override window for one backend flag atomic.
+///
+/// Sets `flag` to `value` on acquire and restores the PREVIOUS value on
+/// drop — panic-safe, unlike the hand-restored pairs this replaces:
+/// `set(flag, false); run(); set(flag, true)` leaked "forced ON" past any
+/// assertion failure between the two, and even on the success path it
+/// restored a forced state instead of the `-1` env-follow default, so a
+/// suite run with `CCC_NO_COMMUTED_ACC`/`CCC_HIDDEN_READ_COPY_CHAIN` set
+/// produced outcomes that depended on test order. Holding the lock for the
+/// window's whole lifetime also makes flip windows mutually exclusive.
+pub(crate) struct TriStateFlagWindow {
+    _guard: Option<MutexGuard<'static, ()>>,
+    flag: &'static std::sync::atomic::AtomicI8,
+    previous: i8,
+}
+
+impl TriStateFlagWindow {
+    pub(crate) fn new(flag: &'static std::sync::atomic::AtomicI8, value: i8) -> Self {
+        let depth = FLAG_WINDOW_DEPTH.with(|d| {
+            let n = d.get();
+            d.set(n + 1);
+            n
+        });
+        let guard = (depth == 0).then(backend_flag_lock);
+        let previous = flag.load(std::sync::atomic::Ordering::Relaxed);
+        flag.store(value, std::sync::atomic::Ordering::Relaxed);
+        Self {
+            _guard: guard,
+            flag,
+            previous,
+        }
+    }
+}
+
+impl Drop for TriStateFlagWindow {
+    fn drop(&mut self) {
+        self.flag
+            .store(self.previous, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 fn env_lock() -> MutexGuard<'static, ()> {
     ENV_LOCK
         .get_or_init(|| Mutex::new(()))

@@ -1146,7 +1146,15 @@ impl X86Codegen {
                                         let name = super::emit::phys_reg_name(home);
                                         if name != xmm_regs[reg_idx] {
                                             if self.isa.avx {
-                                                let mv = if ty == IrType::F32 {
+                                                // D32 is a 4-byte datum like
+                                                // F32: the scalar 32-bit move
+                                                // is width-exact (vmovsd would
+                                                // copy 8 bytes - correct, but
+                                                // one byte wider and it reads
+                                                // garbage lanes the consumer
+                                                // can never observe).
+                                                let mv = if matches!(ty, IrType::F32 | IrType::D32)
+                                                {
                                                     "vmovss"
                                                 } else {
                                                     "vmovsd"
@@ -1156,7 +1164,8 @@ impl X86Codegen {
                                                     mv, name, name, xmm_regs[reg_idx]
                                                 ));
                                             } else {
-                                                let mv = if ty == IrType::F32 {
+                                                let mv = if matches!(ty, IrType::F32 | IrType::D32)
+                                                {
                                                     "movaps"
                                                 } else {
                                                     "movapd"
@@ -1171,7 +1180,7 @@ impl X86Codegen {
                                     } else {
                                         let gpr = super::emit::phys_reg_name(home);
                                         let gpr32 = super::emit::phys_reg_name_32(home);
-                                        if ty == IrType::F32 {
+                                        if matches!(ty, IrType::F32 | IrType::D32) {
                                             self.state.emit_fmt(format_args!(
                                                 "    movd %{}, %{}",
                                                 gpr32, xmm_regs[reg_idx]

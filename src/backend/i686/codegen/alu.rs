@@ -1255,13 +1255,13 @@ impl I686Codegen {
             // move the remainder into %eax for its acc-flow consumer.
             self.store_eax_to(&div_dest);
             self.state.emit("    movl %edx, %eax");
-            self.state.reg_cache.set_acc(rem_dest.0, false);
+            self.state.park_acc(rem_dest.0, false);
         } else if div_slotless {
             // Remainder out first (its store cannot touch %eax here); the
             // quotient is already in %eax — just claim the cache entry its
             // consumer will read.
             self.store_edx_to(&rem_dest);
-            self.state.reg_cache.set_acc(div_dest.0, false);
+            self.state.park_acc(div_dest.0, false);
         } else if edx_side_writes_eax {
             // Quotient first (its store cannot touch %edx here); then the
             // remainder store rewrites %eax — invalidate the acc claim the

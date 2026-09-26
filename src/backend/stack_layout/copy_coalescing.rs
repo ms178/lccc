@@ -1528,12 +1528,6 @@ static COMMUTED_ACC_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 /// environment, 0 = forced LHS-only, 1 = forced commuted-RHS (tests).
 static COMMUTED_ACC_OVERRIDE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
 
-/// Test-only override for [`commuted_acc_enabled`].
-#[cfg(test)]
-fn set_commuted_acc_for_tests(follow: bool) {
-    COMMUTED_ACC_OVERRIDE.store(follow as i8, std::sync::atomic::Ordering::Relaxed);
-}
-
 fn is_safe_sole_consumer(inst: &Instruction, value_id: u32, lhs_first_binop: bool) -> bool {
     match inst {
         Instruction::Store {
@@ -3399,6 +3393,11 @@ mod cfg_copy_coalesce_tests {
     /// write-only deferred slots (the dead park stores).
     #[test]
     fn immediately_consumed_commutative_rhs_on_lhs_first() {
+        // Pin FORCED-COMMUTED for the duration of the test: the outcome
+        // asserted here is the commuted arm (commuted-RHS eligibility is the behavior under test), and a concurrent
+        // flip window must not change it. Also serializes this test against
+        // the flip windows on the shared backend-flag lock.
+        let _pin = crate::test_support::TriStateFlagWindow::new(&COMMUTED_ACC_OVERRIDE, 1);
         let mut func = IrFunction::new("maj".to_string(), IrType::I32, vec![], false);
         // v1 := 6; v0 := 4; v2 := And(v1, v0)  [v0 consumed as RHS, adjacent]
         func.blocks.push(block(
@@ -3449,9 +3448,13 @@ mod cfg_copy_coalesce_tests {
             ],
             Terminator::Return(Some(Operand::Value(Value(2)))),
         ));
-        set_commuted_acc_for_tests(false);
+        // The window restores the PREVIOUS override state (-1 env-follow by
+        // default) on drop — panic-safe, and it restores the DEFAULT rather
+        // than a forced-ON state, so a suite run with CCC_NO_COMMUTED_ACC
+        // set produces order-independent outcomes. Held under the shared
+        // backend-flag lock, so flip windows are mutually exclusive.
+        let _lhs_only = crate::test_support::TriStateFlagWindow::new(&COMMUTED_ACC_OVERRIDE, 0);
         let skip = compute_immediately_consumed(&func, true);
-        set_commuted_acc_for_tests(true); // restore before any panic path
         assert!(
             !skip.contains(&0),
             "the override must restore the LHS-only contract"
@@ -3472,6 +3475,11 @@ mod cfg_copy_coalesce_tests {
     /// class with no slot and no fallback.
     #[test]
     fn immediately_consumed_commutative_rhs_narrow_widths() {
+        // Pin FORCED-COMMUTED for the duration of the test: the outcome
+        // asserted here is the commuted arm (narrow-width commuted eligibility (audit M2 coverage)), and a concurrent
+        // flip window must not change it. Also serializes this test against
+        // the flip windows on the shared backend-flag lock.
+        let _pin = crate::test_support::TriStateFlagWindow::new(&COMMUTED_ACC_OVERRIDE, 1);
         let narrow_def = |dest: u32, value: i32, ty: IrType| Instruction::BinOp {
             dest: Value(dest),
             op: IrBinOp::Add,
@@ -3514,6 +3522,11 @@ mod cfg_copy_coalesce_tests {
     /// (i686) keeps the LHS-only rule for the same shape.
     #[test]
     fn immediately_consumed_commutative_rhs_rejected_when_not_lhs_first() {
+        // Pin FORCED-COMMUTED for the duration of the test: the outcome
+        // asserted here is the commuted arm (the commuted arm is what must reject here), and a concurrent
+        // flip window must not change it. Also serializes this test against
+        // the flip windows on the shared backend-flag lock.
+        let _pin = crate::test_support::TriStateFlagWindow::new(&COMMUTED_ACC_OVERRIDE, 1);
         let mut func = IrFunction::new("maj".to_string(), IrType::I32, vec![], false);
         func.blocks.push(block(
             0,
@@ -3542,6 +3555,11 @@ mod cfg_copy_coalesce_tests {
     /// even on lhs-first backends — the sdivm3 `0 - (v/3)` class.
     #[test]
     fn immediately_consumed_non_commutative_rhs_rejected_on_lhs_first() {
+        // Pin FORCED-COMMUTED for the duration of the test: the outcome
+        // asserted here is the commuted arm (rejection is independent of the commuted arm, but the outcome is still flag-shaped), and a concurrent
+        // flip window must not change it. Also serializes this test against
+        // the flip windows on the shared backend-flag lock.
+        let _pin = crate::test_support::TriStateFlagWindow::new(&COMMUTED_ACC_OVERRIDE, 1);
         let mut func = IrFunction::new("sub".to_string(), IrType::I32, vec![], false);
         func.blocks.push(block(
             0,

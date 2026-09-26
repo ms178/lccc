@@ -1040,11 +1040,39 @@ pub struct AsmOutput {
     /// fast paths (slot-independent sourcing, commuted-RHS) run on.
     #[cfg(debug_assertions)]
     pub(crate) rax_write_epoch: u64,
-    /// DEBUG-ONLY: the most recent line the analyzer could not classify, for
-    /// the assertion message. `None` once every emitted line was classified
-    /// by the table.
+    /// DEBUG-ONLY: whether the %rax shadow-epoch machinery is active for the
+    /// target being generated. Only the targets whose accumulator cache
+    /// tracks the %rax-family register — x86-64 and i686 — opt in (their
+    /// constructors call `CodegenState::enable_rax_epoch_discipline`); the
+    /// field is `false` by construction for every other target.
+    ///
+    /// The opt-in is load-bearing for soundness of the ASSERTION (not of the
+    /// cache): the sink classifier speaks AT&T x86 only, and foreign-ISA
+    /// vocabularies can false-positive it. A RISC-V `call foo` line shares
+    /// its mnemonic with the x86 implicit-%rax writer, and RISC-V `mul`/
+    /// `div` would hit the implicit table before any operand check — on a
+    /// target where the cached register is `a0`, not `%rax`. With the flag
+    /// off, `debug_scan_tail` is inert and the epoch can never move, so a
+    /// foreign-ISA compilation can neither false-assert nor silently corrupt
+    /// an x86-64 function's epochs (each function generation owns its own
+    /// `CodegenState`). The generic pass layer (generate_load/store,
+    /// remat_indexed_acc_safe, generate_copy) runs for every target and
+    /// speaks the verified API; the flag — not the call sites — is what
+    /// scopes the semantics to the x86 family.
     #[cfg(debug_assertions)]
-    pub(crate) last_unclassified: Option<String>,
+    pub(crate) rax_epoch_active: bool,
+    /// DEBUG-ONLY: byte offset through which the sink's line classifier has
+    /// consumed the buffer. `debug_scan_tail` classifies every complete line
+    /// not yet covered (not just the last one — an emit may carry embedded
+    /// newlines, and the exploratory dual-layout truncation rewinds the
+    /// tail), so this and `buf.len()` differ exactly while a line is mid-
+    /// construction. The module handoff asserts equality: "every public
+    /// emit method ends in `debug_scan_tail()`" is machine-checked, not
+    /// taken on trust — the escape-hatch class (`emit_cmp_zero_mem_sized`
+    /// pushed complete lines without a scan) fails this assert by
+    /// construction. Inert for non-opted-in targets (see `rax_epoch_active`).
+    #[cfg(debug_assertions)]
+    pub(crate) scanned_len: usize,
 }
 
 /// Write an i64 directly into a String buffer using manual digit extraction.
@@ -1317,8 +1345,15 @@ pub(crate) fn asm_line_writes_rax(line: &str) -> bool {
     // table's job, answered above). An UNKNOWN mnemonic whose destination
     // is rax-shaped still reports the write (dest-last is universal) and
     // is recorded so the table can name it; an unknown mnemonic with a
-    // non-rax destination is soundly `false`, which keeps non-x86 lines
-    // and foreign mnemonics from inflating the epoch.
+    // non-rax destination is soundly `false`.
+    //
+    // NOTE: "unknown mnemonic with a non-rax destination is false" does NOT
+    // by itself make foreign-ISA assembly safe here — table hits above are
+    // unconditional on operands (RISC-V `call`/`mul`/`div` share x86
+    // mnemonics), and only the x86-64/i686 targets opt into scanning at all
+    // (`AsmOutput::rax_epoch_active`). Within an opted-in target every
+    // emitted line IS AT&T x86, which is the contract this classifier is
+    // written against.
     let ops = split_operands_top_level(operands_part);
     match ops.last() {
         Some(last) if pure_rax_reg(last) => {
@@ -1342,6 +1377,9 @@ pub(crate) fn asm_line_writes_rax(line: &str) -> bool {
                         c.push(token.to_string());
                     }
                 });
+                LAST_UNCLASSIFIED_LINE.with(|c| {
+                    *c.borrow_mut() = Some(line.to_string());
+                });
             }
             true
         }
@@ -1355,6 +1393,14 @@ thread_local! {
     /// table can be extended; release builds never touch it.
     static UNCLASSIFIED_MNEMONICS: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// The most recent full line carrying an unclassified mnemonic, for the
+    /// acc-epoch assertion's "last unclassified emitted line" context. The
+    /// AsmOutput field of the same name was declared but never written (the
+    /// assert message therefore always printed None); this thread-local is
+    /// the actual source, recorded at the point of classification where the
+    /// line text is at hand.
+    static LAST_UNCLASSIFIED_LINE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 impl AsmOutput {
@@ -1367,30 +1413,91 @@ impl AsmOutput {
             #[cfg(debug_assertions)]
             rax_write_epoch: 0,
             #[cfg(debug_assertions)]
-            last_unclassified: None,
+            rax_epoch_active: false,
+            #[cfg(debug_assertions)]
+            scanned_len: 0,
         }
     }
 
-    /// DEBUG-ONLY: classify the just-completed line and bump the shadow
-    /// epoch when it writes any part of %rax. A no-op compiled out of
-    /// release builds (the call sites stay unconditional; this body
+    /// DEBUG-ONLY: classify every emitted-but-not-yet-classified complete
+    /// line and bump the shadow epoch for each %rax write. A no-op compiled
+    /// out of release builds (the call sites stay unconditional; this body
     /// collapses to nothing).
+    ///
+    /// Multi-line by design: a scan call covers everything from the last
+    /// scanned offset, so a method that pushes two lines before scanning,
+    /// or an `emit` carrying an embedded newline, is classified exactly
+    /// once per line instead of silently losing the earlier ones. The tail
+    /// form ("classify just the line just completed") is subsumed: the
+    /// common case is exactly one pending line.
     #[inline]
     pub(crate) fn debug_scan_tail(&mut self) {
         #[cfg(debug_assertions)]
         {
-            let buf = &self.buf;
-            if buf.is_empty() || !buf.ends_with('\n') {
+            // Inert unless the target opted in (x86-64, i686). Foreign-ISA
+            // lines must never move the epoch: the classifier's vocabulary
+            // is AT&T x86, and a RISC-V `call`/`mul`/`div` line would
+            // false-positive the implicit-write table (see
+            // `rax_epoch_active` for the full argument).
+            if !self.rax_epoch_active {
                 return;
             }
-            let end = buf.len() - 1;
-            let start = match buf[..end].rfind('\n') {
-                Some(p) => p + 1,
-                None => 0,
-            };
-            if end > start && asm_line_writes_rax(&buf[start..end]) {
-                self.rax_write_epoch += 1;
+            // The exploratory dual-layout emission truncates the buffer and
+            // re-emits from the mark; the replaced tail was already counted,
+            // so rewind the scan offset to the truncation point.
+            if self.scanned_len > self.buf.len() {
+                self.scanned_len = self.buf.len();
             }
+            let start = self.scanned_len;
+            if start >= self.buf.len() {
+                return;
+            }
+            let mut writes = 0u64;
+            let mut end = start;
+            for line in self.buf[start..].split_inclusive('\n') {
+                if let Some(complete) = line.strip_suffix('\n') {
+                    if asm_line_writes_rax(complete) {
+                        writes += 1;
+                    }
+                    end += line.len();
+                }
+                // A trailing fragment without its newline is mid-construction;
+                // its completer's scan classifies it.
+            }
+            self.rax_write_epoch += writes;
+            self.scanned_len = end;
+        }
+    }
+
+    /// DEBUG-ONLY: assert that every byte pushed to the buffer has been
+    /// classified — i.e. no emit method completed a line without a
+    /// `debug_scan_tail()`. Called once at the module handoff, where the
+    /// buffer is final. This is the mechanical form of the "every public
+    /// emit method ends in `debug_scan_tail()`" banner: a future sink that
+    /// pushes lines without scanning fails here instead of silently
+    /// blinding the epoch validator. Scoped to opted-in targets (foreign
+    /// ISAs never scan by design).
+    #[inline]
+    pub(crate) fn debug_assert_fully_scanned(&self) {
+        #[cfg(debug_assertions)]
+        {
+            if !self.rax_epoch_active {
+                return;
+            }
+            assert_eq!(
+                self.scanned_len,
+                self.buf.len(),
+                "x86 codegen: {} unclassified output byte(s) at module handoff — an emit \
+                 method pushed a complete line without debug_scan_tail(). The epoch \
+                 validator is blind to that text; route the push through a scanned \
+                 emit method (first offender from the handoff point: {:?}).",
+                self.buf.len() - self.scanned_len,
+                self.buf[self.scanned_len..].lines().next(),
+            );
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            let _ = self;
         }
     }
 
@@ -1408,11 +1515,15 @@ impl AsmOutput {
     }
 
     /// DEBUG-ONLY: the most recent unclassified line, for diagnostics.
+    /// Sourced from the classifier's thread-local record: the
+    /// `last_unclassified` field this used to read was declared but never
+    /// written, so the assertion's context always printed None. Owned
+    /// return: the thread-local borrow cannot outlive `with`.
     #[inline]
-    pub(crate) fn debug_last_unclassified(&self) -> Option<&str> {
+    pub(crate) fn debug_last_unclassified(&self) -> Option<String> {
         #[cfg(debug_assertions)]
         {
-            self.last_unclassified.as_deref()
+            LAST_UNCLASSIFIED_LINE.with(|c| c.borrow().clone())
         }
         #[cfg(not(debug_assertions))]
         {
@@ -1537,6 +1648,14 @@ impl AsmOutput {
             write_i64_fast(&mut self.buf, offset);
             self.buf.push_str("(%rbp)\n");
         }
+        // This method is the sink that falsified the "every public emit
+        // method ends in debug_scan_tail()" banner (PR #637 audit, F2): a
+        // completed line without a scan is a line the epoch validator is
+        // blind to — and `debug_assert_fully_scanned` now fails the module
+        // handoff if any such sink exists. Today the line is a `cmp` (flags
+        // only, no %rax write); the scan is what keeps that true
+        // mechanically if the method ever grows a %rax-writing form.
+        self.debug_scan_tail();
     }
 
     /// Emit: `    {mnemonic} %{reg}, {offset}(%rbp)` (or rsp-relative when frame pointer omitted)
@@ -3444,7 +3563,7 @@ mod value_type_map_tests {
 
 #[cfg(test)]
 mod rax_epoch_analyzer_tests {
-    use super::asm_line_writes_rax;
+    use super::{AsmOutput, asm_line_writes_rax};
 
     #[test]
     fn explicit_destination_writes() {
@@ -3559,5 +3678,114 @@ mod rax_epoch_analyzer_tests {
         // Directives and labels never reach the analyzer's instruction path.
         assert!(!asm_line_writes_rax(".quad 1"));
         assert!(!asm_line_writes_rax("Lfoo:"));
+    }
+}
+
+#[cfg(all(test, debug_assertions))]
+mod rax_epoch_sink_coverage_tests {
+    use super::{AsmOutput, asm_line_writes_rax};
+
+    /// F2 regression (PR #637 audit): `emit_cmp_zero_mem` used to complete
+    /// its line WITHOUT a `debug_scan_tail()` — the one sink that falsified
+    /// the "every public emit method ends in debug_scan_tail()" banner. The
+    /// contract now: the method scans (so a future %rax-writing form of it
+    /// cannot slip past the epoch validator), the epoch does not move (a
+    /// compare writes flags only), and the module-handoff completeness
+    /// assert (`debug_assert_fully_scanned`) sees full byte coverage.
+    #[test]
+    fn cmp_zero_mem_is_scanned_and_moves_no_epoch() {
+        let mut out = AsmOutput::new();
+        out.rax_epoch_active = true;
+        let before = out.debug_rax_epoch();
+        out.emit("    movq %rbx, %rax"); // a real write first
+        let after_write = out.debug_rax_epoch();
+        assert_eq!(after_write, before + 1);
+        out.emit_cmp_zero_mem(-16);
+        out.emit_cmp_zero_mem_sized(-24, "cmpq");
+        assert_eq!(
+            out.debug_rax_epoch(),
+            after_write,
+            "compares write flags only — the epoch must not move"
+        );
+        // Byte coverage: nothing pending at handoff time.
+        out.debug_assert_fully_scanned();
+    }
+
+    /// The completeness assert catches the escape-hatch class by
+    /// construction: a raw buf push of a complete line without any scan
+    /// leaves unscanned bytes that the handoff assert refuses, and the
+    /// next scan covers them (no double-count).
+    #[test]
+    fn unscanned_sink_is_caught_and_next_scan_recovers() {
+        let mut out = AsmOutput::new();
+        out.rax_epoch_active = true;
+        out.emit("    movq $1, %rax");
+        let scanned_ok = out.scanned_len;
+        // Simulate the F2 class: a raw complete-line push, no scan.
+        out.buf.push_str("    movq $2, %rax\n");
+        let epoch_before = out.debug_rax_epoch();
+        assert_eq!(epoch_before, 1, "the raw push is invisible until scanned");
+        // The handoff assert must refuse.
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            out.debug_assert_fully_scanned();
+        }));
+        assert!(refused.is_err(), "unscanned bytes must fail the handoff");
+        // A subsequent scan classifies the pending line exactly once.
+        out.emit("    movq %rbx, %rcx"); // benign line, triggers the scan
+        assert_eq!(
+            out.debug_rax_epoch(),
+            2,
+            "the pending write is counted once"
+        );
+        assert_eq!(
+            out.scanned_len,
+            scanned_ok + "    movq $2, %rax\n".len() + "    movq %rbx, %rcx\n".len()
+        );
+        out.debug_assert_fully_scanned();
+    }
+
+    /// An `emit` carrying an embedded newline classifies BOTH lines (the
+    /// old tail-only scan silently lost the first).
+    #[test]
+    fn embedded_newline_emits_classify_every_line() {
+        let mut out = AsmOutput::new();
+        out.rax_epoch_active = true;
+        out.emit("    pushq %rax\n    popq %rax");
+        assert_eq!(
+            out.debug_rax_epoch(),
+            1,
+            "pushq reads (NEVER table), popq writes — exactly one epoch bump"
+        );
+        out.debug_assert_fully_scanned();
+    }
+
+    /// The classifier records the full line text for an unknown mnemonic
+    /// with a rax-shaped destination, and `debug_last_unclassified`
+    /// surfaces it (the previously-dead diagnostic now carries data).
+    #[test]
+    fn unknown_mnemonic_line_is_recorded_for_diagnostics() {
+        // NB: the probe must avoid the f- prefix (x87 quiet rule) and j-
+        // prefix (jump family) — any other unknown token is fail-loud.
+        assert!(asm_line_writes_rax("    zbork %rax"));
+        let recorded = AsmOutput::new().debug_last_unclassified();
+        assert_eq!(
+            recorded.as_deref(),
+            // The classifier trims leading indentation before analysis and
+            // records the trimmed form (no indentation noise in diagnostics).
+            Some("zbork %rax"),
+            "the assertion's last-line context must name the actual line"
+        );
+        assert!(!asm_line_writes_rax("    zbork %rbx"));
+        // The record holds the most recent line classified through the
+        // generic dest-last rule whose token is outside the explicit
+        // tables — by design, since that rule is what covers the regular
+        // vocabulary (mov/add/...), and a NEW vocabulary member appearing
+        // here is the signal to audit it into a table.
+        assert!(asm_line_writes_rax("    movq %rbx, %rax"));
+        assert_eq!(
+            AsmOutput::new().debug_last_unclassified().as_deref(),
+            Some("movq %rbx, %rax"),
+            "the most recent generic-rule line is what the assertion names"
+        );
     }
 }

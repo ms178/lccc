@@ -1296,8 +1296,12 @@ impl X86Codegen {
     pub(crate) fn new_with_ra_config(ra_config: Arc<RaConfig>) -> Self {
         let machinst_enabled = !ra_config.no_machinst;
         let machinst_disabled_kinds = parse_machinst_disabled_kinds(&ra_config.mi_disable_kinds);
+        let mut state = CodegenState::new_with_ra_config(ra_config);
+        // x86-64 tracks the %rax accumulator through the shared generic
+        // passes: arm the sink's shadow-epoch validator for this target.
+        state.enable_rax_epoch_discipline();
         Self {
-            state: CodegenState::new_with_ra_config(ra_config),
+            state,
             current_return_type: IrType::I64,
             func_ret_classes: Vec::new(),
             func_set_second_ret: false,

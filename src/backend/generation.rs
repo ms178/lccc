@@ -3456,6 +3456,16 @@ pub fn generate_module(
     // (the count check would catch it, but draining closes the class).
     crate::passes::block_layout::clear_chain_candidates();
 
+    // Debug-only mechanical closure of the sink-coverage invariant: every
+    // byte the backends emitted was classified by the shadow-epoch scanner.
+    // An emit method that completes a line without debug_scan_tail() (the
+    // emit_cmp_zero_mem_sized escape hatch the PR #637 audit found) fails
+    // HERE, at the only point where "nothing else will touch the buffer"
+    // is guaranteed, instead of silently blinding the validator to its
+    // text. Release builds compile this away with the rest of the epoch
+    // machinery; foreign-ISA targets return immediately (they never scan).
+    cg.state().out.debug_assert_fully_scanned();
+
     std::mem::take(&mut cg.state().out.buf)
 }
 
