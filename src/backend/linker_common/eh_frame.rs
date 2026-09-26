@@ -14,6 +14,28 @@
 //!     i32 initial_location (relative to eh_frame_hdr start)
 //!     i32 fde_address      (relative to eh_frame_hdr start)
 
+/// Bounds of one non-zero CIE/FDE record.  The length excludes its own
+/// 4/12-byte header and must include the 4/8-byte CIE pointer.  Check it
+/// against the *remaining input* before advancing any of the three walkers:
+/// a wrapping extended length used to invent FDEs and even move backwards.
+fn record_bounds(data: &[u8], pos: usize, length: u32) -> Option<(usize, usize, usize)> {
+    if data.len().checked_sub(pos)? < 4 {
+        return None;
+    }
+    let (body, id_size, size) = if length == u32::MAX {
+        let body = pos.checked_add(12)?;
+        if body > data.len() {
+            return None;
+        }
+        (body, 8, read_u64_le(data, pos + 4))
+    } else {
+        (pos.checked_add(4)?, 4, u64::from(length))
+    };
+    let size = usize::try_from(size).ok()?;
+    let end = body.checked_add(size)?;
+    (size >= id_size && end <= data.len()).then_some((body, end, id_size))
+}
+
 /// Count the number of FDE entries in an .eh_frame section by scanning structure.
 /// This only reads length and CIE_id fields, so it works on unrelocated data.
 /// Used during layout to reserve space for .eh_frame_hdr (12 + 8 * count bytes).
@@ -21,32 +43,18 @@ pub fn count_eh_frame_fdes(data: &[u8]) -> usize {
     let mut count = 0;
     let mut pos = 0;
     while pos + 4 <= data.len() {
-        let length = read_u32_le(data, pos) as u64;
+        let length = read_u32_le(data, pos);
         if length == 0 {
-            // Zero terminator from a merged input section; skip it
-            pos += 4;
+            pos += 4; // terminator between concatenated input sections
             continue;
         }
-        let (actual_length, header_size) = if length == 0xFFFFFFFF {
-            if pos + 12 > data.len() {
-                break;
-            }
-            (read_u64_le(data, pos + 4), 12usize)
-        } else {
-            (length, 4usize)
-        };
-        let entry_data_start = pos + header_size;
-        let entry_end = entry_data_start + actual_length as usize;
-        if entry_end > data.len() || entry_data_start + 4 > data.len() {
+        let Some((entry_data_start, entry_end, id_size)) = record_bounds(data, pos, length) else {
             break;
-        }
-        let cie_id = if length == 0xFFFFFFFF {
-            if entry_data_start + 8 > data.len() {
-                break;
-            }
+        };
+        let cie_id = if id_size == 8 {
             read_u64_le(data, entry_data_start)
         } else {
-            read_u32_le(data, entry_data_start) as u64
+            u64::from(read_u32_le(data, entry_data_start))
         };
         if cie_id != 0 {
             count += 1;
@@ -131,55 +139,39 @@ fn parse_eh_frame_fdes(data: &[u8], base_vaddr: u64, is_64bit: bool) -> Vec<EhFr
     // rather than a HashMap because the distinct-CIE count is in the single
     // digits for essentially every real input, where linear scan over a
     // contiguous array beats hashing.
-    let mut cie_cache: Vec<(usize, u8)> = Vec::new();
+    let mut cie_cache: Vec<(usize, Option<u8>)> = Vec::new();
 
     while pos + 4 <= data.len() {
-        let length = read_u32_le(data, pos) as u64;
+        let length = read_u32_le(data, pos);
         if length == 0 {
-            // Zero terminator from a merged input section; skip it
             pos += 4;
             continue;
         }
-
-        let is_extended = length == 0xFFFFFFFF;
-        let (actual_length, header_size) = if is_extended {
-            if pos + 12 > data.len() {
-                break;
-            }
-            (read_u64_le(data, pos + 4), 12usize)
-        } else {
-            (length, 4usize)
-        };
-
         let entry_start = pos;
-        let entry_data_start = pos + header_size;
-        let entry_end = entry_data_start + actual_length as usize;
-        if entry_end > data.len() {
+        let Some((entry_data_start, entry_end, cie_id_field_size)) =
+            record_bounds(data, pos, length)
+        else {
             break;
-        }
-
-        // CIE_id field (4 or 8 bytes depending on extended)
-        if entry_data_start + 4 > data.len() {
-            break;
-        }
-        let cie_id = if is_extended {
-            if entry_data_start + 8 > data.len() {
-                break;
-            }
+        };
+        // CIE id is zero; an FDE instead points backwards to its CIE.
+        let cie_id = if cie_id_field_size == 8 {
             read_u64_le(data, entry_data_start)
         } else {
-            read_u32_le(data, entry_data_start) as u64
+            u64::from(read_u32_le(data, entry_data_start))
         };
-
-        // CIE has cie_id == 0; FDE has cie_id != 0 (it's a pointer back to CIE)
         if cie_id != 0 {
             // This is an FDE
             // The CIE_pointer is relative: entry_data_start - cie_id points to the CIE
-            let cie_id_field_size = if is_extended { 8 } else { 4 };
-            let cie_pos = (entry_data_start as u64).wrapping_sub(cie_id) as usize;
+            let Some(cie_pos) = usize::try_from(cie_id)
+                .ok()
+                .and_then(|back| entry_data_start.checked_sub(back))
+            else {
+                pos = entry_end;
+                continue;
+            };
 
             // Parse the CIE to get the FDE encoding (memoised; see cie_cache)
-            let fde_encoding = match cie_cache.iter().find(|&&(p, _)| p == cie_pos) {
+            let encoding = match cie_cache.iter().find(|&&(p, _)| p == cie_pos) {
                 Some(&(_, enc)) => enc,
                 None => {
                     let enc = parse_cie_fde_encoding(data, cie_pos, is_64bit);
@@ -187,10 +179,14 @@ fn parse_eh_frame_fdes(data: &[u8], base_vaddr: u64, is_64bit: bool) -> Vec<EhFr
                     enc
                 }
             };
+            let Some(fde_encoding) = encoding else {
+                pos = entry_end;
+                continue; // invalid CIE: never guess an FDE encoding
+            };
 
             // After CIE_pointer comes: initial_location, address_range, ...
             let iloc_offset = entry_data_start + cie_id_field_size;
-            if iloc_offset + 4 > data.len() {
+            if entry_end - iloc_offset < 4 {
                 pos = entry_end;
                 continue;
             }
@@ -199,7 +195,7 @@ fn parse_eh_frame_fdes(data: &[u8], base_vaddr: u64, is_64bit: bool) -> Vec<EhFr
 
             // Decode initial_location based on the CIE's FDE encoding
             let initial_location = decode_eh_pointer(
-                data,
+                &data[..entry_end],
                 iloc_offset,
                 fde_encoding,
                 base_vaddr + iloc_offset as u64,
@@ -224,105 +220,97 @@ fn parse_eh_frame_fdes(data: &[u8], base_vaddr: u64, is_64bit: bool) -> Vec<EhFr
 
 /// Parse a CIE to extract the FDE pointer encoding (R augmentation).
 ///
-/// Returns the encoding byte, or 0x00 (DW_EH_PE_absptr) if not found.
-fn parse_cie_fde_encoding(data: &[u8], cie_pos: usize, _is_64bit: bool) -> u8 {
-    if cie_pos + 4 > data.len() {
-        return 0x00;
+/// `Some(0)` means a valid absolute encoding; `None` means malformed input.
+fn parse_cie_fde_encoding(data: &[u8], cie_pos: usize, is_64bit: bool) -> Option<u8> {
+    if data
+        .len()
+        .checked_sub(cie_pos)
+        .is_none_or(|remaining| remaining < 4)
+    {
+        return None;
     }
+    let Some((start, end, id_size)) = record_bounds(data, cie_pos, read_u32_le(data, cie_pos))
+    else {
+        return None;
+    };
+    let id = if id_size == 8 {
+        read_u64_le(data, start)
+    } else {
+        u64::from(read_u32_le(data, start))
+    };
+    if id != 0 {
+        return None;
+    }
+    let Some(&version) = data.get(start + id_size).filter(|_| start + id_size < end) else {
+        return None;
+    };
+    let aug_start = start + id_size + 1;
+    let Some(aug_len) = data[aug_start..end].iter().position(|&b| b == 0) else {
+        return None;
+    };
+    let aug = &data[aug_start..aug_start + aug_len];
+    let mut cur = aug_start + aug_len + 1;
+    let cie = &data[..end];
 
-    let length = read_u32_le(data, cie_pos) as u64;
-    if length == 0 || length == 0xFFFFFFFF {
-        return 0x00;
-    }
-
-    let header_size = 4usize;
-    let cie_data_start = cie_pos + header_size;
-    let cie_end = cie_data_start + length as usize;
-    if cie_end > data.len() {
-        return 0x00;
-    }
-
-    // CIE_id must be 0
-    if cie_data_start + 4 > data.len() {
-        return 0x00;
-    }
-    let cie_id = read_u32_le(data, cie_data_start);
-    if cie_id != 0 {
-        return 0x00;
-    }
-
-    // version (1 byte)
-    if cie_data_start + 5 > data.len() {
-        return 0x00;
-    }
-    let _version = data[cie_data_start + 4];
-
-    // augmentation string (null-terminated)
-    let aug_start = cie_data_start + 5;
-    let mut aug_end = aug_start;
-    while aug_end < cie_end && data[aug_end] != 0 {
-        aug_end += 1;
-    }
-    if aug_end >= cie_end {
-        return 0x00;
-    }
-    let aug_str: Vec<u8> = data[aug_start..aug_end].to_vec();
-    let mut cur = aug_end + 1; // skip null terminator
-
-    // code_alignment_factor (ULEB128)
-    let (_, n) = read_uleb128(data, cur);
-    cur += n;
-    // data_alignment_factor (SLEB128)
-    let (_, n) = read_sleb128(data, cur);
-    cur += n;
-    // return_address_register (ULEB128)
-    let (_, n) = read_uleb128(data, cur);
-    cur += n;
-
-    // Parse augmentation data
-    if !aug_str.is_empty() && aug_str[0] == b'z' {
-        // Augmentation data length (ULEB128)
-        let (aug_data_len, n) = read_uleb128(data, cur);
+    // The return-address column is a byte in CIE v1, ULEB in v3/v4.
+    let Some((_, n)) = read_uleb128(cie, cur) else {
+        return None;
+    };
+    cur += n; // code alignment factor
+    let Some((_, n)) = read_sleb128(cie, cur) else {
+        return None;
+    };
+    cur += n; // data alignment factor
+    if version == 1 {
+        if cur >= end {
+            return None;
+        }
+        cur += 1;
+    } else {
+        let Some((_, n)) = read_uleb128(cie, cur) else {
+            return None;
+        };
         cur += n;
-        let aug_data_end = cur + aug_data_len as usize;
-
-        // Walk augmentation string after 'z'
-        for &ch in &aug_str[1..] {
-            if cur >= aug_data_end {
-                break;
+    }
+    if aug.first() != Some(&b'z') {
+        return Some(0x00); // default absolute-pointer encoding
+    }
+    let Some((len, n)) = read_uleb128(cie, cur) else {
+        return None;
+    };
+    cur += n;
+    let Some(aug_end) = usize::try_from(len)
+        .ok()
+        .and_then(|len| cur.checked_add(len))
+        .filter(|&e| e <= end)
+    else {
+        return None;
+    };
+    for &ch in &aug[1..] {
+        match ch {
+            b'R' => {
+                return data.get(cur).filter(|_| cur < aug_end).copied();
             }
-            match ch {
-                b'R' => {
-                    // FDE encoding
-                    if cur < data.len() {
-                        return data[cur];
-                    }
-                    return 0x00;
+            b'L' => cur += 1,
+            b'P' => {
+                let Some(&enc) = data.get(cur).filter(|_| cur < aug_end) else {
+                    return None;
+                };
+                cur += 1;
+                let size = eh_pointer_size(enc, is_64bit);
+                if size == 0 {
+                    return None; // variable-length personality: cannot locate R
                 }
-                b'L' => {
-                    // LSDA encoding (skip 1 byte)
-                    cur += 1;
-                }
-                b'P' => {
-                    // Personality encoding + pointer
-                    if cur >= data.len() {
-                        return 0x00;
-                    }
-                    let enc = data[cur];
-                    cur += 1;
-                    let ptr_size = eh_pointer_size(enc, _is_64bit);
-                    cur += ptr_size;
-                }
-                b'S' | b'B' => {
-                    // Signal frame / has ABI tag - no data
-                }
-                _ => break,
+                cur += size;
             }
+            b'S' | b'B' => {} // no augmentation data
+            _ => return None,
+        }
+        if cur > aug_end {
+            return None;
         }
     }
-
-    // Default: absolute pointer encoding
-    0x00
+    Some(0x00)
 }
 
 /// Decode an eh_frame pointer value based on its encoding.
@@ -357,7 +345,7 @@ fn decode_eh_pointer(
         }
         0x01 => {
             // DW_EH_PE_uleb128
-            let (v, _) = read_uleb128(data, offset);
+            let (v, _) = read_uleb128(data, offset)?;
             (v as i64, 0)
         }
         0x02 => {
@@ -386,7 +374,7 @@ fn decode_eh_pointer(
         }
         0x09 => {
             // DW_EH_PE_sleb128
-            let (v, _) = read_sleb128(data, offset);
+            let (v, _) = read_sleb128(data, offset)?;
             (v, 0)
         }
         0x0A => {
@@ -459,46 +447,32 @@ fn write_i32_le(data: &mut [u8], off: usize, val: i32) {
     data[off..off + 4].copy_from_slice(&b);
 }
 
-fn read_uleb128(data: &[u8], mut off: usize) -> (u64, usize) {
-    let start = off;
-    let mut result = 0u64;
-    let mut shift = 0;
-    loop {
-        if off >= data.len() {
-            return (result, off - start);
-        }
-        let byte = data[off];
-        off += 1;
-        result |= ((byte & 0x7F) as u64) << shift;
+/// Bounded LEB readers: malformed inputs must not truncate modulo 64 bits or
+/// borrow bytes from the next CIE/FDE.  A 64-bit number needs at most 10 bytes.
+fn read_uleb128(data: &[u8], off: usize) -> Option<(u64, usize)> {
+    let mut result = 0u128;
+    for (i, &byte) in data.get(off..)?.iter().take(10).enumerate() {
+        result |= u128::from(byte & 0x7f) << (i * 7);
         if byte & 0x80 == 0 {
-            break;
+            return Some((u64::try_from(result).ok()?, i + 1));
         }
-        shift += 7;
     }
-    (result, off - start)
+    None
 }
 
-fn read_sleb128(data: &[u8], mut off: usize) -> (i64, usize) {
-    let start = off;
-    let mut result = 0i64;
-    let mut shift = 0;
-    let mut byte;
-    loop {
-        if off >= data.len() {
-            return (result, off - start);
-        }
-        byte = data[off];
-        off += 1;
-        result |= ((byte & 0x7F) as i64) << shift;
-        shift += 7;
+fn read_sleb128(data: &[u8], off: usize) -> Option<(i64, usize)> {
+    let mut result = 0i128;
+    for (i, &byte) in data.get(off..)?.iter().take(10).enumerate() {
+        let shift = (i + 1) * 7;
+        result |= i128::from(byte & 0x7f) << (i * 7);
         if byte & 0x80 == 0 {
-            break;
+            if byte & 0x40 != 0 {
+                result |= -1i128 << shift;
+            }
+            return Some((i64::try_from(result).ok()?, i + 1));
         }
     }
-    if shift < 64 && byte & 0x40 != 0 {
-        result |= -(1i64 << shift);
-    }
-    (result, off - start)
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -540,27 +514,15 @@ pub fn scan_eh_frame_records(data: &[u8]) -> Vec<EhFrameRecord> {
     let mut out = Vec::new();
     let mut pos = 0usize;
     while pos + 4 <= data.len() {
-        let length = read_u32_le(data, pos) as u64;
+        let length = read_u32_le(data, pos);
         if length == 0 {
-            // Zero terminator (input sections are concatenated with padding).
             pos += 4;
             continue;
         }
-        let is_extended = length == 0xFFFF_FFFF;
-        let (actual_length, header_size, id_size) = if is_extended {
-            if pos + 12 > data.len() {
-                break;
-            }
-            (read_u64_le(data, pos + 4), 12usize, 8usize)
-        } else {
-            (length, 4usize, 4usize)
-        };
-        let data_start = pos + header_size;
-        let end = data_start + actual_length as usize;
-        if end > data.len() || data_start + id_size > data.len() {
+        let Some((data_start, end, id_size)) = record_bounds(data, pos, length) else {
             break;
-        }
-        let cie_id = if is_extended {
+        };
+        let cie_id = if id_size == 8 {
             read_u64_le(data, data_start)
         } else {
             read_u32_le(data, data_start) as u64
@@ -906,7 +868,8 @@ mod tests {
             ]);
             if id != 0 {
                 let cie_pos = id_off - id as usize;
-                let enc = parse_cie_fde_encoding(data, cie_pos, true);
+                let enc = parse_cie_fde_encoding(data, cie_pos, true)
+                    .expect("reference CIE must be valid");
                 let iloc_off = id_off + 4;
                 if let Some(v) =
                     decode_eh_pointer(data, iloc_off, enc, base_vaddr + iloc_off as u64, true)
@@ -1275,6 +1238,124 @@ mod tests {
         }];
         assert_eq!(prune_dead_fdes(&mut objects, &dead), 0);
         assert_eq!(count_eh_frame_fdes(&objects[0].section_data[0]), 2);
+    }
+
+    /// A damaged CIE pointer must not turn a PC-relative FDE into an
+    /// apparently valid *absolute* PC and poison the header's search table.
+    #[test]
+    fn invalid_cie_pointer_cannot_fabricate_a_header_entry() {
+        let mut data = synth_eh_frame(1, PCREL_SDATA4);
+        let id_off = scan_eh_frame_records(&data)[1].id_offset;
+        data[id_off..id_off + 4].copy_from_slice(&1u32.to_le_bytes());
+        assert!(parse_eh_frame_fdes(&data, 0x400000, true).is_empty());
+        let hdr = build_eh_frame_hdr(&data, 0x400000, 0x3f0000, true);
+        assert_eq!(&hdr[8..12], &0u32.to_le_bytes());
+    }
+
+    /// Extended lengths must be checked *before* converting/adding them.
+    /// On 64-bit release builds this length wraps the end offset to 11:
+    /// an FDE is counted even though its record is outside the input.
+    #[test]
+    fn oversized_extended_record_is_not_an_fde() {
+        let mut data = vec![0u8; 32];
+        data[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        data[4..12].copy_from_slice(&u64::MAX.to_le_bytes());
+        data[12..20].copy_from_slice(&1u64.to_le_bytes());
+        assert_eq!(count_eh_frame_fdes(&data), 0);
+        assert!(scan_eh_frame_records(&data).is_empty());
+        assert!(parse_eh_frame_fdes(&data, 0x400000, true).is_empty());
+    }
+
+    /// Long or truncated LEBs from an object must not panic the linker or
+    /// be interpreted as a truncated, apparently valid pointer/length.
+    #[test]
+    fn malformed_leb_does_not_panic() {
+        for data in [vec![0x80; 11], vec![0xff; 10], vec![0x80; 1]] {
+            assert_eq!(read_uleb128(&data, 0), None);
+            assert_eq!(read_sleb128(&data, 0), None);
+        }
+        let mut unsigned_max = vec![0xff; 9];
+        unsigned_max.push(1);
+        assert_eq!(read_uleb128(&unsigned_max, 0), Some((u64::MAX, 10)));
+        let mut signed_min = vec![0x80; 9];
+        signed_min.push(0x7f);
+        assert_eq!(read_sleb128(&signed_min, 0), Some((i64::MIN, 10)));
+        assert_eq!(read_uleb128(&[0xff; 9], 0), None);
+        assert_eq!(read_sleb128(&[0xff; 9], 0), None);
+    }
+
+    #[test]
+    fn extended_cie_fde_uses_its_own_encoding() {
+        // DWARF64 .eh_frame, CIE v1 with zR augmentation and pcrel/sdata4.
+        // Both structural scan and relocated decode must agree on the FDE.
+        let mut data = Vec::new();
+        let cie = [
+            0u8, 0, 0, 0, 0, 0, 0, 0, // 8-byte CIE id
+            1, b'z', b'R', 0, 1, 0x78, 16, 1, 0x1b,
+        ];
+        data.extend(u32::MAX.to_le_bytes());
+        data.extend((cie.len() as u64).to_le_bytes());
+        data.extend(cie);
+        let fde_start = data.len();
+        data.extend(u32::MAX.to_le_bytes());
+        data.extend(16u64.to_le_bytes()); // 8-byte CIE pointer + 4 + 4
+        data.extend(((fde_start + 12) as u64).to_le_bytes());
+        data.extend(0x100i32.to_le_bytes()); // PC-relative initial location
+        data.extend(4u32.to_le_bytes());
+        assert_eq!(count_eh_frame_fdes(&data), 1);
+        let records = scan_eh_frame_records(&data);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1].iloc_offset, Some(fde_start + 20));
+        for is_64bit in [true, false] {
+            let fdes = parse_eh_frame_fdes(&data, 0x400000, is_64bit);
+            assert_eq!(fdes.len(), 1);
+            assert_eq!(
+                fdes[0].initial_location,
+                0x400000 + fde_start as u64 + 20 + 0x100
+            );
+        }
+        // Truncate inside the FDE's location: it must not borrow bytes from
+        // a later record even if the input slice contains them.
+        let short = &data[..fde_start + 12];
+        assert_eq!(count_eh_frame_fdes(short), 0);
+        assert!(parse_eh_frame_fdes(short, 0x400000, true).is_empty());
+    }
+
+    /// Deterministic length/pointer fuzzing of the three independent EH
+    /// walkers.  An invalid record cannot cause a backwards scan, fabricate
+    /// an FDE, index another record, or trap on an oversized LEB.
+    #[test]
+    fn arbitrary_records_do_not_escape_their_bounds() {
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        for case in 0..2048 {
+            let n = case % 113;
+            let mut data = vec![0; n];
+            for byte in &mut data {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                *byte = seed as u8;
+            }
+            if case % 4 == 0 && n >= 12 {
+                data[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+                data[4..12].copy_from_slice(&seed.to_le_bytes());
+            }
+            let records = scan_eh_frame_records(&data);
+            assert_eq!(
+                count_eh_frame_fdes(&data),
+                records.iter().filter(|r| r.is_fde).count(),
+                "case {case}"
+            );
+            let mut prev_end = 0;
+            for r in records {
+                assert!(r.start >= prev_end && r.end > r.start && r.end <= n);
+                assert!(r.id_offset + r.id_size <= r.end);
+                prev_end = r.end;
+            }
+            for is_64bit in [true, false] {
+                let _ = build_eh_frame_hdr(&data, 0x400000, 0x3f0000, is_64bit);
+            }
+        }
     }
 
     /// Malformed input must terminate, not hang or panic. The zero-length and

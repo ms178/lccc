@@ -960,6 +960,10 @@ pub(crate) fn run_passes(
     // vectorize.rs). AVX2 is tracked separately so `-mno-avx` downgrades to
     // 128-bit SSE2 instead of disabling vectorization outright.
     vectorize::set_x86_simd_isa(x86_isa.simd, x86_isa.ymm, x86_isa.sse41, x86_avx512vl);
+    // Vec*I64x2 map intrinsics are implemented only by the x86-64 backend.
+    // Refresh the per-thread gate for every TU: a worker may compile i686
+    // immediately after x86-64 in the same process.
+    vectorize::set_x86_map_i64_available(target == crate::backend::Target::X86_64);
     // Pass B (two-block guard-free unroll) kill switch, resolved once here for
     // the same reason as the ISA gates above: the unroller is a hot path and
     // must not read the process environment per call, and per-thread state

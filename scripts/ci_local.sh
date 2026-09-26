@@ -302,6 +302,12 @@ gate "i686-atomics" fast \
 gate "i686-integer-isa-parity" fast \
     bash tests/regression/check_i686_integer_isa_parity.sh
 
+# The x86-64 64-bit map SIMD path must use two lanes (including AVX2),
+# match GCC and the scalar kill switch for all tails/overlaps, and decline
+# the i686 backend that cannot lower register-based Vec*I64x2 intrinsics.
+gate "map-i64-two-lane" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_map_i64_two_lane.sh
+
 gate "fortify-diagnose-as" fast \
     bash tests/regression/check_fortify_diagnose_as.sh
 

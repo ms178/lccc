@@ -138,6 +138,18 @@ thread_local! {
     // backend emit vprold for every rotate amount.  Default FALSE: the
     // driver opts in per TU, failing closed exactly like the other gates.
     static X86_AVX512VL_AVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // The I64 map lowering uses register-based Vec*I64x2 operations.  i686's
+    // stack-based vector backend does not implement those operations.  This
+    // target bit is set by the driver per translation unit, not by host cfg.
+    static X86_MAP_I64_AVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn set_x86_map_i64_available(available: bool) {
+    X86_MAP_I64_AVAILABLE.with(|cell| cell.set(available));
+}
+
+fn x86_map_i64_available() -> bool {
+    X86_MAP_I64_AVAILABLE.with(|cell| cell.get())
 }
 
 /// Record the x86 SIMD ISA profile for the current translation unit.
@@ -662,6 +674,11 @@ fn vectorize_with_analysis_mode(
                     && !force_two_wide
                     && std::env::var("LCCC_FORCE_MAP_SSE").is_err()
                     && x86_avx2_available();
+                // I64/U64 map intrinsics are two-lane XMM operations even on
+                // AVX2 targets.  Advertising four lanes here advances the IV
+                // by 32 bytes but only loads/stores 16, silently dropping
+                // every other pair of elements.
+                let avx2 = avx2 && !matches!(map_pattern.elem_ty, IrType::I64 | IrType::U64);
                 if debug {
                     eprintln!(
                         "[VEC] Map pattern matched! Transforming to {}-bit {:?}",
@@ -6312,14 +6329,16 @@ fn analyze_map_pattern(
     // loop scalar; FP division is IEEE-defined elementwise (no trap) and is
     // parsed into the map expression tree.
     const MAP_MAX_STREAMS: usize = 4;
+    let i64_map = !neon && x86_map_i64_available() && x86_simd_available();
     let mut load_infos: Vec<(usize, Value, Value, IrType)> = Vec::new();
     let mut store_info = None; // (block, ptr value, stored val, element type)
     for &block_idx in &loop_info.body {
         for inst in &func.blocks[block_idx].instructions {
             match inst {
                 Instruction::Load { dest, ptr, ty, .. } => {
-                    // Packed I32/U32/F32/F64 all have native forms; I8/U8
-                    // enters through the byte-lane demotion path (OP-05d),
+                    // Packed I32/U32/F32/F64 all have native forms; I64/U64
+                    // use x86-64's two-lane register-based SSE2 lowering.
+                    // I8/U8 enter through the byte-lane demotion path (OP-05d),
                     // which re-parses the promoted 32-bit tree and proves it
                     // byte-exact before any narrow op is emitted.
                     if !matches!(
@@ -6332,7 +6351,8 @@ fn analyze_map_pattern(
                             | IrType::U8
                             | IrType::I16
                             | IrType::U16
-                    ) || load_infos.len() >= MAP_MAX_STREAMS
+                    ) && !(i64_map && matches!(*ty, IrType::I64 | IrType::U64))
+                        || load_infos.len() >= MAP_MAX_STREAMS
                     {
                         if debug {
                             eprintln!("[VEC-MAP] BAIL: bad load ty/streams");
@@ -6352,7 +6372,8 @@ fn analyze_map_pattern(
                             | IrType::U8
                             | IrType::I16
                             | IrType::U16
-                    ) || store_info.is_some()
+                    ) && !(i64_map && matches!(*ty, IrType::I64 | IrType::U64))
+                        || store_info.is_some()
                     {
                         if debug {
                             eprintln!("[VEC-MAP] BAIL: bad store ty/dup");
@@ -23825,6 +23846,8 @@ pub(crate) fn vectorize_const_trip_map_loops(
             let avx2 = std::env::var("LCCC_FORCE_MAP_SSE").is_err()
                 && std::env::var("LCCC_FORCE_SSE2").is_err()
                 && x86_avx2_available();
+            // The I64/U64 intrinsic family has only two-lane XMM forms.
+            let avx2 = avx2 && !matches!(pattern.elem_ty, IrType::I64 | IrType::U64);
             let n = transform_map_vector(func, &pattern, avx2, fp_contract);
             if n > 0 {
                 if debug {

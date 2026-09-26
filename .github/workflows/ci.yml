@@ -631,6 +631,7 @@ jobs:
           bash tests/regression/check_i686_atomics.sh
           bash tests/regression/check_i686_tls_ie_relax.sh
           bash tests/regression/check_i686_integer_isa_parity.sh
+          bash tests/regression/check_map_i64_two_lane.sh
           bash tests/regression/check_fortify_diagnose_as.sh
           bash tests/regression/check_asm_case_insensitive.sh
           bash tests/regression/check_debug_info_flags.sh
