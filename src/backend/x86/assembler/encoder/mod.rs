@@ -103,6 +103,17 @@ pub const R_X86_64_CODE_5_GOTPC32_TLSDESC: u32 = 48;
 // Internal-only: 8-bit PC-relative relocation for jrcxz/loop (never emitted to ELF)
 pub const R_X86_64_PC8_INTERNAL: u32 = 0x8000_0001;
 
+/// The precise ModR/M+SIB+displacement span emitted by the shared vector
+/// core. An i686 caller can substitute its address-mode-specific encoding
+/// without parsing an arbitrary opcode stream or guessing where the ModR/M
+/// byte is. EVEX disp8*N is an instruction-specific part of that contract.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MemoryEmission {
+    pub start: usize,
+    pub end: usize,
+    pub disp8_scale: u32,
+}
+
 /// Instruction encoding context.
 pub struct InstructionEncoder {
     /// Output bytes.
@@ -111,6 +122,10 @@ pub struct InstructionEncoder {
     pub relocations: Vec<Relocation>,
     /// Current offset within the section.
     pub offset: u64,
+    /// The i686 delegation boundary requests one address emission record;
+    /// ordinary x86-64 instructions never capture an unnecessary trace.
+    pub(crate) track_memory_emission: bool,
+    pub(crate) memory_emission: Option<MemoryEmission>,
     /// APX `{nf}`: emit EVEX.NF (no EFLAGS update).
     apx_nf: bool,
     /// APX `{evex}`: force the map-4 EVEX encoding of a legacy insn.
@@ -602,7 +617,7 @@ pub(crate) fn op_decorated(op: &Operand) -> bool {
 /// reference GAS assembles (`vmovaps foo,%xmm0` -> disp32 + R_X86_64_32S,
 /// never RIP-relative). Standalone `{...}` decorators are labels too
 /// and must be preserved for the EVEX SAE peel.
-fn normalize_bare_label(op: &mut Operand) {
+pub(crate) fn normalize_bare_label(op: &mut Operand) {
     if let Operand::Label(s) = op {
         if s.starts_with('{') {
             return;
@@ -626,6 +641,8 @@ impl InstructionEncoder {
             bytes: Vec::new(),
             relocations: Vec::new(),
             offset: 0,
+            track_memory_emission: false,
+            memory_emission: None,
             apx_nf: false,
             apx_evex: false,
             vex_hint: None,
@@ -658,8 +675,39 @@ impl InstructionEncoder {
         Ok(())
     }
 
-    /// Encode a single instruction and append bytes.
+    /// Encode one instruction atomically. Post-encode decorator validation
+    /// may fail *after* emitting bytes, relocations and advancing `offset`;
+    /// callers that reuse an encoder must never retain that partial state.
     pub fn encode(&mut self, instr: &Instruction) -> Result<(), String> {
+        let bytes = self.bytes.len();
+        let relocations = self.relocations.len();
+        let offset = self.offset;
+        let hints = (
+            self.apx_nf,
+            self.apx_evex,
+            self.vex_hint,
+            self.apx_rex2,
+            self.apx_dfv,
+        );
+        let trace = (self.track_memory_emission, self.memory_emission);
+        let result = self.encode_checked(instr);
+        if result.is_err() {
+            self.bytes.truncate(bytes);
+            self.relocations.truncate(relocations);
+            self.offset = offset;
+            (
+                self.apx_nf,
+                self.apx_evex,
+                self.vex_hint,
+                self.apx_rex2,
+                self.apx_dfv,
+            ) = hints;
+            (self.track_memory_emission, self.memory_emission) = trace;
+        }
+        result
+    }
+
+    fn encode_checked(&mut self, instr: &Instruction) -> Result<(), String> {
         // Bare labels in memory position (`vmovaps foo,%xmm0`) and `%eiz`
         // are rewritten centrally so every encoder sees canonical
         // operands. The clone runs only when a rewrite applies (branches
@@ -1069,18 +1117,24 @@ impl InstructionEncoder {
         // than `mask not on destination'. Runs only when the body
         // succeeded; body errors (bad operands) take precedence.
         if result.is_ok() {
-            self.check_decorators(&instr.mnemonic, &instr.operands)?;
+            Self::check_decorators(&self.bytes[start_len..], &instr.mnemonic, &instr.operands)?;
         }
 
         result
     }
 
-    /// Post-encode EVEX-decorator checks. Also run by i686's shared-vector
-    /// path, whose 32-bit wrapper cannot call x86-64 `encode()` wholesale.
-    pub(crate) fn check_decorators(&self, mnemonic: &str, ops: &[Operand]) -> Result<(), String> {
+    /// Post-encode EVEX-decorator checks on *one instruction*'s bytes,
+    /// shared with i686 without copying the emitted byte vector. A reused
+    /// x86-64 encoder also must not mistake the previous instruction's
+    /// prefix for this one's (or vice versa).
+    pub(crate) fn check_decorators(
+        bytes: &[u8],
+        mnemonic: &str,
+        ops: &[Operand],
+    ) -> Result<(), String> {
         let stem = decor_stem(mnemonic);
-        let pi = self.prefix_start();
-        let evex = self.bytes.get(pi).copied() == Some(0x62);
+        let pi = Self::prefix_start_of(bytes);
+        let evex = bytes.get(pi).copied() == Some(0x62);
         if !evex {
             // No EVEX form selected: every decorator is unsupported.
             // Operand order (a misplaced `{sae}` at op[0] beats a mask
@@ -1110,12 +1164,12 @@ impl InstructionEncoder {
         // caller is covered with no per-arm chaining. Other ignored
         // memory broadcast (`vmovaps` has no broadcast form) and
         // per-instruction N validity stay each EVEX encoder's job.
-        let scalar_class = if self.bytes.len() >= pi + 5 {
+        let scalar_class = if bytes.len() >= pi + 5 {
             Self::evex_scalar_bcst_class(
-                self.bytes[pi + 1] & 7,
-                self.bytes[pi + 2] & 3,
-                (self.bytes[pi + 2] >> 7) & 1,
-                self.bytes[pi + 4],
+                bytes[pi + 1] & 7,
+                bytes[pi + 2] & 3,
+                (bytes[pi + 2] >> 7) & 1,
+                bytes[pi + 4],
             )
         } else {
             None
@@ -6687,6 +6741,79 @@ mod merged_pr629_followup_tests {
             "rex2 pseudo prefix cannot be used for `vaddps'"
         );
         assert!(fails("{vex} vpbroadcastb %eax,%xmm1")); // EVEX-only GPR row.
+    }
+
+    #[test]
+    fn decorators_inspect_only_the_current_instruction() {
+        use super::InstructionEncoder;
+        use crate::backend::x86::assembler::parser::{AsmItem, parse_asm};
+        let mut encoder = InstructionEncoder::new();
+        for line in [
+            "vaddps %xmm1,%xmm2,%xmm3",      // C5 VEX prefix
+            "vpaddd %zmm1,%zmm2,%zmm3{%k1}", // EVEX masking
+        ] {
+            let items = parse_asm(line).unwrap();
+            for item in items {
+                if let AsmItem::Instruction(instr) = item {
+                    encoder.encode(&instr).unwrap();
+                }
+            }
+        }
+        assert_eq!(
+            encoder
+                .bytes
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+            format!(
+                "{} {}",
+                hex("vaddps %xmm1,%xmm2,%xmm3"),
+                hex("vpaddd %zmm1,%zmm2,%zmm3{%k1}")
+            )
+        );
+    }
+
+    #[test]
+    fn rejected_decorators_rollback_bytes_relocations_and_offset() {
+        use super::InstructionEncoder;
+        use crate::backend::x86::assembler::parser::{AsmItem, Instruction, parse_asm};
+        let parse = |line: &str| -> Instruction {
+            parse_asm(line)
+                .unwrap()
+                .into_iter()
+                .find_map(|item| match item {
+                    AsmItem::Instruction(instr) => Some(instr),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let first = parse("vaddps %xmm1,%xmm2,%xmm3");
+        let bad = parse("vmovddup bad(%rax){1to2},%xmm1");
+        let last = parse("vmovdqu8 good(%rax),%zmm1");
+        let mut candidate = InstructionEncoder::new();
+        candidate.encode(&first).unwrap();
+        let bytes = candidate.bytes.clone();
+        let offset = candidate.offset;
+        let relocations = candidate.relocations.len();
+        assert!(candidate.encode(&bad).is_err());
+        assert_eq!(candidate.bytes, bytes);
+        assert_eq!(candidate.offset, offset);
+        assert_eq!(candidate.relocations.len(), relocations);
+        candidate.encode(&last).unwrap();
+        let mut expected = InstructionEncoder::new();
+        expected.encode(&first).unwrap();
+        expected.encode(&last).unwrap();
+        assert_eq!(candidate.bytes, expected.bytes);
+        assert_eq!(candidate.offset, expected.offset);
+        let reloc = |encoder: &InstructionEncoder| {
+            encoder
+                .relocations
+                .iter()
+                .map(|r| (r.symbol.clone(), r.offset, r.reloc_type, r.addend))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(reloc(&candidate), reloc(&expected));
     }
 
     #[test]

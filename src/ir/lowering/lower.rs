@@ -93,6 +93,12 @@ pub struct Lowerer {
     pub(super) func_meta: FunctionMeta,
     /// Set of emitted global variable names (O(1) dedup)
     pub(super) emitted_global_names: FxHashSet<String>,
+    /// Emitted globals whose only definition so far is a TENTATIVE one of an
+    /// incomplete array type (`int x[];`). A later declaration of the same
+    /// identifier with a complete array type forms the composite type
+    /// (C11 6.2.7p3, 6.9.2p2) and must replace the provisional one-element
+    /// storage.
+    pub(super) tentative_incomplete_arrays: FxHashSet<String>,
     /// String literal deduplication: maps string content → label.
     /// Identical string literals share the same .rodata entry so that
     /// pointer equality (`"hello" == "hello"`) holds, matching GCC behavior.
@@ -238,6 +244,7 @@ impl Lowerer {
             types: type_context,
             func_meta: FunctionMeta::default(),
             emitted_global_names: FxHashSet::default(),
+            tentative_incomplete_arrays: FxHashSet::default(),
             string_dedup: FxHashMap::default(),
             wide_string_dedup: FxHashMap::default(),
             char16_string_dedup: FxHashMap::default(),
@@ -488,6 +495,46 @@ impl Lowerer {
         self.func_mut().insert_local_scoped(name, info);
     }
 
+    /// Attach a function-pointer signature to the innermost binding of `name`.
+    /// Must run after the binding was inserted (`insert_local_scoped`): the
+    /// signature is part of that binding, so scope exit / shadowing drop it
+    /// together with the local.
+    pub(super) fn set_local_fptr_sig(&mut self, name: &str, sig: FuncSig) {
+        if let Some(info) = self.func_mut().locals.get_mut(name) {
+            info.fptr_sig = Some(Box::new(sig));
+        }
+    }
+
+    /// Declared signature of the innermost LOCAL binding of `name`, if that
+    /// binding is a function pointer whose declarator spelled one.  A local
+    /// without one yields `None` even when a function or an unrelated
+    /// declaration elsewhere has the same name (C scoping: the local
+    /// shadows); callers then derive the signature from the local's `c_type`.
+    pub(super) fn local_fptr_sig(&self, name: &str) -> Option<&FuncSig> {
+        self.func_state
+            .as_ref()?
+            .locals
+            .get(name)?
+            .fptr_sig
+            .as_deref()
+    }
+
+    /// Signature for a call through the function-pointer VARIABLE `name`
+    /// (`is_func_ptr_variable(name)` holds).  A local binding is authoritative
+    /// and never falls back to a same-named function's `sigs` entry; only a
+    /// file-scope function-pointer object consults `sigs`.
+    pub(super) fn fptr_variable_sig(&self, name: &str) -> Option<&FuncSig> {
+        let is_local = self
+            .func_state
+            .as_ref()
+            .is_some_and(|fs| fs.locals.contains_key(name));
+        if is_local {
+            self.local_fptr_sig(name)
+        } else {
+            self.func_meta.sigs.get(name)
+        }
+    }
+
     /// Insert an enum constant, tracking the change in the current scope frame.
     pub(super) fn insert_enum_scoped(&mut self, name: String, value: i64) {
         self.types.insert_enum_scoped(name, value);
@@ -615,10 +662,8 @@ impl Lowerer {
                     // (e.g., `register int x __asm__("rbx")`), which is handled separately
                     // in lower_global_decl. We only redirect function declarations here.
                     if let Some(ref asm_label) = declarator.attrs.asm_register {
-                        let is_function_decl = declarator
-                            .derived
-                            .iter()
-                            .any(|d| matches!(d, DerivedDeclarator::Function(_, _)));
+                        let is_function_decl =
+                            DerivedDeclarator::declares_function(&declarator.derived);
                         if is_function_decl || !is_x86_register_name(asm_label) {
                             self.asm_label_map
                                 .insert(declarator.name.clone(), asm_label.clone());
@@ -636,10 +681,8 @@ impl Lowerer {
                     // references take the read_global_register path before the
                     // asm_label_map lookup, and they never carry a definition.
                     if let Some(ref asm_label) = declarator.attrs.asm_register {
-                        let is_function_decl = declarator
-                            .derived
-                            .iter()
-                            .any(|d| matches!(d, DerivedDeclarator::Function(_, _)));
+                        let is_function_decl =
+                            DerivedDeclarator::declares_function(&declarator.derived);
                         if !is_function_decl
                             && !is_x86_register_name(asm_label)
                             && !decl.is_typedef()

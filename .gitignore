@@ -55,6 +55,8 @@ bench_*
 # Likewise the codegen-gate self-test is CI source, not a scratch test
 # binary: without this negation `test_*` swallows it.
 !.github/scripts/test_ci_codegen_gate.py
+# CI's executable mode/corpus parity mutation tests are source, not outputs.
+!scripts/test_ci_gate_parity.py
 
 # Benchmark / test output
 /test-results/

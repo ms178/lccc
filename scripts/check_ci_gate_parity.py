@@ -15,6 +15,7 @@ otherwise pass this check while silently losing coverage.
 from __future__ import annotations
 
 import re
+import shlex
 import sys
 from pathlib import Path
 
@@ -150,6 +151,75 @@ def check_orphaned_gates(local_text: str, hosted: str) -> int:
     return 0
 
 
+def direct_asmdiff_commands(script: str) -> list[list[str]]:
+    """Parse directly executed asm-diff commands, preserving mode and corpus.
+
+    Path-only parity conflates x86-64 and i686 invocations of asmdiff.py.
+    Only a real `python3 scripts/asmdiff.py ...` shell line qualifies: prose,
+    comments, and `echo python3 ...` are not executable differential gates.
+    Consume `\\` continuation lines from that invocation, not the enclosing
+    ci_local `gate ... \\` line.
+    """
+    lines = script.splitlines()
+    commands = []
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        i += 1
+        if not line.startswith("python3 scripts/asmdiff.py "):
+            continue
+        while line.endswith("\\") and i < len(lines):
+            line = line[:-1] + " " + lines[i].strip()
+            i += 1
+        try:
+            tokens = shlex.split(line, comments=True)
+        except ValueError:
+            continue
+        if tokens[:2] == ["python3", "scripts/asmdiff.py"]:
+            commands.append(tokens[2:])
+    return commands
+
+
+def asm_option(tokens: list[str], name: str) -> str | None:
+    for i, token in enumerate(tokens):
+        if token == name and i + 1 < len(tokens):
+            return tokens[i + 1]
+        if token.startswith(name + "="):
+            return token[len(name) + 1 :]
+    return None
+
+
+def check_asmdiff_gate_parity(local_text: str, hosted: str) -> int:
+    """Require the *specific mode, compiler and corpus*, not just the path."""
+    specs = (
+        ("merged-pr629-x86-asm-diff", False, "target/fastbuild/lccc-x86",
+         ("tests/asm-diff/merged-pr629-followup.casefile",)),
+        ("i686-asm-diff", True, "target/fastbuild/lccc-i686", ()),
+    )
+    missing = []
+    for where, text in (("local", local_text), ("hosted", hosted)):
+        commands = direct_asmdiff_commands(text)
+        for gate, mode32, compiler, casefiles in specs:
+            if not any(
+                ("--32" in cmd) == mode32
+                and asm_option(cmd, "--jobs") == "2"
+                and asm_option(cmd, "--lccc") == compiler
+                and set(casefiles) == {t for t in cmd if t.endswith(".casefile")}
+                and (where != "hosted" or mode32 or
+                     "gas-2.47-x86_64-linux-gnu/bin/as" in (asm_option(cmd, "--as") or ""))
+                for cmd in commands
+            ):
+                missing.append(f"{where}: {gate} (mode/corpus/compiler/jobs/oracle)")
+    if "bash scripts/ensure_gas_247.sh x86_64-linux-gnu" not in hosted:
+        missing.append("hosted: install GNU as 2.47 x86-64 oracle")
+    if missing:
+        print("missing mode/corpus-specific assembly gates:", file=sys.stderr)
+        for item in missing:
+            print(f"  {item}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main() -> int:
     local_text = LOCAL.read_text()
     local_paths = set(COMMAND.findall(local_text))
@@ -166,7 +236,12 @@ def main() -> int:
     rc = check_orphaned_gates(local_text, hosted)
     if rc != 0:
         return rc
-    print(f"CI/local standalone gate parity: PASS ({len(local_paths)} commands)")
+    if check_asmdiff_gate_parity(local_text, hosted) != 0:
+        return 1
+    print(
+        f"CI/local standalone gate parity: PASS ({len(local_paths)} commands, "
+        "2 mode/corpus-specific asm-diff gates)"
+    )
     return 0
 
 

@@ -1,0 +1,143 @@
+{
+  "description": "Portable isolated review regressions. Single instructions except two ordered/offset checks; each source is assembled independently by pinned GAS 2.47 and the candidate LCCC. Both ELF32 and ELF64 bytes and .text relocations are compared.",
+  "cases": [
+    {
+      "series": "review-boundary",
+      "id": "i686-r8d-byte",
+      "target": "i686",
+      "source": "vpbroadcastb %r8d,%xmm1"
+    },
+    {
+      "series": "review-boundary",
+      "id": "i686-r8d-word",
+      "target": "i686",
+      "source": "vpbroadcastw %r8d,%xmm1"
+    },
+    {
+      "series": "review-boundary",
+      "id": "i686-r8d-dword",
+      "target": "i686",
+      "source": "vpbroadcastd %r8d,%xmm1"
+    },
+    {
+      "series": "review-boundary",
+      "id": "i686-r8-qword",
+      "target": "i686",
+      "source": "vpbroadcastq %r8,%xmm1"
+    },
+    {
+      "series": "review-boundary",
+      "id": "i686-rax-qword",
+      "target": "i686",
+      "source": "vpbroadcastq %rax,%xmm1"
+    },
+    {
+      "series": "review-boundary",
+      "id": "i686-r8d-memory-base-code32",
+      "target": "i686",
+      "source": ".code32\nvaddps 8(%r8d),%xmm2,%xmm1"
+    },
+    {
+      "series": "review-boundary",
+      "id": "i686-r8d-memory-index-code16",
+      "target": "i686",
+      "source": ".code16\nvpaddd 16(,%r8d,4),%zmm1,%zmm2"
+    },
+    {
+      "series": "review-boundary",
+      "id": "i686-high-vector-source",
+      "target": "i686",
+      "source": "vpabsq %xmm8,%xmm1"
+    },
+    {
+      "series": "review-boundary",
+      "id": "i686-high-vector-dest",
+      "target": "i686",
+      "source": "vpbroadcastb %eax,%zmm31"
+    },
+    {
+      "series": "review-boundary",
+      "id": "i686-eax-broadcast-legal",
+      "target": "i686",
+      "source": "vpbroadcastd %eax,%zmm1"
+    },
+    {
+      "series": "review-boundary",
+      "id": "i686-edi-broadcast-legal",
+      "target": "i686",
+      "source": "vpbroadcastb %edi,%ymm7"
+    },
+    {
+      "series": "review-boundary",
+      "id": "i686-low-zmm-legal-code16",
+      "target": "i686",
+      "source": ".code16\nvpaddd (%bx),%zmm2,%zmm1{%k1}"
+    },
+    {
+      "series": "review-boundary",
+      "id": "i686-code16-addr16-evex",
+      "target": "i686",
+      "source": ".code16\nvmovdqu8 64(%bx),%zmm1"
+    },
+    {
+      "series": "review-boundary",
+      "id": "i686-code16-addr32-evex",
+      "target": "i686",
+      "source": ".code16\nvmovdqu8 64(%eax),%zmm1"
+    },
+    {
+      "series": "review-boundary",
+      "id": "i686-code32-addr16-evex",
+      "target": "i686",
+      "source": ".code32\nvmovdqu8 64(%bx),%zmm1"
+    },
+    {
+      "series": "review-boundary",
+      "id": "i686-symbol-after-nop",
+      "target": "i686",
+      "source": "nop\nvmovdqu8 sym(%eax),%zmm1"
+    },
+    {
+      "series": "review-boundary",
+      "id": "i686-code16-absolute-symbol",
+      "target": "i686",
+      "source": ".code16\nvpaddd sym,%zmm1,%zmm2"
+    },
+    {
+      "series": "review-boundary",
+      "id": "i686-decor-reject",
+      "target": "i686",
+      "source": "vmovddup bad(%eax){1to2},%xmm1"
+    },
+    {
+      "series": "review-boundary",
+      "id": "x64-r8-qword-legal",
+      "target": "x86_64",
+      "source": "vpbroadcastq %r8,%zmm1"
+    },
+    {
+      "series": "review-boundary",
+      "id": "x64-r8d-dword-legal",
+      "target": "x86_64",
+      "source": "vpbroadcastd %r8d,%xmm1"
+    },
+    {
+      "series": "review-boundary",
+      "id": "x64-high-vector-legal",
+      "target": "x86_64",
+      "source": "vpabsq %xmm8,%xmm1"
+    },
+    {
+      "series": "review-boundary",
+      "id": "x64-vex-then-evex",
+      "target": "x86_64",
+      "source": "vaddps %xmm1,%xmm2,%xmm3\nvpaddd %zmm1,%zmm2,%zmm3{%k1}"
+    },
+    {
+      "series": "review-boundary",
+      "id": "x64-decor-reject",
+      "target": "x86_64",
+      "source": "vmovddup bad(%rax){1to2},%xmm1"
+    }
+  ]
+}

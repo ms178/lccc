@@ -435,9 +435,7 @@ impl Lowerer {
                     .iter()
                     .map(|p| self.type_spec_to_ir(&p.type_spec))
                     .collect();
-                self.func_meta
-                    .ptr_sigs
-                    .insert(declarator.name.clone(), FuncSig::for_ptr(ret_ty, param_tys));
+                self.set_local_fptr_sig(&declarator.name, FuncSig::for_ptr(ret_ty, param_tys));
                 break;
             }
         }
@@ -679,9 +677,7 @@ impl Lowerer {
                     .iter()
                     .map(|p| self.type_spec_to_ir(&p.type_spec))
                     .collect();
-                self.func_meta
-                    .ptr_sigs
-                    .insert(declarator.name.clone(), FuncSig::for_ptr(ret_ty, param_tys));
+                self.set_local_fptr_sig(&declarator.name, FuncSig::for_ptr(ret_ty, param_tys));
                 break;
             }
         }

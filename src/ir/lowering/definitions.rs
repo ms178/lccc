@@ -96,6 +96,17 @@ pub(super) struct LocalInfo {
     /// variable's own accesses are volatile; for pointer locals the pointee
     /// accesses are (when the pointee is not itself a pointer).
     pub base_type_volatile: bool,
+    /// Pointed-to signature when this binding is a function pointer whose
+    /// declarator spelled the parameter list (`int (*fp)(void *, long)`,
+    /// function-typedef parameters).  It lives on the binding itself so it
+    /// follows C identifier scoping exactly: an inner declaration, a later
+    /// function, or a block-scope `extern` of the same name can never observe
+    /// a stale signature.  (A former function-global name-keyed side table
+    /// leaked `void (*xCallback)(void *, i64, int)` from
+    /// `sqlite3_memory_alarm` into `sqlite3_exec`'s typedef-declared
+    /// `xCallback`, truncating its `char **` argument to 32 bits.)  `None`
+    /// means "derive from `c_type`".
+    pub fptr_sig: Option<Box<FuncSig>>,
 }
 
 impl std::ops::Deref for LocalInfo {
@@ -415,8 +426,6 @@ impl DeclAnalysis {
 pub(super) struct FunctionMeta {
     /// Function name -> consolidated signature.
     pub sigs: FxHashMap<String, FuncSig>,
-    /// Function pointer variable name -> signature (return type + param types).
-    pub ptr_sigs: FxHashMap<String, FuncSig>,
 }
 
 /// Tracks how each original C parameter maps to IR parameters after ABI decomposition.
@@ -496,6 +505,7 @@ impl LocalInfo {
             cleanup_fn: None,
             is_const,
             base_type_volatile: da.base_type_volatile,
+            fptr_sig: None,
         }
     }
 
@@ -514,6 +524,7 @@ impl LocalInfo {
             cleanup_fn: None,
             is_const,
             base_type_volatile: da.base_type_volatile,
+            fptr_sig: None,
         }
     }
 }

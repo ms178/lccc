@@ -886,26 +886,14 @@ impl Lowerer {
             stripped = inner;
         }
         if let Expr::Identifier(name, _) = stripped {
-            // When the callee is a local function pointer variable, prefer ptr_sigs
-            // over sigs. This prevents a parameter named e.g. `round` from picking up
-            // the seeded `double round(double)` library signature instead of the
-            // actual function pointer's signature.
+            // A function-pointer VARIABLE decides its own return type: its
+            // declared signature, else its `c_type` (below).  It must never
+            // pick up a same-named function's signature, builtin, or sema
+            // entry — a parameter named e.g. `round` is not `double
+            // round(double)`.
             if self.is_func_ptr_variable(name) {
-                if let Some(ret_ty) = self
-                    .func_meta
-                    .ptr_sigs
-                    .get(name.as_str())
-                    .map(|s| s.return_type)
-                {
-                    return ret_ty;
-                }
-                if let Some(ret_ty) = self
-                    .func_meta
-                    .sigs
-                    .get(name.as_str())
-                    .map(|s| s.return_type)
-                {
-                    return ret_ty;
+                if let Some(sig) = self.fptr_variable_sig(name) {
+                    return sig.return_type;
                 }
             } else {
                 if let Some(ret_ty) = self
@@ -916,21 +904,13 @@ impl Lowerer {
                 {
                     return ret_ty;
                 }
-                if let Some(ret_ty) = self
-                    .func_meta
-                    .ptr_sigs
-                    .get(name.as_str())
-                    .map(|s| s.return_type)
-                {
+                if let Some(ret_ty) = self.builtin_return_type(name) {
                     return ret_ty;
                 }
-            }
-            if let Some(ret_ty) = self.builtin_return_type(name) {
-                return ret_ty;
-            }
-            // Fall back to sema's function signatures for IrType derivation
-            if let Some(func_info) = self.sema_functions.get(name.as_str()) {
-                return IrType::from_ctype(&func_info.return_type);
+                // Fall back to sema's function signatures for IrType derivation
+                if let Some(func_info) = self.sema_functions.get(name.as_str()) {
+                    return IrType::from_ctype(&func_info.return_type);
+                }
             }
         }
         if let Some(ctype) = self.get_expr_ctype(stripped) {

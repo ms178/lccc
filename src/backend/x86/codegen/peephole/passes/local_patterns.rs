@@ -23,7 +23,7 @@ use super::helpers::{
     self_zeroing_full_write, src_mentions_family, writes_family, writes_family_full,
 };
 use super::liveness::FileLiveness;
-use super::relay_and_lea::function_range;
+use super::relay_and_lea::{LazyDeadness, function_range, splice_lea_into_mem_operand};
 
 #[cfg(test)]
 mod nonzero_bitcount_staging_tests {
@@ -1482,6 +1482,7 @@ pub(super) fn eliminate_dead_sign_extensions(
 pub(super) fn fold_lea_into_memory_op(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut changed = false;
+    let mut dead = LazyDeadness::new();
     let mut i = 0;
     while i < len {
         if infos[i].is_nop() {
@@ -1520,7 +1521,6 @@ pub(super) fn fold_lea_into_memory_op(store: &mut LineStore, infos: &mut [LineIn
             i += 1;
             continue;
         }
-        let displacement = addr_text[..open].trim();
         let fields: Vec<&str> = addr_text[open + 1..close]
             .split(',')
             .map(str::trim)
@@ -1551,29 +1551,15 @@ pub(super) fn fold_lea_into_memory_op(store: &mut LineStore, infos: &mut [LineIn
                 continue;
             }
             let next = infos[j].trimmed(store.get(j));
-            let addr_pat = format!("({})", dst_text);
-            // Match a BARE `(%dst)` memory operand. A displacement form like
-            // `8(%rdx)` or `0x2(%rdx)` must not match — the replacement would
-            // corrupt `8(` into `8disp(`.
-            let bare_ok = next.match_indices(&addr_pat).any(|(pos, _)| {
-                pos == 0 || {
-                    let c = next.as_bytes()[pos - 1] as char;
-                    c == ' ' || c == ',' || c == '\t'
-                }
-            });
-            if !bare_ok {
+            // Compose, never splice text: `8(%rdx)` after `leaq 2(%r9),%rdx`
+            // is `10(%r9)`. See `splice_lea_into_mem_operand`.
+            let Some(replacement) = splice_lea_into_mem_operand(next, dst_text, addr_text) else {
                 i += 1;
                 continue;
-            }
+            };
             // The address was already computed by the LEA; dropping it is valid
             // only if the destination register is dead after the memory op.
-            if fam_read_after(store, infos, j + 1, dst_family) {
-                i += 1;
-                continue;
-            }
-            let sib = format!("{}({})", displacement, base);
-            let replacement = next.replacen(&addr_pat, &sib, 1);
-            if replacement == next {
+            if !dead.dead_after(store, infos, j, dst_family, &[i, j]) {
                 i += 1;
                 continue;
             }
@@ -1590,6 +1576,7 @@ pub(super) fn fold_lea_into_memory_op(store: &mut LineStore, infos: &mut [LineIn
             }
             mark_nop(&mut infos[i]);
             replace_line(store, &mut infos[j], j, format!("    {}", replacement));
+            dead.invalidate(store, infos, j);
             changed = true;
             i = j + 1;
             continue;
@@ -1626,13 +1613,11 @@ pub(super) fn fold_lea_into_memory_op(store: &mut LineStore, infos: &mut [LineIn
             continue;
         }
         let next = infos[j].trimmed(store.get(j));
-        let addr_pat = format!("({})", dst_text);
-        let sib = if fields.len() == 3 {
-            format!("{}({},{},{})", displacement, base, index, fields[2])
-        } else {
-            format!("{}({},{})", displacement, base, index)
-        };
-        if !next.contains(&addr_pat) {
+        // Compose the LEA address with the consumer operand -- summing the
+        // displacements, never gluing their text together (`8(%r9)` after
+        // `leaq 8(%r13,%r10),%r9` is `16(%r13, %r10)`, not `88(...)`).
+        let folded = splice_lea_into_mem_operand(next, dst_text, addr_text);
+        let Some(replacement) = folded else {
             // A common store shape uses one extra address-register copy:
             //   leaq (...), %rdi
             //   movq %rdi, %rcx
@@ -1657,9 +1642,9 @@ pub(super) fn fold_lea_into_memory_op(store: &mut LineStore, infos: &mut [LineIn
                     }
                     if k < len && !infos[k].is_barrier() {
                         let mem_next = infos[k].trimmed(store.get(k));
-                        let tmp_pat = format!("({})", tmp);
-                        if mem_next.contains(&tmp_pat)
-                            && !fam_read_after(store, infos, k + 1, tmp_family)
+                        if let Some(replacement) =
+                            splice_lea_into_mem_operand(mem_next, tmp, addr_text)
+                            && dead.dead_after(store, infos, k, tmp_family, &[j, k])
                             // SOUNDNESS (sqlite3): removing the leaq leaves the
                             // LEA destination register undefined. The
                             // temporary-copy check alone is not enough: the
@@ -1671,40 +1656,27 @@ pub(super) fn fold_lea_into_memory_op(store: &mut LineStore, infos: &mut [LineIn
                             // folded memory operation. Without this, sqlite3's
                             // opcode/schema-init store sequence wrote struct
                             // fields through an undefined base register.
-                            && !fam_read_after(store, infos, k + 1, dst_family)
+                            && dead.dead_after(store, infos, k, dst_family, &[i, j])
+                            && !line_refs_gp_family(&replacement, tmp_family)
+                            && !line_refs_gp_family(&replacement, dst_family)
                         {
-                            let replacement = mem_next.replacen(&tmp_pat, &sib, 1);
-                            if replacement != mem_next
-                                && !line_refs_gp_family(&replacement, tmp_family)
-                                && !line_refs_gp_family(&replacement, dst_family)
-                            {
-                                mark_nop(&mut infos[i]);
-                                mark_nop(&mut infos[j]);
-                                replace_line(
-                                    store,
-                                    &mut infos[k],
-                                    k,
-                                    format!("    {}", replacement),
-                                );
-                                changed = true;
-                                i = k + 1;
-                                continue;
-                            }
+                            mark_nop(&mut infos[i]);
+                            mark_nop(&mut infos[j]);
+                            replace_line(store, &mut infos[k], k, format!("    {}", replacement));
+                            dead.invalidate(store, infos, k);
+                            changed = true;
+                            i = k + 1;
+                            continue;
                         }
                     }
                 }
             }
             i += 1;
             continue;
-        }
+        };
         // The address fields were already evaluated by LEA. Removing it is
         // valid only if the temporary is dead after the memory operation.
-        if fam_read_after(store, infos, j + 1, dst_family) {
-            i += 1;
-            continue;
-        }
-        let replacement = next.replacen(&addr_pat, &sib, 1);
-        if replacement == next {
+        if !dead.dead_after(store, infos, j, dst_family, &[i, j]) {
             i += 1;
             continue;
         }
@@ -1717,6 +1689,7 @@ pub(super) fn fold_lea_into_memory_op(store: &mut LineStore, infos: &mut [LineIn
         }
         mark_nop(&mut infos[i]);
         replace_line(store, &mut infos[j], j, format!("    {}", replacement));
+        dead.invalidate(store, infos, j);
         changed = true;
         i = j + 1;
     }
@@ -1793,75 +1766,6 @@ fn line_refs_gp_family(line: &str, fam: u8) -> bool {
 // Requirements: REG_IDX and REG_BASE must be callee-saved or otherwise
 // guaranteed not clobbered between definition and use.
 
-/// Whole-function scan: does any line after `start` READ register family `fam`?
-///
-/// Path-insensitive and deliberately conservative: a line that references the
-/// family counts as a read unless it is a provable pure write (mov*-family
-/// store into the register, or the xor-self zeroing idiom). Implicit reads
-/// (cltq/cdq/cqo, integer div/mul, shld/shrd) are detected via
-/// [`implicit_read_reg_family`]. The scan stops at the next function's
-/// `.cfi_startproc`.
-///
-/// This is used by [`fold_base_index_addressing`] to prove that a register
-/// whose defining instruction is about to be removed is dead after the folded
-/// memory operation. The previous window-until-barrier scans missed reads in
-/// LATER basic blocks (e.g. phi copy-backs after a branch), which left a
-/// never-defined register live and miscompiled switch/loop code (regression:
-/// phi_gep_fold.c — zlib-ng zng_deflateSetParams).
-fn fam_read_after(store: &LineStore, infos: &[LineInfo], start: usize, fam: u8) -> bool {
-    if fam > 15 {
-        return true; // unknown family: be conservative
-    }
-    let mask = 1u16 << fam;
-    for n in start..store.len() {
-        if infos[n].is_nop() {
-            continue;
-        }
-        let td = infos[n].trimmed(store.get(n));
-        if td.starts_with(".cfi_startproc") {
-            break; // next function: its registers are independent
-        }
-        if implicit_read_reg_family(td) == Some(fam) {
-            return true;
-        }
-        if infos[n].reg_refs & mask == 0 {
-            continue;
-        }
-        let dest = get_dest_reg(&infos[n]);
-        if dest == fam {
-            // Pure write: mov-family store to the register (no memory operand
-            // through it) or xor-self zeroing. Anything else with dest == fam
-            // (addq %r8,%rax, ...) also READS the register.
-            let name64 = REG_NAMES[0][fam as usize];
-            let name32 = REG_NAMES[1][fam as usize];
-            // SOUNDNESS: a mov to the family is a pure write only if the
-            // SOURCE part does not reference the family — including through
-            // displacement-form memory operands like `movq 8(%r13), %r13`
-            // (or `movl 4(%r13), %r13d`), which the old `(%r13)`-substring
-            // checks missed (`8(%r13)` does not contain `(r13)`). Such a
-            // line READS the family, so it must block the fold. The check must
-            // cover EVERY width spelling of the family, not just the 64-/32-bit
-            // names: `movzbl %al, %eax` reads %rax through `%al` and a
-            // name64/name32 substring test does not see it.
-            let src_part = &td[..td.rfind(',').unwrap_or(td.len())];
-            let fam_in_src = line_refs_gp_family(src_part, fam);
-            let mov_store =
-                (td.starts_with("mov") || td.starts_with("movabs") || td.starts_with("lea"))
-                    && !fam_in_src;
-            let explicit_lea_write = td.starts_with("lea")
-                && td.ends_with(&format!(", %{}", name64))
-                && !td[..td.rfind(',').unwrap_or(0)].contains(name64);
-            let xor_self = (td.starts_with("xorl ") || td.starts_with("xorq "))
-                && td.contains(&format!("{}, {}", name32, name32));
-            if mov_store || explicit_lea_write || xor_self {
-                continue;
-            }
-        }
-        return true;
-    }
-    false
-}
-
 /// Fold `leaq (%base,%index[,scale]), %tmp` into EVERY memory operand that
 /// uses `(%tmp)` within the same basic block, then delete the LEA.
 ///
@@ -1889,13 +1793,17 @@ fn fam_read_after(store: &LineStore, infos: &[LineInfo], start: usize, fam: u8) 
 ///     LEA did (this is the check the older pass gets for free by only ever
 ///     looking at the very next line);
 ///   * `%tmp` must be dead after the last rewritten use, and must not be read
-///     in any form the rewrite does not cover (a bare `(%tmp)` is the only
-///     shape matched; `8(%tmp)` and plain register reads block the fold);
+///     in any form the rewrite does not cover: a memory operand based on
+///     `%tmp` (`(%tmp)`, `8(%tmp)`, `8(%tmp,%idx,4)`) is rewritten by address
+///     COMPOSITION through `splice_lea_into_mem_operand` (displacements are
+///     summed, never concatenated as text); plain register reads block the
+///     fold;
 ///   * `%tmp` must differ from base and index, or deleting the LEA would
 ///     change the value the folded operand reads.
 pub(super) fn fold_lea_all_uses_in_block(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut changed = false;
+    let mut dead = LazyDeadness::new();
     let mut i = 0;
 
     while i < len {
@@ -1932,7 +1840,6 @@ pub(super) fn fold_lea_all_uses_in_block(store: &mut LineStore, infos: &mut [Lin
             i += 1;
             continue;
         }
-        let displacement = addr_text[..open].trim();
         let fields: Vec<&str> = addr_text[open + 1..close]
             .split(',')
             .map(str::trim)
@@ -1965,23 +1872,11 @@ pub(super) fn fold_lea_all_uses_in_block(store: &mut LineStore, infos: &mut [Lin
             continue;
         }
 
-        let sib = if fields.len() == 3 {
-            format!(
-                "{}({},{},{})",
-                displacement, fields[0], fields[1], fields[2]
-            )
-        } else {
-            format!("{}({},{})", displacement, fields[0], fields[1])
-        };
-        let addr_pat = format!("({})", dst_text);
         let dst64 = REG_NAMES[0][dst_family as usize];
-        let dst32 = REG_NAMES[1][dst_family as usize];
-        let base_mask = 1u16 << base_family;
-        let index_mask = 1u16 << index_family;
-        let dst_mask = 1u16 << dst_family;
 
-        // Collect every rewritable use up to the end of the block.
-        let mut uses: Vec<usize> = Vec::new();
+        // Collect every rewritable use up to the end of the block, with its
+        // composed replacement text.
+        let mut uses: Vec<(usize, String)> = Vec::new();
         let mut ok = true;
         let mut n = i + 1;
         while n < len {
@@ -2002,33 +1897,25 @@ pub(super) fn fold_lea_all_uses_in_block(store: &mut LineStore, infos: &mut [Lin
             {
                 break;
             }
-            if infos[n].reg_refs & dst_mask != 0 {
-                // A bare `(%tmp)` operand is rewritable. Anything else that
-                // mentions the register (displacement form, plain read, or a
-                // write) is not, so the LEA has to stay.
-                let bare = t.match_indices(&addr_pat).any(|(pos, _)| {
-                    pos == 0 || matches!(t.as_bytes()[pos - 1] as char, ' ' | ',' | '\t')
-                });
-                // REG_NAMES entries already include the '%' prefix; the old
-                // format!("%{}", ..) built "%%rdx", which never matched, so a
-                // redefinition of the destination register was INVISIBLE to
-                // this scan. The first LEA then folded uses belonging to a
-                // second LEA into the same register (vectorize_float_matmul:
-                // C[0][0] += ... executed against A's address).
-                let mentions = t.contains(dst64) || t.contains(dst32);
-                if bare {
-                    // Reject a line that ALSO uses %tmp in a non-bare position.
-                    let stripped = t.replace(&addr_pat, "");
-                    if stripped.contains(dst64) || stripped.contains(dst32) {
-                        ok = false;
-                        break;
-                    }
-                    uses.push(n);
-                } else if mentions {
+            if infos[n].reg_refs & (1u16 << dst_family) != 0 || line_refs_gp_family(t, dst_family) {
+                // A memory operand based on %tmp absorbs the LEA by address
+                // composition (`8(%tmp)` sums the displacements; it is never
+                // spliced as text). The rewritten line must not mention %tmp
+                // anywhere else: any such mention reads the LEA's value.
+                if let Some(rep) = splice_lea_into_mem_operand(t, dst_text, addr_text)
+                    && !line_refs_gp_family(&rep, dst_family)
+                {
+                    uses.push((n, rep));
+                } else {
                     // A pure redefinition of %tmp ends its live range cleanly:
                     // everything after belongs to a different value.
                     // `writes_family` also sees architectural implicit writes
                     // (`cqto` redefining an %rdx temporary).
+                    // REG_NAMES entries already include the '%' prefix; the old
+                    // format!("%{}", ..) built "%%rdx", which never matched, so
+                    // a redefinition of the destination register was INVISIBLE
+                    // to this scan (vectorize_float_matmul: C[0][0] += ...
+                    // executed against A's address).
                     if writes_family(&infos[n], t, dst_family)
                         && !t[..t.rfind(',').unwrap_or(t.len())].contains(dst64)
                     {
@@ -2038,7 +1925,6 @@ pub(super) fn fold_lea_all_uses_in_block(store: &mut LineStore, infos: &mut [Lin
                     break;
                 }
             }
-            let _ = (base_mask, index_mask);
             n += 1;
         }
 
@@ -2048,25 +1934,23 @@ pub(super) fn fold_lea_all_uses_in_block(store: &mut LineStore, infos: &mut [Lin
             i += 1;
             continue;
         }
-        // %tmp must be dead after the block region we rewrote.
-        if fam_read_after(store, infos, n, dst_family) {
+        // %tmp must be dead after its last rewritten use (on every path,
+        // including around back edges).
+        let mut owned: Vec<usize> = Vec::with_capacity(uses.len() + 1);
+        owned.push(i);
+        owned.extend(uses.iter().map(|(u, _)| *u));
+        let last_use = uses[uses.len() - 1].0;
+        if !dead.dead_after(store, infos, last_use, dst_family, &owned) {
             i += 1;
             continue;
         }
 
-        for &u in &uses {
-            let t = infos[u].trimmed(store.get(u));
-            let replacement = t.replacen(&addr_pat, &sib, 1);
-            if replacement == t {
-                ok = false;
-                break;
-            }
-            replace_line(store, &mut infos[u], u, format!("    {}", replacement));
+        for (u, rep) in uses {
+            replace_line(store, &mut infos[u], u, format!("    {}", rep));
         }
-        if ok {
-            mark_nop(&mut infos[i]);
-            changed = true;
-        }
+        dead.invalidate(store, infos, i);
+        mark_nop(&mut infos[i]);
+        changed = true;
         i += 1;
     }
     changed
@@ -2075,6 +1959,7 @@ pub(super) fn fold_lea_all_uses_in_block(store: &mut LineStore, infos: &mut [Lin
 pub(super) fn fold_base_index_addressing(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut changed = false;
+    let mut dead = LazyDeadness::new();
     let mut i = 0;
 
     while i < len {
@@ -2143,17 +2028,18 @@ pub(super) fn fold_base_index_addressing(store: &mut LineStore, infos: &mut [Lin
         let tk = infos[k].trimmed(store.get(k));
 
         // Case 1: Direct use — the mem op uses (%rax)
-        if let Some(folded) = try_fold_mem_op_with_sib(tk, "(%rax)", base_reg, idx_reg) {
+        if let Some(folded) = try_fold_mem_op_with_sib(tk, "(%rax)", base_reg, idx_reg, 0) {
             // Safety: verify rax is dead after k. The NOP'd instructions
             // leave rax without the computed address. If anything reads rax
             // after k expecting the address, the fold is unsafe. The scan is
             // whole-function (not window-until-barrier): a read in a LATER
             // basic block is just as unsafe as one in the same block.
-            let rax_dead = !fam_read_after(store, infos, k + 1, 0);
+            let rax_dead = dead.dead_after(store, infos, k, 0, &[i, j, k]);
             if rax_dead {
                 mark_nop(&mut infos[i]); // remove movq %REG, %rax
                 mark_nop(&mut infos[j]); // remove addq %REG_BASE, %rax
                 replace_line(store, &mut infos[k], k, folded);
+                dead.invalidate(store, infos, k);
                 changed = true;
                 i = k + 1;
                 continue;
@@ -2177,26 +2063,28 @@ pub(super) fn fold_base_index_addressing(store: &mut LineStore, infos: &mut [Lin
                 if m < len && !infos[m].is_barrier() {
                     let tm = infos[m].trimmed(store.get(m));
                     let addr_pat = format!("(%{})", &tmp_reg[1..]); // e.g. "(%rcx)"
-                    if let Some(folded) = try_fold_mem_op_with_sib(tm, &addr_pat, base_reg, idx_reg)
+                    if let Some(folded) =
+                        try_fold_mem_op_with_sib(tm, &addr_pat, base_reg, idx_reg, tmp_family)
                     {
                         // Safety: verify %TMP is dead after m. If anything
                         // reads %TMP after the folded mem op, the NOP'd movq
                         // at k means %TMP holds a stale value. Whole-function
                         // scan (not window-until-barrier): cross-block reads
                         // (e.g. phi copy-backs) are just as unsafe.
-                        let tmp_dead = !fam_read_after(store, infos, m + 1, tmp_family);
+                        let tmp_dead = dead.dead_after(store, infos, m, tmp_family, &[k, m]);
                         // SOUNDNESS: the fold removes the `movq %idx, %rax`
                         // AND `addq %base, %rax`, leaving %rax undefined. The
                         // tmp-copy deadness alone is not sufficient: a later
                         // instruction may read %rax expecting the computed
                         // address (the accumulator is reused constantly).
-                        let rax_dead = !fam_read_after(store, infos, m + 1, 0);
+                        let rax_dead = dead.dead_after(store, infos, m, 0, &[i, j, k, m]);
 
                         if tmp_dead && rax_dead {
                             mark_nop(&mut infos[i]); // remove movq %REG, %rax
                             mark_nop(&mut infos[j]); // remove addq
                             mark_nop(&mut infos[k]); // remove movq %rax, %TMP
                             replace_line(store, &mut infos[m], m, folded);
+                            dead.invalidate(store, infos, m);
                             changed = true;
                             i = m + 1;
                             continue;
@@ -2213,22 +2101,35 @@ pub(super) fn fold_base_index_addressing(store: &mut LineStore, infos: &mut [Lin
 
 /// Try to replace a memory operand `(ADDR_PAT)` in an instruction with SIB `(%BASE,%IDX)`.
 /// Returns the new instruction text if the pattern matches.
+///
+/// `(ADDR_PAT)` holds `%base + %idx` with no displacement of its own, so a
+/// consumer displacement (`8(%rax)`) stays in front of the substituted
+/// operand unchanged and every occurrence reads the same address.
+///
+/// `addr_fam` is the family `ADDR_PAT` names. The fold deletes the
+/// instructions that defined it, so the consumer must not READ that family
+/// through any other operand (`addq (%rax), %rax` would read an undefined
+/// accumulator); a pure overwrite (`movq (%rax), %rax`) is fine.
 fn try_fold_mem_op_with_sib(
     instr: &str,
     addr_pat: &str,
     base_reg: &str,
     idx_reg: &str,
+    addr_fam: RegId,
 ) -> Option<String> {
-    // The instruction must contain the address pattern exactly once
     if !instr.contains(addr_pat) {
         return None;
     }
-    // Don't fold into instructions that also reference rax/rcx in a way that conflicts
-    // (the movq/addq we're removing clobber rax)
-    // Build the SIB replacement
     let sib = format!("(%{}, %{})", &base_reg[1..], &idx_reg[1..]);
-    let new_instr = format!("    {}", instr.replace(addr_pat, &sib));
-    Some(new_instr)
+    let folded = instr.replace(addr_pat, &sib);
+    // Judge the text OUTSIDE the substituted operands: `%base` may itself be
+    // the address family (`movq %rax, %rcx; movb $0, (%rcx)` folds to
+    // `(%rcx, %r14)`, which reads the ORIGINAL base in %rcx, still intact).
+    let outside = instr.replace(addr_pat, "");
+    if line_refs_gp_family(&outside, addr_fam) && !pure_family_write(&folded, addr_fam) {
+        return None;
+    }
+    Some(format!("    {}", folded))
 }
 
 /// Does `td` (a trimmed asm line) REDEFINE the whole GP family `fam` from a
@@ -2560,6 +2461,7 @@ fn is_32bit_eax_consumer(trimmed: &str) -> bool {
 pub(super) fn eliminate_fp_xmm_roundtrips(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let mut changed = false;
     let len = store.len();
+    let mut gp_dead = LazyDeadness::new();
     // Frame-slot / XMM liveness oracle for Pattern E (built lazily: most
     // files never reach that pattern).
     let mut lv: Option<FpLiveness> = None;
@@ -2600,10 +2502,13 @@ pub(super) fn eliminate_fp_xmm_roundtrips(store: &mut LineStore, infos: &mut [Li
                             .rsplit_once(',')
                             .map(|(_, dst)| dst.trim())
                             .unwrap_or("");
-                        if !dst_xmm.is_empty() && !fam_read_after(store, infos, j + 1, gpr_family) {
+                        if !dst_xmm.is_empty()
+                            && gp_dead.dead_after(store, infos, j, gpr_family, &[i, j])
+                        {
                             let replacement = format!("    movsd {}, {}", src, dst_xmm);
                             replace_line(store, &mut infos[i], i, replacement);
                             mark_nop(&mut infos[j]);
+                            gp_dead.invalidate(store, infos, i);
                             changed = true;
                             i = j + 1;
                             continue;
@@ -2656,7 +2561,7 @@ pub(super) fn eliminate_fp_xmm_roundtrips(store: &mut LineStore, infos: &mut [Li
                             let bridge_dead = if load_reg == 0 {
                                 rax_elidable_after(store, infos, k, len)
                             } else {
-                                !fam_read_after(store, infos, k, 1 /* rcx */)
+                                gp_dead.dead_after(store, infos, j, 1 /* rcx */, &[i, j])
                             };
                             if bridge_dead {
                                 let load_text = infos[i].trimmed(store.get(i));
@@ -2672,6 +2577,7 @@ pub(super) fn eliminate_fp_xmm_roundtrips(store: &mut LineStore, infos: &mut [Li
                                 if let Some(o) = lv.as_mut() {
                                     o.refresh_at(store, infos, i);
                                 }
+                                gp_dead.invalidate(store, infos, i);
                                 changed = true;
                                 i += 1;
                                 continue;

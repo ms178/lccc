@@ -1,0 +1,1679 @@
+{
+  "description": "Historical PR #629 isolated GAS 2.47 probe inputs, verbatim from recorded 88-case final set, 143 recorded broadcast-width probes, and 48 EVEX-table probes. These are inputs, not historical results.",
+  "cases": [
+    {
+      "series": "pr629-isolated",
+      "id": "vex_ccmp",
+      "target": "x86_64",
+      "source": "{vex} ccmpeq %rcx, %rax"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "vex_ctest",
+      "target": "x86_64",
+      "source": "{vex} ctestne %rcx, %rax"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "vex_cfcmov",
+      "target": "x86_64",
+      "source": "{vex} cfcmovbe %rax, %rbx"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "vex_imulzu",
+      "target": "x86_64",
+      "source": "{vex} imulzu $2, %ax, %cx"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "vex_vmread64",
+      "target": "x86_64",
+      "source": "{vex} vmread %rax, %rbx"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "vex_vmread32",
+      "target": "i686",
+      "source": "{vex} vmread %eax, %ebx"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "vex_vmcall",
+      "target": "x86_64",
+      "source": "{vex} vmcall"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "vex_verr",
+      "target": "x86_64",
+      "source": "{vex} verr %ax"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "vex_vmmcall",
+      "target": "x86_64",
+      "source": "{vex} vmmcall"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "vex_vpdp_x64",
+      "target": "x86_64",
+      "source": "{vex} vpdpbusd %ymm3, %ymm1, %ymm2"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "vex_vpdp_i686",
+      "target": "i686",
+      "source": "{vex} vpdpbusd %ymm3, %ymm1, %ymm2"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "default_vpdp_i686",
+      "target": "i686",
+      "source": "vpdpbusd %ymm3, %ymm1, %ymm2"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "vex_vmovdqu8_i686",
+      "target": "i686",
+      "source": "{vex} vmovdqu8 %ymm1, %ymm2"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "vex_vmovdqu8_x64",
+      "target": "x86_64",
+      "source": "{vex} vmovdqu8 %ymm1, %ymm2"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "vex3_vaddps_x64",
+      "target": "x86_64",
+      "source": "{vex3} vaddps %xmm1, %xmm2, %xmm3"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "vex3_vaddps_i686",
+      "target": "i686",
+      "source": "{vex3} vaddps %xmm1, %xmm2, %xmm3"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "vex2_vaddps",
+      "target": "x86_64",
+      "source": "{vex2} vaddps %xmm1, %xmm2, %xmm3"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "vex3_vmovss",
+      "target": "x86_64",
+      "source": "{vex3} vmovss %xmm1, %xmm6, %xmm2"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "vex2_vpdp",
+      "target": "x86_64",
+      "source": "{vex2} vpdpbusd %ymm3, %ymm1, %ymm2"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "vex3_vpdp",
+      "target": "x86_64",
+      "source": "{vex3} vpdpbusd %ymm3, %ymm1, %ymm2"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "vex3_vpdp_i686",
+      "target": "i686",
+      "source": "{vex3} vpdpbusd %ymm3, %ymm1, %ymm2"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "nf_vex",
+      "target": "x86_64",
+      "source": "{nf} {vex} vpaddd %xmm1, %xmm2, %xmm3"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "rex2_vex",
+      "target": "x86_64",
+      "source": "{rex2} {vex} vpaddd %xmm1, %xmm2, %xmm3"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "vex_nf",
+      "target": "x86_64",
+      "source": "{vex} {nf} addl %eax, %ebx"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "rex2_vex_legacy",
+      "target": "x86_64",
+      "source": "{rex2} {vex} movq %rax, %rbx"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "tuple_xmm",
+      "target": "x86_64",
+      "source": "vmovddup (%rax){1to2}, %xmm1"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "tuple_ymm",
+      "target": "x86_64",
+      "source": "vmovddup (%rax){1to4}, %ymm1"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "tuple_zmm",
+      "target": "x86_64",
+      "source": "vmovddup (%rax){1to8}, %zmm1"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "tuple_xmm_i686",
+      "target": "i686",
+      "source": "vmovddup (%eax){1to2}, %xmm1"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "vmovddup_xmm",
+      "target": "x86_64",
+      "source": "vmovddup -1024(%rdx), %xmm30"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "vpbroadcastb_ah",
+      "target": "x86_64",
+      "source": "vpbroadcastb %ah, %xmm5"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "vpinsrb_ah",
+      "target": "x86_64",
+      "source": "vpinsrb $1, %ah, %xmm3, %xmm4"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "vmovd_ah",
+      "target": "x86_64",
+      "source": "vmovd %ah, %xmm4"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "vmovddup_mixed_register_widths",
+      "target": "x86_64",
+      "source": "vmovddup %ymm3, %xmm4"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "enclv",
+      "target": "x86_64",
+      "source": "enclv"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "xop_vex_x64",
+      "target": "x86_64",
+      "source": "{vex} vpcmov %xmm1, %xmm2, %xmm3, %xmm4"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "xop_vex_i686",
+      "target": "i686",
+      "source": "{vex} vpcmov %xmm1, %xmm2, %xmm3, %xmm4"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "lwp_vex_i686",
+      "target": "i686",
+      "source": "{vex} lwpins $1, %eax, %edx"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "legacy_vmlaunch",
+      "target": "x86_64",
+      "source": "{vex} vmlaunch"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "legacy_vmresume",
+      "target": "x86_64",
+      "source": "{vex} vmresume"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "legacy_vmxoff",
+      "target": "x86_64",
+      "source": "{vex} vmxoff"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "legacy_vmfunc",
+      "target": "x86_64",
+      "source": "{vex} vmfunc"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "legacy_vmcall_i686",
+      "target": "i686",
+      "source": "{vex} vmcall"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "legacy_vmmcall_i686",
+      "target": "i686",
+      "source": "{vex} vmmcall"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "legacy_enclv",
+      "target": "x86_64",
+      "source": "{vex} enclv"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "legacy_mov",
+      "target": "x86_64",
+      "source": "{vex} movl %eax, %ecx"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "vex3_vcvtsi2ssl64",
+      "target": "x86_64",
+      "source": "{vex3} vcvtsi2ssl %eax, %xmm1, %xmm2"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "vex3_vcvtsi2ssl32",
+      "target": "i686",
+      "source": "{vex3} vcvtsi2ssl %eax, %xmm1, %xmm2"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "vex3_vmovd64",
+      "target": "x86_64",
+      "source": "{vex3} vmovd %eax, %xmm2"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "vex3_vmovd32",
+      "target": "i686",
+      "source": "{vex3} vmovd %eax, %xmm2"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "vex3_vaddps_addr32",
+      "target": "x86_64",
+      "source": "{vex3} vaddps (%eax), %xmm1, %xmm2"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "vex2_fallback_32",
+      "target": "i686",
+      "source": "{vex2} vpdpbusd %ymm3, %ymm1, %ymm2"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "vex_evex_last_wins",
+      "target": "x86_64",
+      "source": "{vex} {evex} vpdpbusd %ymm3, %ymm1, %ymm2"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "evex_vex_last_wins",
+      "target": "x86_64",
+      "source": "{evex} {vex} vpdpbusd %ymm3, %ymm1, %ymm2"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "default_ifma_vex64",
+      "target": "x86_64",
+      "source": "{vex} vpmadd52huq %ymm3, %ymm1, %ymm2"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "default_ifma_vex32",
+      "target": "i686",
+      "source": "{vex} vpmadd52huq %ymm3, %ymm1, %ymm2"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "default_ifma_32",
+      "target": "i686",
+      "source": "vpmadd52huq %ymm3, %ymm1, %ymm2"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "i686_evex_hint",
+      "target": "i686",
+      "source": "{evex} vmovdqu8 %ymm1, %ymm2"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "i686_vmcall_normal",
+      "target": "i686",
+      "source": "vmcall"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "i686_tuple_vex",
+      "target": "i686",
+      "source": "{vex} vmovddup (%eax){1to2}, %xmm1"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "i686_tuple_default_ymm",
+      "target": "i686",
+      "source": "vmovddup (%eax){1to4}, %ymm1"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "i686_tuple_default_zmm",
+      "target": "i686",
+      "source": "vmovddup (%eax){1to8}, %zmm1"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "i686_tuple_plain",
+      "target": "i686",
+      "source": "vmovddup -1024(%eax), %xmm1"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "x64_tuple_plain",
+      "target": "x86_64",
+      "source": "vmovddup -1024(%rax), %xmm1"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "x64_tuple_plain_zmm",
+      "target": "x86_64",
+      "source": "vmovddup -1024(%rax), %zmm1"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "x64_tuple_evex_plain_xmm",
+      "target": "x86_64",
+      "source": "{evex} vmovddup -1024(%rax), %xmm1"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "high_gp_broadcast_ymm",
+      "target": "x86_64",
+      "source": "vpbroadcastb %ah, %ymm1"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "high_gp_broadcast_32",
+      "target": "i686",
+      "source": "vpbroadcastb %ah, %xmm1"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "high_gp_broadcast_bh",
+      "target": "x86_64",
+      "source": "vpbroadcastb %bh, %xmm1"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "valid_gp_broadcast_al",
+      "target": "x86_64",
+      "source": "vpbroadcastb %al, %xmm5"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "valid_gp_broadcast_spl",
+      "target": "x86_64",
+      "source": "vpbroadcastb %spl, %xmm5"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "valid_gp_broadcast_r8b",
+      "target": "x86_64",
+      "source": "vpbroadcastb %r8b, %xmm5"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "valid_gp_broadcast_eax",
+      "target": "x86_64",
+      "source": "vpbroadcastd %eax, %xmm5"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "valid_gp_broadcast_i686_al",
+      "target": "i686",
+      "source": "vpbroadcastb %al, %xmm1"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "evex_apx_base16",
+      "target": "x86_64",
+      "source": "vmovdqu8 (%r16), %zmm1"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "evex_apx_index17",
+      "target": "x86_64",
+      "source": "vmovdqu8 (%rax,%r17,4), %zmm1"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "evex_apx_baseindex",
+      "target": "x86_64",
+      "source": "vmovdqu8 64(%r16,%r17,2), %zmm1"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "evex_vector_zmm31",
+      "target": "x86_64",
+      "source": "vmovdqu8 %zmm31, %zmm16"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "evex_vector_register31",
+      "target": "x86_64",
+      "source": "vpaddd %zmm31, %zmm30, %zmm29"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "vex3_invalid_evexonly",
+      "target": "i686",
+      "source": "{vex3} vmovdqu8 %ymm1,%ymm2"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "nf_vex_32",
+      "target": "i686",
+      "source": "{nf} {vex} vpaddd %xmm1,%xmm2,%xmm3"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "rex2_vex_32",
+      "target": "i686",
+      "source": "{rex2} {vex} vpaddd %xmm1,%xmm2,%xmm3"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "vex3_rex2_order",
+      "target": "x86_64",
+      "source": "{vex3} {rex2} vaddps %xmm1,%xmm2,%xmm3"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "vex_movss_addrs",
+      "target": "x86_64",
+      "source": "{vex} vmovss %xmm1, (%rax)"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "vex_masked_avx",
+      "target": "x86_64",
+      "source": "{vex} vaddps %zmm1, %zmm2, %zmm3{%k1}"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "vex_masked_avx_i686",
+      "target": "i686",
+      "source": "{vex} vpaddd %ymm1, %ymm2, %ymm3{%k1}"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "i686_mask_plain_avx",
+      "target": "i686",
+      "source": "vaddps %ymm1, %ymm2, %ymm3{%k1}"
+    },
+    {
+      "series": "pr629-isolated",
+      "id": "i686_bcst_bad_avx",
+      "target": "i686",
+      "source": "vaddps (%eax){1to8}, %ymm1, %ymm2"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-001",
+      "target": "x86_64",
+      "source": "vpbroadcastb %al, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-002",
+      "target": "x86_64",
+      "source": "vpbroadcastb %al, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-003",
+      "target": "x86_64",
+      "source": "vpbroadcastb %al, %zmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-004",
+      "target": "x86_64",
+      "source": "vpbroadcastb %ah, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-005",
+      "target": "x86_64",
+      "source": "vpbroadcastb %ah, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-006",
+      "target": "x86_64",
+      "source": "vpbroadcastb %ah, %zmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-007",
+      "target": "x86_64",
+      "source": "vpbroadcastb %ax, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-008",
+      "target": "x86_64",
+      "source": "vpbroadcastb %ax, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-009",
+      "target": "x86_64",
+      "source": "vpbroadcastb %ax, %zmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-010",
+      "target": "x86_64",
+      "source": "vpbroadcastb %eax, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-011",
+      "target": "x86_64",
+      "source": "vpbroadcastb %eax, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-012",
+      "target": "x86_64",
+      "source": "vpbroadcastb %eax, %zmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-013",
+      "target": "x86_64",
+      "source": "vpbroadcastb %rax, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-014",
+      "target": "x86_64",
+      "source": "vpbroadcastb %rax, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-015",
+      "target": "x86_64",
+      "source": "vpbroadcastb %rax, %zmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-016",
+      "target": "x86_64",
+      "source": "vpbroadcastb %r8b, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-017",
+      "target": "x86_64",
+      "source": "vpbroadcastb %r8b, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-018",
+      "target": "x86_64",
+      "source": "vpbroadcastb %r8b, %zmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-019",
+      "target": "x86_64",
+      "source": "vpbroadcastb %r8w, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-020",
+      "target": "x86_64",
+      "source": "vpbroadcastb %r8w, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-021",
+      "target": "x86_64",
+      "source": "vpbroadcastb %r8w, %zmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-022",
+      "target": "x86_64",
+      "source": "vpbroadcastb %r8d, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-023",
+      "target": "x86_64",
+      "source": "vpbroadcastb %r8d, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-024",
+      "target": "x86_64",
+      "source": "vpbroadcastb %r8d, %zmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-025",
+      "target": "x86_64",
+      "source": "vpbroadcastb %r8, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-026",
+      "target": "x86_64",
+      "source": "vpbroadcastb %r8, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-027",
+      "target": "x86_64",
+      "source": "vpbroadcastb %r8, %zmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-028",
+      "target": "x86_64",
+      "source": "vpbroadcastw %al, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-029",
+      "target": "x86_64",
+      "source": "vpbroadcastw %al, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-030",
+      "target": "x86_64",
+      "source": "vpbroadcastw %al, %zmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-031",
+      "target": "x86_64",
+      "source": "vpbroadcastw %ah, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-032",
+      "target": "x86_64",
+      "source": "vpbroadcastw %ah, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-033",
+      "target": "x86_64",
+      "source": "vpbroadcastw %ah, %zmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-034",
+      "target": "x86_64",
+      "source": "vpbroadcastw %ax, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-035",
+      "target": "x86_64",
+      "source": "vpbroadcastw %ax, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-036",
+      "target": "x86_64",
+      "source": "vpbroadcastw %ax, %zmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-037",
+      "target": "x86_64",
+      "source": "vpbroadcastw %eax, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-038",
+      "target": "x86_64",
+      "source": "vpbroadcastw %eax, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-039",
+      "target": "x86_64",
+      "source": "vpbroadcastw %eax, %zmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-040",
+      "target": "x86_64",
+      "source": "vpbroadcastw %rax, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-041",
+      "target": "x86_64",
+      "source": "vpbroadcastw %rax, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-042",
+      "target": "x86_64",
+      "source": "vpbroadcastw %rax, %zmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-043",
+      "target": "x86_64",
+      "source": "vpbroadcastw %r8b, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-044",
+      "target": "x86_64",
+      "source": "vpbroadcastw %r8b, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-045",
+      "target": "x86_64",
+      "source": "vpbroadcastw %r8b, %zmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-046",
+      "target": "x86_64",
+      "source": "vpbroadcastw %r8w, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-047",
+      "target": "x86_64",
+      "source": "vpbroadcastw %r8w, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-048",
+      "target": "x86_64",
+      "source": "vpbroadcastw %r8w, %zmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-049",
+      "target": "x86_64",
+      "source": "vpbroadcastw %r8d, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-050",
+      "target": "x86_64",
+      "source": "vpbroadcastw %r8d, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-051",
+      "target": "x86_64",
+      "source": "vpbroadcastw %r8d, %zmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-052",
+      "target": "x86_64",
+      "source": "vpbroadcastw %r8, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-053",
+      "target": "x86_64",
+      "source": "vpbroadcastw %r8, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-054",
+      "target": "x86_64",
+      "source": "vpbroadcastw %r8, %zmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-055",
+      "target": "x86_64",
+      "source": "vpbroadcastd %al, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-056",
+      "target": "x86_64",
+      "source": "vpbroadcastd %al, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-057",
+      "target": "x86_64",
+      "source": "vpbroadcastd %al, %zmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-058",
+      "target": "x86_64",
+      "source": "vpbroadcastd %ah, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-059",
+      "target": "x86_64",
+      "source": "vpbroadcastd %ah, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-060",
+      "target": "x86_64",
+      "source": "vpbroadcastd %ah, %zmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-061",
+      "target": "x86_64",
+      "source": "vpbroadcastd %ax, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-062",
+      "target": "x86_64",
+      "source": "vpbroadcastd %ax, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-063",
+      "target": "x86_64",
+      "source": "vpbroadcastd %ax, %zmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-064",
+      "target": "x86_64",
+      "source": "vpbroadcastd %eax, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-065",
+      "target": "x86_64",
+      "source": "vpbroadcastd %eax, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-066",
+      "target": "x86_64",
+      "source": "vpbroadcastd %eax, %zmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-067",
+      "target": "x86_64",
+      "source": "vpbroadcastd %rax, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-068",
+      "target": "x86_64",
+      "source": "vpbroadcastd %rax, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-069",
+      "target": "x86_64",
+      "source": "vpbroadcastd %rax, %zmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-070",
+      "target": "x86_64",
+      "source": "vpbroadcastd %r8b, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-071",
+      "target": "x86_64",
+      "source": "vpbroadcastd %r8b, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-072",
+      "target": "x86_64",
+      "source": "vpbroadcastd %r8b, %zmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-073",
+      "target": "x86_64",
+      "source": "vpbroadcastd %r8w, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-074",
+      "target": "x86_64",
+      "source": "vpbroadcastd %r8w, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-075",
+      "target": "x86_64",
+      "source": "vpbroadcastd %r8w, %zmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-076",
+      "target": "x86_64",
+      "source": "vpbroadcastd %r8d, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-077",
+      "target": "x86_64",
+      "source": "vpbroadcastd %r8d, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-078",
+      "target": "x86_64",
+      "source": "vpbroadcastd %r8d, %zmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-079",
+      "target": "x86_64",
+      "source": "vpbroadcastd %r8, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-080",
+      "target": "x86_64",
+      "source": "vpbroadcastd %r8, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-081",
+      "target": "x86_64",
+      "source": "vpbroadcastd %r8, %zmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-082",
+      "target": "x86_64",
+      "source": "vpbroadcastq %al, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-083",
+      "target": "x86_64",
+      "source": "vpbroadcastq %al, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-084",
+      "target": "x86_64",
+      "source": "vpbroadcastq %al, %zmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-085",
+      "target": "x86_64",
+      "source": "vpbroadcastq %ah, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-086",
+      "target": "x86_64",
+      "source": "vpbroadcastq %ah, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-087",
+      "target": "x86_64",
+      "source": "vpbroadcastq %ah, %zmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-088",
+      "target": "x86_64",
+      "source": "vpbroadcastq %ax, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-089",
+      "target": "x86_64",
+      "source": "vpbroadcastq %ax, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-090",
+      "target": "x86_64",
+      "source": "vpbroadcastq %ax, %zmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-091",
+      "target": "x86_64",
+      "source": "vpbroadcastq %eax, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-092",
+      "target": "x86_64",
+      "source": "vpbroadcastq %eax, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-093",
+      "target": "x86_64",
+      "source": "vpbroadcastq %eax, %zmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-094",
+      "target": "x86_64",
+      "source": "vpbroadcastq %rax, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-095",
+      "target": "x86_64",
+      "source": "vpbroadcastq %rax, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-096",
+      "target": "x86_64",
+      "source": "vpbroadcastq %rax, %zmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-097",
+      "target": "x86_64",
+      "source": "vpbroadcastq %r8b, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-098",
+      "target": "x86_64",
+      "source": "vpbroadcastq %r8b, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-099",
+      "target": "x86_64",
+      "source": "vpbroadcastq %r8b, %zmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-100",
+      "target": "x86_64",
+      "source": "vpbroadcastq %r8w, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-101",
+      "target": "x86_64",
+      "source": "vpbroadcastq %r8w, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-102",
+      "target": "x86_64",
+      "source": "vpbroadcastq %r8w, %zmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-103",
+      "target": "x86_64",
+      "source": "vpbroadcastq %r8d, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-104",
+      "target": "x86_64",
+      "source": "vpbroadcastq %r8d, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-105",
+      "target": "x86_64",
+      "source": "vpbroadcastq %r8d, %zmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-106",
+      "target": "x86_64",
+      "source": "vpbroadcastq %r8, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-107",
+      "target": "x86_64",
+      "source": "vpbroadcastq %r8, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-108",
+      "target": "x86_64",
+      "source": "vpbroadcastq %r8, %zmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-109",
+      "target": "i686",
+      "source": "vpbroadcastb %al, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-110",
+      "target": "i686",
+      "source": "vpbroadcastb %al, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-111",
+      "target": "i686",
+      "source": "vpbroadcastb %ah, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-112",
+      "target": "i686",
+      "source": "vpbroadcastb %ah, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-113",
+      "target": "i686",
+      "source": "vpbroadcastb %ax, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-114",
+      "target": "i686",
+      "source": "vpbroadcastb %ax, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-115",
+      "target": "i686",
+      "source": "vpbroadcastb %eax, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-116",
+      "target": "i686",
+      "source": "vpbroadcastb %eax, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-117",
+      "target": "i686",
+      "source": "vpbroadcastb %eax, %zmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-118",
+      "target": "i686",
+      "source": "vpbroadcastw %al, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-119",
+      "target": "i686",
+      "source": "vpbroadcastw %al, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-120",
+      "target": "i686",
+      "source": "vpbroadcastw %ah, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-121",
+      "target": "i686",
+      "source": "vpbroadcastw %ah, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-122",
+      "target": "i686",
+      "source": "vpbroadcastw %ax, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-123",
+      "target": "i686",
+      "source": "vpbroadcastw %ax, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-124",
+      "target": "i686",
+      "source": "vpbroadcastw %eax, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-125",
+      "target": "i686",
+      "source": "vpbroadcastw %eax, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-126",
+      "target": "i686",
+      "source": "vpbroadcastw %eax, %zmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-127",
+      "target": "i686",
+      "source": "vpbroadcastd %al, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-128",
+      "target": "i686",
+      "source": "vpbroadcastd %al, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-129",
+      "target": "i686",
+      "source": "vpbroadcastd %ah, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-130",
+      "target": "i686",
+      "source": "vpbroadcastd %ah, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-131",
+      "target": "i686",
+      "source": "vpbroadcastd %ax, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-132",
+      "target": "i686",
+      "source": "vpbroadcastd %ax, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-133",
+      "target": "i686",
+      "source": "vpbroadcastd %eax, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-134",
+      "target": "i686",
+      "source": "vpbroadcastd %eax, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-135",
+      "target": "i686",
+      "source": "vpbroadcastd %eax, %zmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-136",
+      "target": "i686",
+      "source": "vpbroadcastq %al, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-137",
+      "target": "i686",
+      "source": "vpbroadcastq %al, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-138",
+      "target": "i686",
+      "source": "vpbroadcastq %ah, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-139",
+      "target": "i686",
+      "source": "vpbroadcastq %ah, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-140",
+      "target": "i686",
+      "source": "vpbroadcastq %ax, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-141",
+      "target": "i686",
+      "source": "vpbroadcastq %ax, %ymm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-142",
+      "target": "i686",
+      "source": "vpbroadcastq %eax, %xmm1"
+    },
+    {
+      "series": "broadcast-width",
+      "id": "broadcast-width-143",
+      "target": "i686",
+      "source": "vpbroadcastq %eax, %ymm1"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-001",
+      "target": "x86_64",
+      "source": "vpabsq %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-002",
+      "target": "x86_64",
+      "source": "{vex} vpabsq %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-003",
+      "target": "x86_64",
+      "source": "vpandnd %xmm3, %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-004",
+      "target": "x86_64",
+      "source": "{vex} vpandnd %xmm3, %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-005",
+      "target": "x86_64",
+      "source": "vpandnq %xmm3, %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-006",
+      "target": "x86_64",
+      "source": "{vex} vpandnq %xmm3, %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-007",
+      "target": "x86_64",
+      "source": "vpconflictd %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-008",
+      "target": "x86_64",
+      "source": "{vex} vpconflictd %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-009",
+      "target": "x86_64",
+      "source": "vpconflictq %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-010",
+      "target": "x86_64",
+      "source": "{vex} vpconflictq %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-011",
+      "target": "x86_64",
+      "source": "vpmaxsq %xmm3, %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-012",
+      "target": "x86_64",
+      "source": "{vex} vpmaxsq %xmm3, %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-013",
+      "target": "x86_64",
+      "source": "vpmaxuq %xmm3, %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-014",
+      "target": "x86_64",
+      "source": "{vex} vpmaxuq %xmm3, %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-015",
+      "target": "x86_64",
+      "source": "vpminsq %xmm3, %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-016",
+      "target": "x86_64",
+      "source": "{vex} vpminsq %xmm3, %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-017",
+      "target": "x86_64",
+      "source": "vpminuq %xmm3, %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-018",
+      "target": "x86_64",
+      "source": "{vex} vpminuq %xmm3, %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-019",
+      "target": "x86_64",
+      "source": "vpmullq %xmm3, %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-020",
+      "target": "x86_64",
+      "source": "{vex} vpmullq %xmm3, %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-021",
+      "target": "x86_64",
+      "source": "vpsraq $1, %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-022",
+      "target": "x86_64",
+      "source": "{vex} vpsraq $1, %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-023",
+      "target": "x86_64",
+      "source": "vpsravq %xmm3, %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-024",
+      "target": "x86_64",
+      "source": "{vex} vpsravq %xmm3, %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-025",
+      "target": "i686",
+      "source": "vpabsq %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-026",
+      "target": "i686",
+      "source": "{vex} vpabsq %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-027",
+      "target": "i686",
+      "source": "vpandnd %xmm3, %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-028",
+      "target": "i686",
+      "source": "{vex} vpandnd %xmm3, %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-029",
+      "target": "i686",
+      "source": "vpandnq %xmm3, %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-030",
+      "target": "i686",
+      "source": "{vex} vpandnq %xmm3, %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-031",
+      "target": "i686",
+      "source": "vpconflictd %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-032",
+      "target": "i686",
+      "source": "{vex} vpconflictd %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-033",
+      "target": "i686",
+      "source": "vpconflictq %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-034",
+      "target": "i686",
+      "source": "{vex} vpconflictq %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-035",
+      "target": "i686",
+      "source": "vpmaxsq %xmm3, %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-036",
+      "target": "i686",
+      "source": "{vex} vpmaxsq %xmm3, %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-037",
+      "target": "i686",
+      "source": "vpmaxuq %xmm3, %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-038",
+      "target": "i686",
+      "source": "{vex} vpmaxuq %xmm3, %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-039",
+      "target": "i686",
+      "source": "vpminsq %xmm3, %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-040",
+      "target": "i686",
+      "source": "{vex} vpminsq %xmm3, %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-041",
+      "target": "i686",
+      "source": "vpminuq %xmm3, %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-042",
+      "target": "i686",
+      "source": "{vex} vpminuq %xmm3, %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-043",
+      "target": "i686",
+      "source": "vpmullq %xmm3, %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-044",
+      "target": "i686",
+      "source": "{vex} vpmullq %xmm3, %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-045",
+      "target": "i686",
+      "source": "vpsraq $1, %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-046",
+      "target": "i686",
+      "source": "{vex} vpsraq $1, %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-047",
+      "target": "i686",
+      "source": "vpsravq %xmm3, %xmm1, %xmm2"
+    },
+    {
+      "series": "evex-only",
+      "id": "evex-only-048",
+      "target": "i686",
+      "source": "{vex} vpsravq %xmm3, %xmm1, %xmm2"
+    }
+  ]
+}

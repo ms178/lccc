@@ -523,10 +523,19 @@ jobs:
           CCC: target/fastbuild/lccc
         run: bash tests/regression/check_seg_prefix_full_matrix.sh
 
+      # The isolated PR #629 x86-64 corpus uses APX encodings unavailable
+      # in ubuntu-latest's distro binutils. Install the pinned oracle instead
+      # of silently skipping its 90-case accepted/rejected differential gate.
+      - name: Install GNU as 2.47 for x86-64 differential
+        run: bash scripts/ensure_gas_247.sh x86_64-linux-gnu
+
+      - name: Verify merged PR #629 x86-64 assembly differential vs GNU as 2.47
+        run: python3 scripts/asmdiff.py --jobs 2 --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" --lccc target/fastbuild/lccc-x86 tests/asm-diff/merged-pr629-followup.casefile
+
       # Whole-object ELF32 differential corpus, including relocation/addend
       # ownership for bare memory operands and relaxation-patched loop/jecxz.
       - name: Verify i686 assembly differential vs GNU as
-        run: python3 scripts/asmdiff.py --32 --lccc target/fastbuild/lccc-i686
+        run: python3 scripts/asmdiff.py --32 --jobs 2 --lccc target/fastbuild/lccc-i686
 
       # Keep every standalone gate from ci_local.sh represented in hosted CI.
       # Group the compact contracts to avoid YAML drift and setup overhead;
@@ -537,6 +546,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/check_ci_gate_parity.py
+          python3 scripts/test_ci_gate_parity.py
           bash tests/regression/check_loop_memset.sh
           bash tests/regression/check_bool_pair_tail_jmp.sh
           bash tests/regression/check_bool_pair_prune.sh

@@ -1,0 +1,44 @@
+{
+  "repository_head": "da01098fe423dd023270cf256d9e527fea000ada",
+  "note": "Compiled binaries (not merely HEAD); identify them by SHA-256 below. Diagnostic wording is informational.",
+  "inputs": "engineering/evidence/2026-09-26-pr630-review/pr629-probe-inputs.json",
+  "inputs_sha256": "841fcfc2bf758d95c692d562995525f1d98eb01d93ce223594c10ebfbd9f7c5f",
+  "oracle": {
+    "x86_64": {
+      "version": "GNU assembler (GNU Binutils) 2.47.20260726",
+      "sha256": "337fffe4e577749002dbd0cf268bf49b75fe3032f641a79cb4993cc21589dfc0"
+    },
+    "i686": {
+      "version": "GNU assembler (GNU Binutils) 2.47.20260726",
+      "sha256": "f3139962e4030bc58708aaf8e0d7612f46be66546fc05badd7c5934dbe332493"
+    }
+  },
+  "compiler_sha256": {
+    "x86_64": "4ab6f26e1d416567597311cc72a72577fb9ed2b5cff55ec81e11ed84c9e00a98",
+    "i686": "4ef6e60dbc33157a59d565a335146599e83dd07615224afd494afeadb1e13368"
+  },
+  "per_series": {
+    "broadcast-width": {
+      "total": 143,
+      "accepted_by_gas": 33,
+      "accepted_by_lccc": 33,
+      "matches": 143,
+      "mismatch_reasons": {}
+    },
+    "evex-only": {
+      "total": 48,
+      "accepted_by_gas": 24,
+      "accepted_by_lccc": 24,
+      "matches": 48,
+      "mismatch_reasons": {}
+    },
+    "pr629-isolated": {
+      "total": 88,
+      "accepted_by_gas": 41,
+      "accepted_by_lccc": 41,
+      "matches": 88,
+      "mismatch_reasons": {}
+    }
+  },
+  "mismatches": []
+}

@@ -414,22 +414,23 @@ impl SemanticAnalyzer {
                 if declarator.name.is_empty() {
                     continue;
                 }
-                // Check for function typedef (e.g., typedef int func_t(int, int);)
-                let has_func_derived = declarator
-                    .derived
-                    .iter()
-                    .any(|d| matches!(d, DerivedDeclarator::Function(_, _)));
-                let has_fptr_derived = declarator
-                    .derived
-                    .iter()
-                    .any(|d| matches!(d, DerivedDeclarator::FunctionPointer(_, _)));
-
-                if has_func_derived && !has_fptr_derived {
-                    // Function typedef like: typedef int func_t(int x);
-                    if let Some(DerivedDeclarator::Function(params, variadic)) = declarator
+                // Check for function typedef (e.g., typedef int func_t(int, int);),
+                // including function types RETURNING function pointers
+                // (`typedef void (*fn_t(int))(void);`), which must not be
+                // mistaken for function-pointer typedefs merely because the
+                // return type contains a FunctionPointer declarator.
+                let has_func_derived = DerivedDeclarator::declares_function(&declarator.derived);
+                let has_fptr_derived = !has_func_derived
+                    && declarator
                         .derived
                         .iter()
-                        .find(|d| matches!(d, DerivedDeclarator::Function(_, _)))
+                        .any(|d| matches!(d, DerivedDeclarator::FunctionPointer(_, _)));
+
+                if has_func_derived {
+                    // Function typedef like: typedef int func_t(int x);
+                    // The typedef's own parameter list is the LAST derived.
+                    if let Some(DerivedDeclarator::Function(params, variadic)) =
+                        declarator.derived.last()
                     {
                         let ptr_count = declarator
                             .derived

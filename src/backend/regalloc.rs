@@ -10,8 +10,9 @@
 
 use super::live_range::{self, LinearScanAllocator};
 use super::liveness::{
-    LiveInterval, LivenessResult, compute_live_intervals, for_each_operand_in_instruction,
-    for_each_operand_in_terminator, for_each_value_use_in_instruction,
+    LiveInterval, LivenessResult, compute_live_intervals, compute_live_intervals_with_hidden_reads,
+    for_each_operand_in_instruction, for_each_operand_in_terminator,
+    for_each_value_use_in_instruction,
 };
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
@@ -99,6 +100,14 @@ pub(crate) struct RaConfig {
     pub(crate) no_iterated_hazard: bool,
     /// `CCC_NO_SEGMENT_FILL`: disable segment-fill allocation (default: false).
     pub(crate) no_segment_fill: bool,
+    /// `CCC_SEGMENT_FILL_LIMIT=N`: bisection aid — admit at most N Phase-2f
+    /// segment fills per allocation run (default: unlimited).  Combine with
+    /// `CCC_SEGMENT_FILL_FUNC` to confine the limit to one function; the
+    /// `CCC_DEBUG_SEGMENT_FILL` trace lists the fills in admission order.
+    pub(crate) segment_fill_limit: Option<usize>,
+    /// `CCC_SEGMENT_FILL_FUNC=name`: restrict `CCC_SEGMENT_FILL_LIMIT` to the
+    /// named function (default: the limit, when set, applies everywhere).
+    pub(crate) segment_fill_func: Option<String>,
     /// `CCC_NO_REDUCTION_VECREG`: disable reduction vector homes (default: false).
     pub(crate) no_reduction_vecreg: bool,
     /// `CCC_NO_MAP_VECREG`: disable map vector homes (default: false).
@@ -324,6 +333,9 @@ impl RaConfig {
             hot_web_steal: number("CCC_HOT_WEB_STEAL", 3),
             no_iterated_hazard: present("CCC_NO_ITERATED_HAZARD"),
             no_segment_fill: present("CCC_NO_SEGMENT_FILL"),
+            segment_fill_limit: text("CCC_SEGMENT_FILL_LIMIT")
+                .and_then(|value| value.parse::<usize>().ok()),
+            segment_fill_func: text("CCC_SEGMENT_FILL_FUNC"),
             no_reduction_vecreg: present("CCC_NO_REDUCTION_VECREG"),
             no_map_vecreg: present("CCC_NO_MAP_VECREG"),
             no_fp_copy_web: present("CCC_NO_FP_COPY_WEB"),
@@ -1104,22 +1116,17 @@ pub struct RegAllocConfig {
     pub allow_inline_asm_regalloc: bool,
     pub xmm_regs: Vec<PhysReg>,
     pub never_materialized: FxHashSet<u32>,
-    /// Backend-folded GEP index consumers: map of `index value id` → the
-    /// GEP-dest value ids whose Load/Store consumes the index through an
-    /// indexed addressing form. The IR records no use of the index at that
-    /// point (the offset computation was folded away), so the allocator must
-    /// extend the index's live interval to the consumer's own interval end —
-    /// otherwise the index's register is free for reuse and the emitted
-    /// `[base, index, lsl #N]` reads whatever moved in (reproduced: fa[i]
-    /// stores landing on fa[seed] on aarch64 -O0/-O2).
-    ///
-    /// ONLY backends that actually EMIT the indexed form (overriding
-    /// emit_load_indexed/emit_store_indexed — currently arm alone) may pass a
-    /// non-empty map. x86-64/i686 return false from the default hooks and
-    /// re-materialise the skipped GEP at the load (IR-visible uses intact);
-    /// extending there only adds register pressure (it regressed
-    /// check_gpr_leaf_param_codegen::pointer_mix when applied globally —
-    /// session-23 audit of the Agent-B patch).
+    /// Backend-folded operand reads: map of `operand value id` → consumer
+    /// value ids whose emission re-reads the operand's register with no IR
+    /// operand recording it — the (peeled) index of a SIB/indexed-folded GEP,
+    /// read at the consumer's Load/Store, and CMP-REPLAY operands, re-compared
+    /// at the Cmp's consumers. The allocator hands the map to
+    /// `compute_live_intervals_with_hidden_reads`, which treats the operand as
+    /// used at each consumer's definition and uses inside the liveness
+    /// dataflow; otherwise the operand's register is free for reuse and the
+    /// emitted `[base, index, lsl #N]` reads whatever moved in (reproduced:
+    /// fa[i] stores landing on fa[seed] on aarch64 -O0/-O2; sqlite
+    /// `wherePathSolver` indexing `aLoop[]` with a pointer on x86-64).
     pub folded_index_uses: FxHashMap<u32, Vec<u32>>,
     /// ABI-preferred homes (e.g. an incoming ParamRef already in `%rdi`).
     /// Hints never override `follow_value` and are honored only when the
@@ -3127,7 +3134,17 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     }
 
     let is_32bit = crate::common::types::target_is_32bit();
-    let mut liveness = compute_live_intervals(func);
+    // Backend-folded operand reads (peeled SIB indices, CMP-REPLAY operands;
+    // see RegAllocConfig::folded_index_uses) are ordinary uses to the
+    // liveness dataflow, so every interval and hole-aware segment derived
+    // below already covers them on every CFG path.
+    let no_hidden_reads = FxHashMap::default();
+    let hidden_reads = if config.ra_config.no_folded_index_liveness {
+        &no_hidden_reads
+    } else {
+        &config.folded_index_uses
+    };
+    let mut liveness = compute_live_intervals_with_hidden_reads(func, hidden_reads);
     // DivRem pair tails are physically born at their head's dual-store;
     // extend their intervals before ANY interval map is derived. Without
     // this, homes/slots in the head..tail window get double-assigned.
@@ -3135,160 +3152,6 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // Mul-acc chain tails are born at their head's fused store, and the
     // virtual feeder sources live until the head reads them — same contract.
     patch_mulacc_intervals(func, &mut liveness, &config.ra_config);
-    // Extend live intervals for backend-folded index consumers BEFORE any
-    // interval map is derived (see RegAllocConfig::folded_index_uses).
-    if !config.folded_index_uses.is_empty() && !config.ra_config.no_folded_index_liveness {
-        // value_id -> (start, end) from the consumer GEP-dest intervals. The
-        // dest's END is the access that re-reads the operand RA-invisibly
-        // (SIB load/store, replayed cmp). dest.start is the GEP / Cmp itself
-        // — NOT always the last IR-visible read of `idx`: `resolve_index`
-        // peels Cast/Shl/Mul/Add, so a peeled index's last IR use is the
-        // widening Cast sitting BEFORE the GEP (sqlite3 vdbeChangeP4Full).
-        let mut bounds_of: FxHashMap<u32, (u32, u32)> = FxHashMap::default();
-        for iv in &liveness.intervals {
-            bounds_of.insert(iv.value_id, (iv.start, iv.end));
-        }
-        // Multi-def (phi-elim latch) values: the only shape whose folded
-        // consumer can sit inside a liveness HOLE before the final segment,
-        // where a tail-only stretch is a silent no-op. For single-def values
-        // the historical LAST-segment stretch is kept: merging the consumer
-        // spans into the union moves the coverage boundary anchors
-        // (first/last live unit) that the segment scan's die-at-birth
-        // permission is computed against, and for values whose hole is not
-        // real liveness (no redefinition between producer and access) the
-        // moved anchors let a boundary touch through at a NON-boundary
-        // position — under-constraining exactly where the merge meant to
-        // over-constrain (preboot-ZSTD: every pattern failed with
-        // "ZSTD-compressed data is corrupt" until the merge was gated back
-        // to multi-def latches).
-        let mut def_count: FxHashMap<u32, u32> = FxHashMap::default();
-        for block in &func.blocks {
-            for inst in &block.instructions {
-                if let Some(d) = inst.dest() {
-                    *def_count.entry(d.0).or_insert(0) += 1;
-                }
-            }
-        }
-        let multi_def: FxHashSet<u32> = def_count
-            .iter()
-            .filter(|&(_, &c)| c > 1)
-            .map(|(&v, _)| v)
-            .collect();
-        for (idx, dests) in &config.folded_index_uses {
-            let mut new_end: Option<u32> = None;
-            // Real-liveness ranges the operand must survive: one per
-            // consumer. dest.start is the GEP, but a peeled index's last
-            // IR use is typically a widening Cast / scale BEFORE the GEP
-            // (the GEP reads orig_offset). Starting required at dest.start
-            // then misses every call between that last IR use and the GEP:
-            // sqlite3 vdbeChangeP4Full inlined sqlite3DbStrNDup homes the
-            // multi-def I32 Copy of `n` in %r10, memcpy clobbers it, then
-            // ensure_sib_index_form movslqs the stale register for p[n]=0.
-            // required starts at the last IR-visible segment end when the
-            // index is not live at dest.start (fills Cast→Store including
-            // the call). A covering segment keeps [GEP, Store].
-            let mut required: Vec<(u32, u32)> = Vec::new();
-            // Fat interval end is the block envelope (join block runs through
-            // memcpy+GEP+Store), so it is NOT the last IR use. Use hole-aware
-            // segments: if idx is not live at dest.start, start required at
-            // the preceding segment end (the peeled Cast) so calls in the
-            // hole are covered. A covering segment keeps historical
-            // [GEP, Store] (vsprintf digit latch).
-            let idx_segs: Vec<(u32, u32)> = liveness
-                .segments
-                .iter()
-                .filter(|seg| seg.value_id == *idx)
-                .map(|seg| (seg.start, seg.end))
-                .collect();
-            for d in dests {
-                if let Some(&(s, e)) = bounds_of.get(d) {
-                    new_end = Some(new_end.map_or(e, |x: u32| x.max(e)));
-                    if s < e {
-                        let covering = idx_segs.iter().any(|&(ss, ee)| ss <= s && s < ee);
-                        let req_s = if covering {
-                            s
-                        } else {
-                            idx_segs
-                                .iter()
-                                .map(|&(_, ee)| ee)
-                                .filter(|&ee| ee <= s)
-                                .max()
-                                .unwrap_or(s)
-                        };
-                        if req_s < e {
-                            required.push((req_s, e));
-                        }
-                    }
-                }
-            }
-            if let Some(e) = new_end {
-                for iv in &mut liveness.intervals {
-                    if iv.value_id == *idx && iv.end < e {
-                        iv.end = e;
-                    }
-                }
-                // Hole-aware segments. Stretching only the LAST segment is a
-                // silent NO-OP for multi-def latch values: their fat envelope
-                // already ends past the access (the backedge copy), so both
-                // `iv.end < e` and `last_seg.end < e` are false while a live
-                // HOLE sits exactly on the access — the IR's last read of the
-                // operand is the folded-away GEP, and liveness legitimately
-                // dies there. The scan's hole-aware interference then reused
-                // the register across the access: vsprintf number()'s
-                // `tmp[i++] = digit` wrote tmp[digit] because the digit's
-                // zext landed in i's register between the GEP and the store.
-                // The operand IS read at the producer position (its segment
-                // covers [.., producer]) and re-read at the access, so
-                // [producer, access] is real liveness for multi-def latches:
-                // merge it into the segment union. Single-def values keep
-                // the historical tail stretch (see the multi_def note above
-                // for why the unconditional merge is NOT sound).
-                let mut pieces: Vec<(u32, u32)> = Vec::new();
-                let mut has_segments = false;
-                liveness.segments.retain(|seg| {
-                    if seg.value_id != *idx {
-                        return true;
-                    }
-                    has_segments = true;
-                    pieces.push((seg.start, seg.end));
-                    false
-                });
-                if has_segments {
-                    if multi_def.contains(idx) && !required.is_empty() {
-                        required.sort_unstable();
-                        pieces.sort_unstable();
-                        let mut merged: Vec<(u32, u32)> = Vec::new();
-                        insert_segment_union(&mut merged, &pieces);
-                        insert_segment_union(&mut merged, &required);
-                        pieces = merged;
-                    } else {
-                        // Historical tail stretch (single-def shapes).
-                        if let Some(last) = pieces.last_mut() {
-                            if last.1 < e {
-                                last.1 = e;
-                            }
-                        }
-                        pieces.sort_unstable();
-                    }
-                    for &(s, e2) in &pieces {
-                        liveness
-                            .segments
-                            .push(crate::backend::liveness::LiveInterval {
-                                value_id: *idx,
-                                start: s,
-                                end: e2,
-                            });
-                    }
-                }
-                // Values without segment data keep the fat-envelope
-                // extension above (fail-closed: the scan and the verifier
-                // both fall back to the envelope for them).
-            }
-        }
-        liveness
-            .segments
-            .sort_unstable_by_key(|segment| (segment.start, segment.value_id, segment.end));
-    }
     let iv_map = interval_map(&liveness);
     let call_points = &liveness.call_points;
 
@@ -5014,7 +4877,17 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             .filter(|r| used_regs_set.contains(&r.0))
             .collect();
         let mut added = 0usize;
+        let fill_limit = config.ra_config.segment_fill_limit.filter(|_| {
+            config
+                .ra_config
+                .segment_fill_func
+                .as_deref()
+                .is_none_or(|f| f == func.name)
+        });
         for (_, _, value) in candidates {
+            if fill_limit.is_some_and(|limit| added >= limit) {
+                break;
+            }
             let Some(candidate_segments) = owned_segments.get(&value) else {
                 continue;
             };
@@ -11344,6 +11217,8 @@ mod ra_config_tests {
         assert_eq!(defaults.ra_drop_func, None);
         assert_eq!(defaults.phi_coalesce_skip, None);
         assert_eq!(defaults.phi_coalesce_func, None);
+        assert_eq!(defaults.segment_fill_limit, None);
+        assert_eq!(defaults.segment_fill_func, None);
 
         let configured = from(&[
             ("CCC_LOOP_PIN", "7"),
@@ -11365,6 +11240,8 @@ mod ra_config_tests {
             ("CCC_MI_FN_DISABLE", "cold"),
             ("CCC_MI_FN_FORCE", "hot"),
             ("CCC_MI_DISABLE_KINDS", "call,load"),
+            ("CCC_SEGMENT_FILL_LIMIT", "4"),
+            ("CCC_SEGMENT_FILL_FUNC", "fill_fn"),
         ]);
         assert_eq!(configured.loop_pin, 7);
         assert_eq!(configured.hot_web_steal, 9);
@@ -11388,6 +11265,8 @@ mod ra_config_tests {
         assert_eq!(configured.mi_fn_disable, "cold");
         assert_eq!(configured.mi_fn_force, "hot");
         assert_eq!(configured.mi_disable_kinds, "call,load");
+        assert_eq!(configured.segment_fill_limit, Some(4));
+        assert_eq!(configured.segment_fill_func.as_deref(), Some("fill_fn"));
 
         let malformed = from(&[
             ("CCC_LOOP_PIN", "not-a-number"),
@@ -11396,6 +11275,7 @@ mod ra_config_tests {
             ("CCC_RA_LOOP_SPAN_RESERVE", "not-a-number"),
             ("CCC_PGO_WEIGHT_MAX", "0"),
             ("CCC_MI_MAX_LOOP_INSTS", "bad"),
+            ("CCC_SEGMENT_FILL_LIMIT", "-3"),
         ]);
         assert_eq!(malformed.loop_pin, 2);
         assert_eq!(malformed.hot_web_steal, 3);
@@ -11403,6 +11283,7 @@ mod ra_config_tests {
         assert_eq!(malformed.loop_span_reserve, 0);
         assert_eq!(malformed.pgo_weight_max, 1);
         assert_eq!(malformed.mi_max_loop_insts, MI_MAX_LOOP_INSTS_DEFAULT);
+        assert_eq!(malformed.segment_fill_limit, None);
 
         let fp_override = from(&[
             ("CCC_DISABLE_SCALAR_FP_XMM", "1"),
