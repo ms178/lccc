@@ -1008,11 +1008,12 @@ impl Lowerer {
                             return true;
                         }
                     } else {
-                        // Fallback: check ptr_sigs only when c_type is unavailable.
-                        // When c_type IS available, the check above is authoritative —
-                        // ptr_sigs may contain entries for pointer-to-function-pointers
+                        // Fallback: consult the binding's declared function-pointer
+                        // signature only when c_type is unavailable.  When c_type IS
+                        // available, the check above is authoritative — a declared
+                        // signature is also recorded for pointer-to-function-pointers,
                         // which are NOT no-op derefs.
-                        if self.func_meta.ptr_sigs.contains_key(name.as_str()) {
+                        if self.local_fptr_sig(name).is_some() {
                             return true;
                         }
                     }

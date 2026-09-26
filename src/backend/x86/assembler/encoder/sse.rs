@@ -1046,6 +1046,24 @@ impl super::InstructionEncoder {
         mem: &MemoryOperand,
         scale_n: u32,
     ) -> Result<(), String> {
+        let start = self.bytes.len();
+        let result = self.encode_evex_mem_body(reg_field, mem, scale_n);
+        if result.is_ok() && self.track_memory_emission {
+            self.memory_emission = Some(super::MemoryEmission {
+                start,
+                end: self.bytes.len(),
+                disp8_scale: scale_n,
+            });
+        }
+        result
+    }
+
+    fn encode_evex_mem_body(
+        &mut self,
+        reg_field: u8,
+        mem: &MemoryOperand,
+        scale_n: u32,
+    ) -> Result<(), String> {
         // RIP-relative: same ModRM (mod=00 rm=101 + disp32) as the legacy
         // encoder, including `sym@GOTPCREL` / `@GOTTPOFF` / `@TLSDESC`.
         // `gotpcrel_x_type` then classifies AVX-512 EVEX as plain

@@ -667,9 +667,15 @@ impl super::InstructionEncoder {
     /// Skip group-2/3/4 legacy prefixes; return the index of the first
     /// opcode/REX/VEX/EVEX byte of the instruction currently in `self.bytes`.
     pub(crate) fn prefix_start(&self) -> usize {
+        Self::prefix_start_of(&self.bytes)
+    }
+
+    /// The same prefix scan over one instruction, also used by the i686
+    /// decorator validator without constructing/copying an x86-64 encoder.
+    pub(crate) fn prefix_start_of(bytes: &[u8]) -> usize {
         let mut i = 0;
-        while i < self.bytes.len() {
-            match self.bytes[i] {
+        while i < bytes.len() {
+            match bytes[i] {
                 0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x66 | 0x67 | 0xF0 | 0xF2 | 0xF3 => {
                     i += 1
                 }
@@ -810,6 +816,19 @@ impl super::InstructionEncoder {
         reg_field: u8,
         mem: &MemoryOperand,
     ) -> Result<(), String> {
+        let start = self.bytes.len();
+        let result = self.encode_modrm_mem_body(reg_field, mem);
+        if result.is_ok() && self.track_memory_emission {
+            self.memory_emission = Some(super::MemoryEmission {
+                start,
+                end: self.bytes.len(),
+                disp8_scale: 1,
+            });
+        }
+        result
+    }
+
+    fn encode_modrm_mem_body(&mut self, reg_field: u8, mem: &MemoryOperand) -> Result<(), String> {
         let base = mem.base.as_ref();
         let index = mem.index.as_ref();
 

@@ -23,6 +23,7 @@ use super::helpers::{
     implicit_read_reg_family, is_read_modify_write, is_rsp_shift_line, src_mentions_family,
     writes_family,
 };
+use super::liveness::call_window_verdict;
 
 /// True when a line transfers control or merges paths, so that textual line
 /// order can diverge from execution order.  A load-value reader textually
@@ -1128,11 +1129,10 @@ pub(super) fn fold_store_relay(store: &mut LineStore, infos: &mut [LineInfo]) ->
     changed
 }
 
-/// Check if %rax is dead starting from instruction index `start`.
-/// Returns true if rax is overwritten before being read within a 16-instruction window.
-/// Returns true if the register `reg` (0=rax, 1=rcx, 2=rdx) is not read
-/// again before the next write within a 16-instruction window starting at
-/// `start`. Barriers (except calls) conservatively return false.
+/// Returns true if GP family `reg` (0=rax, 1=rcx, 2=rdx, ...) is not read
+/// again before the next write within a 64-instruction window starting at
+/// `start`. Calls follow `call_window_verdict`; every other barrier
+/// conservatively returns false.
 fn is_reg_dead_after(
     store: &LineStore,
     infos: &[LineInfo],
@@ -1154,19 +1154,24 @@ fn is_reg_dead_after(
             scan += 1;
             continue;
         }
-        // A barrier means control flow splits or the function returns. Only a
-        // function CALL genuinely clobbers caller-saved registers. A Ret may
-        // use %rax as the return value, and a branch/label may have the
-        // register LIVE on another edge — so we must NOT treat
-        // Ret/branch/label as dead. This was the soundness bug in the relay
-        // passes: they forwarded through barriers and produced wrong code on
-        // paths that used the register.
-        if infos[scan].is_barrier() {
-            if infos[scan].kind == LineKind::Call {
-                // A call clobbers caller-saved registers (their results
-                // overwrite any prior value), so the register is dead after.
-                return true;
+        // A call kills only what it clobbers without reading, and is
+        // transparent to callee-saved families (see `call_window_verdict`).
+        if infos[scan].kind == LineKind::Call {
+            match call_window_verdict(store, infos, scan, reg) {
+                Some(dead) => return dead,
+                None => {
+                    scan += 1;
+                    continue;
+                }
             }
+        }
+        // Any other barrier means control flow splits or the function
+        // returns. A Ret may use %rax as the return value, and a
+        // branch/label may have the register LIVE on another edge — so we
+        // must NOT treat Ret/branch/label as dead. This was the soundness bug
+        // in the relay passes: they forwarded through barriers and produced
+        // wrong code on paths that used the register.
+        if infos[scan].is_barrier() {
             return false;
         }
         if infos[scan].reg_refs & mask != 0 {
@@ -1249,8 +1254,17 @@ fn scratch_dead_after_relaxed(
             }
             _ => {}
         }
+        if infos[scan].kind == LineKind::Call {
+            match call_window_verdict(store, infos, scan, reg) {
+                Some(dead) => return dead,
+                None => {
+                    scan += 1;
+                    continue;
+                }
+            }
+        }
         if infos[scan].is_barrier() {
-            return infos[scan].kind == LineKind::Call;
+            return false;
         }
         if infos[scan].reg_refs & mask != 0 {
             match infos[scan].kind {
@@ -4194,5 +4208,90 @@ mod memfold_dst_move_tests {
             out.iter().any(|l| l == "movb %dl, %al"),
             "the establishing movb must remain: {out:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod movslq_relay_call_tests {
+    use super::super::super::types::classify_line;
+    use super::fold_movslq_relay;
+    use crate::backend::peephole_common::LineStore;
+
+    fn run(asm: &str) -> (bool, Vec<String>) {
+        let mut store = LineStore::new(asm.to_string());
+        let n = store.len();
+        let mut infos: Vec<_> = (0..n).map(|i| classify_line(store.get(i))).collect();
+        let changed = fold_movslq_relay(&mut store, &mut infos);
+        let out = (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect();
+        (changed, out)
+    }
+
+    /// `int sz = ...; p = malloc(sz); memset(p, 0, sz);` — the widened size
+    /// is homed in callee-saved %rbx and read again after the call. A call
+    /// does not end a callee-saved family's lifetime, so the relay must stay.
+    #[test]
+    fn callee_saved_tmp_read_after_call_is_live() {
+        let asm = "\
+    movslq %eax, %rbx\n\
+    movq %rbx, %rdi\n\
+    call malloc@PLT\n\
+    # LCCC_CALL_ARGS 1\n\
+    movq %rax, %rdi\n\
+    xorl %esi, %esi\n\
+    movq %rbx, %rdx\n\
+    call memset@PLT\n\
+    # LCCC_CALL_ARGS 3\n\
+";
+        let (changed, out) = run(asm);
+        assert!(!changed, "must keep the %rbx home: {out:?}");
+    }
+
+    /// A caller-saved scratch the callee does not read is clobbered by the
+    /// call, so the relay still folds.
+    #[test]
+    fn caller_saved_scratch_dies_at_call() {
+        let asm = "\
+    movslq %eax, %r11\n\
+    movq %r11, %rdi\n\
+    call malloc@PLT\n\
+    # LCCC_CALL_ARGS 1\n\
+    movq %r11, %rdx\n\
+";
+        let (changed, out) = run(asm);
+        assert!(changed, "r11 is clobbered by the call: {out:?}");
+        assert_eq!(out[0], "movslq %eax, %rdi");
+    }
+
+    /// An argument register the call consumes is live at the call.
+    #[test]
+    fn argument_register_read_by_call_is_live() {
+        let asm = "\
+    movslq %eax, %rsi\n\
+    movq %rsi, %rdi\n\
+    call f@PLT\n\
+    # LCCC_CALL_ARGS 2\n\
+";
+        let (changed, _) = run(asm);
+        assert!(!changed, "%rsi is the second argument");
+    }
+
+    /// Callee-saved and never read again: the scan continues past the call
+    /// and finds the redefinition, so the relay folds.
+    #[test]
+    fn callee_saved_tmp_redefined_after_call_folds() {
+        let asm = "\
+    movslq %eax, %rbx\n\
+    movq %rbx, %rdi\n\
+    call f@PLT\n\
+    # LCCC_CALL_ARGS 1\n\
+    movl $7, %ebx\n\
+    movq %rbx, %rsi\n\
+";
+        let (changed, out) = run(asm);
+        assert!(changed, "{out:?}");
+        assert_eq!(out[0], "movslq %eax, %rdi");
     }
 }

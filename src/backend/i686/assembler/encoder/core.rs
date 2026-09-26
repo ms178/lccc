@@ -911,12 +911,27 @@ impl super::InstructionEncoder {
         reg_field: u8,
         mem: &MemoryOperand,
     ) -> Result<(), String> {
+        self.encode_modrm_mem_scaled(reg_field, mem, 1)
+    }
+
+    /// Encode the same address planner used by legacy i686 instructions,
+    /// with the EVEX disp8*N compression supplied by the shared opcode
+    /// emitter. Ordinary VEX/XOP/legacy addresses have scale 1. 32-bit and
+    /// 16-bit addressing select their own full-width fallback (disp32 or
+    /// disp16); a raw disp8 would refer to a *different* address under EVEX.
+    pub(super) fn encode_modrm_mem_scaled(
+        &mut self,
+        reg_field: u8,
+        mem: &MemoryOperand,
+        disp8_scale: u32,
+    ) -> Result<(), String> {
+        if disp8_scale == 0 {
+            return Err("internal error: zero EVEX displacement scale".to_string());
+        }
         let folded = fold_index_into_base(mem);
         let mem = folded.as_ref().unwrap_or(mem);
-
         let (displacement, relocation) = i686_memory_displacement(&mem.displacement);
-
-        let plan = i686_plan_memory_address(
+        let mut plan = i686_plan_memory_address(
             self.code16,
             reg_field,
             mem.base.as_ref().map(|reg| reg.name.as_str()),
@@ -924,6 +939,42 @@ impl super::InstructionEncoder {
             mem.scale,
             displacement,
         )?;
+
+        if disp8_scale != 1 && !displacement.is_relocatable() {
+            let (bits, in_union) = displacement.normalize(plan.address16);
+            let mode = plan.bytes[0] >> 6;
+            // mod=00 with no displacement stays mod=00; an absolute or
+            // index-only 32-bit address MUST retain its full-width field.
+            if mode != 0 {
+                let signed = if plan.address16 {
+                    i64::from(bits as u16 as i16)
+                } else {
+                    i64::from(bits as i32)
+                };
+                let n = i64::from(disp8_scale);
+                let compressible = in_union && signed % n == 0 && i8::try_from(signed / n).is_ok();
+                let disp_len = if compressible {
+                    1
+                } else if plan.address16 {
+                    2
+                } else {
+                    4
+                };
+                let encoded = if compressible {
+                    (signed / n) as u32
+                } else {
+                    bits
+                };
+                let sib = (plan.header_len == 2).then_some(plan.bytes[1]);
+                plan = i686_make_address_plan(
+                    (if compressible { 1 } else { 2 }) << 6 | (plan.bytes[0] & 0x3F),
+                    sib,
+                    encoded,
+                    disp_len,
+                    plan.address16,
+                );
+            }
+        }
 
         self.i686_resolve_and_emit(&plan, relocation, true)
     }

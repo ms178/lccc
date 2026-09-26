@@ -1,0 +1,300 @@
+{
+  "repository_head": "a066f0c9b835ff36445a06bd762051e5a5039043",
+  "note": "Compiled binaries (not merely HEAD); identify them by SHA-256 below. Diagnostic wording is informational.",
+  "inputs": "engineering/evidence/2026-09-26-pr630-review/pr630-review-probe-inputs.json",
+  "inputs_sha256": "e168cc1a66ca91265bcbc6f9c34862017d2b985a11f0caf26efee1ae049ef700",
+  "oracle": {
+    "x86_64": {
+      "version": "GNU assembler (GNU Binutils) 2.47.20260726",
+      "sha256": "337fffe4e577749002dbd0cf268bf49b75fe3032f641a79cb4993cc21589dfc0"
+    },
+    "i686": {
+      "version": "GNU assembler (GNU Binutils) 2.47.20260726",
+      "sha256": "f3139962e4030bc58708aaf8e0d7612f46be66546fc05badd7c5934dbe332493"
+    }
+  },
+  "compiler_sha256": {
+    "x86_64": "fe855254c78a8fb52eb6c36ad8b450ce24ced11a2aa6b1e9c285d55a42d09f50",
+    "i686": "300318e86d88cb47806bc8d6f677f6c613a3a3e19219e42d037ab6608b5fd21c"
+  },
+  "per_series": {
+    "review-boundary": {
+      "total": 23,
+      "accepted_by_gas": 12,
+      "accepted_by_lccc": 20,
+      "matches": 8,
+      "mismatch_reasons": {
+        "acceptance": 10,
+        "bytes_or_relocs": 5
+      }
+    }
+  },
+  "mismatches": [
+    {
+      "id": "i686-r8d-byte",
+      "series": "review-boundary",
+      "target": "i686",
+      "source": "vpbroadcastb %r8d,%xmm1",
+      "match": false,
+      "gas": {
+        "ok": false,
+        "diagnostic": "Error: bad register name `%r8d'"
+      },
+      "lccc": {
+        "ok": true,
+        "text": "62 d2 7d 08 7a c8",
+        "relocs": []
+      }
+    },
+    {
+      "id": "i686-r8d-word",
+      "series": "review-boundary",
+      "target": "i686",
+      "source": "vpbroadcastw %r8d,%xmm1",
+      "match": false,
+      "gas": {
+        "ok": false,
+        "diagnostic": "Error: bad register name `%r8d'"
+      },
+      "lccc": {
+        "ok": true,
+        "text": "62 d2 7d 08 7b c8",
+        "relocs": []
+      }
+    },
+    {
+      "id": "i686-r8d-dword",
+      "series": "review-boundary",
+      "target": "i686",
+      "source": "vpbroadcastd %r8d,%xmm1",
+      "match": false,
+      "gas": {
+        "ok": false,
+        "diagnostic": "Error: bad register name `%r8d'"
+      },
+      "lccc": {
+        "ok": true,
+        "text": "62 d2 7d 08 7c c8",
+        "relocs": []
+      }
+    },
+    {
+      "id": "i686-r8-qword",
+      "series": "review-boundary",
+      "target": "i686",
+      "source": "vpbroadcastq %r8,%xmm1",
+      "match": false,
+      "gas": {
+        "ok": false,
+        "diagnostic": "Error: bad register name `%r8'"
+      },
+      "lccc": {
+        "ok": true,
+        "text": "62 d2 fd 08 7c c8",
+        "relocs": []
+      }
+    },
+    {
+      "id": "i686-rax-qword",
+      "series": "review-boundary",
+      "target": "i686",
+      "source": "vpbroadcastq %rax,%xmm1",
+      "match": false,
+      "gas": {
+        "ok": false,
+        "diagnostic": "Error: bad register name `%rax'"
+      },
+      "lccc": {
+        "ok": true,
+        "text": "62 f2 fd 08 7c c8",
+        "relocs": []
+      }
+    },
+    {
+      "id": "i686-r8d-memory-base-code32",
+      "series": "review-boundary",
+      "target": "i686",
+      "source": ".code32\nvaddps 8(%r8d),%xmm2,%xmm1",
+      "match": false,
+      "gas": {
+        "ok": false,
+        "diagnostic": "Error: bad register name `%r8d)'"
+      },
+      "lccc": {
+        "ok": true,
+        "text": "c4 c1 68 58 48 08",
+        "relocs": []
+      }
+    },
+    {
+      "id": "i686-r8d-memory-index-code16",
+      "series": "review-boundary",
+      "target": "i686",
+      "source": ".code16\nvpaddd 16(,%r8d,4),%zmm1,%zmm2",
+      "match": false,
+      "gas": {
+        "ok": false,
+        "diagnostic": "Error: bad register name `%r8d'"
+      },
+      "lccc": {
+        "ok": true,
+        "text": "62 b1 75 48 fe 14 85 10 00 00 00",
+        "relocs": []
+      }
+    },
+    {
+      "id": "i686-high-vector-source",
+      "series": "review-boundary",
+      "target": "i686",
+      "source": "vpabsq %xmm8,%xmm1",
+      "match": false,
+      "gas": {
+        "ok": false,
+        "diagnostic": "Error: bad register name `%xmm8'"
+      },
+      "lccc": {
+        "ok": true,
+        "text": "62 d2 fd 08 1f c8",
+        "relocs": []
+      }
+    },
+    {
+      "id": "i686-high-vector-dest",
+      "series": "review-boundary",
+      "target": "i686",
+      "source": "vpbroadcastb %eax,%zmm31",
+      "match": false,
+      "gas": {
+        "ok": false,
+        "diagnostic": "Error: bad register name `%zmm31'"
+      },
+      "lccc": {
+        "ok": true,
+        "text": "62 62 7d 48 7a f8",
+        "relocs": []
+      }
+    },
+    {
+      "id": "i686-low-zmm-legal-code16",
+      "series": "review-boundary",
+      "target": "i686",
+      "source": ".code16\nvpaddd (%bx),%zmm2,%zmm1{%k1}",
+      "match": false,
+      "gas": {
+        "ok": true,
+        "text": "62 f1 6d 49 fe 0f",
+        "relocs": []
+      },
+      "lccc": {
+        "ok": true,
+        "text": "62 f1 6d 49 fe 0b",
+        "relocs": []
+      }
+    },
+    {
+      "id": "i686-code16-addr16-evex",
+      "series": "review-boundary",
+      "target": "i686",
+      "source": ".code16\nvmovdqu8 64(%bx),%zmm1",
+      "match": false,
+      "gas": {
+        "ok": true,
+        "text": "62 f1 7f 48 6f 4f 01",
+        "relocs": []
+      },
+      "lccc": {
+        "ok": true,
+        "text": "62 f1 7f 48 6f 4b 01",
+        "relocs": []
+      }
+    },
+    {
+      "id": "i686-code16-addr32-evex",
+      "series": "review-boundary",
+      "target": "i686",
+      "source": ".code16\nvmovdqu8 64(%eax),%zmm1",
+      "match": false,
+      "gas": {
+        "ok": true,
+        "text": "67 62 f1 7f 48 6f 48 01",
+        "relocs": []
+      },
+      "lccc": {
+        "ok": true,
+        "text": "62 f1 7f 48 6f 48 01",
+        "relocs": []
+      }
+    },
+    {
+      "id": "i686-code32-addr16-evex",
+      "series": "review-boundary",
+      "target": "i686",
+      "source": ".code32\nvmovdqu8 64(%bx),%zmm1",
+      "match": false,
+      "gas": {
+        "ok": true,
+        "text": "67 62 f1 7f 48 6f 4f 01",
+        "relocs": []
+      },
+      "lccc": {
+        "ok": true,
+        "text": "62 f1 7f 48 6f 4b 01",
+        "relocs": []
+      }
+    },
+    {
+      "id": "i686-symbol-after-nop",
+      "series": "review-boundary",
+      "target": "i686",
+      "source": "nop\nvmovdqu8 sym(%eax),%zmm1",
+      "match": false,
+      "gas": {
+        "ok": true,
+        "text": "90 62 f1 7f 48 6f 88 00 00 00 00",
+        "relocs": [
+          [
+            7,
+            1,
+            "sym",
+            0
+          ]
+        ]
+      },
+      "lccc": {
+        "ok": true,
+        "text": "90 62 f1 7f 48 6f 88 00 00 00 00",
+        "relocs": [
+          [
+            8,
+            1,
+            "sym",
+            0
+          ]
+        ]
+      }
+    },
+    {
+      "id": "i686-code16-absolute-symbol",
+      "series": "review-boundary",
+      "target": "i686",
+      "source": ".code16\nvpaddd sym,%zmm1,%zmm2",
+      "match": false,
+      "gas": {
+        "ok": true,
+        "text": "62 f1 75 48 fe 16 00 00",
+        "relocs": [
+          [
+            6,
+            20,
+            "sym",
+            0
+          ]
+        ]
+      },
+      "lccc": {
+        "ok": false,
+        "diagnostic": "error: unsupported EVEX binary operands"
+      }
+    }
+  ]
+}

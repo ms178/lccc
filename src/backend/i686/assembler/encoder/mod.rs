@@ -15,7 +15,8 @@ mod x87;
 pub(crate) use registers::*;
 
 use crate::backend::x86::assembler::encoder::{
-    InstructionEncoder as X86InstructionEncoder, is_vex_xop_encoding, op_decorated,
+    InstructionEncoder as X86InstructionEncoder, gp_id, is_reg64, is_vex_xop_encoding,
+    normalize_bare_label, op_decorated, vec_reg_id,
 };
 use crate::backend::x86::assembler::parser::*;
 
@@ -193,8 +194,39 @@ impl InstructionEncoder {
         }
     }
 
-    /// Encode a single instruction and append bytes.
+    /// Encode one instruction atomically: callers may reuse this encoder
+    /// after an error without exposing an emitted prefix, a stale relocation
+    /// or a shifted location counter to the next instruction.
     pub fn encode(&mut self, instr: &Instruction) -> Result<(), String> {
+        let bytes = self.bytes.len();
+        let relocations = self.relocations.len();
+        let offset = self.offset;
+        let pending_addr32 = self.pending_addr32;
+        let sized_op = self.sized_op;
+        let ljmp_wide = self.ljmp_wide;
+        let vex_hint = self.vex_hint;
+        let result = self.encode_checked(instr);
+        if result.is_err() {
+            self.bytes.truncate(bytes);
+            self.relocations.truncate(relocations);
+            self.offset = offset;
+            self.pending_addr32 = pending_addr32;
+            self.sized_op = sized_op;
+            self.ljmp_wide = ljmp_wide;
+            self.vex_hint = vex_hint;
+        }
+        result
+    }
+
+    fn encode_checked(&mut self, instr: &Instruction) -> Result<(), String> {
+        // Shared x86-64 VEX/EVEX/XOP encoding cannot decide which register
+        // *names* exist in this mode. Validate every data/base/index operand
+        // before either the local or delegated path can alias r8d to eax or
+        // encode a 64-bit-only extension bit in a 32-bit object. EVEX and
+        // zmm0..7 remain legal in .code32 and .code16.
+        for op in &instr.operands {
+            validate_i686_operand_registers(op)?;
+        }
         // APX modifiers are not supported in 32-bit mode even if the
         // instruction would otherwise have a legal VEX/EVEX row. GAS 2.47
         // rejects them before testing the selected vector encoding.
@@ -245,9 +277,11 @@ impl InstructionEncoder {
             ));
         }
         if result.is_ok() && instr.operands.iter().any(op_decorated) {
-            let mut shared = X86InstructionEncoder::new();
-            shared.bytes.extend_from_slice(&self.bytes[start_len..]);
-            result = shared.check_decorators(&instr.mnemonic, &instr.operands);
+            result = X86InstructionEncoder::check_decorators(
+                &self.bytes[start_len..],
+                &instr.mnemonic,
+                &instr.operands,
+            );
         }
 
         // Canonical legacy-prefix order (GAS 2.47, byte-verified):
@@ -1862,10 +1896,6 @@ impl InstructionEncoder {
             "vbroadcastsd" => self.encode_avx_broadcast(ops, &[0x19]),
             "vbroadcastf128" => self.encode_avx_broadcast(ops, &[0x1A]),
             "vbroadcasti128" => self.encode_avx_broadcast(ops, &[0x5A]),
-            "vpbroadcastb" => self.encode_vpbroadcast(ops, 0x78, 0x7A),
-            "vpbroadcastw" => self.encode_vpbroadcast(ops, 0x79, 0x7B),
-            "vpbroadcastd" => self.encode_vpbroadcast(ops, 0x58, 0x7C),
-            "vpbroadcastq" => self.encode_vpbroadcast(ops, 0x59, 0x7C),
             "vpand" => self.encode_avx_3op_commutative(ops, 0xDB, true, true),
             "vpandn" => self.encode_avx_3op(ops, 0xDF, true),
             "vpor" => self.encode_avx_3op_commutative(ops, 0xEB, true, true),
@@ -2229,21 +2259,106 @@ impl InstructionEncoder {
         instr: &Instruction,
         x64: &mut X86InstructionEncoder,
     ) -> Result<(), String> {
+        // x86-64's public encode() normalizes a bare symbol to absolute
+        // memory before reaching encode_mnemonic(). i686 must make the same
+        // canonical operands when calling that core directly; otherwise a
+        // legal vector load from `sym` is rejected before its 16/32-bit
+        // absolute address and relocation can reach the i686 planner.
+        let owned;
+        let instr = if instr
+            .operands
+            .iter()
+            .any(|op| matches!(op, Operand::Label(s) if !s.starts_with('{')))
+        {
+            let mut normalized = instr.clone();
+            for op in &mut normalized.operands {
+                normalize_bare_label(op);
+            }
+            owned = normalized;
+            &owned
+        } else {
+            instr
+        };
         x64.configure_encoding_hints(instr)?;
+        // Record the actual address span and EVEX tuple scale in the shared
+        // *emitter*. Parsing opcode bytes here would be fragile across VEX2,
+        // VEX3, XOP and AVX-512 instruction families.
+        x64.track_memory_emission = true;
         x64.encode_mnemonic(instr)?;
         // The i686 wrapper runs the shared post-encode decorator check once
-        // after it has the real 32-bit prefixes. Do not recheck here: a
-        // masked vector instruction would otherwise pay for two checks.
-        self.bytes.extend_from_slice(&x64.bytes);
+        // after it has the real 32-bit prefixes. Do not recheck here.
+        let memories: Vec<&MemoryOperand> = instr
+            .operands
+            .iter()
+            .filter_map(|op| match op {
+                Operand::Memory(m) => Some(m),
+                Operand::Indirect(inner) => match inner.as_ref() {
+                    Operand::Memory(m) => Some(m),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        // .code16 uses a 0x67 prefix for 32-bit addresses even when the
+        // shared x86-64 core produced identical ModR/M+SIB bytes. The
+        // 16-bit BX/BP/SI/DI address table differs in *both* .code16 and
+        // .code32; bare absolute addresses are mode-specific as well.
+        let address16 = memories.iter().any(|m| {
+            m.base
+                .as_ref()
+                .is_some_and(|r| matches!(r.name.as_str(), "bx" | "bp" | "si" | "di"))
+                || m.index
+                    .as_ref()
+                    .is_some_and(|r| matches!(r.name.as_str(), "bx" | "bp" | "si" | "di"))
+        });
+        let absolute = memories
+            .iter()
+            .any(|m| m.base.is_none() && m.index.is_none());
+        let rewrite = address16 || absolute;
+        if self.code16 && !memories.is_empty() && !rewrite {
+            self.pending_addr32 = true;
+        }
+        let append_start = self.bytes.len() as u64;
+        let mut replaced = None;
+        if rewrite {
+            if memories.len() != 1 {
+                return Err("internal error: expected one delegated memory operand".to_string());
+            }
+            let emission = x64
+                .memory_emission
+                .ok_or_else(|| "unsupported delegated 16-bit vector memory encoding".to_string())?;
+            if emission.start >= emission.end || emission.end > x64.bytes.len() {
+                return Err("internal error: invalid shared memory emission span".to_string());
+            }
+            let modrm = x64.bytes[emission.start];
+            if modrm >> 6 == 3 {
+                return Err("internal error: register ModR/M for memory operand".to_string());
+            }
+            self.bytes.extend_from_slice(&x64.bytes[..emission.start]);
+            let new_start = self.bytes.len();
+            self.encode_modrm_mem_scaled((modrm >> 3) & 7, memories[0], emission.disp8_scale)?;
+            let new_len = self.bytes.len() - new_start;
+            self.bytes.extend_from_slice(&x64.bytes[emission.end..]);
+            let delta = new_len as i64 - (emission.end - emission.start) as i64;
+            replaced = Some((emission.start as u64, emission.end as u64, delta));
+        } else {
+            self.bytes.extend_from_slice(&x64.bytes);
+        }
+
+        // The shared emitter's relocation positions are relative to its own
+        // zero-based bytes. The ELF writer adds the section base offset; doing
+        // that here *again* used to put every post-NOP delegated relocation
+        // too late. The local i686 address planner owns any relocation inside
+        // the replaced span (and chooses R_386_16 for disp16).
         for r in &x64.relocations {
-            let Ok(reloc_type) = translate_x64_reloc(r.reloc_type) else {
-                return Err(format!(
-                    "internal error: vector instruction produced 64-bit-only relocation type {}",
-                    r.reloc_type
-                ));
+            let offset = match replaced {
+                Some((start, end, _)) if r.offset >= start && r.offset < end => continue,
+                Some((_, end, delta)) if r.offset >= end => (r.offset as i64 + delta) as u64,
+                _ => r.offset,
             };
+            let reloc_type = translate_x64_reloc(r.reloc_type)?;
             self.relocations.push(Relocation {
-                offset: self.offset + r.offset,
+                offset: append_start + offset,
                 symbol: r.symbol.clone(),
                 reloc_type,
                 addend: r.addend,
@@ -2275,9 +2390,49 @@ fn translate_x64_reloc(t: u32) -> Result<u32, String> {
     }
 }
 
-/// (The memory base/index registers are deliberately NOT considered here:
-/// the shared core encodes i686 addressing byte-identically, so only GP
-/// register DATA operands force the local path.)
+/// Register *availability* is a property of the selected CPU mode, not of
+/// whether the x86-64 encoder happens to have an encoding for a name. The
+/// eight low vector registers and k0..k7 are legal under i686 EVEX; XMM/YMM/
+/// ZMM 8..31, x86-64 GPRs (including their low-byte aliases), and RIP are
+/// not. Apply this before either vector delegation or local encoding so a
+/// future dispatch change cannot reintroduce a mode-boundary bypass.
+fn i686_unavailable_register(name: &str) -> bool {
+    is_reg64(name)
+        || name == "rip"
+        || matches!(name, "spl" | "bpl" | "sil" | "dil" | "dr8")
+        || gp_id(name).is_some_and(|id| id >= 8)
+        || vec_reg_id(name).is_some_and(|id| id >= 8)
+}
+
+fn validate_i686_operand_registers(op: &Operand) -> Result<(), String> {
+    match op {
+        Operand::Register(r) if i686_unavailable_register(&r.name) => {
+            Err(format!("bad register name `%{}'", r.name))
+        }
+        Operand::Memory(m) => {
+            for (reg, is_last) in [
+                (m.base.as_ref(), m.index.is_none() && m.scale.is_none()),
+                (m.index.as_ref(), m.scale.is_none()),
+            ] {
+                if let Some(reg) = reg {
+                    if i686_unavailable_register(&reg.name) {
+                        return Err(format!(
+                            "bad register name `%{}{}'",
+                            reg.name,
+                            if is_last { ")" } else { "" }
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+        Operand::Indirect(inner) => validate_i686_operand_registers(inner),
+        _ => Ok(()),
+    }
+}
+
+/// (GP data operands, not base/index registers, take the local REX-free path.
+/// 16-bit memory addresses are handled separately below.)
 fn is_gp_reg_name(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     matches!(
@@ -2306,42 +2461,6 @@ fn is_gp_reg_name(name: &str) -> bool {
             | "bh"
             | "ch"
             | "dh"
-            | "sil"
-            | "dil"
-            | "spl"
-            | "bpl"
-            | "r8d"
-            | "r9d"
-            | "r10d"
-            | "r11d"
-            | "r12d"
-            | "r13d"
-            | "r14d"
-            | "r15d"
-            | "r8w"
-            | "r9w"
-            | "r10w"
-            | "r11w"
-            | "r12w"
-            | "r13w"
-            | "r14w"
-            | "r15w"
-            | "r8b"
-            | "r9b"
-            | "r10b"
-            | "r11b"
-            | "r12b"
-            | "r13b"
-            | "r14b"
-            | "r15b"
-            | "r8"
-            | "r9"
-            | "r10"
-            | "r11"
-            | "r12"
-            | "r13"
-            | "r14"
-            | "r15"
     )
 }
 
@@ -2492,6 +2611,138 @@ mod merged_pr629_followup_tests {
             "no VEX/XOP encoding for `vmcall'"
         );
         assert_eq!(assemble("vmcall").unwrap(), "0f 01 c1");
+    }
+
+    #[test]
+    fn unavailable_registers_never_cross_the_i686_delegation_boundary() {
+        // The shared width check knows that r8d is a 32-bit GPR, but it
+        // cannot make r8d *available* in 32-bit mode. The formerly local
+        // broadcast path rejected this; unconditional delegation did not.
+        for source in [
+            "vpbroadcastb %r8d,%xmm1",
+            "vpbroadcastw %r8d,%xmm1",
+            "vpbroadcastd %r8d,%xmm1",
+            "vpbroadcastq %r8,%xmm1",
+        ] {
+            assert_eq!(
+                assemble(source).unwrap_err(),
+                format!(
+                    "bad register name `%{}'",
+                    if source.contains("r8d") { "r8d" } else { "r8" }
+                )
+            );
+        }
+        // These were pre-existing, broader delegated-vector defects: the
+        // x86-64 core also accepted vector registers 8..31 in .code32.
+        for source in [
+            "vpbroadcastq %rax,%xmm1",
+            "vpbroadcastb %eax,%xmm8",
+            "vpbroadcastd %edi,%zmm31",
+            "vpabsq %xmm8,%xmm1",
+            "{vex} vaddps %xmm8,%xmm0,%xmm1",
+            "vpcmov %xmm1,%xmm8,%xmm2,%xmm3",
+            "lwpins $1,%r8d,%edx",
+            "vmovdqu8 8(%r8d),%zmm1",
+            "vaddps %xmm1,%xmm2,%xmm8",
+        ] {
+            assert!(assemble(source).is_err(), "{source}");
+        }
+        assert_eq!(
+            assemble("vpbroadcastb %eax,%xmm1").unwrap(),
+            "62 f2 7d 08 7a c8"
+        );
+        assert_eq!(
+            assemble("vpbroadcastb %edi,%xmm7").unwrap(),
+            "62 f2 7d 08 7a ff"
+        );
+        assert_eq!(
+            assemble("vpbroadcastw %edi,%ymm7").unwrap(),
+            "62 f2 7d 28 7b ff"
+        );
+        assert_eq!(
+            assemble("vpbroadcastd %edi,%zmm7").unwrap(),
+            "62 f2 7d 48 7c ff"
+        );
+        assert_eq!(assemble("vpabsq %zmm7,%zmm1").unwrap(), "62 f2 fd 48 1f cf");
+        assert_eq!(
+            assemble("vpcmov %xmm7,%xmm6,%xmm5,%xmm4").unwrap(),
+            "8f e8 50 a2 e6 70"
+        );
+    }
+
+    fn parsed_instruction(line: &str) -> Instruction {
+        parse_asm(line)
+            .unwrap()
+            .into_iter()
+            .find_map(|item| match item {
+                AsmItem::Instruction(instr) => Some(instr),
+                _ => None,
+            })
+            .expect("expected one instruction")
+    }
+
+    #[test]
+    fn delegated_code16_address_plan_and_symbol_relocation_are_mode_correct() {
+        let mut encoder = InstructionEncoder::new();
+        encoder.code16 = true;
+        encoder
+            .encode(&parsed_instruction("vmovdqu8 64(%bx),%zmm1"))
+            .unwrap();
+        assert_eq!(encoder.bytes, [0x62, 0xf1, 0x7f, 0x48, 0x6f, 0x4f, 0x01]);
+        encoder
+            .encode(&parsed_instruction("{vex3} vaddps 8(%eax),%xmm2,%xmm1"))
+            .unwrap();
+        assert_eq!(
+            &encoder.bytes[7..],
+            &[0x67, 0xc4, 0xe1, 0x68, 0x58, 0x48, 0x08]
+        );
+        encoder
+            .encode(&parsed_instruction("vpaddd sym(%bx),%zmm1,%zmm2"))
+            .unwrap();
+        let reloc = encoder.relocations.last().unwrap();
+        assert_eq!(reloc.reloc_type, R_386_16);
+        assert_eq!(reloc.offset, 20); // 7 + 7 + (EVEX4 + opcode1 + ModR/M1)
+        assert_eq!(reloc.symbol, "sym");
+
+        let mut absolute = InstructionEncoder::new();
+        absolute.code16 = true;
+        absolute
+            .encode(&parsed_instruction("vpaddd sym,%zmm1,%zmm2"))
+            .unwrap();
+        assert_eq!(absolute.bytes, [0x62, 0xf1, 0x75, 0x48, 0xfe, 0x16, 0, 0]);
+        assert_eq!(absolute.relocations[0].offset, 6);
+        assert_eq!(absolute.relocations[0].reloc_type, R_386_16);
+    }
+
+    #[test]
+    fn encode_failure_is_transactional_for_bytes_relocations_and_offset() {
+        let first = parsed_instruction("vaddps %xmm1,%xmm2,%xmm3");
+        let invalid = parsed_instruction("vmovddup bad(%eax){1to2},%xmm1");
+        let last = parsed_instruction("vaddps good(%eax),%xmm2,%xmm1");
+        let mut candidate = InstructionEncoder::new();
+        candidate.encode(&first).unwrap();
+        let bytes = candidate.bytes.clone();
+        let offset = candidate.offset;
+        let relocations = candidate.relocations.len();
+        assert!(candidate.encode(&invalid).is_err());
+        assert_eq!(candidate.bytes, bytes);
+        assert_eq!(candidate.offset, offset);
+        assert_eq!(candidate.relocations.len(), relocations);
+        candidate.encode(&last).unwrap();
+
+        let mut expected = InstructionEncoder::new();
+        expected.encode(&first).unwrap();
+        expected.encode(&last).unwrap();
+        assert_eq!(candidate.bytes, expected.bytes);
+        assert_eq!(candidate.offset, expected.offset);
+        assert_eq!(candidate.relocations.len(), expected.relocations.len());
+        for (a, b) in candidate.relocations.iter().zip(&expected.relocations) {
+            assert_eq!(
+                (&a.symbol, a.offset, a.reloc_type),
+                (&b.symbol, b.offset, b.reloc_type)
+            );
+        }
+        assert_eq!(candidate.relocations[0].offset, 8); // 4-byte first insn + VEX/op/modrm
     }
 
     #[test]

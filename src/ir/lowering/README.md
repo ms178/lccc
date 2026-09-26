@@ -165,7 +165,10 @@ Iterates over all `ExternalDecl` entries and lowers them:
   Use `FuncSig::for_ptr(ret, params)` to create minimal function pointer signatures.
 
 - **`FunctionMeta`** (`definitions.rs`) -- Maps function names to `FuncSig` via `sigs`
-  (for direct calls) and `ptr_sigs` (for function pointer variables).
+  (for direct calls and file-scope function-pointer objects).  A LOCAL function
+  pointer's declared signature lives on its binding (`LocalInfo::fptr_sig`), so it
+  follows C scoping; resolve it through `fptr_variable_sig` / `local_fptr_sig`,
+  never by bare name.
 
 - **`ParamKind`** (`definitions.rs`) -- Classifies how each C parameter maps to IR
   params after ABI decomposition: `Normal`, `Struct`, `ComplexDecomposed`,

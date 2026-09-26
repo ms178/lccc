@@ -35,14 +35,7 @@ impl Lowerer {
             if declarator.name.is_empty() {
                 continue;
             }
-            let is_function_decl = declarator
-                .derived
-                .iter()
-                .any(|d| matches!(d, DerivedDeclarator::Function(_, _)))
-                && !declarator
-                    .derived
-                    .iter()
-                    .any(|d| matches!(d, DerivedDeclarator::FunctionPointer(_, _)));
+            let is_function_decl = DerivedDeclarator::declares_function(&declarator.derived);
             if is_function_decl {
                 if let Some(align) = decl.alignment {
                     self.module
@@ -70,6 +63,14 @@ impl Lowerer {
             let da = self.prepare_global_analysis(decl, declarator);
 
             let is_extern_decl = decl.is_extern() && declarator.init.is_none();
+            if !is_extern_decl
+                && declarator.init.is_none()
+                && da.is_array
+                && self.declares_unsized_array(&decl.type_spec, &declarator.derived)
+            {
+                self.tentative_incomplete_arrays
+                    .insert(declarator.name.clone());
+            }
 
             // Register before evaluating initializer so self-referential
             // initializers (e.g., `struct Node n = {&n}`) can resolve.
@@ -189,16 +190,7 @@ impl Lowerer {
         declarator: &InitDeclarator,
     ) -> bool {
         // Skip function declarations (prototypes), but NOT function pointer variables.
-        if declarator
-            .derived
-            .iter()
-            .any(|d| matches!(d, DerivedDeclarator::Function(_, _)))
-            && !declarator
-                .derived
-                .iter()
-                .any(|d| matches!(d, DerivedDeclarator::FunctionPointer(_, _)))
-            && declarator.init.is_none()
-        {
+        if DerivedDeclarator::declares_function(&declarator.derived) && declarator.init.is_none() {
             return true;
         }
         // Skip declarations using function typedefs or typeof-declared functions.
@@ -250,6 +242,26 @@ impl Lowerer {
     fn try_lower_extern_global(&mut self, decl: &Declaration, declarator: &InitDeclarator) -> bool {
         if !decl.is_extern() || declarator.init.is_some() {
             return false;
+        }
+        // `int x[]; extern int x[300];` -- the extern declaration completes
+        // the composite type of the earlier tentative definition (C11
+        // 6.2.7p3), whose storage therefore has 300 elements, not one.
+        if self.tentative_incomplete_arrays.contains(&declarator.name)
+            && !self.declares_unsized_array(&decl.type_spec, &declarator.derived)
+        {
+            let da = self.analyze_declaration(&decl.type_spec, &declarator.derived);
+            if da.is_array && da.actual_alloc_size > 0 {
+                for g in &mut self.module.globals {
+                    if g.name == declarator.name && !g.is_extern {
+                        g.size = g.size.max(da.actual_alloc_size);
+                    }
+                }
+                if let Some(ginfo) = self.globals.get_mut(&declarator.name) {
+                    ginfo.var.c_type = da.c_type.clone();
+                }
+                self.tentative_incomplete_arrays.remove(&declarator.name);
+            }
+            return true;
         }
         if !self.globals.contains_key(&declarator.name) {
             let mut da = self.analyze_declaration(&decl.type_spec, &declarator.derived);
@@ -310,6 +322,28 @@ impl Lowerer {
         }
         if declarator.init.is_none() {
             if self.emitted_global_names.contains(&declarator.name) {
+                // `int x[]; ... int x[300];` -- the composite of the two
+                // tentative definitions is `int[300]` (C11 6.2.7p3), so the
+                // provisional one-element storage of the first is replaced.
+                // Keeping it (the old behaviour: a fixed 256-element
+                // placeholder) under-allocated any array longer than that.
+                if !decl.is_extern()
+                    && self.tentative_incomplete_arrays.contains(&declarator.name)
+                    && !self.declares_unsized_array(&decl.type_spec, &declarator.derived)
+                {
+                    let prior_was_weak = self
+                        .module
+                        .globals
+                        .iter()
+                        .find(|g| g.name == declarator.name)
+                        .is_some_and(|g| g.is_weak);
+                    self.module.globals.retain(|g| g.name != declarator.name);
+                    self.emitted_global_names.remove(&declarator.name);
+                    self.tentative_incomplete_arrays.remove(&declarator.name);
+                    return RedeclResult::Proceed {
+                        prior_was_weak: prior_was_weak || declarator.attrs.is_weak(),
+                    };
+                }
                 let prior_is_extern = self
                     .module
                     .globals
@@ -347,6 +381,7 @@ impl Lowerer {
                 .is_some_and(|g| g.is_weak);
             self.module.globals.retain(|g| g.name != declarator.name);
             self.emitted_global_names.remove(&declarator.name);
+            self.tentative_incomplete_arrays.remove(&declarator.name);
             return RedeclResult::Proceed { prior_was_weak };
         }
         RedeclResult::Proceed {
@@ -377,6 +412,27 @@ impl Lowerer {
             &declarator.derived,
             &declarator.init,
         );
+        if declarator.init.is_none()
+            && !decl.is_extern()
+            && da.is_array
+            && self.declares_unsized_array(&decl.type_spec, &declarator.derived)
+        {
+            // A tentative definition whose array type is still incomplete
+            // at the end of the translation unit behaves as if it had a zero
+            // initializer: the array has ONE element (C11 6.9.2p2 and
+            // example 6.9.2p5; GCC warns "array assumed to have one
+            // element"). The outermost stride is the size of that element
+            // (`int w[][3]` is 12 bytes). A later complete declaration
+            // replaces this storage (handle_global_redeclaration).
+            let one = da
+                .array_dim_strides
+                .first()
+                .copied()
+                .unwrap_or(da.elem_size)
+                .max(1);
+            da.alloc_size = one;
+            da.actual_alloc_size = one;
+        }
         if !da.is_array && !da.is_pointer && da.struct_layout.is_none() {
             let c_size = self.sizeof_type(&decl.type_spec);
             da.actual_alloc_size = c_size.max(da.var_ty.size());
@@ -738,6 +794,33 @@ impl Lowerer {
             is_ptr_to_func_ptr,
             base_type_volatile: false,
         }
+    }
+
+    /// Does this declarator declare an array whose outermost dimension is
+    /// unspecified (`int a[]`, `int *a[]`, `T a[][3]`, or a typedef of such a
+    /// type)?
+    ///
+    /// The declared object's own array dimensions are the TRAILING run of
+    /// `Array` entries in `derived`, in source order (`int w[][3]` is
+    /// `[Array(None), Array(3)]`; `int *a[]` is `[Pointer, Array(None)]`), so
+    /// the outermost dimension is the first entry of that run. A declarator
+    /// ending in `Pointer`/`Function*` is not an array at all (`int (*p)[]`
+    /// is `[Array(None), Pointer]`).
+    pub(super) fn declares_unsized_array(
+        &self,
+        type_spec: &TypeSpecifier,
+        derived: &[DerivedDeclarator],
+    ) -> bool {
+        let run = derived
+            .iter()
+            .rev()
+            .take_while(|d| matches!(d, DerivedDeclarator::Array(_)))
+            .count();
+        if run == 0 {
+            return derived.is_empty()
+                && matches!(self.type_spec_to_ctype(type_spec), CType::Array(_, None));
+        }
+        matches!(derived[derived.len() - run], DerivedDeclarator::Array(None))
     }
 
     /// Fix up allocation size and strides for unsized arrays (int a[] = {...}).

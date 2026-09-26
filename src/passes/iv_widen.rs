@@ -95,8 +95,9 @@
 //! - Rotated self-loops (header == latch) are widenable when a preheader
 //!   exists for the hoists.
 //! - Loop-exit comparisons that cannot be safely widened (incompatible
-//!   predicate or a loop-variant other operand) keep a narrow cmp fed by one
-//!   truncation, instead of aborting the whole widening.
+//!   predicate, a loop-variant other operand, or an other operand that is not
+//!   available in the preheader, e.g. a bound reloaded after the loop) keep a
+//!   narrow cmp fed by one truncation, instead of aborting the whole widening.
 //!
 //! Out-of-scope (the pass declines the IV):
 //! - `i8`/`i16` IVs: the C int-promotion latch is `trunc(add(phi, 1):I32)`,
@@ -126,7 +127,9 @@ use crate::ir::analysis::{CfgAnalysis, FlatAdj};
 use crate::ir::constants::IrConst;
 use crate::ir::instruction::{BasicBlock, Instruction, Operand, Terminator, Value};
 use crate::ir::reexports::{BlockId, IrBinOp, IrCmpOp, IrFunction};
-use crate::passes::loop_analysis::{NaturalLoop, find_natural_loops, merge_loops_by_header};
+use crate::passes::loop_analysis::{
+    DominanceChecker, NaturalLoop, find_natural_loops, merge_loops_by_header,
+};
 
 /// Entry point used by the dirty-tracking pipeline.
 pub(crate) fn run_function(func: &mut IrFunction) -> usize {
@@ -160,13 +163,14 @@ fn widen_ivs_in_function(func: &mut IrFunction) -> usize {
             break;
         }
         let loops = merge_loops_by_header(raw);
+        let dom = DominanceChecker::new(cfg.num_blocks, &cfg.idom);
         // Innermost-first: smallest body. Widening an inner IV does not
         // disturb outer-loop analysis.
         let mut sorted: Vec<&NaturalLoop> = loops.iter().collect();
         sorted.sort_by_key(|lp| lp.body.len());
         let mut did = false;
         for lp in sorted {
-            if try_widen_loop(func, lp, &cfg, debug) {
+            if try_widen_loop(func, lp, &cfg, &dom, debug) {
                 total += 1;
                 did = true;
                 break; // IR changed — rebuild before the next candidate.
@@ -459,7 +463,13 @@ struct PhiCandidate {
 
 /// Try to widen exactly one IV in `lp`. Returns true if a widening was
 /// applied.
-fn try_widen_loop(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis, debug: bool) -> bool {
+fn try_widen_loop(
+    func: &mut IrFunction,
+    lp: &NaturalLoop,
+    cfg: &CfgAnalysis,
+    dom: &DominanceChecker,
+    debug: bool,
+) -> bool {
     let Some(preheader) = lp.find_preheader(&cfg.preds) else {
         return false;
     };
@@ -480,11 +490,13 @@ fn try_widen_loop(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis, de
     let uses = build_use_map(func);
 
     for cand in &candidates {
+        let hoist = PreheaderSite { preheader, dom };
         let Some(plan) = analyze_iv(
             func,
             lp,
             &cfg.succs,
             &uses,
+            &hoist,
             cand.phi_dest,
             cand.phi_ty,
             cand.init_op,
@@ -500,7 +512,7 @@ fn try_widen_loop(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis, de
         // step would need a per-iteration cast (no win) or, worse, a
         // preheader cast of a loop-defined value (invalid SSA). The previous
         // revision checked only the cmp's other operand, not the step.
-        if !operand_is_const_or_loop_invariant(&plan.step, lp, func, plan.phi_dest) {
+        if !operand_hoistable_to_preheader(&plan.step, lp, func, plan.phi_dest, &hoist) {
             if debug {
                 eprintln!(
                     "[IV-WIDEN] skip phi {:?}: latch step not loop-invariant",
@@ -509,7 +521,7 @@ fn try_widen_loop(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis, de
             }
             continue;
         }
-        if !verify_plan(func, &plan) {
+        if !verify_plan(func, &plan, lp, &hoist) {
             if debug {
                 eprintln!(
                     "[IV-WIDEN] skip phi {:?}: plan failed live-IR verification",
@@ -736,6 +748,7 @@ fn analyze_iv(
     lp: &NaturalLoop,
     succs: &FlatAdj,
     uses: &UseMap,
+    hoist: &PreheaderSite<'_>,
     phi_dest: Value,
     phi_ty: IrType,
     init: Operand,
@@ -1234,6 +1247,27 @@ fn analyze_iv(
                         continue;
                     }
                     match other_widen_for_pred(cur_ext, other, func) {
+                        // A value operand is widened by a cast hoisted to the
+                        // end of the preheader, which is only well-formed
+                        // when the value is available there. A loop-EXIT
+                        // compare may read a value defined after the loop
+                        // (a post-loop reload of the bound): keep that cmp
+                        // narrow instead of emitting a use before its def.
+                        Some(CmpOther::InvariantValue { value, .. })
+                            if !operand_hoistable_to_preheader(
+                                &Operand::Value(value),
+                                lp,
+                                func,
+                                phi_dest,
+                                hoist,
+                            ) =>
+                        {
+                            cmps.push(CmpAction::Trunc {
+                                cmp_dest: *dest,
+                                member: cur,
+                                iv_is_lhs: lhs_is_cur,
+                            });
+                        }
                         Some(ow) => {
                             cmps.push(CmpAction::Widen {
                                 cmp_dest: *dest,
@@ -1612,7 +1646,12 @@ fn plan_is_integral(func: &IrFunction, plan: &WidenPlan) -> bool {
     true
 }
 
-fn verify_plan(func: &IrFunction, plan: &WidenPlan) -> bool {
+fn verify_plan(
+    func: &IrFunction,
+    plan: &WidenPlan,
+    lp: &NaturalLoop,
+    hoist: &PreheaderSite<'_>,
+) -> bool {
     // Integer-closure invariant, re-checked on the *plan* right before any
     // mutation: every widening identity this pass relies on is stated over
     // integers, and `widen_const` cannot represent an FP constant. A single
@@ -1753,6 +1792,27 @@ fn verify_plan(func: &IrFunction, plan: &WidenPlan) -> bool {
                 if b != true_val && b != false_val {
                     return false;
                 }
+            }
+        }
+    }
+
+    // Every value apply_widen casts at the end of the preheader (a widened
+    // cmp's invariant operand; the step is checked by the caller) must be
+    // available there, or the hoisted cast is a use before its def.
+    for c in &plan.cmps {
+        if let CmpAction::Widen {
+            other: CmpOther::InvariantValue { value, .. },
+            ..
+        } = c
+        {
+            if !operand_hoistable_to_preheader(
+                &Operand::Value(*value),
+                lp,
+                func,
+                plan.phi_dest,
+                hoist,
+            ) {
+                return false;
             }
         }
     }
@@ -2434,6 +2494,46 @@ fn operand_is_const_or_loop_invariant(
     }
 }
 
+/// Where apply_widen materialises hoisted widening casts: appended to the end
+/// of the loop preheader.
+struct PreheaderSite<'a> {
+    preheader: usize,
+    dom: &'a DominanceChecker,
+}
+
+/// Whether a widening cast of `op` may be appended to the preheader: `op` is a
+/// constant, or a loop-invariant value whose defining block dominates the
+/// preheader (a def IN the preheader precedes the appended cast).
+///
+/// Loop invariance alone ("not defined in the body") is not sufficient. The
+/// closure also follows members out of the loop, so a loop-EXIT compare can
+/// read a value defined after the loop: SQLite's `selectExpander` reloads
+/// `pEList->nExpr` in the exit block for `if( k<pEList->nExpr )`, and
+/// hoisting that value's sext into the preheader read an undefined register
+/// (the `SELECT * FROM (subquery)` column-name miscompile). For an in-loop
+/// use the check is implied by SSA dominance (an invariant def dominating a
+/// body use dominates the header, hence the preheader), so only exit
+/// compares are affected. A value with no defining instruction is
+/// ill-formed IR and is conservatively rejected.
+fn operand_hoistable_to_preheader(
+    op: &Operand,
+    lp: &NaturalLoop,
+    func: &IrFunction,
+    phi_dest: Value,
+    site: &PreheaderSite<'_>,
+) -> bool {
+    if !operand_is_const_or_loop_invariant(op, lp, func, phi_dest) {
+        return false;
+    }
+    match op {
+        Operand::Const(_) => true,
+        Operand::Value(v) => match find_def(func, *v) {
+            Some((bi, _)) => site.dom.dominates(bi, site.preheader),
+            None => false,
+        },
+    }
+}
+
 fn is_loop_invariant(val_id: u32, body: &FxHashSet<usize>, func: &IrFunction) -> bool {
     for (bi, b) in func.blocks.iter().enumerate() {
         if body.contains(&bi) {
@@ -2617,6 +2717,125 @@ mod tests {
         assert!(func.blocks[2].instructions.iter().any(
             |i| matches!(i, Instruction::GetElementPtr { offset: Operand::Value(v), .. } if v.0 == 1)
         ));
+    }
+
+    /// `a[i]` loop (header exit test `i < 10`) followed by a loop-EXIT compare
+    /// `i < n`. `bound_in_exit` places the load of `n` in the exit block (a
+    /// post-loop reload, as in SQLite's `selectExpander`); otherwise it is
+    /// loaded in the preheader.
+    fn exit_cmp_loop(name: &str, bound_in_exit: bool) -> IrFunction {
+        let body = vec![
+            Instruction::Cast {
+                dest: Value(10),
+                src: Operand::Value(Value(1)),
+                from_ty: IrType::I32,
+                to_ty: IrType::I64,
+            },
+            gep_inst(11, 10, IrType::I8),
+            Instruction::Store {
+                volatile: false,
+                val: Operand::Const(IrConst::I32(0)),
+                ptr: Value(11),
+                ty: IrType::I8,
+                seg_override: AddressSpace::Default,
+            },
+        ];
+        let header_cmp = Instruction::Cmp {
+            dest: Value(2),
+            op: IrCmpOp::Slt,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Const(IrConst::I32(10)),
+            ty: IrType::I32,
+        };
+        let mut func = counting_loop(name, IrType::I32, IrBinOp::Add, body, Some(header_cmp));
+        let load = Instruction::Load {
+            dest: Value(60),
+            ptr: Value(50),
+            ty: IrType::I32,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        };
+        if bound_in_exit {
+            func.blocks[4].instructions.push(load);
+        } else {
+            func.blocks[0].instructions.push(load);
+        }
+        func.blocks[4].instructions.push(Instruction::Cmp {
+            dest: Value(61),
+            op: IrCmpOp::Slt,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Value(Value(60)),
+            ty: IrType::I32,
+        });
+        func.blocks[4].terminator = Terminator::Return(Some(Operand::Value(Value(61))));
+        func
+    }
+
+    fn exit_cmp(func: &IrFunction) -> (IrType, Operand, Operand) {
+        func.blocks[4]
+            .instructions
+            .iter()
+            .find_map(|i| match i {
+                Instruction::Cmp {
+                    dest, lhs, rhs, ty, ..
+                } if dest.0 == 61 => Some((*ty, *lhs, *rhs)),
+                _ => None,
+            })
+            .expect("exit cmp v61 survives")
+    }
+
+    /// LCCC-SQLITE-STAR-EXPAND: the exit compare's bound is defined AFTER
+    /// the loop, so its widening cast cannot be hoisted to the preheader.
+    /// The IV is still widened; the exit compare stays narrow (I32, fed by a
+    /// truncation of the wide IV) and reads the bound directly — and nothing
+    /// in the preheader reads v60 (`check` also runs the def-dominates-use
+    /// verifier, which rejected the old preheader `sext v60`).
+    #[test]
+    fn test_exit_cmp_bound_defined_after_loop_stays_narrow() {
+        let mut func = exit_cmp_loop("exit_bound_after_loop", true);
+        check(&mut func, 1);
+        assert!(matches!(
+            func.blocks[1].instructions[0],
+            Instruction::Phi {
+                ty: IrType::I64,
+                ..
+            }
+        ));
+        let (ty, lhs, rhs) = exit_cmp(&func);
+        assert_eq!(ty, IrType::I32);
+        assert!(matches!(rhs, Operand::Value(v) if v.0 == 60));
+        let Operand::Value(trunc) = lhs else {
+            panic!("exit cmp lhs must be the truncated IV, got {lhs:?}");
+        };
+        assert!(func.blocks[4].instructions.iter().any(|i| matches!(
+            i,
+            Instruction::Cast { dest, src: Operand::Value(s), from_ty: IrType::I64, to_ty: IrType::I32 }
+                if dest.0 == trunc.0 && s.0 == 1
+        )));
+        assert!(!func.blocks[0].instructions.iter().any(|i| matches!(
+            i,
+            Instruction::Cast { src: Operand::Value(s), .. } if s.0 == 60
+        )));
+    }
+
+    /// Control: the same exit compare with the bound available in the
+    /// preheader keeps the established widening (sext hoisted into the
+    /// preheader, I64 compare against the wide IV).
+    #[test]
+    fn test_exit_cmp_bound_in_preheader_is_widened() {
+        let mut func = exit_cmp_loop("exit_bound_in_preheader", false);
+        check(&mut func, 1);
+        let (ty, lhs, rhs) = exit_cmp(&func);
+        assert_eq!(ty, IrType::I64);
+        assert!(matches!(lhs, Operand::Value(v) if v.0 == 1));
+        let Operand::Value(wide) = rhs else {
+            panic!("exit cmp rhs must be the hoisted sext, got {rhs:?}");
+        };
+        assert!(func.blocks[0].instructions.iter().any(|i| matches!(
+            i,
+            Instruction::Cast { dest, src: Operand::Value(s), from_ty: IrType::I32, to_ty: IrType::I64 }
+                if dest.0 == wide.0 && s.0 == 60
+        )));
     }
 
     /// Element-scale chain: `Cast i32→i64(phi); Shl i64 2; GEP`.

@@ -3873,34 +3873,6 @@ impl super::InstructionEncoder {
         }
     }
 
-    /// Encode vpbroadcastw/d/q from a GPR source (VEX.256.66.0F38 7B/7C /r).
-    pub(crate) fn encode_avx_broadcast_gpr(
-        &mut self,
-        ops: &[Operand],
-        opcode: &[u8],
-        w: u8,
-    ) -> Result<(), String> {
-        if ops.len() != 2 {
-            return Err("vpbroadcast-gpr requires 2 operands".to_string());
-        }
-        match (&ops[0], &ops[1]) {
-            (Operand::Register(src), Operand::Register(dst))
-                if !is_xmm_or_ymm(&src.name) && is_xmm_or_ymm(&dst.name) =>
-            {
-                let src_num = reg_num(&src.name).ok_or("bad register")?;
-                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                let r = needs_vex_ext(&dst.name);
-                let b = needs_vex_ext(&src.name);
-                // VEX.256.66.0F38.W{0|1} 7B|7C /r (mm=2, pp=1 for 66 prefix)
-                self.emit_vex(r, false, b, 2, w, 0, 1, 1);
-                self.bytes.extend_from_slice(opcode);
-                self.bytes.push(self.modrm(3, dst_num, src_num));
-                Ok(())
-            }
-            _ => Err("unsupported vpbroadcast-gpr operands".to_string()),
-        }
-    }
-
     /// Encode EVEX GPR-source vpbroadcastb/w/d/q (62 .. 7A/7B/7C /r).
     /// EVEX.256.66.0F38.W{0|1} 7A|7B|7C /r with a GPR r/m source — the single-
     /// uop (port-5) scalar->vector splat that has no VEX equivalent.

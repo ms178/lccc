@@ -42,6 +42,21 @@ impl Lowerer {
         }
     }
 
+    /// Whether a call through the function-pointer variable `name` (the callee
+    /// expression `callee`) is variadic: the declared signature when the
+    /// declarator spelled one, else the pointed-to function type of the
+    /// variable's `c_type` (typedef-declared pointers such as
+    /// `typedef int (*pf)(const char *, ...); void g(pf f)` carry `...` only
+    /// there; missing it drops AL on x86-64 and misplaces FP varargs).
+    pub(super) fn fptr_variable_is_variadic(&self, name: &str, callee: &Expr) -> bool {
+        if let Some(sig) = self.fptr_variable_sig(name) {
+            return sig.is_variadic;
+        }
+        self.get_expr_ctype(callee)
+            .and_then(|ct| ct.get_function_type().map(|ft| ft.variadic))
+            .unwrap_or(false)
+    }
+
     /// Check if an identifier is a function pointer variable rather than a direct function.
     /// A local variable always shadows a known function of the same name (e.g., a parameter
     /// named `free` that is a function pointer should produce an indirect call, not a direct
@@ -55,11 +70,11 @@ impl Lowerer {
         };
         if func_state.locals.contains_key(name) {
             // Local variable exists with this name. Check if it's a function pointer
-            // via ptr_sigs (set for function pointer params and locals) or c_type.
-            if self.func_meta.ptr_sigs.contains_key(name) {
+            // via its declared signature (LocalInfo::fptr_sig) or c_type.
+            if self.local_fptr_sig(name).is_some() {
                 return true;
             }
-            // Also check the local's CType for function pointer types not in ptr_sigs
+            // Also check the local's CType (typedef-declared function pointers carry no fptr_sig)
             if let Some(local_info) = func_state.locals.get(name) {
                 if let Some(ref cty) = local_info.c_type {
                     if cty.is_function_pointer() {
@@ -125,8 +140,14 @@ impl Lowerer {
         // Use the resolved expression for emit_call_instruction too
         let effective_func = stripped_func;
 
-        // Resolve __builtin_* functions first
-        if let Expr::Identifier(name, _) = stripped_func {
+        // Resolve __builtin_* functions first — unless the identifier names a
+        // local binding.  A block-scope object or parameter (`llf_t abs`,
+        // `void *(*memcpy)(...)`) shadows the library function of that name
+        // (C11 6.2.1p4); expanding the builtin anyway silently replaced a
+        // call through `i64 (*abs)(i64)` with a constant-folded `int abs(int)`.
+        let callee_is_local = matches!(stripped_func, Expr::Identifier(n, _)
+            if self.func_state.as_ref().is_some_and(|fs| fs.locals.contains_key(n.as_str())));
+        if let (Expr::Identifier(name, _), false) = (stripped_func, callee_is_local) {
             if let Some(result) = self.try_lower_builtin_call(name, args) {
                 return result;
             }
@@ -255,12 +276,7 @@ impl Lowerer {
                 // definitions, so `int (*fp)(char*, ...) -> f(fp);
                 // (*fp)(b, "%.0f", 5.0)` sent the double to fa0 instead of
                 // a2 and aborted glibc's vsprintf (gcc.c-torture 930513-1).
-                self.func_meta
-                    .ptr_sigs
-                    .get(name.as_str())
-                    .or_else(|| self.func_meta.sigs.get(name.as_str()))
-                    .map(|sig| sig.is_variadic)
-                    .unwrap_or(false)
+                self.fptr_variable_is_variadic(name, stripped_func)
             } else {
                 self.is_function_variadic(name)
             }
@@ -271,10 +287,7 @@ impl Lowerer {
         // Decompose complex double/float arguments into (real, imag) pairs for ABI compliance
         let param_ctypes_for_decompose = if let Expr::Identifier(name, _) = stripped_func {
             let sig_for_decompose = if self.is_func_ptr_variable(name) {
-                self.func_meta
-                    .ptr_sigs
-                    .get(name.as_str())
-                    .or_else(|| self.func_meta.sigs.get(name.as_str()))
+                self.fptr_variable_sig(name)
             } else {
                 self.func_meta.sigs.get(name.as_str())
             };
@@ -367,10 +380,7 @@ impl Lowerer {
             let variadic = call_is_variadic;
             let n_fixed = if variadic {
                 let variadic_sig = if self.is_func_ptr_variable(name) {
-                    self.func_meta
-                        .ptr_sigs
-                        .get(name.as_str())
-                        .or_else(|| self.func_meta.sigs.get(name.as_str()))
+                    self.fptr_variable_sig(name)
                 } else {
                     self.func_meta.sigs.get(name.as_str())
                 };
@@ -762,21 +772,15 @@ impl Lowerer {
             }
             _ => None,
         };
-        // When the callee is a local function pointer variable, prefer ptr_sigs
+        // When the callee is a function pointer variable, prefer its own signature
         // over sigs. This prevents a parameter named e.g. `round` from picking up
         // the seeded `double round(double)` library signature instead of the
         // actual function pointer's signature.
         let sig = func_name.and_then(|name| {
             if self.is_func_ptr_variable(name) {
-                self.func_meta
-                    .ptr_sigs
-                    .get(name)
-                    .or_else(|| self.func_meta.sigs.get(name))
+                self.fptr_variable_sig(name)
             } else {
-                self.func_meta
-                    .sigs
-                    .get(name)
-                    .or_else(|| self.func_meta.ptr_sigs.get(name))
+                self.func_meta.sigs.get(name)
             }
         });
 
@@ -1341,7 +1345,7 @@ impl Lowerer {
                 // But dereferencing a pointer-to-function-pointer is a real load:
                 // (*fpp)(args) where fpp is func_ptr* needs to load the func_ptr first.
                 // Use the comprehensive is_function_pointer_deref check which also handles
-                // cases where c_type is None but ptr_sigs or known_functions provide info.
+                // cases where c_type is None but a declared fptr_sig or known_functions provide info.
                 let is_noop_deref = self.is_function_pointer_deref(inner);
                 // A call through a dereferenced function pointer still follows
                 // the pointed-to type's signature: if that type declares `...`,
@@ -1350,13 +1354,7 @@ impl Lowerer {
                 // the 5.0 of `(*fp)(buf, "%.0f", 5.0)` to fa0 instead of a2 and
                 // aborted glibc's vsprintf on rv64 (gcc.c-torture 930513-1).
                 let deref_variadic = match &**inner {
-                    Expr::Identifier(name, _) => self
-                        .func_meta
-                        .ptr_sigs
-                        .get(name.as_str())
-                        .or_else(|| self.func_meta.sigs.get(name.as_str()))
-                        .map(|sig| sig.is_variadic)
-                        .unwrap_or(false),
+                    Expr::Identifier(name, _) => self.fptr_variable_is_variadic(name, inner),
                     _ => false,
                 };
                 let n = arg_vals.len();

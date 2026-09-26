@@ -233,6 +233,8 @@ gate "doc-link-integrity" fast \
 
 gate "ci-gate-parity" fast \
     python3 scripts/check_ci_gate_parity.py
+gate "ci-asm-diff-parity-self-test" fast \
+    python3 scripts/test_ci_gate_parity.py
 
 gate "ra-web-inloop-use" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_ra_web_inloop_use.sh

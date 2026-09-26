@@ -595,6 +595,7 @@ impl Lowerer {
                 cleanup_fn: None,
                 is_const: orig_param.is_const,
                 base_type_volatile: orig_param.is_volatile,
+                fptr_sig: None,
             },
         );
 
@@ -611,7 +612,7 @@ impl Lowerer {
                     .collect();
                 let mut signature = FuncSig::for_ptr(ret_ty, param_tys);
                 signature.is_variadic = orig_param.fptr_variadic;
-                self.func_meta.ptr_sigs.insert(name.clone(), signature);
+                self.set_local_fptr_sig(name, signature);
             }
         } else if let Some(ref name) = orig_param.name {
             // Fallback: check if the parameter type is a bare function typedef
@@ -627,9 +628,7 @@ impl Lowerer {
                         .iter()
                         .map(|fp| self.type_spec_to_ir(&fp.type_spec))
                         .collect();
-                    self.func_meta
-                        .ptr_sigs
-                        .insert(name.clone(), FuncSig::for_ptr(ret_ty, param_tys));
+                    self.set_local_fptr_sig(name, FuncSig::for_ptr(ret_ty, param_tys));
                 }
             }
         }
@@ -678,6 +677,7 @@ impl Lowerer {
                 cleanup_fn: None,
                 is_const: orig_param.is_const,
                 base_type_volatile: orig_param.is_volatile,
+                fptr_sig: None,
             },
         );
     }
@@ -713,6 +713,7 @@ impl Lowerer {
                 cleanup_fn: None,
                 is_const: orig_param.is_const,
                 base_type_volatile: orig_param.is_volatile,
+                fptr_sig: None,
             },
         );
     }
@@ -806,6 +807,7 @@ impl Lowerer {
                 cleanup_fn: None,
                 is_const: orig_param.is_const,
                 base_type_volatile: orig_param.is_volatile,
+                fptr_sig: None,
             },
         );
     }

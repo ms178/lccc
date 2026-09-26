@@ -788,6 +788,31 @@ pub enum DerivedDeclarator {
     FunctionPointer(Vec<ParamDecl>, bool), // params, variadic
 }
 
+impl DerivedDeclarator {
+    /// Whether a declarator with this derived list declares a FUNCTION (as
+    /// opposed to an object of pointer/array/function-pointer type).
+    ///
+    /// The parser's encoding (`combine_declarator_parts`) always places the
+    /// declared entity's own parameter list LAST: `int f(int)` → `[Function]`,
+    /// `int *f(int)` → `[Pointer, Function]`, and a function returning a
+    /// function pointer, `void (*f(int))(void)` →
+    /// `[Pointer, FunctionPointer(void), Function(int)]`.  Function-pointer
+    /// objects end in `FunctionPointer` (`int (*fp)(int)`), a pointer
+    /// (`int (**fpp)(int)`), or an array (`int (*fps[3])(int)`).
+    ///
+    /// This is the single canonical predicate.  The historical spelling
+    /// "contains a Function and no FunctionPointer" misclassified every
+    /// function returning a function pointer as an OBJECT, so a plain
+    /// prototype such as SQLite's
+    /// `void (*sqlite3OsDlSym(sqlite3_vfs*, void*, const char*))(void);`
+    /// emitted a tentative definition (`B sqlite3OsDlSym`) in every TU that
+    /// included it and the link failed with "multiple definition"
+    /// (regression `fn_returning_fnptr_prototype.c`).
+    pub fn declares_function(derived: &[DerivedDeclarator]) -> bool {
+        matches!(derived.last(), Some(DerivedDeclarator::Function(_, _)))
+    }
+}
+
 /// An initializer.
 #[derive(Debug, Clone)]
 pub enum Initializer {

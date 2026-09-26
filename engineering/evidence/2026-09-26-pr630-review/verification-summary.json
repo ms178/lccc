@@ -1,0 +1,87 @@
+{
+  "purpose": "Reproducible local evidence for post-merge PR #630 review. Candidate is a code commit based directly on upstream main; evidence is committed separately.",
+  "base_commit": "a066f0c9b835ff36445a06bd762051e5a5039043",
+  "candidate_code_commit": "da01098fe423dd023270cf256d9e527fea000ada",
+  "tools": {
+    "rustc": "1.98.1 (48a229cea 2026-09-01)",
+    "gnu_as": "GNU Binutils 2.47.20260726",
+    "binutils_2_47_source_tar_sha256": "154ab23b60070e8f27013c22977f1129425d67d1e8acd6e13010e617811e4cff",
+    "oracle_binary_sha256": {
+      "x86_64": {
+        "version": "GNU assembler (GNU Binutils) 2.47.20260726",
+        "sha256": "337fffe4e577749002dbd0cf268bf49b75fe3032f641a79cb4993cc21589dfc0"
+      },
+      "i686": {
+        "version": "GNU assembler (GNU Binutils) 2.47.20260726",
+        "sha256": "f3139962e4030bc58708aaf8e0d7612f46be66546fc05badd7c5934dbe332493"
+      }
+    }
+  },
+  "local_fast_ci": {
+    "passed_gates": 76,
+    "failed_gates": 0,
+    "skipped_gates": 3,
+    "unit_tests_passed": 3513,
+    "unit_tests_ignored": 7,
+    "rustfmt": "pass",
+    "clippy": "pass",
+    "parity_negative_tests": 5,
+    "note": "Three gates are intentionally skipped by --fast; some i686 runtime legs skipped on this VM without i386 libc. Hosted CI was not executed here."
+  },
+  "whole_object_differential": [
+    {
+      "mode": "x86_64",
+      "cases_passed": 1045,
+      "cases_failed": 0,
+      "oracle": "pinned GNU as 2.47"
+    },
+    {
+      "mode": "i686",
+      "cases_passed": 549,
+      "cases_failed": 0,
+      "oracle": "pinned GNU as 2.47"
+    },
+    {
+      "mode": "i686",
+      "cases_passed": 393,
+      "cases_failed": 0,
+      "oracle": "system GNU as 2.44",
+      "note": "Generated mode matrix subset; included in the 549-case count above."
+    }
+  ],
+  "tracked_inputs_sha256": {
+    "tests/asm-diff/i686/merged-pr630-mode-boundary.casefile": "3635fd76037f33006d6a48564a4715f0b001b1aa4e473e1759007396ab3900f2",
+    "tests/asm-diff/i686/merged-pr630-mode-matrix.casefile": "ad403c16dd0594fb1abb26d70bf613a9b2380d405d3355094b5eadf471548e84",
+    "tests/asm-diff/merged-pr629-followup.casefile": "814d52f89b8a5bf366d4cb042aef84845b2d8e70435bc74d13237565da44bb0c",
+    "engineering/evidence/2026-09-26-pr630-review/generate_mode_matrix.py": "baa9fb29607489c3806c521f7674f7ef0a72cf15417baa09561af1fc0dfce000",
+    "engineering/evidence/2026-09-26-pr630-review/pr629-probe-inputs.json": "841fcfc2bf758d95c692d562995525f1d98eb01d93ce223594c10ebfbd9f7c5f",
+    "engineering/evidence/2026-09-26-pr630-review/pr630-review-probe-inputs.json": "e168cc1a66ca91265bcbc6f9c34862017d2b985a11f0caf26efee1ae049ef700"
+  },
+  "isolated_probes": {
+    "historical_pr629_recorded_inputs": {
+      "count": 279,
+      "acceptance_bytes_relocations_matches": 279,
+      "gas_accepted": 98,
+      "compiler_accepted": 98,
+      "note": "88 + 143 recorded broadcast-width + 48 EVEX-only; not an asserted 180 broadcast rows."
+    },
+    "review_regressions_before": {
+      "total": 23,
+      "matches": 8,
+      "acceptance_mismatches": 10,
+      "bytes_or_relocation_mismatches": 5
+    },
+    "review_regressions_after": {
+      "total": 23,
+      "matches": 23,
+      "acceptance_mismatches": 0,
+      "bytes_or_relocation_mismatches": 0
+    }
+  },
+  "performance": {
+    "host": "2-vCPU virtual Intel Xeon @ 2.60GHz",
+    "target": "i7-14700KF (AVX2, no AVX-512)",
+    "target_hardware_timing_available": false,
+    "performance_claim": null
+  }
+}

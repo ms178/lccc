@@ -45,6 +45,11 @@ pub fn extract_fptr_typedef_info(
     base_type: &TypeSpecifier,
     derived: &[DerivedDeclarator],
 ) -> Option<FunctionTypedefInfo> {
+    // A FUNCTION type whose return type is a function pointer
+    // (`typedef void (*fn_t(int))(void);`) is not a function-pointer typedef.
+    if DerivedDeclarator::declares_function(derived) {
+        return None;
+    }
     let (params, variadic) = derived.iter().find_map(|d| {
         if let DerivedDeclarator::FunctionPointer(p, v) = d {
             Some((p, v))

@@ -441,6 +441,69 @@ pub(super) fn provably_dead_lv(
     provably_dead(store, infos, use_idx, fam, owned)
 }
 
+/// Deadness oracle for passes that delete a definition and rewrite its
+/// consumer: exact CFG liveness ([`FileLiveness`]) built on first use and
+/// refreshed per dirtied function on demand, with [`provably_dead`]'s
+/// syntactic proofs as the fallback for functions the dataflow declines.
+///
+/// It replaces a forward TEXT scan ("no read of the family on any later
+/// line of the function") that the LEA/SIB folds used to rely on.  That scan
+/// ignores control flow in the backward direction: a read at the top of a
+/// loop is reached around the back edge from a definition at the bottom, yet
+/// sits EARLIER in the text.  `leaq 8(%rsi), %r9; .L: movq (%r9), %rax; ...;
+/// leaq 8(%r13, %r10), %r9; movq (%r9), %rcx; jmp .L` had its second LEA
+/// folded away, so the next iteration dereferenced the stale `%r9`.
+pub(super) struct LazyDeadness {
+    lv: Option<FileLiveness>,
+    /// First line of every function rewritten since the last refresh.
+    dirty: Vec<usize>,
+}
+
+impl LazyDeadness {
+    pub(super) fn new() -> Self {
+        LazyDeadness {
+            lv: None,
+            dirty: Vec::new(),
+        }
+    }
+
+    /// Is `fam` dead after line `use_idx`?  `owned` lists the lines the
+    /// caller is about to rewrite or delete (the only mentions the
+    /// whole-function fallback may ignore).
+    pub(super) fn dead_after(
+        &mut self,
+        store: &LineStore,
+        infos: &[LineInfo],
+        use_idx: usize,
+        fam: RegId,
+        owned: &[usize],
+    ) -> bool {
+        if fam > REG_GP_MAX {
+            return false;
+        }
+        let lv = self
+            .lv
+            .get_or_insert_with(|| FileLiveness::new(store, infos));
+        for start in self.dirty.drain(..) {
+            lv.refresh_at(store, infos, start);
+        }
+        provably_dead_lv(lv, store, infos, use_idx, fam, owned)
+    }
+
+    /// Record that line `idx` (and so its function) was rewritten.  A fold
+    /// extends the live ranges of the registers it substitutes in, so cached
+    /// answers for that function are stale until the next query refreshes it.
+    pub(super) fn invalidate(&mut self, store: &LineStore, infos: &[LineInfo], idx: usize) {
+        if self.lv.is_none() {
+            return;
+        }
+        let start = function_range(store, infos, idx).map_or(idx, |(s, _)| s);
+        if !self.dirty.contains(&start) {
+            self.dirty.push(start);
+        }
+    }
+}
+
 /// Split `OP SRC, DST` (AT&T, dest last) into the trimmed operand texts.
 pub(super) fn split_two_operands(rest: &str) -> Option<(&str, &str)> {
     // AT&T SIB operands contain internal commas: `src, disp(%base,%idx,4)`.
@@ -901,10 +964,28 @@ fn parse_disp(text: &str) -> Option<(Option<String>, i64)> {
                 return None;
             }
             let off = text[i..].parse::<i64>().ok()?;
+            if !is_plain_symbol(sym) {
+                return None;
+            }
             return Some((Some(sym.to_string()), off));
         }
     }
+    if !is_plain_symbol(text) {
+        return None;
+    }
     Some((Some(text.to_string()), 0))
+}
+
+/// A displacement symbol the composition may carry verbatim: an assembler
+/// identifier (`table`, `.LC0`, `x.1`, `sym@PLT`-style specifiers) and
+/// nothing else.  Anything with an operand prefix (`%fs:`, `*`), whitespace
+/// (a mnemonic or `lock` prefix picked up by `operand_start`) or punctuation
+/// is not a displacement: treating it as one would print it back glued to
+/// the composed operand.
+fn is_plain_symbol(sym: &str) -> bool {
+    let mut chars = sym.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '.')
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '$' | '@'))
 }
 
 impl SibAddr {
@@ -1115,6 +1196,12 @@ fn compose_sib(inner: &SibAddr, outer: &SibAddr) -> Option<String> {
         (None, None) => None,
     };
     let disp = inner.disp.checked_add(outer.disp)?;
+    // A ModRM/SIB displacement is a sign-extended 32-bit field.  A numeric
+    // sum outside it has no encoding; with a symbol the linker range-checks
+    // the relocation instead.
+    if sym.is_none() && i32::try_from(disp).is_err() {
+        return None;
+    }
     Some(
         SibAddr {
             sym,
@@ -1168,6 +1255,74 @@ fn compose_indexed_relay(
         index: cons.index,
     };
     compose_sib(&producer, &cons_rest)
+}
+
+/// Substitute the address computed by `leaq PRODUCER, %T` into the single
+/// memory operand of `line` that carries `%T` in its BASE slot, whatever that
+/// operand's displacement and index are, and return the rewritten line.
+///
+/// The consumer's displacement is ADDED to the producer's through
+/// `compose_sib`; it is never spliced as text.  The textual splice this
+/// replaces turned `leaq 8(%r13, %r10), %r9; movq 8(%r9), %rcx` into
+/// `movq 88(%r13, %r10), %rcx` -- the consumer's `8` glued in front of the
+/// producer's `8(` (sqlite3GenerateColumnNames at -O1 loaded the column
+/// name from the wrong struct field).
+///
+/// Fails closed (`None`) when:
+///   * `%T` is not the base of exactly one memory operand -- two such operands
+///     are not rewritten half-way;
+///   * the consumer operand is not a plain `[disp](%T[, %idx[, s]])`: segment
+///     overrides (`%fs:8(%T)`) and indirect-branch operands (`*8(%T)`) put a
+///     prefix in the displacement slot that `parse_disp` would otherwise treat
+///     as a symbol;
+///   * the sum needs more registers than one SIB byte encodes, two symbols, or
+///     a numeric displacement outside disp32.
+///
+/// The caller still owns the liveness proof and must reject the result when it
+/// mentions `%T` anywhere else (a remaining read of the deleted LEA's value).
+pub(super) fn splice_lea_into_mem_operand(
+    line: &str,
+    dst_text: &str,
+    producer_text: &str,
+) -> Option<String> {
+    let bare = format!("({})", dst_text);
+    let indexed = format!("({},", dst_text);
+    let mut hits = line
+        .match_indices(&bare)
+        .chain(line.match_indices(&indexed))
+        .map(|(pos, _)| pos);
+    let pos = hits.next()?;
+    if hits.next().is_some() {
+        return None;
+    }
+    let close = pos + line[pos..].find(')')?;
+    let op_start = operand_start(line, pos);
+    let disp_text = line[op_start..pos].trim();
+    if disp_text.contains(['%', ':', '*', '(', ')', '$', ' ', '\t']) {
+        return None;
+    }
+    let producer = SibAddr::parse(producer_text)?;
+    let cons = SibAddr::parse(&format!("{}{}", disp_text, &line[pos..=close]))?;
+    if cons.base.as_deref() != Some(dst_text) {
+        return None;
+    }
+    let cons_rest = SibAddr {
+        sym: cons.sym,
+        disp: cons.disp,
+        base: None,
+        index: cons.index,
+    };
+    let composed = compose_sib(&producer, &cons_rest)?;
+    // Keep the whitespace that separated the operand from the mnemonic or the
+    // previous comma; replace exactly `disp(...)`.
+    let lead = line[op_start..pos].len() - line[op_start..pos].trim_start().len();
+    let start = op_start + lead;
+    Some(format!(
+        "{}{}{}",
+        &line[..start],
+        composed,
+        &line[close + 1..]
+    ))
 }
 
 /// Requirements: no barrier, no implicit register traffic and no write to
@@ -2978,7 +3133,7 @@ fn rename_plain_family_reads(t: &str, from: RegId, to: RegId) -> Option<String> 
 #[cfg(test)]
 mod tests {
     use super::super::super::peephole_optimize;
-    use super::{SibAddr, compose_sib, operand_start, parse_disp};
+    use super::{SibAddr, compose_sib, operand_start, parse_disp, splice_lea_into_mem_operand};
 
     fn run(asm: &str) -> String {
         peephole_optimize(asm.to_string())
@@ -4799,8 +4954,11 @@ mod tests {
         assert!(out.contains("leaq 1(%rbx), %r10"), "{out}");
     }
 
+    /// A displacement-form use absorbs the LEA by SUMMING the displacements.
+    /// It used to be rejected outright because the only available rewrite was
+    /// a textual splice, which would have produced `movzbl 81(%rbx)`.
     #[test]
-    fn displacement_form_use_is_not_folded() {
+    fn displacement_form_use_composes_displacements() {
         let out = run(concat!(
             "foo:\n",
             ".cfi_startproc\n",
@@ -4809,8 +4967,9 @@ mod tests {
             "    ret\n",
             ".cfi_endproc\n",
         ));
-        assert!(out.contains("leaq 1(%rbx), %r10"), "{out}");
-        assert!(out.contains("movzbl 8(%r10), %r14d"), "{out}");
+        assert!(out.contains("movzbl 9(%rbx), %r14d"), "{out}");
+        assert!(!out.contains("81(%rbx)"), "{out}");
+        assert!(!out.contains("leaq 1(%rbx), %r10"), "{out}");
     }
 
     /// The loop-latch increment: the copy dest is live across the back edge
@@ -5524,5 +5683,98 @@ mod tests {
             index: None,
         };
         assert_eq!(compose_sib(&inner, &outer).as_deref(), Some("24(%rax)"));
+    }
+
+    /// sqlite3GenerateColumnNames at -O1: `pEList->a[i].zEName` was loaded
+    /// through `88(%r13,%r10)` instead of `16(%r13,%r10)` because the
+    /// consumer's `8` was glued in front of the producer's `8(`.
+    #[test]
+    fn splice_sums_consumer_and_producer_displacements() {
+        assert_eq!(
+            splice_lea_into_mem_operand("movq 8(%r9), %rcx", "%r9", "8(%r13, %r10)").as_deref(),
+            Some("movq 16(%r13, %r10), %rcx")
+        );
+        assert_eq!(
+            splice_lea_into_mem_operand("movq (%r9), %rcx", "%r9", "8(%r13,%r10)").as_deref(),
+            Some("movq 8(%r13, %r10), %rcx")
+        );
+        // Store destination operand, negative and hex displacements.
+        assert_eq!(
+            splice_lea_into_mem_operand("movl %eax, -4(%rdx)", "%rdx", "0x10(%rsi)").as_deref(),
+            Some("movl %eax, 12(%rsi)")
+        );
+        // Opposite displacements cancel to GAS's canonical empty form.
+        assert_eq!(
+            splice_lea_into_mem_operand("movzbl -8(%rdx), %eax", "%rdx", "8(%rsi,%rcx,4)")
+                .as_deref(),
+            Some("movzbl (%rsi, %rcx, 4), %eax")
+        );
+        // A consumer index composes with a single-base producer.
+        assert_eq!(
+            splice_lea_into_mem_operand("movq 8(%rdx,%rcx,8), %rax", "%rdx", "16(%rsi)").as_deref(),
+            Some("movq 24(%rsi, %rcx, 8), %rax")
+        );
+        // A symbolic producer displacement survives verbatim.
+        assert_eq!(
+            splice_lea_into_mem_operand("movl 4(%rdx), %eax", "%rdx", "table(%rsi)").as_deref(),
+            Some("movl table+4(%rsi), %eax")
+        );
+    }
+
+    #[test]
+    fn splice_fails_closed_on_unrepresentable_or_ambiguous_operands() {
+        // Three registers cannot share one SIB byte.
+        assert_eq!(
+            splice_lea_into_mem_operand("movq (%rdx,%rcx,8), %rax", "%rdx", "(%rsi,%rdi)"),
+            None
+        );
+        // %T in the INDEX slot is not a base substitution.
+        assert_eq!(
+            splice_lea_into_mem_operand("movq (%rsi,%rdx,8), %rax", "%rdx", "8(%rdi)"),
+            None
+        );
+        // Two memory operands based on %T (movs-style) are not half-rewritten.
+        assert_eq!(
+            splice_lea_into_mem_operand("cmpsb (%rdx), (%rdx)", "%rdx", "8(%rdi)"),
+            None
+        );
+        // Operand prefixes are not displacements.
+        assert_eq!(
+            splice_lea_into_mem_operand("movq %fs:8(%rdx), %rax", "%rdx", "8(%rdi)"),
+            None
+        );
+        assert_eq!(
+            splice_lea_into_mem_operand("jmp *8(%rdx)", "%rdx", "8(%rdi)"),
+            None
+        );
+        // Two symbols cannot be added.
+        assert_eq!(
+            splice_lea_into_mem_operand("movl a(%rdx), %eax", "%rdx", "b(%rsi)"),
+            None
+        );
+        // disp32 overflow has no encoding.
+        assert_eq!(
+            splice_lea_into_mem_operand("movl 2147483647(%rdx), %eax", "%rdx", "1(%rsi)"),
+            None
+        );
+        // `%r1` must not match inside `%r10`.
+        assert_eq!(
+            splice_lea_into_mem_operand("movq 8(%r10), %rax", "%r1", "8(%rsi)"),
+            None
+        );
+        // A consumer without the register at all.
+        assert_eq!(
+            splice_lea_into_mem_operand("movq %rdx, %rax", "%rdx", "8(%rsi)"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_disp_rejects_operand_prefixes_as_symbols() {
+        assert_eq!(parse_disp("%fs:8"), None);
+        assert_eq!(parse_disp("*8"), None);
+        assert_eq!(parse_disp("lock addq 8"), None);
+        assert_eq!(parse_disp(".LC0+8"), Some((Some(".LC0".to_string()), 8)));
+        assert_eq!(parse_disp("x.1"), Some((Some("x.1".to_string()), 0)));
     }
 }

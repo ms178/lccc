@@ -1693,6 +1693,22 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
 #[cfg(test)]
 mod whitespace_invariance;
 
+/// Wrap a peephole test fragment in a complete function: a `.cfi_startproc`
+/// / `.cfi_endproc` pair and a `ret` whose `%rax` is freshly zeroed.  The
+/// passes that delete a definition prove its register dead with the CFG
+/// liveness oracle, which only answers inside a real function: a bare
+/// fragment says nothing about what its (unknown) continuation reads.
+#[cfg(test)]
+fn in_function(body: &[&str]) -> String {
+    let mut out = String::from("f:\n.cfi_startproc\n");
+    for line in body {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str("    xorl %eax, %eax\n    ret\n.cfi_endproc\n");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2613,7 +2629,11 @@ mod tests {
 
     #[test]
     fn test_fp_xmm_roundtrip_load_rcx() {
-        let asm = "    movq -40(%rbp), %rcx\n    movq %rcx, %xmm1\n".to_string();
+        let asm = in_function(&[
+            "    movq -40(%rbp), %rcx",
+            "    movq %rcx, %xmm1",
+            "    movsd %xmm1, (%rdi)",
+        ]);
         let result = peephole_optimize(asm);
         assert!(
             result.contains("movsd -40(%rbp), %xmm1"),
@@ -2800,12 +2820,105 @@ mod tests {
         );
     }
 
+    /// Exact -O1 sqlite3GenerateColumnNames shape (LCCC-SQLITE-COLNAMES-O1):
+    /// the fold must SUM the consumer displacement into the SIB operand.
     #[test]
-    fn test_lea_into_indexed_load() {
-        let asm = ["    leaq (%r12, %r9), %rdi", "    movsbq (%rdi), %rsi"].join("\n") + "\n";
+    fn test_lea_sib_fold_sums_consumer_displacement() {
+        let asm = in_function(&[
+            "    leaq 8(%r13, %r10), %r9",
+            "    movq 8(%r9), %rcx",
+            "    movq %rcx, (%rdi)",
+        ]);
+        let mut store = LineStore::new(asm.clone());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        assert!(local_patterns::fold_lea_into_memory_op(
+            &mut store, &mut infos
+        ));
+        assert_eq!(store.get(3).trim(), "movq 16(%r13, %r10), %rcx");
         let result = peephole_optimize(asm);
         assert!(
-            result.contains("movsbq (%r12,%r9), %rsi"),
+            !result.contains("88("),
+            "displacements glued as text: {result}"
+        );
+    }
+
+    /// Same bug class in the multi-use fold: every use keeps its own offset.
+    #[test]
+    fn test_lea_all_uses_fold_sums_each_displacement() {
+        let asm = in_function(&[
+            "    leaq 8(%r13, %r10), %r9",
+            "    movq 8(%r9), %rcx",
+            "    movl (%r9), %edx",
+            "    movq %rax, 16(%r9)",
+        ]);
+        let mut store = LineStore::new(asm);
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        assert!(local_patterns::fold_lea_all_uses_in_block(
+            &mut store, &mut infos
+        ));
+        assert!(infos[2].is_nop());
+        assert_eq!(store.get(3).trim(), "movq 16(%r13, %r10), %rcx");
+        assert_eq!(store.get(4).trim(), "movl 8(%r13, %r10), %edx");
+        assert_eq!(store.get(5).trim(), "movq %rax, 24(%r13, %r10)");
+    }
+
+    /// A definition at the bottom of a loop whose value is read at the TOP of
+    /// the loop (earlier in the text, reached around the back edge) is live.
+    /// The old forward-only text scan saw no later read and deleted the LEA,
+    /// leaving the next iteration to dereference the stale `%r9`.
+    #[test]
+    fn test_lea_fold_respects_back_edge_liveness() {
+        let asm = [
+            "foo:",
+            ".cfi_startproc",
+            "    leaq 8(%rsi), %r9",
+            ".LBB1:",
+            "    movq (%r9), %rax",
+            "    testq %rax, %rax",
+            "    je .LBB2",
+            "    leaq 8(%r13, %r10), %r9",
+            "    movq (%r9), %rcx",
+            "    addq %rcx, %rdx",
+            "    jmp .LBB1",
+            ".LBB2:",
+            "    movq %rdx, %rax",
+            "    ret",
+            ".cfi_endproc",
+        ]
+        .join("\n")
+            + "\n";
+        for pass in [
+            local_patterns::fold_lea_into_memory_op as fn(&mut LineStore, &mut [LineInfo]) -> bool,
+            local_patterns::fold_lea_all_uses_in_block,
+        ] {
+            let mut store = LineStore::new(asm.clone());
+            let mut infos: Vec<LineInfo> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            pass(&mut store, &mut infos);
+            let lea = (0..store.len())
+                .find(|&n| store.get(n).contains("leaq 8(%r13, %r10), %r9"))
+                .expect("LEA line present");
+            assert!(!infos[lea].is_nop(), "loop-carried LEA deleted");
+        }
+        let result = peephole_optimize(asm);
+        assert!(result.contains("leaq 8(%r13, %r10), %r9"), "{result}");
+    }
+
+    #[test]
+    fn test_lea_into_indexed_load() {
+        let asm = in_function(&[
+            "    leaq (%r12, %r9), %rdi",
+            "    movsbq (%rdi), %rsi",
+            "    movq %rsi, (%rdx)",
+        ]);
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movsbq (%r12, %r9), %rsi"),
             "should fold LEA into SIB load: {}",
             result
         );
@@ -2818,16 +2931,14 @@ mod tests {
 
     #[test]
     fn test_lea_copy_into_indexed_store() {
-        let asm = [
+        let asm = in_function(&[
             "    leaq (%r12, %r9), %rdi",
             "    movq %rdi, %rcx",
             "    movb $0, (%rcx)",
-        ]
-        .join("\n")
-            + "\n";
+        ]);
         let result = peephole_optimize(asm);
         assert!(
-            result.contains("movb $0, (%r12,%r9)"),
+            result.contains("movb $0, (%r12, %r9)"),
             "should fold LEA/copy into SIB store: {}",
             result
         );
@@ -2843,13 +2954,11 @@ mod tests {
         // This is the exact shape from Expat's corpus tail fill.  Once the
         // load/store uses r8 as a folded SIB index, dead-register elimination
         // must still observe r8 as a read and preserve its defining move.
-        let asm = [
+        let asm = in_function(&[
             "    movq %rax, %r8",
             "    leaq (%rdx, %r8), %r9",
             "    movb $0x20, (%r9)",
-        ]
-        .join("\n")
-            + "\n";
+        ]);
         assert_ne!(
             scan_register_refs(b"movb $0x20, (%rdx,%r8)") & (1u16 << 8),
             0,
@@ -2863,13 +2972,13 @@ mod tests {
             &mut store, &mut infos
         ));
         assert_ne!(
-            infos[2].reg_refs & (1u16 << 8),
+            infos[4].reg_refs & (1u16 << 8),
             0,
             "rewritten SIB store must retain r8 in LineInfo: {}",
-            store.get(2)
+            store.get(4)
         );
         assert_eq!(
-            helpers::get_dest_reg(&infos[2]),
+            helpers::get_dest_reg(&infos[4]),
             REG_NONE,
             "SIB memory operands do not write their base/index registers"
         );
@@ -2877,15 +2986,13 @@ mod tests {
             !dead_code::eliminate_dead_reg_moves(&store, &mut infos),
             "index producer must not become dead after SIB fold"
         );
+        // Pipeline level: the index is either kept in %r8 together with its
+        // producer, or copy-propagated from %rax once %r8 is proven dead.
         let result = peephole_optimize(asm);
         assert!(
-            result.contains("movb $0x20, (%rdx,%r8)"),
-            "should fold to indexed store: {}",
-            result
-        );
-        assert!(
-            result.contains("movq %rax, %r8"),
-            "SIB index producer must remain live after folding: {}",
+            (result.contains("movb $0x20, (%rdx, %r8)") && result.contains("movq %rax, %r8"))
+                || result.contains("movb $0x20, (%rdx, %rax)"),
+            "SIB index must stay defined after folding: {}",
             result
         );
     }
@@ -4439,38 +4546,91 @@ mod regression_tests {
     #[test]
     fn test_sib_indexed_store_via_copy() {
         // Pattern: movq %idx, %rax; addq %base, %rax; movq %rax, %tmp; store (%tmp)
-        let asm = [
+        let asm = super::in_function(&[
             "    movq %r14, %rax",
             "    addq %rcx, %rax",
             "    movq %rax, %rcx",
             "    movb $0, (%rcx)",
+        ]);
+        // Pass level: fold_base_index_addressing owns this shape.
+        let mut store = LineStore::new(asm.clone());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        assert!(super::local_patterns::fold_base_index_addressing(
+            &mut store, &mut infos
+        ));
+        assert_eq!(store.get(5).trim(), "movb $0, (%rcx, %r14)");
+        // Pipeline level: with exact liveness an earlier pass may retarget
+        // the add onto %rcx first (`addq %r14, %rcx; movb $0, (%rcx)`); either
+        // way the accumulator round-trip must be gone.
+        let result = peephole_optimize(asm);
+        assert!(
+            !result.contains("addq %rcx, %rax") && !result.contains("%rax"),
+            "accumulator round-trip should be eliminated: {}",
+            result
+        );
+    }
+
+    /// The fold deletes the `movq/addq` pair that defined %rax, so a consumer
+    /// that also READS %rax outside the substituted operand must block it.
+    #[test]
+    fn test_sib_fold_rejects_consumer_reading_the_address_register() {
+        let asm = super::in_function(&[
+            "    movq %r14, %rax",
+            "    addq %rbx, %rax",
+            "    addq (%rax), %rax",
+            "    movq %rax, (%rdi)",
+        ]);
+        let mut store = LineStore::new(asm);
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        assert!(!super::local_patterns::fold_base_index_addressing(
+            &mut store, &mut infos
+        ));
+    }
+
+    /// Back-edge liveness for the accumulator form: %rax is read at the loop
+    /// head, which the old forward text scan never saw.
+    #[test]
+    fn test_sib_fold_respects_back_edge_liveness() {
+        let asm = [
+            "f:",
+            ".cfi_startproc",
+            "    movq %rsi, %rax",
+            ".LBB1:",
+            "    movq (%rax), %rdx",
+            "    testq %rdx, %rdx",
+            "    je .LBB2",
+            "    movq %r14, %rax",
+            "    addq %rbx, %rax",
+            "    movb $0, (%rax)",
+            "    jmp .LBB1",
+            ".LBB2:",
+            "    xorl %eax, %eax",
+            "    ret",
+            ".cfi_endproc",
         ]
         .join("\n")
             + "\n";
-        let result = peephole_optimize(asm);
-        eprintln!("sib_indexed result: {:?}", result);
-        assert!(
-            result.contains("(%rcx, %r14)") || result.contains("(%rcx,%r14)"),
-            "should fold to SIB indexed addressing: {}",
-            result
-        );
-        assert!(
-            !result.contains("addq %rcx, %rax"),
-            "addq should be eliminated: {}",
-            result
-        );
+        let mut store = LineStore::new(asm);
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        assert!(!super::local_patterns::fold_base_index_addressing(
+            &mut store, &mut infos
+        ));
     }
 
     #[test]
     fn test_sib_indexed_store_direct_rax() {
         // Pattern: movq %idx, %rax; addq %base, %rax; store (%rax)
-        let asm = [
+        let asm = super::in_function(&[
             "    movq %r14, %rax",
             "    addq %rbx, %rax",
             "    movb $0, (%rax)",
-        ]
-        .join("\n")
-            + "\n";
+        ]);
         let result = peephole_optimize(asm);
         eprintln!("sib_direct result: {:?}", result);
         assert!(

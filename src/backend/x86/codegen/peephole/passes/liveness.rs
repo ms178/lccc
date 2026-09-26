@@ -70,6 +70,137 @@ const RET_LIVE: u16 =
 /// return-value materialisation leaves behind.
 const RET_LIVE_RAX_ONLY: u16 = RET_LIVE & !RDX;
 
+/// Registers the `call` on line `n` reads: the leading SysV GP argument
+/// registers its `# LCCC_CALL_ARGS <n>` marker publishes (all six when the
+/// marker is absent), `%rax` at `# LCCC_VA_CALL` sites, `%r10` at static-chain
+/// and external-retpoline sites, plus every register its own text mentions.
+/// The single authority for call-site reads: [`FileLiveness`] and the
+/// windowed dead-register scans (`call_window_verdict`) both consult it, so
+/// the two liveness oracles cannot disagree about a call.
+pub(super) fn call_site_reads(store: &LineStore, infos: &[LineInfo], n: usize) -> u16 {
+    let t = infos[n].trimmed(store.get(n));
+    let mentioned = infos[n].reg_refs;
+    // A VARIADIC callee reads %rax (the live SSE register count
+    // in %al — SysV AMD64 3.5.7); a prototyped non-variadic
+    // callee reads nothing from the accumulator. The codegen
+    // marks every variadic site with `# LCCC_VA_CALL`
+    // immediately after the call text (same authority contract
+    // as the `# LCCC_RET_*` prologue markers): absent marker ⇒
+    // the accumulator is unread here. Dropping the false read
+    // unlocks copy/extension folding up to the call in every
+    // non-variadic caller (the gzip_crc32 harness kept
+    // `movzbl+movq+movb` chains live solely on it).
+    let variadic = (n + 1..(n + 3).min(infos.len())).any(|k| {
+        !infos[k].is_nop() && infos[k].trimmed(store.get(k)).starts_with("# LCCC_VA_CALL")
+    });
+    // A static-chain callee reads the chain staged in %r10 by
+    // the SetStaticChain emission directly before this call;
+    // `# LCCC_CHAIN_CALL` marks exactly those sites. The
+    // staging write's own liveness DEPENDS on this read: without
+    // it, dead-write elimination would retire the staging and
+    // silently drop the chain.
+    let chain = (n + 1..(n + 3).min(infos.len())).any(|k| {
+        !infos[k].is_nop()
+            && infos[k]
+                .trimmed(store.get(k))
+                .starts_with("# LCCC_CHAIN_CALL")
+    });
+    // External-retpoline indirect call: the target register is
+    // read by the THUNK symbol, not by this instruction's text
+    // (`call __x86_indirect_thunk_r10` names no register). The
+    // call-site lowering always stages the target in %r10
+    // (emit_call_spill_fptr_impl), so this form reads family 10.
+    // The inline-thunk and `call *%r10` forms mention %r10 in
+    // their own text (`mentioned` covers them).
+    let retpoline_r10 = t.starts_with("call __x86_indirect_thunk_");
+    // `# LCCC_CALL_ARGS <n>`: the codegen's authoritative count
+    // of leading SysV GP argument registers THIS call reads
+    // (armed by the register-argument phase from the
+    // `CallArgClass` classification, published right after the
+    // call text — the same authority contract as the VA marker).
+    // The conservative model reads all six at every call, which
+    // pins any argument-register value across every call and
+    // blocks folds whenever the RA homes a scratch in %rdx/
+    // %rcx/... (measured: the hash-chain chase lost its
+    // load→compare fold when the two-block unroller's
+    // profitability gate shifted the register allocation).
+    // Absent/illegible marker (hand-written fragments, raw
+    // `call` emissions like the i128 helpers) keeps all six:
+    // fail-closed.
+    let mut gp_args: usize = 6;
+    for k in n + 1..(n + 5).min(infos.len()) {
+        if infos[k].is_nop() {
+            continue;
+        }
+        let mk = infos[k].trimmed(store.get(k));
+        if let Some(rest) = mk.strip_prefix("# LCCC_CALL_ARGS ") {
+            if let Ok(v) = rest.trim().parse::<usize>() {
+                gp_args = v.min(6);
+            }
+            break;
+        }
+        if mk.starts_with('#') || mk.starts_with('.') {
+            continue; // a sibling marker or directive
+        }
+        break; // a real instruction ends the marker window
+    }
+    // The first n GP argument registers, in SysV order.
+    let arg_reads: u16 = match gp_args {
+        0 => 0,
+        1 => 1 << 7,                                                // rdi
+        2 => (1 << 7) | (1 << 6),                                   // +rsi
+        3 => (1 << 7) | (1 << 6) | RDX,                             // +rdx
+        4 => (1 << 7) | (1 << 6) | RDX | RCX,                       // +rcx
+        5 => (1 << 7) | (1 << 6) | RDX | RCX | (1 << 8),            // +r8
+        _ => (1 << 7) | (1 << 6) | RDX | RCX | (1 << 8) | (1 << 9), // +r9
+    };
+    let mut reads = if variadic {
+        arg_reads | RAX | mentioned
+    } else {
+        arg_reads | mentioned
+    };
+    if chain || retpoline_r10 {
+        reads |= 1 << 10;
+    }
+    reads
+}
+
+/// Verdict of a forward windowed scan for GP family `reg` that reaches the
+/// `call` on line `n`:
+/// * `Some(false)`: live — the call reads it (argument, variadic count,
+///   static chain, indirect target), or the target is a LOCAL label whose
+///   code the linear window cannot follow;
+/// * `Some(true)`: dead — an external callee clobbers the caller-saved
+///   family without reading it;
+/// * `None`: transparent — a callee-saved family survives the call
+///   unchanged, so the scan must continue past it. Concluding "dead" here
+///   deleted the only write of a value read after the call
+///   (`movslq %eax, %rbx; movq %rbx, %rdi; call malloc` folded to
+///   `movslq %eax, %rdi` while `memset` later read `%rbx`).
+pub(super) fn call_window_verdict(
+    store: &LineStore,
+    infos: &[LineInfo],
+    n: usize,
+    reg: RegId,
+) -> Option<bool> {
+    let mask = 1u16 << reg;
+    if call_site_reads(store, infos, n) & mask != 0 {
+        return Some(false);
+    }
+    let t = infos[n].trimmed(store.get(n));
+    if t.split_whitespace()
+        .nth(1)
+        .is_some_and(|target| target.starts_with('.'))
+    {
+        return Some(false);
+    }
+    if CALLER_SAVED & mask != 0 {
+        Some(true)
+    } else {
+        None
+    }
+}
+
 /// Per-line liveness for a whole assembly file.
 pub(super) struct FileLiveness {
     /// Registers live immediately AFTER each line, when its function could be
@@ -742,89 +873,10 @@ impl FileLiveness {
                 Vec::new(),
             )),
             LineKind::Call => {
-                // A VARIADIC callee reads %rax (the live SSE register count
-                // in %al — SysV AMD64 3.5.7); a prototyped non-variadic
-                // callee reads nothing from the accumulator. The codegen
-                // marks every variadic site with `# LCCC_VA_CALL`
-                // immediately after the call text (same authority contract
-                // as the `# LCCC_RET_*` prologue markers): absent marker ⇒
-                // the accumulator is unread here. Dropping the false read
-                // unlocks copy/extension folding up to the call in every
-                // non-variadic caller (the gzip_crc32 harness kept
-                // `movzbl+movq+movb` chains live solely on it).
-                let variadic = (n + 1..(n + 3).min(infos.len())).any(|k| {
-                    !infos[k].is_nop()
-                        && infos[k].trimmed(store.get(k)).starts_with("# LCCC_VA_CALL")
-                });
-                // A static-chain callee reads the chain staged in %r10 by
-                // the SetStaticChain emission directly before this call;
-                // `# LCCC_CHAIN_CALL` marks exactly those sites. The
-                // staging write's own liveness DEPENDS on this read: without
-                // it, dead-write elimination would retire the staging and
-                // silently drop the chain.
-                let chain = (n + 1..(n + 3).min(infos.len())).any(|k| {
-                    !infos[k].is_nop()
-                        && infos[k]
-                            .trimmed(store.get(k))
-                            .starts_with("# LCCC_CHAIN_CALL")
-                });
-                // External-retpoline indirect call: the target register is
-                // read by the THUNK symbol, not by this instruction's text
-                // (`call __x86_indirect_thunk_r10` names no register). The
-                // call-site lowering always stages the target in %r10
-                // (emit_call_spill_fptr_impl), so this form reads family 10.
-                // The inline-thunk and `call *%r10` forms mention %r10 in
-                // their own text (`mentioned` covers them).
-                let retpoline_r10 = t.starts_with("call __x86_indirect_thunk_");
-                // `# LCCC_CALL_ARGS <n>`: the codegen's authoritative count
-                // of leading SysV GP argument registers THIS call reads
-                // (armed by the register-argument phase from the
-                // `CallArgClass` classification, published right after the
-                // call text — the same authority contract as the VA marker).
-                // The conservative model reads all six at every call, which
-                // pins any argument-register value across every call and
-                // blocks folds whenever the RA homes a scratch in %rdx/
-                // %rcx/... (measured: the hash-chain chase lost its
-                // load→compare fold when the two-block unroller's
-                // profitability gate shifted the register allocation).
-                // Absent/illegible marker (hand-written fragments, raw
-                // `call` emissions like the i128 helpers) keeps all six:
-                // fail-closed.
-                let mut gp_args: usize = 6;
-                for k in n + 1..(n + 5).min(infos.len()) {
-                    if infos[k].is_nop() {
-                        continue;
-                    }
-                    let mk = infos[k].trimmed(store.get(k));
-                    if let Some(rest) = mk.strip_prefix("# LCCC_CALL_ARGS ") {
-                        if let Ok(v) = rest.trim().parse::<usize>() {
-                            gp_args = v.min(6);
-                        }
-                        break;
-                    }
-                    if mk.starts_with('#') || mk.starts_with('.') {
-                        continue; // a sibling marker or directive
-                    }
-                    break; // a real instruction ends the marker window
-                }
-                // The first n GP argument registers, in SysV order.
-                let arg_reads: u16 = match gp_args {
-                    0 => 0,
-                    1 => 1 << 7,                                                // rdi
-                    2 => (1 << 7) | (1 << 6),                                   // +rsi
-                    3 => (1 << 7) | (1 << 6) | RDX,                             // +rdx
-                    4 => (1 << 7) | (1 << 6) | RDX | RCX,                       // +rcx
-                    5 => (1 << 7) | (1 << 6) | RDX | RCX | (1 << 8),            // +r8
-                    _ => (1 << 7) | (1 << 6) | RDX | RCX | (1 << 8) | (1 << 9), // +r9
-                };
-                let mut reads = if variadic {
-                    arg_reads | RAX | mentioned
-                } else {
-                    arg_reads | mentioned
-                };
-                if chain || retpoline_r10 {
-                    reads |= 1 << 10;
-                }
+                // Call-site reads: see `call_site_reads` (the shared
+                // authority for the LCCC_CALL_ARGS / LCCC_VA_CALL /
+                // LCCC_CHAIN_CALL marker protocol).
+                let reads = call_site_reads(store, infos, n);
                 // Intra-function call target (the inline-retpoline
                 // `.Lrpl_set/.Lrpl_inner` pair, local trampolines): control
                 // transfers to the label, and the `ret` inside returns to

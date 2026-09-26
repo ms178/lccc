@@ -60,6 +60,18 @@ victim is simply the cheapest one under one consistent order.
 `RegAllocConfig` includes call/indirect exclusions, XMM regs, folded index
 uses, and ABI physical hints.
 
+**Hidden operand reads are liveness uses.** `folded_index_uses` (the peeled
+root of a SIB-folded GEP index — `resolve_index` looks through
+Cast/Shl/Mul/Add/Sub — and CMP-REPLAY operands) is passed to
+`compute_live_intervals_with_hidden_reads`, which records a read of the
+operand at every consumer's definition and uses inside the backward
+dataflow. Intervals and hole-aware segments are therefore exact on every CFG
+path, whatever the block layout. The former post-hoc stretch of the
+operand's last segment missed reads sitting in a hole BEFORE that segment
+(LCCC-SQLITE-WPS: `wherePathSolver` indexed `aLoop[nLoop-1]` through the
+`nLoop` U8 load whose final IR use was laid out after the accesses; Phase 2f
+homed a load dest in the same register inside the hole).
+
 PhysReg **(11) = %r10** (static chain), (10) = %r11.
 
 The static-chain register is **removed from every allocatable pool** in a
@@ -84,4 +96,7 @@ residual Briggs on spilled (RA-09).
 `CCC_NO_ABI_REG_HINTS`, `CCC_NO_VECREG`, `CCC_EVICT_MODE`,
 `CCC_PGO_WEIGHT_MAX`, `CCC_NO_TIER2_GRAPH`, `CCC_RA_EXPLAIN`,
 `CCC_TRACE_ALLOCSTATS[=filter]`, `CCC_DEBUG_SEGMENT_FILL`,
-`CCC_VERIFY_REGALLOC`.
+`CCC_VERIFY_REGALLOC`, `CCC_NO_FOLDED_INDEX_LIVENESS` (drops the hidden
+reads — unsound, A/B only). Phase 2f bisection: `CCC_SEGMENT_FILL_LIMIT=N`
+admits only the first N fills (in `CCC_DEBUG_SEGMENT_FILL` order), confined
+to one function by `CCC_SEGMENT_FILL_FUNC=name`.

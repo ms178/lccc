@@ -1085,6 +1085,20 @@ pub(crate) fn run_passes(
     // predictable for faster debug-style builds while still removing obvious
     // dead/copy/constant IR introduced by lowering.
     if opt_level == 1 {
+        // Per-pass checkpoint for the -O1 tier: the same CCC_DUMP_EACH_PASS /
+        // CCC_DUMP_FUNC dump and CCC_VERIFY_IR structural check the -O2+
+        // tiers run after every pass. Without it an -O1-only miscompile
+        // cannot be attributed to a pass (the verifier only ever saw the
+        // module after the final FMA peel). Both are no-ops unless the
+        // corresponding environment variable is set.
+        macro_rules! o1_checkpoint {
+            ($name:expr_2021) => {
+                if dump_each_pass {
+                    dump_ir_filtered(module, &format!("O1 {}", $name));
+                }
+                verify::verify_after_pass(module, $name);
+            };
+        }
         // Parameter allocas are promoted up front so the folding passes
         // below see ParamRef-SSA operands (range_fold + simplify need that
         // shape to fold 20041114-1's unsigned-range disjunction). The
@@ -1097,12 +1111,16 @@ pub(crate) fn run_passes(
         if time_passes {
             eprintln!("[PASS] o1 mem2reg");
         }
+        o1_checkpoint!("o1 mem2reg");
         ip_purity::run(module);
+        o1_checkpoint!("ip_purity");
         if !pass_disabled(&disabled, "fortifyfold") {
             fortify_fold::run(module, target.is_32bit());
         }
+        o1_checkpoint!("fortifyfold");
         constant_fold::run(module);
         copy_prop::run(module);
+        o1_checkpoint!("constfold+copyprop");
         // Local simplifier at -O1: shift identity folds (x>>0 -> x, 0<<x -> 0,
         // all-ones arithmetic shr), `fabs(x) < 0.0` -> false and related
         // per-instruction canonicalizations. gcc.c-torture shiftopt-1 and
@@ -1113,6 +1131,7 @@ pub(crate) fn run_passes(
         if !pass_disabled(&disabled, "simplify") {
             simplify::run_with_config(module, true);
         }
+        o1_checkpoint!("simplify");
         // Inlining at -O1: GCC's -O1 tier inlines always_inline and
         // extern-inline functions plus called-once/small static helpers, and
         // several torture cases depend on the resulting constant propagation
@@ -1127,11 +1146,13 @@ pub(crate) fn run_passes(
         if !pass_disabled(&disabled, "inline") {
             inline::run(module);
         }
+        o1_checkpoint!("inline");
         // Post-inline parameter promotion: with the inliner done, param
         // allocas can become SSA values. Constants passed through inlined
         // calls (20010119-1: a = 10) become visible to the propagation
         // chain below, exactly like the -O2 tier's post-inline mem2reg.
         crate::ir::mem2reg::promote_allocas_with_params(module);
+        o1_checkpoint!("post-inline mem2reg");
         // Range-check folding at -O1 (same transform as the -O2 loop's
         // "range_fold" pass): (x >= lo && x <= hi) ->
         // (unsigned)(x - lo) <= (hi - lo) plus the complement form.
@@ -1141,6 +1162,7 @@ pub(crate) fn run_passes(
         if !pass_disabled(&disabled, "range_fold") {
             module.for_each_function(range_check::run_function);
         }
+        o1_checkpoint!("range_fold");
         // Second copy-prop + constant-fold round: simplify rewrites shift
         // identities into Copies (x>>0 => Copy(x)), so comparisons against the
         // original value only become identical-operand compares after the new
@@ -1150,21 +1172,27 @@ pub(crate) fn run_passes(
         // preserving parity. Both passes are linear and idempotent.
         copy_prop::run(module);
         constant_fold::run(module);
+        o1_checkpoint!("copyprop2+constfold2");
         // Same f128-builtin fold as -O0 (see above).
         simplify::fold_math_intrinsic_calls(module);
         module.for_each_function(dce::eliminate_dead_code);
+        o1_checkpoint!("mathfold+dce");
         // Same-block dead store elimination is cheap and removes the
         // store-overwritten lowering residue at -O1 too.
         module.for_each_function(dse::eliminate_dead_stores);
+        o1_checkpoint!("dse");
         module.for_each_function(store_load_forward::run);
+        o1_checkpoint!("slforward");
         constant_fold::run(module);
         module.for_each_function(cfg_simplify::simplify_cfg);
+        o1_checkpoint!("constfold3+cfg");
         // Resolve remaining __builtin_constant_p queries BEFORE the final DCE:
         // an unresolved IsConstant node keeps both select arms alive, so the
         // not-taken arm's calls (20010119-1: undef()) only become removable
         // after resolution. The final DCE then collects them; previously the
         // resolver ran last and the dead branches survived to codegen.
         constant_fold::resolve_remaining_is_constant(module);
+        o1_checkpoint!("is_constant");
         // Post-resolution prune: resolving IsConstant turns previously
         // both-arms-alive diamonds into constant branches, so one more
         // cfg_simplify + DCE round folds the taken edge and deletes the
@@ -1172,6 +1200,7 @@ pub(crate) fn run_passes(
         // body's not-constant arm reached codegen before this round).
         module.for_each_function(cfg_simplify::simplify_cfg);
         module.for_each_function(dce::eliminate_dead_code);
+        o1_checkpoint!("cfg+dce");
         // Bool-phi merge-diamond branch threading (same call as the -O2+
         // tier's late phase; see there for the rationale).
         if !pass_disabled(&disabled, "boolthread") && std::env::var("CCC_NO_BOOL_THREAD").is_err() {
@@ -1180,6 +1209,7 @@ pub(crate) fn run_passes(
                 module.for_each_function(cfg_simplify::simplify_cfg);
                 module.for_each_function(dce::eliminate_dead_code);
             }
+            o1_checkpoint!("boolthread");
         }
         // FMA operand-negation peel (same call as the -O2+ tail; see Phase
         // 11f there). GCC folds fma(-a,b,-c) to one vfnmsub at -O1, so the

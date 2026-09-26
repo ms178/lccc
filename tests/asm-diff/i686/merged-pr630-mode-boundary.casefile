@@ -1,0 +1,292 @@
+# PR #630 follow-up: i686 register-file boundary, independently compared to
+# GNU as 2.47.20260726. Every reject is a single-instruction case: a different
+# rejected instruction cannot conceal a false acceptance. zmm0..7 and EVEX
+# remain legal in 32-bit and 16-bit code modes.
+
+;;; pr630_broadcast_r8d_b reject
+.text
+vpbroadcastb %r8d,%xmm1
+;;; pr630_broadcast_r8d_w reject
+.text
+vpbroadcastw %r8d,%xmm1
+;;; pr630_broadcast_r8d_d reject
+.text
+vpbroadcastd %r8d,%xmm1
+;;; pr630_broadcast_r8_q reject
+.text
+vpbroadcastq %r8,%xmm1
+;;; pr630_broadcast_rax_q reject
+.text
+vpbroadcastq %rax,%xmm1
+;;; pr630_broadcast_xmm8 reject
+.text
+vpbroadcastb %eax,%xmm8
+;;; pr630_broadcast_zmm31 reject
+.text
+vpbroadcastd %edi,%zmm31
+;;; pr630_vec_xmm8_evex reject
+.text
+vpabsq %xmm8,%xmm1
+;;; pr630_vec_zmm8_evex reject
+.text
+vpabsq %zmm8,%zmm1
+;;; pr630_vec_zmm8_move reject
+.text
+vmovdqu8 %zmm8,%zmm1
+;;; pr630_vec_xmm8_vex reject
+.text
+{vex} vaddps %xmm8,%xmm0,%xmm1
+;;; pr630_vec_ymm8_vex reject
+.text
+vaddps %ymm8,%ymm0,%ymm1
+;;; pr630_vec_xmm8_dest reject
+.text
+vaddps %xmm1,%xmm2,%xmm8
+;;; pr630_vec_xmm8_xop reject
+.text
+vpcmov %xmm1,%xmm8,%xmm2,%xmm3
+;;; pr630_lwp_r8d reject
+.text
+lwpins $1,%r8d,%edx
+;;; pr630_mem_r8d_evex reject
+.text
+vmovdqu8 8(%r8d),%zmm1
+;;; pr630_mem_r8d_vex reject
+.text
+vaddps 8(%r8d),%ymm2,%ymm1
+;;; pr630_mem_zmm8_dest reject
+.text
+vmovdqu8 8(%eax),%zmm8
+;;; pr630_rex_low_byte reject
+.text
+vpbroadcastb %spl,%xmm1
+;;; pr630_broadcast_q_wrong_width reject
+.text
+vpbroadcastq %edx,%zmm1
+;;; pr630_broadcast_eax_xmm
+.text
+vpbroadcastb %eax,%xmm1
+;;; pr630_broadcast_edi_xmm
+.text
+vpbroadcastb %edi,%xmm7
+;;; pr630_broadcast_edi_ymm
+.text
+vpbroadcastw %edi,%ymm7
+;;; pr630_broadcast_edi_zmm
+.text
+vpbroadcastd %edi,%zmm7
+;;; pr630_evex_zmm7_low
+.text
+vpabsq %zmm7,%zmm1
+;;; pr630_evex_zmm7_mem
+.text
+vmovdqu8 (%ebp),%zmm7
+;;; pr630_xop_low
+.text
+vpcmov %xmm7,%xmm6,%xmm5,%xmm4
+;;; pr630_code16_broadcast_registers
+.text
+.code16
+vpbroadcastd %edi,%zmm1
+;;; pr630_code16gcc_broadcast_registers
+.text
+.code16gcc
+vpbroadcastw %eax,%ymm1
+;;; pr630_code16_vex3_registers
+.text
+.code16
+{vex3} vaddps %xmm1,%xmm2,%xmm3
+
+# Address-mode and relocation bridge: these were pre-existing delegated-vector
+# wrong bytes / wrong ELF relocation offsets, independently probed with GAS
+# 2.47 for code32, code16, and code16gcc. Multi-instruction *accepted* groups
+# deliberately check selector isolation and relocation bases after a NOP.
+
+;;; pr630_code32_16bit_indexed
+.text
+.code32
+vaddps 4(%bx,%si),%xmm2,%xmm1
+
+;;; pr630_code32_16bit_evex
+.text
+.code32
+vmovdqu8 8(%bx),%zmm1
+
+;;; pr630_code32_16bit_evex_compressed
+.text
+.code32
+vmovdqu8 64(%bx),%zmm1
+
+;;; pr630_code32_16bit_bp_si
+.text
+.code32
+vmovdqu8 8(%bp,%si),%zmm1
+
+;;; pr630_code16_16bit_vex3
+.text
+.code16
+{vex3} vaddps 4(%bx,%si),%xmm2,%xmm1
+
+;;; pr630_code16_32bit_vex3
+.text
+.code16
+{vex3} vaddps 8(%eax),%xmm2,%xmm1
+
+;;; pr630_code16_32bit_evex
+.text
+.code16
+vmovdqu8 64(%eax),%zmm1
+
+;;; pr630_code16_16bit_evex_disp16
+.text
+.code16
+vmovdqu8 8(%bx),%zmm1
+
+;;; pr630_code16_16bit_evex_compressed
+.text
+.code16
+vmovdqu8 64(%bx),%zmm1
+
+;;; pr630_code16_16bit_evex_zero
+.text
+.code16
+vmovdqu8 (%bp),%zmm1
+
+;;; pr630_code16_16bit_evex_implicit
+.text
+.code16
+vmovdqu8 0(%bx),%zmm1
+
+;;; pr630_code16_16bit_tuple_q
+.text
+.code16
+vpmullq 64(%bx),%zmm1,%zmm2
+
+;;; pr630_code16_16bit_tuple_d
+.text
+.code16
+vpaddd 64(%bx),%zmm1,%zmm2
+
+;;; pr630_code16_16bit_evex_imm
+.text
+.code16
+vpsraq $3,8(%bx),%xmm2
+
+;;; pr630_code16_xop_mem_imm
+.text
+.code16
+vpcmov %xmm1,8(%bx),%xmm2,%xmm3
+
+;;; pr630_code16_seg_fs
+.text
+.code16
+vmovdqu8 %fs:8(%bx),%zmm1
+
+;;; pr630_code16_seg_bp_ss
+.text
+.code16
+vmovdqu8 %ss:8(%bp),%zmm1
+
+;;; pr630_code16_seg_bp_ds
+.text
+.code16
+vmovdqu8 %ds:8(%bp),%zmm1
+
+;;; pr630_code16gcc_index
+.text
+.code16gcc
+vaddps 4(%bx,%si),%xmm2,%xmm1
+
+;;; pr630_code16gcc_evex
+.text
+.code16gcc
+vmovdqu8 8(%bx),%zmm1
+
+;;; pr630_code16_mem_bad_mixed reject
+.text
+.code16
+vmovdqu8 8(%bx,%ecx),%zmm1
+
+;;; pr630_code16_mem_bad_scale reject
+.text
+.code16
+vmovdqu8 8(%bx,%si,2),%zmm1
+
+;;; pr630_code32_mem_bad_mixed reject
+.text
+.code32
+vmovdqu8 8(%bx,%ecx),%zmm1
+
+;;; pr630_reloc_after_nop
+.text
+.globl anchor
+anchor:
+nop
+vaddps ext(%eax),%xmm2,%xmm1
+
+;;; pr630_reloc_after_two
+.text
+.globl anchor
+anchor:
+nop
+.byte 0x90
+vaddps ext(%eax),%xmm2,%xmm1
+
+;;; pr630_reloc_code16_s16
+.text
+.code16
+.byte 0x90
+vpaddd sym(%bx),%zmm1,%zmm2
+
+;;; pr630_reloc_code32_addr16
+.text
+.byte 0x90
+vpaddd sym(%bx),%zmm1,%zmm2
+
+;;; pr630_reloc_code16_addr32
+.text
+.code16
+.byte 0x90
+vpaddd sym(%eax),%zmm1,%zmm2
+
+;;; pr630_reloc_code16_xop_immediate
+.text
+.code16
+.byte 0x90
+vpcmov %xmm1,sym(%bx),%xmm2,%xmm3
+
+;;; pr630_reloc_code16_fs
+.text
+.code16
+.byte 0x90
+vmovdqu8 %fs:sym(%bx),%zmm1
+
+;;; pr630_reloc_code32_absolute
+.text
+.byte 0x90
+vpaddd sym,%zmm1,%zmm2
+
+;;; pr630_reloc_code16_absolute
+.text
+.code16
+.byte 0x90
+vpaddd sym,%zmm1,%zmm2
+
+;;; pr630_reloc_code16_vex_absolute
+.text
+.code16
+.byte 0x90
+vaddps sym,%xmm1,%xmm2
+
+;;; pr630_reloc_code16_evex_absolute
+.text
+.code16
+.byte 0x90
+vmovdqu8 sym,%zmm1
+
+;;; pr630_selector_alternating
+.text
+.code32
+{vex3} vaddps %xmm1,%xmm2,%xmm3
+vaddps %xmm1,%xmm2,%xmm3
+{vex2} vaddps %xmm1,%xmm2,%xmm3
