@@ -1522,7 +1522,9 @@ fn is_safe_sole_consumer(inst: &Instruction, value_id: u32, lhs_first_binop: boo
             src: Operand::Value(v),
             ..
         } => v.0 == value_id,
-        Instruction::BinOp { lhs, rhs, ty, .. } => {
+        Instruction::BinOp {
+            op, lhs, rhs, ty, ..
+        } => {
             if ty.is_float() || ty.is_long_double() {
                 return false;
             }
@@ -1536,7 +1538,33 @@ fn is_safe_sole_consumer(inst: &Instruction, value_id: u32, lhs_first_binop: boo
             // into %rcx or a memory operand from its HOME. Skipping that home
             // made the load read zero (alu_peepholes sdivm3: `0 - (v/3)`
             // returned 0 instead of the negated quotient).
-            operand_is_value(lhs, value_id) && (operand_is_const(rhs) || lhs_first_binop)
+            if operand_is_value(lhs, value_id) {
+                return operand_is_const(rhs) || lhs_first_binop;
+            }
+            // COMMUTED-RHS PRODUCERS (sha256 MAJ temporaries): on lhs-first
+            // backends the emitter commutes a commutative integer binop
+            // whose RHS is accumulator-resident — `And(c, x)` with x in %rax
+            // emits `andl <c-home>, %eax`, reading the OTHER operand from
+            // its own home — so the RHS of Add/Mul/And/Or/Xor is an equally
+            // safe sole consumer. Without this arm `a^b` and `(a^b)&c`
+            // (single-use, adjacent, RHS-consumed) were assigned deferred
+            // slots whose definition parks (`movl %eax, N(%rsp)`) are never
+            // read: pure dead stores whenever the peephole's never-read
+            // analysis fails closed on an indexed `disp(%rsp,%rX,s)` access
+            // (the LEA→memory fold creates those). The emitter's
+            // acc-resident read path already serves these consumers; the
+            // slot was write-only. Non-commutative ops keep the LHS-only
+            // contract, and so does every AccumulatorCentric backend
+            // (i686: its consumer order does not promise the commute).
+            // CCC_NO_COMMUTED_ACC restores the LHS-only contract for
+            // bisection.
+            lhs_first_binop
+                && std::env::var_os("CCC_NO_COMMUTED_ACC").is_none()
+                && matches!(
+                    op,
+                    IrBinOp::Add | IrBinOp::Mul | IrBinOp::And | IrBinOp::Or | IrBinOp::Xor
+                )
+                && operand_is_value(rhs, value_id)
         }
         Instruction::Cmp { lhs, rhs, ty, .. } => {
             if ty.is_float() || ty.is_long_double() {
@@ -3332,6 +3360,95 @@ mod cfg_copy_coalesce_tests {
         ));
         let skip = compute_immediately_consumed(&func, false);
         assert!(skip.contains(&0));
+    }
+
+    /// Commuted-RHS producers (the sha256 MAJ shape `maj = (a&b) ^ ((a^b)&c)`:
+    /// `a^b` is the RHS of the And, `(a^b)&c` the RHS of the Xor). On
+    /// lhs-first backends the emitter commutes (`andl <other-home>, %eax`),
+    /// so these are safe accumulator consumers and must NOT be given
+    /// write-only deferred slots (the dead park stores).
+    #[test]
+    fn immediately_consumed_commutative_rhs_on_lhs_first() {
+        let mut func = IrFunction::new("maj".to_string(), IrType::I32, vec![], false);
+        // v1 := 6; v0 := 4; v2 := And(v1, v0)  [v0 consumed as RHS, adjacent]
+        func.blocks.push(block(
+            0,
+            vec![
+                scalar_def(1, 6),
+                scalar_def(0, 4),
+                Instruction::BinOp {
+                    dest: Value(2),
+                    op: IrBinOp::And,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Value(Value(0)),
+                    ty: IrType::I32,
+                },
+            ],
+            Terminator::Return(Some(Operand::Value(Value(2)))),
+        ));
+        let skip = compute_immediately_consumed(&func, true);
+        assert!(
+            skip.contains(&0),
+            "commutative RHS consumer must be acc-eligible on lhs-first"
+        );
+        // v1's use is the And but its def is NOT adjacent (v0 sits between):
+        // only the adjacent producer is acc-consumable.
+        assert!(!skip.contains(&1));
+    }
+
+    /// The commute contract is lhs-first-only: an AccumulatorCentric backend
+    /// (i686) keeps the LHS-only rule for the same shape.
+    #[test]
+    fn immediately_consumed_commutative_rhs_rejected_when_not_lhs_first() {
+        let mut func = IrFunction::new("maj".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(block(
+            0,
+            vec![
+                scalar_def(1, 6),
+                scalar_def(0, 4),
+                Instruction::BinOp {
+                    dest: Value(2),
+                    op: IrBinOp::And,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Value(Value(0)),
+                    ty: IrType::I32,
+                },
+            ],
+            Terminator::Return(Some(Operand::Value(Value(2)))),
+        ));
+        let skip = compute_immediately_consumed(&func, false);
+        assert!(
+            !skip.contains(&0),
+            "RHS consumption is NOT acc-safe without the lhs-first commute contract"
+        );
+    }
+
+    /// Non-commutative consumers (`Sub(X, v)`: x86-64 stages the LHS into
+    /// %rax and subtracts <v> loaded from its HOME) keep the LHS-only rule
+    /// even on lhs-first backends — the sdivm3 `0 - (v/3)` class.
+    #[test]
+    fn immediately_consumed_non_commutative_rhs_rejected_on_lhs_first() {
+        let mut func = IrFunction::new("sub".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(block(
+            0,
+            vec![
+                scalar_def(1, 6),
+                scalar_def(0, 4),
+                Instruction::BinOp {
+                    dest: Value(2),
+                    op: IrBinOp::Sub,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Value(Value(0)),
+                    ty: IrType::I32,
+                },
+            ],
+            Terminator::Return(Some(Operand::Value(Value(2)))),
+        ));
+        let skip = compute_immediately_consumed(&func, true);
+        assert!(
+            !skip.contains(&0),
+            "Sub RHS is not commutable: the producer needs a home"
+        );
     }
 
     #[test]
