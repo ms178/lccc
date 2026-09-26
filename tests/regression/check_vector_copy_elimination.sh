@@ -409,10 +409,20 @@ EOF
         # zeroed upper bits a 128-bit read genuinely needs (refusing them is
         # correct), and the rest are the FMA form-selection cases that belong to
         # instruction selection.  The ratchet is here so neither grows silently.
-        if [[ "$n_copies" -le 42 ]]; then
-            ok "runtime kernel carries $n_copies vector register copies (budget 42, inventoried in FOLLOWUP-2026-09-19E)"
+        # 2026-09-26 (PR #631 follow-up): 42 -> 47.  The +5 are NOT spills:
+        # they are direct `movsd %xmmK, %xmm{0,1,2}` FP-ARGUMENT STAGING
+        # sites where the previous tree paid a two-instruction %rax relay
+        # (`movq %xmmK,%rax; movq %rax,%xmmN`, invisible to this counter
+        # because neither line is an xmm->xmm copy). The relay-fold now
+        # collapses those pairs into the single direct move GCC and Clang
+        # emit for FP argument staging — a net -5 instructions on this
+        # kernel, zero new spill traffic. Every one of the 5 was verified
+        # against the pre-change tree: movsd xmm8/9/10 -> xmm0/1/2 (the
+        # fmaf_add call) and movsd xmm11/4 -> xmm0/1 (the printf pair).
+        if [[ "$n_copies" -le 47 ]]; then
+            ok "runtime kernel carries $n_copies vector register copies (budget 47: 42 residual + 5 direct arg-staging forms that replaced two-instruction %rax relays, net -5 instructions)"
         else
-            bad "runtime kernel carries $n_copies vector register copies, budget is 42"
+            bad "runtime kernel carries $n_copies vector register copies, budget is 47"
             insns "$work/runtime.s" | grep -E "$COPY_RE" | head -10 | note
         fi
     fi

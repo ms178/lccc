@@ -95,10 +95,7 @@ impl Lowerer {
         } else {
             None
         };
-        let ptr_count = declarator.derived[..declarator.derived.len().saturating_sub(1)]
-            .iter()
-            .filter(|d| matches!(d, DerivedDeclarator::Pointer))
-            .count();
+        let ptr_count = DerivedDeclarator::return_pointer_depth(&declarator.derived);
         if let Some((params, variadic)) = func_info {
             self.register_block_func_meta(
                 &declarator.name,
