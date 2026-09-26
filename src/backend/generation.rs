@@ -6610,16 +6610,18 @@ mod indexed_gep_machinst_gate_tests {
 
         let consumer_block = &function.blocks[1];
         let gep_block = &function.blocks[2];
-        assert!(function
-            .blocks
-            .iter()
-            .position(|b| b.label == consumer_block.label)
-            .unwrap()
-            < function
+        assert!(
+            function
                 .blocks
                 .iter()
-                .position(|b| b.label == gep_block.label)
-                .unwrap());
+                .position(|b| b.label == consumer_block.label)
+                .unwrap()
+                < function
+                    .blocks
+                    .iter()
+                    .position(|b| b.label == gep_block.label)
+                    .unwrap()
+        );
         assert!(indexed_gep_memory_access(
             &consumer_block.instructions[0],
             &indexed_gep_map

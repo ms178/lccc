@@ -2450,10 +2450,7 @@ mod tests {
                 .any(|s| s.value_id == v && s.start <= p && p <= s.end)
         };
         let plain = compute_live_intervals(&func);
-        assert!(
-            !covers(&plain, 1, 7),
-            "precondition: IR liveness has a hole"
-        );
+        assert!(!covers(&plain, 1, 7), "precondition: IR liveness has a hole");
         assert!(covers(&plain, 1, 10));
 
         let mut hidden: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
