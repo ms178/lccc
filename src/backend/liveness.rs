@@ -1383,12 +1383,6 @@ static HIDDEN_READ_COPY_CHAIN_ENV: std::sync::OnceLock<bool> = std::sync::OnceLo
 static HIDDEN_READ_COPY_CHAIN_OVERRIDE: std::sync::atomic::AtomicI8 =
     std::sync::atomic::AtomicI8::new(-1);
 
-/// Test-only override for [`hidden_read_copy_chain_enabled`].
-#[cfg(test)]
-fn set_hidden_read_copy_chain_for_tests(follow: bool) {
-    HIDDEN_READ_COPY_CHAIN_OVERRIDE.store(follow as i8, std::sync::atomic::Ordering::Relaxed);
-}
-
 /// Extend `start_id` and (when `follow_copies`) every Copy-chain source (all
 /// phi-elim preds) to `point`.
 ///
@@ -2566,6 +2560,12 @@ mod tests {
         let mut hidden: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
         hidden.insert(4, vec![6]);
         hidden.insert(5, vec![8]);
+        // Pin FORCED-PRECISE for this assertion: the outcome is the precise
+        // walk contract, which must hold regardless of any bisection env
+        // knob; this also serializes the test against the flip windows on
+        // the shared backend-flag lock (see test_support::TriStateFlagWindow).
+        let _pin =
+            crate::test_support::TriStateFlagWindow::new(&HIDDEN_READ_COPY_CHAIN_OVERRIDE, 0);
         let r = compute_live_intervals_with_hidden_reads(&func, &hidden);
         let covers = |r: &LivenessResult, v: u32, p: u32| {
             r.segments
@@ -2618,9 +2618,13 @@ mod tests {
         );
         // The conservative chain walk (bisection knob) still pins the pred:
         // the model difference is statable, not accidental.
-        set_hidden_read_copy_chain_for_tests(true);
+        // Tri-state window: forces the conservative walk for the compute
+        // below and restores the previous override state (-1 env-follow)
+        // on drop — panic-safe and order-independent under the shared
+        // backend-flag lock (see test_support::TriStateFlagWindow).
+        let _conservative =
+            crate::test_support::TriStateFlagWindow::new(&HIDDEN_READ_COPY_CHAIN_OVERRIDE, 1);
         let conservative = compute_live_intervals_with_hidden_reads(&func, &hidden);
-        set_hidden_read_copy_chain_for_tests(false);
         assert!(
             covers(&conservative, 3, 8),
             "conservative chain walk pins the entry pred at the access"
@@ -2680,6 +2684,12 @@ mod tests {
 
         let mut hidden: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
         hidden.insert(4, vec![6]);
+        // Pin FORCED-PRECISE for this assertion: the outcome is the precise
+        // walk contract, which must hold regardless of any bisection env
+        // knob; this also serializes the test against the flip windows on
+        // the shared backend-flag lock (see test_support::TriStateFlagWindow).
+        let _pin =
+            crate::test_support::TriStateFlagWindow::new(&HIDDEN_READ_COPY_CHAIN_OVERRIDE, 0);
         let r = compute_live_intervals_with_hidden_reads(&func, &hidden);
         let covers = |r: &LivenessResult, v: u32, p: u32| {
             r.segments
@@ -2712,9 +2722,13 @@ mod tests {
         // The same covering property under the conservative chain walk —
         // the model difference is the COST (the pred is pinned to the
         // access), never the contiguity.
-        set_hidden_read_copy_chain_for_tests(true);
+        // Tri-state window: forces the conservative walk for the compute
+        // below and restores the previous override state (-1 env-follow)
+        // on drop — panic-safe and order-independent under the shared
+        // backend-flag lock (see test_support::TriStateFlagWindow).
+        let _conservative =
+            crate::test_support::TriStateFlagWindow::new(&HIDDEN_READ_COPY_CHAIN_OVERRIDE, 1);
         let conservative = compute_live_intervals_with_hidden_reads(&func, &hidden);
-        set_hidden_read_copy_chain_for_tests(false);
         for p in 0..=3 {
             assert!(
                 covers(&conservative, 3, p) || covers(&conservative, 4, p),
@@ -2832,6 +2846,12 @@ mod tests {
 
         let mut hidden: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
         hidden.insert(1, vec![5]);
+        // Pin FORCED-PRECISE for this assertion: the outcome is the precise
+        // walk contract, which must hold regardless of any bisection env
+        // knob; this also serializes the test against the flip windows on
+        // the shared backend-flag lock (see test_support::TriStateFlagWindow).
+        let _pin =
+            crate::test_support::TriStateFlagWindow::new(&HIDDEN_READ_COPY_CHAIN_OVERRIDE, 0);
         let r = compute_live_intervals_with_hidden_reads(&func, &hidden);
         for p in 1..=7 {
             assert!(covers(&r, 1, p), "v1 must be live at {p}");

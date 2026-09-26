@@ -85,7 +85,7 @@ impl I686Codegen {
             self.store_eax_to(dest);
         } else {
             match reg {
-                "eax" => self.state.reg_cache.set_acc(dest.0, false),
+                "eax" => self.state.park_acc(dest.0, false),
                 "edx" => self.state.reg_cache.set_sec(dest.0, false),
                 _ => {}
             }
@@ -130,7 +130,7 @@ impl I686Codegen {
             let d_name = super::emit::phys_reg_name(d_reg);
             emit!(self.state, "    {} {}, %{}", load_instr, sym, d_name);
             match d_name {
-                "eax" => self.state.reg_cache.set_acc(dest.0, false),
+                "eax" => self.state.park_acc(dest.0, false),
                 "edx" => self.state.reg_cache.set_sec(dest.0, false),
                 _ => {}
             }
@@ -223,7 +223,7 @@ impl I686Codegen {
             self.store_eax_to(dest);
         } else {
             match reg {
-                "eax" => self.state.reg_cache.set_acc(dest.0, false),
+                "eax" => self.state.park_acc(dest.0, false),
                 "edx" => self.state.reg_cache.set_sec(dest.0, false),
                 _ => {}
             }
@@ -257,7 +257,7 @@ impl I686Codegen {
             self.store_eax_to(dest);
         } else {
             match reg {
-                "eax" => self.state.reg_cache.set_acc(dest.0, false),
+                "eax" => self.state.park_acc(dest.0, false),
                 "edx" => self.state.reg_cache.set_sec(dest.0, false),
                 _ => {}
             }

@@ -446,8 +446,14 @@ impl I686Codegen {
     }
 
     pub(crate) fn new_with_ra_config(ra_config: Arc<RaConfig>) -> Self {
+        let mut state = CodegenState::new_with_ra_config(ra_config);
+        // i686 tracks the %eax accumulator (same rax-family discipline as
+        // x86-64, same AT&T vocabulary for the sink classifier): arm the
+        // shadow-epoch validator for this target too. Its parks go through
+        // `park_acc` and its consuming probes through `acc_has_verified`.
+        state.enable_rax_epoch_discipline();
         Self {
-            state: CodegenState::new_with_ra_config(ra_config),
+            state,
             current_return_type: IrType::I32,
             is_variadic: false,
             reg_assignments: FxHashMap::default(),
@@ -648,10 +654,13 @@ impl I686Codegen {
 
     /// Load an operand into %eax.
     pub(super) fn operand_to_eax(&mut self, op: &Operand) {
-        // Check register cache - skip load if value is already in eax
+        // Check register cache - skip load if value is already in eax.
+        // This SOURCES the value from %eax when it returns early, so it is
+        // a verified consume: the epoch contract must hold between the park
+        // and this probe.
         if let Operand::Value(v) = op {
             let is_alloca = self.state.is_alloca(v.0);
-            if self.state.reg_cache.acc_has(v.0, is_alloca) {
+            if self.state.acc_has_verified(v.0, is_alloca) {
                 return;
             }
         }
@@ -676,11 +685,11 @@ impl I686Codegen {
                         // Value is homed in %eax itself (Phase 2e): it is
                         // already where the caller wants it. Refresh the
                         // cache entry and emit nothing.
-                        self.state.reg_cache.set_acc(v.0, false);
+                        self.state.park_acc(v.0, false);
                     } else {
                         let reg = phys_reg_name(phys);
                         emit!(self.state, "    movl %{}, %eax", reg);
-                        self.state.reg_cache.set_acc(v.0, false);
+                        self.state.park_acc(v.0, false);
                     }
                 } else if let Some(slot) = self.state.get_slot(v.0) {
                     let sr = self.slot_ref(slot);
@@ -698,7 +707,7 @@ impl I686Codegen {
                         // Regular value: load the value from the slot
                         emit!(self.state, "    movl {}, %eax", sr);
                     }
-                    self.state.reg_cache.set_acc(v.0, is_alloca);
+                    self.state.park_acc(v.0, is_alloca);
                 } else {
                     // i686 acc-flow contract: the accumulator-centric backend
                     // has paths where a no-home value is consumed DIRECTLY
@@ -855,10 +864,12 @@ impl I686Codegen {
                     } else {
                         emit!(self.state, "    movl {}, %ecx", sr);
                     }
-                } else if self.state.reg_cache.acc_has(v.0, false)
-                    || self.state.reg_cache.acc_has(v.0, true)
+                } else if self.state.acc_has_verified(v.0, false)
+                    || self.state.acc_has_verified(v.0, true)
                 {
                     // Value is in accumulator (no stack slot) — move eax to ecx.
+                    // Verified consume: the eax→ecx move sources the value
+                    // from the accumulator, so the epoch contract must hold.
                     self.state.emit("    movl %eax, %ecx");
                 } else {
                     self.state.emit("    xorl %ecx, %ecx");
@@ -873,16 +884,16 @@ impl I686Codegen {
             if phys.0 == 6 {
                 // Destination homed in %eax (Phase 2e): the result is already
                 // home. Keep the cache entry, emit nothing.
-                self.state.reg_cache.set_acc(dest.0, false);
+                self.state.park_acc(dest.0, false);
                 return;
             }
             let reg = phys_reg_name(phys);
             emit!(self.state, "    movl %eax, %{}", reg);
             // `movl %eax,%reg` leaves %eax unchanged, so the accumulator still
             // holds the value. Keep the cache entry (mirror the slot path's
-            // set_acc below) so a later operand_to_eax / cast skips the reload;
+            // park below) so a later operand_to_eax / cast skips the reload;
             // the cache is invalidated by any real %eax clobber anyway.
-            self.state.reg_cache.set_acc(dest.0, false);
+            self.state.park_acc(dest.0, false);
         } else if let Some(slot) = self.state.get_slot(dest.0) {
             let sr = self.slot_ref(slot);
             emit!(self.state, "    movl %eax, {}", sr);
@@ -895,7 +906,7 @@ impl I686Codegen {
                 let sr4 = self.slot_ref_offset(slot, 4);
                 emit!(self.state, "    movl $0, {}", sr4);
             }
-            self.state.reg_cache.set_acc(dest.0, false);
+            self.state.park_acc(dest.0, false);
         }
     }
 
@@ -2373,7 +2384,7 @@ impl ArchCodegen for I686Codegen {
         } else {
             emit!(self.state, "    leal {}(%{}), %eax", offset as i32, b_name);
         }
-        self.state.reg_cache.set_acc(dest.0, false);
+        self.state.park_acc(dest.0, false);
         self.emit_store_result(dest);
         true
     }

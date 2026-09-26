@@ -76,8 +76,16 @@ cargo_test() { # cargo_test <filter> [extra cargo-test args...]
         total_mb=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}')
         [[ -n "$total_mb" && "$total_mb" -lt 6000 ]] && jobs=1
     fi
+    # --no-keep-memory is a GNU-ld flag; non-GNU linkers (e.g. macOS ld)
+    # reject it and the gate would read a linker error as a test failure.
+    # The repository targets Linux (BUILDING_LINUX.txt), so this guard is
+    # for portability hygiene, not a supported configuration.
+    local ld_flags=""
+    if [[ "$(uname -s)" == "Linux" ]]; then
+        ld_flags="-C link-arg=-Wl,--no-keep-memory"
+    fi
     CARGO_PROFILE_FASTBUILD_DEBUG=0 CARGO_INCREMENTAL=0 \
-    RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-Wl,--no-keep-memory" \
+    RUSTFLAGS="${RUSTFLAGS:-} ${ld_flags}" \
         timeout 1800 cargo test --profile "$PROFILE" --lib --locked -j "$jobs" \
         "$filter" -- "$@" 2>&1
 }

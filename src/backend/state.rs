@@ -61,9 +61,10 @@ pub struct RegCache {
     /// a stack reload when the value was recently loaded to %rcx.
     pub sec: Option<RegCacheEntry>,
     /// DEBUG-ONLY: the `AsmOutput` %rax shadow epoch at the moment `acc`
-    /// was last (re)written. Every x86-64 park goes through
-    /// `CodegenState::park_acc` (which syncs this) and every x86-64 consume
-    /// goes through `CodegenState::acc_has_verified` (which asserts it).
+    /// was last (re)written. Every park on an epoch-enabled target
+    /// (x86-64, i686 — see `AsmOutput::rax_epoch_active`) goes through
+    /// `CodegenState::park_acc` (which syncs this) and every consume goes
+    /// through `CodegenState::acc_has_verified` (which asserts it).
     /// An emitter that writes %rax without `invalidate_acc` leaves the
     /// epochs unequal at the next consume — the dead-%rax-read miscompile
     /// class becomes a loud debug assertion naming the value and the last
@@ -1265,13 +1266,39 @@ pub enum SlotAddr {
 }
 
 impl CodegenState {
+    /// Declare that this compilation tracks the %rax-family accumulator
+    /// (x86-64 or i686): every emitted line is AT&T x86 the sink's
+    /// shadow-epoch analyzer can classify, and every park/consume is held
+    /// to the epoch contract. Called by the x86-64 and i686 backend
+    /// constructors. Foreign-ISA backends (AArch64, RISC-V) must NOT call
+    /// this: their assembly is not AT&T x86 and the classifier's
+    /// vocabulary cannot describe it (see `AsmOutput::rax_epoch_active`).
+    #[inline]
+    pub fn enable_rax_epoch_discipline(&mut self) {
+        #[cfg(debug_assertions)]
+        {
+            self.out.rax_epoch_active = true;
+        }
+    }
+
     /// Record that the accumulator now holds `value_id`, syncing the debug
-    /// %rax shadow epoch (see [`RegCache::acc_park_epoch`]). Every x86-64
-    /// park MUST go through this — a raw `set_acc` leaves the epoch stale
-    /// and the next `acc_has_verified` would (correctly, but spuriously)
-    /// report a discipline violation. i686/ARM/RISC-V keep raw `set_acc`:
-    /// they run no verified consumes, and their targets never share a
-    /// `CodegenState` with an x86-64 function.
+    /// %rax shadow epoch (see [`RegCache::acc_park_epoch`]). Every park on
+    /// an epoch-enabled target (x86-64, i686) MUST go through this — a raw
+    /// `set_acc` leaves the epoch stale and the next `acc_has_verified`
+    /// would (correctly, but spuriously) report a discipline violation.
+    /// Foreign-ISA backends (AArch64, RISC-V) keep raw `set_acc`: the epoch
+    /// machinery is inert for them (`out.rax_epoch_active == false`), so a
+    /// stale epoch there is unobservable.
+    ///
+    /// History note: this comment once claimed foreign targets "never share
+    /// a `CodegenState` with an x86-64 function". That was false — the
+    /// generic `generate_module` driver (generate_load/store,
+    /// generate_copy, remat_indexed_acc_safe) runs for every target and
+    /// speaks this verified API — and a RISC-V `call`/`mul`/`div` line
+    /// moves the x86 classifier's implicit-write table regardless of its
+    /// operands. The target-scoped opt-in flag is the fix: the generic pass
+    /// layer keeps the verified API, and the flag (not the call sites)
+    /// scopes the epoch semantics to the x86 family.
     #[inline]
     pub fn park_acc(&mut self, value_id: u32, is_alloca: bool) {
         self.reg_cache.set_acc(value_id, is_alloca);
@@ -1300,7 +1327,10 @@ impl CodegenState {
         let has = self.reg_cache.acc_has(value_id, is_alloca);
         #[cfg(debug_assertions)]
         {
-            if has {
+            // The assert is meaningful only on epoch-enabled targets; on a
+            // foreign ISA the epoch cannot move (the scan is gated off), so
+            // a stale park epoch would compare against a frozen 0.
+            if has && self.out.rax_epoch_active {
                 let park = self.reg_cache.acc_park_epoch;
                 let now = self.out.debug_rax_epoch();
                 debug_assert!(
@@ -1411,6 +1441,9 @@ mod acc_epoch_validator_tests {
     #[test]
     fn unstaged_rax_clobber_is_caught_between_park_and_consume() {
         let mut state = CodegenState::new();
+        // This test speaks x86 vocabulary, so it opts into the discipline
+        // exactly as the x86-64/i686 constructors do.
+        state.enable_rax_epoch_discipline();
         // Park v7 (e.g. the tail of store_rax_to): the park syncs the epoch.
         state.park_acc(7, false);
         assert!(
@@ -1453,6 +1486,7 @@ mod acc_epoch_validator_tests {
     #[test]
     fn repark_after_clobber_resyncs_the_epoch() {
         let mut state = CodegenState::new();
+        state.enable_rax_epoch_discipline();
         state.park_acc(3, false);
         state.out.emit("    addq %rcx, %rax");
         assert_ne!(
@@ -1465,6 +1499,71 @@ mod acc_epoch_validator_tests {
         assert!(
             state.acc_has_verified(3, false),
             "a re-park re-establishes residency with a fresh epoch"
+        );
+    }
+
+    /// The epoch machinery is target-scoped: a fresh `CodegenState` (what
+    /// every foreign-ISA backend constructor produces) has it DISABLED, and
+    /// on a disabled target the sink classifier is inert — lines that would
+    /// be %rax writes on x86 (`call`, `movl ... %eax`) must NOT move the
+    /// epoch, and a verified consume must NOT assert even when the park
+    /// epoch is stale. This pins the F1 fix: the generic pass layer runs
+    /// for every target, so a foreign-ISA compilation (RISC-V `call foo`,
+    /// i686 %eax traffic on an unenabled state) can neither false-assert
+    /// nor be silently validated by machinery whose vocabulary does not
+    /// describe its assembly.
+    #[test]
+    fn epoch_machinery_is_inert_without_target_opt_in() {
+        let mut state = CodegenState::new();
+        assert!(
+            !state.out.rax_epoch_active,
+            "the discipline is opt-in per target; default state must be off"
+        );
+        // Park WITHOUT opting in (a foreign backend's park_acc): the epoch
+        // syncs (to 0 — the scan is inert), but no assertion can fire.
+        state.park_acc(7, false);
+        // Lines that would be %rax writes on x86-64: `call` is in the
+        // implicit-write table; `movl ... %eax` matches the dest-last rule.
+        // With the machinery disabled these must be ignored entirely.
+        state.out.emit("    call foo");
+        state.out.emit("    movl $1, %eax");
+        assert_eq!(
+            state.out.debug_rax_epoch(),
+            0,
+            "a non-opted-in target must never move the epoch"
+        );
+        // The consume returns the raw residency predicate and — critically —
+        // must not panic, although the park epoch was never re-synced after
+        // these lines.
+        assert!(
+            state.acc_has_verified(7, false),
+            "residency predicate is unchanged for foreign targets"
+        );
+    }
+
+    /// Opting in (as the x86-64/i686 constructors do) is what arms the
+    /// classifier: the same two lines that were inert above now move the
+    /// epoch and make a stale park assert. Paired with
+    /// `epoch_machinery_is_inert_without_target_opt_in`, this pins BOTH
+    /// directions of the target gate.
+    #[test]
+    fn target_opt_in_arms_the_classifier() {
+        let mut state = CodegenState::new();
+        state.enable_rax_epoch_discipline();
+        assert!(state.out.rax_epoch_active);
+        state.park_acc(7, false);
+        state.out.emit("    call foo");
+        assert_ne!(
+            state.out.debug_rax_epoch(),
+            0,
+            "an opted-in target classifies `call` as an implicit %rax write"
+        );
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            state.acc_has_verified(7, false);
+        }));
+        assert!(
+            refused.is_err(),
+            "on an opted-in target the stale park must be refused"
         );
     }
 }

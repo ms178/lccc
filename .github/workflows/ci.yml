@@ -65,6 +65,29 @@ jobs:
         # fastbuild policy: opt-level 1 and no more than two Cargo jobs.
         run: cargo test --profile fastbuild --all-targets --locked -j 2
 
+      # The fastbuild profile inherits `release`, which compiles every
+      # debug_assert! OUT - and with them the mechanical enforcement this
+      # repo's correctness story rests on: the %rax shadow-epoch validator
+      # (`CodegenState::acc_has_verified`), the GVN span-lockstep check, and
+      # every other debug-only invariant. That is how the GVN drained-Vec
+      # bug survived the suite until someone remembered to run
+      # `-C debug-assertions` locally (see its fix commit). This second
+      # invocation re-runs the whole suite with debug-assertions forced ON
+      # via Cargo's profile env-override (no Cargo.toml change, so the
+      # shipped fastbuild build stays assertion-free). The dual-layout
+      # exploratory emission and the epoch validator make this run ~1.3x
+      # the wall clock of the step above; it is the only place CI can
+      # observe the debug-only contract, so the cost is the point.
+      - name: Run tests (debug-assertions on)
+        env:
+          CARGO_BUILD_JOBS: "2"
+          RUSTFLAGS: -D warnings
+        run: >-
+          cargo test --profile fastbuild --all-targets --locked -j 2
+          --config 'profile.fastbuild.debug-assertions=true'
+          --config 'profile.fastbuild.incremental=false'
+          --config 'profile.fastbuild.debug=0'
+
       # Record the exact host/toolchain contract beside the regression JSON.
       # Hosted runners vary their GCC/binutils versions and exposed CPU flags;
       # a failing native-code test is not diagnosable from an exit status alone.
@@ -659,6 +682,34 @@ jobs:
             --lccc "$LCCC_LD" \
             --iters 64 \
             --seed "$FUZZ_SEED"
+
+      # Every corpus gate above runs a compiler binary whose fastbuild
+      # profile compiles debug_assertions OUT - so the %rax shadow-epoch
+      # validator and every other debug-only invariant never observe real
+      # codegen in CI. This closing step rebuilds the compiler with
+      # assertions forced ON (profile env-override; distinct unit
+      # fingerprints, so the earlier gates' artifacts stay cached) and
+      # re-runs the SSA-validated regression corpus against real codegen.
+      # It runs LAST deliberately: the assertions-ON binary overwrites the
+      # target/fastbuild/lccc path, and no later step in this job uses it.
+      # A missed invalidate_acc() on any corpus-covered dataflow now fails
+      # CI here - loudly, naming the value, both epochs, and the last
+      # unclassified emitted line.
+      - name: Regression corpus (debug-assertions compiler)
+        env:
+          CCC_VALIDATE_SSA: "1"
+          CARGO_BUILD_JOBS: "2"
+          RUSTFLAGS: -D warnings
+        run: |
+          set -o pipefail
+          CARGO_INCREMENTAL=0 cargo build --profile fastbuild --bin lccc --locked -j 2 \
+            --config 'profile.fastbuild.debug-assertions=true' \
+            --config 'profile.fastbuild.incremental=false' \
+            --config 'profile.fastbuild.debug=0'
+          python3 tests/regression/run_regression.py \
+            --lccc target/fastbuild/lccc \
+            -j 2 \
+            --json regression-dbgassert-results.json 2>&1 | tee regression-dbgassert-results.log
 
   clippy:
     name: Clippy
