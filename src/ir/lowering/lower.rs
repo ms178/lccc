@@ -615,10 +615,8 @@ impl Lowerer {
                     // (e.g., `register int x __asm__("rbx")`), which is handled separately
                     // in lower_global_decl. We only redirect function declarations here.
                     if let Some(ref asm_label) = declarator.attrs.asm_register {
-                        let is_function_decl = declarator
-                            .derived
-                            .iter()
-                            .any(|d| matches!(d, DerivedDeclarator::Function(_, _)));
+                        let is_function_decl =
+                            DerivedDeclarator::declares_function(&declarator.derived);
                         if is_function_decl || !is_x86_register_name(asm_label) {
                             self.asm_label_map
                                 .insert(declarator.name.clone(), asm_label.clone());
@@ -636,10 +634,8 @@ impl Lowerer {
                     // references take the read_global_register path before the
                     // asm_label_map lookup, and they never carry a definition.
                     if let Some(ref asm_label) = declarator.attrs.asm_register {
-                        let is_function_decl = declarator
-                            .derived
-                            .iter()
-                            .any(|d| matches!(d, DerivedDeclarator::Function(_, _)));
+                        let is_function_decl =
+                            DerivedDeclarator::declares_function(&declarator.derived);
                         if !is_function_decl
                             && !is_x86_register_name(asm_label)
                             && !decl.is_typedef()

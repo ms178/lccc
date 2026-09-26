@@ -256,6 +256,24 @@ fn can_const_addr_fold(cg: &dyn ArchCodegen, info: &GepFoldInfo) -> bool {
     cg.const_offset_fold_reg_base_ok(&info.base)
 }
 
+/// Whether a memory access is addressed by a GEP represented in the
+/// function-wide indexed-address map.  MachInst only sees the pointer's RA
+/// home; it has no access to this map and can therefore bypass the indexed
+/// emitter when CFG block emission order reaches a consumer before its
+/// dominating GEP definition.  Such accesses must stay on `generate_load` /
+/// `generate_store`, which consult the map independently of that order.
+fn indexed_gep_memory_access(
+    inst: &Instruction,
+    indexed_gep_map: &FxHashMap<u32, IndexedGepInfo>,
+) -> bool {
+    match inst {
+        Instruction::Load { ptr, .. } | Instruction::Store { ptr, .. } => {
+            indexed_gep_map.contains_key(&ptr.0)
+        }
+        _ => false,
+    }
+}
+
 fn can_indexed_addr_fold(
     cg: &dyn ArchCodegen,
     info: &IndexedGepInfo,
@@ -5248,7 +5266,15 @@ fn generate_function(
                 }
             }
 
-            if cg.try_lower_machinst(inst, &dead_global_addrs) {
+            // The folded-GEP marker is installed when its producer is
+            // visited, but block-vector emission order need not be
+            // dominance order.  A MachInst load/store can therefore see a
+            // consumer before that marker exists, then read the never-written
+            // pointer home instead of using the indexed-address map.  Route
+            // every map-managed access through the indexed-aware generator.
+            if !indexed_gep_memory_access(inst, &indexed_gep_map)
+                && cg.try_lower_machinst(inst, &dead_global_addrs)
+            {
                 cg.state().current_program_point += 1;
                 continue;
             }
@@ -6497,6 +6523,124 @@ mod conditional_increment_tests {
         }
         instructions.push(select());
         assert!(detect(&function_with(instructions)).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod indexed_gep_machinst_gate_tests {
+    use super::*;
+    use crate::ir::reexports::IrParam;
+
+    fn param(ty: IrType) -> IrParam {
+        IrParam {
+            ty,
+            noalias: false,
+            struct_size: None,
+            struct_align: None,
+            param_align: None,
+            struct_eightbyte_classes: Vec::new(),
+            is_f128_sse: false,
+            riscv_float_class: None,
+        }
+    }
+
+    fn late_gep_function() -> IrFunction {
+        let mut function = IrFunction::new(
+            "indexed_gep_block_order".to_string(),
+            IrType::U32,
+            vec![param(IrType::Ptr), param(IrType::U32)],
+            false,
+        );
+        // The entry jumps to the GEP block (vector index 2), which dominates
+        // the consumer (vector index 1).  Code generation still walks the
+        // block vector, so it sees the consumer before the dominating GEP.
+        function.blocks = vec![
+            BasicBlock {
+                label: crate::ir::reexports::BlockId(0),
+                instructions: vec![
+                    Instruction::ParamRef {
+                        dest: Value(0),
+                        param_idx: 0,
+                        ty: IrType::Ptr,
+                    },
+                    Instruction::ParamRef {
+                        dest: Value(1),
+                        param_idx: 1,
+                        ty: IrType::U32,
+                    },
+                ],
+                terminator: Terminator::Branch(crate::ir::reexports::BlockId(2)),
+                source_spans: Vec::new(),
+            },
+            BasicBlock {
+                label: crate::ir::reexports::BlockId(1),
+                instructions: vec![Instruction::Load {
+                    dest: Value(4),
+                    ptr: Value(3),
+                    ty: IrType::U16,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                }],
+                terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+                source_spans: Vec::new(),
+            },
+            BasicBlock {
+                label: crate::ir::reexports::BlockId(2),
+                instructions: vec![Instruction::GetElementPtr {
+                    dest: Value(3),
+                    base: Value(0),
+                    offset: Operand::Value(Value(1)),
+                    ty: IrType::Ptr,
+                }],
+                terminator: Terminator::Branch(crate::ir::reexports::BlockId(1)),
+                source_spans: Vec::new(),
+            },
+        ];
+        function.next_value_id = 5;
+        function
+    }
+
+    #[test]
+    fn indexed_access_bypasses_machinst_when_consumer_precedes_gep_in_emission_order() {
+        let function = late_gep_function();
+        let use_counts = count_value_uses(&function);
+        let stability = analyze_base_stability(&function);
+        let indexed_gep_map = build_indexed_gep_map(&function, &use_counts, &stability);
+        assert!(indexed_gep_map.contains_key(&3));
+
+        let consumer_block = &function.blocks[1];
+        let gep_block = &function.blocks[2];
+        assert!(function
+            .blocks
+            .iter()
+            .position(|b| b.label == consumer_block.label)
+            .unwrap()
+            < function
+                .blocks
+                .iter()
+                .position(|b| b.label == gep_block.label)
+                .unwrap());
+        assert!(indexed_gep_memory_access(
+            &consumer_block.instructions[0],
+            &indexed_gep_map
+        ));
+        let indexed_store = Instruction::Store {
+            val: Operand::Value(Value(4)),
+            ptr: Value(3),
+            ty: IrType::U16,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        };
+        assert!(indexed_gep_memory_access(&indexed_store, &indexed_gep_map));
+
+        let unrelated_load = Instruction::Load {
+            dest: Value(5),
+            ptr: Value(6),
+            ty: IrType::U16,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        };
+        assert!(!indexed_gep_memory_access(&unrelated_load, &indexed_gep_map));
     }
 }
 

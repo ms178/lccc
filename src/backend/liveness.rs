@@ -383,6 +383,31 @@ struct ProgramPointState {
 /// Always walks the IR (even when every dest is an alloca): vecreg builds
 /// synthetic alloca intervals and *must* see real `call_points`.
 pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
+    compute_live_intervals_with_hidden_reads(func, &FxHashMap::default())
+}
+
+/// [`compute_live_intervals`] plus backend-invisible operand reads.
+///
+/// `hidden_reads` maps an operand value id to the consumer value ids whose
+/// emission re-reads that operand's register without any IR operand
+/// recording it: the peeled root of a SIB-folded GEP index
+/// (`resolve_index` looks through Cast/Shl/Mul/Add/Sub, so the register
+/// read at the Load/Store is e.g. the U8 load feeding a zext, not the GEP's
+/// own offset operand) and CMP-REPLAY operands re-compared at the Cmp's
+/// consumers. The operand is treated as used at the consumer's definition
+/// and at every IR use of the consumer, and the reads are fed into the
+/// SAME backward dataflow as ordinary uses. Liveness is therefore exact on
+/// every CFG path from the operand's definition to each hidden read,
+/// independent of block layout: a post-hoc linear stretch of the operand's
+/// last segment misses reads that sit in a hole before it (LCCC-SQLITE-WPS:
+/// sqlite `wherePathSolver` re-read `nLoop`'s U8 load for
+/// `aLoop[nLoop-1]` in blocks laid out before the load's final IR use, the
+/// segment fill homed a load dest in the same register there, and the SIB
+/// access dereferenced a pointer as an index).
+pub fn compute_live_intervals_with_hidden_reads(
+    func: &IrFunction,
+    hidden_reads: &FxHashMap<u32, Vec<u32>>,
+) -> LivenessResult {
     let num_blocks = func.blocks.len();
     if num_blocks == 0 {
         return LivenessResult {
@@ -410,6 +435,21 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
     let mut folded_read_points: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
     let gep_base_values = extend_gep_base_liveness(
         func,
+        &alloca_set,
+        &id_to_dense,
+        &ps.copy_src,
+        &ps.def_points,
+        &ps.block_start_points,
+        &ps.block_end_points,
+        &mut ps.last_use_points,
+        &mut ps.block_gen,
+        &mut folded_read_points,
+        &mut ps.touches,
+    );
+
+    extend_hidden_operand_reads(
+        func,
+        hidden_reads,
         &alloca_set,
         &id_to_dense,
         &ps.copy_src,
@@ -1194,6 +1234,100 @@ fn extend_gep_base_liveness(
         block_point = block_point.saturating_add(1);
     }
     folded_bases
+}
+
+/// Record the hidden reads of [`compute_live_intervals_with_hidden_reads`]:
+/// every operand linked to a consumer is read at the consumer's definition
+/// point and at each instruction/terminator point that uses the consumer.
+/// Program points follow `assign_program_points` (one per instruction, one
+/// per terminator), exactly like `extend_gep_base_liveness`.
+#[expect(clippy::too_many_arguments)]
+fn extend_hidden_operand_reads(
+    func: &IrFunction,
+    hidden_reads: &FxHashMap<u32, Vec<u32>>,
+    alloca_set: &FxHashSet<u32>,
+    id_to_dense: &FxHashMap<u32, usize>,
+    copy_src: &FxHashMap<u32, Vec<u32>>,
+    def_points: &[u32],
+    block_start_points: &[u32],
+    block_end_points: &[u32],
+    last_use_points: &mut [u32],
+    block_gen: &mut [BitSet],
+    read_points: &mut FxHashMap<u32, Vec<u32>>,
+    touches: &mut BlockTouches,
+) {
+    if hidden_reads.is_empty() {
+        return;
+    }
+    let mut operands_of: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    for (&operand, consumers) in hidden_reads {
+        for &consumer in consumers {
+            let list = operands_of.entry(consumer).or_default();
+            if !list.contains(&operand) {
+                list.push(operand);
+            }
+        }
+    }
+    let mut point: u32 = 0;
+    let mut hits: Vec<u32> = Vec::new();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        let range = (block_start_points[bi], block_end_points[bi]);
+        let mut read_at = |hits: &mut Vec<u32>, point: u32| {
+            hits.sort_unstable();
+            hits.dedup();
+            for consumer in hits.drain(..) {
+                let Some(operands) = operands_of.get(&consumer) else {
+                    continue;
+                };
+                for &operand in operands {
+                    extend_use_following_copies(
+                        operand,
+                        point,
+                        bi,
+                        alloca_set,
+                        id_to_dense,
+                        def_points,
+                        &range,
+                        copy_src,
+                        last_use_points,
+                        block_gen,
+                        read_points,
+                        touches,
+                    );
+                }
+            }
+        };
+        for inst in &block.instructions {
+            if let Some(dest) = inst.dest() {
+                if operands_of.contains_key(&dest.0) {
+                    hits.push(dest.0);
+                }
+            }
+            for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    if operands_of.contains_key(&v.0) {
+                        hits.push(v.0);
+                    }
+                }
+            });
+            for_each_value_use_in_instruction(inst, |v| {
+                if operands_of.contains_key(&v.0) {
+                    hits.push(v.0);
+                }
+            });
+            read_at(&mut hits, point);
+            point = point.saturating_add(1);
+        }
+        for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                if operands_of.contains_key(&v.0) {
+                    hits.push(v.0);
+                }
+            }
+        });
+        read_at(&mut hits, point);
+        point = point.saturating_add(1);
+    }
 }
 
 /// Extend `start_id` and every Copy-chain source (all phi-elim preds) to `point`.
@@ -2217,6 +2351,127 @@ mod tests {
             is_const: false,
             ret_eightbyte_classes: Vec::new(),
         }
+    }
+
+    /// LCCC-SQLITE-WPS shape: the SIB fold peels `aLoop[nLoop-1]` down to the
+    /// U8 load `v1`, whose last IR use (the `nLoop == 2` Cmp) sits in a block
+    /// laid out AFTER the access block. Without the hidden read `v1` has a
+    /// hole exactly on the folded Load; with it the dataflow keeps `v1` live
+    /// from its definition through the access block, and not beyond it.
+    #[test]
+    fn hidden_read_covers_folded_access_in_a_hole_before_the_last_use() {
+        use crate::common::types::AddressSpace;
+        use crate::ir::reexports::IrCmpOp;
+        let load = |dest: u32, ptr: u32, ty: IrType| Instruction::Load {
+            dest: Value(dest),
+            ptr: Value(ptr),
+            ty,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        };
+        let mut func = IrFunction::new("wps".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::BinOp {
+                    dest: Value(0),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Const(IrConst::I64(4096)),
+                    rhs: Operand::Const(IrConst::I64(8)),
+                    ty: IrType::I64,
+                },
+                load(1, 0, IrType::U8),
+                Instruction::Cast {
+                    dest: Value(2),
+                    src: Operand::Value(Value(1)),
+                    from_ty: IrType::U8,
+                    to_ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(2)),
+                true_label: BlockId(1),
+                false_label: BlockId(3),
+            },
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                Instruction::BinOp {
+                    dest: Value(3),
+                    op: IrBinOp::Sub,
+                    lhs: Operand::Value(Value(2)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::I32,
+                },
+                Instruction::BinOp {
+                    dest: Value(4),
+                    op: IrBinOp::Shl,
+                    lhs: Operand::Value(Value(3)),
+                    rhs: Operand::Const(IrConst::I64(3)),
+                    ty: IrType::I64,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(5),
+                    base: Value(0),
+                    offset: Operand::Value(Value(4)),
+                    ty: IrType::Ptr,
+                },
+                load(6, 5, IrType::Ptr),
+            ],
+            terminator: Terminator::Branch(BlockId(2)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![],
+            terminator: Terminator::Return(Some(Operand::Value(Value(6)))),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: vec![Instruction::Cmp {
+                dest: Value(7),
+                op: IrCmpOp::Eq,
+                lhs: Operand::Value(Value(1)),
+                rhs: Operand::Const(IrConst::I8(2)),
+                ty: IrType::U8,
+            }],
+            terminator: Terminator::Return(Some(Operand::Value(Value(7)))),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 8;
+
+        // Points: B0 0..=3, B1 4..=8 (folded Load of v6 at 7), B2 9, B3 10..=11.
+        let covers = |r: &LivenessResult, v: u32, p: u32| {
+            r.segments
+                .iter()
+                .any(|s| s.value_id == v && s.start <= p && p <= s.end)
+        };
+        let plain = compute_live_intervals(&func);
+        assert!(
+            !covers(&plain, 1, 7),
+            "precondition: IR liveness has a hole"
+        );
+        assert!(covers(&plain, 1, 10));
+
+        let mut hidden: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+        hidden.insert(1, vec![5]);
+        let r = compute_live_intervals_with_hidden_reads(&func, &hidden);
+        for p in 1..=7 {
+            assert!(covers(&r, 1, p), "v1 must be live at {p}");
+        }
+        assert!(covers(&r, 1, 10), "the IR use keeps its coverage");
+        // The access block's live-in envelope runs to its terminator (8);
+        // the successor B2, reached only after the access, stays a hole.
+        assert!(!covers(&r, 1, 9), "no coverage past the access block");
+        assert_eq!(
+            r.folded_read_points.get(&1).map(|v| v.contains(&7)),
+            Some(true)
+        );
+        let iv = r.intervals.iter().find(|iv| iv.value_id == 1).unwrap();
+        assert!(iv.start <= 1 && iv.end >= 10);
     }
 
     #[test]

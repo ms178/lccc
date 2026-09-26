@@ -47,10 +47,7 @@ impl Lowerer {
         }
 
         // Check if this is a function declaration (extern int f(int))
-        let is_func_decl = declarator
-            .derived
-            .iter()
-            .any(|d| matches!(d, DerivedDeclarator::Function(_, _)));
+        let is_func_decl = DerivedDeclarator::declares_function(&declarator.derived);
         if is_func_decl {
             return false; // Fall through to the function declaration handler
         }
@@ -80,34 +77,28 @@ impl Lowerer {
             return false;
         }
 
-        // Check for direct function declarator: int f(int, int)
-        // A block-scope function declaration has the form: type name(params);
-        // The derived list starts with Function (possibly preceded by Pointer for
-        // return type indirection like `int *f(int)`).
-        // If we encounter a FunctionPointer before Function, this is a variable
-        // with a function pointer type, not a function declaration.
-        let mut ptr_count = 0;
-        let mut func_info = None;
-        let mut has_fptr_before_func = false;
-        for d in &declarator.derived {
-            match d {
-                DerivedDeclarator::Pointer => ptr_count += 1,
-                DerivedDeclarator::Function(p, v) => {
-                    func_info = Some((p.clone(), *v));
-                    break;
-                }
-                DerivedDeclarator::FunctionPointer(_, _) => {
-                    has_fptr_before_func = true;
-                    break;
-                }
-                _ => {}
+        // Block-scope function declaration: `type name(params);`, including
+        // pointer returns (`int *f(int)`) and functions returning function
+        // pointers (`void (*f(int))(void)`, derived
+        // `[Pointer, FunctionPointer(void), Function(int)]`).  The canonical
+        // predicate keys on the declarator's OWN parameter list being last;
+        // function-pointer VARIABLES (`int (*(*p)(int))(int)`) end in
+        // FunctionPointer and fall through to the variable path.  Everything
+        // before that parameter list is the return type; every such prefix
+        // makes the return a pointer (array/function returns are invalid C),
+        // so the pointer count is the ABI-relevant summary the meta needs.
+        let func_info = if DerivedDeclarator::declares_function(&declarator.derived) {
+            match declarator.derived.last() {
+                Some(DerivedDeclarator::Function(p, v)) => Some((p.clone(), *v)),
+                _ => None,
             }
-        }
-        // If we found a FunctionPointer before a Function, this is a function pointer
-        // variable (e.g., int (*(*p)(int))(int)), not a function declaration.
-        if has_fptr_before_func {
-            return false;
-        }
+        } else {
+            None
+        };
+        let ptr_count = declarator.derived[..declarator.derived.len().saturating_sub(1)]
+            .iter()
+            .filter(|d| matches!(d, DerivedDeclarator::Pointer))
+            .count();
         if let Some((params, variadic)) = func_info {
             self.register_block_func_meta(
                 &declarator.name,

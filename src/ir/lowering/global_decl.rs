@@ -35,14 +35,7 @@ impl Lowerer {
             if declarator.name.is_empty() {
                 continue;
             }
-            let is_function_decl = declarator
-                .derived
-                .iter()
-                .any(|d| matches!(d, DerivedDeclarator::Function(_, _)))
-                && !declarator
-                    .derived
-                    .iter()
-                    .any(|d| matches!(d, DerivedDeclarator::FunctionPointer(_, _)));
+            let is_function_decl = DerivedDeclarator::declares_function(&declarator.derived);
             if is_function_decl {
                 if let Some(align) = decl.alignment {
                     self.module
@@ -189,16 +182,7 @@ impl Lowerer {
         declarator: &InitDeclarator,
     ) -> bool {
         // Skip function declarations (prototypes), but NOT function pointer variables.
-        if declarator
-            .derived
-            .iter()
-            .any(|d| matches!(d, DerivedDeclarator::Function(_, _)))
-            && !declarator
-                .derived
-                .iter()
-                .any(|d| matches!(d, DerivedDeclarator::FunctionPointer(_, _)))
-            && declarator.init.is_none()
-        {
+        if DerivedDeclarator::declares_function(&declarator.derived) && declarator.init.is_none() {
             return true;
         }
         // Skip declarations using function typedefs or typeof-declared functions.
