@@ -404,10 +404,10 @@ EOF
             bad "no 213-rotated FMA in the runtime kernel ($n_fma FMA sites): the differential would not exercise the rotation"
         fi
         # And the copies this pass exists to remove must be largely gone from a
-        # kernel this copy-heavy.  48 is the measured residual, inventoried by
-        # shape in FOLLOWUP-2026-09-19E: 14 are VEX merge-form copies whose
-        # zeroed upper bits a 128-bit read genuinely needs (refusing them is
-        # correct), and the rest are the FMA form-selection cases that belong to
+        # kernel this copy-heavy.  The residual is inventoried by shape in
+        # FOLLOWUP-2026-09-19E: 14 are VEX merge-form copies whose zeroed upper
+        # bits a 128-bit read genuinely needs (refusing them is correct), and
+        # the rest are the FMA form-selection cases that belong to
         # instruction selection.  The ratchet is here so neither grows silently.
         # 2026-09-26 (PR #631 follow-up): 42 -> 47.  The +5 are NOT spills:
         # they are direct `movsd %xmmK, %xmm{0,1,2}` FP-ARGUMENT STAGING
@@ -419,11 +419,38 @@ EOF
         # kernel, zero new spill traffic. Every one of the 5 was verified
         # against the pre-change tree: movsd xmm8/9/10 -> xmm0/1/2 (the
         # fmaf_add call) and movsd xmm11/4 -> xmm0/1 (the printf pair).
-        if [[ "$n_copies" -le 47 ]]; then
-            ok "runtime kernel carries $n_copies vector register copies (budget 47: 42 residual + 5 direct arg-staging forms that replaced two-instruction %rax relays, net -5 instructions)"
+        # 2026-09-26 (this session): 47 -> 48.  The call-argument staging
+        # emitter now stages every XMM-resident FP argument DIRECTLY
+        # (calls.rs FloatReg), and the printf 3rd-argument relay — the one
+        # residual pair the new relay counter below caught — became the 6th
+        # direct staging copy. THE UNIT LAW this counter obeys: folding a
+        # relay REMOVES two instructions (a GP bit-move pair) and ADDS one
+        # counted xmm->xmm copy; every fold is a net -1 instruction that
+        # raises this budget by 1. The relay floor below (0) and this
+        # budget move together: a relay may only ever be exchanged for a
+        # counted copy, never added silently.
+        if [[ "$n_copies" -le 48 ]]; then
+            ok "runtime kernel carries $n_copies vector register copies (budget 48: 42 residual + 6 direct arg-staging forms, each a folded 2-instruction %rax relay worth net -1 instruction)"
         else
-            bad "runtime kernel carries $n_copies vector register copies, budget is 47"
+            bad "runtime kernel carries $n_copies vector register copies, budget is 48"
             insns "$work/runtime.s" | grep -E "$COPY_RE" | head -10 | note
+        fi
+        # RELAY COUNTER (2026-09-26): the two-instruction `%rax` relay pairs
+        # (`movq %xmmK,%rax` immediately followed by `movq %rax,%xmmN`) that
+        # the counter above was blind to — the blindness that let the budget
+        # sit at 42 while 5 relays still existed. The relay-fold removed all
+        # 5; this pins the floor at 0 so a future tree either stays relay-
+        # free or the budget conversation happens EXPLICITLY, with the new
+        # relays counted in the same unit as the copies they replaced.
+        n_relays=$(insns "$work/runtime.s" | awk '
+            prev ~ /^movq[[:space:]]+%xmm[0-9]+,[[:space:]]*%rax$/ &&
+            $0    ~ /^movq[[:space:]]+%rax,[[:space:]]*%xmm[0-9]+$/ { n++ }
+            { prev = $0 }
+            END { print n + 0 }')
+        if [[ "$n_relays" -eq 0 ]]; then
+            ok "runtime kernel carries 0 xmm→%rax→xmm relay pairs (relay-fold holds)"
+        else
+            bad "runtime kernel carries $n_relays xmm→%rax→xmm relay pairs (floor is 0: fold them or ratchet the budget explicitly)"
         fi
     fi
 

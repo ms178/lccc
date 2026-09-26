@@ -835,7 +835,7 @@ impl X86Codegen {
                 self.state.emit("    subq $8, %rsp");
                 self.state.emit("    fstpl (%rsp)");
                 self.state.emit("    popq %rax");
-                self.state.reg_cache.set_acc(dest.0, false);
+                self.state.park_acc(dest.0, false);
                 self.state.f128_direct_slots.insert(dest.0);
             } else {
                 self.state.emit("    subq $8, %rsp");
@@ -1164,7 +1164,7 @@ impl X86Codegen {
                 self.state.emit("    subq $8, %rsp");
                 self.state.emit("    fstpl (%rsp)");
                 self.state.emit("    popq %rax");
-                self.state.reg_cache.set_acc(dest.0, false);
+                self.state.park_acc(dest.0, false);
                 self.state.f128_direct_slots.insert(dest.0);
             } else {
                 self.state.emit("    subq $8, %rsp");
@@ -1466,7 +1466,7 @@ impl X86Codegen {
                 // is in %rax (NOT %rcx regardless of the target xmm): reading
                 // %rcx for an xmm1 target would load garbage. Fix: always
                 // source the accumulator.
-                if self.state.reg_cache.acc_has(v.0, is_alloca) {
+                if self.state.acc_has_verified(v.0, is_alloca) {
                     if ty == IrType::F32 {
                         self.state.emit_fmt(format_args!("    movd %eax, %{}", xmm));
                     } else {

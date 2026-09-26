@@ -262,6 +262,24 @@ fn can_const_addr_fold(cg: &dyn ArchCodegen, info: &GepFoldInfo) -> bool {
 /// emitter when CFG block emission order reaches a consumer before its
 /// dominating GEP definition.  Such accesses must stay on `generate_load` /
 /// `generate_store`, which consult the map independently of that order.
+///
+/// EXCLUSION LIST — why no other pointer-bearing `Instruction` variant is
+/// gated here. The map can only ever contain GEPs whose every use is a
+/// foldable Load/Store (or a Copy/Cast alias chain into one): the builder
+/// runs `retain_indexed_ptr_only_uses` (twice, around
+/// `propagate_stable_aliases`), which marks any GEP dest consumed by any
+/// other instruction — `AtomicRmw`/`AtomicInc`/`AtomicCmpxchg`/
+/// `AtomicLoad`/`AtomicStore` (their ptr operand), `VaArg`/`VaArgStruct`/
+/// `VaStart`/`VaEnd`/`VaCopy`, `Memcpy`, calls, terminators — and REMOVES
+/// it from the map, so the GEP is materialized normally and its home is
+/// written before any such consumer reads it. `try_lower_machinst`
+/// likewise only ever lowers Load/Store (plus Call/CallIndirect/BinOp/
+/// Cast/Cmp/ParamRef, none of which dereference a map-managed pointer);
+/// the atomic and va_list emitters dispatch through `generate_instruction`
+/// with the raw operand and are covered by the retention gate, not by
+/// this one. `CallIndirect.func_ptr` consumes the pointer's VALUE (an
+/// ordinary operand materialization), a different — and already-sound —
+/// class.
 fn indexed_gep_memory_access(
     inst: &Instruction,
     indexed_gep_map: &FxHashMap<u32, IndexedGepInfo>,
@@ -5445,7 +5463,7 @@ fn remat_indexed_acc_safe(
             let st = cg.state_ref();
             !cg.is_value_reg_assigned(v.0)
                 && st.get_slot(v.0).is_none()
-                && (st.reg_cache.acc_has(v.0, st.is_alloca(v.0)) || st.is_accumulator_location(v.0))
+                && (st.acc_has_verified(v.0, st.is_alloca(v.0)) || st.is_accumulator_location(v.0))
         }
         Operand::Const(_) => false,
     };
@@ -5467,7 +5485,7 @@ fn remat_indexed_acc_safe(
         if let Operand::Value(v) = val {
             cg.emit_acc_restore();
             let is_alloca = cg.state_ref().is_alloca(v.0);
-            cg.state().reg_cache.set_acc(v.0, is_alloca);
+            cg.state().park_acc(v.0, is_alloca);
         }
     }
 }
@@ -6099,7 +6117,7 @@ fn generate_copy(cg: &mut dyn ArchCodegen, dest: &Value, src: &Operand) {
                     }
                     crate::backend::state::SlotAddr::Reg(reg) => cg.emit_reg_to_acc(reg),
                 }
-                cg.state().reg_cache.set_acc(src_val.0, true);
+                cg.state().park_acc(src_val.0, true);
                 cg.emit_store_result(dest);
                 return;
             }
@@ -6113,8 +6131,8 @@ fn generate_copy(cg: &mut dyn ArchCodegen, dest: &Value, src: &Operand) {
             let src_slot = cg.state_ref().get_slot(src_val.0);
             if let (Some(ds), Some(ss)) = (dest_slot, src_slot) {
                 if ds.0 == ss.0 {
-                    if cg.state_ref().reg_cache.acc_has(src_val.0, false) {
-                        cg.state().reg_cache.set_acc(dest.0, false);
+                    if cg.state_ref().acc_has_verified(src_val.0, false) {
+                        cg.state().park_acc(dest.0, false);
                     }
                     return;
                 }

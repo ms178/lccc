@@ -37,6 +37,14 @@ set -uo pipefail
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 cd "$repo_root"
 
+# Prefer the persisted rustup installation: the phases drive `cargo test`
+# directly, and a bare environment (cron, CI shards, fresh shells) does not
+# have ~/.cargo/bin on PATH — the gate then reads "cargo: command not found"
+# as three test failures.
+if [[ -x "${CARGO_HOME:-$HOME/.cargo}/bin/cargo" ]]; then
+    export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
+fi
+
 CCC=${CCC:-target/fastbuild/lccc}
 PROFILE=${PROFILE:-fastbuild}
 JOBS=${JOBS:-2}
@@ -56,7 +64,21 @@ want_phase() { [[ -z "${2:-}" || "${2#--phase }" == "$1" ]] && return 0; return 
 
 cargo_test() { # cargo_test <filter> [extra cargo-test args...]
     local filter=$1; shift
-    timeout 1800 cargo test --profile "$PROFILE" --lib --locked -j "$JOBS" \
+    # Low-memory discipline (mirrors ci_local.sh's cargo_test_repeated): the
+    # fastbuild profile's incremental session state plus line-tables-only
+    # debuginfo OOMs a 4 GB host during the lib-test compile, and the gate
+    # then reads a SIGKILLed compiler as three test failures. Drop
+    # incremental and debuginfo, give the linker --no-keep-memory, and pin
+    # one compile job on small hosts.
+    local jobs="$JOBS"
+    if [[ -z "${JOBS:-}" ]]; then
+        local total_mb
+        total_mb=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}')
+        [[ -n "$total_mb" && "$total_mb" -lt 6000 ]] && jobs=1
+    fi
+    CARGO_PROFILE_FASTBUILD_DEBUG=0 CARGO_INCREMENTAL=0 \
+    RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-Wl,--no-keep-memory" \
+        timeout 1800 cargo test --profile "$PROFILE" --lib --locked -j "$jobs" \
         "$filter" -- "$@" 2>&1
 }
 

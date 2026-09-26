@@ -205,7 +205,7 @@ impl X86Codegen {
     pub(super) fn emit_call_compute_stack_space_impl(
         &self,
         arg_classes: &[CallArgClass],
-        _arg_types: &[IrType],
+        arg_types: &[IrType],
         struct_arg_aligns: &[Option<usize>],
         _struct_arg_is_f128_sse: &[bool],
     ) -> usize {
@@ -220,7 +220,7 @@ impl X86Codegen {
         &mut self,
         args: &[Operand],
         arg_classes: &[CallArgClass],
-        _arg_types: &[IrType],
+        arg_types: &[IrType],
         stack_arg_space: usize,
         _fptr_spill: usize,
         _f128_temp_space: usize,
@@ -561,7 +561,7 @@ impl X86Codegen {
                 // (1) live accumulator: `pushq %rax` is exactly the
                 // fallback's push, minus the materialisation.
                 let is_alloca = self.state.is_alloca(v.0);
-                if self.state.reg_cache.acc_has(v.0, is_alloca) {
+                if self.state.acc_has_verified(v.0, is_alloca) {
                     self.state.emit("    pushq %rax");
                     return true;
                 }
@@ -659,7 +659,7 @@ impl X86Codegen {
         &mut self,
         args: &[Operand],
         arg_classes: &[CallArgClass],
-        _arg_types: &[IrType],
+        arg_types: &[IrType],
         total_sp_adjust: i64,
         _f128_temp_space: usize,
         _stack_arg_space: usize,
@@ -1118,10 +1118,82 @@ impl X86Codegen {
                             self.emit_fp_operand_to_xmm(arg, IrType::D32, xmm_regs[reg_idx]);
                         }
                         _ => {
-                            self.operand_to_rax(arg);
-                            self.state
-                                .out
-                                .emit_instr_reg_reg("    movq", "rax", xmm_regs[reg_idx]);
+                            // Width-exact staging. The value's FRESH home
+                            // decides the cheapest correct move:
+                            //   * XMM home → one direct scalar move (the VEX
+                            //     3-operand form reads only the source, same
+                            //     law as emit_fp_operand_to_xmm's direct
+                            //     path) — the old unconditional
+                            //     `operand_to_rax` + `movq %rax, %xmmN`
+                            //     shuttle paid TWO instructions and a GPR
+                            //     bit-cast round trip for a value that was
+                            //     already vector-resident (the printf
+                            //     staging relay the copy-budget relay
+                            //     counter caught);
+                            //   * GPR home (a bit-cast carrier) → one
+                            //     movd/movq straight from that GPR, not
+                            //     through %rax;
+                            //   * otherwise the accumulator shuttle: when the
+                            //     value is acc-resident, `operand_to_rax`
+                            //     emits nothing and the pair is one move —
+                            //     the historical single-instruction case,
+                            //     preserved.
+                            let ty = arg_types.get(i).copied().unwrap_or(IrType::F64);
+                            let mut staged = false;
+                            if let Operand::Value(v) = arg {
+                                if let Some(home) = self.fresh_home_of(v.0) {
+                                    if super::emit::is_xmm_reg(home) {
+                                        let name = super::emit::phys_reg_name(home);
+                                        if name != xmm_regs[reg_idx] {
+                                            if self.isa.avx {
+                                                let mv = if ty == IrType::F32 {
+                                                    "vmovss"
+                                                } else {
+                                                    "vmovsd"
+                                                };
+                                                self.state.emit_fmt(format_args!(
+                                                    "    {} %{}, %{}, %{}",
+                                                    mv, name, name, xmm_regs[reg_idx]
+                                                ));
+                                            } else {
+                                                let mv = if ty == IrType::F32 {
+                                                    "movaps"
+                                                } else {
+                                                    "movapd"
+                                                };
+                                                self.state.emit_fmt(format_args!(
+                                                    "    {} %{}, %{}",
+                                                    mv, name, xmm_regs[reg_idx]
+                                                ));
+                                            }
+                                        }
+                                        staged = true;
+                                    } else {
+                                        let gpr = super::emit::phys_reg_name(home);
+                                        let gpr32 = super::emit::phys_reg_name_32(home);
+                                        if ty == IrType::F32 {
+                                            self.state.emit_fmt(format_args!(
+                                                "    movd %{}, %{}",
+                                                gpr32, xmm_regs[reg_idx]
+                                            ));
+                                        } else {
+                                            self.state.emit_fmt(format_args!(
+                                                "    movq %{}, %{}",
+                                                gpr, xmm_regs[reg_idx]
+                                            ));
+                                        }
+                                        staged = true;
+                                    }
+                                }
+                            }
+                            if !staged {
+                                self.operand_to_rax(arg);
+                                self.state.out.emit_instr_reg_reg(
+                                    "    movq",
+                                    "rax",
+                                    xmm_regs[reg_idx],
+                                );
+                            }
                         }
                     }
                     float_count += 1;
@@ -1541,7 +1613,7 @@ impl X86Codegen {
                 self.state.emit("    subq $8, %rsp");
                 self.state.emit("    fstpl (%rsp)");
                 self.state.emit("    popq %rax");
-                self.state.reg_cache.set_acc(dest.0, false);
+                self.state.park_acc(dest.0, false);
                 self.state.f128_direct_slots.insert(dest.0);
             } else {
                 self.state.emit("    subq $8, %rsp");

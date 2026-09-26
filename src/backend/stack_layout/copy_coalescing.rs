@@ -1504,6 +1504,36 @@ fn is_gpr_acc_preserving_producer(inst: &Instruction) -> bool {
     }
 }
 
+/// `CCC_NO_COMMUTED_ACC`: restore the LHS-only sole-consumer contract (the
+/// commuted-RHS arm of [`is_safe_sole_consumer`] stops marking). Default OFF
+/// — the commuted arm is enabled. Same tri-state override discipline as the
+/// liveness walker's `CCC_HIDDEN_READ_COPY_CHAIN`: tests flip the atomic
+/// (edition-2024 makes `set_var` unsafe in the multithreaded harness), the
+/// environment is consulted ONCE per process (`OnceLock` — the flag cannot
+/// legitimately change mid-compilation, and this query sat in the
+/// per-instruction layout walk).
+fn commuted_acc_enabled() -> bool {
+    let o = COMMUTED_ACC_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if o >= 0 {
+        return o == 1;
+    }
+    !*COMMUTED_ACC_ENV.get_or_init(|| std::env::var_os("CCC_NO_COMMUTED_ACC").is_some())
+}
+
+/// Process-lifetime cache of the `CCC_NO_COMMUTED_ACC` environment decision
+/// (see [`commuted_acc_enabled`]).
+static COMMUTED_ACC_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Shared tri-state override for [`commuted_acc_enabled`]: -1 = follow the
+/// environment, 0 = forced LHS-only, 1 = forced commuted-RHS (tests).
+static COMMUTED_ACC_OVERRIDE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+/// Test-only override for [`commuted_acc_enabled`].
+#[cfg(test)]
+fn set_commuted_acc_for_tests(follow: bool) {
+    COMMUTED_ACC_OVERRIDE.store(follow as i8, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn is_safe_sole_consumer(inst: &Instruction, value_id: u32, lhs_first_binop: bool) -> bool {
     match inst {
         Instruction::Store {
@@ -1559,7 +1589,7 @@ fn is_safe_sole_consumer(inst: &Instruction, value_id: u32, lhs_first_binop: boo
             // CCC_NO_COMMUTED_ACC restores the LHS-only contract for
             // bisection.
             lhs_first_binop
-                && std::env::var_os("CCC_NO_COMMUTED_ACC").is_none()
+                && commuted_acc_enabled()
                 && matches!(
                     op,
                     IrBinOp::Add | IrBinOp::Mul | IrBinOp::And | IrBinOp::Or | IrBinOp::Xor
@@ -3394,6 +3424,90 @@ mod cfg_copy_coalesce_tests {
         // v1's use is the And but its def is NOT adjacent (v0 sits between):
         // only the adjacent producer is acc-consumable.
         assert!(!skip.contains(&1));
+    }
+
+    /// `CCC_NO_COMMUTED_ACC` (forced through the tri-state override): the
+    /// commuted-RHS arm stops marking, restoring the LHS-only contract for
+    /// bisection — the same shape as above loses its skip marking. This is
+    /// the disabled path the audit called untestable; the atomic override
+    /// makes it a first-class test citizen.
+    #[test]
+    fn ccc_no_commuted_acc_restores_lhs_only_contract() {
+        let mut func = IrFunction::new("maj".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(block(
+            0,
+            vec![
+                scalar_def(1, 6),
+                scalar_def(0, 4),
+                Instruction::BinOp {
+                    dest: Value(2),
+                    op: IrBinOp::And,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Value(Value(0)),
+                    ty: IrType::I32,
+                },
+            ],
+            Terminator::Return(Some(Operand::Value(Value(2)))),
+        ));
+        set_commuted_acc_for_tests(false);
+        let skip = compute_immediately_consumed(&func, true);
+        set_commuted_acc_for_tests(true); // restore before any panic path
+        assert!(
+            !skip.contains(&0),
+            "the override must restore the LHS-only contract"
+        );
+    }
+
+    /// Sub-32-bit commuted-RHS shapes (the audit's M2 coverage gap). The
+    /// coalescer's decision is width-blind by design — the producer side
+    /// already filters to GPR-cache types (I8/I16 qualify) — and the
+    /// emitter's width guard cannot decline the no-slot class: for a
+    /// value with NO slot, `is_small_slot(v)` is false, so
+    /// `(use_32bit || !is_small_slot(v))` holds for every `ty`. The width
+    /// law lives in the established narrow-op convention (64-bit forms on
+    /// a GPR-cached value; `store_rax_to`/`store_eax_to` consult
+    /// `is_small_slot(dest)` internally for the store), so an i8/i16 MAJ
+    /// shape takes the acc path exactly like the I32 one. Pinning it
+    /// here keeps a future width filter from silently stranding the
+    /// class with no slot and no fallback.
+    #[test]
+    fn immediately_consumed_commutative_rhs_narrow_widths() {
+        let narrow_def = |dest: u32, value: i32, ty: IrType| Instruction::BinOp {
+            dest: Value(dest),
+            op: IrBinOp::Add,
+            lhs: Operand::Const(IrConst::I32(value)),
+            rhs: Operand::Const(IrConst::I32(0)),
+            ty,
+        };
+        for (name, ty) in [("maj8", IrType::I8), ("maj16", IrType::I16)] {
+            let mut func = IrFunction::new(name.to_string(), IrType::I32, vec![], false);
+            // v1 := 6 (narrow); v0 := 4 (narrow); v2 = And v1, v0 (narrow,
+            // RHS consumed adjacent) — the same MAJ shape as the I32 test.
+            func.blocks.push(block(
+                0,
+                vec![
+                    narrow_def(1, 6, ty),
+                    narrow_def(0, 4, ty),
+                    Instruction::BinOp {
+                        dest: Value(2),
+                        op: IrBinOp::And,
+                        lhs: Operand::Value(Value(1)),
+                        rhs: Operand::Value(Value(0)),
+                        ty,
+                    },
+                ],
+                Terminator::Return(Some(Operand::Value(Value(2)))),
+            ));
+            let skip = compute_immediately_consumed(&func, true);
+            assert!(
+                skip.contains(&0),
+                "{name}: adjacent narrow commuted RHS must be acc-eligible"
+            );
+            assert!(
+                !skip.contains(&1),
+                "{name}: non-adjacent producer must not be skipped"
+            );
+        }
     }
 
     /// The commute contract is lhs-first-only: an AccumulatorCentric backend

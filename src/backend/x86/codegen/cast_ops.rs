@@ -286,7 +286,7 @@ impl X86Codegen {
                 self.state.emit("    subq $8, %rsp");
                 self.state.emit("    fstpl (%rsp)");
                 self.state.emit("    popq %rax");
-                self.state.reg_cache.set_acc(dest.0, false);
+                self.state.park_acc(dest.0, false);
                 self.state.f128_direct_slots.insert(dest.0);
                 return;
             }
@@ -1118,7 +1118,7 @@ impl X86Codegen {
         // the generic path (which handles them today).
         if src_phys.is_none() && src_slot.is_none() {
             let Operand::Value(v) = src else { return false };
-            if !self.state.reg_cache.acc_has(v.0, self.state.is_alloca(v.0)) {
+            if !self.state.acc_has_verified(v.0, self.state.is_alloca(v.0)) {
                 return false;
             }
             return self.emit_cast_from_accumulator(kind, to_ty, dest_32, dest_64);

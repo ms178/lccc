@@ -2288,12 +2288,18 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
         }
     }
 
+    // Compare against the REBUILT instruction vector, not
+    // `func.blocks[block_idx].instructions`: the rewrite loop drained that
+    // Vec in place, so its len() is 0 here and the lockstep assertion
+    // could only ever pass compiled-out (debug-assertions off — which is
+    // exactly how this escaped the fastbuild-profile test runs; found by
+    // running the suite with -C debug-assertions).
     debug_assert!(
-        !spans_in_lockstep || new_spans.len() == func.blocks[block_idx].instructions.len(),
+        !spans_in_lockstep || new_spans.len() == new_instructions.len(),
         "GVN span bookkeeping desynced in block {}: {} spans for {} instructions",
         block_idx,
         new_spans.len(),
-        func.blocks[block_idx].instructions.len()
+        new_instructions.len()
     );
     func.blocks[block_idx].instructions = new_instructions;
     func.blocks[block_idx].source_spans = new_spans;

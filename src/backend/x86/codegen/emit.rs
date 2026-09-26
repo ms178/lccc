@@ -2086,7 +2086,7 @@ impl X86Codegen {
                 if !self.rematerialize_stale_into_rax(&sv, is_alloca, depth - 1) {
                     self.operand_to_rax(&Operand::Value(sv));
                 }
-                self.state.reg_cache.set_acc(v.0, is_alloca);
+                self.state.park_acc(v.0, is_alloca);
                 true
             }
             crate::ir::reexports::Instruction::Cast {
@@ -2107,7 +2107,7 @@ impl X86Codegen {
                     // behavior then applies).
                     if from_sz >= to_sz {
                         self.operand_to_rax(&Operand::Value(sv));
-                        self.state.reg_cache.set_acc(v.0, is_alloca);
+                        self.state.park_acc(v.0, is_alloca);
                         return true;
                     }
                     return false;
@@ -2120,7 +2120,7 @@ impl X86Codegen {
                         .out
                         .emit_instr_reg_reg("    movslq", "eax", "rax");
                 }
-                self.state.reg_cache.set_acc(v.0, is_alloca);
+                self.state.park_acc(v.0, is_alloca);
                 true
             }
             _ => false,
@@ -2615,8 +2615,8 @@ impl X86Codegen {
                         // Stale home, unwritten slot: the def chain was
                         // re-emitted into @target (e.g. a sign-extended
                         // index re-extended from its narrow source slot).
-                    } else if self.state.reg_cache.acc_has(v.0, false)
-                        || self.state.reg_cache.acc_has(v.0, true)
+                    } else if self.state.acc_has_verified(v.0, false)
+                        || self.state.acc_has_verified(v.0, true)
                     {
                         // ACC-RESIDENT FIRST (exposed-forward fix): a value
                         // parked in %eax must be read from %eax, not reloaded
@@ -2643,8 +2643,8 @@ impl X86Codegen {
                             v.0, self.state.current_func_name
                         );
                     }
-                } else if self.state.reg_cache.acc_has(v.0, false)
-                    || self.state.reg_cache.acc_has(v.0, true)
+                } else if self.state.acc_has_verified(v.0, false)
+                    || self.state.acc_has_verified(v.0, true)
                 {
                     // ACC-RESIDENT FIRST (exposed-forward fix, mirroring the
                     // stale-home chain): %rax holds the value right now; the
@@ -2771,8 +2771,8 @@ impl X86Codegen {
                                 .out
                                 .emit_instr_rbp_reg("    movq", slot.0, target_name);
                         }
-                    } else if self.state.reg_cache.acc_has(v.0, false)
-                        || self.state.reg_cache.acc_has(v.0, true)
+                    } else if self.state.acc_has_verified(v.0, false)
+                        || self.state.acc_has_verified(v.0, true)
                     {
                         self.state
                             .out
@@ -2794,8 +2794,8 @@ impl X86Codegen {
                             .out
                             .emit_instr_rbp_reg("    movq", slot.0, target_name);
                     }
-                } else if self.state.reg_cache.acc_has(v.0, false)
-                    || self.state.reg_cache.acc_has(v.0, true)
+                } else if self.state.acc_has_verified(v.0, false)
+                    || self.state.acc_has_verified(v.0, true)
                 {
                     self.state
                         .out
@@ -2892,14 +2892,14 @@ impl X86Codegen {
             Operand::Value(v) => {
                 let is_alloca = self.state.is_alloca(v.0);
                 // Check cache: skip load if value is already in %rax
-                if self.state.reg_cache.acc_has(v.0, is_alloca) {
+                if self.state.acc_has_verified(v.0, is_alloca) {
                     return;
                 }
                 // Check secondary cache: if value is in %rcx, use movq %rcx, %rax
                 // (3 bytes) instead of loading from stack (7-8 bytes)
                 if self.state.reg_cache.sec_has(v.0, is_alloca) {
                     self.state.out.emit_instr_reg_reg("    movq", "rcx", "rax");
-                    self.state.reg_cache.set_acc(v.0, is_alloca);
+                    self.state.park_acc(v.0, is_alloca);
                     return;
                 }
                 // Check register allocation: load from assigned register
@@ -2915,10 +2915,10 @@ impl X86Codegen {
                             .out
                             .emit_instr_reg_reg("    movq", reg_name, "rax");
                     }
-                    self.state.reg_cache.set_acc(v.0, false);
+                    self.state.park_acc(v.0, false);
                 } else if self.state.get_slot(v.0).is_some() {
                     self.value_to_reg(v, "rax");
-                    self.state.reg_cache.set_acc(v.0, is_alloca);
+                    self.state.park_acc(v.0, is_alloca);
                 } else {
                     // A rematerialisable GlobalAddr deliberately has no home:
                     // its address computation is omitted at the definition and
@@ -2938,7 +2938,7 @@ impl X86Codegen {
                     });
                     if is_global_addr {
                         self.value_to_reg(v, "rax");
-                        self.state.reg_cache.set_acc(v.0, is_alloca);
+                        self.state.park_acc(v.0, is_alloca);
                         return;
                     }
                     // Fallback for coalescing failures: if the value is defined
@@ -2989,8 +2989,7 @@ impl X86Codegen {
                                     || self.state.get_slot(src_v.0).is_some()
                                     || self
                                         .state
-                                        .reg_cache
-                                        .acc_has(src_v.0, self.state.is_alloca(src_v.0))
+                                        .acc_has_verified(src_v.0, self.state.is_alloca(src_v.0))
                                     || self
                                         .state
                                         .reg_cache
@@ -3000,7 +2999,7 @@ impl X86Codegen {
                         };
                         if src_has_home {
                             self.operand_to_rax(&src_op);
-                            self.state.reg_cache.set_acc(v.0, is_alloca);
+                            self.state.park_acc(v.0, is_alloca);
                             return;
                         }
                     }
@@ -3122,12 +3121,12 @@ impl X86Codegen {
             }
             Operand::Value(v) => {
                 let is_alloca = self.state.is_alloca(v.0);
-                if self.state.reg_cache.acc_has(v.0, is_alloca) {
+                if self.state.acc_has_verified(v.0, is_alloca) {
                     return;
                 }
                 if self.state.reg_cache.sec_has(v.0, is_alloca) {
                     self.state.emit("    movl %ecx, %eax");
-                    self.state.reg_cache.set_acc(v.0, is_alloca);
+                    self.state.park_acc(v.0, is_alloca);
                     return;
                 }
                 if let Some(&reg) = self.reg_assignments.get(&v.0) {
@@ -3181,7 +3180,7 @@ impl X86Codegen {
                     self.operand_to_rax(op);
                     return;
                 }
-                self.state.reg_cache.set_acc(v.0, false);
+                self.state.park_acc(v.0, false);
             }
         }
     }
@@ -3200,7 +3199,7 @@ impl X86Codegen {
             .unwrap_or(0)
             == 0
         {
-            self.state.reg_cache.set_acc(dest.0, false);
+            self.state.park_acc(dest.0, false);
             return;
         }
         // Use movl (4 bytes) for small-slot values instead of movq (8 bytes).
@@ -3238,7 +3237,7 @@ impl X86Codegen {
                 dest.0
             );
         }
-        self.state.reg_cache.set_acc(dest.0, false);
+        self.state.park_acc(dest.0, false);
     }
 
     /// Store an XMM register holding a scalar F64/F32 value to a value's
@@ -3311,7 +3310,7 @@ impl X86Codegen {
             .unwrap_or(0)
             == 0
         {
-            self.state.reg_cache.set_acc(dest.0, false);
+            self.state.park_acc(dest.0, false);
             return;
         }
         if let Some(&reg) = self.reg_assignments.get(&dest.0) {
@@ -3345,7 +3344,7 @@ impl X86Codegen {
                 dest.0
             );
         }
-        self.state.reg_cache.set_acc(dest.0, false);
+        self.state.park_acc(dest.0, false);
     }
 
     /// Load a value to %eax using movl (32-bit) from stack, or movl %regd, %eax
@@ -3381,7 +3380,7 @@ impl X86Codegen {
             }
             Operand::Value(v) => {
                 let is_alloca = self.state.is_alloca(v.0);
-                if self.state.reg_cache.acc_has(v.0, is_alloca) {
+                if self.state.acc_has_verified(v.0, is_alloca) {
                     return; // cache hit
                 }
                 if let Some(&reg) = self.reg_assignments.get(&v.0) {
@@ -3395,12 +3394,12 @@ impl X86Codegen {
                         self.state
                             .emit_fmt(format_args!("    movl %{}, %eax", reg_name_32));
                     }
-                    self.state.reg_cache.set_acc(v.0, false);
+                    self.state.park_acc(v.0, false);
                 } else if self.state.get_slot(v.0).is_some() {
                     // Load from stack using movl (32-bit)
                     let slot = self.state.get_slot(v.0).unwrap();
                     self.state.out.emit_instr_rbp_reg("    movl", slot.0, "eax");
-                    self.state.reg_cache.set_acc(v.0, is_alloca);
+                    self.state.park_acc(v.0, is_alloca);
                 } else {
                     self.state.emit("    xorl %eax, %eax");
                     self.state.reg_cache.invalidate_acc();
@@ -3990,8 +3989,8 @@ impl X86Codegen {
                     self.state
                         .out
                         .emit_instr_reg_reg("    movq", reg_name, "rcx");
-                } else if self.state.reg_cache.acc_has(v.0, false)
-                    || self.state.reg_cache.acc_has(v.0, true)
+                } else if self.state.acc_has_verified(v.0, false)
+                    || self.state.acc_has_verified(v.0, true)
                 {
                     // ACC-RESIDENT FIRST (exposed-forward fix): read the
                     // %rax copy before touching the slot.
@@ -4212,7 +4211,7 @@ impl X86Codegen {
                 // cache entry, if any, stays valid — the non-rax
                 // materialization wrote neither home.)
                 if reg == "rax" {
-                    self.state.reg_cache.set_acc(val.0, false);
+                    self.state.park_acc(val.0, false);
                 }
             } else {
                 self.state.out.emit_instr_rbp_reg("    movq", slot.0, reg);
@@ -4297,8 +4296,8 @@ impl X86Codegen {
                     // after a computation staged through rax). Without this,
                     // materialising such a value for an asm operand panicked
                     // even though the data was live in rax.
-                    if self.state.reg_cache.acc_has(val.0, false)
-                        || self.state.reg_cache.acc_has(val.0, true)
+                    if self.state.acc_has_verified(val.0, false)
+                        || self.state.acc_has_verified(val.0, true)
                     {
                         self.state.out.emit_instr_reg_reg("    movq", "rax", reg);
                         return;
@@ -5049,7 +5048,7 @@ impl X86Codegen {
             let lhs_in_acc = match lhs {
                 Operand::Value(v) => {
                     let is_alloca = self.state.is_alloca(v.0);
-                    self.state.reg_cache.acc_has(v.0, is_alloca)
+                    self.state.acc_has_verified(v.0, is_alloca)
                 }
                 _ => false,
             };
@@ -5899,7 +5898,7 @@ fn resolve_stack_vregs(
                     && !window_defs.contains(id)
                     && slot_fits(id, inst_size)
                     && !state.vector_values.contains(id)
-                    && state.reg_cache.acc_has(*id, false)
+                    && state.acc_has_verified(*id, false)
                 {
                     return MachOperand::Reg(MachReg::Phys(super::machinst::RAX));
                 }
@@ -6169,7 +6168,7 @@ fn resolve_reg_or_slot(
                 && !window_defs.contains(id)
                 && slot_fits_width(state, *id, size)
                 && !state.vector_values.contains(id)
-                && state.reg_cache.acc_has(*id, false)
+                && state.acc_has_verified(*id, false)
             {
                 return MachOperand::Reg(super::machinst::MachReg::Phys(super::machinst::RAX));
             }
@@ -8778,7 +8777,7 @@ impl ArchCodegen for X86Codegen {
             self.state
                 .emit_fmt(format_args!("    leaq {}(%{}), %rax", offset, b_name));
         }
-        self.state.reg_cache.set_acc(dest.0, false);
+        self.state.park_acc(dest.0, false);
         self.emit_store_result(dest);
         true
     }
@@ -8879,7 +8878,7 @@ impl ArchCodegen for X86Codegen {
                     self.state.emit("    subq $8, %rsp");
                     self.state.emit("    fstpl (%rsp)");
                     self.state.emit("    popq %rax");
-                    self.state.reg_cache.set_acc(dest.0, false);
+                    self.state.park_acc(dest.0, false);
                     self.state.f128_direct_slots.insert(dest.0);
                     return;
                 }

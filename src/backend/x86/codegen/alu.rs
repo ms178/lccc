@@ -146,7 +146,7 @@ impl X86Codegen {
                     not_name,
                     if narrow { "eax" } else { "rax" }
                 ));
-                self.state.reg_cache.set_acc(dest.0, false);
+                self.state.park_acc(dest.0, false);
             }
             (true, OtherSrc::Mem(mem)) => {
                 self.state.emit_fmt(format_args!(
@@ -156,7 +156,7 @@ impl X86Codegen {
                     not_name,
                     if narrow { "eax" } else { "rax" }
                 ));
-                self.state.reg_cache.set_acc(dest.0, false);
+                self.state.park_acc(dest.0, false);
             }
             (false, OtherSrc::Reg(other_name)) => {
                 if let Some(reg) = self.dest_reg(dest).filter(|r| !super::emit::is_xmm_reg(*r)) {
@@ -661,7 +661,7 @@ impl X86Codegen {
             } else {
                 self.state.emit("    movq %rdx, %rax");
             }
-            self.state.reg_cache.set_acc(dest.0, false);
+            self.state.park_acc(dest.0, false);
         } else {
             panic!(
                 "x86 codegen: live remainder value {} has no assigned location",
@@ -770,12 +770,12 @@ impl X86Codegen {
             } else {
                 self.state.emit("    movq %rdx, %rax");
             }
-            self.state.reg_cache.set_acc(rem_dest.0, false);
+            self.state.park_acc(rem_dest.0, false);
         } else if div_slotless {
             // Quotient stays in %rax for its acc-flow consumer; store the
             // remainder first (its store cannot touch %rax).
             self.store_rdx_to(&rem_dest, use_32bit);
-            self.state.reg_cache.set_acc(div_dest.0, false);
+            self.state.park_acc(div_dest.0, false);
         } else {
             // Canonical order: remainder out of %rdx first (its store cannot
             // touch %rax — see screening), then the quotient store.
@@ -1225,7 +1225,7 @@ impl X86Codegen {
                     // its own (the cache entry was set by the producer's
                     // store, nothing between the adjacent def and this
                     // consumer can have evicted it without the cache knowing).
-                    if !matches!(op, IrBinOp::Sub) && self.state.reg_cache.acc_has(rhs_val.0, false)
+                    if !matches!(op, IrBinOp::Sub) && self.state.acc_has_verified(rhs_val.0, false)
                     {
                         let suffix = if use_32bit { "l" } else { "q" };
                         let acc = if use_32bit { "eax" } else { "rax" };
@@ -1326,7 +1326,7 @@ impl X86Codegen {
                         // sole-consumer lhs has no slot (the commuted-RHS
                         // class of is_safe_sole_consumer never got one), so
                         // the residency check must not require one.
-                        if self.state.reg_cache.acc_has(lhs_val.0, false) {
+                        if self.state.acc_has_verified(lhs_val.0, false) {
                             let suffix = if use_32bit { "l" } else { "q" };
                             let acc = if use_32bit { "eax" } else { "rax" };
                             if let Some(imm) = Self::const_as_imm32_typed(rhs, use_32bit) {
@@ -1856,7 +1856,7 @@ impl X86Codegen {
             let acc_rhs = self.dest_reg(rhs_val).is_none()
                 && !self.state.is_alloca(rhs_val.0)
                 && (use_32bit || !self.state.is_small_slot(rhs_val.0))
-                && self.state.reg_cache.acc_has(rhs_val.0, false);
+                && self.state.acc_has_verified(rhs_val.0, false);
             if acc_rhs {
                 let acc_reg = if use_32bit { "eax" } else { "rax" };
                 if let Some(imm) = Self::const_as_imm32_typed(mul_lhs, use_32bit) {
@@ -2007,7 +2007,7 @@ impl X86Codegen {
                 if self.state.get_slot(v.0).is_some() {
                     return true;
                 }
-                if self.state.reg_cache.acc_has(v.0, self.state.is_alloca(v.0)) {
+                if self.state.acc_has_verified(v.0, self.state.is_alloca(v.0)) {
                     return true;
                 }
                 self.get_defining_instruction(v.0).is_some_and(|inst| {
@@ -2040,7 +2040,7 @@ impl X86Codegen {
         // Register the product before any staging decision consults the
         // cache — a stale entry here silently redirected acc staging into
         // reading the product AS the acc.
-        self.state.reg_cache.set_acc(mul_dest.0, false);
+        self.state.park_acc(mul_dest.0, false);
 
         let dest_phys = self
             .dest_reg(add_dest)

@@ -46,10 +46,12 @@ pub struct RegCacheEntry {
 /// behavior as before the cache existed), while a missing invalidation could cause
 /// incorrect code by skipping a needed load.
 ///
-/// Architecture mapping:
-/// - x86:    acc = %rax,  sec = %rcx
-/// - ARM64:  acc = x0,    sec = x1
-/// - RISC-V: acc = t0,    sec = t1
+/// Since PR #635 the missing-invalidation direction is no longer merely
+/// "incorrect code by skipping a needed load": the slot-independent acc
+/// fast paths SOURCE THE VALUE FROM %rax with no slot fallback. A stale
+/// entry is a dead-register read. The epoch field above mechanically
+/// enforces the invalidation discipline in debug builds; see
+/// `CodegenState::acc_has_verified`.
 #[derive(Debug, Default)]
 pub struct RegCache {
     /// Which value is currently in the primary accumulator register (%rax on x86).
@@ -58,6 +60,16 @@ pub struct RegCache {
     /// Tracked so that operand_to_rax can use `movq %rcx, %rax` instead of
     /// a stack reload when the value was recently loaded to %rcx.
     pub sec: Option<RegCacheEntry>,
+    /// DEBUG-ONLY: the `AsmOutput` %rax shadow epoch at the moment `acc`
+    /// was last (re)written. Every x86-64 park goes through
+    /// `CodegenState::park_acc` (which syncs this) and every x86-64 consume
+    /// goes through `CodegenState::acc_has_verified` (which asserts it).
+    /// An emitter that writes %rax without `invalidate_acc` leaves the
+    /// epochs unequal at the next consume — the dead-%rax-read miscompile
+    /// class becomes a loud debug assertion naming the value and the last
+    /// unclassified line. Release builds compile the field away.
+    #[cfg(debug_assertions)]
+    pub(crate) acc_park_epoch: u64,
 }
 
 impl RegCache {
@@ -1197,7 +1209,62 @@ pub enum SlotAddr {
 }
 
 impl CodegenState {
+    /// Record that the accumulator now holds `value_id`, syncing the debug
+    /// %rax shadow epoch (see [`RegCache::acc_park_epoch`]). Every x86-64
+    /// park MUST go through this — a raw `set_acc` leaves the epoch stale
+    /// and the next `acc_has_verified` would (correctly, but spuriously)
+    /// report a discipline violation. i686/ARM/RISC-V keep raw `set_acc`:
+    /// they run no verified consumes, and their targets never share a
+    /// `CodegenState` with an x86-64 function.
     #[inline]
+    pub fn park_acc(&mut self, value_id: u32, is_alloca: bool) {
+        self.reg_cache.set_acc(value_id, is_alloca);
+        #[cfg(debug_assertions)]
+        {
+            self.reg_cache.acc_park_epoch = self.out.debug_rax_epoch();
+        }
+    }
+
+    /// The authoritative accumulator query for every site about to SOURCE a
+    /// value FROM %rax. Returns `reg_cache.acc_has(...)`, and in debug builds
+    /// asserts the shadow epoch is unchanged since the park — i.e. that no
+    /// instruction wrote any part of %rax without an `invalidate_acc` since
+    /// the cache claimed residency. This is the mechanical enforcement behind
+    /// the slot-independent acc fast paths: without a slot there is no
+    /// slow-but-correct fallback, only a dead-register read (silent
+    /// miscompile) or, after an over-invalidation, the loud no-location
+    /// panic. The epoch check catches the under-invalidation direction.
+    ///
+    /// Sites that merely test residency to decide whether to skip a RELOAD
+    /// (reading %rax to move it elsewhere is still a consume — they must use
+    /// this too). Only genuinely non-consuming probes may call
+    /// `reg_cache.acc_has` directly.
+    #[inline]
+    pub fn acc_has_verified(&self, value_id: u32, is_alloca: bool) -> bool {
+        let has = self.reg_cache.acc_has(value_id, is_alloca);
+        #[cfg(debug_assertions)]
+        {
+            if has {
+                let park = self.reg_cache.acc_park_epoch;
+                let now = self.out.debug_rax_epoch();
+                debug_assert!(
+                    park == now,
+                    "x86 codegen: acc cache claims value {} is resident in %rax, but the \
+                     %rax shadow epoch moved since the park ({} -> {}): some emitter wrote \
+                     %rax without invalidate_acc, and sourcing the value from %rax now \
+                     reads a dead register. Last unclassified emitted line: {:?} \
+                     (extend the analyzer tables in backend/common.rs if that line is \
+                     benign — otherwise fix the missing invalidate_acc).",
+                    value_id,
+                    park,
+                    now,
+                    self.out.debug_last_unclassified()
+                );
+            }
+        }
+        has
+    }
+
     pub fn is_accumulator_location(&self, val_id: u32) -> bool {
         matches!(
             self.explicit_locations.get(&val_id),
@@ -1273,5 +1340,75 @@ mod slot_addr_tests {
             .insert(18, ExplicitLocation::Accumulator);
         assert!(state.is_accumulator_location(18));
         assert!(state.resolve_slot_addr(18).is_none());
+    }
+}
+
+#[cfg(all(test, debug_assertions))]
+mod acc_epoch_validator_tests {
+    use super::*;
+
+    /// The mechanical-enforcement contract of the acc cache: an emitter
+    /// that writes %rax through the output sink without `invalidate_acc`
+    /// desyncs the shadow epoch, and the next verified consume must refuse
+    /// (debug panic) instead of sourcing a dead register. The release
+    /// predicate itself is unchanged — the assert is the enforcement.
+    #[test]
+    fn unstaged_rax_clobber_is_caught_between_park_and_consume() {
+        let mut state = CodegenState::new();
+        // Park v7 (e.g. the tail of store_rax_to): the park syncs the epoch.
+        state.park_acc(7, false);
+        assert!(
+            state.acc_has_verified(7, false),
+            "a fresh park verifies and consumes"
+        );
+        // Benign traffic that does not write %rax: still verifiable.
+        state.out.emit("    movq %rbx, %rcx");
+        state.out.emit("    movl %eax, -8(%rbp)");
+        assert!(state.acc_has_verified(7, false), "non-writing lines hold");
+        // An UNSTAGED clobber (the bug class: a future emitter forgets its
+        // invalidate_acc). The sink classifies the write and bumps the epoch.
+        state.out.emit("    movq $1, %rax");
+        assert_ne!(
+            state.reg_cache.acc_park_epoch,
+            state.out.debug_rax_epoch(),
+            "the sink must bump the epoch for the %rax write"
+        );
+        // The verified consume refuses loudly; the raw predicate is what
+        // release would consult (the assert is the whole difference).
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            state.acc_has_verified(7, false);
+        }));
+        assert!(
+            refused.is_err(),
+            "stale acc residency must panic under debug_assertions"
+        );
+        assert!(
+            state.reg_cache.acc_has(7, false),
+            "the cache entry itself is unchanged (invalidation, not the query, fixes it)"
+        );
+        // A proper invalidate_acc clears the entry; the consume is simply
+        // false — the over-invalidation direction, safe by construction.
+        state.reg_cache.invalidate_acc();
+        assert!(!state.acc_has_verified(7, false));
+    }
+
+    /// Re-parking after an intervening clobber heals the cache: the epoch
+    /// syncs to the CURRENT sink state, so the next consume verifies again.
+    #[test]
+    fn repark_after_clobber_resyncs_the_epoch() {
+        let mut state = CodegenState::new();
+        state.park_acc(3, false);
+        state.out.emit("    addq %rcx, %rax");
+        assert_ne!(
+            state.reg_cache.acc_park_epoch,
+            state.out.debug_rax_epoch(),
+            "addq %rax is an explicit-destination write and must bump"
+        );
+        // The value is recomputed and re-parked (e.g. by store_rax_to's tail):
+        state.park_acc(3, false);
+        assert!(
+            state.acc_has_verified(3, false),
+            "a re-park re-establishes residency with a fresh epoch"
+        );
     }
 }

@@ -1809,7 +1809,17 @@ pub(super) fn indirect_thunk_family(name: &str) -> Option<u8> {
 /// symbol. Returns 0 when `s` names no thunk.
 pub(super) fn indirect_thunk_refs(s: &str) -> u16 {
     let mut refs = 0u16;
-    let mut rest = s;
+    // Scan the CODE text only: everything from '#' is a comment and can
+    // never name an executed thunk (the historical phantom: a comment or
+    // .ascii payload mentioning the symbol kept a register alive for no
+    // reason). Labels keep their conservative treatment — a label whose
+    // text contains the substring still yields a (safe, conservative)
+    // fail-closed read rather than a missed one.
+    let code = match s.find('#') {
+        Some(pos) => &s[..pos],
+        None => s,
+    };
+    let mut rest = code;
     while let Some(pos) = rest.find("__x86_indirect_thunk_") {
         rest = &rest[pos + "__x86_indirect_thunk_".len()..];
         let name: &str = rest
@@ -2952,5 +2962,39 @@ mod register_spelling_oracle_tests {
             0,
             "rep movsq reads the %rcx count"
         );
+    }
+}
+
+#[cfg(test)]
+mod thunk_comment_tests {
+    use super::{indirect_thunk_family, indirect_thunk_refs};
+
+    #[test]
+    fn comments_cannot_conjure_a_thunk_read() {
+        // A comment mentioning the symbol must not model a read: the code
+        // text before '#' carries the only executed reference.
+        assert_eq!(indirect_thunk_refs("call __x86_indirect_thunk_rax"), 1 << 0);
+        assert_eq!(
+            indirect_thunk_refs("call __x86_indirect_thunk_rax # thunk no longer used here"),
+            1 << 0
+        );
+        assert_eq!(
+            indirect_thunk_refs("    # comment only: __x86_indirect_thunk_rax"),
+            0,
+            "a comment mentioning the symbol is not a read"
+        );
+        assert_eq!(
+            indirect_thunk_refs("jmp __x86_indirect_thunk_r10 # real thunk above this text? no"),
+            1 << 10,
+            "only the code text is consulted"
+        );
+        // Unknown suffixes stay fail-closed (the %r10 staging convention).
+        assert_eq!(
+            indirect_thunk_refs("call __x86_indirect_thunk_zzz"),
+            1 << 10
+        );
+        // The family oracle itself is unaffected by comment text.
+        assert_eq!(indirect_thunk_family("rax"), Some(0));
+        assert_eq!(indirect_thunk_family("r10"), Some(10));
     }
 }

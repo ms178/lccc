@@ -224,7 +224,7 @@ fi
 window=$(grep -B40 -E 'call f10(@PLT)?$' "$work/staging.s" \
     | awk '/vaddsd|vmulsd|vcvtsi|vxorpd|fnmadd|fmadd|fld|fst|movabsq/ { buf = "" } { buf = buf $0 "\n" } END { printf "%s", buf }')
 staged=$(printf '%s\n' "$window" \
-    | grep -oE '^    (movq %rax, %xmm[0-7]|movsd %xmm[0-9]+, %xmm[0-7]|movsd? [^,]+, %xmm[0-7])$' \
+    | grep -oE '^    (movq %rax, %xmm[0-7]|movq %r[a-z0-9]+, %xmm[0-7]|movd %r[a-z0-9]+, %xmm[0-7]|movsd? [^,]+, %xmm[0-7]|movap[ds] %xmm[0-9]+, %xmm[0-7]|vmovs[ds] %xmm[0-9]+, %xmm[0-9]+, %xmm[0-7])$' \
     | grep -oE '%xmm[0-7]$' | sort -u | wc -l)
 if [[ "$staged" -eq 8 ]]; then
     ok "the 10-argument volatile call stages all 8 SSE argument registers (the exact shape the bug deleted)"

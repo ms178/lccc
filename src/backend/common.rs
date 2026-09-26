@@ -1020,6 +1020,25 @@ pub struct AsmOutput {
     /// RBP-relative: offset(%rbp) where offset is negative
     /// RSP-relative: (frame_size + offset)(%rsp) since RSP = RBP - frame_size
     pub rsp_frame_size: i64,
+    /// DEBUG-ONLY shadow epoch of instructions that write any part of %rax.
+    ///
+    /// Every public emit method ends in `debug_scan_tail()`, so each completed
+    /// line is classified exactly once by [`asm_line_writes_rax`] and a write
+    /// bumps this counter. The accumulator cache (`RegCache::acc`) records the
+    /// epoch at every park; every consume site asserts the epochs still match
+    /// (`CodegenState::acc_has_verified`). A missed `invalidate_acc()` anywhere
+    /// — present or future — therefore turns the silent dead-%rax-read
+    /// miscompile class into a loud debug assertion in CI, with zero per-site
+    /// discipline and zero release cost (the field does not exist in release).
+    /// This is the mechanical enforcement of the invariant the acc-resident
+    /// fast paths (slot-independent sourcing, commuted-RHS) run on.
+    #[cfg(debug_assertions)]
+    pub(crate) rax_write_epoch: u64,
+    /// DEBUG-ONLY: the most recent line the analyzer could not classify, for
+    /// the assertion message. `None` once every emitted line was classified
+    /// by the table.
+    #[cfg(debug_assertions)]
+    pub(crate) last_unclassified: Option<String>,
 }
 
 /// Write an i64 directly into a String buffer using manual digit extraction.
@@ -1073,6 +1092,265 @@ fn write_u64_fast(buf: &mut String, val: u64) {
     buf.push_str(s);
 }
 
+// ── %rax shadow-epoch analyzer (debug builds) ───────────────────────────
+//
+// The accumulator cache's truthfulness rests on ~40 hand-placed
+// `invalidate_acc()` calls across the emitters. Since the slot-independent
+// acc fast paths (PR #635) that cache is load-bearing for correctness, not
+// merely for speed: one missed invalidation anywhere reads a dead %rax.
+// Rather than demanding new per-site discipline (an epoch bump per emitter
+// is exactly as forgettable as the invalidation it guards), the validator
+// is MECHANICAL: every emitted line passes through AsmOutput exactly once,
+// so the sink itself classifies the line and bumps the shadow epoch. The
+// consume sites assert park-epoch == current-epoch, and a missed
+// invalidation becomes a loud CI failure naming the offending line.
+
+/// Register tokens that name part of architectural %rax. The high bytes
+/// alias the family exactly as the low bytes do (bits 8..15 of the same
+/// register — see `register_family_at` in the peephole for the same law).
+const RAX_FAMILY: [&str; 5] = ["rax", "eax", "ax", "al", "ah"];
+
+/// Mnemonics (already prefix-stripped, suffix-normalized) that write some
+/// part of %rax implicitly, regardless of their explicit operands.
+const IMPLICIT_RAX_WRITES: [&str; 23] = [
+    "div",
+    "idiv",
+    "mul",     // one-operand forms: quotient/product in rax:rdx
+    "call",    // caller-saved clobber, direct or through memory/`*%reg`
+    "lods",    // lodsb/lodsw/lodsl/lodsq: al/ax/eax/rax = [rsi]
+    "cmpxchg", // may reload rax from the destination on compare failure
+    "syscall",
+    "sysenter",
+    "cpuid",
+    "rdtsc",
+    "rdtscp",
+    "xgetbv",
+    "rdmsr",
+    "lahf", // ah = flags
+    "cdqe", // rax = sign-extend(eax)
+    "cltq",
+    "cwde",
+    "cbw",
+    "cwtl", // aliases of the same extension family
+    "cmpxchg8b",
+    "cmpxchg16b", // rdx:rax rewritten
+    "fstsw",
+    "fnstsw", // x87 status word INTO %ax (the lone x87 rax writer)
+];
+
+/// Mnemonics that name %rax-family registers among their operands without
+/// ever writing %rax: compare/test write flags only, push reads, jumps and
+/// returns read or transfer control, and the cqo/cdq family extends %rax
+/// INTO %rdx while leaving %rax itself intact.
+const NEVER_RAX_WRITES: [&str; 13] = [
+    "cmp", "test", "push", "jmp", "ret", "leave", "cqo", "cqto", "cdq", "cltd", "cwd", "cwtd",
+    "enter",
+];
+
+/// Mnemonics where BOTH operands are written (xchg swaps; xadd adds the
+/// source into the destination and returns the old destination in the
+/// source). Either operand naming %rax therefore writes %rax.
+const BOTH_OPERAND_WRITES: [&str; 2] = ["xchg", "xadd"];
+
+/// `mulx` writes its TWO explicit destinations (last two operands); the
+/// implicit register (%rdx) is the source.
+const LAST_TWO_WRITES: [&str; 3] = ["mulx", "mulxl", "mulxq"];
+
+#[inline]
+fn is_mnemonic_byte(c: char) -> bool {
+    c.is_ascii_alphanumeric()
+}
+
+/// Split an operand list on top-level commas (paren-aware): SIB memory
+/// operands `disp(%base,%idx,s)` carry commas inside the parens and must
+/// stay one operand.
+fn split_operands_top_level(rest: &str) -> Vec<&str> {
+    let mut out = Vec::with_capacity(4);
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (i, c) in rest.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                out.push(&rest[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&rest[start..]);
+    out
+}
+
+/// A pure register operand: exactly `%reg` — no memory parens, no immediate
+/// `$`, no segment `:` — whose register token names a %rax family member.
+fn pure_rax_reg(op: &str) -> bool {
+    let op = op.trim();
+    if !op.starts_with('%') || op.len() < 2 {
+        return false;
+    }
+    if op[1..].contains(|c: char| !is_mnemonic_byte(c)) {
+        return false;
+    }
+    RAX_FAMILY.contains(&&op[1..])
+}
+
+/// Does an operand token (register or memory) REFERENCE %rax at all — used
+/// only by the both-operand and last-two write classes, where a memory
+/// operand can never appear (xchg/xadd/mulx register forms).
+fn operand_references_rax(op: &str) -> bool {
+    let op = op.trim();
+    let bytes = op.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let mut j = i + 1;
+            while j < bytes.len() && is_mnemonic_byte(bytes[j] as char) {
+                j += 1;
+            }
+            if RAX_FAMILY.contains(&&op[i + 1..j]) {
+                return true;
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+/// Normalize a mnemonic token: drop the AT&T width suffix for table
+/// lookups (`movq` → `mov`), keeping the exact token as a fallback so
+/// suffixed rows (`cltq`) never lose their identity.
+#[inline]
+fn mnemonic_base(token: &str) -> &str {
+    match token.as_bytes().last() {
+        Some(b'b') | Some(b'w') | Some(b'l') | Some(b'q') => &token[..token.len() - 1],
+        _ => token,
+    }
+}
+
+/// Does this AT&T-syntax assembly line write any part of %rax?
+///
+/// Classifies the line vocabulary the backends emit. An UNKNOWN mnemonic
+/// carrying operands is treated as a write (fail-loud): a false "write"
+/// only risks a debug assertion naming the line for the table, while a
+/// missed write would silently defeat the validator. Labels (trailing
+/// `:`), assembler directives (leading `.`) and empty lines are ignored.
+pub(crate) fn asm_line_writes_rax(line: &str) -> bool {
+    let line = line.trim_start();
+    if line.is_empty() || line.ends_with(':') || line.starts_with('.') {
+        return false;
+    }
+    let mut rest = line;
+    // Prefix chain: lock/rep/segment/bnd hints precede the real mnemonic.
+    loop {
+        let end = rest
+            .find(|c: char| !is_mnemonic_byte(c))
+            .unwrap_or(rest.len());
+        let token = &rest[..end];
+        match token {
+            "lock" | "rep" | "repe" | "repz" | "repne" | "repnz" | "bnd" | "data16" | "notrack"
+            | "xacquire" | "xrelease" | "cs" | "ds" | "es" | "ss" => {
+                rest = rest[end..].trim_start();
+                if rest.is_empty() {
+                    return false;
+                }
+            }
+            _ => break,
+        }
+    }
+    let end = rest
+        .find(|c: char| !is_mnemonic_byte(c))
+        .unwrap_or(rest.len());
+    let token = &rest[..end];
+    let operands_part = rest[end..].trim_start();
+    let base = mnemonic_base(token);
+
+    if IMPLICIT_RAX_WRITES.contains(&token) || IMPLICIT_RAX_WRITES.contains(&base) {
+        return true;
+    }
+    if NEVER_RAX_WRITES.contains(&token) || NEVER_RAX_WRITES.contains(&base) {
+        return false;
+    }
+    // Jump family (ja/jb/jmp/jcc/jecxz/loop*/...): control transfer only.
+    if base.starts_with('j') {
+        return false;
+    }
+    // x87 operates on st(0)/memory and never touches GP registers (fstsw is
+    // answered by the implicit table above); prefetch streams to memory.
+    if base.starts_with('f') || base.starts_with("prefetch") || base == "bt" {
+        return false;
+    }
+    if BOTH_OPERAND_WRITES.contains(&token) || BOTH_OPERAND_WRITES.contains(&base) {
+        let ops = split_operands_top_level(operands_part);
+        return ops.iter().any(|o| operand_references_rax(o));
+    }
+    if LAST_TWO_WRITES.contains(&token) || LAST_TWO_WRITES.contains(&base) {
+        let ops = split_operands_top_level(operands_part);
+        return ops.len() >= 2 && ops[ops.len() - 2..].iter().any(|o| pure_rax_reg(o));
+    }
+    // imul's one-operand form multiplies INTO rax:rdx; its two/three-operand
+    // forms write only the explicit destination (handled by the generic rule).
+    if (token == "imul" || base == "imul") && !operands_part.is_empty() {
+        let ops = split_operands_top_level(operands_part);
+        if ops.len() == 1 {
+            return true;
+        }
+    }
+    if operands_part.is_empty() {
+        // Zero-operand instruction outside every table (vzeroupper, wait,
+        // fchs, ...): none of the emitted vocabulary writes %rax.
+        return false;
+    }
+    // Generic AT&T rule: the destination is the LAST operand, and a write
+    // to %rax happens exactly when that operand is a pure %rax-family
+    // register. Memory destinations (parens) and immediates never write —
+    // for ANY AT&T instruction, known or not (implicit writers are the
+    // table's job, answered above). An UNKNOWN mnemonic whose destination
+    // is rax-shaped still reports the write (dest-last is universal) and
+    // is recorded so the table can name it; an unknown mnemonic with a
+    // non-rax destination is soundly `false`, which keeps non-x86 lines
+    // and foreign mnemonics from inflating the epoch.
+    let ops = split_operands_top_level(operands_part);
+    match ops.last() {
+        Some(last) if pure_rax_reg(last) => {
+            let known = IMPLICIT_RAX_WRITES.contains(&token)
+                || IMPLICIT_RAX_WRITES.contains(&base)
+                || NEVER_RAX_WRITES.contains(&token)
+                || NEVER_RAX_WRITES.contains(&base)
+                || BOTH_OPERAND_WRITES.contains(&token)
+                || BOTH_OPERAND_WRITES.contains(&base)
+                || LAST_TWO_WRITES.contains(&token)
+                || LAST_TWO_WRITES.contains(&base)
+                || base.starts_with('j')
+                || base.starts_with('f')
+                || base.starts_with("prefetch")
+                || base == "bt"
+                || base == "imul";
+            if !known {
+                UNCLASSIFIED_MNEMONICS.with(|c| {
+                    let mut c = c.borrow_mut();
+                    if !c.iter().any(|m| m == token) {
+                        c.push(token.to_string());
+                    }
+                });
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+thread_local! {
+    /// Mnemonics the analyzer met but could not classify. Debug builds
+    /// surface this list through the acc-epoch assertion message so the
+    /// table can be extended; release builds never touch it.
+    static UNCLASSIFIED_MNEMONICS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 impl AsmOutput {
     pub fn new() -> Self {
         // Pre-allocate 256KB to avoid repeated reallocations during codegen.
@@ -1080,6 +1358,59 @@ impl AsmOutput {
             buf: String::with_capacity(256 * 1024),
             use_rsp_addressing: false,
             rsp_frame_size: 0,
+            #[cfg(debug_assertions)]
+            rax_write_epoch: 0,
+            #[cfg(debug_assertions)]
+            last_unclassified: None,
+        }
+    }
+
+    /// DEBUG-ONLY: classify the just-completed line and bump the shadow
+    /// epoch when it writes any part of %rax. A no-op compiled out of
+    /// release builds (the call sites stay unconditional; this body
+    /// collapses to nothing).
+    #[inline]
+    pub(crate) fn debug_scan_tail(&mut self) {
+        #[cfg(debug_assertions)]
+        {
+            let buf = &self.buf;
+            if buf.is_empty() || !buf.ends_with('\n') {
+                return;
+            }
+            let end = buf.len() - 1;
+            let start = match buf[..end].rfind('\n') {
+                Some(p) => p + 1,
+                None => 0,
+            };
+            if end > start && asm_line_writes_rax(&buf[start..end]) {
+                self.rax_write_epoch += 1;
+            }
+        }
+    }
+
+    /// DEBUG-ONLY: the current %rax shadow epoch (always 0 in release).
+    #[inline]
+    pub(crate) fn debug_rax_epoch(&self) -> u64 {
+        #[cfg(debug_assertions)]
+        {
+            self.rax_write_epoch
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            0
+        }
+    }
+
+    /// DEBUG-ONLY: the most recent unclassified line, for diagnostics.
+    #[inline]
+    pub(crate) fn debug_last_unclassified(&self) -> Option<&str> {
+        #[cfg(debug_assertions)]
+        {
+            self.last_unclassified.as_deref()
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            None
         }
     }
 
@@ -1088,6 +1419,7 @@ impl AsmOutput {
     pub fn emit(&mut self, s: &str) {
         self.buf.push_str(s);
         self.buf.push('\n');
+        self.debug_scan_tail();
     }
 
     /// Emit formatted assembly directly into the buffer (no temporary String).
@@ -1095,6 +1427,7 @@ impl AsmOutput {
     pub fn emit_fmt(&mut self, args: std::fmt::Arguments<'_>) {
         std::fmt::Write::write_fmt(&mut self.buf, args).unwrap();
         self.buf.push('\n');
+        self.debug_scan_tail();
     }
 
     // ── Fast-path emitters ──────────────────────────────────────────────
@@ -1113,6 +1446,7 @@ impl AsmOutput {
         self.buf.push_str(", %");
         self.buf.push_str(reg);
         self.buf.push('\n');
+        self.debug_scan_tail();
     }
 
     /// Emit: `    {mnemonic} %{src}, %{dst}`
@@ -1125,6 +1459,7 @@ impl AsmOutput {
         self.buf.push_str(", %");
         self.buf.push_str(dst);
         self.buf.push('\n');
+        self.debug_scan_tail();
     }
 
     /// Emit: `    {mnemonic} {offset}(%rbp), %{reg}`
@@ -1142,6 +1477,7 @@ impl AsmOutput {
         }
         self.buf.push_str(reg);
         self.buf.push('\n');
+        self.debug_scan_tail();
     }
 
     /// Emit a stack-slot reference after a `pushq` scratch-save has lowered RSP.
@@ -1213,6 +1549,7 @@ impl AsmOutput {
             self.buf.push_str("(%rbp)");
         }
         self.buf.push('\n');
+        self.debug_scan_tail();
     }
 
     /// Emit a block label line: `.LBB{id}:`
@@ -1222,6 +1559,7 @@ impl AsmOutput {
         write_u64_fast(&mut self.buf, block_id as u64);
         self.buf.push(':');
         self.buf.push('\n');
+        self.debug_scan_tail();
     }
 
     /// Emit: `    jmp .LBB{block_id}`
@@ -1230,6 +1568,7 @@ impl AsmOutput {
         self.buf.push_str("    jmp .LBB");
         write_u64_fast(&mut self.buf, block_id as u64);
         self.buf.push('\n');
+        self.debug_scan_tail();
     }
 
     /// Emit: `    {jcc} .LBB{block_id}` (conditional jump to block label)
@@ -1239,6 +1578,7 @@ impl AsmOutput {
         self.buf.push_str(" .LBB");
         write_u64_fast(&mut self.buf, block_id as u64);
         self.buf.push('\n');
+        self.debug_scan_tail();
     }
 
     /// Emit: `    {mnemonic} {reg}`  (single-register instruction like push/pop)
@@ -1248,6 +1588,7 @@ impl AsmOutput {
         self.buf.push_str(" %");
         self.buf.push_str(reg);
         self.buf.push('\n');
+        self.debug_scan_tail();
     }
 
     /// Emit: `    {mnemonic} ${imm}`  (single-immediate instruction like push)
@@ -1257,6 +1598,7 @@ impl AsmOutput {
         self.buf.push_str(" $");
         write_i64_fast(&mut self.buf, imm);
         self.buf.push('\n');
+        self.debug_scan_tail();
     }
 
     /// Write an i64 into the buffer without newline. Useful for building
@@ -1285,6 +1627,7 @@ impl AsmOutput {
             self.buf.push_str("(%rbp)");
         }
         self.buf.push('\n');
+        self.debug_scan_tail();
     }
 
     /// Emit a named label definition: `{label}:`
@@ -1293,6 +1636,7 @@ impl AsmOutput {
         self.buf.push_str(label);
         self.buf.push(':');
         self.buf.push('\n');
+        self.debug_scan_tail();
     }
 
     /// Emit: `    jmp {label}` (jump to named label)
@@ -1301,6 +1645,7 @@ impl AsmOutput {
         self.buf.push_str("    jmp ");
         self.buf.push_str(label);
         self.buf.push('\n');
+        self.debug_scan_tail();
     }
 
     /// Emit: `    {jcc} {label}` (conditional jump to named label)
@@ -1310,6 +1655,7 @@ impl AsmOutput {
         self.buf.push(' ');
         self.buf.push_str(label);
         self.buf.push('\n');
+        self.debug_scan_tail();
     }
 
     /// Emit: `    call {target}` (direct call to named function/label)
@@ -1318,6 +1664,7 @@ impl AsmOutput {
         self.buf.push_str("    call ");
         self.buf.push_str(target);
         self.buf.push('\n');
+        self.debug_scan_tail();
     }
 
     /// Emit: `    {mnemonic} {offset}(%{base}), %{reg}` (memory to register with arbitrary base)
@@ -1333,6 +1680,7 @@ impl AsmOutput {
         self.buf.push_str("), %");
         self.buf.push_str(reg);
         self.buf.push('\n');
+        self.debug_scan_tail();
     }
 
     /// Emit: `    {mnemonic} %{reg}, {offset}(%{base})` (register to memory with arbitrary base)
@@ -1349,6 +1697,7 @@ impl AsmOutput {
         self.buf.push_str(base);
         self.buf.push(')');
         self.buf.push('\n');
+        self.debug_scan_tail();
     }
 
     /// Emit: `    {mnemonic} ${imm}, {offset}(%{base})` (immediate to memory with arbitrary base)
@@ -1365,6 +1714,7 @@ impl AsmOutput {
         self.buf.push_str(base);
         self.buf.push(')');
         self.buf.push('\n');
+        self.debug_scan_tail();
     }
 
     /// Emit: `    {mnemonic} {symbol}(%{base}), %{reg}` (symbol-relative addressing)
@@ -1379,6 +1729,7 @@ impl AsmOutput {
         self.buf.push_str("), %");
         self.buf.push_str(reg);
         self.buf.push('\n');
+        self.debug_scan_tail();
     }
 
     /// Emit: `    {mnemonic} ${symbol}, %{reg}` (symbol as immediate)
@@ -1391,6 +1742,7 @@ impl AsmOutput {
         self.buf.push_str(", %");
         self.buf.push_str(reg);
         self.buf.push('\n');
+        self.debug_scan_tail();
     }
 
     /// Push a string slice without newline.
@@ -1403,6 +1755,7 @@ impl AsmOutput {
     #[inline]
     pub fn newline(&mut self) {
         self.buf.push('\n');
+        self.debug_scan_tail();
     }
 }
 
@@ -3080,5 +3433,125 @@ mod value_type_map_tests {
         );
         // The alloca dest is pointer-width (thread-local target size).
         assert_eq!(map.get(&0).copied(), Some(IrType::Ptr), "ptr: {map:?}");
+    }
+}
+
+#[cfg(test)]
+mod rax_epoch_analyzer_tests {
+    use super::asm_line_writes_rax;
+
+    #[test]
+    fn explicit_destination_writes() {
+        for line in [
+            "    movq %rbx, %rax",
+            "    addl %ecx, %eax",
+            "    movl $5, %eax",
+            "    movslq %eax, %rax",
+            "    movzbl %al, %eax",
+            "    xorl %eax, %eax",
+            "    shlq %cl, %rax",
+            "    leaq 48(%rbp,%rcx,8), %rax",
+            "    bswap %eax",
+            "    negq %rax",
+            "    imulq %rcx, %rax",
+            "    imulq $3, %rcx, %rax",
+            "    popq %rax",
+            "    sete %al",
+            "    movd %xmm0, %eax",
+            "    pextrb $0, %xmm2, %eax",
+            "    vcvttsd2siq %xmm0, %rax",
+            "    vpmovmskb %xmm1, %eax",
+            "    movabsq $8826686330870431363, %rax",
+            "    movl %fs:0, %eax",
+            "    btsq %rcx, %rax",
+            "    movq %rbx, %rax",
+        ] {
+            assert!(asm_line_writes_rax(line), "must WRITE rax: {line:?}");
+        }
+    }
+
+    #[test]
+    fn implicit_writes() {
+        for line in [
+            "    divq %rcx",
+            "    idivl %esi",
+            "    divb %cl",
+            "    mulq %rcx",
+            "    imulq %rcx",
+            "    call printf",
+            "    call *%r10",
+            "    call __x86_indirect_thunk_r10",
+            "    syscall",
+            "    cmpxchgq %rcx, (%rbx)",
+            "    lock xaddl %eax, (%rsp)",
+            "    xchgq %rax, %rbx",
+            "    xchgq %rax, (%rbx)",
+            "    cltq",
+            "    cdqe",
+            "    fnstsw %ax",
+            "    fstsw %ax",
+            "    mulxq %rbx, %rax, %rcx",
+            "    rdrand %eax",
+        ] {
+            assert!(asm_line_writes_rax(line), "must WRITE rax: {line:?}");
+        }
+    }
+
+    #[test]
+    fn non_writes() {
+        for line in [
+            "    movq %rax, -8(%rbp)",
+            "    movl %eax, 16(%rsp)",
+            "    movq %rbx, (%rsp,%rax,8)",
+            "    orq %rax, (%rbx)",
+            "    movq %rax, %fs:8(%rbx)",
+            "    cmpq %rax, %rbx",
+            "    cmpq $0, %rax",
+            "    testb %al, %al",
+            "    pushq %rax",
+            "    jmpq *%rax",
+            "    jne .L3",
+            "    ret",
+            "    retq",
+            "    leave",
+            "    cqto",
+            "    cltd",
+            "    cdq",
+            "    vzeroupper",
+            "    movq %rax, %xmm3",
+            "    movsd %xmm8, %xmm0",
+            "    fstpl (%esp)",
+            "    fnstcw (%rsp)",
+            "    fldl (%rax)",
+            "    btl $1, %eax",
+            "    prefetcht0 (%rax)",
+            "    rep stosq",
+            "    sahf",
+            "    nop",
+            "    endbr64",
+            ".p2align 4",
+            ".LCFP_3:",
+            "",
+            "    ",
+        ] {
+            assert!(!asm_line_writes_rax(line), "must NOT write rax: {line:?}");
+        }
+    }
+
+    #[test]
+    fn unknown_mnemonics_fail_loud() {
+        // An unclassified mnemonic whose DESTINATION is rax-shaped still
+        // reports a write (dest-last is universal in AT&T) and is recorded
+        // for the assertion message.
+        assert!(asm_line_writes_rax("    zkshift $1, %rax"));
+        // With a non-rax destination the answer is soundly false — memory
+        // and immediate destinations cannot write rax for any AT&T
+        // instruction, and implicit writers are the table's job.
+        assert!(!asm_line_writes_rax("    frobnicate x0, x1, x2"));
+        assert!(!asm_line_writes_rax("    add x0, x1, x2"));
+        assert!(!asm_line_writes_rax("    ldr w0, [sp, #8]"));
+        // Directives and labels never reach the analyzer's instruction path.
+        assert!(!asm_line_writes_rax(".quad 1"));
+        assert!(!asm_line_writes_rax("Lfoo:"));
     }
 }

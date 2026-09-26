@@ -1222,6 +1222,18 @@ fn extend_gep_base_liveness(
                             def_points,
                             &(block_start_points[bi], block_end_points[bi]),
                             copy_src,
+                            // STAGED CONSERVATISM — deliberate, not an
+                            // oversight. The operand/index sites moved to
+                            // the precise contract on their own measured
+                            // evidence (varint +1 push, expat/stencil5
+                            // spills); the base is the loop-carried pointer
+                            // in the hottest kernels — the single riskiest
+                            // value to un-pin — and flipping it here would
+                            // conflate two variables in any future
+                            // bisection. Flip this to
+                            // hidden_read_copy_chain_enabled() only behind
+                            // the same corpus A/B measurement, never
+                            // "for symmetry".
                             true,
                             last_use_points,
                             block_gen,
@@ -1349,14 +1361,22 @@ fn extend_hidden_operand_reads(
 /// for backend-folded operand reads (phi-elim preds extended to the access).
 /// Default OFF — the precise contract extends only the operand itself.
 /// Tests force the mode through the atomic override (edition-2024 makes
-/// `set_var` unsafe in the multithreaded test harness).
+/// `set_var` unsafe in the multithreaded test harness). The environment is
+/// consulted ONCE per process (`OnceLock`): the flag cannot legitimately
+/// change mid-compilation, and the per-query `var_os` lookups sat on the
+/// hidden-read walk's hot path.
 fn hidden_read_copy_chain_enabled() -> bool {
     let o = HIDDEN_READ_COPY_CHAIN_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
     if o >= 0 {
         return o == 1;
     }
-    std::env::var_os("CCC_HIDDEN_READ_COPY_CHAIN").is_some()
+    *HIDDEN_READ_COPY_CHAIN_ENV
+        .get_or_init(|| std::env::var_os("CCC_HIDDEN_READ_COPY_CHAIN").is_some())
 }
+
+/// Process-lifetime cache of the `CCC_HIDDEN_READ_COPY_CHAIN` environment
+/// decision (see [`hidden_read_copy_chain_enabled`]).
+static HIDDEN_READ_COPY_CHAIN_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 /// Shared tri-state override for [`hidden_read_copy_chain_enabled`]: -1 =
 /// follow the environment, 0/1 = forced precise/conservative (tests).
@@ -1389,8 +1409,17 @@ fn set_hidden_read_copy_chain_for_tests(follow: bool) {
 /// folded access — after the copy the operand's home carries the value. The
 /// one exception is a coalesced copy (source and operand share a home): the
 /// web then covers `[source def .. copy] ∪ [copy .. access]`, two ADJACENT
-/// ranges with no hole between them, so per-value segments already keep any
-/// third value out of the shared home across the whole span. Following the
+/// ranges with no hole between them — and the adjacency generalizes to
+/// arbitrary copy CHAINS (`pred → c1 → c2 → operand`, all coalesced onto one
+/// home): every intermediate Copy is an ordinary IR instruction whose src-use
+/// the raw walk records, so c1 is live from its own def (the copy that birthed
+/// it) to the copy that reads it, c2 likewise, and each segment shares its
+/// endpoints with the next. The union of per-value segments over the shared
+/// home is therefore contiguous BY CONSTRUCTION — for every program point in
+/// `[pred def .. access]`, some chain member is live — which is precisely the
+/// interference property the allocator needs: a third value can never be
+/// assigned the shared home inside the span. (`hidden_read_coalesced_home_
+/// union_has_no_hole` pins this mechanically.) Following the
 /// chain anyway pins every phi-elim pred of a loop-carried folded index live
 /// through the entire loop body (block_gen at the consumer block + backward
 /// dataflow around the backedge), which forced sqlite_varint's reversal-loop
@@ -2595,6 +2624,106 @@ mod tests {
         assert!(
             covers(&conservative, 3, 8),
             "conservative chain walk pins the entry pred at the access"
+        );
+    }
+
+    /// The COALESCED-shared-home case of the precise contract — the one
+    /// place the argument could break, made mechanical. When the phi-elim
+    /// entry Copy is coalesced (pred and operand share a home), the RA
+    /// keeps a third value out of that home only if the per-value segments
+    /// cover `[pred def .. access]` with NO hole. This pins the covering
+    /// property directly: the pred dies at the Copy (precise contract) but
+    /// its segment TOUCHES the operand's segment there, so every point of
+    /// the span is covered by SOME chain member — in BOTH walk modes. The
+    /// conservative mode extends the pred to the access (still contiguous,
+    /// merely costlier); the precise mode keeps the two-segment union
+    /// contiguous by construction. Either way the allocator cannot insert
+    /// a third value into the shared home inside the span.
+    #[test]
+    fn hidden_read_coalesced_home_union_has_no_hole() {
+        use crate::common::types::AddressSpace;
+        let mut func = IrFunction::new("coalesced".to_string(), IrType::I32, vec![], false);
+        // Entry: pred def (v3), the phi-elim entry Copy (v4 = v3), then a
+        // folded GEP whose index is the operand v4, and the access (Load).
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::BinOp {
+                    dest: Value(3),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Const(IrConst::I64(4096)),
+                    rhs: Operand::Const(IrConst::I64(8)),
+                    ty: IrType::I64,
+                },
+                Instruction::Copy {
+                    dest: Value(4),
+                    src: Operand::Value(Value(3)),
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(6),
+                    base: Value(0),
+                    offset: Operand::Value(Value(4)),
+                    ty: IrType::Ptr,
+                },
+                Instruction::Load {
+                    dest: Value(7),
+                    ptr: Value(6),
+                    ty: IrType::U8,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(7)))),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 8;
+
+        let mut hidden: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+        hidden.insert(4, vec![6]);
+        let r = compute_live_intervals_with_hidden_reads(&func, &hidden);
+        let covers = |r: &LivenessResult, v: u32, p: u32| {
+            r.segments
+                .iter()
+                .any(|s| s.value_id == v && s.start <= p && p <= s.end)
+        };
+        // Points: pred def 0, Copy 1, GEP 2, access (Load) 3, Return 4.
+        // THE PRECISE CONTRACT: the pred dies at the Copy — its register is
+        // read by the Copy, never by the folded access.
+        assert!(
+            !covers(&r, 3, 3),
+            "coalesced pred must not be pinned to the access"
+        );
+        assert!(!covers(&r, 3, 2));
+        assert!(covers(&r, 3, 0), "pred live at its def");
+        assert!(covers(&r, 3, 1), "pred live to the Copy that reads it");
+        // The operand carries the shared home to the access.
+        assert!(covers(&r, 4, 3), "operand live at the hidden read");
+        assert!(covers(&r, 4, 2), "operand live at the GEP");
+        assert!(covers(&r, 4, 1), "operand live from its def (the Copy)");
+        // THE COVERING PROPERTY (the no-hole statement): every point of the
+        // span is covered by SOME chain member, so the shared home has no
+        // window for a third value anywhere between pred-def and access.
+        for p in 0..=3 {
+            assert!(
+                covers(&r, 3, p) || covers(&r, 4, p),
+                "shared home must be covered at point {p} (precise mode)"
+            );
+        }
+        // The same covering property under the conservative chain walk —
+        // the model difference is the COST (the pred is pinned to the
+        // access), never the contiguity.
+        set_hidden_read_copy_chain_for_tests(true);
+        let conservative = compute_live_intervals_with_hidden_reads(&func, &hidden);
+        set_hidden_read_copy_chain_for_tests(false);
+        for p in 0..=3 {
+            assert!(
+                covers(&conservative, 3, p) || covers(&conservative, 4, p),
+                "shared home must be covered at point {p} (conservative mode)"
+            );
+        }
+        assert!(
+            covers(&conservative, 3, 3),
+            "conservative walk pins the pred at the access (the documented cost)"
         );
     }
 

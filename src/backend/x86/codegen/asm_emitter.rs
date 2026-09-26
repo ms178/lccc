@@ -1134,7 +1134,7 @@ mod tied_operand_no_slot_tests {
     #[test]
     fn asm_input_without_slot_moves_from_accumulator() {
         let mut cg = X86Codegen::new();
-        cg.state.reg_cache.set_acc(43, false);
+        cg.state.park_acc(43, false);
         let op = tied_rcx_operand();
         cg.load_input_to_reg(&op, &Operand::Value(Value(43)), "0");
         let text = emitted(&cg);
