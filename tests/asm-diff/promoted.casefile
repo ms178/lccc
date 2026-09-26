@@ -1,0 +1,95 @@
+;;; evex_promoted_cvt_to_gp
+.text
+{evex} vcvtsd2si %xmm1, %eax
+{evex} vcvtsd2si %xmm1, %rax
+{evex} vcvtsd2si %xmm16, %eax
+{evex} vcvtsd2si %xmm16, %r31
+{evex} vcvtss2si %xmm1, %eax
+{evex} vcvttsd2si %xmm1, %rax
+{evex} vcvttss2si %xmm16, %r16d
+{evex} vcvtsd2si 8(%rax), %eax
+{evex} vcvtsd2si 1016(%r20), %rax
+{evex} vcvtss2si 508(%r20), %eax
+{evex} vcvttsd2si -8(%r13), %r8
+vcvtsd2si %xmm16, %eax
+vcvtss2si %xmm17, %r17d
+vcvtsd2si 8(%r20), %rax
+;;; evex_promoted_cvt_to_gp_suffix
+{evex} vcvtsd2sil 1016(%r20), %eax
+{evex} vcvtsd2siq 1016(%r20), %rax
+{evex} vcvtsd2siq %xmm16, %rax
+{evex} vcvttss2siq %xmm16, %r9
+{evex} vcvtss2sil %xmm16, %r9d
+;;; evex_promoted_cvt_from_gp
+{evex} vcvtsi2sdl 508(%r20), %xmm1, %xmm2
+{evex} vcvtsi2sdq 1016(%r20), %xmm1, %xmm2
+{evex} vcvtsi2ssq 1016(%r20), %xmm1, %xmm2
+{evex} vcvtsi2sdl %r9d, %xmm1, %xmm2
+{evex} vcvtsi2sdq %r9, %xmm1, %xmm2
+vcvtsi2sdq 1016(%r20), %xmm16, %xmm17
+vcvtsi2sdl 508(%r20), %xmm16, %xmm17
+{evex} vcvtsi2sd 508(%rax), %xmm1, %xmm2
+;;; evex_promoted_vmovd_vmovq
+{evex} vmovd (%rax), %xmm0
+{evex} vmovd %xmm0, (%rax)
+{evex} vmovd %eax, %xmm0
+{evex} vmovd %xmm0, %eax
+{evex} vmovq (%r20), %xmm0
+{evex} vmovq %xmm0, (%r20)
+{evex} vmovq %r9, %xmm0
+{evex} vmovq %xmm0, %r9
+{evex} vmovd %xmm1, %xmm2
+{evex} vmovq %xmm1, %xmm2
+;;; evex_promoted_extract_insert
+{evex} vpextrb $1, %xmm1, %eax
+{evex} vpextrb $255, %xmm16, %r9d
+{evex} vpextrb $1, %xmm1, (%rax)
+{evex} vpextrw $1, %xmm1, %eax
+{evex} vpextrw $1, %xmm16, %r9d
+{evex} vpextrw $1, %xmm1, (%rax)
+{evex} vpextrw $1, %xmm16, %r9d
+{evex} vpextrw $1, %xmm16, %r31
+{evex} vpextrd $1, %xmm1, %eax
+{evex} vpextrq $1, %xmm1, %r9
+{evex} vpinsrb $1, %eax, %xmm1, %xmm2
+{evex} vpinsrw $1, %eax, %xmm1, %xmm2
+{evex} vpinsrd $1, %eax, %xmm16, %xmm2
+{evex} vpinsrq $1, %r9, %xmm16, %xmm2
+{evex} vpinsrb $1, (%rax), %xmm1, %xmm2
+{evex} vinsertps $1, %xmm1, %xmm2, %xmm3
+{evex} vinsertps $1, (%rax), %xmm1, %xmm2
+{evex} vextractps $1, %xmm1, %eax
+{evex} vextractps $1, %xmm1, (%rax)
+;;; evex_promoted_vmpsadbw
+{evex} vmpsadbw $1, %xmm2, %xmm1, %xmm3
+{evex} vmpsadbw $1, 16(%rax), %xmm1, %xmm3
+{evex} vmpsadbw $1, %ymm2, %ymm1, %ymm3
+vmpsadbw $1, %ymm2, %ymm1, %ymm3
+vmpsadbw $1, 16(%rax), %ymm1, %ymm3
+vmpsadbw $1, %zmm2, %zmm1, %zmm3
+vmpsadbw $1, 16(%rax), %zmm1, %zmm3
+vmpsadbw $1, 16(%r20), %zmm1, %zmm3{%k5}
+;;; evex_promoted_rejects reject
+{evex} vcvtsd2si %xmm0, (%rax)
+;;; evex_promoted_rejects2 reject
+vcvtsd2sil %xmm16, %rax
+;;; evex_promoted_rejects3 reject
+{evex} vcvtsd2sil %xmm16, %rax
+;;; evex_promoted_rejects5 reject
+vpextrb $256, %xmm0, %ebx
+;;; evex_promoted_rejects6 reject
+vpextrd $-2, %xmm0, %ebx
+;;; evex_promoted_rejects7 reject
+vpinsrb $-2, %ebx, %xmm0, %xmm1
+;;; evex_promoted_rejects8 reject
+vpinsrw $300, %ebx, %xmm0, %xmm1
+;;; evex_promoted_rejects9 reject
+vinsertps $-2, %xmm0, %xmm1, %xmm2
+;;; evex_promoted_rejects10 reject
+{evex} vmovql (%r20), %xmm1
+;;; evex_promoted_rejects11 reject
+{evex} vmpsadbw $-2, %xmm1, %xmm2, %xmm3
+;;; evex_promoted_rejects12 reject
+vmpsadbw $300, %xmm1, %xmm2, %xmm3
+;;; evex_promoted_rejects13 reject
+{evex} vmovd %xmm1, %xmm3{%k2}

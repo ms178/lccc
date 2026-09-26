@@ -4,26 +4,21 @@ use super::super::parser::*;
 pub(crate) fn reg_num(name: &str) -> Option<u8> {
     match name {
         "al" | "ax" | "eax" | "rax" | "xmm0" | "st" | "st(0)" | "mm0" | "es" | "ymm0" | "zmm0"
-        | "k0" => Some(0),
-        "cl" | "cx" | "ecx" | "rcx" | "xmm1" | "st(1)" | "mm1" | "cs" | "ymm1" | "zmm1" | "k1" => {
-            Some(1)
-        }
-        "dl" | "dx" | "edx" | "rdx" | "xmm2" | "st(2)" | "mm2" | "ss" | "ymm2" | "zmm2" | "k2" => {
-            Some(2)
-        }
-        "bl" | "bx" | "ebx" | "rbx" | "xmm3" | "st(3)" | "mm3" | "ds" | "ymm3" | "zmm3" | "k3" => {
-            Some(3)
-        }
+        | "k0" | "K0" => Some(0),
+        "cl" | "cx" | "ecx" | "rcx" | "xmm1" | "st(1)" | "mm1" | "cs" | "ymm1" | "zmm1" | "k1"
+        | "K1" => Some(1),
+        "dl" | "dx" | "edx" | "rdx" | "xmm2" | "st(2)" | "mm2" | "ss" | "ymm2" | "zmm2" | "k2"
+        | "K2" => Some(2),
+        "bl" | "bx" | "ebx" | "rbx" | "xmm3" | "st(3)" | "mm3" | "ds" | "ymm3" | "zmm3" | "k3"
+        | "K3" => Some(3),
         "ah" | "spl" | "sp" | "esp" | "rsp" | "xmm4" | "st(4)" | "mm4" | "fs" | "ymm4" | "zmm4"
-        | "k4" => Some(4),
+        | "k4" | "K4" => Some(4),
         "ch" | "bpl" | "bp" | "ebp" | "rbp" | "xmm5" | "st(5)" | "mm5" | "gs" | "ymm5" | "zmm5"
-        | "k5" => Some(5),
-        "dh" | "sil" | "si" | "esi" | "rsi" | "xmm6" | "st(6)" | "mm6" | "ymm6" | "zmm6" | "k6" => {
-            Some(6)
-        }
-        "bh" | "dil" | "di" | "edi" | "rdi" | "xmm7" | "st(7)" | "mm7" | "ymm7" | "zmm7" | "k7" => {
-            Some(7)
-        }
+        | "k5" | "K5" => Some(5),
+        "dh" | "sil" | "si" | "esi" | "rsi" | "xmm6" | "st(6)" | "mm6" | "ymm6" | "zmm6" | "k6"
+        | "K6" => Some(6),
+        "bh" | "dil" | "di" | "edi" | "rdi" | "xmm7" | "st(7)" | "mm7" | "ymm7" | "zmm7" | "k7"
+        | "K7" => Some(7),
         "r8b" | "r8w" | "r8d" | "r8" | "xmm8" | "ymm8" | "zmm8" => Some(0),
         "r9b" | "r9w" | "r9d" | "r9" | "xmm9" | "ymm9" | "zmm9" => Some(1),
         "r10b" | "r10w" | "r10d" | "r10" | "xmm10" | "ymm10" | "zmm10" => Some(2),
@@ -253,8 +248,6 @@ pub(crate) fn operand_needs_evex(op: &Operand) -> bool {
                 || needs_evex_rprime(&r.name)
                 || r.mask.is_some()
                 || r.zeroing
-                || r.sae
-                || r.rounding.is_some()
         }
         Operand::Memory(m) => m.mask.is_some() || m.zeroing || m.broadcast.is_some(),
         Operand::Label(s) => is_evex_sae_token(s),
@@ -510,23 +503,20 @@ pub(crate) fn infer_suffix(mnemonic: &str, ops: &[Operand]) -> String {
         return mnemonic.to_string();
     }
 
-    // For shift/rotate instructions, infer size from the *destination*
-    // register, never from %cl: the classic 2-operand form has the
-    // destination second (`shl %cl, %edx` -> `shll`), the APX NDD
-    // 3-operand form has it LAST (`shl %cl, %ecx, %edx` -> `shll` — the
-    // old first-register scan picked %cl and produced `shlb`, silently
-    // encoding an 8-bit shift of %cl), and the 1-operand shift-by-1 form
-    // has it first (`shl %edx` -> `shll`). Scanning from the end and
-    // skipping %cl covers all three shapes with one rule.
-    // A memory-only shift has no register to consult; it stays unsuffixed
-    // and the encoder applies the GAS 32-bit default (`shl (%rax)` is
-    // `d1 20`, not `48 d1 20` — byte-verified against GAS 2.47).
+    // For shift/rotate instructions, the suffix comes from the LAST
+    // operand when that operand is a REGISTER — including %cl as the
+    // destination (`shl %cl` = d0 e1, `shr $4,%cl` = c0 e9 04,
+    // `sar %cl,%cl` = d2 f9 — all byte-probed against GAS 2.47). The
+    // classic 2-operand form has the destination last (`shl %cl,%edx` ->
+    // `shll`), the APX NDD 3-operand form has it last (`shl
+    // %cl,%ecx,%edx` -> `shll`), and the 1-operand shift-by-1 form has
+    // it first and only (`shl %edx` -> `shll`). A memory LAST operand
+    // leaves the mnemonic unsuffixed for the encoder's GAS 32-bit
+    // default (`shl (%rax)` = d1 20, `sal %cl,(%rax)` = d3 20 — the %cl
+    // COUNT never decides the size, only a register DESTINATION does).
     let is_shift = matches!(mnemonic, "shl" | "shr" | "sar" | "rol" | "ror");
     if is_shift {
-        if let Some(r) = ops.iter().rev().find_map(|op| match op {
-            Operand::Register(r) if r.name != "cl" => Some(r),
-            _ => None,
-        }) {
+        if let Some(Operand::Register(r)) = ops.last() {
             if let Some(suffix) = register_size_suffix(&r.name) {
                 return format!("{}{}", mnemonic, suffix);
             }
@@ -860,6 +850,16 @@ fn check_pextr_shape(mnemonic: &str, ops: &[Operand]) -> Result<(), String> {
     };
     if ops.len() != expect {
         return Err(format!("number of operands mismatch for `{mnemonic}'"));
+    }
+    // The pextr/pinsr imm8 is UNSIGNED 0..255 in GAS 2.47 — `$256` and
+    // `$-2` are `operand type mismatch` (byte-probed for the VEX rows
+    // here and for the EVEX-promoted rows in encoder/promoted.rs;
+    // vmpsadbw's VEX rows are the signed exception, checked in its own
+    // encoder).
+    if let Some(Operand::Immediate(ImmediateValue::Integer(v))) = ops.first() {
+        if !(0..=255).contains(v) {
+            return Err(format!("operand type mismatch for `{mnemonic}'"));
+        }
     }
     let type_err = || format!("operand type mismatch for `{mnemonic}'");
     let size_err = || format!("operand size mismatch for `{mnemonic}'");

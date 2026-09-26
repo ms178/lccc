@@ -318,3 +318,23 @@ shldl $63, %eax, %ecx
 shrdq $63, %rax, %rcx
 shldl %cl, %eax, %ecx
 shrdq %cl, %rax, %r15
+;;; shift_cl_destination
+.text
+shl %cl
+shl %dl
+shl %rax
+shr $4, %cl
+shr $4, %dl
+sar %cl, %cl
+sar %cl, %dl
+rol %cl, %bl
+ror %cl, %r9w
+shl %cl, (%rax)
+shl $2, (%rax,%rdx,8)
+shl %cl, 8(%r12,%rax,4)
+sal %cl, (%rax)
+sal %cl, %edx
+rcl %cl, %edx
+rcr %cl, %edx
+shl %cl, %ecx, %edx
+shr $1, %r8d

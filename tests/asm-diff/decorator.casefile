@@ -1,0 +1,64 @@
+;;; sae_standalone
+.text
+vmaxss {sae}, %xmm0, %xmm1, %xmm2
+vaddsd {rd-sae}, %xmm0, %xmm1, %xmm2
+vaddss {rn-sae}, %xmm0, %xmm1, %xmm2
+vaddps {ru-sae}, %zmm1, %zmm2, %zmm3
+vmaxps {sae}, %zmm1, %zmm2, %zmm3
+;;; sae_suffixed_rejects reject
+vaddss %xmm0, %xmm1, %xmm2{sae}
+;;; sae_suffixed_rejects2 reject
+vmaxss %xmm0, %xmm1, %xmm2{sae}
+;;; sae_suffixed_rejects3 reject
+vaddps %zmm1, %zmm0, %zmm2{rn-sae}
+;;; sae_suffixed_rejects4 reject
+vaddsd %xmm0, %xmm1, %xmm2{%k3}{sae}
+;;; sae_suffixed_rejects5 reject
+vaddss (%rax){sae}, %xmm1, %xmm2
+;;; sae_class_law reject
+vaddss {sae}, %xmm0, %xmm1, %xmm2
+;;; mask_dup_across_operands reject
+vaddps %zmm0{%k1}, %zmm1, %zmm2{%k1}
+;;; mask_dup_within_operand reject
+vaddps %zmm0{%k1}{%k2}, %zmm1, %zmm2
+;;; mask_dup_echo_tail reject
+vaddps %zmm0{%k1}, %zmm1, %zmm2{%k1}{z}
+;;; z_dup reject
+vaddps %zmm0{z}{z}, %zmm1, %zmm2
+;;; bcst_dup reject
+vaddps %zmm0{1to4}, %zmm1, %zmm2{1to4}
+;;; k0_dedicated reject
+vaddps %zmm0{%k0}, %zmm1, %zmm2
+;;; standalone_junk reject
+vaddps {sae}{%k1}, %zmm0, %zmm1, %zmm2
+;;; standalone_junk2 reject
+vpunpcklbw {%k1}, %zmm0, %zmm1, %zmm2
+;;; k_uppercase
+.text
+vaddps %zmm1, %zmm2, %zmm0{%K1}
+vaddps %zmm1, %zmm2, %zmm0{%K1}{z}
+vaddps %zmm1, %zmm2, %zmm0{%k1}
+;;; scalar_bcst_rejects reject
+vaddss 8(%rax){1to4}, %xmm1, %xmm2
+;;; scalar_bcst_rejects2 reject
+vmaxss 8(%rax){1to4}, %xmm1, %xmm2
+;;; scalar_bcst_rejects3 reject
+vaddsd 16(%rax){1to8}, %xmm1, %xmm2
+;;; scalar_bcst_rejects4 reject
+vcvtsi2sdl 8(%rax){1to4}, %xmm1, %xmm2
+;;; scalar_bcst_rejects5 reject
+vcvtsd2si 16(%rax){1to8}, %rax
+;;; scalar_bcst_rejects6 reject
+vmovss 8(%rax){1to4}, %xmm1, %xmm2
+;;; scalar_bcst_rejects7 reject
+vmovsd 16(%rax){1to8}, %xmm1, %xmm2
+;;; scalar_bcst_rejects8 reject
+vcmpss $3, 8(%rax){1to4}, %xmm1, %xmm2
+;;; scalar_bcst_rejects9 reject
+vgetmantss $3, 8(%rax){1to4}, %xmm1, %xmm2
+;;; scalar_bcst_rejects10 reject
+vscalefss 8(%rax){1to4}, %xmm1, %xmm2
+;;; scalar_bcst_rejects11 reject
+vfmadd132ss 8(%rax){1to4}, %xmm1, %xmm2
+;;; scalar_bcst_rejects12 reject
+vmovddup 16(%rax){1to8}, %xmm1

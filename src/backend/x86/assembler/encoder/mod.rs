@@ -49,6 +49,10 @@ pub const R_X86_64_PC64: u32 = 24;
 #[expect(dead_code)] // ELF standard constant, defined for reference/future use
 pub const R_X86_64_GOT32: u32 = 3;
 pub const R_X86_64_PLT32: u32 = 4;
+/// 8-bit absolute (S + A, 1-byte patch; x86-64 psABI type 14). GAS emits
+/// this for the 8-bit symbol-immediate forms (`add $sym,%al` = `04 00`
+/// with R_X86_64_8, `addb $sym,(%rax)` likewise).
+pub const R_X86_64_8: u32 = 14;
 pub const R_X86_64_32: u32 = 10;
 pub const R_X86_64_32S: u32 = 11;
 pub const R_X86_64_16: u32 = 12;
@@ -353,9 +357,7 @@ fn unwrap_indirect(op: &Operand) -> &Operand {
 fn op_decorated(op: &Operand) -> bool {
     let op = unwrap_indirect(op);
     match op {
-        Operand::Register(r) => {
-            r.mask.is_some() || r.zeroing || r.broadcast.is_some() || r.sae || r.rounding.is_some()
-        }
+        Operand::Register(r) => r.mask.is_some() || r.zeroing || r.broadcast.is_some(),
         Operand::Memory(m) => m.mask.is_some() || m.zeroing || m.broadcast.is_some(),
         Operand::Label(s) => registers::is_evex_sae_token(s),
         _ => false,
@@ -700,26 +702,26 @@ impl InstructionEncoder {
             self.encode_mnemonic(instr)
         };
         // `{evex}` post-check: the instruction must have taken an EVEX
-        // (0x62) or REX2 (0xD5) arm. A body that starts with the legacy
-        // prefix run and then a non-APX opcode byte means a silent legacy
-        // fallback — exactly GAS 2.47's `no EVEX encoding for `<m>''
-        // reject. Checking the byte SHAPE (prefix run + 0x62/0xD5) rather
-        // than only the first byte keeps segment/lock/0x66 splices working
-        // while still catching `push`/`ret`-style false positives where a
-        // 0x62 immediate could appear mid-body.
+        // (0x62) arm. Per the SDM the only legacy prefixes that may
+        // precede EVEX are segment overrides and the 0x67 address-size
+        // prefix — a 66/F2/F3/F0 byte in front of 0x62 is a #UD sequence
+        // (`{nf} divw %cx` used to leak `66 62 …` this way; the 16-bit
+        // paths now guard their 0x66 with `encode_unary_rm_66`). REX2
+        // (0xD5) is likewise not an EVEX encoding — a body shaped
+        // `prefix* D5` under `{evex}` is a silent fallback, exactly
+        // GAS 2.47's `no EVEX encoding for `<m>'' reject. Checking the
+        // byte SHAPE rather than only the first byte keeps
+        // segment/0x67 splices working while still catching
+        // `push`/`ret`-style false positives where a 0x62 immediate
+        // could appear mid-body.
         if result.is_ok() && self.apx_evex {
             let body = &self.bytes[start_len..];
-            let is_prefix = |b: u8| {
-                matches!(
-                    b,
-                    0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x67 | 0x66 | 0xF0 | 0xF2 | 0xF3
-                )
-            };
+            let is_prefix = |b: u8| matches!(b, 0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x67);
             let mut k = 0;
             while k < body.len() && is_prefix(body[k]) {
                 k += 1;
             }
-            if k >= body.len() || (body[k] != 0x62 && body[k] != 0xD5) {
+            if k >= body.len() || body[k] != 0x62 {
                 self.bytes.truncate(start_len);
                 self.relocations.truncate(reloc_base);
                 result = Err(format!(
@@ -821,35 +823,40 @@ impl InstructionEncoder {
             }
             return Ok(());
         }
-        // EVEX selected. First the suffixed-`{sae}` kind check (a
-        // decorator-value error, so it precedes placement): the class
-        // comes from the emitted (map, opcode), so no mnemonic table.
-        // (If the body FAILED (arity/shape), that error wins instead;
-        // GAS reports `unknown vector operation' even then, but the
-        // class is unknowable without emitted bytes. Verdict-identical.)
-        if self.bytes.len() >= pi + 5 {
-            let map = self.bytes[pi + 1] & 7;
-            let opcode = self.bytes[pi + 4];
-            for op in ops {
-                if let Operand::Register(r) = unwrap_indirect(op) {
-                    if (is_xmm(&r.name) || is_ymm(&r.name) || is_zmm(&r.name))
-                        && let Some(tok) =
-                            Self::check_evex_sae_token(map, opcode, r.sae, r.rounding)
-                    {
-                        return Err(format!("unknown vector operation: `{tok}'"));
-                    }
-                }
-            }
-        }
+        // EVEX selected. (A suffixed `{sae}` never reaches here: the
+        // parser rejects it with `unknown vector operation` on every
+        // operand kind, byte-probed against GAS 2.47.)
         // Broadcast on a register is never valid, and a write mask
         // anywhere but the destination (last operand) is misplaced.
-        // Memory broadcast the encoder ignored (`vmovaps` has no
-        // broadcast form) and per-instruction N validity are each EVEX
-        // encoder's job (`evex_forbid_*` audit follow-up).
+        // Scalar-Tuple1 memory broadcast is tuple-impossible (no scalar
+        // instruction has a `{1toN}` form), rejected centrally from the
+        // emitted (map, pp, W, opcode) — every present and future scalar
+        // caller is covered with no per-arm chaining. Other ignored
+        // memory broadcast (`vmovaps` has no broadcast form) and
+        // per-instruction N validity stay each EVEX encoder's job.
+        let scalar_class = if self.bytes.len() >= pi + 5 {
+            Self::evex_scalar_bcst_class(
+                self.bytes[pi + 1] & 7,
+                self.bytes[pi + 2] & 3,
+                (self.bytes[pi + 2] >> 7) & 1,
+                self.bytes[pi + 4],
+            )
+        } else {
+            None
+        };
         for op in ops {
             let (_, _, bcst, _) = op_decor(op);
-            if bcst && matches!(unwrap_indirect(op), Operand::Register(_)) {
-                return Err(format!("unsupported broadcast for `{mnemonic}'"));
+            if !bcst {
+                continue;
+            }
+            match (unwrap_indirect(op), scalar_class) {
+                (Operand::Register(_), _) => {
+                    return Err(format!("unsupported broadcast for `{mnemonic}'"));
+                }
+                (Operand::Memory(_), Some(class)) => {
+                    return Err(format!("{} for `{stem}'", class));
+                }
+                _ => {}
             }
         }
         if let Some(last) = ops.len().checked_sub(1) {
@@ -1143,8 +1150,8 @@ impl InstructionEncoder {
             // vmovss/vmovsd masked spellings (k-signal routes here; the
             // unmasked VEX forms stay on the VEX path, shorter): the
             // merge/load/store EVEX shapes with full opmask support.
-            "vmovss" => r(self.encode_evex_scalarmov(ops, 2, 0)),
-            "vmovsd" => r(self.encode_evex_scalarmov(ops, 3, 1)),
+            "vmovss" => r(self.encode_evex_scalarmov(ops, 2, 0, "vmovss")),
+            "vmovsd" => r(self.encode_evex_scalarmov(ops, 3, 1, "vmovsd")),
             // VEX-native AVX2 dup/shuffles with EVEX.0F forms (EVEX.F2/F3.
             // 0F.W 12/16): full unary machinery (mem, {k}{z}; no broadcast).
             "vmovddup" => r(self.encode_evex_unary(ops, 1, 3, 1, 0x12)),
@@ -1422,12 +1429,14 @@ impl InstructionEncoder {
                 None,
                 None,
                 4,
+                false,
                 "vextractps",
             )),
-            "vpextrb" => {
-                r(self.encode_evex_promoted_extract(ops, 3, 1, 0, 0x14, None, None, 1, "vpextrb"))
-            }
-            // vpextrw: register dest = map1 C5, memory dest = map3 op 15.
+            "vpextrb" => r(self
+                .encode_evex_promoted_extract(ops, 3, 1, 0, 0x14, None, None, 1, false, "vpextrb")),
+            // vpextrw: register dest = map1 C5 with the GP register in
+            // ModRM.reg (opposite the other extracts — GAS 2.47
+            // `62 f1 7d 08 c5 c1 01`); memory dest = map3 op 15.
             "vpextrw" => r(self.encode_evex_promoted_extract(
                 ops,
                 1,
@@ -1437,14 +1446,13 @@ impl InstructionEncoder {
                 Some(3),
                 Some(0x15),
                 2,
+                true,
                 "vpextrw",
             )),
-            "vpextrd" => {
-                r(self.encode_evex_promoted_extract(ops, 3, 1, 0, 0x16, None, None, 4, "vpextrd"))
-            }
-            "vpextrq" => {
-                r(self.encode_evex_promoted_extract(ops, 3, 1, 1, 0x16, None, None, 8, "vpextrq"))
-            }
+            "vpextrd" => r(self
+                .encode_evex_promoted_extract(ops, 3, 1, 0, 0x16, None, None, 4, false, "vpextrd")),
+            "vpextrq" => r(self
+                .encode_evex_promoted_extract(ops, 3, 1, 1, 0x16, None, None, 8, false, "vpextrq")),
             "vpinsrb" => r(self.encode_evex_promoted_insert(ops, 3, 1, 0, 0x20, 1, "vpinsrb")),
             "vpinsrw" => r(self.encode_evex_promoted_insert(ops, 1, 1, 0, 0xC4, 2, "vpinsrw")),
             "vpinsrd" => r(self.encode_evex_promoted_insert(ops, 3, 1, 0, 0x22, 4, "vpinsrd")),
@@ -1452,18 +1460,88 @@ impl InstructionEncoder {
             "vinsertps" => r(self.encode_evex_promoted_insert(ops, 3, 1, 0, 0x21, 4, "vinsertps")),
             // GAS 2.47 promotes VMPSADBW with the F3 prefix (pp=2), not the
             // legacy 66 — byte-probed ({evex} vmpsadbw $2, %xmm0, %xmm1, %xmm2
-            // = 62 f3 76 08 42 d0 02).
-            "vmpsadbw" => r(self.encode_evex_promoted_insert(ops, 3, 2, 0, 0x42, 16, "vmpsadbw")),
-            "vcvtsd2si" => r(self.encode_evex_promoted_cvt_to_gp(ops, 3, 0x2D, true, "vcvtsd2si")),
-            "vcvtss2si" => r(self.encode_evex_promoted_cvt_to_gp(ops, 2, 0x2D, false, "vcvtss2si")),
+            // = 62 f3 76 08 42 d0 02). AVX10.2 adds ymm/zmm rows with full
+            // L'L + masking and N=1 memory; {evex} on an ymm spelling takes
+            // the EVEX row, not the legacy VEX one.
+            "vmpsadbw" => {
+                let has_wide = ops.iter().any(
+                    |op| matches!(op, Operand::Register(r) if is_ymm(&r.name) || is_zmm(&r.name)),
+                );
+                if has_wide {
+                    r(self.encode_evex_vmpsadbw_avx10(ops))
+                } else {
+                    r(self.encode_evex_promoted_insert(ops, 3, 2, 0, 0x42, 16, "vmpsadbw"))
+                }
+            }
+            // Size-suffixed spellings reach the promoted rows too (GAS
+            // 2.47 accepts vcvtsi2sdl/q, vcvtsi2ssl/q and vcvts*2sil/q
+            // under {evex} and for xmm16+; the suffix fixes W and must
+            // AGREE with any GP register's width). Every other promoted
+            // mnemonic rejects suffixes ("invalid instruction suffix").
+            "vcvtsd2si" => {
+                r(self.encode_evex_promoted_cvt_to_gp(ops, 3, 0x2D, true, None, "vcvtsd2si"))
+            }
+            "vcvtsd2sil" => {
+                r(self.encode_evex_promoted_cvt_to_gp(ops, 3, 0x2D, true, Some(0), "vcvtsd2sil"))
+            }
+            "vcvtsd2siq" => {
+                r(self.encode_evex_promoted_cvt_to_gp(ops, 3, 0x2D, true, Some(1), "vcvtsd2siq"))
+            }
+            "vcvtss2si" => {
+                r(self.encode_evex_promoted_cvt_to_gp(ops, 2, 0x2D, false, None, "vcvtss2si"))
+            }
+            "vcvtss2sil" => {
+                r(self.encode_evex_promoted_cvt_to_gp(ops, 2, 0x2D, false, Some(0), "vcvtss2sil"))
+            }
+            "vcvtss2siq" => {
+                r(self.encode_evex_promoted_cvt_to_gp(ops, 2, 0x2D, false, Some(1), "vcvtss2siq"))
+            }
             "vcvttsd2si" => {
-                r(self.encode_evex_promoted_cvt_to_gp(ops, 3, 0x2C, true, "vcvttsd2si"))
+                r(self.encode_evex_promoted_cvt_to_gp(ops, 3, 0x2C, true, None, "vcvttsd2si"))
+            }
+            "vcvttsd2sil" => {
+                r(self.encode_evex_promoted_cvt_to_gp(ops, 3, 0x2C, true, Some(0), "vcvttsd2sil"))
+            }
+            "vcvttsd2siq" => {
+                r(self.encode_evex_promoted_cvt_to_gp(ops, 3, 0x2C, true, Some(1), "vcvttsd2siq"))
             }
             "vcvttss2si" => {
-                r(self.encode_evex_promoted_cvt_to_gp(ops, 2, 0x2C, false, "vcvttss2si"))
+                r(self.encode_evex_promoted_cvt_to_gp(ops, 2, 0x2C, false, None, "vcvttss2si"))
             }
-            "vcvtsi2sd" => r(self.encode_evex_promoted_cvt_from_gp(ops, 3, true, "vcvtsi2sd")),
-            "vcvtsi2ss" => r(self.encode_evex_promoted_cvt_from_gp(ops, 2, false, "vcvtsi2ss")),
+            "vcvttss2sil" => r(self.encode_evex_promoted_cvt_to_gp(
+                ops,
+                2,
+                0x2C,
+                false,
+                Some(0),
+                "vcvttss2sil",
+            )),
+            "vcvttss2siq" => r(self.encode_evex_promoted_cvt_to_gp(
+                ops,
+                2,
+                0x2C,
+                false,
+                Some(1),
+                "vcvttss2siq",
+            )),
+            "vcvtsi2sd" => {
+                r(self.encode_evex_promoted_cvt_from_gp(ops, 3, true, None, "vcvtsi2sd"))
+            }
+            "vcvtsi2sdl" => {
+                r(self.encode_evex_promoted_cvt_from_gp(ops, 3, true, Some(0), "vcvtsi2sdl"))
+            }
+            "vcvtsi2sdq" => {
+                r(self.encode_evex_promoted_cvt_from_gp(ops, 3, true, Some(1), "vcvtsi2sdq"))
+            }
+            "vcvtsi2ss" => {
+                r(self.encode_evex_promoted_cvt_from_gp(ops, 2, false, None, "vcvtsi2ss"))
+            }
+            "vcvtsi2ssl" => {
+                r(self.encode_evex_promoted_cvt_from_gp(ops, 2, false, Some(0), "vcvtsi2ssl"))
+            }
+            "vcvtsi2ssq" => {
+                r(self.encode_evex_promoted_cvt_from_gp(ops, 2, false, Some(1), "vcvtsi2ssq"))
+            }
             // APX map-4 promotions of the CET/system stores ({evex} only;
             // the legacy paths below keep the 66-0F38 forms).
             "wrssd" => r(self.encode_evex_wrss(ops, false, 0, 0x66, "wrssd")),
@@ -2150,21 +2228,14 @@ impl InstructionEncoder {
             if let Some(result) = self.try_encode_evex(mnemonic, ops) {
                 return result;
             }
-            if let Some(("cmp", size)) = promoted::promoted_stem_size(mnemonic) {
+            if let Some((stem, size)) = promoted::promoted_stem_size(mnemonic) {
+                let is_test = stem == "test";
                 let size = if size == 0 {
                     apx::infer_ccmp_size(ops)
                 } else {
                     size
                 };
-                return self.encode_ccmp_test(ops, size, apx::APX_CC_T, false);
-            }
-            if let Some(("test", size)) = promoted::promoted_stem_size(mnemonic) {
-                let size = if size == 0 {
-                    apx::infer_ccmp_size(ops)
-                } else {
-                    size
-                };
-                return self.encode_ccmp_test(ops, size, apx::APX_CC_T, true);
+                return self.encode_ccmp_test(ops, size, apx::APX_CC_T, is_test);
             }
         }
 
@@ -2204,6 +2275,23 @@ impl InstructionEncoder {
         // xmm/ymm0–15 stay on the VEX path (shorter). Without the high-reg
         // check, xmm16 would wrap into the 3-bit VEX/ModRM fields as xmm0.
         let has_zmm_or_k = ops.iter().any(operand_needs_evex);
+        // An EGPR memory address (r16-r31 base/index) is only encodable
+        // with an EVEX or REX2 prefix. AVX mnemonics must take the EVEX
+        // arm so the B4/X4 bits are emitted (`vcvtsd2si 8(%r20),%rax`);
+        // non-AVX mnemonics fall through to their APX/REX2 arms below,
+        // and the encode() EGPR gate rejects anything that silently
+        // dropped the EGPR.
+        if !has_zmm_or_k
+            && ops.iter().any(|op| {
+                matches!(op, Operand::Memory(m) if
+                    m.base.as_ref().is_some_and(|b| gp_id(&b.name).is_some_and(|id| id >= 16))
+                    || m.index.as_ref().is_some_and(|i| gp_id(&i.name).is_some_and(|id| id >= 16)))
+            })
+        {
+            if let Some(result) = self.try_encode_evex(mnemonic, ops) {
+                return result;
+            }
+        }
         // Mnemonics with NO VEX encoding (EVEX is the only form): must be
         // routed to the EVEX table even for 128/256-bit (xmm/ymm) operands.
         // NOTE the order inside `matches!` is grouping, not semantics; every
@@ -3590,10 +3678,7 @@ impl InstructionEncoder {
 
             // ---- Unsigned multiply (single-operand) ----
             "mull" => self.encode_unary_rm(ops, 4, 4),
-            "mulw" => {
-                self.bytes.push(0x66);
-                self.encode_unary_rm(ops, 4, 2)
-            }
+            "mulw" => self.encode_unary_rm_66(ops, 4, 2),
 
             // ---- Rotate through carry ----
             "rclq" | "rcll" | "rclw" | "rclb" => self.encode_shift(ops, mnemonic, 2),
@@ -3611,15 +3696,9 @@ impl InstructionEncoder {
 
             // ---- Additional unary sizes ----
             "notb" => self.encode_unary_rm(ops, 2, 1),
-            "notw" => {
-                self.bytes.push(0x66);
-                self.encode_unary_rm(ops, 2, 2)
-            }
+            "notw" => self.encode_unary_rm_66(ops, 2, 2),
             "negb" => self.encode_unary_rm(ops, 3, 1),
-            "negw" => {
-                self.bytes.push(0x66);
-                self.encode_unary_rm(ops, 3, 2)
-            }
+            "negw" => self.encode_unary_rm_66(ops, 3, 2),
 
             // ---- Additional conditional branches ----
             "jrcxz" => {
@@ -4233,7 +4312,17 @@ impl InstructionEncoder {
             "vroundpd" => self.encode_avx_2op_3a_pp_imm8(ops, 0x09, 1),
             "vroundss" => self.encode_avx_3op_3a_imm8(ops, 0x0A, true),
             "vroundsd" => self.encode_avx_3op_3a_imm8(ops, 0x0B, true),
-            "vinsertps" => self.encode_avx_3op_3a_imm8(ops, 0x21, true),
+            // VINSERTPS imm8 is unsigned 0..255 (GAS 2.47: `$-2` is
+            // `operand type mismatch` — byte-probed; the EVEX-promoted
+            // row checks the same range in encoder/promoted.rs).
+            "vinsertps" => {
+                if let Some(Operand::Immediate(ImmediateValue::Integer(v))) = ops.first() {
+                    if !(0..=255).contains(v) {
+                        return Err("operand type mismatch for `vinsertps'".to_string());
+                    }
+                }
+                self.encode_avx_3op_3a_imm8(ops, 0x21, true)
+            }
             "vextractps" => self.encode_avx_extract_gpr_imm8(ops, 0x17, true),
             "vdpps" => self.encode_avx_3op_3a_imm8(ops, 0x40, true),
             "vdppd" => self.encode_avx_3op_3a_imm8(ops, 0x41, true),
@@ -4483,30 +4572,21 @@ impl InstructionEncoder {
                     Some(Operand::Register(r)) => infer_reg_size(&r.name),
                     _ => 4,
                 };
-                if size == 2 {
-                    self.bytes.push(0x66);
-                }
-                self.encode_unary_rm(ops, 4, size)
+                self.encode_unary_rm_66(ops, 4, size)
             }
             "div" => {
                 let size = match ops.last() {
                     Some(Operand::Register(r)) => infer_reg_size(&r.name),
                     _ => 4,
                 };
-                if size == 2 {
-                    self.bytes.push(0x66);
-                }
-                self.encode_unary_rm(ops, 6, size)
+                self.encode_unary_rm_66(ops, 6, size)
             }
             "idiv" => {
                 let size = match ops.last() {
                     Some(Operand::Register(r)) => infer_reg_size(&r.name),
                     _ => 4,
                 };
-                if size == 2 {
-                    self.bytes.push(0x66);
-                }
-                self.encode_unary_rm(ops, 7, size)
+                self.encode_unary_rm_66(ops, 7, size)
             }
             "bswap" => {
                 let size = if let Some(Operand::Register(r)) = ops.first() {
@@ -4569,15 +4649,9 @@ impl InstructionEncoder {
             "sbbw" | "sbbb" => self.encode_alu(ops, mnemonic, 3),
 
             // ---- divw, divb, idivw, idivb, mulb ----
-            "divw" => {
-                self.bytes.push(0x66);
-                self.encode_unary_rm(ops, 6, 2)
-            }
+            "divw" => self.encode_unary_rm_66(ops, 6, 2),
             "divb" => self.encode_unary_rm(ops, 6, 1),
-            "idivw" => {
-                self.bytes.push(0x66);
-                self.encode_unary_rm(ops, 7, 2)
-            }
+            "idivw" => self.encode_unary_rm_66(ops, 7, 2),
             "idivb" => self.encode_unary_rm(ops, 7, 1),
             "mulb" => self.encode_unary_rm(ops, 4, 1),
 
@@ -5230,7 +5304,26 @@ mod apx_tests {
         })
     }
 
-    fn hex_relocs(line: &str) -> (String, Vec<u32>) {
+    /// Exact rejection text (stronger than `fails`): panics if `line`
+    /// parses AND encodes, else returns the first error string — from
+    /// the parser (decorator diagnostics fire there) or the encoder.
+    pub(super) fn fail_msg(line: &str) -> String {
+        if let Err(e) = parse_asm(line) {
+            return e;
+        }
+        let items = parse_asm(line).unwrap();
+        let mut enc = InstructionEncoder::new();
+        for it in items {
+            if let AsmItem::Instruction(i) = it {
+                if let Err(e) = enc.encode(&i) {
+                    return e;
+                }
+            }
+        }
+        panic!("expected `{line}` to fail encoding")
+    }
+
+    pub(super) fn hex_relocs(line: &str) -> (String, Vec<u32>) {
         let items = parse_asm(line).unwrap_or_else(|e| panic!("parse `{line}`: {e}"));
         let mut enc = InstructionEncoder::new();
         for it in items {
@@ -5632,7 +5725,7 @@ mod apx_tests {
 
 #[cfg(test)]
 mod encoding_opt_tests {
-    use super::apx_tests::{fails, hex};
+    use super::apx_tests::{fail_msg, fails, hex, hex_relocs};
     use super::*;
 
     #[test]
@@ -6092,5 +6185,190 @@ mod encoding_opt_tests {
         assert!(fails("{nf} bswapq %rax"));
         assert!(fails("{evex} movq %rcx, %rax"));
         assert!(fails("{nf}{rex2} addq %rcx, %rax"));
+    }
+    /// Scalar-Tuple1 sniff table pins (map, pp, W, opcode) -> N. Packed
+    /// neighbors that must NOT match: map-1 pp0/1, the even packed-FMA
+    /// opcodes, the odd-but-packed vfmsubadd 97/A7/B7, the VNNI pp-tricks
+    /// in map 2, and the packed vmovsldup (pp2 12).
+    #[test]
+    fn evex_scalar_tuple_n_table() {
+        let n = |map: u8, pp: u8, w: u8, op: u8| {
+            InstructionEncoder::evex_scalar_tuple_n(map, pp, w, op)
+        };
+        assert_eq!(n(1, 2, 0, 0x58), Some(4));
+        assert_eq!(n(1, 3, 1, 0x58), Some(8));
+        assert_eq!(n(1, 2, 0, 0x51), Some(4));
+        assert_eq!(n(1, 3, 1, 0x5A), Some(8));
+        assert_eq!(n(1, 2, 0, 0xC2), Some(4));
+        assert_eq!(n(1, 3, 0, 0x2A), Some(8));
+        assert_eq!(n(1, 2, 0, 0x2D), Some(4));
+        assert_eq!(n(1, 3, 0, 0x10), Some(8));
+        assert_eq!(n(1, 3, 0, 0x12), Some(8));
+        assert_eq!(n(1, 2, 0, 0x12), None); // packed vmovsldup
+        assert_eq!(n(1, 0, 0, 0x58), None);
+        assert_eq!(n(1, 1, 1, 0x58), None);
+        assert_eq!(n(2, 1, 0, 0x99), Some(4));
+        assert_eq!(n(2, 1, 1, 0x99), Some(8));
+        assert_eq!(n(2, 1, 1, 0xBF), Some(8));
+        assert_eq!(n(2, 1, 0, 0x2D), Some(4));
+        assert_eq!(n(2, 1, 1, 0x43), Some(8));
+        assert_eq!(n(2, 1, 0, 0x98), None);
+        assert_eq!(n(2, 1, 1, 0xBE), None);
+        assert_eq!(n(2, 1, 0, 0x97), None);
+        assert_eq!(n(2, 1, 1, 0xA7), None);
+        assert_eq!(n(2, 3, 0, 0x50), None);
+        assert_eq!(n(2, 2, 0, 0x51), None);
+        assert_eq!(n(3, 1, 0, 0x27), Some(4));
+        assert_eq!(n(3, 1, 1, 0x27), Some(8));
+        assert_eq!(n(3, 1, 0, 0x51), Some(4));
+        assert_eq!(n(3, 1, 0, 0x26), None); // packed vgetmantpd
+    }
+
+    /// Scalar Tuple1 disp8-N (GAS 2.47 refs): disp8 covers N*127
+    /// (ss: 508, sd: 1016); past-boundary and misaligned displacements
+    /// fall back to disp32 exactly like GAS; EVEX.b stays 0 on scalar.
+    #[test]
+    fn evex_scalar_tuple1() {
+        assert_eq!(
+            hex("vaddss 508(%rdx), %xmm5, %xmm6{%k7}"),
+            "62 f1 56 0f 58 72 7f"
+        );
+        assert_eq!(
+            hex("vaddsd 1016(%rdx), %xmm5, %xmm6{%k7}"),
+            "62 f1 d7 0f 58 72 7f"
+        );
+        assert_eq!(
+            hex("vaddss 512(%rdx), %xmm5, %xmm6{%k7}"),
+            "62 f1 56 0f 58 b2 00 02 00 00"
+        );
+        assert_eq!(
+            hex("vaddsd 508(%rdx), %xmm5, %xmm6{%k7}"),
+            "62 f1 d7 0f 58 b2 fc 01 00 00"
+        );
+        assert_eq!(hex("vaddss %xmm1, %xmm5, %xmm6{%k7}"), "62 f1 56 0f 58 f1");
+        assert_eq!(hex("vaddsd %xmm1, %xmm5, %xmm6{%k7}"), "62 f1 d7 0f 58 f1");
+    }
+
+    /// The audit's silent-wrong-code fixes, pinned at the byte level
+    /// (GAS 2.47 references from the red-team probe log).
+    #[test]
+    fn promoted_cvt_and_extract_field_law() {
+        // H1: GP destination in ModRM.reg, xmm in r/m — the swapped
+        // spelling used to encode `%xmm0,%ecx` silently.
+        assert_eq!(hex("{evex} vcvtsd2si %xmm1, %eax"), "62 f1 7f 08 2d c1");
+        assert_eq!(hex("{evex} vcvtsd2si %xmm1, %rax"), "62 f1 ff 08 2d c1");
+        // The xmm16 r/m rides the EVEX X bit (P0 0xb1), not B.
+        assert_eq!(hex("{evex} vcvtsd2si %xmm16, %eax"), "62 b1 7f 08 2d c0");
+        assert_eq!(
+            hex("{evex} vcvtsd2si 8(%rax), %eax"),
+            "62 f1 7f 08 2d 40 01"
+        );
+        // H2: vpextrw's C5 row has the GP destination in ModRM.reg.
+        assert_eq!(
+            hex("{evex} vpextrw $1, %xmm1, %eax"),
+            "62 f1 7d 08 c5 c1 01"
+        );
+        assert_eq!(
+            hex("{evex} vpextrw $1, %xmm16, %r9d"),
+            "62 31 7d 08 c5 c8 01"
+        );
+        // vcvtsi2s* memory N = 4 << W (m64 sources were mis-scaled by 4).
+        assert_eq!(
+            hex("{evex} vcvtsi2sdl 508(%r20), %xmm1, %xmm2"),
+            "62 f9 77 08 2a 54 24 7f"
+        );
+        assert_eq!(
+            hex("{evex} vcvtsi2sdq 1016(%r20), %xmm1, %xmm2"),
+            "62 f9 f7 08 2a 54 24 7f"
+        );
+        // Suffix/GP-width agreement (GAS text).
+        assert_eq!(
+            fail_msg("{evex} vcvtsd2sil %xmm16, %rax"),
+            "incorrect register `%rax' used with `l' suffix"
+        );
+    }
+
+    #[test]
+    fn apx_unary_two_operand_law() {
+        // mul/imul have no two-operand unary form in any mode.
+        assert_eq!(
+            fail_msg("mul %ecx, %eax"),
+            "number of operands mismatch for `mul'"
+        );
+        assert_eq!(
+            fail_msg("{evex} mul %ecx, %eax"),
+            "number of operands mismatch for `mul'"
+        );
+        assert!(fails("imul %ecx, %eax").then_some(0).is_none()); // 2-op imul is the 0F AF family
+        // div/idiv: the accumulator, in every mode; vvvv mirrors it.
+        assert_eq!(hex("{nf} idiv %ecx, %eax"), "62 f4 7c 0c f7 f9");
+        assert_eq!(hex("{nf} div %rcx, %rax"), "62 f4 fc 0c f7 f1");
+        assert_eq!(hex("{evex} idiv %ecx, %eax"), "62 f4 7c 08 f7 f9");
+        assert!(fails("{nf} idiv %ecx, %edx"));
+        assert!(fails("{evex} idiv %r9, %r8"));
+        // 16-bit: the 66-ness rides the EVEX pp field, never a legacy 66.
+        assert_eq!(hex("{nf} idivw %cx, %ax"), "62 f4 7d 0c f7 f9");
+        assert_eq!(hex("{nf} divw %cx"), "62 f4 7d 0c f7 f1");
+        assert!(fails("{evex} push %rax"));
+    }
+
+    #[test]
+    fn shift_suffix_destination_law() {
+        // %cl as DESTINATION decides the suffix; a %cl COUNT never does.
+        assert_eq!(hex("shl %cl"), "d0 e1");
+        assert_eq!(hex("shr $4, %cl"), "c0 e9 04");
+        assert_eq!(hex("sar %cl, %cl"), "d2 f9");
+        assert_eq!(hex("sal %cl, (%rax)"), "d3 20");
+        // The APX NDD 3-op form (count in rm, src in vvvv) — GAS 2.47
+        // emits the same bytes without any decorator hint.
+        assert_eq!(hex("shl %cl, %ecx, %edx"), "62 f4 6c 18 d3 e1");
+    }
+
+    #[test]
+    fn symbol_immediate_size_law() {
+        // Relocation classes pinned: R_8/R_16/R_32/R_32S by operand size.
+        let (bytes, relocs) = hex_relocs("add $sym, %al");
+        assert_eq!(bytes, "04 00");
+        assert_eq!(relocs, vec![R_X86_64_8]);
+        let (bytes, relocs) = hex_relocs("add $sym, %eax");
+        assert_eq!(bytes, "05 00 00 00 00");
+        assert_eq!(relocs, vec![R_X86_64_32]);
+        let (bytes, relocs) = hex_relocs("add $sym, %rax");
+        assert_eq!(bytes, "48 05 00 00 00 00");
+        assert_eq!(relocs, vec![R_X86_64_32S]);
+        let (bytes, relocs) = hex_relocs("add $sym, %bl");
+        assert_eq!(bytes, "80 c3 00");
+        assert_eq!(relocs, vec![R_X86_64_8]);
+    }
+
+    #[test]
+    fn decorator_diagnostics() {
+        // Cross-operand duplicate detection (per-instruction slots).
+        assert_eq!(
+            fail_msg("vaddps %zmm0{%k1}, %zmm1, %zmm2{%k1}"),
+            "duplicated `{%k1}'"
+        );
+        assert_eq!(
+            fail_msg("vaddps %zmm0{%k1}, %zmm1, %zmm2{%k1}{z}"),
+            "duplicated `{%k1}{z}'"
+        );
+        assert_eq!(
+            fail_msg("vaddps %zmm0{z}{z}, %zmm1, %zmm2"),
+            "duplicated `{z}'"
+        );
+        // Case-insensitive masks parse; {%K1} reaches the placement check.
+        assert!(fails("vaddps %zmm0{%K1}, %zmm1, %zmm2"));
+        // Scalar memory broadcast: tuple-impossible, per-family text.
+        assert_eq!(
+            fail_msg("vaddss 8(%rax){1to4}, %xmm1, %xmm2"),
+            "unsupported broadcast for `vaddss'"
+        );
+        assert_eq!(
+            fail_msg("vmovss 8(%rax){1to4}, %xmm1, %xmm2"),
+            "operand type mismatch for `vmovss'"
+        );
+        // Suffixed {sae} never parses; the standalone spelling does.
+        assert!(fails("vaddss %xmm0, %xmm1, %xmm2{sae}"));
+        assert!(fails("vmaxss %xmm0, %xmm1, %xmm2{sae}"));
     }
 }

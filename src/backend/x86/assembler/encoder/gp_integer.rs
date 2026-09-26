@@ -958,14 +958,48 @@ impl super::InstructionEncoder {
                 }
                 self.emit_rex_rm(size, "", mem);
                 let rc = self.relocations.len();
-                self.bytes.push(0x81);
-                self.encode_modrm_mem(alu_op, mem)?;
-                // Emit 4-byte relocation for the symbol immediate.
-                // Use bytes.len() (instruction-relative offset) since
-                // elf_writer_common adds the section base offset separately.
-                self.add_relocation(sym, R_X86_64_32S, addend);
-                self.bytes.extend_from_slice(&[0; 4]);
-                self.adjust_rip_reloc_addend(rc, 4);
+                // Operand-sized immediate + matching relocation width
+                // (GAS 2.47, byte-probed): 8-bit = `80 /0 ib` +
+                // R_X86_64_8 (`addb $sym,(%rax)` = `80 00 00`), 16-bit =
+                // `66 81 /0 iw` + R_X86_64_16, 32/64-bit = `81 /0 id` +
+                // R_X86_64_32S. The old path always emitted opcode 81
+                // with a 4-byte R_32S — the 8-bit form is a #UD-adjacent
+                // mis-encode (81 has no 8-bit row).
+                match size {
+                    1 => {
+                        self.bytes.push(0x80);
+                        self.encode_modrm_mem(alu_op, mem)?;
+                        self.add_relocation(sym, R_X86_64_8, addend);
+                        self.bytes.push(0);
+                        self.adjust_rip_reloc_addend(rc, 1);
+                    }
+                    2 => {
+                        self.bytes.push(0x81);
+                        self.encode_modrm_mem(alu_op, mem)?;
+                        self.add_relocation(sym, R_X86_64_16, addend);
+                        self.bytes.extend_from_slice(&[0; 2]);
+                        self.adjust_rip_reloc_addend(rc, 2);
+                    }
+                    4 => {
+                        self.bytes.push(0x81);
+                        self.encode_modrm_mem(alu_op, mem)?;
+                        // R_X86_64_32 for the 32-bit form (GAS class law;
+                        // R_32S is the 64-bit/REX spelling).
+                        self.add_relocation(sym, R_X86_64_32, addend);
+                        self.bytes.extend_from_slice(&[0; 4]);
+                        self.adjust_rip_reloc_addend(rc, 4);
+                    }
+                    _ => {
+                        self.bytes.push(0x81);
+                        self.encode_modrm_mem(alu_op, mem)?;
+                        // Emit 4-byte relocation for the symbol immediate.
+                        // Use bytes.len() (instruction-relative offset) since
+                        // elf_writer_common adds the section base offset separately.
+                        self.add_relocation(sym, R_X86_64_32S, addend);
+                        self.bytes.extend_from_slice(&[0; 4]);
+                        self.adjust_rip_reloc_addend(rc, 4);
+                    }
+                }
                 Ok(())
             }
             (Operand::Immediate(ImmediateValue::Symbol(sym)), Operand::Register(dst))
@@ -986,16 +1020,60 @@ impl super::InstructionEncoder {
                     // Accumulator short form with a relocated immediate:
                     // `add $(_GLOBAL_OFFSET_TABLE_ - .), %eax` is `05
                     // disp32`, not `81 /0` — one byte shorter, exactly what
-                    // GAS 2.47 emits for the kernel's GOT-base idiom.
+                    // GAS 2.47 emits for the kernel's GOT-base idiom. The
+                    // immediate is OPERAND-SIZED (GAS 2.47, byte-probed):
+                    // `add $sym,%al` = `04 00` + R_X86_64_8 and
+                    // `sub $sym,%ax` = `66 2d 00 00` + R_X86_64_16 — not
+                    // the 32-bit form with a 4-byte R_32S.
                     self.bytes
                         .push(if size == 1 { 0x04 } else { 0x05 } + alu_op * 8);
-                } else {
-                    self.bytes.push(0x81);
-                    self.bytes.push(self.modrm(3, alu_op, dst_num));
+                    match size {
+                        1 => {
+                            self.add_relocation(sym, R_X86_64_8, addend);
+                            self.bytes.push(0);
+                        }
+                        2 => {
+                            self.add_relocation(sym, R_X86_64_16, addend);
+                            self.bytes.extend_from_slice(&[0; 2]);
+                        }
+                        // 32-bit takes R_X86_64_32 (GAS: `add $sym,%eax` =
+                        // R_32 — the zero-extending class), 64-bit takes
+                        // the sign-extending R_X86_64_32S.
+                        4 => {
+                            self.add_relocation(sym, R_X86_64_32, addend);
+                            self.bytes.extend_from_slice(&[0; 4]);
+                        }
+                        _ => {
+                            self.add_relocation(sym, R_X86_64_32S, addend);
+                            self.bytes.extend_from_slice(&[0; 4]);
+                        }
+                    }
+                    return Ok(());
                 }
-                // Use instruction-relative offset; elf_writer_common adds section base.
-                self.add_relocation(sym, R_X86_64_32S, addend);
-                self.bytes.extend_from_slice(&[0; 4]);
+                // Non-accumulator: 8-bit uses the 80 /ib form with an
+                // 8-bit relocation (`add $sym,%bl` = `80 c3 00` +
+                // R_X86_64_8 — the 81 /0 id form is 16/32-bit only);
+                // 16-bit keeps 66 81 with a 2-byte R_16 field.
+                match size {
+                    1 => {
+                        self.bytes.push(0x80);
+                        self.bytes.push(self.modrm(3, alu_op, dst_num));
+                        self.add_relocation(sym, R_X86_64_8, addend);
+                        self.bytes.push(0);
+                    }
+                    2 => {
+                        self.bytes.push(0x81);
+                        self.bytes.push(self.modrm(3, alu_op, dst_num));
+                        self.add_relocation(sym, R_X86_64_16, addend);
+                        self.bytes.extend_from_slice(&[0; 2]);
+                    }
+                    _ => {
+                        self.bytes.push(0x81);
+                        self.bytes.push(self.modrm(3, alu_op, dst_num));
+                        self.add_relocation(sym, R_X86_64_32S, addend);
+                        self.bytes.extend_from_slice(&[0; 4]);
+                    }
+                }
                 Ok(())
             }
             (Operand::Immediate(ImmediateValue::SymbolDiff(sym, diff)), Operand::Register(dst)) => {
@@ -1511,6 +1589,25 @@ impl super::InstructionEncoder {
         }
     }
 
+    /// 16-bit unary dispatch for callers that push the legacy 0x66
+    /// operand-size prefix themselves. The 0x66 byte belongs to the
+    /// LEGACY encoding only: when the two-operand or APX path is taken
+    /// the 16-bit-ness rides the EVEX pp field instead, and a pushed
+    /// legacy byte would leave `66 62 …` in the stream — a #UD sequence
+    /// on real silicon (GAS 2.47: `{nf} divw %cx` = `62 f4 7d 0c f7 f1`,
+    /// byte-probed; NOT `66 62 …`).
+    pub(crate) fn encode_unary_rm_66(
+        &mut self,
+        ops: &[Operand],
+        op_ext: u8,
+        size: u8,
+    ) -> Result<(), String> {
+        if size == 2 && ops.len() != 2 && !self.apx_wants_evex() {
+            self.bytes.push(0x66);
+        }
+        self.encode_unary_rm(ops, op_ext, size)
+    }
+
     pub(crate) fn encode_unary_rm(
         &mut self,
         ops: &[Operand],
@@ -1523,7 +1620,6 @@ impl super::InstructionEncoder {
         if ops.len() != 1 {
             return Err("unary op requires 1 operand".to_string());
         }
-
         // inc (op_ext=0) and dec (op_ext=1) use FE/FF, not F6/F7
         let base_opcode = if op_ext <= 1 {
             if size == 1 { 0xFE } else { 0xFF }
@@ -1786,31 +1882,49 @@ impl super::InstructionEncoder {
         if self.apx_nf && op_ext == 2 {
             return Err("{nf} unsupported for `not'".to_string());
         }
-        // A two-operand div/idiv WITHOUT decorators maps to the LEGACY
-        // unary with the implicit accumulator checked against the second
-        // operand (GAS 2.47: `div %ecx, %eax` = `f7 f1`; `div %cl, %bl`
-        // and `idiv %ecx, %edx` are `operand type mismatch`; `mul` has no
-        // two-operand form at all). neg/not keep the NDD promotion.
-        if ops.len() == 2 && !self.apx_wants_evex() && matches!(op_ext, 6 | 7) {
-            if matches!(op_ext, 4) {
-                return Err("number of operands mismatch".to_string());
+        // Two-operand unary laws (GAS 2.47, byte-probed in every mode —
+        // plain, {nf} and {evex}):
+        //   * mul/imul have NO two-operand unary form. `mul %ecx,%eax` is
+        //     `number of operands mismatch for `mul'' (the real 2-op imul
+        //     is the 0F AF family and never reaches this encoder). The old
+        //     dead `matches!(op_ext, 4)` check inside the 6|7 guard let a
+        //     silent APX encoding (ND=1!) out for both.
+        //   * div/idiv require the second operand to be the implicit
+        //     accumulator of the matching size (`{nf} idiv %ecx,%edx` is
+        //     `operand type mismatch for `idiv'`).
+        if ops.len() == 2 {
+            if matches!(op_ext, 4 | 5) {
+                return Err(format!(
+                    "number of operands mismatch for `{}'",
+                    if op_ext == 4 { "mul" } else { "imul" }
+                ));
             }
-            let acc = match size {
-                1 => "al",
-                2 => "ax",
-                4 => "eax",
-                _ => "rax",
-            };
-            match &ops[1] {
-                Operand::Register(r) if r.name.eq_ignore_ascii_case(acc) => {
+            if matches!(op_ext, 6 | 7) {
+                let acc = match size {
+                    1 => "al",
+                    2 => "ax",
+                    4 => "eax",
+                    _ => "rax",
+                };
+                match &ops[1] {
+                    Operand::Register(r) if r.name.eq_ignore_ascii_case(acc) => {}
+                    _ => {
+                        return Err(format!(
+                            "operand type mismatch for `{}'",
+                            if op_ext == 6 { "div" } else { "idiv" }
+                        ));
+                    }
+                }
+                if !self.apx_wants_evex() {
+                    // No decorators: the LEGACY unary with the single r/m
+                    // operand (`div %ecx,%eax` = `f7 f1`).
                     return self.encode_unary_rm(std::slice::from_ref(&ops[0]), op_ext, size);
                 }
-                _ => {
-                    return Err(format!(
-                        "operand type mismatch for `{}'",
-                        if op_ext == 6 { "div" } else { "idiv" }
-                    ));
-                }
+                // {nf}/{evex}: fall through to the ND=0 arms below with
+                // ops unchanged — vvvv mirrors the (accumulator-checked)
+                // second operand, which for %eax stores 1111, the
+                // hardware's unused pattern (`{nf} idiv %ecx,%eax` =
+                // `62 f4 7c 0c f7 f9`).
             }
         }
         let nf = self.apx_nf;
@@ -2443,8 +2557,8 @@ impl super::InstructionEncoder {
                     Operand::Register(reg) => {
                         let num = reg_num(&reg.name).ok_or("bad register")?;
                         // 16-bit targets take the operand-size prefix
-                        // (`call *%ax` = 66 ff d0; without it the same
-                        // bytes decode as the 64-bit `call *%rax` —
+                        // (`jmp *%ax` = 66 ff e0; without it the same
+                        // bytes decode as the 64-bit `jmp *%rax` —
                         // GAS 2.47 byte-verified).
                         if is_reg16(&reg.name) {
                             self.bytes.push(0x66);
