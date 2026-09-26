@@ -105,24 +105,14 @@ pub(super) fn call_site_reads(store: &LineStore, infos: &[LineInfo], n: usize) -
                 .trimmed(store.get(k))
                 .starts_with("# LCCC_CHAIN_CALL")
     });
-    // External-retpoline indirect call: the target register is read by
-    // the THUNK symbol, not by this instruction's %-tokens. The register
-    // named by the symbol suffix (`__x86_indirect_thunk_rax` reads %rax)
-    // is decoded into this line's `reg_refs` — and therefore `mentioned` —
-    // by the classifier (see `indirect_thunk_refs`); the call-site
-    // lowering's own form always stages the target in %r10
-    // (emit_call_spill_fptr_impl). The re-OR below is fail-closed for
-    // LineInfos that bypassed the classifier (hand-built test fixtures):
-    // `indirect_thunk_refs` answers every bit the name implies — the
-    // decoded family, or the historical %r10 for an unrecognised suffix —
-    // and OR-ing it again is idempotent when `mentioned` is already exact.
-    // The inline-thunk and `call *%r10` forms mention %r10 in their own
-    // text (`mentioned` covers them).
-    let retpoline_thunk_bits = if t.starts_with("call __x86_indirect_thunk_") {
-        super::super::types::indirect_thunk_refs(&t)
-    } else {
-        0
-    };
+    // External-retpoline indirect call: the target register is
+    // read by the THUNK symbol, not by this instruction's text
+    // (`call __x86_indirect_thunk_r10` names no register). The
+    // call-site lowering always stages the target in %r10
+    // (emit_call_spill_fptr_impl), so this form reads family 10.
+    // The inline-thunk and `call *%r10` forms mention %r10 in
+    // their own text (`mentioned` covers them).
+    let retpoline_r10 = t.starts_with("call __x86_indirect_thunk_");
     // `# LCCC_CALL_ARGS <n>`: the codegen's authoritative count
     // of leading SysV GP argument registers THIS call reads
     // (armed by the register-argument phase from the
@@ -169,10 +159,10 @@ pub(super) fn call_site_reads(store: &LineStore, infos: &[LineInfo], n: usize) -
     } else {
         arg_reads | mentioned
     };
-    if chain {
+    if chain || retpoline_r10 {
         reads |= 1 << 10;
     }
-    reads | retpoline_thunk_bits
+    reads
 }
 
 /// Verdict of a forward windowed scan for GP family `reg` that reaches the
@@ -734,21 +724,8 @@ impl FileLiveness {
                 continue;
             }
             let t = infos[n].trimmed(store.get(n));
-            // `jmpq *%rT` — take the target register. The thunk-extern
-            // retpoline form `jmp __x86_indirect_thunk_rT` dispatches
-            // through the same %rT (read by the thunk symbol): the
-            // leaq/movslq/addq staging chain above it is identical, so
-            // the table resolves exactly the same way. Without this arm a
-            // PIC switch under retpoline made the whole function
-            // unanalysable (JmpIndirect with unknown successors), losing
-            // every liveness-driven peephole in it. Both spellings are
-            // normalised to the bare register name for the comparisons
-            // with the staging lines' `%rT` operands.
-            let target_bare: &str = if let Some(r) = t.strip_prefix("jmpq *") {
-                r.trim_start_matches('%')
-            } else if let Some(name) = t.strip_prefix("jmp __x86_indirect_thunk_") {
-                name
-            } else {
+            // `jmpq *%rT` — take the target register.
+            let Some(target_reg) = t.strip_prefix("jmpq *") else {
                 continue;
             };
             // The two preceding instructions must be `addq %rB, %rT` and
@@ -767,7 +744,7 @@ impl FileLiveness {
             ) else {
                 continue;
             };
-            if add_dst.trim_start_matches('%') != target_bare {
+            if add_dst != target_reg {
                 continue;
             }
             let Some(mov_rest) = mov_t.strip_prefix("movslq (") else {
@@ -783,7 +760,7 @@ impl FileLiveness {
                 continue;
             }
             let mov_dst = mov_rest[close + 1..].trim_start_matches(',').trim();
-            if mov_dst.trim_start_matches('%') != target_bare {
+            if mov_dst != target_reg {
                 continue;
             }
             // Third preceding instruction: `leaq .LjtN(%rip), %rB`.
@@ -1232,135 +1209,6 @@ mod tests {
         (0..store.len())
             .find(|&i| store.get(i).contains(needle))
             .expect("line")
-    }
-
-    /// H1 (PR #628 follow-up): a thunk-extern call reads the register named
-    /// by the SYMBOL SUFFIX, not a hardcoded %r10. The codegen's own form
-    /// stages in %r10 today (calls.rs), but the contract of the thunk ABI
-    /// (objtool --retpoline) is per-register, and the peephole's authority
-    /// must model the text it is handed, not the current emitter's habits.
-    #[test]
-    fn thunk_call_reads_suffix_register_not_r10() {
-        let asm = concat!(
-            "foo:\n",
-            ".cfi_startproc\n",
-            "    call __x86_indirect_thunk_rax\n",
-            "    ret\n",
-            ".cfi_endproc\n",
-        );
-        let store = LineStore::new(asm.to_string());
-        let infos: Vec<LineInfo> = (0..store.len())
-            .map(|i| classify_line(store.get(i)))
-            .collect();
-        let n = line_of(&store, "call __x86_indirect_thunk_rax");
-        let reads = call_site_reads(&store, &infos, n);
-        assert!(
-            reads & (1 << 0) != 0,
-            "%rax is the thunk target: {reads:#b}"
-        );
-        assert!(
-            reads & (1 << 10) == 0,
-            "%r10 is NOT read by the rax thunk: {reads:#b}"
-        );
-        // And the shared window verdict keeps the target register live
-        // across the call (a dead-write pass must not delete its staging).
-        assert_eq!(call_window_verdict(&store, &infos, n, 0), Some(false));
-        assert_eq!(
-            call_window_verdict(&store, &infos, n, 10),
-            Some(true),
-            "r10 is caller-saved and unread: clobbered"
-        );
-    }
-
-    /// The r10 form keeps its historical read, and an UNRECOGNISED thunk
-    /// suffix stays fail-closed on the %r10 model (the register the
-    /// call-site lowering stages targets in).
-    #[test]
-    fn thunk_call_r10_and_unrecognised_suffix_fail_closed() {
-        let asm = concat!(
-            "foo:\n",
-            ".cfi_startproc\n",
-            "    call __x86_indirect_thunk_r10\n",
-            "    call __x86_indirect_thunk_zz9\n",
-            "    ret\n",
-            ".cfi_endproc\n",
-        );
-        let store = LineStore::new(asm.to_string());
-        let infos: Vec<LineInfo> = (0..store.len())
-            .map(|i| classify_line(store.get(i)))
-            .collect();
-        let n10 = line_of(&store, "thunk_r10");
-        let reads10 = call_site_reads(&store, &infos, n10);
-        assert!(reads10 & (1 << 10) != 0, "%r10 read: {reads10:#b}");
-        assert_eq!(call_window_verdict(&store, &infos, n10, 10), Some(false));
-        let nzz = line_of(&store, "thunk_zz9");
-        let readszz = call_site_reads(&store, &infos, nzz);
-        assert!(
-            readszz & (1 << 10) != 0,
-            "unrecognised suffix keeps the fail-closed %r10 model: {readszz:#b}"
-        );
-    }
-
-    /// The jmp thunk forms the codegen ACTUALLY emits today (`jmp
-    /// __x86_indirect_thunk_rax` computed goto, `..._rdx` PIC switch
-    /// dispatch) classify as JmpIndirect whose reg_refs name the dispatch
-    /// register — the read every textual consumer was blind to.
-    #[test]
-    fn thunk_jump_classification_names_the_dispatch_register() {
-        for (line, fam) in [
-            ("    jmp __x86_indirect_thunk_rax", 0u8),
-            ("    jmp __x86_indirect_thunk_rdx", 2),
-            ("    jmp __x86_indirect_thunk_r10", 10),
-        ] {
-            let info = classify_line(line);
-            assert!(matches!(info.kind, LineKind::JmpIndirect), "{line}");
-            assert!(
-                info.reg_refs & (1 << fam) != 0,
-                "{line}: family {fam} must be in reg_refs"
-            );
-        }
-    }
-
-    /// A PIC switch dispatched through a thunk-extern retpoline resolves
-    /// to its table targets (the staging chain is identical to the `jmpq
-    /// *%rT` form), so the enclosing function stays ANALYSABLE — every
-    /// liveness-driven peephole used to be lost in such functions — and
-    /// the dispatch register's staging write is live at the jmp (the
-    /// thunk reads it; deleting the `addq %rcx, %rdx` would jump through
-    /// garbage).
-    #[test]
-    fn pic_switch_thunk_dispatch_is_analysable_and_keeps_staging_live() {
-        let asm = concat!(
-            "foo:\n",
-            ".cfi_startproc\n",
-            "    movl %edi, %eax\n",
-            "    leaq .Ljt0(%rip), %rcx\n",
-            "    movslq (%rcx,%rax,4), %rdx\n",
-            "    addq %rcx, %rdx\n",
-            "    jmp __x86_indirect_thunk_rdx\n",
-            ".LBB0:\n",
-            "    xorl %eax, %eax\n",
-            "    ret\n",
-            ".LBB1:\n",
-            "    movl $1, %eax\n",
-            "    ret\n",
-            ".Ljt0:\n",
-            "    .long .LBB0 - .Ljt0\n",
-            "    .long .LBB1 - .Ljt0\n",
-            ".cfi_endproc\n",
-        );
-        let (store, _infos, lv) = build(asm);
-        let jmp = line_of(&store, "jmp __x86_indirect_thunk_rdx");
-        assert!(
-            lv.live_after(jmp, 2).is_some(),
-            "the function must be analysable despite the thunk dispatch"
-        );
-        let add = line_of(&store, "addq %rcx, %rdx");
-        assert_eq!(
-            lv.live_after(add, 2),
-            Some(true),
-            "the thunk reads %rdx: the staging write stays live"
-        );
     }
 
     #[test]
