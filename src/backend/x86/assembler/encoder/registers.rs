@@ -456,6 +456,13 @@ pub(crate) fn is_xmm(name: &str) -> bool {
     name.starts_with("xmm")
 }
 
+/// Is this a general-purpose register (r0-r31 in any width spelling)?
+/// Used to select the EVEX r/m +16 extension bit: GPRs extend through
+/// rex2.B (P0 bit 3, set), vectors through EVEX.X (P0 bit 6, inverted).
+pub(crate) fn is_gpr_name(name: &str) -> bool {
+    gp_id(name).is_some()
+}
+
 /// Is this an XMM or YMM register?
 pub(crate) fn is_xmm_or_ymm(name: &str) -> bool {
     name.starts_with("xmm") || name.starts_with("ymm")

@@ -1,0 +1,16 @@
+== phase 1: in-tree corpus, seven paddings
+ok   peephole output is invariant to trailing whitespace (1 passed)
+== phase 2: exhaustive operand matrix (ignored in the default suite)
+ok   the pipeline never panics on any operand spelling (exhaustive matrix)
+== phase 3: generating assembly from 59 C sources with target/fastbuild/lccc
+   generated 236 assembly files (0 source/level pairs did not compile)
+ok   whitespace invariance holds over 236 freshly generated assembly files
+== phase 4: padded assembly must assemble to identical objects
+   compared 28 padded/unpadded object pairs (0 sources did not assemble)
+ok   the assembler is whitespace-invariant over 28 object pairs
+
+ok   peephole output is invariant to trailing whitespace (1 passed)
+ok   the pipeline never panics on any operand spelling (exhaustive matrix)
+ok   whitespace invariance holds over 236 freshly generated assembly files
+ok   the assembler is whitespace-invariant over 28 object pairs
+check_peephole_whitespace: PASS (in-tree corpus, operand totality, generated corpus, assembler path)

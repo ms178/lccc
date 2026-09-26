@@ -2301,6 +2301,7 @@ mod stack_width_tests {
             operands: vec![operand],
             nf: false,
             force_evex: false,
+            force_vex: false,
             force_rex2: false,
             dfv: 0,
         }

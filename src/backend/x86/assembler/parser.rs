@@ -226,6 +226,11 @@ pub struct Instruction {
     pub nf: bool,
     /// GNU as `{evex}`: force the APX EVEX (map-4) encoding of a legacy insn.
     pub force_evex: bool,
+    /// GNU as `{vex}`/`{vex2}`/`{vex3}`: forbid the EVEX encoding. Dual-
+    /// encoded mnemonics (vpdpbusd, vpdpwssd, vpmadd52*) take their VEX
+    /// row; EVEX-only shapes are rejected like GAS (`unsupported
+    /// instruction'/`unsupported masking'/`no VEX/XOP encoding').
+    pub force_vex: bool,
     /// GNU as `{rex2}`: force a REX2 prefix even without an EGPR.
     pub force_rex2: bool,
     /// GNU as `{dfv=cf,zf,sf,of}`: APX default-flags value for CCMP/CTEST.
@@ -1310,7 +1315,7 @@ fn parse_instruction(line: &str, prefixes: Vec<String>) -> Result<AsmItem, Strin
     }
 
     // Split mnemonic from operands
-    let (nf, force_evex, force_rex2, rest) = parse_encoding_hints(trimmed);
+    let (nf, force_evex, force_vex, force_rex2, rest) = parse_encoding_hints(trimmed);
     let (mnemonic, operand_str) = split_mnemonic_operands(rest);
     let (dfv, operand_str) = parse_dfv_hint(operand_str)?;
 
@@ -1330,18 +1335,22 @@ fn parse_instruction(line: &str, prefixes: Vec<String>) -> Result<AsmItem, Strin
         operands,
         nf,
         force_evex,
+        force_vex,
         force_rex2,
         dfv,
     }))
 }
 
 /// Strip stacked GNU as encoding-prefix hints (`{nf}`, `{evex}`, `{rex2}`,
-/// `{vex}`/`{vex2}`/`{vex3}`). `{vex*}` is accepted and ignored (the encoder
-/// already picks the shortest legal VEX form). `{nf}`/`{evex}`/`{rex2}` are
-/// APX hints forwarded to the encoder.
-fn parse_encoding_hints(line: &str) -> (bool, bool, bool, &str) {
+/// `{vex}`/`{vex2}`/`{vex3}`). `{vex*}` FORBIDS the EVEX encoding: GAS 2.47
+/// rejects every EVEX-only shape under it (`unsupported instruction',
+/// `unsupported masking') and forces the VEX row for dual-encoded
+/// mnemonics (`{vex} vpdpbusd`, `{vex} vpmadd52huq`). `{nf}`/`{evex}`/
+/// `{rex2}` are APX hints forwarded to the encoder.
+fn parse_encoding_hints(line: &str) -> (bool, bool, bool, bool, &str) {
     let mut nf = false;
     let mut force_evex = false;
+    let mut force_vex = false;
     let mut force_rex2 = false;
     let mut s = line.trim_start();
     loop {
@@ -1353,14 +1362,23 @@ fn parse_encoding_hints(line: &str) -> (bool, bool, bool, &str) {
         };
         match &s[1..close] {
             "nf" => nf = true,
-            "evex" => force_evex = true,
+            // Encoding-selectors are LAST-WINS (GAS 2.47: `{vex} {evex}
+            // vpdpbusd` encodes EVEX, `{evex} {vex} vpdpbusd` encodes VEX),
+            // so a later selector clears the earlier one.
+            "evex" => {
+                force_evex = true;
+                force_vex = false;
+            }
             "rex2" => force_rex2 = true,
-            "vex" | "vex2" | "vex3" => {}
+            "vex" | "vex2" | "vex3" => {
+                force_vex = true;
+                force_evex = false;
+            }
             _ => break,
         }
         s = s[close + 1..].trim_start();
     }
-    (nf, force_evex, force_rex2, s)
+    (nf, force_evex, force_vex, force_rex2, s)
 }
 
 /// GNU as `{dfv=cf,zf,sf,of}` sits *after* the mnemonic (never as a leading

@@ -1,0 +1,309 @@
+{
+  "context": "Diagnostic assembly splice; ONLY one immediately adjacent redundant `testq %rcx, %rcx` after BMI1 ANDN removed. No compiler change shipped. Both arms assembled from identical LCCC -O2 -march=x86-64-v3 -mtune=raptorlake -DPASSES=32768 source assembly; pinned Xeon VM, output checked each round.",
+  "binaries": {
+    "original": {
+      "path": "engineering/evidence/2026-09-26-followups/diagnostics/findbit-lccc-original-asm",
+      "sha256": "32159d4ea6e9b73866d49ec457fb576156159c7cf1edca6ce91c94fd47e6d220"
+    },
+    "no_test": {
+      "path": "engineering/evidence/2026-09-26-followups/diagnostics/findbit-lccc-no-test-asm",
+      "sha256": "bf17fd76a2dc39eb2d4a173cd338e1dbc4cd61c45e52486c7d96cb9abd182d27"
+    }
+  },
+  "warmups": [
+    {
+      "order": [
+        "original",
+        "no_test"
+      ],
+      "times_s": {
+        "original": 0.45297739800000003,
+        "no_test": 0.45509018100000004
+      }
+    },
+    {
+      "order": [
+        "original",
+        "no_test"
+      ],
+      "times_s": {
+        "original": 0.434803675,
+        "no_test": 0.437823518
+      }
+    },
+    {
+      "order": [
+        "original",
+        "no_test"
+      ],
+      "times_s": {
+        "original": 0.43666693100000004,
+        "no_test": 0.444381509
+      }
+    }
+  ],
+  "samples": [
+    {
+      "round": 0,
+      "order": [
+        "no_test",
+        "original"
+      ],
+      "times_s": {
+        "no_test": 0.44612195200000004,
+        "original": 0.43941655300000004
+      },
+      "no_test_over_original": 1.0152597778900696
+    },
+    {
+      "round": 1,
+      "order": [
+        "original",
+        "no_test"
+      ],
+      "times_s": {
+        "original": 0.450298248,
+        "no_test": 0.44131186
+      },
+      "no_test_over_original": 0.9800434755411263
+    },
+    {
+      "round": 2,
+      "order": [
+        "no_test",
+        "original"
+      ],
+      "times_s": {
+        "no_test": 0.44234391900000003,
+        "original": 0.438330174
+      },
+      "no_test_over_original": 1.0091568986989246
+    },
+    {
+      "round": 3,
+      "order": [
+        "original",
+        "no_test"
+      ],
+      "times_s": {
+        "original": 0.434518422,
+        "no_test": 0.42622766300000003
+      },
+      "no_test_over_original": 0.9809196605247729
+    },
+    {
+      "round": 4,
+      "order": [
+        "no_test",
+        "original"
+      ],
+      "times_s": {
+        "no_test": 0.420387277,
+        "original": 0.43679961100000003
+      },
+      "no_test_over_original": 0.9624259418124802
+    },
+    {
+      "round": 5,
+      "order": [
+        "original",
+        "no_test"
+      ],
+      "times_s": {
+        "original": 0.43664259000000005,
+        "no_test": 0.444160158
+      },
+      "no_test_over_original": 1.017216753867276
+    },
+    {
+      "round": 6,
+      "order": [
+        "original",
+        "no_test"
+      ],
+      "times_s": {
+        "original": 0.43517750200000005,
+        "no_test": 0.44605482300000004
+      },
+      "no_test_over_original": 1.0249951363524303
+    },
+    {
+      "round": 7,
+      "order": [
+        "original",
+        "no_test"
+      ],
+      "times_s": {
+        "original": 0.434655467,
+        "no_test": 0.44194496400000005
+      },
+      "no_test_over_original": 1.0167707473008731
+    },
+    {
+      "round": 8,
+      "order": [
+        "no_test",
+        "original"
+      ],
+      "times_s": {
+        "no_test": 0.44051798900000005,
+        "original": 0.43493586
+      },
+      "no_test_over_original": 1.012834372865921
+    },
+    {
+      "round": 9,
+      "order": [
+        "no_test",
+        "original"
+      ],
+      "times_s": {
+        "no_test": 0.43641670200000005,
+        "original": 0.453854378
+      },
+      "no_test_over_original": 0.9615786982669583
+    },
+    {
+      "round": 10,
+      "order": [
+        "no_test",
+        "original"
+      ],
+      "times_s": {
+        "no_test": 0.445349594,
+        "original": 0.43811629100000005
+      },
+      "no_test_over_original": 1.0165100069287312
+    },
+    {
+      "round": 11,
+      "order": [
+        "original",
+        "no_test"
+      ],
+      "times_s": {
+        "original": 0.43744801800000005,
+        "no_test": 0.440965773
+      },
+      "no_test_over_original": 1.0080415383205599
+    },
+    {
+      "round": 12,
+      "order": [
+        "original",
+        "no_test"
+      ],
+      "times_s": {
+        "original": 0.43802569300000005,
+        "no_test": 0.484524936
+      },
+      "no_test_over_original": 1.1061564281344565
+    },
+    {
+      "round": 13,
+      "order": [
+        "no_test",
+        "original"
+      ],
+      "times_s": {
+        "no_test": 0.455580427,
+        "original": 0.43514491000000005
+      },
+      "no_test_over_original": 1.0469625555312136
+    },
+    {
+      "round": 14,
+      "order": [
+        "original",
+        "no_test"
+      ],
+      "times_s": {
+        "original": 0.432107285,
+        "no_test": 0.44318881000000004
+      },
+      "no_test_over_original": 1.0256453093587627
+    },
+    {
+      "round": 15,
+      "order": [
+        "original",
+        "no_test"
+      ],
+      "times_s": {
+        "original": 0.437997913,
+        "no_test": 0.439821524
+      },
+      "no_test_over_original": 1.0041635152722748
+    },
+    {
+      "round": 16,
+      "order": [
+        "no_test",
+        "original"
+      ],
+      "times_s": {
+        "no_test": 0.442176958,
+        "original": 0.435738061
+      },
+      "no_test_over_original": 1.014776990068811
+    },
+    {
+      "round": 17,
+      "order": [
+        "original",
+        "no_test"
+      ],
+      "times_s": {
+        "original": 0.439269516,
+        "no_test": 0.444009794
+      },
+      "no_test_over_original": 1.0107912746670087
+    },
+    {
+      "round": 18,
+      "order": [
+        "original",
+        "no_test"
+      ],
+      "times_s": {
+        "original": 0.437016416,
+        "no_test": 0.44254539400000004
+      },
+      "no_test_over_original": 1.0126516483078751
+    },
+    {
+      "round": 19,
+      "order": [
+        "original",
+        "no_test"
+      ],
+      "times_s": {
+        "original": 0.469312724,
+        "no_test": 0.46061496700000004
+      },
+      "no_test_over_original": 0.9814670334827743
+    },
+    {
+      "round": 20,
+      "order": [
+        "original",
+        "no_test"
+      ],
+      "times_s": {
+        "original": 0.44320070600000006,
+        "no_test": 0.459339971
+      },
+      "no_test_over_original": 1.0364152511074745
+    }
+  ],
+  "paired_median_ratio": 1.012834372865921,
+  "medians_s": {
+    "original": 0.43744801800000005,
+    "no_test": 0.44254539400000004
+  },
+  "minima_s": {
+    "original": 0.432107285,
+    "no_test": 0.420387277
+  },
+  "n": 21
+}

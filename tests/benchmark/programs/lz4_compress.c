@@ -8,6 +8,12 @@
  * This kernel exercises 4-byte hash table lookups, unaligned word memory
  * reads, match-length extension loops, literal run output generation, and
  * store-to-load forwarding.
+ *
+ * MATCH_RICH uses deterministic 96-byte repeats in every 256-byte block.
+ * The default pseudorandom input has no four-byte matches in the measured
+ * run, so it exercises literal copying but NOT the byte-compare extension
+ * loop. Keep the default for historical continuity; use MATCH_RICH with a
+ * scaled pass count to measure the match-extend path separately.
  */
 #include <stdio.h>
 
@@ -129,6 +135,11 @@ fill_source(void)
 
   for (i = 0; i < SRC_SIZE; i++) {
     state = state * 1664525U + 1013904223U;
+#ifdef MATCH_RICH
+    if (i >= 128 && (i & 255U) < 96U)
+      src_data[i] = src_data[i - 128U];
+    else
+#endif
     if ((state & 0x0fU) < 6 && i >= 128)
       src_data[i] = src_data[i - 128 + (state & 0x3fU)];
     else
