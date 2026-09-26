@@ -14,7 +14,9 @@ mod x87;
 
 pub(crate) use registers::*;
 
-use crate::backend::x86::assembler::encoder::InstructionEncoder as X86InstructionEncoder;
+use crate::backend::x86::assembler::encoder::{
+    InstructionEncoder as X86InstructionEncoder, is_vex_xop_encoding, op_decorated,
+};
 use crate::backend::x86::assembler::parser::*;
 
 /// True for the FMA3 mnemonics that use the VEX 3-operand `0F38` encoding.
@@ -172,6 +174,8 @@ pub struct InstructionEncoder {
     pub(super) sized_op: bool,
     /// Current far jump uses the explicit 32-bit-offset spelling (`ljmpl`).
     pub(super) ljmp_wide: bool,
+    /// Per-instruction VEX selector, needed by local GP-touching VEX forms.
+    vex_hint: Option<VexHint>,
 }
 
 impl InstructionEncoder {
@@ -185,12 +189,24 @@ impl InstructionEncoder {
             pending_addr32: false,
             sized_op: false,
             ljmp_wide: false,
+            vex_hint: None,
         }
     }
 
     /// Encode a single instruction and append bytes.
     pub fn encode(&mut self, instr: &Instruction) -> Result<(), String> {
+        // APX modifiers are not supported in 32-bit mode even if the
+        // instruction would otherwise have a legal VEX/EVEX row. GAS 2.47
+        // rejects them before testing the selected vector encoding.
+        if instr.nf {
+            return Err("`{nf}' is only supported in 64-bit mode".to_string());
+        }
+        if instr.force_rex2 {
+            return Err("`{rex2}' is only supported in 64-bit mode".to_string());
+        }
+        self.vex_hint = instr.vex_hint;
         let start_len = self.bytes.len();
+        let reloc_base = self.relocations.len();
 
         // Handle prefixes. Stacked HLE pairs (`lock xacquire addl ...`)
         // arrive in source order; F0 sinks past any F2/F3 byte so both
@@ -212,7 +228,27 @@ impl InstructionEncoder {
             self.bytes.push(*b);
         }
 
-        let result = self.encode_mnemonic(instr);
+        let mut result = self.encode_mnemonic(instr);
+        // The x86-64 encoder cannot provide the entire 32-bit wrapper:
+        // prefix order, `.code16` and address-size splicing differ. Check
+        // the emitted encoding and decorators HERE instead of asking the
+        // x86-64 core to rewrite 32-bit addresses as 64-bit instructions.
+        if result.is_ok()
+            && self.vex_hint.is_some()
+            && !is_vex_xop_encoding(&self.bytes[start_len..])
+        {
+            self.bytes.truncate(start_len);
+            self.relocations.truncate(reloc_base);
+            result = Err(format!(
+                "no VEX/XOP encoding for `{}'",
+                instr.mnemonic.to_ascii_lowercase().trim_end_matches(".s")
+            ));
+        }
+        if result.is_ok() && instr.operands.iter().any(op_decorated) {
+            let mut shared = X86InstructionEncoder::new();
+            shared.bytes.extend_from_slice(&self.bytes[start_len..]);
+            result = shared.check_decorators(&instr.mnemonic, &instr.operands);
+        }
 
         // Canonical legacy-prefix order (GAS 2.47, byte-verified):
         // `lock xacquire adcw $100,(%ecx)` -> `66 f2 f0 83 11 64` — the
@@ -483,6 +519,13 @@ impl InstructionEncoder {
         // Relocations translate R_X86_64_* → R_386_* with identical
         // semantics (PC32→PC32, PLT32→PLT32, ABS 32/32S→32); the RIP-based
         // GOT classes cannot occur in 32-bit code and are rejected loudly.
+        if self.vex_hint.is_some() {
+            let raw = instr.mnemonic.to_ascii_lowercase();
+            let stem = raw.strip_suffix(".s").unwrap_or(&raw);
+            if !stem.starts_with('v') && !X86InstructionEncoder::is_xop_mnemonic(stem) {
+                return Err(format!("no VEX/XOP encoding for `{stem}'"));
+            }
+        }
         if let Some(result) = self.delegate_vector_to_x64(instr) {
             return result;
         }
@@ -2135,6 +2178,18 @@ impl InstructionEncoder {
         if !stem.starts_with('v') {
             return None;
         }
+        // The four packed broadcasts have both VEX vector-source rows and
+        // EVEX GPR-source rows, even in 32-bit mode. The local i686 encoder
+        // incorrectly used a non-existent VEX GPR row (and rejected zmm),
+        // whereas the shared encoder already validates source width and
+        // chooses the right opcode. `%eax` and the other i686 GPRs have the
+        // same ModRM id in both encoders, so this family can share both rows.
+        if matches!(
+            stem,
+            "vpbroadcastb" | "vpbroadcastw" | "vpbroadcastd" | "vpbroadcastq"
+        ) {
+            return Some(self.encode_via_x64(instr));
+        }
         // Suffixed GP-touching spellings (vcvtsi2ssl, vcvtsd2siq, …): the
         // stem before the size suffix decides.
         let stem_base = stem.strip_suffix(".s").unwrap_or(stem);
@@ -2174,28 +2229,28 @@ impl InstructionEncoder {
         instr: &Instruction,
         x64: &mut X86InstructionEncoder,
     ) -> Result<(), String> {
-        match x64.encode_mnemonic(instr) {
-            Err(e) => Err(e),
-            Ok(()) => {
-                self.bytes.extend_from_slice(&x64.bytes);
-                for r in &x64.relocations {
-                    let Ok(reloc_type) = translate_x64_reloc(r.reloc_type) else {
-                        return Err(format!(
-                            "internal error: vector instruction produced 64-bit-only relocation type {}",
-                            r.reloc_type
-                        ));
-                    };
-                    self.relocations.push(Relocation {
-                        offset: self.offset + r.offset,
-                        symbol: r.symbol.clone(),
-                        reloc_type,
-                        addend: r.addend,
-                        diff_symbol: r.diff_symbol.clone(),
-                    });
-                }
-                Ok(())
-            }
+        x64.configure_encoding_hints(instr)?;
+        x64.encode_mnemonic(instr)?;
+        // The i686 wrapper runs the shared post-encode decorator check once
+        // after it has the real 32-bit prefixes. Do not recheck here: a
+        // masked vector instruction would otherwise pay for two checks.
+        self.bytes.extend_from_slice(&x64.bytes);
+        for r in &x64.relocations {
+            let Ok(reloc_type) = translate_x64_reloc(r.reloc_type) else {
+                return Err(format!(
+                    "internal error: vector instruction produced 64-bit-only relocation type {}",
+                    r.reloc_type
+                ));
+            };
+            self.relocations.push(Relocation {
+                offset: self.offset + r.offset,
+                symbol: r.symbol.clone(),
+                reloc_type,
+                addend: r.addend,
+                diff_symbol: r.diff_symbol.clone(),
+            });
         }
+        Ok(())
     }
 }
 
@@ -2301,7 +2356,7 @@ mod stack_width_tests {
             operands: vec![operand],
             nf: false,
             force_evex: false,
-            force_vex: false,
+            vex_hint: None,
             force_rex2: false,
             dfv: 0,
         }
@@ -2377,5 +2432,98 @@ mod stack_width_tests {
         encoder.code16 = true;
         encoder.encode(&instruction("pushl", reg("ds"))).unwrap();
         assert_eq!(encoder.bytes, [0x66, 0x1e]);
+    }
+}
+
+#[cfg(test)]
+mod merged_pr629_followup_tests {
+    use super::*;
+
+    fn assemble(line: &str) -> Result<String, String> {
+        let mut encoder = InstructionEncoder::new();
+        for item in parse_asm(line)? {
+            if let AsmItem::Instruction(instr) = item {
+                encoder.encode(&instr)?;
+            }
+        }
+        Ok(encoder
+            .bytes
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(" "))
+    }
+
+    #[test]
+    fn delegated_hints_preserve_i686_vector_rows_and_local_vex3() {
+        assert_eq!(
+            assemble("vpdpbusd %ymm3,%ymm1,%ymm2").unwrap(),
+            "62 f2 75 28 50 d3"
+        );
+        assert_eq!(
+            assemble("{vex} vpdpbusd %ymm3,%ymm1,%ymm2").unwrap(),
+            "c4 e2 75 50 d3"
+        );
+        assert_eq!(
+            assemble("{vex2} vpdpbusd %ymm3,%ymm1,%ymm2").unwrap(),
+            "c4 e2 75 50 d3"
+        );
+        assert_eq!(
+            assemble("{vex3} vaddps %xmm1,%xmm2,%xmm3").unwrap(),
+            "c4 e1 68 58 d9"
+        );
+        // GP data operands use the local i686 VEX encoder, not x86-64
+        // addressing. Its C4/C5 choice must honor the same typed selector.
+        assert_eq!(
+            assemble("{vex3} vcvtsi2ssl %eax,%xmm1,%xmm2").unwrap(),
+            "c4 e1 72 2a d0"
+        );
+        assert_eq!(
+            assemble("{vex3} vmovd %eax,%xmm2").unwrap(),
+            "c4 e1 79 6e d0"
+        );
+        assert_eq!(
+            assemble("{vex} vpcmov %xmm1,%xmm2,%xmm3,%xmm4").unwrap(),
+            "8f e8 60 a2 e2 10"
+        );
+        assert!(assemble("{vex} vmovdqu8 %ymm1,%ymm2").is_err());
+        assert_eq!(
+            assemble("{vex} vmcall").unwrap_err(),
+            "no VEX/XOP encoding for `vmcall'"
+        );
+        assert_eq!(assemble("vmcall").unwrap(), "0f 01 c1");
+    }
+
+    #[test]
+    fn decorators_apx_32bit_and_gpr_broadcasts_cannot_silently_fall_back() {
+        // A vector-only instruction delegated to x86-64 used to ignore
+        // `force_vex`, plus the x86-64 wrapper's decorator check.
+        assert!(assemble("{vex} vpaddd %ymm1,%ymm2,%ymm3{%k1}").is_err());
+        assert!(assemble("vmovddup (%eax){1to2},%xmm1").is_err());
+        assert!(assemble("vmovddup (%eax){1to4},%ymm1").is_err());
+        assert_eq!(
+            assemble("vmovddup -1024(%eax),%xmm1").unwrap(),
+            "c5 fb 12 88 00 fc ff ff"
+        );
+        // The GPR-source row is EVEX even in 32-bit mode, NEVER VEX 7A.
+        assert_eq!(
+            assemble("vpbroadcastb %eax,%xmm1").unwrap(),
+            "62 f2 7d 08 7a c8"
+        );
+        assert_eq!(
+            assemble("vpbroadcastb %eax,%zmm1").unwrap(),
+            "62 f2 7d 48 7a c8"
+        );
+        assert!(assemble("vpbroadcastb %ah,%xmm1").is_err());
+        assert!(assemble("vpbroadcastq %eax,%xmm1").is_err());
+        assert!(assemble("{vex} vpbroadcastb %eax,%xmm1").is_err());
+        assert_eq!(
+            assemble("{nf} {vex} vpaddd %xmm1,%xmm2,%xmm3").unwrap_err(),
+            "`{nf}' is only supported in 64-bit mode"
+        );
+        assert_eq!(
+            assemble("{rex2} {vex} vpaddd %xmm1,%xmm2,%xmm3").unwrap_err(),
+            "`{rex2}' is only supported in 64-bit mode"
+        );
     }
 }

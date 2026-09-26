@@ -83,8 +83,10 @@ provisioned from sourceware `releases/` (kernel.org mirror 404s the
 
 ## Next-agent backlog (ranked)
 1. **AVX512-FP16 cluster** (~1,000+ MISSING lines: v*ph, vcvtph2*,
-   vfmadd*ph...) — the largest single gap on both suites; Raptor Lake
-   (i7-14700KF) has AVX512-FP16.
+   vfmadd*ph...) — the largest single assembler-coverage gap on both suites.
+   Correction (2026-09-26): the i7-14700KF target does **not** support
+   AVX-512 or AVX512-FP16. This gap matters for other CPUs and ISA
+   completeness, not for that machine's executable runtime performance.
 2. Remaining WRONG-BYTES classes (36 lines, non-VEX): x87 bare `fadd`/
    `f{add,sub,mul,div}{,r}p %st(N)` operand-dropping (14), `.` position
    semantics + `.+N` expressions collapsing to 0 (10), relational

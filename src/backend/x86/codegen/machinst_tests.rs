@@ -990,13 +990,17 @@ fn find_assembler() -> Option<(String, String)> {
     if let Ok(p) = std::env::var("LCCC_GAS") {
         cands.push(p);
     }
-    // ensure_gas_247.sh installs to /home/user/.cache/gas-2.47-<target>/bin/as
+    // ensure_gas_247.sh installs to /home/user/.cache/gas-2.47-<target>/bin/as.
+    // These are x86-64 MachInst tests. If BOTH target caches are installed,
+    // lexicographic ordering selects i686 first and makes all 64-bit probes
+    // fail with bad-register errors. If only i686 is present, use system as
+    // rather than passing 64-bit assembly to a 32-bit-only oracle.
     if let Ok(entries) = std::fs::read_dir("/home/user/.cache") {
         let mut hits: Vec<String> = entries
             .flatten()
             .filter_map(|e| {
                 let n = e.file_name().to_string_lossy().to_string();
-                n.starts_with("gas-2.47-").then(|| {
+                n.starts_with("gas-2.47-x86_64-").then(|| {
                     e.path()
                         .join("bin")
                         .join("as")

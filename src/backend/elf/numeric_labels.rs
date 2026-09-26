@@ -93,7 +93,7 @@ pub fn resolve_numeric_labels(items: &[AsmItem]) -> Vec<AsmItem> {
                     operands: new_ops,
                     nf: instr.nf,
                     force_evex: instr.force_evex,
-                    force_vex: instr.force_vex,
+                    vex_hint: instr.vex_hint,
                     force_rex2: instr.force_rex2,
                     dfv: instr.dfv,
                 }));

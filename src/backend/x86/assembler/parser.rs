@@ -212,6 +212,16 @@ pub enum CfiDirective {
     Other(String),
 }
 
+/// GAS encoding selector. `{vex}` and `{vex2}` use the shortest legal
+/// VEX prefix (a 0F38/0F3A opcode still needs C4); `{vex3}` insists on C4
+/// even when the instruction also has a C5 spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VexHint {
+    Vex,
+    Vex2,
+    Vex3,
+}
+
 /// An x86-64 instruction with mnemonic and operands.
 #[derive(Debug, Clone)]
 pub struct Instruction {
@@ -226,11 +236,10 @@ pub struct Instruction {
     pub nf: bool,
     /// GNU as `{evex}`: force the APX EVEX (map-4) encoding of a legacy insn.
     pub force_evex: bool,
-    /// GNU as `{vex}`/`{vex2}`/`{vex3}`: forbid the EVEX encoding. Dual-
-    /// encoded mnemonics (vpdpbusd, vpdpwssd, vpmadd52*) take their VEX
-    /// row; EVEX-only shapes are rejected like GAS (`unsupported
-    /// instruction'/`unsupported masking'/`no VEX/XOP encoding').
-    pub force_vex: bool,
+    /// GNU as `{vex}`/`{vex2}`/`{vex3}`: select a VEX/XOP opcode row,
+    /// rejecting EVEX-only shapes. Vex3 additionally selects the C4 prefix
+    /// even when C5 is legal; Vex2 falls back to C4 when necessary.
+    pub vex_hint: Option<VexHint>,
     /// GNU as `{rex2}`: force a REX2 prefix even without an EGPR.
     pub force_rex2: bool,
     /// GNU as `{dfv=cf,zf,sf,of}`: APX default-flags value for CCMP/CTEST.
@@ -1315,7 +1324,7 @@ fn parse_instruction(line: &str, prefixes: Vec<String>) -> Result<AsmItem, Strin
     }
 
     // Split mnemonic from operands
-    let (nf, force_evex, force_vex, force_rex2, rest) = parse_encoding_hints(trimmed);
+    let (nf, force_evex, vex_hint, force_rex2, rest) = parse_encoding_hints(trimmed);
     let (mnemonic, operand_str) = split_mnemonic_operands(rest);
     let (dfv, operand_str) = parse_dfv_hint(operand_str)?;
 
@@ -1335,22 +1344,21 @@ fn parse_instruction(line: &str, prefixes: Vec<String>) -> Result<AsmItem, Strin
         operands,
         nf,
         force_evex,
-        force_vex,
+        vex_hint,
         force_rex2,
         dfv,
     }))
 }
 
 /// Strip stacked GNU as encoding-prefix hints (`{nf}`, `{evex}`, `{rex2}`,
-/// `{vex}`/`{vex2}`/`{vex3}`). `{vex*}` FORBIDS the EVEX encoding: GAS 2.47
-/// rejects every EVEX-only shape under it (`unsupported instruction',
-/// `unsupported masking') and forces the VEX row for dual-encoded
-/// mnemonics (`{vex} vpdpbusd`, `{vex} vpmadd52huq`). `{nf}`/`{evex}`/
-/// `{rex2}` are APX hints forwarded to the encoder.
-fn parse_encoding_hints(line: &str) -> (bool, bool, bool, bool, &str) {
+/// `{vex}`/`{vex2}`/`{vex3}`). The VEX selectors forbid the EVEX row;
+/// `{vex3}` also controls the prefix length when C5 would be legal.
+/// Selectors are last-wins, while incompatible APX modifiers are validated
+/// by the encoder (GAS accepts them syntactically, but rejects the instruction).
+fn parse_encoding_hints(line: &str) -> (bool, bool, Option<VexHint>, bool, &str) {
     let mut nf = false;
     let mut force_evex = false;
-    let mut force_vex = false;
+    let mut vex_hint = None;
     let mut force_rex2 = false;
     let mut s = line.trim_start();
     loop {
@@ -1362,23 +1370,26 @@ fn parse_encoding_hints(line: &str) -> (bool, bool, bool, bool, &str) {
         };
         match &s[1..close] {
             "nf" => nf = true,
-            // Encoding-selectors are LAST-WINS (GAS 2.47: `{vex} {evex}
-            // vpdpbusd` encodes EVEX, `{evex} {vex} vpdpbusd` encodes VEX),
-            // so a later selector clears the earlier one.
+            // GAS 2.47: `{vex} {evex} vpdpbusd` selects EVEX, while
+            // `{evex} {vex} vpdpbusd` selects VEX.
             "evex" => {
                 force_evex = true;
-                force_vex = false;
+                vex_hint = None;
             }
             "rex2" => force_rex2 = true,
             "vex" | "vex2" | "vex3" => {
-                force_vex = true;
+                vex_hint = Some(match &s[1..close] {
+                    "vex2" => VexHint::Vex2,
+                    "vex3" => VexHint::Vex3,
+                    _ => VexHint::Vex,
+                });
                 force_evex = false;
             }
             _ => break,
         }
         s = s[close + 1..].trim_start();
     }
-    (nf, force_evex, force_vex, force_rex2, s)
+    (nf, force_evex, vex_hint, force_rex2, s)
 }
 
 /// GNU as `{dfv=cf,zf,sf,of}` sits *after* the mnemonic (never as a leading

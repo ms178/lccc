@@ -1,0 +1,194 @@
+# Merged PR #629 follow-up, isolated GAS 2.47 x86 assembler probes.
+# Each group is ONE instruction: an unrelated reject cannot hide a false accept.
+# Selector, decorator, GPR-width, APX-extension and xmm EVEX-only controls.
+# Generated from independent GAS 2.47 objects; no expected bytes are assumed.
+
+;;; pr629_vex_vmread32 reject
+.text
+{vex} vmread %eax, %ebx
+;;; pr629_vex_vpdp_i686
+.text
+{vex} vpdpbusd %ymm3, %ymm1, %ymm2
+;;; pr629_default_vpdp_i686
+.text
+vpdpbusd %ymm3, %ymm1, %ymm2
+;;; pr629_vex_vmovdqu8_i686 reject
+.text
+{vex} vmovdqu8 %ymm1, %ymm2
+;;; pr629_vex3_vaddps_i686
+.text
+{vex3} vaddps %xmm1, %xmm2, %xmm3
+;;; pr629_vex3_vpdp_i686
+.text
+{vex3} vpdpbusd %ymm3, %ymm1, %ymm2
+;;; pr629_tuple_xmm_i686 reject
+.text
+vmovddup (%eax){1to2}, %xmm1
+;;; pr629_high_gp_broadcast_32 reject
+.text
+vpbroadcastb %ah, %xmm1
+;;; pr629_xop_vex_i686
+.text
+{vex} vpcmov %xmm1, %xmm2, %xmm3, %xmm4
+;;; pr629_lwp_vex_i686
+.text
+{vex} lwpins $1, %eax, %edx
+;;; pr629_legacy_vmcall_i686 reject
+.text
+{vex} vmcall
+;;; pr629_legacy_vmmcall_i686 reject
+.text
+{vex} vmmcall
+;;; pr629_vex3_vcvtsi2ssl32
+.text
+{vex3} vcvtsi2ssl %eax, %xmm1, %xmm2
+;;; pr629_vex3_vmovd32
+.text
+{vex3} vmovd %eax, %xmm2
+;;; pr629_vex2_fallback_32
+.text
+{vex2} vpdpbusd %ymm3, %ymm1, %ymm2
+;;; pr629_default_ifma_vex32
+.text
+{vex} vpmadd52huq %ymm3, %ymm1, %ymm2
+;;; pr629_default_ifma_32
+.text
+vpmadd52huq %ymm3, %ymm1, %ymm2
+;;; pr629_i686_evex_hint
+.text
+{evex} vmovdqu8 %ymm1, %ymm2
+;;; pr629_i686_vmcall_normal
+.text
+vmcall
+;;; pr629_i686_tuple_vex reject
+.text
+{vex} vmovddup (%eax){1to2}, %xmm1
+;;; pr629_i686_tuple_default_ymm reject
+.text
+vmovddup (%eax){1to4}, %ymm1
+;;; pr629_i686_tuple_default_zmm reject
+.text
+vmovddup (%eax){1to8}, %zmm1
+;;; pr629_i686_tuple_plain
+.text
+vmovddup -1024(%eax), %xmm1
+;;; pr629_valid_gp_broadcast_i686_al reject
+.text
+vpbroadcastb %al, %xmm1
+;;; pr629_vex3_invalid_evexonly reject
+.text
+{vex3} vmovdqu8 %ymm1,%ymm2
+;;; pr629_nf_vex_32 reject
+.text
+{nf} {vex} vpaddd %xmm1,%xmm2,%xmm3
+;;; pr629_rex2_vex_32 reject
+.text
+{rex2} {vex} vpaddd %xmm1,%xmm2,%xmm3
+;;; pr629_vex_masked_avx_i686 reject
+.text
+{vex} vpaddd %ymm1, %ymm2, %ymm3{%k1}
+;;; pr629_i686_mask_plain_avx
+.text
+vaddps %ymm1, %ymm2, %ymm3{%k1}
+;;; pr629_i686_bcst_bad_avx
+.text
+vaddps (%eax){1to8}, %ymm1, %ymm2
+;;; pr629_broadcast_valid_32_b
+.text
+vpbroadcastb %eax, %xmm1
+;;; pr629_broadcast_valid_32_w
+.text
+vpbroadcastw %eax, %ymm1
+;;; pr629_broadcast_valid_32_d
+.text
+vpbroadcastd %eax, %zmm1
+;;; pr629_broadcast_invalid_high_8 reject
+.text
+vpbroadcastb %ah, %xmm1
+;;; pr629_broadcast_invalid_8 reject
+.text
+vpbroadcastw %al, %ymm1
+;;; pr629_broadcast_invalid_16 reject
+.text
+vpbroadcastd %ax, %xmm1
+;;; pr629_broadcast_invalid_q_32 reject
+.text
+vpbroadcastq %eax, %xmm1
+;;; pr629_broadcast_vex_gpr_only_evex reject
+.text
+{vex} vpbroadcastb %eax, %xmm1
+;;; pr629_broadcast_evex_forced
+.text
+{evex} vpbroadcastb %eax, %xmm1
+;;; pr629_evex_only_low_01
+.text
+vpabsq %xmm1, %xmm2
+;;; pr629_evex_only_low_01_forced_vex reject
+.text
+{vex} vpabsq %xmm1, %xmm2
+;;; pr629_evex_only_low_02
+.text
+vpandnd %xmm3, %xmm1, %xmm2
+;;; pr629_evex_only_low_02_forced_vex reject
+.text
+{vex} vpandnd %xmm3, %xmm1, %xmm2
+;;; pr629_evex_only_low_03
+.text
+vpandnq %xmm3, %xmm1, %xmm2
+;;; pr629_evex_only_low_03_forced_vex reject
+.text
+{vex} vpandnq %xmm3, %xmm1, %xmm2
+;;; pr629_evex_only_low_04
+.text
+vpconflictd %xmm1, %xmm2
+;;; pr629_evex_only_low_04_forced_vex reject
+.text
+{vex} vpconflictd %xmm1, %xmm2
+;;; pr629_evex_only_low_05
+.text
+vpconflictq %xmm1, %xmm2
+;;; pr629_evex_only_low_05_forced_vex reject
+.text
+{vex} vpconflictq %xmm1, %xmm2
+;;; pr629_evex_only_low_06
+.text
+vpmaxsq %xmm3, %xmm1, %xmm2
+;;; pr629_evex_only_low_06_forced_vex reject
+.text
+{vex} vpmaxsq %xmm3, %xmm1, %xmm2
+;;; pr629_evex_only_low_07
+.text
+vpmaxuq %xmm3, %xmm1, %xmm2
+;;; pr629_evex_only_low_07_forced_vex reject
+.text
+{vex} vpmaxuq %xmm3, %xmm1, %xmm2
+;;; pr629_evex_only_low_08
+.text
+vpminsq %xmm3, %xmm1, %xmm2
+;;; pr629_evex_only_low_08_forced_vex reject
+.text
+{vex} vpminsq %xmm3, %xmm1, %xmm2
+;;; pr629_evex_only_low_09
+.text
+vpminuq %xmm3, %xmm1, %xmm2
+;;; pr629_evex_only_low_09_forced_vex reject
+.text
+{vex} vpminuq %xmm3, %xmm1, %xmm2
+;;; pr629_evex_only_low_10
+.text
+vpmullq %xmm3, %xmm1, %xmm2
+;;; pr629_evex_only_low_10_forced_vex reject
+.text
+{vex} vpmullq %xmm3, %xmm1, %xmm2
+;;; pr629_evex_only_low_11
+.text
+vpsraq $1, %xmm1, %xmm2
+;;; pr629_evex_only_low_11_forced_vex reject
+.text
+{vex} vpsraq $1, %xmm1, %xmm2
+;;; pr629_evex_only_low_12
+.text
+vpsravq %xmm3, %xmm1, %xmm2
+;;; pr629_evex_only_low_12_forced_vex reject
+.text
+{vex} vpsravq %xmm3, %xmm1, %xmm2
