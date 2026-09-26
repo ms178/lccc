@@ -856,25 +856,31 @@ fn resolve_builtin_link_setup(
 
 /// Add architecture-specific extra libraries after "gcc" in the needed libs list.
 ///
-/// Most architectures need libgcc_eh.a (static) or libgcc_s.so (dynamic) for
-/// exception handling / stack unwinding, but the exact policy varies:
-/// - x86-64: no extra libs needed (libgcc alone suffices)
-/// - i686: always adds gcc_eh (needed for __divmoddi4, etc.)
-/// - AArch64/RISC-V: gcc_eh for static, gcc_s for dynamic
+/// This mirrors the GCC driver's libgcc spec: the unwinder (`_Unwind_*`,
+/// `__gcc_personality_v0`, `__register_frame_info`, ...) comes from the
+/// static `libgcc_eh.a` only for `-static` links; dynamic executables take it
+/// from `libgcc_s.so` (DT_NEEDED is recorded only when a symbol actually
+/// resolves there, i.e. `--as-needed` semantics).
+/// - x86-64: nothing to add -- the x86-64 linker resolves leftover undefined
+///   symbols against libgcc_s.so.1 itself.
+/// - everything else: gcc_eh for static, gcc_s for dynamic.
+///
+/// A dynamic executable must never carry a private static unwinder: glibc's
+/// pthread_exit/pthread_cancel dlopen libgcc_s.so.1 and drive the forced
+/// unwind with *that* unwinder, which then calls the personality routine the
+/// CIEs name.  If `DW.ref.__gcc_personality_v0` binds to a static copy linked
+/// into the executable, the two libgcc instances disagree about the unwind
+/// context, and the personality routine aborts() on the first frame with a
+/// cleanup.  (libgcc.a alone already provides the i386 64-bit division
+/// helpers such as __divmoddi4; libgcc_eh.a holds only the unwinder,
+/// personality, emutls and nested-function trampoline support.)
 #[cfg(not(feature = "gcc_linker"))]
 fn add_arch_extra_libs(setup: &mut BuiltinLinkSetup, elf_machine: u16, is_static: bool) {
-    // x86-64 doesn't need extra gcc libs
     if elf_machine == EM_X86_64 {
         return;
     }
-    // Find the "gcc" entry and insert the extra lib after it
     if let Some(pos) = setup.needed_libs.iter().position(|l| l == "gcc") {
-        // i686 always needs gcc_eh; others use gcc_eh for static, gcc_s for dynamic
-        let extra = if elf_machine == EM_386 || is_static {
-            "gcc_eh"
-        } else {
-            "gcc_s"
-        };
+        let extra = if is_static { "gcc_eh" } else { "gcc_s" };
         setup.needed_libs.insert(pos + 1, extra.to_string());
     }
 }

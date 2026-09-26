@@ -169,8 +169,7 @@ pub(super) fn load_file_as_needed(
         path,
         EM_X86_64,
     )?;
-    let obj_idx = objects.len();
-    linker_common::register_symbols_elf64(obj_idx, &obj, globals, x86_should_replace_extra)?;
+    linker_common::register_symbols_elf64(objects, &obj, globals, x86_should_replace_extra)?;
     objects.push(obj);
     Ok(())
 }

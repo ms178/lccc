@@ -583,6 +583,96 @@ pub fn scan_eh_frame_records(data: &[u8]) -> Vec<EhFrameRecord> {
     out
 }
 
+/// An `.eh_frame` input section with some FDEs removed; see
+/// [`compact_eh_frame`].
+pub struct EhFrameCompaction {
+    /// The surviving records, packed, plus a zero terminator.
+    pub data: Vec<u8>,
+    records: Vec<EhFrameRecord>,
+    /// New offset of each record (`usize::MAX` when pruned).
+    new_start: Vec<usize>,
+}
+
+impl EhFrameCompaction {
+    /// Where a byte (a relocation offset) of the original section lives in
+    /// the compacted one: `None` inside a pruned record. Offsets outside
+    /// every record (malformed input) keep their position rather than being
+    /// silently dropped.
+    pub fn map_offset(&self, off: usize) -> Option<usize> {
+        match self
+            .records
+            .iter()
+            .position(|r| off >= r.start && off < r.end)
+        {
+            Some(i) if self.new_start[i] == usize::MAX => None,
+            Some(i) => Some(off - self.records[i].start + self.new_start[i]),
+            None => Some(off),
+        }
+    }
+}
+
+/// Remove the records flagged in `prune` (FDEs only; a CIE is never pruned)
+/// from an unrelocated `.eh_frame` section and pack the survivors.
+///
+/// Every surviving FDE's `CIE_pointer` is relative to its own position, so
+/// it is re-encoded for the new layout.  The CIE is found by decoding the
+/// pointer, never by assuming it is the nearest preceding CIE: GNU as emits
+/// a CIE before the first FDE that needs it and later FDEs point back past
+/// intervening CIEs (`zR` function, `zPLR` function with a cleanup, `zR`
+/// function), and the integrated assembler places all CIEs first.  Re-aiming
+/// such an FDE at the nearest CIE hands the unwinder the wrong augmentation
+/// -- a phantom personality routine and LSDA for a plain C frame.
+pub fn compact_eh_frame(
+    data: &[u8],
+    records: &[EhFrameRecord],
+    prune: &[bool],
+) -> EhFrameCompaction {
+    let read_id = |rec: &EhFrameRecord| -> u64 {
+        if rec.id_size == 8 {
+            read_u64_le(data, rec.id_offset)
+        } else {
+            read_u32_le(data, rec.id_offset) as u64
+        }
+    };
+    let mut new_start = vec![usize::MAX; records.len()];
+    let mut off = 0usize;
+    for (i, rec) in records.iter().enumerate() {
+        if prune[i] && rec.is_fde {
+            continue;
+        }
+        new_start[i] = off;
+        off += rec.end - rec.start;
+    }
+    let mut out = vec![0u8; off + 4]; // + the end-of-section terminator
+    for (i, rec) in records.iter().enumerate() {
+        let dst = new_start[i];
+        if dst == usize::MAX {
+            continue;
+        }
+        out[dst..dst + (rec.end - rec.start)].copy_from_slice(&data[rec.start..rec.end]);
+        if !rec.is_fde {
+            continue;
+        }
+        // CIE_pointer = offset_of(CIE_pointer field) - offset_of(CIE).
+        let cie_pos = (rec.id_offset as u64).wrapping_sub(read_id(rec)) as usize;
+        let Some(cie) = records.iter().position(|r| !r.is_fde && r.start == cie_pos) else {
+            continue; // dangling pointer in the input: leave it as it was
+        };
+        let field_pos = dst + (rec.id_offset - rec.start);
+        let value = field_pos - new_start[cie];
+        if rec.id_size == 8 {
+            out[field_pos..field_pos + 8].copy_from_slice(&(value as u64).to_le_bytes());
+        } else {
+            out[field_pos..field_pos + 4].copy_from_slice(&(value as u32).to_le_bytes());
+        }
+    }
+    EhFrameCompaction {
+        data: out,
+        records: records.to_vec(),
+        new_start,
+    }
+}
+
 /// Drop the FDEs that describe garbage-collected functions.
 ///
 /// `--gc-sections` works at *input section* granularity, but a translation
@@ -670,78 +760,19 @@ pub fn prune_dead_fdes(
                 continue;
             }
 
-            // ---- compact -------------------------------------------------
-            // new_start[i] = offset of record i in the compacted section
-            // (usize::MAX for a pruned one).
-            let mut new_start = vec![usize::MAX; records.len()];
-            // CIEs are never pruned, so the CIE preceding record `i` is the
-            // same before and after compaction; only its offset moves.
-            let mut cie_of = vec![usize::MAX; records.len()];
-            let mut last_cie = usize::MAX;
-            for (i, rec) in records.iter().enumerate() {
-                if !rec.is_fde {
-                    last_cie = i;
-                }
-                cie_of[i] = last_cie;
-            }
-            let mut off = 0usize;
-            for (i, rec) in records.iter().enumerate() {
-                if prune[i] {
-                    continue;
-                }
-                new_start[i] = off;
-                off += rec.end - rec.start;
-            }
-            let mut out = vec![0u8; off + 4]; // + the end-of-section terminator
-            for (i, rec) in records.iter().enumerate() {
-                if prune[i] {
-                    continue;
-                }
-                let dst = new_start[i];
-                out[dst..dst + (rec.end - rec.start)].copy_from_slice(&data[rec.start..rec.end]);
-                // Rewrite the FDE's CIE_pointer: by definition it is
-                // `offset_of(CIE_pointer field) - offset_of(CIE record)`, so
-                // both operands change under compaction.
-                if rec.is_fde && rec.iloc_offset.is_some() {
-                    let cie_idx = cie_of[i];
-                    if cie_idx != usize::MAX {
-                        let field_pos = dst + (rec.id_offset - rec.start);
-                        let value = field_pos - new_start[cie_idx];
-                        if rec.id_size == 8 {
-                            out[field_pos..field_pos + 8]
-                                .copy_from_slice(&(value as u64).to_le_bytes());
-                        } else {
-                            out[field_pos..field_pos + 4]
-                                .copy_from_slice(&(value as u32).to_le_bytes());
-                        }
-                    }
-                }
-            }
-
-            // ---- shift / drop relocations --------------------------------
-            let mut new_relocs = Vec::with_capacity(relocs.len());
-            for (i, rec) in records.iter().enumerate() {
-                if prune[i] {
-                    dropped += 1;
-                    continue;
-                }
-                let delta = rec.start as i64 - new_start[i] as i64;
-                for r in relocs
-                    .iter()
-                    .filter(|r| (r.offset as usize) >= rec.start && (r.offset as usize) < rec.end)
-                {
+            let compacted = compact_eh_frame(data, &records, &prune);
+            dropped += prune.iter().filter(|&&p| p).count();
+            let mut new_relocs: Vec<_> = relocs
+                .iter()
+                .filter_map(|r| {
+                    let offset = compacted.map_offset(r.offset as usize)?;
                     let mut r2 = r.clone();
-                    r2.offset = (r.offset as i64 - delta) as u64;
-                    new_relocs.push(r2);
-                }
-            }
-            // Relocations outside every record (malformed input) are kept at
-            // their original offset rather than silently dropped.
-            let covered = |o: usize| records.iter().any(|r| o >= r.start && o < r.end);
-            for r in relocs.iter().filter(|r| !covered(r.offset as usize)) {
-                new_relocs.push(r.clone());
-            }
+                    r2.offset = offset as u64;
+                    Some(r2)
+                })
+                .collect();
             new_relocs.sort_by_key(|r| r.offset);
+            let out = compacted.data;
 
             // `SectionData` is immutable by design (it usually aliases the
             // mmap of the input), so the compacted section is materialised as
@@ -1018,6 +1049,63 @@ mod tests {
             assert_eq!(w[0].end, w[1].start, "records are contiguous");
         }
         assert_eq!(recs.last().unwrap().end, data.len());
+    }
+
+    /// FDEs may point back past an intervening CIE (GNU as: `zR` function,
+    /// `zPLR` function with a cleanup, `zR` function; lccc's assembler puts
+    /// every CIE first).  Compaction must re-aim each FDE at the CIE its
+    /// pointer names, not at the nearest preceding one.
+    #[test]
+    fn compact_eh_frame_keeps_each_fde_on_its_own_cie() {
+        fn cie(aug: &[u8]) -> Vec<u8> {
+            let mut body = vec![0, 0, 0, 0, 1];
+            body.extend_from_slice(aug);
+            body.extend_from_slice(&[0, 1, 0x78, 16, 1, 0x1b]);
+            while (body.len() + 4) % 8 != 0 {
+                body.push(0);
+            }
+            let mut r = (body.len() as u32).to_le_bytes().to_vec();
+            r.extend(body);
+            r
+        }
+        fn fde(at: usize, cie_at: usize, tag: u8) -> Vec<u8> {
+            let ptr = (at + 4 - cie_at) as u32;
+            let mut body = ptr.to_le_bytes().to_vec();
+            body.extend_from_slice(&[0, 0, 0, 0, tag, 0, 0, 0, 0, 0, 0, 0]);
+            let mut r = (body.len() as u32).to_le_bytes().to_vec();
+            r.extend(body);
+            r
+        }
+        let mut data = cie(b"zR");
+        let cie_a = 0;
+        let fde1 = data.len();
+        data.extend(fde(fde1, cie_a, 1));
+        let cie_b = data.len();
+        data.extend(cie(b"zPLR"));
+        let fde2 = data.len();
+        data.extend(fde(fde2, cie_b, 2));
+        let fde3 = data.len();
+        data.extend(fde(fde3, cie_a, 3));
+
+        let recs = scan_eh_frame_records(&data);
+        assert_eq!(recs.len(), 5);
+        let prune = [false, true, false, false, false];
+        let c = compact_eh_frame(&data, &recs, &prune);
+        let out = &c.data;
+        let recs2 = scan_eh_frame_records(out);
+        assert_eq!(recs2.len(), 4, "FDE 1 is gone");
+        let cie_of = |r: &EhFrameRecord| {
+            let v = u32::from_le_bytes(out[r.id_offset..r.id_offset + 4].try_into().unwrap());
+            r.id_offset - v as usize
+        };
+        let (a, b) = (recs2[0].start, recs2[1].start);
+        assert_eq!(cie_of(&recs2[2]), b, "FDE 2 -> zPLR CIE");
+        assert_eq!(cie_of(&recs2[3]), a, "FDE 3 -> zR CIE, not the nearer zPLR");
+        // Relocation offsets move with their records; offsets in the pruned
+        // record are dropped.
+        assert_eq!(c.map_offset(fde1 + 8), None);
+        assert_eq!(c.map_offset(fde3 + 8), Some(recs2[3].start + 8));
+        assert_eq!(c.map_offset(cie_b + 3), Some(b + 3));
     }
 
     /// The core `--gc-sections` invariant: an FDE for a collected function is

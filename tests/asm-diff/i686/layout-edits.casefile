@@ -1,0 +1,634 @@
+# Whole-object layout cases for the integrated assembler's post-emission
+# edits -- jump relaxation, alignment padding, deferred LEB128 and CFA
+# advance sizing -- and its .eh_frame lowering (GAS 2.47 oracle).
+# Every edit moves the section's offset-bearing records through one
+# routine (ElfWriterCore::remap_offsets); each case below broke when an
+# edit path left one kind of record behind.
+
+;;; scaled_diff_after_relaxed_jmp
+# `.long (b-a)*2` behind a jump that relaxes to its short form must be
+# folded into its own field, not at its pre-relaxation offset.
+.text
+f:
+jmp .Lx
+.long (.Lb-.La)*2
+.byte 0xaa, 0xbb, 0xcc, 0xdd
+.La:
+nop
+nop
+.Lb:
+.Lx:
+ret
+
+;;; label_before_grown_alignment
+# A label written before `.p2align` stays in front of padding that only
+# relaxation makes necessary; the label after the directive moves.
+.text
+f:
+jmp .Lt
+.byte 0,0,0,0,0,0,0,0,0,0,0
+.Lend:
+.p2align 4
+.Lt:
+ret
+.data
+.long .Lend - f
+.long .Lt - f
+
+;;; size_before_next_function_alignment
+# `.size f, .-f` measures f alone even when the next function's alignment
+# padding grows after relaxation.
+.text
+.globl f
+.type f, @function
+f:
+jmp .Lr
+.byte 0,0,0,0,0,0,0,0,0,0
+.Lr:
+ret
+.size f, .-f
+.p2align 4
+.globl g
+.type g, @function
+g:
+ret
+.size g, .-g
+
+;;; uleb_diff_after_relaxed_jmp
+# A `.uleb128` difference behind a relaxed jump lands in its own field,
+# and the jump across it still reaches its target after the 10-byte
+# placeholder shrinks.
+.text
+f:
+jmp .Lx
+.uleb128 .Lb - .La
+.byte 0xaa, 0xbb
+.La:
+nop
+nop
+nop
+.Lb:
+.Lx:
+ret
+
+;;; cfi_advance_forms
+# Location advances at every encoding boundary (63/64, 255/256,
+# 65535/65536 bytes and zero), a second CIE emitted at its first use
+# between FDEs, and only the last FDE padded to the pointer size.
+.text
+f:
+.cfi_startproc
+.skip 0x3f
+.cfi_def_cfa_offset 16
+.skip 0x40
+.cfi_def_cfa_offset 24
+.skip 0xff
+.cfi_def_cfa_offset 32
+.skip 0x100
+.cfi_def_cfa_offset 40
+.skip 0xffff
+.cfi_def_cfa_offset 48
+.skip 0x10000
+.cfi_def_cfa_offset 56
+.cfi_def_cfa_offset 64
+ret
+.cfi_endproc
+g:
+.cfi_startproc
+.cfi_signal_frame
+nop
+.cfi_def_cfa_offset 16
+ret
+.cfi_endproc
+h:
+.cfi_startproc
+ret
+.cfi_endproc
+
+;;; cfi_after_handwritten_eh_frame
+# Hand-written .eh_frame data (glibc's signal-restorer shape; a 20-byte
+# CIE) is followed directly by the generated entries: no padding in front
+# of them, which an unwinder would read as the zero terminator.
+.section .eh_frame,"a",@progbits
+.long 16
+.long 0
+.byte 1
+.string "zR"
+.uleb128 1
+.sleb128 -4
+.uleb128 8
+.uleb128 1
+.byte 0x1b
+.byte 0x0c, 4, 4
+.text
+f:
+.cfi_startproc
+pushl %ebx
+.cfi_def_cfa_offset 8
+.cfi_offset %ebx, -8
+popl %ebx
+.cfi_def_cfa_offset 4
+ret
+.cfi_endproc
+
+;;; section_bare_reentry
+# `.section NAME` (or empty flags) re-enters an existing section with its
+# attributes unchanged, as GCC does for .gcc_except_table.
+.section .foo,"a",@progbits
+.byte 1
+.text
+nop
+.section .foo
+.byte 2
+.section .foo,""
+.byte 3
+.section .bar,"aw",@nobits
+.zero 4
+.text
+.section .bar
+.zero 4
+
+;;; section_changed_attributes reject
+# Explicit contradicting flags are still an error.
+.section .foo,"a",@progbits
+.byte 1
+.section .foo,"aw",@progbits
+.byte 2
+
+;;; gcc_cleanup_personality_lsda
+# GCC 14 -m32 -O2 -fPIC -fexceptions output for a function with a cleanup
+# variable (see the x86-64 corpus): zPLR CIE, pcrel LSDA, uleb128 label
+# differences, bare section re-entries, a COMDAT DW.ref slot and the PIC
+# thunk's FDE.
+	.text
+	.section	.text.unlikely,"ax",@progbits
+.LCOLDB0:
+	.text
+.LHOTB0:
+	.p2align 4
+	.globl	f
+	.type	f, @function
+f:
+.LFB0:
+	.cfi_startproc
+	.cfi_personality 0x9b,DW.ref.__gcc_personality_v0
+	.cfi_lsda 0x1b,.LLSDA0
+	pushl	%ebp
+	.cfi_def_cfa_offset 8
+	.cfi_offset 5, -8
+	movl	%esp, %ebp
+	.cfi_def_cfa_register 5
+	pushl	%edi
+	pushl	%esi
+	.cfi_offset 7, -12
+	.cfi_offset 6, -16
+	leal	-28(%ebp), %edi
+	call	__x86.get_pc_thunk.si
+	addl	$_GLOBAL_OFFSET_TABLE_, %esi
+	pushl	%ebx
+	subl	$56, %esp
+	.cfi_offset 3, -20
+	movl	$0, -28(%ebp)
+	pushl	%edi
+	movl	%esi, %ebx
+.LEHB0:
+	.cfi_escape 0x2e,0x10
+	call	work@PLT
+.LEHE0:
+	movl	-28(%ebp), %eax
+	movl	%eax, -44(%ebp)
+	movl	%edi, (%esp)
+.LEHB1:
+	call	release@PLT
+.LEHE1:
+	movl	-44(%ebp), %eax
+	addl	$16, %esp
+	leal	-12(%ebp), %esp
+	popl	%ebx
+	.cfi_remember_state
+	.cfi_restore 3
+	popl	%esi
+	.cfi_restore 6
+	popl	%edi
+	.cfi_restore 7
+	popl	%ebp
+	.cfi_restore 5
+	.cfi_def_cfa 4, 4
+	ret
+.L3:
+	.cfi_restore_state
+	movl	%eax, -44(%ebp)
+	jmp	.L2
+	.section	.gcc_except_table,"a",@progbits
+.LLSDA0:
+	.byte	0xff
+	.byte	0xff
+	.byte	0x1
+	.uleb128 .LLSDACSE0-.LLSDACSB0
+.LLSDACSB0:
+	.uleb128 .LEHB0-.LFB0
+	.uleb128 .LEHE0-.LEHB0
+	.uleb128 .L3-.LFB0
+	.uleb128 0
+	.uleb128 .LEHB1-.LFB0
+	.uleb128 .LEHE1-.LEHB1
+	.uleb128 0
+	.uleb128 0
+.LLSDACSE0:
+	.text
+	.cfi_endproc
+	.section	.text.unlikely
+	.cfi_startproc
+	.cfi_personality 0x9b,DW.ref.__gcc_personality_v0
+	.cfi_lsda 0x1b,.LLSDAC0
+	.type	f.cold, @function
+f.cold:
+.LFSB0:
+.L2:
+	.cfi_def_cfa 5, 8
+	.cfi_offset 3, -20
+	.cfi_offset 5, -8
+	.cfi_offset 6, -16
+	.cfi_offset 7, -12
+	subl	$12, %esp
+	movl	%esi, %ebx
+	pushl	%edi
+.LEHB2:
+	call	release@PLT
+	popl	%eax
+	pushl	-44(%ebp)
+	call	_Unwind_Resume@PLT
+.LEHE2:
+	.cfi_endproc
+.LFE0:
+	.section	.gcc_except_table
+.LLSDAC0:
+	.byte	0xff
+	.byte	0xff
+	.byte	0x1
+	.uleb128 .LLSDACSEC0-.LLSDACSBC0
+.LLSDACSBC0:
+	.uleb128 .LEHB2-.LCOLDB0
+	.uleb128 .LEHE2-.LEHB2
+	.uleb128 0
+	.uleb128 0
+.LLSDACSEC0:
+	.section	.text.unlikely
+	.text
+	.size	f, .-f
+	.section	.text.unlikely
+	.size	f.cold, .-f.cold
+.LCOLDE0:
+	.text
+.LHOTE0:
+	.section	.text.__x86.get_pc_thunk.si,"axG",@progbits,__x86.get_pc_thunk.si,comdat
+	.globl	__x86.get_pc_thunk.si
+	.hidden	__x86.get_pc_thunk.si
+	.type	__x86.get_pc_thunk.si, @function
+__x86.get_pc_thunk.si:
+.LFB1:
+	.cfi_startproc
+	movl	(%esp), %esi
+	ret
+	.cfi_endproc
+.LFE1:
+	.hidden	DW.ref.__gcc_personality_v0
+	.weak	DW.ref.__gcc_personality_v0
+	.section	.data.rel.local.DW.ref.__gcc_personality_v0,"awG",@progbits,DW.ref.__gcc_personality_v0,comdat
+	.align 4
+	.type	DW.ref.__gcc_personality_v0, @object
+	.size	DW.ref.__gcc_personality_v0, 4
+DW.ref.__gcc_personality_v0:
+	.long	__gcc_personality_v0
+	.globl	__gcc_personality_v0
+
+;;; nop_table_lea32
+# 32-bit code in an ELF32 object pads with GAS's `lea` NOPs (never NOPL,
+# which i686-class Geode LX / VIA C3 cores lack): every size 1..8, the
+# last all-NOP gap (23), the first jump-over (24), and both jump forms.
+.text
+.balign 256
+.rept 254
+nop
+.endr
+ret
+.balign 256
+.rept 253
+nop
+.endr
+ret
+.balign 256
+.rept 252
+nop
+.endr
+ret
+.balign 256
+.rept 251
+nop
+.endr
+ret
+.balign 256
+.rept 250
+nop
+.endr
+ret
+.balign 256
+.rept 249
+nop
+.endr
+ret
+.balign 256
+.rept 248
+nop
+.endr
+ret
+.balign 256
+.rept 247
+nop
+.endr
+ret
+.balign 256
+.rept 246
+nop
+.endr
+ret
+.balign 256
+.rept 240
+nop
+.endr
+ret
+.balign 256
+.rept 239
+nop
+.endr
+ret
+.balign 256
+.rept 232
+nop
+.endr
+ret
+.balign 256
+.rept 231
+nop
+.endr
+ret
+.balign 256
+.rept 126
+nop
+.endr
+ret
+.balign 256
+.rept 125
+nop
+.endr
+ret
+.balign 256
+
+;;; nop_table_after_data
+# Padding after data (not a complete instruction) leads with one `nop`.
+.text
+.byte 0xc3
+.balign 8
+ret
+.byte 0x0f, 0x0b
+.balign 16
+ret
+
+;;; nop_table_code64_in_elf32
+# `.code64` in an ELF32 object: REX.W `lea` NOPs, jump-over past 2 x 9.
+.text
+.code64
+.balign 256
+.rept 254
+nop
+.endr
+ret
+.balign 256
+.rept 253
+nop
+.endr
+ret
+.balign 256
+.rept 252
+nop
+.endr
+ret
+.balign 256
+.rept 251
+nop
+.endr
+ret
+.balign 256
+.rept 250
+nop
+.endr
+ret
+.balign 256
+.rept 249
+nop
+.endr
+ret
+.balign 256
+.rept 248
+nop
+.endr
+ret
+.balign 256
+.rept 247
+nop
+.endr
+ret
+.balign 256
+.rept 246
+nop
+.endr
+ret
+.balign 256
+.rept 237
+nop
+.endr
+ret
+.balign 256
+.rept 229
+nop
+.endr
+ret
+.balign 256
+.rept 228
+nop
+.endr
+ret
+.balign 256
+.rept 125
+nop
+.endr
+ret
+.balign 256
+.code32
+
+;;; nop_table_code16
+# `.code16`: 16-bit `lea`/`mov` NOPs; a jump-over beyond rel8 range is
+# `66 e9 rel32` (a bare `e9` would take a rel16 and land short).
+# The case deliberately ENDS in .code16: GAS 2.47 picks the jump's prefix
+# from the mode at the END of assembly, so a trailing `.code32` makes it
+# emit `e9 7d 00 00 00`, i.e. `jmp` to 2 bytes before the aligned target
+# (objdump -mi8086), executing `00 00`. lccc keeps the correct encoding.
+.text
+.code16
+.balign 256
+.rept 254
+nop
+.endr
+ret
+.balign 256
+.rept 253
+nop
+.endr
+ret
+.balign 256
+.rept 252
+nop
+.endr
+ret
+.balign 256
+.rept 251
+nop
+.endr
+ret
+.balign 256
+.rept 250
+nop
+.endr
+ret
+.balign 256
+.rept 245
+nop
+.endr
+ret
+.balign 256
+.rept 241
+nop
+.endr
+ret
+.balign 256
+.rept 240
+nop
+.endr
+ret
+.balign 256
+.rept 126
+nop
+.endr
+ret
+.balign 256
+.rept 125
+nop
+.endr
+ret
+.balign 256
+
+;;; nop_table_mode_switch_after_align
+# The table is fixed when the directive is seen: relaxation re-pads the
+# 3-byte gap below with the 32-bit `lea` NOP although the assembler is in
+# `.code16` by then (a mode read at fixup time would give `8d 74 00`).
+.text
+f:
+jmp .Lt
+.byte 0,0,0,0,0,0,0,0,0,0,0
+.p2align 4
+.Lt:
+ret
+.code16
+nop
+
+;;; backedge_across_shrinking_maxskip_align
+# Relaxation sweeps in address order like GAS: once the far `jmp` grows,
+# the `.p2align 4,,10` between the loop head and its back-edge re-pads
+# 10 -> 7 before the back-edge is sized, so `jne .Lb` stays short.
+# Deciding every jump against the pass's starting layout saw the stale
+# padding and grew it for good (RX-1: sqlite shell.c +16 bytes).
+.text
+f:
+jmp .Lfar
+.Lb:
+.rept 4
+nop
+.endr
+.p2align 4,,10
+.rept 114
+nop
+.endr
+jne .Lb
+.rept 130
+nop
+.endr
+.Lfar:
+ret
+
+;;; backedge_target_at_shrinking_align
+# The back-edge target sits exactly at the alignment's offset but was
+# defined before the directive: the shrinking padding moves the branch,
+# not the label (source-order tie rule), so the branch stays short.
+.text
+f:
+jmp .Lfar
+.rept 4
+nop
+.endr
+.Lb:
+.p2align 4,,10
+.rept 118
+nop
+.endr
+jne .Lb
+.rept 130
+nop
+.endr
+.Lfar:
+ret
+
+;;; forward_target_across_align_keeps_old_position
+# GAS relax regions: a positive stretch is not pushed onto a forward
+# target behind an alignment (the padding may absorb it), so `jne .Lt`
+# is sized against .Lt's old position and stays short (RX-2).
+.text
+f:
+jmp .Lfar
+.rept 4
+nop
+.endr
+jne .Lt
+.rept 112
+nop
+.endr
+.p2align 4,,10
+.rept 8
+nop
+.endr
+.Lt:
+ret
+.rept 130
+nop
+.endr
+.Lfar:
+ret
+
+;;; backedge_across_org_anchored_before_growth
+# `.org .Lbase+20` is anchored before the growing `jmp`: its fill
+# shrinks by the growth, so the back-edge across it stays short.
+.text
+f:
+.Lbase:
+jmp .Lfar
+.Lb:
+nop
+.org .Lbase+20
+.rept 110
+nop
+.endr
+jne .Lb
+.rept 130
+nop
+.endr
+.Lfar:
+ret

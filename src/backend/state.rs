@@ -562,14 +562,41 @@ pub struct CodegenState {
     pub function_sections: bool,
     /// Whether to place each data object in its own section (-fdata-sections).
     pub data_sections: bool,
-    /// Whether any 64-bit division/modulo runtime helpers (__divdi3, __udivdi3,
-    /// __moddi3, __umoddi3) were referenced during code generation.
+    /// Whether any 64-bit division/modulo runtime helper (i686: lccc's private
+    /// `__lccc_divdi3` family) was referenced during code generation.
     /// When true, the i686 backend emits weak implementations of these functions
     /// so that standalone builds (without libgcc) can link successfully.
     pub needs_divdi3_helpers: bool,
     /// Whether to emit CFI directives (.cfi_startproc, .cfi_endproc, etc.)
     /// for generating .eh_frame unwind tables. Enabled by default (like GCC).
     pub emit_cfi: bool,
+    /// Emit bare `.cfi_startproc`/`.cfi_endproc` around every function and
+    /// no other CFI; the backend derives the unwind info from the final code
+    /// after its peephole (`cfi_synth`) or strips the markers when `emit_cfi`
+    /// is off. The x86 peephole delimits functions by these two directives:
+    /// its exact liveness and every whole-function proof answer only inside
+    /// a delimited function, and its input is now identical with and
+    /// without unwind tables (previously `-fno-asynchronous-unwind-tables`
+    /// disabled those passes: +21% instructions on SQLite's select.c, while
+    /// prologue CFI in the default mode blocked callee-save elimination).
+    pub fn_boundary_markers: bool,
+    /// Functions that received the codegen's boundary markers. Only these
+    /// are rewritten after the peephole (the `.cfi_startproc` right after
+    /// `NAME:` through the `.cfi_endproc` right before `.size NAME, .-NAME`),
+    /// so CFI the user writes in top-level asm is never touched.
+    pub fn_boundary_marked: FxHashSet<String>,
+    /// i686: bytes a directly called function pops on return (`ret $N`:
+    /// the i386 SysV hidden struct-return pointer, the stack arguments of a
+    /// fastcall callee), keyed by callee symbol. The call's text does not
+    /// say so, yet %esp after the call depends on it: the codegen folds the
+    /// pop into its cleanup (`addl $12` after a 16-byte sret call), so
+    /// `cfi_synth` needs it to keep the CFA exact past such a call. `None`:
+    /// call sites disagree (incompatible declarations of one function), so
+    /// no single amount describes every call.
+    pub callee_pops_direct: FxHashMap<String, Option<u32>>,
+    /// i686: per function, the bytes each indirect call pops, in emission
+    /// order (`None`: not knowable, e.g. `__builtin_apply`'s call).
+    pub callee_pops_indirect: FxHashMap<String, Vec<Option<u32>>>,
 
     /// Floating-point constant pool: maps bit pattern → label name.
     /// FP constants are emitted as .rodata entries and loaded via
@@ -584,6 +611,31 @@ pub struct CodegenState {
 }
 
 impl CodegenState {
+    /// Record what the callee of the call just emitted pops on return; see
+    /// `callee_pops_direct`. `direct` is the callee symbol, `None` for an
+    /// indirect call. Every call is recorded, pop or not: a direct callee's
+    /// sites must agree, and the indirect list must line up with the
+    /// indirect calls of the final code.
+    pub fn record_call_pop(&mut self, direct: Option<&str>, pops: Option<u32>) {
+        match direct {
+            Some(name) => match self.callee_pops_direct.get_mut(name) {
+                Some(seen) => {
+                    if *seen != pops {
+                        *seen = None;
+                    }
+                }
+                None => {
+                    self.callee_pops_direct.insert(name.to_string(), pops);
+                }
+            },
+            None => self
+                .callee_pops_indirect
+                .entry(self.current_func_name.clone())
+                .or_default()
+                .push(pops),
+        }
+    }
+
     /// Convenience constructor for direct backend/unit-test users. The normal
     /// driver path calls [`Self::new_with_ra_config`] with its one captured
     /// configuration object instead.
@@ -688,6 +740,10 @@ impl CodegenState {
             data_sections: false,
             needs_divdi3_helpers: false,
             emit_cfi: true,
+            fn_boundary_markers: false,
+            fn_boundary_marked: FxHashSet::default(),
+            callee_pops_direct: FxHashMap::default(),
+            callee_pops_indirect: FxHashMap::default(),
 
             fp_const_pool: FxHashMap::default(),
             vec_const_pool: FxHashMap::default(),
@@ -1273,5 +1329,30 @@ mod slot_addr_tests {
             .insert(18, ExplicitLocation::Accumulator);
         assert!(state.is_accumulator_location(18));
         assert!(state.resolve_slot_addr(18).is_none());
+    }
+}
+
+#[cfg(test)]
+mod call_pop_tests {
+    use super::*;
+
+    /// A symbol whose call sites disagree on what the callee pops has no
+    /// single amount: it must read as unknown, never as the last site's.
+    #[test]
+    fn disagreeing_direct_sites_become_unknown() {
+        let mut state = CodegenState::new();
+        state.current_func_name = "caller".to_string();
+        state.record_call_pop(Some("make"), Some(4));
+        state.record_call_pop(Some("make"), Some(4));
+        state.record_call_pop(Some("plain"), Some(0));
+        assert_eq!(state.callee_pops_direct["make"], Some(4));
+        assert_eq!(state.callee_pops_direct["plain"], Some(0));
+        state.record_call_pop(Some("make"), Some(0));
+        assert_eq!(state.callee_pops_direct["make"], None);
+        state.record_call_pop(Some("make"), Some(4));
+        assert_eq!(state.callee_pops_direct["make"], None);
+        state.record_call_pop(None, Some(8));
+        state.record_call_pop(None, None);
+        assert_eq!(state.callee_pops_indirect["caller"], vec![Some(8), None]);
     }
 }

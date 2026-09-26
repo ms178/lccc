@@ -1021,12 +1021,15 @@ impl I686Codegen {
         lhs: &Operand,
         rhs: &Operand,
     ) {
+        // The shared lowering names the libgcc double-word helpers; i686
+        // calls lccc's own private, hidden copies (emit.rs, "64-bit
+        // division runtime stubs"), which bind locally: no PLT in PIC.
         let di_func = match func_name {
-            "__divti3" => "__divdi3",
-            "__udivti3" => "__udivdi3",
-            "__modti3" => "__moddi3",
-            "__umodti3" => "__umoddi3",
-            _ => func_name,
+            "__divti3" => "__lccc_divdi3",
+            "__udivti3" => "__lccc_udivdi3",
+            "__modti3" => "__lccc_moddi3",
+            "__umodti3" => "__lccc_umoddi3",
+            other => unreachable!("i686: no double-word helper for {other}"),
         };
 
         self.state.needs_divdi3_helpers = true;
@@ -1039,11 +1042,7 @@ impl I686Codegen {
         self.emit_load_acc_pair(lhs);
         self.state.emit("    pushl %edx");
         self.state.emit("    pushl %eax");
-        if self.state.needs_plt(di_func) {
-            emit!(self.state, "    call {}@PLT", di_func);
-        } else {
-            emit!(self.state, "    call {}", di_func);
-        }
+        emit!(self.state, "    call {}", di_func);
         self.state.emit("    addl $16, %esp");
         self.esp_adjust -= 8;
     }

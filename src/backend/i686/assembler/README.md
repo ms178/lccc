@@ -222,10 +222,13 @@ byte.  This is essential for the REL format where the addend is embedded inline.
   i686 uses the single-byte `0x40+r` (inc) and `0x48+r` (dec) encodings for
   32-bit registers.
 
-- **Absolute addressing for calls/jumps**.  All branch instructions (`call`,
-  `jmp`, `jcc`) emit `R_386_PLT32` relocations for label targets, matching
-  modern GCC/binutils behavior. The `@PLT` suffix is stripped from symbol names
-  but does not affect the relocation type (always PLT32).
+- **Branch relocations**.  `call`, `jmp` and `jcc` to a label emit
+  `R_386_PC32`; only an explicit `sym@PLT` emits `R_386_PLT32` (the suffix is
+  stripped from the symbol name).  This is the i386 psABI meaning GNU as
+  implements: an i386 PIC PLT entry jumps through `name@GOT(%ebx)`, so a PLT
+  reference the source did not ask for would silently require %ebx = GOT.
+  A PLT32 whose target folds into its section symbol (a local label in
+  another section) is written as PC32, as GNU as does.
 
 - **Operand-size prefix** (`0x66`) is emitted for 16-bit operations.  Segment
   override prefixes (`0x64` for `%fs`, `0x65` for `%gs`) are emitted for

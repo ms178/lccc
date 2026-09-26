@@ -2757,10 +2757,8 @@ impl X86Codegen {
                 }
             }
             let actual_stack = frame_size.max(n_saves * 8);
-            if self.state.emit_cfi {
-                self.state
-                    .emit_fmt(format_args!("    .cfi_def_cfa_offset {}", actual_stack + 8));
-            }
+            // Unwind info is derived from the final instruction stream after
+            // the peephole (backend::cfi_synth); the prologue emits none.
             self.state.out.use_rsp_addressing = true;
             // RSP-relative addressing models a virtual frame base at the
             // caller's entry %rsp.  When the empty-local-frame elision keeps a
@@ -2777,15 +2775,9 @@ impl X86Codegen {
             // Reset RSP-relative addressing flag: a previous FPO function may have
             // set it, and the AsmOutput is shared across all functions in the module.
             self.state.out.use_rsp_addressing = false;
+            // CFI for this frame comes from backend::cfi_synth.
             self.state.emit("    pushq %rbp");
-            if self.state.emit_cfi {
-                self.state.emit("    .cfi_def_cfa_offset 16");
-                self.state.emit("    .cfi_offset %rbp, -16");
-            }
             self.state.emit("    movq %rsp, %rbp");
-            if self.state.emit_cfi {
-                self.state.emit("    .cfi_def_cfa_register %rbp");
-            }
 
             // Classic mcount site (-pg without -mfentry/-mnop-mcount): the
             // call belongs AFTER the frame is established — the mcount ABI

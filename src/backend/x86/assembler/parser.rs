@@ -64,6 +64,11 @@ pub enum AsmItem {
     Long(Vec<DataValue>),
     /// Emit ULEB128-encoded values: `.uleb128 val, ...` (DWARF/.eh_frame)
     Uleb128(Vec<DataValue>),
+    /// `DW_CFA_advance_loc*` by the distance from label `from` to label `to`
+    /// (one code section), sized to its smallest encoding once the code
+    /// layout is final. Produced only by the CFI lowering
+    /// (`cfi::lower_cfi`); no source directive parses to it.
+    CfaAdvance { from: String, to: String },
     /// Emit SLEB128-encoded values: `.sleb128 val, ...` (DWARF/.eh_frame)
     Sleb128(Vec<DataValue>),
     /// Emit 64-bit values: `.quad val, ...` (can be symbol references)
@@ -83,9 +88,8 @@ pub enum AsmItem {
     Comm(String, u64, u32),
     /// Symbol alias: `.set alias, target`
     Set(String, String),
-    /// CFI directive (ignored for code generation, kept for .eh_frame)
-    #[cfg_attr(not(feature = "gcc_assembler"), expect(dead_code))]
-    // Parsed by parser but skipped during encoding (DWARF .eh_frame not yet emitted)
+    /// CFI directive. `cfi::lower_cfi` replaces these by location labels and
+    /// `.eh_frame` data before layout; the ELF writers never see one.
     Cfi(CfiDirective),
     /// Debug file directive: `.file N "filename"`
     #[cfg_attr(not(feature = "gcc_assembler"), expect(dead_code))]
@@ -200,9 +204,10 @@ pub enum DataValue {
     SymbolDiffScaled(String, String, i64, i64, i64),
 }
 
-/// CFI directives (call frame information).
+/// CFI directives (call frame information), lowered by `cfi::lower_cfi`.
+/// The common forms the codegen emits are pre-parsed; everything else keeps
+/// its source text in `Other` and is decoded by the lowering.
 #[derive(Debug, Clone)]
-#[expect(dead_code)] // Variants constructed by parser; not yet consumed for .eh_frame emission
 pub enum CfiDirective {
     StartProc,
     EndProc,
@@ -971,8 +976,10 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
         ".comm" => parse_comm_directive(args),
         ".set" => parse_set_directive(args),
         ".symver" => parse_symver_directive(args),
-        ".cfi_startproc" => Ok(AsmItem::Cfi(CfiDirective::StartProc)),
-        ".cfi_endproc" => Ok(AsmItem::Cfi(CfiDirective::EndProc)),
+        // `.cfi_startproc simple` (no CIE initial instructions) keeps its
+        // text so the lowering sees the operand.
+        ".cfi_startproc" if args.trim().is_empty() => Ok(AsmItem::Cfi(CfiDirective::StartProc)),
+        ".cfi_endproc" if args.trim().is_empty() => Ok(AsmItem::Cfi(CfiDirective::EndProc)),
         ".cfi_def_cfa_offset" => {
             // Accept full constant expressions (e.g. "8*2", "N*8+N").
             let val =
@@ -1067,9 +1074,8 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
         d if d.starts_with(".cfi_") => {
             // Any other .cfi_* directive (restore, adjust_cfa_offset, def_cfa,
             // register, undefined, escape, personality, lsda, sections,
-            // signal_frame, remember/restore_state, val_offset, expression):
-            // record tolerantly — CFI is parsed but not emitted by the builtin
-            // assembler, so no argument shape may abort glibc/GCC-generated .S.
+            // signal_frame, remember/restore_state, val_offset, ...): keep the
+            // text; `cfi::lower_cfi` decodes and validates it.
             Ok(AsmItem::Cfi(CfiDirective::Other(line.to_string())))
         }
         _ => {

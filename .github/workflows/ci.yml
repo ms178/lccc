@@ -210,6 +210,31 @@ jobs:
           CCC: target/fastbuild/lccc
         run: bash tests/regression/check_overalign_typed_census.sh
 
+      # Unwind tables are derived from the final (post-peephole) code, so the
+      # peephole must see identical input with and without them, and the
+      # integrated assembler must turn the CFI into a real .eh_frame:
+      # backtrace() and pthread_exit()/pthread_cancel() cleanups through
+      # lccc frames, lccc-ld's .eh_frame_hdr after --gc-sections/COMDAT.
+      - name: Verify peephole parity with and without unwind tables
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_nocfi_peephole_parity.sh
+
+      - name: Verify unwinding through lccc frames (.eh_frame)
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_eh_frame_unwind.sh
+
+      - name: Verify synthesized CFI invariants (corpus, x86-64 + i686)
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_cfi_invariants.sh
+
+      - name: Verify COMDAT groups are identified by signature (x86-64 + i686 links)
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_comdat_signature_identity.sh
+
       # Segment-qualified declarator contract: a `__seg_fs`/`__seg_gs`
       # qualifier before a nested type-name's base must reach that
       # type-name's own `*` (cast `(__seg_fs unsigned long *)40` — the

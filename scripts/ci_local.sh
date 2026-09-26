@@ -204,6 +204,18 @@ gate "machinst-window-alloc" fast \
 gate "overalign-typed-census" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_overalign_typed_census.sh
 
+gate "nocfi-peephole-parity" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_nocfi_peephole_parity.sh
+
+gate "eh-frame-unwind" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_eh_frame_unwind.sh
+
+gate "cfi-invariants" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_cfi_invariants.sh
+
+gate "comdat-signature-identity" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_comdat_signature_identity.sh
+
 gate "loop-memset-decisions" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_loop_memset.sh
 

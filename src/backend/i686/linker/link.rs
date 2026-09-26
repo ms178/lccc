@@ -71,10 +71,10 @@ pub fn link_builtin(
         all_objs.push(lib_path.clone());
     }
 
-    let (inputs, _archive_pool) = load_and_parse_objects(&all_objs, &defsym_defs)?;
+    let (mut inputs, _archive_pool) = load_and_parse_objects(&all_objs, &defsym_defs)?;
 
     // Phase 5: Merge sections
-    let (mut output_sections, mut section_name_to_idx, section_map) = merge_sections(&inputs);
+    let (mut output_sections, mut section_name_to_idx, section_map) = merge_sections(&mut inputs);
 
     // Phase 6: Resolve symbols
     let (mut global_symbols, sym_resolution) =
@@ -375,10 +375,10 @@ pub fn link_shared(
     all_objs.extend(extra_object_files);
 
     // Parse all input objects
-    let (inputs, _archive_pool) = load_and_parse_objects(&all_objs, &defsym_defs)?;
+    let (mut inputs, _archive_pool) = load_and_parse_objects(&all_objs, &defsym_defs)?;
 
     // Merge sections
-    let (mut output_sections, section_name_to_idx, section_map) = merge_sections(&inputs);
+    let (mut output_sections, section_name_to_idx, section_map) = merge_sections(&mut inputs);
 
     // Resolve symbols (no dynamic library symbols for shared lib output)
     let dynlib_syms: FxHashMap<String, (String, u8, u32, Option<String>, bool, u8)> =

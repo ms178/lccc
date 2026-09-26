@@ -11,10 +11,27 @@
 use super::types::*;
 
 /// Read dynamic symbol info, with library search paths for resolving linker script entries.
+///
+/// Every symbol carries the SONAME of the ELF object that actually defines
+/// it.  A linker script (`libc.so`, `libgcc_s.so`) is only an indirection:
+/// the DT_NEEDED a reference records must name the member that resolved it
+/// (`libgcc_s.so.1`, `ld-linux.so.2`), never the script's file name, which
+/// the dynamic loader cannot open.
 pub(super) fn read_dynsyms_with_search(
     path: &str,
     lib_search_paths: &[&str],
 ) -> Result<Vec<DynSymInfo>, String> {
+    let mut syms = read_dynsyms_file(path, lib_search_paths)?;
+    if let Some(soname) = parse_soname_elf32(path) {
+        // Members of a linker script were stamped by their own recursion.
+        for s in syms.iter_mut().filter(|s| s.soname.is_none()) {
+            s.soname = Some(soname.clone());
+        }
+    }
+    Ok(syms)
+}
+
+fn read_dynsyms_file(path: &str, lib_search_paths: &[&str]) -> Result<Vec<DynSymInfo>, String> {
     const LOCAL_SHT_GNU_VERSYM: u32 = 0x6fffffff;
     const SHT_GNU_VERDEF: u32 = 0x6ffffffd;
 
@@ -147,6 +164,7 @@ pub(super) fn read_dynsyms_with_search(
                     binding,
                     version,
                     is_default_ver,
+                    soname: None,
                 });
             }
         }
@@ -167,6 +185,7 @@ fn read_dynsyms_from_dynamic(data: &[u8]) -> Result<Vec<DynSymInfo>, String> {
     const DT_SYMTAB: u32 = 6;
     const DT_STRSZ: u32 = 10;
     const DT_SYMENT: u32 = 11;
+    const DT_SONAME: u32 = 14;
     const PT_LOAD: u32 = 1;
     const PT_DYNAMIC: u32 = 2;
 
@@ -212,6 +231,7 @@ fn read_dynsyms_from_dynamic(data: &[u8]) -> Result<Vec<DynSymInfo>, String> {
     let mut symtab_va: u32 = 0;
     let mut strsz: u32 = 0;
     let mut syment: u32 = 16;
+    let mut soname_off: Option<u32> = None;
     let mut pos = doff;
     while pos + 8 <= data.len() {
         let tag = read_u32(data, pos);
@@ -223,6 +243,7 @@ fn read_dynsyms_from_dynamic(data: &[u8]) -> Result<Vec<DynSymInfo>, String> {
             DT_SYMTAB => symtab_va = val,
             DT_STRSZ => strsz = val,
             DT_SYMENT => syment = val,
+            DT_SONAME => soname_off = Some(val),
             _ => {}
         }
     }
@@ -275,7 +296,16 @@ fn read_dynsyms_from_dynamic(data: &[u8]) -> Result<Vec<DynSymInfo>, String> {
             binding,
             version: None,
             is_default_ver: false,
+            soname: None,
         });
+    }
+    // parse_soname_elf32 needs section headers; this image has none, so
+    // take DT_SONAME from the dynamic segment walked above.
+    if let Some(off) = soname_off.filter(|&o| (o as usize) < strtab.len()) {
+        let soname = read_cstr(strtab, off as usize);
+        for s in &mut syms {
+            s.soname = Some(soname.clone());
+        }
     }
 
     Ok(syms)

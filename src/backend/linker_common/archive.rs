@@ -73,8 +73,7 @@ fn resolve_archive_members<G: GlobalSymbolOps>(
         while i < member_objects.len() {
             if member_resolves_undefined_generic(&member_objects[i], globals) {
                 let obj = member_objects.remove(i);
-                let obj_idx = objects.len();
-                register_symbols_elf64(obj_idx, &obj, globals, should_replace_extra)?;
+                register_symbols_elf64(objects, &obj, globals, should_replace_extra)?;
                 objects.push(obj);
                 changed = true;
             } else {
@@ -180,8 +179,7 @@ pub fn load_archive_elf64_backed<G: GlobalSymbolOps>(
     if whole_archive {
         // --whole-archive: include ALL members unconditionally
         for obj in member_objects.drain(..) {
-            let obj_idx = objects.len();
-            register_symbols_elf64(obj_idx, &obj, globals, should_replace_extra)?;
+            register_symbols_elf64(objects, &obj, globals, should_replace_extra)?;
             objects.push(obj);
         }
     } else {
@@ -229,8 +227,7 @@ pub fn load_thin_archive_elf64<G: GlobalSymbolOps>(
     }
     if whole_archive {
         for obj in member_objects.drain(..) {
-            let obj_idx = objects.len();
-            register_symbols_elf64(obj_idx, &obj, globals, should_replace_extra)?;
+            register_symbols_elf64(objects, &obj, globals, should_replace_extra)?;
             objects.push(obj);
         }
     } else {
@@ -362,8 +359,7 @@ pub fn load_file_elf64<G: GlobalSymbolOps>(
 
     // Regular ELF object
     let obj = parse_elf64_object(&data, path, expected_machine)?;
-    let obj_idx = objects.len();
-    register_symbols_elf64(obj_idx, &obj, globals, should_replace_extra)?;
+    register_symbols_elf64(objects, &obj, globals, should_replace_extra)?;
     objects.push(obj);
     Ok(())
 }

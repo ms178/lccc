@@ -283,12 +283,15 @@ pub fn resolve_dynamic_symbols_elf64<G: GlobalSymbolOps>(
 
 /// Register symbols from an object file into the global symbol table.
 ///
-/// Handles defined symbols, COMMON symbols, and undefined references.
-/// For defined symbols, a GLOBAL definition replaces a WEAK one.
-/// The `should_replace_extra` callback allows x86's linker to also check
-/// `is_dynamic` when deciding whether to replace an existing symbol.
+/// `prior` holds the objects registered before `obj`, in link order; `obj`
+/// becomes object `prior.len()`. Handles defined symbols, COMMON symbols,
+/// and undefined references. For defined symbols, a GLOBAL definition
+/// replaces a WEAK one. The `should_replace_extra` callback allows x86's
+/// linker to also check `is_dynamic` when deciding whether to replace an
+/// existing symbol. A definition in a discarded COMDAT copy never displaces
+/// another (see `comdat::in_discarded_group`).
 pub fn register_symbols_elf64<G: GlobalSymbolOps>(
-    obj_idx: usize,
+    prior: &[Elf64Object],
     obj: &Elf64Object,
     globals: &mut FxHashMap<String, G>,
     should_replace_extra: fn(existing: &G) -> bool,
@@ -296,6 +299,7 @@ pub fn register_symbols_elf64<G: GlobalSymbolOps>(
     // PERF: pre-size the map for this object's symbols. Growth rehashes the
     // WHOLE table (re-hash every existing key string); with 40k-symbol
     // objects the doubling cascade dominated registration time.
+    let obj_idx = prior.len();
     globals.reserve(obj.symbols.len());
     // PERF: single-lookup registration via get_mut + in-place replacement.
     // The old shape did `globals.get(&name)` followed by
@@ -324,13 +328,20 @@ pub fn register_symbols_elf64<G: GlobalSymbolOps>(
                     // A tentative (COMMON) definition is superseded by any
                     // real definition (GNU ld / mold behavior).
                     let e_common = e.section_idx() == SHN_COMMON;
-                    if !e.is_defined()
-                        || should_replace_extra(e)
-                        || e_common
-                        || (e_weak && sym.is_global())
-                    {
+                    // Only asked where this definition would displace or
+                    // clash with an existing one (see the doc comment).
+                    let discarded_copy =
+                        || super::comdat::in_discarded_group(prior, obj, sym.shndx as usize);
+                    if !e.is_defined() || should_replace_extra(e) {
                         *e = G::new_defined(obj_idx, sym);
-                    } else if sym.is_global() && !e_weak && !e.is_dynamic() && e.is_defined() {
+                    } else if (e_common || (e_weak && sym.is_global())) && !discarded_copy() {
+                        *e = G::new_defined(obj_idx, sym);
+                    } else if sym.is_global()
+                        && !e_weak
+                        && !e.is_dynamic()
+                        && e.is_defined()
+                        && !discarded_copy()
+                    {
                         // Two strong definitions of the same symbol: this is a
                         // hard error in every mainstream linker. Silently keeping
                         // the first definition produces subtly wrong programs.

@@ -478,7 +478,11 @@ without the linker:
   `S + A - P` is applied and the result is patched into the section data.
 
 - **`R_X86_64_PLT32`** -- Same-section, local-symbol targets: resolved
-  identically to PC32.
+  identically to PC32.  A PLT32 against a local symbol in another section is
+  emitted as `R_X86_64_PC32` against the section symbol (a section has no PLT
+  entry; GNU as 2.47 does the same, for implicit branch PLT32 and explicit
+  `@PLT` alike).  Branches assembled under `.code32` use the i386 rule: bare
+  targets are PC32, only `sym@PLT` is PLT32.
 
 - **`R_X86_64_32`** -- Absolute references to local symbols: `S + A` patched
   directly.

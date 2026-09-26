@@ -254,12 +254,21 @@ impl X86Arch for I686Arch {
         // i686 object, we need to keep i686 relocation types (R_386_*) because
         // the object file is still ELF32. The linker (ld -m elf_i386) expects
         // R_386_* relocations.
+        // The x86-64 encoder marks every branch PLT32 and strips `@PLT`; in
+        // an ELF32 object only an explicit `sym@PLT` means R_386_PLT32
+        // (GAS 2.47 `--32`, `.code64`: `call ext` -> R_386_PC32,
+        // `call ext@PLT` -> R_386_PLT32).
+        let explicit_plt = matches!(
+            instr.operands.as_slice(),
+            [Operand::Label(label)] if label.ends_with("@PLT")
+        );
         let relocations = encoder
             .relocations
             .into_iter()
             .map(|r| {
                 // Map x86-64 reloc types to i686 equivalents
                 let reloc_type = match r.reloc_type {
+                    R_X86_64_PLT32 if explicit_plt => R_386_PLT32,
                     R_X86_64_PC32 | R_X86_64_PLT32 => R_386_PC32,
                     R_X86_64_64 | R_X86_64_32 | R_X86_64_32S => R_386_32,
                     other => other,
@@ -381,6 +390,92 @@ mod tests {
             data.windows(6).any(|w| w == b"\xeb\xffHdrS"),
             "PC8 addend patch clobbered bytes after the field"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Contents of section `name` in an ELF32 object (test-only walk).
+    fn section32(obj: &[u8], name: &str) -> Option<Vec<u8>> {
+        let rd32 = |o: usize| u32::from_le_bytes(obj[o..o + 4].try_into().unwrap()) as usize;
+        let rd16 = |o: usize| u16::from_le_bytes(obj[o..o + 2].try_into().unwrap()) as usize;
+        let (shoff, shentsize, shnum, shstrndx) = (rd32(32), rd16(46), rd16(48), rd16(50));
+        let hdr = |i: usize| shoff + i * shentsize;
+        let strtab = rd32(hdr(shstrndx) + 16);
+        (0..shnum).find_map(|i| {
+            let h = hdr(i);
+            let start = strtab + rd32(h);
+            let end = start + obj[start..].iter().position(|&b| b == 0)?;
+            (&obj[start..end] == name.as_bytes())
+                .then(|| obj[rd32(h + 16)..rd32(h + 16) + rd32(h + 20)].to_vec())
+        })
+    }
+
+    /// i386 psABI branch relocations, as GNU as 2.47 writes them: a bare
+    /// target is R_386_PC32, only `sym@PLT` is R_386_PLT32 (an i386 PIC PLT
+    /// entry needs %ebx = GOT, so the assembler must never invent one), a
+    /// `@PLT` against a local folded into its section is PC32, and
+    /// `.code64` code keeps an explicit `@PLT`.
+    #[test]
+    fn branch_relocations_follow_i386_psabi() {
+        let dir = std::env::temp_dir().join(format!(
+            "lccc_i686_plt_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("t")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("b.o");
+        let asm = concat!(
+            ".text\n",
+            "call ext\njmp ext\njne ext\ncall ext@PLT\ncall lcold@PLT\n",
+            ".code64\ncall ext\ncall ext@PLT\n.code32\n",
+            ".section .text.unlikely,\"ax\",@progbits\nlcold: ret\n",
+        );
+        assemble(asm, out.to_str().unwrap()).unwrap();
+        let data = std::fs::read(&out).unwrap();
+        let mut rel: Vec<(u32, u8)> = section32(&data, ".rel.text")
+            .expect(".rel.text present")
+            .chunks_exact(8)
+            .map(|e| {
+                let off = u32::from_le_bytes(e[0..4].try_into().unwrap());
+                (off, e[4])
+            })
+            .collect();
+        rel.sort();
+        // R_386_PC32 = 2, R_386_PLT32 = 4.
+        assert_eq!(
+            rel,
+            [(1, 2), (6, 2), (12, 2), (17, 4), (22, 2), (27, 2), (32, 4)]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 32-bit code in an ELF32 object pads with GNU as's `lea` NOPs, never
+    /// NOPL (absent on i686-class Geode LX / VIA C3), and a gap re-padded
+    /// after relaxation keeps the table of the mode its directive was in
+    /// (the trailing `.code16` must not leak into it). A gap that follows
+    /// data rather than an instruction starts with a lone `nop`, as in GAS
+    /// (bytes checked against GNU as 2.47 `--32`).
+    #[test]
+    fn padding_uses_lea_nops_of_the_directive_mode() {
+        let dir = std::env::temp_dir().join(format!(
+            "lccc_i686_nop_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("t")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("n.o");
+        let text_of = |filler: &str| {
+            let asm = format!(".text\nf:\njmp .Lt\n{filler}.p2align 4\n.Lt:\nret\n.code16\nnop\n");
+            assemble(&asm, out.to_str().unwrap()).unwrap();
+            let data = std::fs::read(&out).unwrap();
+            section32(&data, ".text").expect(".text present")
+        };
+        // jmp relaxes to 2 bytes: 2 + 11 = 13, so a 3-byte gap before .Lt.
+        let after_insn = text_of(&"nop\n".repeat(11));
+        assert_eq!(after_insn[..2], [0xeb, 0x0e]);
+        assert_eq!(after_insn[13..17], [0x8d, 0x76, 0x00, 0xc3]);
+        let after_data = text_of(".byte 0,0,0,0,0,0,0,0,0,0,0\n");
+        assert_eq!(after_data[..2], [0xeb, 0x0e]);
+        assert_eq!(after_data[13..17], [0x90, 0x66, 0x90, 0xc3]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
