@@ -1182,13 +1182,6 @@ fn extend_gep_base_liveness(
                                 break;
                             }
                             indices += 1;
-                            // The same precise read contract as the RA's
-                            // hidden-read walk: the folded access re-reads
-                            // the INDEX's own register, not its Copy-chain
-                            // sources' (a phi-elim pred's register is read
-                            // by its Copy, which the raw walk records).
-                            // The conservative chain walk stays behind
-                            // CCC_HIDDEN_READ_COPY_CHAIN=1.
                             extend_use_following_copies(
                                 idx_id,
                                 block_point,
@@ -1198,7 +1191,6 @@ fn extend_gep_base_liveness(
                                 def_points,
                                 &(block_start_points[bi], block_end_points[bi]),
                                 copy_src,
-                                hidden_read_copy_chain_enabled(),
                                 last_use_points,
                                 block_gen,
                                 folded_read_points,
@@ -1222,7 +1214,6 @@ fn extend_gep_base_liveness(
                             def_points,
                             &(block_start_points[bi], block_end_points[bi]),
                             copy_src,
-                            true,
                             last_use_points,
                             block_gen,
                             folded_read_points,
@@ -1298,12 +1289,6 @@ fn extend_hidden_operand_reads(
                         def_points,
                         &range,
                         copy_src,
-                        // Precise read contract: a folded access re-reads
-                        // the operand's own register, not its Copy-chain
-                        // sources' registers (see the helper's doc). The
-                        // conservative chain walk stays available behind
-                        // CCC_HIDDEN_READ_COPY_CHAIN=1 for bisection.
-                        hidden_read_copy_chain_enabled(),
                         last_use_points,
                         block_gen,
                         read_points,
@@ -1345,32 +1330,7 @@ fn extend_hidden_operand_reads(
     }
 }
 
-/// `CCC_HIDDEN_READ_COPY_CHAIN=1`: restore the conservative Copy-chain walk
-/// for backend-folded operand reads (phi-elim preds extended to the access).
-/// Default OFF — the precise contract extends only the operand itself.
-/// Tests force the mode through the atomic override (edition-2024 makes
-/// `set_var` unsafe in the multithreaded test harness).
-fn hidden_read_copy_chain_enabled() -> bool {
-    let o = HIDDEN_READ_COPY_CHAIN_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
-    if o >= 0 {
-        return o == 1;
-    }
-    std::env::var_os("CCC_HIDDEN_READ_COPY_CHAIN").is_some()
-}
-
-/// Shared tri-state override for [`hidden_read_copy_chain_enabled`]: -1 =
-/// follow the environment, 0/1 = forced precise/conservative (tests).
-static HIDDEN_READ_COPY_CHAIN_OVERRIDE: std::sync::atomic::AtomicI8 =
-    std::sync::atomic::AtomicI8::new(-1);
-
-/// Test-only override for [`hidden_read_copy_chain_enabled`].
-#[cfg(test)]
-fn set_hidden_read_copy_chain_for_tests(follow: bool) {
-    HIDDEN_READ_COPY_CHAIN_OVERRIDE.store(follow as i8, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Extend `start_id` and (when `follow_copies`) every Copy-chain source (all
-/// phi-elim preds) to `point`.
+/// Extend `start_id` and every Copy-chain source (all phi-elim preds) to `point`.
 ///
 /// The `block_gen` insertion — which keeps the value live at the consuming
 /// block's ENTRY so liveness propagates through intermediate blocks — is
@@ -1381,21 +1341,6 @@ fn set_hidden_read_copy_chain_for_tests(follow: bool) {
 /// masqueraded as register pressure and blocked homes for values whose real
 /// ranges are a few instructions (vsprintf number()'s `num % base` digit
 /// index measured [0..22] instead of [12..15]).
-///
-/// `follow_copies = false` models the PRECISE read contract of backend-folded
-/// operand accesses: the access re-reads the OPERAND's own register. A
-/// Copy-chain source's register is read by the COPY ITSELF (an ordinary IR
-/// instruction whose liveness the raw walk already records), never by the
-/// folded access — after the copy the operand's home carries the value. The
-/// one exception is a coalesced copy (source and operand share a home): the
-/// web then covers `[source def .. copy] ∪ [copy .. access]`, two ADJACENT
-/// ranges with no hole between them, so per-value segments already keep any
-/// third value out of the shared home across the whole span. Following the
-/// chain anyway pins every phi-elim pred of a loop-carried folded index live
-/// through the entire loop body (block_gen at the consumer block + backward
-/// dataflow around the backedge), which forced sqlite_varint's reversal-loop
-/// initializer into a callee-saved home (+1 push, +1 copy) and cost
-/// expat_xml_scan/stencil5 their spill counts.
 #[expect(clippy::too_many_arguments)]
 fn extend_use_following_copies(
     start_id: u32,
@@ -1406,7 +1351,6 @@ fn extend_use_following_copies(
     def_points: &[u32],
     block_range: &(u32, u32),
     copy_src: &FxHashMap<u32, Vec<u32>>,
-    follow_copies: bool,
     last_use_points: &mut [u32],
     block_gen: &mut [BitSet],
     read_points: &mut FxHashMap<u32, Vec<u32>>,
@@ -1441,12 +1385,10 @@ fn extend_use_following_copies(
                 block_gen[block_idx].insert(dense);
             }
         }
-        if follow_copies {
-            if let Some(srcs) = copy_src.get(&id) {
-                for &src in srcs {
-                    if src != id {
-                        stack.push(src);
-                    }
+        if let Some(srcs) = copy_src.get(&id) {
+            for &src in srcs {
+                if src != id {
+                    stack.push(src);
                 }
             }
         }
@@ -2409,193 +2351,6 @@ mod tests {
             is_const: false,
             ret_eightbyte_classes: Vec::new(),
         }
-    }
-
-    /// The precise Copy-web contract (sqlite_varint's reversal loop): a
-    /// folded access re-reads the LOOP-CARRIED PHI's own register at the
-    /// access, and NOTHING ELSE. The phi-elim entry Copy `v112 = Copy(v163)`
-    /// is an ordinary IR instruction: v163's register is read by the COPY,
-    /// not by the access, so v163 must NOT be live past the copy. The
-    /// pre-PR-precise semantics extended every copy-chain source to the
-    /// access point — pinning v163 through the whole loop body (block_gen at
-    /// the consumer block + backward dataflow around the backedge), which
-    /// forced the initializer into a callee-saved home (+1 push, +1 copy,
-    /// sqlite_varint pushes 7->8) and cost expat_xml_scan/stencil5 their
-    /// spill counts. The phi dests themselves (v111, v112) MUST stay live to
-    /// the accesses — the SIB load/store re-reads their registers there.
-    #[test]
-    fn hidden_read_does_not_pin_phi_elim_entry_pred_through_the_loop() {
-        use crate::common::types::AddressSpace;
-        let load = |dest: u32, ptr: u32, ty: IrType| Instruction::Load {
-            dest: Value(dest),
-            ptr: Value(ptr),
-            ty,
-            seg_override: AddressSpace::Default,
-            volatile: false,
-        };
-        let mut func = IrFunction::new("varint".to_string(), IrType::I32, vec![], false);
-        // Preheader: the widened initializer v163 (the movslq result) and
-        // the two loop phis' entry definitions (phi-elim Copies).
-        func.blocks.push(BasicBlock {
-            label: BlockId(0),
-            instructions: vec![
-                Instruction::BinOp {
-                    dest: Value(0),
-                    op: IrBinOp::Add,
-                    lhs: Operand::Const(IrConst::I64(4096)),
-                    rhs: Operand::Const(IrConst::I64(8)),
-                    ty: IrType::I64,
-                },
-                Instruction::Cast {
-                    dest: Value(3),
-                    src: Operand::Value(Value(0)),
-                    from_ty: IrType::I32,
-                    to_ty: IrType::I64,
-                },
-                Instruction::Copy {
-                    dest: Value(4),
-                    src: Operand::Const(IrConst::I64(0)),
-                },
-                Instruction::Copy {
-                    dest: Value(5),
-                    src: Operand::Value(Value(3)),
-                },
-            ],
-            terminator: Terminator::Branch(BlockId(1)),
-            source_spans: Vec::new(),
-        });
-        // Loop body: folded GEPs (indices = the phis v4/v5), the accesses,
-        // the decrements, and the latch Copies.
-        func.blocks.push(BasicBlock {
-            label: BlockId(1),
-            instructions: vec![
-                Instruction::GetElementPtr {
-                    dest: Value(6),
-                    base: Value(0),
-                    offset: Operand::Value(Value(4)),
-                    ty: IrType::Ptr,
-                },
-                load(7, 6, IrType::U8),
-                Instruction::GetElementPtr {
-                    dest: Value(8),
-                    base: Value(0),
-                    offset: Operand::Value(Value(5)),
-                    ty: IrType::Ptr,
-                },
-                Instruction::Store {
-                    val: Operand::Value(Value(7)),
-                    ptr: Value(8),
-                    ty: IrType::U8,
-                    seg_override: AddressSpace::Default,
-                    volatile: false,
-                },
-                Instruction::BinOp {
-                    dest: Value(9),
-                    op: IrBinOp::Sub,
-                    lhs: Operand::Value(Value(5)),
-                    rhs: Operand::Const(IrConst::I64(1)),
-                    ty: IrType::I64,
-                },
-                Instruction::BinOp {
-                    dest: Value(10),
-                    op: IrBinOp::Add,
-                    lhs: Operand::Value(Value(4)),
-                    rhs: Operand::Const(IrConst::I64(1)),
-                    ty: IrType::I64,
-                },
-                Instruction::Copy {
-                    dest: Value(4),
-                    src: Operand::Value(Value(10)),
-                },
-                Instruction::Copy {
-                    dest: Value(5),
-                    src: Operand::Value(Value(9)),
-                },
-                Instruction::Cmp {
-                    dest: Value(11),
-                    op: crate::ir::reexports::IrCmpOp::Sgt,
-                    lhs: Operand::Value(Value(5)),
-                    rhs: Operand::Const(IrConst::I64(0)),
-                    ty: IrType::I64,
-                },
-            ],
-            terminator: Terminator::CondBranch {
-                cond: Operand::Value(Value(11)),
-                true_label: BlockId(1),
-                false_label: BlockId(2),
-            },
-            source_spans: Vec::new(),
-        });
-        func.blocks.push(BasicBlock {
-            label: BlockId(2),
-            instructions: vec![],
-            terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
-            source_spans: Vec::new(),
-        });
-        func.next_value_id = 12;
-
-        let mut hidden: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
-        hidden.insert(4, vec![6]);
-        hidden.insert(5, vec![8]);
-        let r = compute_live_intervals_with_hidden_reads(&func, &hidden);
-        let covers = |r: &LivenessResult, v: u32, p: u32| {
-            r.segments
-                .iter()
-                .any(|s| s.value_id == v && s.start <= p && p <= s.end)
-        };
-        // Points: B0 0..=4 (term), B1 5..=14 (term), B2 15.
-        // GEP v6 at 5, its Load (the access) at 6; GEP v8 at 7, its Store
-        // (the access) at 8; latch Copies at 12/13.
-        // The phi dests stay live to the accesses (soundness of the fold).
-        for p in 5..=6 {
-            assert!(covers(&r, 4, p), "up-counter phi v4 must be live at {p}");
-        }
-        for p in 5..=8 {
-            assert!(covers(&r, 5, p), "down-counter phi v5 must be live at {p}");
-        }
-        // The folded read points feed the phi-coalesce veto.
-        assert!(
-            r.folded_read_points
-                .get(&4)
-                .is_some_and(|pts| pts.contains(&6))
-        );
-        assert!(
-            r.folded_read_points
-                .get(&5)
-                .is_some_and(|pts| pts.contains(&8))
-        );
-        // THE REGRESSION: the entry pred v163 (v3) must die at the entry
-        // Copy (point 3), NOT be pinned through the loop body to the access
-        // (point 8) — its register is read by the Copy, not by the access.
-        assert!(
-            !covers(&r, 3, 8),
-            "entry pred v3 must not be live at the folded access"
-        );
-        assert!(
-            !covers(&r, 3, 6),
-            "entry pred v3 must not be live inside the loop body"
-        );
-        // ...but its normal IR liveness to the Copy is intact.
-        assert!(covers(&r, 3, 3));
-        // The latch sources die at their Copies (their registers are read
-        // there), not at the next iteration's accesses.
-        assert!(
-            !covers(&r, 9, 6),
-            "latch source v9 must not wrap to the load"
-        );
-        assert!(
-            !covers(&r, 10, 6),
-            "latch source v10 must not wrap to the load"
-        );
-        // The conservative chain walk (bisection knob) still pins the pred:
-        // the model difference is statable, not accidental.
-        set_hidden_read_copy_chain_for_tests(true);
-        let conservative = compute_live_intervals_with_hidden_reads(&func, &hidden);
-        set_hidden_read_copy_chain_for_tests(false);
-        assert!(
-            covers(&conservative, 3, 8),
-            "conservative chain walk pins the entry pred at the access"
-        );
     }
 
     /// LCCC-SQLITE-WPS shape: the SIB fold peels `aLoop[nLoop-1]` down to the

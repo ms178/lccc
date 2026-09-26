@@ -554,15 +554,7 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
             if sb[3] == b' ' {
                 // `jmp label` or `jmp __x86_indirect_thunk_rax` or `jmp *%reg`
                 if s.contains("indirect_thunk") {
-                    // The thunk reads the suffix register through the symbol
-                    // name — decode it into the line's reg_refs so every
-                    // reg_refs consumer (FileLiveness, dead-write scans,
-                    // relay gates) sees the same instruction the CPU does.
-                    return line_info_with_regs(
-                        LineKind::JmpIndirect,
-                        ts,
-                        scan_register_refs(sb) | indirect_thunk_refs(s),
-                    );
+                    return line_info_with_regs(LineKind::JmpIndirect, ts, scan_register_refs(sb));
                 }
                 // `jmp *%rcx` / `jmp *%rax` – indirect jump through register
                 if sb.len() > 4 && sb[4] == b'*' {
@@ -582,15 +574,7 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
 
     if first == b'c' {
         if sb.len() >= 4 && sb[1] == b'a' && sb[2] == b'l' && sb[3] == b'l' {
-            // `call __x86_indirect_thunk_<reg>` (thunk-extern retpoline):
-            // the callee reads the register named by the symbol suffix, not
-            // by any %-token of this line.
-            let extra = if s.contains("__x86_indirect_thunk_") {
-                indirect_thunk_refs(s)
-            } else {
-                0
-            };
-            return line_info_with_regs(LineKind::Call, ts, scan_register_refs(sb) | extra);
+            return line_info_with_regs(LineKind::Call, ts, scan_register_refs(sb));
         }
         // Compare: cmpX
         if sb.len() >= 5 && sb[1] == b'm' && sb[2] == b'p' {
@@ -1773,61 +1757,6 @@ pub(super) const REG_NAMES: [[&str; 16]; 4] = [
         "%r11b", "%r12b", "%r13b", "%r14b", "%r15b",
     ],
 ];
-
-/// The GP family a kernel retpoline thunk name encodes in its suffix.
-///
-/// `__x86_indirect_thunk_<reg>` (thunk-extern retpoline, objtool --retpoline
-/// ABI) reads EXACTLY the register named by the suffix — a read invisible to
-/// %-token scanning because the register appears inside a SYMBOL name.
-/// The kernel emits one thunk per register (`_rax`..`_rdi`, `_r8`..`_r15`),
-/// always by the bare 64-bit name. `None` for any other spelling: the caller
-/// must stay fail-closed (the historical model read `%r10` for every thunk).
-pub(super) fn indirect_thunk_family(name: &str) -> Option<u8> {
-    Some(match name {
-        "rax" => 0,
-        "rcx" => 1,
-        "rdx" => 2,
-        "rbx" => 3,
-        "rsp" => 4,
-        "rbp" => 5,
-        "rsi" => 6,
-        "rdi" => 7,
-        "r8" => 8,
-        "r9" => 9,
-        "r10" => 10,
-        "r11" => 11,
-        "r12" => 12,
-        "r13" => 13,
-        "r14" => 14,
-        "r15" => 15,
-        _ => return None,
-    })
-}
-
-/// Families named by a `__x86_indirect_thunk_<reg>` token inside `s`, for
-/// `call`/`jmp` lines whose target register is read through the thunk
-/// symbol. Returns 0 when `s` names no thunk.
-pub(super) fn indirect_thunk_refs(s: &str) -> u16 {
-    let mut refs = 0u16;
-    let mut rest = s;
-    while let Some(pos) = rest.find("__x86_indirect_thunk_") {
-        rest = &rest[pos + "__x86_indirect_thunk_".len()..];
-        let name: &str = rest
-            .split(|c: char| c.is_whitespace() || c == ',')
-            .next()
-            .unwrap_or("");
-        match indirect_thunk_family(name) {
-            Some(f) => refs |= 1u16 << f,
-            None => {
-                // Unrecognised thunk: fail-closed, model the historical
-                // %r10 read (the register the call-site lowering stages
-                // indirect targets in).
-                refs |= 1 << 10;
-            }
-        }
-    }
-    refs
-}
 
 /// Scan assembly line bytes for register references and return a bitmask.
 /// Bit N set means register family N is referenced somewhere in the line.
