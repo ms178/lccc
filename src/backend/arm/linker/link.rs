@@ -40,7 +40,7 @@ pub fn link_builtin(
             object_files, output_path, user_args, is_static
         );
     }
-    let mut objects: Vec<ElfObject> = Vec::new();
+    let mut objects = linker_common::ObjectSet::new();
     let mut globals: FxHashMap<String, GlobalSymbol> = FxHashMap::default();
     let mut needed_sonames: Vec<String> = Vec::new();
 
@@ -382,7 +382,7 @@ pub fn link_shared(
     user_args: &[String],
     lib_paths: &[&str],
 ) -> Result<(), String> {
-    let mut objects: Vec<ElfObject> = Vec::new();
+    let mut objects = linker_common::ObjectSet::new();
     let mut globals: FxHashMap<String, GlobalSymbol> = FxHashMap::default();
     let mut needed_sonames: Vec<String> = Vec::new();
     let lib_path_strings: Vec<String> = lib_paths.iter().map(|s| s.to_string()).collect();

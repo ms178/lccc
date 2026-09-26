@@ -306,6 +306,9 @@ impl I686Codegen {
                 self.state.emit("    movl 8(%esi), %ecx");
                 self.state.emit("    movl 0(%esi), %eax");
                 self.state.emit("    call *%ebx");
+                // The target's own convention decides what it pops; the
+                // `leal` below re-derives %esp from %ebp either way.
+                self.state.record_call_pop(None, None);
                 // Discard the staging region and return %esp to the tracked
                 // position: baseline + entry-esp_adjust + the three pushes.
                 emit!(

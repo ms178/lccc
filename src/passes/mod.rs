@@ -58,6 +58,7 @@ pub(crate) mod outline_switch;
 pub(crate) mod quadratic_sr;
 pub(crate) mod range_check;
 pub(crate) mod reassoc_accum;
+pub(crate) mod reassoc_latency;
 pub(crate) mod recursion_to_iter;
 pub(crate) mod redundant_loads;
 mod resolve_asm;
@@ -2776,6 +2777,20 @@ pub(crate) fn run_passes(
     // passes are function-local transforms with no reachability dependence,
     // so nothing between the old and new positions observes the move.
     dead_statics::eliminate_dead_static_functions(module);
+
+    // Phase 11g: Latency-driven reassociation of associative integer trees
+    // inside loops (see reassoc_latency.rs): the operands of a single-use
+    // Add/And/Or/Xor tree are recombined in order of availability, so the
+    // loop-carried operand is added last (SHA-256's t1: 8 -> 5 ops on the
+    // e->e recurrence). ORDER: after every range/overflow-reasoning pass
+    // (IV widening, CVP, SCCP) -- the soundness argument for signed sums --
+    // and after the unroller and vectorizers, whose matchers expect source
+    // shape; before the FMA peel, which stays the last IR transform. Pass
+    // name for CCC_DISABLE_PASSES: "reassoc_lat".
+    if !pass_disabled(&disabled, "reassoc_lat") {
+        module.for_each_function(reassoc_latency::run_function);
+        verify::verify_after_pass(module, "reassoc_lat");
+    }
 
     // Phase 11f: FMA operand-negation peel. LAST IR transform: after every
     // vectorizer (their SLP matchers must not see the Signed variants) and

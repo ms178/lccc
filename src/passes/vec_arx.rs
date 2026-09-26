@@ -32,6 +32,28 @@
 //! SSE2 single-block ChaCha20 shuffle trick (6 `pshufd` per double round),
 //! derived here mechanically from the slot pattern instead of hard-coded.
 //!
+//! # Lane frames are chosen for latency, not op count
+//!
+//! Which role gets shuffled is a free choice: lane `l` of a chunk may
+//! compute statement `(l + s) % 4` for any shift `s`, as long as every
+//! chunk linked by a direct op→op edge uses the same `s` (those values
+//! never pass through a slot, so they cannot be realigned).  Values that
+//! cross a slot are realigned exactly by `rotated`, whatever the frames.
+//! So each op→op component picks its own `s`, and the choice matters: a
+//! round loop is a serial recurrence (ChaCha's blocks even chain through
+//! the feed-forward), so its speed is the critical-path latency, not the
+//! op count.  Statement 0's frame (`s = 0`) shuffles the diagonal round's
+//! `b` role, and `b = rotl(b, 7)` feeds `a += b` immediately, putting two
+//! `pshufd` per double round on the critical path (30 cycles vs 28).
+//! Anchoring on `b` instead shuffles `a`, `c` and `d`, which all have
+//! slack there.  Rather than hard-coding that cipher fact, the emitter
+//! simulates the four shifts of each component, in program order, and
+//! keeps the one whose results are ready earliest (ties: fewer emitted
+//! instructions, then `s = 0`, so frame-insensitive kernels are
+//! unchanged).  Latencies: every emitted op is 1 cycle except the
+//! shift-pair rotate (2; 1 with AVX-512VL `vprold`), uniform across Zen
+//! 3/4/5 and Intel P-cores.  `scripts/loop_latency.py` checks the result.
+//!
 //! # Soundness model (fail-closed everywhere)
 //!
 //! * The body block must consist ONLY of: constant GEPs on the one state
@@ -547,7 +569,9 @@ fn args_isomorphic(a: &Arg, b: &Arg, k: usize) -> bool {
     }
 }
 
-/// Emission context.
+/// Emission context.  `Clone` so the lane-frame choice can simulate each
+/// candidate shift on a scratch copy before emitting for real.
+#[derive(Clone)]
 struct Emitter {
     /// op index → chunk result value.
     op_result: Vec<Value>,
@@ -562,6 +586,15 @@ struct Emitter {
     rot_masks: FxHashMap<i64, Value>,
     out: Vec<Instruction>,
     next_val: u32,
+    /// Lane shift of the chunk being emitted: lane `l` computes statement
+    /// `(l + shift) % 4` (see "Lane frames are chosen for latency").
+    shift: u8,
+    /// Value id → cycle its result is ready, with the loop-entry state
+    /// ready at 0 (the latency model of the frame choice).
+    ready: FxHashMap<u32, u32>,
+    /// Latency of a non-byte-multiple rotate: 2 for the AVX2 shift pair
+    /// (`vpslld`/`vpsrld` in parallel, then `vpor`), 1 for `vprold`.
+    rot_latency: u32,
 }
 
 /// The 4-per-dword pshufb mask for a left rotation by `k` whole bytes
@@ -590,6 +623,10 @@ impl Emitter {
         v
     }
 
+    fn ready_of(&self, v: Value) -> u32 {
+        self.ready.get(&v.0).copied().unwrap_or(0)
+    }
+
     /// `src` (materialized at rotation `src_rot`) rotated so lane `l`
     /// reads slot `4g + (read_lane + l) % 4`.
     fn rotated(&mut self, src: Value, src_rot: u8, read_lane: u8) -> Value {
@@ -611,7 +648,91 @@ impl Emitter {
             ],
         });
         self.rot_cache.insert((src.0, src_rot, read_lane), dest);
+        let lat = arx_vec_op_latency(IntrinsicOp::VecShufdI32x4, self.rot_latency);
+        self.ready.insert(dest.0, self.ready_of(src) + lat);
         dest
+    }
+
+    /// Emit one chunk (four isomorphic statements) as one vector op in the
+    /// current lane frame.  `None` = the chunk cannot be expressed (the
+    /// caller declines the whole loop).
+    fn emit_chunk(
+        &mut self,
+        body: &Body,
+        chunk: &Chunk,
+        entry: &[Value],
+        nslots: u8,
+    ) -> Option<Value> {
+        let op0 = &body.ops[chunk.op_indices[0]];
+        let is_rot = op0.op == IrBinOp::RotateLeft;
+        let a = self.resolve_arg(&op0.a, entry, nslots)?;
+        // A rotate's `b` is the constant AMOUNT (extract_body enforces
+        // 1..=31), never a vector operand; `resolve_arg` refuses Const
+        // args by design, so it must not be consulted for it.
+        let b = if is_rot {
+            None
+        } else {
+            Some(self.resolve_arg(&op0.b, entry, nslots)?)
+        };
+        let operand_values: Vec<Value> = std::iter::once(a).chain(b).collect();
+        let dest = self.fresh();
+        // Whole-byte rotate with a materialised mask: one vpshufb
+        // (args = [data, mask]) instead of the shift triple.
+        let shufb_mask = if is_rot {
+            match &op0.b {
+                Arg::Const(c) => self.rot_masks.get(&c.to_i64()?).copied(),
+                _ => return None,
+            }
+        } else {
+            None
+        };
+        let intrinsic_op = match op0.op {
+            IrBinOp::Add => IntrinsicOp::VecAddI32x4,
+            IrBinOp::Xor => IntrinsicOp::VecXorI32x4,
+            IrBinOp::RotateLeft => {
+                if shufb_mask.is_some() {
+                    IntrinsicOp::VecShufbI32x4
+                } else {
+                    IntrinsicOp::VecRotlI32x4
+                }
+            }
+            _ => return None,
+        };
+        let mut args = vec![Operand::Value(a)];
+        if let Some(mask_v) = shufb_mask {
+            args.push(Operand::Value(mask_v));
+        } else if is_rot {
+            if let Arg::Const(c) = &op0.b {
+                args.push(Operand::Const(c.clone()));
+            } else {
+                return None;
+            }
+        } else {
+            args.push(Operand::Value(b.expect("non-rotate has vector b")));
+        }
+        self.out.push(Instruction::Intrinsic {
+            dest: Some(dest),
+            op: intrinsic_op,
+            dest_ptr: None,
+            args,
+        });
+        let lat = arx_vec_op_latency(intrinsic_op, self.rot_latency);
+        let ready = operand_values
+            .iter()
+            .map(|&v| self.ready_of(v))
+            .max()
+            .unwrap_or(0)
+            + lat;
+        self.ready.insert(dest.0, ready);
+        for &m in &chunk.op_indices {
+            self.op_result[m] = dest;
+        }
+        if let Some(s) = chunk.store {
+            let g = (s / 4) as usize;
+            let rot = (s % 4 + self.shift) % 4;
+            self.group_writes[g].push((dest, rot));
+        }
+        Some(dest)
     }
 
     /// Resolve an operand of statement 0 of a chunk to a vector value.
@@ -619,7 +740,7 @@ impl Emitter {
         match arg {
             Arg::Slot { slot, version } => {
                 let g = (*slot / 4) as usize;
-                let read_lane = slot % 4;
+                let read_lane = (slot % 4 + self.shift) % 4;
                 if *version == 0 {
                     let src = entry.get(g).copied()?;
                     Some(self.rotated(src, 0, read_lane))
@@ -634,6 +755,152 @@ impl Emitter {
             Arg::Const(_) => None,
         }
     }
+}
+
+/// Latency (cycles) of a non-byte-multiple lane rotate as the x86 backend
+/// lowers `VecRotlI32x4`: AVX-512VL `vprold` is one µop; otherwise the
+/// shift pair runs in parallel and `vpor` joins it, 2 cycles.
+pub(crate) fn arx_rot_latency() -> u32 {
+    if crate::passes::vectorize::x86_avx512vl_available_pub() {
+        1
+    } else {
+        2
+    }
+}
+
+/// The ARX lane-vectorizers' latency model, shared by `vec_arx` and
+/// `arx_vectorize` so both passes rank schedules by the same numbers.
+/// Every op they emit is a 1-cycle vector-integer µop on Zen 3/4/5 and on
+/// Intel P-cores (add, xor, pshufb, pshufd), except the rotate.
+pub(crate) fn arx_vec_op_latency(op: IntrinsicOp, rot_latency: u32) -> u32 {
+    match op {
+        IntrinsicOp::VecRotlI32x4 => rot_latency,
+        _ => 1,
+    }
+}
+
+/// Critical-path length of a straight-line kernel under
+/// `arx_vec_op_latency`, with every value defined outside it (loop phis,
+/// preheader masks) ready at cycle 0.  For a round-loop body this is the
+/// loop-carried recurrence per iteration: every result feeds the next
+/// iteration's phis.
+pub(crate) fn kernel_critical_path(insts: &[Instruction], rot_latency: u32) -> u32 {
+    let mut ready: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut finish = 0;
+    for inst in insts {
+        if let Instruction::Intrinsic {
+            dest: Some(d),
+            op,
+            args,
+            ..
+        } = inst
+        {
+            let start = args
+                .iter()
+                .filter_map(|a| match a {
+                    Operand::Value(v) => ready.get(&v.0).copied(),
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(0);
+            let t = start + arx_vec_op_latency(*op, rot_latency);
+            ready.insert(d.0, t);
+            finish = finish.max(t);
+        }
+    }
+    finish
+}
+
+/// Partition the chunks into op→op components: chunks linked by an
+/// `Arg::Op` operand exchange values without passing through a slot, so
+/// they must share one lane frame.  Returns a dense component id per chunk.
+fn chunk_components(body: &Body, chunks: &[Chunk]) -> Vec<usize> {
+    let mut op_chunk = vec![usize::MAX; body.ops.len()];
+    for (ci, ch) in chunks.iter().enumerate() {
+        for &m in &ch.op_indices {
+            op_chunk[m] = ci;
+        }
+    }
+    fn find(parent: &mut [usize], x: usize) -> usize {
+        let mut root = x;
+        while parent[root] != root {
+            root = parent[root];
+        }
+        let mut y = x;
+        while parent[y] != root {
+            let next = parent[y];
+            parent[y] = root;
+            y = next;
+        }
+        root
+    }
+    let mut parent: Vec<usize> = (0..chunks.len()).collect();
+    for (ci, ch) in chunks.iter().enumerate() {
+        // Isomorphism makes every lane's Op operand land in the same chunk,
+        // so statement 0 is representative.
+        let op0 = &body.ops[ch.op_indices[0]];
+        for arg in [&op0.a, &op0.b] {
+            if let Arg::Op { index } = arg {
+                let cj = op_chunk[*index];
+                if cj != usize::MAX {
+                    let (ra, rb) = (find(&mut parent, ci), find(&mut parent, cj));
+                    parent[ra] = rb;
+                }
+            }
+        }
+    }
+    let mut dense: FxHashMap<usize, usize> = FxHashMap::default();
+    (0..chunks.len())
+        .map(|ci| {
+            let root = find(&mut parent, ci);
+            let next = dense.len();
+            *dense.entry(root).or_insert(next)
+        })
+        .collect()
+}
+
+/// Choose the lane shift of the component whose first chunk is `first`:
+/// simulate each shift on a scratch emitter through the component's last
+/// chunk (later, still-undecided components provisionally use shift 0) and
+/// keep the one whose results are ready earliest; ties prefer fewer emitted
+/// instructions, then the smaller shift (s = 0 is the historical frame).
+#[allow(clippy::too_many_arguments)]
+fn choose_lane_shift(
+    base: &Emitter,
+    body: &Body,
+    chunks: &[Chunk],
+    comp: &[usize],
+    comp_shift: &[Option<u8>],
+    first: usize,
+    entry: &[Value],
+    nslots: u8,
+) -> Option<u8> {
+    let c = comp[first];
+    let last = (first..chunks.len()).rev().find(|&i| comp[i] == c)?;
+    let mut best: Option<(u32, usize, u8)> = None;
+    for s in 0..LANES as u8 {
+        let mut e = base.clone();
+        let mut finish = 0;
+        for i in first..=last {
+            e.shift = if comp[i] == c {
+                s
+            } else {
+                comp_shift[comp[i]].unwrap_or(0)
+            };
+            let v = e.emit_chunk(body, &chunks[i], entry, nslots)?;
+            if comp[i] == c {
+                finish = finish.max(e.ready_of(v));
+            }
+        }
+        let better = match best {
+            None => true,
+            Some((bf, bn, _)) => (finish, e.out.len()) < (bf, bn),
+        };
+        if better {
+            best = Some((finish, e.out.len(), s));
+        }
+    }
+    best.map(|(_, _, s)| s)
 }
 
 /// Public entry: transform one function. Returns the number of scalar ARX
@@ -937,76 +1204,35 @@ fn try_transform_loop(
         rot_masks,
         out: Vec::new(),
         next_val,
+        shift: 0,
+        ready: FxHashMap::default(),
+        rot_latency: arx_rot_latency(),
     };
-    for chunk in &chunks {
-        let op0 = &body.ops[chunk.op_indices[0]];
-        let is_rot = op0.op == IrBinOp::RotateLeft;
-        let a = match emitter.resolve_arg(&op0.a, &v_phi, nslots) {
-            Some(v) => v,
-            None => return 0,
-        };
-        // A rotate's `b` is the constant AMOUNT (extract_body enforces
-        // 1..=31), never a vector operand; `resolve_arg` refuses Const
-        // args by design, so it must not be consulted for it.
-        let b = if is_rot {
-            None
-        } else {
-            match emitter.resolve_arg(&op0.b, &v_phi, nslots) {
-                Some(v) => Some(v),
-                None => return 0,
+    let comp = chunk_components(&body, &chunks);
+    let mut comp_shift: Vec<Option<u8>> = vec![None; comp.iter().max().map_or(0, |&c| c + 1)];
+    for (ci, chunk) in chunks.iter().enumerate() {
+        let shift = match comp_shift[comp[ci]] {
+            Some(s) => s,
+            None => {
+                let Some(s) = choose_lane_shift(
+                    &emitter,
+                    &body,
+                    &chunks,
+                    &comp,
+                    &comp_shift,
+                    ci,
+                    &v_phi,
+                    nslots,
+                ) else {
+                    return 0;
+                };
+                comp_shift[comp[ci]] = Some(s);
+                s
             }
         };
-        let dest = emitter.fresh();
-        // Whole-byte rotate with a materialised mask: one vpshufb
-        // (args = [data, mask]) instead of the shift triple.
-        let shufb_mask = if is_rot {
-            match &op0.b {
-                Arg::Const(c) => match c.to_i64() {
-                    Some(n) => emitter.rot_masks.get(&n).copied(),
-                    None => return 0,
-                },
-                _ => return 0,
-            }
-        } else {
-            None
-        };
-        let intrinsic_op = match op0.op {
-            IrBinOp::Add => IntrinsicOp::VecAddI32x4,
-            IrBinOp::Xor => IntrinsicOp::VecXorI32x4,
-            IrBinOp::RotateLeft => {
-                if shufb_mask.is_some() {
-                    IntrinsicOp::VecShufbI32x4
-                } else {
-                    IntrinsicOp::VecRotlI32x4
-                }
-            }
-            _ => return 0,
-        };
-        let mut args = vec![Operand::Value(a)];
-        if let Some(mask_v) = shufb_mask {
-            args.push(Operand::Value(mask_v));
-        } else if is_rot {
-            if let Arg::Const(c) = &op0.b {
-                args.push(Operand::Const(c.clone()));
-            } else {
-                return 0;
-            }
-        } else {
-            args.push(Operand::Value(b.expect("non-rotate has vector b")));
-        }
-        emitter.out.push(Instruction::Intrinsic {
-            dest: Some(dest),
-            op: intrinsic_op,
-            dest_ptr: None,
-            args,
-        });
-        for &m in &chunk.op_indices {
-            emitter.op_result[m] = dest;
-        }
-        if let Some(s) = chunk.store {
-            let g = (s / 4) as usize;
-            let rot = s % 4;
-            emitter.group_writes[g].push((dest, rot));
+        emitter.shift = shift;
+        if emitter.emit_chunk(&body, chunk, &v_phi, nslots).is_none() {
+            return 0;
         }
     }
 
@@ -1307,6 +1533,40 @@ mod tests {
         assert_eq!(pshufd_imm(3), 0x93);
         assert_eq!(pshufd_imm(0), 0xE4);
         assert_eq!(pshufd_imm(4), 0xE4);
+    }
+
+    #[test]
+    fn kernel_critical_path_is_the_longest_latency_chain() {
+        let v = |n: u32| Operand::Value(Value(n));
+        let op = |dest: u32, op: IntrinsicOp, args: Vec<Operand>| Instruction::Intrinsic {
+            dest: Some(Value(dest)),
+            op,
+            dest_ptr: None,
+            args,
+        };
+        // Values 1 and 2 are loop-entry state (ready at 0).
+        // 10 = 1 + 2; 11 = rotl(10, 7); 12 = pshufd(11); 13 = 12 ^ 1
+        // (the long chain), plus a short side chain 14 = 1 ^ 2.
+        let kernel = vec![
+            op(10, IntrinsicOp::VecAddI32x4, vec![v(1), v(2)]),
+            op(
+                11,
+                IntrinsicOp::VecRotlI32x4,
+                vec![v(10), Operand::Const(IrConst::I32(7))],
+            ),
+            op(
+                12,
+                IntrinsicOp::VecShufdI32x4,
+                vec![v(11), Operand::Const(IrConst::I32(0x39))],
+            ),
+            op(13, IntrinsicOp::VecXorI32x4, vec![v(12), v(1)]),
+            op(14, IntrinsicOp::VecXorI32x4, vec![v(1), v(2)]),
+        ];
+        // Shift-pair rotate (2 cycles): 1 + 2 + 1 + 1.
+        assert_eq!(kernel_critical_path(&kernel, 2), 5);
+        // vprold (1 cycle): 1 + 1 + 1 + 1.
+        assert_eq!(kernel_critical_path(&kernel, 1), 4);
+        assert_eq!(kernel_critical_path(&[], 2), 0);
     }
 
     #[test]

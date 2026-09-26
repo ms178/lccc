@@ -21,6 +21,10 @@
 #
 # Usage:  ./lccc-snapshot.sh "<slug>" "<one-line description>"
 # Env:    LCCC_REPO, LCCC_ARTIFACTS, LCCC_DELIVERABLE
+#         LCCC_CI_STAMP — ci_local.sh pass stamp (default target/ci_local.pass);
+#                         the snapshot refuses a tree without a matching one.
+#         LCCC_SNAPSHOT_UNGATED=1 — emergency pre-wipe save without that proof
+#                         (ledger ci_gate=UNGATED; never a delivery candidate).
 #         LCCC_BASE_REF — explicit upstream base for a rebase/new session.
 #                         When set, it atomically supersedes artifacts/.base_ref
 #                         after ancestry validation.
@@ -180,6 +184,41 @@ MSG
   return 0
 }
 
+# ---- CI-mirror gate -----------------------------------------------------------
+# A snapshot is a delivery candidate, so it must carry proof that EXACTLY this
+# tree passed the local CI mirror (S20 shipped a red CI because ci_local.sh was
+# skipped). ci_local.sh writes the git tree hash of the worktree it tested --
+# re-checked at the end, so an edit during the run voids it -- and we compare
+# it with the tree `git add -A` is about to commit. Running the 30+ minute
+# mirror here instead would defeat the point of a fast, wipe-resistant
+# autosave. LCCC_SNAPSHOT_UNGATED=1 exists for emergency pre-wipe saves only
+# and is recorded as such in the ledger.
+CI_STAMP=${LCCC_CI_STAMP:-$REPO/target/ci_local.pass}
+tree_now=$(bash "$REPO/scripts/worktree_tree.sh" "$REPO") ||
+  { echo "unable to hash the worktree" >&2; exit 1; }
+# Read only an existing stamp: under `set -euo pipefail` a failing sed in the
+# substitution would abort the script without the explanation below.
+stamp_tree='' stamp_mode=''
+if [[ -r $CI_STAMP ]]; then
+  stamp_tree=$(sed -n 's/^tree=//p' "$CI_STAMP" | head -1)
+  stamp_mode=$(sed -n 's/^mode=//p' "$CI_STAMP" | head -1)
+fi
+if [[ -n $stamp_tree && $stamp_tree == "$tree_now" ]]; then
+  ci_gate="ci_local-${stamp_mode:-unknown}-PASS"
+elif [[ ${LCCC_SNAPSHOT_UNGATED:-0} == 1 ]]; then
+  ci_gate="UNGATED"
+  echo "WARNING: snapshot of tree $tree_now WITHOUT a matching ci_local.sh pass;" \
+       "recorded as UNGATED -- not a delivery candidate." >&2
+else
+  cat >&2 <<MSG
+refusing to snapshot: tree $tree_now has no matching ci_local.sh pass stamp
+  stamp: $CI_STAMP (tree=${stamp_tree:-none})
+Run ./scripts/ci_local.sh --fast (or full) on this exact tree first, or set
+LCCC_SNAPSHOT_UNGATED=1 for an emergency pre-wipe save (ledger: UNGATED).
+MSG
+  exit 3
+fi
+
 if ! git diff --quiet || ! git diff --cached --quiet || \
    [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
   git add -A
@@ -326,8 +365,8 @@ fi
 files=$(git diff --stat "$BASE" "$HEAD_SHA" | tail -1 | sed 's/^ *//')
 printf '| %d | %s | `%s` | %s | %s |\n' \
   "$seq" "$stamp" "$tag" "$desc" "${files:-none}" >> "$ledger_tmp"
-printf '<!-- base=%s patch_sha256=%s tar_sha256=%s bundle_sha256=%s verdict=%s -->\n' \
-  "$BASE" "$patch_sha" "$tar_sha" "$bundle_sha" "$verdict" >> "$ledger_tmp"
+printf '<!-- base=%s patch_sha256=%s tar_sha256=%s bundle_sha256=%s verdict=%s ci_gate=%s tree=%s -->\n' \
+  "$BASE" "$patch_sha" "$tar_sha" "$bundle_sha" "$verdict" "$ci_gate" "$tree_now" >> "$ledger_tmp"
 sync -f "$ledger_tmp" 2>/dev/null || true
 mv -f "$ledger_tmp" "$LEDGER"
 
@@ -339,7 +378,7 @@ sync 2>/dev/null || true
 echo "SNAPSHOT $tag"
 echo "  base       : $BASE"
 echo "  head       : $HEAD_SHA"
-echo "  deliverable: $DELIVERABLE ($bytes bytes, sha256 $patch_sha) [$verdict]"
+echo "  deliverable: $DELIVERABLE ($bytes bytes, sha256 $patch_sha) [$verdict, $ci_gate]"
 echo "  source tar : $BULK/lccc-src.tar.gz (sha256 $tar_sha)"
 echo "  bundle     : $ART/lccc.bundle (sha256 $bundle_sha)"
 echo "  artifacts  : $ART"

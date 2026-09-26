@@ -932,5 +932,6 @@ behavior across iterations.
 | `licm.rs`                | Loop-invariant code motion                             |
 | `loop_analysis.rs`       | Shared loop detection and body computation utilities   |
 | `narrow.rs`              | Integer narrowing (3-phase C promotion elimination)    |
+| `reassoc_latency.rs`     | Loop-recurrence-driven reassociation of int trees      |
 | `resolve_asm.rs`         | Post-inline assembly symbol resolution                 |
 | `simplify.rs`            | Algebraic simplification, strength reduction, and peephole |

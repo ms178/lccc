@@ -83,12 +83,12 @@ All code generation logic lives under `src/backend/i686/codegen/`:
 
 | File | Responsibility |
 |------|---------------|
-| `emit.rs` | `I686Codegen` struct and `ArchCodegen` trait impl. Core accumulator helpers (`operand_to_eax`, `operand_to_ecx`, `store_eax_to`), x87 FPU load/store helpers (`emit_f128_load_to_x87`, `emit_f64_load_to_x87`, `emit_f64_store_from_x87`), wide (64-bit) atomic operations via `lock cmpxchg8b`, runtime stubs (`__x86.get_pc_thunk.bx`, `__divdi3`/`__udivdi3`/`__moddi3`/`__umoddi3`), fastcall call emission, segment-override load/store (`%fs:`/`%gs:`), 64-bit bit manipulation (clz, ctz, bswap, popcount), and utility functions. |
+| `emit.rs` | `I686Codegen` struct and `ArchCodegen` trait impl. Core accumulator helpers (`operand_to_eax`, `operand_to_ecx`, `store_eax_to`), x87 FPU load/store helpers (`emit_f128_load_to_x87`, `emit_f64_load_to_x87`, `emit_f64_store_from_x87`), wide (64-bit) atomic operations via `lock cmpxchg8b`, runtime stubs (`__x86.get_pc_thunk.bx`, `__lccc_divdi3`/`__lccc_udivdi3`/`__lccc_moddi3`/`__lccc_umoddi3`), fastcall call emission, segment-override load/store (`%fs:`/`%gs:`), 64-bit bit manipulation (clz, ctz, bswap, popcount), and utility functions. |
 | `prologue.rs` | Stack frame setup: `calculate_stack_space`, `emit_prologue`/`emit_epilogue`/`emit_epilogue_and_ret`, parameter storage from stack/registers to slots, register allocator integration, frame pointer omission logic, `aligned_frame_size` computation, and `emit_param_ref` for parameter re-reads. |
 | `calls.rs` | Call ABI: stack argument layout, `regparm` register argument emission (reverse-order to avoid clobbering `%eax`), call instruction emission (direct/indirect/PLT), result retrieval (`%eax`, `%eax:%edx`, `st(0)` for float/double/F128). |
 | `memory.rs` | Load/store for all type widths, 64-bit and F128 split load/store via `%eax:%edx` and x87, constant-offset load/store with offset folding, GEP address computation (direct, indirect, over-aligned), dynamic alloca support, memcpy emission via `rep movsb`, and over-aligned alloca handling via runtime `leal`+`andl` alignment. |
 | `alu.rs` | Integer ALU: `add`/`sub`/`mul`/`and`/`or`/`xor`/`shl`/`shr`/`sar`, signed and unsigned division (`idivl`/`divl`), LEA strength reduction for multiply by 3/5/9, immediate-operand fast paths, integer negation (`negl`), bitwise NOT (`notl`), CLZ (`lzcntl`), CTZ (`tzcntl`), bswap, popcount, and F32 negation (SSE `xorps` with sign-bit mask).  (F64 negation uses x87 `fchs` in `emit.rs`; F128 negation is in `float_ops.rs`.) |
-| `i128_ops.rs` | 64-bit register-pair operations (called "i128" in the shared trait): `add`/`adc`, `sub`/`sbb`, `mul` (schoolbook cross-product), `shld`/`shrd` shifts with 32-bit boundary handling, constant shift specializations, comparisons (`cmpl`+`sete`+`andb` for equality, high-first branching for ordered), `__divdi3`/`__udivdi3` calls for division, float conversions via x87 `fildq`/`fisttpq` with unsigned 2^63 correction. |
+| `i128_ops.rs` | 64-bit register-pair operations (called "i128" in the shared trait): `add`/`adc`, `sub`/`sbb`, `mul` (schoolbook cross-product), `shld`/`shrd` shifts with 32-bit boundary handling, constant shift specializations, comparisons (`cmpl`+`sete`+`andb` for equality, high-first branching for ordered), `__lccc_divdi3`/`__lccc_udivdi3` calls for division, float conversions via x87 `fildq`/`fisttpq` with unsigned 2^63 correction. |
 | `comparison.rs` | Float comparisons (SSE `ucomiss` for F32, x87 `fucomip` for F64/F128), integer comparisons (`cmpl` + `setCC` for all 10 comparison operators), fused compare-and-branch (`cmpl` + `jCC`), and `select` via conditional branching (test condition, branch to true/false label, copy appropriate value). |
 | `casts.rs` | Type conversions: integer widening (`movsbl`/`movzbl`/`movswl`/`movzwl`) and narrowing, float-to-int and int-to-float via x87 (`fildl`/`fildq`/`fisttpl`/`fisttpq`), F128 conversions via `fldt`/`fstpt`, unsigned-to-float fixup for values with the sign bit set (2^64 / 2^63 correction paths), SSE scalar F32 casts (`cvtsi2ssl`/`cvttss2si`), and I64 widening/narrowing (sign-extension via `cltd` and half-word extraction). |
 | `returns.rs` | Return value placement: 64-bit in `%eax:%edx` (loaded via `emit_load_acc_pair`), F32 returned in `st(0)` (pushed from `%eax` bit pattern via `flds`), F64 returned in `st(0)` (loaded from `%eax:%edx` 8-byte pair via `fldl`), F128 returned in `st(0)` (loaded via `fldt`), 32-bit scalars in `%eax` (no-op). Second return value accessors for F32/F64/F128 multi-register returns. |
@@ -361,12 +361,12 @@ sequences for amounts < 32, == 32, and > 32.
 ### 64-bit Division and Modulo
 
 Hardware `divl`/`idivl` only supports 32-bit divisors.  For 64-bit
-division, the backend calls runtime helper functions (`__divdi3`,
-`__udivdi3`, `__moddi3`, `__umoddi3`) following the cdecl convention -- both
-the dividend and divisor are pushed as 8-byte pairs.  The compiler emits
-`.weak` implementations of these helpers (based on compiler-rt's algorithms)
-so that standalone builds without libgcc can link successfully, while builds
-that do link libgcc naturally use its versions instead.
+division, the backend calls runtime helpers following the cdecl convention --
+both the dividend and divisor are pushed as 8-byte pairs.  The helpers are
+lccc's own (compiler-rt's algorithms) under compiler-private names --
+`__lccc_divdi3`, `__lccc_udivdi3`, `__lccc_moddi3`, `__lccc_umoddi3` -- so
+objects link without libgcc and never define, hide or interpose libgcc's
+public `__divdi3` family (see "Standalone 64-bit Division Runtime").
 
 The division helper stubs use normalized-divisor estimation and are only
 emitted when 64-bit division is actually used (`needs_divdi3_helpers` flag on
@@ -679,12 +679,23 @@ translation units.
 
 ### Standalone 64-bit Division Runtime
 
-Programs that link without libgcc (e.g., musl libc) need compiler-provided
-implementations of `__divdi3`, `__udivdi3`, `__moddi3`, and `__umoddi3`.
-The backend emits these as `.weak` symbols in the `.text` section, based on
-the compiler-rt i386 division algorithms using normalized-divisor estimation.
-If libgcc is linked, its strong symbols take precedence.  The stubs are only
-emitted when 64-bit division is actually used (`needs_divdi3_helpers` flag).
+Programs that link without libgcc (e.g., musl libc) still need 64-bit
+division helpers.  The backend emits them itself, based on the compiler-rt
+i386 algorithms (normalized-divisor estimation), as `__lccc_udivdi3`,
+`__lccc_umoddi3`, `__lccc_divdi3` and `__lccc_moddi3`: each in its own COMDAT
+group and `.text.NAME` section, `.globl` + `.hidden`, exactly as GCC emits
+`__x86.get_pc_thunk.*`.  COMDAT keeps one copy per link and lets
+`--gc-sections` drop unused ones; hidden visibility keeps them out of every
+shared object's dynamic ABI and makes their mutual calls bind locally
+(plain PC32: no PLT, no %ebx = GOT requirement).
+
+The public libgcc names are deliberately not defined.  A linked symbol takes
+the most constraining visibility of all its definitions, so a hidden weak
+`__divdi3` in any object would hide a strong one that a shared object exports
+on purpose (glibc i386's compat `__divdi3@GLIBC_2.0`), and a default-visibility
+weak copy would be exported from, and interpose across, every lccc-built DSO.
+The stubs are only emitted when 64-bit division is actually used
+(`needs_divdi3_helpers` flag).
 
 ### 64-bit Atomic Operations
 

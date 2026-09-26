@@ -1746,10 +1746,13 @@ impl super::InstructionEncoder {
                     return Ok(());
                 }
                 self.bytes.push(0xE9);
-                // Always use R_386_PLT32 for branch targets, matching modern GCC/binutils.
-                // R_386_PC32 is rejected by ld for PIE executables calling shared lib functions.
-                let reloc_type = R_386_PLT32;
-                self.add_relocation(sym, reloc_type, -4);
+                // The i386 psABI spelling: a bare branch target is R_386_PC32
+                // and only `sym@PLT` asks for R_386_PLT32 (i686_make_relocation
+                // strips the suffix and promotes). An i386 PIC PLT entry jumps
+                // through `name@GOT(%ebx)`, so a PLT32 the source never asked
+                // for would make the call depend on %ebx holding the GOT.
+                // GAS 2.47 `--32`: `call ext` -> PC32, `call ext@PLT` -> PLT32.
+                self.add_relocation(label, R_386_PC32, -4);
                 self.bytes.extend_from_slice(&[0, 0, 0, 0]);
                 Ok(())
             }
@@ -1953,9 +1956,13 @@ impl super::InstructionEncoder {
                     return Ok(());
                 }
                 self.bytes.extend_from_slice(&[0x0F, 0x80 + cc]);
-                // Always use R_386_PLT32 for branch targets, matching modern GCC/binutils.
-                let reloc_type = R_386_PLT32;
-                self.add_relocation(sym, reloc_type, -4);
+                // The i386 psABI spelling: a bare branch target is R_386_PC32
+                // and only `sym@PLT` asks for R_386_PLT32 (i686_make_relocation
+                // strips the suffix and promotes). An i386 PIC PLT entry jumps
+                // through `name@GOT(%ebx)`, so a PLT32 the source never asked
+                // for would make the call depend on %ebx holding the GOT.
+                // GAS 2.47 `--32`: `call ext` -> PC32, `call ext@PLT` -> PLT32.
+                self.add_relocation(label, R_386_PC32, -4);
                 self.bytes.extend_from_slice(&[0, 0, 0, 0]);
                 Ok(())
             }
@@ -1989,9 +1996,13 @@ impl super::InstructionEncoder {
                     return Ok(());
                 }
                 self.bytes.push(0xE8);
-                // Always use R_386_PLT32 for branch targets, matching modern GCC/binutils.
-                let reloc_type = R_386_PLT32;
-                self.add_relocation(sym, reloc_type, -4);
+                // The i386 psABI spelling: a bare branch target is R_386_PC32
+                // and only `sym@PLT` asks for R_386_PLT32 (i686_make_relocation
+                // strips the suffix and promotes). An i386 PIC PLT entry jumps
+                // through `name@GOT(%ebx)`, so a PLT32 the source never asked
+                // for would make the call depend on %ebx holding the GOT.
+                // GAS 2.47 `--32`: `call ext` -> PC32, `call ext@PLT` -> PLT32.
+                self.add_relocation(label, R_386_PC32, -4);
                 self.bytes.extend_from_slice(&[0, 0, 0, 0]);
                 Ok(())
             }

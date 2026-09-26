@@ -299,7 +299,7 @@ pub fn plan_string_merge(
 /// abandoned and the link proceeds without dedup (correctness > size).
 /// Returns true if the plan was applied.
 pub fn apply_string_merge<G: super::symbols::GlobalSymbolOps>(
-    objects: &mut Vec<Elf64Object>,
+    objects: &mut super::ObjectSet,
     globals: &mut FxHashMap<String, G>,
     dead_sections: &mut crate::common::fx_hash::FxHashSet<(usize, usize)>,
     plan: &StringMergePlan,

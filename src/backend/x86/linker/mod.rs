@@ -51,7 +51,23 @@ pub use link::link_builtin;
 /// points do not match".
 pub fn load_inputs_for_ld(
     inputs: &[(String, bool)],
-    objects: &mut Vec<crate::backend::linker_common::Elf64Object>,
+    out: &mut Vec<crate::backend::linker_common::Elf64Object>,
+    undefined: &[String],
+) -> Result<(), String> {
+    // COMDAT claims are only consulted while symbols are registered (see
+    // `ObjectSet`), so they live for the duration of loading; the callers'
+    // relocatable and script links take the plain list. Objects already in
+    // `out` are registered as claims first, exactly as if pushed.
+    let mut objects: crate::backend::linker_common::ObjectSet =
+        std::mem::take(out).into_iter().collect();
+    let result = load_inputs_into(inputs, &mut objects, undefined);
+    *out = objects.into_vec();
+    result
+}
+
+fn load_inputs_into(
+    inputs: &[(String, bool)],
+    objects: &mut crate::backend::linker_common::ObjectSet,
     undefined: &[String],
 ) -> Result<(), String> {
     let mut globals: crate::common::fx_hash::FxHashMap<String, types::GlobalSymbol> =

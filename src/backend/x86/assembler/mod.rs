@@ -9,6 +9,7 @@
 //! - `encoder.rs`    – Encode x86-64 instructions into machine code bytes
 //! - `elf_writer.rs` – Write ELF object files with sections, symbols, and relocations
 
+pub mod cfi;
 pub mod elf_writer;
 pub mod encoder;
 pub mod parser;
@@ -21,6 +22,7 @@ use parser::parse_asm;
 /// This is the default assembler (used when the `gcc_assembler` feature is disabled).
 pub fn assemble(asm_text: &str, output_path: &str) -> Result<(), String> {
     let items = parse_asm(asm_text)?;
+    let items = cfi::lower_cfi(items, cfi::CfiArch::X86_64)?;
     let obj = ElfWriter::new();
     let elf_bytes = obj.build(&items)?;
     std::fs::write(output_path, &elf_bytes)

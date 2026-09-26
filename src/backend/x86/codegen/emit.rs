@@ -1494,6 +1494,10 @@ impl X86Codegen {
         // Publish for the emitters without `&self` (MachInst, peepholes).
         super::super::isa::set_current(opts.isa);
         self.state.emit_cfi = opts.emit_cfi;
+        // The peephole needs function delimiters regardless of unwind
+        // tables; Target::generate_assembly_with_opts_and_debug strips them
+        // after the peephole when emit_cfi is off.
+        self.state.fn_boundary_markers = true;
         self.fp_contract = opts.fp_contract;
         // FMA3 contraction follows the permission, not the request bit: the
         // baseline-v3 default grants it, `-mno-fma`/`-mno-avx`/`-march=x86-64`

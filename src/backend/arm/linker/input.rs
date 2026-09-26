@@ -12,7 +12,7 @@ use crate::backend::linker_common;
 
 pub fn load_file(
     path: &str,
-    objects: &mut Vec<ElfObject>,
+    objects: &mut linker_common::ObjectSet,
     globals: &mut FxHashMap<String, GlobalSymbol>,
     needed_sonames: &mut Vec<String>,
     lib_paths: &[String],
@@ -119,8 +119,7 @@ pub fn load_file(
     }
 
     let obj = parse_object(&data, path)?;
-    let obj_idx = objects.len();
-    linker_common::register_symbols_elf64(obj_idx, &obj, globals, arm_should_replace_extra)?;
+    linker_common::register_symbols_elf64(objects, &obj, globals, arm_should_replace_extra)?;
     objects.push(obj);
     Ok(())
 }

@@ -210,6 +210,46 @@ jobs:
           CCC: target/fastbuild/lccc
         run: bash tests/regression/check_overalign_typed_census.sh
 
+      # Unwind tables are derived from the final (post-peephole) code, so the
+      # peephole must see identical input with and without them, and the
+      # integrated assembler must turn the CFI into a real .eh_frame:
+      # backtrace() and pthread_exit()/pthread_cancel() cleanups through
+      # lccc frames, lccc-ld's .eh_frame_hdr after --gc-sections/COMDAT.
+      - name: Verify peephole parity with and without unwind tables
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_nocfi_peephole_parity.sh
+
+      - name: Verify unwinding through lccc frames (.eh_frame)
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_eh_frame_unwind.sh
+
+      - name: Verify synthesized CFI invariants (corpus, x86-64 + i686)
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_cfi_invariants.sh
+
+      # ARX lane vectorizers: lane frames chosen for the round loop's
+      # critical path (scripts/loop_latency.py), plus RFC 7539 / GCC checksums.
+      - name: Verify ARX lane-frame latency (vec_arx + arx_vectorize)
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_arx_frame_latency.sh
+
+      # Latency-driven reassociation (reassoc_lat): SHA-256 round recurrence
+      # at the 5/6-cycle floor with a same-run negative control, plus a
+      # GCC-differential of signed/unsigned Add/Xor/And/Or loop trees.
+      - name: Verify latency-driven reassociation (reassoc_lat)
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_reassoc_latency.sh
+
+      - name: Verify COMDAT groups are identified by signature (x86-64 + i686 links)
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_comdat_signature_identity.sh
+
       # Segment-qualified declarator contract: a `__seg_fs`/`__seg_gs`
       # qualifier before a nested type-name's base must reach that
       # type-name's own `*` (cast `(__seg_fs unsigned long *)40` — the
@@ -534,8 +574,12 @@ jobs:
 
       # Whole-object ELF32 differential corpus, including relocation/addend
       # ownership for bare memory operands and relaxation-patched loop/jecxz.
-      - name: Verify i686 assembly differential vs GNU as
-        run: python3 scripts/asmdiff.py --32 --jobs 2 --lccc target/fastbuild/lccc-i686
+      # Pinned to the same GNU as 2.47 oracle as the x86-64 differential: the
+      # byte-exact layout cases (NOP tables, relaxation order) differ between
+      # GAS releases -- 2.44 places the lea-NOP remainder after the long NOP,
+      # 2.47 before it -- so the runner image's assembler is not an oracle.
+      - name: Verify i686 assembly differential vs GNU as 2.47
+        run: python3 scripts/asmdiff.py --32 --jobs 2 --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" --lccc target/fastbuild/lccc-i686
 
       # Keep every standalone gate from ci_local.sh represented in hosted CI.
       # Group the compact contracts to avoid YAML drift and setup overhead;

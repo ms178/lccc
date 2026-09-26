@@ -13,10 +13,17 @@
 //! # Why the executable path needed this
 //!
 //! `emit_rel.rs` (the `ld -r` path) has done this since it was written, but the
-//! executable path never did. Symbol resolution hid the consequence: only one
-//! definition ever *wins*, so the program behaves correctly and every tool that
-//! looks at symbols agrees with GNU ld. The duplicate section *bodies* were
-//! still laid out, though — dead bytes reachable by nothing.
+//! executable path never did. Symbol resolution hid the consequence for the
+//! usual C++ copies, whose symbols are weak: only one definition ever *wins*,
+//! so the program behaves correctly and every tool that looks at symbols agrees
+//! with GNU ld. The duplicate section *bodies* were still laid out, though —
+//! dead bytes reachable by nothing.
+//!
+//! A *strong* global defined in every copy (hand-written or C COMDAT code,
+//! `-fno-weak`) was worse: resolution saw two strong definitions and failed
+//! with "multiple definition". A discarded copy's definitions do not take
+//! part in resolution in GNU ld or lld; `in_discarded_group` gives symbol
+//! registration the same answer where a definition would displace another.
 //!
 //! Measured on three small C++ TUs sharing one header
 //! (`g++ -O0 -fno-inline`), searching the linked image for the exact byte
@@ -39,7 +46,7 @@
 //! more reliable.
 
 use crate::backend::elf::{GRP_COMDAT, SHT_GROUP, read_u32};
-use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::common::fx_hash::FxHashSet;
 
 use super::types::Elf64Object;
 
@@ -55,6 +62,125 @@ pub struct ComdatPlan {
     pub bytes_saved: u64,
 }
 
+/// The COMDAT groups of `obj`: (signature, member section indices) per
+/// `SHT_GROUP` section carrying `GRP_COMDAT` and a named signature. A plain
+/// group is never deduplicated, and an unnamed signature identifies nothing.
+fn comdat_groups(obj: &Elf64Object) -> impl Iterator<Item = (&str, &[u8])> {
+    obj.sections.iter().enumerate().filter_map(|(si, sec)| {
+        if sec.sh_type != SHT_GROUP {
+            return None;
+        }
+        let data = obj.section_data[si].as_slice();
+        // Word 0 is the flag word; the rest are section indices.
+        if data.len() < 4 || read_u32(data, 0) & GRP_COMDAT == 0 {
+            return None;
+        }
+        // sh_info indexes the signature symbol in the object's symtab.
+        let sig = obj.symbols.get(sec.info as usize)?;
+        (!sig.name.is_empty()).then(|| (sig.name.as_str(), &data[4..]))
+    })
+}
+
+fn members(words: &[u8]) -> impl Iterator<Item = usize> + '_ {
+    words.chunks_exact(4).map(|w| read_u32(w, 0) as usize)
+}
+
+/// The link's input objects in link order, together with the COMDAT group
+/// signatures they claim.
+///
+/// Symbol registration asks, for a definition that would displace or clash
+/// with an existing one, whether its section belongs to a group some earlier
+/// object already claimed (`in_discarded_group`). Answering that by
+/// rescanning every earlier object's groups made registration quadratic: a
+/// link of N objects whose overriding definitions sit in COMDAT members took
+/// 0.04 s at N = 500 and 1.75 s at N = 4000. Objects only ever enter the link
+/// through `push`, which records their signatures, so the query is one hash
+/// lookup. The set derefs to a SLICE, never to the `Vec`: element contents
+/// may be edited by later link phases, but the object list can only grow
+/// through `push`, so the claims can never go stale.
+#[derive(Debug, Default)]
+pub struct ObjectSet {
+    objects: Vec<Elf64Object>,
+    claimed: FxHashSet<String>,
+}
+
+impl ObjectSet {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append the next object in link order and record the group
+    /// signatures it claims.
+    pub fn push(&mut self, obj: Elf64Object) {
+        for (sig, _) in comdat_groups(&obj) {
+            if !self.claimed.contains(sig) {
+                self.claimed.insert(sig.to_string());
+            }
+        }
+        self.objects.push(obj);
+    }
+
+    /// Did an object in the set claim COMDAT signature `sig`?
+    pub fn claims(&self, sig: &str) -> bool {
+        self.claimed.contains(sig)
+    }
+
+    pub fn into_vec(self) -> Vec<Elf64Object> {
+        self.objects
+    }
+}
+
+impl std::ops::Deref for ObjectSet {
+    type Target = [Elf64Object];
+    fn deref(&self) -> &[Elf64Object] {
+        &self.objects
+    }
+}
+
+impl std::ops::DerefMut for ObjectSet {
+    fn deref_mut(&mut self) -> &mut [Elf64Object] {
+        &mut self.objects
+    }
+}
+
+impl FromIterator<Elf64Object> for ObjectSet {
+    fn from_iter<I: IntoIterator<Item = Elf64Object>>(iter: I) -> Self {
+        let mut set = ObjectSet::new();
+        for obj in iter {
+            set.push(obj);
+        }
+        set
+    }
+}
+
+impl<'a> IntoIterator for &'a ObjectSet {
+    type Item = &'a Elf64Object;
+    type IntoIter = std::slice::Iter<'a, Elf64Object>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.objects.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut ObjectSet {
+    type Item = &'a mut Elf64Object;
+    type IntoIter = std::slice::IterMut<'a, Elf64Object>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.objects.iter_mut()
+    }
+}
+
+/// Is section `shndx` of `obj` a member of a COMDAT group whose signature
+/// an object in `prior` (the objects registered before it, in link order)
+/// already claimed? Such a copy is discarded -- `plan_comdat` makes the same
+/// first-wins decision over the same order -- so its definitions must not
+/// compete with the kept copy's. O(groups of `obj`): the prior claims are
+/// one hash lookup (see `ObjectSet`).
+pub fn in_discarded_group(prior: &ObjectSet, obj: &Elf64Object, shndx: usize) -> bool {
+    comdat_groups(obj)
+        .find(|(_, words)| members(words).any(|m| m == shndx))
+        .is_some_and(|(sig, _)| prior.claims(sig))
+}
+
 /// Decide which COMDAT group members lose.
 ///
 /// The winner is the first group with a given signature in link order, which
@@ -65,46 +191,17 @@ pub struct ComdatPlan {
 /// they do not need to be marked dead here; the emitter already skips them.
 pub fn plan_comdat(objects: &[Elf64Object]) -> ComdatPlan {
     let mut plan = ComdatPlan::default();
-    // signature -> (object, section) of the winning group, for diagnostics.
-    let mut winners: FxHashMap<String, (usize, usize)> = FxHashMap::default();
-
+    // Signatures claimed so far (borrowed from the objects: no allocation).
+    let mut winners: FxHashSet<&str> = FxHashSet::default();
     for (oi, obj) in objects.iter().enumerate() {
-        for (si, sec) in obj.sections.iter().enumerate() {
-            if sec.sh_type != SHT_GROUP {
+        for (sig, words) in comdat_groups(obj) {
+            if winners.insert(sig) {
                 continue;
             }
-            let data = obj.section_data[si].as_slice();
-            if data.len() < 4 {
-                continue;
-            }
-            // Word 0 is the flag word; the rest are section indices.
-            if read_u32(data, 0) & GRP_COMDAT == 0 {
-                continue; // a plain (non-COMDAT) group is never deduplicated
-            }
-            // sh_info indexes the signature symbol in the object's symtab.
-            let Some(sig_sym) = obj.symbols.get(sec.info as usize) else {
-                continue;
-            };
-            if sig_sym.name.is_empty() {
-                continue;
-            }
-            let sig = sig_sym.name.to_string();
-
-            match winners.get(&sig) {
-                None => {
-                    winners.insert(sig, (oi, si));
-                }
-                Some(_) => {
-                    plan.groups_discarded += 1;
-                    for k in (4..data.len()).step_by(4) {
-                        if k + 4 > data.len() {
-                            break;
-                        }
-                        let member = read_u32(data, k) as usize;
-                        if member < obj.sections.len() && plan.dead.insert((oi, member)) {
-                            plan.bytes_saved += obj.sections[member].size;
-                        }
-                    }
+            plan.groups_discarded += 1;
+            for member in members(words) {
+                if member < obj.sections.len() && plan.dead.insert((oi, member)) {
+                    plan.bytes_saved += obj.sections[member].size;
                 }
             }
         }
@@ -224,6 +321,108 @@ mod tests {
             plan.dead.is_empty(),
             "only GRP_COMDAT groups are interchangeable"
         );
+    }
+
+    /// Symbol registration's view of the same first-wins decision: only a
+    /// member of a later copy of a claimed signature is discarded.
+    #[test]
+    fn in_discarded_group_matches_the_plan() {
+        let objs: ObjectSet = [
+            comdat_object("sig_a", &[16, 8], true),
+            comdat_object("sig_b", &[16], true),
+            comdat_object("", &[16], true),
+        ]
+        .into_iter()
+        .collect();
+        let later_a = comdat_object("sig_a", &[16, 8], true);
+        let later_plain = comdat_object("sig_a", &[16], false);
+        let later_unnamed = comdat_object("", &[16], true);
+        assert!(in_discarded_group(&objs, &later_a, 1));
+        assert!(in_discarded_group(&objs, &later_a, 2));
+        // The group section itself is not a member.
+        assert!(!in_discarded_group(&objs, &later_a, 3));
+        assert!(
+            !in_discarded_group(&ObjectSet::new(), &later_a, 1),
+            "first copy wins"
+        );
+        assert!(!in_discarded_group(&objs, &later_plain, 1));
+        assert!(!in_discarded_group(&objs, &later_unnamed, 1));
+    }
+
+    /// An object with several groups: `(signature, member sizes)` each, the
+    /// members of group k following those of groups 0..k.
+    fn multi_group_object(groups: &[(&str, Vec<u64>)]) -> Elf64Object {
+        let mut sections = vec![section("", 0, 0, 0)];
+        let mut section_data = vec![SectionData::empty()];
+        let mut symbols = vec![symbol("")];
+        let mut group_secs = Vec::new();
+        for (sig, sizes) in groups {
+            let mut gdata = GRP_COMDAT.to_le_bytes().to_vec();
+            for sz in sizes {
+                gdata.extend_from_slice(&(sections.len() as u32).to_le_bytes());
+                sections.push(section(".text.m", SHT_PROGBITS, *sz, 0));
+                section_data.push(SectionData::owned(vec![0u8; *sz as usize]));
+            }
+            symbols.push(symbol(sig));
+            group_secs.push((symbols.len() as u32 - 1, gdata));
+        }
+        for (sig_idx, gdata) in group_secs {
+            sections.push(section(".group", SHT_GROUP, gdata.len() as u64, sig_idx));
+            section_data.push(SectionData::owned(gdata));
+        }
+        Elf64Object {
+            sections,
+            symbols,
+            section_data,
+            relocations: Vec::new(),
+            source_name: "<multi>".to_string(),
+        }
+    }
+
+    /// Property: registration's incremental answer equals the whole-link
+    /// plan, member by member, over random links (xorshift, fixed seeds:
+    /// reproducible without a dependency). Objects draw 0..=3 groups from a
+    /// pool of 6 signatures, so claims, repeats and fresh signatures mix.
+    #[test]
+    fn in_discarded_group_agrees_with_plan_comdat_on_random_links() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        };
+        let pool = ["s0", "s1", "s2", "s3", "s4", "s5"];
+        for _link in 0..200 {
+            let n_objs = 1 + next(12) as usize;
+            let mut objs = Vec::new();
+            for _ in 0..n_objs {
+                let mut sigs: Vec<&str> = Vec::new();
+                for _ in 0..next(4) {
+                    let s = pool[next(pool.len() as u64) as usize];
+                    if !sigs.contains(&s) {
+                        sigs.push(s);
+                    }
+                }
+                let groups: Vec<(&str, Vec<u64>)> = sigs
+                    .into_iter()
+                    .map(|s| (s, (0..1 + next(3)).map(|k| 4 + k).collect()))
+                    .collect();
+                objs.push(multi_group_object(&groups));
+            }
+            let plan = plan_comdat(&objs);
+            let mut prior = ObjectSet::new();
+            for (oi, obj) in objs.into_iter().enumerate() {
+                for shndx in 0..obj.sections.len() {
+                    assert_eq!(
+                        in_discarded_group(&prior, &obj, shndx),
+                        plan.dead.contains(&(oi, shndx)),
+                        "object {oi} section {shndx}"
+                    );
+                }
+                prior.push(obj);
+            }
+        }
     }
 
     #[test]

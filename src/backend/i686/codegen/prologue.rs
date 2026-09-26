@@ -584,50 +584,17 @@ impl I686Codegen {
         if matches!(func.return_type, IrType::I64 | IrType::U64) || is_i128_type(func.return_type) {
             self.state.emit("# lccc-i686-return-uses-edx");
         }
-        // CFA tracking for unwind tables: with a frame pointer the CFA is
-        // %ebp+8 once `pushl %ebp` ran and switches register with
-        // cfi_def_cfa_register; the callee-save pushes and the frame
-        // subtraction then move the CFA by known, emitted amounts. Without a
-        // frame pointer the CFA stays %esp-relative and every push/sub
-        // advances it (the previous code emitted none of these, so
-        // unwinders saw the entry CFA and restored garbage into
-        // %ebx/%esi/%edi at every interior PC).
-        let mut cfa_offset: i64 = 4; // entry CFA: %esp+4
-        let frame_ptr_mode = !self.omit_frame_pointer;
-        if self.omit_frame_pointer {
-            // No frame pointer setup; use ESP-relative addressing.
-            // frame_base_offset and esp_adjust are set after the
-            // callee-saved pushes; the CFA stays %esp-based and is
-            // tracked through every push/sub below.
-        } else {
+        // Unwind info for this frame is derived from the final instruction
+        // stream after the peephole (backend::cfi_synth), so it stays exact
+        // when the peephole drops a callee-saved push or reshapes the frame.
+        if !self.omit_frame_pointer {
             self.state.emit("    pushl %ebp");
-            if self.state.emit_cfi {
-                self.state.emit("    .cfi_def_cfa_offset 8");
-                self.state.emit("    .cfi_offset %ebp, -8");
-            }
-            cfa_offset = 8;
             self.state.emit("    movl %esp, %ebp");
-            if self.state.emit_cfi {
-                self.state.emit("    .cfi_def_cfa_register %ebp");
-            }
         }
 
         for &reg in self.used_callee_saved.iter() {
             let name = phys_reg_name(reg);
             emit!(self.state, "    pushl %{}", name);
-            if self.state.emit_cfi {
-                cfa_offset += 4;
-                // Frame-pointer mode: the CFA is %ebp+8 and does NOT move
-                // when %esp changes; only the saved-register offset grows.
-                // No-FP mode: the CFA tracks %esp, so both directives
-                // advance (the pushed register sits at CFA-cfa_offset).
-                if frame_ptr_mode {
-                    emit!(self.state, "    .cfi_offset %{}, -{}", name, cfa_offset);
-                } else {
-                    emit!(self.state, "    .cfi_def_cfa_offset {}", cfa_offset);
-                    emit!(self.state, "    .cfi_offset %{}, -{}", name, cfa_offset);
-                }
-            }
         }
 
         if self.pic_got_live {
@@ -642,10 +609,6 @@ impl I686Codegen {
 
         if frame_size > 0 {
             emit!(self.state, "    subl ${}, %esp", frame_size);
-            if self.state.emit_cfi && !frame_ptr_mode {
-                cfa_offset += frame_size;
-                emit!(self.state, "    .cfi_def_cfa_offset {}", cfa_offset);
-            }
         }
 
         // Post-prologue %esp baseline (ebp-relative), valid in both frame

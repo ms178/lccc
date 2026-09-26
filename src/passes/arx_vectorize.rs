@@ -1375,7 +1375,6 @@ fn transform_arx_loop(
     // ---- Kernel: the proven double round, four lanes at a time. ----
     // Every intrinsic below evaluates EXACTLY one node of the reference
     // term construction the matcher proved equal to the scalar loop.
-    let mut k: Vec<Instruction> = Vec::with_capacity(64);
     fn kbin(
         op: IntrinsicOp,
         a: Value,
@@ -1440,78 +1439,123 @@ fn transform_arx_loop(
             _ => unreachable!("lane offset 0 is skipped by the callers"),
         }
     };
-    let mut a = phi_a;
-    let mut b = phi_b;
-    let mut c = phi_c;
-    let mut d = phi_d;
-    for round in 0..2 {
-        let kcst: &[u8; 4] = if round == 0 {
-            &arx.shape_r
-        } else {
-            &arx.shape_s
-        };
-        if round == 1 {
-            // Lane-rotated group setup: rotate the b/c/d roles into the
-            // proved offsets.  After this, lane j of (A, B, C, D) is
-            // group-1 QR j's (a, b, c, d).  A zero offset is a no-op.
-            if arx.shape_kb != 0 {
-                b = kshufd(b, lanerot(arx.shape_kb), &mut k, &mut next_val_id);
+    // Lane-frame choice.  Rotating ALL four roles of the lane-rotated
+    // group by one extra amount only relabels which lane computes which
+    // quarter round, so any role can be the one left unshuffled: with
+    // anchor offset `t`, role x is rotated by `(k_x - t) mod 4` (k_a = 0)
+    // and back afterwards.  Anchor 0 is the historical choice (shuffle
+    // b/c/d); for ChaCha it puts b's shuffle straight after
+    // `b = rotl(b, 7)`, on the critical path, twice per double round.
+    // The round loop is a serial recurrence, so rank the candidates by the
+    // kernel's critical path under the latency model shared with vec_arx;
+    // ties keep fewer instructions, then the historical anchor.
+    let rot_latency = crate::passes::vec_arx::arx_rot_latency();
+    let base_val_id = next_val_id;
+    let mut best: Option<(u32, usize, Vec<Instruction>, [Value; 4], u32)> = None;
+    let mut seen: Vec<u8> = Vec::with_capacity(4);
+    for anchor in [0, arx.shape_kb, arx.shape_kc, arx.shape_kd] {
+        if seen.contains(&anchor) {
+            continue;
+        }
+        seen.push(anchor);
+        let rel = |x: u8| (x + 4 - anchor) % 4;
+        let mut k: Vec<Instruction> = Vec::with_capacity(64);
+        let mut next_val_id = base_val_id;
+        let mut a = phi_a;
+        let mut b = phi_b;
+        let mut c = phi_c;
+        let mut d = phi_d;
+        for round in 0..2 {
+            let kcst: &[u8; 4] = if round == 0 {
+                &arx.shape_r
+            } else {
+                &arx.shape_s
+            };
+            if round == 1 {
+                // Lane-rotated group setup: rotate the roles into the proved
+                // offsets relative to the anchor.  After this, lane j of
+                // (A, B, C, D) is group-1 QR (j - anchor)'s (a, b, c, d).  A
+                // zero offset is a no-op.
+                if rel(0) != 0 {
+                    a = kshufd(a, lanerot(rel(0)), &mut k, &mut next_val_id);
+                }
+                if rel(arx.shape_kb) != 0 {
+                    b = kshufd(b, lanerot(rel(arx.shape_kb)), &mut k, &mut next_val_id);
+                }
+                if rel(arx.shape_kc) != 0 {
+                    c = kshufd(c, lanerot(rel(arx.shape_kc)), &mut k, &mut next_val_id);
+                }
+                if rel(arx.shape_kd) != 0 {
+                    d = kshufd(d, lanerot(rel(arx.shape_kd)), &mut k, &mut next_val_id);
+                }
             }
-            if arx.shape_kc != 0 {
-                c = kshufd(c, lanerot(arx.shape_kc), &mut k, &mut next_val_id);
-            }
-            if arx.shape_kd != 0 {
-                d = kshufd(d, lanerot(arx.shape_kd), &mut k, &mut next_val_id);
+            // a += b; d ^= a; d = rot[0](d)
+            a = kbin(IntrinsicOp::VecAddI32x4, a, b, &mut k, &mut next_val_id);
+            d = kbin(IntrinsicOp::VecXorI32x4, d, a, &mut k, &mut next_val_id);
+            d = match rot_masks.get(&kcst[0]) {
+                Some(&m) => kshufb(d, m, &mut k, &mut next_val_id),
+                None => krot(d, kcst[0] as i64, &mut k, &mut next_val_id),
+            };
+            // c += d; b ^= c; b = rot[1](b)
+            c = kbin(IntrinsicOp::VecAddI32x4, c, d, &mut k, &mut next_val_id);
+            b = kbin(IntrinsicOp::VecXorI32x4, b, c, &mut k, &mut next_val_id);
+            b = match rot_masks.get(&kcst[1]) {
+                Some(&m) => kshufb(b, m, &mut k, &mut next_val_id),
+                None => krot(b, kcst[1] as i64, &mut k, &mut next_val_id),
+            };
+            // a += b; d ^= a; d = rot[2](d)
+            a = kbin(IntrinsicOp::VecAddI32x4, a, b, &mut k, &mut next_val_id);
+            d = kbin(IntrinsicOp::VecXorI32x4, d, a, &mut k, &mut next_val_id);
+            d = match rot_masks.get(&kcst[2]) {
+                Some(&m) => kshufb(d, m, &mut k, &mut next_val_id),
+                None => krot(d, kcst[2] as i64, &mut k, &mut next_val_id),
+            };
+            // c += d; b ^= c; b = rot[3](b)
+            c = kbin(IntrinsicOp::VecAddI32x4, c, d, &mut k, &mut next_val_id);
+            b = kbin(IntrinsicOp::VecXorI32x4, b, c, &mut k, &mut next_val_id);
+            b = match rot_masks.get(&kcst[3]) {
+                Some(&m) => kshufb(b, m, &mut k, &mut next_val_id),
+                None => krot(b, kcst[3] as i64, &mut k, &mut next_val_id),
+            };
+            if round == 1 {
+                // Lane-rotated group teardown: rotate the roles back, so the
+                // backedge registers are in the same alignment the preheader
+                // packs and the epilogue extracts assume.  rotl_{4-k} is the
+                // inverse of rotl_k (rotl2 is an involution); zero offsets
+                // need nothing.
+                let ia = (4 - rel(0)) % 4;
+                let ib = (4 - rel(arx.shape_kb)) % 4;
+                let ic = (4 - rel(arx.shape_kc)) % 4;
+                let id = (4 - rel(arx.shape_kd)) % 4;
+                if ia != 0 {
+                    a = kshufd(a, lanerot(ia), &mut k, &mut next_val_id);
+                }
+                if ib != 0 {
+                    b = kshufd(b, lanerot(ib), &mut k, &mut next_val_id);
+                }
+                if ic != 0 {
+                    c = kshufd(c, lanerot(ic), &mut k, &mut next_val_id);
+                }
+                if id != 0 {
+                    d = kshufd(d, lanerot(id), &mut k, &mut next_val_id);
+                }
             }
         }
-        // a += b; d ^= a; d = rot[0](d)
-        a = kbin(IntrinsicOp::VecAddI32x4, a, b, &mut k, &mut next_val_id);
-        d = kbin(IntrinsicOp::VecXorI32x4, d, a, &mut k, &mut next_val_id);
-        d = match rot_masks.get(&kcst[0]) {
-            Some(&m) => kshufb(d, m, &mut k, &mut next_val_id),
-            None => krot(d, kcst[0] as i64, &mut k, &mut next_val_id),
+        let cp = crate::passes::vec_arx::kernel_critical_path(&k, rot_latency);
+        let better = match &best {
+            None => true,
+            Some((bcp, blen, ..)) => (cp, k.len()) < (*bcp, *blen),
         };
-        // c += d; b ^= c; b = rot[1](b)
-        c = kbin(IntrinsicOp::VecAddI32x4, c, d, &mut k, &mut next_val_id);
-        b = kbin(IntrinsicOp::VecXorI32x4, b, c, &mut k, &mut next_val_id);
-        b = match rot_masks.get(&kcst[1]) {
-            Some(&m) => kshufb(b, m, &mut k, &mut next_val_id),
-            None => krot(b, kcst[1] as i64, &mut k, &mut next_val_id),
-        };
-        // a += b; d ^= a; d = rot[2](d)
-        a = kbin(IntrinsicOp::VecAddI32x4, a, b, &mut k, &mut next_val_id);
-        d = kbin(IntrinsicOp::VecXorI32x4, d, a, &mut k, &mut next_val_id);
-        d = match rot_masks.get(&kcst[2]) {
-            Some(&m) => kshufb(d, m, &mut k, &mut next_val_id),
-            None => krot(d, kcst[2] as i64, &mut k, &mut next_val_id),
-        };
-        // c += d; b ^= c; b = rot[3](b)
-        c = kbin(IntrinsicOp::VecAddI32x4, c, d, &mut k, &mut next_val_id);
-        b = kbin(IntrinsicOp::VecXorI32x4, b, c, &mut k, &mut next_val_id);
-        b = match rot_masks.get(&kcst[3]) {
-            Some(&m) => kshufb(b, m, &mut k, &mut next_val_id),
-            None => krot(b, kcst[3] as i64, &mut k, &mut next_val_id),
-        };
-        if round == 1 {
-            // Lane-rotated group teardown: rotate the roles back, so the
-            // backedge registers are in the same alignment the preheader
-            // packs and the epilogue extracts assume.  rotl_{4-k} is the
-            // inverse of rotl_k (rotl2 is an involution); zero offsets
-            // need nothing.
-            let ib = (4 - arx.shape_kb) % 4;
-            let ic = (4 - arx.shape_kc) % 4;
-            let id = (4 - arx.shape_kd) % 4;
-            if ib != 0 {
-                b = kshufd(b, lanerot(ib), &mut k, &mut next_val_id);
-            }
-            if ic != 0 {
-                c = kshufd(c, lanerot(ic), &mut k, &mut next_val_id);
-            }
-            if id != 0 {
-                d = kshufd(d, lanerot(id), &mut k, &mut next_val_id);
-            }
+        if better {
+            best = Some((cp, k.len(), k, [a, b, c, d], next_val_id));
         }
     }
+    let Some((_, _, chosen, [a, b, c, d], chosen_next)) = best else {
+        return 0;
+    };
+    let mut k = chosen;
+    next_val_id = chosen_next;
+
     // Rename the final role values onto the backedge phi inputs: BOTH
     // the definition and every use.  (Patching only the destination left
     // the later `d ^= a`-style uses referencing the old value id, and the

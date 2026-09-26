@@ -64,8 +64,11 @@ fi
 
 # Persist across VM reboots and keep the box biased toward reclaiming cold
 # pages rather than the hot compiler working set.
+# The append must run with the same privilege as mkswap/swapon: a bare
+# `>> /etc/fstab` is opened by the unprivileged shell and fails with EACCES.
 if ! grep -q "^$swapfile" /etc/fstab 2>/dev/null; then
-    echo "$swapfile none swap sw 0 0" >> /etc/fstab 2>/dev/null || true
+    echo "$swapfile none swap sw 0 0" |
+        "${privilege[@]}" tee -a /etc/fstab >/dev/null 2>&1 || true
 fi
 "${privilege[@]}" /sbin/sysctl -w vm.swappiness=20 >/dev/null 2>&1 || true
 

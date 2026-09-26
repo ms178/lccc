@@ -12,6 +12,7 @@ pub(crate) mod peephole_common; // Shared peephole optimizer utilities (word mat
 // Shared codegen framework, split into focused modules:
 pub(crate) mod call_abi; // Unified ABI classification: call args + callee params, stack computation
 pub(crate) mod cast; // Cast and float operation classification
+pub(crate) mod cfi_synth; // Unwind info derived from final x86/i686 code
 pub(crate) mod f128_softfloat; // Shared F128 soft-float orchestration (ARM + RISC-V)
 pub(crate) mod generation; // Module/function/instruction dispatch
 pub(crate) mod inline_asm; // InlineAsmEmitter trait and shared framework
@@ -32,6 +33,7 @@ pub(crate) mod i686;
 pub(crate) mod riscv;
 pub mod x86;
 
+use crate::common::fx_hash::FxHashSet;
 use crate::ir::reexports::IrModule;
 
 /// Function-entry mcount instrumentation, derived from `-pg` (and its `-m`
@@ -255,6 +257,76 @@ pub enum Target {
     Riscv64,
 }
 
+/// Turn the codegen's bare function-boundary markers into their final form:
+/// full CFI derived from the final code when unwind tables are on, nothing
+/// when they are off.
+fn finish_fn_boundaries(
+    asm: &str,
+    state: &state::CodegenState,
+    emit_cfi: bool,
+    arch: cfi_synth::CfiArch,
+) -> String {
+    let marked = &state.fn_boundary_marked;
+    if marked.is_empty() {
+        asm.to_string()
+    } else if emit_cfi {
+        let pops = cfi_synth::CalleePops {
+            direct: &state.callee_pops_direct,
+            indirect: &state.callee_pops_indirect,
+        };
+        cfi_synth::synthesize(asm, arch, marked, pops)
+    } else {
+        strip_fn_boundary_markers(asm, marked)
+    }
+}
+
+/// Remove the `.cfi_startproc`/`.cfi_endproc` function delimiters that the
+/// x86-64/i686 codegen emits for its peephole when unwind tables are disabled
+/// (`CodegenState::fn_boundary_markers`). With `emit_cfi` off no other CFI
+/// directive is generated for these functions, so what remains is exactly
+/// the no-unwind output.
+///
+/// Only the codegen's own markers go: the `.cfi_startproc` directly after
+/// the `NAME:` label and the `.cfi_endproc` directly before
+/// `.size NAME, .-NAME`, for NAME in `marked`. Identical directives inside
+/// user inline asm (a hand-written function with its own CFI) are kept.
+fn strip_fn_boundary_markers(asm: &str, marked: &FxHashSet<String>) -> String {
+    let mut out = String::with_capacity(asm.len());
+    // Set after `NAME:` of a marked function: the next line should be the
+    // generated `.cfi_startproc`.
+    let mut expect_start = false;
+    let mut last_line_start: Option<(usize, bool)> = None;
+    for line in asm.split_inclusive('\n') {
+        let t = line.trim();
+        if expect_start {
+            expect_start = false;
+            if t == ".cfi_startproc" {
+                continue;
+            }
+        }
+        if let Some(name) = t.strip_suffix(':') {
+            expect_start = marked.contains(name);
+        }
+        if let Some(rest) = t.strip_prefix(".size ") {
+            if let Some((name, expr)) = rest.split_once(',') {
+                let name = name.trim();
+                let expr = expr.trim();
+                if marked.contains(name)
+                    && expr.strip_prefix(".-") == Some(name)
+                    && let Some((start, true)) = last_line_start
+                {
+                    out.truncate(start);
+                }
+            }
+        }
+        if !t.is_empty() {
+            last_line_start = Some((out.len(), t == ".cfi_endproc"));
+        }
+        out.push_str(line);
+    }
+    out
+}
+
 impl Target {
     /// Return the GCC-style target triple for this architecture.
     /// Used by configure scripts (via -dumpmachine) to detect the target.
@@ -454,14 +526,15 @@ impl Target {
                 );
                 // Escape hatch for bisecting a suspected peephole miscompile:
                 // LCCC_NO_PEEPHOLE=1 emits the pre-peephole assembly verbatim.
-                if std::env::var_os("LCCC_NO_PEEPHOLE").is_some() {
+                let asm = if std::env::var_os("LCCC_NO_PEEPHOLE").is_some() {
                     raw
                 } else {
                     x86::codegen::peephole::peephole_optimize_with_config(
                         raw,
                         opts.ra_config.as_ref(),
                     )
-                }
+                };
+                finish_fn_boundaries(&asm, &cg.state, opts.emit_cfi, cfi_synth::CfiArch::X86_64)
             }
             Target::I686 => {
                 let mut cg = i686::I686Codegen::new_with_ra_config(opts.ra_config.clone());
@@ -484,6 +557,12 @@ impl Target {
                 } else {
                     i686::codegen::peephole::peephole_optimize(raw)
                 };
+                let optimized = finish_fn_boundaries(
+                    &optimized,
+                    &cg.state,
+                    opts.emit_cfi,
+                    cfi_synth::CfiArch::I386,
+                );
                 if opts.code16gcc {
                     format!(".code16gcc\n{}", optimized)
                 } else {
@@ -578,5 +657,39 @@ impl Target {
         user_args: &[String],
     ) -> Result<(), String> {
         common::link_with_args(&self.linker_config(), object_files, output_path, user_args)
+    }
+}
+
+#[cfg(test)]
+mod fn_boundary_marker_tests {
+    use super::strip_fn_boundary_markers;
+    use crate::common::fx_hash::FxHashSet;
+
+    fn marked(names: &[&str]) -> FxHashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn strips_only_generated_markers() {
+        let asm = "    .type f, @function\nf:\n    .cfi_startproc\n    ret\n    .cfi_endproc\n    .size f, .-f\n\n";
+        let out = strip_fn_boundary_markers(asm, &marked(&["f"]));
+        assert_eq!(
+            out,
+            "    .type f, @function\nf:\n    ret\n    .size f, .-f\n\n"
+        );
+    }
+
+    #[test]
+    fn keeps_user_cfi_in_inline_asm() {
+        // A hand-written function in top-level asm carries its own CFI and
+        // is not in the marked set: every directive survives.
+        let asm = "g:\n.cfi_startproc\nnop\n.cfi_endproc\n.size g, .-g\n\
+                   f:\n    .cfi_startproc\n.cfi_startproc\nnop\n.cfi_endproc\n    ret\n    .cfi_endproc\n    .size f, .-f\n";
+        let out = strip_fn_boundary_markers(asm, &marked(&["f"]));
+        assert_eq!(
+            out,
+            "g:\n.cfi_startproc\nnop\n.cfi_endproc\n.size g, .-g\n\
+             f:\n.cfi_startproc\nnop\n.cfi_endproc\n    ret\n    .size f, .-f\n"
+        );
     }
 }

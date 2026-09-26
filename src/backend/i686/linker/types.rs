@@ -235,6 +235,9 @@ pub(super) struct DynSymInfo {
     pub binding: u8,
     pub version: Option<String>,
     pub is_default_ver: bool,
+    /// DT_SONAME of the shared object defining the symbol (None when it has
+    /// none; the caller then falls back to the name the library was found by).
+    pub soname: Option<String>,
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
