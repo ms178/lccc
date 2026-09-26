@@ -6642,7 +6642,10 @@ mod indexed_gep_machinst_gate_tests {
             seg_override: AddressSpace::Default,
             volatile: false,
         };
-        assert!(!indexed_gep_memory_access(&unrelated_load, &indexed_gep_map));
+        assert!(!indexed_gep_memory_access(
+            &unrelated_load,
+            &indexed_gep_map
+        ));
     }
 }
 
