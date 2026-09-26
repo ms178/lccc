@@ -432,11 +432,8 @@ impl SemanticAnalyzer {
                     if let Some(DerivedDeclarator::Function(params, variadic)) =
                         declarator.derived.last()
                     {
-                        let ptr_count = declarator
-                            .derived
-                            .iter()
-                            .take_while(|d| matches!(d, DerivedDeclarator::Pointer))
-                            .count();
+                        let ptr_count =
+                            DerivedDeclarator::return_pointer_depth(&declarator.derived);
                         let mut return_type = decl.type_spec.clone();
                         for _ in 0..ptr_count {
                             return_type = TypeSpecifier::Pointer(
@@ -462,12 +459,12 @@ impl SemanticAnalyzer {
                         .iter()
                         .find(|d| matches!(d, DerivedDeclarator::FunctionPointer(_, _)))
                     {
-                        let ptr_count = declarator
-                            .derived
-                            .iter()
-                            .take_while(|d| matches!(d, DerivedDeclarator::Pointer))
-                            .count();
-                        let ret_ptr_count = if ptr_count > 0 { ptr_count - 1 } else { 0 };
+                        // The entity is itself one pointer: the return
+                        // type's depth is the canonical depth minus that
+                        // one indirection.
+                        let ret_ptr_count =
+                            DerivedDeclarator::return_pointer_depth(&declarator.derived)
+                                .saturating_sub(1);
                         let mut return_type = decl.type_spec.clone();
                         for _ in 0..ret_ptr_count {
                             return_type = TypeSpecifier::Pointer(
