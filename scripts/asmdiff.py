@@ -230,8 +230,12 @@ def read_elf(path: Path) -> ElfImage:
 def _interesting(name: str) -> bool:
     if name.startswith((".debug", ".note")):
         return False
-    return name not in (".comment", ".eh_frame", ".eh_frame_hdr", ".group",
-                        ".llvm_addrsig")
+    # `.eh_frame` IS compared: CFA advances are sized from the final code
+    # layout and FDE lengths from the final CFI stream, and both corpora
+    # match GAS 2.47 byte for byte. Excluding it hid a CFA advance baked
+    # before a `.uleb128` in `.text` shrank (layout-edits/
+    # cfa_advance_across_shrinking_uleb).
+    return name not in (".comment", ".eh_frame_hdr", ".group", ".llvm_addrsig")
 
 
 def normalize_relocs(img: ElfImage) -> dict[str, list[tuple]]:
@@ -599,8 +603,16 @@ def main() -> int:
     if len(failures) > args.max_report:
         print(f"... and {len(failures) - args.max_report} more")
 
+    # Name the oracle's RELEASE, not just its path: byte-exact layout cases
+    # (NOP tables, relaxation order) legitimately differ between GAS
+    # releases, and a failure log must say which one it was checked against.
+    try:
+        version = subprocess.run([args.gas, "--version"], capture_output=True,
+                                 text=True, check=False).stdout.splitlines()[0]
+    except (OSError, IndexError):
+        version = "unknown version"
     print(f"=== asm-diff: {passed} passed, {len(failures)} failed "
-          f"({len(cases)} cases, oracle={args.gas}) ===")
+          f"({len(cases)} cases, oracle={args.gas}: {version}) ===")
     return 1 if failures else 0
 
 

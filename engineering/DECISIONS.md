@@ -2671,3 +2671,75 @@ after ordering fix on our CI image.
 - F7 alloc: confirmed no-clone iteration over `use_locs` slice, GlobalAddr
   map O(F*I+G*refs) not O(G*F*I), and no unnecessary `clone()` of templates
   beyond required owned string for map key.
+
+## PERF-ARX-LAT (2026-09-26) — ARX lane frames chosen by critical-path latency
+
+**Decision.** `vec_arx` and `arx_vectorize` choose which roles of the
+lane-rotated ARX group are shuffled by minimising the round loop's critical
+path under one shared, microarchitecture-neutral latency model
+(`arx_vec_op_latency`: every emitted vector op 1 cycle, the shift-pair rotate
+2, `vprold` 1).  `vec_arx` decides per op→op component, greedily in program
+order (ties: fewer instructions, then the historical frame); `arx_vectorize`
+ranks its four anchor offsets by `kernel_critical_path`.
+
+**Why.** The previous frame shuffled the diagonal group's b role, whose value
+comes from `rotl(b, 7)` and is consumed by `a += b` immediately: two `pshufd`
+on the critical path per double round.  The loop is a serial recurrence, so
+this cost 2 of 30 cycles on every model (llvm-mca znver4/5, raptorlake,
+sapphirerapids), and the op-count cost model of the original design could
+not see it.  Anchoring b is derived, not hard-coded: the same search keeps
+any frame-insensitive kernel byte-identical.
+
+**Evidence.** chacha20_block: recurrence 30 → 28 (v3), 34 → 32 (SSE2),
+26 → 24 (AVX-512VL), both source forms; identical instruction count and
+output; paired wall-clock after/before median 0.941 (18/21 faster, Xeon host);
+lccc/gcc-v3 0.950.  Gate: `tests/regression/check_arx_frame_latency.sh`
+(fails on the old compiler in all six configurations by exactly 2 cycles).
+
+**Rejected.** Hard-coding "never shuffle b" (cipher-specific, and wrong for
+schedules whose last op writes another role); a per-`-mtune` latency table
+(the relevant latencies are identical on Zen 3–5 and Intel P-cores); counting
+shuffles (the old design's error: all candidates have the same count).
+
+## PERF-REASSOC-LAT (2026-09-26) — reassociate integer trees by recurrence latency
+
+**Decision.** A new last-scalar-IR pass (`reassoc_latency.rs`,
+`CCC_DISABLE_PASSES=reassoc_lat`) rebuilds single-use Add/And/Or/Xor trees
+(i32/u32/i64/u64) that lie on a loop-carried recurrence.  Availability is
+`(r, l)`: `r` = time along the innermost loop's recurrences (non-IV header
+phis start at 0; invariants, IVs and IV-addressed loads are free), `l` =
+local depth.  Free leaves are left-folded in source order; the partial sum
+and the carried leaves are merged Huffman-style (two earliest first).  A
+tree is rewritten only if its root's `r` strictly drops.  Leaves' pure
+single-use chains are sunk to their new consumer.
+
+**Why.** SHA-256 (benchmark ratio 1.30 vs GCC on EPYC) builds `t1` in source
+order, putting four serial adds after Σ1 on the e→e recurrence.  Measured
+round loop, llvm-mca 19 cycles/round: lccc 13.35 → **7.05** (znver4/5),
+15.01 → **10.02** (raptorlake/SPR); GCC 16.2 9.69/12.01, Clang 23.1
+12.03/14.02.  Recurrence bound (loop_latency.py --loads): 8 → **5** at v3
+(the floor: Σ1 3 + 1 + 1), 8 → 6 at x86-64; GCC/Clang/ICX all 7.  Wall
+clock (Xeon host, paired): sha256 0.930, sqlite_varint 0.959,
+switch_dispatch 0.973, i686_alu_chains 0.983; 44 of 51 benchmark programs
+byte-identical; outputs identical in all 7 that change.
+
+**Why these rules (each from a measured failure).**
+* *Recurrence-only:* the first version also balanced off-recurrence trees
+  by local depth; conv_u8_3x3's 9-product sum then spilled (+24% dynamic
+  instructions).  An off-recurrence tree is overlapped across iterations by
+  the out-of-order core, so depth there buys nothing.
+* *Sinking:* without it Σ1 and Ch stayed live across `K[i] + W[i] + h` and
+  the round loop spilled one GPR.
+* *`Not`→`And` costs 0:* BMI1 `andn` (default v3) makes Ch 2 deep; charging
+  the `Not` tied Ch with Σ1 and gave 6 instead of 5.
+* *Signed sums are legal:* IR integer Add wraps (no nsw flags) and every
+  overflow-reasoning pass (IV widening, CVP, SCCP) runs before this one.
+
+**Rejected.** GCC's rank-sorted linear chain (orders by def depth, not by
+recurrence: its SHA round is 7, not 5); balancing every tree (register
+pressure, above); a per-`-mtune` latency table (only relative order
+matters, and the rule set is target-neutral except the `andn` fold).
+
+**Known cost.** sqlite_varint executes +3.8% instructions (reg-reg copies
+from coalescing around the reshaped trees; no spills) while running 4%
+faster — a copy-coalescing follow-up, not a reason to narrow the pass.

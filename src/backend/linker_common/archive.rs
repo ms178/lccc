@@ -62,7 +62,7 @@ fn member_resolves_undefined_generic<G: GlobalSymbolOps>(
 /// any currently-undefined global symbol. Repeat until no more progress.
 fn resolve_archive_members<G: GlobalSymbolOps>(
     member_objects: &mut Vec<Elf64Object>,
-    objects: &mut Vec<Elf64Object>,
+    objects: &mut super::ObjectSet,
     globals: &mut FxHashMap<String, G>,
     should_replace_extra: fn(&G) -> bool,
 ) -> Result<(), String> {
@@ -73,8 +73,7 @@ fn resolve_archive_members<G: GlobalSymbolOps>(
         while i < member_objects.len() {
             if member_resolves_undefined_generic(&member_objects[i], globals) {
                 let obj = member_objects.remove(i);
-                let obj_idx = objects.len();
-                register_symbols_elf64(obj_idx, &obj, globals, should_replace_extra)?;
+                register_symbols_elf64(objects, &obj, globals, should_replace_extra)?;
                 objects.push(obj);
                 changed = true;
             } else {
@@ -94,7 +93,7 @@ fn resolve_archive_members<G: GlobalSymbolOps>(
 pub fn load_archive_elf64<G: GlobalSymbolOps>(
     data: &[u8],
     archive_path: &str,
-    objects: &mut Vec<Elf64Object>,
+    objects: &mut super::ObjectSet,
     globals: &mut FxHashMap<String, G>,
     expected_machine: u16,
     should_replace_extra: fn(&G) -> bool,
@@ -121,7 +120,7 @@ pub fn load_archive_elf64<G: GlobalSymbolOps>(
 pub fn load_archive_elf64_shared<G: GlobalSymbolOps>(
     buf: &std::sync::Arc<[u8]>,
     archive_path: &str,
-    objects: &mut Vec<Elf64Object>,
+    objects: &mut super::ObjectSet,
     globals: &mut FxHashMap<String, G>,
     expected_machine: u16,
     should_replace_extra: fn(&G) -> bool,
@@ -146,7 +145,7 @@ pub fn load_archive_elf64_shared<G: GlobalSymbolOps>(
 pub fn load_archive_elf64_backed<G: GlobalSymbolOps>(
     buf: &crate::backend::linker_common::filemap::FileBacking,
     archive_path: &str,
-    objects: &mut Vec<Elf64Object>,
+    objects: &mut super::ObjectSet,
     globals: &mut FxHashMap<String, G>,
     expected_machine: u16,
     should_replace_extra: fn(&G) -> bool,
@@ -180,8 +179,7 @@ pub fn load_archive_elf64_backed<G: GlobalSymbolOps>(
     if whole_archive {
         // --whole-archive: include ALL members unconditionally
         for obj in member_objects.drain(..) {
-            let obj_idx = objects.len();
-            register_symbols_elf64(obj_idx, &obj, globals, should_replace_extra)?;
+            register_symbols_elf64(objects, &obj, globals, should_replace_extra)?;
             objects.push(obj);
         }
     } else {
@@ -197,7 +195,7 @@ pub fn load_archive_elf64_backed<G: GlobalSymbolOps>(
 pub fn load_thin_archive_elf64<G: GlobalSymbolOps>(
     data: &[u8],
     archive_path: &str,
-    objects: &mut Vec<Elf64Object>,
+    objects: &mut super::ObjectSet,
     globals: &mut FxHashMap<String, G>,
     expected_machine: u16,
     should_replace_extra: fn(&G) -> bool,
@@ -229,8 +227,7 @@ pub fn load_thin_archive_elf64<G: GlobalSymbolOps>(
     }
     if whole_archive {
         for obj in member_objects.drain(..) {
-            let obj_idx = objects.len();
-            register_symbols_elf64(obj_idx, &obj, globals, should_replace_extra)?;
+            register_symbols_elf64(objects, &obj, globals, should_replace_extra)?;
             objects.push(obj);
         }
     } else {
@@ -251,7 +248,7 @@ pub fn load_thin_archive_elf64<G: GlobalSymbolOps>(
 #[expect(dead_code)] // Planned shared infrastructure; x86/ARM linkers will migrate to this
 pub fn load_file_elf64<G: GlobalSymbolOps>(
     path: &str,
-    objects: &mut Vec<Elf64Object>,
+    objects: &mut super::ObjectSet,
     globals: &mut FxHashMap<String, G>,
     expected_machine: u16,
     lib_paths: &[String],
@@ -362,8 +359,7 @@ pub fn load_file_elf64<G: GlobalSymbolOps>(
 
     // Regular ELF object
     let obj = parse_elf64_object(&data, path, expected_machine)?;
-    let obj_idx = objects.len();
-    register_symbols_elf64(obj_idx, &obj, globals, should_replace_extra)?;
+    register_symbols_elf64(objects, &obj, globals, should_replace_extra)?;
     objects.push(obj);
     Ok(())
 }

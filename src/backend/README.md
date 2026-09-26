@@ -341,7 +341,7 @@ points are:
 6. Emits extern visibility directives for referenced symbols.
 7. Iterates over functions, calling `generate_function` for each.
 8. Emits aliases, symbol attributes, `.init_array`/`.fini_array` entries.
-9. Emits architecture-specific runtime helper stubs (e.g., i686 `__divdi3`).
+9. Emits architecture-specific runtime helper stubs (e.g., i686 `__lccc_divdi3`).
 10. Emits `.note.GNU-stack` section for non-executable stack.
 
 ### `generate_function`

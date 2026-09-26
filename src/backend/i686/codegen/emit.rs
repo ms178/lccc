@@ -504,6 +504,9 @@ impl I686Codegen {
         self.regparm = opts.regparm;
         self.omit_frame_pointer = opts.omit_frame_pointer;
         self.state.emit_cfi = opts.emit_cfi;
+        // Function delimiters for the peephole even without unwind tables;
+        // stripped after it (see CodegenState::fn_boundary_markers).
+        self.state.fn_boundary_markers = true;
         // 0 (Default::default()) means "unspecified" -> SysV 16.
         self.stack_boundary = match opts.preferred_stack_bytes {
             4 => 4,
@@ -1671,6 +1674,13 @@ impl I686Codegen {
             }
         }
 
+        let pops = if is_variadic { 0 } else { stack_bytes as u32 };
+        if indirect {
+            self.state.record_call_pop(None, Some(pops));
+        } else if direct_name.is_some() {
+            self.state.record_call_pop(direct_name, Some(pops));
+        }
+
         // Phase 4: Stack cleanup. Non-variadic fastcall callees pop the
         // stack args themselves (`ret $N`); variadic callees pop nothing.
         if is_variadic {
@@ -2661,6 +2671,10 @@ impl ArchCodegen for I686Codegen {
         );
         self.emit_call_instruction(direct_name, func_ptr, indirect, stack_arg_space);
         let callee_pops = self.callee_pops_bytes_for_sret(is_sret);
+        if indirect || direct_name.is_some() {
+            let target = if indirect { None } else { direct_name };
+            self.state.record_call_pop(target, Some(callee_pops as u32));
+        }
         // Account for bytes the callee pops via `ret $N` (sret pointer on i686).
         if callee_pops > 0 {
             self.esp_adjust -= callee_pops as i64;
@@ -3542,8 +3556,10 @@ impl ArchCodegen for I686Codegen {
             s.emit(".hidden __x86.get_pc_thunk.bx");
             s.emit(".type __x86.get_pc_thunk.bx, @function");
             s.emit("__x86.get_pc_thunk.bx:");
+            begin_runtime_stub(s, "__x86.get_pc_thunk.bx");
             s.emit("    movl (%esp), %ebx");
             s.emit("    ret");
+            end_runtime_stub(s);
             s.emit(".size __x86.get_pc_thunk.bx, .-__x86.get_pc_thunk.bx");
             s.emit(".text");
         }
@@ -3552,27 +3568,38 @@ impl ArchCodegen for I686Codegen {
             return;
         }
 
-        // Switch to .text explicitly: the last function in the module may have been
-        // in a custom section (e.g. .init.text), and without this directive the
-        // helper stubs would inherit that section.  The Linux kernel's modpost
-        // check rejects .text -> .init.text cross-references, so these must live
-        // in .text.
-        self.state.emit(".text");
-
+        // Each helper opens its own `.text.NAME` COMDAT section, so none can
+        // inherit the last function's custom section (e.g. `.init.text`, which
+        // the Linux kernel's modpost would reject .text references into; it
+        // classifies `.text.*` as text). Return to `.text` afterwards, as the
+        // thunk above does.
         self.emit_udivdi3_stub();
         self.emit_umoddi3_stub();
         self.emit_divdi3_stub();
         self.emit_moddi3_stub();
+        self.state.emit(".text");
     }
 }
 
 // ─── 64-bit division runtime stubs for i686 ──────────────────────────────────
 //
-// On 32-bit x86, 64-bit division/modulo requires runtime helpers normally
-// provided by libgcc (__divdi3, __udivdi3, __moddi3, __umoddi3).  Standalone
-// builds (e.g. musl libc) that don't link libgcc need the compiler to provide
-// these.  We emit them as .weak symbols so that if libgcc IS linked, its
-// versions take precedence.
+// On 32-bit x86, 64-bit division/modulo needs runtime helpers (libgcc's
+// __divdi3, __udivdi3, __moddi3, __umoddi3). lccc emits its own so that
+// objects link without libgcc, under COMPILER-PRIVATE names in the
+// implementation namespace -- `__lccc_divdi3` etc. -- the way GCC emits
+// `__x86.get_pc_thunk.*`: each in its own COMDAT group (one copy per link,
+// however many objects carry it; unused ones fall to --gc-sections),
+// `.globl` + `.hidden` (never exported from a shared object, never
+// interposable, and their mutual calls bind locally: a plain PC32, no PLT
+// and no %ebx = GOT requirement).
+//
+// The public libgcc names must NOT be defined here. ELF gives a linked
+// symbol the most constraining visibility of all its definitions, so a
+// hidden (weak) `__divdi3` in any object silently hides a strong one that a
+// shared object exports on purpose -- glibc i386 exports its compat
+// `__divdi3@GLIBC_2.0` exactly so (measured: the version vanished from
+// .dynsym). A default-visibility weak copy is no better: every lccc-built
+// DSO would export and interpose the helpers.
 //
 // Calling convention (cdecl, stack-based):
 //   4(%esp)  = dividend low  (A_lo)
@@ -3581,16 +3608,47 @@ impl ArchCodegen for I686Codegen {
 //   16(%esp) = divisor high  (B_hi)
 //   Return: edx:eax = 64-bit result
 
+/// Open a hand-written runtime helper as a function the CFI pass manages:
+/// the same bare boundary markers codegen puts around compiled functions,
+/// so `cfi_synth` derives the FDE from the helper's final instructions
+/// (push/pop depth, mid-function returns) exactly as GCC's own
+/// `__x86.get_pc_thunk.*` and libgcc division helpers carry one.  Without
+/// an FDE, an asynchronous unwind (profiler/backtrace from a signal
+/// handler, pthread_cancel) that lands in the helper cannot find its caller.
+/// With unwind tables off the markers are stripped again.
+fn begin_runtime_stub(s: &mut CodegenState, name: &str) {
+    s.emit(".cfi_startproc");
+    s.fn_boundary_marked.insert(name.to_string());
+}
+
+/// Open a 64-bit division helper: its own COMDAT group and `.text.NAME`
+/// section (modpost classifies `.text.*` as text), global + hidden, then the
+/// CFI-managed body (see the block comment above the stubs).
+fn open_divrem_helper(s: &mut CodegenState, name: &str) {
+    s.emit("");
+    s.emit_fmt(format_args!(
+        ".section .text.{name},\"axG\",@progbits,{name},comdat"
+    ));
+    s.emit_fmt(format_args!(".globl {name}"));
+    s.emit_fmt(format_args!(".hidden {name}"));
+    s.emit_fmt(format_args!(".type {name}, @function"));
+    s.emit_fmt(format_args!("{name}:"));
+    begin_runtime_stub(s, name);
+}
+
+/// Close a helper opened by [`begin_runtime_stub`]; must directly precede
+/// its `.size NAME, .-NAME`.
+fn end_runtime_stub(s: &mut CodegenState) {
+    s.emit(".cfi_endproc");
+}
+
 impl I686Codegen {
     /// Emit __udivdi3: unsigned 64-bit division, returns quotient in edx:eax.
     /// Algorithm based on compiler-rt's i386/udivdi3.S (Stephen Canon, 2008).
     /// Uses normalized-divisor estimation with remainder-based adjustment.
     fn emit_udivdi3_stub(&mut self) {
         let s = &mut self.state;
-        s.emit("");
-        s.emit(".weak __udivdi3");
-        s.emit(".type __udivdi3, @function");
-        s.emit("__udivdi3:");
+        open_divrem_helper(s, "__lccc_udivdi3");
         s.emit("# lccc-i686-return-uses-edx");
         // Stack: ret(0), A_lo(4), A_hi(8), B_lo(12), B_hi(16)
         s.emit("    pushl %ebx");
@@ -3674,17 +3732,15 @@ impl I686Codegen {
         s.emit("    movl %ebx, %edx"); // edx = Q_hi
         s.emit("    popl %ebx");
         s.emit("    ret");
-        s.emit(".size __udivdi3, .-__udivdi3");
+        end_runtime_stub(s);
+        s.emit(".size __lccc_udivdi3, .-__lccc_udivdi3");
     }
 
     /// Emit __umoddi3: unsigned 64-bit modulo, returns remainder in edx:eax.
     /// Computes a % b = a - (a / b) * b, delegating division to __udivdi3.
     fn emit_umoddi3_stub(&mut self) {
         let s = &mut self.state;
-        s.emit("");
-        s.emit(".weak __umoddi3");
-        s.emit(".type __umoddi3, @function");
-        s.emit("__umoddi3:");
+        open_divrem_helper(s, "__lccc_umoddi3");
         s.emit("# lccc-i686-return-uses-edx");
         // Stack: ret(0), A_lo(4), A_hi(8), B_lo(12), B_hi(16)
         s.emit("    pushl %ebx");
@@ -3698,7 +3754,7 @@ impl I686Codegen {
         s.emit("    pushl 32(%esp)"); // B_lo (28+4=32 after push)
         s.emit("    pushl 32(%esp)"); // A_hi (24+8=32 after two pushes)
         s.emit("    pushl 32(%esp)"); // A_lo (20+12=32 after three pushes)
-        s.emit("    call __udivdi3");
+        s.emit("    call __lccc_udivdi3");
         s.emit("    addl $16, %esp");
         // edx:eax = quotient (Q_hi:Q_lo)
 
@@ -3727,17 +3783,15 @@ impl I686Codegen {
         s.emit("    popl %esi");
         s.emit("    popl %ebx");
         s.emit("    ret");
-        s.emit(".size __umoddi3, .-__umoddi3");
+        end_runtime_stub(s);
+        s.emit(".size __lccc_umoddi3, .-__lccc_umoddi3");
     }
 
     /// Emit __divdi3: signed 64-bit division.
     /// Negates operands to unsigned, calls __udivdi3, negates result if needed.
     fn emit_divdi3_stub(&mut self) {
         let s = &mut self.state;
-        s.emit("");
-        s.emit(".weak __divdi3");
-        s.emit(".type __divdi3, @function");
-        s.emit("__divdi3:");
+        open_divrem_helper(s, "__lccc_divdi3");
         s.emit("# lccc-i686-return-uses-edx");
         // Stack: ret, A_lo(4), A_hi(8), B_lo(12), B_hi(16)
         s.emit("    pushl %ebx");
@@ -3769,7 +3823,7 @@ impl I686Codegen {
         s.emit("    pushl %ebx"); // B_lo (unsigned)
         s.emit("    pushl %edx"); // A_hi (unsigned)
         s.emit("    pushl %eax"); // A_lo (unsigned)
-        s.emit("    call __udivdi3");
+        s.emit("    call __lccc_udivdi3");
         s.emit("    addl $16, %esp");
         // Result in edx:eax. Negate if sign differs.
         s.emit("    testl %edi, %edi");
@@ -3782,17 +3836,15 @@ impl I686Codegen {
         s.emit("    popl %esi");
         s.emit("    popl %ebx");
         s.emit("    ret");
-        s.emit(".size __divdi3, .-__divdi3");
+        end_runtime_stub(s);
+        s.emit(".size __lccc_divdi3, .-__lccc_divdi3");
     }
 
     /// Emit __moddi3: signed 64-bit modulo.
     /// Negates operands to unsigned, calls __umoddi3, negates result if dividend was negative.
     fn emit_moddi3_stub(&mut self) {
         let s = &mut self.state;
-        s.emit("");
-        s.emit(".weak __moddi3");
-        s.emit(".type __moddi3, @function");
-        s.emit("__moddi3:");
+        open_divrem_helper(s, "__lccc_moddi3");
         s.emit("# lccc-i686-return-uses-edx");
         // Stack: ret, A_lo(4), A_hi(8), B_lo(12), B_hi(16)
         s.emit("    pushl %ebx");
@@ -3823,7 +3875,7 @@ impl I686Codegen {
         s.emit("    pushl %ebx");
         s.emit("    pushl %edx");
         s.emit("    pushl %eax");
-        s.emit("    call __umoddi3");
+        s.emit("    call __lccc_umoddi3");
         s.emit("    addl $16, %esp");
         // Negate result if dividend was negative
         s.emit("    testl %edi, %edi");
@@ -3836,7 +3888,8 @@ impl I686Codegen {
         s.emit("    popl %esi");
         s.emit("    popl %ebx");
         s.emit("    ret");
-        s.emit(".size __moddi3, .-__moddi3");
+        end_runtime_stub(s);
+        s.emit(".size __lccc_moddi3, .-__lccc_moddi3");
     }
 }
 

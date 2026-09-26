@@ -66,6 +66,28 @@ class AsmDiffParityTest(unittest.TestCase):
         self.assertIn(needle, self.hosted)
         self.assert_rejected(self.hosted.replace(needle, "echo installer removed", 1))
 
+    def test_i686_gate_requires_the_pinned_oracle(self) -> None:
+        pinned = "--as \"$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as\" "
+        self.assertIn(pinned, self.i686)
+        for replacement in (self.i686.replace(pinned, "", 1),
+                            self.i686.replace(pinned, "--as as ", 1)):
+            with self.subTest(replacement=replacement):
+                self.assert_rejected(self.hosted.replace(self.i686, replacement, 1))
+
+    def test_local_gates_require_the_pinned_oracle_and_installer(self) -> None:
+        pinned = "--as \"$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as\""
+        self.assertEqual(self.local.count(pinned), 2)
+        for i in range(2):
+            with self.subTest(occurrence=i):
+                parts = self.local.split(pinned)
+                local = pinned.join(parts[: i + 1]) + "--as as" + pinned.join(parts[i + 1 :])
+                with redirect_stderr(StringIO()):
+                    self.assertEqual(parity.check_asmdiff_gate_parity(local, self.hosted), 1)
+        needle = "bash scripts/ensure_gas_247.sh x86_64-linux-gnu"
+        with redirect_stderr(StringIO()):
+            self.assertEqual(parity.check_asmdiff_gate_parity(
+                self.local.replace(needle, "echo installer removed", 1), self.hosted), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

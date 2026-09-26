@@ -57,6 +57,15 @@ for arg in "$@"; do
 done
 
 LCCC=target/fastbuild/lccc
+# Pass stamp: the content address of the tree this run tested, written only
+# when every gate is green AND the tree did not change during the run.
+# lccc-snapshot.sh refuses to publish a tree without a matching stamp (S20
+# shipped a red hosted CI because this script was skipped). Removed up front:
+# a run that does not finish green leaves no proof behind.
+STAMP=target/ci_local.pass
+mkdir -p target
+rm -f "$STAMP"
+TREE_START=$(bash scripts/worktree_tree.sh 2>/dev/null || true)
 FAILED=()
 PASSED=0
 SKIPPED=0
@@ -204,6 +213,24 @@ gate "machinst-window-alloc" fast \
 gate "overalign-typed-census" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_overalign_typed_census.sh
 
+gate "nocfi-peephole-parity" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_nocfi_peephole_parity.sh
+
+gate "eh-frame-unwind" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_eh_frame_unwind.sh
+
+gate "cfi-invariants" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_cfi_invariants.sh
+
+gate "arx-frame-latency" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_arx_frame_latency.sh
+
+gate "reassoc-latency" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_reassoc_latency.sh
+
+gate "comdat-signature-identity" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_comdat_signature_identity.sh
+
 gate "loop-memset-decisions" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_loop_memset.sh
 
@@ -290,15 +317,23 @@ gate "dep-files" fast \
 gate "i686-boot-asm" fast \
     bash tests/regression/check_i686_boot_asm.sh
 
+# Byte-exact assembler differentials have ONE oracle: GNU as 2.47, exactly as
+# hosted CI. Distro assemblers are not interchangeable -- GAS 2.44 orders the
+# i386 lea-NOP remainder after the long NOP, 2.47 before it -- so an unpinned
+# oracle makes these gates depend on the host image. Provisioned (idempotent,
+# cached under ~/.cache) by the same script hosted CI runs.
+gate "asm-diff-oracle-gas-2.47" fast \
+    bash scripts/ensure_gas_247.sh x86_64-linux-gnu
+
 # Isolated PR #629 follow-up rows: x86-64 is not part of the i686 default
 # corpus, and a one-instruction reject must never be hidden by another reject.
-# Confirmed with GAS 2.47; the system GAS 2.44 also accepts/rejects this set.
 gate "merged-pr629-x86-asm-diff" fast \
-    python3 scripts/asmdiff.py --jobs 2 --lccc target/fastbuild/lccc-x86 \
-        tests/asm-diff/merged-pr629-followup.casefile
+    python3 scripts/asmdiff.py --jobs 2 --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" \
+        --lccc target/fastbuild/lccc-x86 tests/asm-diff/merged-pr629-followup.casefile
 
 gate "i686-asm-diff" fast \
-    python3 scripts/asmdiff.py --32 --jobs 2 --lccc target/fastbuild/lccc-i686
+    python3 scripts/asmdiff.py --32 --jobs 2 --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" \
+        --lccc target/fastbuild/lccc-i686
 gate "i686-tls-ie-relax" fast \
     bash tests/regression/check_i686_tls_ie_relax.sh
 
@@ -599,3 +634,19 @@ if [ ${#FAILED[@]} -gt 0 ]; then
     exit 1
 fi
 echo "ALL GATES GREEN"
+if [ -n "$ONLY" ]; then
+    echo "(--only $ONLY: partial run, no pass stamp)"
+else
+    TREE_END=$(bash scripts/worktree_tree.sh 2>/dev/null || true)
+    if [ -n "$TREE_START" ] && [ "$TREE_START" = "$TREE_END" ]; then
+        mode=full
+        [ "$FAST" = 1 ] && mode=fast
+        printf 'tree=%s\nmode=%s\nutc=%s\nhead=%s\n' "$TREE_END" "$mode" \
+            "$(date -u +%Y%m%dT%H%M%SZ)" "$(git rev-parse HEAD)" >"$STAMP.tmp" &&
+            mv -f "$STAMP.tmp" "$STAMP"
+        echo "pass stamp: $STAMP (tree $TREE_END, $mode)"
+    else
+        echo "WARNING: the worktree changed during the run" \
+             "(${TREE_START:-?} -> ${TREE_END:-?}); no pass stamp" >&2
+    fi
+fi

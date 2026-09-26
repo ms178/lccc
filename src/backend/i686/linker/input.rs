@@ -239,9 +239,9 @@ pub(super) fn load_libraries(
                         .map(|p| p.to_string_lossy().into_owned())
                         .unwrap_or(path.clone());
                     if let Ok(syms) = read_dynsyms_with_search(&check_path, &all_lib_refs) {
-                        let lib_soname = filename.clone();
                         for sym in syms {
-                            insert_dynsym(&mut dynlib_syms, sym, &lib_soname);
+                            let so = sym.soname.clone().unwrap_or_else(|| filename.clone());
+                            insert_dynsym(&mut dynlib_syms, sym, &so);
                         }
                     }
                     static_lib_objects.push(path);
@@ -288,18 +288,17 @@ pub(super) fn scan_shared_lib(
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or(cand.clone());
             if let Ok(syms) = read_dynsyms_with_search(&check_path, lib_refs) {
-                // Read the actual SONAME from the ELF file; fall back to hardcoded defaults
-                let lib_soname = parse_soname_elf32(&check_path).unwrap_or_else(|| {
-                    if lib == "c" {
-                        "libc.so.6".to_string()
-                    } else if lib == "m" {
-                        "libm.so.6".to_string()
-                    } else {
-                        format!("lib{}.so", lib)
-                    }
-                });
+                // Each symbol names the SONAME of the object defining it
+                // (linker-script members included); a library without
+                // DT_SONAME is recorded by the name it was found under, as
+                // GNU ld does.
+                let found_as = std::path::Path::new(cand)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| so_base.clone());
                 for sym in syms {
-                    insert_dynsym(dynlib_syms, sym, &lib_soname);
+                    let so = sym.soname.clone().unwrap_or_else(|| found_as.clone());
+                    insert_dynsym(dynlib_syms, sym, &so);
                 }
                 return true;
             }

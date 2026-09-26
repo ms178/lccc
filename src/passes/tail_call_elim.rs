@@ -482,6 +482,24 @@ pub(crate) fn tail_calls_to_loops(func: &mut IrFunction) -> usize {
             continue;
         }
 
+        // Everything after the call must be removable dead code. The rewrite
+        // below turns the call into a back edge but leaves the trailing
+        // instructions in place, so they would run *before* the callee's
+        // body instead of after it returns. Their results can feed nothing
+        // but the block's own tail (the block ends in `return`), so a pure
+        // tail is dead and harmless; a side effect is reordered across the
+        // whole recursive activation. `int r = f(n - 1); counter++; return
+        // r;` executed every increment before the base case ran, and a
+        // volatile `asm` after the recursive call was hoisted likewise
+        // (GCC keeps the frame here: the call is not in tail position).
+        // Dest-less instructions are rooted like DCE roots them.
+        if block.instructions[call_idx + 1..]
+            .iter()
+            .any(|inst| crate::passes::dce::has_side_effects(inst) || inst.dest().is_none())
+        {
+            continue;
+        }
+
         // Verify no instruction after the call uses the call result.
         if let Some(result_val) = call_dest {
             let later_use = block.instructions[call_idx + 1..].iter().any(|inst| {
@@ -1207,6 +1225,62 @@ mod tests {
             1,
             "non-recursive function should be unchanged"
         );
+    }
+
+    /// `long sum(int n, long acc)` whose recursive block stores to a global
+    /// after the self call: `r = sum(n - 1, acc + n); counter = n; return r;`
+    fn make_sum_func_with_trailing(trailing: Vec<Instruction>) -> IrFunction {
+        let mut func = make_sum_func();
+        let rec = &mut func.blocks[2];
+        rec.instructions.push(Instruction::GlobalAddr {
+            dest: Value(7),
+            name: "counter".to_string(),
+        });
+        rec.instructions.extend(trailing);
+        func.next_value_id = 9;
+        func
+    }
+
+    #[test]
+    fn test_tce_rejects_side_effect_after_self_call() {
+        // The trailing store would run before the callee's body once the
+        // call became a back edge: every `counter` write would precede the
+        // base case instead of following it.
+        let mut func = make_sum_func_with_trailing(vec![Instruction::Store {
+            val: Operand::Value(Value(0)),
+            ptr: Value(7),
+            ty: IrType::I32,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        }]);
+        assert_eq!(tail_calls_to_loops(&mut func), 0);
+        assert_eq!(func.blocks.len(), 3, "function must be left untouched");
+    }
+
+    #[test]
+    fn test_tce_accepts_dead_pure_tail_after_self_call() {
+        // A pure tail can only feed the block's own tail (the block ends in
+        // `return`), so it is dead code and does not block the rewrite.
+        let mut func = make_sum_func_with_trailing(vec![Instruction::Load {
+            dest: Value(8),
+            ptr: Value(7),
+            ty: IrType::I32,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        }]);
+        assert_eq!(tail_calls_to_loops(&mut func), 1);
+    }
+
+    #[test]
+    fn test_tce_rejects_volatile_load_after_self_call() {
+        let mut func = make_sum_func_with_trailing(vec![Instruction::Load {
+            dest: Value(8),
+            ptr: Value(7),
+            ty: IrType::I32,
+            seg_override: AddressSpace::Default,
+            volatile: true,
+        }]);
+        assert_eq!(tail_calls_to_loops(&mut func), 0);
     }
 
     #[test]

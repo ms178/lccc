@@ -205,13 +205,18 @@ def check_asmdiff_gate_parity(local_text: str, hosted: str) -> int:
                 and asm_option(cmd, "--jobs") == "2"
                 and asm_option(cmd, "--lccc") == compiler
                 and set(casefiles) == {t for t in cmd if t.endswith(".casefile")}
-                and (where != "hosted" or mode32 or
-                     "gas-2.47-x86_64-linux-gnu/bin/as" in (asm_option(cmd, "--as") or ""))
+                # Every byte-exact differential, in both modes and on both
+                # sides, uses the pinned GAS 2.47 oracle: an unpinned `as`
+                # is whatever release the host image ships (the i686 gate
+                # once failed only because the runner's 2.42 lays out NOP
+                # fills differently from 2.47).
+                and "gas-2.47-x86_64-linux-gnu/bin/as" in (asm_option(cmd, "--as") or "")
                 for cmd in commands
             ):
                 missing.append(f"{where}: {gate} (mode/corpus/compiler/jobs/oracle)")
-    if "bash scripts/ensure_gas_247.sh x86_64-linux-gnu" not in hosted:
-        missing.append("hosted: install GNU as 2.47 x86-64 oracle")
+    for where, text in (("local", local_text), ("hosted", hosted)):
+        if "bash scripts/ensure_gas_247.sh x86_64-linux-gnu" not in text:
+            missing.append(f"{where}: install GNU as 2.47 x86-64 oracle")
     if missing:
         print("missing mode/corpus-specific assembly gates:", file=sys.stderr)
         for item in missing:

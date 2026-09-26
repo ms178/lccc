@@ -23,6 +23,10 @@ use elf_writer::ElfWriter;
 /// This is the default assembler (used when the `gcc_assembler` feature is disabled).
 pub fn assemble(asm_text: &str, output_path: &str) -> Result<(), String> {
     let items = parse_asm(asm_text)?;
+    let items = crate::backend::x86::assembler::cfi::lower_cfi(
+        items,
+        crate::backend::x86::assembler::cfi::CfiArch::I386,
+    )?;
     let obj = ElfWriter::new();
     let elf_bytes = obj.build(&items)?;
     std::fs::write(output_path, &elf_bytes)

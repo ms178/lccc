@@ -88,6 +88,7 @@ mod write;
 // callers see no change from the previous flat-file layout.
 
 // types.rs
+pub use comdat::ObjectSet;
 pub use types::{DynSymbol, Elf64Object, Elf64Rela, Elf64Section, Elf64Symbol};
 
 // parse_object.rs
@@ -154,7 +155,10 @@ pub use args::{HashStyle, exclude_libs_matches, parse_linker_args};
 pub use check::{check_undefined_symbols_elf64, check_undefined_symbols_elf64_verbose};
 
 // eh_frame.rs
-pub use eh_frame::{build_eh_frame_hdr, count_eh_frame_fdes, prune_dead_fdes};
+pub use eh_frame::{
+    build_eh_frame_hdr, compact_eh_frame, count_eh_frame_fdes, prune_dead_fdes,
+    scan_eh_frame_records,
+};
 
 // gc_sections.rs
 pub use gc_sections::{

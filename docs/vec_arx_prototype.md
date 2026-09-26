@@ -40,6 +40,27 @@ where a fused shuffle form exists.
   2× `vpaddd (%rsi)` + 2× `vmovdqu` stores (the loop never re-stores state —
   the original block stays in memory and is re-read once).
 
+## Latency, not op count, decides the round loop (2026-09-26 correction)
+
+The op-count table below is right about instruction counts and wrong as a
+performance model.  A round loop is a serial recurrence, and the benchmark
+chains blocks through the feed-forward, so the time per double round is its
+critical path.  Measured with `scripts/loop_latency.py` and llvm-mca 19:
+
+| loop (cycles / double round) | znver4/5 | raptorlake/SPR |
+|---|---|---|
+| lccc lane form, b/c/d shuffled (before) | 30 | 31 |
+| lccc lane form, a/c/d shuffled (b anchored) | **28** | **29** |
+| icx `-O2 -march=x86-64-v3` (lane form) | 30 | 30 |
+| gcc 16.2 / clang 23.1 `-O2 -march=x86-64-v3` (scalar, `rol`) | 24 | 32 |
+
+`b = rotl(b, 7)` feeds `a += b` directly, so shuffling b puts one `pshufd`
+per group boundary on the critical path.  The ARX passes therefore pick
+lane frames with an explicit latency model (`vec_arx::kernel_critical_path`).
+Scalar ARX has the lower latency bound on Zen (1-cycle `rol` vs the 2-cycle
+shift-pair rotate); the lane form wins on Intel, whose `rol` issues on two
+ports only.  With AVX-512VL (`vprold`) the lane form reaches 24 everywhere.
+
 ## Cost model (per QR, 4 lanes at once)
 
 | op       | scalar (×4 lanes) | AVX2 lane form | note |

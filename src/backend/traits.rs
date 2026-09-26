@@ -2697,8 +2697,8 @@ pub trait ArchCodegen {
 
     /// Emit runtime helper stubs needed by this architecture.
     /// Called after all functions are generated, before the .note.GNU-stack section.
-    /// The i686 backend uses this to emit __divdi3/__udivdi3/__moddi3/__umoddi3
-    /// as weak symbols for standalone builds without libgcc.
+    /// The i686 backend uses this to emit its private, hidden COMDAT 64-bit
+    /// division helpers (`__lccc_divdi3` family) for builds without libgcc.
     fn emit_runtime_stubs(&mut self) {}
 
     /// Flush a pending deferred vector-result store (x86 lazy-flush).

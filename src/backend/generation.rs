@@ -4069,9 +4069,17 @@ fn generate_function(
     cg.state()
         .emit_fmt(format_args!(".type {}, {}", func.name, type_dir));
     cg.state().emit_fmt(format_args!("{}:", func.name));
-    let emit_cfi = cg.state().emit_cfi;
+    // Function delimiters. A backend with `fn_boundary_markers` (x86-64,
+    // i686) gets bare markers: after its peephole they are either expanded
+    // into full CFI derived from the final code (cfi_synth) or stripped
+    // when unwind tables are off.
+    let markers = cg.state().fn_boundary_markers;
+    let emit_cfi = cg.state().emit_cfi || markers;
     if emit_cfi {
         cg.state().emit(".cfi_startproc");
+        if markers {
+            cg.state().fn_boundary_marked.insert(func.name.clone());
+        }
     }
 
     if emit_patchable {
