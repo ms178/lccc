@@ -28,11 +28,11 @@ use super::helpers::{get_dest_reg, writes_family_full};
 use super::liveness::FileLiveness;
 use super::relay_and_lea::{
     dead_in_block_after, family_private_to, function_range, line_refs_family, plain_gp_operand,
-    provably_dead, split_two_operands,
+    provably_dead, rbp_is_gpr_in_function, split_two_operands,
 };
 
 /// What a line does to EFLAGS.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum FlagsEffect {
     /// Neither reads nor writes the flags (moves, `lea`, most SSE data moves).
     Neutral,
@@ -139,10 +139,23 @@ pub(super) fn flags_effect(t: &str) -> FlagsEffect {
         return FlagsEffect::Neutral;
     }
     // Plain stack push/pop do not touch EFLAGS.  pushf is a flag READER
-    // (handled above), popf a flag WRITER (handled below).  The token must
-    // END at the mnemonic — `popcntq` is not a stack pop, `pushfq` is not a
-    // plain push.
-    if t == "push" || t.starts_with("push ") || t == "pop" || t.starts_with("pop ") {
+    // (handled above), popf a flag WRITER (handled below).  The mnemonic may
+    // carry an operand-size suffix (`popq %rbp` — the spelling every AT&T
+    // epilogue emits), which the old `starts_with("pop ")` test missed: the
+    // suffixed forms fell through to the "unknown" catch-all, were treated
+    // as flag READERS, and `flags_dead_after` then refused every
+    // flag-discarding fold across a callee-save restore.  The stem must END
+    // at the mnemonic — `popcnt` shares no stem letters with this check
+    // ('t' is not a width suffix), and `pushfq`/`popfq` reduce to
+    // `pushf`/`popf`, which are classified above/below as reader/writer.
+    let mnem_end = t.find(|c: char| !c.is_ascii_lowercase()).unwrap_or(t.len());
+    let mnem = &t[..mnem_end];
+    let stem = mnem
+        .strip_suffix('q')
+        .or_else(|| mnem.strip_suffix('l'))
+        .or_else(|| mnem.strip_suffix('w'))
+        .unwrap_or(mnem);
+    if matches!(stem, "pop" | "push") {
         return FlagsEffect::Neutral;
     }
     // A call clobbers flags (they are not preserved across the SysV boundary),
@@ -569,10 +582,14 @@ pub(super) fn fold_copy_add_into_lea(store: &mut LineStore, infos: &mut [LineInf
             continue;
         }
         let Some(mut imm) = imm_value(imm_text) else {
-            // Register addend: `movl %A, %D; addl %R, %D` -> `leal (%A,%R), %D`.
+            // Register addend: `movl %A, %D; addl %R, %D` -> `leal (%A, %R), %D`.
             // R must be named at the add's width (a `%r8b` addend is not a
             // 32-bit add) and must not be D (after the copy D holds A; that
             // aliasing case is left alone) or %rsp (not encodable as index).
+            // %rbp as the destination participates only when
+            // `rbp_is_gpr_in_function` proves the function never establishes
+            // a frame pointer — the same policy the relay retarget uses; in
+            // a frame-pointer build an rbp write is the frame, not a value.
             let Some(r_fam) = plain_gp_operand(imm_text) else {
                 i += 1;
                 continue;
@@ -583,6 +600,13 @@ pub(super) fn fold_copy_add_into_lea(store: &mut LineStore, infos: &mut [LineInf
                 || r_fam == dst_fam
                 || r_fam == 4
                 || !names_family_at_width(imm_text, r_fam, add_wide)
+                || (dst_fam == 5
+                    && !{
+                        match function_range(store, infos, i) {
+                            Some((fs, fe)) => rbp_is_gpr_in_function(store, infos, fs, fe),
+                            None => false,
+                        }
+                    })
                 || !flags_dead_after(store, infos, j + 1)
             {
                 i += 1;
@@ -591,7 +615,7 @@ pub(super) fn fold_copy_add_into_lea(store: &mut LineStore, infos: &mut [LineInf
             let mnemonic = if add_wide { "leaq" } else { "leal" };
             let dst_name = REG_NAMES[if add_wide { 0 } else { 1 }][dst_fam as usize];
             let new_line = format!(
-                "    {} ({},{}), {}",
+                "    {} ({}, {}), {}",
                 mnemonic, REG_NAMES[0][src_fam as usize], REG_NAMES[0][r_fam as usize], dst_name
             );
             mark_nop(&mut infos[i]);
@@ -1935,6 +1959,63 @@ mod tests {
         peephole_optimize(asm.to_string())
     }
 
+    /// Register push/pop (any operand-size suffix) never touch EFLAGS per the
+    /// SDM; only PUSHF/POPF do. `popq`/`pushq` — the spelling every AT&T
+    /// epilogue emits — used to fall through the size-suffix-less `pop `
+    /// check into the "unknown" catch-all and were treated as flag READERS,
+    /// so `flags_dead_after` refused every flag-discarding fold whose
+    /// producer sat before a callee-save restore.
+    #[test]
+    fn register_push_pop_width_suffixed_is_flag_neutral() {
+        for t in [
+            "popq %rbp",
+            "popl %eax",
+            "popw %bx",
+            "pop %rax",
+            "pushq %rbp",
+            "pushq $16",
+            "push %rax",
+        ] {
+            assert_eq!(
+                flags_effect(t),
+                FlagsEffect::Neutral,
+                "{t} must be flag-neutral"
+            );
+        }
+        // The flag stack ops keep their classifications ...
+        assert_eq!(flags_effect("pushfq"), FlagsEffect::Reads);
+        assert_eq!(flags_effect("popfq"), FlagsEffect::Writes);
+        // ... and `popcnt` is not a stack pop.
+        assert_eq!(flags_effect("popcntq %rax, %rax"), FlagsEffect::Writes);
+    }
+
+    /// End-to-end: a flag-dropping fold must now reach across a callee-save
+    /// `popq` restore. `addq $1, %rax` staged through a copy folds to a lea
+    /// even though the only flag event after it is the epilogue's pops.
+    #[test]
+    fn flag_discard_reaches_across_callee_save_pop() {
+        // The sum is returned in %rax (observable), so only the staging copy
+        // and the add may fold — the pipeline must not delete the value.
+        let out = run(concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movq %rsi, %rbx\n",
+            "    addq $16, %rbx\n",
+            "    movq %rbx, %rax\n",
+            "    popq %rbx\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            out.contains("leaq 16(%rsi), %rax"),
+            "staged add must fold to a lea across the popq:\n{out}"
+        );
+        assert!(
+            !out.contains("addq $16"),
+            "the flag-writing add must be gone:\n{out}"
+        );
+    }
+
     #[test]
     fn self_test_after_and_is_removed() {
         let out = run(concat!(
@@ -2047,8 +2128,8 @@ mod tests {
             "    ret\n",
             ".cfi_endproc\n",
         ));
-        assert!(out.contains("leal (%r12,%rdi), %ebp"), "{out}");
-        assert!(out.contains("leaq (%rbx,%rsi), %r8"), "{out}");
+        assert!(out.contains("leal (%r12, %rdi), %ebp"), "{out}");
+        assert!(out.contains("leaq (%rbx, %rsi), %r8"), "{out}");
         assert!(!out.contains("movq %r12, %rbp"), "{out}");
         assert!(!out.contains("addl %edi, %ebp"), "{out}");
     }

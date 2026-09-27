@@ -1718,7 +1718,7 @@ mod tests {
         let out = run(&asm);
         // The GP sum survives, as written or as the copy+add fold's lea.
         assert!(
-            out.contains("addq %rsi, %rax") || out.contains("leaq (%rdi,%rsi), %rax"),
+            out.contains("addq %rsi, %rax") || out.contains("leaq (%rdi, %rsi), %rax"),
             "{out}"
         );
     }

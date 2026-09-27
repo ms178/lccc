@@ -861,6 +861,27 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
                 changed |= c;
             }
         }
+        if !sk("staged_add_lea") {
+            {
+                let c = local_patterns::fuse_staged_add_and_relay(&mut store, &mut infos);
+                trace("fuse_staged_add_and_relay", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        if !sk("load_lea_add") {
+            {
+                let c = local_patterns::fuse_load_lea_add(&mut store, &mut infos);
+                trace("fuse_load_lea_add", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        if !sk("load_lea_base") {
+            {
+                let c = local_patterns::fuse_load_lea_into_base(&mut store, &mut infos);
+                trace("fuse_load_lea_into_base", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
         if !sk("fp_hoist") {
             {
                 let c = local_patterns::promote_loop_invariant_fp_load(&mut store, &mut infos);
@@ -1467,6 +1488,19 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
                 changed2 |= memory_fold::fold_load_copy_relay(&mut store, &mut infos);
             }
             changed2 |= local_patterns::eliminate_rcx_address_copy(&mut store, &mut infos);
+            // Phase 2's copy propagation and relay passes keep creating
+            // copy+add(+copy) chains; re-run the staged-add fold so those
+            // late shapes also reach the single-LEA form. Idempotent and
+            // liveness-checked.
+            if !sk("staged_add_lea") {
+                changed2 |= local_patterns::fuse_staged_add_and_relay(&mut store, &mut infos);
+            }
+            if !sk("load_lea_add") {
+                changed2 |= local_patterns::fuse_load_lea_add(&mut store, &mut infos);
+            }
+            if !sk("load_lea_base") {
+                changed2 |= local_patterns::fuse_load_lea_into_base(&mut store, &mut infos);
+            }
             changed2 |= local_patterns::fold_ptr_deref_through_stack(&mut store, &mut infos);
             changed2 |= local_patterns::eliminate_fp_spill_around_load(&mut store, &mut infos);
             if !sk("dead_regs") {
