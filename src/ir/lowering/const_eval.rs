@@ -104,6 +104,27 @@ impl Lowerer {
             | Expr::FloatLiteralF32(..)
             | Expr::FloatLiteralLongDouble(..)
             | Expr::FloatLiteralF128(..) => shared_const_eval::eval_literal(expr),
+            // C23 decimal literal: the 16 bytes are the raw BID bit pattern
+            // (little-endian), mirroring the lower_expr materialization.
+            // Lowering-local (not shared): sema keeps declining decimal
+            // constants until its own const users grow BID arms.
+            Expr::FloatLiteralDecimal(width, bytes, _) => match *width {
+                32 => {
+                    let v = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                    Some(IrConst::D32(v))
+                }
+                64 => {
+                    let v = u64::from_le_bytes([
+                        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+                        bytes[7],
+                    ]);
+                    Some(IrConst::D64(v))
+                }
+                _ => {
+                    let v = u128::from_le_bytes(*bytes);
+                    Some(IrConst::I128(v as i128))
+                }
+            },
             Expr::UnaryOp(UnaryOp::Plus, inner, _) => self.eval_const_expr(inner),
             Expr::UnaryOp(UnaryOp::Neg, inner, _) => {
                 let val = self.eval_const_expr(inner)?;
@@ -111,8 +132,15 @@ impl Lowerer {
                 // (binary128). Float negation flips the SIGN BIT (bit 127),
                 // not the integer value: -0x3fff8000... (1.5) must become
                 // 0xbfff8000... (-1.5), not 0xc0008000... (-3.0).
+                // _Decimal128 rides the same I128 carrier with its sign at
+                // bit 127 too. The CType check (not just literal shape)
+                // covers const-propagated identifiers; unsigned __int128
+                // keeps wrapping negation via the fallthrough below.
+                let inner_ct = self.get_expr_ctype(inner);
                 if self.infer_expr_type(inner) == IrType::F128
                     || matches!(inner.as_ref(), Expr::FloatLiteralF128(..))
+                    || inner_ct == Some(CType::Float128)
+                    || inner_ct == Some(CType::Decimal128)
                 {
                     if let IrConst::I128(bits) = val {
                         let toggled = (bits as u128) ^ (1u128 << 127);
@@ -127,15 +155,35 @@ impl Lowerer {
                 let l = self.eval_const_expr(lhs);
                 let r = self.eval_const_expr(rhs);
                 if let (Some(l), Some(r)) = (l, r) {
-                    // Use infer_expr_type (C semantic types) for proper usual arithmetic
-                    // conversions. get_expr_type returns IR storage types (IntLiteral → I64)
-                    // which loses 32-bit width info needed for correct folding of
-                    // expressions like (1 << 31) / N.
-                    let lhs_ty = self.infer_expr_type(lhs);
-                    let rhs_ty = self.infer_expr_type(rhs);
-                    let result = self.eval_const_binop(op, &l, &r, lhs_ty, rhs_ty);
-                    if result.is_some() {
-                        return result;
+                    // F33: _Float128/_Decimal128 constants ride the I128
+                    // carrier, and the shared integer/float binop folders
+                    // would compute on their BITS (`1.5F128 + 1` folded as
+                    // integer add). Decline any binop with a 128-bit-float
+                    // or decimal side up front (decimal sides already
+                    // decline inside via to_i64/to_f64, but one central
+                    // guard covers all three widths and both folders).
+                    // Logical operators still fold below via is_nonzero,
+                    // which is BID-aware for D32/D64.
+                    let wide_float_side = |e: &Expr| {
+                        matches!(
+                            self.get_expr_ctype(e),
+                            Some(CType::Float128)
+                                | Some(CType::Decimal32)
+                                | Some(CType::Decimal64)
+                                | Some(CType::Decimal128)
+                        )
+                    };
+                    if !wide_float_side(lhs) && !wide_float_side(rhs) {
+                        // Use infer_expr_type (C semantic types) for proper usual arithmetic
+                        // conversions. get_expr_type returns IR storage types (IntLiteral → I64)
+                        // which loses 32-bit width info needed for correct folding of
+                        // expressions like (1 << 31) / N.
+                        let lhs_ty = self.infer_expr_type(lhs);
+                        let rhs_ty = self.infer_expr_type(rhs);
+                        let result = self.eval_const_binop(op, &l, &r, lhs_ty, rhs_ty);
+                        if result.is_some() {
+                            return result;
+                        }
                     }
                 }
                 // For LogicalOr/LogicalAnd, handle cases where one operand is a
@@ -334,7 +382,12 @@ impl Lowerer {
         let target_ct = self.type_spec_to_ctype(target_type);
         let src_ct = self.get_expr_ctype(inner);
         if target_ct == CType::Float128 || src_ct == Some(CType::Float128) {
-            return None;
+            // ... except _Float128 -> decimal: the BID master conversion
+            // below folds it exactly (static initializers have no runtime
+            // soft-float path to defer to).
+            if !(src_ct == Some(CType::Float128) && target_ct.is_decimal()) {
+                return None;
+            }
         }
 
         let src_val = self.eval_const_expr(inner)?;
@@ -343,7 +396,8 @@ impl Lowerer {
         // cast must NORMALIZE, not bit-copy: `(_Bool)5` is 1, not 5 (the
         // runtime path emits `val != 0`; the fold must mirror it, including
         // NaN -> 1, ±0.0 -> 0, negative integers -> 1).  Decimal constants
-        // are declined so `lower_decimal_truthiness` (+0 == -0) handles them.
+        // fold through BID-decoded truthiness (+0 == -0), exactly what the
+        // runtime lower_decimal_truthiness computes.
         if target_ct == CType::Bool {
             let is_nonzero = match &src_val {
                 IrConst::F32(v) => *v != 0.0,
@@ -355,9 +409,27 @@ impl Lowerer {
                 IrConst::I64(v) => *v != 0,
                 IrConst::I128(v) => *v != 0,
                 IrConst::Zero => false,
-                IrConst::D32(_) | IrConst::D64(_) => return None,
+                IrConst::D32(_) | IrConst::D64(_) => src_val.is_nonzero(),
             };
             return Some(IrConst::I8(if is_nonzero { 1 } else { 0 }));
+        }
+
+        // Decimal-target casts fold through the BID master conversion, so
+        // `(_Decimal32)5` and `(_Decimal64)1.5` work in static initializers
+        // exactly like their literal forms. Unknown source kinds decline
+        // (the I128 carrier is ambiguous: never guess).
+        if target_ct.is_decimal() {
+            let width = match target_ct {
+                CType::Decimal32 => 32,
+                CType::Decimal64 => 64,
+                _ => 128,
+            };
+            if let Some(ref src_ct) = src_ct {
+                if let Some(bid) = const_arith::const_to_bid(&src_val, src_ct, width) {
+                    return Some(bid);
+                }
+            }
+            return None;
         }
 
         // Handle float source types: use value-based conversion, not bit manipulation
@@ -368,6 +440,17 @@ impl Lowerer {
             if matches!(&src_val, IrConst::F32(_) | IrConst::F64(_)) {
                 return IrConst::cast_float_to_target(fv, target_ir_ty);
             }
+        }
+
+        // Decimal sources convert by value (decode + truncate/re-encode),
+        // never by carrier bits: `(int)2.5DF` is 2, `(double)1.5DD` is 1.5.
+        // _Decimal128 rides I128, so it needs the CType check; D32/D64 are
+        // unambiguous variants.
+        if src_ct == Some(CType::Decimal128) && matches!(src_val, IrConst::I128(_)) {
+            return Self::cast_bid_to_ir_type(&src_val, target_ir_ty, &target_ct);
+        }
+        if matches!(src_val, IrConst::D32(_) | IrConst::D64(_)) {
+            return Self::cast_bid_to_ir_type(&src_val, target_ir_ty, &target_ct);
         }
 
         // Handle I128 source: use full 128-bit value to avoid truncation
@@ -450,6 +533,131 @@ impl Lowerer {
             _ => return None,
         };
         Some(result)
+    }
+
+    /// Convert a decimal constant (D32/D64/I128-carried D128) to an integer
+    /// or binary-float constant of `target_ir_ty` under C cast semantics.
+    /// Integers truncate toward zero with range checks; floats parse from
+    /// the exact decimal expansion (correctly rounded, like strtod).
+    /// Decimal targets never reach here (folded earlier); ambiguous U128
+    /// targets resolve through `target_ct`. None on overflow/UB (decline,
+    /// like GCC errors) — never carrier-bit garbage.
+    fn cast_bid_to_ir_type(
+        val: &IrConst,
+        target_ir_ty: IrType,
+        target_ct: &CType,
+    ) -> Option<IrConst> {
+        use crate::common::decimal::*;
+        #[derive(Clone, Copy)]
+        enum Dec {
+            Finite(bool, u128, i32),
+            Inf(bool),
+            Nan(bool),
+        }
+        let dec = match *val {
+            IrConst::D32(v) => match decode_bid32(v) {
+                Some((neg, c, e)) => Dec::Finite(neg, c as u128, e),
+                None => {
+                    let (neg, is_nan) = bid32_special(v);
+                    if is_nan { Dec::Nan(neg) } else { Dec::Inf(neg) }
+                }
+            },
+            IrConst::D64(v) => match decode_bid64(v) {
+                Some((neg, c, e)) => Dec::Finite(neg, c as u128, e),
+                None => {
+                    let (neg, is_nan) = bid64_special(v);
+                    if is_nan { Dec::Nan(neg) } else { Dec::Inf(neg) }
+                }
+            },
+            IrConst::I128(v) => {
+                let b = v as u128;
+                let hi = (b >> 64) as u64;
+                match decode_bid128(hi, b as u64) {
+                    Some((neg, c, e)) => Dec::Finite(neg, c, e),
+                    None => {
+                        let (neg, is_nan) = bid128_special_hi(hi);
+                        if is_nan { Dec::Nan(neg) } else { Dec::Inf(neg) }
+                    }
+                }
+            }
+            _ => return None,
+        };
+        // Correctly-rounded decimal -> binary-float (strtod semantics).
+        let to_f64 = || -> Option<f64> {
+            match dec {
+                Dec::Finite(neg, c, e) => format!("{}{c}e{e}", if neg { "-" } else { "" })
+                    .parse::<f64>()
+                    .ok(),
+                Dec::Inf(neg) => Some(if neg {
+                    f64::NEG_INFINITY
+                } else {
+                    f64::INFINITY
+                }),
+                Dec::Nan(neg) => Some(if neg { -f64::NAN } else { f64::NAN }),
+            }
+        };
+        match target_ir_ty {
+            IrType::F32 => {
+                let f = match dec {
+                    Dec::Finite(neg, c, e) => format!("{}{c}e{e}", if neg { "-" } else { "" })
+                        .parse::<f32>()
+                        .ok()?,
+                    Dec::Inf(neg) => {
+                        if neg {
+                            f32::NEG_INFINITY
+                        } else {
+                            f32::INFINITY
+                        }
+                    }
+                    Dec::Nan(neg) => {
+                        if neg {
+                            -f32::NAN
+                        } else {
+                            f32::NAN
+                        }
+                    }
+                };
+                Some(IrConst::F32(f))
+            }
+            IrType::F64 => Some(IrConst::F64(to_f64()?)),
+            IrType::F128 => Some(IrConst::long_double(to_f64()?)),
+            IrType::I8
+            | IrType::U8
+            | IrType::I16
+            | IrType::U16
+            | IrType::I32
+            | IrType::U32
+            | IrType::I64
+            | IrType::U64
+            | IrType::I128
+            | IrType::U128 => {
+                let Dec::Finite(neg, c, e) = dec else {
+                    // NaN/Inf -> integer is UB: decline.
+                    return None;
+                };
+                // 128-bit carriers resolve through the target CType so a
+                // decimal->128-bit-int cast never emits BID/F128 bits.
+                if matches!(target_ir_ty, IrType::I128 | IrType::U128)
+                    && !matches!(target_ct, CType::Int128 | CType::UInt128)
+                {
+                    return None;
+                }
+                let bits = target_ir_ty.size() as u32 * 8;
+                let v = bid_to_int(c, e, neg, bits, target_ir_ty.is_unsigned())?;
+                Some(match target_ir_ty {
+                    IrType::I8 => IrConst::I8(v as i8),
+                    IrType::U8 => IrConst::I64(v as u8 as i64),
+                    IrType::I16 => IrConst::I16(v as i16),
+                    IrType::U16 => IrConst::I64(v as u16 as i64),
+                    IrType::I32 => IrConst::I32(v as i32),
+                    IrType::U32 => IrConst::I64(v as u32 as i64),
+                    IrType::I64 | IrType::U64 => IrConst::I64(v as i64),
+                    IrType::I128 | IrType::U128 => IrConst::I128(v),
+                    _ => return None,
+                })
+            }
+            _ => None,
+        }
     }
 
     fn eval_const_identifier(&self, name: &str) -> Option<IrConst> {
@@ -708,7 +916,7 @@ impl Lowerer {
     }
 
     /// Check if an expression has an unsigned type for constant evaluation.
-    fn is_expr_unsigned_for_const(&self, expr: &Expr) -> bool {
+    pub(super) fn is_expr_unsigned_for_const(&self, expr: &Expr) -> bool {
         if let Expr::Cast(target_type, _, _) = expr {
             let ty = self.type_spec_to_ir(target_type);
             return ty.is_unsigned();
@@ -728,6 +936,20 @@ impl Lowerer {
     ) -> Option<IrConst> {
         let l = self.eval_const_expr(lhs)?;
         let r = self.eval_const_expr(rhs)?;
+        // F33: decline 128-bit-float/decimal sides (same guard as the
+        // BinaryOp arm above: the shared folders would compute on
+        // carrier BITS).
+        for e in [lhs, rhs] {
+            if matches!(
+                self.get_expr_ctype(e),
+                Some(CType::Float128)
+                    | Some(CType::Decimal32)
+                    | Some(CType::Decimal64)
+                    | Some(CType::Decimal128)
+            ) {
+                return None;
+            }
+        }
         let lhs_ty = self.infer_expr_type(lhs);
         let rhs_ty = self.infer_expr_type(rhs);
         let result = self.eval_const_binop(op, &l, &r, lhs_ty, rhs_ty)?;

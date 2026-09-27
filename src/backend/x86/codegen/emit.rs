@@ -8682,6 +8682,78 @@ impl ArchCodegen for X86Codegen {
         std::env::var_os("CCC_NO_X64_SIB").is_none()
     }
 
+    /// x86-64 mirror of `emit_load_indexed_common`/`emit_store_indexed_common`'s
+    /// acceptance conditions, consulted by `can_indexed_addr_fold` BEFORE the
+    /// GEP's emission is skipped and its offset chain declared dead.
+    ///
+    /// The trait default accepts every non-128-bit type — true for this
+    /// backend's SCALAR emitters, but the INDEXED emitters answer the FP
+    /// family only with their SSE arms, and until the contract audit those
+    /// two arms were the sole `F32|F64`-only outliers in memory.rs (every
+    /// non-indexed fast path has grouped F64|F32|D64|D32 since 1fdb401a).
+    /// A deciding-side "yes" the emitter later refuses rematerialises the
+    /// folded GEP at the access site — reading an offset chain the
+    /// dead-producer walk already skipped, i.e. a never-written home: the
+    /// exact failure the trait's soundness contract forbids. This override
+    /// mirrors the emitters' type arms exactly, plus their `shift <= 3`
+    /// guard (`resolve_index` already caps the SIB scale at the map build;
+    /// the mirror costs one compare and keeps the override self-contained).
+    ///
+    /// There is deliberately NO register-home/staging check here, although
+    /// the const-offset sibling (`const_offset_fold_reg_base_ok`) excludes
+    /// the emitter's %rdx/%r11 scratch set: that exclusion exists because
+    /// the const-offset trait-default path calls `emit_save_acc` for
+    /// Indirect/OverAligned slot bases. The INDEXED path never touches
+    /// either register — full write inventory of everything a folded
+    /// access can emit:
+    ///
+    /// * SIB formation: `ensure_sib_index_form` extends the index home in
+    ///   place (`movslq %edx,%rdx`); the `sib_mem64*` builders are pure
+    ///   strings; the PIC sym arm rebuilds the base in reserved %rcx; the
+    ///   alloca arm only accepts Direct slots (pure `%rbp/%rsp` strings).
+    /// * Store value staging: immediates go direct (`mov $imm,mem`, no
+    ///   staging); `operand_to_rax` materialises into %rax on every arm
+    ///   (const mov/xor, acc/sec/home moves, slot reloads, the Cast/Copy
+    ///   fallback's recursion, stale-remat's in-place `movslq %eax,%rax`);
+    ///   the FP shuttle lands in xmm0 via %rax/%rcx at most; the
+    ///   pending-vec-store flush writes memory or `(%rax)`.
+    /// * Load destinations land in the dest home or the accumulator.
+    ///
+    /// So a folded access writes only the index/value/dest homes plus
+    /// %rax/%rcx/xmm0 — none of which can host a SIB operand (%rax/%rcx
+    /// are not allocatable homes at all; XMM SIB is refused by the
+    /// emitter). A %rdx/%r11-homed SIB base or index (e.g. sqlite's
+    /// `movb %r9b, 8(%rsp, %rdx)`) is therefore always safe to fold, for
+    /// every value operand; refusing it only forces a redundant LEA
+    /// rematerialisation (+1 insn, +1 stackmem — the golden-gate
+    /// sqlite_varint regression). The i686 override keeps its own
+    /// staging check: i686's accumulator/x87 staging genuinely differs,
+    /// so that mirror is NOT covered by this proof.
+    fn indexed_fold_ok(&self, info: &crate::backend::generation::IndexedGepInfo) -> bool {
+        let _ = self;
+        if info.shift > 3 {
+            return false;
+        }
+        info.access_tys.iter().all(|t| {
+            matches!(
+                t,
+                IrType::F64
+                    | IrType::F32
+                    | IrType::D64
+                    | IrType::D32
+                    | IrType::I8
+                    | IrType::U8
+                    | IrType::I16
+                    | IrType::U16
+                    | IrType::I32
+                    | IrType::U32
+                    | IrType::I64
+                    | IrType::U64
+                    | IrType::Ptr
+            )
+        })
+    }
+
     fn const_offset_fold_reg_base_ok(&self, base: &Value) -> bool {
         // Register-base const-offset folds consume the base at the Load/Store
         // position (RA-invisible): sound only with the folded-base liveness

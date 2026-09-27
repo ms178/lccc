@@ -359,11 +359,22 @@ impl Lowerer {
         };
 
         // _Float128 call args: ONE 16-byte XMM register each (SysV psABI).
-        // Derived from the argument expression's C type so it also covers
-        // indirect/function-pointer calls and variadic positions.
+        // For prototyped positions the value reaching the backend has the
+        // PARAM's type (S4 converts or raw-casts every prototyped arg), so
+        // the ABI flag follows the declared param: arg-derived flags lie
+        // for converted args (double->F128 passed integer classes, sending
+        // the backend down its x87 spilling dance -> segfault; F128->double
+        // would conversely pass SSE classes for an F64 value).
+        // Unknown/unprototyped/variadic-tail/complex-callee positions keep
+        // the argument expression's own type (covers indirect calls and
+        // variadic positions, as before).
         let struct_arg_is_f128_sse: Vec<bool> = args
             .iter()
-            .map(|a| {
+            .enumerate()
+            .map(|(i, a)| {
+                if let Some(p) = param_ctypes_for_decompose.as_ref().and_then(|v| v.get(i)) {
+                    return matches!(p, CType::Float128 | CType::Decimal128);
+                }
                 matches!(
                     self.get_expr_ctype(a),
                     Some(CType::Float128) | Some(CType::Decimal128)
@@ -993,6 +1004,29 @@ impl Lowerer {
                         if is_bool_param {
                             // For _Bool params, normalize at source type before truncation.
                             return self.emit_bool_normalize_typed(val, arg_ty);
+                        }
+                        // C23 decimals (either side) route through the libbid
+                        // helpers, mirroring the _Float128 soft-float routing
+                        // at init/assign/return: a raw IR cast would emit a
+                        // binary conversion on BID carriers (silent miscompile).
+                        // _Float128 itself routes here too (same bug class: a
+                        // raw double->U128 bit-cast segfaults soft-float code).
+                        if let Some(ref pctypes) = param_ctypes {
+                            if i < pctypes.len() {
+                                let arg_ct = self.expr_ctype(a);
+                                if pctypes[i].is_decimal()
+                                    || arg_ct.is_decimal()
+                                    || pctypes[i] == CType::Float128
+                                    || arg_ct == CType::Float128
+                                {
+                                    return self.convert_scalar_ctype(
+                                        val,
+                                        arg_ty,
+                                        &arg_ct,
+                                        &pctypes[i],
+                                    );
+                                }
+                            }
                         }
                         let cast_val = self.emit_implicit_cast(val, arg_ty, param_ty);
                         return cast_val;

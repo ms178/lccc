@@ -123,11 +123,46 @@ impl Lowerer {
 
         // Scalar constant
         if let Some(val) = self.eval_const_expr(expr) {
+            // C23 decimals: the initializer must become exact BID bits via
+            // the master const conversion (integers convert by value with
+            // half-even rounding, binary floats through their exact
+            // expansion, BID sources by decode/re-encode) — never a raw
+            // integer/float bit-cast (`_Decimal32 g = 5` used to emit the
+            // I64 {5}). Unhandled kinds fall through to coerce (status quo).
+            let target_ct = self.type_spec_to_ctype(type_spec);
+            if target_ct.is_decimal() {
+                let width = match target_ct {
+                    CType::Decimal32 => 32,
+                    CType::Decimal64 => 64,
+                    _ => 128,
+                };
+                if let Some(src_ct) = self.get_expr_ctype(expr) {
+                    if let Some(bid) =
+                        crate::common::const_arith::const_to_bid(&val, &src_ct, width)
+                    {
+                        return GlobalInit::Scalar(bid);
+                    }
+                } else if !matches!(val, IrConst::I128(_)) {
+                    // Unknown source kind, unambiguous carrier: signedness
+                    // from the const-type query (literals and enums always
+                    // know their type; the I128 carrier never guesses).
+                    let fallback = if self.is_expr_unsigned_for_const(expr) {
+                        CType::UInt
+                    } else {
+                        CType::Int
+                    };
+                    if let Some(bid) =
+                        crate::common::const_arith::const_to_bid(&val, &fallback, width)
+                    {
+                        return GlobalInit::Scalar(bid);
+                    }
+                }
+            }
             // _Float128 (binary128): the initializer must become the IEEE
             // binary128 BIT PATTERN (via the exact long_double-module
             // conversions), never an integer/float bit-cast of the U128
             // carrier (`_Float128 g = 100.0` used to emit the I128 {100,0}).
-            if self.type_spec_to_ctype(type_spec) == CType::Float128 {
+            if target_ct == CType::Float128 {
                 if let Some(bits) = Self::const_to_f128_bits(&val) {
                     return GlobalInit::Scalar(IrConst::I128(bits as i128));
                 }

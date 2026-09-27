@@ -218,26 +218,25 @@ impl super::InstructionEncoder {
                     self.add_diff_relocation(sym_a, sym_b, R_X86_64_32, 0);
                     self.bytes.extend_from_slice(&[0, 0, 0, 0]);
                 } else if size == 8 {
-                    // mov r64, imm32 — 7 bytes against movabs's 10. A label
+                    // mov r64, imm32 -- 7 bytes against movabs's 10. A label
                     // difference is section-relative by construction (both
                     // labels live in one object, or the right side is the
                     // position counter), so the value always fits a signed
                     // 32-bit and GAS always uses the C7 form here
                     // (byte-probed: `movq $(b - a), %rcx` = 48 c7 c1 02 00
                     // 00 00; `movq $(xtrn - .), %rax` = 48 c7 c0 + PC32
-                    // xtrn+0x3). The diff-relocation folds same-object
-                    // pairs after layout; an external left side converts
-                    // to PC32 exactly like the ALU path above. movabs
-                    // stays correct but is 3 dead bytes of I-cache.
+                    // xtrn+0x3). A same-section pair folds to its disp32; an
+                    // external-minus-local pair becomes R_X86_64_PC32 against
+                    // the external symbol via the diff path (raw addend 0: the
+                    // writer's diff pass adds (reloc_offset - b_off), and PC32
+                    // then subtracts the place -- exactly GAS's `PC32 xtrn+0x3`
+                    // semantics for `xtrn - .`). movabs stays correct but is
+                    // 3 dead bytes of I-cache.
                     self.emit_rex_unary(8, &dst.name);
                     self.bytes.push(0xC7);
                     self.bytes.push(self.modrm(3, 0, dst_num));
-                    // Raw addend 0: the writer's diff pass adds
-                    // (reloc_offset - b_off), and PC32 then subtracts the
-                    // place — the combination yields exactly S - addr(b),
-                    // GAS's `PC32 xtrn+0x3` semantics for `xtrn - .`.
                     self.add_diff_relocation(sym_a, sym_b, R_X86_64_PC32, 0);
-                    self.bytes.extend_from_slice(&[0, 0, 0, 0]);
+                    self.bytes.extend_from_slice(&[0; 4]);
                 } else {
                     return Err(format!(
                         "symbol-difference mov immediate only supported at 32-bit width (got size {})",

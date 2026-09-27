@@ -1,0 +1,46 @@
+;;; x87_pop_forms
+.text
+faddp
+fsubp
+fsubrp
+fmulp
+fdivp
+fdivrp
+faddp %st(0)
+faddp %st(3)
+faddp %st(7)
+fsubp %st(2)
+fsubrp %st(5)
+fmulp %st(6)
+fdivp %st(1)
+fdivrp %st(4)
+faddp %st, %st(0)
+faddp %st, %st(2)
+fsubp %st, %st(4)
+fmulp %st, %st(7)
+fdivrp %st, %st(5)
+faddp %st(3), %st
+fadd
+fsub
+fsubr
+fmul
+fdiv
+fdivr
+fsub %st(2)
+fsubr %st(2)
+fdiv %st(2)
+fdivr %st(2)
+fadd %st, %st(4)
+fmul %st, %st(4)
+fsub %st, %st(4)
+fsubr %st, %st(4)
+fdiv %st, %st(4)
+fdivr %st, %st(4)
+fadd %st(4), %st
+fsub %st(6), %st
+;;; x87_pop_reversed_reject reject
+.text
+fsubp %st(5), %st
+fsubrp %st(6), %st
+fdivp %st(2), %st
+fdivrp %st(2), %st

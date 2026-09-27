@@ -343,6 +343,12 @@ impl Lowerer {
             }
             // _Float128 (IEEE binary128): 16 bytes, 16-byte aligned (LP64).
             TypeSpecifier::Float128 => Some((16, 16)),
+            // C23 decimals (BID): sizeof = 4/8/16 on both x86-64 and i386;
+            // GCC aligns _Decimal64 to 8 and _Decimal128 to 16 even on
+            // i386 (unlike the long-long align-4 rule), _Decimal32 to 4.
+            TypeSpecifier::Decimal32 => Some((4, 4)),
+            TypeSpecifier::Decimal64 => Some((8, 8)),
+            TypeSpecifier::Decimal128 => Some((16, 16)),
             TypeSpecifier::ComplexFloat => Some((8, 4)),
             TypeSpecifier::ComplexDouble => {
                 let align = if ptr_sz == 4 { 4 } else { 8 };

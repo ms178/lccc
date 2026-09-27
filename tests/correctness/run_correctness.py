@@ -1160,6 +1160,78 @@ int main(void){
   return 0;
 }
 """, ["-O2"], None),
+
+    # ── C23 decimal FP (F30/F31) ──────────────────────────────────────────
+    # Implicit int<->decimal conversions at init/assign/return/call-arg/
+    # compound/ternary sites; each check folds into `fails` (exit code).
+    # lccc and GCC must both print `fails=0`.
+    ("decimal_implicit_conversions", r'''
+// F30 targeted runtime tests: implicit int<->decimal conversions at
+// init/assign/return/call-arg/compound/ternary sites. Each check folds into
+// `fails` via exact decimal comparison; exit code = fails (0 = all green).
+#include <stdio.h>
+
+static _Decimal32 g32;
+static _Decimal64 g64;
+static int fails = 0;
+#define CHK(c) do { if (!(c)) { fails++; printf("FAIL line %d: %s\n", __LINE__, #c); } } while (0)
+
+static _Decimal32 id32(_Decimal32 x) { return x; }
+static _Decimal64 id64(_Decimal64 x) { return x; }
+static _Decimal128 id128(_Decimal128 x) { return x; }
+static double idd(double x) { return x; }
+static _Decimal32 const32(void) { return 7; }          // S3: int -> DF return
+static _Decimal64 const64(void) { return 1.5; }        // S3: double -> DF return
+static int toint(_Decimal32 x) { return (int)(x); }   // explicit (control)
+
+int main(void) {
+    // S1: init from int/double/DF
+    _Decimal32 a = 5;              CHK(a == 5.0DF);
+    _Decimal32 b = 1.5;            CHK(b == 1.5DF);
+    _Decimal64 c = 1000000;        CHK(c == 1000000.0DD);
+    _Decimal64 d = a;              CHK(d == 5.0DD);          // DF widen (control-ish)
+    // S2: assign from int/double/DF
+    a = 42;                        CHK(a == 42.0DF);
+    a = -3.25;                     CHK(a == -3.25DF);
+    g32 = 9;                       CHK(g32 == 9.0DF);
+    g64 = -17;                     CHK(g64 == -17.0DD);
+    // S3: return conversions
+    CHK(const32() == 7.0DF);
+    CHK(const64() == 1.5DD);
+    // S4: call args (decimal param from int/double; double param from decimal)
+    CHK(id32(11) == 11.0DF);
+    CHK(id32(2.5) == 2.5DF);
+    CHK(id64(-8) == -8.0DD);
+    CHK(id128(13) == 13.0DL);
+    { _Decimal128 e = 5; e += 2; CHK(e == 7.0DL); CHK(id128(e) == 7.0DL); }
+    CHK(idd(a) == (double)a);      // decimal -> double param
+    CHK(toint(9.0DF) == 9);
+    // S5: compound assign
+    a = 10.0DF; a += 5;            CHK(a == 15.0DF);
+    a += 0.5DF;                    CHK(a == 15.5DF);
+    a -= 0.5DF;                    CHK(a == 15.0DF);
+    a *= 2;                        CHK(a == 30.0DF);
+    a /= 4;                        CHK(a == 7.5DF);
+    c = 100.0DD; c += 1;           CHK(c == 101.0DD);
+    c -= 2.5DD;                    CHK(c == 98.5DD);
+    { int i = 100; i += 5.0DF; CHK(i == 105); }      // int lhs, decimal rhs
+    { int j = 7; j *= 3.0DF; CHK(j == 21); }
+    // S6: ternary, runtime + const cond, mixed arms
+    { int k = 1; _Decimal32 t = k ? 3.0DF : 4;     CHK(t == 3.0DF); }
+    { int k = 0; _Decimal32 t = k ? 3.0DF : 4;     CHK(t == 4.0DF); }
+    { int k = 1; _Decimal32 t = k ? 8 : 9.5DF;     CHK(t == 8.0DF); }
+    { _Decimal32 t = 1 ? 2.5DF : 99;               CHK(t == 2.5DF); }  // const cond
+    { _Decimal32 t = 0 ? 99 : 2.5DF;               CHK(t == 2.5DF); }
+    { int k = 2; _Decimal32 t = k ? 1.5DF : 2;      CHK(t == 1.5DF); }
+    // GNU ?: including -0DF truthiness
+    { _Decimal32 z = 0.0DF; _Decimal32 t = z ?: 6.0DF; CHK(t == 6.0DF); }
+    { _Decimal32 z = -0.0DF; _Decimal32 t = z ?: 6.0DF; CHK(t == 6.0DF); }
+    { _Decimal32 z = 5.0DF; _Decimal32 t = z ?: 6.0DF; CHK(t == 5.0DF); }
+    { int k = 0; _Decimal32 t = k ?: 7.5DF;        CHK(t == 7.5DF); }  // int cond
+    printf("fails=%d\n", fails);
+    return fails;
+}
+    ''', [], None),
 ]
 
 # Multi-file test (handled specially)

@@ -833,7 +833,56 @@ impl Lowerer {
     pub(super) fn lower_expr_with_type(&mut self, expr: &Expr, target_ty: IrType) -> Operand {
         let src = self.lower_expr(expr);
         let src_ty = self.value_ir_type(expr);
+        // C23 decimals: any conversion touching a decimal carrier routes
+        // through the libbid helpers; a raw IR cast would emit a binary
+        // conversion on BID carriers (silent miscompile). This is the choke
+        // point for the decimal-vs-binary binop fallback, which lowers its
+        // operands to a binary float type here.
+        let mut src_ct = self.expr_ctype(expr);
+        if !src_ct.is_decimal() {
+            // Stale-composite insurance: trust the IR carrier when it says
+            // decimal but the CType disagrees (never fires for well-typed
+            // trees; converts a silent miscompile into a correct conversion
+            // when some composite-type query lags behind).
+            src_ct = match src_ty {
+                IrType::D32 => CType::Decimal32,
+                IrType::D64 => CType::Decimal64,
+                // (D128 rides the U128 carrier and is ctype-exact already.)
+                _ => src_ct,
+            };
+        }
+        if src_ct.is_decimal() || target_ty.is_decimal() {
+            if let Some(target_ct) = Self::decimal_conversion_target_ct(target_ty) {
+                return self.convert_scalar_ctype(src, src_ty, &src_ct, &target_ct);
+            }
+        }
         self.emit_implicit_cast(src, src_ty, target_ty)
+    }
+
+    /// Recover a conversion-target CType from an IR type for decimal-aware
+    /// lowering. Width and signedness (all the libbid helper selection
+    /// needs) round-trip exactly, except for the ambiguous carriers, which
+    /// decline (fall back to the raw cast, i.e. status quo ante):
+    /// - `U128` is shared by `_Float128` and `unsigned __int128`;
+    /// - pointers/void/aggregates never reach decimal conversions.
+    fn decimal_conversion_target_ct(target_ty: IrType) -> Option<CType> {
+        Some(match target_ty {
+            IrType::F32 => CType::Float,
+            IrType::F64 => CType::Double,
+            IrType::F128 => CType::LongDouble,
+            IrType::D32 => CType::Decimal32,
+            IrType::D64 => CType::Decimal64,
+            IrType::I8 => CType::Char,
+            IrType::U8 => CType::UChar,
+            IrType::I16 => CType::Short,
+            IrType::U16 => CType::UShort,
+            IrType::I32 => CType::Int,
+            IrType::U32 => CType::UInt,
+            IrType::I64 => CType::Long,
+            IrType::U64 => CType::ULong,
+            IrType::I128 => CType::Int128,
+            _ => return None,
+        })
     }
 
     /// Insert an implicit type cast if src_ty differs from target_ty.

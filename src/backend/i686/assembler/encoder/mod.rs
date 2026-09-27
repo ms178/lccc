@@ -1409,33 +1409,15 @@ impl InstructionEncoder {
             "fistpq" => self.encode_x87_mem(ops, &[0xDF], 7),
             "fisttpq" => self.encode_x87_mem(ops, &[0xDD], 1),
             "fisttpl" => self.encode_x87_mem(ops, &[0xDB], 1),
-            "faddp" => {
-                self.bytes.extend_from_slice(&[0xDE, 0xC1]);
-                Ok(())
-            }
             // Note: AT&T syntax swaps the meaning of fsub/fsubr and fdiv/fdivr
             // relative to Intel mnemonics for the *p (pop) forms.
             // GAS: fsubp = DE E1, fsubrp = DE E9, fdivp = DE F1, fdivrp = DE F9
-            "fsubp" => {
-                self.bytes.extend_from_slice(&[0xDE, 0xE1]);
-                Ok(())
-            }
-            "fsubrp" => {
-                self.bytes.extend_from_slice(&[0xDE, 0xE9]);
-                Ok(())
-            }
-            "fmulp" => {
-                self.bytes.extend_from_slice(&[0xDE, 0xC9]);
-                Ok(())
-            }
-            "fdivp" => {
-                self.bytes.extend_from_slice(&[0xDE, 0xF1]);
-                Ok(())
-            }
-            "fdivrp" => {
-                self.bytes.extend_from_slice(&[0xDE, 0xF9]);
-                Ok(())
-            }
+            "faddp" => self.encode_x87_pop_reg(ops, "faddp", 0xC0),
+            "fsubp" => self.encode_x87_pop_reg(ops, "fsubp", 0xE0),
+            "fsubrp" => self.encode_x87_pop_reg(ops, "fsubrp", 0xE8),
+            "fmulp" => self.encode_x87_pop_reg(ops, "fmulp", 0xC8),
+            "fdivp" => self.encode_x87_pop_reg(ops, "fdivp", 0xF0),
+            "fdivrp" => self.encode_x87_pop_reg(ops, "fdivrp", 0xF8),
             "fchs" => {
                 self.bytes.extend_from_slice(&[0xD9, 0xE0]);
                 Ok(())

@@ -168,6 +168,14 @@ impl IrConst {
             IrConst::F32(v) => *v == 0.0,
             IrConst::F64(v) => *v == 0.0,
             IrConst::LongDouble(v, _) => *v == 0.0,
+            // C23 decimals: BID-decoded truthiness (+0 == -0 in any
+            // quantum; Inf/NaN nonzero). Powers branch/logical folding
+            // over decimal constants. (D128 rides I128 and stays
+            // integer-exact there: the carrier is ambiguous with plain
+            // integers, so non-canonical-zero D128 bit patterns do not
+            // fold — same conservative corner as _Float128 -0.0.)
+            IrConst::D32(v) => crate::common::decimal::bid32_is_zero(*v),
+            IrConst::D64(v) => crate::common::decimal::bid64_is_zero(*v),
             IrConst::Zero => true,
             _ => false,
         }
