@@ -3096,7 +3096,9 @@ impl Lowerer {
         };
         let helper = match (s, d) {
             ("sd", "sf") => "__bid_truncsdsf".to_string(),
-            ("sd", "df") => "__bid_truncsddf".to_string(),
+            // D32 -> double is a widening: libgcc calls it extendsddf
+            // (truncsddf does not exist; measured against GCC 16 -S).
+            ("sd", "df") => "__bid_extendsddf".to_string(),
             ("sd", "xf") => "__bid_extendsdxf".to_string(),
             ("sd", "tf") => "__bid_extendsdtf".to_string(),
             ("dd", "sf") => "__bid_truncddsf".to_string(),
@@ -3259,6 +3261,66 @@ impl Lowerer {
                 self.lower_arithmetic_binop(op, lhs, rhs)
             }
         }
+    }
+
+    /// Lower a decimal-involved compound assignment (`d += x`, `i += d`).
+    /// Only Add/Sub/Mul/Div reach here (the caller filters); remainder,
+    /// bitwise and shift compound ops fall through to the generic path,
+    /// mirroring [`Self::lower_decimal_binop`]'s `_` arm (invalid C; sema
+    /// reports).
+    ///
+    /// The LHS is evaluated exactly once through the lvalue machinery (like
+    /// the generic path); both sides convert to the UAC common type and the
+    /// operation runs through the libbid helpers. When UAC picks a binary
+    /// float (the decimal-vs-binary rule), the operation is a plain IR float
+    /// op on the converted values. The result converts back to the LHS type
+    /// before the store (mirroring `narrow_from_op`).
+    pub(super) fn lower_decimal_compound_assign(
+        &mut self,
+        op: &ast::BinOp,
+        lhs: &Expr,
+        rhs: &Expr,
+        lhs_ct: &CType,
+        rhs_ct: &CType,
+        common_ct: &CType,
+    ) -> Operand {
+        let rhs_val = self.lower_expr(rhs);
+        if let Some(lv) = self.lower_lvalue(lhs) {
+            let lhs_ir = self.get_expr_type(lhs);
+            let loaded = self.load_lvalue_typed(&lv, lhs_ir);
+            let rhs_ir = self.get_expr_type(rhs);
+            let l = self.convert_scalar_ctype(loaded, lhs_ir, lhs_ct, common_ct);
+            let r = self.convert_scalar_ctype(rhs_val, rhs_ir, rhs_ct, common_ct);
+            let common_ir = IrType::from_ctype(common_ct);
+            let result = if let Some(w) = Self::decimal_width(common_ct) {
+                let s = Self::dec_suffix(w);
+                let name = match op {
+                    ast::BinOp::Add => "add",
+                    ast::BinOp::Sub => "sub",
+                    ast::BinOp::Mul => "mul",
+                    ast::BinOp::Div => "div",
+                    _ => unreachable!("non-arithmetic decimal compound op: {op:?}"),
+                };
+                let dec_ty = Self::dec_ty(w);
+                self.emit_decimal_call(
+                    &format!("__bid_{name}{s}3"),
+                    vec![(l, dec_ty, w == 128), (r, dec_ty, w == 128)],
+                    dec_ty,
+                    w == 128,
+                )
+            } else {
+                // Binary-float common type: plain IR float arithmetic on the
+                // converted values (IrBinOp::{Add, Sub, Mul, Div} lower by
+                // operand type, exactly like the generic float path).
+                let ir_op = Self::binop_to_ir(*op, false);
+                self.emit_binop_val(ir_op, l, r, common_ir)
+            };
+            let store_val =
+                self.convert_scalar_ctype(Operand::Value(result), common_ir, common_ct, lhs_ct);
+            self.store_lvalue_typed(&lv, store_val, lhs_ir);
+            return store_val;
+        }
+        rhs_val
     }
 
     /// Truthiness test for a decimal operand (`x != 0` under decimal

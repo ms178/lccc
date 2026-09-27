@@ -1273,8 +1273,12 @@ impl CodegenState {
     /// constructors. Foreign-ISA backends (AArch64, RISC-V) must NOT call
     /// this: their assembly is not AT&T x86 and the classifier's
     /// vocabulary cannot describe it (see `AsmOutput::rax_epoch_active`).
+    /// `pub(crate)` enforces exactly that: the flag is load-bearing for
+    /// the ASSERTION's soundness, so arming it must stay reviewable inside
+    /// the crate that owns the two constructors — a must-not-call API
+    /// visible beyond the crate is a documented bug waiting to compile.
     #[inline]
-    pub fn enable_rax_epoch_discipline(&mut self) {
+    pub(crate) fn enable_rax_epoch_discipline(&mut self) {
         #[cfg(debug_assertions)]
         {
             self.out.rax_epoch_active = true;
@@ -1339,12 +1343,14 @@ impl CodegenState {
                      %rax shadow epoch moved since the park ({} -> {}): some emitter wrote \
                      %rax without invalidate_acc, and sourcing the value from %rax now \
                      reads a dead register. Last unclassified emitted line: {:?} \
-                     (extend the analyzer tables in backend/common.rs if that line is \
-                     benign — otherwise fix the missing invalidate_acc).",
+                     (unclassified vocabulary so far: {:?} — extend the analyzer tables \
+                     in backend/common.rs if that line is benign — otherwise fix the \
+                     missing invalidate_acc).",
                     value_id,
                     park,
                     now,
-                    self.out.debug_last_unclassified()
+                    self.out.debug_last_unclassified(),
+                    self.out.debug_unclassified_mnemonics()
                 );
             }
         }

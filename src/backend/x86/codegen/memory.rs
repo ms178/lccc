@@ -2020,9 +2020,22 @@ impl X86Codegen {
         if shift > 3 {
             return false;
         }
-        // FP loads stay in the SSE domain.
-        if matches!(ty, IrType::F32 | IrType::F64) {
-            let instr = if ty == IrType::F64 { "movsd" } else { "movss" };
+        // FP loads stay in the SSE domain. Decimal carriers move here too:
+        // D64 is a bit-exact 64-bit move (movsd), D32 a bit-exact 32-bit one
+        // (movss) — the same law the non-indexed FP fast paths above have
+        // grouped as F64|F32|D64|D32 since 1fdb401a. These two arms are the
+        // indexed emitters' half of the fold contract (`can_indexed_addr_fold`
+        // ↔ `ArchCodegen::indexed_fold_ok` ↔ these arms must agree exactly):
+        // a type the deciding side guarantees but an arm refuses rematerialises
+        // the folded GEP at the access site after the dead-producer walk
+        // already skipped its offset chain — the never-written-home read the
+        // trait's soundness contract exists to forbid.
+        if matches!(ty, IrType::F64 | IrType::F32 | IrType::D64 | IrType::D32) {
+            let instr = if matches!(ty, IrType::F64 | IrType::D64) {
+                "movsd"
+            } else {
+                "movss"
+            };
             let dest_xmm_reg = self
                 .reg_assignments
                 .get(&dest.0)
@@ -2118,9 +2131,18 @@ impl X86Codegen {
         if shift > 3 {
             return false;
         }
-        // FP stores straight from the XMM home.
-        if matches!(ty, IrType::F32 | IrType::F64) {
-            let instr = if ty == IrType::F64 { "movsd" } else { "movss" };
+        // FP stores straight from the XMM home. Decimal carriers store here
+        // too: D64 via movsd, D32 via movss — bit-exact moves, never a value
+        // conversion (same law as the load arm above and the non-indexed
+        // store fast path). Both halves of the fold contract must accept the
+        // same type set or a guaranteed fold rematerialises over a dead
+        // offset chain (see the load arm's contract note).
+        if matches!(ty, IrType::F64 | IrType::F32 | IrType::D64 | IrType::D32) {
+            let instr = if matches!(ty, IrType::F64 | IrType::D64) {
+                "movsd"
+            } else {
+                "movss"
+            };
             let src = self.fp_store_value_xmm(val, ty);
             self.state
                 .emit_fmt(format_args!("    {} %{}, {}", instr, src, mem));
@@ -3916,5 +3938,261 @@ impl X86Codegen {
             "    {} %{}, {}{}(%rip)",
             store_instr, store_reg, seg_prefix, sym
         ));
+    }
+}
+
+#[cfg(test)]
+mod indexed_fold_contract_tests {
+    use super::*;
+    use crate::backend::generation::IndexedGepInfo;
+    use crate::backend::traits::ArchCodegen;
+
+    /// The SIB operand every emitter assertion shares: register base, register
+    /// index, scale 4 — the exact shape `emit_load_indexed_impl` builds for a
+    /// register-resident base and index at shift 2.
+    fn mem4() -> String {
+        X86Codegen::sib_mem64("rbx", "rcx", 2, 0)
+    }
+
+    /// ...and its scale-8 sibling.
+    fn mem8() -> String {
+        X86Codegen::sib_mem64("rbx", "rcx", 3, 0)
+    }
+
+    fn xmm_home(cg: &mut X86Codegen, v: u32) {
+        // PhysReg(20) is an allocatable XMM home (xmm2 — xmm0/xmm1 are
+        // scratch and never assigned as homes).
+        cg.reg_assignments.insert(v, PhysReg(20));
+    }
+
+    fn gep_info(access_tys: Vec<IrType>, feeds_store: bool, shift: u8) -> IndexedGepInfo {
+        IndexedGepInfo {
+            base: Value(1),
+            index: Value(2),
+            shift,
+            disp: 0,
+            orig_offset: Value(3),
+            access_tys,
+            feeds_store,
+        }
+    }
+
+    // ── the emitter half: D32/D64 reach the SSE arms width-exactly ─────────
+
+    #[test]
+    fn d32_indexed_load_and_store_move_like_f32() {
+        // Load: dest homed in an XMM register, value lands there width-exactly.
+        let mut cg = X86Codegen::new();
+        xmm_home(&mut cg, 100);
+        assert!(cg.emit_load_indexed_common(&Value(100), &Value(2), 2, IrType::D32, mem4()));
+        assert!(
+            cg.state
+                .out
+                .buf
+                .contains("    movss (%rbx, %rcx, 4), %xmm2"),
+            "D32 indexed load must use the 32-bit scalar move, got: {:?}",
+            cg.state.out.buf
+        );
+        assert!(
+            !cg.state.out.buf.contains("movsd"),
+            "no 64-bit move for D32"
+        );
+
+        // Store: source homed in an XMM register, same width law.
+        let mut cg = X86Codegen::new();
+        xmm_home(&mut cg, 101);
+        assert!(cg.emit_store_indexed_common(
+            &Operand::Value(Value(101)),
+            &Value(2),
+            2,
+            IrType::D32,
+            mem4()
+        ));
+        assert!(
+            cg.state
+                .out
+                .buf
+                .contains("    movss %xmm2, (%rbx, %rcx, 4)"),
+            "D32 indexed store must use movss, got: {:?}",
+            cg.state.out.buf
+        );
+    }
+
+    #[test]
+    fn d64_indexed_load_and_store_move_like_f64() {
+        let mut cg = X86Codegen::new();
+        xmm_home(&mut cg, 100);
+        assert!(cg.emit_load_indexed_common(&Value(100), &Value(2), 3, IrType::D64, mem8()));
+        assert!(
+            cg.state
+                .out
+                .buf
+                .contains("    movsd (%rbx, %rcx, 8), %xmm2"),
+            "D64 indexed load must use the 64-bit scalar move, got: {:?}",
+            cg.state.out.buf
+        );
+
+        let mut cg = X86Codegen::new();
+        xmm_home(&mut cg, 101);
+        assert!(cg.emit_store_indexed_common(
+            &Operand::Value(Value(101)),
+            &Value(2),
+            3,
+            IrType::D64,
+            mem8()
+        ));
+        assert!(
+            cg.state
+                .out
+                .buf
+                .contains("    movsd %xmm2, (%rbx, %rcx, 8)"),
+            "D64 indexed store must use movsd, got: {:?}",
+            cg.state.out.buf
+        );
+    }
+
+    #[test]
+    fn f32_f64_indexed_arms_unchanged() {
+        // Guard the widening against accidental drift of the incumbent types.
+        let mut cg = X86Codegen::new();
+        xmm_home(&mut cg, 100);
+        assert!(cg.emit_load_indexed_common(&Value(100), &Value(2), 2, IrType::F32, mem4()));
+        assert!(
+            cg.state
+                .out
+                .buf
+                .contains("    movss (%rbx, %rcx, 4), %xmm2")
+        );
+
+        let mut cg = X86Codegen::new();
+        xmm_home(&mut cg, 100);
+        assert!(cg.emit_load_indexed_common(&Value(100), &Value(2), 3, IrType::F64, mem8()));
+        assert!(
+            cg.state
+                .out
+                .buf
+                .contains("    movsd (%rbx, %rcx, 8), %xmm2")
+        );
+    }
+
+    #[test]
+    fn i128_indexed_still_refused() {
+        // The one type family the fold's generic gate and this emitter agree
+        // to refuse: a pair-emulating type has no SIB arm.
+        let mut cg = X86Codegen::new();
+        assert!(!cg.emit_load_indexed_common(&Value(100), &Value(2), 3, IrType::I128, mem8()));
+        assert!(
+            cg.state.out.buf.is_empty(),
+            "a refused fold must emit nothing, got: {:?}",
+            cg.state.out.buf
+        );
+    }
+
+    // ── the deciding half: indexed_fold_ok mirrors the emitter exactly ─────
+
+    #[test]
+    fn override_accepts_every_emitter_accepted_type() {
+        let cg = X86Codegen::new();
+        let accepted = [
+            IrType::F64,
+            IrType::F32,
+            IrType::D64,
+            IrType::D32,
+            IrType::I8,
+            IrType::U8,
+            IrType::I16,
+            IrType::U16,
+            IrType::I32,
+            IrType::U32,
+            IrType::I64,
+            IrType::U64,
+            IrType::Ptr,
+        ];
+        for ty in accepted {
+            assert!(
+                cg.indexed_fold_ok(&gep_info(vec![ty], false, 2)),
+                "{ty:?} load folds must be guaranteed"
+            );
+        }
+    }
+
+    #[test]
+    fn override_refuses_every_emitter_refused_type() {
+        let cg = X86Codegen::new();
+        for ty in [IrType::I128, IrType::U128, IrType::F128, IrType::Void] {
+            assert!(
+                !cg.indexed_fold_ok(&gep_info(vec![IrType::I32, ty], false, 2)),
+                "{ty:?} must be refused before the fold is guaranteed"
+            );
+        }
+    }
+
+    #[test]
+    fn override_mirrors_the_shift_guard() {
+        let cg = X86Codegen::new();
+        assert!(cg.indexed_fold_ok(&gep_info(vec![IrType::F32], false, 3)));
+        assert!(!cg.indexed_fold_ok(&gep_info(vec![IrType::F32], false, 4)));
+    }
+
+    #[test]
+    fn store_fed_folds_accept_any_gpr_homed_address_registers() {
+        // F15 regression pin: x86-64 indexed-store staging writes %rax
+        // (integer path) or %xmm0 (FP path) only — audited scratch-free of
+        // every allocatable home — so ANY GPR-homed SIB base/index folds,
+        // including %r11/%rdx. An earlier revision refused those homes and
+        // cost double_reduction/spectral_norm +2/+4 instructions against
+        // the corpus ratchet (the {%rdx, %r11} set was copied from the
+        // const-offset fold, whose staging machinery is different).
+        // Pin the PhysReg numbers this test's vocabulary rests on: a
+        // renumbering must fail loudly here, not silently test the wrong
+        // homes.
+        //
+        // S13 note: S08 accidentally reverted BOTH this pin and the F15
+        // removal (bad rebase, ungated session), resurrecting the bogus
+        // rule and tripping the sqlite_varint/expat golden gates. S13
+        // re-removed the rule and re-flipped this pin; the golden gate plus
+        // check_indexed_fold_scratch_index.sh now triple-pin the fold, so a
+        // third revert fails loudly in three places, not zero.
+        assert_eq!(phys_reg_name(PhysReg(10)), "r11");
+        assert_eq!(phys_reg_name(PhysReg(16)), "rdx");
+        assert_eq!(phys_reg_name(PhysReg(1)), "rbx");
+        assert_eq!(phys_reg_name(PhysReg(3)), "r13");
+        // %r11-homed index (the spectral_norm shape: `208(%rsp,%r11,8)`).
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(2, PhysReg(10)); // index in %r11
+        assert!(
+            cg.indexed_fold_ok(&gep_info(vec![IrType::I32], true, 2)),
+            "an %r11-homed index must fold: staging never writes %r11"
+        );
+
+        // %rdx-homed base.
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(1, PhysReg(16)); // base in %rdx
+        cg.reg_assignments.insert(2, PhysReg(1)); // index in %rbx
+        assert!(
+            cg.indexed_fold_ok(&gep_info(vec![IrType::I32], true, 2)),
+            "a %rdx-homed base must fold: staging never writes %rdx"
+        );
+
+        // Ordinary callee-saved homes.
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(1, PhysReg(1)); // base in %rbx
+        cg.reg_assignments.insert(2, PhysReg(3)); // index in %r13
+        assert!(
+            cg.indexed_fold_ok(&gep_info(vec![IrType::I32], true, 2)),
+            "non-scratch homes fold"
+        );
+
+        // %r11-homed BASE (the double_reduction shape: `(%r11,%rdi,4)`).
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(1, PhysReg(10)); // base in %r11
+        assert!(
+            cg.indexed_fold_ok(&gep_info(vec![IrType::I32], true, 2)),
+            "an %r11-homed base must fold: staging never writes %r11"
+        );
+
+        // No register home at all: frame-anchored slot or sym form.
+        let cg = X86Codegen::new();
+        assert!(cg.indexed_fold_ok(&gep_info(vec![IrType::I32], true, 2)));
     }
 }

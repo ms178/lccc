@@ -968,6 +968,43 @@ impl Lowerer {
         let else_ct = self.expr_ctype(else_expr);
         let result_is_complex = then_ct.is_complex() || else_ct.is_complex();
 
+        // C23 decimals: both arms convert to the UAC common type through the
+        // libbid helpers (raw IR casts would emit binary conversions on BID
+        // carriers). Mirrors the complex path below, including dead-branch
+        // elimination for constant conditions. When the common type is a
+        // binary float (the decimal-vs-binary UAC rule), convert_scalar_ctype
+        // performs the decimal->binary conversion on each arm.
+        if then_ct.is_decimal() || else_ct.is_decimal() {
+            let common_ct = CType::usual_arithmetic_conversion(&then_ct, &else_ct);
+            let common_ir = IrType::from_ctype(&common_ct);
+            if let Some(const_val) = self.eval_const_expr(cond) {
+                let (live_expr, live_ct) = if const_val.is_nonzero() {
+                    (then_expr, &then_ct)
+                } else {
+                    (else_expr, &else_ct)
+                };
+                let live_val = self.lower_expr(live_expr);
+                return self.convert_scalar_ctype(
+                    live_val,
+                    self.get_expr_type(live_expr),
+                    live_ct,
+                    &common_ct,
+                );
+            }
+            return self.emit_ternary_branch_cond(
+                cond,
+                common_ir,
+                |s| {
+                    let v = s.lower_expr(then_expr);
+                    s.convert_scalar_ctype(v, s.get_expr_type(then_expr), &then_ct, &common_ct)
+                },
+                |s| {
+                    let v = s.lower_expr(else_expr);
+                    s.convert_scalar_ctype(v, s.get_expr_type(else_expr), &else_ct, &common_ct)
+                },
+            );
+        }
+
         // Constant-fold the condition at lowering time. If the condition is a
         // compile-time constant (e.g., sizeof(x)==4, __builtin_constant_p(v)),
         // skip generating code for the dead branch entirely. This is critical
@@ -1148,6 +1185,47 @@ impl Lowerer {
                 |s| {
                     let v = s.lower_expr(else_expr);
                     s.convert_to_complex(v, &else_ct, &common_ct)
+                },
+            );
+        }
+
+        // C23 decimals: both arms convert to the UAC common type through the
+        // libbid helpers (same rationale as lower_conditional). The condition
+        // value doubles as the "then" arm; test it with decimal truthiness
+        // (+0 == -0), not an integer comparison of the BID carrier.
+        if cond_ct.is_decimal() || else_ct.is_decimal() {
+            let common_ct = CType::usual_arithmetic_conversion(&cond_ct, &else_ct);
+            let common_ir = IrType::from_ctype(&common_ct);
+            // Booleanize the condition: decimal truthiness for decimal
+            // conditions, the generic != 0 comparison otherwise (a raw
+            // integer is not a valid branch condition).
+            let cond_bool_val = if cond_ct.is_decimal() {
+                let truthy = self.lower_decimal_truthiness(cond_val, &cond_ct);
+                self.operand_to_value(truthy)
+            } else {
+                let int_ty = crate::common::types::target_int_ir_type();
+                let zero = if int_ty == IrType::I32 {
+                    IrConst::I32(0)
+                } else {
+                    IrConst::I64(0)
+                };
+                let b = self.fresh_value();
+                self.emit(Instruction::Cmp {
+                    dest: b,
+                    op: IrCmpOp::Ne,
+                    lhs: cond_val,
+                    rhs: Operand::Const(zero),
+                    ty: int_ty,
+                });
+                b
+            };
+            return self.emit_ternary_branch(
+                Operand::Value(cond_bool_val),
+                common_ir,
+                |s| s.convert_scalar_ctype(cond_val, cond_ty, &cond_ct, &common_ct),
+                |s| {
+                    let v = s.lower_expr(else_expr);
+                    s.convert_scalar_ctype(v, s.get_expr_type(else_expr), &else_ct, &common_ct)
                 },
             );
         }

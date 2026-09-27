@@ -160,6 +160,14 @@ impl<'a> SemaConstEval<'a> {
                     let lhs_unsigned = lhs_ctype.as_ref().is_some_and(|ct| ct.is_unsigned());
                     let rhs_size = rhs_ctype.as_ref().map_or(4, |ct| self.ctype_size(ct));
                     let rhs_unsigned = rhs_ctype.as_ref().is_some_and(|ct| ct.is_unsigned());
+                    // F33: _Float128 constants ride the I128 carrier; the
+                    // shared folders would compute on their BITS. Decline
+                    // any 128-bit-float-side binop (sema never produces
+                    // D32/D64 constants, so no decimal check is needed).
+                    let wide_side = |ct: &Option<CType>| matches!(ct, Some(CType::Float128));
+                    if wide_side(&lhs_ctype) || wide_side(&rhs_ctype) {
+                        return None;
+                    }
                     let result = shared_const_eval::eval_binop_with_types(
                         op,
                         lv,

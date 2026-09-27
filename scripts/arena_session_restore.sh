@@ -63,6 +63,26 @@ if ! "$CARGO_HOME/bin/rustup" component add --toolchain "$RUSTUP_TOOLCHAIN" rust
     log "FATAL: unable to install rustfmt/clippy for $RUSTUP_TOOLCHAIN"
     exit 1
 fi
+# The snapshot persists /home/user/.cargo but can drop all but one of the
+# hardlinked rustup shims (observed: only `rustup` survived, so cargo and
+# rustc were MISSING despite an installed toolchain, and the build failed
+# 10 minutes later with no hint of the cause). Recreate any missing shim
+# as a hardlink to the multicall binary, then fail fast if cargo is still
+# unusable rather than limping into a doomed build.
+for shim in cargo rustc rustdoc rustfmt cargo-fmt cargo-clippy clippy-driver; do
+    if [[ ! -x $CARGO_HOME/bin/$shim ]]; then
+        if ln -f "$CARGO_HOME/bin/rustup" "$CARGO_HOME/bin/$shim" 2>/dev/null; then
+            log "recreated missing $shim shim"
+        else
+            log "FATAL: unable to recreate $shim shim"
+            exit 1
+        fi
+    fi
+done
+if ! cargo --version >/dev/null 2>&1; then
+    log 'FATAL: cargo unusable after toolchain install'
+    exit 1
+fi
 log "rustc: $(rustc --version 2>/dev/null || echo MISSING)"
 log "cargo: $(cargo --version 2>/dev/null || echo MISSING)"
 
@@ -114,21 +134,32 @@ if [[ ! -d .git ]]; then
         mkdir -p /home/user/artifacts
         cp /home/user/target/artifacts/lccc.bundle /home/user/artifacts/lccc.bundle
     fi
+    bundle_err=""
     if [[ -f /home/user/artifacts/lccc.bundle ]] \
-        && git clone -q /home/user/artifacts/lccc.bundle "$tmp_git" 2>/dev/null; then
+        && bundle_err=$(git -c init.defaultBranch=main clone -q /home/user/artifacts/lccc.bundle "$tmp_git" 2>&1); then
         mv "$tmp_git/.git" ./.git
         git remote set-url origin https://github.com/ms178/lccc.git 2>/dev/null || true
         log "recovered from bundle: branch=$(git branch --show-current 2>/dev/null || echo detached) HEAD=$(git rev-parse --short HEAD)"
         log "recovered: $(git status --porcelain | wc -l) worktree changes preserved as modifications"
-    elif git clone --depth 200 -q https://github.com/ms178/lccc.git "$tmp_git"; then
-        mv "$tmp_git/.git" ./.git
-        # MIXED reset: rebuilds the index from HEAD and leaves the worktree
-        # alone (see NEVER above).
-        git reset -q
-        log "recovered from upstream: HEAD=$(git rev-parse --short HEAD) ($(git rev-list --count HEAD ^origin/main 2>/dev/null || echo 0) local commits)"
-        log "recovered: $(git status --porcelain | wc -l) worktree changes preserved as modifications"
     else
-        log 'RECOVERY FAILED: bundle and upstream clone both failed; worktree is intact but git is unavailable'
+        if [[ -n $bundle_err ]]; then
+            # A broken bundle must never fail silently: the quiet fallback
+            # hid an incomplete S03 bundle for two sessions (shallow-clone
+            # prerequisites, which `git bundle verify` does not catch).
+            # Surface the error line, not the hint noise above it.
+            log "bundle clone failed: $(printf '%s\n' "$bundle_err" | grep -m1 -E '^(error|fatal):' || printf '%s\n' "$bundle_err" | tail -1)"
+        fi
+        upstream_err=""
+        if upstream_err=$(git -c init.defaultBranch=main clone --depth 200 -q https://github.com/ms178/lccc.git "$tmp_git" 2>&1); then
+            mv "$tmp_git/.git" ./.git
+            # MIXED reset: rebuilds the index from HEAD and leaves the worktree
+            # alone (see NEVER above).
+            git reset -q
+            log "recovered from upstream: HEAD=$(git rev-parse --short HEAD) ($(git rev-list --count HEAD ^origin/main 2>/dev/null || echo 0) local commits)"
+            log "recovered: $(git status --porcelain | wc -l) worktree changes preserved as modifications"
+        else
+            log "RECOVERY FAILED: bundle and upstream clone both failed ($(printf '%s\n' "$upstream_err" | grep -m1 -E '^(error|fatal):' || echo 'see log')); worktree is intact but git is unavailable"
+        fi
     fi
     rm -rf "$(dirname "$tmp_git")" 2>/dev/null || true
 fi

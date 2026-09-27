@@ -501,7 +501,9 @@ def run_case(c: Case, lccc: str, gas: str, wd: str, verbose: bool,
     src.write_text(c.text)
     lo, go = Path(wd) / f"{tag}.l.o", Path(wd) / f"{tag}.g.o"
 
-    r1 = subprocess.run([lccc, "-c", str(src), "-o", str(lo)],
+    r1 = subprocess.run([lccc, "-m32", "-c", str(src), "-o", str(lo)]
+                        if bits32 else
+                        [lccc, "-c", str(src), "-o", str(lo)],
                         capture_output=True, text=True, timeout=180)
     gas_bits = "--32" if bits32 else "--64"
     r2 = subprocess.run([gas, gas_bits, "-o", str(go), str(src)],
