@@ -178,9 +178,79 @@ via `scripts/insndiff.py` / `encoding_diff.py` + GAS 2.47 (INF-GAS-1).
 
 ## Tier 3 — verifier / infra
 
-### VER-DOM-1 · Def-dominates-use in the IR verifier
-Six structural properties clean; dominance is the uncovered one (how an
-SSA violation once shipped). Cooper-Harvey-Kennedy over RPO next.
+### FE-RELRO-1 · CLOSED — multi-level pointer const leaked into `.data.rel.ro` placement (2026-09-27)
+The parser OR-ed `decl_flag::POINTER_CONST` across every star of a
+declarator, so `short * const * gp` (outer object **writable**) was
+classified read-only and `classify_global` routed it to `.data.rel.ro`;
+RELRO page-protection then made the first run-time store SIGSEGV
+(Csmith seed 20260928, differential vs GCC at -O0; wild store to the
+globals page, gdb-confirmed read-only mapping at run time). Fix:
+each star iteration now *clears* the flag, so only the identifier-
+adjacent (outermost) level's const survives — which also fixes
+cross-declarator leakage (`int * const a, *b;` made `b` read-only).
+Regression: `tests/regression/pointer_const_multi_level_relro.c`
+(SIGSEGVs on the pre-fix build; byte-compares vs GCC).
+Do-not-reopen: the single-star `T *const p` case is
+`pointer_const_data_rel_ro.c` (kernel zstd contract); the volatile
+sibling (`short * volatile * gp` marks the declaration volatile —
+conservative, safe, missed-opt only) is deliberately NOT changed in
+the same commit; measure before touching it.
+
+### VER-PHIARITY-1 · CLOSED — φ-arity contract is two-sided: reachable ⊆ named ⊆ static (2026-09-27, refined after corpus run)
+phi elimination materializes one edge copy per (reachable pred,
+incoming) pair and never visits unreachable blocks, so (a) a statically
+present but dead predecessor legally has no φ incoming — the frontend
+lowering leaves such dead edges routinely — and (b) an entry for a dead
+predecessor is inert (the edge copy sits on a path that never runs;
+switch/loop lowering produces these, e.g. switch_dispatch's 16-pred
+join). The first cut of the reachable contract enforced EQUALITY with
+the reachable set and false-positived on 15 corpus files, all of the
+`extra [dead-pred]` class. Final contract, identical in BOTH checkers:
+every REACHABLE predecessor must be named (missing = live-edge defect,
+the miscompile class), and only real CFG predecessors may be named
+(stray = carelessly retargeted edge); an entry for a dead predecessor
+sits legally in the gap. GLA check 7 (src/backend/location_alloc/
+verifier.rs) and the `CCC_VALIDATE_SSA` PHI-ARITY check (src/passes/
+mod.rs) implement it with unit tests for both sides. Do not weaken the
+reachable-preds coverage side: that is the real defect detector
+(Csmith 20260981's compile abort). Also added a
+`lowering:entry` validator checkpoint (at -O0 the optimizer loop is
+empty, so without it a frontend IR defect was only visible at
+`backend:pre-eliminate_phis`) and dump-before-validate ordering there.
+
+### PHI-SINK-1 · CLOSED (superseding entry) — composed with #645; profitability = live phi home (2026-09-27, S66)
+The unguarded sink regressed `spectral_norm` (289 > 287 budget): sinking the
+accumulator's add across the body/latch boundary separated it from its mul
+and lccc lost `vfmadd231sd`. Final rule: sink ONLY when the phi home is
+live across the window — an instruction between definition and relay (same
+block) or in the strictly-dominated region reads or writes the home (the
+rotation's `f <- e` copy). Dead-home accumulator shapes are refused; the
+allocator coalesces them anyway and the fold would only distance the
+computation from its operands. Both behaviors unit-pinned
+(`computed_incoming_folds_to_its_copy_slot`, `dead_home_computed_incoming_is_not_sunk`,
+`fold_sinks_definition_without_touching_readers` — rewritten after it was
+found to pass vacuously under refusal). Composed with #645 (Agent B's
+rotation lags + residency guard + lea addend fold — audit:
+`engineering/AUDIT-PR645-reassoc-latency.md`): rot 55/3 → 53/3, sha256
+144→142, corpus −5 insns/−5 rrmov with 183/186 functions identical, full
+lib 3621/0. Gate ratchet: escape-off census pinned to the exact composed
+shape (k_i ≤ 53 / k_s ≤ 3); the beat-gcc and beat-legacy-by-10 contract
+unchanged. Do-not-reopen: the predicate gates profitability only —
+correctness always stays with the RA's disjoint-interval coalescing rule.
+
+### CC-O0CALL-1 · -O0 call-argument materialization clobbers a register home (OPEN, P0)
+Csmith 20260945 (differential vs GCC 14.2 at -O0): deterministic
+SIGSEGV, `-O1`/`-O2` and GCC clean. At -O0 (`disable_regalloc`),
+a call argument's pointer base stayed in `%rax` across the previous
+argument's evaluation; the next argument loaded through the stale
+`%rax` (`mov (%rax),%r8`) and dereferenced garbage. Independent of
+GLA (crashes with `CCC_RA_GLOBAL_LOCATION=0` too) and of FE-RELRO-1
+(fixed binary still crashes). Reproducer:
+`artifacts/repros/miscompile_csmith_20260945_-O0.c`; reduction in
+progress. Debug leads: `CCC_DEBUG_NOHOME` home-freshness reporting,
+the -O0 slot-assignment path in `stack_layout/`, and the Call lowering
+argument-order walk. Done = minimized repro + root cause + regression
+test + full CI green.
 
 ### INF-HARNESS-1 · Subtract startup / scale short benchmarks
 lz4's 1.94× hid a 10× work gap (~2 ms fixed cost in a 7 ms measure).
@@ -210,7 +280,14 @@ lccc failures). Setup: `tools/linker/setup_oracles.sh`,
 ---
 
 ## Closed this cycle (do not re-open without new evidence)
-<!-- durable here for grep-ability; narrative in engineering/journal/2026-09-W2.md -->
+<!-- durable here for grep-ability; narrative in engineering/journal/2026-09-W2.md and 2026-09-W3.md -->
+
+VER-DOM-1 (def-dominates-use in the IR verifier — landed as
+`src/passes/verify.rs` checks 7 & 8: SSA single definition and
+def-dominates-use over an interval-encoded dominator tree, with the
+diamond/loop/terminator test family in `verify/tests.rs`; the 2026-09-27
+triage found this item stale — the dominance check has been in place
+since the IR-verifier birth arc);
 
 `__builtin_memcpy` → native Memcpy + the two latent aliasing fixes it
 exposed; chacha20/ARX 10.01× → ~1.05×; `iv_widen` constant-scale firing

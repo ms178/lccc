@@ -212,12 +212,46 @@ pub(crate) fn verify_rewrite(
         }
     }
 
-    // 7. φ arity vs the CFG: every φ names exactly the block's predecessor
-    // SET (compared as sets — build_cfg records both arms of a CondBranch
-    // that targets the same block). A trampoline retarget that strands an
-    // edge leaves a predecessor with no incoming (phi elimination would
-    // feed it undef), which check 6 cannot see.
+    // 7. φ arity vs the CFG: every φ names exactly the block's REACHABLE
+    // predecessor SET (compared as sets — build_cfg records both arms of a
+    // CondBranch that targets the same block). A trampoline retarget that
+    // strands an edge leaves a predecessor with no incoming (phi
+    // elimination would feed it undef), which check 6 cannot see.
+    //
+    // Reachability, not static presence, is the contract: phi elimination
+    // materializes one edge copy per (reachable pred, incoming) pair and
+    // never visits unreachable blocks, so a statically present but
+    // dynamically dead predecessor legally has NO φ incoming — the
+    // frontend routinely leaves such dead edges (Csmith 20260945:
+    // func_45 block .LBB701 has preds {694, 703} with .LBB703 unreachable,
+    // φ incoming {694}).  Comparing against the STATIC set made every GLA
+    // plan touching such a function fail verification and abort (zero
+    // edits), both a spurious compile-time error (Csmith 20260981) and a
+    // silent optimization loss on every other one.
+    let reachable = {
+        let mut reach = vec![false; after.blocks.len()];
+        if !after.blocks.is_empty() {
+            reach[0] = true;
+            let mut stack = vec![0usize];
+            while let Some(bi) = stack.pop() {
+                for &s in succs.row(bi) {
+                    let si = s as usize;
+                    if si < reach.len() && !reach[si] {
+                        reach[si] = true;
+                        stack.push(si);
+                    }
+                }
+            }
+        }
+        reach
+    };
     for (bi, b) in after.blocks.iter().enumerate() {
+        // A φ inside an unreachable block never executes; its incoming set
+        // is inert (dead-region cleanup may leave arbitrary entries behind).
+        // Only reachable blocks carry the live-edge contract.
+        if !reachable[bi] {
+            continue;
+        }
         let phis: Vec<_> = b
             .instructions
             .iter()
@@ -226,11 +260,22 @@ pub(crate) fn verify_rewrite(
         if phis.is_empty() {
             continue;
         }
-        let mut cfg_preds: FxHashSet<u32> = FxHashSet::default();
+        // Same contract as the pass-level PHI-ARITY check (src/passes/mod.rs):
+        // every REACHABLE predecessor must be named, and only real CFG
+        // predecessors may be named. An incoming for a statically present but
+        // unreachable predecessor sits in the gap between the two bounds —
+        // its edge copy is on a dead path and never executes — so it is
+        // tolerated, exactly as phi elimination tolerates emitting it.
+        let mut reachable_preds: FxHashSet<u32> = FxHashSet::default();
+        let mut static_preds: FxHashSet<u32> = FxHashSet::default();
         for &p in preds.row(bi) {
             let pidx = p as usize;
             if pidx < after.blocks.len() {
-                cfg_preds.insert(after.blocks[pidx].label.0);
+                let label = after.blocks[pidx].label.0;
+                static_preds.insert(label);
+                if reachable[pidx] {
+                    reachable_preds.insert(label);
+                }
             }
         }
         for phi in phis {
@@ -238,11 +283,11 @@ pub(crate) fn verify_rewrite(
                 unreachable!()
             };
             let named: FxHashSet<u32> = incoming.iter().map(|(_, p)| p.0).collect();
-            if named != cfg_preds {
-                let missing: Vec<u32> = cfg_preds.difference(&named).copied().collect();
-                let extra: Vec<u32> = named.difference(&cfg_preds).copied().collect();
+            let missing: Vec<u32> = reachable_preds.difference(&named).copied().collect();
+            let stray: Vec<u32> = named.difference(&static_preds).copied().collect();
+            if !missing.is_empty() || !stray.is_empty() {
                 return Err(format!(
-                    "φ in block {} incoming set mismatches CFG preds (missing {missing:?}, extra {extra:?})",
+                    "φ in block {} incoming set violates the reachable-pred contract (missing {missing:?}, not-a-CFG-pred {stray:?})",
                     b.label.0
                 ));
             }
