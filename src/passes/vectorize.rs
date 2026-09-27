@@ -142,6 +142,10 @@ thread_local! {
     // stack-based vector backend does not implement those operations.  This
     // target bit is set by the driver per translation unit, not by host cfg.
     static X86_MAP_I64_AVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // The map kill switch is resolved once by the pass runner and refreshed
+    // for every translation unit, so early and main map entries agree without
+    // reading the process environment for every function.
+    static NO_MAP_VEC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub(crate) fn set_x86_map_i64_available(available: bool) {
@@ -150,6 +154,14 @@ pub(crate) fn set_x86_map_i64_available(available: bool) {
 
 fn x86_map_i64_available() -> bool {
     X86_MAP_I64_AVAILABLE.with(|cell| cell.get())
+}
+
+pub(crate) fn set_no_map_vec(disabled: bool) {
+    NO_MAP_VEC.with(|cell| cell.set(disabled));
+}
+
+fn no_map_vec() -> bool {
+    NO_MAP_VEC.with(|cell| cell.get())
 }
 
 /// Record the x86 SIMD ISA profile for the current translation unit.
@@ -653,7 +665,7 @@ fn vectorize_with_analysis_mode(
                 }
                 total_changes += transform_reduction_avx2(func, &red_pattern, fp_contract);
             }
-        } else if std::env::var("CCC_NO_MAP_VEC").is_err() {
+        } else if !no_map_vec() {
             // Conditional-store statement forms (`if (c1 && c2) s[i] = f(s[i]);`)
             // are not map-shaped until the guarded store becomes a select
             // against the dominating same-address load.  Rewrite first
@@ -686,7 +698,7 @@ fn vectorize_with_analysis_mode(
                         map_pattern.elem_ty
                     );
                 }
-                total_changes += transform_map_vector(func, &map_pattern, avx2, fp_contract);
+                total_changes += transform_map_vector(func, &map_pattern, avx2, neon, fp_contract);
             } else if std::env::var("CCC_NO_STENCIL_VEC").is_err() {
                 // OP-05a: generalized non-reduction FP loops (stencils and
                 // multi-load maps with constant tap offsets). AArch64's NEON
@@ -4153,6 +4165,10 @@ impl MapExpr {
 struct MapEmitCtx<'a> {
     src_bases: &'a [Value],
     byte_iv: Value,
+    /// Constant displacement for the current unrolled copy.  The x86 memory
+    /// emitters fold it into `disp(base,index)`; keeping it separate from the
+    /// SSA byte IV avoids a per-copy LEA in the hot loop.
+    byte_disp: i64,
     load_op: IntrinsicOp,
     broadcast_op: IntrinsicOp,
     sqrt_op: Option<IntrinsicOp>,
@@ -4181,6 +4197,12 @@ struct MapEmitCtx<'a> {
     /// or the SSE2 unpack chains).  `None` on dword/FP paths.
     byte_broadcast_op: Option<IntrinsicOp>,
     node_cache: Vec<(String, Value)>,
+    /// Broadcast values are shared across separately emitted unrolled copies
+    /// of the same map expression.  `node_cache` is deliberately cleared
+    /// between copies because loads and all derived nodes use a different
+    /// byte offset; invariant broadcasts, however, are loop-invariant and
+    /// must be emitted exactly once in the preheader.
+    broadcast_cache: Vec<(String, Value)>,
     preheader_insts: Vec<Instruction>,
     vec_insts: Vec<Instruction>,
     next_val_id: u32,
@@ -4209,20 +4231,35 @@ impl<'a> MapEmitCtx<'a> {
         match expr {
             MapExpr::Load(stream) => {
                 let dest = self.fresh();
+                let mut args = vec![
+                    Operand::Value(self.src_bases[*stream]),
+                    Operand::Value(self.byte_iv),
+                ];
+                if self.byte_disp != 0 {
+                    args.push(Operand::Const(IrConst::I64(self.byte_disp)));
+                }
                 self.vec_insts.push(Instruction::Intrinsic {
                     dest: Some(dest),
                     op: self.load_op,
                     dest_ptr: None,
-                    args: vec![
-                        Operand::Value(self.src_bases[*stream]),
-                        Operand::Value(self.byte_iv),
-                    ],
+                    args,
                 });
                 Some(dest)
             }
             MapExpr::Invariant(operand) => {
                 // Broadcasts live in the PREHEADER so they are hoisted out
-                // of the packed loop (register-allocated once).
+                // of the packed loop (register-allocated once).  Unrolled
+                // map copies clear `node_cache` between lanes because their
+                // loads must be re-emitted at a new byte offset; invariant
+                // broadcasts are instead shared through `broadcast_cache`.
+                let cache_key = format!("{:?}", operand);
+                if let Some(&(_, cached)) = self
+                    .broadcast_cache
+                    .iter()
+                    .find(|(key, _)| *key == cache_key)
+                {
+                    return Some(cached);
+                }
                 //
                 // Byte lanes splat through the DWORD broadcast, so a
                 // constant must be replicated into all four bytes here --
@@ -4254,6 +4291,7 @@ impl<'a> MapEmitCtx<'a> {
                     dest_ptr: None,
                     args: vec![operand],
                 });
+                self.broadcast_cache.push((cache_key, dest));
                 Some(dest)
             }
             MapExpr::Sqrt(x) => {
@@ -8382,6 +8420,7 @@ fn transform_byte_count_reduction_inner(
         let mut ctx = MapEmitCtx {
             src_bases: &p.src_bases,
             byte_iv,
+            byte_disp: 0,
             load_op: IntrinsicOp::VecLoadI32x8,
             broadcast_op: IntrinsicOp::VecBroadcastI32x8,
             sqrt_op: None,
@@ -8394,6 +8433,7 @@ fn transform_byte_count_reduction_inner(
             narrow_const_bytes: Some(1),
             byte_broadcast_op: Some(IntrinsicOp::VecBroadcastI8x32),
             node_cache: Vec::new(),
+            broadcast_cache: Vec::new(),
             preheader_insts: Vec::new(),
             vec_insts: Vec::new(),
             next_val_id: *next_val_id,
@@ -21671,6 +21711,7 @@ fn transform_map_vector(
     func: &mut IrFunction,
     pattern: &MapPattern,
     avx2: bool,
+    neon: bool,
     fp_contract: crate::common::fp_contract::FpContract,
 ) -> usize {
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
@@ -21682,10 +21723,35 @@ fn transform_map_vector(
         return 0;
     };
     let vec_width: u64 = u64::from(if avx2 { 32 / elem_size } else { 16 / elem_size });
+    // I64/U64 has a deliberate two-lane XMM lowering even when AVX2 is
+    // available.  A small fixed unroll restores the missing four/eight-byte
+    // memory-level parallelism without pretending that a 128-bit intrinsic
+    // handles four lanes.  Keep larger expression trees rolled: every extra
+    // copy multiplies their live range and can turn the speed win into spills.
+    // The simple three-node load/op/load maps are the hot path and can safely
+    // use four two-lane operations per counted iteration; modest trees use
+    // two, and complex trees retain the conservative rolled body.  The
+    // environment kill switch is intentionally scoped to this I64/U64
+    // unroll decision so A/B runs can separate unroll benefit from the
+    // underlying two-lane vectorization.
+    let vector_unroll: u64 = if std::env::var_os("CCC_NO_MAP_I64_UNROLL").is_some() {
+        1
+    } else if matches!(pattern.elem_ty, IrType::I64 | IrType::U64) {
+        match pattern.expr.node_count() {
+            0..=3 => 4,
+            4..=8 => 2,
+            _ => 1,
+        }
+    } else {
+        1
+    };
+    let packed_width = vec_width
+        .checked_mul(vector_unroll)
+        .expect("map packed width must fit in u64");
 
     // A zero-iteration vector loop plus scalar remainder only adds overhead.
     if matches!(&pattern.limit, Operand::Const(c)
-        if c.to_i64().is_some_and(|n| n <= vec_width as i64))
+        if c.to_i64().is_some_and(|n| n <= packed_width as i64))
     {
         return 0;
     }
@@ -22107,7 +22173,7 @@ fn transform_map_vector(
         func,
         pattern,
         &expr,
-        vec_width,
+        packed_width,
         byte_iv,
         elem_size,
         &mut next_val_id,
@@ -22141,10 +22207,10 @@ fn transform_map_vector(
 
     // Divide the loop bound by the packed width (constant folded or dynamic).
     let divided_limit = match &pattern.limit {
-        Operand::Const(IrConst::I32(n)) => Operand::Const(IrConst::I32(*n / vec_width as i32)),
-        Operand::Const(IrConst::I64(n)) => Operand::Const(IrConst::I64(*n / vec_width as i64)),
+        Operand::Const(IrConst::I32(n)) => Operand::Const(IrConst::I32(*n / packed_width as i32)),
+        Operand::Const(IrConst::I64(n)) => Operand::Const(IrConst::I64(*n / packed_width as i64)),
         Operand::Value(limit_val) => {
-            let shift = vec_width.trailing_zeros() as i64;
+            let shift = packed_width.trailing_zeros() as i64;
             let int_const = |n: i64| match pattern.iv_ty {
                 IrType::I32 | IrType::U32 => IrConst::I32(n as i32),
                 _ => IrConst::I64(n),
@@ -22180,7 +22246,7 @@ fn transform_map_vector(
                     dest: bias,
                     op: IrBinOp::And,
                     lhs: Operand::Value(sign),
-                    rhs: Operand::Const(int_const(vec_width as i64 - 1)),
+                    rhs: Operand::Const(int_const(packed_width as i64 - 1)),
                     ty: pattern.iv_ty,
                 });
                 quotient_insts.push(Instruction::BinOp {
@@ -22274,7 +22340,7 @@ fn transform_map_vector(
             dest: byte_iv_next,
             op: IrBinOp::Add,
             lhs: Operand::Value(byte_iv),
-            rhs: Operand::Const(IrConst::I64((elem_size as u64 * vec_width) as i64)),
+            rhs: Operand::Const(IrConst::I64((elem_size as u64 * packed_width) as i64)),
             ty: IrType::I64,
         });
     changes += 2;
@@ -22308,7 +22374,7 @@ fn transform_map_vector(
     // guaranteed by construction: `T <= limit` and the loop already indexes
     // `limit * elem_size` bytes of real memory, so `T * S <= limit *
     // elem_size` fits in the address space.
-    let stride_bytes = i64::from(elem_size) * vec_width as i64;
+    let stride_bytes = i64::from(elem_size) * packed_width as i64;
     let fused_iv = {
         // The exit comparison lives in the loop and tests an IV-derived value
         // against `divided_limit`.  Find it; if its shape is not the one the
@@ -22430,8 +22496,6 @@ fn transform_map_vector(
         }
     }
 
-    let dst_address = (dst_base, Operand::Value(byte_iv));
-
     // Mask-arithmetic strength reduction (see `strength_reduce_mask_select`)
     // is a PACKED-ONLY lowering: it treats a compare result as an all-ones
     // lane mask, which is what `vpcmpgt*` produces but NOT what a scalar
@@ -22464,10 +22528,19 @@ fn transform_map_vector(
 
     // Replace the scalar store with only the packed operations present in the
     // source expression.  DCE removes the now-unreachable scalar dataflow.
+    //
+    // I64/U64 is intentionally emitted as several independent two-lane
+    // operations in one counted iteration.  Each copy gets a fresh byte
+    // offset and a fresh expression cache; only invariant broadcasts are
+    // shared.  This is the critical distinction from advertising a fake
+    // four-lane I64 intrinsic: every memory access still covers exactly one
+    // 128-bit vector, while the loop/latch advances by the complete unrolled
+    // chunk.
     {
         let mut ctx = MapEmitCtx {
             src_bases: &src_bases,
             byte_iv,
+            byte_disp: 0,
             load_op,
             broadcast_op,
             sqrt_op,
@@ -22491,30 +22564,67 @@ fn transform_map_vector(
                 _ => None,
             },
             node_cache: Vec::new(),
+            broadcast_cache: Vec::new(),
             preheader_insts: Vec::new(),
             vec_insts: Vec::new(),
             next_val_id,
             changes: &mut changes,
         };
-        let Some(current) = ctx.emit(&packed_expr) else {
-            if debug {
-                eprintln!("[VEC-MAP]   Tree emission failed");
+        for copy_index in 0..vector_unroll {
+            let offset_bytes = copy_index
+                .checked_mul(vec_width)
+                .and_then(|lanes| lanes.checked_mul(u64::from(elem_size)))
+                .and_then(|bytes| i64::try_from(bytes).ok())
+                .expect("map unroll offset must fit in i64");
+            // The x86 vector memory emitters accept a constant displacement
+            // as a fourth argument.  Keep the induction variable in one GPR
+            // and fold 16/32/48-byte offsets into the load/store SIB instead
+            // of materialising `byte_iv + offset` with a LEA per copy.  NEON's
+            // emitter predates that optional argument, so keep a real SSA
+            // offset there; otherwise every ARM copy would address lane zero.
+            let byte_offset = if neon && offset_bytes != 0 {
+                let offset = ctx.fresh();
+                ctx.vec_insts.push(Instruction::BinOp {
+                    dest: offset,
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(byte_iv),
+                    rhs: Operand::Const(IrConst::I64(offset_bytes)),
+                    ty: IrType::I64,
+                });
+                offset
+            } else {
+                byte_iv
+            };
+            ctx.byte_iv = byte_offset;
+            ctx.byte_disp = if neon { 0 } else { offset_bytes };
+            // Loads and all expression nodes are lane-offset-specific.  Do
+            // not let the cache return lane 0's value for lane 1; invariant
+            // broadcasts use the separate cache and remain hoisted once.
+            ctx.node_cache.clear();
+            let Some(current) = ctx.emit(&packed_expr) else {
+                if debug {
+                    eprintln!("[VEC-MAP]   Tree emission failed");
+                }
+                return changes;
+            };
+            let mut store_args = vec![
+                Operand::Value(current),
+                Operand::Value(dst_base),
+                Operand::Value(byte_offset),
+            ];
+            if !neon && offset_bytes != 0 {
+                store_args.push(Operand::Const(IrConst::I64(offset_bytes)));
             }
-            return changes;
-        };
-        let store_args = vec![
-            Operand::Value(current),
-            Operand::Value(dst_address.0),
-            dst_address.1.clone(),
-        ];
-        ctx.vec_insts.push(Instruction::Intrinsic {
-            dest: None,
-            op: store_op,
-            dest_ptr: Some(dst_address.0),
-            args: store_args,
-        });
+            ctx.vec_insts.push(Instruction::Intrinsic {
+                dest: None,
+                op: store_op,
+                dest_ptr: Some(dst_base),
+                args: store_args,
+            });
+        }
         // Broadcasts live in the preheader so they are hoisted out of the
-        // packed loop (register-allocated once, reused across iterations).
+        // packed loop (register-allocated once, reused by every unrolled
+        // copy).
         func.blocks[preheader_idx]
             .instructions
             .extend(ctx.preheader_insts);
@@ -22712,7 +22822,7 @@ fn transform_map_vector(
             dst_base_g,
             0,
             &checks,
-            elem_size as i64 * vec_width as i64,
+            elem_size as i64 * packed_width as i64,
             elem_size as i64,
             rem_header_label,
             rem_iv_phi,
@@ -23781,6 +23891,7 @@ pub(crate) fn vectorize_function(func: &mut IrFunction) -> usize {
 pub(crate) fn vectorize_const_trip_map_loops(
     func: &mut IrFunction,
     fp_contract: FpContract,
+    no_map_vec: bool,
 ) -> usize {
     // ISA gate FIRST.  This entry runs before the main vectorizer and
     // therefore needs its own gate: it emits the same Vec* intrinsics, but the
@@ -23795,6 +23906,8 @@ pub(crate) fn vectorize_const_trip_map_loops(
     // -mgeneral-regs-only` contract) otherwise pays a DynAlloca scan, a
     // volatile-access scan and an `env::var` allocation for every function in
     // the module to reach a test that was already decided before the pass ran.
+    // The caller snapshots CCC_NO_MAP_VEC once per compilation and passes it
+    // here, so this early entry and the main vectorizer cannot disagree.
     // All four guards are pure `return 0`, so the ordering is semantic-free.
     if !x86_simd_available() {
         return 0;
@@ -23813,7 +23926,7 @@ pub(crate) fn vectorize_const_trip_map_loops(
     if func_has_volatile_loop_access(func) {
         return 0;
     }
-    if std::env::var("CCC_NO_MAP_VEC").is_ok() {
+    if no_map_vec {
         return 0;
     }
     // Same diamond pre-conversion as the main vectorizer (see there).
@@ -23848,7 +23961,7 @@ pub(crate) fn vectorize_const_trip_map_loops(
                 && x86_avx2_available();
             // The I64/U64 intrinsic family has only two-lane XMM forms.
             let avx2 = avx2 && !matches!(pattern.elem_ty, IrType::I64 | IrType::U64);
-            let n = transform_map_vector(func, &pattern, avx2, fp_contract);
+            let n = transform_map_vector(func, &pattern, avx2, false, fp_contract);
             if n > 0 {
                 if debug {
                     eprintln!(

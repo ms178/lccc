@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 # Runtime/differential and codegen gate for the two-lane x86-64 I64 map path.
+# The codegen assertions also pin the adaptive four-copy unroll: four 128-bit
+# operations, one 64-byte loop step, and displacement operands rather than
+# per-copy LEAs.  This is deliberately a shape contract, not a fake 256-bit
+# lane-width contract.
 set -euo pipefail
 CCC=${CCC:-target/fastbuild/lccc}
 source_file=tests/regression/map_i64_two_lane.c
@@ -29,8 +33,14 @@ def body(path):
     return match.group(1)
 v, s = body(vector), body(scalar)
 needle = 'vpsubq' if arch == 'x86-64-v3' else 'psubq'
-if not re.search(r'\b' + needle + r'\b', v):
-    raise SystemExit(f'{arch}: expected {needle} in two-lane sub64')
+packed = re.findall(r'\b' + needle + r'\b', v)
+if len(packed) != 4:
+    raise SystemExit(f'{arch}: expected four independent two-lane {needle} operations, got {len(packed)}')
+vector_body = v.split('.LBB4:', 1)[0]
+if 'addq $64' not in vector_body:
+    raise SystemExit(f'{arch}: I64 map did not advance by the four-copy 64-byte chunk')
+if re.search(r'\bleaq\s+(?:16|32|48)\(', vector_body):
+    raise SystemExit(f'{arch}: unrolled I64 map materialized a displacement with LEA')
 if '%ymm' in v:
     raise SystemExit(f'{arch}: 64-bit map advanced by four lanes but only used XMM')
 if re.search(r'\b(?:vpsubq|psubq)\b', s):

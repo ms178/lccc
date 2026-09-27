@@ -1130,6 +1130,12 @@ pub(crate) fn run_passes(
         _ => false,
     });
     let mut disabled = std::env::var("CCC_DISABLE_PASSES").unwrap_or_default();
+    // Snapshot the map kill switch once, like the other pass-pipeline policy
+    // knobs.  Both the pre-unroll constant-trip entry and the main vectorizer
+    // must make the same decision without re-reading the environment per
+    // function.
+    let no_map_vec = std::env::var("CCC_NO_MAP_VEC").is_ok();
+    vectorize::set_no_map_vec(no_map_vec);
     // Linux's `.code16gcc` setup image has a hard 32 KiB code+data+BSS limit
     // and only six generally usable GPRs.  On the real linux-cachymod setup
     // corpus these four transformations increase final machine-code size by
@@ -1631,7 +1637,7 @@ pub(crate) fn run_passes(
                     &dirty,
                     &mut changed,
                     |f: &mut crate::ir::reexports::IrFunction| {
-                        vectorize::vectorize_const_trip_map_loops(f, fp_contract)
+                        vectorize::vectorize_const_trip_map_loops(f, fp_contract, no_map_vec)
                     }
                 )
             );
