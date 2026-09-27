@@ -1692,6 +1692,43 @@ impl super::InstructionEncoder {
         opcode: u8,
         allow_mixed: bool,
     ) -> Result<(), String> {
+        // No-SAE families keep the 6-argument signature (every existing
+        // call site); the SAE-aware families route through
+        // encode_evex_3src_imm_sae.
+        self.encode_evex_3src_imm_sae(ops, map, pp, w, opcode, allow_mixed, false)
+    }
+
+    /// SAE-aware 3src+imm8 encoder. `sae_scalar_lig` selects the family's
+    /// `{sae}` width law (GAS 2.47, byte-probed on vfixupimm/vrange/
+    /// vreduce/vrndscale/vgetmant):
+    ///
+    ///  * scalar families (ss/sd opcodes — LIG): `{sae}` requires every
+    ///    register to be XMM (`vfixupimmss $1,{sae},%xmm..` = 62 03 15 10
+    ///    55 f4 01; zmm/ymm spellings are rejected "operand size mismatch"
+    ///    even without a decorator);
+    ///  * packed families (ps/pd opcodes): `{sae}` requires ZMM — with
+    ///    EVEX.b set, the RC bits occupy LL and 512-bit is implied, so
+    ///    xmm/ymm spellings are rejected the same way;
+    ///  * in both cases ONLY bare `{sae}` is accepted — a rounding token
+    ///    is "unsupported static rounding/sae" (the imm8 carries the
+    ///    rounding control for these families, unlike vfixupimm's
+    ///    vreduce-style cousins handled by EvexSae::Sae elsewhere);
+    ///  * the LL bits are ZEROED when the decorator is present (the RC
+    ///    field occupies them): `vfixupimmpd $0xab,{sae},%zmm..` =
+    ///    62 03 95 10 54 f4 ab, NOT ... 50 ... — the old code kept the
+    ///    operand-derived LL and emitted a 512-bit-shaped encoding with
+    ///    b'=1, a different instruction.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_evex_3src_imm_sae(
+        &mut self,
+        ops: &[Operand],
+        map: u8,
+        pp: u8,
+        w: u8,
+        opcode: u8,
+        allow_mixed: bool,
+        sae_scalar_lig: bool,
+    ) -> Result<(), String> {
         // Same-width rule: every vector REGISTER operand must agree on
         // xmm/ymm/zmm (GAS 2.47 byte-probed on vpternlogd: mixed →
         // `register type mismatch'); the sentinel is attached by the
@@ -1746,7 +1783,6 @@ impl super::InstructionEncoder {
             }
             _ => (ops, None),
         };
-        let (sae_bcst, _) = Self::apply_evex_sae(sae, EvexSae::Sae, 0)?;
         if ops.len() != 4 {
             return Err("EVEX 3src-imm op requires 4 operands (imm, src2, src1, dst)".to_string());
         }
@@ -1759,7 +1795,28 @@ impl super::InstructionEncoder {
         {
             return Err("operand type mismatch: imm8 out of range".to_string());
         }
-        let ll = Self::evex_ll(ops);
+        // The SAE law (see the function doc): b'=1 moves RC into LL, so LL
+        // is zeroed; the width gate then demands XMM (scalar families) or
+        // ZMM (packed families) — never YMM. Without a decorator the
+        // operand-derived VL survives untouched. The old code discarded
+        // apply_evex_sae's LL result and kept the operand VL: a zmm
+        // `{sae}` spelling emitted LL=10 + b'=1 — a 512-bit-shaped
+        // encoding that is NOT the instruction GAS assembles.
+        let vl_ll = Self::evex_ll(ops);
+        // Scalar families are xmm-only even WITHOUT a decorator
+        // (GAS-probed: `vfixupimmss $1,%zmm28,..` and `vgetmantss ..
+        // %ymm..` are "operand size mismatch" — LIG means the length is
+        // fixed 128-bit for these, not don't-care).
+        if sae_scalar_lig && vl_ll != 0 {
+            return Err(CMP_SIZE_MISMATCH.to_string());
+        }
+        let (sae_bcst, ll) = Self::apply_evex_sae(sae, EvexSae::Sae, vl_ll)?;
+        if sae.is_some() {
+            let want = if sae_scalar_lig { 0b00 } else { 0b10 };
+            if vl_ll != want {
+                return Err(CMP_SIZE_MISMATCH.to_string());
+            }
+        }
         let (aaa, z) = Self::evex_mask_info(&ops[3]);
         match (&ops[0], &ops[1], &ops[2], &ops[3]) {
             (
@@ -2125,10 +2182,20 @@ impl super::InstructionEncoder {
         match (&ops[0], &ops[1]) {
             (Operand::Register(src), Operand::Register(dst)) => {
                 let (aaa, z) = Self::evex_mask_info(&ops[1]);
-                let (dst_num, src_num) =
-                    self.emit_evex_mod3(&dst.name, &src.name, None, 1, w, pp, ll, z, aaa, false)?;
-                self.bytes.push(load_op);
-                self.bytes.push(self.modrm(3, dst_num, src_num));
+                // `.s` selects the store-direction opcode with the SOURCE in
+                // ModRM.reg (`vmovapd.s %xmm29,%xmm30` = 62 01 fd 08 29 ee,
+                // GAS-probed) — the alternate encoding of the same move.
+                if self.s_flip {
+                    let (src_num, dst_num) = self
+                        .emit_evex_mod3(&src.name, &dst.name, None, 1, w, pp, ll, z, aaa, false)?;
+                    self.bytes.push(store_op);
+                    self.bytes.push(self.modrm(3, src_num, dst_num));
+                } else {
+                    let (dst_num, src_num) = self
+                        .emit_evex_mod3(&dst.name, &src.name, None, 1, w, pp, ll, z, aaa, false)?;
+                    self.bytes.push(load_op);
+                    self.bytes.push(self.modrm(3, dst_num, src_num));
+                }
                 Ok(())
             }
             (Operand::Memory(mem), Operand::Register(dst)) => {
@@ -4596,6 +4663,17 @@ impl super::InstructionEncoder {
                     return Err(format!("operand size mismatch for `{mnemonic}'"));
                 }
                 let (aaa, z) = Self::evex_mask_info(&ops[2]);
+                // `.s` selects the store-direction opcode 0x11 with the
+                // source pair swapped into the register slots
+                // (`vmovss.s %xmm28,%xmm29,%xmm30{%k7}` =
+                // 62 01 16 07 11 e6, GAS-probed).
+                if self.s_flip {
+                    let (src1_num, dst_num) =
+                        self.emit_evex_mod3(src1, dst, Some(src2), map, w, pp, 0, z, aaa, false)?;
+                    self.bytes.push(0x11);
+                    self.bytes.push(self.modrm(3, src1_num, dst_num));
+                    return Ok(());
+                }
                 let (dst_num, rm_num) =
                     self.emit_evex_mod3(dst, src1, Some(src2), map, w, pp, 0, z, aaa, false)?;
                 self.bytes.push(0x10);
@@ -5144,8 +5222,12 @@ impl super::InstructionEncoder {
     ) -> Result<(), String> {
         match ops.len() {
             0 => {
-                // Default: fadd %st(1), %st (i.e., st(0) = st(0) op st(1))
-                self.bytes.extend_from_slice(&[opcode_st0, base_modrm + 1]);
+                // GAS 2.47 byte-probed: the operand-LESS `fadd`/`fmul`/
+                // `fsub`/`fsubr`/`fdiv`/`fdivr` assembles the POP form
+                // with the implicit st(1) operand — `fadd` alone is
+                // `de c1` (faddp %st,%st(1)), NOT `d8 c1`. The old code
+                // emitted D8 base+1, a misencode of the non-pop form.
+                self.bytes.extend_from_slice(&[0xDE, base_modrm + 1]);
                 Ok(())
             }
             1 => {
@@ -5206,6 +5288,57 @@ impl super::InstructionEncoder {
             _ => return Err("fxch requires 0 or 1 operand".to_string()),
         };
         self.bytes.extend_from_slice(&[0xD9, 0xC8 + n]);
+        Ok(())
+    }
+
+    /// x87 pop-form arithmetic: `faddp`/`fmulp`/`fsubp`/`fsubrp`/`fdivp`/
+    /// `fdivrp`. Every operand spelling collapses to `DE base+rm` where rm
+    /// is the one register that is NOT %st (GAS 2.47 byte-probed):
+    ///
+    ///   * bare `faddp`        → DE C1  (rm = 1, the implicit st(1))
+    ///   * `faddp %st(3)`      → DE C3
+    ///   * `faddp %st,%st(3)`  → DE C3  (dst names the non-st(0) side)
+    ///   * `faddp %st(3),%st`  → DE C3
+    ///
+    /// The old code ignored the operand entirely and always emitted the
+    /// bare DE base+1 — `faddp %st(3)` silently became `faddp %st(1)`.
+    /// AT&T direction note: fsubp = DE E1 (subtracts st from st(1) and
+    /// pops), fsubrp = DE E9 — the same swap encode_x87_arith_reg documents.
+    pub(crate) fn encode_x87_pop_arith(
+        &mut self,
+        ops: &[Operand],
+        base_modrm: u8,
+    ) -> Result<(), String> {
+        let rm = match ops.len() {
+            0 => 1,
+            1 => match &ops[0] {
+                Operand::Register(reg) => parse_st_num(&reg.name)?,
+                _ => return Err("x87 arith requires st register operand".to_string()),
+            },
+            2 => {
+                let (Some(a), Some(b)) = (ops.first(), ops.get(1)) else {
+                    return Err("x87 arith requires 0-2 operands".to_string());
+                };
+                match (a, b) {
+                    (Operand::Register(r1), Operand::Register(r2)) => {
+                        let n1 = parse_st_num(&r1.name)?;
+                        let n2 = parse_st_num(&r2.name)?;
+                        if n2 == 0 {
+                            n1
+                        } else if n1 == 0 {
+                            n2
+                        } else {
+                            return Err("x87 arith: one operand must be st(0)".to_string());
+                        }
+                    }
+                    _ => {
+                        return Err("x87 arith requires st register operands".to_string());
+                    }
+                }
+            }
+            _ => return Err("x87 arith requires 0-2 operands".to_string()),
+        };
+        self.bytes.extend_from_slice(&[0xDE, base_modrm + rm]);
         Ok(())
     }
 

@@ -1297,8 +1297,13 @@ fn is_prefixed_instruction(rest: &str) -> bool {
     // Segment-override names are legal instruction prefixes in their own right:
     // the kernel writes `ds wrmsr` (arch/x86/include/asm/msr.h) to reserve a
     // byte that ALTERNATIVE can later patch into a different encoding.
+    // Case-insensitive: GAS accepts `REP MOVSQ` and `LOCK ADDQ` (glibc .S
+    // files use uppercase; `REP MOVSQ` used to fall through to the bare
+    // `rep` arm, emit a lone 0xF3 and SILENTLY DROP the instruction).
     match rest.split_once(|c: char| c.is_whitespace()) {
-        Some((head, tail)) => INSN_PREFIXES.contains(&head) && !tail.trim().is_empty(),
+        Some((head, tail)) => {
+            !tail.trim().is_empty() && INSN_PREFIXES.iter().any(|p| p.eq_ignore_ascii_case(head))
+        }
         None => false,
     }
 }
@@ -1312,8 +1317,10 @@ fn parse_prefixed_instruction(line: &str) -> Result<AsmItem, String> {
     let mut rest = line.trim();
     let mut prefixes: Vec<String> = Vec::new();
     while let Some((head, tail)) = rest.split_once(|c: char| c.is_whitespace()) {
-        if INSN_PREFIXES.contains(&head) && !tail.trim().is_empty() {
-            prefixes.push(head.to_string());
+        // Case-insensitive match (GAS: `REP MOVSQ`); store the canonical
+        // lowercase spelling so the encoder's byte mapping stays exact.
+        if !tail.trim().is_empty() && INSN_PREFIXES.iter().any(|p| p.eq_ignore_ascii_case(head)) {
+            prefixes.push(head.to_ascii_lowercase());
             rest = tail.trim();
         } else {
             break;
@@ -1671,9 +1678,25 @@ fn parse_operand(s: &str) -> Result<Operand, String> {
         None
     };
     let s = suf.as_ref().map(|suf| suf.rest.as_str()).unwrap_or(s);
+    // GAS lexer quirks for degenerate operands (byte-probed 2.47):
+    // a TRAILING binary operator with no right-hand side still assembles —
+    // `push 1 +` and `push 1 -`/`1 /` keep the left value, `push 1 *`
+    // becomes 0 — while a LEADING `+`/`-` is an ordinary unary sign
+    // (`push + 1` = 1, `push - 1` = -1). LCCC used to turn both shapes
+    // into a symbol reference and silently assemble address 0.
+    let s = {
+        let t = s.trim_end();
+        if t.ends_with('+') || t.ends_with('-') || t.ends_with('/') {
+            t[..t.len() - 1].trim_end()
+        } else if t.ends_with('*') {
+            "0"
+        } else {
+            t
+        }
+    };
     if s.bytes()
         .next()
-        .is_some_and(|c| c.is_ascii_digit() || c == b'-')
+        .is_some_and(|c| c.is_ascii_digit() || c == b'-' || c == b'+')
         && !is_numeric_label
     {
         if let Ok(val) = crate::backend::asm_expr::parse_integer_expr(s) {
@@ -1907,6 +1930,36 @@ fn parse_immediate_operand(s: &str) -> Result<Operand, String> {
         return Ok(Operand::Immediate(ImmediateValue::SymbolMod(sym, modifier)));
     }
 
+    // `sym@SIZE` / `sym@SIZE ± expr` (GAS 2.47): the SIZE of the section
+    // containing sym, as an immediate. The trailing arithmetic rides as a
+    // plain addend on the `name@SIZE` pseudo-symbol; the writer folds the
+    // pair to a constant when the section is local (GAS: `movl
+    // $.data@SIZE + 4, %eax` with an empty .data = b8 04 00 00 00).
+    if let Some(at) = s.rfind('@') {
+        let tail = &s[at + 1..];
+        let split = tail
+            .find(|c: char| c == '+' || c == '-' || c.is_whitespace())
+            .unwrap_or(tail.len());
+        let (mod_part, rest) = (&tail[..split], &tail[split..]);
+        if mod_part.eq_ignore_ascii_case("SIZE") {
+            let base = s[..at].trim();
+            if !base.is_empty() {
+                if rest.trim().is_empty() {
+                    return Ok(Operand::Immediate(ImmediateValue::SymbolMod(
+                        base.to_string(),
+                        "SIZE".to_string(),
+                    )));
+                }
+                if let Ok(v) = parse_integer_expr(rest.trim()) {
+                    return Ok(Operand::Immediate(ImmediateValue::SymbolPlusOffset(
+                        format!("{base}@SIZE"),
+                        v,
+                    )));
+                }
+            }
+        }
+    }
+
     // Check for symbol difference: SYM-LABEL (e.g., $_DYNAMIC-1b, $4f-1b)
     // Scan for '-' after position 0 where both sides look like labels.
     if let Some(diff) = parse_immediate_label_diff(s) {
@@ -1944,6 +1997,7 @@ fn is_known_reloc_modifier(m: &str) -> bool {
             | "DTPMOD"
             | "DTPOFF"
             | "TLSDESC"
+            | "TLSCALL"
             | "PLTOFF"
             | "SECREL"
             | "SIZE"
@@ -2192,6 +2246,21 @@ fn parse_displacement(s: &str) -> Result<Displacement, String> {
     let s = s.trim();
     if s.is_empty() {
         return Ok(Displacement::None);
+    }
+
+    // GAS's bracket displacement: `[expr](%base)` — a constant (or
+    // constant-foldable expression) inside square brackets IS the
+    // displacement (GAS 2.47 byte-probed: `mov [-1](%eax),%eax` =
+    // 67 8b 40 ff, `mov [~1](%eax),%eax` = 67 8b 40 fe, `mov [!1](%eax),
+    // %eax` = 67 8b 00 — `!` is logical not, `~` bitwise). Evaluate the
+    // bracket contents with the shared expression evaluator; the old code
+    // silently turned the whole bracket into displacement 0.
+    if s.starts_with('[') && s.ends_with(']') {
+        let inner = &s[1..s.len() - 1];
+        match crate::backend::asm_expr::parse_integer_expr(inner) {
+            Ok(v) => return Ok(Displacement::Integer(v)),
+            Err(e) => return Err(format!("bad displacement expression `{inner}': {e}")),
+        }
     }
 
     // Strip outer parentheses used for grouping expressions like (pcpu_hot + 16).

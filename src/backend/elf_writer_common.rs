@@ -255,12 +255,25 @@ struct JumpInfo {
     can_grow: bool,
 }
 
-/// Apply a source-level branch addend without wrapping an invalid target into
-/// the section.  Returning `None` leaves the ordinary unresolved-target path
-/// in control; it must never manufacture an address on overflow.
+/// Apply a source-level branch addend. Negative effective targets are
+/// legal (`ja lbl-0x70`, `ja .+2-0x70`) and are kept as wrapped usize so
+/// the signed displacement math in `relax_jumps` sees their true value;
+/// a genuine i64 overflow still returns `None` and leaves the
+/// unresolved-target path in control.
 fn jump_target_with_addend(offset: Option<usize>, addend: i64) -> Option<usize> {
     let offset = i64::try_from(offset?).ok()?;
-    usize::try_from(offset.checked_add(addend)?).ok()
+    // Wrapping, not checked: a NEGATIVE effective target is legal GAS
+    // input (`ja lbl-0x70` with lbl at 0, or `ja .+2-0x70` after the
+    // dot-rewrite — target offset -0x6e). The displacement arithmetic
+    // below is signed and wraps correctly; checked_add returned None and
+    // the jump was left in its long form forever (GAS: `77 88`).
+    usize::try_from(offset.wrapping_add(addend))
+        .ok()
+        .or_else(|| {
+            // Negative values: keep them addressable as wrapped usize so the
+            // i64 displacement math in relax_jumps still sees the true value.
+            Some(offset.wrapping_add(addend) as usize)
+        })
 }
 
 /// Tracks an alignment or .org marker within a section.
@@ -2051,6 +2064,25 @@ impl<A: X86Arch> ElfWriterCore<A> {
         let sec_idx = self.current_section.unwrap();
         let base_offset = self.sections[sec_idx].data.len() as u64;
 
+        // GAS `.` in an operand expression is the position of THIS
+        // instruction's start (statement position). Rewrite every
+        // standalone `.` into a synthetic label pinned at base_offset so
+        // the whole existing label machinery handles it: branch targets
+        // (`jmp .` = eb fe, `ja .+2-0x70` = 77 90 — the short form becomes
+        // reachable through relaxation), immediate deltas (`mov
+        // $target-., %rax` = 48 c7 c0 <imm32> — GAS folds the both-sides-
+        // local difference instead of emitting a 10-byte movabs) and
+        // displacement forms alike. Before this, `jmp .` emitted a
+        // relocation against a literal symbol named `.` that resolved to
+        // garbage, and `.+N` never folded.
+        let owned;
+        let instr = if instr_operands_mention_dot(instr) {
+            owned = self.rewrite_dot_operands(instr, sec_idx)?;
+            &owned
+        } else {
+            instr
+        };
+
         // Use the appropriate encoder based on current code mode.
         // When the i686 assembler is in .code64 mode, it delegates to
         // the x86-64 encoder for 64-bit instruction encoding.
@@ -2129,6 +2161,60 @@ impl<A: X86Arch> ElfWriterCore<A> {
         }
 
         Ok(())
+    }
+
+    /// Rewrite every standalone `.` in an instruction's operand expressions
+    /// to a synthetic `.Ldotpos_{sec}_{off}` label placed at the CURRENT
+    /// section offset (the instruction's own start). Returns the rewritten
+    /// instruction (operands cloned; mnemonic/prefixes/hints preserved).
+    fn rewrite_dot_operands(
+        &mut self,
+        instr: &Instruction,
+        sec_idx: usize,
+    ) -> Result<Instruction, String> {
+        let mut out = instr.clone();
+        let mut sub = |w: &mut Self, s: &mut String| -> Result<(), String> {
+            if s.contains('.') {
+                if let Some((_, rewritten)) = w.substitute_dot(s) {
+                    *s = rewritten;
+                }
+            }
+            Ok(())
+        };
+        for op in &mut out.operands {
+            match op {
+                Operand::Label(s) => sub(self, s)?,
+                Operand::Indirect(inner) => {
+                    if let Operand::Label(s) = inner.as_mut() {
+                        sub(self, s)?;
+                    }
+                }
+                Operand::Immediate(imm) => match imm {
+                    ImmediateValue::Symbol(s)
+                    | ImmediateValue::SymbolPlusOffset(s, _)
+                    | ImmediateValue::SymbolMod(s, _) => sub(self, s)?,
+                    ImmediateValue::SymbolDiff(a, b) => {
+                        sub(self, a)?;
+                        sub(self, b)?;
+                    }
+                    ImmediateValue::Integer(_) => {}
+                },
+                Operand::Memory(mem) => match &mut mem.displacement {
+                    Displacement::Symbol(s)
+                    | Displacement::SymbolPlusOffset(s, _)
+                    | Displacement::SymbolAddend(s, _)
+                    | Displacement::SymbolMod(s, _) => sub(self, s)?,
+                    Displacement::SymbolDiff(a, b) | Displacement::SymbolDiffAddend(a, b, _) => {
+                        sub(self, a)?;
+                        sub(self, b)?;
+                    }
+                    Displacement::Integer(_) | Displacement::None => {}
+                },
+                Operand::Register(_) => {}
+            }
+        }
+        let _ = sec_idx; // substitute_dot uses the CURRENT section already
+        Ok(out)
     }
 
     fn get_jump_target_label(&self, instr: &Instruction) -> Option<(String, i64)> {
@@ -2925,6 +3011,25 @@ impl<A: X86Arch> ElfWriterCore<A> {
             let mut relocs = Vec::new();
 
             for reloc in &sec.relocations {
+                // `name@SIZE` pseudo-relocations fold to a constant when
+                // the section is local: the value is that section's final
+                // size plus the addend (GAS: `movl $.data@SIZE + 4, %eax`
+                // with a local empty .data = b8 04 00 00 00, no reloc
+                // emitted). Patch the 4-byte field in place and drop the
+                // relocation entirely.
+                if let Some(base) = reloc.symbol.strip_suffix("@SIZE")
+                    && let Some(target) = self
+                        .sections
+                        .iter()
+                        .find(|s| s.name.eq_ignore_ascii_case(base))
+                {
+                    let value = (target.data.len() as i64 + reloc.addend) as u32;
+                    let off = reloc.offset as usize;
+                    if off + 4 <= data.len() {
+                        data[off..off + 4].copy_from_slice(&value.to_le_bytes());
+                        continue;
+                    }
+                }
                 // GAS converts a relocation against ANY local defined symbol
                 // into section-symbol + offset — not only `.L` labels. The
                 // kernel relies on this: objtool reads
@@ -3478,7 +3583,11 @@ impl<A: X86Arch> ElfWriterCore<A> {
                             }
                             // Everything after the jump moves; the new
                             // displacement relocation is added afterwards so
-                            // it is not moved with it.
+                            // it is not moved with it. The source-level
+                            // addend (`jmp lbl+8` surviving as long form)
+                            // MUST ride along: dropping it silently
+                            // retargeted the branch to the bare label
+                            // (`jmp .Ldot+0x1234` became disp -5).
                             self.shift_after(sec_idx, offset + 1, grow as i64, None);
                             // Restore the original mode's relocation width. A
                             // `.code16` near branch owns a two-byte rel16 field;
@@ -3489,6 +3598,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                             } else {
                                 offset + 1
                             }) as u64;
+                            let target_addend = self.sections[sec_idx].jumps[j_idx].target_addend;
                             self.sections[sec_idx].relocations.push(ElfRelocation {
                                 offset: reloc_pos,
                                 symbol: target.clone(),
@@ -3498,7 +3608,11 @@ impl<A: X86Arch> ElfWriterCore<A> {
                                 } else {
                                     A::reloc_pc32()
                                 },
-                                addend: if rel16 { -2 } else { -4 },
+                                addend: if rel16 {
+                                    -2 + target_addend
+                                } else {
+                                    -4 + target_addend
+                                },
                                 diff_symbol: None,
                                 patch_size: if rel16 { 2 } else { 4 },
                             });
@@ -4339,6 +4453,50 @@ pub(crate) fn encode_sleb128(out: &mut Vec<u8>, mut val: i64) {
         byte |= 0x80;
         out.push(byte);
     }
+}
+
+/// Cheap gate for the `.`-rewrite in `encode_instruction`: true when any
+/// operand expression string contains a STANDALONE '.' (the location
+/// counter — bordered by non-identifier characters). Label names like
+/// `.Lfoo` contain dots but never match, so they skip the rewrite path
+/// entirely (this runs for every instruction; the precision matters).
+fn instr_operands_mention_dot(instr: &Instruction) -> bool {
+    fn standalone_dot(s: &str) -> bool {
+        let b = s.as_bytes();
+        b.iter().enumerate().any(|(i, &c)| {
+            c == b'.' && {
+                let prev_ok = i == 0
+                    || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_' || b[i - 1] == b'.');
+                let next_ok = i + 1 >= b.len()
+                    || !(b[i + 1].is_ascii_alphanumeric() || b[i + 1] == b'_' || b[i + 1] == b'.');
+                prev_ok && next_ok
+            }
+        })
+    }
+    instr.operands.iter().any(|op| match op {
+        Operand::Label(s) => standalone_dot(s),
+        Operand::Indirect(inner) => {
+            matches!(inner.as_ref(), Operand::Label(s) if standalone_dot(s))
+        }
+        Operand::Immediate(imm) => match imm {
+            ImmediateValue::Symbol(s)
+            | ImmediateValue::SymbolPlusOffset(s, _)
+            | ImmediateValue::SymbolMod(s, _) => standalone_dot(s),
+            ImmediateValue::SymbolDiff(a, b) => standalone_dot(a) || standalone_dot(b),
+            ImmediateValue::Integer(_) => false,
+        },
+        Operand::Memory(mem) => match &mem.displacement {
+            Displacement::Symbol(s)
+            | Displacement::SymbolPlusOffset(s, _)
+            | Displacement::SymbolAddend(s, _)
+            | Displacement::SymbolMod(s, _) => standalone_dot(s),
+            Displacement::SymbolDiff(a, b) | Displacement::SymbolDiffAddend(a, b, _) => {
+                standalone_dot(a) || standalone_dot(b)
+            }
+            Displacement::Integer(_) | Displacement::None => false,
+        },
+        Operand::Register(_) => false,
+    })
 }
 
 #[cfg(test)]

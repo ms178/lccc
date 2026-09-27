@@ -403,17 +403,38 @@ impl super::InstructionEncoder {
 
     // ---- Segment register moves ----
 
-    pub(crate) fn encode_mov_seg(&mut self, ops: &[Operand]) -> Result<(), String> {
+    pub(crate) fn encode_mov_seg(
+        &mut self,
+        ops: &[Operand],
+        size: Option<u8>,
+    ) -> Result<(), String> {
         if ops.len() != 2 {
             return Err("mov seg requires 2 operands".to_string());
         }
+        // Operand size for the GP side: the mnemonic suffix when present,
+        // otherwise the register's own width (GAS 2.47 byte-probed:
+        // `mov %ds,%ax` = 66 8c d8, `mov %ds,%eax` = 8c d8, `movw %ds,%di`
+        // = 66 8c df). A 16-bit operation needs the 0x66 prefix in 64-bit
+        // mode. REX.W is NEVER set: Sreg→GP is architecturally a 16-bit
+        // move that zero-extends (`mov %ds,%rax` = 8c d8, no W — probed),
+        // and the memory forms never take 0x66 either (`movw %ss,(%rax)`
+        // = 8c 10; an `l' suffix is rejected outright).
+        let infer = |gp: &str| -> u8 {
+            match size {
+                Some(s) => s,
+                None => infer_reg_size(gp),
+            }
+        };
         match (&ops[0], &ops[1]) {
             // mov %seg, %reg
             (Operand::Register(src), Operand::Register(dst)) if is_segment_reg(&src.name) => {
                 let src_num = reg_num(&src.name).ok_or("bad seg register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 // 8C /r - MOV r/m16, Sreg
-                // MOV Sreg→GP never needs REX.W; a 64-bit dest zero-extends.
+                let sz = infer(&dst.name);
+                if sz == 2 {
+                    self.bytes.push(0x66);
+                }
                 self.emit_rex_unary(4, &dst.name);
                 self.bytes.push(0x8C);
                 self.bytes.push(self.modrm(3, src_num, dst_num));
@@ -424,6 +445,10 @@ impl super::InstructionEncoder {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad seg register")?;
                 // 8E /r - MOV Sreg, r/m16
+                let sz = infer(&src.name);
+                if sz == 2 {
+                    self.bytes.push(0x66);
+                }
                 self.emit_rex_unary(4, &src.name);
                 self.bytes.push(0x8E);
                 self.bytes.push(self.modrm(3, dst_num, src_num));
@@ -517,7 +542,7 @@ impl super::InstructionEncoder {
             .iter()
             .any(|op| matches!(op, Operand::Register(r) if is_segment_reg(&r.name)))
         {
-            return self.encode_mov_seg(ops);
+            return self.encode_mov_seg(ops, None);
         }
         // Check for control registers
         if ops
@@ -533,7 +558,19 @@ impl super::InstructionEncoder {
         {
             return self.encode_mov_dr(ops);
         }
-        let size = infer_operand_size_from_pair(&ops[0], &ops[1]);
+        // Suffix-less size law (GAS 2.47): a REGISTER operand decides;
+        // immediate-to-MEMORY with no register anywhere defaults to 32-bit
+        // (`mov $foo,ebx` in %-prefix-less mode is memory-at-symbol `ebx`,
+        // and GAS emits the 32-bit `c7 04 25 ..` — LCCC used to pick the
+        // 64-bit `48 c7`, writing 8 bytes where GAS writes 4).
+        let size = match (&ops[0], &ops[1]) {
+            (Operand::Immediate(_), Operand::Memory(_) | Operand::Label(_))
+                if !ops.iter().any(|op| matches!(op, Operand::Register(_))) =>
+            {
+                4
+            }
+            _ => infer_operand_size_from_pair(&ops[0], &ops[1]),
+        };
         self.encode_mov(ops, size)
     }
 
