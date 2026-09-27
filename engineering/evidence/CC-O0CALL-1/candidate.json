@@ -1,0 +1,11 @@
+{
+  "task": "CC-O0CALL-1",
+  "compiler_commit": "HEAD (this implementation commit)",
+  "change": "Disable the x86 accumulator-address load fast path when disable_regalloc is enabled, selecting existing stack-home address materialization.",
+  "target": "x86-64 SysV, -O0",
+  "correctness_oracle": {
+    "command": "gcc -O0 -Wall -Wextra -Werror tests/regression/o0_call_argument_stack_home.c -o /tmp/o0-call-gcc && /tmp/o0-call-gcc",
+    "exit_code": 0
+  },
+  "benchmark": "not applicable: correctness-only task"
+}

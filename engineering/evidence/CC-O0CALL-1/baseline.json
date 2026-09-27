@@ -1,0 +1,10 @@
+{
+  "task": "CC-O0CALL-1",
+  "compiler_commit": "563fb0bcb39488a97a6aa69858458196cf91710c",
+  "state": "pre-fix source baseline",
+  "target": "x86-64 SysV, -O0",
+  "host": "container VM; not i7-14700KF",
+  "reproducer": "artifacts/repros/miscompile_csmith_20260945_-O0.c",
+  "known_failure": "A later call argument dereferenced a stale %rax pointer base when -O0 non-SSA value identities were reused.",
+  "benchmark": "not applicable: correctness-only task"
+}

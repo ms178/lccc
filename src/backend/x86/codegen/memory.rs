@@ -1086,7 +1086,17 @@ impl X86Codegen {
         // the relay.  This path is restricted to a verified cache hit and
         // scalar integer/pointer loads; float and wide paths retain their
         // dedicated ABI handling below.
-        if !ty.is_float()
+        // `-O0` retains non-SSA value identities after phi elimination, so a
+        // cache hit only proves that %rax contains *some* definition with
+        // this numeric id.  It does not prove that it holds the definition
+        // used by this load.  In particular, call-argument evaluation can
+        // leave an earlier pointer definition parked in %rax and this fast
+        // path would turn it into `mov (...%rax), %r8`, dereferencing the
+        // stale base (CC-O0CALL).  With physical allocation disabled stack
+        // homes are the authoritative representation; keep this pure
+        // SSA/cache optimization out of that mode.
+        if !self.state.disable_regalloc
+            && !ty.is_float()
             && !matches!(ty, IrType::I128 | IrType::U128 | IrType::F128)
             && !self.state.is_alloca(ptr.0)
             && self.state.acc_has_verified(ptr.0, false)
