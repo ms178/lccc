@@ -116,10 +116,15 @@ RA-06 intra-block splitting-measurement is recorded dead (W1 09-05).
 156 insns vs clang 76 (**77 spills**). `CCC_NO_AGGREGATE_SPLIT` escape.
 Done = ≤1.05× on Raptor-Lake report.
 
-### PF-CHACHA-1 · chacha20 v3 ARX schedule (222 insns vs icx 63)
-plain-`-O2` at parity; the `-march=x86-64-v3` ARX-lane schedule is the
-gap (superword diag + horizontal ARX; W2 09-08). Done = v3 ARX closer
-to ICX, plain-`-O2` ≤1.05×.
+### PF-CHACHA-1 · chacha20 ARX schedule — remaining ICX gap (118 insns vs icx 74 @-O2, icx 63 @v3)
+Refreshed 09-27 (oracle, static counts): PR #638's ARX work already took
+the `-O2` body from the old 592 and the v3 body from 222 down to **118**
+(oracle: lccc 118 < clang 176 < gcc16.2 180; icc 1104). The remaining gap
+is ICX only (74 @`-O2`, 63 @v3): the v3 ARX-lane schedule (superword diag +
+horizontal ARX; W2 09-08) plus ICX's tighter quarter-round folding at base.
+Done = v3 closer to ICX's 63, `-O2` static ≤1.15× of ICX's 74 (runtime
+parity on the author's box no longer counts as done — keep static and
+runtime numbers separate).
 
 ### PF-SCHEDULER-1 · sha256 message-schedule vectorization
 GCC vectorizes the sliding-window expansion even at -O2 (`m[i-2..i-16]`

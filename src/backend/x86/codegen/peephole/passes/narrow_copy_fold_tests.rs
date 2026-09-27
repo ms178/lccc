@@ -262,14 +262,21 @@ fn a_copy_survives_when_the_use_also_writes_the_destination() {
         "rule 4 violated:\n{}",
         out
     );
-    // The copy may still disappear through a different, legal route: the
-    // later `load_op_fuse` "copy + commutative op into the dying operand"
-    // pass turns the triple into `addl %eax, %ecx; movl %ecx, %eax` because
-    // %ecx (caller-saved) and %esi are dead at `ret`. Either shape is correct;
-    // the illegal rule-4 shape is the only thing this test forbids.
+    // The copy may still disappear through a different, legal route:
+    //   (a) the later `load_op_fuse` "copy + commutative op into the dying
+    //       operand" pass turns the triple into `addl %eax, %ecx; movl
+    //       %ecx, %eax` because %ecx (caller-saved) and %esi are dead at
+    //       `ret`; or
+    //   (b) `fuse_staged_add_and_relay` folds copy+add+relay in one step into
+    //       `leal (%rax, %ecx), %eax` — legal precisely because the lea READS
+    //       its address operands before writing the destination, so the rule-4
+    //       clobber hazard cannot arise.
+    // Any of the shapes is correct; the illegal rule-4 shape (`addl %ecx,
+    // %eax` as an ADD) is the only thing this test forbids.
     let survives = count(&out, "movl %eax, %esi") == 1 && out.contains("addl %ecx, %esi");
     let bridged = out.contains("addl %eax, %ecx") && out.contains("movl %ecx, %eax");
-    assert!(survives || bridged, "unexpected shape:\n{}", out);
+    let staged = out.contains("leal (%rax, %rcx), %eax");
+    assert!(survives || bridged || staged, "unexpected shape:\n{}", out);
 }
 
 #[test]
@@ -339,16 +346,25 @@ fn a_copy_survives_when_the_use_is_a_variable_shift_count() {
 /// sides. (Only the destination side is observable end-to-end: a copy whose
 /// SOURCE is %rsp gets collapsed by copy propagation into `movq %rsp, %rax`,
 /// which is correct and renames nothing away, so it cannot distinguish this
-/// pass's behaviour.)
+/// pass's behaviour.) The fixture must ESTABLISH a frame — a bare `movq
+/// %rax, %rbp` in a rsp-relative function makes %rbp a plain GPR, which the
+/// rbp-as-GPR retarget legally folds (pinned by
+/// `load_relay_into_gpr_rbp_home_retargets`).
 #[test]
 fn a_copy_into_a_frame_register_is_never_folded() {
     let out = run(&f(concat!(
+        "    pushq %rbp\n",
+        "    movq %rsp, %rbp\n",
         "    movq %rax, %rbp\n",
         "    movq %rbp, %rcx\n",
-        "    movq %rcx, %rax\n",
+        "    movq %rbp, %rsp\n",
+        "    popq %rbp\n",
         "    ret"
     )));
     assert_eq!(count(&out, "movq %rax, %rbp"), 1, "{}", out);
+    // The frame epilogue survives untouched.
+    assert_eq!(count(&out, "movq %rbp, %rsp"), 1, "{}", out);
+    assert_eq!(count(&out, "popq %rbp"), 1, "{}", out);
 }
 
 // ── register-name aliasing: the substring hazards ───────────────────────────

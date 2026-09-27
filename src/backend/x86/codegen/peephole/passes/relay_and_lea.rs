@@ -78,6 +78,95 @@ pub(super) fn is_relayable_family(fam: RegId) -> bool {
     fam <= REG_GP_MAX && fam != 4 && fam != 5
 }
 
+/// Is `fam` safe to *receive* a retargeted value, given per-function `%rbp`
+/// knowledge from [`rbp_is_gpr_in_function`]?
+///
+/// `%rsp` (4) is the stack pointer on every target and is never writable by a
+/// value transform. `%rbp` (5) is writable only when this function does not
+/// use it as a frame pointer: lccc's default frame layout is `%rsp`-relative,
+/// and the frame-pointer build (`movq %rsp, %rbp` + `N(%rbp)` slot traffic,
+/// `leave`, or a `.cfi_def_cfa` rooted at rbp) makes every rbp mention part
+/// of the frame contract. Callers MUST pass evidence gathered over the whole
+/// enclosing function, never a local window: a single `(%rbp)` operand
+/// anywhere proves the frame-pointer build.
+#[inline]
+pub(super) fn is_writable_family_gpr(fam: RegId, rbp_gpr: bool) -> bool {
+    fam <= REG_GP_MAX && fam != 4 && (fam != 5 || rbp_gpr)
+}
+
+/// Scan the whole `[fstart, fend]` function range and decide whether `%rbp`
+/// is an ordinary allocator-owned general register there rather than a frame
+/// pointer. `true` means passes may retarget a value INTO `%rbp` (or delete a
+/// copy whose only purpose was moving a value through it); `false` means rbp
+/// carries the frame and must stay untouched.
+///
+/// Evidence treated as FRAME-POINTER (any single hit decides `false`):
+/// * any parenthesised rbp operand (`N(%rbp)`, `(%rbp)`, any width) — that is
+///   slot traffic or address arithmetic on the frame,
+/// * the setup/restore pair (`movq %rsp, %rbp`, `movq %rbp, %rsp`) and
+///   `leave`/`leaveq`,
+/// * a `.cfi_def_cfa`/`.cfi_def_cfa_register` line naming rbp (the unwinder's
+///   CFA is then defined by rbp, so its value is ABI-observed),
+/// * a pinned or inline-assembly line mentioning rbp in any spelling — those
+///   lines are opaque, so their rbp contract is unknowable.
+///
+/// Everything else is GPR evidence: reg-to-reg moves, ALU operands, and the
+/// callee-save `pushq %rbp`/`popq %rbp` pair of an `%rsp`-relative frame
+/// (which says nothing about rbp's role beyond "saved").
+///
+/// The scan is linear in the function and only runs for candidates that
+/// actually mention rbp, so the hot no-rbp path pays one branch.
+pub(super) fn rbp_is_gpr_in_function(
+    store: &LineStore,
+    infos: &[LineInfo],
+    fstart: usize,
+    fend: usize,
+) -> bool {
+    for n in fstart..=fend.min(infos.len().saturating_sub(1)) {
+        if infos[n].is_nop() {
+            continue;
+        }
+        let t = infos[n].trimmed(store.get(n));
+        // Opaque lines: any rbp spelling inside them is unknowable.
+        if infos[n].pinned || infos[n].kind == LineKind::InlineAsm {
+            if t.contains("%rbp")
+                || t.contains("%ebp")
+                || t.contains("%bp,")
+                || t == "%bp"
+                || t.contains("%bpl")
+            {
+                return false;
+            }
+            continue;
+        }
+        // Frame-pointer setup / restore / leave.
+        if t.starts_with("movq %rsp, %rbp")
+            || t.starts_with("mov %rsp, %rbp")
+            || t.starts_with("movq %rbp, %rsp")
+            || t.starts_with("mov %rbp, %rsp")
+            || t.starts_with("leave")
+        {
+            return false;
+        }
+        // CFA rooted at rbp (frame-pointer build's unwind contract).
+        if (t.starts_with(".cfi_def_cfa ") && t.contains("%rbp"))
+            || (t.starts_with(".cfi_def_cfa_register") && t.ends_with(" 6"))
+            || t.starts_with(".cfi_def_cfa_register %rbp")
+        {
+            return false;
+        }
+        // Any parenthesised rbp operand: slot traffic or &rbp arithmetic.
+        if (t.contains("(%rbp)") || t.contains("(%ebp)")) && !t.starts_with(".cfi") {
+            return false;
+        }
+        // 16-bit/8-bit spellings inside memory operands.
+        if (t.contains("(%bp)") || t.contains("(%bpl)")) && !t.starts_with(".cfi") {
+            return false;
+        }
+    }
+    true
+}
+
 /// Does `line` name any width of GP family `fam`? Boundary-checked so `%r1`
 /// never matches inside `%r10` and `%r8` never matches inside `%r8b`.
 /// Conservatively `true` for out-of-range families.
@@ -1546,7 +1635,19 @@ pub(super) fn retarget_producer_into_copy(store: &mut LineStore, infos: &mut [Li
             i += 1;
             continue;
         };
-        if !is_relayable_family(a_fam) {
+        // `%rbp` participates only when it is a plain GPR in this function
+        // (see `rbp_is_gpr_in_function`); the frame-pointer build keeps the
+        // conservative `is_relayable_family` refusal. The function-range scan
+        // runs lazily: candidates without an rbp operand never pay for it.
+        let rbp_gpr = if a_fam == 5 {
+            match function_range(store, infos, i) {
+                Some((fs, fe)) => rbp_is_gpr_in_function(store, infos, fs, fe),
+                None => false,
+            }
+        } else {
+            false
+        };
+        if !is_writable_family_gpr(a_fam, rbp_gpr) {
             i += 1;
             continue;
         }
@@ -1585,7 +1686,18 @@ pub(super) fn retarget_producer_into_copy(store: &mut LineStore, infos: &mut [Li
             i += 1;
             continue;
         };
-        if d_fam == a_fam || !is_relayable_family(d_fam) {
+        if d_fam == a_fam {
+            i += 1;
+            continue;
+        }
+        let rbp_gpr = rbp_gpr
+            || (d_fam == 5 && {
+                match function_range(store, infos, i) {
+                    Some((fs, fe)) => rbp_is_gpr_in_function(store, infos, fs, fe),
+                    None => false,
+                }
+            });
+        if !is_writable_family_gpr(d_fam, rbp_gpr) {
             i += 1;
             continue;
         }
@@ -3137,6 +3249,88 @@ mod tests {
 
     fn run(asm: &str) -> String {
         peephole_optimize(asm.to_string())
+    }
+
+    /// A `movl` load whose value is relayed once into the register the loop
+    /// actually uses may retarget the load into that register and drop the
+    /// relay — including when the loaded-from register is `%rbp` used as a
+    /// plain callee-saved GPR (no frame-pointer setup, no rbp slot traffic).
+    /// This is the `rot` entry shape.
+    #[test]
+    fn load_relay_into_gpr_rbp_home_retargets() {
+        let out = run(concat!(
+            "rot:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbp\n",
+            "    movl 28(%rdi), %ebp\n",
+            "    movq %rbp, %rdx\n",
+            "    movl %edx, (%rsi)\n",
+            "    popq %rbp\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            out.contains("movl 28(%rdi), %edx"),
+            "load must retarget into the relay home:\n{out}"
+        );
+        assert!(
+            !out.contains("movq %rbp, %rdx"),
+            "the relay must be gone:\n{out}"
+        );
+    }
+
+    /// The same shape under a FRAME-POINTER build must keep the LOAD homed in
+    /// the frame register: rbp carries the frame, so the load may not be
+    /// retargeted into the relay home. The relay itself is fair game for the
+    /// always-on redundant-zero-extension elimination — `movl 28(%rdi),%ebp`
+    /// zero-extends, so the follow-up `movq %rbp,%rdx` may respell to
+    /// `movl %ebp,%edx` (identical 64 bits) — and a single-use store may then
+    /// relay the copy source through (`movl %ebp,(%rsi)`). The narrowed copy
+    /// survives because %rdx is conservatively live at `ret` (SysV 128-bit
+    /// integer returns). What this test actually pins is the soundness
+    /// invariant: the frame register is never the retarget victim.
+    #[test]
+    fn load_relay_under_frame_pointer_load_stays_in_rbp() {
+        let out = run(concat!(
+            "rot:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbp\n",
+            "    movq %rsp, %rbp\n",
+            "    movl 28(%rdi), %ebp\n",
+            "    movq %rbp, %rdx\n",
+            "    movl %edx, (%rsi)\n",
+            "    movq %rbp, %rsp\n",
+            "    popq %rbp\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            out.contains("movl 28(%rdi), %ebp"),
+            "frame-homed load must stay in rbp:\n{out}"
+        );
+        assert!(
+            !out.contains("28(%rdi), %edx"),
+            "the load must not retarget into the relay home under a frame pointer:\n{out}"
+        );
+        // The store happens, via the relay or through the relayed copy source.
+        assert!(
+            (out.contains("movq %rbp, %rdx") && out.contains("movl %edx, (%rsi)"))
+                || out.contains("movl %ebp, (%rsi)")
+                || out.contains("movl %edx, (%rsi)"),
+            "the store must read the loaded value:\n{out}"
+        );
+        // The frame itself is intact.
+        for frame_line in [
+            "pushq %rbp",
+            "movq %rsp, %rbp",
+            "movq %rbp, %rsp",
+            "popq %rbp",
+        ] {
+            assert!(
+                out.contains(frame_line),
+                "frame line `{frame_line}` lost:\n{out}"
+            );
+        }
     }
 
     #[test]

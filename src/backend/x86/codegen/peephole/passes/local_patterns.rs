@@ -20,10 +20,14 @@ use super::fp_liveness::FpLiveness;
 use super::helpers::{
     extract_jump_target, get_dest_reg, has_implicit_reg_usage, implicit_read_reg_family,
     is_callee_saved_reg, is_read_modify_write, is_valid_gp_reg, replace_reg_family,
-    self_zeroing_full_write, src_mentions_family, writes_family, writes_family_full,
+    replace_reg_name_exact, self_zeroing_full_write, src_mentions_family, writes_family,
+    writes_family_full,
 };
 use super::liveness::FileLiveness;
-use super::relay_and_lea::{LazyDeadness, function_range, splice_lea_into_mem_operand};
+use super::relay_and_lea::{
+    LazyDeadness, function_range, is_writable_family_gpr, plain_gp_operand, provably_dead_lv,
+    rbp_is_gpr_in_function, splice_lea_into_mem_operand, split_two_operands,
+};
 
 #[cfg(test)]
 mod nonzero_bitcount_staging_tests {
@@ -3447,10 +3451,27 @@ pub(super) fn fuse_copy_and_operation(store: &mut LineStore, infos: &mut [LineIn
                 // (`mov`, `andn`, `lea`, ...) hide a later `jcc` that still
                 // reads the add's flags — the central `flags_dead_after`
                 // scan walks to the next real reader or writer.
+                //
+                // The imm32 → disp32 width discipline: an addq's imm32 is
+                // SIGN-EXTENDED (64-bit add), and so is a LEA disp32, so a
+                // constant that encoded as `addq $imm` also folds as a
+                // displacement — but ONLY while it stays inside the signed
+                // i32 range both encodings share. Nothing wider can appear
+                // here (the backend stages 64-bit immediates through
+                // movabs), yet a stray wide immediate must not become a
+                // silently-truncating displacement: refuse it.
                 let add_suffix = format!(", %{}", dst_reg_str);
                 if line_j.starts_with("addq $") && line_j.ends_with(&add_suffix) {
                     let imm_str = &line_j[6..line_j.len() - add_suffix.len()]; // between "addq $" and ", %dst"
-                    if flags_dead_after(store, infos, j + 1) {
+                    let (mag, is_neg) = match imm_str.strip_prefix('-') {
+                        Some(rest) => (rest, true),
+                        None => (imm_str, false),
+                    };
+                    let in_i32 = mag
+                        .parse::<i128>()
+                        .map(|v| if is_neg { -v } else { v })
+                        .is_ok_and(|v| v >= i32::MIN as i128 && v <= i32::MAX as i128);
+                    if in_i32 && flags_dead_after(store, infos, j + 1) {
                         let new_text =
                             format!("    leaq {}(%{}), %{}", imm_str, src_reg, dst_reg_str);
                         mark_nop(&mut infos[i]);
@@ -6689,6 +6710,871 @@ pub(super) fn eliminate_vector_self_moves(store: &mut LineStore, infos: &mut [Li
     changed
 }
 
+// ── Staged register-add fusion (`mov`+`add`+relay → one `lea`) ───────────────
+//
+// The two-address x86 ADD forces a staging copy whenever both arithmetic
+// operands must survive the operation. The allocator then homes the staged
+// sum through yet another copy into its final register:
+//
+// ```text
+//     movq %r12, %rbp          leal (%r12,%rdi), %r13
+//     addl %edi, %ebp    →
+//     movq %rbp, %r13
+// ```
+//
+// `rot`'s SHA-256-shaped rotation loop (`h=g; g=f; …; e=d+t1`) pays this
+// three-instruction sequence per iteration: a MOVQ (3 bytes) + ADDL (3) +
+// MOVQ (3) where one LEAL (4) computes the identical value directly into the
+// final home. GCC 13 emits the LEA form; before this pass lccc spent two
+// extra instructions per rotation, which is exactly the static-count gap the
+// `check_phi_acyclic_order` contract pins against GCC.
+//
+// Soundness (every clause is checked, no exceptions):
+// * *Value equality.* `leal (%A,%B), %D` computes zext32(low32(A)+low32(B));
+//   `movq/movl %A,%X` + `addl %B,%X` computes zext32(low32(A)+low32(B)) in
+//   X (any staging width, because ADDL reads only the low 32 bits and
+//   zero-extends). The 64-bit forms are equal by the same argument over full
+//   registers. A `movl` staging under an `addq` consumer is the one matrix
+//   cell that is NOT equal (the staging zeroes X's upper half before the
+//   64-bit add) and is refused.
+// * *Adjacency.* Only the matched lines (and NOPs) may sit between the copy,
+//   the add and the relay: an intervening instruction could read X's staged
+//   value or X's pre-copy value, and both readings break when the moves
+//   disappear. Labels make the next line fail the shape parse, so a
+//   branch target inside the window can never be skipped.
+// * *Flags.* ADD writes EFLAGS, LEA does not. The shared
+//   `flags_dead_after` scan (walks to the next real reader/writer, so an
+//   intervening flag-NEUTRAL `mov`/`lea` cannot hide a `jcc`) must prove the
+//   add's flags dead before any rewrite applies.
+// * *No self-read.* B != X is mandatory: with the staging move deleted, an
+//   add whose source IS the staged register would read the pre-copy value.
+//   A == B is fine (`leal (%rax,%rax)` = 2·a).
+// * *Writable destinations.* X and Y may never be `%rsp`. `%rbp` may only
+//   receive a value when `rbp_is_gpr_in_function` proves this function's rbp
+//   is an allocator-owned general register (no frame-pointer setup, no rbp
+//   slot traffic, no rbp-rooted CFA, no opaque inline asm mentioning it).
+//   Sources A and B are read-only in both spellings and need no proof.
+// * *Relay deadness.* The relay form additionally requires X to be provably
+//   dead after the relay (`FileLiveness` dataflow with the shared syntactic
+//   fallbacks, the same oracle `retarget_producer_into_copy` uses). The
+//   2-line form needs no liveness proof at all: it preserves X's value from
+//   the add's position onward and nothing between the copy and the add can
+//   observe X (adjacency).
+// * *Relay width.* An `addl` may relay through `movq` (X is zero-extended by
+//   the add; the movq copies exactly that) or `movl`. An `addq` may relay
+//   only through `movq` — an `movl` relay would truncate the 64-bit sum.
+//
+// Immediates take the same path: `movq %A,%X; addl $K,%X; movq %X,%Y` →
+// `leal K(%A), %Y`. This subsumes the immediate 2-line fold of
+// `fuse_copy_and_operation` (which handles only `addq $imm`) and adds the
+// 32-bit and relayed forms nothing else covers. The immediate text passes
+// through verbatim after a strict shape check: `add $imm32` and a disp32
+// displacement accept exactly the same value range, so any immediate GAS
+// accepted for the ADD encodes identically as a displacement.
+pub(super) fn fuse_staged_add_and_relay(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() || infos[i].pinned {
+            i += 1;
+            continue;
+        }
+        let stage_t = infos[i].trimmed(store.get(i)).to_string();
+
+        // Staging: full-width or zero-extending 32-bit reg-to-reg move only.
+        // Memory sources are `retarget_producer_into_copy`'s domain; this
+        // pass fuses a *register* staging into the add and relay chain.
+        let (stage_w, srest) = if let Some(r) = stage_t.strip_prefix("movq ") {
+            (64u8, r)
+        } else if let Some(r) = stage_t.strip_prefix("movl ") {
+            (32u8, r)
+        } else {
+            i += 1;
+            continue;
+        };
+        let Some((src_text, dst_text)) = split_two_operands(srest) else {
+            i += 1;
+            continue;
+        };
+        let Some(a_fam) = plain_gp_operand(src_text) else {
+            i += 1;
+            continue;
+        };
+        let Some(x_fam) = plain_gp_operand(dst_text) else {
+            i += 1;
+            continue;
+        };
+        if a_fam == x_fam {
+            i += 1;
+            continue;
+        }
+
+        // The add must be the next real instruction.
+        let mut j = i + 1;
+        while j < len && infos[j].is_nop() {
+            j += 1;
+        }
+        if j >= len || infos[j].pinned {
+            i += 1;
+            continue;
+        }
+        let add_t = infos[j].trimmed(store.get(j)).to_string();
+        let (add_w, op_w, arest) = if let Some(r) = add_t.strip_prefix("addq ") {
+            (64u8, 64u8, r)
+        } else if let Some(r) = add_t.strip_prefix("addl ") {
+            (32u8, 32u8, r)
+        } else {
+            i += 1;
+            continue;
+        };
+        // `movl` staging zeroes the upper half; an `addq` consumer would then
+        // add over 64 bits of a value the staging did NOT carry. Refuse.
+        if stage_w == 32 && add_w == 64 {
+            i += 1;
+            continue;
+        }
+        let Some((add_src, add_dst)) = split_two_operands(arest) else {
+            i += 1;
+            continue;
+        };
+        if plain_gp_operand(add_dst) != Some(x_fam) {
+            i += 1;
+            continue;
+        }
+        // Operand B: a plain GP register, or an immediate canonicalized into
+        // signed-disp space (see below). Anything else (memory operand,
+        // segment override) cannot enter a LEA.
+        enum Addend {
+            Reg(RegId),
+            Imm(String),
+        }
+        let addend = if let Some(fam) = plain_gp_operand(add_src) {
+            if fam == x_fam {
+                i += 1;
+                continue;
+            }
+            // The addend becomes the LEA's SIB index; %rsp is not
+            // representable there (SIB index 100 encodes "no index"), and
+            // emitting `(%A, %rsp)` would be rejected by the assembler.
+            if fam == 4 {
+                i += 1;
+                continue;
+            }
+            Addend::Reg(fam)
+        } else if let Some(imm) = add_src.strip_prefix('$') {
+            // An ALU imm32 is a BIT PATTERN: a 32-bit add computes mod 2^32,
+            // so `addl $2882400001` (0xABCDEF01) is legal. A LEA disp32 is
+            // SIGN-EXTENDED, so the same number as a displacement would both
+            // refuse to encode (> i32::MAX) and — were it accepted — compute
+            // `base - 1412567295`, a different value. Canonicalize: for
+            // 32-bit adds rewrite the displacement into the signed
+            // representative of the same residue (`0xABCDEF01` folds to
+            // `-1412567295`; identical 32-bit result, encodable, GAS-valid).
+            // In-range constants keep their original spelling verbatim, so
+            // every audited output stays byte-identical. 64-bit adds have no
+            // such freedom — the disp is the real 64-bit addend — so only
+            // signed-i32 constants fold and everything else stays an ADD.
+            let (mag, is_neg) = match imm.strip_prefix('-') {
+                Some(rest) => (rest, true),
+                None => (imm, false),
+            };
+            let parsed = if let Some(hex) = mag.strip_prefix("0x") {
+                if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    i += 1;
+                    continue;
+                }
+                i128::from_str_radix(hex, 16).ok()
+            } else if mag.starts_with("0X") {
+                i += 1;
+                continue;
+            } else if !mag.is_empty() && mag.bytes().all(|b| b.is_ascii_digit()) {
+                mag.parse::<i128>().ok()
+            } else {
+                i += 1;
+                continue;
+            };
+            let Some(mut v) = parsed else {
+                i += 1;
+                continue;
+            };
+            if is_neg {
+                v = -v;
+            }
+            let disp_text = if add_w == 64 {
+                if v < i32::MIN as i128 || v > i32::MAX as i128 {
+                    i += 1;
+                    continue;
+                }
+                imm.to_string()
+            } else {
+                // A real imm32 emission carries a value in [-2^32, 2^32)
+                // (the backend stages anything wider); refuse the rest.
+                if !(v >= -(1i128 << 32) && v < (1i128 << 32)) {
+                    i += 1;
+                    continue;
+                }
+                let signed32 = ((v + (1i128 << 31)) & ((1i128 << 32) - 1)) - (1i128 << 31);
+                if v >= i32::MIN as i128 && v <= i32::MAX as i128 {
+                    imm.to_string()
+                } else {
+                    (signed32 as i64).to_string()
+                }
+            };
+            Addend::Imm(disp_text)
+        } else {
+            i += 1;
+            continue;
+        };
+
+        // LEA drops the ADD's flags: prove them dead with the shared scan.
+        if !flags_dead_after(store, infos, j + 1) {
+            i += 1;
+            continue;
+        }
+
+        // Optional relay into the final home.
+        let mut k = j + 1;
+        while k < len && infos[k].is_nop() {
+            k += 1;
+        }
+        let mut relay_w: Option<u8> = None;
+        let mut y_fam: Option<RegId> = None;
+        if k < len && !infos[k].pinned {
+            let relay_t = infos[k].trimmed(store.get(k));
+            let (w, rrest) = if let Some(r) = relay_t.strip_prefix("movq ") {
+                (64u8, r)
+            } else if let Some(r) = relay_t.strip_prefix("movl ") {
+                // An `addq` sum relayed through `movl` truncates; the fused
+                // LEA would keep the upper half. Refuse that cell.
+                if op_w == 64 { (0u8, "") } else { (32u8, r) }
+            } else {
+                (0u8, "")
+            };
+            if w != 0 {
+                if let Some((rsrc, rdst)) = split_two_operands(rrest) {
+                    if plain_gp_operand(rsrc) == Some(x_fam) {
+                        if let Some(fam) = plain_gp_operand(rdst) {
+                            if fam != x_fam {
+                                relay_w = Some(w);
+                                y_fam = Some(fam);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // rbp destination knowledge: needed only when X or Y is family 5.
+        let need_rbp = x_fam == 5 || y_fam == Some(5);
+        let rbp_gpr = if need_rbp {
+            match function_range(store, infos, i) {
+                Some((fs, fe)) => rbp_is_gpr_in_function(store, infos, fs, fe),
+                None => false,
+            }
+        } else {
+            false
+        };
+        if !is_writable_family_gpr(x_fam, rbp_gpr) {
+            i += 1;
+            continue;
+        }
+
+        // Op width decides the LEA opcode and its destination spelling.
+        let (lea_op, dst32) = if op_w == 64 {
+            ("leaq", false)
+        } else {
+            ("leal", true)
+        };
+        // AT&T SIB layout: disp(base,index) for a register addend, with the
+        // base ALWAYS parenthesised; a bare immediate is a plain
+        // displacement `K(base)`. Address operands in 64-bit mode must use
+        // the 64-bit register spellings even under `leal` (the ADDRESS math
+        // is 64-bit; only the result is truncated), so both the base and the
+        // index are re-spelled to REG_NAMES[0] regardless of the width the
+        // staging move or the ADD happened to name.
+        let base64 = REG_NAMES[0][a_fam as usize];
+        let mem_operand = match &addend {
+            Addend::Reg(fam) => format!("({}, {})", base64, REG_NAMES[0][*fam as usize]),
+            Addend::Imm(imm) => format!("{}({})", imm, base64),
+        };
+
+        if let (Some(y), Some(rw)) = (y_fam, relay_w) {
+            // Three-line form: retarget the LEA into the relay's destination
+            // and delete both moves. X must be provably dead after the relay.
+            if is_writable_family_gpr(y, rbp_gpr) {
+                let y_text = if rw == 64 && op_w == 64 {
+                    REG_NAMES[0][y as usize].to_string()
+                } else {
+                    // addl under either relay width, or addq via movq only —
+                    // the movl-relay-under-addq cell was refused above.
+                    REG_NAMES[1][y as usize].to_string()
+                };
+                let mut lv = FileLiveness::new(store, infos);
+                if provably_dead_lv(&lv, store, infos, k, x_fam, &[i, j, k]) {
+                    let new_text = format!("    {lea_op} {mem_operand}, {y_text}");
+                    mark_nop(&mut infos[i]);
+                    mark_nop(&mut infos[j]);
+                    replace_line(store, &mut infos[k], k, new_text);
+                    changed = true;
+                    i = k + 1;
+                    continue;
+                }
+            }
+        }
+
+        // Two-line form: same value straight into the staging register.
+        let x_text = if dst32 {
+            REG_NAMES[1][x_fam as usize]
+        } else {
+            REG_NAMES[0][x_fam as usize]
+        };
+        let new_text = format!("    {lea_op} {mem_operand}, {x_text}");
+        mark_nop(&mut infos[i]);
+        replace_line(store, &mut infos[j], j, new_text);
+        changed = true;
+        i = j + 1;
+    }
+    changed
+}
+
+// ── Load + LEA + ADD chain fold (associativity, one instruction saved) ───────
+//
+// The t1 lowering of `h + e + f + g + k[i]` picks the depth-2 association
+// `k[i] + h` first (one LEA covers both), then adds the pre-computed
+// `e+f+g` partial:
+//
+// ```text
+//     movl (%rsi,%r10,4), %ebp        leal (%rdx,%r14), %edi
+//     leal (%rbp,%rdx), %edi    →     addl (%rsi,%r10,4), %edi
+//     addl %r14d, %edi
+// ```
+//
+// Integer addition in the LCCC IR is wrapping (the IR has no nsw/nuw flags —
+// the same contract `reassoc_latency` builds on), so `(k+h)+p == (h+p)+k`
+// exactly, for signed and unsigned widths alike. The rewrite folds the
+// staged load into the residual ADD's memory operand — GCC 13's
+// `addl -4(%rsi), %edx` shape — saving one instruction per chain with the
+// flag semantics BIT-IDENTICAL (the surviving ADD keeps its opcode; the
+// deleted MOV and LEA never wrote flags).
+//
+// Soundness (all clauses checked):
+// * *Value equality.* Wrapping associativity + commutativity, exact for
+//   every input; the widths must agree (l/l/l or q/q/q — a 32-bit staged
+//   load under a 64-bit ADD would zero the upper half the original kept).
+// * *Adjacency.* Only NOPs may sit between the three lines: the rewritten
+//   ADD reads `MEM` one instruction later than the MOV did, so any
+//   intervening memory access (or any write to `X`, `B`, `C`, `D`) would
+//   observe a different machine state. A label makes the window fail its
+//   shape parse. The single allowed intervening line is the LEA itself — a
+//   pure register operation that reads neither memory nor flags — so even a
+//   `volatile` load moves past nothing observable.
+// * *Staged register.* `X` must die at the LEA (the shared
+//   `provably_dead_lv` oracle), must not be the LEA's other address
+//   operand (base==index would re-read the stale pre-load value once the
+//   MOV is gone), and must not be the ADD's source `C` (same staleness
+//   argument at the rewritten LEA).
+// * *Memory operand.* `MEM` may not mention `X` (with the MOV gone the
+//   address would compute from a stale `X`), and may not mention `D` or
+//   `C` (the rewritten chain writes `D` before the ADD reads `MEM`; a
+//   `MEM` that addressed `D`/`C` would see the new value). `MEM` may
+//   mention `B`: `B` is read, never written, by the whole window.
+// * *Scale.* `(%X,%B,s)` with s != 1 computes `X + s·B`; the rewrite can
+//   carry no scale, so it refuses. Base-only `disp(%X)` folds as
+//   `disp(%C)` + `ADD MEM`.
+pub(super) fn fuse_load_lea_add(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() || infos[i].pinned {
+            i += 1;
+            continue;
+        }
+        let load_t = infos[i].trimmed(store.get(i)).to_string();
+        // Staged load: `movl MEM, %X` / `movq MEM, %X` with a memory source
+        // and a plain GP destination.
+        let (w, lrest) = if let Some(r) = load_t.strip_prefix("movl ") {
+            (32u8, r)
+        } else if let Some(r) = load_t.strip_prefix("movq ") {
+            (64u8, r)
+        } else {
+            i += 1;
+            continue;
+        };
+        let Some((mem_text, x_text)) = split_two_operands(lrest) else {
+            i += 1;
+            continue;
+        };
+        if !mem_text.contains('(') {
+            i += 1; // register-to-register staging: other passes' domain
+            continue;
+        }
+        let Some(x_fam) = plain_gp_operand(x_text) else {
+            i += 1;
+            continue;
+        };
+        // The LEA must be the next real instruction.
+        let mut j = i + 1;
+        while j < len && infos[j].is_nop() {
+            j += 1;
+        }
+        if j >= len || infos[j].pinned {
+            i += 1;
+            continue;
+        }
+        let lea_t = infos[j].trimmed(store.get(j)).to_string();
+        let (lea_w, lrrest) = if let Some(r) = lea_t.strip_prefix("leal ") {
+            (32u8, r)
+        } else if let Some(r) = lea_t.strip_prefix("leaq ") {
+            (64u8, r)
+        } else {
+            i += 1;
+            continue;
+        };
+        if lea_w != w {
+            i += 1;
+            continue;
+        }
+        let Some((lea_mem, d_text)) = split_two_operands(lrrest) else {
+            i += 1;
+            continue;
+        };
+        let Some(d_fam) = plain_gp_operand(d_text) else {
+            i += 1;
+            continue;
+        };
+        // Decompose the LEA's memory operand: `disp(%X)`, `(%X,%B)` or
+        // `(%B,%X)` — always width-suffix-free 64-bit address spellings,
+        // never a scale. `disp_prefix` is the text before the parenthesis
+        // (the displacement); `inner` is the comma-separated base/index list
+        // inside it.
+        let (disp_prefix, inner) = match lea_mem.rfind('(') {
+            Some(p) if lea_mem.ends_with(')') => {
+                (&lea_mem[..p], &lea_mem[p + 1..lea_mem.len() - 1])
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        if disp_prefix.contains('(') {
+            i += 1;
+            continue;
+        }
+        let disp_prefix = disp_prefix.trim();
+        // A trailing `,s` scale suffix refuses the fold.
+        let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+        let (b_fam, disp) = match parts.as_slice() {
+            [only] => {
+                // base-only form: `disp(%X)` — X is the base, B is absent
+                // (the fold moves the displacement onto C).
+                if plain_gp_operand(only) != Some(x_fam) {
+                    i += 1;
+                    continue;
+                }
+                (None, disp_prefix.to_string())
+            }
+            [a, b] => {
+                let (Some(af), Some(bf)) = (plain_gp_operand(a), plain_gp_operand(b)) else {
+                    i += 1;
+                    continue;
+                };
+                if af == x_fam {
+                    (Some(bf), String::new())
+                } else if bf == x_fam {
+                    (Some(af), String::new())
+                } else {
+                    i += 1;
+                    continue;
+                }
+            }
+            _ => {
+                i += 1; // scale form or malformed
+                continue;
+            }
+        };
+
+        // The ADD must be the next real instruction after the LEA.
+        let mut k = j + 1;
+        while k < len && infos[k].is_nop() {
+            k += 1;
+        }
+        if k >= len || infos[k].pinned {
+            i += 1;
+            continue;
+        }
+        let add_t = infos[k].trimmed(store.get(k)).to_string();
+        let add_op = if w == 32 { "addl " } else { "addq " };
+        let Some(arest) = add_t.strip_prefix(add_op) else {
+            i += 1;
+            continue;
+        };
+        let Some((c_text, add_dst)) = split_two_operands(arest) else {
+            i += 1;
+            continue;
+        };
+        if plain_gp_operand(add_dst) != Some(d_fam) {
+            i += 1;
+            continue;
+        }
+        // C: a plain GP register, or an immediate that folds into the LEA's
+        // displacement. In the SIB form an immediate C becomes the disp.
+        enum Addend {
+            Reg(RegId),
+            Imm(String),
+        }
+        let addend = if let Some(fam) = plain_gp_operand(c_text) {
+            // C becomes the LEA's SIB index; %rsp is not representable there.
+            if fam == 4 {
+                i += 1;
+                continue;
+            }
+            Addend::Reg(fam)
+        } else if let Some(imm) = c_text.strip_prefix('$') {
+            // The immediate is re-emitted as the LEA's displacement, so it
+            // must be a numeral that fits disp32 — an `addl $0xffffffff`
+            // would otherwise become the out-of-range displacement
+            // `4294967295(...)`. Parse with checked arithmetic end to end:
+            // malformed numerals and i64 overflow refuse the fold (checked_neg
+            // because `-i64::MIN` would panic).
+            let (neg, body) = match imm.strip_prefix('-') {
+                Some(b) => (true, b),
+                None => (false, imm),
+            };
+            let mag = if let Some(hex) = body.strip_prefix("0x") {
+                i64::from_str_radix(hex, 16).ok()
+            } else {
+                body.parse::<i64>().ok()
+            };
+            let Some(mag) = mag else {
+                i += 1;
+                continue;
+            };
+            let value = if neg {
+                match mag.checked_neg() {
+                    Some(v) => v,
+                    None => {
+                        i += 1;
+                        continue;
+                    }
+                }
+            } else {
+                mag
+            };
+            if !(i32::MIN as i64..=i32::MAX as i64).contains(&value) {
+                i += 1;
+                continue;
+            }
+            Addend::Imm(imm.to_string())
+        } else {
+            i += 1; // memory addend: load_op_fuse's domain
+            continue;
+        };
+
+        // Soundness guards.
+        let c_fam = match &addend {
+            Addend::Reg(f) => Some(*f),
+            Addend::Imm(_) => None,
+        };
+        if c_fam == Some(x_fam) {
+            i += 1; // the ADD would read the staged value after it is gone
+            continue;
+        }
+        if let Some(b) = b_fam {
+            if b == x_fam {
+                i += 1; // base==index re-reads the stale pre-load value
+                continue;
+            }
+            // B is re-emitted in the LEA's base-or-index slot; %rsp as INDEX
+            // is unencodable, and as a base it would make the rewritten ADD
+            // (which takes MEM verbatim) and the LEA alias the stack pointer
+            // with a dying staged value. Leave stack-relative addressing to
+            // the passes that prove rsp's role.
+            if b == 4 {
+                i += 1;
+                continue;
+            }
+            if c_fam == Some(b) && matches!(addend, Addend::Reg(_)) {
+                // C == B is fine value-wise ((B)+C doubling), keep going.
+            }
+        }
+        // MEM must not mention X, D or C.
+        if line_refs_gp_family(mem_text, x_fam as u8)
+            || line_refs_gp_family(mem_text, d_fam as u8)
+            || c_fam.is_some_and(|c| line_refs_gp_family(mem_text, c as u8))
+        {
+            i += 1;
+            continue;
+        }
+        // X must die at the LEA.
+        let mut lv = FileLiveness::new(store, infos);
+        if !provably_dead_lv(&lv, store, infos, j, x_fam, &[i, j]) {
+            i += 1;
+            continue;
+        }
+
+        // Rewrite: NOP the load, LEA moves the association onto (B,C) —
+        // or disp(C) in the base-only / immediate forms — and the surviving
+        // ADD takes the load's memory operand verbatim.
+        let d_name = if w == 32 {
+            REG_NAMES[1][d_fam as usize]
+        } else {
+            REG_NAMES[0][d_fam as usize]
+        };
+        let opname = lea_op_name(w);
+        // REG_NAMES entries carry their own `%`, so the literal adds none.
+        let lea_new = match (&b_fam, &addend) {
+            (Some(b), Addend::Reg(c)) => format!(
+                "    {} ({}, {}), {}",
+                opname, REG_NAMES[0][*b as usize], REG_NAMES[0][*c as usize], d_name
+            ),
+            (Some(b), Addend::Imm(imm)) => format!(
+                "    {} {}({}), {}",
+                opname, imm, REG_NAMES[0][*b as usize], d_name
+            ),
+            (None, Addend::Reg(c)) => format!(
+                "    {} {}({}), {}",
+                opname, disp, REG_NAMES[0][*c as usize], d_name
+            ),
+            // base-only + immediate: `X+disp+C` — needs two displacements,
+            // which one LEA cannot carry. Refuse (fall through to 2-line).
+            (None, Addend::Imm(_)) => {
+                i += 1;
+                continue;
+            }
+        };
+        let add_new = format!("    {add_op}{}, {}", mem_text, d_name);
+        mark_nop(&mut infos[i]);
+        replace_line(store, &mut infos[j], j, lea_new);
+        replace_line(store, &mut infos[k], k, add_new);
+        changed = true;
+        i = k + 1;
+    }
+    changed
+}
+
+/// LEA opcode for width `w` (32 → `leal`, 64 → `leaq`).
+fn lea_op_name(w: u8) -> &'static str {
+    if w == 32 { "leal" } else { "leaq" }
+}
+
+/// Fold a staged load and a dying-base three-operand LEA into one RMW add,
+/// renaming the LEA result's single use to the base:
+///
+/// ```text
+///     movl MEM, %X             (mov deleted)
+///     leal (%B, %X), %D   →    addl MEM, %B     (D's single use renamed to B)
+/// ```
+///
+/// Two instructions become one and the load's memory operand is carried by
+/// the ADD, so this composes with the value profile that makes
+/// `fuse_load_lea_add` profitable (the SHA rotation kernel's staged
+/// `k[i]` load feeding `h + k`): the recurrence schedule is untouched —
+/// the same values flow through the same positions — and one instruction
+/// plus one staging register disappear.
+///
+/// Guards (all checked, each refusals a real corruption class):
+/// * *Two-address legality.* `%B` must be provably dead at the LEA: the
+///   rewrite turns it into the ADD's read-modify-write destination. `%X`
+///   must be provably dead at the LEA (the MOV dies). `%D` must differ
+///   from `%B` and `%X`, and scale must be 1 (`lea` carries no scale into
+///   an ADD). `%B == %X` re-reads the stale pre-load value once the MOV
+///   is gone and is refused like in `fuse_load_lea_add`.
+/// * *Single-use rename.* `%D`'s ONLY reference is one exact 64-bit
+///   operand of the instruction immediately after the LEA (nops skipped),
+///   as a source — never as that instruction's destination, and `%D` must
+///   not appear anywhere in `MEM`. The rename is a delimiter-exact text
+///   substitution (`replace_reg_name_exact`), so `%rdi` never matches
+///   `%rdi`-prefixed spellings of other operands.
+/// * *Memory operand.* `MEM` may not mention `%X` (with the MOV gone the
+///   ADD would address from a stale `%X`), nor `%B` (the ADD writes `%B`,
+///   and `provably_dead_lv` answered for a program where only the LEA
+///   read `MEM`), nor `%D` (its one allowed use is the renamed operand).
+/// * *Flags.* The LEA writes no flags but the ADD does, so the fold needs
+///   `flags_dead_after` at the LEA.
+/// * *Liveness.* `FileLiveness`-checked (`provably_dead_lv`); the load and
+///   the LEA are the keep-set excluded from the queries, matching the
+///   program the rewrite actually produces.
+pub(super) fn fuse_load_lea_into_base(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() || infos[i].pinned {
+            i += 1;
+            continue;
+        }
+        let load_t = infos[i].trimmed(store.get(i)).to_string();
+        let (w, lrest) = if let Some(r) = load_t.strip_prefix("movl ") {
+            (32u8, r)
+        } else if let Some(r) = load_t.strip_prefix("movq ") {
+            (64u8, r)
+        } else {
+            i += 1;
+            continue;
+        };
+        let Some((mem_text, x_text)) = split_two_operands(lrest) else {
+            i += 1;
+            continue;
+        };
+        if !mem_text.contains('(') {
+            i += 1;
+            continue;
+        }
+        let Some(x_fam) = plain_gp_operand(x_text) else {
+            i += 1;
+            continue;
+        };
+        // The LEA must be the next real instruction.
+        let mut j = i + 1;
+        while j < len && infos[j].is_nop() {
+            j += 1;
+        }
+        if j >= len || infos[j].pinned {
+            i += 1;
+            continue;
+        }
+        let lea_t = infos[j].trimmed(store.get(j)).to_string();
+        let (lea_w, lrrest) = if let Some(r) = lea_t.strip_prefix("leal ") {
+            (32u8, r)
+        } else if let Some(r) = lea_t.strip_prefix("leaq ") {
+            (64u8, r)
+        } else {
+            i += 1;
+            continue;
+        };
+        if lea_w != w {
+            i += 1;
+            continue;
+        }
+        let Some((lea_mem, d_text)) = split_two_operands(lrrest) else {
+            i += 1;
+            continue;
+        };
+        let Some(d_fam) = plain_gp_operand(d_text) else {
+            i += 1;
+            continue;
+        };
+        // Decompose the LEA's memory operand: exactly `(%B, %X)` or
+        // `(%X, %B)`, scale-1, both plain GP, distinct. A displacement form
+        // never decomposes here (`plain_gp_operand` refuses `disp(%B)`
+        // spellings as SIB halves); those are `fuse_load_lea_add`'s domain.
+        let Some(inner) = lea_mem.strip_prefix('(').and_then(|s| s.strip_suffix(')')) else {
+            i += 1;
+            continue;
+        };
+        let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+        let b_fam = match parts.as_slice() {
+            [a, b] => {
+                let (Some(af), Some(bf)) = (plain_gp_operand(a), plain_gp_operand(b)) else {
+                    i += 1;
+                    continue;
+                };
+                if af == x_fam {
+                    bf
+                } else if bf == x_fam {
+                    af
+                } else {
+                    i += 1;
+                    continue;
+                }
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        if b_fam == x_fam || d_fam == b_fam || d_fam == x_fam {
+            i += 1;
+            continue;
+        }
+        // MEM must not mention X, B or D.
+        if line_refs_gp_family(mem_text, x_fam as u8)
+            || line_refs_gp_family(mem_text, b_fam as u8)
+            || line_refs_gp_family(mem_text, d_fam as u8)
+        {
+            i += 1;
+            continue;
+        }
+        // D's single use: the next real instruction, as source operands only
+        // (never its destination, in any width or inside a memory operand).
+        let mut k = j + 1;
+        while k < len && infos[k].is_nop() {
+            k += 1;
+        }
+        if k >= len || infos[k].pinned {
+            i += 1;
+            continue;
+        }
+        let use_t = infos[k].trimmed(store.get(k)).to_string();
+        if !line_refs_gp_family(&use_t, d_fam as u8) {
+            i += 1;
+            continue;
+        }
+        let after_mnem = &use_t[use_t.find(' ').unwrap_or(0) + 1..];
+        let Some((_, u_dst)) = split_two_operands(after_mnem) else {
+            i += 1;
+            continue;
+        };
+        if line_refs_gp_family(u_dst, d_fam as u8) {
+            i += 1; // D flows into the use's destination side: not a pure rename
+            continue;
+        }
+        // The delimiter-exact rename must fire and must consume EVERY
+        // reference of the family on the use line. The substitution runs in
+        // the folded width's spelling (32-bit arithmetic emits `%ecx`, not
+        // `%rcx`); the residual check then refuses any other-width spelling
+        // of the same family (`%ecx` beside `%rcx`) that would read a value
+        // whose definition is going away.
+        let w_idx = if w == 32 { 1 } else { 0 };
+        let d_name = REG_NAMES[w_idx][d_fam as usize];
+        let b_name = REG_NAMES[w_idx][b_fam as usize];
+        // Real 32-bit streams spell the use either way (`addl %ecx, %esi` or
+        // `leal (…, %rdi), %r14d`), so try the folded width first, then the
+        // 64-bit spelling. The residual check below refuses any leftover
+        // other-width spelling of the family, covering mixed cases.
+        let mut use_new = replace_reg_name_exact(&use_t, d_name, b_name);
+        if use_new == use_t {
+            let d64 = REG_NAMES[0][d_fam as usize];
+            let b64 = REG_NAMES[0][b_fam as usize];
+            use_new = replace_reg_name_exact(&use_t, d64, b64);
+        }
+        if use_new == use_t || line_refs_gp_family(&use_new, d_fam as u8) {
+            i += 1;
+            continue;
+        }
+        // Liveness: X and B die at the LEA (the MOV and the LEA are the
+        // keep-set, matching the rewritten program's reads), and D is dead
+        // after the renamed use (any later read would still reference the
+        // deleted LEA's definition).
+        let mut lv = FileLiveness::new(store, infos);
+        if !provably_dead_lv(&lv, store, infos, j, x_fam, &[i, j])
+            || !provably_dead_lv(&lv, store, infos, j, b_fam, &[i, j])
+            || !provably_dead_lv(&lv, store, infos, k, d_fam, &[j, k])
+        {
+            i += 1;
+            continue;
+        }
+        // The ADD writes flags; the LEA did not. At this point line j is
+        // still the flag-neutral LEA, so scanning from j+1 walks exactly the
+        // lines the rewritten program runs after the ADD.
+        if !flags_dead_after(store, infos, j + 1) {
+            i += 1;
+            continue;
+        }
+        let add_op = if w == 32 { "addl" } else { "addq" };
+        let add_new = format!("    {} {}, {}", add_op, mem_text, b_name);
+        mark_nop(&mut infos[i]);
+        replace_line(store, &mut infos[j], j, add_new);
+        replace_line(store, &mut infos[k], k, use_new);
+        lv.refresh_at(store, infos, j);
+        changed = true;
+        i = k + 1;
+    }
+    changed
+}
+
 /// Fold an immediate staged through a register into its single ALU consumer:
 ///
 /// ```text
@@ -8132,6 +9018,1236 @@ fn loop_is_single_entry(
         }
     }
     true
+}
+
+#[cfg(test)]
+mod staged_add_relay_tests {
+    use super::*;
+
+    fn run(asm: &str) -> Vec<String> {
+        let store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let mut store = store;
+        fuse_staged_add_and_relay(&mut store, &mut infos);
+        (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect()
+    }
+
+    /// The motivating `rot` shape: a register-add staged through a copy and
+    /// relayed into the value's final home collapses to ONE lea.
+    #[test]
+    fn rot_triple_folds_into_relay_home() {
+        let asm = "\
+.cfi_startproc
+    pushq %rbp
+    movl 28(%rdi), %ebp
+    movq %r12, %rbp
+    addl %edi, %ebp
+    movq %rbp, %r13
+    popq %rbp
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| *l == "leal (%r12, %rdi), %r13d"),
+            "triple must fold into the relay home:\n{}",
+            out.join("\n")
+        );
+        assert!(
+            !out.iter().any(|l| l == "movq %r12, %rbp"
+                || l == "addl %edi, %ebp"
+                || l == "movq %rbp, %r13"),
+            "staging copy, add and relay must all disappear:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// Without a relay the same pair still collapses, into the staging
+    /// register itself.
+    #[test]
+    fn two_line_form_folds_into_staging_register() {
+        let asm = "\
+.cfi_startproc
+    movq %r12, %rbp
+    addl %edi, %ebp
+    movl %ebp, (%r9)
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| *l == "leal (%r12, %rdi), %ebp"),
+            "pair must fold into the staging register:\n{}",
+            out.join("\n")
+        );
+        assert!(
+            !out.iter().any(|l| l.starts_with("movq %r12")),
+            "the staging copy must be gone:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// The phi_latch_absorb regression: an ALU imm32 is a BIT PATTERN (a
+    /// 32-bit add computes mod 2^32), a disp32 is SIGN-EXTENDED. Folding
+    /// `addl $2882400001` verbatim into a LEA both refused to encode
+    /// (> i32::MAX) and would have computed base - 1412567295. The fold
+    /// must canonicalize the displacement into signed range: same 32-bit
+    /// result, encodable, GAS-valid.
+    #[test]
+    fn unsigned_imm32_add_canonicalizes_disp() {
+        let asm = "\
+.cfi_startproc
+    pushq %rbp
+    movl 28(%rdi), %ebp
+    movq %r12, %rbp
+    addl $2882400001, %ebp
+    movq %rbp, %r13
+    popq %rbp
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| *l == "leal -1412567295(%r12), %r13d"),
+            "0xABCDEF01 must fold as its signed disp twin -1412567295:\n{}",
+            out.join("\n")
+        );
+        assert!(
+            !out.iter().any(|l| l.contains("2882400001")),
+            "the raw unsigned spelling must not survive anywhere:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// Same canonicalization for the negative side: `addl $-3000000000` is
+    /// an encodable imm32 bit pattern whose signed-disp twin is
+    /// -3000000000 + 2^32 = +1294967296.
+    #[test]
+    fn negative_below_i32_min_add_canonicalizes_up() {
+        let asm = "\
+.cfi_startproc
+    pushq %rbp
+    movl 28(%rdi), %ebp
+    movq %r12, %rbp
+    addl $-3000000000, %ebp
+    movq %rbp, %r13
+    popq %rbp
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| *l == "leal 1294967296(%r12), %r13d"),
+            "-3000000000 must fold as +1294967296:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// Constants inside the shared imm32/disp32 range keep their original
+    /// spelling verbatim (byte-identity for every audited output).
+    #[test]
+    fn in_range_imm_keeps_verbatim_spelling() {
+        let asm = "\
+.cfi_startproc
+    pushq %rbp
+    movl 28(%rdi), %ebp
+    movq %r12, %rbp
+    addl $1000000, %ebp
+    movq %rbp, %r13
+    popq %rbp
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| *l == "leal 1000000(%r12), %r13d"),
+            "in-range constants fold verbatim:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// A 64-bit add's immediate IS the 64-bit addend (sign-extended imm32);
+    /// nothing wider than i32 can enter a disp32, and there is no modular
+    /// freedom to rewrite it — refuse and keep the add.
+    #[test]
+    fn wide_sixtyfour_imm_add_refuses() {
+        let asm = "\
+.cfi_startproc
+    movq %r12, %rbp
+    addq $5000000000, %rbp
+    movq %rbp, (%r9)
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| *l == "addq $5000000000, %rbp"),
+            "the 64-bit add must stay:\n{}",
+            out.join("\n")
+        );
+        assert!(
+            !out.iter().any(|l| l.contains("leaq 5000000000")),
+            "no lea may carry a disp32 that cannot encode:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// A value that is not even an imm32 bit pattern (`addl $4294967296`
+    /// cannot be encoded by any real emitter) has no LEA meaning either:
+    /// refuse instead of folding an unknown-provenance numeral.
+    #[test]
+    fn beyond_imm32_window_refuses() {
+        let asm = "\
+.cfi_startproc
+    movq %r12, %rbp
+    addl $4294967296, %ebp
+    movq %rbp, (%r9)
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| *l == "addl $4294967296, %ebp"),
+            "an impossible imm32 stays an add:\n{}",
+            out.join("\n")
+        );
+        assert!(
+            !out.iter().any(|l| l.starts_with("leal")),
+            "nothing folds:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// 64-bit adds fold to `leaq` with 64-bit address spellings.
+    #[test]
+    fn sixtyfour_bit_form_uses_leaq() {
+        let asm = "\
+.cfi_startproc
+    movq %r8, %r10
+    addq %r9, %r10
+    movq %r10, %r11
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| *l == "leaq (%r8, %r9), %r11"),
+            "64-bit triple must fold to leaq with 64-bit address regs:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// A consumer of the ADD's flags (`jl` behind flag-neutral traffic)
+    /// refuses every form: LEA does not write EFLAGS.
+    #[test]
+    fn flags_consumer_refuses_fusion() {
+        let asm = "\
+.cfi_startproc
+.LBB1:
+    movq %r12, %rbp
+    addl %edi, %ebp
+    movq %rbp, %r13
+    jl .LBB1
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| *l == "addl %edi, %ebp"),
+            "the add must survive while its flags are read:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// A read of the staged register between the copy and the add breaks
+    /// adjacency: the shape must not match at all.
+    #[test]
+    fn nonadjacent_addend_reader_refuses() {
+        let asm = "\
+.cfi_startproc
+    movq %r12, %rbp
+    movl %ebp, (%r9)
+    addl %edi, %ebp
+    movq %rbp, %r13
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| *l == "addl %edi, %ebp")
+                && out.iter().any(|l| *l == "movq %r12, %rbp"),
+            "with a reader in between, both instructions must survive:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// `movl` staging under an `addq` consumer zeroes the upper half before
+    /// the 64-bit add — the LEA form would add the FULL source. Refuse.
+    #[test]
+    fn movl_staging_under_addq_refused() {
+        let asm = "\
+.cfi_startproc
+    movl %r12d, %ebp
+    addq %rdi, %rbp
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| *l == "addq %rdi, %rbp"),
+            "width-mismatched cell must stay:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// An `addq` sum relayed through `movl` truncates; the fused `leaq` into
+    /// the relay home would keep the upper half. The RELAY is refused while
+    /// the sound two-line fold into the staging register still applies.
+    #[test]
+    fn addq_through_movl_relay_refused() {
+        let asm = "\
+.cfi_startproc
+    movq %r12, %rbp
+    addq %rdi, %rbp
+    movl %ebp, %r13d
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| *l == "leaq (%r12, %rdi), %rbp"),
+            "the two-line fold into the staging register is sound and fires:\n{}",
+            out.join("\n")
+        );
+        assert!(
+            out.iter().any(|l| *l == "movl %ebp, %r13d"),
+            "the truncating relay survives unchanged, reading the staging              register that now carries the sum:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// The addend may not BE the staged register: deleting the staging move
+    /// would change what the add reads.
+    #[test]
+    fn self_addend_refused() {
+        let asm = "\
+.cfi_startproc
+    movq %r12, %rbp
+    addl %ebp, %ebp
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| *l == "addl %ebp, %ebp"),
+            "self-addend must stay:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// Memory addends cannot enter a LEA.
+    #[test]
+    fn memory_addend_refused() {
+        let asm = "\
+.cfi_startproc
+    movq %r12, %rbp
+    addl (%rax), %ebp
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| *l == "addl (%rax), %ebp"),
+            "memory addend must stay:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// `A == B` folds to the doubling LEA `(%rax, %rax)`.
+    #[test]
+    fn doubling_addend_folds() {
+        let asm = "\
+.cfi_startproc
+    movq %rax, %rcx
+    addl %eax, %ecx
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| *l == "leal (%rax, %rax), %ecx"),
+            "doubling addend must fold:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// Immediates fold through the same path, including the relay form, with
+    /// the immediate verbatim as the displacement.
+    #[test]
+    fn immediate_addend_with_relay() {
+        let asm = "\
+.cfi_startproc
+    movq %r12, %rbp
+    addl $-16, %ebp
+    movq %rbp, %r13
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| *l == "leal -16(%r12), %r13d"),
+            "immediate triple must fold:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// A frame-pointer build pins %rbp: the staging copy into rbp must
+    /// survive (the value could alias frame slot traffic through rbp).
+    #[test]
+    fn frame_pointer_rbp_refused() {
+        let asm = "\
+.cfi_startproc
+    pushq %rbp
+    movq %rsp, %rbp
+    movl 8(%rbp), %eax
+    movq %r12, %rbp
+    addl %edi, %ebp
+    movq %rbp, %r13
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| *l == "addl %edi, %ebp"),
+            "rbp must not be retargeted while it carries the frame:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// rbp as a saved GPR (callee-save push, no frame traffic) is writable.
+    #[test]
+    fn gpr_rbp_accepted() {
+        let asm = "\
+.cfi_startproc
+    pushq %rbp
+    .cfi_offset %rbp, -16
+    movq %r12, %rbp
+    addl %edi, %ebp
+    movq %rbp, %r13
+    popq %rbp
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| *l == "leal (%r12, %rdi), %r13d"),
+            "rbp-as-GPR function must fold:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// A relay whose destination is read later keeps the two-line fold but
+    /// must not delete the relay.
+    #[test]
+    fn live_relay_home_keeps_two_line_form() {
+        let asm = "\
+.cfi_startproc
+    movq %r12, %rbp
+    addl %edi, %ebp
+    movq %rbp, %r13
+    movl %ebp, (%r9)
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| *l == "leal (%r12, %rdi), %ebp"),
+            "the add still folds into the staging register:\n{}",
+            out.join("\n")
+        );
+        assert!(
+            out.iter().any(|l| *l == "movq %rbp, %r13"),
+            "a live relay destination keeps the relay:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// 32-bit staging under a 32-bit add is the zero-extension-equivalent
+    /// cell and folds; the result spelling is 32-bit under `leal`.
+    #[test]
+    fn movl_staging_addl_folds() {
+        let asm = "\
+.cfi_startproc
+    movl %r12d, %ebp
+    addl %edi, %ebp
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| *l == "leal (%r12, %rdi), %ebp"),
+            "32-bit staging must fold with 64-bit address spellings:\n{}",
+            out.join("\n")
+        );
+    }
+}
+
+#[cfg(test)]
+mod load_lea_add_tests {
+    use super::*;
+
+    fn run(asm: &str) -> Vec<String> {
+        let store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let mut store = store;
+        fuse_load_lea_add(&mut store, &mut infos);
+        (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect()
+    }
+
+    /// The motivating t1 shape: the staged k-load folds into the residual
+    /// ADD's memory operand, one instruction cheaper, flags identical.
+    #[test]
+    fn rot_t1_chain_folds() {
+        let asm = "\
+.cfi_startproc
+.LBB2:
+    movl (%rsi, %r10, 4), %ebp
+    leal (%rbp, %rdx), %edi
+    addl %r14d, %edi
+    addq $1, %r10
+    jl .LBB2
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| *l == "leal (%rdx, %r14), %edi"),
+            "LEA must take the association onto (h, p):\n{}",
+            out.join("\n")
+        );
+        assert!(
+            out.iter().any(|l| *l == "addl (%rsi, %r10, 4), %edi"),
+            "the load must fold into the ADD's memory operand:\n{}",
+            out.join("\n")
+        );
+        assert!(
+            !out.iter().any(|l| l.starts_with("movl (%rsi")),
+            "the staged load must be gone:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// 64-bit triple.
+    #[test]
+    fn sixtyfour_bit_triple_folds() {
+        let asm = "\
+.cfi_startproc
+    movq (%rdi), %r8
+    leaq (%r8, %r9), %r10
+    addq %r11, %r10
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| *l == "leaq (%r9, %r11), %r10"),
+            "\n{}",
+            out.join("\n")
+        );
+        assert!(
+            out.iter().any(|l| *l == "addq (%rdi), %r10"),
+            "\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// Base-only LEA: the displacement transfers onto the surviving source.
+    #[test]
+    fn base_only_lea_transfers_disp() {
+        let asm = "\
+.cfi_startproc
+    movl 16(%rax), %ecx
+    leal -8(%rcx), %edx
+    addl %ebx, %edx
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| *l == "leal -8(%rbx), %edx"),
+            "\n{}",
+            out.join("\n")
+        );
+        assert!(
+            out.iter().any(|l| *l == "addl 16(%rax), %edx"),
+            "\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// Width-mixed triple refused: a 32-bit staged load under a 64-bit ADD
+    /// zero-extends where the original kept the full width.
+    #[test]
+    fn width_mix_refused() {
+        let asm = "\
+.cfi_startproc
+    movl (%rdi), %r8d
+    leal (%r8, %r9), %r10d
+    addq %r11, %r10
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| *l == "movl (%rdi), %r8d"),
+            "\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// The staged register must die at the LEA.
+    #[test]
+    fn live_staged_register_refused() {
+        let asm = "\
+.cfi_startproc
+    movl (%rdi), %r8d
+    leal (%r8, %r9), %r10d
+    addl %r11d, %r10d
+    movl %r8d, (%rax)
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| *l == "movl (%rdi), %r8d"),
+            "\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// A memory operand that addresses the fold's own destination changes
+    /// meaning once D is written first: refuse.
+    #[test]
+    fn mem_addressing_dest_refused() {
+        let asm = "\
+.cfi_startproc
+    movl (%rax, %r9), %r8d
+    leal (%r8, %r9), %rax
+    addl %r11d, %rax
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| *l == "movl (%rax, %r9), %r8d"),
+            "\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// C == X would read the stale pre-load value at the rewritten LEA.
+    #[test]
+    fn add_source_is_staged_register_refused() {
+        let asm = "\
+.cfi_startproc
+    movl (%rdi), %r8d
+    leal (%r8, %r9), %r10d
+    addl %r8d, %r10d
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| *l == "movl (%rdi), %r8d"),
+            "\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// base==index in the LEA re-reads the stale value; refuse.
+    #[test]
+    fn doubling_lea_refused() {
+        let asm = "\
+.cfi_startproc
+    movl (%rdi), %r8d
+    leal (%r8, %r8), %r10d
+    addl %r9d, %r10d
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| *l == "movl (%rdi), %r8d"),
+            "\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// Scale != 1 carries no equivalent: refuse.
+    #[test]
+    fn scaled_lea_refused() {
+        let asm = "\
+.cfi_startproc
+    movl (%rdi), %r8d
+    leal (%r8, %r9, 4), %r10d
+    addl %r11d, %r10d
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| *l == "movl (%rdi), %r8d"),
+            "\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// An immediate ADD source folds into the LEA displacement (SIB form).
+    #[test]
+    fn immediate_add_folds_into_disp() {
+        let asm = "\
+.cfi_startproc
+    movl (%rdi), %r8d
+    leal (%r8, %r9), %r10d
+    addl $32, %r10d
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| *l == "leal 32(%r9), %r10d"),
+            "\n{}",
+            out.join("\n")
+        );
+        assert!(
+            out.iter().any(|l| *l == "addl (%rdi), %r10d"),
+            "\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// base-only LEA with an immediate ADD: two displacements, one LEA
+    /// cannot carry both — refuse.
+    #[test]
+    fn base_only_with_immediate_refused() {
+        let asm = "\
+.cfi_startproc
+    movl (%rdi), %r8d
+    leal -8(%r8), %r10d
+    addl $32, %r10d
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| *l == "movl (%rdi), %r8d"),
+            "\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// The flags survive exactly: the surviving ADD keeps its opcode, so a
+    /// consumer of the ADD's flags must not block the fold.
+    #[test]
+    fn flags_consumer_still_folds() {
+        let asm = "\
+.cfi_startproc
+.LBB1:
+    movl (%rdi), %r8d
+    leal (%r8, %r9), %r10d
+    addl %r11d, %r10d
+    jl .LBB1
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| *l == "addl (%rdi), %r10d"),
+            "\n{}",
+            out.join("\n")
+        );
+        assert!(
+            !out.iter().any(|l| l.starts_with("movl (%rdi)")),
+            "\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// A label between load and LEA ends the window.
+    #[test]
+    fn label_between_refused() {
+        let asm = "\
+.cfi_startproc
+    movl (%rdi), %r8d
+.Lmid:
+    leal (%r8, %r9), %r10d
+    addl %r11d, %r10d
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| *l == "movl (%rdi), %r8d"),
+            "\n{}",
+            out.join("\n")
+        );
+    }
+    /// The immediate becomes the LEA's displacement, so disp32 bounds apply.
+    /// In-range hex folds (and keeps its spelling).
+    #[test]
+    fn immediate_addend_in_range_hex_folds() {
+        let asm = "\
+.cfi_startproc
+    movl (%rdi), %eax
+    leal (%rbx, %rax), %ecx
+    addl $-0x8, %ecx
+    movl %ecx, %eax
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        let has = |p: &str| out.iter().any(|l| l.contains(p));
+        assert!(
+            has("leal -0x8(%rbx), %ecx"),
+            "hex addend must fold verbatim: {out:?}"
+        );
+        assert!(has("addl (%rdi), %ecx"), "{out:?}");
+        assert!(!has("movl (%rdi)"), "the staged load must be gone: {out:?}");
+    }
+
+    /// disp32 boundary: i32::MAX folds, i32::MAX+1 refuses. Both fixtures
+    /// overwrite %eax before `ret` so the return register is not live-out —
+    /// otherwise liveness (correctly) refuses for a different reason and the
+    /// test would not exercise the displacement bound at all.
+    #[test]
+    fn immediate_addend_disp32_boundary() {
+        let ok = "\
+.cfi_startproc
+    movl (%rdi), %eax
+    leal (%rbx, %rax), %ecx
+    addl $2147483647, %ecx
+    movl %ecx, %eax
+    ret
+.cfi_endproc
+";
+        let out = run(ok);
+        assert!(
+            out.iter()
+                .any(|l| l.contains("leal 2147483647(%rbx), %ecx")),
+            "i32::MAX must fold: {out:?}"
+        );
+        let big = "\
+.cfi_startproc
+    movl (%rdi), %eax
+    leal (%rbx, %rax), %ecx
+    addl $2147483648, %ecx
+    movl %ecx, %eax
+    ret
+.cfi_endproc
+";
+        let out = run(big);
+        assert!(
+            out.iter().any(|l| l.contains("addl $2147483648, %ecx"))
+                && out.iter().any(|l| l.contains("leal (%rbx, %rax), %ecx")),
+            "i32::MAX+1 must refuse the fold: {out:?}"
+        );
+    }
+
+    /// A 32-bit add immediate at the uint32 spelling (GAS truncates it to
+    /// imm32) exceeds disp32 as a displacement: refuse rather than emit an
+    /// out-of-range displacement.
+    #[test]
+    fn immediate_addend_rejects_uint32_spelling() {
+        let asm = "\
+.cfi_startproc
+    movl (%rdi), %eax
+    leal (%rbx, %rax), %ecx
+    addl $4294967295, %ecx
+    movl %ecx, %eax
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| l.contains("addl $4294967295, %ecx")),
+            "out-of-disp32-range addend must keep the ADD: {out:?}"
+        );
+        assert!(
+            !out.iter().any(|l| l.contains("leal 4294967295")),
+            "no out-of-range displacement may be emitted: {out:?}"
+        );
+    }
+}
+
+/// Tests for [`fuse_load_lea_into_base`].
+///
+/// Fixture discipline (each learned the hard way here): every fixture
+/// carries the `# LCCC_RET_*` prologue markers (otherwise %rdx is
+/// conservatively live at `ret` and liveness refuses before the guard the
+/// test targets), establishes a frame for %rbx (push/pop — otherwise the
+/// callee-saved conservatism at `ret` masks every later guard), and kills
+/// %eax before `ret` (otherwise the return-register conservatism does).
+/// Under those, each negative is refused by ITS guard and by nothing
+/// earlier — proven by mutation below the pass.
+#[cfg(test)]
+mod load_lea_base_tests {
+    use super::*;
+
+    fn run(asm: &str) -> Vec<String> {
+        let store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let mut store = store;
+        fuse_load_lea_into_base(&mut store, &mut infos);
+        (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect()
+    }
+
+    /// The SHA-rotation shape: a staged k-load feeds `h + k`, the base dies,
+    /// and the LEA result has exactly one source use. The load's memory
+    /// operand moves onto the RMW add and the use is renamed to the base.
+    #[test]
+    fn staged_load_into_dying_base_folds_and_renames() {
+        let asm = "\
+.cfi_startproc
+    # LCCC_RET_RAX 1
+    # LCCC_RET_RDX 0
+    pushq %rbp
+    pushq %r15
+.LBB2:
+    movl (%rsi, %r10, 4), %ebp
+    leal (%rdx, %rbp), %edi
+    leal (%r15, %rdi), %r14d
+    addl %r14d, %eax
+    popq %r15
+    popq %rbp
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| l == "addl (%rsi, %r10, 4), %edx"),
+            "the load must fold into an RMW add of the base: {out:?}"
+        );
+        assert!(
+            out.iter().any(|l| l == "leal (%r15, %rdx), %r14d"),
+            "the single use must be renamed to the base: {out:?}"
+        );
+        assert!(
+            !out.iter()
+                .any(|l| l.contains("%ebp") || l.contains("movl (%rsi")),
+            "the staging MOV must be gone: {out:?}"
+        );
+        assert_eq!(
+            out.iter()
+                .filter(|l| !l.starts_with('.') && !l.starts_with('#'))
+                .count(),
+            8,
+            "{out:?}"
+        );
+    }
+
+    /// Same fold with a 32-bit-spelled single use (`adcl %ecx, %edx`): the
+    /// rename must run in the folded width's spelling, and the fold is legal
+    /// because `stc`'s carry is dead before the rewritten ADD (no flag reader
+    /// between the LEA and the RET markers).
+    #[test]
+    fn staged_load_folds_with_32bit_spelled_use() {
+        let asm = "\
+.cfi_startproc
+    # LCCC_RET_RAX 1
+    # LCCC_RET_RDX 0
+    pushq %rbx
+    movl (%rdi), %eax
+    leal (%rbx, %rax), %ecx
+    movl %ecx, %edx
+    movl $7, %eax
+    popq %rbx
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| l == "addl (%rdi), %ebx"),
+            "the load must fold into an RMW add of the base: {out:?}"
+        );
+        assert!(
+            out.iter().any(|l| l == "movl %ebx, %edx"),
+            "the 32-bit-spelled use must be renamed to the base: {out:?}"
+        );
+        assert!(
+            !out.iter().any(|l| l.contains("%ebp") || l.contains("leal")),
+            "staging MOV and LEA must be gone: {out:?}"
+        );
+    }
+
+    /// The base is read after the LEA: turning it into the RMW destination
+    /// would clobber a live value. Refuse.
+    #[test]
+    fn live_base_refuses() {
+        let asm = "\
+.cfi_startproc
+    # LCCC_RET_RAX 1
+    # LCCC_RET_RDX 0
+    pushq %rbx
+    movl (%rdi), %eax
+    leal (%rbx, %rax), %ecx
+    addl %ecx, %esi
+    addl %ebx, %esi
+    movl $7, %eax
+    popq %rbx
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| l.starts_with("movl (%rdi)")),
+            "the load must stay: {out:?}"
+        );
+        assert!(
+            out.iter().any(|l| l.starts_with("leal (%rbx, %rax)")),
+            "the lea must stay: {out:?}"
+        );
+    }
+
+    /// The next instruction READS the ADD's flags (`adc` parses as a plain
+    /// two-operand instruction, so only the flags proof can refuse here):
+    /// the LEA wrote no flags, the rewrite's ADD would clobber the carry
+    /// the adc consumes. Refuse. (A jcc consumer is refused earlier, by the
+    /// operand split; this test exists because that earlier guard would
+    /// otherwise make the flags proof untestable.)
+    #[test]
+    fn flags_read_refuses() {
+        let asm = "\
+.cfi_startproc
+    # LCCC_RET_RAX 1
+    # LCCC_RET_RDX 0
+    pushq %rbx
+    stc
+    movl (%rdi), %eax
+    leal (%rbx, %rax), %ecx
+    adcl %ecx, %edx
+    movl $7, %eax
+    popq %rbx
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| l.starts_with("movl (%rdi)")),
+            "the load must stay: {out:?}"
+        );
+        assert!(
+            out.iter().any(|l| l.starts_with("leal (%rbx, %rax)")),
+            "the lea must stay: {out:?}"
+        );
+        assert!(
+            out.iter().any(|l| l.starts_with("adcl %ecx, %edx")),
+            "the flag reader must be untouched: {out:?}"
+        );
+    }
+
+    /// The LEA result feeds the next instruction's DESTINATION: a rename
+    /// there would corrupt the store. Refuse.
+    #[test]
+    fn result_used_as_destination_refuses() {
+        let asm = "\
+.cfi_startproc
+    # LCCC_RET_RAX 1
+    # LCCC_RET_RDX 0
+    pushq %rbx
+    movl (%rdi), %eax
+    leal (%rbx, %rax), %ecx
+    movl %edx, %ecx
+    movl $7, %eax
+    popq %rbx
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| l.starts_with("leal (%rbx, %rax)")),
+            "{out:?}"
+        );
+    }
+
+    /// A scale on the SIB is not carryable into an ADD. Refuse.
+    #[test]
+    fn scaled_index_refuses() {
+        let asm = "\
+.cfi_startproc
+    # LCCC_RET_RAX 1
+    # LCCC_RET_RDX 0
+    pushq %rbx
+    movl (%rdi), %eax
+    leal (%rbx, %rax, 4), %ecx
+    addl %ecx, %esi
+    movl $7, %eax
+    popq %rbx
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(out.iter().any(|l| l.starts_with("movl (%rdi)")), "{out:?}");
+    }
+
+    /// A narrower spelling of the result's family beside the exact one would
+    /// survive the exact-text rename and read a deleted definition. Refuse.
+    #[test]
+    fn narrower_family_spelling_refuses() {
+        let asm = "\
+.cfi_startproc
+    # LCCC_RET_RAX 1
+    # LCCC_RET_RDX 0
+    pushq %rbx
+    movl (%rdi), %eax
+    leal (%rbx, %rax), %ecx
+    movzbl %cl, %edx
+    movl $7, %eax
+    popq %rbx
+    ret
+.cfi_endproc
+";
+        // %cl is family 1 at byte width, but the line spells neither the
+        // folded width's name (%ecx) nor the 64-bit name (%rcx), so the
+        // delimiter-exact rename cannot fire: a substitution would silently
+        // rewrite nothing while the MOV dies and %bl would hold a different
+        // value's low byte. The rename guard is the sole refuser here (the
+        // use at k is in the liveness keep-set, so D is dead after it).
+        let out = run(asm);
+        assert!(out.iter().any(|l| l.starts_with("movl (%rdi)")), "{out:?}");
+    }
+
+    /// X is read AFTER the LEA: the staged load's value escapes past the
+    /// fold point, so deleting the MOV would leave the reader with garbage.
+    /// Refuse.
+    #[test]
+    fn index_live_after_lea_refuses() {
+        let asm = "\
+.cfi_startproc
+    # LCCC_RET_RAX 1
+    # LCCC_RET_RDX 0
+    pushq %rbx
+    movl (%rdi), %eax
+    leal (%rbx, %rax), %ecx
+    movl %ecx, %edx
+    addl %eax, %esi
+    movl $7, %eax
+    popq %rbx
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| l.starts_with("movl (%rdi)")),
+            "the load must stay: {out:?}"
+        );
+        assert!(
+            out.iter().any(|l| l.starts_with("leal (%rbx, %rax)")),
+            "the lea must stay: {out:?}"
+        );
+    }
+
+    /// D is read AFTER its single renamed use: the rename covers only the
+    /// use at k — any later read still references the deleted LEA's
+    /// definition. Refuse.
+    #[test]
+    fn result_live_after_use_refuses() {
+        let asm = "\
+.cfi_startproc
+    # LCCC_RET_RAX 1
+    # LCCC_RET_RDX 0
+    pushq %rbx
+    movl (%rdi), %eax
+    leal (%rbx, %rax), %ecx
+    movl %ecx, %edx
+    addl %ecx, %esi
+    movl $7, %eax
+    popq %rbx
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| l.starts_with("movl (%rdi)")),
+            "the load must stay: {out:?}"
+        );
+        assert!(
+            out.iter().any(|l| l.starts_with("leal (%rbx, %rax)")),
+            "the lea must stay: {out:?}"
+        );
+    }
+
+    /// B == X (`leal (%rax, %rax), %ecx`): the folded ADD would read MEM
+    /// into the same register whose staged load it replaces — the second
+    /// addend would be the STALE pre-load value. Refuse.
+    #[test]
+    fn base_equals_index_refuses() {
+        let asm = "\
+.cfi_startproc
+    # LCCC_RET_RAX 1
+    # LCCC_RET_RDX 0
+    pushq %rbx
+    movl (%rdi), %eax
+    leal (%rax, %rax), %ecx
+    movl %ecx, %edx
+    movl $7, %eax
+    popq %rbx
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| l.starts_with("movl (%rdi)")),
+            "the load must stay: {out:?}"
+        );
+        assert!(
+            out.iter().any(|l| l.starts_with("leal (%rax, %rax)")),
+            "the lea must stay: {out:?}"
+        );
+    }
+
+    /// 64-bit form folds symmetrically, renaming inside a memory operand.
+    #[test]
+    fn wide_form_renames_into_memory_operand() {
+        let asm = "\
+.cfi_startproc
+    # LCCC_RET_RAX 1
+    # LCCC_RET_RDX 0
+    pushq %rbx
+    movq (%rdi), %rax
+    leaq (%rbx, %rax), %rcx
+    movq (%rcx), %rdx
+    movl $1, %eax
+    popq %rbx
+    ret
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| l == "addq (%rdi), %rbx"),
+            "wide form folds: {out:?}"
+        );
+        assert!(
+            out.iter().any(|l| l == "movq (%rbx), %rdx"),
+            "the use's memory operand is renamed: {out:?}"
+        );
+    }
 }
 
 #[cfg(test)]
