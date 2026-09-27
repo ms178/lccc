@@ -23,7 +23,16 @@
 #      sums and a multi-use interior node print the same as GCC's build;
 #   4. the rewritten IR passes the structural verifier (CCC_VERIFY_IR=abort
 #      armed for the differential builds), and the pass really fires on the
-#      differential program.  Idempotence is a unit test.
+#      differential program.  Idempotence is a unit test;
+#   5. rotation lags: in check_phi_acyclic_order.sh's rot() (SHA's
+#      h=g; g=f; f=e state rotation) the rotating words are ready 1-3
+#      iterations early; the recurrence bound is 2 cycles with the pass and
+#      5 without it (timing every carried phi at 0 reshaped rot() without
+#      shortening it and cost the PR #638 CI run);
+#   6. register residency: at -m32 (6 GPRs) SHA-256 and rot() keep eight
+#      rotating words live, their recurrences are memory-resident, and the
+#      pass leaves both byte-identical to the pass disabled; bitops (whose
+#      recurrence fits) and x86-64 rot() are still rewritten (controls).
 set -euo pipefail
 CCC=${CCC:-./target/fastbuild/lccc}
 GCC=${GCC_BIN:-gcc}
@@ -37,7 +46,7 @@ fail=0
 sha="$repo/tests/benchmark/programs/sha256_transform.c"
 bound_of() { $lat "$1" --function sha256_transform | sed -n 's/.*bound \([0-9.]*\) .*/\1/p'; }
 
-for cfg in ":v3:5" "-march=x86-64:x86-64:6"; do
+for cfg in ":v3:5" "-march=x86-64:x86-64:5"; do
   flag=${cfg%%:*}
   rest=${cfg#*:}
   name=${rest%%:*}
@@ -154,5 +163,49 @@ if cmp -s "$tmp/d_on.s" "$tmp/d_off.s"; then
   fail=1
 else
   echo "PASS: reassoc_lat rewrites trees in the differential program"
+fi
+
+# 5. Rotation lags (rot() from check_phi_acyclic_order.sh).
+cat >"$tmp/rot.c" <<'C'
+unsigned rot(unsigned *st, const unsigned *k, int n) {
+    unsigned a = st[0], b = st[1], c = st[2], d = st[3];
+    unsigned e = st[4], f = st[5], g = st[6], h = st[7];
+    for (int i = 0; i < n; i++) {
+        unsigned t1 = h + e + f + g + k[i];
+        unsigned t2 = a + b + c;
+        h = g; g = f; f = e; e = d + t1;
+        d = c; c = b; b = a; a = t1 + t2;
+    }
+    return a ^ b ^ c ^ d ^ e ^ f ^ g ^ h;
+}
+C
+$CCC -O2 -S -o "$tmp/rot_on.s" "$tmp/rot.c"
+CCC_DISABLE_PASSES=reassoc_lat $CCC -O2 -S -o "$tmp/rot_off.s" "$tmp/rot.c"
+rb() { $lat "$1" --function rot | sed -n 's/.*bound \([0-9.]*\) .*/\1/p'; }
+r_on=$(rb "$tmp/rot_on.s")
+r_off=$(rb "$tmp/rot_off.s")
+if awk -v a="$r_on" -v b="$r_off" 'BEGIN { exit !(a + 0 <= 2 && b + 0 > 2) }'; then
+  echo "PASS: rot() recurrence $r_on cycles (<= 2); pass disabled $r_off"
+else
+  echo "FAIL: rot() recurrence $r_on (want <= 2), pass disabled $r_off (want > 2)"
+  fail=1
+fi
+
+# 6. Register residency.
+same_as_off() { # $1 = flags, $2 = source
+  $CCC -O2 $1 -S -o "$tmp/res_on.s" "$2"
+  CCC_DISABLE_PASSES=reassoc_lat $CCC -O2 $1 -S -o "$tmp/res_off.s" "$2"
+  cmp -s "$tmp/res_on.s" "$tmp/res_off.s"
+}
+bitops="$repo/tests/benchmark/programs/bitops.c"
+res_ok=1
+same_as_off -m32 "$sha" || { echo "FAIL: -m32 sha256_transform reshaped (memory-resident recurrence)"; res_ok=0; }
+same_as_off -m32 "$tmp/rot.c" || { echo "FAIL: -m32 rot() reshaped (memory-resident recurrence)"; res_ok=0; }
+same_as_off -m32 "$bitops" && { echo "FAIL: -m32 bitops no longer rewritten (its recurrence fits)"; res_ok=0; }
+same_as_off "" "$tmp/rot.c" && { echo "FAIL: x86-64 rot() no longer rewritten"; res_ok=0; }
+if [ "$res_ok" = 1 ]; then
+  echo "PASS: residency: -m32 SHA-256/rot() left alone, -m32 bitops and x86-64 rot() rewritten"
+else
+  fail=1
 fi
 exit $fail

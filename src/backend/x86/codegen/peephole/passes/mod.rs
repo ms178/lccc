@@ -4633,10 +4633,18 @@ mod regression_tests {
         ]);
         let result = peephole_optimize(asm);
         eprintln!("sib_direct result: {:?}", result);
+        // Scale 1 and neither register is %rsp: base and index commute (the
+        // copy+add fold may form the lea as (%r14,%rbx) before this fold).
         assert!(
-            result.contains("(%rbx, %r14)") || result.contains("(%rbx,%r14)"),
+            ["(%rbx, %r14)", "(%rbx,%r14)", "(%r14, %rbx)", "(%r14,%rbx)"]
+                .iter()
+                .any(|a| result.contains(&format!("movb $0, {a}"))),
             "should fold to SIB indexed addressing: {}",
             result
+        );
+        assert!(
+            !result.contains("(%rax)"),
+            "store still through %rax: {result}"
         );
     }
 

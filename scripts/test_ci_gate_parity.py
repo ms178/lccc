@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from contextlib import redirect_stderr
 from io import StringIO
+from pathlib import Path
+import tempfile
 import unittest
 
 import check_ci_gate_parity as parity
@@ -87,6 +89,90 @@ class AsmDiffParityTest(unittest.TestCase):
         with redirect_stderr(StringIO()):
             self.assertEqual(parity.check_asmdiff_gate_parity(
                 self.local.replace(needle, "echo installer removed", 1), self.hosted), 1)
+
+
+class HostedStepsMirroredTest(unittest.TestCase):
+    """check_hosted_steps_mirrored: every hosted command must run locally."""
+
+    HOSTED = (
+        "python3 scripts/check_inline_asm_utf8.py --lccc x\n"
+        "cargo test --profile fastbuild --config 'profile.fastbuild.debug-assertions=true'\n"
+        "python3 .github/scripts/ci-bench.py\n"
+    )
+    LOCAL = (
+        "gate utf8 fast python3 scripts/check_inline_asm_utf8.py\n"
+        "CFG=(--config 'profile.fastbuild.debug-assertions=true')\n"
+        "cargo test \"${CFG[@]}\"\n"
+    )
+
+    def setUp(self) -> None:
+        self.dir = tempfile.TemporaryDirectory()
+        self.saved = parity.HOSTED_ONLY
+        parity.HOSTED_ONLY = Path(self.dir.name) / "hosted_only.txt"
+        self.allow(".github/scripts/ci-bench.py  # measurement")
+
+    def tearDown(self) -> None:
+        parity.HOSTED_ONLY = self.saved
+        self.dir.cleanup()
+
+    def allow(self, *entries: str) -> None:
+        parity.HOSTED_ONLY.write_text("# header\n" + "".join(e + "\n" for e in entries))
+
+    def check(self, local: str, hosted: str | None = None) -> tuple[int, str]:
+        err = StringIO()
+        with redirect_stderr(err):
+            rc = parity.check_hosted_steps_mirrored(local, self.HOSTED if hosted is None else hosted)
+        return rc, err.getvalue()
+
+    def test_mirrored_tree_passes(self) -> None:
+        self.assertEqual(self.check(self.LOCAL), (0, ""))
+
+    def test_hosted_only_script_fails(self) -> None:
+        rc, err = self.check(self.LOCAL.replace("scripts/check_inline_asm_utf8.py", "x"))
+        self.assertEqual(rc, 1)
+        self.assertIn("script scripts/check_inline_asm_utf8.py", err)
+
+    def test_comment_does_not_mirror_a_script_or_a_build_mode(self) -> None:
+        local = (
+            "# python3 scripts/check_inline_asm_utf8.py\n"
+            "cargo test  # --config 'profile.fastbuild.debug-assertions=true'\n"
+        )
+        rc, err = self.check(local)
+        self.assertEqual(rc, 1)
+        self.assertIn("script scripts/check_inline_asm_utf8.py", err)
+        self.assertIn("--config profile.fastbuild.debug-assertions=true", err)
+
+    def test_missing_build_mode_fails_in_every_spelling(self) -> None:
+        local = self.LOCAL.replace("debug-assertions=true", "debug-assertions=false")
+        for hosted in (
+            "cargo test --config 'profile.fastbuild.debug-assertions=true'",
+            'cargo test --config "profile.fastbuild.debug-assertions=true"',
+            "cargo test --config=profile.fastbuild.debug-assertions=true",
+        ):
+            rc, err = self.check(local, hosted)
+            self.assertEqual(rc, 1, hosted)
+            self.assertIn("--config profile.fastbuild.debug-assertions=true", err)
+
+    def test_missing_cargo_subcommand_fails(self) -> None:
+        rc, err = self.check(self.LOCAL, self.HOSTED + "cargo build --bin lccc\n")
+        self.assertEqual(rc, 1)
+        self.assertIn("cargo build", err)
+
+    def test_allowlist_exempts_and_must_shrink(self) -> None:
+        self.allow(".github/scripts/ci-bench.py", "scripts/check_inline_asm_utf8.py")
+        rc, err = self.check(self.LOCAL)
+        self.assertEqual(rc, 1)
+        self.assertIn("now mirrors (delete them)", err)
+        self.allow()
+        rc, err = self.check(self.LOCAL)
+        self.assertEqual(rc, 1)
+        self.assertIn("script .github/scripts/ci-bench.py", err)
+
+    def test_repository_is_mirrored(self) -> None:
+        local = parity.LOCAL.read_text()
+        hosted = "\n".join(parity.run_script_bodies(p) for p in sorted(parity.WORKFLOWS.glob("*.yml")))
+        parity.HOSTED_ONLY = self.saved
+        self.assertEqual(self.check(local, hosted), (0, ""))
 
 
 if __name__ == "__main__":
