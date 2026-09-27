@@ -192,8 +192,10 @@ def asm_option(tokens: list[str], name: str) -> str | None:
 def check_asmdiff_gate_parity(local_text: str, hosted: str) -> int:
     """Require the *specific mode, compiler and corpus*, not just the path."""
     specs = (
-        ("merged-pr629-x86-asm-diff", False, "target/fastbuild/lccc-x86",
-         ("tests/asm-diff/merged-pr629-followup.casefile",)),
+        # No .casefile operands: asmdiff.py defaults to the whole corpus
+        # (every tests/asm-diff/*.casefile), so new corpora cannot land
+        # ungated the way a pinned follow-up file allowed.
+        ("x86-asm-diff", False, "target/fastbuild/lccc-x86", ()),
         ("i686-asm-diff", True, "target/fastbuild/lccc-i686", ()),
     )
     missing = []

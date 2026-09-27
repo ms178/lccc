@@ -200,18 +200,19 @@ impl super::InstructionEncoder {
                     self.add_diff_relocation(sym_a, sym_b, R_X86_64_32, 0);
                     self.bytes.extend_from_slice(&[0, 0, 0, 0]);
                 } else if size == 8 {
-                    // movabs $sym_a - sym_b, %reg — 64-bit symbol-difference
-                    // immediate. arch/x86/mm/mem_encrypt_boot.S emits
-                    // `movq $(.L__enc_copy_end - __enc_copy), %rcx` to load
-                    // the encrypted-memory copy routine's length. Both labels
-                    // live in the same object, so the difference resolves at
-                    // link time to a constant; a R_X86_64_64 diff-relocation
-                    // folds to the absolute 64-bit value. movabs (REX.W +
-                    // B8+rd) is the only 64-bit-immediate mov form.
+                    // REX.W + C7 /0 with a 32-bit field (GAS 2.47: `movq
+                    // $(.Lend - .Lstart), %rcx` is `48 c7 c1 <imm32>`,
+                    // folded, no reloc -- never movabs). A same-section
+                    // pair folds to its disp32; an external-minus-local
+                    // pair (`movq $(xtrn - .), %rax`) becomes R_X86_64_PC32
+                    // against the external symbol via the diff path. The
+                    // old movabs + R_X86_64_64 was 3 bytes longer than GAS
+                    // for foldable pairs and unresolvable for the rest.
                     self.emit_rex_unary(8, &dst.name);
-                    self.bytes.push(0xB8 + (dst_num & 7));
-                    self.add_diff_relocation(sym_a, sym_b, R_X86_64_64, 0);
-                    self.bytes.extend_from_slice(&[0; 8]);
+                    self.bytes.push(0xC7);
+                    self.bytes.push(self.modrm(3, 0, dst_num));
+                    self.add_diff_relocation(sym_a, sym_b, R_X86_64_PC32, 0);
+                    self.bytes.extend_from_slice(&[0; 4]);
                 } else {
                     return Err(format!(
                         "symbol-difference mov immediate only supported at 32-bit width (got size {})",

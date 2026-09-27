@@ -698,6 +698,17 @@ pub fn compact_eh_frame(
             continue; // dangling pointer in the input: leave it as it was
         };
         let field_pos = dst + (rec.id_offset - rec.start);
+        if new_start[cie] >= field_pos {
+            // Malformed input: the FDE precedes (or overlaps) the CIE its
+            // pointer names, so the re-encoded `CIE_pointer` would be zero
+            // or negative. `field_pos - new_start[cie]` underflows: a
+            // panic in debug, a wild ~4 GiB-back pointer in release (and a
+            // zero would even reclassify the FDE as a CIE). Well-formed
+            // input always points strictly backwards, so skipping the
+            // rewrite preserves every valid layout and leaves the garbage
+            // bytes untouched instead of crashing the link.
+            continue;
+        }
         let value = field_pos - new_start[cie];
         if rec.id_size == 8 {
             out[field_pos..field_pos + 8].copy_from_slice(&(value as u64).to_le_bytes());
@@ -1552,5 +1563,110 @@ mod tests {
             let _ = parse_eh_frame_fdes(&data, 0x400000, true);
             let _ = build_eh_frame_hdr(&data, 0x400000, 0x3f0000, true);
         }
+    }
+
+    /// A std-format record shorter than its own `CIE_id` field (length 1..3)
+    /// is malformed: the id read would land in the *next* record's bytes
+    /// and compaction's FDE rewrite would clobber them. The scan must stop
+    /// instead of emitting a record it does not own.
+    #[test]
+    fn scan_rejects_std_record_shorter_than_cie_id() {
+        for len in [1u32, 2, 3] {
+            let mut data = len.to_le_bytes().to_vec();
+            data.extend_from_slice(&[0xAA; 16]);
+            let recs = scan_eh_frame_records(&data);
+            assert!(
+                recs.is_empty(),
+                "length-{len} record must terminate the scan"
+            );
+            assert_eq!(count_eh_frame_fdes(&data), 0, "length-{len} count");
+        }
+    }
+
+    /// An extended-format record narrower than its 8-byte `CIE_id` reads
+    /// and rewrites past its own end. Same law as the std form.
+    #[test]
+    fn scan_rejects_extended_record_shorter_than_cie_id() {
+        for len in [0u64, 1, 4, 7] {
+            let mut data = 0xFFFF_FFFFu32.to_le_bytes().to_vec();
+            data.extend_from_slice(&len.to_le_bytes());
+            data.extend_from_slice(&[0xBB; 16]);
+            let recs = scan_eh_frame_records(&data);
+            assert!(recs.is_empty(), "extended length-{len} must stop the scan");
+            assert_eq!(count_eh_frame_fdes(&data), 0);
+        }
+    }
+
+    /// A hostile `0xFFFFFFFFFFFFFFFF` extended length must not panic the
+    /// linker (debug addition overflow) nor wrap into an out-of-bounds
+    /// read (release). `.eh_frame` comes from arbitrary object files.
+    #[test]
+    fn scan_rejects_huge_extended_length_without_panic() {
+        let mut data = 0xFFFF_FFFFu32.to_le_bytes().to_vec();
+        data.extend_from_slice(&u64::MAX.to_le_bytes());
+        data.extend_from_slice(&[0xCC; 32]);
+        assert!(scan_eh_frame_records(&data).is_empty());
+        assert_eq!(count_eh_frame_fdes(&data), 0);
+        // `build_eh_frame_hdr` walks the same bytes during layout: a
+        // header with an empty table, not a panic.
+        let hdr = build_eh_frame_hdr(&data, 0x400000, 0x3f0000, true);
+        assert_eq!(hdr.len(), 12);
+        assert_eq!(i32::from_le_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]), 0);
+    }
+
+    /// Truncated input (length past the section end) terminates every walk.
+    #[test]
+    fn scan_rejects_truncated_record() {
+        let mut data = 64u32.to_le_bytes().to_vec();
+        data.extend_from_slice(&[0xDD; 8]);
+        assert!(scan_eh_frame_records(&data).is_empty());
+        assert_eq!(count_eh_frame_fdes(&data), 0);
+    }
+
+    /// An FDE whose `CIE_pointer` aims *forward* at a later CIE is
+    /// malformed (DWARF pointers always run backwards), but it must not
+    /// crash compaction: `field_pos - new_start[cie]` underflows. The
+    /// rewrite is skipped and the copied bytes are left untouched.
+    ///
+    /// The pointer needs its 8-byte form to reach the subtraction: a
+    /// 32-bit forward pointer wraps `cie_pos` into unmapped `u64` space
+    /// and takes the dangling-pointer exit first. A pruned FDE between
+    /// the two records makes the test non-vacuous in release builds too
+    /// (without the guard the rebased pointer differs from the input;
+    /// with it the input bytes survive verbatim).
+    #[test]
+    fn compact_skips_fde_aimed_at_later_cie() {
+        // Extended FDE at 0: body 24 bytes, 8-byte CIE_pointer forward
+        // past the dead FDE to the CIE at 52.
+        let ptr = 12u64.wrapping_sub(52);
+        let mut data = 0xFFFF_FFFFu32.to_le_bytes().to_vec();
+        data.extend_from_slice(&24u64.to_le_bytes());
+        data.extend_from_slice(&ptr.to_le_bytes());
+        data.extend_from_slice(&[0x11; 16]);
+        // Dead std FDE at 36 (pruned): length 12, dangling id.
+        assert_eq!(data.len(), 36);
+        data.extend_from_slice(&12u32.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&[0x33; 8]);
+        // CIE at 52: length 8, CIE_id 0.
+        assert_eq!(data.len(), 52);
+        data.extend_from_slice(&8u32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&[0x22; 4]);
+
+        let recs = scan_eh_frame_records(&data);
+        assert_eq!(recs.len(), 3);
+        assert!(recs[0].is_fde && recs[1].is_fde && !recs[2].is_fde);
+        let prune = [false, true, false];
+        let c = compact_eh_frame(&data, &recs, &prune);
+        // The forward pointer survives byte-identical (no wild rewrite),
+        // and the surviving records compact around the pruned one.
+        assert_eq!(&c.data[..36], &data[..36]);
+        assert_eq!(
+            u64::from_le_bytes(c.data[12..20].try_into().unwrap()),
+            ptr,
+            "forward CIE_pointer left untouched"
+        );
+        assert_eq!(&c.data[36..48], &data[52..64]);
     }
 }

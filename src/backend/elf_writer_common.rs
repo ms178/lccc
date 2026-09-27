@@ -17,10 +17,10 @@
 //! the `supports_deferred_skips()` trait method.
 
 use crate::backend::elf::{
-    self as elf_mod, ElfConfig, ObjReloc, ObjSection, ObjSymbol, SHF_ALLOC, SHF_EXECINSTR,
-    SHF_WRITE, SHT_NOBITS, SHT_PROGBITS, STB_GLOBAL, STB_LOCAL, STB_WEAK, STT_FUNC, STT_GNU_IFUNC,
-    STT_NOTYPE, STT_OBJECT, STT_TLS, STV_DEFAULT, STV_HIDDEN, STV_INTERNAL, STV_PROTECTED,
-    SymbolTableInput, parse_section_flags, resolve_numeric_labels,
+    self as elf_mod, ELFCLASS32, ElfConfig, ObjReloc, ObjSection, ObjSymbol, SHF_ALLOC,
+    SHF_EXECINSTR, SHF_WRITE, SHT_NOBITS, SHT_PROGBITS, STB_GLOBAL, STB_LOCAL, STB_WEAK, STT_FUNC,
+    STT_GNU_IFUNC, STT_NOTYPE, STT_OBJECT, STT_TLS, STV_DEFAULT, STV_HIDDEN, STV_INTERNAL,
+    STV_PROTECTED, SymbolTableInput, parse_section_flags, resolve_numeric_labels,
 };
 use crate::backend::x86::assembler::parser::*;
 use crate::common::fx_hash::FxHashMap;
@@ -2086,6 +2086,13 @@ impl<A: X86Arch> ElfWriterCore<A> {
         // Register jump for relaxation if detected
         if let Some(jump_det) = result.jump {
             if let Some((label, target_addend)) = self.get_jump_target_label(instr) {
+                // `.` targets the current instruction: anchor it so the
+                // relaxation engine resolves (and shrinks) the jump.
+                let label = if label == "." {
+                    self.dot_anchor(sec_idx, base_offset)
+                } else {
+                    label
+                };
                 if jump_det.already_short {
                     // Short-only jumps (jecxz/jcxz/loop) - already short, just need displacement patched
                     self.sections[sec_idx].jumps.push(JumpInfo {
@@ -2118,17 +2125,48 @@ impl<A: X86Arch> ElfWriterCore<A> {
 
         // Copy relocations
         for reloc in result.relocations {
+            // `.` (either side of a diff, e.g. `movq $(xtrn - .)`) names
+            // this instruction's start: anchor it, else the reference
+            // escapes as an external relocation against ".".
+            let symbol = if reloc.symbol == "." {
+                self.dot_anchor(sec_idx, base_offset)
+            } else {
+                reloc.symbol
+            };
+            let diff_symbol = match reloc.diff_symbol {
+                Some(d) if d == "." => Some(self.dot_anchor(sec_idx, base_offset)),
+                other => other,
+            };
             self.sections[sec_idx].relocations.push(ElfRelocation {
                 offset: base_offset + reloc.offset,
-                symbol: reloc.symbol,
+                symbol,
                 reloc_type: reloc.reloc_type,
                 addend: reloc.addend,
-                diff_symbol: reloc.diff_symbol,
+                diff_symbol,
                 patch_size: A::reloc_patch_size(reloc.reloc_type),
             });
         }
 
         Ok(())
+    }
+
+    /// Anchor `.` (the location counter) for the instruction starting at
+    /// `base_offset`: place (idempotently -- one instruction anchors once)
+    /// and return the synthetic label naming it.
+    ///
+    /// In instruction operands `.` is the CURRENT instruction's start
+    /// (GAS). The encoder records `.`-rooted references with symbol "."
+    /// and any `+/-N` folded into the addend, but "." is not a label, so
+    /// the raw spelling used to fall through to an external relocation
+    /// against a symbol literally named "." (`jrcxz .` grew a bogus
+    /// R_X86_64_64 on its disp8, `call .` a PLT32). The synthetic label
+    /// rides `shift_after` like any label, so relaxation and dispersed
+    /// `.`-arithmetic (`ja .+0x10` shrinking to short) stay correct, and
+    /// it never reaches the symbol table (`place_label` does not intern).
+    fn dot_anchor(&mut self, sec_idx: usize, base_offset: u64) -> String {
+        let name = format!(".Linsndot_{sec_idx}_{base_offset}");
+        self.place_label(&name, sec_idx, base_offset);
+        name
     }
 
     fn get_jump_target_label(&self, instr: &Instruction) -> Option<(String, i64)> {
@@ -2147,10 +2185,13 @@ impl<A: X86Arch> ElfWriterCore<A> {
 
         // The parser deliberately leaves bare control-flow operands
         // context-neutral.  Split the same symbol-plus-constant grammar used
-        // by relocation emission here because short-only loop/jecxz branches
-        // never emit a relocation: the relaxation engine patches their disp8
-        // directly.  Applying the addend there exactly once avoids looking up
-        // a non-existent literal label named `.Ltarget+1`.
+        // by relocation emission here: a short-only loop/jecxz branch to a
+        // LOCAL label is patched by the relaxation engine directly, but one
+        // to an EXTERNAL symbol is emitted as a real PC8 relocation (by the
+        // encoder on x86-64, by `patch_short_jumps` where the encoder
+        // records none), and both consumers need the base symbol and the
+        // constant separately.  Applying the addend exactly once avoids
+        // looking up a non-existent literal label named `.Ltarget+1`.
         if let Some((base, addend)) =
             crate::backend::x86::assembler::parser::split_relocation_symbol_addend(label)
         {
@@ -2440,7 +2481,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
         shrunk.dedup();
         for sec_idx in shrunk {
             if !self.sections[sec_idx].jumps.is_empty() {
-                self.patch_short_jumps(sec_idx);
+                self.patch_short_jumps(sec_idx)?;
             }
         }
         // Taken only now: the placeholder shrinking above moves them.
@@ -2837,7 +2878,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
         // placements produce identical output for every currently-existing
         // backend, but the unconditional form is the one that stays correct
         // if a future arch ever overrides the default `false`.
-        self.relax_jumps();
+        self.relax_jumps()?;
         for sec_idx in 0..self.sections.len() {
             self.fixup_alignment_markers(sec_idx);
         }
@@ -2862,7 +2903,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
         }
 
         // Relax long jumps to short form where possible.
-        self.relax_jumps();
+        self.relax_jumps()?;
 
         // Fix alignment/org markers for EVERY section again: relaxation only
         // maintains them for sections that actually contain jumps
@@ -2913,8 +2954,9 @@ impl<A: X86Arch> ElfWriterCore<A> {
         // patch constants and never reach the symbol table.
         self.resolve_set_constants();
 
-        // Resolve internal relocations
-        self.resolve_internal_relocations();
+        // Resolve internal relocations (unresolvable differences and
+        // out-of-range short branches are hard assembler errors, as in GAS).
+        self.resolve_internal_relocations()?;
 
         // Convert to shared ObjSection/ObjSymbol format
         let section_names: Vec<String> = self.sections.iter().map(|s| s.name.clone()).collect();
@@ -3305,7 +3347,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
 
     // ─── Jump relaxation ──────────────────────────────────────────────
 
-    fn relax_jumps(&mut self) {
+    fn relax_jumps(&mut self) -> Result<(), String> {
         for sec_idx in 0..self.sections.len() {
             if self.sections[sec_idx].jumps.is_empty() {
                 continue;
@@ -3518,8 +3560,9 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 }
             }
 
-            self.patch_short_jumps(sec_idx);
+            self.patch_short_jumps(sec_idx)?;
         }
+        Ok(())
     }
 
     /// Offset and source position of the label a jump targets, if it is
@@ -3731,44 +3774,85 @@ impl<A: X86Arch> ElfWriterCore<A> {
     /// layout. Runs once relaxation is stable, and again after anything
     /// later removes bytes from a code section (a shrinking `.uleb128`),
     /// which moves targets without touching the jumps.
-    fn patch_short_jumps(&mut self, sec_idx: usize) {
+    fn patch_short_jumps(&mut self, sec_idx: usize) -> Result<(), String> {
         let mut local_labels: FxHashMap<String, usize> = FxHashMap::default();
         for (name, &(s_idx, offset)) in &self.label_positions {
             if s_idx == sec_idx {
                 local_labels.insert(name.clone(), offset as usize);
             }
         }
-        let patches: Vec<(usize, u8)> = self.sections[sec_idx]
-            .jumps
-            .iter()
-            .filter(|j| j.relaxed)
-            .filter_map(|jump| {
-                let target = jump_target_with_addend(
-                    local_labels.get(&jump.target).copied().or_else(|| {
-                        self.resolve_numeric_label(&jump.target, jump.offset as u64, sec_idx)
-                            .map(|(_, off)| off as usize)
-                    }),
-                    jump.target_addend,
-                );
-                target.map(|target_off| {
-                    let end_of_instr = jump.offset + 2;
-                    let disp = target_off as i64 - end_of_instr as i64;
-                    // A surviving short jump must be representable exactly.
-                    assert!(
-                        (-128..=127).contains(&disp),
-                        "short jump displacement out of range after relaxation ({}: {} -> {} = {})",
-                        jump.target,
-                        jump.offset,
-                        target_off,
-                        disp
-                    );
-                    (jump.offset + 1, disp as u8)
-                })
-            })
-            .collect();
+        // Two phases: resolve every relaxed jump under a shared borrow,
+        // then apply patches and push relocations mutably.
+        let mut patches: Vec<(usize, u8)> = Vec::new();
+        let mut push_pc8: Vec<ElfRelocation> = Vec::new();
+        for jump in self.sections[sec_idx].jumps.iter() {
+            if !jump.relaxed {
+                continue;
+            }
+            let target = jump_target_with_addend(
+                local_labels.get(&jump.target).copied().or_else(|| {
+                    self.resolve_numeric_label(&jump.target, jump.offset as u64, sec_idx)
+                        .map(|(_, off)| off as usize)
+                }),
+                jump.target_addend,
+            );
+            let Some(target_off) = target else {
+                // Unresolvable target (undefined/external). A short-only
+                // branch (jecxz/loop: never relaxed BY the engine, hence
+                // `can_grow == false`) has no long form to fall back on,
+                // so GAS emits a real R_386_PC8/R_X86_64_PC8 relocation
+                // (`jecxz undef32` -> disp 0xFF baked for REL, addend -1
+                // for RELA). Encoders that already recorded one (x86-64
+                // native jrcxz/loop carry a PC8_INTERNAL reloc, rewritten
+                // to PC8 downstream) must not get a second: this pass runs
+                // twice per assembly, so the scan doubles as the
+                // already-pushed guard. Letting the jump fall through
+                // instead would leave disp 0 with no reloc: a silent jump
+                // into the next instruction.
+                if !jump.can_grow
+                    && !self.sections[sec_idx]
+                        .relocations
+                        .iter()
+                        .any(|r| r.offset == jump.offset as u64 + 1)
+                {
+                    let Some(pc8) = A::reloc_pc8() else {
+                        return Err(format!(
+                            "cannot resolve short jump to undefined symbol {}",
+                            jump.target
+                        ));
+                    };
+                    push_pc8.push(ElfRelocation {
+                        offset: jump.offset as u64 + 1,
+                        symbol: jump.target.clone(),
+                        reloc_type: pc8,
+                        // Wrapping: a source addend of i64::MIN is not a
+                        // legal ELF addend, but it must truncate through
+                        // emission like any other out-of-field value, never
+                        // panic the assembler (the encoder's `add_relocation`
+                        // treats its own addend fold with the same care).
+                        addend: jump.target_addend.wrapping_sub(1),
+                        diff_symbol: None,
+                        patch_size: 1,
+                    });
+                }
+                continue;
+            };
+            let end_of_instr = jump.offset + 2;
+            let disp = target_off as i64 - end_of_instr as i64;
+            // A surviving short jump must be representable exactly. Out
+            // of range, a short-only branch is unencodable and GAS errors
+            // (`value of N too large for field of 1 byte`); panicking
+            // the assembler instead is never acceptable.
+            if !(-128..=127).contains(&disp) {
+                return Err(Self::pc8_range_error(disp, jump.offset as u64 + 1));
+            }
+            patches.push((jump.offset + 1, disp as u8));
+        }
         for (off, byte) in patches {
             self.sections[sec_idx].data[off] = byte;
         }
+        self.sections[sec_idx].relocations.extend(push_pc8);
+        Ok(())
     }
 
     /// Recompute each section's header alignment from the FINAL marker
@@ -4170,7 +4254,77 @@ impl<A: X86Arch> ElfWriterCore<A> {
         }
     }
 
-    fn resolve_internal_relocations(&mut self) {
+    /// Format a PC8 range failure exactly like GAS: positive values
+    /// print decimal (`value of 300 ...`), negative ones as hex of the
+    /// target address cell, and the offset as hex of the target address
+    /// width (16 digits on 64-bit targets, 8 on 32-bit ones -- GAS 2.47
+    /// `--32` says `at 0000012e` where `--64` says `at
+    /// 000000000000012e`).
+    fn pc8_range_error(rel: i64, offset: u64) -> String {
+        if A::elf_class() == ELFCLASS32 {
+            let val = if rel < 0 {
+                format!("{:08x}", rel as u32)
+            } else {
+                format!("{rel}")
+            };
+            format!("value of {val} too large for field of 1 byte at {offset:08x}")
+        } else {
+            let val = if rel < 0 {
+                format!("{:016x}", rel as u64)
+            } else {
+                format!("{rel}")
+            };
+            format!("value of {val} too large for field of 1 byte at {offset:016x}")
+        }
+    }
+
+    /// A surviving 8-byte relocation the target cannot represent. ELF32
+    /// has neither a 64-bit PC-relative nor a 64-bit absolute type
+    /// (both trait fallbacks alias the 32-bit ones); GAS rejects every
+    /// shape that needs one -- `.quad ext` with BFD_RELOC_64, `.quad ext
+    /// - .` and cross-section `.quad other - .` with BFD_RELOC_64_PCREL
+    /// -- instead of emitting a truncated 4-byte patch in an 8-byte
+    /// slot. Returns the GAS error text, or None when representable.
+    fn unrepresentable_quad_error(reloc: &ElfRelocation) -> Option<String> {
+        if reloc.patch_size != 8 {
+            return None;
+        }
+        if reloc.reloc_type == A::reloc_pc32() && A::reloc_pc64() == A::reloc_pc32() {
+            return Some("cannot represent relocation type BFD_RELOC_64_PCREL".to_string());
+        }
+        if reloc.reloc_type == A::reloc_abs64() && A::reloc_abs64() == A::reloc_abs(4) {
+            return Some("cannot represent relocation type BFD_RELOC_64".to_string());
+        }
+        None
+    }
+
+    /// Rewrite an internal-only PC8 relocation that survived internal
+    /// resolution to the real ELF PC8 type. The survivor names an
+    /// external (or cross-section) target: GAS emits R_X86_64_PC8 /
+    /// R_386_PC8 for it (`jrcxz undefined` assembles; bfd/lld range-check
+    /// at link time). The INTERNAL number must never reach the object --
+    /// it truncated to R_X86_64_64, an 8-byte patch over a 1-byte field.
+    fn externalize_pc8_reloc(reloc: &ElfRelocation) -> ElfRelocation {
+        let mut out = reloc.clone();
+        if let Some(internal) = A::reloc_pc8_internal() {
+            if out.reloc_type == internal {
+                // An arch that records PC8_INTERNAL must define the real
+                // PC8 type it rewrites to: without one the INTERNAL number
+                // would reach the object and truncate to an 8-byte patch
+                // over the 1-byte field. Loud in debug, free in release.
+                debug_assert!(
+                    A::reloc_pc8().is_some(),
+                    "arch with PC8_INTERNAL must define a real PC8 type"
+                );
+                if let Some(pc8) = A::reloc_pc8() {
+                    out.reloc_type = pc8;
+                }
+            }
+        }
+        out
+    }
+
+    fn resolve_internal_relocations(&mut self) -> Result<(), String> {
         for sec_idx in 0..self.sections.len() {
             let mut resolved: Vec<(usize, i64, usize)> = Vec::new(); // (offset, value, patch_size)
             let mut pc8_patches: Vec<(usize, u8)> = Vec::new();
@@ -4222,11 +4376,43 @@ impl<A: X86Arch> ElfWriterCore<A> {
                                     unresolved.push(conv);
                                     continue;
                                 }
+                                // 8-byte sibling (`.quad xtrn - local`,
+                                // GAS 2.47: R_X86_64_PC64). The old path let
+                                // the ABS64 diff-reloc survive to emission,
+                                // which evaluates S+A instead of S+A-P. An
+                                // architecture without a PC64 type (ELF32)
+                                // cannot represent it at all -- GAS errors.
+                                if b_sec == sec_idx && reloc.patch_size == 8 {
+                                    if A::reloc_pc64() != A::reloc_pc32() {
+                                        let mut conv = reloc.clone();
+                                        conv.reloc_type = A::reloc_pc64();
+                                        conv.addend += reloc.offset as i64 - b_off as i64;
+                                        conv.diff_symbol = None;
+                                        unresolved.push(conv);
+                                        continue;
+                                    }
+                                    return Err(
+                                        "cannot represent relocation type BFD_RELOC_64_PCREL"
+                                            .to_string(),
+                                    );
+                                }
                             }
                         }
                     }
-                    unresolved.push(reloc.clone());
-                    continue;
+                    // No rule consumed the difference: it is not a link-time
+                    // constant (`local - external`, two externals, or a
+                    // cross-section pair). GAS rejects every such shape with
+                    // `can't resolve A - B`, folding a local A to its section
+                    // (`.text - xtrn`); silently emitting a one-sided reloc
+                    // miscomputes the field.
+                    let section_names: Vec<String> =
+                        self.sections.iter().map(|s| s.name.clone()).collect();
+                    let a_name = match self.label_positions.get(&reloc.symbol) {
+                        Some((sec, _)) => section_names[*sec].clone(),
+                        None => reloc.symbol.clone(),
+                    };
+                    let b_name = reloc.diff_symbol.clone().unwrap_or_default();
+                    return Err(format!("can't resolve {a_name} - {b_name}"));
                 }
 
                 let label_pos = self
@@ -4249,13 +4435,18 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         }
                     }
 
-                    // Handle PC8 internal relocations (x86-64 loop/jrcxz)
+                    // Handle PC8 internal relocations (x86-64 loop/jrcxz).
+                    // Out of range, the short-only branch is unencodable:
+                    // GAS errors (`value of N too large for field of 1
+                    // byte`); silently keeping disp 0 jumps into the next
+                    // instruction instead.
                     if let Some(pc8_type) = A::reloc_pc8_internal() {
                         if reloc.reloc_type == pc8_type && target_sec == sec_idx {
                             let rel = (target_off as i64) + reloc.addend - (reloc.offset as i64);
-                            if (-128..=127).contains(&rel) {
-                                pc8_patches.push((reloc.offset as usize, rel as u8));
+                            if !(-128..=127).contains(&rel) {
+                                return Err(Self::pc8_range_error(rel, reloc.offset));
                             }
+                            pc8_patches.push((reloc.offset as usize, rel as u8));
                             continue;
                         }
                     }
@@ -4273,13 +4464,22 @@ impl<A: X86Arch> ElfWriterCore<A> {
                             let val = (target_off as i64) + reloc.addend;
                             resolved.push((reloc.offset as usize, val, reloc.patch_size as usize));
                         } else {
-                            unresolved.push(reloc.clone());
+                            if let Some(msg) = Self::unrepresentable_quad_error(reloc) {
+                                return Err(msg);
+                            }
+                            unresolved.push(Self::externalize_pc8_reloc(reloc));
                         }
                     } else {
-                        unresolved.push(reloc.clone());
+                        if let Some(msg) = Self::unrepresentable_quad_error(reloc) {
+                            return Err(msg);
+                        }
+                        unresolved.push(Self::externalize_pc8_reloc(reloc));
                     }
                 } else {
-                    unresolved.push(reloc.clone());
+                    if let Some(msg) = Self::unrepresentable_quad_error(reloc) {
+                        return Err(msg);
+                    }
+                    unresolved.push(Self::externalize_pc8_reloc(reloc));
                 }
             }
 
@@ -4308,6 +4508,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
 
             self.sections[sec_idx].relocations = unresolved;
         }
+        Ok(())
     }
 }
 
@@ -5058,6 +5259,130 @@ ret
         assert_eq!(
             assembled_section(asm, ".text"),
             [0xeb, 0x06, 0x03, 0xaa, 0xbb, 0x90, 0x90, 0x90, 0xc3]
+        );
+    }
+
+    use crate::backend::i686::assembler::assemble as assemble32;
+
+    /// Assemble `asm`, expecting success. The relocation TYPE the
+    /// external-PC8 path emits (R_X86_64_PC8/R_386_PC8, addend -1) is pinned
+    /// by the `pc8_external` asmdiff rows; this test pins ACCEPTANCE under
+    /// the assertions-on test harness, which is what executes the
+    /// `externalize_pc8_reloc` INTERNAL-implies-real-PC8 debug_assert that
+    /// the release-like fastbuild binary compiles out.
+    fn assemble_ok(asm: &str, arch32: bool) {
+        let dir = std::env::temp_dir().join(format!(
+            "lccc_acc_{}_{}_{}",
+            std::process::id(),
+            if arch32 { "32" } else { "64" },
+            std::thread::current()
+                .name()
+                .unwrap_or("t")
+                .replace("::", "_")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("t.o");
+        let res = if arch32 {
+            assemble32(asm, out.to_str().unwrap())
+        } else {
+            assemble(asm, out.to_str().unwrap())
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        res.unwrap_or_else(|e| panic!("input must assemble: {e}"));
+    }
+
+    /// Assemble `asm`, expecting failure, and return the error text.
+    fn assemble_err(asm: &str, arch32: bool) -> String {
+        let dir = std::env::temp_dir().join(format!(
+            "lccc_rej_{}_{}_{}",
+            std::process::id(),
+            if arch32 { "32" } else { "64" },
+            std::thread::current()
+                .name()
+                .unwrap_or("t")
+                .replace("::", "_")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("t.o");
+        let res = if arch32 {
+            assemble32(asm, out.to_str().unwrap())
+        } else {
+            assemble(asm, out.to_str().unwrap())
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        res.expect_err("input must be rejected")
+    }
+
+    /// Short-only branches to externals assemble (GAS emits a real PC8
+    /// relocation and range-checks at link time); the x86-64 arm routes
+    /// through the PC8_INTERNAL rewrite whose debug_assert this harness
+    /// executes.
+    #[test]
+    fn pc8_external_assembles() {
+        assemble_ok(".text\njrcxz ext_a\nloop ext_b\n", false);
+        assemble_ok(".text\njecxz ext_a\nloop ext_b\n", true);
+    }
+
+    /// Every string below is GAS 2.47's exact text (`--64` and `--32`);
+    /// the `pc8.casefile` `reject` groups assert the refusal itself.
+    #[test]
+    fn pc8_range_error_matches_gas() {
+        let fwd = ".text\njrcxz far\n.fill 300,1,0x90\nfar: ret\n";
+        assert_eq!(
+            assemble_err(fwd, false),
+            "value of 300 too large for field of 1 byte at 0000000000000001"
+        );
+        let bwd = ".text\nfar: nop\n.fill 300,1,0x90\njrcxz far\n";
+        assert_eq!(
+            assemble_err(bwd, false),
+            "value of fffffffffffffed1 too large for field of 1 byte at 000000000000012e"
+        );
+        let fwd32 = ".text\njecxz far\n.fill 300,1,0x90\nfar: ret\n";
+        assert_eq!(
+            assemble_err(fwd32, true),
+            "value of 300 too large for field of 1 byte at 00000001"
+        );
+        let bwd32 = ".text\nfar: nop\n.fill 300,1,0x90\njecxz far\n";
+        assert_eq!(
+            assemble_err(bwd32, true),
+            "value of fffffed1 too large for field of 1 byte at 0000012e"
+        );
+    }
+
+    #[test]
+    fn cant_resolve_names_match_gas() {
+        // A local minuend folds to its section; externals stay verbatim.
+        assert_eq!(
+            assemble_err(".text\nl1: nop\nmovq $(l1-xtrnA), %rax\n", false),
+            "can't resolve .text - xtrnA"
+        );
+        assert_eq!(
+            assemble_err(".text\nmovq $(xtrn1-xtrn2), %rax\n", false),
+            "can't resolve xtrn1 - xtrn2"
+        );
+        assert_eq!(
+            assemble_err(".text\nl1: nop\nmovl $(l1-xtrnA), %eax\n", true),
+            "can't resolve .text - xtrnA"
+        );
+    }
+
+    #[test]
+    fn i686_quad_extern_diff_is_unrepresentable() {
+        assert_eq!(
+            assemble_err(".data\nqloc: .quad 0\n.quad xtrn_q - qloc\n", true),
+            "cannot represent relocation type BFD_RELOC_64_PCREL"
+        );
+        assert_eq!(
+            assemble_err(".data\n.quad plainExt\n", true),
+            "cannot represent relocation type BFD_RELOC_64"
+        );
+        assert_eq!(
+            assemble_err(".data\n.quad extdot - .\n", true),
+            "cannot represent relocation type BFD_RELOC_64_PCREL"
+        );
+        assert_eq!(
+            assemble_err(".text\nt1: nop\n.data\n.quad t1 - .\n", true),
+            "cannot represent relocation type BFD_RELOC_64_PCREL"
         );
     }
 }

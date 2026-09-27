@@ -586,14 +586,15 @@ jobs:
           CCC: target/fastbuild/lccc
         run: bash tests/regression/check_seg_prefix_full_matrix.sh
 
-      # The isolated PR #629 x86-64 corpus uses APX encodings unavailable
-      # in ubuntu-latest's distro binutils. Install the pinned oracle instead
-      # of silently skipping its 90-case accepted/rejected differential gate.
+      # The x86-64 corpus uses APX encodings unavailable in
+      # ubuntu-latest's distro binutils. Install the pinned oracle instead
+      # of silently skipping its whole-corpus accepted/rejected
+      # differential gate (every tests/asm-diff/*.casefile).
       - name: Install GNU as 2.47 for x86-64 differential
         run: bash scripts/ensure_gas_247.sh x86_64-linux-gnu
 
-      - name: Verify merged PR #629 x86-64 assembly differential vs GNU as 2.47
-        run: python3 scripts/asmdiff.py --jobs 2 --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" --lccc target/fastbuild/lccc-x86 tests/asm-diff/merged-pr629-followup.casefile
+      - name: Verify x86-64 assembly differential vs GNU as 2.47
+        run: python3 scripts/asmdiff.py --jobs 2 --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" --lccc target/fastbuild/lccc-x86
 
       # Whole-object ELF32 differential corpus, including relocation/addend
       # ownership for bare memory operands and relaxation-patched loop/jecxz.
@@ -658,18 +659,6 @@ jobs:
       - name: Verify kernel tool-identity invalidation
         run: bash tests/regression/check_kernel_tool_identity.sh
 
-      - name: Upload regression results
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: regression-results
-          path: |
-            regression-results.json
-            regression-results.log
-            ci-regression-environment.txt
-            inline-asm-utf8.json
-          if-no-files-found: warn
-
       # Deterministic bounded fuzzing catches parser/linker panics without
       # making ordinary PRs depend on an unbounded corpus or external fuzzer.
       - name: Run linker fuzz smoke
@@ -692,10 +681,21 @@ jobs:
       # fingerprints, so the earlier gates' artifacts stay cached) and
       # re-runs the SSA-validated regression corpus against real codegen.
       # It runs LAST deliberately: the assertions-ON binary overwrites the
-      # target/fastbuild/lccc path, and no later step in this job uses it.
-      # A missed invalidate_acc() on any corpus-covered dataflow now fails
-      # CI here - loudly, naming the value, both epochs, and the last
-      # unclassified emitted line.
+      # target/fastbuild/lccc path, and no later step in this job USES it -
+      # only the artifact upload follows, and `if: always()` publishes this
+      # step's JSON/log even when it fails (a gate that fails without its
+      # artifacts is a report without evidence). A missed invalidate_acc()
+      # on any corpus-covered dataflow now fails CI here - loudly, naming
+      # the value, both epochs, and the last unclassified emitted line.
+      #
+      # NOT a duplicate of "Run tests (debug-assertions on)": that step
+      # exercises the in-process unit suite (every pass's debug-only
+      # invariant); this one exercises the validator end-to-end over real
+      # codegen dataflow through the compiler binary. Different layers:
+      # dropping either one silently unobserves that layer's debug-only
+      # contract. The build cost is shared (same profile override, so this
+      # step's build is a cache hit of the unit step's) and the marginal
+      # cost of keeping both is the corpus runtime itself.
       - name: Regression corpus (debug-assertions compiler)
         env:
           CCC_VALIDATE_SSA: "1"
@@ -711,6 +711,25 @@ jobs:
             --lccc target/fastbuild/lccc \
             -j 2 \
             --json regression-dbgassert-results.json 2>&1 | tee regression-dbgassert-results.log
+      # The result artifacts are retained already, but GitHub's public job
+      # view truncates long outputs, and a gate that fails without its
+      # artifacts is a report without evidence. This step runs at the very
+      # END of the job so `if: always()` also publishes what the closing
+      # debug-assertions corpus gate wrote
+      # (regression-dbgassert-results.{json,log}) when IT fails.
+      - name: Upload regression results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: regression-results
+          path: |
+            regression-results.json
+            regression-results.log
+            regression-dbgassert-results.json
+            regression-dbgassert-results.log
+            ci-regression-environment.txt
+            inline-asm-utf8.json
+          if-no-files-found: warn
 
   clippy:
     name: Clippy

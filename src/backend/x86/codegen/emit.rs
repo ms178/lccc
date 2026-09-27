@@ -8682,6 +8682,71 @@ impl ArchCodegen for X86Codegen {
         std::env::var_os("CCC_NO_X64_SIB").is_none()
     }
 
+    /// x86-64 mirror of `emit_load_indexed_common`/`emit_store_indexed_common`'s
+    /// acceptance conditions, consulted by `can_indexed_addr_fold` BEFORE the
+    /// GEP's emission is skipped and its offset chain declared dead.
+    ///
+    /// The trait default accepts every non-128-bit type — true for this
+    /// backend's SCALAR emitters, but the INDEXED emitters answer the FP
+    /// family only with their SSE arms, and until the contract audit those
+    /// two arms were the sole `F32|F64`-only outliers in memory.rs (every
+    /// non-indexed fast path has grouped F64|F32|D64|D32 since 1fdb401a).
+    /// A deciding-side "yes" the emitter later refuses rematerialises the
+    /// folded GEP at the access site — reading an offset chain the
+    /// dead-producer walk already skipped, i.e. a never-written home: the
+    /// exact failure the trait's soundness contract forbids. This override
+    /// mirrors the emitters' type arms exactly:
+    ///
+    /// * `shift <= 3` mirrors the emitters' defensive guard (`resolve_index`
+    ///   already caps the SIB scale at the map build; the mirror costs one
+    ///   compare and keeps the override self-contained).
+    /// * There is deliberately NO store-staging rule on x86-64, although
+    ///   i686's mirror has one and an earlier revision of this override
+    ///   copied the const-offset fold's {%rdx, %r11} scratch set. That set
+    ///   does not transfer: the indexed-store staging this fold guarantees
+    ///   is `operand_to_rax` (writes %rax only — all Const arms, the
+    ///   acc/sec/home/slot Value arms, `emit_imm_to_gpr`, and the whole of
+    ///   `value_to_reg_inner` were audited: zero %r11/%rdx/%rcx writes; the
+    ///   one %rcx touch is a sec-cache READ) or the FP path's
+    ///   `fp_store_value_xmm` ( register-direct, constant-pool, or slot-
+    ///   direct into %xmm0 — the "GPR shuttle" the FP helper's own comments
+    ///   describe is code it deliberately does NOT use). %rax is not an
+    ///   allocatable home at all, and a SIB base/index is Ptr/int-typed so
+    ///   never XMM-homed: staging cannot clobber a folded address on this
+    ///   path, and the copied rule refused real folds (%r11-homed base in
+    ///   double_reduction, two %r11-homed sites in spectral_norm) at a
+    ///   measured +2/+4 instructions. Do NOT re-add a scratch exclusion
+    ///   without re-auditing the staging chain above — the i686 rule stands
+    ///   on i686's own evidence (accumulator staging through %eax/%edx plus
+    ///   the %ecx address scratch, with documented clobber miscompiles)
+    ///   and says nothing about this backend.
+    fn indexed_fold_ok(&self, info: &crate::backend::generation::IndexedGepInfo) -> bool {
+        if info.shift > 3 {
+            return false;
+        }
+        // NOTE: `feeds_store` is intentionally unread: no store-staging
+        // exclusion exists on x86-64 (see above). i686's mirror DOES read
+        // it — do not "unify" the two.
+        info.access_tys.iter().all(|t| {
+            matches!(
+                t,
+                IrType::F64
+                    | IrType::F32
+                    | IrType::D64
+                    | IrType::D32
+                    | IrType::I8
+                    | IrType::U8
+                    | IrType::I16
+                    | IrType::U16
+                    | IrType::I32
+                    | IrType::U32
+                    | IrType::I64
+                    | IrType::U64
+                    | IrType::Ptr
+            )
+        })
+    }
+
     fn const_offset_fold_reg_base_ok(&self, base: &Value) -> bool {
         // Register-base const-offset folds consume the base at the Load/Store
         // position (RA-invisible): sound only with the folded-base liveness
