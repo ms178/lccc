@@ -50,7 +50,41 @@ fn tokenize_expr(s: &str) -> Result<Vec<ExprToken>, String> {
             i += 1;
             continue;
         }
-        if c == b'('
+        // Two-character operators first: << >> <= >= == != && || <>.
+        // A single < or > is GAS's COMPARISON operator (see eval_compare),
+        // not part of a shift — `mov $0 < 1, %esp` is a complete
+        // expression (GAS 2.47 byte-probed: evaluates to -1, i.e. TRUE is
+        // all-ones — not C's 1).
+        if c == b'<' && i + 1 < bytes.len() && bytes[i + 1] == b'<' {
+            tokens.push(ExprToken::Op2("<<"));
+            i += 2;
+        } else if c == b'>' && i + 1 < bytes.len() && bytes[i + 1] == b'>' {
+            tokens.push(ExprToken::Op2(">>"));
+            i += 2;
+        } else if c == b'<' && i + 1 < bytes.len() && bytes[i + 1] == b'=' {
+            tokens.push(ExprToken::Op2("<="));
+            i += 2;
+        } else if c == b'>' && i + 1 < bytes.len() && bytes[i + 1] == b'=' {
+            tokens.push(ExprToken::Op2(">="));
+            i += 2;
+        } else if c == b'=' && i + 1 < bytes.len() && bytes[i + 1] == b'=' {
+            tokens.push(ExprToken::Op2("=="));
+            i += 2;
+        } else if c == b'!' && i + 1 < bytes.len() && bytes[i + 1] == b'=' {
+            tokens.push(ExprToken::Op2("!="));
+            i += 2;
+        } else if c == b'&' && i + 1 < bytes.len() && bytes[i + 1] == b'&' {
+            tokens.push(ExprToken::Op2("&&"));
+            i += 2;
+        } else if c == b'|' && i + 1 < bytes.len() && bytes[i + 1] == b'|' {
+            tokens.push(ExprToken::Op2("||"));
+            i += 2;
+        } else if c == b'<' && i + 1 < bytes.len() && bytes[i + 1] == b'>' {
+            // GAS accepts `<>` as an alternative spelling of `!=`
+            // (`mov $1 <> 0, %ecx` — byte-probed on 2.47: b9 ff ff ff ff).
+            tokens.push(ExprToken::Op2("!="));
+            i += 2;
+        } else if c == b'('
             || c == b')'
             || c == b'+'
             || c == b'-'
@@ -62,15 +96,11 @@ fn tokenize_expr(s: &str) -> Result<Vec<ExprToken>, String> {
             || c == b'^'
             || c == b'~'
             || c == b'!'
+            || c == b'<'
+            || c == b'>'
         {
             tokens.push(ExprToken::Op(c as char));
             i += 1;
-        } else if c == b'<' && i + 1 < bytes.len() && bytes[i + 1] == b'<' {
-            tokens.push(ExprToken::Op2("<<"));
-            i += 2;
-        } else if c == b'>' && i + 1 < bytes.len() && bytes[i + 1] == b'>' {
-            tokens.push(ExprToken::Op2(">>"));
-            i += 2;
         } else if c == b'\'' {
             // Character literal: 'c' or '\n', '\t', '\\', etc.
             i += 1; // skip opening quote
@@ -139,7 +169,41 @@ fn tokenize_expr(s: &str) -> Result<Vec<ExprToken>, String> {
 }
 
 fn eval_tokens(tokens: &[ExprToken], pos: &mut usize) -> Result<i64, String> {
-    eval_or(tokens, pos)
+    // GAS operator precedence, loosest to tightest (binutils manual,
+    // "Operator Precedence"): || < && < | < ^ < & < == != <>
+    // < < > <= >= < << >> < + - < * / % < unary. Every comparison and
+    // logical operator yields -1 (all ones) for TRUE and 0 for false —
+    // the shell convention, NOT C's 1. `mov $0 < 1, %esp` is therefore
+    // bc ff ff ff ff (GAS 2.47 byte-probed).
+    eval_lor(tokens, pos)
+}
+
+fn eval_lor(tokens: &[ExprToken], pos: &mut usize) -> Result<i64, String> {
+    let mut val = eval_land(tokens, pos)?;
+    while *pos < tokens.len() {
+        if matches!(&tokens[*pos], ExprToken::Op2("||")) {
+            *pos += 1;
+            let rhs = eval_land(tokens, pos)?;
+            val = -i64::from(val != 0 || rhs != 0);
+        } else {
+            break;
+        }
+    }
+    Ok(val)
+}
+
+fn eval_land(tokens: &[ExprToken], pos: &mut usize) -> Result<i64, String> {
+    let mut val = eval_or(tokens, pos)?;
+    while *pos < tokens.len() {
+        if matches!(&tokens[*pos], ExprToken::Op2("&&")) {
+            *pos += 1;
+            let rhs = eval_or(tokens, pos)?;
+            val = -i64::from(val != 0 && rhs != 0);
+        } else {
+            break;
+        }
+    }
+    Ok(val)
 }
 
 fn eval_or(tokens: &[ExprToken], pos: &mut usize) -> Result<i64, String> {
@@ -169,13 +233,65 @@ fn eval_xor(tokens: &[ExprToken], pos: &mut usize) -> Result<i64, String> {
 }
 
 fn eval_and(tokens: &[ExprToken], pos: &mut usize) -> Result<i64, String> {
-    let mut val = eval_shift(tokens, pos)?;
+    let mut val = eval_eq(tokens, pos)?;
     while *pos < tokens.len() {
         if matches!(&tokens[*pos], ExprToken::Op('&')) {
             *pos += 1;
-            val &= eval_shift(tokens, pos)?;
+            val &= eval_eq(tokens, pos)?;
         } else {
             break;
+        }
+    }
+    Ok(val)
+}
+
+/// `==` / `!=` (and GAS's `<>` spelling, unified to `!=` by the tokenizer).
+fn eval_eq(tokens: &[ExprToken], pos: &mut usize) -> Result<i64, String> {
+    let mut val = eval_cmp(tokens, pos)?;
+    while *pos < tokens.len() {
+        match &tokens[*pos] {
+            ExprToken::Op2("==") => {
+                *pos += 1;
+                let rhs = eval_cmp(tokens, pos)?;
+                val = -i64::from(val == rhs);
+            }
+            ExprToken::Op2("!=") => {
+                *pos += 1;
+                let rhs = eval_cmp(tokens, pos)?;
+                val = -i64::from(val != rhs);
+            }
+            _ => break,
+        }
+    }
+    Ok(val)
+}
+
+/// `<` `>` `<=` `>=` — GAS comparison operators, TRUE = -1.
+fn eval_cmp(tokens: &[ExprToken], pos: &mut usize) -> Result<i64, String> {
+    let mut val = eval_shift(tokens, pos)?;
+    while *pos < tokens.len() {
+        match &tokens[*pos] {
+            ExprToken::Op('<') => {
+                *pos += 1;
+                let rhs = eval_shift(tokens, pos)?;
+                val = -i64::from(val < rhs);
+            }
+            ExprToken::Op('>') => {
+                *pos += 1;
+                let rhs = eval_shift(tokens, pos)?;
+                val = -i64::from(val > rhs);
+            }
+            ExprToken::Op2("<=") => {
+                *pos += 1;
+                let rhs = eval_shift(tokens, pos)?;
+                val = -i64::from(val <= rhs);
+            }
+            ExprToken::Op2(">=") => {
+                *pos += 1;
+                let rhs = eval_shift(tokens, pos)?;
+                val = -i64::from(val >= rhs);
+            }
+            _ => break,
         }
     }
     Ok(val)
@@ -557,6 +673,37 @@ pub fn parse_integer_expr(s: &str) -> Result<i64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// test the GAS comparison semantics
+    #[test]
+    fn test_gas_comparisons() {
+        // TRUE is -1 (all ones), FALSE is 0 — GAS/shell convention.
+        assert_eq!(parse_integer_expr("0 < 1").unwrap(), -1);
+        assert_eq!(parse_integer_expr("1 < 0").unwrap(), 0);
+        assert_eq!(parse_integer_expr("0 <= 0").unwrap(), -1);
+        assert_eq!(parse_integer_expr("0 >= 1").unwrap(), 0);
+        assert_eq!(parse_integer_expr("1 > 0").unwrap(), -1);
+        assert_eq!(parse_integer_expr("0 > 1").unwrap(), 0);
+        assert_eq!(parse_integer_expr("0 == 0").unwrap(), -1);
+        assert_eq!(parse_integer_expr("0 == 1").unwrap(), 0);
+        assert_eq!(parse_integer_expr("1 != 0").unwrap(), -1);
+        assert_eq!(parse_integer_expr("1 <> 0").unwrap(), -1);
+        assert_eq!(parse_integer_expr("0 != 0").unwrap(), 0);
+        // Logical connectives share the -1/0 convention.
+        assert_eq!(parse_integer_expr("1 && 2").unwrap(), -1);
+        assert_eq!(parse_integer_expr("1 && 0").unwrap(), 0);
+        assert_eq!(parse_integer_expr("0 || 0").unwrap(), 0);
+        assert_eq!(parse_integer_expr("0 || 3").unwrap(), -1);
+        // Precedence: comparison binds TIGHTER than & and |, looser than
+        // shift, and +/- sit between shift and comparison.
+        assert_eq!(parse_integer_expr("(1 < 2) + (3 < 4)").unwrap(), -2);
+        assert_eq!(parse_integer_expr("1 < 2 == 3 < 4").unwrap(), -1);
+        assert_eq!(parse_integer_expr("4 > 1 << 1").unwrap(), -1);
+        assert_eq!(parse_integer_expr("2 + 2 == 4").unwrap(), -1);
+        // A shift still beats a comparison: 1 < (2 << 3).
+        assert_eq!(parse_integer_expr("1 < 2 << 3").unwrap(), -1);
+        assert_eq!(parse_integer_expr("16 < 1 << 3").unwrap(), 0);
+    }
 
     #[test]
     fn test_simple_integers() {

@@ -534,6 +534,12 @@ impl super::InstructionEncoder {
                 // (m16:32 far pointer) — the form the kernel's EFI mixed-mode
                 // thunk uses to drop from long mode into protected mode.
                 // `lcallq *mem` is the m16:64 form and needs REX.W.
+                // `lcallw *mem` is the m16:16 form: 0x66 + FF /3
+                // (`lcallw *xxx(,%edi,4)` = 67 66 ff 1c bd, GAS-probed; the
+                // 0x67 is spliced centrally before the 0x66).
+                if mnemonic == "lcallw" {
+                    self.bytes.push(0x66);
+                }
                 if mnemonic == "lcallq" {
                     self.emit_rex_rm(8, "", mem);
                 } else {
@@ -576,14 +582,22 @@ impl super::InstructionEncoder {
         }
     }
 
-    /// Encode LJMP (far jump): EA cp (direct) or FF /5 (indirect memory)
-    pub(crate) fn encode_ljmp(&mut self, ops: &[Operand], _mnemonic: &str) -> Result<(), String> {
+    /// Encode LJMP (far jump): EA cp (direct) or FF /5 (indirect memory).
+    /// The `w` suffix selects a 16-bit offset in the far pointer: the
+    /// indirect form takes 0x66 (`ljmpw *xxx(,%edi,4)` = 67 66 ff 2c bd,
+    /// GAS 2.47 byte-probed; the 0x67 comes from the central splice) and
+    /// the direct EA form narrows the offset to iw.
+    pub(crate) fn encode_ljmp(&mut self, ops: &[Operand], mnemonic: &str) -> Result<(), String> {
+        let w = mnemonic.starts_with("ljmpw");
         match ops.len() {
             // ljmpl *mem - indirect far jump through memory
             1 => {
                 match &ops[0] {
                     Operand::Indirect(inner) => match inner.as_ref() {
                         Operand::Memory(mem) => {
+                            if w {
+                                self.bytes.push(0x66);
+                            }
                             self.emit_rex_rm(0, "", mem);
                             self.bytes.push(0xFF);
                             self.encode_modrm_mem(5, mem)
@@ -592,6 +606,9 @@ impl super::InstructionEncoder {
                     },
                     Operand::Memory(mem) => {
                         // ljmp *mem (without explicit indirect prefix)
+                        if w {
+                            self.bytes.push(0x66);
+                        }
                         self.emit_rex_rm(0, "", mem);
                         self.bytes.push(0xFF);
                         self.encode_modrm_mem(5, mem)
@@ -667,8 +684,11 @@ impl super::InstructionEncoder {
             (Operand::Register(src), Operand::Register(dst)) => {
                 let src_num = reg_num(&src.name).ok_or("bad src register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
-                // Infer size from destination register
-                let size = infer_reg_size(&dst.name);
+                // Infer size from destination register. LAR never takes
+                // REX.W (GAS 2.47: `lar %rdx,%rdx` = 0f 02 d2 — the 32-bit
+                // form zero-extends into the 64-bit destination), so the
+                // width clamps at 4; only a 16-bit destination takes 66.
+                let size = infer_reg_size(&dst.name).min(4);
                 if size == 2 {
                     self.bytes.push(0x66); // operand-size prefix (before REX)
                 }
@@ -679,7 +699,7 @@ impl super::InstructionEncoder {
             }
             (Operand::Memory(mem), Operand::Register(dst)) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
-                let size = infer_reg_size(&dst.name);
+                let size = infer_reg_size(&dst.name).min(4);
                 if size == 2 {
                     self.bytes.push(0x66); // operand-size prefix (before REX)
                 }
@@ -705,7 +725,7 @@ impl super::InstructionEncoder {
             (Operand::Register(src), Operand::Register(dst)) => {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                let size = infer_reg_size(&dst.name);
+                let size = infer_reg_size(&dst.name).min(4); // no REX.W (GAS: lsl %rdx,%rdx = 0f 03 d2)
                 if size == 2 {
                     self.bytes.push(0x66); // operand-size prefix (before REX)
                 }
@@ -716,7 +736,7 @@ impl super::InstructionEncoder {
             }
             (Operand::Memory(mem), Operand::Register(dst)) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                let size = infer_reg_size(&dst.name);
+                let size = infer_reg_size(&dst.name).min(4); // no REX.W
                 if size == 2 {
                     self.bytes.push(0x66); // operand-size prefix (before REX)
                 }
@@ -725,6 +745,192 @@ impl super::InstructionEncoder {
                 self.encode_modrm_mem(dst_num, mem)
             }
             _ => Err("unsupported lsl operands".to_string()),
+        }
+    }
+}
+
+// ---- User-MSR / MSR-immediate family (APX, map-7 VEX/EVEX) ----
+//
+// Byte-exact from GAS 2.47's x86-64-user_msr.d / x86-64-msr_imm.d:
+//
+//   urdmsr  %s,%d   F2.0F38.F8 (r0-r15)   EVEX m4 pp3 F8 (any r16-r31)
+//   uwrmsr  %s,%d   F3.0F38.F8 (r0-r15)   EVEX m4 pp2 F8
+//   urdmsr  $i,%d   VEX m7 pp3 F8         EVEX m7 pp3 F8   (r16-r31)
+//   uwrmsr  %s,$i   VEX m7 pp2 F8         EVEX m7 pp2 F8
+//   rdmsr   $i,%d   VEX m7 pp3 F6         EVEX m7 pp3 F6
+//   wrmsrns %s,$i   VEX m7 pp2 F6         EVEX m7 pp2 F6
+//
+// (m4/m7 = the 3-bit map field of P0; pp 3 = F2, 2 = F3.) Registers are
+// 64-bit only — GAS rejects %r12d with "operand size mismatch". The
+// immediate is UNSIGNED 32-bit: the invalid-testsuite rejects $-1 and
+// anything above 0xffffffff. Legacy rdmsr/wrmsr (0F 32/30, no operands)
+// are unchanged; only the $imm / 2-register spellings route here.
+impl super::InstructionEncoder {
+    fn msr_gp64<'a>(op: &'a Operand) -> Option<&'a str> {
+        match op {
+            Operand::Register(r) if is_reg64(&r.name) => Some(&r.name),
+            _ => None,
+        }
+    }
+
+    /// True when the register needs the r16-r31 EVEX form (bit 4 set).
+    fn msr_is_egpr(name: &str) -> bool {
+        gp_id(name).map(|n| n & 16 != 0).unwrap_or(false)
+    }
+
+    pub(crate) fn encode_user_msr(
+        &mut self,
+        ops: &[Operand],
+        mnemonic: &str,
+    ) -> Result<(), String> {
+        let check_imm_u32 = |v: &i64| -> Result<(), String> {
+            if !(0..=0xFFFF_FFFFu64 as i64).contains(v) {
+                return Err(format!("operand type mismatch for `{mnemonic}'"));
+            }
+            Ok(())
+        };
+        match mnemonic {
+            // ---- 2-register forms ----
+            "urdmsr" | "uwrmsr" => {
+                let [a, b] = ops else {
+                    return Err(format!("number of operands mismatch for `{mnemonic}'"));
+                };
+                // The immediate spellings share the mnemonic:
+                // `urdmsr $imm,%reg' reads, `uwrmsr %reg,$imm' writes.
+                let imm_form = match (a, b) {
+                    (Operand::Immediate(_), Operand::Register(_)) if mnemonic == "urdmsr" => {
+                        Some("urdmsr_imm")
+                    }
+                    (Operand::Register(_), Operand::Immediate(_)) if mnemonic == "uwrmsr" => {
+                        Some("uwrmsr_imm")
+                    }
+                    _ => None,
+                };
+                if let Some(inner) = imm_form {
+                    return self.encode_user_msr(ops, inner);
+                }
+                let (Some(src), Some(dst)) = (Self::msr_gp64(a), Self::msr_gp64(b)) else {
+                    return Err(format!("operand size mismatch for `{mnemonic}'"));
+                };
+                let pp_f2 = mnemonic == "urdmsr"; // F2 for read, F3 for write
+                if Self::msr_is_egpr(src) || Self::msr_is_egpr(dst) {
+                    // EVEX m4, pp 3(read)/2(write), opcode F8, P2 = 08.
+                    let (s, d) = (gp_id(src).unwrap(), gp_id(dst).unwrap());
+                    self.emit_evex(
+                        s & 8 != 0,
+                        false,
+                        d & 8 != 0,
+                        s & 16 != 0,
+                        4,
+                        0,
+                        0,
+                        false,
+                        if pp_f2 { 3 } else { 2 },
+                        0,
+                        false,
+                        0,
+                        false,
+                        d & 16 != 0,
+                        false,
+                    );
+                    self.bytes.push(0xF8);
+                    // urdmsr: reg=src rm=dst; uwrmsr SWAPS (GAS:
+                    // `uwrmsr %r12,%r14' = f3 45 0f 38 f8 f4 — reg=r14).
+                    if pp_f2 {
+                        self.bytes.push(self.modrm(3, (s & 7) as u8, (d & 7) as u8));
+                    } else {
+                        self.bytes.push(self.modrm(3, (d & 7) as u8, (s & 7) as u8));
+                    }
+                } else {
+                    // Legacy F2/F3.0F38.F8 with REX.R (src) REX.B (dst).
+                    if pp_f2 {
+                        self.bytes.push(0xF2);
+                    } else {
+                        self.bytes.push(0xF3);
+                    }
+                    let (s, d) = (gp_id(src).unwrap(), gp_id(dst).unwrap());
+                    let rex = 0x40 | (u8::from(s & 8 != 0) << 2) | u8::from(d & 8 != 0);
+                    self.bytes.push(rex);
+                    self.bytes.extend_from_slice(&[0x0F, 0x38, 0xF8]);
+                    if pp_f2 {
+                        self.bytes.push(self.modrm(3, (s & 7) as u8, (d & 7) as u8));
+                    } else {
+                        self.bytes.push(self.modrm(3, (d & 7) as u8, (s & 7) as u8));
+                    }
+                }
+                Ok(())
+            }
+            // ---- immediate forms ----
+            "rdmsr" | "urdmsr_imm" | "wrmsrns" | "uwrmsr_imm" => {
+                // Canonical shapes: ($imm, %reg) for the readers,
+                // (%reg, $imm) for the writers.
+                let (imm_op, reg_op, opcode, pp) = match mnemonic {
+                    "rdmsr" => {
+                        let [a, b] = ops else {
+                            return Err("number of operands mismatch for `rdmsr'".to_string());
+                        };
+                        (a, b, 0xF6u8, 3u8)
+                    }
+                    "urdmsr_imm" => {
+                        let [a, b] = ops else {
+                            return Err("number of operands mismatch for `urdmsr'".to_string());
+                        };
+                        (a, b, 0xF8, 3)
+                    }
+                    "wrmsrns" | "uwrmsr_imm" => {
+                        let [a, b] = ops else {
+                            return Err(format!("number of operands mismatch for `{mnemonic}'"));
+                        };
+                        (b, a, 0xF6, 2)
+                    }
+                    _ => unreachable!(),
+                };
+                // wrmsrns/uwrmsr write: opcode F6 with pp2 for wrmsrns, F8
+                // pp2 for uwrmsr.
+                let opcode = if mnemonic == "uwrmsr_imm" {
+                    0xF8
+                } else {
+                    opcode
+                };
+                let reg = Self::msr_gp64(reg_op)
+                    .ok_or_else(|| format!("operand size mismatch for `{mnemonic}'"))?;
+                let imm = match imm_op {
+                    Operand::Immediate(ImmediateValue::Integer(v)) => *v,
+                    _ => return Err(format!("operand type mismatch for `{mnemonic}'")),
+                };
+                check_imm_u32(&imm)?;
+                let r = gp_id(reg).unwrap();
+                if Self::msr_is_egpr(reg) {
+                    // EVEX m7: reg field 0, rm = destination, B/B4 ext.
+                    self.emit_evex(
+                        false,
+                        false,
+                        r & 8 != 0,
+                        false,
+                        7,
+                        0,
+                        0,
+                        false,
+                        pp,
+                        0,
+                        false,
+                        0,
+                        false,
+                        r & 16 != 0,
+                        false,
+                    );
+                    self.bytes.push(opcode);
+                    self.bytes.push(self.modrm(3, 0, (r & 7) as u8));
+                } else {
+                    // VEX m7: C4, R=1, X=1, B = !(r&8).
+                    self.emit_vex(false, false, r & 8 != 0, 7, 0, 0, 0, pp);
+                    self.bytes.push(opcode);
+                    self.bytes.push(self.modrm(3, 0, (r & 7) as u8));
+                }
+                self.bytes.extend_from_slice(&(imm as u32).to_le_bytes());
+                Ok(())
+            }
+            _ => Err(format!("not a user-msr mnemonic: {mnemonic}")),
         }
     }
 }

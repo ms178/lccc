@@ -175,6 +175,24 @@ impl super::InstructionEncoder {
                     self.bytes.push(self.modrm(3, 0, dst_num));
                     self.add_relocation(sym, R_X86_64_32S, addend);
                     self.bytes.extend_from_slice(&[0, 0, 0, 0]);
+                } else if size == 2 {
+                    // `movw $xtrn, %ax` = 66 b8 <iw> + R_X86_64_16 (GAS
+                    // 2.47 byte-probed; the old code fell into the 32-bit
+                    // arm and wrote EAX with a 4-byte patch).
+                    self.bytes.push(0x66);
+                    self.emit_rex_unary(2, &dst.name);
+                    self.bytes.push(0xB8 + (dst_num & 7));
+                    self.add_relocation(sym, R_X86_64_16, addend);
+                    self.bytes.extend_from_slice(&[0, 0]);
+                } else if size == 1 {
+                    // `movb $xtrn, %al` = b0 <ib> + R_X86_64_8 (GAS-probed;
+                    // same opcode as the Integer path, including the
+                    // mandatory-REX rule for %spl/%bpl/%sil/%dil documented
+                    // there). The old code wrote a full EAX load instead.
+                    self.emit_rex_unary(1, &dst.name);
+                    self.bytes.push(0xB0 + (dst_num & 7));
+                    self.add_relocation(sym, R_X86_64_8, addend);
+                    self.bytes.push(0);
                 } else {
                     // B8+rd id — one byte shorter than C7 /0 because the
                     // destination register folds into the opcode. Same
@@ -200,18 +218,26 @@ impl super::InstructionEncoder {
                     self.add_diff_relocation(sym_a, sym_b, R_X86_64_32, 0);
                     self.bytes.extend_from_slice(&[0, 0, 0, 0]);
                 } else if size == 8 {
-                    // movabs $sym_a - sym_b, %reg — 64-bit symbol-difference
-                    // immediate. arch/x86/mm/mem_encrypt_boot.S emits
-                    // `movq $(.L__enc_copy_end - __enc_copy), %rcx` to load
-                    // the encrypted-memory copy routine's length. Both labels
-                    // live in the same object, so the difference resolves at
-                    // link time to a constant; a R_X86_64_64 diff-relocation
-                    // folds to the absolute 64-bit value. movabs (REX.W +
-                    // B8+rd) is the only 64-bit-immediate mov form.
+                    // mov r64, imm32 — 7 bytes against movabs's 10. A label
+                    // difference is section-relative by construction (both
+                    // labels live in one object, or the right side is the
+                    // position counter), so the value always fits a signed
+                    // 32-bit and GAS always uses the C7 form here
+                    // (byte-probed: `movq $(b - a), %rcx` = 48 c7 c1 02 00
+                    // 00 00; `movq $(xtrn - .), %rax` = 48 c7 c0 + PC32
+                    // xtrn+0x3). The diff-relocation folds same-object
+                    // pairs after layout; an external left side converts
+                    // to PC32 exactly like the ALU path above. movabs
+                    // stays correct but is 3 dead bytes of I-cache.
                     self.emit_rex_unary(8, &dst.name);
-                    self.bytes.push(0xB8 + (dst_num & 7));
-                    self.add_diff_relocation(sym_a, sym_b, R_X86_64_64, 0);
-                    self.bytes.extend_from_slice(&[0; 8]);
+                    self.bytes.push(0xC7);
+                    self.bytes.push(self.modrm(3, 0, dst_num));
+                    // Raw addend 0: the writer's diff pass adds
+                    // (reloc_offset - b_off), and PC32 then subtracts the
+                    // place — the combination yields exactly S - addr(b),
+                    // GAS's `PC32 xtrn+0x3` semantics for `xtrn - .`.
+                    self.add_diff_relocation(sym_a, sym_b, R_X86_64_PC32, 0);
+                    self.bytes.extend_from_slice(&[0, 0, 0, 0]);
                 } else {
                     return Err(format!(
                         "symbol-difference mov immediate only supported at 32-bit width (got size {})",
@@ -219,8 +245,22 @@ impl super::InstructionEncoder {
                     ));
                 }
             }
-            ImmediateValue::SymbolMod(_, _) => {
-                Err("unsupported immediate type for mov".to_string())?
+            ImmediateValue::SymbolMod(sym, modifier) => {
+                // `sym@SIZE`: the section-size pseudo-value. The B8+rd
+                // form with an R_X86_64_32 against the `name@SIZE`
+                // pseudo-symbol; the writer folds it to a constant when
+                // the section is local (GAS byte-parity: `movl $.data@SIZE
+                // + 4, %eax` = b8 04 00 00 00).
+                if !modifier.eq_ignore_ascii_case("SIZE") {
+                    Err("unsupported immediate type for mov".to_string())?
+                }
+                if size == 8 {
+                    Err("movq of @SIZE is not supported".to_string())?
+                }
+                self.emit_rex_unary(4, &dst.name);
+                self.bytes.push(0xB8 + (dst_num & 7));
+                self.add_relocation(&format!("{sym}@SIZE"), R_X86_64_32, 0);
+                self.bytes.extend_from_slice(&[0, 0, 0, 0]);
             }
         }
         Ok(())
@@ -237,6 +277,15 @@ impl super::InstructionEncoder {
 
         if size == 2 {
             self.bytes.push(0x66);
+        }
+        // `.s` selects the load-direction opcode (8A/8B) with the roles
+        // swapped: `movl.s %eax,%ebx` = 8b d8, not 89 c3 (GAS-probed) —
+        // the alternate encoding of the same move.
+        if self.s_flip {
+            self.emit_rex_rr(size, &dst.name, &src.name);
+            self.bytes.push(if size == 1 { 0x8A } else { 0x8B });
+            self.bytes.push(self.modrm(3, dst_num, src_num));
+            return Ok(());
         }
         self.emit_rex_rr(size, &src.name, &dst.name);
         if size == 1 {
@@ -646,12 +695,19 @@ impl super::InstructionEncoder {
         }
     }
 
-    pub(crate) fn encode_push(&mut self, ops: &[Operand]) -> Result<(), String> {
+    /// `size`: 8 (default/`q'/`l') or 2 (`pushw`). The 16-bit immediate
+    /// form is `66 68 iw` (GAS 2.47: `pushw $1000` = 66 68 e8 03 — the
+    /// imm32 form is never used when the operand size is 16-bit).
+    pub(crate) fn encode_push(&mut self, ops: &[Operand], size: u8) -> Result<(), String> {
         if self.apx_nf || self.apx_evex {
             return Err("{nf}/{evex} unsupported for `push'".to_string());
         }
         if ops.len() != 1 {
             return Err("push requires 1 operand".to_string());
+        }
+        let want16 = size == 2;
+        if want16 {
+            self.bytes.push(0x66);
         }
         match &ops[0] {
             Operand::Register(reg) => {
@@ -681,6 +737,17 @@ impl super::InstructionEncoder {
                 Ok(())
             }
             Operand::Immediate(ImmediateValue::Integer(val)) => {
+                if want16 {
+                    // PUSH imm16: value must fit; GAS rejects wider ones.
+                    if !(-32768..=65535).contains(val) {
+                        return Err(format!(
+                            "operand type mismatch: pushw immediate out of 16-bit range"
+                        ));
+                    }
+                    self.bytes.push(0x68);
+                    self.bytes.extend_from_slice(&(*val as u16).to_le_bytes());
+                    return Ok(());
+                }
                 // push imm is a 64-bit operation in long mode: imm32 is
                 // sign-extended, so the same faithfulness gate applies.
                 Self::check_imm32s_q("push", 8, *val)?;
@@ -695,13 +762,19 @@ impl super::InstructionEncoder {
             }
             Operand::Immediate(ImmediateValue::Symbol(sym))
             | Operand::Immediate(ImmediateValue::SymbolPlusOffset(sym, _)) => {
-                // pushq $symbol or pushq $(symbol+offset)
                 let addend =
                     if let Operand::Immediate(ImmediateValue::SymbolPlusOffset(_, a)) = &ops[0] {
                         *a
                     } else {
                         0
                     };
+                if want16 {
+                    // `pushw $early` = 66 68 <iw> + R_X86_64_16 (GAS-probed).
+                    self.bytes.push(0x68);
+                    self.add_relocation(sym, R_X86_64_16, addend);
+                    self.bytes.extend_from_slice(&[0, 0]);
+                    return Ok(());
+                }
                 self.bytes.push(0x68);
                 self.add_relocation(sym, R_X86_64_32S, addend);
                 self.bytes.extend_from_slice(&[0, 0, 0, 0]);
@@ -1412,23 +1485,37 @@ impl super::InstructionEncoder {
         }
     }
 
-    /// `nop r/m16` / `nop r/m32` — the 0F 1F /0 multi-byte NOP forms.
-    pub(crate) fn encode_nop_rm(&mut self, ops: &[Operand], word: bool) -> Result<(), String> {
+    /// NOP with an operand: 0F 1F /r (the canonical long-NOP body).
+    /// Register destinations pick their operand size from the register's
+    /// own width (GAS 2.47 byte-probed: `nop %al` = 0f 1f c0, `nop %ax` =
+    /// 66 0f 1f c0, `nop %rax` = 48 0f 1f c0, `nop %r10` = 49 0f 1f c2 —
+    /// REX.W for the 64-bit register, 0x66 for the 16-bit one). `forced`
+    /// overrides the register width for the suffixed spellings (`nopw`,
+    /// `nopl`, `nopq`); memory operands default to 32-bit.
+    pub(crate) fn encode_nop_rm(
+        &mut self,
+        ops: &[Operand],
+        forced: Option<u8>,
+    ) -> Result<(), String> {
         if ops.len() != 1 {
             return Err("nop with operand requires exactly 1 operand".to_string());
         }
-        if word {
+        let size = match &ops[0] {
+            Operand::Register(reg) => forced.unwrap_or_else(|| infer_reg_size(&reg.name)),
+            _ => forced.unwrap_or(4),
+        };
+        if size == 2 {
             self.bytes.push(0x66);
         }
         match &ops[0] {
             Operand::Memory(mem) => {
-                self.emit_rex_rm(if word { 2 } else { 4 }, "", mem);
+                self.emit_rex_rm(if size == 8 { 8 } else { 4 }, "", mem);
                 self.bytes.extend_from_slice(&[0x0F, 0x1F]);
                 self.encode_modrm_mem(0, mem)
             }
             Operand::Register(reg) => {
                 let num = reg_num(&reg.name).ok_or("bad register")?;
-                self.emit_rex_unary(if word { 2 } else { 4 }, &reg.name);
+                self.emit_rex_unary(if size == 8 { 8 } else { size.min(4) }, &reg.name);
                 self.bytes.extend_from_slice(&[0x0F, 0x1F]);
                 self.bytes.push(self.modrm(3, 0, num));
                 Ok(())
@@ -1460,7 +1547,11 @@ impl super::InstructionEncoder {
                 // 0x66 operand-size prefix for 16-bit operands just like
                 // mul/div/neg/not do; routing through encode_imul previously
                 // skipped it, so `imulw %bx` encoded as the 32-bit `imull`.
-                if size == 2 {
+                // Under `{nf}`/`{evex}` the EVEX body carries the size in
+                // its pp bits — a manual 0x66 in front of an EVEX prefix
+                // is a #UD sequence (`{nf} imul %dx` used to leak
+                // `66 62 f4 ..`).
+                if size == 2 && !self.apx_wants_evex() {
                     self.bytes.push(0x66);
                 }
                 self.encode_unary_rm(ops, 5, size)
@@ -1552,29 +1643,54 @@ impl super::InstructionEncoder {
                 match &ops[1] {
                     Operand::Register(src) => {
                         let src_num = reg_num(&src.name).ok_or("bad register")?;
-                        if size == 2 {
-                            self.bytes.push(0x66);
+                        // `{nf} imul $3, %ecx, %edx` — EVEX map-4 NF form
+                        // (62 f4 7c 0c 6b d1 03, GAS-probed); the immediate
+                        // and the register operands keep their legacy
+                        // ModRM/imm layout.
+                        if self.apx_wants_evex() {
+                            self.emit_apx_evex_rr(size, &dst.name, &src.name, None, self.apx_nf)?;
+                            self.bytes.push(if short { 0x6B } else { 0x69 });
+                            self.bytes.push(self.modrm(3, dst_num, src_num));
+                        } else {
+                            if size == 2 {
+                                self.bytes.push(0x66);
+                            }
+                            self.emit_rex_rr(size, &dst.name, &src.name);
+                            self.bytes.push(if short { 0x6B } else { 0x69 });
+                            self.bytes.push(self.modrm(3, dst_num, src_num));
                         }
-                        self.emit_rex_rr(size, &dst.name, &src.name);
-                        self.bytes.push(if short { 0x6B } else { 0x69 });
-                        self.bytes.push(self.modrm(3, dst_num, src_num));
                     }
                     Operand::Memory(mem) => {
-                        if size == 2 {
-                            self.bytes.push(0x66);
-                        }
-                        self.emit_rex_rm(size, &dst.name, mem);
-                        let rc = self.relocations.len();
-                        self.bytes.push(if short { 0x6B } else { 0x69 });
-                        self.encode_modrm_mem(dst_num, mem)?;
-                        let trailing: i64 = if short {
-                            1
-                        } else if size == 2 {
-                            2
+                        if self.apx_wants_evex() {
+                            self.emit_apx_evex_rm(size, &dst.name, mem, None, self.apx_nf)?;
+                            let rc = self.relocations.len();
+                            self.bytes.push(if short { 0x6B } else { 0x69 });
+                            self.encode_modrm_mem(dst_num, mem)?;
+                            let trailing: i64 = if short {
+                                1
+                            } else if size == 2 {
+                                2
+                            } else {
+                                4
+                            };
+                            self.adjust_rip_reloc_addend(rc, trailing);
                         } else {
-                            4
-                        };
-                        self.adjust_rip_reloc_addend(rc, trailing);
+                            if size == 2 {
+                                self.bytes.push(0x66);
+                            }
+                            self.emit_rex_rm(size, &dst.name, mem);
+                            let rc = self.relocations.len();
+                            self.bytes.push(if short { 0x6B } else { 0x69 });
+                            self.encode_modrm_mem(dst_num, mem)?;
+                            let trailing: i64 = if short {
+                                1
+                            } else if size == 2 {
+                                2
+                            } else {
+                                4
+                            };
+                            self.adjust_rip_reloc_addend(rc, trailing);
+                        }
                     }
                     _ => return Err("unsupported imul operands".to_string()),
                 }
@@ -2339,13 +2455,52 @@ impl super::InstructionEncoder {
             }
         })?;
 
+        // APX auto-promotion (GAS 2.47 byte-probed): a 32/64-bit REGISTER
+        // destination cannot use the legacy byte form — that would write
+        // only the low byte and call it a day (`setae %eax` silently
+        // becoming `setae %al` was a miscompile). GAS promotes to the
+        // EVEX map-4 SETcc instead: `setae %eax` = 62 f4 7f 18 43 c0,
+        // `setae %rax` = 62 f4 ff 18 43 c0 (W=1), `setae %r12d` =
+        // 62 d4 7f 18 43 c4. 16-bit destinations are rejected verbatim
+        // ("operand size mismatch for `setae'"); byte registers keep the
+        // legacy 0F 90+cc form below. i686 has no APX: its own encoder
+        // never reaches this code.
+        if !self.apx_evex && !self.apx_rex2 {
+            if let Operand::Register(reg) = &ops[0] {
+                match infer_reg_size(&reg.name) {
+                    4 | 8 => {
+                        let w = infer_reg_size(&reg.name) == 8;
+                        let num = reg_num(&reg.name).ok_or("bad register")?;
+                        // NDD form: P2.ND=1, vvvv=dest, ModRM.reg=0
+                        // (`setae %eax` = 62 f4 7f 18 43 c0, GAS-probed).
+                        self.emit_apx_evex_rr_pp(w, "", &reg.name, Some(&reg.name), false, 3)?;
+                        self.bytes.push(0x40 + cc);
+                        self.bytes.push(self.modrm(3, 0, num));
+                        return Ok(());
+                    }
+                    2 => {
+                        return Err(format!("operand size mismatch for `{mnemonic}'"));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         // `{evex} setCC` is EVEX without ZU (ND=0). `setzuCC` above is the ZU form.
         // EGPR without `{evex}` stays on the shorter REX2 0F 90+cc encoding.
         if self.apx_evex {
             return match &ops[0] {
                 Operand::Register(reg) => {
                     let num = reg_num(&reg.name).ok_or("bad register")?;
-                    self.emit_apx_evex_rr_pp(false, "", &reg.name, None, false, 3)?;
+                    // 32/64-bit registers take the NDD form (P2.ND=1,
+                    // vvvv=dest — `{evex} setae %eax` = 62 f4 7f 18 43 c0);
+                    // byte registers the plain promoted form (P2=08).
+                    let ndd = if infer_reg_size(&reg.name) >= 4 {
+                        Some(reg.name.as_str())
+                    } else {
+                        None
+                    };
+                    self.emit_apx_evex_rr_pp(false, "", &reg.name, ndd, false, 3)?;
                     self.bytes.push(0x40 + cc);
                     self.bytes.push(self.modrm(3, 0, num));
                     Ok(())
@@ -2569,6 +2724,42 @@ impl super::InstructionEncoder {
                         Ok(())
                     }
                     Operand::Memory(mem) => {
+                        // `call *sym@tlscall(%reg)`: the @tlscall marker is
+                        // NOT a displacement — GAS emits the plain
+                        // register-indirect FF /2 with no disp and an
+                        // R_X86_64_TLSDESC_CALL relocation on the
+                        // instruction (byte-probed: `call *x@tlscall(%rax)`
+                        // = ff 10). Anything but a bare base register is
+                        // rejected ("@TLSCALL operator cannot be used...").
+                        if let Displacement::SymbolMod(sym, modifier) = &mem.displacement
+                            && modifier.eq_ignore_ascii_case("tlscall")
+                        {
+                            if mem.index.is_some() || mem.base.is_none() {
+                                return Err(format!(
+                                    "operand type mismatch for `call' after @tlscall"
+                                ));
+                            }
+                            // GAS uses the MEMORY form (mod=00, no
+                            // displacement): `call *x@tlscall(%rax)` =
+                            // ff 10 — NOT the register form ff d0. A
+                            // zero-displacement memory operand reuses the
+                            // full SIB/disp0 ModRM machinery.
+                            let base = mem.base.clone().unwrap();
+                            let zero_mem = MemoryOperand {
+                                segment: mem.segment.clone(),
+                                displacement: Displacement::Integer(0),
+                                base: Some(base),
+                                index: None,
+                                scale: None,
+                                mask: None,
+                                zeroing: false,
+                                broadcast: None,
+                            };
+                            self.add_relocation(sym, R_X86_64_TLSDESC_CALL, 0);
+                            self.emit_rex_rm(0, "", &zero_mem);
+                            self.bytes.push(0xFF);
+                            return self.encode_modrm_mem(2, &zero_mem);
+                        }
                         // call *disp(%base) - FF /2 with memory operand
                         self.emit_rex_rm(0, "", mem);
                         self.bytes.push(0xFF);
@@ -2802,4 +2993,240 @@ impl super::InstructionEncoder {
             _ => Err("wrss/wruss requires register, memory operands".to_string()),
         }
     }
+
+    /// DIV/IDIV with GAS 2.47's optional accumulator-hint second operand.
+    ///
+    /// `div %cx,%ax` is legal: the FIRST operand is the real r/m (its
+    /// register size selects the operation size — 16-bit → `66 f7 f1`),
+    /// the second names the implied dividend and MUST be the size-matched
+    /// accumulator (`al`/`ax`/`eax`/`rax`; `div %ecx,%rax` — GAS: "register
+    /// type mismatch for `div'"). `idiv` behaves identically; `mul` does
+    /// NOT accept the hint (dispatch checks the count). There is NO APX
+    /// NDD form of div/idiv — every two-register spelling is the hint
+    /// form, so this encoder intercepts ALL of them (the suffixless
+    /// `div` reaches here after infer_suffix would otherwise pick the
+    /// wrong size from the wrong operand, and `divw`/`divl` used to route
+    /// 2-op shapes into the NDD path, emitting `f7 f1` for `div %cx,%ax`).
+    pub(crate) fn encode_div_idiv(
+        &mut self,
+        ops: &[Operand],
+        ext: u8,
+        size: u8,
+        mnem: &str,
+    ) -> Result<(), String> {
+        let (rm, hint) = match ops {
+            [single] => (single, None),
+            [a, b] => (a, Some(b)),
+            _ => {
+                return Err(format!("number of operands mismatch for `{mnem}'"));
+            }
+        };
+        if let Some(h) = hint {
+            let expected = match size {
+                1 => "al",
+                2 => "ax",
+                4 => "eax",
+                _ => "rax",
+            };
+            match h {
+                Operand::Register(r) if r.name.eq_ignore_ascii_case(expected) => {}
+                _ => return Err(format!("register type mismatch for `{mnem}'")),
+            }
+        }
+        if size == 2 && !self.apx_wants_evex() {
+            self.bytes.push(0x66);
+        }
+        self.encode_unary_rm(std::slice::from_ref(rm), ext, size)
+    }
+
+    /// String operations (MOVS/STOS/LODS/SCAS/CMPS/INS/OUTS), both spellings.
+    ///
+    /// Bare `movsb` emits the plain opcode. The explicit form
+    /// (`movsb %fs:(%esi),%es:(%edi)`) carries GAS 2.47's segment law,
+    /// every byte of it oracle-probed:
+    ///
+    ///  * the EDI-side operand must use `%es` or no segment at all — ES is
+    ///    the architectural default, so an explicit `%es` is DROPPED, never
+    ///    emitted as a redundant 0x26 (`stosb %ds:(%edi)` is REJECTED with
+    ///    "`stos' operand 1 must use `%es' segment");
+    ///  * the ESI-side operand may use any segment: `%ds` is dropped as its
+    ///    default, every other segment is emitted (`%fs` → 0x64);
+    ///  * base registers are NOT validated — `movsb (%rsi),(%rcx)` assembles
+    ///    to a plain `a4` (the instruction uses RSI/RDI architecturally
+    ///    regardless of what the operands named);
+    ///  * prefix order (byte-probed): segment, 0x67, 0x66/REX.W, opcode —
+    ///    `cmpsb %es:(%edi),%fs:(%esi)` = `64 67 a6`, `movsw (%esi),(%edi)`
+    ///    = `67 66 a5`, `movsq (%rsi),(%rdi)` = `48 a5`.
+    ///    (0x67 itself is NOT pushed here: the central address-size splice
+    ///    in `encode` detects the 32-bit base registers of both memory
+    ///    operands and inserts the byte in canonical position.)
+    ///
+    /// `esi_idx`/`edi_idx` name the operand INDEX playing each role
+    /// (`None` when the family has no such operand). The central
+    /// operand-segment choke point in `encode` skips string ops (see
+    /// `is_explicit_string_op`), so this is the ONLY place a string-op
+    /// segment byte is decided.
+    pub(crate) fn encode_string_op(
+        &mut self,
+        ops: &[Operand],
+        opcode: u8,
+        size: u8,
+        esi_idx: Option<usize>,
+        edi_idx: Option<usize>,
+        stem: &str,
+    ) -> Result<(), String> {
+        if ops.is_empty() {
+            if size == 2 {
+                self.bytes.push(0x66);
+            } else if size == 8 {
+                self.bytes.push(0x48); // REX.W
+            }
+            self.bytes.push(if size == 1 { opcode } else { opcode + 1 });
+            return Ok(());
+        }
+        // Single explicit operand: the stos/scas EDI side, the lods ESI
+        // side (`scasb %es:(%edi)` = 67 ae, GAS-probed — one memory
+        // operand, no second dummy).
+        if ops.len() == 1 && edi_idx.is_some() && esi_idx.is_none() {
+            let mem = mem_of(&ops[0]).ok_or(format!("operand type mismatch for `{stem}'"))?;
+            match mem.segment.as_deref() {
+                None | Some("es") => {}
+                Some(_) => {
+                    return Err(format!("`{stem}' operand 1 must use `%es' segment"));
+                }
+            }
+            if size == 2 {
+                self.bytes.push(0x66);
+            } else if size == 8 {
+                self.bytes.push(0x48);
+            }
+            self.bytes.push(if size == 1 { opcode } else { opcode + 1 });
+            return Ok(());
+        }
+        if ops.len() == 1 && esi_idx.is_some() && edi_idx.is_none() {
+            let mem = mem_of(&ops[0]).ok_or(format!("operand type mismatch for `{stem}'"))?;
+            let seg_byte = match mem.segment.as_deref() {
+                None | Some("ds") => None,
+                Some("es") => Some(0x26),
+                Some("cs") => Some(0x2E),
+                Some("ss") => Some(0x36),
+                Some("fs") => Some(0x64),
+                Some("gs") => Some(0x65),
+                Some(other) => {
+                    return Err(format!("unsupported segment override: %{other}"));
+                }
+            };
+            if let Some(b) = seg_byte {
+                self.bytes.push(b);
+            }
+            if size == 2 {
+                self.bytes.push(0x66);
+            } else if size == 8 {
+                self.bytes.push(0x48);
+            }
+            self.bytes.push(if size == 1 { opcode } else { opcode + 1 });
+            return Ok(());
+        }
+        if ops.len() != 2 {
+            return Err(format!("number of operands mismatch for `{stem}'"));
+        }
+        fn mem_of(op: &Operand) -> Option<&MemoryOperand> {
+            match op {
+                Operand::Memory(m) => Some(m),
+                _ => None,
+            }
+        }
+        let m0 = mem_of(&ops[0]).ok_or(format!("operand type mismatch for `{stem}'"))?;
+        let m1 = mem_of(&ops[1]).ok_or(format!("operand type mismatch for `{stem}'"))?;
+        let mems = [m0, m1];
+
+        // EDI side: %es or nothing.
+        if let Some(i) = edi_idx {
+            match mems[i].segment.as_deref() {
+                None | Some("es") => {}
+                Some(_) => {
+                    return Err(format!("`{stem}' operand {} must use `%es' segment", i + 1));
+                }
+            }
+        }
+        // ESI side: any segment; %ds is the default and dropped.
+        let seg_byte = match esi_idx.and_then(|i| mems[i].segment.as_deref()) {
+            None | Some("ds") => None,
+            Some("es") => Some(0x26),
+            Some("cs") => Some(0x2E),
+            Some("ss") => Some(0x36),
+            Some("fs") => Some(0x64),
+            Some("gs") => Some(0x65),
+            Some(other) => {
+                return Err(format!("unsupported segment override: %{other}"));
+            }
+        };
+
+        if let Some(b) = seg_byte {
+            self.bytes.push(b);
+        }
+        if size == 2 {
+            self.bytes.push(0x66);
+        } else if size == 8 {
+            self.bytes.push(0x48); // REX.W
+        }
+        self.bytes.push(if size == 1 { opcode } else { opcode + 1 });
+        Ok(())
+    }
+}
+
+/// Element size (1/2/4/8) of a sized string-op mnemonic suffix.
+pub(crate) fn string_op_size(mnemonic: &str) -> Result<u8, String> {
+    Ok(match mnemonic.as_bytes().last() {
+        Some(b'b') => 1,
+        Some(b'w') => 2,
+        Some(b'l') | Some(b'd') => 4,
+        Some(b'q') => 8,
+        _ => return Err(format!("bad string-op mnemonic: {mnemonic}")),
+    })
+}
+
+/// True when any operand is a 32-bit GP register — the address-size hint
+/// MONITOR/MONITORX spellings carry (`monitor %eax,%rcx,%rdx` → 0x67).
+pub(crate) fn addr_hint_is32(ops: &[Operand]) -> bool {
+    ops.iter().any(|op| match op {
+        Operand::Register(r) => {
+            matches!(
+                r.name.to_ascii_lowercase().as_str(),
+                "eax" | "ebx" | "ecx" | "edx" | "esi" | "edi" | "ebp" | "esp"
+            )
+        }
+        _ => false,
+    })
+}
+
+/// True when any operand is a register — used to route `movs{b,w,l}` with
+/// register operands to their MOVSX spellings and keep two-memory-operand
+/// forms on the string path.
+pub(crate) fn has_reg_operand(ops: &[Operand]) -> bool {
+    ops.iter().any(|op| matches!(op, Operand::Register(_)))
+}
+
+/// True when the instruction is an explicit string op with MEMORY operands
+/// (one or two): the central operand-segment choke point must NOT emit a
+/// segment byte for these (encode_string_op applies the ES/DS default law
+/// itself, and an explicit `%es`/`%ds` is DROPPED as the architectural
+/// default).
+pub(crate) fn is_explicit_string_op(mnemonic: &str, ops: &[Operand]) -> bool {
+    if ops.is_empty() || !ops.iter().all(|op| matches!(op, Operand::Memory(_))) {
+        return false;
+    }
+    if ops.len() > 2 {
+        return false;
+    }
+    let m = mnemonic.to_ascii_lowercase();
+    let m = m.strip_suffix(".s").unwrap_or(&m);
+    let stem = match m.as_bytes().last() {
+        Some(b'b' | b'w' | b'l' | b'd' | b'q') => &m[..m.len() - 1],
+        _ => return false,
+    };
+    matches!(
+        stem,
+        "movs" | "stos" | "lods" | "scas" | "cmps" | "ins" | "outs"
+    )
 }

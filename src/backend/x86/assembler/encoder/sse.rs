@@ -84,6 +84,18 @@ impl super::InstructionEncoder {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 let prefix_len = opcode.iter().position(|&b| b == 0x0F).unwrap_or(0);
+                if use_mmx && self.apx_rex2 {
+                    // GAS 2.47: `{rex2}` on an MMX form emits the REX2
+                    // prefix and folds the 0F escape into its M bit
+                    // (`{rex2} pmullw %mm0,%mm6` = d5 80 d5 f0 — the MMX
+                    // registers are untouched by every REX2 bit, so the
+                    // prefix is carried verbatim rather than dropped).
+                    // fixup_rex2_map1 performs the 0F strip/M0 set.
+                    self.emit_rex2(false, false, false, false, false, false, false);
+                    self.bytes.extend_from_slice(&opcode[prefix_len..]);
+                    self.bytes.push(self.modrm(3, dst_num, src_num));
+                    return Ok(());
+                }
                 if !use_mmx {
                     for &b in &opcode[..prefix_len] {
                         self.bytes.push(b);
