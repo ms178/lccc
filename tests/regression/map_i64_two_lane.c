@@ -21,6 +21,14 @@ __attribute__((noinline)) void add64(uint64_t *restrict d, const uint64_t *restr
                                       const uint64_t *restrict y, unsigned long n) {
     for (unsigned long i = 0; i < n; ++i) d[i] = x[i] + y[i];
 }
+__attribute__((noinline)) void tier2(uint64_t *restrict d, const uint64_t *restrict x,
+ const uint64_t *restrict y, const uint64_t *restrict z, unsigned long n) {
+ for (unsigned long i=0;i<n;++i) d[i]=x[i]-y[i]+z[i];
+}
+__attribute__((noinline)) void invariant64(uint64_t *restrict d, const uint64_t *restrict x,
+ uint64_t k, unsigned long n) {
+ for (unsigned long i=0;i<n;++i) d[i]=x[i]-k;
+}
 /* Without restrict, writing ahead of an input read must take the scalar
  * path.  In-place (distance zero) is legal to vectorize. */
 __attribute__((noinline)) void shifted64(uint64_t *d, const uint64_t *x,
@@ -66,6 +74,19 @@ int main(void) {
             ref[i] = x + y;
         }
         if (check("add", n)) return 1;
+        tier2(out, a, b, a, n);
+        for (unsigned long i=0;i<n;++i) {
+            volatile uint64_t x=a[i], y=b[i];
+            ref[i]=x-y+x;
+        }
+        if (check("tier2", n)) return 1;
+        invariant64(out, a, UINT64_C(0xdeadbeef01234567), n);
+        for (unsigned long i=0;i<n;++i) {
+            volatile uint64_t x=a[i];
+            ref[i]=x-UINT64_C(0xdeadbeef01234567);
+        }
+        if (check("invariant", n)) return 1;
+
     }
     for (unsigned long offset = 0; offset < 5; ++offset) {
         for (unsigned long n = 0; n < 32; ++n) {

@@ -22,30 +22,26 @@ for arch in x86-64-v3 x86-64; do
     cmp "$tmp/lccc.txt" "$tmp/scalar.txt"
     "$CCC" "${flags[@]}" -S "$source_file" -o "$tmp/vector.s"
     CCC_NO_MAP_VEC=1 "$CCC" "${flags[@]}" -S "$source_file" -o "$tmp/scalar.s"
-    python3 - "$arch" "$tmp/vector.s" "$tmp/scalar.s" <<'PY'
-import re, sys
-arch, vector, scalar = sys.argv[1:]
-def body(path):
-    text = open(path, encoding='utf8').read()
-    match = re.search(r'(?ms)^sub64:\n(.*?)^\.size sub64,', text)
-    if match is None:
-        raise SystemExit('missing sub64 assembly')
-    return match.group(1)
-v, s = body(vector), body(scalar)
-needle = 'vpsubq' if arch == 'x86-64-v3' else 'psubq'
-packed = re.findall(r'\b' + needle + r'\b', v)
-if len(packed) != 4:
-    raise SystemExit(f'{arch}: expected four independent two-lane {needle} operations, got {len(packed)}')
-vector_body = v.split('.LBB4:', 1)[0]
-if 'addq $64' not in vector_body:
-    raise SystemExit(f'{arch}: I64 map did not advance by the four-copy 64-byte chunk')
-if re.search(r'\bleaq\s+(?:16|32|48)\(', vector_body):
-    raise SystemExit(f'{arch}: unrolled I64 map materialized a displacement with LEA')
-if '%ymm' in v:
-    raise SystemExit(f'{arch}: 64-bit map advanced by four lanes but only used XMM')
-if re.search(r'\b(?:vpsubq|psubq)\b', s):
-    raise SystemExit('scalar kill switch did not suppress packed subtraction')
-PY
+    CCC_NO_MAP_I64_UNROLL=1 "$CCC" "${flags[@]}" -S "$source_file" -o "$tmp/rolled.s"
+    CCC_NO_MAP_I64_UNROLL=1 "$CCC" "${flags[@]}" "$source_file" -o "$tmp/rolled"
+    "$tmp/rolled" > "$tmp/rolled.txt"
+    cmp "$tmp/lccc.txt" "$tmp/rolled.txt"
+    small=tests/regression/map_i64_small_trip.c
+    "$CCC" "${flags[@]}" -S "$small" -o "$tmp/small.s"
+    for mode in vector rolled scalar; do
+        case $mode in
+            vector) env_args=();;
+            rolled) env_args=(CCC_NO_MAP_I64_UNROLL=1);;
+            scalar) env_args=(CCC_NO_MAP_VEC=1);;
+        esac
+        env "${env_args[@]}" "$CCC" "${flags[@]}" "$small" -o "$tmp/small"
+        "$tmp/small" > "$tmp/small-$mode.txt"
+    done
+    gcc "${flags[@]}" "$small" -o "$tmp/small-gcc"
+    "$tmp/small-gcc" > "$tmp/small-gcc.txt"
+    for mode in vector rolled scalar; do cmp "$tmp/small-gcc.txt" "$tmp/small-$mode.txt"; done
+    python3 tests/regression/check_map_i64_shapes.py "$tmp/vector.s" "$tmp/rolled.s" "$tmp/scalar.s" "$tmp/small.s"
+
 done
 
 # i686 has no register-based Vec*I64x2 lowering. Even with SSE2 enabled it
