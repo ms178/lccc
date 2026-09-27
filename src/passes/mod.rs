@@ -233,6 +233,69 @@ pub(crate) fn validate_unique_defs(module: &IrModule, tag: &str) {
                     }
                 }
             }
+
+            // PHI-ARITY: for every φ in a REACHABLE block, the incoming
+            // set must (a) COVER every reachable CFG predecessor and
+            // (b) name only actual CFG predecessors.  phi elimination
+            // materializes one edge copy per (reachable pred, incoming)
+            // pair and never visits unreachable blocks, so a missing
+            // REACHABLE predecessor leaves the φ home without a copy on a
+            // live edge — the value reads whatever the register/slot held
+            // (the defect class this check exists for; Csmith 20260945).
+            // Everything else is legal: an entry for a statically present
+            // but dead predecessor is never materialized (inert — the
+            // frontend and switch/loop lowering leave those routinely,
+            // e.g. switch_dispatch's 16-pred join), a φ inside an
+            // unreachable block never executes (adler_inline_tail
+            // `like_ssse3` block 113), and duplicate per-pred entries are
+            // rejected by the phi-prefix checks.  Checking here
+            // attributes the malformed φ to the exact pass that created
+            // it instead of to a backend abort.
+            for (bi, block) in func.blocks.iter().enumerate() {
+                if !reachable(bi) {
+                    continue;
+                }
+                let mut named: crate::common::fx_hash::FxHashSet<u32> =
+                    crate::common::fx_hash::FxHashSet::default();
+                let mut has_phi = false;
+                for inst in &block.instructions {
+                    let Instruction::Phi { incoming, .. } = inst else {
+                        continue;
+                    };
+                    has_phi = true;
+                    for (_, p) in incoming {
+                        named.insert(p.0);
+                    }
+                }
+                if !has_phi {
+                    continue;
+                }
+                let mut reachable_preds: crate::common::fx_hash::FxHashSet<u32> =
+                    crate::common::fx_hash::FxHashSet::default();
+                let mut static_preds: crate::common::fx_hash::FxHashSet<u32> =
+                    crate::common::fx_hash::FxHashSet::default();
+                for &p in cfg.preds.row(bi) {
+                    let pidx = p as usize;
+                    if pidx < func.blocks.len() {
+                        let label = func.blocks[pidx].label.0;
+                        static_preds.insert(label);
+                        if reachable(pidx) {
+                            reachable_preds.insert(label);
+                        }
+                    }
+                }
+                let missing: Vec<u32> = reachable_preds.difference(&named).copied().collect();
+                let stray: Vec<u32> = named.difference(&static_preds).copied().collect();
+                if !missing.is_empty() || !stray.is_empty() {
+                    panic!(
+                        "SSA PHI-ARITY VIOLATION after phase '{}': function '{}' \
+                         block {} φ incoming pred labels {named:?} violates the \
+                         reachable-pred contract (missing {missing:?}, not-a-CFG-pred \
+                         {stray:?})",
+                        tag, func.name, block.label.0
+                    );
+                }
+            }
         }
 
         // SAME-BLOCK ORDER: a use of v inside the block that defines v must
@@ -308,6 +371,14 @@ fn dump_ir_filtered(module: &IrModule, tag: &str) {
     if std::env::var_os("CCC_VALIDATE_SSA").is_some() {
         validate_unique_defs(module, tag);
     }
+    dump_ir_filtered_inner(module, tag);
+}
+
+/// Dump half of [`dump_ir_filtered`] without the SSA validation gate, for
+/// checkpoints that must show the IR *before* reporting a violation (the
+/// lowering:entry checkpoint dumps the input shape first so the phi-arity
+/// panic is inspectable at all).
+fn dump_ir_filtered_inner(module: &IrModule, tag: &str) {
     if std::env::var_os("CCC_DUMP_EACH_PASS").is_none() {
         return;
     }
@@ -954,6 +1025,23 @@ pub(crate) fn run_passes(
     x86_avx512vl: bool,
     ra_config: &crate::backend::regalloc::RaConfig,
 ) {
+    // Checkpoint the lowering output BEFORE any optimizer runs: the SSA
+    // validators in this function attribute a violation to the phase that
+    // created it, and at -O0 the optimizer phase loop is the empty set —
+    // without this entry checkpoint a malformed phi from the frontend
+    // (Csmith 20260945: a φ missing its entry-edge incoming) would only be
+    // reported by the backend's pre-eliminate_phis tag, falsely implicating
+    // everything in between.
+    if std::env::var_os("CCC_VALIDATE_SSA").is_some() {
+        // Dump BEFORE validating so a phi-arity/dominance panic at the
+        // entry checkpoint is inspectable (post-pass checkpoints validate
+        // first inside dump_ir_filtered; there the IR is the pass's output
+        // and a dump of a violating shape is still wanted — but the panic
+        // in validate_unique_defs would suppress it, which is acceptable
+        // there because the pass tag alone identifies the offender).
+        dump_ir_filtered_inner(module, "lowering:entry");
+        validate_unique_defs(module, "lowering:entry");
+    }
     // x86 SIMD register-file availability for the middle end. Under `-mno-sse`
     // / `-mgeneral-regs-only` there is no xmm state on the target at all, so
     // the vectorizer must not rewrite a single loop (see the gate in
@@ -2987,6 +3075,93 @@ mod ssa_validator_tests {
             source_spans: vec![],
         };
         let module = module_with_blocks(vec![entry(vec![]), dead], 2);
+        validate_unique_defs(&module, "unit:strict");
+    }
+
+    // ── phi arity vs reachable predecessors ────────────────────────────────
+
+    fn join_with_phi(incomings: Vec<(Operand, BlockId)>) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(2),
+            instructions: vec![Instruction::Phi {
+                dest: Value(3),
+                ty: IrType::I32,
+                incoming: incomings,
+            }],
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+        }
+    }
+
+    fn diamond(phi_block: BasicBlock) -> IrModule {
+        // Classic diamond: entry cond-branches into arm 1 / the join, and
+        // arm 1 falls through into the join, so the join's reachable pred
+        // set is {1 (arm), 0 (entry's false arm)}.
+        let arm = BasicBlock {
+            label: BlockId(1),
+            instructions: vec![],
+            terminator: Terminator::Branch(BlockId(2)),
+            source_spans: vec![],
+        };
+        let entry_blk = BasicBlock {
+            label: BlockId(0),
+            instructions: vec![Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I32(1)),
+            }],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(0)),
+                true_label: BlockId(1),
+                false_label: BlockId(2),
+            },
+            source_spans: vec![],
+        };
+        module_with_blocks(vec![entry_blk, arm, phi_block], 4)
+    }
+
+    #[test]
+    fn phi_covering_all_reachable_preds_is_accepted() {
+        let join = join_with_phi(vec![
+            (Operand::Const(IrConst::I32(1)), BlockId(1)),
+            (Operand::Const(IrConst::I32(2)), BlockId(0)),
+        ]);
+        validate_unique_defs(&diamond(join), "unit:strict");
+    }
+
+    #[test]
+    #[should_panic(expected = "SSA PHI-ARITY VIOLATION")]
+    fn reachable_pred_without_phi_incoming_is_a_violation() {
+        // The live-edge defect class: phi elimination emits one copy per
+        // (reachable pred, incoming) pair, so a reachable predecessor with
+        // no φ entry leaves the φ home without a definition on that edge.
+        let join = join_with_phi(vec![(Operand::Const(IrConst::I32(1)), BlockId(1))]);
+        validate_unique_defs(&diamond(join), "unit:strict");
+    }
+
+    #[test]
+    fn unreachable_pred_legally_has_no_phi_incoming() {
+        // Csmith 20260945 shape: the frontend leaves a dead edge into a
+        // φ block.  phi elimination never visits unreachable blocks, so
+        // the missing incoming is the CONTRACT, not a defect — comparing
+        // against the static pred set instead of the reachable set made
+        // GLA abort every plan on such functions.  The join names BOTH
+        // reachable preds ({1, 0}); only the dead block's edge is absent.
+        let join = join_with_phi(vec![
+            (Operand::Const(IrConst::I32(1)), BlockId(1)),
+            (Operand::Const(IrConst::I32(2)), BlockId(0)),
+        ]);
+        let mut module = diamond(join);
+        // Append a dead block (label 3) branching into the join: a static
+        // predecessor no execution ever takes.
+        let dead = BasicBlock {
+            label: BlockId(3),
+            instructions: vec![],
+            terminator: Terminator::Branch(BlockId(2)),
+            source_spans: vec![],
+        };
+        if let Some(func) = module.functions.first_mut() {
+            func.blocks.push(dead);
+        }
         validate_unique_defs(&module, "unit:strict");
     }
 }

@@ -127,7 +127,7 @@
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::ir::reexports::{
-    BasicBlock, BlockId, Instruction, IrFunction, IrModule, Operand, Terminator, Value,
+    BasicBlock, BlockId, Instruction, IrBinOp, IrFunction, IrModule, Operand, Terminator, Value,
 };
 
 /// Eliminate all phi nodes in the module by lowering them to copies.
@@ -441,11 +441,13 @@ struct EdgeCopyPlan {
 ///
 /// Both arms are separate functions so the unit tests can pin each policy
 /// directly instead of mutating the process environment.
+///
+/// `guards[i]` lists IR value ids that copy `i`'s *computed* source reads
+/// (see [`plan_edge_copies_guards`]); register-to-register copies carry an
+/// empty set. Only the acyclic arm consults them.
 fn plan_edge_copies(copies: &[(u32, Option<u32>)], policy: CopyOrderPolicy) -> EdgeCopyPlan {
-    match policy {
-        CopyOrderPolicy::Acyclic => plan_edge_copies_acyclic(copies),
-        CopyOrderPolicy::Legacy => plan_edge_copies_legacy(copies),
-    }
+    let empty: Vec<crate::common::fx_hash::FxHashSet<u32>> = vec![Default::default(); copies.len()];
+    plan_edge_copies_guards(copies, &empty, policy)
 }
 
 /// Decompose one edge's parallel copies into cyclic and orderable parts.
@@ -460,7 +462,36 @@ fn plan_edge_copies(copies: &[(u32, Option<u32>)], policy: CopyOrderPolicy) -> E
 /// The order is deterministic: each round scans `remaining` in ascending index
 /// order, so the result is the lexicographically smallest topological order by
 /// index. No hash-map iteration reaches the output.
-fn plan_edge_copies_acyclic(copies: &[(u32, Option<u32>)]) -> EdgeCopyPlan {
+///
+/// `guards[i]` are value ids read by copy `i`'s computed (non-copy) source
+/// definition — an ALU instruction in the predecessor, not another copy. After
+/// copy `i` executes, its destination may be clobbered freely, but while it is
+/// pending the values its computation reads must stay intact. Copies whose
+/// destination is such a guard are therefore deferred: they may run, but only
+/// once every guarded computation that still waits for them has run. This is
+/// what lets `fold_computed_phi_incomings` sink a computed source to its copy
+/// slot instead of materializing it through a temporary relay (the `rot()`
+/// relay that cost one instruction per iteration in
+/// `tests/regression/check_phi_acyclic_order.sh`). Deferral never deadlocks:
+/// a ready copy is deferred only by another *ready* copy's guard, and a full
+/// round that emits nothing falls back to ignoring deferral, so progress is
+/// guaranteed and the result stays a valid topological order of the same
+/// precedence graph (only the tie-break changed).
+fn plan_edge_copies_guards(
+    copies: &[(u32, Option<u32>)],
+    guards: &[crate::common::fx_hash::FxHashSet<u32>],
+    policy: CopyOrderPolicy,
+) -> EdgeCopyPlan {
+    match policy {
+        CopyOrderPolicy::Acyclic => plan_edge_copies_acyclic_guards(copies, guards),
+        CopyOrderPolicy::Legacy => plan_edge_copies_legacy(copies),
+    }
+}
+
+fn plan_edge_copies_acyclic_guards(
+    copies: &[(u32, Option<u32>)],
+    guards: &[crate::common::fx_hash::FxHashSet<u32>],
+) -> EdgeCopyPlan {
     let n = copies.len();
     // value -> index of the copy that writes it. Phi destinations are unique
     // within a block, so this map is a function; `entry().or_insert()` keeps
@@ -497,8 +528,16 @@ fn plan_edge_copies_acyclic(copies: &[(u32, Option<u32>)]) -> EdgeCopyPlan {
     loop {
         let mut progressed = false;
         let mut blocked: Vec<usize> = Vec::new();
+        // Guard deferral: a ready copy is held back while some still-unemitted
+        // copy's computed source reads its destination. Scanned in ascending
+        // index order, then unblocked wholesale if it starved a round.
         for &i in &remaining {
-            if preds[i].iter().all(|&p| emitted[p] || skippable[p]) {
+            let ready = preds[i].iter().all(|&p| emitted[p] || skippable[p]);
+            let deferred = ready
+                && remaining.iter().any(|&k| {
+                    k != i && !emitted[k] && !skippable[k] && guards[k].contains(&copies[i].0)
+                });
+            if ready && !deferred {
                 ordered.push(i);
                 emitted[i] = true;
                 progressed = true;
@@ -506,7 +545,19 @@ fn plan_edge_copies_acyclic(copies: &[(u32, Option<u32>)]) -> EdgeCopyPlan {
                 blocked.push(i);
             }
         }
-        remaining = blocked;
+        if !progressed {
+            // Everything left is either genuinely blocked (a cycle — drained
+            // below) or mutually guard-deferred; emit ready copies ignoring
+            // deferral so the topological drain always advances.
+            for &i in &blocked {
+                if preds[i].iter().all(|&p| emitted[p] || skippable[p]) {
+                    ordered.push(i);
+                    emitted[i] = true;
+                    progressed = true;
+                }
+            }
+        }
+        remaining = blocked.iter().copied().filter(|&i| !emitted[i]).collect();
         if !progressed {
             break;
         }
@@ -636,15 +687,49 @@ fn eliminate_phis_with_policy(
         if phis.len() == 1 {
             emit_single_phi_copies(&phis[0], target_block_id, &mut ctx);
         } else {
-            emit_multi_phi_copies(phis, block_idx, target_block_id, &mut ctx);
+            emit_multi_phi_copies(phis, block_idx, target_block_id, func, &mut ctx);
         }
     }
 
     resolve_self_loop_copies(func, &mut ctx);
     apply_phi_transformations(func, &mut ctx);
+    if ctx.copy_order == CopyOrderPolicy::Acyclic {
+        fold_computed_phi_incomings(func);
+    }
     func.next_value_id = ctx.next_value;
 }
 
+/// Fold computed phi incomings into the copy sequence ("sink to slot").
+///
+/// After elimination, an edge's copy for a phi whose incoming was *computed*
+/// in the predecessor reads a scratch value `v` defined by an ALU instruction
+/// in the same block: `v = d + t1` ... `e := v`. Materializing `v` into its
+/// own home and then copying costs one extra register move per execution —
+/// the "relay" that `tests/regression/check_phi_acyclic_order.sh` pins for
+/// `rot()` (SHA-256's rotation shape), and one that kept resurfacing because
+/// ordinary coalescing cannot remove it: at the ALU instruction's original
+/// position every phi home is still occupied by its old value, so the
+/// computed value and the phi destination formally interfere.
+///
+/// The acyclic planner guarantees readers of a destination precede its copy
+/// and (via guard deferral) delays copies that would clobber the
+/// computation's operands, so the defining instruction can instead execute
+/// directly at its copy's slot, writing the phi destination's home:
+/// `f := e` ... `e = d + t1` ... with no relay at all. This performs the
+/// move only when an explicit hazard scan proves it legal:
+///
+/// * the ALU definition is pure and non-trapping ([`is_pure_sinking_op`]),
+/// * `v` has exactly one use in the whole function (this copy),
+/// * nothing strictly between the definition and the copy writes any of its
+///   operands or reads `v`,
+/// * nothing after the copy's position in the run reads the phi destination
+///   (every reader must consume the *old* value before the fold redefines
+///   it — the planner already guarantees this; re-checked here so the fold
+///   can never depend on planner internals for its correctness).
+///
+/// The copy itself becomes a self-move and is dropped. The transformation is
+/// policy-gated to the acyclic arm: the legacy arm must keep reproducing the
+/// historical shape bit-for-bit for the gate's A/B contract.
 /// Collect PhiInfo from all blocks.
 fn collect_block_phis(func: &IrFunction) -> Vec<Vec<PhiInfo>> {
     func.blocks
@@ -695,6 +780,7 @@ fn emit_multi_phi_copies(
     phis: &[PhiInfo],
     block_idx: usize,
     target_block_id: BlockId,
+    func: &IrFunction,
     ctx: &mut PhiElimCtx,
 ) {
     // Collect unique predecessor labels.
@@ -722,6 +808,7 @@ fn emit_multi_phi_copies(
         &pred_labels,
         &phi_src_maps,
         &ctx.label_to_idx,
+        &func.blocks,
         ctx.copy_order,
     );
     let mut globally_needs_temp: FxHashSet<usize> = FxHashSet::default();
@@ -805,17 +892,82 @@ fn plan_all_edges(
     pred_labels: &[BlockId],
     phi_src_maps: &[FxHashMap<BlockId, &Operand>],
     label_to_idx: &FxHashMap<BlockId, usize>,
+    blocks: &[BasicBlock],
     policy: CopyOrderPolicy,
 ) -> Vec<(BlockId, EdgeCopyPlan)> {
     let mut plans = Vec::new();
     for pred_label in pred_labels {
-        if !label_to_idx.contains_key(pred_label) {
+        let Some(&pred_idx) = label_to_idx.get(pred_label) else {
             continue;
-        }
+        };
         let copies_info = edge_copies_info(phis, phi_src_maps, pred_label);
-        plans.push((*pred_label, plan_edge_copies(&copies_info, policy)));
+        // Computed incomings carry their computation's operand ids as guards
+        // so the planner defers copies that would clobber them (see
+        // [`plan_edge_copies_guards`]); the sink pass can then fold the
+        // definition onto its copy slot instead of through a relay.
+        let guards: Vec<FxHashSet<u32>> = copies_info
+            .iter()
+            .map(|&(_, src)| {
+                src.and_then(|src| computed_source_operands(&blocks[pred_idx], src))
+                    .unwrap_or_default()
+            })
+            .collect();
+        plans.push((
+            *pred_label,
+            plan_edge_copies_guards(&copies_info, &guards, policy),
+        ));
     }
     plans
+}
+
+/// If `v` is defined in `block` by a pure, non-trapping ALU instruction
+/// (no memory access, no division — sinking must not move a faulting or
+/// observing operation), return that instruction's value operands.
+fn computed_source_operands(block: &BasicBlock, v: u32) -> Option<FxHashSet<u32>> {
+    block.instructions.iter().find_map(|inst| {
+        if let Instruction::BinOp {
+            dest: Value(dv),
+            op,
+            lhs,
+            rhs,
+            ..
+        } = inst
+        {
+            if *dv == v && is_pure_sinking_op(*op) {
+                let mut ops = FxHashSet::default();
+                if let Operand::Value(Value(x)) = lhs {
+                    ops.insert(*x);
+                }
+                if let Operand::Value(Value(x)) = rhs {
+                    ops.insert(*x);
+                }
+                return Some(ops);
+            }
+        }
+        None
+    })
+}
+
+/// Operations whose definition may be sunk across the phi copy sequence:
+/// pure register arithmetic that can neither fault nor observe memory.
+/// Division and remainder are excluded because `x / 0` and `x % 0` trap;
+/// reordering them across copies would move the fault point.
+fn is_pure_sinking_op(op: IrBinOp) -> bool {
+    matches!(
+        op,
+        IrBinOp::Add
+            | IrBinOp::Sub
+            | IrBinOp::Mul
+            | IrBinOp::And
+            | IrBinOp::Or
+            | IrBinOp::Xor
+            | IrBinOp::Shl
+            | IrBinOp::AShr
+            | IrBinOp::LShr
+            | IrBinOp::BitTest
+            | IrBinOp::RotateLeft
+            | IrBinOp::RotateRight
+    )
 }
 
 /// Build the ordered copy instructions for a single predecessor edge:
@@ -1256,6 +1408,232 @@ fn apply_phi_transformations(func: &mut IrFunction, ctx: &mut PhiElimCtx) {
             source_spans: vec![crate::common::source::Span::dummy(); num_copies],
             terminator: Terminator::Branch(trampoline.branch_target),
         });
+    }
+}
+
+fn fold_computed_phi_incomings(func: &mut IrFunction) {
+    use crate::ir::analysis;
+    use Instruction as I;
+
+    // Sink computed phi-incoming definitions to their copy slots.
+    //
+    // After elimination an edge copy for a phi whose incoming was *computed*
+    // in the predecessor reads a scratch value `v` defined by an ALU
+    // instruction in the same block: `v = d + t1` ... `e := v`. The add runs
+    // where it was first scheduled, so `v`'s live interval spans every phi
+    // home still holding its old value; the allocator must give `v` its own
+    // home and the copy becomes a real register move per execution — the
+    // "relay" that `tests/regression/check_phi_acyclic_order.sh` pins for
+    // `rot()` (SHA-256's rotation shape).
+    //
+    // The sink is only profitable — and only attempted — when a *pending
+    // relay into the same phi home* sits after the definition (same block,
+    // later position, or a block the defining block strictly dominates).
+    // Such a relay is why ordinary coalescing must refuse to seat `v` in
+    // the phi home: the def would clobber the home before the earlier
+    // incoming's copy drained it. When no other incoming copy to the home
+    // follows the definition (the preheader-only shape that a simple loop
+    // accumulator produces), the allocator already merges `v` into the home
+    // across the disjoint interval, the relay was never real, and sinking
+    // would only move the computation away from its operands — measured
+    // `spectral_norm` lost `vfmadd231sd` (mul and add separated across the
+    // body/latch boundary) for zero copies saved.
+    //
+    // Moving the definition (a pure, non-trapping ALU op) to directly before
+    // its copy is semantics-preserving when nothing between the two positions
+    // reads `v` or writes an operand of the computation, and it collapses
+    // `v`'s interval to the two instructions before the copy. The register
+    // allocator's copy coalescer unions `Copy dest <- Value src` pairs with
+    // disjoint intervals, so `v` then shares the phi home, the edge copy
+    // becomes a same-home no-op at emission, and the relay disappears —
+    // without breaking the post-elimination def discipline (one `Copy` per
+    // edge) that the SSA validator enforces: the IR def structure is
+    // untouched; only the position of a pure computation moved.
+    //
+    // Candidates are processed BOTTOM-UP (farthest slot first): chained
+    // computations (`a = t1 + t2` reading `t1` that `e = d + t1` also
+    // relays) move their reader below the upstream relay's slot first, which
+    // empties the upstream hazard window and lets both fold. Each fold moves
+    // the parallel `source_spans` entry with its instruction.
+    //
+    // The pending-relay test needs the CFG's dominator tree; the fold never
+    // changes edges, so it is computed once per function.
+    let num_blocks = func.blocks.len();
+    let label_to_idx = analysis::build_label_map(func);
+    let (preds, succs) = analysis::build_cfg(func, &label_to_idx);
+    let idom = analysis::compute_dominators(num_blocks, &preds, &succs);
+    for bi in 0..func.blocks.len() {
+        // Candidates: every Copy in the block whose source is defined by a
+        // pure ALU instruction in the same block. The whole block is scanned
+        // (not just the trailing run) because a previously sunk definition
+        // splits the trailing Copy run.
+        let mut candidates: Vec<(Value, Value)> = Vec::new();
+        {
+            let block = &func.blocks[bi];
+            for inst in &block.instructions {
+                if let I::Copy {
+                    dest,
+                    src: Operand::Value(v),
+                } = inst
+                {
+                    if v.0 != dest.0 {
+                        candidates.push((*dest, *v));
+                    }
+                }
+            }
+        }
+        for (dest, v) in candidates.iter().rev() {
+            // ── decision phase (immutable) ──────────────────────────────
+            let decision: Option<(usize, usize)> = (|| {
+                let block = &func.blocks[bi];
+                let copy_pos = block.instructions.iter().position(|inst| {
+                    matches!(inst, I::Copy { dest: d, src: Operand::Value(s) }
+                        if *d == *dest && *s == *v)
+                })?;
+                // The computed definition must live in this block, above the
+                // copy.
+                let def_pos = block.instructions[..copy_pos].iter().position(|inst| {
+                    matches!(inst, I::BinOp { dest: Value(d), op, .. }
+                        if *d == v.0 && is_pure_sinking_op(*op))
+                })?;
+                // Operand ids of the computation (constants guard nothing).
+                let operands: Vec<u32> = match &block.instructions[def_pos] {
+                    I::BinOp { lhs, rhs, .. } => [&lhs, &rhs]
+                        .into_iter()
+                        .filter_map(|o| match o {
+                            Operand::Value(Value(x)) => Some(*x),
+                            _ => None,
+                        })
+                        .collect(),
+                    _ => unreachable!("def_pos was matched as BinOp"),
+                };
+                // PROFITABILITY: sink only if the phi home `dest` is still
+                // *live across the window* — some instruction between the
+                // definition and the relay copy (same block), or anywhere in
+                // a block the defining block strictly dominates, reads or
+                // writes the home. That pending access is exactly what
+                // forces `v` into a scratch home: seating `v` directly in
+                // the home at its definition would clobber the old value
+                // before its reader drains it (the `25 <- 24` rotation copy
+                // pinned by check_phi_acyclic_order) or be clobbered by the
+                // home's next writer. When the home is dead across the
+                // window (a simple loop accumulator whose only other
+                // incoming copy lives in the preheader), the allocator's
+                // coalescer already seats `v` in the home across the
+                // disjoint interval, the relay was never a real move, and
+                // sinking would only distance the computation from its
+                // operands (measured: `spectral_norm` decomposed
+                // vfmadd231sd into mul+add for zero copies saved).
+                let mut pending_relay =
+                    block.instructions[def_pos + 1..copy_pos]
+                        .iter()
+                        .any(|inst| {
+                            inst.dest().is_some_and(|Value(d)| d == dest.0) || {
+                                let mut reads = false;
+                                inst.for_each_used_value(|id| {
+                                    if id == dest.0 {
+                                        reads = true;
+                                    }
+                                });
+                                reads
+                            }
+                        });
+                if !pending_relay {
+                    // Conservative dominated-region sweep: a rotation relay
+                    // that the planner parked in a trampoline reads the home
+                    // after this block ends. C1 itself lives in this block,
+                    // so the sweep cannot match the relay we are folding.
+                    'dom: for (bj, blkj) in func.blocks.iter().enumerate() {
+                        if bj == bi {
+                            continue;
+                        }
+                        // Strict dominance via the idom chain of `bj`
+                        // (bounded walk; the usize::MAX sentinel marks
+                        // unreachable blocks and terminates the loop).
+                        let mut cur = bj;
+                        let mut steps = 0usize;
+                        while cur < idom.len() && steps <= num_blocks {
+                            if cur == bi {
+                                for inst in &blkj.instructions {
+                                    if inst.dest().is_some_and(|Value(d)| d == dest.0) {
+                                        pending_relay = true;
+                                        break 'dom;
+                                    }
+                                    let mut touches = false;
+                                    inst.for_each_used_value(|id| {
+                                        if id == dest.0 {
+                                            touches = true;
+                                        }
+                                    });
+                                    if touches {
+                                        pending_relay = true;
+                                        break 'dom;
+                                    }
+                                }
+                                break;
+                            }
+                            let next = idom[cur];
+                            if next == cur || next >= idom.len() {
+                                // entry self-parent or sentinel: stop
+                                break;
+                            }
+                            cur = next;
+                            steps += 1;
+                        }
+                    }
+                }
+                if !pending_relay {
+                    return None;
+                }
+                // Hazard scan over everything strictly between the definition
+                // and the copy:
+                // * a reader of `v` there would read past its (moved)
+                //   definition — use before def;
+                // * a writer of an operand would change what the computation
+                //   sees after the move;
+                // * a second definition of `v` in the window would reorder
+                //   two defs of one value.
+                // `dest()` is the exhaustive defined-value helper (calls
+                // included), so no writing variant can slip through.
+                let hazard = block.instructions[def_pos + 1..copy_pos]
+                    .iter()
+                    .any(|inst| {
+                        let mut bad = inst
+                            .dest()
+                            .is_some_and(|Value(d)| d == v.0 || operands.contains(&d));
+                        inst.for_each_used_value(|id| {
+                            if id == v.0 {
+                                bad = true;
+                            }
+                        });
+                        bad
+                    });
+                if hazard {
+                    return None;
+                }
+                Some((copy_pos, def_pos))
+            })();
+            let Some((copy_pos, def_pos)) = decision else {
+                continue;
+            };
+
+            // ── mutation phase ───────────────────────────────────────────
+            let block = &mut func.blocks[bi];
+            // Position-only mutation: the definition (and the IR def set)
+            // is unchanged; the sink merely relocates it.
+            let def_inst = block.instructions.remove(def_pos);
+            if !block.source_spans.is_empty() {
+                let span = block
+                    .source_spans
+                    .remove(def_pos.min(block.source_spans.len() - 1));
+                let at = (copy_pos - 1).min(block.source_spans.len());
+                block.source_spans.insert(at, span);
+            }
+            // Definition removal shifted the copy down one slot; the
+            // definition lands directly before it.
+            let copy_pos = copy_pos - 1;
+            block.instructions.insert(copy_pos, def_inst);
+        }
     }
 }
 
@@ -1731,7 +2109,7 @@ mod tests {
     fn legacy_switch_policy_restores_the_over_approximation() {
         let chain = vec![(10, Some(20)), (20, Some(30))];
         let legacy = plan_edge_copies_legacy(&chain);
-        let current = plan_edge_copies_acyclic(&chain);
+        let current = plan_edge_copies(&chain, CopyOrderPolicy::Acyclic);
 
         assert_eq!(
             legacy.cyclic.len(),
@@ -1979,6 +2357,419 @@ mod tests {
             latch,
             vec![(22, 21), (21, 20), (20, 19)],
             "rotation copies are missing or misordered"
+        );
+    }
+
+    // ── guard deferral + computed-incoming folding ─────────────────────────
+
+    use crate::common::fx_hash::FxHashSet as TestFxHashSet;
+
+    /// A ready copy whose destination is read by another copy's *computed*
+    /// source must wait for that computation to be folded first, so the sink
+    /// can place the definition at its slot without crossing a clobber.
+    #[test]
+    fn guard_deferral_holds_back_clobbers_of_computed_sources() {
+        let copies = vec![(10, Some(11)), (12, Some(13))];
+        // No guards: plain Kahn ascending order.
+        let plain = plan_edge_copies(&copies, CopyOrderPolicy::Acyclic);
+        assert_eq!(plain.ordered, vec![0, 1]);
+        // guards[1] = {10}: copy 1's computed source reads v10, which copy 0
+        // writes. Copy 0 must be deferred until copy 1 has run.
+        let mut guards: Vec<TestFxHashSet<u32>> = vec![TestFxHashSet::default(); 2];
+        guards[1].insert(10);
+        let planned = plan_edge_copies_guards(&copies, &guards, CopyOrderPolicy::Acyclic);
+        assert_eq!(
+            planned.ordered,
+            vec![1, 0],
+            "the clobbering copy was not deferred past the guarded computation"
+        );
+        // The plan must remain a valid sequential execution of the parallel
+        // assignment. (State covers every id the copies name.)
+        let state: Vec<u32> = (0..14).map(|i| 100 + i * 7).collect();
+        assert_eq!(
+            simultaneous_result(&copies, &state),
+            sequential_result(&copies, &planned, &state),
+            "guard deferral changed the parallel-copy semantics"
+        );
+    }
+
+    /// End to end, the SHA-256 rotation shape: phis a..h where the latch
+    /// incoming of `e` is `d + t1` and that of `a` is `t1 + t2` (both computed
+    /// in the latch). The guard-aware planner must schedule `d <- c` behind
+    /// `e`'s slot and everything reading old `a` behind `a`'s slot, and the
+    /// sink must seat each defining BinOp DIRECTLY before its relay copy —
+    /// collapsing the relay value's live interval to zero so the register
+    /// allocator's copy coalescer can union it with the phi home. The IR def
+    /// set is untouched (the SSA validator's post-elimination contract).
+    #[test]
+    fn computed_incoming_folds_to_its_copy_slot() {
+        let mut func = IrFunction::new(
+            "folds".to_string(),
+            crate::common::types::IrType::Void,
+            Vec::new(),
+            false,
+        );
+        let phi = |dest: u32, pre: u32, latch: u32| Instruction::Phi {
+            dest: Value(dest),
+            ty: crate::common::types::IrType::I32,
+            incoming: vec![
+                (Operand::Value(Value(pre)), BlockId(0)),
+                (Operand::Value(Value(latch)), BlockId(2)),
+            ],
+        };
+        let add = |dest: u32, lhs: u32, rhs: u32| Instruction::BinOp {
+            dest: Value(dest),
+            op: crate::ir::ops::IrBinOp::Add,
+            lhs: Operand::Value(Value(lhs)),
+            rhs: Operand::Value(Value(rhs)),
+            ty: crate::common::types::IrType::I32,
+        };
+        func.blocks = vec![
+            blk(0, Vec::new(), Terminator::Branch(BlockId(1))),
+            blk(
+                1,
+                vec![
+                    phi(20, 10, 41),
+                    phi(21, 11, 20),
+                    phi(22, 12, 21),
+                    phi(23, 13, 22),
+                    phi(24, 14, 40),
+                    phi(25, 15, 24),
+                    phi(26, 16, 25),
+                    phi(27, 17, 26),
+                    cmp9(27),
+                ],
+                cond(9, 2, 3),
+            ),
+            blk(
+                2,
+                vec![add(40, 23, 14), add(41, 40, 15)],
+                Terminator::Branch(BlockId(1)),
+            ),
+            blk(3, Vec::new(), Terminator::Return(None)),
+        ];
+        func.next_value_id = 64;
+        func.next_label = 4;
+
+        let mut next_block_id = 4;
+        eliminate_phis_with_policy(&mut func, &mut next_block_id, CopyOrderPolicy::Acyclic);
+
+        let latch_block = func
+            .blocks
+            .iter()
+            .find(|b| b.label.0 == 2)
+            .expect("latch disappeared");
+        // No temporary was minted (the rotation is acyclic) and the def set
+        // is untouched: both computations still define their own values.
+        assert!(
+            func.next_value_id <= 64,
+            "a temporary was allocated for an acyclic computed incoming"
+        );
+        for computed in [40u32, 41u32] {
+            assert!(
+                latch_block.instructions.iter().any(|i| matches!(i,
+                    Instruction::BinOp { dest: Value(d), .. } if *d == computed)),
+                "v{computed} lost its definition"
+            );
+        }
+        // Each relay copy is immediately preceded by the BinOp defining its
+        // source (the sink), and the guard-aware order holds: e's slot sits
+        // before `d <- c` (the operand clobber), a's slot is last.
+        let seq: Vec<u32> = latch_block
+            .instructions
+            .iter()
+            .filter_map(|i| match i {
+                Instruction::BinOp { dest: Value(d), .. } => Some(*d),
+                Instruction::Copy {
+                    dest: Value(d),
+                    src: Operand::Value(Value(s)),
+                } => Some(1_000_000 + 100 * d + s), // encode copy (d, s)
+                _ => None,
+            })
+            .collect();
+        // copies: h<-g=27/26 g<-f=26/25 f<-e=25/24 e<-t1=24/40
+        //         d<-c=23/22 c<-b=22/21 b<-a=21/20 a<-t2=20/41
+        let expected: Vec<u32> = [
+            1_000_000 + 100 * 27 + 26,
+            1_000_000 + 100 * 26 + 25,
+            1_000_000 + 100 * 25 + 24,
+            40, // e = d + t1, sunk directly before its copy
+            1_000_000 + 100 * 24 + 40,
+            1_000_000 + 100 * 23 + 22,
+            1_000_000 + 100 * 22 + 21,
+            1_000_000 + 100 * 21 + 20,
+            41, // a = t1 + t2, sunk directly before its copy
+            1_000_000 + 100 * 20 + 41,
+        ]
+        .to_vec();
+        assert_eq!(
+            seq, expected,
+            "sink did not seat the definitions at their copy slots"
+        );
+    }
+
+    /// Sinking is position-only: when the home has a pending reader (the
+    /// `21 <- 20` copy) the sink fires, and a downstream reader of the
+    /// relayed VALUE (here: the terminator's condition) stays untouched —
+    /// the definition still dominates it because it sits directly before
+    /// its copy, still above the terminator.
+    #[test]
+    fn fold_sinks_definition_without_touching_readers() {
+        let mut func = IrFunction::new(
+            "multiuse".to_string(),
+            crate::common::types::IrType::Void,
+            Vec::new(),
+            false,
+        );
+        let latch_add = Instruction::BinOp {
+            dest: Value(40),
+            op: crate::ir::ops::IrBinOp::Add,
+            lhs: Operand::Value(Value(21)),
+            rhs: Operand::Const(crate::ir::reexports::IrConst::I32(1)),
+            ty: crate::common::types::IrType::I32,
+        };
+        func.blocks = vec![
+            blk(
+                0,
+                vec![latch_add],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(40)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(1),
+                },
+            ),
+            blk(1, Vec::new(), Terminator::Return(None)),
+        ];
+        func.next_value_id = 64;
+        func.next_label = 2;
+        // A pending reader of the phi home 20 keeps the sink profitable:
+        // seating v40 in home 20 at the add's original position would
+        // clobber the value this copy drains.
+        func.blocks[0].instructions.push(Instruction::Copy {
+            dest: Value(22),
+            src: Operand::Value(Value(20)),
+        });
+        // The trailing copy run the pass scans:
+        func.blocks[0].instructions.push(Instruction::Copy {
+            dest: Value(20),
+            src: Operand::Value(Value(40)),
+        });
+        fold_computed_phi_incomings(&mut func);
+        let b = &func.blocks[0];
+        // The home-reading copy keeps its position; the definition moved to
+        // directly before the relay copy; the terminator still reads v40.
+        assert_eq!(
+            b.instructions.len(),
+            3,
+            "instruction count changed: {:?}",
+            b.instructions
+        );
+        assert!(
+            matches!(
+                b.instructions.first(),
+                Some(Instruction::Copy {
+                    dest: Value(22),
+                    src: Operand::Value(Value(20))
+                })
+            ),
+            "the pending home reader moved: {:?}",
+            b.instructions
+        );
+        assert!(
+            matches!(
+                b.instructions[1],
+                Instruction::BinOp {
+                    dest: Value(40),
+                    ..
+                }
+            ),
+            "definition did not sink to directly before its copy: {:?}",
+            b.instructions
+        );
+        assert!(
+            matches!(
+                b.instructions[2],
+                Instruction::Copy {
+                    dest: Value(20),
+                    src: Operand::Value(Value(40))
+                }
+            ),
+            "relay copy was disturbed: {:?}",
+            b.instructions
+        );
+        assert!(
+            matches!(
+                b.terminator,
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(40)),
+                    ..
+                }
+            ),
+            "terminator reader was modified"
+        );
+    }
+
+    /// The profitability predicate must REFUSE the sink when the phi home has
+    /// no pending reader across the window and none in the dominated region
+    /// (a single-incoming accumulator shape): the allocator coalesces the
+    /// relay across the disjoint intervals anyway, and moving the
+    /// computation measured a real regression (spectral_norm decomposed
+    /// `vfmadd231sd` into mul+add for zero copies saved). The definition
+    /// starts AWAY from its copy, so a sink is observable if it wrongly
+    /// fires.
+    #[test]
+    fn dead_home_computed_incoming_is_not_sunk() {
+        let mut func = IrFunction::new(
+            "deadhome".to_string(),
+            crate::common::types::IrType::Void,
+            Vec::new(),
+            false,
+        );
+        let add = |dest: u32, lhs: u32, rhs: u32| Instruction::BinOp {
+            dest: Value(dest),
+            op: crate::ir::ops::IrBinOp::Add,
+            lhs: Operand::Value(Value(lhs)),
+            rhs: Operand::Value(Value(rhs)),
+            ty: crate::common::types::IrType::I32,
+        };
+        func.blocks = vec![
+            blk(
+                0,
+                vec![
+                    add(40, 1, 2),
+                    // Neutral filler: touches neither v40 nor the home 20,
+                    // so only the profitability predicate can refuse.
+                    Instruction::Copy {
+                        dest: Value(50),
+                        src: Operand::Value(Value(51)),
+                    },
+                    Instruction::Copy {
+                        dest: Value(20),
+                        src: Operand::Value(Value(40)),
+                    },
+                ],
+                Terminator::Branch(BlockId(1)),
+            ),
+            blk(1, Vec::new(), Terminator::Return(None)),
+        ];
+        func.next_value_id = 64;
+        func.next_label = 2;
+        fold_computed_phi_incomings(&mut func);
+        let b = &func.blocks[0];
+        let seq: Vec<u32> = b
+            .instructions
+            .iter()
+            .map(|inst| match inst {
+                Instruction::BinOp { dest, .. } | Instruction::Copy { dest, .. } => dest.0,
+                _ => u32::MAX,
+            })
+            .collect();
+        assert_eq!(
+            seq,
+            vec![40, 50, 20],
+            "definition moved even though the home had no pending reader"
+        );
+    }
+
+    /// A use in a DIFFERENT block refuses the fold: that block reads a value
+    /// this edge does not define, so the rename would strand it.
+    #[test]
+    fn fold_refuses_cross_block_readers() {
+        let mut func = IrFunction::new(
+            "xblock".to_string(),
+            crate::common::types::IrType::Void,
+            Vec::new(),
+            false,
+        );
+        let latch_add = Instruction::BinOp {
+            dest: Value(40),
+            op: crate::ir::ops::IrBinOp::Add,
+            lhs: Operand::Value(Value(21)),
+            rhs: Operand::Const(crate::ir::reexports::IrConst::I32(1)),
+            ty: crate::common::types::IrType::I32,
+        };
+        func.blocks = vec![
+            blk(
+                0,
+                vec![latch_add],
+                Terminator::CondBranch {
+                    cond: Operand::Const(crate::ir::reexports::IrConst::I32(1)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            blk(1, Vec::new(), Terminator::Return(None)),
+            blk(
+                2,
+                vec![Instruction::Copy {
+                    dest: Value(50),
+                    src: Operand::Value(Value(40)),
+                }],
+                Terminator::Return(None),
+            ),
+        ];
+        func.next_value_id = 64;
+        func.next_label = 3;
+        func.blocks[0].instructions.push(Instruction::Copy {
+            dest: Value(20),
+            src: Operand::Value(Value(40)),
+        });
+        fold_computed_phi_incomings(&mut func);
+        assert!(
+            func.blocks[0].instructions.iter().any(|i| matches!(
+                i,
+                Instruction::Copy {
+                    dest: Value(20),
+                    src: Operand::Value(Value(40))
+                }
+            )),
+            "fold ignored a cross-block reader of the source"
+        );
+    }
+
+    /// The fold must refuse when a crossed instruction clobbers an operand of
+    /// the computation: sinking past it would read the new value.
+    #[test]
+    fn fold_refuses_operand_clobber_in_between() {
+        let mut func = IrFunction::new(
+            "clobber".to_string(),
+            crate::common::types::IrType::Void,
+            Vec::new(),
+            false,
+        );
+        let latch_add = Instruction::BinOp {
+            dest: Value(40),
+            op: crate::ir::ops::IrBinOp::Add,
+            lhs: Operand::Value(Value(21)),
+            rhs: Operand::Const(crate::ir::reexports::IrConst::I32(1)),
+            ty: crate::common::types::IrType::I32,
+        };
+        func.blocks = vec![blk(
+            0,
+            vec![
+                latch_add,
+                // Clobbers v21 — an operand of the computation above — after
+                // it and before the relay copy.
+                cp(21, 12),
+                Instruction::Copy {
+                    dest: Value(20),
+                    src: Operand::Value(Value(40)),
+                },
+            ],
+            Terminator::Return(None),
+        )];
+        func.next_value_id = 64;
+        func.next_label = 1;
+        fold_computed_phi_incomings(&mut func);
+        assert!(
+            func.blocks[0].instructions.iter().any(|i| matches!(
+                i,
+                Instruction::Copy {
+                    dest: Value(20),
+                    src: Operand::Value(Value(40))
+                }
+            )),
+            "fold crossed an operand clobber"
         );
     }
 }

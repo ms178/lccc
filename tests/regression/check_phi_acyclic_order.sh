@@ -232,9 +232,14 @@ if not d_i < g_i:
 # reach the nearly fully register-allocated shape and must beat the legacy
 # policy by a wide margin (measured on 52e01b9: 55/3 vs legacy 70/27; the
 # historical 56/2 on the older base shifted by one relay each with PR
-# #501/#502). Pinned as <=56 insns / <=4 stack refs so a resolver regression
-# fails loudly without baking in one instruction's worth of drift.
-if not (k_i <= 56 and k_s <= 4 and k_i < l_i - 10):
+# #501/#502). Since the computed-φ-incoming sink (S66) plus #645's rotation
+# lags compose, the escape-off census is 53/3 (default arm 53/2) — the two
+# relay moves are folded into their phi homes by the sink's copy coalescing
+# while the reassoc latency model keeps the folded `add (mem), reg`.
+# Pinned as <=53 insns / <=3 stack refs, the exact measured shape: the
+# output is deterministic, so any shift is a real codegen change and must
+# ratchet this pin explicitly.
+if not (k_i <= 53 and k_s <= 3 and k_i < l_i - 10):
     bad.append(f"escape-off resolver shape regressed ({k_i} insns/{k_s} stkref; "
                f"legacy {l_i}/{l_s}): resolver contribution changed")
 # The escape must never make THIS shape worse than no-escape-at-all: the

@@ -983,9 +983,22 @@ mod tests {
     fn verifier_catches_phi_missing_predecessor_incoming() {
         // b1 has two CFG predecessors (b0, b2) but its φ lists only b0 —
         // the shape a stranded edge after a careless retarget produces.
+        // Both preds must be REACHABLE: an unreachable predecessor legally
+        // has no φ incoming (phi elimination never materializes a copy on a
+        // dead edge), and pinning that legal shape here would contradict the
+        // reachable-pred contract this verifier shares with the pass-level
+        // PHI-ARITY check (Csmith 20260945 / corpus adler_inline_tail).
         let func = func_with(
             vec![
-                blk(0, vec![], Terminator::Branch(BlockId(1))),
+                blk(
+                    0,
+                    vec![],
+                    Terminator::CondBranch {
+                        cond: Operand::Const(IrConst::I64(1)),
+                        true_label: BlockId(1),
+                        false_label: BlockId(2),
+                    },
+                ),
                 blk(
                     1,
                     vec![Instruction::Phi {
@@ -1001,7 +1014,7 @@ mod tests {
         );
         let err = verify_rewrite(&func, &FxHashSet::default()).unwrap_err();
         assert!(
-            err.contains("incoming set mismatches"),
+            err.contains("violates the reachable-pred contract (missing [2]"),
             "unexpected error: {err}"
         );
     }

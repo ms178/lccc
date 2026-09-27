@@ -60,9 +60,31 @@ impl Parser {
             pre_aligned = Some(pre_aligned.map_or(a, |prev: usize| prev.max(a)));
         }
 
-        // Parse pointer(s) with optional qualifiers and attributes
+        // Parse pointer(s) with optional qualifiers and attributes.
+        //
+        // POINTER_CONST must describe the DECLARED OBJECT's own
+        // qualification -- the star immediately left of the identifier --
+        // and never an inner pointer level.  Stars are consumed
+        // left-to-right, so every iteration first CLEARS the flag; after
+        // the loop it holds the last star's qualifier run, which is
+        // exactly the outermost level:
+        //
+        //     char *const p       -> true   (the one star is outermost)
+        //     short *const *gp    -> false  (gp stays writable; the const
+        //                                     qualifies its POINTEE)
+        //     int *const a, *b;   -> a: true, b: false (no cross-declarator
+        //                                     leakage either)
+        //
+        // The previous accumulate-across-stars behavior classified the
+        // mutable `gp` above as read-only, so `classify_global` routed it
+        // to `.data.rel.ro`; the dynamic loader's RELRO mprotect made the
+        // page read-only and the first run-time store through/to `gp`
+        // took SIGSEGV (found by Csmith seed 20260928 vs GCC; minimal
+        // repro tests/regression/pointer_const_multi_level_relro.c).
         while self.consume_if(&TokenKind::Star) {
             derived.push(DerivedDeclarator::Pointer);
+            // Only the outermost level's qualifiers describe the object.
+            self.attrs.set_pointer_const(false);
             self.skip_cv_qualifiers();
             self.skip_gcc_extensions();
         }
