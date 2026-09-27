@@ -31,6 +31,7 @@ pub(super) fn emit_executable(
     _needed_libs_param: &[&str],
     output_path: &str,
     pending_defsyms: &[(String, String, usize)],
+    interp: &[u8],
 ) -> Result<(), String> {
     let num_ifunc = ifunc_symbols.len();
 
@@ -361,7 +362,8 @@ pub(super) fn emit_executable(
 
     let phdrs_total_size = num_phdrs * phdr_size;
 
-    let interp_data = INTERP.to_vec();
+    // NUL-terminated PT_INTERP payload chosen by the caller (`link_builtin`).
+    let interp_data = interp.to_vec();
 
     // Section layout tracking
     let mut file_offset: u32 = ehdr_size;
@@ -877,6 +879,7 @@ pub(super) fn emit_executable(
         plt_entry_size,
         gotplt_vaddr,
         gotplt_reserved,
+        PltAddressing::Absolute,
     );
 
     // ── Apply relocations ────────────────────────────────────────────────
@@ -1283,6 +1286,7 @@ pub(super) fn emit_executable(
     }
 
     // Write all output sections
+    check_sections_placed(output_sections, "executable")?;
     for sec in output_sections.iter() {
         if sec.sh_type == SHT_NOBITS || sec.data.is_empty() {
             continue;
@@ -1307,6 +1311,34 @@ pub(super) fn emit_executable(
 }
 
 // ── Helpers for emit_executable ──────────────────────────────────────────────
+
+/// Placement invariant for the ELF32 emitters: every allocatable output
+/// section that carries bytes must have been assigned an address by the
+/// layout, or the section write loop copies it to file offset 0 — on top of
+/// the ELF header — and the link "succeeds" with a file that is not ELF at
+/// all (a `.note` section the shared-library layout never placed did exactly
+/// that).  Offset/address 0 is always the ELF header, so it can never be a
+/// real placement.  Failing loudly here turns any future layout omission
+/// into a diagnosable link error instead of silent corruption.
+pub(super) fn check_sections_placed(
+    output_sections: &[OutputSection],
+    what: &str,
+) -> Result<(), String> {
+    for sec in output_sections {
+        if sec.flags & SHF_ALLOC != 0
+            && !sec.data.is_empty()
+            && sec.addr == 0
+            && sec.file_offset == 0
+        {
+            return Err(format!(
+                "i686 {what} layout: allocatable section '{}' ({} bytes) was never placed",
+                sec.name,
+                sec.data.len()
+            ));
+        }
+    }
+    Ok(())
+}
 
 pub(super) fn layout_section(
     name: &str,
@@ -1652,6 +1684,30 @@ fn assign_symbol_addresses(
     super::link::evaluate_pending_defsyms(global_symbols, pending_defsyms)
 }
 
+/// How PLT entries address their `.got.plt` slots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PltAddressing {
+    /// Position-dependent executable: `jmp *abs32` / `pushl abs32`.
+    Absolute,
+    /// Shared object: slots are addressed relative to `%ebx`, which the i386
+    /// psABI requires every PLT caller to load with the address of
+    /// `_GLOBAL_OFFSET_TABLE_` (the payload is that symbol's link-time
+    /// value).  Absolute slot addresses are wrong in a shared object: the
+    /// object is loaded at an arbitrary base, so `jmp *abs32` reads a
+    /// random (usually unmapped) address and faults.
+    EbxRelative { got_symbol: u32 },
+}
+
+/// Build the i386 lazy-binding PLT.
+///
+/// ```text
+///            Absolute                     EbxRelative (PIC)
+/// PLT0:      ff 35 <GOT.PLT+4>            ff b3 <GOT.PLT+4 - GOT>     pushl
+///            ff 25 <GOT.PLT+8>            ff a3 <GOT.PLT+8 - GOT>     jmp *
+/// PLTn:      ff 25 <slot>                 ff a3 <slot - GOT>          jmp *
+///            68 <n*8>                     68 <n*8>                    push reloc off
+///            e9 <PLT0 - next>             e9 <PLT0 - next>            jmp PLT0
+/// ```
 pub(super) fn build_plt(
     num_plt: usize,
     plt_vaddr: u32,
@@ -1659,20 +1715,29 @@ pub(super) fn build_plt(
     plt_entry_size: u32,
     gotplt_vaddr: u32,
     gotplt_reserved: u32,
+    addressing: PltAddressing,
 ) -> Vec<u8> {
     let mut plt_data: Vec<u8> = Vec::new();
     if num_plt == 0 {
         return plt_data;
     }
 
-    // PLT[0]: resolver stub
-    let got1 = gotplt_vaddr + 4;
-    let got2 = gotplt_vaddr + 8;
+    // (ModRM for `pushl m32`, ModRM for `jmp *m32`, bias subtracted from
+    // the slot address).  ModRM 0x35/0x25 = disp32 absolute; 0xb3/0xa3 =
+    // disp32(%ebx).
+    let (push_modrm, jmp_modrm, bias) = match addressing {
+        PltAddressing::Absolute => (0x35u8, 0x25u8, 0u32),
+        PltAddressing::EbxRelative { got_symbol } => (0xb3u8, 0xa3u8, got_symbol),
+    };
+
+    // PLT[0]: resolver stub — push GOT.PLT[1] (link_map), jump GOT.PLT[2].
+    let got1 = (gotplt_vaddr + 4).wrapping_sub(bias);
+    let got2 = (gotplt_vaddr + 8).wrapping_sub(bias);
     plt_data.push(0xff);
-    plt_data.push(0x35);
+    plt_data.push(push_modrm);
     plt_data.extend_from_slice(&got1.to_le_bytes());
     plt_data.push(0xff);
-    plt_data.push(0x25);
+    plt_data.push(jmp_modrm);
     plt_data.extend_from_slice(&got2.to_le_bytes());
     while plt_data.len() < plt_header_size as usize {
         plt_data.push(0x90);
@@ -1680,11 +1745,11 @@ pub(super) fn build_plt(
 
     // PLT[N]
     for i in 0..num_plt {
-        let gotplt_entry = gotplt_vaddr + (gotplt_reserved + i as u32) * 4;
+        let gotplt_entry = (gotplt_vaddr + (gotplt_reserved + i as u32) * 4).wrapping_sub(bias);
         let plt_entry_addr = plt_vaddr + plt_header_size + (i as u32) * plt_entry_size;
 
         plt_data.push(0xff);
-        plt_data.push(0x25);
+        plt_data.push(jmp_modrm);
         plt_data.extend_from_slice(&gotplt_entry.to_le_bytes());
         plt_data.push(0x68);
         plt_data.extend_from_slice(&(i as u32 * 8).to_le_bytes());
@@ -1715,4 +1780,90 @@ fn write_elf_header(output: &mut [u8], entry_point: u32, ehdr_size: u32, num_phd
     output[46..48].copy_from_slice(&40u16.to_le_bytes());
     output[48..50].copy_from_slice(&0u16.to_le_bytes());
     output[50..52].copy_from_slice(&0u16.to_le_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn disp32(bytes: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+    }
+
+    #[test]
+    fn absolute_plt_uses_absolute_slot_addresses() {
+        let plt = build_plt(2, 0x1000, 16, 16, 0x3000, 3, PltAddressing::Absolute);
+        assert_eq!(plt.len(), 48);
+        assert_eq!(&plt[0..2], &[0xff, 0x35]);
+        assert_eq!(disp32(&plt, 2), 0x3004);
+        assert_eq!(&plt[6..8], &[0xff, 0x25]);
+        assert_eq!(disp32(&plt, 8), 0x3008);
+        // PLT1 -> GOT.PLT[4], reloc offset 8, jmp back to PLT0.
+        assert_eq!(&plt[32..34], &[0xff, 0x25]);
+        assert_eq!(disp32(&plt, 34), 0x3010);
+        assert_eq!(plt[38], 0x68);
+        assert_eq!(disp32(&plt, 39), 8);
+        assert_eq!(plt[43], 0xe9);
+        assert_eq!(disp32(&plt, 44) as i32, 0x1000 - (0x1020 + 16));
+    }
+
+    #[test]
+    fn shared_plt_addresses_slots_relative_to_ebx_got_symbol() {
+        // `_GLOBAL_OFFSET_TABLE_` sits below .got.plt (it names .got in the
+        // shared-object layout), so the displacements are GOT-relative and
+        // must round-trip to the absolute slot address.
+        let got = 0x2ff0;
+        let plt = build_plt(
+            2,
+            0x1000,
+            16,
+            16,
+            0x3000,
+            3,
+            PltAddressing::EbxRelative { got_symbol: got },
+        );
+        assert_eq!(plt.len(), 48);
+        assert_eq!(&plt[0..2], &[0xff, 0xb3], "pushl disp32(%ebx)");
+        assert_eq!(got + disp32(&plt, 2), 0x3004);
+        assert_eq!(&plt[6..8], &[0xff, 0xa3], "jmp *disp32(%ebx)");
+        assert_eq!(got + disp32(&plt, 8), 0x3008);
+        for i in 0..2u32 {
+            let e = (16 + 16 * i) as usize;
+            assert_eq!(&plt[e..e + 2], &[0xff, 0xa3]);
+            assert_eq!(got + disp32(&plt, e + 2), 0x3000 + (3 + i) * 4);
+            assert_eq!(disp32(&plt, e + 7), i * 8);
+            let next = 0x1000 + e as u32 + 16;
+            assert_eq!(next.wrapping_add(disp32(&plt, e + 12)), 0x1000);
+        }
+    }
+
+    fn sec(name: &str, flags: u32, len: usize, addr: u32, off: u32) -> OutputSection {
+        OutputSection {
+            name: name.to_string(),
+            sh_type: SHT_PROGBITS,
+            flags,
+            data: vec![0; len],
+            align: 4,
+            addr,
+            file_offset: off,
+        }
+    }
+
+    #[test]
+    fn unplaced_allocatable_section_is_a_hard_error() {
+        let placed = [
+            sec(".text", SHF_ALLOC | SHF_EXECINSTR, 8, 0x1000, 0x1000),
+            // Empty and non-alloc sections never reach the write loop at 0.
+            sec(".note", SHF_ALLOC, 0, 0, 0),
+            sec(".comment", 0, 16, 0, 0),
+        ];
+        assert!(check_sections_placed(&placed, "shared library").is_ok());
+
+        let unplaced = [sec(".note", SHF_ALLOC, 0x30, 0, 0)];
+        let err = check_sections_placed(&unplaced, "shared library").unwrap_err();
+        assert!(
+            err.contains("'.note'") && err.contains("never placed"),
+            "{err}"
+        );
+    }
 }

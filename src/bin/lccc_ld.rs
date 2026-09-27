@@ -439,7 +439,10 @@ fn run(args: &[String]) -> Result<(), String> {
             }
             "--help" => {
                 println!("Usage: lccc-ld [options] file...");
-                println!("  Standard userspace, -r relocatable, and -T script links supported.");
+                println!(
+                    "  Standard userspace (elf_x86_64, elf_i386), -r relocatable (elf_x86_64),"
+                );
+                println!("  and -T script links (both) supported.");
                 return Ok(());
             }
             "-e" | "--entry" => {
@@ -913,10 +916,6 @@ fn run(args: &[String]) -> Result<(), String> {
         );
     }
 
-    if elf_i386 {
-        return Err("ELF32/i386 output without a linker script is not implemented in lccc-ld; use the i686 compiler driver or pass -T".into());
-    }
-
     // ------------------------------------------------------------------
     // Mode 3: standard userspace link — same pipeline as the compiler
     // driver (`link_builtin`/`link_shared`). CRT objects arrive as
@@ -941,6 +940,30 @@ fn run(args: &[String]) -> Result<(), String> {
         }
     }
     let object_refs: Vec<&str> = object_files.iter().map(|s| s.as_str()).collect();
+
+    // ELF32/i386 userspace links (`gcc -m32 -fuse-ld=…` spawns `ld -m
+    // elf_i386 … crt1.o crti.o crtbegin.o … -lc … crtend.o crtn.o`) drive
+    // the SAME i686 pipeline the `lccc-i686` compiler driver links with —
+    // symbol resolution, archive extraction, libc/libgcc_s dynamic binding,
+    // PLT/GOT, TLS, IFUNC, eh_frame_hdr — with the CRT objects and every
+    // library arriving positionally from the caller.
+    if elf_i386 {
+        if shared {
+            return lccc::linker_entry::link_shared_i386(&object_refs, &output, &passthrough);
+        }
+        // The i686 executable emitter produces ET_EXEC at the ABI base
+        // address only.  A PIE needs a load-address-independent image plus
+        // R_386_RELATIVE for every absolute word; emitting ET_EXEC anyway
+        // would silently hand the caller a non-PIE (ASLR-less) binary it did
+        // not ask for, so refuse — exactly like the -static-pie refusal
+        // below.  (`gcc -m32` on PIE-default distributions: pass -no-pie.)
+        if is_pie {
+            return Err("ELF32/i386 -pie output is not implemented: lccc-ld emits \
+                 ET_EXEC for i386 (link with -no-pie)"
+                .to_string());
+        }
+        return lccc::linker_entry::link_builtin_i386(&object_refs, &output, &passthrough);
+    }
 
     if shared {
         return lccc::linker_entry::link_shared_x86(&object_refs, &output, &passthrough);

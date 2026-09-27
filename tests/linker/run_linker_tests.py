@@ -2203,6 +2203,79 @@ def _script_undefined_archive_test_i386(args, oracles):
     finally:
         shutil.rmtree(td, ignore_errors=True)
 
+def _i386_gcc_driver_test(args, oracles):
+    """`gcc -m32 -B<dir-with-ld=lccc-ld>` userspace links (exe and -shared).
+
+    Pins three i386 defects together, since each only shows with the real
+    gcc driver inputs (crti/crtbeginS/crtendS/crtn, -lgcc_s, libc.so):
+      * `-m elf_i386` userspace links used to be rejected outright;
+      * the shared-object layout never placed the merged `.note` section
+        (crtbeginS's `.note.gnu.property`), so it was written at file
+        offset 0 over the ELF header;
+      * the shared-object PLT used absolute `jmp *slot` entries, which
+        fault once the object is loaded anywhere but address 0 — every
+        external call (and crtbeginS's `__cxa_finalize@plt` at exit) crashed.
+    Each library is exercised lazily and with LD_BIND_NOW.
+    """
+    name = "i386_gcc_driver_exe_and_shared"
+    td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
+    try:
+        lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+        shim = os.path.join(td, "shim")
+        os.mkdir(shim)
+        os.symlink(lccc_ld, os.path.join(shim, "ld"))
+        srcs = {
+            "lib.c": "#include <stdio.h>\n#include <stdlib.h>\n"
+                     "int counter = 5;\n"
+                     "int lib_fn(int x){ printf(\"lib %d\\n\", x);"
+                     " return abs(-x) * 3 + counter; }\n",
+            "main.c": "#include <stdio.h>\n#include <math.h>\n"
+                      "int lib_fn(int);\n"
+                      "static __thread int tls = 7;\n"
+                      "int main(void){ volatile double d = 2.0;"
+                      " printf(\"%d %d %.0f\\n\", lib_fn(12), tls, sqrt(d * 8));"
+                      " return 0; }\n",
+        }
+        for fn, body in srcs.items():
+            with open(os.path.join(td, fn), "w") as f:
+                f.write(body)
+        probe = sh([CC, "-m32", "-c", "main.c", "-o", "probe.o"], cwd=td)
+        if probe.returncode != 0:
+            return Result(name, "SKIP", "no gcc -m32 multilib")
+        b = f"-B{shim}"
+        r = sh([CC, "-m32", "-O2", "-fPIC", "-shared", b, "lib.c", "-o", "libt.so"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL", f"-shared link failed: {r.stderr.decode()[:400]}")
+        with open(os.path.join(td, "libt.so"), "rb") as f:
+            if f.read(4) != b"\x7fELF":
+                return Result(name, "FAIL", "libt.so ELF header clobbered")
+        r = sh([CC, "-m32", "-O2", "-no-pie", b, "main.c", "-L.", "-lt", "-lm",
+                "-o", "main"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL", f"exe link failed: {r.stderr.decode()[:400]}")
+        # Cross-check each side against the system linker so a failure
+        # names the broken artifact.
+        r = sh([CC, "-m32", "-O2", "-no-pie", "main.c", "-L.", "-lt", "-lm",
+                "-o", "main_ref"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "SKIP", "reference -m32 link failed")
+        want = "lib 12\n41 7 4\n"
+        for exe in ("main", "main_ref"):
+            for env in ({}, {"LD_BIND_NOW": "1"}):
+                env = dict(env, LD_LIBRARY_PATH=td)
+                r = sh([os.path.join(td, exe)], cwd=td, env=env)
+                out = r.stdout.decode()
+                if r.returncode != 0 or out != want:
+                    return Result(name, "FAIL",
+                                  f"{exe} env={env.get('LD_BIND_NOW', 'lazy')}: "
+                                  f"rc={r.returncode} out={out!r}")
+        return Result(name, "PASS")
+    except Exception as e:
+        return Result(name, "FAIL", f"harness exception: {e!r}")
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
 VDSO_SCRIPT = r"""
 PHDRS {
  text PT_LOAD FILEHDR PHDRS FLAGS(5);
@@ -7172,6 +7245,8 @@ def main():
             and (not args.tag or args.tag == "script"):
         results.append(_script_undefined_archive_test(args, oracles))
         results.append(_script_undefined_archive_test_i386(args, oracles))
+    if (not args.filter or "i386" in args.filter) and (not args.tag or args.tag == "shared"):
+        results.append(_i386_gcc_driver_test(args, oracles))
     if (not args.filter or "vdso" in args.filter) and (not args.tag or args.tag == "script"):
         results.append(_vdso_script_test(args, oracles))
         results.append(_vdso_note_phdr_test(args, oracles))

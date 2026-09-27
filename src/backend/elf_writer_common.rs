@@ -230,6 +230,73 @@ pub struct JumpDetection {
 
 // ─── Internal types ───────────────────────────────────────────────────
 
+/// One queued padding rewrite of `fixup_alignment_markers`, in the
+/// coordinates of the section before the sweep's first flush.
+struct PadEdit {
+    /// Start of the marker's padding run.
+    start: usize,
+    /// Current length of the run (replaced by `bytes`).
+    old_len: usize,
+    bytes: Vec<u8>,
+    /// `shift_after` anchor: the run's end ...
+    at: u64,
+    /// ... and the marker's source position (tie rule).
+    seq: u64,
+}
+
+/// Queued padding rewrites with a prefix-sum position map.
+#[derive(Default)]
+struct PadQueue {
+    edits: Vec<PadEdit>,
+    /// `cum[i]`: total size change of `edits[..=i]`.
+    cum: Vec<i64>,
+}
+
+impl PadQueue {
+    /// Whether `edit` keeps the anchors sorted, which `map`'s prefix
+    /// search requires.
+    fn accepts(&self, edit: &PadEdit) -> bool {
+        self.edits.last().is_none_or(|last| {
+            (last.at, last.seq) <= (edit.at, edit.seq) && last.start + last.old_len <= edit.start
+        })
+    }
+
+    fn push(&mut self, edit: PadEdit) {
+        let delta = edit.bytes.len() as i64 - edit.old_len as i64;
+        self.cum.push(self.cum.last().copied().unwrap_or(0) + delta);
+        self.edits.push(edit);
+    }
+
+    /// Where the record at `off` (source position `seq`, `None` for
+    /// byte-bearing records) sits once every queued edit is applied:
+    /// `shift_after(at, delta, Some(edit.seq))` moves it iff
+    /// `off > at`, or `off == at` and it is byte-bearing or later in the
+    /// source -- exactly `(at, edit.seq) < (off, seq)` with `None` = +inf.
+    fn map(&self, off: u64, seq: Option<u64>) -> u64 {
+        let passed = match seq {
+            Some(s) => self.edits.partition_point(|e| (e.at, e.seq) < (off, s)),
+            None => self.edits.partition_point(|e| e.at <= off),
+        };
+        match passed {
+            0 => off,
+            n => off.wrapping_add_signed(self.cum[n - 1]),
+        }
+    }
+
+    /// Section length once every queued edit is applied.
+    fn len_after(&self, len: usize) -> usize {
+        (len as i64 + self.cum.last().copied().unwrap_or(0)) as usize
+    }
+}
+
+/// One relaxation-pass transition of a jump (see `relax_jumps`).
+enum JumpAction {
+    /// Long form -> 2-byte short form (first, optimistic pass only).
+    Shrink,
+    /// Short form -> the jump's `long_len` near form.
+    Grow,
+}
+
 /// Tracks a jump instruction for relaxation (long <-> short).
 #[derive(Clone, Debug)]
 struct JumpInfo {
@@ -3494,11 +3561,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 }
 
                 // Classify every jump by its target distance.
-                enum Action {
-                    Shrink,
-                    Grow,
-                }
-                let mut actions: Vec<(usize, Action)> = Vec::new();
+                let mut actions: Vec<(usize, JumpAction)> = Vec::new();
                 let dbg = std::env::var("CCC_DEBUG_RELAX").is_ok();
                 for (j_idx, jump) in self.sections[sec_idx].jumps.iter().enumerate() {
                     let target_off_opt = jump_target_with_addend(
@@ -3539,7 +3602,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         // that does not currently fit: the growth phase below
                         // restores exactly those that still do not fit once the
                         // layout has settled.
-                        actions.push((j_idx, Action::Shrink));
+                        actions.push((j_idx, JumpAction::Shrink));
                     } else if dbg && jump.relaxed && jump.can_grow && !fits_short {
                         eprintln!("[RELAX] sec{sec_idx} j{j_idx} misses disp8 in the snapshot");
                     }
@@ -3554,7 +3617,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 // always forces.
                 if !first_pass || actions.is_empty() {
                     for j_idx in self.plan_jump_growth(sec_idx, &local_labels) {
-                        actions.push((j_idx, Action::Grow));
+                        actions.push((j_idx, JumpAction::Grow));
                     }
                 }
 
@@ -3562,114 +3625,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     break;
                 }
 
-                // Process back to front so earlier offsets stay valid.
-                actions.sort_unstable_by_key(|&(j, _)| j);
-                actions.reverse();
-
-                for &(j_idx, ref action) in &actions {
-                    // Snapshot every field the transition needs so the
-                    // immutable borrow ends before the mutable section edits.
-                    let (offset, old_len, long_len, is_conditional, target) = {
-                        let jump = &self.sections[sec_idx].jumps[j_idx];
-                        (
-                            jump.offset,
-                            jump.len,
-                            jump.long_len,
-                            jump.is_conditional,
-                            jump.target.clone(),
-                        )
-                    };
-
-                    match action {
-                        Action::Shrink => {
-                            let new_len = 2usize;
-                            let shrink = old_len - new_len;
-                            let data = &mut self.sections[sec_idx].data;
-                            if is_conditional {
-                                let cc = data[offset + 1] - 0x80;
-                                data[offset] = 0x70 + cc;
-                                data[offset + 1] = 0;
-                            } else {
-                                data[offset] = 0xEB;
-                                data[offset + 1] = 0;
-                            }
-                            let remove_start = offset + new_len;
-                            let remove_end = offset + old_len;
-                            data.drain(remove_start..remove_end);
-                            // The long form's displacement relocation goes
-                            // (the short form is resolved internally), then
-                            // everything after the jump moves.
-                            let old_reloc_pos = if is_conditional {
-                                offset + 2
-                            } else {
-                                offset + 1
-                            } as u64;
-                            self.sections[sec_idx]
-                                .relocations
-                                .retain(|reloc| reloc.offset != old_reloc_pos);
-                            self.shift_after(sec_idx, offset + 1, -(shrink as i64), None);
-                            self.sections[sec_idx].jumps[j_idx].relaxed = true;
-                            self.sections[sec_idx].jumps[j_idx].can_grow = true;
-                            self.sections[sec_idx].jumps[j_idx].len = new_len;
-                        }
-                        Action::Grow => {
-                            let new_len = long_len;
-                            let grow = new_len - old_len;
-                            let data = &mut self.sections[sec_idx].data;
-                            if is_conditional {
-                                // short 0x7x disp8 -> near 0x0f 0x8x rel16/32
-                                let cc = data[offset] - 0x70;
-                                let insert = vec![0u8; grow];
-                                data.splice(offset + 2..offset + 2, insert);
-                                data[offset] = 0x0f;
-                                data[offset + 1] = 0x80 + cc;
-                            } else {
-                                // short 0xeb disp8 -> near 0xe9 rel16/32
-                                let insert = vec![0u8; grow];
-                                data.splice(offset + 2..offset + 2, insert);
-                                data[offset] = 0xE9;
-                            }
-                            // Everything after the jump moves; the new
-                            // displacement relocation is added afterwards so
-                            // it is not moved with it. The source-level
-                            // addend (`jmp lbl+8` surviving as long form)
-                            // MUST ride along: dropping it silently
-                            // retargeted the branch to the bare label
-                            // (`jmp .Ldot+0x1234` became disp -5).
-                            self.shift_after(sec_idx, offset + 1, grow as i64, None);
-                            // Restore the original mode's relocation width. A
-                            // `.code16` near branch owns a two-byte rel16 field;
-                            // writing rel32 would overwrite the next instruction.
-                            let rel16 = long_len == if is_conditional { 4 } else { 3 };
-                            let reloc_pos = (if is_conditional {
-                                offset + 2
-                            } else {
-                                offset + 1
-                            }) as u64;
-                            let target_addend = self.sections[sec_idx].jumps[j_idx].target_addend;
-                            self.sections[sec_idx].relocations.push(ElfRelocation {
-                                offset: reloc_pos,
-                                symbol: target.clone(),
-                                reloc_type: if rel16 {
-                                    A::reloc_pc16()
-                                        .expect("rel16 branch without architecture relocation")
-                                } else {
-                                    A::reloc_pc32()
-                                },
-                                addend: if rel16 {
-                                    -2 + target_addend
-                                } else {
-                                    -4 + target_addend
-                                },
-                                diff_symbol: None,
-                                patch_size: if rel16 { 2 } else { 4 },
-                            });
-                            self.sections[sec_idx].jumps[j_idx].relaxed = false;
-                            self.sections[sec_idx].jumps[j_idx].len = new_len;
-                        }
-                    }
-                    any_change = true;
-                }
+                self.apply_jump_transitions(sec_idx, &actions);
+                any_change = true;
 
                 // Recompute alignment padding after the size changes.
                 self.fixup_alignment_markers(sec_idx);
@@ -3683,6 +3640,135 @@ impl<A: X86Arch> ElfWriterCore<A> {
             self.patch_short_jumps(sec_idx)?;
         }
         Ok(())
+    }
+
+    /// Apply one relaxation pass's jump transitions in a single rebuild of
+    /// the section.
+    ///
+    /// Each transition used to be applied on its own, back to front: a
+    /// `drain`/`splice` of the section bytes, a `retain` over every
+    /// relocation and a full `shift_after` remap (every label, relocation,
+    /// jump, marker and deferred record, plus a string-keyed `label_seq`
+    /// lookup per label).  That is O(jumps x records) per pass: the -O0
+    /// torture source memclr.c (2049 functions, 9 MB of assembly, 41k
+    /// labels) spent ~150 s here, where GNU as needs under a second.
+    ///
+    /// The batched edit is the same edit.  Processed back to front, every
+    /// transition's `shift_after(offset + 1, delta)` saw ORIGINAL
+    /// coordinates, so the composite remap is `off + sum(delta)` over the
+    /// transitions with `offset + 1 <= off` -- a prefix sum, looked up by
+    /// binary search.  The bytes written, the relocations dropped and the
+    /// relocations appended (still in descending offset order) are exactly
+    /// the sequential ones, so the object file is byte-identical.
+    fn apply_jump_transitions(&mut self, sec_idx: usize, actions: &[(usize, JumpAction)]) {
+        let reloc_pos = |offset: usize, is_conditional: bool| {
+            (if is_conditional {
+                offset + 2
+            } else {
+                offset + 1
+            }) as u64
+        };
+        let mut edits: Vec<(usize, bool)> = actions
+            .iter()
+            .map(|(j, a)| (*j, matches!(a, JumpAction::Shrink)))
+            .collect();
+        edits.sort_unstable_by_key(|&(j, _)| self.sections[sec_idx].jumps[j].offset);
+
+        // The long form's displacement relocation of every shrunk jump goes
+        // (the short form is resolved internally by `patch_short_jumps`).
+        let mut dropped: Vec<u64> = edits
+            .iter()
+            .filter(|&&(_, shrink)| shrink)
+            .map(|&(j, _)| {
+                let jump = &self.sections[sec_idx].jumps[j];
+                reloc_pos(jump.offset, jump.is_conditional)
+            })
+            .collect();
+        if !dropped.is_empty() {
+            dropped.sort_unstable();
+            self.sections[sec_idx]
+                .relocations
+                .retain(|reloc| dropped.binary_search(&reloc.offset).is_err());
+        }
+
+        // Rebuild the bytes and the shift table in one front-to-back sweep.
+        let old = std::mem::take(&mut self.sections[sec_idx].data);
+        let mut data = Vec::with_capacity(old.len() + 4 * edits.len());
+        let mut shifts: Vec<(u64, i64)> = Vec::with_capacity(edits.len());
+        let (mut cursor, mut total) = (0usize, 0i64);
+        for &(j, shrink) in &edits {
+            let jump = &self.sections[sec_idx].jumps[j];
+            let (offset, old_len) = (jump.offset, jump.len);
+            data.extend_from_slice(&old[cursor..offset]);
+            let new_len = if shrink {
+                // near jcc 0x0f 0x8x rel / jmp 0xe9 rel -> short 0x7x / 0xeb disp8
+                if jump.is_conditional {
+                    data.push(0x70 + (old[offset + 1] - 0x80));
+                } else {
+                    data.push(0xEB);
+                }
+                data.push(0);
+                2
+            } else {
+                // short 0x7x / 0xeb disp8 -> near 0x0f 0x8x / 0xe9 rel16/32;
+                // the unconditional form keeps its old second byte as the
+                // first displacement byte, as the in-place splice did.
+                let grow = jump.long_len - old_len;
+                if jump.is_conditional {
+                    data.push(0x0f);
+                    data.push(0x80 + (old[offset] - 0x70));
+                } else {
+                    data.push(0xE9);
+                    data.push(old[offset + 1]);
+                }
+                data.resize(data.len() + grow, 0);
+                jump.long_len
+            };
+            total += new_len as i64 - old_len as i64;
+            shifts.push(((offset + 1) as u64, total));
+            cursor = offset + old_len;
+        }
+        data.extend_from_slice(&old[cursor..]);
+        self.sections[sec_idx].data = data;
+
+        self.remap_offsets(sec_idx, |off, _| {
+            match shifts.partition_point(|&(at, _)| at <= off) {
+                0 => off,
+                i => off.wrapping_add_signed(shifts[i - 1].1),
+            }
+        });
+
+        // Jump state, and the grown jumps' displacement relocations -- added
+        // after the remap so they are not moved with it, in the descending
+        // offset order the sequential edit appended them in.  The
+        // source-level addend (`jmp lbl+8` surviving as long form) rides
+        // along; a `.code16` near branch owns a two-byte rel16 field.
+        for &(j, shrink) in edits.iter().rev() {
+            let sec = &mut self.sections[sec_idx];
+            let jump = &mut sec.jumps[j];
+            if shrink {
+                jump.relaxed = true;
+                jump.can_grow = true;
+                jump.len = 2;
+                continue;
+            }
+            jump.relaxed = false;
+            jump.len = jump.long_len;
+            let rel16 = jump.long_len == if jump.is_conditional { 4 } else { 3 };
+            let reloc = ElfRelocation {
+                offset: reloc_pos(jump.offset, jump.is_conditional),
+                symbol: jump.target.clone(),
+                reloc_type: if rel16 {
+                    A::reloc_pc16().expect("rel16 branch without architecture relocation")
+                } else {
+                    A::reloc_pc32()
+                },
+                addend: if rel16 { -2 } else { -4 } + jump.target_addend,
+                diff_symbol: None,
+                patch_size: if rel16 { 2 } else { 4 },
+            };
+            sec.relocations.push(reloc);
+        }
     }
 
     /// Offset and source position of the label a jump targets, if it is
@@ -4002,6 +4088,29 @@ impl<A: X86Arch> ElfWriterCore<A> {
         }
     }
 
+    /// Re-pad every alignment/`.org`/tight-loop marker of `sec_idx` against
+    /// the current layout, front to back.
+    ///
+    /// Each marker's decision depends on its offset AFTER the markers before
+    /// it were re-padded, so the sweep is sequential -- but applying each
+    /// padding change on the spot (`splice` + a full `shift_after` remap of
+    /// every label, relocation, jump, marker and deferred record, with a
+    /// string-keyed `label_seq` lookup per label) made one sweep
+    /// O(markers x records).  At -O2 the torture source memclr.c spends
+    /// ~80 s here.  The edits are instead queued (`PadEdit`, in ORIGINAL
+    /// coordinates) and every position the sweep needs is read through the
+    /// queue's prefix-sum map; one rebuild + one remap applies them.
+    ///
+    /// Why that is the same edit: re-padding moves exactly the records
+    /// after the run's end under `shift_after`'s tie rule, i.e. the up-set
+    /// `(offset, seq) > (end, marker.seq)` (byte-bearing records -- `seq`
+    /// `None` -- move at equality).  Such shifts preserve the relative order
+    /// of all records, so "after edit k" can be decided in original
+    /// coordinates, and because the markers are visited in that same order
+    /// the queued anchors are sorted: the edits a position has passed form
+    /// a prefix.  A queue whose next anchor would break the sort (not
+    /// produced by any known input) is flushed first, so the result stays
+    /// exact regardless.
     fn fixup_alignment_markers(&mut self, sec_idx: usize) {
         if self.sections[sec_idx].align_markers.is_empty() {
             return;
@@ -4014,12 +4123,33 @@ impl<A: X86Arch> ElfWriterCore<A> {
 
         let is_exec = self.sections[sec_idx].flags & SHF_EXECINSTR != 0;
 
+        // Back-edge candidates per tight-loop header (jump indices).  Jumps
+        // are only moved by this sweep, never added or resized.
+        let mut jumps_by_target: FxHashMap<String, Vec<usize>> = FxHashMap::default();
+        if self.sections[sec_idx]
+            .align_markers
+            .iter()
+            .any(|m| matches!(m.kind, AlignMarkerKind::TightLoop { .. }))
+        {
+            for (j, jump) in self.sections[sec_idx].jumps.iter().enumerate() {
+                jumps_by_target
+                    .entry(jump.target.clone())
+                    .or_default()
+                    .push(j);
+            }
+        }
+
+        let mut queue = PadQueue::default();
         let mut marker_idx = 0;
         loop {
             if marker_idx >= self.sections[sec_idx].align_markers.len() {
                 break;
             }
-            let current_offset = self.sections[sec_idx].align_markers[marker_idx].offset;
+            let (orig_offset, marker_seq) = {
+                let m = &self.sections[sec_idx].align_markers[marker_idx];
+                (m.offset, m.seq)
+            };
+            let current_offset = queue.map(orig_offset as u64, Some(marker_seq)) as usize;
             let kind = self.sections[sec_idx].align_markers[marker_idx]
                 .kind
                 .clone();
@@ -4050,6 +4180,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         *addend as u64
                     } else if let Some(&(l_sec, l_off)) = self.label_positions.get(label.as_str()) {
                         if l_sec == sec_idx {
+                            let l_seq = self.label_seq.get(label.as_str()).copied().unwrap_or(0);
+                            let l_off = queue.map(l_off, Some(l_seq));
                             (l_off as i64 + *addend) as u64
                         } else {
                             marker_idx += 1;
@@ -4089,16 +4221,21 @@ impl<A: X86Arch> ElfWriterCore<A> {
                             reject_reason = Some("cross-section");
                             break 'arm (None, None);
                         }
-                        let Some(jump) = self.sections[sec_idx]
-                            .jumps
-                            .iter()
-                            .filter(|j| j.target == *header && (j.offset as u64) >= h_off)
-                            .min_by_key(|j| j.offset)
+                        let h_seq = self.label_seq.get(header.as_str()).copied().unwrap_or(0);
+                        let h_off = queue.map(h_off, Some(h_seq));
+                        let jumps = &self.sections[sec_idx].jumps;
+                        let Some((jump_off, jump_len)) = jumps_by_target
+                            .get(header.as_str())
+                            .into_iter()
+                            .flatten()
+                            .map(|&j| (queue.map(jumps[j].offset as u64, None), jumps[j].len))
+                            .filter(|&(off, _)| off >= h_off)
+                            .min_by_key(|&(off, _)| off)
                         else {
                             reject_reason = Some("no-backedge");
                             break 'arm (None, None);
                         };
-                        let body_end = jump.offset + jump.len;
+                        let body_end = jump_off as usize + jump_len;
                         let size = body_end.saturating_sub(h_off as usize);
                         let Some(log2) = tight_bucket_log2(size as u64) else {
                             reject_reason = Some(if size == 0 { "empty" } else { "span>64" });
@@ -4153,8 +4290,6 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 // of it would corrupt an instruction; only a full rebuild
                 // yields a valid, optimally-sized NOP sequence for the new
                 // length.
-                let start = current_offset;
-                let old_end = start + existing_padding;
                 let after_insn = self.sections[sec_idx].align_markers[marker_idx].after_insn;
                 let nops = self.sections[sec_idx].align_markers[marker_idx].nops;
                 // `.org` / org-style `.fill LABEL+N-.` pad with the fill
@@ -4176,17 +4311,32 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     }
                 };
                 debug_assert_eq!(new_bytes.len(), needed_padding);
-                if old_end <= self.sections[sec_idx].data.len() {
-                    self.sections[sec_idx]
-                        .data
-                        .splice(start..old_end, new_bytes);
-                    let delta = needed_padding as i64 - existing_padding as i64;
-                    if delta != 0 {
-                        // Anchor the shift at the run's END. When the run was
-                        // empty, END is `start` itself, and source order
-                        // decides which labels precede the padding.
-                        let seq = self.sections[sec_idx].align_markers[marker_idx].seq;
-                        self.shift_after(sec_idx, old_end, delta, Some(seq));
+                let current_len = queue.len_after(self.sections[sec_idx].data.len());
+                if current_offset + existing_padding <= current_len {
+                    // Anchor the shift at the run's END. When the run was
+                    // empty, END is the marker itself, and source order
+                    // decides which labels precede the padding.
+                    let edit = PadEdit {
+                        start: orig_offset,
+                        old_len: existing_padding,
+                        bytes: new_bytes,
+                        at: (orig_offset + existing_padding) as u64,
+                        seq: marker_seq,
+                    };
+                    if !queue.accepts(&edit) {
+                        self.flush_padding_edits(sec_idx, &mut queue);
+                        // The flush remapped this marker like every other
+                        // record, so its offset is now `current_offset`,
+                        // which the empty queue maps to itself.
+                        let m = &self.sections[sec_idx].align_markers[marker_idx];
+                        let edit = PadEdit {
+                            start: m.offset,
+                            at: (m.offset + existing_padding) as u64,
+                            ..edit
+                        };
+                        queue.push(edit);
+                    } else {
+                        queue.push(edit);
                     }
                 }
             }
@@ -4199,6 +4349,28 @@ impl<A: X86Arch> ElfWriterCore<A> {
 
             marker_idx += 1;
         }
+        self.flush_padding_edits(sec_idx, &mut queue);
+    }
+
+    /// Apply the queued padding rewrites of `fixup_alignment_markers` in one
+    /// rebuild of the section bytes and one remap of its records.
+    fn flush_padding_edits(&mut self, sec_idx: usize, queue: &mut PadQueue) {
+        if queue.edits.is_empty() {
+            return;
+        }
+        let q = std::mem::take(queue);
+        let old = std::mem::take(&mut self.sections[sec_idx].data);
+        let grown = q.cum.last().copied().unwrap_or(0).max(0) as usize;
+        let mut data = Vec::with_capacity(old.len() + grown);
+        let mut cursor = 0usize;
+        for e in &q.edits {
+            data.extend_from_slice(&old[cursor..e.start]);
+            data.extend_from_slice(&e.bytes);
+            cursor = e.start + e.old_len;
+        }
+        data.extend_from_slice(&old[cursor..]);
+        self.sections[sec_idx].data = data;
+        self.remap_offsets(sec_idx, |off, seq| q.map(off, seq));
     }
 
     // ─── Symbol locality check ────────────────────────────────────────
@@ -4704,6 +4876,63 @@ fn instr_operands_mention_dot(instr: &Instruction) -> bool {
         },
         Operand::Register(_) => false,
     })
+}
+
+#[cfg(test)]
+mod pad_queue_tests {
+    use super::{PadEdit, PadQueue};
+
+    fn edit(start: usize, old_len: usize, new_len: usize, seq: u64) -> PadEdit {
+        PadEdit {
+            start,
+            old_len,
+            bytes: vec![0x90; new_len],
+            at: (start + old_len) as u64,
+            seq,
+        }
+    }
+
+    /// `PadQueue::map` must reproduce `shift_after`'s tie rule exactly:
+    /// records strictly after a run's end move; at the end itself a
+    /// byte-bearing record (`None`) moves, a zero-width one only when it is
+    /// later in the source than the marker.
+    #[test]
+    fn map_matches_shift_after_tie_rule() {
+        let mut q = PadQueue::default();
+        q.push(edit(10, 0, 6, 5)); // empty run at 10 grows by 6
+        q.push(edit(32, 4, 1, 9)); // run 32..36 shrinks by 3
+        assert_eq!(q.map(9, None), 9);
+        assert_eq!(
+            q.map(10, Some(4)),
+            10,
+            "label before the directive stays in front"
+        );
+        assert_eq!(
+            q.map(10, Some(6)),
+            16,
+            "label after the directive follows the padding"
+        );
+        assert_eq!(q.map(10, None), 16, "an instruction at the run end moves");
+        assert_eq!(q.map(20, Some(0)), 26);
+        assert_eq!(
+            q.map(32, Some(9)),
+            38,
+            "the second marker itself moves by the first run only"
+        );
+        assert_eq!(q.map(36, Some(8)), 42);
+        assert_eq!(q.map(36, Some(10)), 39);
+        assert_eq!(q.map(36, None), 39);
+        assert_eq!(q.len_after(100), 103);
+    }
+
+    #[test]
+    fn out_of_order_anchor_is_refused() {
+        let mut q = PadQueue::default();
+        q.push(edit(32, 4, 0, 9));
+        assert!(!q.accepts(&edit(10, 0, 6, 5)));
+        assert!(!q.accepts(&edit(34, 0, 2, 12)), "overlaps the queued run");
+        assert!(q.accepts(&edit(36, 0, 2, 12)));
+    }
 }
 
 #[cfg(test)]

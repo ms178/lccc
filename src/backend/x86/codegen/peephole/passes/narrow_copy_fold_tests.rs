@@ -632,3 +632,73 @@ fn ext_parse_shapes_unit() {
     assert!(parse_reg_to_reg_ext("movl %eax, %ecx").is_none());
     assert!(parse_reg_to_reg_ext("rep movsb").is_none());
 }
+
+// ── C. dead in-place extensions ─────────────────────────────────────────────
+
+/// Count the sign extensions of `%eax` into `%rax` that survive, in either
+/// spelling (the pipeline may legitimately merge `movl MEM,%eax; cltq` into
+/// `movslq MEM,%rax`).
+fn rax_sign_extensions(out: &str) -> usize {
+    out.lines()
+        .map(str::trim)
+        .filter(|l| *l == "cltq" || l.starts_with("movslq") && l.ends_with("%rax"))
+        .count()
+}
+
+#[test]
+fn cltq_survives_a_64_bit_read_modify_write() {
+    // SOUNDNESS (gcc.c-torture execute/20010106-1.c, -O0): the switch index
+    // of `case -2 … case 4` is rebased with a 64-bit `subq $-2, %rax`.  The
+    // subtract WRITES %rax but first READS all 64 bits; deleting the `cltq`
+    // made -1 rebase to 0x1_0000_0001 and dispatch to the default arm.
+    for rmw in [
+        "subq $-2, %rax",
+        "addq %rcx, %rax",
+        "imulq $3, %rax",
+        "negq %rax",
+    ] {
+        let out = run(&f(&format!(
+            "    movl -12(%rbp), %eax\n    cltq\n    {rmw}\n    cmpq $7, %rax\n    jae .L9\n    ret\n.L9:\n    ret"
+        )));
+        assert_eq!(rax_sign_extensions(&out), 1, "{rmw}:\n{out}");
+    }
+}
+
+#[test]
+fn cltq_is_dead_before_a_pure_64_bit_redefinition() {
+    let out = run(&f(
+        "    movl %edi, %eax\n    cltq\n    movq %rsi, %rax\n    ret",
+    ));
+    assert_eq!(count(&out, "cltq"), 0, "{}", out);
+}
+
+#[test]
+fn cltq_is_dead_before_a_pure_32_bit_redefinition() {
+    // A 32-bit write zero-extends into all 64 bits without reading them, so
+    // the widened bits are unobservable even though %rax is read afterwards.
+    let out = run(&f(
+        "    movl %edi, %eax\n    cltq\n    movl %esi, %eax\n    movq %rax, %rdx\n    ret",
+    ));
+    assert_eq!(count(&out, "cltq"), 0, "{}", out);
+}
+
+#[test]
+fn cltq_is_dead_before_a_32_bit_read_modify_write() {
+    // `addl` reads only the low half (bit-identical with or without the
+    // extension) and zero-extends its result, so the later 64-bit read sees
+    // zeros in bits 63:32 either way.
+    let out = run(&f(
+        "    movl %edi, %eax\n    cltq\n    addl $1, %eax\n    movq %rax, (%rsi)\n    ret",
+    ));
+    assert_eq!(rax_sign_extensions(&out), 0, "{}", out);
+}
+
+#[test]
+fn cltq_survives_a_partial_byte_write_followed_by_a_64_bit_read() {
+    // SOUNDNESS: `movb` rewrites only bits 7:0 — bits 63:32 still carry the
+    // extension's product into the 64-bit store.
+    let out = run(&f(
+        "    movl %edi, %eax\n    cltq\n    movb $1, %al\n    movq %rax, (%rsi)\n    ret",
+    ));
+    assert_eq!(rax_sign_extensions(&out), 1, "{}", out);
+}

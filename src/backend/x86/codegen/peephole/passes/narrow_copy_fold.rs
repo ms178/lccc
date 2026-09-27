@@ -74,7 +74,9 @@
 //! `%dxl` and the assembler rejected the function.
 
 use super::super::types::*;
-use super::helpers::{get_dest_reg, has_implicit_reg_usage, is_shift_or_rotate, writes_family};
+use super::helpers::{
+    get_dest_reg, has_implicit_reg_usage, is_shift_or_rotate, writes_family, writes_family_full,
+};
 use super::liveness::FileLiveness;
 use super::relay_and_lea::is_full_write;
 
@@ -556,14 +558,35 @@ pub(super) fn eliminate_dead_inplace_ext(store: &mut LineStore, infos: &mut [Lin
                 break;
             }
             if contains_reg(l, "%rax") {
-                // Full-width mention: either a 64-bit read (keep) or a
-                // full-width write (the product is overwritten: dead).
-                dead = writes_family(&infos[j], l, 0);
+                // Full-width mention: the product is dead only when this
+                // line is a PURE redefinition of %rax (`movq …, %rax`,
+                // `movslq …, %rax`, `leaq …, %rax` whose source half does
+                // not read the family).  A read-modify-write (`subq $-2,
+                // %rax`, `addq %rcx, %rax`, `imulq …, %rax`) also *writes*
+                // %rax, but it first reads all 64 bits — the widened bits
+                // are consumed, so the extension is live.  Treating every
+                // write as a kill deleted the `cltq` of a negative
+                // switch index before `subq $min, %rax` and sent `f(-1)`
+                // to the default arm (gcc.c-torture execute/20010106-1.c,
+                // -O0: `case -2 … case 4`).
+                dead = is_full_write(&infos[j], l, 0);
                 break;
             }
-            // Family-0 mentions at ≤32 bits (movl/leal/cmpl on %eax,
-            // `(%rax)`-free address operands) or no mention at all: the
-            // widened bits stay unread so far.
+            // No 64-bit mention on this line.  A write whose destination is
+            // `%eax` — pure (`movl …, %eax`) or read-modify-write (`addl $1,
+            // %eax`, `cmovll %ecx, %eax`) alike — reads at most the low half,
+            // which the extension left bit-identical, and zero-extends its
+            // result into bits 63:32: the widened bits are overwritten
+            // before anything could observe them.  (`writes_family_full` is
+            // the acceptance-grade predicate: byte/word partials such as
+            // `movb …, %al` or `setcc %al` do NOT retire bits 63:32.)
+            if writes_family_full(&infos[j], l, 0) {
+                dead = true;
+                break;
+            }
+            // Family-0 mentions at ≤32 bits that do not write (`cmpl`,
+            // `movl %eax, …`, `(%rax)`-free address operands) or no mention
+            // at all: the widened bits stay unread so far.
             j += 1;
         }
         if dead {

@@ -7,7 +7,7 @@ use crate::common::fx_hash::FxHashMap;
 use std::path::Path;
 
 use super::DynStrTab;
-use super::emit::{build_plt, layout_custom_sections, layout_section, layout_tls};
+use super::emit::{PltAddressing, build_plt, layout_custom_sections, layout_section, layout_tls};
 use super::gnu_hash::build_gnu_hash_32;
 use super::reloc::{RelocContext, resolve_got_reloc, resolve_tls_gotie, resolve_tls_ie};
 use super::types::*;
@@ -481,6 +481,21 @@ pub(super) fn emit_shared_library_32(
     let rel_plt_size = (num_rel_plt as u32) * 8;
     file_offset += rel_plt_size;
     vaddr += rel_plt_size;
+
+    // Merged `.note.*` (SHT_NOTE, SHF_ALLOC — e.g. `.note.gnu.property` from
+    // crti.o/crtbeginS.o) lives in the read-only headers segment, exactly as
+    // the executable emitter places it.  It was never assigned an offset
+    // here, so the section write loop copied it to file offset 0 and wiped
+    // the ELF header of every `gcc -m32 -shared` link through lccc-ld (the
+    // gcc driver always passes crtbeginS.o).
+    let _ = layout_section(
+        ".note",
+        section_name_to_idx,
+        output_sections,
+        &mut file_offset,
+        &mut vaddr,
+        4,
+    );
 
     let ro_headers_end = file_offset;
 
@@ -1038,6 +1053,12 @@ pub(super) fn emit_shared_library_32(
         plt_entry_size,
         gotplt_vaddr,
         gotplt_reserved,
+        // The PLT must reach its slots through %ebx: `got_base` is the value
+        // `_GLOBAL_OFFSET_TABLE_` resolves to above, which is what PIC
+        // callers load into %ebx (R_386_GOTPC) before `call sym@PLT`.
+        PltAddressing::EbxRelative {
+            got_symbol: got_base,
+        },
     );
 
     // ── Build GOT data ───────────────────────────────────────────────────
@@ -1414,6 +1435,7 @@ pub(super) fn emit_shared_library_32(
     }
 
     // Write output sections (text, rodata, data, etc.)
+    super::emit::check_sections_placed(output_sections, "shared library")?;
     for sec in output_sections.iter() {
         if sec.sh_type == SHT_NOBITS {
             continue;
