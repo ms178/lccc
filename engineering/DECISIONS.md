@@ -2743,3 +2743,72 @@ matters, and the rule set is target-neutral except the `andn` fold).
 **Known cost.** sqlite_varint executes +3.8% instructions (reg-reg copies
 from coalescing around the reshaped trees; no spills) while running 4%
 faster — a copy-coalescing follow-up, not a reason to narrow the pass.
+
+## PERF-REASSOC-LAG / CI-MIRROR (2026-09-27) — rotation lags, register residency; the PR #638 CI failure
+
+**What failed.** PR #638 (S24) went red in GitHub CI at step 59
+(`check_phi_acyclic_order.sh`, "rot() beats gcc on size"): lccc 56
+instructions vs Ubuntu 24.04's GCC 13.2 at 56; the check is strict.  The
+local mirror ran the same gate against Debian's GCC 14.2 (71 instructions)
+and passed.  Root cause in the compiler: `reassoc_lat` treated every carried
+header phi as available at time 0, so in the SHA-style state rotation
+(`h = g; g = f; f = e`) it combined `((e + f) + g) + (k + h)` and lost the
+`addl (mem)` fold (55 → 56).
+
+**Decision 1: rotation lags.**  A pure-rotation phi trails the computed
+value it is copied from by `lag` iterations; it starts at `r = -lag` (h 3,
+g 2, f 1; b 1, c 2, d 3).  Rounds repeat to a fixpoint (a' = t1 + t2 is only
+worth re-planning once t1 arrives earlier), and a single-use load leaf is
+always the second operand, the position x86 folds into `add mem, reg`.
+rot(): 55 instructions (GCC 13.2 56, GCC 14.2 71), recurrence bound 4 → 2
+(pass off: 5), wall clock 0.932 of S24 (21 interleaved runs, 19 faster) and
+0.753 of GCC 14.  SHA-256 at baseline x86-64: bound 6 → 5 (Ch = ((f^g)&e)^g
+is 2 deep from e once f and g lag), 0.955 of pass-off wall clock.  The x86
+peephole also folds a register-addend `mov + add` into `lea`.
+The single extra instruction against the pass disabled (54) is the load
+that no longer folds: it now joins a carried phi whose register stays
+live.  Scaling lags by the loop's II would let the load join last at no
+model cost (FOLLOWUP); the 2.5x shorter recurrence is worth more than the
+instruction.  llvm-mca is NOT an oracle
+for this loop shape: it reports 7 cycles for the 2-cycle loop.
+
+**Decision 2: register residency.**  The corpus A/B at `-m32` caught the
+lag model making i686 SHA-256 slower: 1.058 [1.034, 1.070] (paired runs,
+bootstrap 95% CI; identical-binary control 0.994 [0.970, 1.018]).  The
+model times a register-resident recurrence; i686 has 6 allocatable GPRs
+and SHA's eight rotating words, so the recurrence runs through stack slots
+and store-forwarding round trips the model cannot see.  Rule: a tree is
+left alone when the loop's live recurrent values (exact SSA liveness,
+weighted by GPRs occupied) exceed the allocatable GPRs across its whole
+span.  Rejected discriminators, each refuted by data: block peak pressure
+and the integral of block excess pressure (identical for the losing and the
+winning SHA order), and total span pressure (x86-64 lz4_compress is 14/13
+and gains 0.947 [0.919, 0.997]; i686 bitops is 7/6 and gains 0.974
+[0.947, 0.996]).  Recurrent pressure separates every measured case: i686
+SHA 8/6 and rot 8/6 (both now byte-identical to the pass disabled; rot was
+0.897 of S24, whose reshape had cost i686 11%) vs bitops 6/6, lz4 4/13,
+x86-64 SHA 8/13.
+
+**CI mirror.**  `scripts/ci_ubuntu_chroot.sh` runs any command, typically
+the full `scripts/ci_local.sh`, in an Ubuntu 24.04 debootstrap with `$HOME`
+bound at the same path, so the GCC/binutils/glibc oracles are the CI
+runner's.  `ci_local.sh` records `os=<ID-VERSION_ID>` in its stamp and
+the snapshot script records `ci_local-full-PASS@<os>` and warns off-Ubuntu.
+The parity check is now bidirectional: every hosted script, cargo
+subcommand and `--config` build mode must run in ci_local
+(`ci_hosted_only.txt` lists reviewed measurement-only exceptions).  PR
+#639 had added the debug-assertions test and corpus runs to CI alone.
+
+**Rejected.**  Weakening the "beats gcc" check (it caught a real
+regression); an environment knob for the lag model; trusting llvm-mca for
+rotation loops; an i686 special case instead of the pressure rule (the
+rule is about whether the recurrence fits, and fires identically on any
+target with the same pressure).
+
+**Tests.**  reassoc_latency unit tests (lag propagation incl. a swap
+cycle, rot tree order, exact restricted liveness, GPR weights, residency
+with fitting and x86-64 controls; the residency and lag tests fail when
+their rule is mutated away); `check_reassoc_latency.sh` checks 5 (rot
+bound <= 2, pass-off 5) and 6 (-m32 SHA/rot identical to pass-off, -m32
+bitops and x86-64 rot still rewritten); lea fold and refusal unit tests;
+seven parity-check unit tests.

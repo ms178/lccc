@@ -225,6 +225,75 @@ def check_asmdiff_gate_parity(local_text: str, hosted: str) -> int:
     return 0
 
 
+HOSTED_ONLY = ROOT / "scripts" / "ci_hosted_only.txt"
+CARGO_SUBCOMMAND = re.compile(r"\bcargo\s+(?:\+\S+\s+)?([a-z][a-z-]*)")
+CARGO_CONFIG = re.compile(r"""--config[\s=]+(['"]?)([A-Za-z0-9_.-]+=[^'"\s]+)\1""")
+
+
+def check_hosted_steps_mirrored(local_text: str, hosted: str) -> int:
+    """The reverse direction: everything hosted CI executes runs locally too.
+
+    main() proves every ci_local gate is also hosted; nothing proved the
+    converse, so a step added to a workflow alone (PR #639's two
+    debug-assertions steps, the inline-asm UTF-8 check) left ci_local
+    green on a tree CI could fail.  Checked: every gate/helper script a
+    workflow executes, every cargo subcommand, and every `--config` build
+    mode (a different profile is a different compiler: debug-assertions
+    compile in the %rax shadow-epoch validator).  Exceptions live in
+    ci_hosted_only.txt with a reason; like the orphan allowlist it can only
+    shrink -- an entry that ci_local now mirrors must be deleted.
+    """
+    # Execution semantics on the local side too: a ci_local comment that
+    # names a script or a build mode runs nothing.
+    kept = []
+    for line in local_text.splitlines():
+        if line.lstrip().startswith("#"):
+            continue
+        cut = re.search(r"\s#", line)
+        kept.append(line[: cut.start()] if cut else line)
+    local_text = "\n".join(kept)
+    allow = set()
+    if HOSTED_ONLY.exists():
+        for line in HOSTED_ONLY.read_text().splitlines():
+            entry = line.split("#", 1)[0].strip()
+            if entry:
+                allow.add(entry)
+    missing = []
+    for path in sorted(set(COMMAND.findall(hosted))):
+        if path not in local_text and path not in allow:
+            missing.append(f"script {path}")
+    local_subs = set(CARGO_SUBCOMMAND.findall(local_text))
+    for sub in sorted(set(CARGO_SUBCOMMAND.findall(hosted))):
+        if sub not in local_subs and f"cargo {sub}" not in allow:
+            missing.append(f"cargo {sub}")
+    local_cfg = {m[1] for m in CARGO_CONFIG.findall(local_text)}
+    for cfg in sorted({m[1] for m in CARGO_CONFIG.findall(hosted)}):
+        if cfg not in local_cfg and f"--config {cfg}" not in allow:
+            missing.append(f"--config {cfg}")
+    stale = sorted(
+        e
+        for e in allow
+        if e in local_text
+        or (e.startswith("cargo ") and e[6:] in local_subs)
+        or (e.startswith("--config ") and e[9:] in local_cfg)
+    )
+    if missing:
+        print("ci_local.sh does not mirror these hosted CI steps:", file=sys.stderr)
+        for item in missing:
+            print(f"  {item}", file=sys.stderr)
+        print(
+            "  mirror them in scripts/ci_local.sh (or, for a measurement that has"
+            " no local meaning, record it with a reason in"
+            " scripts/ci_hosted_only.txt)",
+            file=sys.stderr,
+        )
+    if stale:
+        print("ci_hosted_only.txt entries ci_local.sh now mirrors (delete them):", file=sys.stderr)
+        for item in stale:
+            print(f"  {item}", file=sys.stderr)
+    return 1 if missing or stale else 0
+
+
 def main() -> int:
     local_text = LOCAL.read_text()
     local_paths = set(COMMAND.findall(local_text))
@@ -243,9 +312,11 @@ def main() -> int:
         return rc
     if check_asmdiff_gate_parity(local_text, hosted) != 0:
         return 1
+    if check_hosted_steps_mirrored(local_text, hosted) != 0:
+        return 1
     print(
         f"CI/local standalone gate parity: PASS ({len(local_paths)} commands, "
-        "2 mode/corpus-specific asm-diff gates)"
+        "2 mode/corpus-specific asm-diff gates, hosted steps mirrored)"
     )
     return 0
 

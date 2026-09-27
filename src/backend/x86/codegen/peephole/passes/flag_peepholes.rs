@@ -3,7 +3,8 @@
 //! Three transforms that need an explicit model of the EFLAGS lifetime, which
 //! the other peephole passes deliberately avoid touching:
 //!
-//! 1. [`fold_copy_add_into_lea`] — `movl %A,%D; addl $imm,%D` → `leal imm(%A),%D`.
+//! 1. [`fold_copy_add_into_lea`] — `movl %A,%D; addl $imm,%D` → `leal imm(%A),%D`,
+//!    and `movl %A,%D; addl %R,%D` → `leal (%A,%R),%D`.
 //!    One instruction less, and — crucially — `lea` does not write flags, which
 //!    is what makes transform 2 applicable to the loop bodies the backend emits.
 //! 2. [`fold_setcc_test_cmov`] — the backend materialises a comparison as a
@@ -486,7 +487,9 @@ fn names_family_at_width(text: &str, fam: RegId, wide: bool) -> bool {
 // ── 1. copy + add-immediate → lea ────────────────────────────────────────────
 
 /// `movl %A, %D` + `addl $imm, %D` → `leal imm(%A), %D` (same for `q`, and for
-/// `sub` with the displacement negated).
+/// `sub` with the displacement negated), and the register-addend form
+/// `movl %A, %D` + `addl %R, %D` → `leal (%A,%R), %D` (`add` only: `lea` has
+/// no subtracted index).
 ///
 /// Saves one instruction and — the reason this pass exists — removes a flags
 /// write from between a comparison and its consumer, which is what lets
@@ -523,9 +526,8 @@ pub(super) fn fold_copy_add_into_lea(store: &mut LineStore, infos: &mut [LineInf
             i += 1;
             continue;
         };
-        // %rsp/%rbp as the LEA destination is never worth the risk, and a
-        // self-copy is not this pattern.
-        if src_fam == dst_fam || dst_fam == 4 || dst_fam == 5 {
+        // A self-copy is not this pattern, and %rsp is never a destination.
+        if src_fam == dst_fam || dst_fam == 4 {
             i += 1;
             continue;
         }
@@ -567,9 +569,43 @@ pub(super) fn fold_copy_add_into_lea(store: &mut LineStore, infos: &mut [LineInf
             continue;
         }
         let Some(mut imm) = imm_value(imm_text) else {
-            i += 1;
+            // Register addend: `movl %A, %D; addl %R, %D` -> `leal (%A,%R), %D`.
+            // R must be named at the add's width (a `%r8b` addend is not a
+            // 32-bit add) and must not be D (after the copy D holds A; that
+            // aliasing case is left alone) or %rsp (not encodable as index).
+            let Some(r_fam) = plain_gp_operand(imm_text) else {
+                i += 1;
+                continue;
+            };
+            // `movq %rsp, %rbp` is the frame setup, whatever follows it.
+            if neg
+                || (dst_fam == 5 && src_fam == 4)
+                || r_fam == dst_fam
+                || r_fam == 4
+                || !names_family_at_width(imm_text, r_fam, add_wide)
+                || !flags_dead_after(store, infos, j + 1)
+            {
+                i += 1;
+                continue;
+            }
+            let mnemonic = if add_wide { "leaq" } else { "leal" };
+            let dst_name = REG_NAMES[if add_wide { 0 } else { 1 }][dst_fam as usize];
+            let new_line = format!(
+                "    {} ({},{}), {}",
+                mnemonic, REG_NAMES[0][src_fam as usize], REG_NAMES[0][r_fam as usize], dst_name
+            );
+            mark_nop(&mut infos[i]);
+            replace_line(store, &mut infos[j], j, new_line);
+            changed = true;
+            i = j + 1;
             continue;
         };
+        // The immediate form keeps its %rbp-destination exclusion (an
+        // immediate adjustment of %rbp is the frame idiom, never a value).
+        if dst_fam == 5 {
+            i += 1;
+            continue;
+        }
         if neg {
             imm = -imm;
         }
@@ -1990,6 +2026,78 @@ mod tests {
         ));
         assert!(out.contains("leal 1(%rbx), %r8d"), "{out}");
         assert!(!out.contains("addl $1, %r8d"), "{out}");
+    }
+
+    /// The rotation loop of check_phi_acyclic_order.sh: a copy into an
+    /// allocatable %rbp plus a register add, with the flags dead (the next
+    /// flags reader is preceded by a writer).
+    #[test]
+    fn copy_plus_register_add_becomes_two_source_lea() {
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movq %r12, %rbp\n",
+            "    addl %edi, %ebp\n",
+            "    movq %rbx, %r8\n",
+            "    addq %rsi, %r8\n",
+            "    cmpq %rbp, %r8\n",
+            "    jl .L1\n",
+            ".L1:\n",
+            "    movq %rsi, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("leal (%r12,%rdi), %ebp"), "{out}");
+        assert!(out.contains("leaq (%rbx,%rsi), %r8"), "{out}");
+        assert!(!out.contains("movq %r12, %rbp"), "{out}");
+        assert!(!out.contains("addl %edi, %ebp"), "{out}");
+    }
+
+    /// Every case the register form must refuse: flags read by the next
+    /// instruction, a `sub` (no negated index), a narrower copy than the add,
+    /// an addend that is the destination or %rsp, a byte-register addend, and
+    /// the frame setup `movq %rsp, %rbp`.
+    #[test]
+    fn copy_plus_register_add_refusals() {
+        for (pair, why) in [
+            (
+                "    movl %ebx, %r8d\n    addl %ecx, %r8d\n    jc .L1\n",
+                "carry read",
+            ),
+            ("    movl %ebx, %r8d\n    subl %ecx, %r8d\n", "sub"),
+            (
+                "    movl %ebx, %r8d\n    addq %rcx, %r8\n",
+                "narrow copy, wide add",
+            ),
+            (
+                "    movl %ebx, %r8d\n    addl %r8d, %r8d\n",
+                "addend is the destination",
+            ),
+            ("    movq %rbx, %r8\n    addq %rsp, %r8\n", "rsp index"),
+            ("    movl %ebx, %r8d\n    addb %cl, %r8b\n", "byte add"),
+            ("    movq %rsp, %rbp\n    addq %rcx, %rbp\n", "frame setup"),
+        ] {
+            let asm = format!(
+                "foo:\n.cfi_startproc\n{pair}    testq %r8, %r8\n    jne .L1\n.L1:\n    ret\n.cfi_endproc\n"
+            );
+            let out = run(&asm);
+            assert!(!out.contains("lea"), "{why}: {out}");
+        }
+    }
+
+    /// The immediate form still folds a copy of %rsp (address of a stack
+    /// slot) -- the register form's frame-setup refusal must not leak.
+    #[test]
+    fn copy_of_rsp_plus_immediate_still_becomes_lea() {
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movq %rsp, %rax\n",
+            "    addq $8, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("leaq 8(%rsp), %rax"), "{out}");
     }
 
     #[test]

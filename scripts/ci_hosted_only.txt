@@ -1,0 +1,7 @@
+# Commands hosted CI executes that scripts/ci_local.sh deliberately does not.
+# check_ci_gate_parity.py fails on a hosted script, cargo subcommand or
+# `--config` build mode that ci_local does not mirror unless it is listed
+# here, and on an entry ci_local mirrors after all, so the list can only
+# shrink.  Only a measurement with no local meaning belongs here; a
+# contract (anything that can fail) must be mirrored.
+.github/scripts/ci-bench.py  # timed benchmark run on the runner's hardware; its pass/fail is output-only, which ci_local's benchmark-output-oracle checks

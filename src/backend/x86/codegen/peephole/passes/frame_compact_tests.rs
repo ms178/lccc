@@ -53,8 +53,14 @@ fn a_dead_leaf_frame_with_one_paired_epilogue_folds() {
     )));
     assert_eq!(count(&out, "subq $16, %rsp"), 0, "{}", out);
     assert_eq!(count(&out, "addq $16, %rsp"), 0, "{}", out);
-    // The body itself must survive.
-    assert_eq!(count(&out, "addl %esi, %eax"), 1, "{}", out);
+    // The body itself must survive: as written, or as the equivalent
+    // two-source lea the copy+add fold makes of it (flags dead at `ret`).
+    assert_eq!(
+        count(&out, "addl %esi, %eax") + count(&out, "leal (%rdi,%rsi), %eax"),
+        1,
+        "{}",
+        out
+    );
 }
 
 #[test]

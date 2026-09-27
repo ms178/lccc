@@ -49,6 +49,20 @@
 //! deep from `e`, not 3, and is added before the 3-deep Σ1; without BMI1
 //! both are 3 deep and their order does not change the bound).
 //!
+//! ## Rotation lags
+//!
+//! SHA-256-style state rotation (`h = g; g = f; f = e; e = d + t1`) makes
+//! some carried phis pure copies of other carried phis.  Such a phi holds a
+//! value computed `lag` iterations ago (h: 3, g: 2, f: 1, e: 0), so it is
+//! ready long before this iteration's computed words: it starts at
+//! `r = -lag`.  Timing every carried phi at 0 instead made the pass combine
+//! `((e + f) + g) + (k + h)` in the rotation loop of
+//! `tests/regression/check_phi_acyclic_order.sh` -- the recurrence did not
+//! get shorter, but the folded `add (mem), reg` was lost (55 -> 56
+//! instructions, one more than GCC 13.2; that is the PR #638 CI failure).
+//! Lags compose along copy chains; a phi on a pure copy cycle (a genuine
+//! swap) has no computed source and keeps lag 0.
+//!
 //! # Transformation
 //!
 //! A *tree* is a maximal set of `BinOp`s with the same associative,
@@ -94,6 +108,29 @@
 //! registers (a 9-product 3x3 convolution sum balanced by depth spilled:
 //! +24% dynamic instructions before this rule).
 //!
+//! Each node puts a single-use load leaf second, the operand position x86
+//! folds into `add mem, reg`.  Rewrites repeat to a fixpoint (at most
+//! `MAX_ROUNDS`): once `t1` is earlier, `a' = t1 + t2` may be worth
+//! re-planning.  Every accepted rewrite strictly lowers its root's
+//! recurrence time, so the rounds terminate on their own.
+//!
+//! # Register residency
+//!
+//! The model times a *register-resident* recurrence.  When the values live
+//! on the loop's recurrences do not fit the allocatable GPRs, the
+//! recurrence runs through stack slots and store-to-load forwarding the
+//! model cannot see, and a reshaped tree moves spill traffic onto it:
+//! i686 SHA-256 (8 rotating words, 6 GPRs) measured 1.058 [1.034, 1.070]
+//! of the source shape.  A tree is therefore left alone when the live
+//! recurrent values (exact SSA liveness restricted to the loop's tainted
+//! values, weighted by the GPRs each occupies) exceed the GPR budget at
+//! *every* point of its span: somewhere in the span the recurrence must be
+//! partly memory-resident.  Measured separation (recurrent / budget):
+//! i686 SHA 8/6 and the rotation loop 8/6 lose; i686 bitops 6/6, x86-64
+//! lz4_compress 4/13 and SHA 8/13 gain.  Block peak pressure, the integral
+//! of excess pressure, and total (not just recurrent) span pressure were
+//! tried and each misclassified a measured case.
+//!
 //! Pass name for CCC_DISABLE_PASSES: "reassoc_lat".
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
@@ -106,11 +143,44 @@ use crate::passes::loop_analysis;
 /// count; real associative chains have a handful of leaves.
 const MAX_LEAVES: usize = 64;
 
+/// Fixpoint bound.  Each accepted rewrite strictly lowers a root's
+/// recurrence time, so this only caps pathological inputs.
+const MAX_ROUNDS: usize = 8;
+
+// ELF machines (local, as in backedge_pre: passes do not depend on the
+// backend crate modules).
+const EM_386: u16 = 3;
+const EM_AARCH64: u16 = 183;
+const EM_RISCV: u16 = 243;
+
+/// Allocatable general-purpose registers of the target, excluding the
+/// stack/frame pointers and the reserved scratch registers.
+fn gpr_budget() -> u32 {
+    match crate::common::types::target_elf_machine() {
+        EM_386 => 6,
+        EM_AARCH64 | EM_RISCV => 26,
+        _ => 13,
+    }
+}
+
+/// GPRs a value of `ty` occupies (floating point: none).
+fn gpr_weight(ty: Option<IrType>) -> u32 {
+    let word = match crate::common::types::target_ptr_size() {
+        0 => 8,
+        w => w,
+    };
+    match ty {
+        Some(t) if t.is_float() || t == IrType::Void => 0,
+        Some(t) => t.size().div_ceil(word).max(1) as u32,
+        None => 1,
+    }
+}
+
 /// Availability of a value: `r` is `None` when the value is off every
 /// loop-carried chain (free), `l` the local depth.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 struct Avail {
-    r: Option<u32>,
+    r: Option<i32>,
     l: u32,
 }
 
@@ -119,7 +189,7 @@ impl Avail {
 
     fn after(self, other: Avail, lat: u32) -> Avail {
         Avail {
-            r: self.r.max(other.r).map(|r| r + lat),
+            r: self.r.max(other.r).map(|r| r + lat as i32),
             l: self.l.max(other.l) + lat,
         }
     }
@@ -254,8 +324,166 @@ fn tainted_values(
     }
 }
 
-/// Run the pass over one function.  Returns the number of trees rewritten.
+/// Rotation lag of each recurrent phi that is a pure copy of other
+/// recurrent phis around the back edge(s): `lag(p) = 1 + min lag(q)` over
+/// its in-loop incomings `q` (the latest source bounds availability), 0 for
+/// a phi fed by a computed value.  Phis on a pure copy cycle keep 0.  Only
+/// positive lags are returned.
+fn rotation_lags(
+    func: &IrFunction,
+    lp: &loop_analysis::NaturalLoop,
+    rec: &FxHashSet<u32>,
+    label_to_idx: &FxHashMap<crate::ir::reexports::BlockId, usize>,
+) -> FxHashMap<u32, i32> {
+    // For each recurrent phi: its in-loop sources if they are all recurrent
+    // phis, None otherwise.
+    let mut srcs: FxHashMap<u32, Option<Vec<u32>>> = FxHashMap::default();
+    for inst in &func.blocks[lp.header].instructions {
+        let Instruction::Phi { dest, incoming, .. } = inst else {
+            continue;
+        };
+        if !rec.contains(&dest.0) {
+            continue;
+        }
+        let mut all: Option<Vec<u32>> = Some(Vec::new());
+        for (op, pred) in incoming {
+            if !label_to_idx.get(pred).is_some_and(|p| lp.body.contains(p)) {
+                continue;
+            }
+            match (op, all.as_mut()) {
+                (Operand::Value(v), Some(list)) if rec.contains(&v.0) && v.0 != dest.0 => {
+                    list.push(v.0)
+                }
+                _ => all = None,
+            }
+        }
+        srcs.insert(dest.0, all.filter(|l| !l.is_empty()));
+    }
+    // Forward propagation from the computed sources: a phi whose sources
+    // all have a lag gets 1 + their minimum.  Monotone (each phi is
+    // assigned once), so it ends after at most |phis| sweeps; phis left
+    // unassigned sit on (or are fed only by) pure copy cycles: lag 0.
+    let mut memo: FxHashMap<u32, i32> = srcs
+        .iter()
+        .filter(|(_, s)| s.is_none())
+        .map(|(&p, _)| (p, 0))
+        .collect();
+    let mut keys: Vec<u32> = srcs.keys().copied().collect();
+    keys.sort_unstable();
+    loop {
+        let mut progress = false;
+        for &p in &keys {
+            if memo.contains_key(&p) {
+                continue;
+            }
+            let Some(Some(qs)) = srcs.get(&p) else {
+                continue;
+            };
+            let lags: Option<Vec<i32>> = qs.iter().map(|q| memo.get(q).copied()).collect();
+            if let Some(min) = lags.and_then(|l| l.into_iter().min()) {
+                memo.insert(p, min + 1);
+                progress = true;
+            }
+        }
+        if !progress {
+            break;
+        }
+    }
+    memo.retain(|_, l| *l > 0);
+    memo
+}
+
+/// Live-out sets of every block, restricted to the values in `track`
+/// (exact SSA liveness: a phi operand is live out of its predecessor only).
+fn live_out_restricted(
+    func: &IrFunction,
+    succs: &analysis::FlatAdj,
+    label_to_idx: &FxHashMap<crate::ir::reexports::BlockId, usize>,
+    track: &FxHashSet<u32>,
+) -> Vec<FxHashSet<u32>> {
+    let n = func.blocks.len();
+    let mut upward: Vec<FxHashSet<u32>> = vec![FxHashSet::default(); n];
+    let mut defs: Vec<FxHashSet<u32>> = vec![FxHashSet::default(); n];
+    // phi_out[b]: tracked phi operands flowing out of b along its edges.
+    let mut phi_out: Vec<FxHashSet<u32>> = vec![FxHashSet::default(); n];
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for inst in &block.instructions {
+            if let Instruction::Phi { incoming, .. } = inst {
+                for (op, pred) in incoming {
+                    if let (Operand::Value(v), Some(&p)) = (op, label_to_idx.get(pred))
+                        && track.contains(&v.0)
+                    {
+                        phi_out[p].insert(v.0);
+                    }
+                }
+            } else {
+                inst.for_each_used_value(|v| {
+                    if track.contains(&v) && !defs[bi].contains(&v) {
+                        upward[bi].insert(v);
+                    }
+                });
+            }
+            if let Some(d) = inst.dest()
+                && track.contains(&d.0)
+            {
+                defs[bi].insert(d.0);
+            }
+        }
+        block.terminator.for_each_used_value(|v| {
+            if track.contains(&v) && !defs[bi].contains(&v) {
+                upward[bi].insert(v);
+            }
+        });
+    }
+    let mut live_in: Vec<FxHashSet<u32>> = upward.clone();
+    let mut live_out: Vec<FxHashSet<u32>> = vec![FxHashSet::default(); n];
+    // Both families of sets only grow (unions of growing sets), so a size
+    // change is exactly a content change.
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for bi in (0..n).rev() {
+            let mut out = phi_out[bi].clone();
+            for &s in succs.row(bi) {
+                out.extend(live_in[s as usize].iter().copied());
+            }
+            let mut inn = upward[bi].clone();
+            inn.extend(out.iter().filter(|v| !defs[bi].contains(v)).copied());
+            if out.len() != live_out[bi].len() {
+                live_out[bi] = out;
+                changed = true;
+            }
+            if inn.len() != live_in[bi].len() {
+                live_in[bi] = inn;
+                changed = true;
+            }
+        }
+    }
+    live_out
+}
+
+/// Per-loop facts shared by the loop's blocks.
+struct LoopFacts {
+    tainted: FxHashSet<u32>,
+    lags: FxHashMap<u32, i32>,
+    live_out: Vec<FxHashSet<u32>>,
+}
+
+/// Run the pass over one function to a fixpoint.  Returns the number of
+/// trees rewritten.
 pub(crate) fn run_function(func: &mut IrFunction) -> usize {
+    let mut total = 0;
+    for _ in 0..MAX_ROUNDS {
+        let r = run_round(func);
+        total += r;
+        if r == 0 {
+            break;
+        }
+    }
+    total
+}
+
+fn run_round(func: &mut IrFunction) -> usize {
     let n = func.blocks.len();
     if n == 0 {
         return 0;
@@ -292,8 +520,26 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
             .for_each_used_value(|v| *uses.entry(v).or_insert(0) += 1);
     }
 
+    // Value types for the residency weights (a Copy takes its source's).
+    let mut types: FxHashMap<u32, IrType> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Some(d) = inst.dest() {
+                if let Some(t) = inst.result_type() {
+                    types.insert(d.0, t);
+                } else if let Instruction::Copy {
+                    src: Operand::Value(s),
+                    ..
+                } = inst
+                    && let Some(&t) = types.get(&s.0)
+                {
+                    types.insert(d.0, t);
+                }
+            }
+        }
+    }
     let mut next_id = func.sound_next_value_id();
-    let mut taint_cache: FxHashMap<usize, FxHashSet<u32>> = FxHashMap::default();
+    let mut facts_cache: FxHashMap<usize, LoopFacts> = FxHashMap::default();
     let mut rewrites = 0usize;
     for bi in 0..n {
         let Some(li) = innermost[bi] else { continue };
@@ -304,16 +550,24 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
         {
             continue;
         }
-        let tainted = taint_cache.entry(li).or_insert_with(|| {
+        let facts = facts_cache.entry(li).or_insert_with(|| {
             let seeds = recurrent_phis(func, &loops[li], &def_block, &label_to_idx);
-            tainted_values(func, &loops[li], &seeds)
+            let lags = rotation_lags(func, &loops[li], &seeds, &label_to_idx);
+            let tainted = tainted_values(func, &loops[li], &seeds);
+            let live_out = live_out_restricted(func, &succs, &label_to_idx, &tainted);
+            LoopFacts {
+                tainted,
+                lags,
+                live_out,
+            }
         });
         let in_loop = |v: u32| {
             def_block
                 .get(&v)
                 .is_some_and(|b| loops[li].body.contains(b))
         };
-        rewrites += rewrite_block(func, bi, tainted, &in_loop, &uses, &mut next_id);
+        let weight = |v: u32| gpr_weight(types.get(&v).copied());
+        rewrites += rewrite_block(func, bi, facts, &in_loop, &weight, &uses, &mut next_id);
     }
     if rewrites > 0 {
         func.next_value_id = next_id;
@@ -334,11 +588,17 @@ struct Tree {
 fn rewrite_block(
     func: &mut IrFunction,
     bi: usize,
-    tainted: &FxHashSet<u32>,
+    facts: &LoopFacts,
     in_loop: &dyn Fn(u32) -> bool,
+    weight: &dyn Fn(u32) -> u32,
     uses: &FxHashMap<u32, u32>,
     next_id: &mut u32,
 ) -> usize {
+    let tainted = &facts.tainted;
+    let carried_start = |v: u32| Avail {
+        r: Some(-facts.lags.get(&v).copied().unwrap_or(0)),
+        l: 0,
+    };
     let insts = &func.blocks[bi].instructions;
     // Local def index and availability of every value defined in the block.
     let mut local: FxHashMap<u32, usize> = FxHashMap::default();
@@ -349,7 +609,7 @@ fn rewrite_block(
         }
         // Defined elsewhere: on the recurrence iff tainted inside the loop.
         if tainted.contains(&v) && in_loop(v) {
-            Avail { r: Some(0), l: 0 }
+            carried_start(v)
         } else {
             Avail::FREE
         }
@@ -386,7 +646,7 @@ fn rewrite_block(
         local.insert(d.0, ii);
         let a = if let Instruction::Phi { .. } = inst {
             if tainted.contains(&d.0) {
-                Avail { r: Some(0), l: 0 }
+                carried_start(d.0)
             } else {
                 Avail::FREE
             }
@@ -402,7 +662,7 @@ fn rewrite_block(
             };
             Avail {
                 r: if tainted.contains(&d.0) {
-                    a.r.map(|r| r + lat)
+                    a.r.map(|r| r + lat as i32)
                 } else {
                     None
                 },
@@ -534,6 +794,41 @@ fn rewrite_block(
             Operand::Const(_) => -1,
         }
     };
+    // Recurrent register pressure after each instruction of the block
+    // (computed on first need; the block is not modified until the end).
+    let mut pressure: Option<Vec<u32>> = None;
+    let recurrent_pressure = || -> Vec<u32> {
+        let mut live: FxHashSet<u32> = facts.live_out[bi].clone();
+        func.blocks[bi].terminator.for_each_used_value(|v| {
+            if tainted.contains(&v) {
+                live.insert(v);
+            }
+        });
+        let mut out = vec![0u32; insts.len()];
+        for ii in (0..insts.len()).rev() {
+            out[ii] = live.iter().map(|&v| weight(v)).sum();
+            if let Some(d) = insts[ii].dest() {
+                live.remove(&d.0);
+            }
+            if !matches!(insts[ii], Instruction::Phi { .. }) {
+                insts[ii].for_each_used_value(|v| {
+                    if tainted.contains(&v) {
+                        live.insert(v);
+                    }
+                });
+            }
+        }
+        out
+    };
+    let budget = gpr_budget();
+    // A single-use load defined in this block: the backend folds it into
+    // the second operand of an ALU op.
+    let foldable_load = |o: &Operand| match o {
+        Operand::Value(v) => local.get(&v.0).is_some_and(|&d| {
+            matches!(insts[d], Instruction::Load { .. }) && uses.get(&v.0) == Some(&1)
+        }),
+        Operand::Const(_) => false,
+    };
     let mut rewrites = 0;
     for t in &trees {
         let root = *t.nodes.last().unwrap();
@@ -613,6 +908,11 @@ fn rewrite_block(
                 }
             }
             sunk.sort_unstable();
+            let (lhs, rhs) = if foldable_load(&o0) && !foldable_load(&o1) {
+                (o1, o0)
+            } else {
+                (o0, o1)
+            };
             planned.push(NewNode {
                 anchor,
                 root,
@@ -620,8 +920,8 @@ fn rewrite_block(
                 inst: Instruction::BinOp {
                     dest,
                     op: t.op,
-                    lhs: o0,
-                    rhs: o1,
+                    lhs,
+                    rhs,
                     ty: t.ty,
                 },
             });
@@ -632,6 +932,12 @@ fn rewrite_block(
         // not a reason to reshape (see above), so ties keep source shape.
         let new_root = work[0].0;
         if new_root.r >= current.r {
+            continue;
+        }
+        // Register residency: skip when the recurrence cannot be register
+        // resident anywhere in the tree's span.
+        let p = pressure.get_or_insert_with(recurrent_pressure);
+        if (t.nodes[0]..=root).all(|ii| p[ii] > budget) {
             continue;
         }
         debug_assert!(work[0].3 <= root as isize);
@@ -900,7 +1206,11 @@ mod tests {
         let Instruction::BinOp { lhs, rhs, .. } = def(&f, inner.0) else {
             panic!("inner node is not a BinOp")
         };
-        assert_eq!((lhs, rhs), (&v(14), &v(3)), "free load first, then h");
+        assert_eq!(
+            (lhs, rhs),
+            (&v(3), &v(14)),
+            "the free load joins h first, as the second operand (folds into add mem)"
+        );
         // The superseded interior node is gone, the id cache is advanced.
         assert!(
             f.blocks
@@ -997,6 +1307,276 @@ mod tests {
         let before = format!("{:?}", f.blocks);
         assert_eq!(run_function(&mut f), 0);
         assert_eq!(format!("{:?}", f.blocks), before);
+    }
+
+    /// An `n`-word state rotation (`w[k] = w[k-1]` for k >= 1, `w[0] = t`)
+    /// with `t = ((((w[n-1] + w[0]) + w[1]) + ...) + w[n-2]) + K[i]`, the
+    /// check_phi_acyclic_order.sh `rot()` shape.  Value ids: IV 40, IV' 41,
+    /// cmp 42, K 43, index 44, gep 45, load 46, words 1..=n, tree 60.., and
+    /// the last tree node (t) is returned by `rot_root`.  With `swap`, two
+    /// extra carried phis 30/31 exchange values (a pure copy cycle).
+    fn rot_fn(n: u32, swap: bool) -> IrFunction {
+        assert!(n >= 3);
+        let mut f = IrFunction::new("rot".to_string(), IrType::U32, vec![], false);
+        let root = rot_root(n);
+        let mut phis = vec![Instruction::Phi {
+            dest: Value(40),
+            ty: IrType::I64,
+            incoming: vec![
+                (Operand::Const(IrConst::I64(0)), BlockId(0)),
+                (v(41), BlockId(2)),
+            ],
+        }];
+        for k in 0..n {
+            let back = if k == 0 { v(root) } else { v(k) }; // w[k] <- w[k-1]
+            phis.push(Instruction::Phi {
+                dest: Value(k + 1),
+                ty: IrType::U32,
+                incoming: vec![
+                    (Operand::Const(IrConst::I32(k as i32)), BlockId(0)),
+                    (back, BlockId(2)),
+                ],
+            });
+        }
+        if swap {
+            for (d, other) in [(30, 31), (31, 30)] {
+                phis.push(Instruction::Phi {
+                    dest: Value(d),
+                    ty: IrType::U32,
+                    incoming: vec![
+                        (Operand::Const(IrConst::I32(d as i32)), BlockId(0)),
+                        (v(other), BlockId(2)),
+                    ],
+                });
+            }
+        }
+        phis.push(Instruction::Cmp {
+            dest: Value(42),
+            op: crate::ir::reexports::IrCmpOp::Slt,
+            lhs: v(40),
+            rhs: Operand::Const(IrConst::I64(64)),
+            ty: IrType::I64,
+        });
+        let mut body = vec![];
+        // ((w[n-1] + w[0]) + w[1]) + ... + w[n-2]
+        body.push(bin(60, IrBinOp::Add, v(n), v(1), IrType::U32));
+        let mut last = 60;
+        for k in 1..n - 1 {
+            body.push(bin(last + 1, IrBinOp::Add, v(last), v(k + 1), IrType::U32));
+            last += 1;
+        }
+        body.push(bin(
+            44,
+            IrBinOp::Shl,
+            v(40),
+            Operand::Const(IrConst::I64(2)),
+            IrType::I64,
+        ));
+        body.push(Instruction::GetElementPtr {
+            dest: Value(45),
+            base: Value(43),
+            offset: v(44),
+            ty: IrType::Ptr,
+        });
+        body.push(Instruction::Load {
+            dest: Value(46),
+            ptr: Value(45),
+            ty: IrType::U32,
+            seg_override: Default::default(),
+            volatile: false,
+        });
+        body.push(bin(root, IrBinOp::Add, v(last), v(46), IrType::U32));
+        body.push(bin(
+            41,
+            IrBinOp::Add,
+            v(40),
+            Operand::Const(IrConst::I64(1)),
+            IrType::I64,
+        ));
+        f.blocks = vec![
+            blk(
+                0,
+                vec![Instruction::GlobalAddr {
+                    dest: Value(43),
+                    name: "K".to_string(),
+                }],
+                Terminator::Branch(BlockId(1)),
+            ),
+            blk(
+                1,
+                phis,
+                Terminator::CondBranch {
+                    cond: v(42),
+                    true_label: BlockId(2),
+                    false_label: BlockId(3),
+                },
+            ),
+            blk(2, body, Terminator::Branch(BlockId(1))),
+            blk(3, vec![], Terminator::Return(Some(v(1)))),
+        ];
+        f.next_value_id = root + 1;
+        f.next_label = 4;
+        f
+    }
+
+    fn rot_root(n: u32) -> u32 {
+        60 + n - 1
+    }
+
+    fn loop_of(
+        f: &IrFunction,
+    ) -> (
+        loop_analysis::NaturalLoop,
+        FxHashMap<crate::ir::reexports::BlockId, usize>,
+    ) {
+        let label_to_idx = analysis::build_label_map(f);
+        let (preds, succs) = analysis::build_cfg(f, &label_to_idx);
+        let idom = analysis::compute_dominators(f.blocks.len(), &preds, &succs);
+        let mut loops = loop_analysis::find_natural_loops(f.blocks.len(), &preds, &succs, &idom);
+        assert_eq!(loops.len(), 1);
+        (loops.remove(0), label_to_idx)
+    }
+
+    fn def_blocks(f: &IrFunction) -> FxHashMap<u32, usize> {
+        let mut m = FxHashMap::default();
+        for (bi, b) in f.blocks.iter().enumerate() {
+            for i in &b.instructions {
+                if let Some(d) = i.dest() {
+                    m.insert(d.0, bi);
+                }
+            }
+        }
+        m
+    }
+
+    /// Sets the thread's target for the duration of a test.
+    struct Target;
+    impl Target {
+        fn set(machine: u16, ptr: usize) -> Target {
+            crate::common::types::set_target_elf_machine(machine);
+            crate::common::types::set_target_ptr_size(ptr);
+            Target
+        }
+    }
+    impl Drop for Target {
+        fn drop(&mut self) {
+            crate::common::types::set_target_elf_machine(62);
+            crate::common::types::set_target_ptr_size(8);
+        }
+    }
+
+    #[test]
+    fn rotation_lags_follow_copy_chains() {
+        let f = rot_fn(8, true);
+        let (lp, label_to_idx) = loop_of(&f);
+        let rec = recurrent_phis(&f, &lp, &def_blocks(&f), &label_to_idx);
+        assert!((1..=8).all(|k| rec.contains(&k)) && rec.contains(&30) && rec.contains(&31));
+        let lags = rotation_lags(&f, &lp, &rec, &label_to_idx);
+        for k in 1..8u32 {
+            assert_eq!(lags.get(&(k + 1)), Some(&(k as i32)), "w[{k}] lags {k}");
+        }
+        assert!(!lags.contains_key(&1), "w[0] is computed: lag 0");
+        assert!(
+            !lags.contains_key(&30) && !lags.contains_key(&31),
+            "a pure swap cycle has no computed source: lag 0"
+        );
+    }
+
+    /// The PR #638 regression: with every carried phi at time 0 the pass
+    /// reshaped rot() without shortening its recurrence and lost the load
+    /// fold.  With lags, the computed word w[0] is combined last (one add
+    /// after it), and the load is the second operand of its node.
+    #[test]
+    fn rotation_combines_the_computed_word_last() {
+        let n = 4;
+        let mut f = rot_fn(n, false);
+        assert_eq!(run_function(&mut f), 1);
+        assert_valid(&f);
+        // Each level combines one leaf with the partial sum below it:
+        // w[0] (lag 0) last, then w[1], w[2], and (w[3] + load) first.
+        let split = |x: &Operand, leaf: Operand| -> Operand {
+            let Operand::Value(x) = x else { panic!("node") };
+            let Instruction::BinOp { lhs, rhs, .. } = def(&f, x.0) else {
+                panic!("node is not a BinOp")
+            };
+            if *lhs == leaf {
+                rhs.clone()
+            } else {
+                assert_eq!(*rhs, leaf, "leaf at this level");
+                lhs.clone()
+            }
+        };
+        let mut cur = split(&v(rot_root(n)), v(1));
+        for leaf in [v(2), v(3)] {
+            cur = split(&cur, leaf);
+        }
+        let Operand::Value(x) = cur else {
+            panic!("first node")
+        };
+        let Instruction::BinOp { lhs, rhs, .. } = def(&f, x.0) else {
+            panic!("first node")
+        };
+        assert_eq!(
+            (lhs, rhs),
+            (&v(4), &v(46)),
+            "the load is the folded second operand"
+        );
+        assert_eq!(run_function(&mut f), 0, "fixpoint reached");
+    }
+
+    #[test]
+    fn recurrent_liveness_is_exact() {
+        let f = rot_fn(4, false);
+        let (lp, label_to_idx) = loop_of(&f);
+        let rec = recurrent_phis(&f, &lp, &def_blocks(&f), &label_to_idx);
+        let tainted = tainted_values(&f, &lp, &rec);
+        let (_, succs) = analysis::build_cfg(&f, &label_to_idx);
+        let live = live_out_restricted(&f, &succs, &label_to_idx, &tainted);
+        let mut body: Vec<u32> = live[2].iter().copied().collect();
+        body.sort_unstable();
+        // w[0..3] feed the next words' phis, t feeds w[0]'s; w[3] dies in
+        // the tree and the tree's interior nodes are single-use temporaries.
+        assert_eq!(body, vec![1, 2, 3, rot_root(4)]);
+        let mut header: Vec<u32> = live[1].iter().copied().collect();
+        header.sort_unstable();
+        assert_eq!(header, vec![1, 2, 3, 4], "all words live into the body");
+        assert!(live[3].is_empty(), "nothing is live out of the exit");
+    }
+
+    #[test]
+    fn gpr_weights_follow_the_target_word() {
+        {
+            let _t = Target::set(EM_386, 4);
+            assert_eq!(gpr_weight(Some(IrType::I64)), 2, "i686 pairs");
+            assert_eq!(gpr_weight(Some(IrType::U32)), 1);
+            assert_eq!(gpr_weight(Some(IrType::F64)), 0);
+            assert_eq!(gpr_budget(), 6);
+        }
+        assert_eq!(gpr_weight(Some(IrType::I64)), 1);
+        assert_eq!(gpr_weight(Some(IrType::I128)), 2);
+        assert_eq!(gpr_weight(Some(IrType::U8)), 1);
+        assert_eq!(gpr_budget(), 13);
+    }
+
+    /// Register residency: eight rotating words cannot stay in i686's six
+    /// GPRs, so the recurrence runs through memory and the reshape is left
+    /// out (measured 1.058x slower on SHA-256).  Four words fit, and x86-64
+    /// holds all eight: both are rewritten.
+    #[test]
+    fn memory_resident_rotation_is_left_alone() {
+        {
+            let _t = Target::set(EM_386, 4);
+            let mut f = rot_fn(8, false);
+            let before = format!("{:?}", f.blocks);
+            assert_eq!(run_function(&mut f), 0, "8 words / 6 GPRs: left alone");
+            assert_eq!(format!("{:?}", f.blocks), before);
+            let mut f = rot_fn(4, false);
+            assert_eq!(run_function(&mut f), 1, "4 words fit i686");
+            assert_valid(&f);
+        }
+        let mut f = rot_fn(8, false);
+        assert_eq!(run_function(&mut f), 1, "8 words fit x86-64");
+        assert_valid(&f);
     }
 
     #[test]

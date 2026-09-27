@@ -1716,7 +1716,11 @@ mod tests {
             "    movq %rdi, %rax\n    addq %rsi, %rax\n    movsd %xmm0, %xmm1\n    vaddsd %xmm1, %xmm2, %xmm0\n    ret\n",
         );
         let out = run(&asm);
-        assert!(out.contains("addq %rsi, %rax"), "{out}");
+        // The GP sum survives, as written or as the copy+add fold's lea.
+        assert!(
+            out.contains("addq %rsi, %rax") || out.contains("leaq (%rdi,%rsi), %rax"),
+            "{out}"
+        );
     }
 
     #[test]

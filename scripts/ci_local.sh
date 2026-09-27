@@ -24,7 +24,18 @@
 #                                      # rustfmt and clippy ALWAYS run — they
 #                                      # are the CI lint jobs, and skipping
 #                                      # them locally is how a red PR ships.
+#   ./scripts/ci_local.sh --slow       # ONLY the three slow gates (plus the
+#                                      # build).  If a --fast stamp for the SAME
+#                                      # tree exists, a green --slow run upgrades
+#                                      # it to mode=full: fast + slow on one tree
+#                                      # is every gate GitHub runs.
 #   ./scripts/ci_local.sh --only NAME  # a single gate, substring match
+#
+# A --fast pass is NOT CI-equivalent: GitHub runs all three slow gates on every
+# PR.  PR #638 (S24) went red on check_peephole_whitespace.sh after a green
+# --fast run, because the snapshot gate accepted a fast stamp.  lccc-snapshot.sh
+# therefore demands mode=full; obtain it with a full run or with --fast then
+# --slow on the unchanged tree.
 #
 #   CI_LOCAL_JOBS=N   parallelism for the clippy gate (default 2).  Set 1 on
 #                     low-memory hosts: `cargo clippy --all-targets` peaks
@@ -45,10 +56,12 @@ export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
 export PATH="$CARGO_HOME/bin:$PATH"
 
 FAST=0
+SLOW_ONLY=0
 ONLY=""
 for arg in "$@"; do
     case "$arg" in
         --fast) FAST=1 ;;
+        --slow) SLOW_ONLY=1 ;;
         --only) ONLY="__NEXT__" ;;
         *) if [ "$ONLY" = "__NEXT__" ]; then ONLY="$arg"; else
                echo "unknown argument: $arg" >&2; exit 2
@@ -64,8 +77,23 @@ LCCC=target/fastbuild/lccc
 # a run that does not finish green leaves no proof behind.
 STAMP=target/ci_local.pass
 mkdir -p target
-rm -f "$STAMP"
+if [ "$FAST" = 1 ] && [ "$SLOW_ONLY" = 1 ]; then
+    echo "--fast and --slow are complementary halves; run them one after the other" >&2
+    exit 2
+fi
 TREE_START=$(bash scripts/worktree_tree.sh 2>/dev/null || true)
+# --fast and --slow are complementary halves.  Remember the complementary
+# half's stamp before it is removed: only both halves green on ONE tree may
+# claim mode=full.
+PRIOR_HALF_TREE=""
+COMPLEMENT=""
+[ "$FAST" = 1 ] && COMPLEMENT=slow
+[ "$SLOW_ONLY" = 1 ] && COMPLEMENT=fast
+if [ -n "$COMPLEMENT" ] && [ -z "$ONLY" ] && [ -r "$STAMP" ] &&
+    [ "$(sed -n 's/^mode=//p' "$STAMP" | head -1)" = "$COMPLEMENT" ]; then
+    PRIOR_HALF_TREE=$(sed -n 's/^tree=//p' "$STAMP" | head -1)
+fi
+rm -f "$STAMP"
 FAILED=()
 PASSED=0
 SKIPPED=0
@@ -82,6 +110,10 @@ gate() {
     if [ "$FAST" = "1" ] && [ "$slow" = "slow" ]; then
         echo "SKIP  $name (--fast)"
         SKIPPED=$((SKIPPED + 1))
+        return 0
+    fi
+    # --slow keeps the build: every slow gate drives the freshly built lccc.
+    if [ "$SLOW_ONLY" = "1" ] && [ "$slow" != "slow" ] && [ "$name" != "build" ]; then
         return 0
     fi
     hr
@@ -180,6 +212,25 @@ cargo_test_repeated() {
 }
 
 gate "cargo-test" fast cargo_test_repeated
+
+# CI's second test run: the fastbuild profile inherits `release`, which
+# compiles every debug_assert! out -- the %rax shadow-epoch validator, the
+# GVN span-lockstep check and every other debug-only invariant.  Same
+# --config overrides as ci.yml ("Run tests (debug-assertions on)"), so the
+# shipped fastbuild build stays assertion-free and the artifacts are cached
+# under their own fingerprints.  Memory heuristics as cargo_test_repeated.
+DBGASSERT_CONFIG=(--config 'profile.fastbuild.debug-assertions=true'
+    --config 'profile.fastbuild.incremental=false'
+    --config 'profile.fastbuild.debug=0')
+cargo_test_dbgassert() {
+    local flags="" jobs=2 total_mb
+    [ -r target/lccc-rustflags ] && flags="$(cat target/lccc-rustflags)"
+    total_mb=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}')
+    [ -n "$total_mb" ] && [ "$total_mb" -lt 6000 ] && jobs=1
+    CARGO_INCREMENTAL=0 RUSTFLAGS="$flags" cargo test --profile fastbuild \
+        --all-targets --locked -j "$jobs" "${DBGASSERT_CONFIG[@]}"
+}
+gate "cargo-test-debug-assertions" slow cargo_test_dbgassert
 
 # CCC_VALIDATE_SSA is what CI sets; without it the corpus does not verify SSA
 # form after every pass and a malformed-IR bug can hide behind a correct
@@ -322,6 +373,11 @@ gate "dep-files" fast \
 
 gate "i686-boot-asm" fast \
     bash tests/regression/check_i686_boot_asm.sh
+
+# ci.yml "Verify inline-asm UTF-8 assembly text".
+gate "inline-asm-utf8" fast \
+    python3 scripts/check_inline_asm_utf8.py --lccc "$LCCC" --expect preserved \
+        --json target/inline-asm-utf8.json
 
 # Byte-exact assembler differentials have ONE oracle: GNU as 2.47, exactly as
 # hosted CI. Distro assemblers are not interchangeable -- GAS 2.44 orders the
@@ -588,6 +644,10 @@ gate "peephole-whitespace-invariance" slow \
 # dynamic path is exercised on a real compile.  Sub-second, so: fast.
 gate "peephole-trace-bisect" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_peephole_trace_bisect.sh
+# ci.yml also runs the tool's parser self-test directly, so a broken parser
+# fails even when the wrapper gate is skipped.
+gate "peephole-trace-bisect-selftest" fast \
+    python3 scripts/peephole_trace_bisect.py --selftest
 
 # The one-move phi-diamond preinitialisation hoists the cheap incoming
 # above the branch. A memory-source init may fault on the path it lands
@@ -619,6 +679,10 @@ fi
 # if-combine pass was predicating short-circuit chains in a UTF-8 scanner that
 # can never be vectorized.  A mirror that covers only one workflow is not a
 # mirror.
+# bench.yml "Gate self-test (stackmem accounting)": the gate's own unit tests.
+gate "codegen-gate-self-test" fast \
+    python3 .github/scripts/test_ci_codegen_gate.py
+
 gate "codegen-quality-gate" fast \
     python3 .github/scripts/ci-codegen-gate.py --lccc "$LCCC"
 
@@ -631,6 +695,27 @@ gate "codegen-quality-gate" fast \
 gate "rustfmt" fast cargo fmt --all -- --check
 gate "clippy" fast \
     cargo clippy --all-targets --profile fastbuild --locked -j "${CI_LOCAL_JOBS:-2}" -- -D warnings
+
+# ci.yml's closing step "Regression corpus (debug-assertions compiler)": the
+# corpus gates above run an assertion-free compiler, so no debug-only
+# invariant (the %rax shadow-epoch validator above all) ever observes real
+# codegen without this.  CI overwrites target/fastbuild/lccc with the
+# assertions-ON binary because nothing after it uses the path; here later
+# work does, so the binary is run from a copy and the shipping build is
+# relinked from its still-cached artifacts afterwards.
+regression_corpus_dbgassert() {
+    local flags="" rc=0
+    [ -r target/lccc-rustflags ] && flags="$(cat target/lccc-rustflags)"
+    CARGO_INCREMENTAL=0 RUSTFLAGS="$flags" cargo build --profile fastbuild \
+        --bin lccc --locked -j 2 "${DBGASSERT_CONFIG[@]}" || return 1
+    cp -f target/fastbuild/lccc target/lccc-dbgassert || return 1
+    CCC_VALIDATE_SSA=1 python3 tests/regression/run_regression.py \
+        --lccc target/lccc-dbgassert -j 2 \
+        --json target/regression-dbgassert-results.json || rc=1
+    ./scripts/build_lccc_fast.sh >/dev/null || rc=1
+    return $rc
+}
+gate "regression-corpus-debug-assertions" slow regression_corpus_dbgassert
 
 # ------------------------------------------------------------------ done ---
 hr
@@ -646,11 +731,26 @@ else
     TREE_END=$(bash scripts/worktree_tree.sh 2>/dev/null || true)
     if [ -n "$TREE_START" ] && [ "$TREE_START" = "$TREE_END" ]; then
         mode=full
-        [ "$FAST" = 1 ] && mode=fast
-        printf 'tree=%s\nmode=%s\nutc=%s\nhead=%s\n' "$TREE_END" "$mode" \
-            "$(date -u +%Y%m%dT%H%M%SZ)" "$(git rev-parse HEAD)" >"$STAMP.tmp" &&
+        if [ -n "$COMPLEMENT" ]; then
+            half=fast
+            [ "$SLOW_ONLY" = 1 ] && half=slow
+            if [ -n "$PRIOR_HALF_TREE" ] && [ "$PRIOR_HALF_TREE" = "$TREE_END" ]; then
+                echo "both halves green on tree $TREE_END (--$COMPLEMENT earlier, --$half now)"
+            else
+                mode=$half
+                echo "NOTE: stamp is mode=$half -- NOT CI-equivalent and not" \
+                     "delivery-grade until --$COMPLEMENT also passes on this tree" >&2
+            fi
+        fi
+        # The userland matters as much as the gate list: system gcc/as/ld/
+        # glibc differ between hosts, and PR #638 was green on Debian 13 and
+        # red on the Ubuntu runner (scripts/ci_ubuntu_chroot.sh mirrors it).
+        os=$( (. /etc/os-release 2>/dev/null && echo "${ID:-unknown}-${VERSION_ID:-unknown}") ||
+            echo unknown)
+        printf 'tree=%s\nmode=%s\nutc=%s\nhead=%s\nos=%s\n' "$TREE_END" "$mode" \
+            "$(date -u +%Y%m%dT%H%M%SZ)" "$(git rev-parse HEAD)" "$os" >"$STAMP.tmp" &&
             mv -f "$STAMP.tmp" "$STAMP"
-        echo "pass stamp: $STAMP (tree $TREE_END, $mode)"
+        echo "pass stamp: $STAMP (tree $TREE_END, $mode, $os)"
     else
         echo "WARNING: the worktree changed during the run" \
              "(${TREE_START:-?} -> ${TREE_END:-?}); no pass stamp" >&2
