@@ -139,19 +139,31 @@ pub(super) fn rbp_is_gpr_in_function(
             }
             continue;
         }
-        // Frame-pointer setup / restore / leave.
+        // Frame-pointer setup / restore / leave — BOTH width spellings.
+        // A `movl %esp, %ebp` frame is exactly as much a frame as the
+        // 64-bit one (three sibling passes check both; the i686 backend
+        // and hand-written 32-bit assembly use the `l` forms), and
+        // `enter` establishes the frame by encoding alone.
         if t.starts_with("movq %rsp, %rbp")
             || t.starts_with("mov %rsp, %rbp")
             || t.starts_with("movq %rbp, %rsp")
             || t.starts_with("mov %rbp, %rsp")
+            || t.starts_with("movl %esp, %ebp")
+            || t.starts_with("mov %esp, %ebp")
+            || t.starts_with("movl %ebp, %esp")
+            || t.starts_with("mov %ebp, %esp")
             || t.starts_with("leave")
+            || t.starts_with("enter")
         {
             return false;
         }
         // CFA rooted at rbp (frame-pointer build's unwind contract).
-        if (t.starts_with(".cfi_def_cfa ") && t.contains("%rbp"))
-            || (t.starts_with(".cfi_def_cfa_register") && t.ends_with(" 6"))
+        // Register 6 is rbp in the x86-64 CFI numbering, 5 in the i386
+        // numbering — either marks a frame-pointer build.
+        if (t.starts_with(".cfi_def_cfa ") && (t.contains("%rbp") || t.contains("%ebp")))
+            || (t.starts_with(".cfi_def_cfa_register") && (t.ends_with(" 6") || t.ends_with(" 5")))
             || t.starts_with(".cfi_def_cfa_register %rbp")
+            || t.starts_with(".cfi_def_cfa_register %ebp")
         {
             return false;
         }

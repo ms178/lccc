@@ -156,6 +156,64 @@ both already carried exactly the range guards this pass lacked. Any
 immediate-to-displacement splice must parse, range-check, and canonicalize;
 verbatim text splicing between operand classes is a bug.
 
+#### 2.1.4 Post-merge review (PR #649 audit): H1–H3 adjudicated, fixed, proven
+
+The post-merge review AI found three miscompile-class defects, all in
+`fuse_load_lea_add`. Adjudication with empirical verification (the review
+could not run code; every claim was re-derived and then tested here):
+
+* **H1 (missing flags guard) — AGREED, PROVEN ON HARDWARE.** The rewrite
+  keeps the ADD opcode but changes its operands ((B+C)+M vs (M+B)+C), so
+  CF/OF/AF belong to a different final pair; only ZF/SF/PF are
+  result-derived. The doc's "flag semantics BIT-IDENTICAL" lemma was false
+  and — worse — `flags_consumer_still_folds` pinned the bug with a live
+  `jl`. Both retracted. Native experiment (the exact triple, `jl` after
+  the final ADD, M=-1 B=2 C=0x7fffffff): original association falls
+  through, folded association takes the branch. Fix:
+  `flags_dead_after(store, infos, k + 1)` (the ADD at k is itself a flags
+  writer; the scan must start at k+1).
+* **H2 (missing D==C refusal) — AGREED.** `lea (X,B),C; add C,C` computes
+  2(M+B) but the rewritten chain computes B+C_old+M. Fix: refuse
+  `c_fam == Some(d_fam)` (imm addends have no family — no change there).
+* **H3 (dropped SIB displacement) — AGREED, FIXED BETTER THAN REFUSAL.**
+  The `[a, b]` decomposition discarded `disp_prefix`, and the imm arm
+  replaced the disp with the addend. The review prescribed refusal; this
+  fix instead CARRIES the displacement: `disp(B,C)` is encodable (disp8/32
+  + SIB), and the imm arm sums `checked_add(disp, imm)` with an explicit
+  disp32 bound — so every disp shape keeps its 3→1 fold and only true
+  encoding overflow refuses. In-range hex inputs now emit canonical
+  decimal (closes review P3b for this pass's output).
+* **P1a — AGREED, FIXED.** `rbp_is_gpr_in_function` now also honors
+  `movl %esp,%ebp` / `movl %ebp,%esp`, `enter`, CFA register 5 (i386
+  numbering) and `%ebp`-spelled `.cfi_def_cfa`, matching the three
+  sibling passes' both-spellings convention. Test added (32-bit-spelled
+  frame pins rbp).
+* **P1b — AGREED, FIXED with an honesty note.** `fuse_load_lea_into_base`
+  refuses `fam == 4` explicitly (sibling parity). The accompanying test
+  pins the observable CONTRACT (an rsp-involving triple never folds);
+  today the visible refusal comes from the liveness oracle — the guard
+  exists so the contract survives oracle changes — and the test comment
+  says exactly that (a mutation-killed guard test is impossible here
+  because FileLiveness never reports rsp dead).
+* **P2/P3/N — DEFERRED** (per the review's own instruction): per-candidate
+  `FileLiveness` hoisting, immediate-parser unification, and the
+  fold_staged/fold_copy_add overlap are backlog items, not silently
+  dropped. Two review nits were wrong on inspection: `op_w` is used (it
+  is `fuse_staged_add_and_relay`'s), and the claimed misnomered test does
+  not exist.
+
+Acceptance evidence: suite 3670 passed / 0 failed; the flipped
+`flags_consumer_refuses_fusion`, `lea_result_as_add_source_refuses`,
+`sib_disp_is_carried_onto_rewritten_lea`,
+`sib_disp_imm_addend_sums_displacement`,
+`sib_disp_imm_overflow_refuses`, and the P1a/P1b tests all green;
+mutation matrix 5/5 discriminating (flags off / c==d off / disp-carry
+dropped / sum→imm / overflow bound off each fail exactly their tests);
+rot byte-identical (56 raw, 53 gate-count, driver output = gcc);
+sha256_transform 142/9 (its t1 site is clean on all three axes, as the
+review predicted); check_reassoc_latency 12/12 legs; check_phi_acyclic
+contract holds; corpus pair differential = gcc.
+
 #### 2.1.2 `flags_dead_after` argument: contract conformance, not a fix
 
 An earlier draft of this document called the `flags_dead_after(store,
