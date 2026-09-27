@@ -337,8 +337,11 @@ impl super::InstructionEncoder {
     ) -> Result<(), String> {
         match ops.len() {
             0 => {
-                // Default: fadd %st(1), %st (i.e., st(0) = st(0) op st(1))
-                self.bytes.extend_from_slice(&[opcode_st0, base_modrm + 1]);
+                // Bare `fadd` is `faddp %st, %st(1)` (GAS 2.47: DE C1):
+                // the no-operand form pops. The D8 default encoded the
+                // non-popping `fadd %st(1), %st` instead. DE pop bases
+                // coincide with the D8/DC bases, so only the opcode changes.
+                self.bytes.extend_from_slice(&[0xDE, base_modrm + 1]);
                 Ok(())
             }
             1 => {
@@ -363,19 +366,14 @@ impl super::InstructionEncoder {
                             self.bytes
                                 .extend_from_slice(&[opcode_st0, base_modrm + src_n]);
                         } else if src_n == 0 {
-                            // fadd %st, %st(i) -> DC (base + i)
-                            // Note: fsub/fdiv swap in DC encoding
-                            let dc_modrm = match base_modrm {
-                                0xC0 => 0xC0, // fadd
-                                0xC8 => 0xC8, // fmul
-                                0xE0 => 0xE8, // fsub -> fsubr encoding in DC
-                                0xE8 => 0xE0, // fsubr -> fsub encoding in DC
-                                0xF0 => 0xF8, // fdiv -> fdivr encoding in DC
-                                0xF8 => 0xF0, // fdivr -> fdiv encoding in DC
-                                _ => base_modrm,
-                            };
+                            // fadd %st, %st(i) -> DC (base + i). The DC base
+                            // is the instruction's OWN base (verified vs GNU
+                            // as 2.47): fsub %st,%st(i) = DC E0+i, fsubr =
+                            // DC E8+i, fdiv = DC F0+i, fdivr = DC F8+i.
+                            // NO swap -- the old remap table encoded fsub as
+                            // fsubr (DC EC for `fsub %st,%st(4)`).
                             self.bytes
-                                .extend_from_slice(&[opcode_sti, dc_modrm + dst_n]);
+                                .extend_from_slice(&[opcode_sti, base_modrm + dst_n]);
                         } else {
                             return Err("x87 arith: one operand must be st(0)".to_string());
                         }
@@ -386,5 +384,106 @@ impl super::InstructionEncoder {
             }
             _ => Err("x87 arith requires 0-2 operands".to_string()),
         }
+    }
+
+    /// Encode the x87 popping arithmetic forms (`faddp` ... `fdivrp`):
+    /// `DE base+N`. Bare is st(1); one register encodes its own index;
+    /// two registers encode the nonzero one. A reversed pair is only
+    /// legal for `faddp`/`fmulp` (commutative); the rest are GAS's
+    /// `operand type mismatch` (the reversal would change the result).
+    pub(super) fn encode_x87_pop_reg(
+        &mut self,
+        ops: &[Operand],
+        mnemonic: &str,
+        base_modrm: u8,
+    ) -> Result<(), String> {
+        let n = match ops.len() {
+            0 => 1,
+            1 => match &ops[0] {
+                Operand::Register(reg) => parse_st_num(&reg.name)?,
+                _ => return Err("x87 pop arith requires st register operand".to_string()),
+            },
+            2 => match (&ops[0], &ops[1]) {
+                (Operand::Register(a), Operand::Register(b)) => {
+                    let (x, y) = (parse_st_num(&a.name)?, parse_st_num(&b.name)?);
+                    if x == 0 {
+                        y
+                    } else if y == 0 {
+                        if !matches!(mnemonic, "faddp" | "fmulp") {
+                            return Err(format!("operand type mismatch for `{mnemonic}'"));
+                        }
+                        x
+                    } else {
+                        return Err("x87 pop arith: one operand must be st(0)".to_string());
+                    }
+                }
+                _ => return Err("x87 pop arith requires st register operands".to_string()),
+            },
+            _ => return Err("x87 pop arith requires 0-2 operands".to_string()),
+        };
+        self.bytes.extend_from_slice(&[0xDE, base_modrm + n]);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod x87_pop_tests {
+    use super::*;
+
+    fn instruction(mnemonic: &str, operands: Vec<Operand>) -> Instruction {
+        Instruction {
+            prefixes: Vec::new(),
+            mnemonic: mnemonic.to_owned(),
+            operands,
+            nf: false,
+            force_evex: false,
+            vex_hint: None,
+            force_rex2: false,
+            dfv: 0,
+        }
+    }
+
+    fn reg(name: &str) -> Operand {
+        Operand::Register(Register {
+            name: name.to_owned(),
+            mask: None,
+            zeroing: false,
+            broadcast: None,
+        })
+    }
+
+    fn hex_of(mnemonic: &str, operands: Vec<Operand>) -> String {
+        let mut enc = InstructionEncoder::new();
+        enc.encode(&instruction(mnemonic, operands)).unwrap();
+        enc.bytes
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn pop_forms_encode_their_register() {
+        assert_eq!(hex_of("faddp", vec![]), "de c1");
+        assert_eq!(hex_of("faddp", vec![reg("st(3)")]), "de c3");
+        assert_eq!(hex_of("fsubp", vec![reg("st(7)")]), "de e7");
+        assert_eq!(hex_of("faddp", vec![reg("st"), reg("st(2)")]), "de c2");
+        assert_eq!(hex_of("fdivrp", vec![reg("st"), reg("st(5)")]), "de fd");
+    }
+
+    #[test]
+    fn bare_arith_is_the_popping_form() {
+        assert_eq!(hex_of("fadd", vec![]), "de c1");
+        assert_eq!(hex_of("fsub", vec![]), "de e1");
+        assert_eq!(hex_of("fmul", vec![]), "de c9");
+    }
+
+    #[test]
+    fn dc_two_operand_forms_keep_their_own_base() {
+        // The old swap table encoded `fsub %st,%st(4)` as DC EC (fsubr).
+        assert_eq!(hex_of("fsub", vec![reg("st"), reg("st(4)")]), "dc e4");
+        assert_eq!(hex_of("fsubr", vec![reg("st"), reg("st(4)")]), "dc ec");
+        assert_eq!(hex_of("fdiv", vec![reg("st"), reg("st(4)")]), "dc f4");
+        assert_eq!(hex_of("fdivr", vec![reg("st"), reg("st(4)")]), "dc fc");
     }
 }

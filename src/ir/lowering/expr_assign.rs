@@ -92,8 +92,14 @@ impl Lowerer {
         } else {
             let rhs_val = self.lower_expr(rhs);
             let rhs_ty = self.value_ir_type(rhs);
-            if lhs_ct == CType::Float128 || rhs_ct == CType::Float128 {
-                // _Float128 assignments route through the soft-float helpers.
+            if lhs_ct == CType::Float128
+                || rhs_ct == CType::Float128
+                || lhs_ct.is_decimal()
+                || rhs_ct.is_decimal()
+            {
+                // _Float128 assignments route through the soft-float helpers;
+                // C23 decimals route through the libbid helpers (same silent-
+                // miscompile class: raw IR casts emit binary conversions).
                 self.convert_scalar_ctype(rhs_val, rhs_ty, &rhs_ct, &lhs_ct)
             } else {
                 self.emit_implicit_cast(rhs_val, rhs_ty, lhs_ty)
@@ -971,6 +977,23 @@ impl Lowerer {
 
     /// Standard scalar compound assignment.
     fn lower_scalar_compound_assign(&mut self, op: &BinOp, lhs: &Expr, rhs: &Expr) -> Operand {
+        // C23 decimals: route Add/Sub/Mul/Div through the libbid helpers.
+        // Raw IR integer arithmetic on BID carriers (or raw IR casts) is a
+        // silent miscompile; remainder/bitwise/shift fall through to the
+        // generic path, mirroring lower_decimal_binop's `_` arm.
+        if matches!(
+            op,
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div
+        ) {
+            let lhs_ct = self.expr_ctype(lhs);
+            let rhs_ct = self.expr_ctype(rhs);
+            if lhs_ct.is_decimal() || rhs_ct.is_decimal() {
+                let common_ct = CType::usual_arithmetic_conversion(&lhs_ct, &rhs_ct);
+                return self.lower_decimal_compound_assign(
+                    op, lhs, rhs, &lhs_ct, &rhs_ct, &common_ct,
+                );
+            }
+        }
         let ty = self.get_expr_type(lhs);
         let lhs_ir_ty = self.infer_expr_type(lhs);
         let rhs_ir_ty = self.infer_expr_type(rhs);

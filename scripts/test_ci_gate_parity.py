@@ -24,7 +24,7 @@ class AsmDiffParityTest(unittest.TestCase):
         cls.x64 = next(
             line.strip() for line in cls.hosted.splitlines()
             if line.strip().startswith("python3 scripts/asmdiff.py")
-            and "merged-pr629-followup.casefile" in line
+            and "--32" not in line
         )
         cls.i686 = next(
             line.strip() for line in cls.hosted.splitlines()
@@ -50,11 +50,17 @@ class AsmDiffParityTest(unittest.TestCase):
         self.assertIn(self.x64, hosted)
         self.assert_rejected(hosted)
 
+    def test_x64_gate_runs_the_whole_corpus(self) -> None:
+        # No .casefile operands: asmdiff.py defaults to every
+        # tests/asm-diff/*.casefile. A pinned subset would let new corpora
+        # land ungated again.
+        self.assertNotIn(".casefile", self.x64)
+
     def test_wrong_mode_compiler_corpus_or_jobs_cannot_satisfy_x64_gate(self) -> None:
         replacements = (
             self.x64.replace("--jobs 2", "--jobs 128", 1),
             self.x64.replace("--lccc target/fastbuild/lccc-x86", "--lccc target/fastbuild/lccc-i686", 1),
-            self.x64.replace("merged-pr629-followup.casefile", "other.casefile", 1),
+            self.x64 + " tests/asm-diff/other.casefile",
             self.x64.replace("python3 scripts/asmdiff.py", "echo python3 scripts/asmdiff.py", 1),
             self.x64.replace("--as \"$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as\"", "--as as", 1),
         )

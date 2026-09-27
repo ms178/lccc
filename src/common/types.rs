@@ -2100,8 +2100,18 @@ impl CType {
                         return Some(e);
                     }
                 }
-                // Both arithmetic types: apply usual arithmetic conversions
-                if t.is_arithmetic() && e.is_arithmetic() {
+                // Both arithmetic types: apply usual arithmetic conversions.
+                // Decimals are deliberately excluded from is_arithmetic(),
+                // but a decimal arm still selects the UAC common type (the
+                // decimal hierarchy absorbing integers; binary float wins
+                // over decimal per our UAC rule). Without this the fallback
+                // below reports the then-arm type, and downstream implicit
+                // conversions re-convert an already-decimal value (silent
+                // miscompile: __bid_float* applied to BID carriers).
+                if (t.is_arithmetic() && e.is_arithmetic())
+                    || t.is_decimal()
+                    || e.is_decimal()
+                {
                     return Some(CType::usual_arithmetic_conversion(&t, &e));
                 }
                 // Fallback: then-branch type (structs, unions, etc.)

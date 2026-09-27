@@ -656,8 +656,13 @@ impl Lowerer {
                 // _Float128 (and its U128 carrier) must route through the
                 // soft-float helpers; a plain F64/F32->U128 bit-cast would
                 // store an integer bit pattern instead of binary128 bytes.
+                // C23 decimals likewise route through the libbid helpers; a
+                // raw IR cast would emit binary cvtsi2ss/sd on BID carriers.
                 Some(target_ct)
-                    if *target_ct == CType::Float128 || rhs_ctype == CType::Float128 =>
+                    if *target_ct == CType::Float128
+                        || rhs_ctype == CType::Float128
+                        || target_ct.is_decimal()
+                        || rhs_ctype.is_decimal() =>
                 {
                     self.convert_scalar_ctype(val, expr_ty, &rhs_ctype, target_ct)
                 }

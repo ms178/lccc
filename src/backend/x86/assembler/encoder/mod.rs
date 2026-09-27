@@ -4045,15 +4045,19 @@ impl InstructionEncoder {
             "fildq" | "fildll" => self.encode_x87_mem(ops, &[0xDF], 5),
             "fisttpq" | "fisttpll" => self.encode_x87_mem(ops, &[0xDD], 1),
             "fistpq" | "fistpll" => self.encode_x87_mem(ops, &[0xDF], 7),
-            "faddp" => self.encode_x87_pop_arith(ops, 0xC0),
             // Note: AT&T syntax swaps the meaning of fsub/fsubr and fdiv/fdivr
             // relative to Intel mnemonics for the *p (pop) forms.
             // GAS: fsubp = DE E1, fsubrp = DE E9, fdivp = DE F1, fdivrp = DE F9
-            "fsubp" => self.encode_x87_pop_arith(ops, 0xE0),
-            "fsubrp" => self.encode_x87_pop_arith(ops, 0xE8),
-            "fmulp" => self.encode_x87_pop_arith(ops, 0xC8),
-            "fdivp" => self.encode_x87_pop_arith(ops, 0xF0),
-            "fdivrp" => self.encode_x87_pop_arith(ops, 0xF8),
+            // (Rebase note: upstream `encode_x87_pop_arith` silently
+            // accepted reversed non-commutative pairs that GAS rejects
+            // with "operand type mismatch" -- probed this session -- so the
+            // mnemonic-aware helper stays; see `x87_pop_reversed_reject`.)
+            "faddp" => self.encode_x87_pop_reg(ops, "faddp", 0xC0),
+            "fsubp" => self.encode_x87_pop_reg(ops, "fsubp", 0xE0),
+            "fsubrp" => self.encode_x87_pop_reg(ops, "fsubrp", 0xE8),
+            "fmulp" => self.encode_x87_pop_reg(ops, "fmulp", 0xC8),
+            "fdivp" => self.encode_x87_pop_reg(ops, "fdivp", 0xF0),
+            "fdivrp" => self.encode_x87_pop_reg(ops, "fdivrp", 0xF8),
             "fchs" => {
                 self.bytes.extend_from_slice(&[0xD9, 0xE0]);
                 Ok(())
@@ -7231,5 +7235,84 @@ mod merged_pr629_followup_tests {
             hex("vmovdqu8 64(%r16,%r17,2),%zmm1"),
             "62 f9 7b 48 6f 4c 48 01"
         );
+    }
+}
+
+#[cfg(test)]
+mod x87_pop_tests {
+    use super::apx_tests::{fail_msg, fails, hex};
+
+    #[test]
+    fn pop_forms_encode_their_register() {
+        // Bare pops default to st(1); an explicit register encodes its
+        // own index (GAS 2.47). The old arms ignored operands (DE C1...).
+        assert_eq!(hex("faddp"), "de c1");
+        assert_eq!(hex("fsubp"), "de e1");
+        assert_eq!(hex("fsubrp"), "de e9");
+        assert_eq!(hex("fmulp"), "de c9");
+        assert_eq!(hex("fdivp"), "de f1");
+        assert_eq!(hex("fdivrp"), "de f9");
+        assert_eq!(hex("faddp %st(0)"), "de c0");
+        assert_eq!(hex("faddp %st(3)"), "de c3");
+        assert_eq!(hex("faddp %st(7)"), "de c7");
+        assert_eq!(hex("fsubp %st(4)"), "de e4");
+        assert_eq!(hex("fsubrp %st(6)"), "de ee");
+        assert_eq!(hex("fmulp %st(5)"), "de cd");
+        assert_eq!(hex("fdivp %st(2)"), "de f2");
+        assert_eq!(hex("fdivrp %st(7)"), "de ff");
+        // Two registers: the nonzero one from either side.
+        assert_eq!(hex("faddp %st, %st(2)"), "de c2");
+        assert_eq!(hex("faddp %st(2), %st"), "de c2");
+        assert_eq!(hex("fsubp %st, %st(0)"), "de e0");
+        assert_eq!(hex("fdivrp %st, %st(5)"), "de fd");
+    }
+
+    #[test]
+    fn bare_arith_is_the_popping_form() {
+        // Bare `fadd` is `faddp %st, %st(1)` (GAS warns "translating to
+        // `faddp'"; bytes are DE C1). D8 C1 would be the non-popping
+        // `fadd %st(1), %st`.
+        assert_eq!(hex("fadd"), "de c1");
+        assert_eq!(hex("fsub"), "de e1");
+        assert_eq!(hex("fsubr"), "de e9");
+        assert_eq!(hex("fmul"), "de c9");
+        assert_eq!(hex("fdiv"), "de f1");
+        assert_eq!(hex("fdivr"), "de f9");
+    }
+
+    #[test]
+    fn dc_two_operand_forms_keep_their_own_base() {
+        // `fsub %st, %st(N)` is DC E0+N, NOT the swapped DC E8+N
+        // (which is fsubr). Same for the fdiv pair.
+        assert_eq!(hex("fadd %st, %st(4)"), "dc c4");
+        assert_eq!(hex("fmul %st, %st(4)"), "dc cc");
+        assert_eq!(hex("fsub %st, %st(4)"), "dc e4");
+        assert_eq!(hex("fsubr %st, %st(4)"), "dc ec");
+        assert_eq!(hex("fdiv %st, %st(4)"), "dc f4");
+        assert_eq!(hex("fdivr %st, %st(4)"), "dc fc");
+        assert_eq!(hex("fsub %st(2)"), "d8 e2");
+        assert_eq!(hex("fsubr %st(2)"), "d8 ea");
+    }
+
+    #[test]
+    fn pop_forms_reject_non_st_operands() {
+        assert!(fails("faddp %st(2), %st(3)"));
+        assert!(fails("faddp %eax"));
+        assert!(fails("faddp %st(8)"));
+        assert_eq!(
+            fail_msg("faddp %st(2), %st(3)"),
+            "x87 pop arith: one operand must be st(0)"
+        );
+        // Reversed pairs only survive for faddp/fmulp (commutative);
+        // GAS rejects the rest as a type mismatch.
+        assert_eq!(
+            fail_msg("fsubp %st(5), %st"),
+            "operand type mismatch for `fsubp'"
+        );
+        assert_eq!(
+            fail_msg("fdivrp %st(2), %st"),
+            "operand type mismatch for `fdivrp'"
+        );
+        assert_eq!(hex("fmulp %st(4), %st"), "de cc");
     }
 }

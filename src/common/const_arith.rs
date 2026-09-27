@@ -8,6 +8,7 @@
 //! lowering) are responsible for determining width/signedness from their own
 //! type systems (CType vs IrType) before calling these shared functions.
 
+use crate::common::types::CType;
 use crate::frontend::parser::ast::BinOp;
 use crate::ir::reexports::IrConst;
 
@@ -512,7 +513,183 @@ pub fn negate_const(val: IrConst) -> Option<IrConst> {
             let neg_val = val ^ (1u128 << 127);
             Some(IrConst::long_double_with_bytes(-v, neg_val.to_le_bytes()))
         }
+        // C23 decimals: BID negation is an exact sign flip (top bit),
+        // so `-0.5DF` folds bit-identically (including -0 preservation).
+        // (D128 rides I128 and is handled by the caller's literal-shape
+        // check: a blind integer negation would corrupt BID128/F128 bits.)
+        IrConst::D32(v) => Some(IrConst::D32(crate::common::decimal::negate_bid32(v))),
+        IrConst::D64(v) => Some(IrConst::D64(crate::common::decimal::negate_bid64(v))),
         _ => None,
+    }
+}
+
+/// Convert a constant to a BID constant of decimal `width` (32/64/128).
+/// The master compile-time decimal conversion, shared by static-init
+/// lowering and decimal-target cast folding:
+/// - integers convert by exact value (magnitudes that exceed the width's
+///   precision round half-even; only infinity-bound magnitudes saturate);
+/// - binary floats and binary128 convert through their EXACT decimal
+///   expansion (GCC/mpfr bit-agreement; no shortest-repr double-rounding);
+/// - BID sources decode and re-encode (cross-width-aware, half-even);
+/// - NaN/Inf map to canonical BID specials (sign-preserving).
+/// `src_ct` disambiguates the I128 carrier (integer vs `_Float128` vs
+/// `_Decimal128`) and supplies integer signedness. Returns None for
+/// non-scalar sources, kind-mismatched carriers, and unknown widths.
+pub fn const_to_bid(val: &IrConst, src_ct: &CType, width: u8) -> Option<IrConst> {
+    use crate::common::decimal::*;
+    let enc = |neg: bool, digits: &[u8], exp: i32| -> Option<IrConst> {
+        match width {
+            32 => Some(IrConst::D32(encode_bid32(neg, digits, exp))),
+            64 => Some(IrConst::D64(encode_bid64(neg, digits, exp))),
+            128 => {
+                let (hi, lo) = encode_bid128(neg, digits, exp);
+                Some(IrConst::I128((((hi as u128) << 64) | lo as u128) as i128))
+            }
+            _ => None,
+        }
+    };
+    let enc_special = |neg: bool, is_nan: bool| -> Option<IrConst> {
+        // GCC canonicalizes float-source NaN to +NaN (0.0/0.0 and even
+        // -nan("") both yield 0x7C000000); infinities keep their sign.
+        let neg = neg && !is_nan;
+        let s32 = (neg as u32) << 31;
+        let s64 = (neg as u64) << 63;
+        match width {
+            32 => Some(IrConst::D32(
+                (if is_nan { BID32_NAN } else { BID32_INF }) | s32,
+            )),
+            64 => Some(IrConst::D64(
+                (if is_nan { BID64_NAN } else { BID64_INF }) | s64,
+            )),
+            128 => {
+                let hi = (if is_nan { BID128_NAN_HI } else { BID128_INF_HI }) | s64;
+                Some(IrConst::I128(((hi as u128) << 64) as i128))
+            }
+            _ => None,
+        }
+    };
+    let enc_binary = |bf: BinaryFloat| -> Option<IrConst> {
+        match bf {
+            // Binary-source zero carries exponent -1 (GCC: 0.0 -> coef 0,
+            // e=-1 at all widths; literal/int zeros keep their own exp).
+            BinaryFloat::Zero(neg) => enc(neg, &[0], -1),
+            BinaryFloat::Inf(neg) => enc_special(neg, false),
+            BinaryFloat::Nan(neg) => enc_special(neg, true),
+            BinaryFloat::Finite(neg, mant, exp2) => {
+                let (digits, exp10) = binary_to_decimal_digits(mant, exp2);
+                enc(neg, &digits, exp10)
+            }
+        }
+    };
+    // Integer sources: magnitude + sign (unsigned ctypes reinterpret bits).
+    let int_src = |mag: u128, neg: bool| -> Option<IrConst> {
+        match width {
+            32 => Some(IrConst::D32(encode_int_bid32(mag, neg))),
+            64 => Some(IrConst::D64(encode_int_bid64(mag, neg))),
+            128 => {
+                let (hi, lo) = encode_int_bid128(mag, neg);
+                Some(IrConst::I128((((hi as u128) << 64) | lo as u128) as i128))
+            }
+            _ => None,
+        }
+    };
+    match val {
+        IrConst::Zero => enc(false, &[0], 0),
+        IrConst::I8(v) => {
+            if src_ct.is_unsigned() {
+                int_src(*v as u8 as u128, false)
+            } else {
+                int_src(v.unsigned_abs() as u128, *v < 0)
+            }
+        }
+        IrConst::I16(v) => {
+            if src_ct.is_unsigned() {
+                int_src(*v as u16 as u128, false)
+            } else {
+                int_src(v.unsigned_abs() as u128, *v < 0)
+            }
+        }
+        IrConst::I32(v) => {
+            if src_ct.is_unsigned() {
+                int_src(*v as u32 as u128, false)
+            } else {
+                int_src(v.unsigned_abs() as u128, *v < 0)
+            }
+        }
+        IrConst::I64(v) => {
+            if src_ct.is_unsigned() {
+                int_src(*v as u64 as u128, false)
+            } else {
+                int_src(v.unsigned_abs() as u128, *v < 0)
+            }
+        }
+        IrConst::I128(v) => match src_ct {
+            CType::Int128 => int_src(v.unsigned_abs(), *v < 0),
+            CType::UInt128 => int_src(*v as u128, false),
+            CType::Float128 => enc_binary(decode_f128_bits(*v as u128)),
+            CType::Decimal128 => {
+                if width == 128 {
+                    return Some(*val);
+                }
+                let b = *v as u128;
+                let (hi, lo) = ((b >> 64) as u64, b as u64);
+                match decode_bid128(hi, lo) {
+                    Some((neg, c, e)) => {
+                        let s = c.to_string();
+                        let digits: Vec<u8> =
+                            s.bytes().map(|ch| ch - b'0').collect();
+                        enc(neg, &digits, e)
+                    }
+                    None => {
+                        let (neg, is_nan) = bid128_special_hi(hi);
+                        enc_special(neg, is_nan)
+                    }
+                }
+            }
+            _ => None,
+        },
+        IrConst::F32(v) => enc_binary(decode_f32_bits(v.to_bits())),
+        IrConst::F64(v) => enc_binary(decode_f64_bits(v.to_bits())),
+        IrConst::LongDouble(_, bytes) => {
+            // LongDouble constants pair an f64 approximation with exact
+            // binary128 bytes: convert from the bytes, never the approx.
+            enc_binary(decode_f128_bits(u128::from_le_bytes(*bytes)))
+        }
+        // Same-width BID sources pass through bit-identically (preserving
+        // any non-canonical quantum); cross-width sources decode and
+        // re-encode with half-even rounding.
+        IrConst::D32(v) => {
+            if width == 32 {
+                return Some(*val);
+            }
+            match decode_bid32(*v) {
+                Some((neg, c, e)) => {
+                    let s = c.to_string();
+                    let digits: Vec<u8> = s.bytes().map(|ch| ch - b'0').collect();
+                    enc(neg, &digits, e)
+                }
+                None => {
+                    let (neg, is_nan) = bid32_special(*v);
+                    enc_special(neg, is_nan)
+                }
+            }
+        }
+        IrConst::D64(v) => {
+            if width == 64 {
+                return Some(*val);
+            }
+            match decode_bid64(*v) {
+                Some((neg, c, e)) => {
+                    let s = c.to_string();
+                    let digits: Vec<u8> = s.bytes().map(|ch| ch - b'0').collect();
+                    enc(neg, &digits, e)
+                }
+                None => {
+                    let (neg, is_nan) = bid64_special(*v);
+                    enc_special(neg, is_nan)
+                }
+            }
+        }
     }
 }
 

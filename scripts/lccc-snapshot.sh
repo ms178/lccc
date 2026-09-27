@@ -76,6 +76,9 @@ atomic_write() {  # atomic_write <destination>; content arrives on stdin
   fi
   sync -f "$tmp" 2>/dev/null || true
   mv -f "$tmp" "$dest"
+  # Published artifacts are data files, not secrets: mktemp's 0600 must not
+  # leak onto them (an owner-only deliverable breaks downstream readers).
+  chmod 644 "$dest"
 }
 
 atomic_copy() {  # atomic_copy <source> <destination>
@@ -88,6 +91,7 @@ atomic_copy() {  # atomic_copy <source> <destination>
   fi
   sync -f "$tmp" 2>/dev/null || true
   mv -f "$tmp" "$dest"
+  chmod 644 "$dest"
 }
 
 previous_base=""
@@ -356,6 +360,21 @@ tar_sha=$(sha256sum "$BULK/lccc-src.tar.gz" | awk '{print $1}')
 # bulk zone would make recovery impossible exactly when it is needed (audit
 # F8 path-agreement law).  The bundle is one ~1-9 MB file — far below the
 # workspace caps.
+#
+# A bundle cut from a shallow clone (the restore path's --depth 200
+# upstream clone) names prerequisites the receiver lacks: `git bundle
+# verify` still reports "okay", but cloning it fails with "remote did not
+# send all necessary objects" (the S03 bundle: the bundle-recovery path
+# silently dead for two sessions).  Unshallow first when the network
+# allows — silently and with a timeout, so an offline snapshot neither
+# hangs nor warns — then PROVE the artifact by test-cloning it.  A bundle
+# that cannot be cloned is flagged in the ledger (bundle_clone=FAIL),
+# never silently published; the patch, series and tarball above are the
+# load-bearing artifacts, so a convenience-artifact failure warns rather
+# than blocking the wipe protection this script exists to provide.
+if [[ -f .git/shallow ]]; then
+  timeout 180 git fetch --unshallow -q 2>/dev/null || true
+fi
 bundle_tmp=$(mktemp "$ART/.lccc.bundle.tmp.XXXXXX")
 if ! git bundle create "$bundle_tmp" --all; then
   rm -f "$bundle_tmp"
@@ -363,6 +382,16 @@ if ! git bundle create "$bundle_tmp" --all; then
   exit 1
 fi
 [[ -s "$bundle_tmp" ]] || { rm -f "$bundle_tmp"; echo "git bundle is empty" >&2; exit 1; }
+bundle_clone=OK
+bundle_verify_dir=$(mktemp -d "${TMPDIR:-/tmp}/lccc-bundle-verify.XXXXXX")
+if git clone -q "$bundle_tmp" "$bundle_verify_dir" 2>/dev/null; then
+  rm -rf "$bundle_verify_dir"
+else
+  rm -rf "$bundle_verify_dir"
+  bundle_clone=FAIL
+  echo "WARNING: published bundle fails test-clone; restore will fall back" \
+       "to an upstream clone (bundle_clone=FAIL in the ledger)." >&2
+fi
 sync -f "$bundle_tmp" 2>/dev/null || true
 mv -f "$bundle_tmp" "$ART/lccc.bundle"
 bundle_sha=$(sha256sum "$ART/lccc.bundle" | awk '{print $1}')
@@ -387,8 +416,8 @@ fi
 files=$(git diff --stat "$BASE" "$HEAD_SHA" | tail -1 | sed 's/^ *//')
 printf '| %d | %s | `%s` | %s | %s |\n' \
   "$seq" "$stamp" "$tag" "$desc" "${files:-none}" >> "$ledger_tmp"
-printf '<!-- base=%s patch_sha256=%s tar_sha256=%s bundle_sha256=%s verdict=%s ci_gate=%s tree=%s -->\n' \
-  "$BASE" "$patch_sha" "$tar_sha" "$bundle_sha" "$verdict" "$ci_gate" "$tree_now" >> "$ledger_tmp"
+printf '<!-- base=%s patch_sha256=%s tar_sha256=%s bundle_sha256=%s bundle_clone=%s verdict=%s ci_gate=%s tree=%s -->\n' \
+  "$BASE" "$patch_sha" "$tar_sha" "$bundle_sha" "${bundle_clone:-unknown}" "$verdict" "$ci_gate" "$tree_now" >> "$ledger_tmp"
 sync -f "$ledger_tmp" 2>/dev/null || true
 mv -f "$ledger_tmp" "$LEDGER"
 

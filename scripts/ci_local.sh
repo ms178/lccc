@@ -387,11 +387,12 @@ gate "inline-asm-utf8" fast \
 gate "asm-diff-oracle-gas-2.47" fast \
     bash scripts/ensure_gas_247.sh x86_64-linux-gnu
 
-# Isolated PR #629 follow-up rows: x86-64 is not part of the i686 default
-# corpus, and a one-instruction reject must never be hidden by another reject.
-gate "merged-pr629-x86-asm-diff" fast \
+# Whole-corpus x86-64 assembly differential (every tests/asm-diff/*.casefile,
+# a one-instruction reject is never hidden by another reject): pinning a
+# single follow-up file let new corpora (pc8, EVEX AVX512, XOP) land ungated.
+gate "x86-asm-diff" fast \
     python3 scripts/asmdiff.py --jobs 2 --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" \
-        --lccc target/fastbuild/lccc-x86 tests/asm-diff/merged-pr629-followup.casefile
+        --lccc target/fastbuild/lccc-x86
 
 gate "i686-asm-diff" fast \
     python3 scripts/asmdiff.py --32 --jobs 2 --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" \

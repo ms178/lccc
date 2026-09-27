@@ -1,0 +1,51 @@
+;;; xop-vpermil2 — XOP (0x8F) + the FMA4-era five-operand VEX shuffles.
+;;; Byte-verified against GNU as 2.47 (S07-S08 campaign): the 4-op XOP
+;;; families (vpcmov/vpperm/vpmac*) place ModRM.reg = dst, r/m = src2
+;;; (register or memory), vvvv = src3, and imm8[7:4] = the slotless
+;;; source; the memory-first form pins V'=1. vfrcz* is the ymm-capable
+;;; unary; vpsha*/vpshl* are xmm-only; vpermil2ps/pd merge the lane
+;;; selector and the slotless register into imm8.
+;;; xop_4op_allreg
+.text
+vpcmov %xmm0, %xmm2, %xmm3, %xmm4
+vpcmov %xmm15, %xmm15, %xmm15, %xmm15
+vpcmov %ymm1, %ymm2, %ymm3, %ymm4
+vpperm %xmm0, %xmm2, %xmm3, %xmm4
+vpmacssdd %xmm1, %xmm2, %xmm3, %xmm4
+vpmacssww %xmm15, %xmm0, %xmm7, %xmm8
+;;; xop_4op_mem_src2
+vpcmov %xmm0, (%rax), %xmm2, %xmm4
+vpcmov %xmm10, (%r9), %xmm15, %xmm15
+vpcmov %ymm0, (%rax), %ymm2, %ymm4
+vpperm %xmm0, 16(%rax), %xmm2, %xmm4
+vpmacssdd %xmm0, (%rax), %xmm2, %xmm4
+;;; xop_4op_mem_first
+vpcmov (%rax), %xmm2, %xmm3, %xmm4
+vpperm (%rax), %xmm2, %xmm3, %xmm4
+;;; vfrcz (xmm+ymm, reg+mem)
+vfrczps %xmm1, %xmm2
+vfrczpd %xmm15, %xmm12
+vfrczps (%rax), %xmm2
+vfrczps %ymm1, %ymm2
+vfrczss (%rax), %xmm2
+vfrczsd %xmm1, %xmm2
+;;; vpsha/vpshl (xmm-only, reg+mem)
+vpshab %xmm1, %xmm2, %xmm3
+vpshaw %xmm1, %xmm2, %xmm3
+vpshad %xmm15, (%r9), %xmm15
+vpshaq %xmm1, %xmm2, %xmm3
+vpshlb %xmm1, %xmm2, %xmm3
+vpshlw %xmm1, %xmm2, %xmm3
+vpshld %xmm15, (%r9), %xmm15
+vpshlq %xmm1, %xmm2, %xmm3
+;;; vpermil2 (VEX.66.0F3A 48/49, imm8 packs sel+slotless reg)
+vpermil2ps $0, %xmm1, %xmm2, %xmm3, %xmm4
+vpermil2pd $3, %xmm14, %xmm13, %xmm11, %xmm10
+vpermil2ps $0, %ymm1, %ymm2, %ymm3, %ymm4
+vpermil2pd $0, %xmm1, (%rax), %xmm3, %xmm4
+vpermil2pd $2, %xmm15, (%rdi), %xmm1, %xmm0
+vpermil2pd $0, (%rax), %xmm2, %xmm3, %xmm4
+vpermil2ps $0, %ymm1, (%rax), %ymm3, %ymm4
+;;; lwp (map A)
+lwpval $1, %ebx, %r15d
+lwpins $2, %r13d, %r14d

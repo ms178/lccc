@@ -5224,9 +5224,13 @@ impl super::InstructionEncoder {
             0 => {
                 // GAS 2.47 byte-probed: the operand-LESS `fadd`/`fmul`/
                 // `fsub`/`fsubr`/`fdiv`/`fdivr` assembles the POP form
-                // with the implicit st(1) operand — `fadd` alone is
-                // `de c1` (faddp %st,%st(1)), NOT `d8 c1`. The old code
-                // emitted D8 base+1, a misencode of the non-pop form.
+                // with the implicit st(1) operand -- bare `fadd` is DE C1
+                // (`faddp %st, %st(1)`), NOT the D8 non-pop row (D8 C1 is
+                // `fadd %st(1), %st`, which does not pop). The DE pop bases
+                // coincide with the D8/DC bases, so only the opcode byte
+                // changes. (GAS also prints a "translating to `faddp'"
+                // warning this assembler cannot emit yet -- bytes match,
+                // diagnostic pending.)
                 self.bytes.extend_from_slice(&[0xDE, base_modrm + 1]);
                 Ok(())
             }
@@ -5277,6 +5281,54 @@ impl super::InstructionEncoder {
         }
     }
 
+    /// Encode the x87 popping arithmetic forms (`faddp`, `fmulp`, `fsubp`,
+    /// `fsubrp`, `fdivp`, `fdivrp`): `DE base+N`.
+    ///
+    /// GAS 2.47 operand law (byte-probed): bare `faddp` is
+    /// `faddp %st, %st(1)` (DE C1, silent); one register encodes its own
+    /// index (`faddp %st(3)` = DE C3); two registers encode the nonzero
+    /// one. A REVERSED pair (`%st(N), %st`, N != 0) is only legal for the
+    /// commutative forms: `faddp`/`fmulp` translate to `%st, %st(N)`
+    /// (with a warning this assembler cannot emit), while `fsubp`,
+    /// `fsubrp`, `fdivp`, `fdivrp` are `operand type mismatch` -- the
+    /// reversal would change the result, so GAS refuses to guess.
+    /// The old arms ignored the operands and always emitted st(1).
+    pub(super) fn encode_x87_pop_reg(
+        &mut self,
+        ops: &[Operand],
+        mnemonic: &str,
+        base_modrm: u8,
+    ) -> Result<(), String> {
+        let n = match ops.len() {
+            0 => 1,
+            1 => match &ops[0] {
+                Operand::Register(reg) => parse_st_num(&reg.name)?,
+                _ => return Err("x87 pop arith requires st register operand".to_string()),
+            },
+            2 => match (&ops[0], &ops[1]) {
+                (Operand::Register(a), Operand::Register(b)) => {
+                    let (x, y) = (parse_st_num(&a.name)?, parse_st_num(&b.name)?);
+                    if x == 0 {
+                        y
+                    } else if y == 0 {
+                        // Reversed pair (x != 0 here): only the commutative
+                        // forms survive; the rest are a type mismatch.
+                        if !matches!(mnemonic, "faddp" | "fmulp") {
+                            return Err(format!("operand type mismatch for `{mnemonic}'"));
+                        }
+                        x
+                    } else {
+                        return Err("x87 pop arith: one operand must be st(0)".to_string());
+                    }
+                }
+                _ => return Err("x87 pop arith requires st register operands".to_string()),
+            },
+            _ => return Err("x87 pop arith requires 0-2 operands".to_string()),
+        };
+        self.bytes.extend_from_slice(&[0xDE, base_modrm + n]);
+        Ok(())
+    }
+
     /// Encode fxch (exchange st(0) with st(i)).
     pub(crate) fn encode_fxch(&mut self, ops: &[Operand]) -> Result<(), String> {
         let n = match ops.len() {
@@ -5288,57 +5340,6 @@ impl super::InstructionEncoder {
             _ => return Err("fxch requires 0 or 1 operand".to_string()),
         };
         self.bytes.extend_from_slice(&[0xD9, 0xC8 + n]);
-        Ok(())
-    }
-
-    /// x87 pop-form arithmetic: `faddp`/`fmulp`/`fsubp`/`fsubrp`/`fdivp`/
-    /// `fdivrp`. Every operand spelling collapses to `DE base+rm` where rm
-    /// is the one register that is NOT %st (GAS 2.47 byte-probed):
-    ///
-    ///   * bare `faddp`        → DE C1  (rm = 1, the implicit st(1))
-    ///   * `faddp %st(3)`      → DE C3
-    ///   * `faddp %st,%st(3)`  → DE C3  (dst names the non-st(0) side)
-    ///   * `faddp %st(3),%st`  → DE C3
-    ///
-    /// The old code ignored the operand entirely and always emitted the
-    /// bare DE base+1 — `faddp %st(3)` silently became `faddp %st(1)`.
-    /// AT&T direction note: fsubp = DE E1 (subtracts st from st(1) and
-    /// pops), fsubrp = DE E9 — the same swap encode_x87_arith_reg documents.
-    pub(crate) fn encode_x87_pop_arith(
-        &mut self,
-        ops: &[Operand],
-        base_modrm: u8,
-    ) -> Result<(), String> {
-        let rm = match ops.len() {
-            0 => 1,
-            1 => match &ops[0] {
-                Operand::Register(reg) => parse_st_num(&reg.name)?,
-                _ => return Err("x87 arith requires st register operand".to_string()),
-            },
-            2 => {
-                let (Some(a), Some(b)) = (ops.first(), ops.get(1)) else {
-                    return Err("x87 arith requires 0-2 operands".to_string());
-                };
-                match (a, b) {
-                    (Operand::Register(r1), Operand::Register(r2)) => {
-                        let n1 = parse_st_num(&r1.name)?;
-                        let n2 = parse_st_num(&r2.name)?;
-                        if n2 == 0 {
-                            n1
-                        } else if n1 == 0 {
-                            n2
-                        } else {
-                            return Err("x87 arith: one operand must be st(0)".to_string());
-                        }
-                    }
-                    _ => {
-                        return Err("x87 arith requires st register operands".to_string());
-                    }
-                }
-            }
-            _ => return Err("x87 arith requires 0-2 operands".to_string()),
-        };
-        self.bytes.extend_from_slice(&[0xDE, base_modrm + rm]);
         Ok(())
     }
 
