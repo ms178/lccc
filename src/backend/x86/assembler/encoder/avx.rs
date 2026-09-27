@@ -36,7 +36,19 @@ pub(crate) enum VcvtKind {
     Same,
     Narrow,
     Wide,
+    /// 4:1 source->dest (vcvtqq2ph: zmm->xmm): LL from the SOURCE width,
+    /// unsuffixed memory forms are ambiguous and rejected by GAS.
+    Narrow4,
+    /// 1:4 source->dest (vcvtph2qq: xmm->zmm): LL from the DEST width,
+    /// memory tuple is VL/4.
+    Wide4,
 }
+
+/// Compare-family diagnostics (GAS 2.47 text, stemmed by the dispatcher
+/// with ` for `mnemonic'`). Match on these constants, not literals.
+pub(crate) const CMP_ARITY_MISMATCH: &str = "number of operands mismatch";
+pub(crate) const CMP_TYPE_MISMATCH: &str = "operand type mismatch";
+pub(crate) const CMP_SIZE_MISMATCH: &str = "operand size mismatch";
 
 /// Per-mnemonic packed-convert parameters: VEX `(opcode, pp)` (None
 /// for the EVEX-only AVX512DQ converts), EVEX `(map, pp, w, opcode)`,
@@ -98,6 +110,33 @@ pub(crate) fn vcvt_params(mnemonic: &str) -> Option<VcvtParams> {
         //   vcvtpd2uqq keeps the lane count: xmm->xmm / ymm->ymm / zmm->zmm.
         "vcvtpd2uqq" => Some(p(None, 1, 1, 1, 0x79, VcvtKind::Same, 8)),
         "vcvttpd2uqq" => Some(p(None, 1, 1, 1, 0x78, VcvtKind::Same, 8)),
+        // ---- AVX512-FP16 / BF16 converts (GAS 2.47.20260726; every key
+        // byte-distilled from the oracle via the FP16 distill probe —
+        // map5 arithmetic rows, one map6 row, one map2 BF16 row). ----
+        // Same width (word<->half, 1:1).
+        "vcvtw2ph" => Some(p(None, 5, 2, 0, 0x7D, VcvtKind::Same, 2)),
+        "vcvtuw2ph" => Some(p(None, 5, 3, 0, 0x7D, VcvtKind::Same, 2)),
+        "vcvtph2w" => Some(p(None, 5, 1, 0, 0x7D, VcvtKind::Same, 2)),
+        "vcvtph2uw" => Some(p(None, 5, 0, 0, 0x7D, VcvtKind::Same, 2)),
+        // Narrowing 2:1 (dword/float -> half; mem->xmm ambiguous, mem->ymm
+        // is m512 like every Narrow row).
+        "vcvtdq2ph" => Some(p(None, 5, 0, 0, 0x5B, VcvtKind::Narrow, 4)),
+        "vcvtudq2ph" => Some(p(None, 5, 3, 0, 0x7A, VcvtKind::Narrow, 4)),
+        "vcvtps2phx" => Some(p(None, 5, 1, 0, 0x1D, VcvtKind::Narrow, 4)),
+        "vcvtneps2bf16" => Some(p(None, 2, 2, 0, 0x72, VcvtKind::Narrow, 4)),
+        // Narrowing 4:1 (qword/double -> half; dst is ALWAYS xmm; the
+        // unsuffixed memory spelling is ambiguous in every width).
+        "vcvtqq2ph" => Some(p(None, 5, 0, 1, 0x5B, VcvtKind::Narrow4, 8)),
+        "vcvtuqq2ph" => Some(p(None, 5, 3, 1, 0x7A, VcvtKind::Narrow4, 8)),
+        "vcvtpd2ph" => Some(p(None, 5, 1, 1, 0x5A, VcvtKind::Narrow4, 8)),
+        // Widening 1:2 (half -> dword/double/float; mem tuple VL/2).
+        "vcvtph2dq" => Some(p(None, 5, 1, 0, 0x5B, VcvtKind::Wide, 2)),
+        "vcvtph2udq" => Some(p(None, 5, 0, 0, 0x79, VcvtKind::Wide, 2)),
+        "vcvtph2pd" => Some(p(None, 5, 0, 0, 0x5A, VcvtKind::Wide4, 2)), // half->double is 1:4
+        "vcvtph2psx" => Some(p(None, 6, 1, 0, 0x13, VcvtKind::Wide, 2)),
+        // Widening 1:4 (half -> qword; mem tuple VL/4).
+        "vcvtph2qq" => Some(p(None, 5, 1, 0, 0x7B, VcvtKind::Wide4, 2)),
+        "vcvtph2uqq" => Some(p(None, 5, 1, 0, 0x79, VcvtKind::Wide4, 2)),
         //   float32 -> uint32 keeps the lane count.
         "vcvtps2udq" => Some(p(None, 1, 0, 0, 0x79, VcvtKind::Same, 4)),
         "vcvttps2udq" => Some(p(None, 1, 0, 0, 0x78, VcvtKind::Same, 4)),
@@ -159,6 +198,8 @@ pub(crate) fn check_vcvt_shape(mnemonic: &str, ops: &[Operand]) -> Result<(), St
                 VcvtKind::Same => src_w == dst_w,
                 VcvtKind::Narrow => matches!((src_w, dst_w), (0, 0) | (1, 0) | (2, 1)),
                 VcvtKind::Wide => matches!((src_w, dst_w), (0, 0) | (0, 1) | (1, 2)),
+                VcvtKind::Narrow4 => matches!((src_w, dst_w), (0, 0) | (1, 0) | (2, 0)),
+                VcvtKind::Wide4 => matches!((src_w, dst_w), (0, 0) | (0, 1) | (0, 2)),
             };
             if !ok {
                 if params.kind == VcvtKind::Same {
@@ -168,12 +209,26 @@ pub(crate) fn check_vcvt_shape(mnemonic: &str, ops: &[Operand]) -> Result<(), St
             }
         }
         Operand::Memory(_) => {
-            if params.kind == VcvtKind::Narrow {
-                match dst_w {
-                    0 => return Err(format!("operand type mismatch for `{mnemonic}'")),
-                    1 => {}
+            match params.kind {
+                // mem->xmm is ambiguous (m128 vs m256 both fit an xmm
+                // result); only the m512->ymm spelling is unambiguous.
+                // An explicit `{1toN}` disambiguates like Narrow4.
+                VcvtKind::Narrow => match (&ops[0], dst_w) {
+                    (Operand::Memory(m), 0) if m.broadcast.is_some() => {}
+                    (_, 0) => return Err(format!("operand type mismatch for `{mnemonic}'")),
+                    (_, 1) => {}
                     _ => return Err(format!("operand size mismatch for `{mnemonic}'")),
-                }
+                },
+                // 4:1 narrowing: the destination is always xmm, so a plain
+                // memory source never names its width (ambiguous). An
+                // explicit `{1toN}` DOES (count * 8 bytes of source), so
+                // broadcast memory is legal with an xmm destination; the
+                // x/y/z-pinned spellings are the deferred rows.
+                VcvtKind::Narrow4 => match &ops[0] {
+                    Operand::Memory(m) if m.broadcast.is_some() && dst_w == 0 => {}
+                    _ => return Err(format!("operand type mismatch for `{mnemonic}'")),
+                },
+                _ => {}
             }
         }
         _ => return Err(format!("operand type mismatch for `{mnemonic}'")),
@@ -584,20 +639,41 @@ impl super::InstructionEncoder {
         )
     }
 
-    fn evex_sae_class(map: u8, opcode: u8) -> EvexSae {
-        match (map, opcode) {
-            (1, 0x58 | 0x59 | 0x5C | 0x5E | 0x51) => EvexSae::Er, // add/mul/sub/div/sqrt
+    fn evex_sae_class(map: u8, pp: u8, opcode: u8) -> EvexSae {
+        match (map, pp, opcode) {
+            (1, _, 0x58 | 0x59 | 0x5C | 0x5E | 0x51) => EvexSae::Er, // add/mul/sub/div/sqrt
             // NOTE: 0x5B stays None here: convert ER is mnemonic-gated in
             // `encode_evex_vcvt` (can-round rule), and no other table
             // consumer encodes map-1 opcode 0x5B. A blanket Er would
             // false-accept e.g. `vcvttps2dq {rz-sae}` (GAS rejects).
-            (1, 0x5D | 0x5F | 0xC2) => EvexSae::Sae, // min/max/vcmp
-            (2, 0x96..=0x9F) | (2, 0xA6..=0xAF) | (2, 0xB6..=0xBF) => EvexSae::Er, // FMA + fmaddsub
+            (1, _, 0x5D | 0x5F | 0xC2) => EvexSae::Sae, // min/max/vcmp
+            (2, _, 0x96..=0x9F) | (2, _, 0xA6..=0xAF) | (2, _, 0xB6..=0xBF) => EvexSae::Er, // FMA + fmaddsub
             // vscalef{ps,pd,ss,sd}: the only SAE-capable member of the
             // AVX512F/DQ scalar-control family that reaches the binary
             // path. Bare `{sae}` is rejected (GAS: `unsupported static
             // rounding/sae`), `{r*-sae}` accepted.
-            (2, 0x2C | 0x2D) => EvexSae::Er,
+            (2, _, 0x2C | 0x2D) => EvexSae::Er,
+            // ---- AVX512-FP16 (GAS 2.47.20260726 byte-probed; pp is now
+            // part of the key because ph/sh rows share opcodes with
+            // DIFFERENT classes). Packed arithmetic lives in map 5 pp0,
+            // scalar in map 5 pp2 (F3). Both packed vsqrtph (at 512-bit)
+            // and scalar vsqrtsh use embedded rounding.
+            (5, 0, 0x58 | 0x59 | 0x5C | 0x5E | 0x51) => EvexSae::Er, // vadd/vmul/vsub/vdiv/vsqrtph (512-bit)
+            (5, 0, 0x5D | 0x5F) => EvexSae::Sae,                     // vmin/vmaxph
+            (5, 2, 0x58 | 0x59 | 0x5C | 0x5E | 0x51) => EvexSae::Er, // scalar sh incl. sqrt
+            (5, 2, 0x5D | 0x5F) => EvexSae::Sae,                     // vmin/vmaxsh
+            // Map 6: FMA (pp1, ph even + sh odd both Er), vscalef,
+            // vgetexp (packed None, scalar Sae), vrcp/vrsqrt (none),
+            // complex FMA (packed None, scalar Er).
+            (6, 1, 0x96..=0x9F) | (6, 1, 0xA6..=0xAF) | (6, 1, 0xB6..=0xBF) => EvexSae::Er,
+            (6, 1, 0x2C | 0x2D) => EvexSae::Er,   // vscalefph/sh
+            (6, 1, 0x42) => EvexSae::Sae, // vgetexpph (packed unary; {sae} zmm-only, probed)
+            (6, 1, 0x43) => EvexSae::Sae, // vgetexpsh (scalar)
+            (6, 1, 0x4C..=0x4F) => EvexSae::None, // vrcp/vrsqrt ph/sh
+            (6, 2, 0x56) | (6, 3, 0x56) => EvexSae::None, // vfmaddcph/vfcmaddcph (packed)
+            (6, 2, 0x57) | (6, 3, 0x57) => EvexSae::Er, // vfmaddcsh/vfcmaddcsh
+            (6, 2, 0xD6) | (6, 3, 0xD6) => EvexSae::None, // vfmulcph/vfcmulcph (packed)
+            (6, 2, 0xD7) | (6, 3, 0xD7) => EvexSae::Er, // vfmulcsh/vfcmulcsh
             _ => EvexSae::None,
         }
     }
@@ -659,7 +735,7 @@ impl super::InstructionEncoder {
         (ops, None)
     }
 
-    fn evex_vl_bytes(ll: u8) -> u32 {
+    pub(crate) fn evex_vl_bytes(ll: u8) -> u32 {
         [16u32, 32, 64][ll.min(2) as usize]
     }
 
@@ -750,7 +826,22 @@ impl super::InstructionEncoder {
             }
         }
         let vl_ll = Self::evex_ll(ops);
-        let (sae_bcst, ll) = Self::apply_evex_sae(sae, Self::evex_sae_class(map, opcode), vl_ll)?;
+        let (sae_bcst, ll) =
+            Self::apply_evex_sae(sae, Self::evex_sae_class(map, pp, opcode), vl_ll)?;
+        // SAE/ER width law (GAS 2.47, byte-probed on every family):
+        // packed rows accept the decorators only at 512-bit, scalar rows
+        // only with all-xmm operands; anything else is `operand size
+        // mismatch`. Before this check `vaddpd {rn-sae}, %ymm5, %ymm6,
+        // %ymm7` silently encoded the rounding bits into a 256-bit form.
+        if sae.is_some() {
+            if scalar_tuple_n.is_some() {
+                if vl_ll != 0 {
+                    return Err(CMP_SIZE_MISMATCH.to_string());
+                }
+            } else if vl_ll != 0b10 {
+                return Err(CMP_SIZE_MISMATCH.to_string());
+            }
+        }
         let mut bcst = sae_bcst;
         let (aaa, z) = Self::evex_mask_info(&ops[2]);
         match (&ops[0], &ops[1], &ops[2]) {
@@ -838,8 +929,14 @@ impl super::InstructionEncoder {
         //    `{r*-sae}` accepted, bare `{sae}` rejected.
         let sae_class = if mnemonic.starts_with("vcvtt") {
             EvexSae::Sae
-        } else if matches!(mnemonic, "vcvtps2pd" | "vcvtdq2pd" | "vcvtudq2pd") {
-            EvexSae::None
+        } else if matches!(
+            mnemonic,
+            "vcvtps2pd" | "vcvtdq2pd" | "vcvtudq2pd" | "vcvtph2pd" | "vcvtph2psx"
+        ) {
+            // The half->double/float widenings take BARE {sae} only
+            // (GAS 2.47: `{rz-sae}` on vcvtph2pd is rejected, `{sae}`
+            // accepted — byte-probed; same class as the truncating rows).
+            EvexSae::Sae
         } else {
             EvexSae::Er
         };
@@ -854,11 +951,32 @@ impl super::InstructionEncoder {
         // applies only without SAE.
         let ll = if sae.is_some() {
             sae_ll
-        } else if params.kind == VcvtKind::Narrow {
+        } else if matches!(params.kind, VcvtKind::Narrow | VcvtKind::Narrow4) {
             match &ops[0] {
                 Operand::Register(r) if is_zmm(&r.name) => 0b10,
                 Operand::Register(r) if is_ymm(&r.name) => 0b01,
-                Operand::Memory(_) => 0b10,
+                // Plain narrow memory is the unambiguous m512 source
+                // (Narrow, dst ymm). A Narrow4 broadcast names its source
+                // width through the count: {1to2} = 2 qwords = m128 (LL=00),
+                // {1to4} = m256, {1to8} = m512.
+                Operand::Memory(m) => {
+                    if matches!(params.kind, VcvtKind::Narrow | VcvtKind::Narrow4)
+                        && m.broadcast.is_some()
+                    {
+                        // The count names the source width: {1toN} of
+                        // elem bytes; LL = log2(count*elem/16).
+                        let elem = params.src_elem;
+                        let count = u32::from(m.broadcast.unwrap_or(0));
+                        let bytes = count.saturating_mul(elem).max(1);
+                        match bytes {
+                            0..=16 => 0b00,
+                            17..=32 => 0b01,
+                            _ => 0b10,
+                        }
+                    } else {
+                        0b10
+                    }
+                }
                 _ => 0b00,
             }
         } else {
@@ -890,8 +1008,9 @@ impl super::InstructionEncoder {
                 } else {
                     match params.kind {
                         VcvtKind::Same => (false, vl),
-                        VcvtKind::Narrow => (false, 64),
+                        VcvtKind::Narrow | VcvtKind::Narrow4 => (false, 64),
                         VcvtKind::Wide => (false, (vl / 2).max(1)),
+                        VcvtKind::Wide4 => (false, (vl / 4).max(1)),
                     }
                 };
                 let dst_num = self.emit_evex_memop(
@@ -1007,7 +1126,12 @@ impl super::InstructionEncoder {
             Some(Operand::Register(r)) if r.name.to_lowercase().starts_with("ymm") => 0b01,
             _ => 0b00,
         };
-        let (sae_bcst, ll) = Self::apply_evex_sae(sae, Self::evex_sae_class(map, opcode), vl_ll)?;
+        let (sae_bcst, ll) =
+            Self::apply_evex_sae(sae, Self::evex_sae_class(map, pp, opcode), vl_ll)?;
+        // Same packed/scalar SAE width law as the binary path (see there).
+        if sae.is_some() && vl_ll != 0b10 {
+            return Err(CMP_SIZE_MISMATCH.to_string());
+        }
         let mut bcst = sae_bcst;
         // Compressed disp8 N is a fraction of VL for the pmovzx/sx wideners:
         // Half (bw/wd/dq), Quarter (bd/wq), Eighth (bq). Everything else is Full.
@@ -1200,6 +1324,90 @@ impl super::InstructionEncoder {
             }
             _ => Err("unsupported EVEX imm2 operands".to_string()),
         }
+    }
+
+    /// SAE-capable imm2 (vgetmant/vreduce/vrndscale packed ps/pd rows):
+    /// GAS 2.47 accepts a bare `{sae}` AFTER the immediate
+    /// (`vreduceps $1, {sae}, %zmm5, %zmm6` = `62 f3 7d 18 56 f5 01`,
+    /// L'L=RC, b'=1), 512-bit only, no rounding tokens. The FP16 ph rows
+    /// share the encoding but reject the decorator (probed) and keep the
+    /// plain imm2 path.
+    pub(crate) fn encode_evex_imm2_sae(
+        &mut self,
+        ops: &[Operand],
+        map: u8,
+        pp: u8,
+        w: u8,
+        opcode: u8,
+    ) -> Result<(), String> {
+        let (ops, head_sae) = Self::peel_evex_sae(ops);
+        if head_sae.is_some() {
+            return Err(SAE_AFTER_IMM.to_string());
+        }
+        let owned;
+        let (ops, sae) = match ops.get(1) {
+            Some(Operand::Label(s)) if evex_sae_rounding(s).is_some() && ops.len() == 4 => {
+                let sae = evex_sae_rounding(s);
+                owned = [ops[0].clone(), ops[2].clone(), ops[3].clone()];
+                (&owned[..], sae)
+            }
+            _ => (ops, None),
+        };
+        if ops.len() != 3 {
+            return Err("EVEX imm2 op requires 3 operands (imm, src, dst)".to_string());
+        }
+        let vl_ll = Self::evex_ll(ops);
+        let (sae_bcst, ll) = Self::apply_evex_sae(sae, EvexSae::Sae, vl_ll)?;
+        if sae.is_some() && vl_ll != 0b10 {
+            return Err(CMP_SIZE_MISMATCH.to_string());
+        }
+        let (aaa, z) = Self::evex_mask_info(&ops[2]);
+        match (&ops[0], &ops[1], &ops[2]) {
+            (
+                Operand::Immediate(ImmediateValue::Integer(imm)),
+                Operand::Register(src),
+                Operand::Register(dst),
+            ) => {
+                let (dst_num, src_num) = self
+                    .emit_evex_mod3(&dst.name, &src.name, None, map, w, pp, ll, z, aaa, sae_bcst)?;
+                self.bytes.push(opcode);
+                self.bytes.push(self.modrm(3, dst_num, src_num));
+                self.bytes.push(*imm as u8);
+                Ok(())
+            }
+            (
+                Operand::Immediate(ImmediateValue::Integer(imm)),
+                Operand::Memory(mem),
+                Operand::Register(dst),
+            ) => {
+                if sae.is_some() {
+                    return Err(SAE_UNSUPPORTED.to_string());
+                }
+                let (mem_bcst, scale_n) = Self::evex_mem_scale(mem, ll, 1);
+                let dst_num =
+                    self.emit_evex_memop(&dst.name, mem, None, map, w, pp, ll, z, aaa, mem_bcst)?;
+                self.bytes.push(opcode);
+                self.encode_evex_mem(dst_num, mem, scale_n)?;
+                self.bytes.push(*imm as u8);
+                Ok(())
+            }
+            _ => Err("unsupported EVEX imm2 operands".to_string()),
+        }
+    }
+
+    /// FP16 scalar 3-op binary (vaddsh/vsubsh/...): the W-derived scalar
+    /// tuple is wrong for half precision — the element is EXPLICIT here
+    /// (2 bytes: `vaddsh -256(%rdx), %xmm5, %xmm6` is disp8*2, GAS-probed).
+    pub(crate) fn encode_evex_binary_scalar_elem(
+        &mut self,
+        ops: &[Operand],
+        map: u8,
+        pp: u8,
+        w: u8,
+        opcode: u8,
+        elem: u32,
+    ) -> Result<(), String> {
+        self.encode_evex_binary_impl(ops, map, pp, w, opcode, Some(elem))
     }
 
     /// EVEX 2-operand + imm8 (vpermq/vpermpd). Dest is ModRM.reg, vvvv unused.
@@ -1518,22 +1726,90 @@ impl super::InstructionEncoder {
     /// EVEX compare-to-mask, AT&T ($imm, src2, src1, kdst).
     /// vpcmpb/ub (0F3A 3F/3E), vpcmpw/uw (3F/3E W1), vpcmpd/ud (1F/1E),
     /// vpcmpq/uq (1F/1E W1). ModRM.reg = k-dest, r/m = src2, vvvv = src1.
+    /// EVEX compare-to-mask with imm8, AT&T `(imm, src2, src1, kdst)` —
+    /// or the pseudo-op spelling `(src2, src1, kdst)` with the predicate
+    /// prepended by the dispatcher. `sae_class` overrides the generic
+    /// `(map, opcode)` sniff because rows that share a key disagree
+    /// (map3/pp0 0xC2 is vcmpph `{sae}`-capable; map3/pp3 0xC2 is
+    /// vcmpbf16, which rejects every `{sae}`). `scalar_tuple` is 0 for
+    /// packed forms and the element size (4/8/2) for scalar forms.
+    ///
+    /// GAS 2.47 laws enforced here (each message byte-probed):
+    ///   * the last operand MUST be a k register — a vector destination
+    ///     is `operand type mismatch` (previously mis-encoded with the
+    ///     vector register number in the k slot);
+    ///   * arity is `number of operands mismatch`;
+    ///   * scalar forms require xmm operands (`operand size mismatch`);
+    ///   * packed `{sae}` requires 512-bit operands (`operand size
+    ///     mismatch` — `vcmppd $0,{sae},%xmm5,%xmm6,%k5` was a false
+    ///     accept before this table existed);
+    ///   * scalar forms reject `{1toN}` (`unsupported broadcast`) and use
+    ///     the element size as the memory tuple.
     pub(crate) fn encode_evex_cmp_mask(
         &mut self,
         ops: &[Operand],
+        mnemonic: &str,
         map: u8,
         pp: u8,
         w: u8,
         opcode: u8,
+        sae_class: EvexSae,
+        scalar_tuple: u8,
     ) -> Result<(), String> {
         // `{sae}` sits between the immediate and src2: `$0, {sae}, %zmm1, %zmm2, %k1`.
-        let (head, rest) = ops.split_first().ok_or("EVEX cmp-mask: missing operands")?;
+        let (head, rest) = ops.split_first().ok_or(CMP_ARITY_MISMATCH)?;
         let (rest, sae) = Self::peel_evex_sae(rest);
         if rest.len() != 3 {
-            return Err("EVEX cmp-mask op requires 4 operands (imm, src2, src1, kdst)".to_string());
+            return Err(CMP_ARITY_MISMATCH.to_string());
+        }
+        // The immediate is an UNSIGNED predicate (GAS rejects $-1 and
+        // $256 alike with `operand type mismatch` — unlike the shuffle
+        // family, which accepts $-1..$255).
+        if let Operand::Immediate(ImmediateValue::Integer(v)) = head {
+            if !(0..=255).contains(v) {
+                return Err(CMP_TYPE_MISMATCH.to_string());
+            }
+        }
+        // The destination must be a mask register.
+        if !matches!(&rest[2], Operand::Register(r) if is_kreg(&r.name)) {
+            return Err(CMP_TYPE_MISMATCH.to_string());
+        }
+        // Same-width rule: every vector REGISTER operand must agree on
+        // xmm/ymm/zmm (GAS 2.47: `vcmpps $0, %ymm5, %zmm6, %k5` is
+        // `register type mismatch`; previously a silent false accept
+        // that encoded with the widest operand's LL).
+        {
+            let width = |name: &str| -> Option<u8> {
+                if is_zmm(name) {
+                    Some(2)
+                } else if is_ymm(name) {
+                    Some(1)
+                } else if is_xmm(name) {
+                    Some(0)
+                } else {
+                    None
+                }
+            };
+            let mut widths: Vec<u8> = Vec::with_capacity(3);
+            for op in rest {
+                if let Operand::Register(r) = op
+                    && let Some(vw) = width(&r.name)
+                {
+                    widths.push(vw);
+                }
+            }
+            if widths.windows(2).any(|p| p[0] != p[1]) {
+                return Err(REG_TYPE_MISMATCH.to_string());
+            }
         }
         let vl_ll = Self::evex_ll(rest);
-        let (sae_bcst, ll) = Self::apply_evex_sae(sae, Self::evex_sae_class(map, opcode), vl_ll)?;
+        if scalar_tuple != 0 && vl_ll != 0 {
+            return Err(CMP_SIZE_MISMATCH.to_string());
+        }
+        if sae.is_some() && scalar_tuple == 0 && vl_ll != 0b10 {
+            return Err(CMP_SIZE_MISMATCH.to_string());
+        }
+        let (sae_bcst, ll) = Self::apply_evex_sae(sae, sae_class, vl_ll)?;
         let mut bcst = sae_bcst;
         match (head, &rest[0], &rest[1], &rest[2]) {
             (
@@ -1572,7 +1848,20 @@ impl super::InstructionEncoder {
                 Operand::Register(src1),
                 Operand::Register(kdst),
             ) => {
-                let (mem_bcst, scale_n) = Self::evex_mem_scale(mem, vl_ll, 1);
+                if scalar_tuple != 0 && mem.broadcast.is_some() {
+                    return Err(format!("unsupported broadcast for `{mnemonic}'"));
+                }
+                // Memory tuple: packed rows read the FULL vector (N = VL,
+                // e.g. `vcmpph $0, -64(%rdx), %zmm5, %k5` is disp8*64);
+                // scalar rows are Tuple1 — N is the ELEMENT size directly
+                // (GAS: `vcmpsd $0, -1024(%rdx), %xmm5, %k5` is disp8*8,
+                // `vcmpeqsh -256(%rdx), %xmm5, %k5` is disp8*2), NOT
+                // VL/element.
+                let (mem_bcst, scale_n) = if scalar_tuple != 0 {
+                    (false, u32::from(scalar_tuple))
+                } else {
+                    Self::evex_mem_scale(mem, vl_ll, 1)
+                };
                 bcst |= mem_bcst;
                 let (aaa, z) = Self::evex_mask_info(&rest[2]);
                 if z {
@@ -1595,7 +1884,7 @@ impl super::InstructionEncoder {
                 self.bytes.push(*imm as u8);
                 Ok(())
             }
-            _ => Err("unsupported EVEX cmp-mask operands".to_string()),
+            _ => Err(CMP_ARITY_MISMATCH.to_string()),
         }
     }
 
@@ -2772,6 +3061,29 @@ impl super::InstructionEncoder {
                 0x27 | 0x51 | 0x55 | 0x57 | 0x0A | 0x0B => Some(if w == 1 { 8 } else { 4 }),
                 _ => None,
             },
+            // AVX512-FP16 scalar rows (GAS 2.47.20260726, byte-probed):
+            // map5 pp2 arithmetic/mov (element 2), map6 pp1 odd-opcode
+            // scalar FMA + specials, map6 pp2/pp3 complex scalar (a COMPLEX
+            // number is 2 halves = 4 bytes: `vfmaddcsh -256(%rdx), %xmm5,
+            // %xmm6` is disp8*4, byte-probed), and the map3 pp0
+            // scalar-control sh rows (getmant/reduce/rndscale).
+            (5, 2) => match opcode {
+                0x58 | 0x59 | 0x5C | 0x5E | 0x5D | 0x5F | 0x51 | 0x10 | 0x11 => Some(2),
+                _ => None,
+            },
+            (6, 1) => match opcode {
+                0x97 | 0x99 | 0x9B | 0x9D | 0x9F | 0xA9 | 0xAB | 0xAD | 0xAF | 0xB9 | 0xBB
+                | 0xBD | 0xBF | 0x2D | 0x43 | 0x4D | 0x4F => Some(2),
+                _ => None,
+            },
+            (6, 2) | (6, 3) => match opcode {
+                0x57 | 0xD7 => Some(4), // complex scalar: 2 halves = 4 bytes
+                _ => None,
+            },
+            (3, 0) => match opcode {
+                0x27 | 0x57 | 0x0A => Some(2), // vgetmantsh/vreducesh/vrndscalesh
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -2792,6 +3104,315 @@ impl super::InstructionEncoder {
             (1, 0xC2) => "no EVEX encoding",
             _ => "unsupported broadcast",
         })
+    }
+
+    /// Packed-broadcast element size per EVEX row, keyed by the emitted
+    /// `(map, pp, W, opcode)`. Every entry is distilled from GAS 2.47 by
+    /// `distill_bcst_elem.py`: the pinned binutils testsuite's `{1toN}`
+    /// lines are re-assembled, the element size is `VL(from LL) / N`, and
+    /// the key comes from the same instruction's plain (non-broadcast)
+    /// encoding. Zero rows are hand-written; the 2026 binutils FP16 rows
+    /// (maps 5 and 6) fall out of the same probe. Drives the central
+    /// `{1toN}` count law in `check_decorators`: a count that does not
+    /// satisfy `count * elem == VL_bytes` is `unsupported broadcast`
+    /// (GAS rejects every such spelling), and a row with no entry has no
+    /// broadcast form at all.
+    pub(crate) fn evex_packed_bcst_elem(map: u8, pp: u8, w: u8, opcode: u8) -> Option<u32> {
+        match (map, pp, w, opcode) {
+            (1, 0, 0, 0x14) => Some(4), // vunpcklps
+            (1, 0, 0, 0x15) => Some(4), // vunpckhps
+            (1, 0, 0, 0x51) => Some(4), // vsqrtps
+            (1, 0, 0, 0x54) => Some(4), // vandps
+            (1, 0, 0, 0x55) => Some(4), // vandnps
+            (1, 0, 0, 0x56) => Some(4), // vorps
+            (1, 0, 0, 0x57) => Some(4), // vxorps
+            (1, 0, 0, 0x58) => Some(4), // vaddps
+            (1, 0, 0, 0x59) => Some(4), // vmulps
+            (1, 0, 0, 0x5A) => Some(8), // vcvtps2pd
+            (1, 0, 0, 0x5B) => Some(4), // vcvtdq2ps
+            (1, 0, 0, 0x5C) => Some(4), // vsubps
+            (1, 0, 0, 0x5D) => Some(4), // vminps
+            (1, 0, 0, 0x5E) => Some(4), // vdivps
+            (1, 0, 0, 0x5F) => Some(4), // vmaxps
+            (1, 0, 0, 0x78) => Some(4), // vcvttps2udq
+            (1, 0, 0, 0x79) => Some(4), // vcvtps2udq
+            (1, 0, 0, 0xC2) => Some(4), // vcmpps
+            (1, 0, 0, 0xC6) => Some(4), // vshufps
+            (1, 0, 1, 0x5B) => Some(8), // vcvtqq2ps, vcvtqq2psx, vcvtqq2psy
+            (1, 0, 1, 0x78) => Some(8), // vcvttpd2udqx, vcvttpd2udqy
+            (1, 0, 1, 0x79) => Some(8), // vcvtpd2udq, vcvtpd2udqx, vcvtpd2udqy
+            (1, 1, 0, 0x5B) => Some(4), // vcvtps2dq
+            (1, 1, 0, 0x62) => Some(4), // vpunpckldq
+            (1, 1, 0, 0x66) => Some(4), // vpcmpgtd
+            (1, 1, 0, 0x6A) => Some(4), // vpunpckhdq
+            (1, 1, 0, 0x6B) => Some(4), // vpackssdw
+            (1, 1, 0, 0x70) => Some(4), // vpshufd
+            (1, 1, 0, 0x72) => Some(4), // vprold, vprord, vpslld, vpsrad, vpsrld
+            (1, 1, 0, 0x76) => Some(4), // vpcmpeqd
+            (1, 1, 0, 0x78) => Some(8), // vcvttps2uqq
+            (1, 1, 0, 0x79) => Some(8), // vcvtps2uqq
+            (1, 1, 0, 0x7A) => Some(8), // vcvttps2qq
+            (1, 1, 0, 0x7B) => Some(8), // vcvtps2qq
+            (1, 1, 0, 0xDB) => Some(4), // vpandd
+            (1, 1, 0, 0xDF) => Some(4), // vpandnd
+            (1, 1, 0, 0xEB) => Some(4), // vpord
+            (1, 1, 0, 0xEF) => Some(4), // vpxord
+            (1, 1, 0, 0xFA) => Some(4), // vpsubd
+            (1, 1, 0, 0xFE) => Some(4), // vpaddd
+            (1, 1, 1, 0x14) => Some(8), // vunpcklpd
+            (1, 1, 1, 0x15) => Some(8), // vunpckhpd
+            (1, 1, 1, 0x51) => Some(8), // vsqrtpd
+            (1, 1, 1, 0x54) => Some(8), // vandpd
+            (1, 1, 1, 0x55) => Some(8), // vandnpd
+            (1, 1, 1, 0x56) => Some(8), // vorpd
+            (1, 1, 1, 0x57) => Some(8), // vxorpd
+            (1, 1, 1, 0x58) => Some(8), // vaddpd
+            (1, 1, 1, 0x59) => Some(8), // vmulpd
+            (1, 1, 1, 0x5A) => Some(8), // vcvtpd2ps, vcvtpd2psx, vcvtpd2psy
+            (1, 1, 1, 0x5C) => Some(8), // vsubpd
+            (1, 1, 1, 0x5D) => Some(8), // vminpd
+            (1, 1, 1, 0x5E) => Some(8), // vdivpd
+            (1, 1, 1, 0x5F) => Some(8), // vmaxpd
+            (1, 1, 1, 0x6C) => Some(8), // vpunpcklqdq
+            (1, 1, 1, 0x6D) => Some(8), // vpunpckhqdq
+            (1, 1, 1, 0x72) => Some(8), // vprolq, vprorq, vpsraq
+            (1, 1, 1, 0x73) => Some(8), // vpsllq, vpsrlq
+            (1, 1, 1, 0x78) => Some(8), // vcvttpd2uqq
+            (1, 1, 1, 0x79) => Some(8), // vcvtpd2uqq
+            (1, 1, 1, 0x7A) => Some(8), // vcvttpd2qq
+            (1, 1, 1, 0x7B) => Some(8), // vcvtpd2qq
+            (1, 1, 1, 0xC2) => Some(8), // vcmppd
+            (1, 1, 1, 0xC6) => Some(8), // vshufpd
+            (1, 1, 1, 0xD4) => Some(8), // vpaddq
+            (1, 1, 1, 0xDB) => Some(8), // vpandq
+            (1, 1, 1, 0xDF) => Some(8), // vpandnq
+            (1, 1, 1, 0xE6) => Some(8), // vcvttpd2dq, vcvttpd2dqx, vcvttpd2dqy
+            (1, 1, 1, 0xEB) => Some(8), // vporq
+            (1, 1, 1, 0xEF) => Some(8), // vpxorq
+            (1, 1, 1, 0xF4) => Some(8), // vpmuludq
+            (1, 1, 1, 0xFB) => Some(8), // vpsubq
+            (1, 2, 0, 0x5B) => Some(4), // vcvttps2dq
+            (1, 2, 0, 0x7A) => Some(8), // vcvtudq2pd
+            (1, 2, 0, 0xE6) => Some(8), // vcvtdq2pd
+            (1, 2, 1, 0x7A) => Some(8), // vcvtuqq2pd
+            (1, 2, 1, 0xE6) => Some(8), // vcvtqq2pd
+            (1, 3, 0, 0x7A) => Some(4), // vcvtudq2ps
+            (1, 3, 1, 0x7A) => Some(8), // vcvtuqq2ps, vcvtuqq2psx, vcvtuqq2psy
+            (1, 3, 1, 0xE6) => Some(8), // vcvtpd2dq, vcvtpd2dqx, vcvtpd2dqy
+            (2, 0, 0, 0x52) => Some(4), // vdpphps
+            (2, 1, 0, 0x14) => Some(4), // vprorvd
+            (2, 1, 0, 0x15) => Some(4), // vprolvd
+            (2, 1, 0, 0x16) => Some(4), // vpermps
+            (2, 1, 0, 0x1E) => Some(4), // vpabsd
+            (2, 1, 0, 0x27) => Some(4), // vptestmd
+            (2, 1, 0, 0x2B) => Some(4), // vpackusdw
+            (2, 1, 0, 0x2C) => Some(4), // vscalefps
+            (2, 1, 0, 0x36) => Some(4), // vpermd
+            (2, 1, 0, 0x39) => Some(4), // vpminsd
+            (2, 1, 0, 0x3B) => Some(4), // vpminud
+            (2, 1, 0, 0x3D) => Some(4), // vpmaxsd
+            (2, 1, 0, 0x3F) => Some(4), // vpmaxud
+            (2, 1, 0, 0x40) => Some(4), // vpmulld
+            (2, 1, 0, 0x42) => Some(4), // vgetexpps
+            (2, 1, 0, 0x44) => Some(4), // vplzcntd
+            (2, 1, 0, 0x45) => Some(4), // vpsrlvd
+            (2, 1, 0, 0x46) => Some(4), // vpsravd
+            (2, 1, 0, 0x47) => Some(4), // vpsllvd
+            (2, 1, 0, 0x4C) => Some(4), // vrcp14ps
+            (2, 1, 0, 0x4E) => Some(4), // vrsqrt14ps
+            (2, 1, 0, 0x50) => Some(4), // vpdpbusd
+            (2, 1, 0, 0x51) => Some(4), // vpdpbusds
+            (2, 1, 0, 0x52) => Some(4), // vpdpwssd
+            (2, 1, 0, 0x53) => Some(4), // vpdpwssds
+            (2, 1, 0, 0x55) => Some(4), // vpopcntd
+            (2, 1, 0, 0x64) => Some(4), // vpblendmd
+            (2, 1, 0, 0x65) => Some(4), // vblendmps
+            (2, 1, 0, 0x67) => Some(4), // vcvt2ps2phx
+            (2, 1, 0, 0x71) => Some(4), // vpshldvd
+            (2, 1, 0, 0x73) => Some(4), // vpshrdvd
+            (2, 1, 0, 0x76) => Some(4), // vpermi2d
+            (2, 1, 0, 0x77) => Some(4), // vpermi2ps
+            (2, 1, 0, 0x7E) => Some(4), // vpermt2d
+            (2, 1, 0, 0x7F) => Some(4), // vpermt2ps
+            (2, 1, 0, 0x96) => Some(4), // vfmaddsub132ps
+            (2, 1, 0, 0x97) => Some(4), // vfmsubadd132ps
+            (2, 1, 0, 0x98) => Some(4), // vfmadd132ps
+            (2, 1, 0, 0x9A) => Some(4), // vfmsub132ps
+            (2, 1, 0, 0x9C) => Some(4), // vfnmadd132ps
+            (2, 1, 0, 0x9E) => Some(4), // vfnmsub132ps
+            (2, 1, 0, 0xA6) => Some(4), // vfmaddsub213ps
+            (2, 1, 0, 0xA7) => Some(4), // vfmsubadd213ps
+            (2, 1, 0, 0xA8) => Some(4), // vfmadd213ps
+            (2, 1, 0, 0xAA) => Some(4), // vfmsub213ps
+            (2, 1, 0, 0xAC) => Some(4), // vfnmadd213ps
+            (2, 1, 0, 0xAE) => Some(4), // vfnmsub213ps
+            (2, 1, 0, 0xB6) => Some(4), // vfmaddsub231ps
+            (2, 1, 0, 0xB7) => Some(4), // vfmsubadd231ps
+            (2, 1, 0, 0xB8) => Some(4), // vfmadd231ps
+            (2, 1, 0, 0xBA) => Some(4), // vfmsub231ps
+            (2, 1, 0, 0xBC) => Some(4), // vfnmadd231ps
+            (2, 1, 0, 0xBE) => Some(4), // vfnmsub231ps
+            (2, 1, 0, 0xC4) => Some(4), // vpconflictd
+            (2, 1, 1, 0x14) => Some(8), // vprorvq
+            (2, 1, 1, 0x15) => Some(8), // vprolvq
+            (2, 1, 1, 0x16) => Some(8), // vpermpd
+            (2, 1, 1, 0x1F) => Some(8), // vpabsq
+            (2, 1, 1, 0x27) => Some(8), // vptestmq
+            (2, 1, 1, 0x28) => Some(8), // vpmuldq
+            (2, 1, 1, 0x29) => Some(8), // vpcmpeqq
+            (2, 1, 1, 0x2C) => Some(8), // vscalefpd
+            (2, 1, 1, 0x36) => Some(8), // vpermq
+            (2, 1, 1, 0x37) => Some(8), // vpcmpgtq
+            (2, 1, 1, 0x39) => Some(8), // vpminsq
+            (2, 1, 1, 0x3B) => Some(8), // vpminuq
+            (2, 1, 1, 0x3D) => Some(8), // vpmaxsq
+            (2, 1, 1, 0x3F) => Some(8), // vpmaxuq
+            (2, 1, 1, 0x40) => Some(8), // vpmullq
+            (2, 1, 1, 0x42) => Some(8), // vgetexppd
+            (2, 1, 1, 0x44) => Some(8), // vplzcntq
+            (2, 1, 1, 0x45) => Some(8), // vpsrlvq
+            (2, 1, 1, 0x46) => Some(8), // vpsravq
+            (2, 1, 1, 0x47) => Some(8), // vpsllvq
+            (2, 1, 1, 0x4C) => Some(8), // vrcp14pd
+            (2, 1, 1, 0x4E) => Some(8), // vrsqrt14pd
+            (2, 1, 1, 0x55) => Some(8), // vpopcntq
+            (2, 1, 1, 0x64) => Some(8), // vpblendmq
+            (2, 1, 1, 0x65) => Some(8), // vblendmpd
+            (2, 1, 1, 0x71) => Some(8), // vpshldvq
+            (2, 1, 1, 0x73) => Some(8), // vpshrdvq
+            (2, 1, 1, 0x76) => Some(8), // vpermi2q
+            (2, 1, 1, 0x77) => Some(8), // vpermi2pd
+            (2, 1, 1, 0x7E) => Some(8), // vpermt2q
+            (2, 1, 1, 0x7F) => Some(8), // vpermt2pd
+            (2, 1, 1, 0x83) => Some(8), // vpmultishiftqb
+            (2, 1, 1, 0x96) => Some(8), // vfmaddsub132pd
+            (2, 1, 1, 0x97) => Some(8), // vfmsubadd132pd
+            (2, 1, 1, 0x98) => Some(8), // vfmadd132pd
+            (2, 1, 1, 0x9A) => Some(8), // vfmsub132pd
+            (2, 1, 1, 0x9C) => Some(8), // vfnmadd132pd
+            (2, 1, 1, 0x9E) => Some(8), // vfnmsub132pd
+            (2, 1, 1, 0xA6) => Some(8), // vfmaddsub213pd
+            (2, 1, 1, 0xA7) => Some(8), // vfmsubadd213pd
+            (2, 1, 1, 0xA8) => Some(8), // vfmadd213pd
+            (2, 1, 1, 0xAA) => Some(8), // vfmsub213pd
+            (2, 1, 1, 0xAC) => Some(8), // vfnmadd213pd
+            (2, 1, 1, 0xAE) => Some(8), // vfnmsub213pd
+            (2, 1, 1, 0xB4) => Some(8), // vpmadd52luq
+            (2, 1, 1, 0xB5) => Some(8), // vpmadd52huq
+            (2, 1, 1, 0xB6) => Some(8), // vfmaddsub231pd
+            (2, 1, 1, 0xB7) => Some(8), // vfmsubadd231pd
+            (2, 1, 1, 0xB8) => Some(8), // vfmadd231pd
+            (2, 1, 1, 0xBA) => Some(8), // vfmsub231pd
+            (2, 1, 1, 0xBC) => Some(8), // vfnmadd231pd
+            (2, 1, 1, 0xBE) => Some(8), // vfnmsub231pd
+            (2, 1, 1, 0xC4) => Some(8), // vpconflictq
+            (2, 2, 0, 0x27) => Some(4), // vptestnmd
+            (2, 2, 0, 0x52) => Some(4), // vdpbf16ps
+            (2, 2, 0, 0x72) => Some(4), // vcvtneps2bf16, vcvtneps2bf16x, vcvtneps2bf16y
+            (2, 2, 1, 0x27) => Some(8), // vptestnmq
+            (2, 3, 0, 0x68) => Some(4), // vp2intersectd
+            (2, 3, 0, 0x72) => Some(4), // vcvtne2ps2bf16
+            (2, 3, 1, 0x68) => Some(8), // vp2intersectq
+            (3, 0, 0, 0x08) => Some(2), // vrndscaleph
+            (3, 0, 0, 0x26) => Some(2), // vgetmantph
+            (3, 0, 0, 0x52) => Some(2), // vminmaxph
+            (3, 0, 0, 0x56) => Some(2), // vreduceph
+            (3, 0, 0, 0x66) => Some(2), // vfpclassph
+            (3, 0, 0, 0xC2) => Some(2), // vcmpph
+            (3, 1, 0, 0x03) => Some(4), // valignd
+            (3, 1, 0, 0x04) => Some(4), // vpermilps
+            (3, 1, 0, 0x08) => Some(4), // vrndscaleps
+            (3, 1, 0, 0x1E) => Some(4), // vpcmpud
+            (3, 1, 0, 0x1F) => Some(4), // vpcmpd
+            (3, 1, 0, 0x23) => Some(4), // vshuff32x4
+            (3, 1, 0, 0x25) => Some(4), // vpternlogd
+            (3, 1, 0, 0x26) => Some(4), // vgetmantps
+            (3, 1, 0, 0x43) => Some(4), // vshufi32x4
+            (3, 1, 0, 0x50) => Some(4), // vrangeps
+            (3, 1, 0, 0x52) => Some(4), // vminmaxps
+            (3, 1, 0, 0x54) => Some(4), // vfixupimmps
+            (3, 1, 0, 0x56) => Some(4), // vreduceps
+            (3, 1, 0, 0x66) => Some(4), // vfpclassps, vfpclasspsx, vfpclasspsy
+            (3, 1, 0, 0x71) => Some(4), // vpshldd
+            (3, 1, 0, 0x73) => Some(4), // vpshrdd
+            (3, 1, 1, 0x03) => Some(8), // valignq
+            (3, 1, 1, 0x05) => Some(8), // vpermilpd
+            (3, 1, 1, 0x09) => Some(8), // vrndscalepd
+            (3, 1, 1, 0x1E) => Some(8), // vpcmpuq
+            (3, 1, 1, 0x1F) => Some(8), // vpcmpq
+            (3, 1, 1, 0x23) => Some(8), // vshuff64x2
+            (3, 1, 1, 0x25) => Some(8), // vpternlogq
+            (3, 1, 1, 0x26) => Some(8), // vgetmantpd
+            (3, 1, 1, 0x43) => Some(8), // vshufi64x2
+            (3, 1, 1, 0x50) => Some(8), // vrangepd
+            (3, 1, 1, 0x52) => Some(8), // vminmaxpd
+            (3, 1, 1, 0x54) => Some(8), // vfixupimmpd
+            (3, 1, 1, 0x56) => Some(8), // vreducepd
+            (3, 1, 1, 0x66) => Some(8), // vfpclasspd, vfpclasspdx, vfpclasspdy
+            (3, 1, 1, 0x71) => Some(8), // vpshldq
+            (3, 1, 1, 0x73) => Some(8), // vpshrdq
+            (3, 1, 1, 0xCE) => Some(8), // vgf2p8affineqb
+            (3, 1, 1, 0xCF) => Some(8), // vgf2p8affineinvqb
+            (3, 3, 0, 0x52) => Some(2), // vminmaxbf16
+            (3, 3, 0, 0x66) => Some(2), // vfpclassbf16
+            (3, 3, 0, 0xC2) => Some(2), // vcmpbf16
+            (5, 0, 0, 0x51) => Some(2), // vsqrtph
+            (5, 0, 0, 0x58) => Some(2), // vaddph
+            (5, 0, 0, 0x59) => Some(2), // vmulph
+            (5, 0, 0, 0x5A) => Some(8), // vcvtph2pd
+            (5, 0, 0, 0x5B) => Some(4), // vcvtdq2ph
+            (5, 0, 0, 0x5C) => Some(2), // vsubph
+            (5, 0, 0, 0x5D) => Some(2), // vminph
+            (5, 0, 0, 0x5E) => Some(2), // vdivph
+            (5, 0, 0, 0x5F) => Some(2), // vmaxph
+            (5, 0, 0, 0x78) => Some(4), // vcvttph2udq
+            (5, 0, 0, 0x79) => Some(4), // vcvtph2udq
+            (5, 0, 0, 0x7C) => Some(2), // vcvttph2uw
+            (5, 0, 0, 0x7D) => Some(2), // vcvtph2uw
+            (5, 0, 1, 0x5B) => Some(8), // vcvtqq2ph
+            (5, 1, 0, 0x1D) => Some(4), // vcvtps2phx
+            (5, 1, 0, 0x5B) => Some(4), // vcvtph2dq
+            (5, 1, 0, 0x78) => Some(8), // vcvttph2uqq
+            (5, 1, 0, 0x79) => Some(8), // vcvtph2uqq
+            (5, 1, 0, 0x7A) => Some(8), // vcvttph2qq
+            (5, 1, 0, 0x7B) => Some(8), // vcvtph2qq
+            (5, 1, 0, 0x7C) => Some(2), // vcvttph2w
+            (5, 1, 0, 0x7D) => Some(2), // vcvtph2w
+            (5, 1, 1, 0x5A) => Some(8), // vcvtpd2ph
+            (5, 2, 0, 0x5B) => Some(4), // vcvttph2dq
+            (5, 2, 0, 0x7D) => Some(2), // vcvtw2ph
+            (5, 3, 0, 0x7A) => Some(4), // vcvtudq2ph
+            (5, 3, 0, 0x7D) => Some(2), // vcvtuw2ph
+            (5, 3, 1, 0x7A) => Some(8), // vcvtuqq2ph
+            (6, 1, 0, 0x13) => Some(4), // vcvtph2psx
+            (6, 1, 0, 0x2C) => Some(2), // vscalefph
+            (6, 1, 0, 0x42) => Some(2), // vgetexpph
+            (6, 1, 0, 0x4C) => Some(2), // vrcpph
+            (6, 1, 0, 0x4E) => Some(2), // vrsqrtph
+            (6, 1, 0, 0x96) => Some(2), // vfmaddsub132ph
+            (6, 1, 0, 0x97) => Some(2), // vfmsubadd132ph
+            (6, 1, 0, 0x98) => Some(2), // vfmadd132ph
+            (6, 1, 0, 0x9A) => Some(2), // vfmsub132ph
+            (6, 1, 0, 0x9C) => Some(2), // vfnmadd132ph
+            (6, 1, 0, 0x9E) => Some(2), // vfnmsub132ph
+            (6, 1, 0, 0xA6) => Some(2), // vfmaddsub213ph
+            (6, 1, 0, 0xA7) => Some(2), // vfmsubadd213ph
+            (6, 1, 0, 0xA8) => Some(2), // vfmadd213ph
+            (6, 1, 0, 0xAA) => Some(2), // vfmsub213ph
+            (6, 1, 0, 0xAC) => Some(2), // vfnmadd213ph
+            (6, 1, 0, 0xAE) => Some(2), // vfnmsub213ph
+            (6, 1, 0, 0xB6) => Some(2), // vfmaddsub231ph
+            (6, 1, 0, 0xB7) => Some(2), // vfmsubadd231ph
+            (6, 1, 0, 0xB8) => Some(2), // vfmadd231ph
+            (6, 1, 0, 0xBA) => Some(2), // vfmsub231ph
+            (6, 1, 0, 0xBC) => Some(2), // vfnmadd231ph
+            (6, 1, 0, 0xBE) => Some(2), // vfnmsub231ph
+            (6, 2, 0, 0x56) => Some(4), // vfmaddcph
+            (6, 2, 0, 0xD6) => Some(4), // vfmulcph
+            (6, 3, 0, 0x56) => Some(4), // vfcmaddcph
+            (6, 3, 0, 0xD6) => Some(4), // vfcmulcph
+            _ => None,
+        }
     }
 
     /// Encode AVX scalar comparison (vcmpss/vcmpsd) with F3/F2 prefix
@@ -3134,13 +3755,21 @@ impl super::InstructionEncoder {
     }
 
     /// Parse AVX comparison predicate from pseudo-op mnemonic.
-    /// Returns (predicate, suffix) e.g. "vcmpnleps" -> Some((6, "ps"))
+    /// Returns (predicate, suffix) e.g. "vcmpnleps" -> Some((6, "ps")).
+    /// Suffixes cover packed/scalar FP (ps/pd/ss/sd) and AVX512-FP16
+    /// (ph/sh — every predicate spelling is accepted for them, probed
+    /// against GAS 2.47). The 12 explicit-suffix aliases (eq_oq->0,
+    /// lt_os->1, le_os->2, unord_q->3, neq_uq->4, nlt_us->5, nle_us->6,
+    /// ord_q->7, false_oq->11, ge_os->13, gt_os->14, true_uq->15) are
+    /// the GAS spellings of the canonical predicates; note GAS's naming
+    /// for 29/30 is ge_oq/gt_oq, NOT the SDM's GE_OS/GT_OS (byte-probed:
+    /// `vcmpge_oqpd` assembles to predicate 29).
     pub(crate) fn parse_avx_cmp_pseudo(mnemonic: &str) -> Option<(u8, &str)> {
         if !mnemonic.starts_with("vcmp") {
             return None;
         }
         let rest = &mnemonic[4..];
-        let suffixes = ["ps", "pd", "ss", "sd"];
+        let suffixes = ["ps", "pd", "ss", "sd", "ph", "sh"];
         for suffix in &suffixes {
             if let Some(pred_str) = rest.strip_suffix(*suffix) {
                 let pred = match pred_str {
@@ -3152,6 +3781,20 @@ impl super::InstructionEncoder {
                     "nlt" => 5,
                     "nle" => 6,
                     "ord" => 7,
+                    // Explicit-suffix spellings of predicates 0-15 (GAS
+                    // accepts both the short and the decorated form).
+                    "eq_oq" => 0,
+                    "lt_os" => 1,
+                    "le_os" => 2,
+                    "unord_q" => 3,
+                    "neq_uq" => 4,
+                    "nlt_us" => 5,
+                    "nle_us" => 6,
+                    "ord_q" => 7,
+                    "false_oq" => 11,
+                    "ge_os" => 13,
+                    "gt_os" => 14,
+                    "true_uq" => 15,
                     // AVX extended predicates (8-31)
                     "eq_uq" => 8,
                     "nge" => 9,
@@ -3788,8 +4431,10 @@ impl super::InstructionEncoder {
     pub(crate) fn encode_evex_scalarmov(
         &mut self,
         ops: &[Operand],
+        map: u8,
         pp: u8,
         w: u8,
+        elem: u32,
         mnemonic: &str,
     ) -> Result<(), String> {
         match ops.len() {
@@ -3802,7 +4447,7 @@ impl super::InstructionEncoder {
                 };
                 let (aaa, z) = Self::evex_mask_info(&ops[2]);
                 let (dst_num, rm_num) =
-                    self.emit_evex_mod3(dst, src1, Some(src2), 1, w, pp, 0, z, aaa, false)?;
+                    self.emit_evex_mod3(dst, src1, Some(src2), map, w, pp, 0, z, aaa, false)?;
                 self.bytes.push(0x10);
                 self.bytes.push(self.modrm(3, dst_num, rm_num));
                 Ok(())
@@ -3811,20 +4456,20 @@ impl super::InstructionEncoder {
                 (Operand::Memory(mem), Operand::Register(dst)) => {
                     let (aaa, z) = Self::evex_mask_info(&ops[1]);
                     let dst_num =
-                        self.emit_evex_memop(&dst.name, mem, None, 1, w, pp, 0, z, aaa, false)?;
+                        self.emit_evex_memop(&dst.name, mem, None, map, w, pp, 0, z, aaa, false)?;
                     self.bytes.push(0x10);
-                    // Element-sized compressed disp (N=4 ss / N=8 sd —
-                    // `vmovsd %xmm30, -1024(%rdx){%k7}` -> disp8 0x80,
-                    // GAS 2.47 byte-probed; the raw N=1 rule forced a
-                    // disp32 fallback GAS never takes).
-                    self.encode_evex_mem(dst_num, mem, if w == 1 { 8 } else { 4 })
+                    // Element-sized compressed disp (N=4 ss / N=8 sd /
+                    // N=2 sh — `vmovsd %xmm30, -1024(%rdx){%k7}` -> disp8
+                    // 0x80, GAS 2.47 byte-probed; the raw N=1 rule forced
+                    // a disp32 fallback GAS never takes).
+                    self.encode_evex_mem(dst_num, mem, elem)
                 }
                 (Operand::Register(src), Operand::Memory(mem)) => {
                     let (aaa, z) = Self::evex_mask_info(&ops[1]);
                     let src_num =
-                        self.emit_evex_memop(&src.name, mem, None, 1, w, pp, 0, z, aaa, false)?;
+                        self.emit_evex_memop(&src.name, mem, None, map, w, pp, 0, z, aaa, false)?;
                     self.bytes.push(0x11);
-                    self.encode_evex_mem(src_num, mem, if w == 1 { 8 } else { 4 })
+                    self.encode_evex_mem(src_num, mem, elem)
                 }
                 (Operand::Register(_), Operand::Register(_)) => {
                     Err(format!("operand type mismatch for `{mnemonic}'"))
