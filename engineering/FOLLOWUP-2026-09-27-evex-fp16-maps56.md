@@ -117,3 +117,90 @@ delegated rows.
 10. **mov/lea/addr32 corpus lines** (~390): GAS testsuite quoting edges
     (`mov "x(y", %eax`), `lea symbol(%eip)`, addr32-prefixed branches —
     low value, high eccentricity; classify before touching.
+
+---
+
+# Audit response (2026-09-27, second round — Review AI verdict on PR #643)
+
+Every audit claim was re-probed against the GAS 2.47.20260726 oracle
+(cross-checked on the system GAS 2.44; the two agree on all disputed
+behaviors). Verdicts, with the oracle as the only authority:
+
+1. **FP16 scalar non-XMM operands — AGREE.** `vaddsh/vfmadd*sh/vfmaddc*sh/
+   vmovsh` with ymm/zmm spellings were false accepts. The shared-boundary
+   XMM gate the audit proposed is exactly right, and the oracle shows it
+   must cover the ss/sd families too (`vaddss/vfmadd132ss/vmovss %ymm`
+   are equally illegal — pre-existing false accepts in the VEX row, fixed
+   by the same law at `encode_evex_binary_impl`, `encode_evex_scalarmov`,
+   and the VEX-row helpers via `check_avx_scalar_xmm`).
+2. **vcomish/vucomish gate — AGREE, but the dispatcher comment was wrong
+   in the other direction.** GAS ACCEPTS a bare `{sae}` on the register
+   form (`62 f5 7c 18 2f d1`, b'=1, L'L=00); masks, broadcasts, non-XMM
+   widths, memory+`{sae}` and rounding tokens are rejected. lccc was both
+   false-accepting (masks, ymm) AND false-rejecting (`{sae}`). New
+   dedicated encoder `encode_evex_comis` for all six mnemonics (the map-1
+   vcomiss/d family gained the same EVEX row: `{sae}`, xmm16+, EGPR).
+   The audit's "instruction-specific validation gate" is implemented;
+   packed unary operations are untouched.
+3. **Decorator legality contradictions — RESOLVED IN FAVOR OF THE CODE.**
+   The oracle accepts `{rn-sae}..{rz-sae}` on `vsqrtph` at 512-bit (Er,
+   identical to vsqrtps) and bare `{sae}` on `vgetmantph/vreduceph/
+   vrndscaleph` zmm register forms (Sae, identical to ps/pd). The
+   dispatcher comments claiming "probed: none" were hallucinated
+   documentation, not code bugs; comments corrected and the behavior is
+   now pinned by `tests/asm-diff/fp16-evex.casefile`.
+4. **Conversion policy — SPLIT RESOLUTION, both sides partial.** The
+   oracle: `vcvtps2pd`/`vcvtph2pd`/`vcvtph2psx` take bare `{sae}` at
+   512-bit only; `vcvtdq2pd`/`vcvtudq2pd`/`vcvtneps2bf16` take NOTHING;
+   all other converts are Er (rounding tokens) at 512-bit only. lccc had
+   the classes half-right and lacked the universal LL=10 gate; both are
+   fixed, with shape-before-decorator error ordering matching GAS.
+5. **Testability — AGREE.** 181-casefile-entry regression net added
+   (`fp16-evex.casefile`: every fixed false-accept/false-reject plus the
+   complete SAE matrix, broadcast-count matrix for maps 1/2/3/5/6,
+   shuffle/unpack and widening/narrowing counts);
+   `scripts/distill_bcst_elem.py` upstreamed with a `--check` mode that
+   re-derives the table from the pinned binutils testsuite and verifies
+   row-for-row (302/302 keys, 0 ambiguous, 0 drift); `th.s` removed.
+
+## Measurement reconciliation (the 9-line corpus delta)
+
+The original table omitted the ENCDIFF column. Re-counting the cached
+sweeps: baseline PASS 42547 / MISSING 19285 / ENCDIFF 612; final
+PASS 51206 / MISSING 10617 / ENCDIFF 621. The FP16 patch moved 2389
+MISSING lines: 2380 to PASS and **9 to ENCDIFF** — all nine were
+`vcomish/vucomish disp8` lines (`vcomish -256(%edx),%xmm6` etc.),
+byte-divergent because lccc scaled the Tuple1 memory operand by Full VL
+(N=16) instead of the element (N=2). This round found the same bug via
+the disp-boundary differential, fixed it (all nine now PASS), and the
+summary now reports every bucket. Post-audit figures, one pinned corpus
+(122508 lines): **PASS 52471, ENCDIFF 618, MISSING 9355, FALSEACC 0.**
+
+## Additional gaps found and fixed by the audit-round differential
+(47 baseline divergences on the audit battery, then extended batteries;
+all oracle-verified, all pinned in the casefile)
+
+- `vcvttph2{dq,udq,qq,uqq,w,uw}`: the entire packed truncating-FP16
+  convert family was undispatched (params + arms + evex_only routing).
+- `vsqrtss/vsqrtsd/vcvtss2sd/vcvtsd2ss`: EVEX rows for `{sae}`/`{r*-sae}`
+  /xmm16+/masked spellings (`vcvtsd2ss` is Er, `vcvtss2sd` is Sae-only).
+- The 24 scalar ss/sd FMA EVEX rows (masked/ER/high-register spellings).
+- `vminmaxps/pd/ph/bf16` (AVX10.2): undispatched; now complete with the
+  unsigned-imm8 law (GAS rejects `$-1` here but accepts it on vpternlog).
+- `vpternlogd $256` silently truncated to imm 0x00 — now rejected
+  (-128..=255 enforced on the whole 3src-imm family).
+- `vpermilpd/vpermilps` variable-index broadcasts: distilled-table rows
+  were missing (count law false-rejected legal `{1toN}` forms).
+- AVX512ER packed `vexp2/vrcp28/vrsqrt28 ps/pd`: zmm-only rows with bare
+  `{sae}`, masks, memory and `{1toN}` — complete, plus their 6 table rows.
+- `vpermq/vpermpd` imm-form broadcasts: 2 table rows were missing.
+- Convert broadcast-count law: `count x src_elem` windows per
+  VcvtKind (the xmm-dst Narrow/Narrow4 leniency is the pinned-row zoo,
+  byte-probed across every family x width x count).
+
+## Validation (all on this tree, GAS 2.47.20260726 oracle)
+
+asmdiff x86-64 **1243/1243**, i686 **568/568**; audit differential
+battery **441/441** (268 valid byte-exact + 173 reject-parity);
+cargo-test **3612/0** (+debug-assertions run); rustfmt + clippy clean;
+`distill_bcst_elem.py --check`: **302/302 table rows verified**.

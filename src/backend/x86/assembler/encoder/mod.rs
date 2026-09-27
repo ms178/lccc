@@ -290,6 +290,18 @@ fn evex_only_mnemonic(mnemonic: &str) -> bool {
             | "vcvtph2psx"
             | "vcvtph2qq"
             | "vcvtph2uqq"
+            | "vcvttph2dq"
+            | "vcvttph2udq"
+            | "vcvttph2qq"
+            | "vcvttph2uqq"
+            | "vcvttph2w"
+            | "vcvttph2uw"
+            // AVX10.2 vminmax: EVEX-only (no VEX row; plain xmm/ymm forms
+            // must route here, not fall through to the VEX table).
+            | "vminmaxps"
+            | "vminmaxpd"
+            | "vminmaxph"
+            | "vminmaxbf16"
     ) {
         return true;
     }
@@ -1484,6 +1496,36 @@ impl InstructionEncoder {
             "vfmsubadd213pd" => r(self.encode_evex_binary(ops, 2, 1, 1, 0xA7)),
             "vfmsubadd231ps" => r(self.encode_evex_binary(ops, 2, 1, 0, 0xB7)),
             "vfmsubadd231pd" => r(self.encode_evex_binary(ops, 2, 1, 1, 0xB7)),
+            // Scalar FMA rows (ss = packed opcode +1 with W0, sd = +1 with
+            // W1; GAS 2.47: `vfmadd132ss %xmm1,%xmm2,%xmm3{%k7}` =
+            // `62 f2 6d 0f 99 d9`, `{rn-sae}` accepted — Er class from
+            // evex_sae_class; memory tuple is the ELEMENT (N=4 ss / 8 sd);
+            // XMM-only via the shared scalar gate). Reached for masked,
+            // `{r*-sae}`, and xmm16+ spellings; plain forms keep the VEX row.
+            "vfmadd132ss" => r(self.encode_evex_binary_scalar(ops, 2, 1, 0, 0x99)),
+            "vfmadd132sd" => r(self.encode_evex_binary_scalar(ops, 2, 1, 1, 0x99)),
+            "vfmadd213ss" => r(self.encode_evex_binary_scalar(ops, 2, 1, 0, 0xA9)),
+            "vfmadd213sd" => r(self.encode_evex_binary_scalar(ops, 2, 1, 1, 0xA9)),
+            "vfmadd231ss" => r(self.encode_evex_binary_scalar(ops, 2, 1, 0, 0xB9)),
+            "vfmadd231sd" => r(self.encode_evex_binary_scalar(ops, 2, 1, 1, 0xB9)),
+            "vfmsub132ss" => r(self.encode_evex_binary_scalar(ops, 2, 1, 0, 0x9B)),
+            "vfmsub132sd" => r(self.encode_evex_binary_scalar(ops, 2, 1, 1, 0x9B)),
+            "vfmsub213ss" => r(self.encode_evex_binary_scalar(ops, 2, 1, 0, 0xAB)),
+            "vfmsub213sd" => r(self.encode_evex_binary_scalar(ops, 2, 1, 1, 0xAB)),
+            "vfmsub231ss" => r(self.encode_evex_binary_scalar(ops, 2, 1, 0, 0xBB)),
+            "vfmsub231sd" => r(self.encode_evex_binary_scalar(ops, 2, 1, 1, 0xBB)),
+            "vfnmadd132ss" => r(self.encode_evex_binary_scalar(ops, 2, 1, 0, 0x9D)),
+            "vfnmadd132sd" => r(self.encode_evex_binary_scalar(ops, 2, 1, 1, 0x9D)),
+            "vfnmadd213ss" => r(self.encode_evex_binary_scalar(ops, 2, 1, 0, 0xAD)),
+            "vfnmadd213sd" => r(self.encode_evex_binary_scalar(ops, 2, 1, 1, 0xAD)),
+            "vfnmadd231ss" => r(self.encode_evex_binary_scalar(ops, 2, 1, 0, 0xBD)),
+            "vfnmadd231sd" => r(self.encode_evex_binary_scalar(ops, 2, 1, 1, 0xBD)),
+            "vfnmsub132ss" => r(self.encode_evex_binary_scalar(ops, 2, 1, 0, 0x9F)),
+            "vfnmsub132sd" => r(self.encode_evex_binary_scalar(ops, 2, 1, 1, 0x9F)),
+            "vfnmsub213ss" => r(self.encode_evex_binary_scalar(ops, 2, 1, 0, 0xAF)),
+            "vfnmsub213sd" => r(self.encode_evex_binary_scalar(ops, 2, 1, 1, 0xAF)),
+            "vfnmsub231ss" => r(self.encode_evex_binary_scalar(ops, 2, 1, 0, 0xBF)),
+            "vfnmsub231sd" => r(self.encode_evex_binary_scalar(ops, 2, 1, 1, 0xBF)),
             // FP binary (EVEX.NDS.66.0F, W1 for pd)
             "vaddpd" => r(self.encode_evex_binary(ops, 1, 1, 1, 0x58)),
             "vaddps" => r(self.encode_evex_binary(ops, 1, 0, 0, 0x58)),
@@ -1522,6 +1564,16 @@ impl InstructionEncoder {
             "vminsd" => r(self.encode_evex_binary_scalar(ops, 1, 3, 1, 0x5D)),
             "vmaxss" => r(self.encode_evex_binary_scalar(ops, 1, 2, 0, 0x5F)),
             "vmaxsd" => r(self.encode_evex_binary_scalar(ops, 1, 3, 1, 0x5F)),
+            // Scalar sqrt and precision-convert EVEX rows: reached for
+            // `{r*-sae}`/`{sae}`, xmm16+ and masked spellings (GAS 2.47:
+            // vsqrtss {rn-sae} -> `62 f1 6e 18 51 d9`; vcvtsd2ss is
+            // ER-capable (double->single rounds), vcvtss2sd takes bare
+            // `{sae}` only (single->double is exact) — the classes live
+            // in evex_sae_class keyed on (map, pp, opcode)).
+            "vsqrtss" => r(self.encode_evex_binary_scalar(ops, 1, 2, 0, 0x51)),
+            "vsqrtsd" => r(self.encode_evex_binary_scalar(ops, 1, 3, 1, 0x51)),
+            "vcvtss2sd" => r(self.encode_evex_binary_scalar(ops, 1, 2, 0, 0x5A)),
+            "vcvtsd2ss" => r(self.encode_evex_binary_scalar(ops, 1, 3, 1, 0x5A)),
             "vmovaps" => r(self.encode_evex_vmov(ops, 0, 0, 0x28, 0x29)),
             "vmovapd" => r(self.encode_evex_vmov(ops, 1, 1, 0x28, 0x29)),
             "vmovups" => r(self.encode_evex_vmov(ops, 0, 0, 0x10, 0x11)),
@@ -1533,6 +1585,24 @@ impl InstructionEncoder {
             "vpabsq" => r(self.encode_evex_unary(ops, 2, 1, 1, 0x1F)),
             "vsqrtpd" => r(self.encode_evex_unary(ops, 1, 1, 1, 0x51)),
             "vsqrtps" => r(self.encode_evex_unary(ops, 1, 0, 0, 0x51)),
+            // AVX512ER approximate arithmetic (map2 0xC8/0xCA/0xCC):
+            // ZMM-ONLY (no VL extension — every xmm/ymm spelling is
+            // `operand size mismatch`), masks/z legal, memory Full or
+            // {1toN} broadcast (count law via the distilled table), and
+            // bare `{sae}` on the register form (rounding tokens rejected
+            // — class from evex_sae_class). GAS 2.47 byte-probed.
+            "vexp2ps" => r(Self::check_zmm_only("vexp2ps", ops)
+                .and_then(|()| self.encode_evex_unary(ops, 2, 1, 0, 0xC8))),
+            "vexp2pd" => r(Self::check_zmm_only("vexp2pd", ops)
+                .and_then(|()| self.encode_evex_unary(ops, 2, 1, 1, 0xC8))),
+            "vrcp28ps" => r(Self::check_zmm_only("vrcp28ps", ops)
+                .and_then(|()| self.encode_evex_unary(ops, 2, 1, 0, 0xCA))),
+            "vrcp28pd" => r(Self::check_zmm_only("vrcp28pd", ops)
+                .and_then(|()| self.encode_evex_unary(ops, 2, 1, 1, 0xCA))),
+            "vrsqrt28ps" => r(Self::check_zmm_only("vrsqrt28ps", ops)
+                .and_then(|()| self.encode_evex_unary(ops, 2, 1, 0, 0xCC))),
+            "vrsqrt28pd" => r(Self::check_zmm_only("vrsqrt28pd", ops)
+                .and_then(|()| self.encode_evex_unary(ops, 2, 1, 1, 0xCC))),
             "vpmovzxbw" => r(self.encode_evex_unary(ops, 2, 1, 0, 0x30)),
             "vpmovzxbd" => r(self.encode_evex_unary(ops, 2, 1, 0, 0x31)),
             "vpmovzxbq" => r(self.encode_evex_unary(ops, 2, 1, 0, 0x32)),
@@ -1818,7 +1888,8 @@ impl InstructionEncoder {
             "vcvtw2ph" | "vcvtuw2ph" | "vcvtph2w" | "vcvtph2uw" | "vcvtdq2ph" | "vcvtudq2ph"
             | "vcvtps2phx" | "vcvtneps2bf16" | "vcvtqq2ph" | "vcvtuqq2ph" | "vcvtpd2ph"
             | "vcvtph2dq" | "vcvtph2udq" | "vcvtph2pd" | "vcvtph2psx" | "vcvtph2qq"
-            | "vcvtph2uqq" => r(self.encode_evex_vcvt(ops, mnemonic)),
+            | "vcvtph2uqq" | "vcvttph2dq" | "vcvttph2udq" | "vcvttph2qq" | "vcvttph2uqq"
+            | "vcvttph2w" | "vcvttph2uw" => r(self.encode_evex_vcvt(ops, mnemonic)),
             // ---- AVX512DQ/F scalar-control family + the VEX-native
             // shuffles/unpacks with EVEX forms. Opcode tables distilled
             // from GAS 2.47 via scripts/distill_evex_opcodes.py; the
@@ -1858,6 +1929,21 @@ impl InstructionEncoder {
             "vrangepd" => r(self.encode_evex_3src_imm(ops, 3, 1, 1, 0x50, false)),
             "vrangess" => r(self.encode_evex_3src_imm(ops, 3, 1, 0, 0x51, false)),
             "vrangesd" => r(self.encode_evex_3src_imm(ops, 3, 1, 1, 0x51, false)),
+            // AVX10.2 vminmax (map3 0x52; pp/W per element type: ps=pp1/W0,
+            // pd=pp1/W1, ph=pp0/W0, bf16=pp3/W0). Same ($imm8, vvvv, rm, dst)
+            // shape as vrange; masks/z/memory legal; bcst {1toN} legal with
+            // the count law from the distilled table; NO SAE (positional
+            // reject handled by the 3src path); imm8 is UNSIGNED 0..=255 —
+            // GAS rejects `$-1` here, unlike the signed-tolerant vpternlog/
+            // vrange rows (byte-probed).
+            "vminmaxps" => r(Self::check_imm8_unsigned("vminmaxps", ops)
+                .and_then(|()| self.encode_evex_3src_imm(ops, 3, 1, 0, 0x52, false))),
+            "vminmaxpd" => r(Self::check_imm8_unsigned("vminmaxpd", ops)
+                .and_then(|()| self.encode_evex_3src_imm(ops, 3, 1, 1, 0x52, false))),
+            "vminmaxph" => r(Self::check_imm8_unsigned("vminmaxph", ops)
+                .and_then(|()| self.encode_evex_3src_imm(ops, 3, 0, 0, 0x52, false))),
+            "vminmaxbf16" => r(Self::check_imm8_unsigned("vminmaxbf16", ops)
+                .and_then(|()| self.encode_evex_3src_imm(ops, 3, 3, 0, 0x52, false))),
             // vreduce (0F3A 56 packed 2src / 57 scalar 3src).
             "vreduceps" => r(self.encode_evex_imm2_sae(ops, 3, 1, 0, 0x56)),
             "vreducepd" => r(self.encode_evex_imm2_sae(ops, 3, 1, 1, 0x56)),
@@ -1877,7 +1963,10 @@ impl InstructionEncoder {
             "vminph" => r(self.encode_evex_binary(ops, 5, 0, 0, 0x5D)),
             "vdivph" => r(self.encode_evex_binary(ops, 5, 0, 0, 0x5E)),
             "vmaxph" => r(self.encode_evex_binary(ops, 5, 0, 0, 0x5F)),
-            // vsqrtph: NO {sae}/{er} in any width (probed; unlike vsqrtps).
+            // vsqrtph: Er-class at zmm exactly like vsqrtps — `{rn-sae}..
+            // {rz-sae}` accepted at 512-bit (L'L=RC, b'=1), bare `{sae}`
+            // and every sub-512 spelling rejected (GAS 2.47 byte-probed,
+            // stable on 2.44).
             "vsqrtph" => r(self.encode_evex_unary(ops, 5, 0, 0, 0x51)),
             "vaddsh" => r(self.encode_evex_binary_scalar_elem(ops, 5, 2, 0, 0x58, 2)),
             "vmulsh" => r(self.encode_evex_binary_scalar_elem(ops, 5, 2, 0, 0x59, 2)),
@@ -1932,8 +2021,9 @@ impl InstructionEncoder {
             "vfcmulcsh" => r(self.encode_evex_binary_scalar_elem(ops, 6, 3, 0, 0xD7, 4)),
             // FP16 specials (map6.pp1): unary packed getexp/rcp/rsqrt;
             // 3-op scalar forms; vscalef both; and the map3.pp0 imm2 rows
-            // (vgetmantph/vreduceph/vrndscaleph — no SAE on the ph rows,
-            // unlike their ps/pd siblings; probed).
+            // (vgetmantph/vreduceph/vrndscaleph — bare `{sae}` accepted
+            // on the zmm register form, exactly like their ps/pd
+            // siblings; sub-512 and memory+`{sae}` rejected; probed).
             "vgetexpph" => r(self.encode_evex_unary(ops, 6, 1, 0, 0x42)),
             "vgetexpsh" => r(self.encode_evex_binary_scalar_elem(ops, 6, 1, 0, 0x43, 2)),
             "vrcpph" => r(self.encode_evex_unary(ops, 6, 1, 0, 0x4C)),
@@ -1945,10 +2035,19 @@ impl InstructionEncoder {
             "vgetmantph" => r(self.encode_evex_imm2_sae(ops, 3, 0, 0, 0x26)),
             "vreduceph" => r(self.encode_evex_imm2_sae(ops, 3, 0, 0, 0x56)),
             "vrndscaleph" => r(self.encode_evex_imm2_sae(ops, 3, 0, 0, 0x08)),
-            // FP16 scalar compare-to-EFLAGS (vcomish/vucomish: map5.pp0
-            // 2F/2E, vvvv=1, no mask/SAE — probed).
-            "vcomish" => r(self.encode_evex_unary(ops, 5, 0, 0, 0x2F)),
-            "vucomish" => r(self.encode_evex_unary(ops, 5, 0, 0, 0x2E)),
+            // Compare-to-EFLAGS family. The FP16 rows (map5.pp0 2F/2E)
+            // are EVEX-only; the ss/d rows (map1) share the dedicated
+            // encoder for their `{sae}` / xmm16+ / masked / broadcast
+            // spellings while their plain low-register forms keep the
+            // shorter VEX row below. All six: xmm-only, no mask, no
+            // broadcast, Tuple1 memory (N = 2/4/8), bare `{sae}` on the
+            // register form only (GAS 2.47 byte-probed).
+            "vcomish" => r(self.encode_evex_comis(ops, 5, 0, 0, 0x2F, 2, "vcomish")),
+            "vucomish" => r(self.encode_evex_comis(ops, 5, 0, 0, 0x2E, 2, "vucomish")),
+            "vcomiss" => r(self.encode_evex_comis(ops, 1, 0, 0, 0x2F, 4, "vcomiss")),
+            "vucomiss" => r(self.encode_evex_comis(ops, 1, 0, 0, 0x2E, 4, "vucomiss")),
+            "vcomisd" => r(self.encode_evex_comis(ops, 1, 1, 1, 0x2F, 8, "vcomisd")),
+            "vucomisd" => r(self.encode_evex_comis(ops, 1, 1, 1, 0x2E, 8, "vucomisd")),
             "vrndscaless" => r(self.encode_evex_3src_imm(ops, 3, 1, 0, 0x0A, false)),
             "vrndscalesd" => r(self.encode_evex_3src_imm(ops, 3, 1, 1, 0x0B, false)),
             // vscalef (0F38 2C packed / 2D scalar): the one SAE-capable
@@ -4413,13 +4512,15 @@ impl InstructionEncoder {
             "vrcpps" => self.encode_avx_2op_0f(ops, 0x53, 0),
             // Unordered/ordered scalar compares: NP.0F for the ss forms,
             // 66.0F for the sd forms.  Two operands, no NDS source.
-            "vcomiss" => self.encode_avx_2op_0f(ops, 0x2F, 0),
-            "vucomiss" => self.encode_avx_2op_0f(ops, 0x2E, 0),
-            "vcomisd" => self.encode_avx_2op_0f(ops, 0x2F, 1),
-            "vucomisd" => self.encode_avx_2op_0f(ops, 0x2E, 1),
+            // XMM-only even on the VEX row (`vcomiss %ymm1,%xmm2` has no
+            // 128-bit repair in GAS 2.47/2.44 — `operand size mismatch`).
+            "vcomiss" => self.encode_vex_comis(ops, 0x2F, 0, "vcomiss"),
+            "vucomiss" => self.encode_vex_comis(ops, 0x2E, 0, "vucomiss"),
+            "vcomisd" => self.encode_vex_comis(ops, 0x2F, 1, "vcomisd"),
+            "vucomisd" => self.encode_vex_comis(ops, 0x2E, 1, "vucomisd"),
             // Scalar precision conversions keep the NDS operand: the prefix
             // names the SOURCE type (F2 = from double, F3 = from single).
-            "vcvtsd2ss" => self.encode_avx_scalar_3op(ops, 0x5A, 3),
+            "vcvtsd2ss" => self.encode_avx_scalar_3op(ops, 0x5A, 3, "vcvtsd2ss"),
             // VEX scalar converts to/from general-purpose registers.
             // pp: 2 = F3 (single), 3 = F2 (double).  0x2D rounds, 0x2C truncates.
             "vcvtsd2si" => self.encode_avx_cvt_to_gp(ops, 0x2D, 3),
@@ -4458,7 +4559,7 @@ impl InstructionEncoder {
             "vpgatherdq" => self.encode_avx_gather(ops, 0x90, 1),
             "vpgatherqd" => self.encode_avx_gather(ops, 0x91, 0),
             "vpgatherqq" => self.encode_avx_gather(ops, 0x91, 1),
-            "vcvtss2sd" => self.encode_avx_scalar_3op(ops, 0x5A, 2),
+            "vcvtss2sd" => self.encode_avx_scalar_3op(ops, 0x5A, 2, "vcvtss2sd"),
             "vsqrtpd" => self.encode_avx_2op_0f(ops, 0x51, 1),
             // Scalar sqrt (VEX.NDS.LIG.F2/F3.0F 51): three operands only —
             // dst = sqrt(src2), upper lanes from vvvv (src1).  The scalar
@@ -4469,8 +4570,8 @@ impl InstructionEncoder {
             // %d` — a hidden upper-lane dependency on %xmm0 in every sqrt
             // loop (and a divergence from every external assembler).
             // Rejecting it here keeps the builtin assembler an honest oracle.
-            "vsqrtsd" => self.encode_avx_scalar_3op(ops, 0x51, 3), // F2
-            "vsqrtss" => self.encode_avx_scalar_3op(ops, 0x51, 2), // F3
+            "vsqrtsd" => self.encode_avx_scalar_3op(ops, 0x51, 3, "vsqrtsd"), // F2
+            "vsqrtss" => self.encode_avx_scalar_3op(ops, 0x51, 2, "vsqrtss"), // F3
             "vaddps" => self.encode_avx_3op_np(ops, 0x58),
             "vsubps" => self.encode_avx_3op_np(ops, 0x5C),
             "vmulps" => self.encode_avx_3op_np(ops, 0x59),
@@ -4779,8 +4880,10 @@ impl InstructionEncoder {
             "vmovmskpd" => self.encode_avx_extract_gp(ops, 0x50, true),
             "vroundps" => self.encode_avx_2op_3a_pp_imm8(ops, 0x08, 1),
             "vroundpd" => self.encode_avx_2op_3a_pp_imm8(ops, 0x09, 1),
-            "vroundss" => self.encode_avx_3op_3a_imm8(ops, 0x0A, true),
-            "vroundsd" => self.encode_avx_3op_3a_imm8(ops, 0x0B, true),
+            "vroundss" => Self::check_avx_scalar_xmm("vroundss", ops)
+                .and_then(|()| self.encode_avx_3op_3a_imm8(ops, 0x0A, true)),
+            "vroundsd" => Self::check_avx_scalar_xmm("vroundsd", ops)
+                .and_then(|()| self.encode_avx_3op_3a_imm8(ops, 0x0B, true)),
             // VINSERTPS imm8 is unsigned 0..255 (GAS 2.47: `$-2` is
             // `operand type mismatch` — byte-probed; the EVEX-promoted
             // row checks the same range in encoder/promoted.rs).
@@ -4810,6 +4913,15 @@ impl InstructionEncoder {
             //   vfnmsub231ps %ymm1,%ymm2,%ymm3 -> c4 e2 6d be d9
             m if is_fma3_vex(m) => {
                 let (opcode, w) = fma3_opcode(m).ok_or("bad FMA3 mnemonic")?;
+                // Scalar rows (the ss/sd element types) are XMM-only like
+                // every VEX scalar FP family (GAS 2.47: `vfmadd231sd
+                // %ymm1,%xmm2,%xmm3` -> `operand size mismatch`; the
+                // packed ps/pd rows keep ymm/zmm). NOTE the opcode low
+                // bit is NOT the scalar test: vfmaddsub/vfmsubadd own
+                // the odd opcodes 0x96/0x97/... while being packed-only.
+                if m.ends_with("ss") || m.ends_with("sd") {
+                    Self::check_avx_scalar_xmm(m, ops)?;
+                }
                 if w == 1 {
                     self.encode_avx_3op_38_w1(ops, opcode, true)
                 } else {
@@ -4820,24 +4932,24 @@ impl InstructionEncoder {
             // AVX comparison with immediate (vcmpps/vcmppd/vcmpss/vcmpsd)
             "vcmpps" => self.encode_avx_3op_0f_imm8(ops, 0xC2, false),
             "vcmppd" => self.encode_avx_3op_0f_imm8(ops, 0xC2, true),
-            "vcmpss" => self.encode_avx_cmp_scalar(ops, 0xC2, 2), // VEX.NDS.LIG.F3.0F C2 /r ib
-            "vcmpsd" => self.encode_avx_cmp_scalar(ops, 0xC2, 3), // VEX.NDS.LIG.F2.0F C2 /r ib
+            "vcmpss" => self.encode_avx_cmp_scalar(ops, 0xC2, 2, "vcmpss"), // VEX.NDS.LIG.F3.0F C2 /r ib
+            "vcmpsd" => self.encode_avx_cmp_scalar(ops, 0xC2, 3, "vcmpsd"), // VEX.NDS.LIG.F2.0F C2 /r ib
 
             // AVX scalar float operations (VEX.NDS.LIG.F3/F2.0F)
             "vmovss" => self.encode_avx_scalar_mov(ops, 0x10, 0x11, 2, "vmovss"), // F3 prefix
             "vmovsd" if !ops.is_empty() => self.encode_avx_scalar_mov(ops, 0x10, 0x11, 3, "vmovsd"), // F2 prefix
-            "vaddss" => self.encode_avx_scalar_3op(ops, 0x58, 2), // VEX.NDS.LIG.F3.0F 58
-            "vsubss" => self.encode_avx_scalar_3op(ops, 0x5C, 2), // VEX.NDS.LIG.F3.0F 5C
-            "vmulss" => self.encode_avx_scalar_3op(ops, 0x59, 2), // VEX.NDS.LIG.F3.0F 59
-            "vdivss" => self.encode_avx_scalar_3op(ops, 0x5E, 2), // VEX.NDS.LIG.F3.0F 5E
-            "vaddsd" => self.encode_avx_scalar_3op(ops, 0x58, 3), // VEX.NDS.LIG.F2.0F 58
-            "vsubsd" => self.encode_avx_scalar_3op(ops, 0x5C, 3), // VEX.NDS.LIG.F2.0F 5C
-            "vmulsd" => self.encode_avx_scalar_3op(ops, 0x59, 3), // VEX.NDS.LIG.F2.0F 59
-            "vdivsd" => self.encode_avx_scalar_3op(ops, 0x5E, 3), // VEX.NDS.LIG.F2.0F 5E
-            "vmaxss" => self.encode_avx_scalar_3op(ops, 0x5F, 2),
-            "vminss" => self.encode_avx_scalar_3op(ops, 0x5D, 2),
-            "vmaxsd" => self.encode_avx_scalar_3op(ops, 0x5F, 3),
-            "vminsd" => self.encode_avx_scalar_3op(ops, 0x5D, 3),
+            "vaddss" => self.encode_avx_scalar_3op(ops, 0x58, 2, "vaddss"), // VEX.NDS.LIG.F3.0F 58
+            "vsubss" => self.encode_avx_scalar_3op(ops, 0x5C, 2, "vsubss"), // VEX.NDS.LIG.F3.0F 5C
+            "vmulss" => self.encode_avx_scalar_3op(ops, 0x59, 2, "vmulss"), // VEX.NDS.LIG.F3.0F 59
+            "vdivss" => self.encode_avx_scalar_3op(ops, 0x5E, 2, "vdivss"), // VEX.NDS.LIG.F3.0F 5E
+            "vaddsd" => self.encode_avx_scalar_3op(ops, 0x58, 3, "vaddsd"), // VEX.NDS.LIG.F2.0F 58
+            "vsubsd" => self.encode_avx_scalar_3op(ops, 0x5C, 3, "vsubsd"), // VEX.NDS.LIG.F2.0F 5C
+            "vmulsd" => self.encode_avx_scalar_3op(ops, 0x59, 3, "vmulsd"), // VEX.NDS.LIG.F2.0F 59
+            "vdivsd" => self.encode_avx_scalar_3op(ops, 0x5E, 3, "vdivsd"), // VEX.NDS.LIG.F2.0F 5E
+            "vmaxss" => self.encode_avx_scalar_3op(ops, 0x5F, 2, "vmaxss"),
+            "vminss" => self.encode_avx_scalar_3op(ops, 0x5D, 2, "vminss"),
+            "vmaxsd" => self.encode_avx_scalar_3op(ops, 0x5F, 3, "vmaxsd"),
+            "vminsd" => self.encode_avx_scalar_3op(ops, 0x5D, 3, "vminsd"),
 
             // AVX extract/permute
             // vpermilps/vpermilpd have two forms: immediate (0F3A 04/05) and
