@@ -81,10 +81,26 @@ pub fn build_eh_frame_hdr(
     // Parse .eh_frame to find all FDEs and their initial_location values
     let fdes = parse_eh_frame_fdes(eh_frame_data, eh_frame_vaddr, is_64bit);
 
-    // Header: 4 bytes + eh_frame_ptr (4 bytes) + fde_count (4 bytes)
-    let header_size = 4 + 4 + 4;
-    let table_entry_size = 8; // two i32s per entry
-    let total_size = header_size + fdes.len() * table_entry_size;
+    // Header: 4 bytes + eh_frame_ptr (4 bytes) + fde_count (4 bytes).
+    // Every table displacement is explicitly sdata4/udata4.  Never truncate
+    // an address or count into those fields: a wrapped entry makes the
+    // unwinder's binary search return an unrelated FDE.  The caller treats an
+    // empty result as "no usable header" and can fall back to linear scans.
+    let header_size = 4usize + 4 + 4;
+    let table_entry_size = 8usize; // two i32s per entry
+    let Some(table_size) = fdes.len().checked_mul(table_entry_size) else {
+        return Vec::new();
+    };
+    let Some(total_size) = header_size.checked_add(table_size) else {
+        return Vec::new();
+    };
+    let eh_frame_ptr = i128::from(eh_frame_vaddr) - (i128::from(eh_frame_hdr_vaddr) + 4);
+    let Ok(eh_frame_ptr) = i32::try_from(eh_frame_ptr) else {
+        return Vec::new();
+    };
+    let Ok(fde_count) = u32::try_from(fdes.len()) else {
+        return Vec::new();
+    };
     let mut data = vec![0u8; total_size];
 
     // Version
@@ -96,21 +112,25 @@ pub fn build_eh_frame_hdr(
     // table encoding: DW_EH_PE_datarel | DW_EH_PE_sdata4
     data[3] = 0x3b;
 
-    // eh_frame_ptr: PC-relative offset from &data[4] to eh_frame
-    let eh_frame_ptr = eh_frame_vaddr as i64 - (eh_frame_hdr_vaddr as i64 + 4);
-    write_i32_le(&mut data, 4, eh_frame_ptr as i32);
-
+    // eh_frame_ptr: PC-relative offset from &data[4] to .eh_frame.
+    write_i32_le(&mut data, 4, eh_frame_ptr);
     // fde_count
-    write_i32_le(&mut data, 8, fdes.len() as i32);
+    write_u32_le(&mut data, 8, fde_count);
 
-    // Table entries: sorted by initial_location
-    // Each entry is (initial_location - eh_frame_hdr_vaddr, fde_address - eh_frame_hdr_vaddr)
+    // Table entries: sorted by initial_location.  Each entry is
+    // (initial_location - eh_frame_hdr_vaddr, fde_address - eh_frame_hdr_vaddr).
     for (i, fde) in fdes.iter().enumerate() {
         let off = header_size + i * table_entry_size;
-        let loc_rel = fde.initial_location as i64 - eh_frame_hdr_vaddr as i64;
-        let fde_rel = fde.fde_vaddr as i64 - eh_frame_hdr_vaddr as i64;
-        write_i32_le(&mut data, off, loc_rel as i32);
-        write_i32_le(&mut data, off + 4, fde_rel as i32);
+        let loc_rel = i128::from(fde.initial_location) - i128::from(eh_frame_hdr_vaddr);
+        let fde_rel = i128::from(fde.fde_vaddr) - i128::from(eh_frame_hdr_vaddr);
+        let Ok(loc_rel) = i32::try_from(loc_rel) else {
+            return Vec::new();
+        };
+        let Ok(fde_rel) = i32::try_from(fde_rel) else {
+            return Vec::new();
+        };
+        write_i32_le(&mut data, off, loc_rel);
+        write_i32_le(&mut data, off + 4, fde_rel);
     }
 
     data
@@ -191,7 +211,10 @@ fn parse_eh_frame_fdes(data: &[u8], base_vaddr: u64, is_64bit: bool) -> Vec<EhFr
                 continue;
             }
 
-            let fde_vaddr = base_vaddr + entry_start as u64;
+            let Some(fde_vaddr) = base_vaddr.checked_add(entry_start as u64) else {
+                pos = entry_end;
+                continue;
+            };
 
             // Decode initial_location based on the CIE's FDE encoding
             let initial_location = decode_eh_pointer(
@@ -244,6 +267,13 @@ fn parse_cie_fde_encoding(data: &[u8], cie_pos: usize, is_64bit: bool) -> Option
     let Some(&version) = data.get(start + id_size).filter(|_| start + id_size < end) else {
         return None;
     };
+    // `.eh_frame` CIEs in the supported DWARF32/DWARF64 formats use the
+    // v1/v3/v4 layouts below.  Treat unknown versions as malformed rather
+    // than interpreting a v5 CIE with the v3 layout and returning a plausible
+    // but wrong FDE encoding.
+    if !matches!(version, 1..=4) {
+        return None;
+    }
     let aug_start = start + id_size + 1;
     let Some(aug_len) = data[aug_start..end].iter().position(|&b| b == 0) else {
         return None;
@@ -251,6 +281,27 @@ fn parse_cie_fde_encoding(data: &[u8], cie_pos: usize, is_64bit: bool) -> Option
     let aug = &data[aug_start..aug_start + aug_len];
     let mut cur = aug_start + aug_len + 1;
     let cie = &data[..end];
+
+    // DWARF v4 inserts address_size and segment_selector_size between the
+    // augmentation string and the alignment factors.  Omitting these two
+    // bytes (the old v1/v3-only parser did) shifts every subsequent read: a
+    // valid v4 zR CIE is then either rejected or, worse, assigned an
+    // unrelated FDE encoding.  We do not support segmented EH pointers, and
+    // the CIE address size must agree with the output ELF class used by the
+    // decoder, so fail closed on either case.
+    if version == 4 {
+        let Some(&address_size) = cie.get(cur) else {
+            return None;
+        };
+        let Some(&segment_selector_size) = cie.get(cur + 1) else {
+            return None;
+        };
+        let expected_address_size = if is_64bit { 8 } else { 4 };
+        if address_size != expected_address_size || segment_selector_size != 0 {
+            return None;
+        }
+        cur += 2;
+    }
 
     // The return-address column is a byte in CIE v1, ULEB in v3/v4.
     let Some((_, n)) = read_uleb128(cie, cur) else {
@@ -328,91 +379,112 @@ fn decode_eh_pointer(
     let base_enc = encoding & 0x0F;
     let rel = encoding & 0x70;
 
-    let (raw_val, _size) = match base_enc {
+    // Indirect encodings require dereferencing a relocated address in the
+    // output image.  This parser only has the section bytes, not the final
+    // address space, so accepting one would manufacture the slot address as
+    // the function PC.  Fail closed instead.
+    if encoding & 0x80 != 0 {
+        return None;
+    }
+
+    // Keep the raw value unsigned plus an explicit signedness bit.  The old
+    // implementation forced udata4/udata8 through `i64`; a perfectly valid
+    // 32-bit absolute address >= 0x8000_0000 was then sign-extended, and a
+    // 64-bit udata8 with bit 63 set could overflow during a PC-relative add.
+    // Signed encodings are sign-extended only when the relative base is
+    // applied; unsigned encodings remain unsigned all the way through.
+    let (raw_val, signed) = match base_enc {
         0x00 => {
             // DW_EH_PE_absptr
             if is_64bit {
-                if offset + 8 > data.len() {
+                if data.len().checked_sub(offset).is_none_or(|n| n < 8) {
                     return None;
                 }
-                (read_u64_le(data, offset) as i64, 8)
+                (read_u64_le(data, offset), false)
             } else {
-                if offset + 4 > data.len() {
+                if data.len().checked_sub(offset).is_none_or(|n| n < 4) {
                     return None;
                 }
-                (read_u32_le(data, offset) as i32 as i64, 4)
+                (u64::from(read_u32_le(data, offset)), false)
             }
         }
         0x01 => {
             // DW_EH_PE_uleb128
             let (v, _) = read_uleb128(data, offset)?;
-            (v as i64, 0)
+            (v, false)
         }
         0x02 => {
             // DW_EH_PE_udata2
-            if offset + 2 > data.len() {
+            if data.len().checked_sub(offset).is_none_or(|n| n < 2) {
                 return None;
             }
             (
-                u16::from_le_bytes([data[offset], data[offset + 1]]) as i64,
-                2,
+                u64::from(u16::from_le_bytes([data[offset], data[offset + 1]])),
+                false,
             )
         }
         0x03 => {
             // DW_EH_PE_udata4
-            if offset + 4 > data.len() {
+            if data.len().checked_sub(offset).is_none_or(|n| n < 4) {
                 return None;
             }
-            (read_u32_le(data, offset) as i64, 4)
+            (u64::from(read_u32_le(data, offset)), false)
         }
         0x04 => {
             // DW_EH_PE_udata8
-            if offset + 8 > data.len() {
+            if data.len().checked_sub(offset).is_none_or(|n| n < 8) {
                 return None;
             }
-            (read_u64_le(data, offset) as i64, 8)
+            (read_u64_le(data, offset), false)
         }
         0x09 => {
             // DW_EH_PE_sleb128
             let (v, _) = read_sleb128(data, offset)?;
-            (v, 0)
+            (v as u64, true)
         }
         0x0A => {
             // DW_EH_PE_sdata2
-            if offset + 2 > data.len() {
+            if data.len().checked_sub(offset).is_none_or(|n| n < 2) {
                 return None;
             }
             (
-                i16::from_le_bytes([data[offset], data[offset + 1]]) as i64,
-                2,
+                i16::from_le_bytes([data[offset], data[offset + 1]]) as i64 as u64,
+                true,
             )
         }
         0x0B => {
             // DW_EH_PE_sdata4
-            if offset + 4 > data.len() {
+            if data.len().checked_sub(offset).is_none_or(|n| n < 4) {
                 return None;
             }
-            (read_i32_le(data, offset) as i64, 4)
+            (read_i32_le(data, offset) as i64 as u64, true)
         }
         0x0C => {
             // DW_EH_PE_sdata8
-            if offset + 8 > data.len() {
+            if data.len().checked_sub(offset).is_none_or(|n| n < 8) {
                 return None;
             }
-            (read_u64_le(data, offset) as i64, 8)
+            (read_u64_le(data, offset) as i64 as u64, true)
         }
         _ => return None,
     };
 
-    let base_val = match rel {
-        0x00 => 0i64,      // DW_EH_PE_absptr
-        0x10 => pc as i64, // DW_EH_PE_pcrel
-        0x20 => 0i64,      // DW_EH_PE_textrel (not commonly used)
-        0x30 => 0i64,      // DW_EH_PE_datarel
-        _ => 0i64,
-    };
-
-    Some((base_val + raw_val) as u64)
+    match rel {
+        0x00 => Some(raw_val), // DW_EH_PE_absptr
+        0x10 => {
+            // DW_EH_PE_pcrel.  Use checked arithmetic: malformed relocation
+            // data must be rejected, never wrap to an unrelated FDE.
+            if signed {
+                pc.checked_add_signed(raw_val as i64)
+            } else {
+                pc.checked_add(raw_val)
+            }
+        }
+        // The caller does not provide text/data bases, and treating either
+        // encoding as absolute silently produces a wrong search table.
+        0x20 | 0x30 => None, // DW_EH_PE_textrel/datarel
+        _ => None,
+    }
 }
 
 /// Return the byte size of an encoded pointer.
@@ -443,6 +515,11 @@ use crate::backend::elf::{
 };
 
 fn write_i32_le(data: &mut [u8], off: usize, val: i32) {
+    let b = val.to_le_bytes();
+    data[off..off + 4].copy_from_slice(&b);
+}
+
+fn write_u32_le(data: &mut [u8], off: usize, val: u32) {
     let b = val.to_le_bytes();
     data[off..off + 4].copy_from_slice(&b);
 }
@@ -1282,6 +1359,108 @@ mod tests {
         assert_eq!(read_sleb128(&signed_min, 0), Some((i64::MIN, 10)));
         assert_eq!(read_uleb128(&[0xff; 9], 0), None);
         assert_eq!(read_sleb128(&[0xff; 9], 0), None);
+    }
+
+    /// Build a DWARF v4 CIE/FDE pair.  Version 4 has two fields that v1/v3
+    /// do not: address_size and segment_selector_size.  The parser must skip
+    /// them before reading the alignment factors and the `zR` augmentation
+    /// payload.
+    fn synth_dwarf4_eh_frame(fde_enc: u8) -> Vec<u8> {
+        let mut data = Vec::new();
+        let mut cie = Vec::new();
+        cie.extend_from_slice(&0u32.to_le_bytes()); // CIE id
+        cie.push(4); // DWARF v4
+        cie.extend_from_slice(b"zR\0");
+        cie.push(8); // address_size for an ELF64 output
+        cie.push(0); // segment_selector_size
+        cie.push(1); // code alignment factor
+        cie.push(0x78); // data alignment factor (-8)
+        cie.push(16); // return-address register (ULEB128)
+        cie.push(1); // augmentation data length
+        cie.push(fde_enc);
+        while (cie.len() + 4) % 8 != 0 {
+            cie.push(0); // DW_CFA_nop padding
+        }
+        data.extend_from_slice(&(cie.len() as u32).to_le_bytes());
+        data.extend_from_slice(&cie);
+
+        let fde_start = data.len();
+        let mut fde = Vec::new();
+        fde.extend_from_slice(&((fde_start + 4) as u32).to_le_bytes());
+        fde.extend_from_slice(&0x100i32.to_le_bytes()); // pcrel initial_location
+        fde.extend_from_slice(&0x20u32.to_le_bytes()); // address_range
+        fde.push(0); // z augmentation data length
+        while (fde.len() + 4) % 8 != 0 {
+            fde.push(0);
+        }
+        data.extend_from_slice(&(fde.len() as u32).to_le_bytes());
+        data.extend_from_slice(&fde);
+        data
+    }
+
+    #[test]
+    fn pointer_decoding_preserves_unsigned_addresses_and_rejects_unsupported_bases() {
+        // A 32-bit absolute pointer with bit 31 set is still an address, not
+        // a negative signed displacement.
+        assert_eq!(
+            decode_eh_pointer(&0x8000_0000u32.to_le_bytes(), 0, 0x00, 0, false),
+            Some(0x8000_0000)
+        );
+        // Likewise, udata8 is allowed to use the high half of the address
+        // space; it must not pass through i64 and wrap.
+        assert_eq!(
+            decode_eh_pointer(&u64::MAX.to_le_bytes(), 0, 0x04, 0, true),
+            Some(u64::MAX)
+        );
+        // Signed PC-relative offsets are applied without signed-overflow
+        // traps, even when the PC is in the high canonical address range.
+        assert_eq!(
+            decode_eh_pointer(
+                &(-0x100i32).to_le_bytes(),
+                0,
+                PCREL_SDATA4,
+                0xffff_ffff_ffff_1000,
+                true
+            ),
+            Some(0xffff_ffff_ffff_0f00)
+        );
+        // No text/data base is available to this section-only decoder.
+        assert_eq!(
+            decode_eh_pointer(&0u32.to_le_bytes(), 0, 0x3b, 0x400000, true),
+            None
+        );
+        // Indirect encodings need a relocated image dereference and therefore
+        // cannot be decoded from the section byte slice alone.
+        assert_eq!(
+            decode_eh_pointer(&0u32.to_le_bytes(), 0, 0x9b, 0x400000, true),
+            None
+        );
+
+        // The fixed-width header fields must reject an unrepresentable
+        // displacement rather than truncating it modulo 2^32.
+        let data = synth_eh_frame(1, PCREL_SDATA4);
+        assert!(build_eh_frame_hdr(&data, 0, 0x1_0000_0000, true).is_empty());
+    }
+
+    #[test]
+    fn dwarf4_cie_skips_address_and_segment_sizes() {
+        let data = synth_dwarf4_eh_frame(PCREL_SDATA4);
+        assert_eq!(count_eh_frame_fdes(&data), 1);
+        let fdes = parse_eh_frame_fdes(&data, 0x400000, true);
+        assert_eq!(fdes.len(), 1);
+        let fde_start = scan_eh_frame_records(&data)[1].start;
+        let iloc = 0x400000 + (fde_start + 8) as u64 + 0x100;
+        assert_eq!(fdes[0].initial_location, iloc);
+
+        // A truncated v4 prefix and an unsupported DWARF version must fail
+        // closed instead of borrowing the following record's bytes.
+        let mut truncated = data.clone();
+        let cie_len = u32::from_le_bytes(truncated[..4].try_into().unwrap()) as usize;
+        truncated.truncate(4 + cie_len - 1);
+        assert!(parse_eh_frame_fdes(&truncated, 0x400000, true).is_empty());
+        let mut unknown = data;
+        unknown[8] = 5; // version byte: length(4) + CIE id(4)
+        assert!(parse_eh_frame_fdes(&unknown, 0x400000, true).is_empty());
     }
 
     #[test]
