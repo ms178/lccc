@@ -1073,6 +1073,26 @@ pub struct AsmOutput {
     /// construction. Inert for non-opted-in targets (see `rax_epoch_active`).
     #[cfg(debug_assertions)]
     pub(crate) scanned_len: usize,
+    /// DEBUG-ONLY: the most recent complete line carrying an unclassified
+    /// mnemonic, recorded by `debug_scan_tail` at the point of classification
+    /// where the line text is at hand. STREAM-scoped by design: a diagnostic
+    /// about this stream's lines belongs to this stream, and the thread-local
+    /// this field replaces was hidden global state — its only test was
+    /// order-independent by luck (every read followed a same-test write), and
+    /// any future read-first test would inherit whatever the previous test on
+    /// the reused thread left behind. Surfaced through the acc-epoch
+    /// assertion's "last unclassified emitted line" context.
+    #[cfg(debug_assertions)]
+    pub(crate) last_unclassified: Option<String>,
+    /// DEBUG-ONLY: every mnemonic this stream's lines carried that the
+    /// analyzer met outside the explicit tables, deduplicated in encounter
+    /// order. Surfaced through the acc-epoch assertion message so the first
+    /// thing a triager reads is the vocabulary to audit into a table — the
+    /// list the assert's "extend the analyzer tables" instruction names but
+    /// which, before this field, was written to a never-read thread-local
+    /// and never printed anywhere.
+    #[cfg(debug_assertions)]
+    pub(crate) unclassified_mnemonics: Vec<String>,
 }
 
 /// Write an i64 directly into a String buffer using manual digit extraction.
@@ -1267,15 +1287,31 @@ fn mnemonic_base(token: &str) -> &str {
 
 /// Does this AT&T-syntax assembly line write any part of %rax?
 ///
-/// Classifies the line vocabulary the backends emit. An UNKNOWN mnemonic
-/// carrying operands is treated as a write (fail-loud): a false "write"
-/// only risks a debug assertion naming the line for the table, while a
-/// missed write would silently defeat the validator. Labels (trailing
-/// `:`), assembler directives (leading `.`) and empty lines are ignored.
-pub(crate) fn asm_line_writes_rax(line: &str) -> bool {
+/// Classifies one line for the %rax shadow-epoch analyzer: does the line
+/// write any part of the %rax family, and — when the write is answered by
+/// the generic dest-last rule with a rax-shaped destination — which
+/// mnemonic token carried it (the analyzer's only per-line record of
+/// having used its fallback rule rather than an explicit table).
+///
+/// The classifier is PURE: it never mutates diagnostic state. An UNKNOWN
+/// mnemonic carrying operands is treated as a write (fail-loud): a false
+/// "write" only risks a debug assertion naming the line for the table,
+/// while a missed write would silently defeat the validator. Labels
+/// (trailing `:`), assembler directives (leading `.`) and empty lines are
+/// ignored.
+///
+/// The `(writes_rax, unclassified_mnemonic)` pair is what the caller —
+/// `AsmOutput::debug_scan_tail`, the only production caller — records INTO
+/// THE OUTPUT STREAM it is scanning. Stream-scoped, not thread-scoped:
+/// diagnostics about a stream's lines belong to the stream, and a
+/// thread-local record was the one remaining piece of hidden global state
+/// in the analyzer (its test could only be order-independent because every
+/// read happened to follow a same-test write; any future read-first test
+/// would inherit whatever the previous test on the reused thread left).
+fn classify_rax_line(line: &str) -> (bool, Option<String>) {
     let line = line.trim_start();
     if line.is_empty() || line.ends_with(':') || line.starts_with('.') {
-        return false;
+        return (false, None);
     }
     let mut rest = line;
     // Prefix chain: lock/rep/segment/bnd hints precede the real mnemonic.
@@ -1289,7 +1325,7 @@ pub(crate) fn asm_line_writes_rax(line: &str) -> bool {
             | "xacquire" | "xrelease" | "cs" | "ds" | "es" | "ss" => {
                 rest = rest[end..].trim_start();
                 if rest.is_empty() {
-                    return false;
+                    return (false, None);
                 }
             }
             _ => break,
@@ -1303,40 +1339,43 @@ pub(crate) fn asm_line_writes_rax(line: &str) -> bool {
     let base = mnemonic_base(token);
 
     if IMPLICIT_RAX_WRITES.contains(&token) || IMPLICIT_RAX_WRITES.contains(&base) {
-        return true;
+        return (true, None);
     }
     if NEVER_RAX_WRITES.contains(&token) || NEVER_RAX_WRITES.contains(&base) {
-        return false;
+        return (false, None);
     }
     // Jump family (ja/jb/jmp/jcc/jecxz/loop*/...): control transfer only.
     if base.starts_with('j') {
-        return false;
+        return (false, None);
     }
     // x87 operates on st(0)/memory and never touches GP registers (fstsw is
     // answered by the implicit table above); prefetch streams to memory.
     if base.starts_with('f') || base.starts_with("prefetch") || base == "bt" {
-        return false;
+        return (false, None);
     }
     if BOTH_OPERAND_WRITES.contains(&token) || BOTH_OPERAND_WRITES.contains(&base) {
         let ops = split_operands_top_level(operands_part);
-        return ops.iter().any(|o| operand_references_rax(o));
+        return (ops.iter().any(|o| operand_references_rax(o)), None);
     }
     if LAST_TWO_WRITES.contains(&token) || LAST_TWO_WRITES.contains(&base) {
         let ops = split_operands_top_level(operands_part);
-        return ops.len() >= 2 && ops[ops.len() - 2..].iter().any(|o| pure_rax_reg(o));
+        return (
+            ops.len() >= 2 && ops[ops.len() - 2..].iter().any(|o| pure_rax_reg(o)),
+            None,
+        );
     }
     // imul's one-operand form multiplies INTO rax:rdx; its two/three-operand
     // forms write only the explicit destination (handled by the generic rule).
     if (token == "imul" || base == "imul") && !operands_part.is_empty() {
         let ops = split_operands_top_level(operands_part);
         if ops.len() == 1 {
-            return true;
+            return (true, None);
         }
     }
     if operands_part.is_empty() {
         // Zero-operand instruction outside every table (vzeroupper, wait,
         // fchs, ...): none of the emitted vocabulary writes %rax.
-        return false;
+        return (false, None);
     }
     // Generic AT&T rule: the destination is the LAST operand, and a write
     // to %rax happens exactly when that operand is a pure %rax-family
@@ -1370,37 +1409,18 @@ pub(crate) fn asm_line_writes_rax(line: &str) -> bool {
                 || base.starts_with("prefetch")
                 || base == "bt"
                 || base == "imul";
-            if !known {
-                UNCLASSIFIED_MNEMONICS.with(|c| {
-                    let mut c = c.borrow_mut();
-                    if !c.iter().any(|m| m == token) {
-                        c.push(token.to_string());
-                    }
-                });
-                LAST_UNCLASSIFIED_LINE.with(|c| {
-                    *c.borrow_mut() = Some(line.to_string());
-                });
-            }
-            true
+            (true, (!known).then(|| token.to_string()))
         }
-        _ => false,
+        _ => (false, None),
     }
 }
 
-thread_local! {
-    /// Mnemonics the analyzer met but could not classify. Debug builds
-    /// surface this list through the acc-epoch assertion message so the
-    /// table can be extended; release builds never touch it.
-    static UNCLASSIFIED_MNEMONICS: std::cell::RefCell<Vec<String>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-    /// The most recent full line carrying an unclassified mnemonic, for the
-    /// acc-epoch assertion's "last unclassified emitted line" context. The
-    /// AsmOutput field of the same name was declared but never written (the
-    /// assert message therefore always printed None); this thread-local is
-    /// the actual source, recorded at the point of classification where the
-    /// line text is at hand.
-    static LAST_UNCLASSIFIED_LINE: std::cell::RefCell<Option<String>> =
-        const { std::cell::RefCell::new(None) };
+/// Pure classification predicate over one emitted line (see
+/// [`classify_rax_line`] for the full contract). Tests assert through this
+/// thin wrapper; production records through `debug_scan_tail`, which owns
+/// the diagnostics the old thread-local write side effect produced.
+pub(crate) fn asm_line_writes_rax(line: &str) -> bool {
+    classify_rax_line(line).0
 }
 
 impl AsmOutput {
@@ -1416,6 +1436,10 @@ impl AsmOutput {
             rax_epoch_active: false,
             #[cfg(debug_assertions)]
             scanned_len: 0,
+            #[cfg(debug_assertions)]
+            last_unclassified: None,
+            #[cfg(debug_assertions)]
+            unclassified_mnemonics: Vec::new(),
         }
     }
 
@@ -1456,8 +1480,20 @@ impl AsmOutput {
             let mut end = start;
             for line in self.buf[start..].split_inclusive('\n') {
                 if let Some(complete) = line.strip_suffix('\n') {
-                    if asm_line_writes_rax(complete) {
+                    // Stream-scoped diagnostics: the classifier is pure; the
+                    // record lives ON the stream it describes. The trimmed
+                    // form matches the assertion message's convention (no
+                    // indentation noise), and the vocabulary list dedups so
+                    // the message names each new mnemonic exactly once.
+                    let (writes_rax, unclassified) = classify_rax_line(complete);
+                    if writes_rax {
                         writes += 1;
+                    }
+                    if let Some(token) = unclassified {
+                        self.last_unclassified = Some(complete.trim_start().to_string());
+                        if !self.unclassified_mnemonics.iter().any(|m| m == &token) {
+                            self.unclassified_mnemonics.push(token);
+                        }
                     }
                     end += line.len();
                 }
@@ -1514,20 +1550,37 @@ impl AsmOutput {
         }
     }
 
-    /// DEBUG-ONLY: the most recent unclassified line, for diagnostics.
-    /// Sourced from the classifier's thread-local record: the
-    /// `last_unclassified` field this used to read was declared but never
-    /// written, so the assertion's context always printed None. Owned
-    /// return: the thread-local borrow cannot outlive `with`.
+    /// DEBUG-ONLY: this stream's most recent unclassified line, for the
+    /// acc-epoch assertion's context. Stream-scoped: recorded by
+    /// `debug_scan_tail` into `last_unclassified` — the thread-local this
+    /// used to read was hidden global state whose value depended on which
+    /// tests had run before on the same reused thread, and the AsmOutput
+    /// field before THAT was declared but never written (the assertion's
+    /// context always printed None).
     #[inline]
     pub(crate) fn debug_last_unclassified(&self) -> Option<String> {
         #[cfg(debug_assertions)]
         {
-            LAST_UNCLASSIFIED_LINE.with(|c| c.borrow().clone())
+            self.last_unclassified.clone()
         }
         #[cfg(not(debug_assertions))]
         {
             None
+        }
+    }
+
+    /// DEBUG-ONLY: this stream's deduplicated vocabulary of unclassified
+    /// mnemonics, for the acc-epoch assertion's "extend the analyzer tables"
+    /// instruction. Empty in release builds (the assert is compiled out too).
+    #[inline]
+    pub(crate) fn debug_unclassified_mnemonics(&self) -> &[String] {
+        #[cfg(debug_assertions)]
+        {
+            &self.unclassified_mnemonics
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            &[]
         }
     }
 
@@ -3759,33 +3812,59 @@ mod rax_epoch_sink_coverage_tests {
         out.debug_assert_fully_scanned();
     }
 
-    /// The classifier records the full line text for an unknown mnemonic
-    /// with a rax-shaped destination, and `debug_last_unclassified`
-    /// surfaces it (the previously-dead diagnostic now carries data).
+    /// The classifier reports unknown mnemonics with a rax-shaped
+    /// destination through the pure `(writes, unclassified)` pair, and a
+    /// scan records them ONTO THE STREAM: `debug_last_unclassified` names
+    /// the trimmed line, `debug_unclassified_mnemonics` dedups the
+    /// vocabulary — the data the acc-epoch assertion prints (line first,
+    /// then the vocabulary to audit into a table).
+    ///
+    /// Stream-scoped by construction: every observation is driven through
+    /// this test's own `AsmOutput`, so the result cannot depend on which
+    /// tests ran before on the same reused thread (the old thread-local
+    /// record's reads were order-safe only because every read happened to
+    /// follow a same-test write).
     #[test]
-    fn unknown_mnemonic_line_is_recorded_for_diagnostics() {
+    fn unknown_mnemonic_line_is_recorded_on_the_stream() {
         // NB: the probe must avoid the f- prefix (x87 quiet rule) and j-
         // prefix (jump family) — any other unknown token is fail-loud.
         assert!(asm_line_writes_rax("    zbork %rax"));
-        let recorded = AsmOutput::new().debug_last_unclassified();
-        assert_eq!(
-            recorded.as_deref(),
-            // The classifier trims leading indentation before analysis and
-            // records the trimmed form (no indentation noise in diagnostics).
-            Some("zbork %rax"),
-            "the assertion's last-line context must name the actual line"
-        );
         assert!(!asm_line_writes_rax("    zbork %rbx"));
-        // The record holds the most recent line classified through the
-        // generic dest-last rule whose token is outside the explicit
-        // tables — by design, since that rule is what covers the regular
-        // vocabulary (mov/add/...), and a NEW vocabulary member appearing
-        // here is the signal to audit it into a table.
-        assert!(asm_line_writes_rax("    movq %rbx, %rax"));
+        // A fresh stream records nothing: the diagnostic is per-stream
+        // state, not a global a previous test could have left set.
+        let mut out = AsmOutput::new();
+        out.rax_epoch_active = true;
+        assert_eq!(out.debug_last_unclassified(), None);
+        assert!(out.debug_unclassified_mnemonics().is_empty());
+        // Two lines through the real emit path: both hit the generic
+        // dest-last rule with out-of-table mnemonics, so both are recorded
+        // (line: most recent wins; vocabulary: deduplicated, order kept).
+        out.emit("    zbork %rax");
+        out.emit("    movq %rbx, %rax");
+        out.debug_assert_fully_scanned();
         assert_eq!(
-            AsmOutput::new().debug_last_unclassified().as_deref(),
+            out.debug_last_unclassified().as_deref(),
+            // The record holds the trimmed form (no indentation noise).
             Some("movq %rbx, %rax"),
             "the most recent generic-rule line is what the assertion names"
         );
+        assert_eq!(
+            out.debug_unclassified_mnemonics(),
+            // `mov`/`movq` sit outside the explicit tables by design — that
+            // rule is what covers the regular vocabulary (mov/add/...), and
+            // a NEW vocabulary member appearing here is the signal to audit
+            // it into a table.
+            &["zbork".to_string(), "movq".to_string()],
+            "the assertion names the vocabulary to audit, once per mnemonic"
+        );
+        // A table-covered line (cmp: NEVER_RAX_WRITES) leaves both records
+        // untouched — the records only carry generic-rule verdicts.
+        out.emit("    cmpq %rbx, %rax");
+        out.debug_assert_fully_scanned();
+        assert_eq!(
+            out.debug_last_unclassified().as_deref(),
+            Some("movq %rbx, %rax")
+        );
+        assert_eq!(out.debug_unclassified_mnemonics().len(), 2);
     }
 }

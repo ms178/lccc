@@ -8682,6 +8682,75 @@ impl ArchCodegen for X86Codegen {
         std::env::var_os("CCC_NO_X64_SIB").is_none()
     }
 
+    /// x86-64 mirror of `emit_load_indexed_common`/`emit_store_indexed_common`'s
+    /// acceptance conditions, consulted by `can_indexed_addr_fold` BEFORE the
+    /// GEP's emission is skipped and its offset chain declared dead.
+    ///
+    /// The trait default accepts every non-128-bit type — true for this
+    /// backend's SCALAR emitters, but the INDEXED emitters answer the FP
+    /// family only with their SSE arms, and until the contract audit those
+    /// two arms were the sole `F32|F64`-only outliers in memory.rs (every
+    /// non-indexed fast path has grouped F64|F32|D64|D32 since 1fdb401a).
+    /// A deciding-side "yes" the emitter later refuses rematerialises the
+    /// folded GEP at the access site — reading an offset chain the
+    /// dead-producer walk already skipped, i.e. a never-written home: the
+    /// exact failure the trait's soundness contract forbids. This override
+    /// mirrors the emitters' type arms exactly and is deliberately STRICTER
+    /// where the emitter's refusal is state-dependent:
+    ///
+    /// * `shift <= 3` mirrors the emitters' defensive guard (`resolve_index`
+    ///   already caps the SIB scale at the map build; the mirror costs one
+    ///   compare and keeps the override self-contained).
+    /// * Store-fed folds stage the stored VALUE through %rax
+    ///   (`operand_to_rax`) or the xmm0 shuttle, whose private scratch set
+    ///   is {%rdx, %r11} — the same set `const_offset_fold_reg_base_ok`
+    ///   excludes. %rax/%rcx are not allocatable homes at all, so the only
+    ///   reachable conflict is a %rdx/%r11-homed SIB base or index; those
+    ///   folds are refused. A frame-anchored alloca base and the sym form
+    ///   are staging-immune by construction (the SIB reads %rbp/%rsp or a
+    ///   rebuilt %rcx, never a staged value register). As with i686's
+    ///   mirror: strictness beyond the emitter's own needs costs only a
+    ///   redundant address materialisation, while the reverse disagreement
+    ///   reads expired homes.
+    fn indexed_fold_ok(&self, info: &crate::backend::generation::IndexedGepInfo) -> bool {
+        if info.shift > 3 {
+            return false;
+        }
+        let scalar_ok = info.access_tys.iter().all(|t| {
+            matches!(
+                t,
+                IrType::F64
+                    | IrType::F32
+                    | IrType::D64
+                    | IrType::D32
+                    | IrType::I8
+                    | IrType::U8
+                    | IrType::I16
+                    | IrType::U16
+                    | IrType::I32
+                    | IrType::U32
+                    | IrType::I64
+                    | IrType::U64
+                    | IrType::Ptr
+            )
+        });
+        if !scalar_ok || !info.feeds_store {
+            return scalar_ok;
+        }
+        // Store-fed folds: the SIB address registers must survive value
+        // staging (the const-offset fold's scratch law, mirrored).
+        let stage_safe = |v: u32| -> bool {
+            match self.reg_assignments.get(&v) {
+                Some(&phys) => !is_xmm_reg(phys) && !matches!(phys.0, 10 | 16),
+                // No register home: a frame-anchored slot or the sym form,
+                // both staging-immune (the emitter re-derives the address
+                // from %rbp/%rsp or the reserved address scratch).
+                None => true,
+            }
+        };
+        stage_safe(info.index.0) && stage_safe(info.base.0)
+    }
+
     fn const_offset_fold_reg_base_ok(&self, base: &Value) -> bool {
         // Register-base const-offset folds consume the base at the Load/Store
         // position (RA-invisible): sound only with the folded-base liveness
