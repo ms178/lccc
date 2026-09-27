@@ -146,6 +146,10 @@ thread_local! {
     // for every translation unit, so early and main map entries agree without
     // reading the process environment for every function.
     static NO_MAP_VEC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // The focused I64/U64 unroll kill switch is also a per-translation-unit
+    // policy bit.  Keeping it beside the map switch avoids an environment
+    // lookup in every candidate loop and makes the early/main entries agree.
+    static NO_MAP_I64_UNROLL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub(crate) fn set_x86_map_i64_available(available: bool) {
@@ -160,8 +164,16 @@ pub(crate) fn set_no_map_vec(disabled: bool) {
     NO_MAP_VEC.with(|cell| cell.set(disabled));
 }
 
+pub(crate) fn set_no_map_i64_unroll(disabled: bool) {
+    NO_MAP_I64_UNROLL.with(|cell| cell.set(disabled));
+}
+
 fn no_map_vec() -> bool {
     NO_MAP_VEC.with(|cell| cell.get())
+}
+
+fn no_map_i64_unroll() -> bool {
+    NO_MAP_I64_UNROLL.with(|cell| cell.get())
 }
 
 /// Record the x86 SIMD ISA profile for the current translation unit.
@@ -4157,6 +4169,27 @@ impl MapExpr {
             MapExpr::Fma { l, r, a, .. } => 1 + l.node_count() + r.node_count() + a.node_count(),
         }
     }
+
+    /// Estimate the work repeated for each unrolled copy of the map body.
+    ///
+    /// Invariants are broadcast once in the preheader and reused through
+    /// `MapEmitCtx::broadcast_cache`; charging them here made an expression
+    /// such as `(x[i] + y[i]) + k` look more expensive than the work that is
+    /// actually copied.  Keep `node_count` as the syntax/compile-time budget
+    /// metric and use this separate metric only for the I64/U64 unroll choice.
+    fn unroll_cost(&self) -> usize {
+        match self {
+            MapExpr::Load(_) => 1,
+            MapExpr::Invariant(_) => 0,
+            MapExpr::BinOp(_, l, r) => 1 + l.unroll_cost() + r.unroll_cost(),
+            MapExpr::Sqrt(x) => 1 + x.unroll_cost(),
+            MapExpr::Cmp(_, l, r) => 1 + l.unroll_cost() + r.unroll_cost(),
+            MapExpr::Select(c, t, f) => 1 + c.unroll_cost() + t.unroll_cost() + f.unroll_cost(),
+            MapExpr::MinMax { l, r, .. } => 1 + l.unroll_cost() + r.unroll_cost(),
+            MapExpr::MaskConj { l, r, .. } => 1 + l.unroll_cost() + r.unroll_cost(),
+            MapExpr::Fma { l, r, a, .. } => 1 + l.unroll_cost() + r.unroll_cost() + a.unroll_cost(),
+        }
+    }
 }
 
 /// Emission context for the elementwise map tree (OP-05a). Owns the fresh
@@ -6337,12 +6370,10 @@ fn analyze_map_pattern(
         return None;
     }
 
-    // Constant trip counts of 4 or fewer are better left scalar.
+    // Tiny loops are handled by complete unrolling followed by SLP. Keep
+    // this existing profitability boundary separate from map unroll policy.
     if let Operand::Const(c) = &limit {
         if c.to_i64().is_some_and(|n| n <= 4) {
-            if debug {
-                eprintln!("[VEC-MAP] BAIL: const trip <= 4");
-            }
             return None;
         }
     }
@@ -21707,6 +21738,56 @@ fn const_of(e: &MapExpr) -> Option<i64> {
     }
 }
 
+/// Shrink by powers of two so the count-division shift remains exact.
+fn map_constant_unroll(width: u64, mut unroll: u64, count: u64) -> u64 {
+    while unroll > 1
+        && (count <= width * unroll || (count <= 16 && count % (width * unroll) >= width))
+    {
+        unroll >>= 1;
+    }
+    unroll
+}
+
+#[cfg(test)]
+mod map_unroll_policy_tests {
+    use super::*;
+
+    #[test]
+    fn constant_trips_preserve_packed_work_and_small_tails() {
+        for count in 0..=259 {
+            let unroll = map_constant_unroll(2, 4, count);
+            assert!(matches!(unroll, 1 | 2 | 4));
+            if count > 2 {
+                assert!(2 * unroll < count);
+            }
+            if count <= 16 {
+                assert!(count % (2 * unroll) < 2);
+            }
+        }
+        assert_eq!(map_constant_unroll(2, 4, 1024), 4);
+        assert_eq!(map_constant_unroll(2, 4, 15), 1);
+        assert_eq!(map_constant_unroll(2, 4, 9), 4);
+    }
+
+    #[test]
+    fn invariant_cost_is_separate_from_tree_budget() {
+        let k = MapExpr::Invariant(Operand::Value(Value(42)));
+        let expr = MapExpr::BinOp(IrBinOp::Sub, Box::new(MapExpr::Load(0)), Box::new(k));
+        assert_eq!(expr.node_count(), 3);
+        assert_eq!(expr.unroll_cost(), 2);
+    }
+
+    #[test]
+    fn unroll_policy_refreshes_on_the_same_worker() {
+        let previous = no_map_i64_unroll();
+        set_no_map_i64_unroll(true);
+        assert!(no_map_i64_unroll());
+        set_no_map_i64_unroll(false);
+        assert!(!no_map_i64_unroll());
+        set_no_map_i64_unroll(previous);
+    }
+}
+
 fn transform_map_vector(
     func: &mut IrFunction,
     pattern: &MapPattern,
@@ -21734,17 +21815,35 @@ fn transform_map_vector(
     // environment kill switch is intentionally scoped to this I64/U64
     // unroll decision so A/B runs can separate unroll benefit from the
     // underlying two-lane vectorization.
-    let vector_unroll: u64 = if std::env::var_os("CCC_NO_MAP_I64_UNROLL").is_some() {
-        1
-    } else if matches!(pattern.elem_ty, IrType::I64 | IrType::U64) {
-        match pattern.expr.node_count() {
-            0..=3 => 4,
-            4..=8 => 2,
-            _ => 1,
+    // The focused unroll is x86-only: AArch64's NEON lowering is currently
+    // one packed operation per counted iteration, and its displacement/offset
+    // handling is intentionally kept out of this policy.  Check the element
+    // type before consulting the kill switch so CCC_NO_MAP_I64_UNROLL cannot
+    // affect unrelated map families.
+    let is_i64_map = matches!(pattern.elem_ty, IrType::I64 | IrType::U64);
+    let mut vector_unroll: u64 = if !neon && is_i64_map {
+        if no_map_i64_unroll() {
+            1
+        } else {
+            match pattern.expr.unroll_cost() {
+                0..=3 => 4,
+                4..=8 => 2,
+                _ => 1,
+            }
         }
     } else {
         1
     };
+
+    // Keep a useful packed body for fixed trips. For the tiny-loop window,
+    // also avoid buying fewer vector iterations with several scalar tails.
+    // Only the unroll choice changes: remainder and alias-guard construction
+    // continue to consume the same packed_width contract.
+    if let Operand::Const(c) = &pattern.limit {
+        if let Some(n) = c.to_i64().filter(|n| *n > 0) {
+            vector_unroll = map_constant_unroll(vec_width, vector_unroll, n as u64);
+        }
+    }
     let packed_width = vec_width
         .checked_mul(vector_unroll)
         .expect("map packed width must fit in u64");
