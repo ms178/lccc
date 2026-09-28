@@ -324,6 +324,86 @@ pub fn compute_dominators(num_blocks: usize, preds: &FlatAdj, succs: &FlatAdj) -
     idom
 }
 
+// ── Dominance frontiers ───────────────────────────────────────────────────────
+
+/// Compute dominance frontiers for each block.
+/// DF(b) = set of blocks where b's dominance ends (join points).
+pub fn compute_dominance_frontiers(
+    num_blocks: usize,
+    preds: &FlatAdj,
+    idom: &[usize],
+) -> Vec<FxHashSet<usize>> {
+    let mut df = vec![FxHashSet::default(); num_blocks];
+
+    for b in 0..num_blocks {
+        if preds.len(b) < 2 {
+            continue;
+        }
+        for &p in preds.row(b) {
+            let mut runner = p as usize;
+            while runner != idom[b] && runner != usize::MAX {
+                df[runner].insert(b);
+                if runner == idom[runner] {
+                    break;
+                }
+                runner = idom[runner];
+            }
+        }
+    }
+
+    df
+}
+
+// ── Dominator tree ────────────────────────────────────────────────────────────
+
+/// Build dominator tree children lists from idom array.
+/// children[b] lists block indices whose immediate dominator is b.
+pub fn build_dom_tree_children(num_blocks: usize, idom: &[usize]) -> Vec<Vec<usize>> {
+    let mut children = vec![Vec::new(); num_blocks];
+    for b in 1..num_blocks {
+        if idom[b] != usize::MAX && idom[b] != b {
+            children[idom[b]].push(b);
+        }
+    }
+    children
+}
+
+// ── Cached analysis bundle ──────────────────────────────────────────────────
+
+/// Pre-computed CFG analysis results shared across multiple passes within
+/// a single pipeline iteration.
+///
+/// GVN, LICM, and IVSR all need the same CFG, dominator, and loop analysis.
+/// Since GVN does not modify the CFG (it only replaces instruction operands),
+/// these results remain valid across all three passes. Computing them once
+/// and sharing avoids redundant `build_cfg` + `compute_dominators` +
+/// `find_natural_loops` calls per function per iteration.
+pub struct CfgAnalysis {
+    pub preds: FlatAdj,
+    pub succs: FlatAdj,
+    pub idom: Vec<usize>,
+    pub dom_children: Vec<Vec<usize>>,
+    pub num_blocks: usize,
+}
+
+impl CfgAnalysis {
+    /// Build a complete CFG analysis bundle for a function.
+    pub fn build(func: &IrFunction) -> Self {
+        let num_blocks = func.blocks.len();
+        let label_to_idx = build_label_map(func);
+        let (preds, succs) = build_cfg(func, &label_to_idx);
+        let idom = compute_dominators(num_blocks, &preds, &succs);
+        let dom_children = build_dom_tree_children(num_blocks, &idom);
+        CfgAnalysis {
+            preds,
+            succs,
+            idom,
+            dom_children,
+            num_blocks,
+        }
+    }
+}
+
 /// Cooper-Harvey-Kennedy iterative dominators: the former implementation,
 /// kept as an independent oracle for [`compute_dominators`].
 #[cfg(test)]
@@ -484,86 +564,6 @@ mod dominator_tests {
             }
             let (snca, chk) = both(&succs);
             assert_eq!(snca, chk, "succs = {succs:?}");
-        }
-    }
-}
-
-// ── Dominance frontiers ───────────────────────────────────────────────────────
-
-/// Compute dominance frontiers for each block.
-/// DF(b) = set of blocks where b's dominance ends (join points).
-pub fn compute_dominance_frontiers(
-    num_blocks: usize,
-    preds: &FlatAdj,
-    idom: &[usize],
-) -> Vec<FxHashSet<usize>> {
-    let mut df = vec![FxHashSet::default(); num_blocks];
-
-    for b in 0..num_blocks {
-        if preds.len(b) < 2 {
-            continue;
-        }
-        for &p in preds.row(b) {
-            let mut runner = p as usize;
-            while runner != idom[b] && runner != usize::MAX {
-                df[runner].insert(b);
-                if runner == idom[runner] {
-                    break;
-                }
-                runner = idom[runner];
-            }
-        }
-    }
-
-    df
-}
-
-// ── Dominator tree ────────────────────────────────────────────────────────────
-
-/// Build dominator tree children lists from idom array.
-/// children[b] lists block indices whose immediate dominator is b.
-pub fn build_dom_tree_children(num_blocks: usize, idom: &[usize]) -> Vec<Vec<usize>> {
-    let mut children = vec![Vec::new(); num_blocks];
-    for b in 1..num_blocks {
-        if idom[b] != usize::MAX && idom[b] != b {
-            children[idom[b]].push(b);
-        }
-    }
-    children
-}
-
-// ── Cached analysis bundle ──────────────────────────────────────────────────
-
-/// Pre-computed CFG analysis results shared across multiple passes within
-/// a single pipeline iteration.
-///
-/// GVN, LICM, and IVSR all need the same CFG, dominator, and loop analysis.
-/// Since GVN does not modify the CFG (it only replaces instruction operands),
-/// these results remain valid across all three passes. Computing them once
-/// and sharing avoids redundant `build_cfg` + `compute_dominators` +
-/// `find_natural_loops` calls per function per iteration.
-pub struct CfgAnalysis {
-    pub preds: FlatAdj,
-    pub succs: FlatAdj,
-    pub idom: Vec<usize>,
-    pub dom_children: Vec<Vec<usize>>,
-    pub num_blocks: usize,
-}
-
-impl CfgAnalysis {
-    /// Build a complete CFG analysis bundle for a function.
-    pub fn build(func: &IrFunction) -> Self {
-        let num_blocks = func.blocks.len();
-        let label_to_idx = build_label_map(func);
-        let (preds, succs) = build_cfg(func, &label_to_idx);
-        let idom = compute_dominators(num_blocks, &preds, &succs);
-        let dom_children = build_dom_tree_children(num_blocks, &idom);
-        CfgAnalysis {
-            preds,
-            succs,
-            idom,
-            dom_children,
-            num_blocks,
         }
     }
 }
