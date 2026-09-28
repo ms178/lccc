@@ -1191,7 +1191,10 @@ pub(super) fn emit_shared_library_32(
                         match data.get_mut(off..off + n) {
                             Some(f) => f.copy_from_slice(&bytes[..n]),
                             None => {
-                                return Err(format!("{}: relocation outside section", obj.filename));
+                                return Err(format!(
+                                    "{}: relocation outside section",
+                                    obj.filename
+                                ));
                             }
                         }
                         None
