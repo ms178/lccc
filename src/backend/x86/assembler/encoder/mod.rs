@@ -15,8 +15,7 @@ mod x87_misc;
 mod xop;
 
 pub(crate) use gp_integer::{
-    addr_hint_is32, check_monitor_hint, has_reg_operand, is_explicit_string_op,
-    monitor_hint_needs_addr32, string_op_size,
+    addr_hint_is32, check_monitor_family, has_reg_operand, is_explicit_string_op, string_op_size,
 };
 pub(crate) use registers::*;
 
@@ -53,6 +52,10 @@ pub const R_X86_64_PC64: u32 = 24;
 #[expect(dead_code)] // ELF standard constant, defined for reference/future use
 pub const R_X86_64_GOT32: u32 = 3;
 pub const R_X86_64_PLT32: u32 = 4;
+/// 16-bit PC-relative (S + A - P, 2-byte patch). The `data16` branch law
+/// (GAS 2.47: `data16 jmp foo` = 66 e9 0000 + R_X86_64_PC16) and the
+/// linker's own patch table (linker/elf.rs, same number 13) agree.
+pub const R_X86_64_PC16: u32 = 13;
 /// 8-bit absolute (S + A, 1-byte patch; x86-64 psABI type 14). GAS emits
 /// this for the 8-bit symbol-immediate forms (`add $sym,%al` = `04 00`
 /// with R_X86_64_8, `addb $sym,(%rax)` likewise).
@@ -146,6 +149,13 @@ pub struct InstructionEncoder {
     /// Memory forms ignore it (the direction is fixed by which side is
     /// memory), and every non-direction instruction ignores it too.
     s_flip: bool,
+    /// The `data16` prefix word (x86-64): besides the central 0x66 splice
+    /// it shrinks direct branch displacements to rel16 with the 16-bit
+    /// PC-relative relocation class (GAS 2.47: `data16 jmp foo` = 66 e9
+    /// 0000 + R_X86_64_PC16, `data16 je foo` = 66 0f 84 0000 + PC16,
+    /// `data16 call foo` = 66 e8 0000 + PC16; with @PLT GAS rejects with
+    /// "4-byte relocation cannot be applied to 2-byte field").
+    explicit_data16: bool,
     /// APX `{evex}`: force the map-4 EVEX encoding of a legacy insn.
     apx_evex: bool,
     /// Select a VEX/XOP row, including `{vex3}`'s forced C4 prefix.
@@ -738,6 +748,7 @@ impl InstructionEncoder {
             memory_emission: None,
             apx_nf: false,
             s_flip: false,
+            explicit_data16: false,
             apx_evex: false,
             vex_hint: None,
             apx_rex2: false,
@@ -885,7 +896,7 @@ impl InstructionEncoder {
         // OR-merge with the body's REX (`rex.x mov %r8d,%ebx` =
         // `46 89 c3`); the `.y/.xy/.z` spellings do not exist.
         let mut explicit_addr32 = false;
-        let mut explicit_data16 = false;
+        self.explicit_data16 = false;
         let mut rex_floor: u8 = 0;
         for p in &instr.prefixes {
             match p.as_str() {
@@ -897,10 +908,10 @@ impl InstructionEncoder {
                     explicit_addr32 = true;
                 }
                 "data16" => {
-                    if explicit_data16 {
+                    if self.explicit_data16 {
                         return Err("same type of prefix used twice".to_string());
                     }
-                    explicit_data16 = true;
+                    self.explicit_data16 = true;
                 }
                 "data32" => return Err("`data32' is not supported in 64-bit mode".to_string()),
                 "rex" => rex_floor |= 0x40,
@@ -1357,7 +1368,7 @@ impl InstructionEncoder {
         // 0x66, or a VEX/EVEX body (a legacy 0x66 ahead of VEX/EVEX is
         // ignored or #UD depending on class), is rejected — matching the
         // GAS duplicate-prefix diagnostic.
-        if result.is_ok() && explicit_data16 {
+        if result.is_ok() && self.explicit_data16 {
             let mut at = start_len;
             while at < self.bytes.len()
                 && matches!(
@@ -4270,37 +4281,24 @@ impl InstructionEncoder {
                 if ops.len() != 3 {
                     return Err("operand type mismatch for `monitorx'".to_string());
                 }
-                check_monitor_hint(ops, "monitorx")?;
-                if monitor_hint_needs_addr32(ops) {
+                if check_monitor_family("monitorx", ops)? {
                     self.bytes.push(0x67);
                 }
                 self.bytes.extend_from_slice(&[0x0F, 0x01, 0xFA]);
                 Ok(())
             }
             "mwaitx" => {
-                // GAS 2.47 pins the implicit spellings: only the exact
-                // 32-bit forms (%eax,%ecx,%ebx) are accepted.
-                let is_a = |n: &str| matches!(n, "eax" | "ax" | "al");
-                let is_c = |n: &str| matches!(n, "ecx" | "cx" | "cl");
-                let is_b = |n: &str| matches!(n, "ebx" | "bx" | "bl");
-                let regs: Vec<&str> = ops
-                    .iter()
-                    .filter_map(|op| match op {
-                        Operand::Register(r) => Some(r.name.as_str()),
-                        _ => None,
-                    })
-                    .collect();
+                // Bare spelling first (GAS: `mwaitx` = 0f01fb); the
+                // explicit form is the monitor_family law: slots
+                // (eax|rax, ecx|rcx, ebx|rbx) in ONE width class, never a
+                // 0x67 (GAS 2.47: `mwaitx %eax,%ecx,%ebx` = 0f 01 fb,
+                // `mwaitx %rax,%rcx,%rbx` = 0f 01 fb, `mwaitx %ax,%cx,%bx`
+                // and `mwaitx %eax,%ecx,%edx` rejected).
                 if ops.is_empty() {
-                    // Bare spelling (GAS: `mwaitx` = 0f01fb).
                     self.bytes.extend_from_slice(&[0x0F, 0x01, 0xFB]);
                     return Ok(());
                 }
-                if ops.len() != 3
-                    || regs.len() != 3
-                    || !(is_a(regs[0]) && is_c(regs[1]) && is_b(regs[2]))
-                {
-                    return Err("register type mismatch for `mwaitx'".to_string());
-                }
+                check_monitor_family("mwaitx", ops)?;
                 self.bytes.extend_from_slice(&[0x0F, 0x01, 0xFB]);
                 Ok(())
             }
@@ -4416,38 +4414,26 @@ impl InstructionEncoder {
                 if ops.len() != 3 {
                     return Err("operand type mismatch for `monitor'".to_string());
                 }
-                check_monitor_hint(ops, "monitor")?;
-                if monitor_hint_needs_addr32(ops) {
+                if check_monitor_family("monitor", ops)? {
                     self.bytes.push(0x67);
                 }
                 self.bytes.extend_from_slice(&[0x0F, 0x01, 0xC8]);
                 Ok(())
             }
             "mwait" => {
-                // 0 or exactly (%eax,%ecx): GAS rejects other/shorter
-                // spellings (`mwait %eax`, `mwait %ebx,%ecx`).
+                // 0 or the monitor_family law: slots (eax|rax, ecx|rcx) in
+                // ONE width class (GAS 2.47: `mwait %eax,%ecx` and
+                // `mwait %rax,%rcx` = 0f 01 c9, `mwait %eax,%rcx` and
+                // `mwait %ax,%cx` rejected); never a 0x67.
                 match ops.len() {
                     0 => {
                         self.bytes.extend_from_slice(&[0x0F, 0x01, 0xC9]);
                         Ok(())
                     }
                     2 => {
-                        let names: Vec<&str> = ops
-                            .iter()
-                            .filter_map(|op| match op {
-                                Operand::Register(r) => Some(r.name.as_str()),
-                                _ => None,
-                            })
-                            .collect();
-                        if names.len() == 2
-                            && matches!(names[0], "eax" | "ax" | "al")
-                            && matches!(names[1], "ecx" | "cx" | "cl")
-                        {
-                            self.bytes.extend_from_slice(&[0x0F, 0x01, 0xC9]);
-                            Ok(())
-                        } else {
-                            Err("register type mismatch for `mwait'".to_string())
-                        }
+                        check_monitor_family("mwait", ops)?;
+                        self.bytes.extend_from_slice(&[0x0F, 0x01, 0xC9]);
+                        Ok(())
                     }
                     _ => Err("operand type mismatch for `mwait'".to_string()),
                 }

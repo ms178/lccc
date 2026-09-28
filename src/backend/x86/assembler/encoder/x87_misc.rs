@@ -449,7 +449,7 @@ impl super::InstructionEncoder {
                 // 0x66 here (`mov %ax,%ds' = 8e d8, `movw %ax,%ds' =
                 // 8e d8, `mov %eax,%ds' = 8e d8) — a 0x66 would be a
                 // redundant lengthening.  REX still tracks the r/m-side
-                // GP register (`mov %r8d,%ds' = 41 8e d0), never REX.W.
+                // GP register (`mov %r8d,%ds' = 41 8e d8), never REX.W.
                 let _ = infer(&src.name);
                 self.emit_rex_unary(4, &src.name);
                 self.bytes.push(0x8E);

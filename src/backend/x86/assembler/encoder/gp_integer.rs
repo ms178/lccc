@@ -2716,8 +2716,22 @@ impl super::InstructionEncoder {
                 // R_X86_64_PC32 is rejected by ld for PIE executables calling shared lib functions.
                 self.bytes.push(0xE9);
                 let sym = label.strip_suffix("@PLT").unwrap_or(label.as_str());
-                let reloc_type = R_X86_64_PLT32;
-                self.add_relocation(sym, reloc_type, -4);
+                if label.ends_with("@PLT") && self.explicit_data16 {
+                    // GAS 2.47: `data16 jmp foo@PLT` — "4-byte relocation
+                    // cannot be applied to 2-byte field": the 16-bit
+                    // displacement field cannot carry a PLT32.
+                    return Err("4-byte relocation cannot be applied to 2-byte field".to_string());
+                }
+                if self.explicit_data16 {
+                    // `data16 jmp foo` shrinks the displacement to rel16
+                    // with the 16-bit PC-relative class (GAS 2.47: 66 e9
+                    // 0000 + R_X86_64_PC16 -2). The 0x66 is inserted by
+                    // the central forced-data16 splice, not here.
+                    self.add_relocation(sym, R_X86_64_PC16, -2);
+                    self.bytes.extend_from_slice(&[0, 0]);
+                    return Ok(());
+                }
+                self.add_relocation(sym, R_X86_64_PLT32, -4);
                 self.bytes.extend_from_slice(&[0, 0, 0, 0]);
                 Ok(())
             }
@@ -2758,9 +2772,19 @@ impl super::InstructionEncoder {
                 // Near jcc with 32-bit displacement
                 // Strip @PLT suffix and use PLT32 relocation (matches GCC behavior)
                 self.bytes.extend_from_slice(&[0x0F, 0x80 + cc]);
-                let reloc_type = R_X86_64_PLT32;
                 let sym = label.strip_suffix("@PLT").unwrap_or(label);
-                self.add_relocation(sym, reloc_type, -4);
+                if label.ends_with("@PLT") && self.explicit_data16 {
+                    // GAS 2.47: a 16-bit jcc field cannot carry a PLT32.
+                    return Err("4-byte relocation cannot be applied to 2-byte field".to_string());
+                }
+                if self.explicit_data16 {
+                    // `data16 je foo` = 66 0f 84 0000 + R_X86_64_PC16 -2;
+                    // the 0x66 comes from the central data16 splice.
+                    self.add_relocation(sym, R_X86_64_PC16, -2);
+                    self.bytes.extend_from_slice(&[0, 0]);
+                    return Ok(());
+                }
+                self.add_relocation(sym, R_X86_64_PLT32, -4);
                 self.bytes.extend_from_slice(&[0, 0, 0, 0]);
                 Ok(())
             }
@@ -2777,9 +2801,19 @@ impl super::InstructionEncoder {
             Operand::Label(label) => {
                 self.bytes.push(0xE8);
                 // Use PLT32 for external function calls (linker will resolve)
-                let reloc_type = R_X86_64_PLT32;
                 let sym = label.strip_suffix("@PLT").unwrap_or(label.as_str());
-                self.add_relocation(sym, reloc_type, -4);
+                if label.ends_with("@PLT") && self.explicit_data16 {
+                    // GAS 2.47: a 16-bit call field cannot carry a PLT32.
+                    return Err("4-byte relocation cannot be applied to 2-byte field".to_string());
+                }
+                if self.explicit_data16 {
+                    // `data16 call foo` = 66 e8 0000 + R_X86_64_PC16 -2;
+                    // the 0x66 comes from the central data16 splice.
+                    self.add_relocation(sym, R_X86_64_PC16, -2);
+                    self.bytes.extend_from_slice(&[0, 0]);
+                    return Ok(());
+                }
+                self.add_relocation(sym, R_X86_64_PLT32, -4);
                 self.bytes.extend_from_slice(&[0, 0, 0, 0]);
                 Ok(())
             }
@@ -3276,68 +3310,79 @@ pub(crate) fn addr_hint_is32(ops: &[Operand]) -> bool {
     })
 }
 
-/// GAS 2.47 MONITOR/MONITORX law: the FIRST operand alone is the
-/// address-size hint, and only the canonical 8 GPR spellings are accepted
-/// (EGPR hints are rejected with "operand type mismatch").
-fn monitor_hint_ok(ops: &[Operand]) -> bool {
-    match ops.first() {
-        Some(Operand::Register(r)) => matches!(
-            r.name.to_ascii_lowercase().as_str(),
-            "rax"
-                | "eax"
-                | "ax"
-                | "al"
-                | "rbx"
-                | "ebx"
-                | "bx"
-                | "bl"
-                | "rcx"
-                | "ecx"
-                | "cx"
-                | "cl"
-                | "rdx"
-                | "edx"
-                | "dx"
-                | "dl"
-                | "rsi"
-                | "esi"
-                | "si"
-                | "rdi"
-                | "edi"
-                | "di"
-                | "rbp"
-                | "ebp"
-                | "bp"
-                | "rsp"
-                | "esp"
-                | "sp"
-        ),
-        _ => false,
+/// One MONITOR-family implicit slot: the register NUMBER (0=A, 1=C, 2=D,
+/// 3=B) and the width class (4 or 8) of a 32/64-bit spelling. 16/8-bit
+/// spellings and every other name return `None` — the caller splits them
+/// into GAS's "operand size mismatch" (16/8-bit) vs "operand type
+/// mismatch" (EGPRs, memory, anything else) diagnostics.
+fn monitor_slot(name: &str) -> Option<(u8, u8)> {
+    match name {
+        "rax" => Some((0, 8)),
+        "eax" => Some((0, 4)),
+        "rcx" => Some((1, 8)),
+        "ecx" => Some((1, 4)),
+        "rdx" => Some((2, 8)),
+        "edx" => Some((2, 4)),
+        "rbx" => Some((3, 8)),
+        "ebx" => Some((3, 4)),
+        _ => None,
     }
 }
 
-/// Validate the MONITOR/MONITORX hint spelling (GAS: EGPR hints are
-/// `operand type mismatch`).
-pub(crate) fn check_monitor_hint(ops: &[Operand], mnemonic: &str) -> Result<(), String> {
-    if monitor_hint_ok(ops) {
-        Ok(())
-    } else {
-        Err(format!("operand type mismatch for `{mnemonic}'"))
-    }
-}
-
-/// 0x67 is emitted iff the hint register's width is BELOW the mode default
-/// (64-bit code: `monitor %eax,...' = 67 ..., `monitor %rax,...` = no 67).
-pub(crate) fn monitor_hint_needs_addr32(ops: &[Operand]) -> bool {
-    match ops.first() {
-        Some(Operand::Register(r)) => {
-            let n = r.name.to_ascii_lowercase();
-            matches!(
-                n.as_str(),
-                "eax" | "ebx" | "ecx" | "edx" | "esi" | "edi" | "ebp" | "esp"
-            )
+/// The GAS 2.47 monitor-family law, matrix-probed on 2.47.20260726 over
+/// all width/register combinations of both modes. The implicit register
+/// NUMBERS are fixed per template — monitor/monitorx (0,1,2) = A,C,D;
+/// mwait (0,1) = A,C; mwaitx (0,1,3) = A,C,B — and every operand is a
+/// 32/64-bit spelling of its slot register: a 16/8-bit spelling is
+/// "operand size mismatch", an EGPR or any other register is "operand
+/// type mismatch".
+///
+/// Width classes (the subtle part, all probe-verified):
+///   * monitor/monitorx pin slots 1+2 to ONE width class and leave the
+///     hint free: `monitor %rax,%ecx,%edx` = 0f 01 c8 (no 67!),
+///     `monitor %eax,%rcx,%rdx` = 67 0f 01 c8, `monitor %rax,%ecx,%rdx`
+///     is REJECTED (slots 1+2 mixed widths), `monitor %eax,%ecx,%ebx` is
+///     REJECTED (slot 2 register number).
+///   * mwait/mwaitx pin ALL slots to one width class:
+///     `mwait %eax,%rcx` is "register type mismatch".
+///   * only monitor/monitorx carry the 0x67 address-size law, and it is
+///     driven by the hint spelling alone (`mwaitx %eax,%ecx,%ebx` =
+///     0f 01 fb, never 67).
+///
+/// Returns `Ok(needs_67)`.
+pub(crate) fn check_monitor_family(mnemonic: &str, ops: &[Operand]) -> Result<bool, String> {
+    let type_err = || format!("operand type mismatch for `{mnemonic}'");
+    let size_err = || format!("operand size mismatch for `{mnemonic}'");
+    let regs: Vec<(u8, u8)> = ops
+        .iter()
+        .map(|op| match op {
+            Operand::Register(r) => {
+                let n = r.name.to_ascii_lowercase();
+                match monitor_slot(&n) {
+                    Some(slot) => Ok(slot),
+                    None if matches!(
+                        n.as_str(),
+                        "ax" | "al" | "cx" | "cl" | "dx" | "dl" | "bx" | "bl"
+                    ) =>
+                    {
+                        Err(size_err())
+                    }
+                    None => Err(type_err()),
+                }
+            }
+            _ => Err(type_err()),
+        })
+        .collect::<Result<_, _>>()?;
+    match (mnemonic, regs.as_slice()) {
+        ("monitor" | "monitorx", [(0, w0), (1, w1), (2, w2)]) => {
+            if w1 != w2 {
+                return Err(type_err());
+            }
+            Ok(*w0 == 4)
         }
-        _ => false,
+        ("mwait", [(0, w0), (1, w1)]) if w0 == w1 => Ok(false),
+        ("mwaitx", [(0, w0), (1, w1), (3, w2)]) if w0 == w1 && w1 == w2 => Ok(false),
+        _ => Err(type_err()),
     }
 }
 

@@ -1,0 +1,49 @@
+# The `.s` (swap/store-direction) suffix and the direction-bit families
+# in 32-bit mode: the x86-64 `suffix-s.casefile` runs --64, so every i686
+# s_flip arm needs its own oracle lines. Every expected byte below was
+# GAS 2.47.20260726 --32-probed while wiring the laws; asmdiff re-derives
+# both sides per run.
+;;; alu_s_reg_reg
+.text
+add.s %edx,%ecx
+sub.s %edx,%ecx
+mov.s %eax,%ebx
+test.s %edx,%ecx
+add.s %dl,%cl
+addb.s %dl,%cl
+;;; unary_width
+.text
+# The 1-operand imul/mul/neg width matrix (the imulw regression pin:
+# encode_imul must not push a second 0x66 ahead of encode_unary_rm's).
+imul %ax
+imul %dx
+imulw %dx
+mul %ax
+neg %cx
+;;; string_seg_laws
+.text
+# Per-side string-op segment law: the EDI side drops %es as its
+# architectural default, the ESI side drops %ds, any other override is
+# kept — and the scan must not stop at the first operand.
+cmpsb %es:(%edi),%fs:(%esi)
+movsb %fs:(%esi),%es:(%edi)
+movsw %fs:(%esi),%es:(%edi)
+lodsb %fs:(%esi)
+stosb %es:(%edi)
+# the dword string form with explicit operands (movsl two-memory arm)
+movsl (%esi),%es:(%edi)
+movsl %ds:(%esi),%es:(%edi)
+;;; string_seg_rejects reject
+.text
+movsb %gs:(%esi),%fs:(%edi)
+;;; sse_movsd_seg
+.text
+# SSE movsd/cmpsd take XMM operands, so the stem-strip trap does not
+# apply: they follow the GENERIC segment law (kept when non-default).
+movsd %es:(%edi),%xmm0
+movsd %fs:(%edi),%xmm0
+movsd (%eax),%xmm0
+movsd %ds:(%eax),%xmm0
+;;; sse_movsd_rejects reject
+.text
+movsd (%esi),(%edi)

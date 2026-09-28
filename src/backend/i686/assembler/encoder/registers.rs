@@ -1,5 +1,7 @@
 //! Register helper functions for i686 instruction encoding.
 
+use crate::backend::x86::assembler::parser::Operand;
+
 /// Register encoding (3-bit register number in ModR/M and SIB).
 pub(crate) fn reg_num(name: &str) -> Option<u8> {
     match name {
@@ -63,8 +65,6 @@ pub(crate) fn is_xmm_or_ymm(name: &str) -> bool {
 pub(crate) fn is_mm(name: &str) -> bool {
     name.starts_with("mm") && !name.starts_with("mmx")
 }
-
-use crate::backend::x86::assembler::parser::Operand;
 
 /// Infer operand size from register name for unsuffixed instructions.
 pub(crate) fn reg_size(name: &str) -> u8 {

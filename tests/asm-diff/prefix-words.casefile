@@ -28,6 +28,18 @@ addr32 fs mov %eax, (%ebx)
 data16 nop
 data16 mov %eax, (%eax)
 data16 mov %eax, %ebx
+;;; data16_branches
+.text
+# the 16-bit branch law: 66 + near form + rel16 + R_X86_64_PC16 (GAS
+# 2.47 objdump-verified); with @PLT GAS rejects the 4-byte reloc on a
+# 2-byte field, and so does the encoder.
+data16 jmp foo
+data16 je foo
+data16 call foo
+;;; data16_branch_rejects reject
+.text
+data16 jmp foo@PLT
+data16 call foo@PLT
 ;;; rex_forms
 .text
 rex mov %ebx, %edi

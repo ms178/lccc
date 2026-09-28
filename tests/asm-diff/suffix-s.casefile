@@ -91,14 +91,43 @@ vmovdqu64.s %zmm29,%zmm30
 vmovq.s %xmm29,%xmm30
 vmovd.s %xmm29,%xmm30
 vmovsd.s %xmm29,%xmm30,%xmm28
+;;; vmovd_vmovq_xmm_xmm
+.text
+vmovd %xmm4,%xmm6
+vmovq %xmm1,%xmm2
+vmovd %xmm29,%xmm30
+vmovq %xmm29,%xmm30
 ;;; monitor_family
 .text
 monitor %rax,%ecx,%edx
 monitor %eax,%ecx,%edx
 monitor %eax,%rcx,%rdx
+monitor %rax,%rcx,%rdx
+monitor %rax,%ecx,%edx
 monitorx %rax,%ecx,%edx
 monitorx %eax,%ecx,%edx
+monitorx %rax,%rcx,%rdx
+mwait
+mwait %eax,%ecx
+mwait %rax,%rcx
+mwaitx
 mwaitx %eax,%ecx,%ebx
+mwaitx %rax,%rcx,%rbx
+;;; monitor_family_rejects reject
+.text
+monitor %ax,%rcx,%rdx
+monitor %al,%rcx,%rdx
+monitor %rax,%rcx,%rbx
+monitor %rax,%r8,%r9
+monitor %rax,%ecx,%rdx
+monitor %eax,%rcx,%edx
+monitorx %rax,%rbx,%rcx
+monitorx %eax,%ecx,%ebx
+mwait %eax,%rcx
+mwait %ax,%ecx
+mwaitx %ax,%cx,%bx
+mwaitx %eax,%ecx,%edx
+mwaitx %r8d,%ecx,%ebx
 ;;; user_msr
 .text
 urdmsr %rdx,%rax

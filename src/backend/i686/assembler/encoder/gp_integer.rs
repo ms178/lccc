@@ -998,7 +998,8 @@ impl super::InstructionEncoder {
                         _ => R_386_32,
                     };
                     self.add_relocation(sym, reloc, addend);
-                    self.bytes.extend_from_slice(&vec![0u8; imm_len as usize]);
+                    let zeros = [0u8; 8];
+                    self.bytes.extend_from_slice(&zeros[..imm_len as usize]);
                 }
                 Ok(())
             }
@@ -1258,7 +1259,17 @@ impl super::InstructionEncoder {
                     self.bytes.push(0x66);
                 }
                 self.bytes.push(if size == 1 { 0x84 } else { 0x85 });
-                self.bytes.push(self.modrm(3, src_num, dst_num));
+                // `.s` flips the ModR/M roles even though TEST is
+                // commutative and both orders decode identically (GAS
+                // 2.47: `test %edx,%ecx` = 85 d1, `test.s %edx,%ecx` =
+                // 85 ca) — the store-direction convention is about the
+                // ENCODING, not the semantics.
+                let (reg_field, rm_field) = if self.s_flip {
+                    (dst_num, src_num)
+                } else {
+                    (src_num, dst_num)
+                };
+                self.bytes.push(self.modrm(3, reg_field, rm_field));
                 Ok(())
             }
             (Operand::Immediate(ImmediateValue::Integer(val)), Operand::Register(dst)) => {
@@ -1349,9 +1360,12 @@ impl super::InstructionEncoder {
         // 16-bit forms take 0x66 and an imm16 immediate (GAS 2.47:
         // `imul $0x9090,(%eax),%dx` = 66 69 10 90 90; `imul $0x90,%edx,%ecx`
         // = 69 ca 90 00 00 00 — $0x90 does not fit the SIGNED imm8, so the
-        // full-width row wins).
+        // full-width row wins). The 1-operand form MUST NOT take the 0x66
+        // here: it routes through encode_unary_rm, which pushes its own
+        // single 0x66 (GAS 2.47: `imul %ax` = 66 f7 e8 — one 0x66; the
+        // unguarded push produced 66 66 f7 e8).
         let word = size == 2;
-        if word {
+        if word && ops.len() >= 2 {
             self.bytes.push(0x66);
         }
         match ops.len() {

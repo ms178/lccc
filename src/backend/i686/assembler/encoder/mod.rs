@@ -452,10 +452,34 @@ impl InstructionEncoder {
             let stem = stem_raw
                 .strip_suffix(['b', 'w', 'l', 'd', 'q'])
                 .unwrap_or(stem_raw);
-            let is_string_op = matches!(
-                stem,
-                "movs" | "cmps" | "lods" | "scas" | "stos" | "ins" | "outs"
-            );
+            // Stem alone is a TRAP: the SSE moves/compares `movsd`, `cmpsd`,
+            // `movsq`, `cmpsq` stem-strip to `movs`/`cmps` but take XMM
+            // operands and follow the GENERIC segment law (GAS 2.47:
+            // `movsd %es:(%edi),%xmm0` = 26 f2 0f 10 07 — ES KEPT;
+            // `movsd %fs:(%edi),%xmm0` = 64 f2 0f 10 07 — accepted).
+            // Classify by operand SHAPE instead: a vector register
+            // anywhere means this is the SSE instruction, not the string
+            // op (the same all-Memory shape rule the x86-64 encoder's
+            // is_explicit_string_op uses).
+            let has_vector_reg = instr.operands.iter().any(|op| {
+                matches!(op, Operand::Register(r) if {
+                    let n = r.name.to_ascii_lowercase();
+                    n.starts_with("xmm") || n.starts_with("ymm")
+                        || n.starts_with("zmm") || n.starts_with("mm")
+                })
+            });
+            let is_string_op = !has_vector_reg
+                && matches!(
+                    stem,
+                    "movs" | "cmps" | "lods" | "scas" | "stos" | "ins" | "outs"
+                );
+            // How many memory operands carry an explicit segment: the
+            // non-string dual-override reject below keys on it.
+            let seg_mem_count = instr
+                .operands
+                .iter()
+                .filter(|op| matches!(op, Operand::Memory(m) if m.segment.is_some()))
+                .count();
             for op in &instr.operands {
                 let Operand::Memory(mem) = op else { continue };
                 let Some(seg) = &mem.segment else { continue };
@@ -480,19 +504,33 @@ impl InstructionEncoder {
                         if prefix != 0x26 {
                             return Err(format!("`{}' operand 1 must use `%es' segment", stem));
                         }
-                        break; // ES on the EDI side: default, dropped.
+                        // ES on the EDI side: default, dropped — but KEEP
+                        // scanning: a second operand can still carry its
+                        // own override (GAS 2.47: `cmpsb
+                        // %es:(%edi),%fs:(%esi)` = 64 a6; a `break` here
+                        // dropped the FS byte).
+                        continue;
                     }
                     if base_is_esi && prefix == 0x3E {
-                        break; // DS on the ESI side: default, dropped.
+                        continue; // DS on the ESI side: default, dropped.
                     }
+                } else if seg_mem_count > 1 {
+                    // A NON-string instruction with overrides on two
+                    // memory operands is rejected by GAS outright — even
+                    // when one of them is the redundant default (2.47:
+                    // `movl %fs:(%eax),%gs:(%ebx)` and
+                    // `movl %ds:(%eax),%fs:(%ebx)` both error; only one
+                    // segment override can exist per instruction).
+                    return Err("operand type mismatch".to_string());
                 }
                 let default = self::core::i686_default_segment(
                     mem.base.as_ref().map(|reg| reg.name.as_str()),
                     mem.index.as_ref().map(|reg| reg.name.as_str()),
                 );
                 if prefix == default {
-                    // Redundant override: GAS drops it.
-                    break;
+                    // Redundant override: GAS drops it. Keep scanning:
+                    // a later operand may still need its byte.
+                    continue;
                 }
                 // Insertion point: past the FWAIT byte (GAS keeps 0x9B ahead
                 // of every prefix: `9b 26 67 d9 7f 08`), then IN FRONT of
@@ -509,7 +547,7 @@ impl InstructionEncoder {
                 // override in place: idempotence guard (defensive; all
                 // per-arm calls were removed).
                 if self.bytes.get(at) == Some(&prefix) {
-                    break;
+                    continue;
                 }
                 self.bytes.insert(at, prefix);
                 for relocation in self.relocations.iter_mut() {
@@ -517,7 +555,7 @@ impl InstructionEncoder {
                         relocation.offset += 1;
                     }
                 }
-                break;
+                continue;
             }
         }
 
@@ -585,7 +623,12 @@ impl InstructionEncoder {
                         && relocation.diff_symbol.is_none())
                 {
                     relocation.reloc_type = R_386_GOTPC;
-                    relocation.addend = (relocation.offset - start_len as u64) as i64;
+                    // Only the addend==0 sentinel (what every creator
+                    // passes today) means "derive the field-offset
+                    // addend"; a future nonzero addend must survive.
+                    if relocation.addend == 0 {
+                        relocation.addend = (relocation.offset - start_len as u64) as i64;
+                    }
                 }
             }
         }
@@ -649,9 +692,12 @@ impl InstructionEncoder {
             i += 1;
         }
         match self.bytes.get(i) {
-            Some(0x66) | Some(0x62) | Some(0xC4) | Some(0xC5) | Some(0xD5) => {
-                Err("same type of prefix used twice".to_string())
-            }
+            Some(0x66) => Err("same type of prefix used twice".to_string()),
+            // 0x62/0xC4/0xC5/0xD5 at the splice point are BOUND/LES/LDS/
+            // AAD OPCODES in 32-bit mode, not prefixes: GAS splices the
+            // 0x66 in front of them like any opcode (`data16 bound
+            // %eax,(%ebx)` = 66 62 03, `data16 aad` = 66 d5 0a — 2.47
+            // probed). Only a body-carried 0x66 is a duplicate.
             _ => {
                 self.bytes.insert(i, 0x66);
                 for relocation in self.relocations.iter_mut() {
@@ -854,6 +900,15 @@ impl InstructionEncoder {
             "movsw" if ops.len() == 2 && ops.iter().all(|o| matches!(o, Operand::Memory(_))) => {
                 self.sized_op = true;
                 self.bytes.extend_from_slice(&[0x66, 0xA5]);
+                Ok(())
+            }
+            // `movsl (mem),(mem)`: the dword string form (GAS 2.47:
+            // `movsl (%esi),%es:(%edi)` = a5, `movsl
+            // %ds:(%esi),%es:(%edi)` = a5 — both segment defaults
+            // dropped). Without this arm the explicit-operand spelling
+            // fell through to "unhandled" while the bare `movsl` worked.
+            "movsl" if ops.len() == 2 && ops.iter().all(|o| matches!(o, Operand::Memory(_))) => {
+                self.bytes.push(0xA5);
                 Ok(())
             }
             "movsb" if !ops.is_empty() => self.encode_movsx_infer_dst(ops, 1),
@@ -1442,16 +1497,17 @@ impl InstructionEncoder {
                                 _ => None,
                             })
                             .collect();
+                        // The implicit register NUMBERS are exact per
+                        // template (GAS 2.47 matrix probes): slots are
+                        // (eax|ax, ecx, edx) — `monitor %eax,%ecx,%ebx`
+                        // and `monitor %eax,%ebx,%ecx` are "operand type
+                        // mismatch" (slot 2 must be register 2), and the
+                        // trailing slots have no 16-bit spellings in
+                        // 32-bit mode (`monitor %eax,%cx,%edx` rejected).
                         if names.len() != 3
                             || !matches!(names[0].as_str(), "eax" | "ax")
-                            || !matches!(
-                                names[1].as_str(),
-                                "eax" | "ebx" | "ecx" | "edx" | "esi" | "edi" | "ebp" | "esp"
-                            )
-                            || !matches!(
-                                names[2].as_str(),
-                                "eax" | "ebx" | "ecx" | "edx" | "esi" | "edi" | "ebp" | "esp"
-                            )
+                            || names[1] != "ecx"
+                            || names[2] != "edx"
                         {
                             return Err(format!("operand type mismatch for `{mnemonic}'"));
                         }
