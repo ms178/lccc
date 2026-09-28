@@ -25,37 +25,18 @@
 //! | `--gc-sections`, `--icf`, `--sort-common`, `--sort-section`, `-O<n>` | warning: ignored | same |
 //! | `--version-script`, `--dynamic-list`, `--exclude-libs`, `-Map`, `--emit-relocs`, `-pie`, `-r`, `-N`, `-Ttext`…, `-z nocopyreloc`, `-z max-page-size≠4096` | error | error |
 
+/// Shared with the x86-64 linker, which parses the options identically.
+pub(super) use crate::backend::linker_common::Symbolic;
 use crate::backend::linker_common::{HashStyle, LinkerArgs};
 
-/// How `-Bsymbolic*` binds a shared object's references to its own
-/// default-visibility definitions.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub(super) enum Symbolic {
-    /// ELF default: such definitions are preemptible; references go through
-    /// the GOT/PLT with symbolic dynamic relocations.
-    #[default]
-    None,
-    /// `-Bsymbolic-functions`: functions bind locally, data stays preemptible.
-    Functions,
-    /// `-Bsymbolic`: everything binds locally; DF_SYMBOLIC is set.
-    All,
-}
-
-// DT_FLAGS bits.
-pub(super) const DF_ORIGIN: u32 = 0x1;
+// DT_FLAGS bits the emitters derive themselves; the keyword-requested ones
+// come from `LinkerArgs::requested_dyn_flags`.
 pub(super) const DF_SYMBOLIC: u32 = 0x2;
 pub(super) const DF_TEXTREL: u32 = 0x4;
 pub(super) const DF_BIND_NOW: u32 = 0x8;
 pub(super) const DF_STATIC_TLS: u32 = 0x10;
 // DT_FLAGS_1 bits.
 pub(super) const DF_1_NOW: u32 = 0x1;
-pub(super) const DF_1_GLOBAL: u32 = 0x2;
-pub(super) const DF_1_NODELETE: u32 = 0x8;
-pub(super) const DF_1_INITFIRST: u32 = 0x20;
-pub(super) const DF_1_NOOPEN: u32 = 0x40;
-pub(super) const DF_1_ORIGIN: u32 = 0x80;
-pub(super) const DF_1_INTERPOSE: u32 = 0x400;
-pub(super) const DF_1_NODEFLIB: u32 = 0x800;
 
 /// Options the emitters act on.
 #[derive(Clone, Debug, Default)]
@@ -273,22 +254,11 @@ pub(super) fn check_capabilities(
         }
     }
 
-    let mut dt_flags = 0u32;
-    let mut dt_flags_1 = 0u32;
-    for kw in &args.z_dyn_flag_keywords {
-        match kw.as_str() {
-            "origin" => {
-                dt_flags |= DF_ORIGIN;
-                dt_flags_1 |= DF_1_ORIGIN;
-            }
-            "nodelete" => dt_flags_1 |= DF_1_NODELETE,
-            "nodlopen" => dt_flags_1 |= DF_1_NOOPEN,
-            "initfirst" => dt_flags_1 |= DF_1_INITFIRST,
-            "interpose" => dt_flags_1 |= DF_1_INTERPOSE,
-            "nodefaultlib" => dt_flags_1 |= DF_1_NODEFLIB,
-            _ => unreachable!("parse_linker_args only records the keywords above"),
-        }
-    }
+    // All DT_FLAGS / DT_FLAGS_1 bits are in the low 32 bits.
+    let (dt_flags, dt_flags_1) = {
+        let (f, f1) = args.requested_dyn_flags();
+        (f as u32, f1 as u32)
+    };
     let mut z_text = false;
     for kw in &args.z_other_keywords {
         let (key, val) = match kw.split_once('=') {
@@ -296,7 +266,8 @@ pub(super) fn check_capabilities(
             None => (kw.as_str(), None),
         };
         match (key, val) {
-            ("global", None) => dt_flags_1 |= DF_1_GLOBAL,
+            // DF_1_GLOBAL: already in `requested_dyn_flags`.
+            ("global", None) => {}
             ("text", None) => z_text = true,
             ("notext" | "textoff", None) => z_text = false,
             // The layout always keeps headers, code and read-only data in
@@ -324,14 +295,11 @@ pub(super) fn check_capabilities(
         eprintln!("lccc-ld: warning: -z {kw} ignored");
     }
 
-    // The last -Bsymbolic* spelling decides; GNU treats -Bsymbolic as the
-    // stronger one when both appear.
-    let symbolic = if !is_shared {
-        Symbolic::None
-    } else if toks.contains(&"-Bsymbolic") {
-        Symbolic::All
-    } else if toks.contains(&"-Bsymbolic-functions") {
-        Symbolic::Functions
+    // The last of -Bsymbolic / -Bsymbolic-functions / -Bno-symbolic
+    // decides, as in GNU ld (parsed in `parse_linker_args`).  An
+    // executable's definitions are never preemptible anyway.
+    let symbolic = if is_shared {
+        args.symbolic
     } else {
         Symbolic::None
     };
@@ -386,8 +354,12 @@ mod tests {
         assert_eq!(o.rpath.as_deref(), Some("/a:/b"));
         assert!(o.use_runpath && o.bind_now && o.export_dynamic && o.build_id);
         assert_eq!(o.hash_style, HashStyle::Both);
-        assert_eq!(o.flags(false, false), DF_ORIGIN | DF_BIND_NOW);
-        assert_eq!(o.flags_1(), DF_1_NOW | DF_1_ORIGIN);
+        use crate::backend::linker_common::dyn_flags as df;
+        assert_eq!(
+            o.flags(false, false),
+            (df::DF_ORIGIN | df::DF_BIND_NOW) as u32
+        );
+        assert_eq!(o.flags_1(), (df::DF_1_NOW | df::DF_1_ORIGIN) as u32);
         assert!(o.relro, "RELRO is the default");
         let tags: Vec<i32> = o
             .extra_dynamic_tags(true, false, false)
@@ -411,6 +383,25 @@ mod tests {
             check(&["-Wl,-Bsymbolic"], false).unwrap().symbolic,
             Symbolic::None
         );
+        // GNU ld: the last spelling wins, in either order, and
+        // -Bno-symbolic resets.
+        for (args, want) in [
+            (
+                &["-Wl,-Bsymbolic", "-Wl,-Bsymbolic-functions"][..],
+                Symbolic::Functions,
+            ),
+            (
+                &["-Wl,-Bsymbolic-functions", "-Wl,-Bsymbolic"][..],
+                Symbolic::All,
+            ),
+            (&["-Wl,-Bsymbolic", "-Wl,-Bno-symbolic"][..], Symbolic::None),
+            (
+                &["-Wl,-Bno-symbolic,-Bsymbolic-functions"][..],
+                Symbolic::Functions,
+            ),
+        ] {
+            assert_eq!(check(args, true).unwrap().symbolic, want, "{args:?}");
+        }
         assert_eq!(
             check(&["-Wl,-Bsymbolic"], true)
                 .unwrap()

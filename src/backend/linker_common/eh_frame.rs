@@ -622,10 +622,16 @@ pub fn scan_eh_frame_records(data: &[u8]) -> Vec<EhFrameRecord> {
     out
 }
 
-/// An `.eh_frame` input section with some FDEs removed; see
+/// An `.eh_frame` input section with some records removed; see
 /// [`compact_eh_frame`].
 pub struct EhFrameCompaction {
-    /// The surviving records, packed, plus a zero terminator.
+    /// The surviving records, packed.  No zero terminator is added: the
+    /// compacted section is one of many concatenated into the output, and a
+    /// terminator in the middle of `.eh_frame` ends it for every consumer
+    /// that walks the section (libgcc's `__register_frame_info` path, gdb).
+    /// The link's single terminator comes from `crtend.o`, as with GNU ld.
+    /// (Zero-length records of the input are not records and do not
+    /// survive either.)
     pub data: Vec<u8>,
     records: Vec<EhFrameRecord>,
     /// New offset of each record (`usize::MAX` when pruned).
@@ -638,11 +644,10 @@ impl EhFrameCompaction {
     /// every record (malformed input) keep their position rather than being
     /// silently dropped.
     pub fn map_offset(&self, off: usize) -> Option<usize> {
-        match self
-            .records
-            .iter()
-            .position(|r| off >= r.start && off < r.end)
-        {
+        // Records are sorted and disjoint: binary search, since this runs
+        // once per relocation of sections with thousands of FDEs.
+        let i = self.records.partition_point(|r| r.start <= off);
+        match i.checked_sub(1).filter(|&i| off < self.records[i].end) {
             Some(i) if self.new_start[i] == usize::MAX => None,
             Some(i) => Some(off - self.records[i].start + self.new_start[i]),
             None => Some(off),
@@ -666,6 +671,38 @@ pub fn compact_eh_frame(
     records: &[EhFrameRecord],
     prune: &[bool],
 ) -> EhFrameCompaction {
+    let fde_only: Vec<bool> = records
+        .iter()
+        .zip(prune)
+        .map(|(r, &p)| p && r.is_fde)
+        .collect();
+    compact_records(data, records, &fde_only)
+}
+
+/// Index in `records` (from [`scan_eh_frame_records`] over `data`) of the
+/// CIE that FDE `records[fde]` uses, if its `CIE_pointer` leads to one.
+pub(crate) fn fde_cie_index(data: &[u8], records: &[EhFrameRecord], fde: usize) -> Option<usize> {
+    let rec = records.get(fde).filter(|r| r.is_fde)?;
+    let id = if rec.id_size == 8 {
+        read_u64_le(data, rec.id_offset)
+    } else {
+        u64::from(read_u32_le(data, rec.id_offset))
+    };
+    cie_at(records, (rec.id_offset as u64).wrapping_sub(id) as usize)
+}
+
+/// Index of the CIE record starting at `pos` (records are sorted by start).
+fn cie_at(records: &[EhFrameRecord], pos: usize) -> Option<usize> {
+    records
+        .binary_search_by_key(&pos, |r| r.start)
+        .ok()
+        .filter(|&i| !records[i].is_fde)
+}
+
+/// [`compact_eh_frame`] for any records, CIEs included.  An FDE whose CIE
+/// is dropped keeps its old `CIE_pointer` bytes: the caller re-aims it (see
+/// [`pack_eh_frame_sections`]).
+fn compact_records(data: &[u8], records: &[EhFrameRecord], drop: &[bool]) -> EhFrameCompaction {
     let read_id = |rec: &EhFrameRecord| -> u64 {
         if rec.id_size == 8 {
             read_u64_le(data, rec.id_offset)
@@ -676,13 +713,13 @@ pub fn compact_eh_frame(
     let mut new_start = vec![usize::MAX; records.len()];
     let mut off = 0usize;
     for (i, rec) in records.iter().enumerate() {
-        if prune[i] && rec.is_fde {
+        if drop[i] {
             continue;
         }
         new_start[i] = off;
         off += rec.end - rec.start;
     }
-    let mut out = vec![0u8; off + 4]; // + the end-of-section terminator
+    let mut out = vec![0u8; off];
     for (i, rec) in records.iter().enumerate() {
         let dst = new_start[i];
         if dst == usize::MAX {
@@ -694,9 +731,12 @@ pub fn compact_eh_frame(
         }
         // CIE_pointer = offset_of(CIE_pointer field) - offset_of(CIE).
         let cie_pos = (rec.id_offset as u64).wrapping_sub(read_id(rec)) as usize;
-        let Some(cie) = records.iter().position(|r| !r.is_fde && r.start == cie_pos) else {
+        let Some(cie) = cie_at(records, cie_pos) else {
             continue; // dangling pointer in the input: leave it as it was
         };
+        if new_start[cie] == usize::MAX {
+            continue; // the CIE was merged away; the caller re-aims this FDE
+        }
         let field_pos = dst + (rec.id_offset - rec.start);
         if new_start[cie] >= field_pos {
             // Malformed input: the FDE precedes (or overlaps) the CIE its
@@ -787,13 +827,20 @@ pub fn prune_dead_fdes(
             }
             let relocs = relocations.get(sec_idx).map(Vec::as_slice).unwrap_or(&[]);
 
-            // Which FDEs describe a collected function?
+            // Which FDEs describe a collected function?  (The first
+            // relocation at each offset, as a linear `find` would pick, but
+            // without its records x relocations cost on big C++ units.)
+            let mut reloc_at: crate::common::fx_hash::FxHashMap<usize, usize> =
+                crate::common::fx_hash::FxHashMap::default();
+            for (ri, r) in relocs.iter().enumerate() {
+                reloc_at.entry(r.offset as usize).or_insert(ri);
+            }
             let mut prune: Vec<bool> = vec![false; records.len()];
             for (i, rec) in records.iter().enumerate() {
                 let Some(iloc) = rec.iloc_offset else {
                     continue;
                 };
-                let Some(rela) = relocs.iter().find(|r| r.offset as usize == iloc) else {
+                let Some(rela) = reloc_at.get(&iloc).map(|&ri| &relocs[ri]) else {
                     continue; // no relocation: cannot prove the target is dead
                 };
                 let Some(sym) = symbols.get(rela.sym_idx as usize) else {
@@ -835,6 +882,345 @@ pub fn prune_dead_fdes(
         }
     }
     dropped
+}
+
+/// An FDE whose CIE was merged into an identical one in an earlier (or the
+/// same) `.eh_frame` input section; its `CIE_pointer` is written once the
+/// output offsets of both sections are known ([`apply_cie_redirects`]).
+#[derive(Debug, Clone, Copy)]
+struct CieRedirect {
+    /// The FDE's section and the offset of its `CIE_pointer` field there.
+    obj: usize,
+    sec: usize,
+    field: usize,
+    width: usize,
+    /// The surviving CIE: section and offset of its length field.
+    target: (usize, usize, usize),
+}
+
+/// Pending `CIE_pointer` rewrites from [`pack_eh_frame_sections`].
+#[derive(Debug, Default)]
+pub struct EhFramePacking {
+    redirects: Vec<CieRedirect>,
+    /// CIE records removed.
+    pub merged: usize,
+    /// Sections whose last record was lengthened to close the alignment gap.
+    pub padded: usize,
+}
+
+/// Lengthen the record at `start` -- the last one of `buf` -- with
+/// `DW_CFA_nop`s (zero bytes) until `buf.len()` is a multiple of `unit`.
+/// Returns whether anything changed.
+fn pad_last_record(buf: &mut Vec<u8>, start: usize, id_size: usize, unit: usize) -> bool {
+    let pad = buf.len().next_multiple_of(unit) - buf.len();
+    if pad == 0 {
+        return false;
+    }
+    if id_size == 8 {
+        let len = read_u64_le(buf, start + 4) + pad as u64;
+        buf[start + 4..start + 12].copy_from_slice(&len.to_le_bytes());
+    } else {
+        let len = read_u32_le(buf, start) as usize + pad;
+        // 0xffff_fff0.. are reserved (0xffff_ffff escapes to the 64-bit
+        // format): never produce one; the gap then stays, as before.
+        let Some(len) = u32::try_from(len).ok().filter(|&l| l < 0xffff_fff0) else {
+            return false;
+        };
+        buf[start..start + 4].copy_from_slice(&len.to_le_bytes());
+    }
+    buf.resize(buf.len() + pad, 0);
+    true
+}
+
+/// Identity of a relocation target inside a CIE (the personality pointer):
+/// a global by name, anything local only within its own object.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum CieRelocTarget {
+    Global(String),
+    Local(usize, u32),
+}
+
+/// A CIE's identity: its bytes plus the relocations applied to them.
+type CieKey = (Vec<u8>, Vec<(usize, u32, i64, CieRelocTarget)>);
+
+/// The records of an unrelocated `.eh_frame` section, or `None` when they
+/// do not tile it exactly (zero-length terminators aside).  Such a section
+/// is opaque: nothing in it is merged, and none of its CIEs is offered to
+/// later sections.
+fn tiled_records(data: &[u8]) -> Option<Vec<EhFrameRecord>> {
+    let records = scan_eh_frame_records(data);
+    let mut pos = 0usize;
+    let mut next = records.iter().peekable();
+    while pos < data.len() {
+        match next.peek() {
+            Some(r) if r.start == pos => {
+                pos = r.end;
+                next.next();
+            }
+            _ if pos + 4 <= data.len() && read_u32_le(data, pos) == 0 => pos += 4,
+            _ => return None,
+        }
+    }
+    Some(records)
+}
+
+/// Prepare the link's `.eh_frame` input sections for concatenation:
+/// merge identical CIEs across them and close the alignment gaps between
+/// them.
+///
+/// Gaps: an input section is typically 8-aligned while its records only
+/// sum to a multiple of 4 (crt1.o's is 0x2c bytes).  The zero bytes the
+/// section merge would insert before the next input read as a zero-length
+/// record, i.e. a terminator, in the middle of the output: libgcc's linear
+/// FDE walk (`__register_frame_info`, the no-`.eh_frame_hdr` path) and
+/// other consumers stop there and lose every later FDE.  So, as GNU ld
+/// does, the last record of each section is lengthened with `DW_CFA_nop`
+/// padding to a multiple of the strictest `.eh_frame` input alignment.
+/// Sections that end in a terminator of their own (crtend.o's) or that
+/// cannot be parsed are left alone.
+///
+/// CIEs:
+/// Every translation unit carries its own CIE (usually the same `zR` one,
+/// plus a `zPLR` one in C++), so a plain concatenation repeats a handful of
+/// 24-to-32-byte records once per object -- GNU ld and lld keep one of
+/// each.  The first occurrence in link order survives; later identical ones
+/// are removed from their sections (compacted, relocations remapped, as for
+/// pruned FDEs) and the FDEs that used them are re-aimed at the survivor.
+/// Two CIEs are identical when their bytes AND the relocations inside them
+/// (the personality routine) agree; a relocation against a local symbol
+/// only matches within its own object.
+///
+/// The re-aimed `CIE_pointer`s cross input sections, so they are written
+/// by [`apply_cie_redirects`] once the section merge has placed every
+/// section.  That requires the merge to lay `.eh_frame` inputs out in the
+/// order they are visited here (object, then section index) -- true of
+/// `merge_sections_elf64*`, not of a linker script, whose path must not
+/// call this.  Sections in `dead` are skipped.
+pub fn pack_eh_frame_sections(
+    objects: &mut [crate::backend::linker_common::Elf64Object],
+    dead: &crate::common::fx_hash::FxHashSet<(usize, usize)>,
+) -> EhFramePacking {
+    use crate::backend::elf::{SHF_ALLOC, STB_LOCAL};
+    let mut result = EhFramePacking::default();
+    let mut canon: crate::common::fx_hash::FxHashMap<CieKey, (usize, usize, usize)> =
+        crate::common::fx_hash::FxHashMap::default();
+    let is_candidate = |obj_idx: usize,
+                        sec_idx: usize,
+                        sec: &crate::backend::linker_common::Elf64Section| {
+        sec.name == ".eh_frame" && sec.flags & SHF_ALLOC != 0 && !dead.contains(&(obj_idx, sec_idx))
+    };
+    // The padding unit: the strictest input alignment, so every padded
+    // section ends where the next one may start.  (Clamped: .eh_frame
+    // fields are at most 8 bytes wide, and an absurd sh_addralign must not
+    // turn into kilobytes of DW_CFA_nop.)
+    let unit = objects
+        .iter()
+        .enumerate()
+        .flat_map(|(o, obj)| {
+            obj.sections
+                .iter()
+                .enumerate()
+                .filter(move |&(s, sec)| is_candidate(o, s, sec))
+                .map(|(_, sec)| sec.addralign)
+        })
+        .max()
+        .unwrap_or(1)
+        .clamp(1, 8) as usize;
+    for (obj_idx, obj) in objects.iter_mut().enumerate() {
+        let crate::backend::linker_common::Elf64Object {
+            sections,
+            symbols,
+            section_data,
+            relocations,
+            ..
+        } = obj;
+        for sec_idx in 0..sections.len() {
+            if !is_candidate(obj_idx, sec_idx, &sections[sec_idx]) {
+                continue;
+            }
+            let Some(data) = section_data.get(sec_idx) else {
+                continue;
+            };
+            let Some(records) = tiled_records(data) else {
+                continue;
+            };
+            let relocs = relocations.get(sec_idx).map(Vec::as_slice).unwrap_or(&[]);
+            let key_of = |rec: &EhFrameRecord| -> CieKey {
+                let mut rs: Vec<(usize, u32, i64, CieRelocTarget)> = relocs
+                    .iter()
+                    .filter(|r| (r.offset as usize) >= rec.start && (r.offset as usize) < rec.end)
+                    .map(|r| {
+                        let target = match symbols.get(r.sym_idx as usize) {
+                            Some(sym) if sym.binding() != STB_LOCAL && !sym.name.is_empty() => {
+                                CieRelocTarget::Global(sym.name.to_string())
+                            }
+                            _ => CieRelocTarget::Local(obj_idx, r.sym_idx),
+                        };
+                        (r.offset as usize - rec.start, r.rela_type, r.addend, target)
+                    })
+                    .collect();
+                rs.sort_by_key(|r| r.0);
+                (data[rec.start..rec.end].to_vec(), rs)
+            };
+            // Which CIEs already exist?  (Keys of this section's own CIEs are
+            // registered after its compaction, at their final offsets; an
+            // identical CIE later in the SAME section merges into the first.)
+            let mut drop = vec![false; records.len()];
+            let mut target_of: Vec<Option<(usize, usize, usize)>> = vec![None; records.len()];
+            let mut local_first: crate::common::fx_hash::FxHashMap<CieKey, usize> =
+                crate::common::fx_hash::FxHashMap::default();
+            let mut keys: Vec<Option<CieKey>> = vec![None; records.len()];
+            for (i, rec) in records.iter().enumerate() {
+                if rec.is_fde {
+                    continue;
+                }
+                let key = key_of(rec);
+                if let Some(&t) = canon.get(&key) {
+                    drop[i] = true;
+                    target_of[i] = Some(t);
+                } else if let Some(&first) = local_first.get(&key) {
+                    drop[i] = true;
+                    target_of[i] = Some((obj_idx, sec_idx, first)); // record index, fixed below
+                } else {
+                    local_first.insert(key.clone(), i);
+                    keys[i] = Some(key);
+                }
+            }
+            if !drop.iter().any(|&d| d) {
+                for (i, key) in keys.into_iter().enumerate() {
+                    if let Some(key) = key {
+                        canon.insert(key, (obj_idx, sec_idx, records[i].start));
+                    }
+                }
+                // Untouched but for the tail padding, if the section ends
+                // with a record (not with a terminator of its own).
+                if let Some(last) = records.last().filter(|r| r.end == data.len()) {
+                    let mut buf = data.to_vec();
+                    if pad_last_record(&mut buf, last.start, last.id_size, unit) {
+                        result.padded += 1;
+                        sections[sec_idx].size = buf.len() as u64;
+                        section_data[sec_idx] =
+                            crate::backend::linker_common::SectionData::owned(buf);
+                    }
+                }
+                continue;
+            }
+            let mut compacted = compact_records(data, &records, &drop);
+            // Same-section targets were record indices; make them offsets.
+            for t in target_of.iter_mut().flatten() {
+                if (t.0, t.1) == (obj_idx, sec_idx) {
+                    t.2 = compacted.new_start[t.2];
+                }
+            }
+            for (i, key) in keys.into_iter().enumerate() {
+                if let Some(key) = key {
+                    canon.insert(key, (obj_idx, sec_idx, compacted.new_start[i]));
+                }
+            }
+            // FDEs of a merged CIE.
+            for (i, rec) in records.iter().enumerate() {
+                if !rec.is_fde || compacted.new_start[i] == usize::MAX {
+                    continue;
+                }
+                let id = if rec.id_size == 8 {
+                    read_u64_le(data, rec.id_offset)
+                } else {
+                    u64::from(read_u32_le(data, rec.id_offset))
+                };
+                let cie_pos = (rec.id_offset as u64).wrapping_sub(id) as usize;
+                let Some(cie) = cie_at(&records, cie_pos) else {
+                    continue;
+                };
+                if let Some(target) = target_of[cie] {
+                    result.redirects.push(CieRedirect {
+                        obj: obj_idx,
+                        sec: sec_idx,
+                        field: compacted.new_start[i] + (rec.id_offset - rec.start),
+                        width: rec.id_size,
+                        target,
+                    });
+                }
+            }
+            result.merged += drop.iter().filter(|&&d| d).count();
+            let mut buf = std::mem::take(&mut compacted.data);
+            // Compaction keeps records only, so the last survivor ends the
+            // section.
+            if let Some(last) = (0..records.len())
+                .rev()
+                .find(|&i| compacted.new_start[i] != usize::MAX)
+                && pad_last_record(
+                    &mut buf,
+                    compacted.new_start[last],
+                    records[last].id_size,
+                    unit,
+                )
+            {
+                result.padded += 1;
+            }
+            let mut new_relocs: Vec<_> = relocs
+                .iter()
+                .filter_map(|r| {
+                    let offset = compacted.map_offset(r.offset as usize)?;
+                    let mut r2 = r.clone();
+                    r2.offset = offset as u64;
+                    Some(r2)
+                })
+                .collect();
+            new_relocs.sort_by_key(|r| r.offset);
+            sections[sec_idx].size = buf.len() as u64;
+            section_data[sec_idx] = crate::backend::linker_common::SectionData::owned(buf);
+            if sec_idx < relocations.len() {
+                relocations[sec_idx] = new_relocs;
+            }
+        }
+    }
+    result
+}
+
+/// Write the `CIE_pointer`s [`pack_eh_frame_sections`] left pending, from the
+/// sections' places in the merged output (`section_map`: input section to
+/// output section and offset).  A pointer must lead backwards within one
+/// output section; anything else means the merge did not preserve input
+/// order, which is an internal error rather than a reason to emit a broken
+/// unwind table.
+pub fn apply_cie_redirects(
+    objects: &mut [crate::backend::linker_common::Elf64Object],
+    section_map: &crate::common::fx_hash::FxHashMap<(usize, usize), (usize, u64)>,
+    dedup: &EhFramePacking,
+) -> Result<(), String> {
+    let mut patched: crate::common::fx_hash::FxHashMap<(usize, usize), Vec<u8>> =
+        crate::common::fx_hash::FxHashMap::default();
+    for r in &dedup.redirects {
+        let placement = |obj: usize, sec: usize| section_map.get(&(obj, sec)).copied();
+        let (Some((fde_out, fde_base)), Some((cie_out, cie_base))) =
+            (placement(r.obj, r.sec), placement(r.target.0, r.target.1))
+        else {
+            return Err("internal error: merged .eh_frame CIE of an unplaced section".into());
+        };
+        let field = fde_base + r.field as u64;
+        let cie = cie_base + r.target.2 as u64;
+        if fde_out != cie_out || cie >= field {
+            return Err(format!(
+                "internal error: merged .eh_frame CIE at output offset {cie:#x} does not precede \
+                 the FDE field at {field:#x}"
+            ));
+        }
+        let value = field - cie;
+        let buf = patched
+            .entry((r.obj, r.sec))
+            .or_insert_with(|| objects[r.obj].section_data[r.sec].to_vec());
+        if r.width == 8 {
+            buf[r.field..r.field + 8].copy_from_slice(&value.to_le_bytes());
+        } else {
+            let v = u32::try_from(value)
+                .map_err(|_| format!("merged .eh_frame CIE pointer {value:#x} overflows"))?;
+            buf[r.field..r.field + 4].copy_from_slice(&v.to_le_bytes());
+        }
+    }
+    for ((obj, sec), buf) in patched {
+        objects[obj].section_data[sec] = crate::backend::linker_common::SectionData::owned(buf);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1668,5 +2054,257 @@ mod tests {
             "forward CIE_pointer left untouched"
         );
         assert_eq!(&c.data[36..48], &data[52..64]);
+    }
+
+    /// An object whose `.eh_frame` (section 1) is `data`, with one PC32
+    /// relocation per FDE `initial_location` against `.text` (section 2)
+    /// and, in `cie_relocs`, relocations inside the CIE against the named
+    /// global (a personality pointer).
+    fn eh_object(
+        data: Vec<u8>,
+        cie_reloc_target: Option<&str>,
+    ) -> crate::backend::linker_common::Elf64Object {
+        use crate::backend::linker_common::{Elf64Rela, Elf64Section, Elf64Symbol, SectionData};
+        let sec = |name: &str, size: u64| Elf64Section {
+            name_idx: 0,
+            name: name.to_string(),
+            sh_type: 1,
+            flags: crate::backend::elf::SHF_ALLOC,
+            addr: 0,
+            offset: 0,
+            size,
+            link: 0,
+            info: 0,
+            addralign: 8,
+            entsize: 0,
+        };
+        let mut relocs: Vec<Elf64Rela> = scan_eh_frame_records(&data)
+            .iter()
+            .filter_map(|r| r.iloc_offset)
+            .map(|off| Elf64Rela {
+                offset: off as u64,
+                sym_idx: 1,
+                rela_type: 2,
+                addend: 0,
+            })
+            .collect();
+        if cie_reloc_target.is_some() {
+            relocs.push(Elf64Rela {
+                offset: 12,
+                sym_idx: 2,
+                rela_type: 2,
+                addend: 0,
+            });
+            relocs.sort_by_key(|r| r.offset);
+        }
+        let sym = |name: &str, info: u8, shndx: u16| Elf64Symbol {
+            name_idx: 0,
+            name: name.into(),
+            info,
+            other: 0,
+            shndx,
+            value: 0,
+            size: 0,
+        };
+        crate::backend::linker_common::Elf64Object {
+            sections: vec![
+                sec("", 0),
+                sec(".eh_frame", data.len() as u64),
+                sec(".text", 64),
+            ],
+            symbols: vec![
+                sym("", 0, 0),
+                sym("", crate::backend::elf::STT_SECTION, 2),
+                sym(cie_reloc_target.unwrap_or("unused"), 0x10, 0),
+            ],
+            section_data: vec![
+                SectionData::owned(Vec::new()),
+                SectionData::owned(data),
+                SectionData::owned(vec![0; 64]),
+            ],
+            relocations: vec![Vec::new(), relocs, Vec::new()],
+            source_name: "t.o".into(),
+        }
+    }
+
+    /// Lay `.eh_frame` of every object out back to back (as the merge
+    /// does), apply the redirects and return the concatenation.
+    fn merged_eh_frame(
+        objs: &mut [crate::backend::linker_common::Elf64Object],
+        d: &EhFramePacking,
+    ) -> Vec<u8> {
+        let mut map = crate::common::fx_hash::FxHashMap::default();
+        let mut off = 0u64;
+        for (i, o) in objs.iter().enumerate() {
+            map.insert((i, 1), (0usize, off));
+            off += o.sections[1].size;
+        }
+        apply_cie_redirects(objs, &map, d).expect("redirects apply");
+        objs.iter()
+            .flat_map(|o| o.section_data[1].to_vec())
+            .collect()
+    }
+
+    /// Every FDE's `CIE_pointer` must land on a CIE of the merged data.
+    fn fde_cies(data: &[u8]) -> Vec<usize> {
+        let recs = scan_eh_frame_records(data);
+        recs.iter()
+            .filter(|r| r.is_fde)
+            .map(|r| {
+                let cie = r.id_offset - read_u32_le(data, r.id_offset) as usize;
+                assert!(
+                    cie_at(&recs, cie).is_some(),
+                    "FDE at {} aims at {cie}, not a CIE",
+                    r.start
+                );
+                cie
+            })
+            .collect()
+    }
+
+    #[test]
+    fn identical_cies_across_objects_merge() {
+        let unit = synth_eh_frame(2, PCREL_SDATA4);
+        let cie_len = scan_eh_frame_records(&unit)[0].end;
+        let mut objs = vec![
+            eh_object(unit.clone(), None),
+            eh_object(unit.clone(), None),
+            eh_object(unit.clone(), None),
+        ];
+        let d = pack_eh_frame_sections(&mut objs, &Default::default());
+        assert_eq!(d.merged, 2);
+        assert_eq!(objs[1].sections[1].size as usize, unit.len() - cie_len);
+        // The FDE relocations moved with their records.
+        let first_fde_iloc = scan_eh_frame_records(&unit)[1].iloc_offset.unwrap();
+        assert_eq!(
+            objs[1].relocations[1][0].offset as usize,
+            first_fde_iloc - cie_len
+        );
+        let merged = merged_eh_frame(&mut objs, &d);
+        assert_eq!(merged.len(), 3 * unit.len() - 2 * cie_len);
+        let cies = fde_cies(&merged);
+        assert_eq!(cies, vec![0; 6], "all six FDEs share the first CIE");
+        assert_eq!(
+            scan_eh_frame_records(&merged)
+                .iter()
+                .filter(|r| !r.is_fde)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn cies_with_different_encodings_or_personalities_stay() {
+        let a = synth_eh_frame(1, PCREL_SDATA4);
+        let b = synth_eh_frame(1, ABS_UDATA8);
+        let mut objs = vec![
+            eh_object(a.clone(), None),
+            eh_object(b.clone(), None),
+            eh_object(a.clone(), Some("__gxx_personality_v0")),
+            eh_object(a.clone(), Some("__gcc_personality_v0")),
+            eh_object(a.clone(), Some("__gxx_personality_v0")),
+        ];
+        let d = pack_eh_frame_sections(&mut objs, &Default::default());
+        // Only the last merges: same bytes, same personality as the third.
+        assert_eq!(d.merged, 1);
+        let merged = merged_eh_frame(&mut objs, &d);
+        let cies = fde_cies(&merged);
+        let starts: Vec<usize> = {
+            let mut o = 0;
+            objs.iter()
+                .map(|x| {
+                    let s = o;
+                    o += x.sections[1].size as usize;
+                    s
+                })
+                .collect()
+        };
+        assert_eq!(
+            cies,
+            vec![starts[0], starts[1], starts[2], starts[3], starts[2]]
+        );
+    }
+
+    #[test]
+    fn duplicate_cie_within_one_section_merges() {
+        let unit = synth_eh_frame(1, PCREL_SDATA4);
+        let mut twice = unit.clone();
+        twice.extend_from_slice(&unit); // [CIE FDE CIE FDE], the second FDE aims at the second CIE
+        let mut objs = vec![eh_object(twice.clone(), None)];
+        let d = pack_eh_frame_sections(&mut objs, &Default::default());
+        assert_eq!(d.merged, 1);
+        let merged = merged_eh_frame(&mut objs, &d);
+        assert_eq!(fde_cies(&merged), vec![0, 0]);
+    }
+
+    #[test]
+    fn opaque_and_dead_sections_are_left_alone() {
+        let unit = synth_eh_frame(1, PCREL_SDATA4);
+        let mut junk = unit.clone();
+        junk.extend_from_slice(&[1, 2, 3]); // does not tile
+        let mut objs = vec![
+            eh_object(unit.clone(), None),
+            eh_object(junk.clone(), None),
+            eh_object(unit.clone(), None),
+        ];
+        let mut dead = crate::common::fx_hash::FxHashSet::default();
+        dead.insert((2usize, 1usize));
+        let d = pack_eh_frame_sections(&mut objs, &dead);
+        assert_eq!(d.merged, 0);
+        assert_eq!(&*objs[1].section_data[1], &junk[..]);
+        assert_eq!(&*objs[2].section_data[1], &unit[..]);
+    }
+
+    #[test]
+    fn sections_are_padded_to_the_strictest_alignment() {
+        // crt1.o's shape: CIE (0x18) + FDE (0x14) = 0x2c bytes, 8-aligned.
+        let full = synth_eh_frame(1, PCREL_SDATA4);
+        let recs = scan_eh_frame_records(&full);
+        let mut odd = full[..recs[1].end].to_vec();
+        let fde_len = odd.len() - recs[1].start - 4;
+        if odd.len() % 8 == 0 {
+            // Make it 4 mod 8: drop 4 bytes of the FDE's (nop) instructions.
+            odd.truncate(odd.len() - 4);
+            let l = (fde_len - 4) as u32;
+            odd[recs[1].start..recs[1].start + 4].copy_from_slice(&l.to_le_bytes());
+        }
+        assert_eq!(odd.len() % 8, 4);
+        let mut term_only = eh_object(vec![0; 4], None);
+        term_only.sections[1].addralign = 4;
+        let mut objs = vec![
+            eh_object(odd.clone(), None),
+            eh_object(full.clone(), None),
+            term_only,
+        ];
+        let d = pack_eh_frame_sections(&mut objs, &Default::default());
+        assert_eq!(d.padded, 1);
+        assert_eq!(objs[0].sections[1].size as usize, odd.len() + 4);
+        assert_eq!(
+            objs[2].sections[1].size, 4,
+            "a bare terminator is not padded"
+        );
+        let merged = merged_eh_frame(&mut objs, &d);
+        // Back to back, the only zero-length record is the final one.
+        let recs = scan_eh_frame_records(&merged);
+        assert_eq!(recs.last().unwrap().end, merged.len() - 4);
+        assert!(
+            recs.windows(2).all(|w| w[0].end == w[1].start),
+            "no gap between records"
+        );
+        assert_eq!(
+            fde_cies(&merged),
+            vec![0, 0],
+            "the second CIE merged, the padded FDE intact"
+        );
+    }
+
+    #[test]
+    fn compaction_adds_no_terminator() {
+        let data = synth_eh_frame(3, PCREL_SDATA4);
+        let recs = scan_eh_frame_records(&data);
+        let prune: Vec<bool> = recs.iter().enumerate().map(|(i, _)| i == 2).collect();
+        let c = compact_eh_frame(&data, &recs, &prune);
+        assert_eq!(c.data.len(), data.len() - (recs[2].end - recs[2].start));
+        assert_eq!(scan_eh_frame_records(&c.data).len(), 3);
     }
 }

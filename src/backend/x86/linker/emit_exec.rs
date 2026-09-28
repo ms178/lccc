@@ -8,10 +8,10 @@ use crate::common::fx_hash::FxHashMap;
 use std::collections::BTreeSet;
 
 use super::elf::*;
-use super::plt_got::exec_got_relax_target;
+use super::plt_got::{exec_got_target, local_got_target};
 use super::reloc_field::{self, w8_checked, w16_checked, w32_checked};
-use super::types::{BASE_ADDR, GlobalSymbol, PAGE_SIZE};
-use crate::backend::elf::{elf64_sym_entry, push_strtab_name};
+use super::types::{BASE_ADDR, GlobalSymbol, LocalSlots, PAGE_SIZE};
+use crate::backend::elf::{STV_PROTECTED, elf64_sym_entry, push_strtab_name};
 use crate::backend::linker_common::{self, DynStrTab, OutputSection};
 
 /// The dynsym NAME for a dynamic symbol reference. Versioned references are
@@ -52,6 +52,9 @@ pub(super) fn emit_executable(
     // `-s` / `--strip-all`: omit `.symtab` and `.strtab` entirely.
     plt_names: &[String],
     got_entries: &[(String, bool)],
+    // GOT slots of LOCAL symbols (`create_plt_got`), placed after the named
+    // slots of `.got`: slot `got_globdat_count + i` holds local `i`'s address.
+    local_got: &LocalSlots,
     // Absolute 64-bit relocations against dynamic data symbols; each becomes a
     // dynamic R_X86_64_64 in .rela.dyn (see AbsDynReloc).
     abs_dyn_relocs: &[super::plt_got::AbsDynReloc],
@@ -63,6 +66,10 @@ pub(super) fn emit_executable(
     needed_sonames: &[String],
     output_path: &str,
     export_dynamic: bool,
+    // `.dynsym` names of the link's shared libraries: an executable
+    // definition of any of them is exported even without --export-dynamic
+    // (see `linker_common::shared_library_dynsym_names`).
+    dso_names: &crate::common::fx_hash::FxHashSet<String>,
     rpath_entries: &[String],
     use_runpath: bool,
     is_static: bool,
@@ -70,6 +77,10 @@ pub(super) fn emit_executable(
     entry_symbol: Option<&str>,
     z_now: bool,
     z_relro: bool,
+    // `(DT_FLAGS, DT_FLAGS_1)` bits the options request
+    // (`LinkerArgs::requested_dyn_flags`: `-z now`, `-z origin`, ...);
+    // DF_1_PIE is added here.
+    requested_dyn_flags: (u64, u64),
     // `-Map=FILE`: write a GNU-ld-compatible link map after layout.
     map_path: Option<&str>,
     // `--version-script=FILE`: restrict which symbols --export-dynamic puts
@@ -93,6 +104,16 @@ pub(super) fn emit_executable(
     pending_defsyms: &[(String, String, usize)],
 ) -> Result<(), String> {
     let ld_time = std::env::var("LCCC_LD_TIME").is_ok();
+    // Without DF_1_PIE an ET_DYN is treated as a shared object: ld.so would
+    // let the global scope interpose its symbols and would not apply the
+    // executable's lookup rules.
+    let (dt_flags, dt_flags_1) = {
+        let (f, mut f1) = requested_dyn_flags;
+        if is_pie {
+            f1 |= crate::backend::linker_common::dyn_flags::DF_1_PIE;
+        }
+        (f, f1)
+    };
     let mut t_zone = std::time::Instant::now();
     macro_rules! zone {
         ($name:expr_2021) => {
@@ -177,11 +198,13 @@ pub(super) fn emit_executable(
         }
     }
 
-    // When --export-dynamic is used, add all defined global symbols to the
-    // dynamic symbol table so shared libraries loaded at runtime (via dlopen)
-    // can find symbols from this executable.
-    if export_dynamic {
-        // A version script narrows the --export-dynamic set exactly as it does
+    // Exported definitions: with --export-dynamic every defined global (so a
+    // dlopen'd plugin can bind to the program), and always those whose name
+    // a linked shared library defines or references -- the library's
+    // callback into the program, or its interposable call to a function the
+    // program replaces (`malloc`).  GNU ld and lld do the same.
+    if export_dynamic || !dso_names.is_empty() {
+        // A version script narrows the exported set exactly as it does
         // for shared objects; `{ global: a; b; local: *; }` is the common
         // spelling used to keep an executable's plugin ABI small.
         let version_script = version_script_path.and_then(linker_common::VersionScript::parse);
@@ -192,6 +215,9 @@ pub(super) fn emit_executable(
                 // symbols.  The predicate is shared with `--gc-sections`'s root
                 // set so the two can never drift apart.
                 if !linker_common::is_exported_dynamic_symbol(*g) {
+                    return false;
+                }
+                if !export_dynamic && !dso_names.contains(dynsym_emit_name(name)) {
                     return false;
                 }
                 if let Some(ref vs) = version_script {
@@ -391,6 +417,13 @@ pub(super) fn emit_executable(
             }
             ord += 1;
         }
+        // Local slots follow the named ones and hold an address in this
+        // output unless the symbol is absolute.
+        for (i, &(obj_idx, si)) in local_got.keys().iter().enumerate() {
+            if objects[obj_idx].symbols[si].shndx != SHN_ABS {
+                v.push(ord + i);
+            }
+        }
         v
     };
     let pie_relative_count = pie_relative.len() + pie_got_relative.len();
@@ -559,7 +592,9 @@ pub(super) fn emit_executable(
         .iter()
         .filter(|(n, p)| !n.is_empty() && !*p)
         .count();
-    let got_size = got_globdat_count as u64 * 8; // GOT needed even for static (TLS, GOTPCREL)
+    // GOT needed even for static (TLS, GOTPCREL): the named slots, then the
+    // local ones.
+    let got_size = (got_globdat_count + local_got.len()) as u64 * 8;
 
     let has_init_array = output_sections
         .iter()
@@ -620,17 +655,9 @@ pub(super) fn emit_executable(
         if relacount > 0 {
             dyn_count += 1;
         }
-        // DT_FLAGS carries BIND_NOW; DT_FLAGS_1 carries NOW and/or PIE.  A PIE
-        // needs DF_1_PIE even without `-z now`, so the two are counted
-        // independently -- and both conditions are spelled identically to the
-        // emission below, which is the only thing keeping DT_* count and bytes
-        // in agreement.
-        if z_now {
-            dyn_count += 1; // DT_FLAGS
-        }
-        if z_now || is_pie {
-            dyn_count += 1; // DT_FLAGS_1
-        }
+        // DT_FLAGS / DT_FLAGS_1: sized from the same two values the writer
+        // emits (`dt_flags`, `dt_flags_1`), so count and bytes agree.
+        dyn_count += u64::from(dt_flags != 0) + u64::from(dt_flags_1 != 0);
         if rpath_string.is_some() {
             dyn_count += 1;
         }
@@ -1235,6 +1262,7 @@ pub(super) fn emit_executable(
             visibility: 0,
             lib_sym_value: 0,
             version: None,
+            absolute: false,
         });
         if entry.defined_in.is_none() && !entry.is_dynamic {
             entry.value = sym.value;
@@ -1301,6 +1329,27 @@ pub(super) fn emit_executable(
             iplt_addr + slot as u64 * iplt_entry_size,
         );
     }
+    // What each local GOT slot holds: the address the relocation pass would
+    // compute for the symbol -- its IPLT stub for a local IFUNC.
+    let local_got_values: Vec<u64> = local_got
+        .keys()
+        .iter()
+        .map(|&(obj_idx, si)| {
+            local_ifunc_slots
+                .get(&(obj_idx, si))
+                .copied()
+                .unwrap_or_else(|| {
+                    resolve_sym(
+                        obj_idx,
+                        &objects[obj_idx].symbols[si],
+                        globals,
+                        section_map,
+                        output_sections,
+                        plt_addr,
+                    )
+                })
+        })
+        .collect();
 
     let entry_name = entry_symbol.unwrap_or("_start");
     let entry_addr = globals
@@ -1614,8 +1663,12 @@ pub(super) fn emit_executable(
         keyed.into_iter().map(|(_, n, g)| (n, g)).collect();
     for (name, gsym) in &sym_names {
         let off = push_strtab_name(&mut symtab_names, name.as_bytes());
-        let shndx: u16 = if gsym.defined_in == Some(usize::MAX) || gsym.section_idx == SHN_ABS {
+        let shndx: u16 = if gsym.absolute {
             SHN_ABS
+        } else if gsym.defined_in == Some(usize::MAX) {
+            // A linker-created address (`_end`, `__start_SEC`, `--defsym
+            // x=_start+4`): the section holding it, as GNU ld reports it.
+            containing_section_hdr(output_sections, &out_sec_to_hdr, gsym.value).unwrap_or(SHN_ABS)
         } else if gsym.section_idx == SHN_COMMON {
             SHN_COMMON
         } else if let Some(obj_idx) = gsym.defined_in {
@@ -2001,6 +2054,39 @@ pub(super) fn emit_executable(
             }
         }
 
+        // st_shndx of an exported definition.  ld.so reads exactly one fact
+        // from it -- SHN_ABS means "do not add the load bias" -- so an
+        // absolute symbol exported from a PIE must say so (it used to claim
+        // index 1 like everything else, and every lookup of it from a
+        // library returned the value plus the PIE's base).  Everything else
+        // gets its real section, as GNU ld writes it; tools and a link
+        // against the executable (`-R`, a PIE used as a library) read it.
+        let dyn_def_shndx = |gsym: &GlobalSymbol| -> u16 {
+            if gsym.absolute {
+                return SHN_ABS;
+            }
+            if let Some(obj_idx) = gsym.defined_in.filter(|&o| o != usize::MAX) {
+                if let Some(&h) = section_map
+                    .get(&(obj_idx, gsym.section_idx as usize))
+                    .and_then(|(oi, _)| out_sec_to_hdr.get(oi))
+                {
+                    return h;
+                }
+            }
+            // COPY-relocated variables, COMMON, linker anchors and
+            // address-valued `--defsym`s.
+            containing_section_hdr(output_sections, &out_sec_to_hdr, gsym.value).unwrap_or(1)
+        };
+        // Visibility an exported definition keeps: only PROTECTED survives
+        // into `.dynsym` (HIDDEN/INTERNAL definitions are never exported).
+        let dyn_st_other = |gsym: &GlobalSymbol| -> u8 {
+            if gsym.visibility & 3 == STV_PROTECTED {
+                STV_PROTECTED
+            } else {
+                0
+            }
+        };
+
         // .dynsym
         let mut ds = dynsym_offset as usize + 24; // skip null entry
         for name in &dyn_sym_names {
@@ -2012,18 +2098,21 @@ pub(super) fn emit_executable(
                         out[ds + 4] = (STB_GLOBAL << 4) | STT_OBJECT;
                         out[ds + 5] = 0;
                     }
-                    w16(&mut out, ds + 6, 1);
+                    w16(&mut out, ds + 6, dyn_def_shndx(gsym));
                     w64(&mut out, ds + 8, gsym.value);
                     w64(&mut out, ds + 16, gsym.size);
-                } else if !gsym.is_dynamic && gsym.section_idx != SHN_UNDEF && gsym.value != 0 {
+                } else if !gsym.is_dynamic
+                    && gsym.section_idx != SHN_UNDEF
+                    && (gsym.value != 0 || gsym.absolute)
+                {
                     let stt = gsym.info & 0xf;
                     let stb = gsym.info >> 4;
                     let st_info = (stb << 4) | stt;
                     if ds + 5 < out.len() {
                         out[ds + 4] = st_info;
-                        out[ds + 5] = 0;
+                        out[ds + 5] = dyn_st_other(gsym);
                     }
-                    w16(&mut out, ds + 6, 1);
+                    w16(&mut out, ds + 6, dyn_def_shndx(gsym));
                     // For TLS symbols, the dynsym value must be the offset within
                     // the TLS segment, not the virtual address.
                     let sym_val = if stt == STT_TLS && tls_addr != 0 {
@@ -2123,14 +2212,18 @@ pub(super) fn emit_executable(
         // ...then the GOT slots holding locally-defined addresses.  Slot N of
         // the non-PLT range lives at got_addr + N*8, matching the numbering the
         // GLOB_DAT writer below uses.
+        // (The named slots in ordinal order, collected once: looking each
+        // one up by a scan from the start was quadratic in the GOT size.)
+        let named_slots: Vec<&str> = got_entries
+            .iter()
+            .filter(|(n, p)| !n.is_empty() && !*p)
+            .map(|(n, _)| n.as_str())
+            .collect();
         for &ord in &pie_got_relative {
-            let name = &got_entries
-                .iter()
-                .filter(|(n, p)| !n.is_empty() && !*p)
-                .nth(ord)
-                .map(|(n, _)| n.clone())
-                .unwrap_or_default();
-            let addend = globals.get(name.as_str()).map(|g| g.value).unwrap_or(0);
+            let addend = match named_slots.get(ord) {
+                Some(name) => globals.get(*name).map(|g| g.value).unwrap_or(0),
+                None => local_got_values[ord - named_slots.len()],
+            };
             w64(&mut out, rd, got_addr + ord as u64 * 8);
             w64(&mut out, rd + 8, R_X86_64_RELATIVE as u64);
             w64(&mut out, rd + 16, addend);
@@ -2381,24 +2474,14 @@ pub(super) fn emit_executable(
             w64(&mut out, dd + 8, verneed_count as u64);
             dd += 16;
         }
-        if z_now {
+        if dt_flags != 0 {
             w64(&mut out, dd, DT_FLAGS as u64);
-            w64(&mut out, dd + 8, DF_BIND_NOW as u64);
+            w64(&mut out, dd + 8, dt_flags);
             dd += 16;
         }
-        if z_now || is_pie {
-            let mut flags1: i64 = 0;
-            if z_now {
-                flags1 |= DF_1_NOW;
-            }
-            if is_pie {
-                // Without DF_1_PIE an ET_DYN is treated as a shared object:
-                // ld.so would let the global scope interpose its symbols and
-                // would not apply the executable's lookup rules.
-                flags1 |= DF_1_PIE;
-            }
+        if dt_flags_1 != 0 {
             w64(&mut out, dd, DT_FLAGS_1 as u64);
-            w64(&mut out, dd + 8, flags1 as u64);
+            w64(&mut out, dd + 8, dt_flags_1);
             dd += 16;
         }
         w64(&mut out, dd, DT_NULL as u64);
@@ -2437,6 +2520,10 @@ pub(super) fn emit_executable(
                 // A shared-library symbol's slot stays zero: its GLOB_DAT (or
                 // TPOFF64) is the only writer.
             }
+            go += 8;
+        }
+        for &v in &local_got_values {
+            w64(&mut out, go, v);
             go += 8;
         }
     }
@@ -2765,54 +2852,40 @@ pub(super) fn emit_executable(
                             }
                         }
                         if !resolved {
-                            // IE-to-LE rewrites a REX-prefixed movq/addq. REX2
-                            // (CODE_4) and APX EVEX (CODE_6) keep a GOT slot
-                            // when one exists; without a slot we refuse rather
-                            // than corrupt the prefix.
-                            if rela.rela_type != R_X86_64_GOTTPOFF {
-                                return Err(format!(
-                                    "GOTTPOFF IE-to-LE relaxation failed: APX/REX2 form of '{}' has no GOT slot",
-                                    sym.name
-                                ));
-                            }
-                            // IE-to-LE relaxation: convert GOT-indirect to immediate TPOFF.
-                            //   movq  sym@GOTTPOFF(%rip), %reg  ->  movq $tpoff, %reg
-                            //   addq  sym@GOTTPOFF(%rip), %reg  ->  addq $tpoff, %reg
-                            // Encodings (fp points at the disp32):
-                            //   REX 8b /r disp32  ->  REX' c7 (0xc0|reg) imm32
-                            //   REX 03 /r disp32  ->  REX' 81 (0xc0|reg) imm32
-                            // CRITICAL: the destination register moves from the
-                            // ModRM.reg field to the ModRM.rm field, so the REX.R
-                            // bit must be transplanted to REX.B. Without this,
-                            // e.g. %r12 (REX.R + reg=100) silently becomes %rsp,
-                            // corrupting the stack pointer (observed as glibc
-                            // static-TLS crashes).
+                            // IE -> LE: `movq/addq sym@gottpoff(%rip), %reg`
+                            // becomes `movq/addq $tpoff, %reg`.  The form is
+                            // verified in the ORIGINAL section bytes (REX.W
+                            // inside the section, RIP-relative ModRM); REX2
+                            // and APX forms keep a GOT slot when they have
+                            // one and are refused otherwise.
+                            let kind = gottpoff_ie_to_le(
+                                rela.rela_type,
+                                objects[obj_idx].section_data[sec_idx].as_slice(),
+                                rela.offset as usize,
+                            )
+                            .ok_or_else(|| {
+                                format!(
+                                    "{obj_name}: {} against '{}' at offset {:#x} is not a \
+                                     REX.W movq/addq sym@gottpoff(%rip), %reg and the symbol \
+                                     has no GOT slot: cannot convert Initial-Exec to Local-Exec",
+                                    reloc_field::name(rela.rela_type).unwrap_or("relocation"),
+                                    sym.name,
+                                    rela.offset
+                                )
+                            })?;
+                            rewrite_ie_to_le(&mut out, fp, kind);
+                            // The -4 in the addend belonged to the RIP-relative
+                            // field; the immediate is the symbol's own TP
+                            // offset (plus any addend beyond that -4).
                             let tpoff = (s as i64 - tls_addr as i64) - tls_mem_size as i64;
-                            let opc = if fp >= 2 { out[fp - 2] } else { 0 };
-                            if fp >= 3 && fp + 4 <= out.len() && (opc == 0x8b || opc == 0x03) {
-                                let modrm = out[fp - 1];
-                                let reg = (modrm >> 3) & 7;
-                                out[fp - 2] = if opc == 0x8b { 0xc7 } else { 0x81 };
-                                out[fp - 1] = 0xc0 | reg;
-                                let rex = out[fp - 3];
-                                if (rex & 0xf0) == 0x40 {
-                                    // Keep W and X; move R into B.
-                                    out[fp - 3] = (rex & 0b1111_1010) | ((rex >> 2) & 1);
-                                }
-                                w32_checked(
-                                    &mut out,
-                                    fp,
-                                    tpoff + a,
-                                    rela.rela_type,
-                                    &sym.name,
-                                    &objects[obj_idx].source_name,
-                                )?;
-                            } else {
-                                return Err(format!(
-                                    "GOTTPOFF IE-to-LE relaxation failed: unrecognized instruction pattern at offset 0x{:x} for symbol '{}' (expected movq/addq GOT(%rip), %reg)",
-                                    fp, sym.name
-                                ));
-                            }
+                            w32_checked(
+                                &mut out,
+                                fp,
+                                tpoff + a + 4,
+                                rela.rela_type,
+                                &sym.name,
+                                obj_name,
+                            )?;
                         }
                     }
                     R_X86_64_GOTPCREL
@@ -2824,117 +2897,144 @@ pub(super) fn emit_executable(
                         // and the target allow it -- also when the symbol has a
                         // slot for some other, unrelaxable reference: the
                         // rewritten instruction saves the dependent load.  The
-                        // decision reads the ORIGINAL section bytes, exactly as
-                        // `create_plt_got` did when it elided slots.  A LOCAL
-                        // symbol never has a slot (see `create_plt_got`) and is
-                        // never preemptible; a local IFUNC's `s` is already its
-                        // IPLT stub.
+                        // decision reads the ORIGINAL section bytes and asks
+                        // the same target question as `create_plt_got`, so a
+                        // reference left unrelaxed always has a slot; a
+                        // missing one is a planner bug, never something to
+                        // patch up here (the instruction LOADS the slot, and
+                        // pointing it at the symbol loads the symbol's bytes).
                         let global = (!sym.name.is_empty() && !sym.is_local())
                             .then(|| globals_snap.get(sym.name.as_str()))
                             .flatten();
-                        let target_ok = match global {
-                            Some(g) => exec_got_relax_target(g),
-                            None => sym.is_local() && sym.shndx != SHN_ABS,
+                        let target = match global {
+                            Some(g) => exec_got_target(g),
+                            None if sym.is_local() => Some(local_got_target(sym)),
+                            None => None,
                         };
-                        let relax = gotpcrelx_relaxation(
-                            rela.rela_type,
-                            a,
-                            objects[obj_idx].section_data[sec_idx].as_slice(),
-                            rela.offset as usize,
-                            is_pie,
-                        );
-                        if let Some(kind) = relax.filter(|_| target_ok) {
-                            let (pos, v) =
-                                rewrite_got_relax(&mut out, fp, kind, rela.rela_type, is_pie, s, p);
-                            w32_checked(
-                                &mut out,
-                                pos,
-                                v,
+                        let relax = target.and_then(|target| {
+                            gotpcrelx_relaxation(
                                 rela.rela_type,
-                                &sym.name,
-                                &objects[obj_idx].source_name,
-                            )?;
+                                a,
+                                objects[obj_idx].section_data[sec_idx].as_slice(),
+                                rela.offset as usize,
+                                is_pie,
+                                target,
+                            )
+                        });
+                        if let Some(kind) = relax {
+                            let (pos, v) =
+                                rewrite_got_relax(&mut out, fp, kind, rela.rela_type, s, p);
+                            w32_checked(&mut out, pos, v, rela.rela_type, &sym.name, obj_name)?;
                             continue;
                         }
-                        if let Some(g) = global {
-                            {
-                                if let Some(gi) = g.got_idx {
-                                    let entry = &got_entries[gi];
-                                    let gea = if entry.1 {
-                                        got_plt_addr + 24 + g.plt_idx.unwrap_or(0) as u64 * 8
-                                    } else {
-                                        let nb = got_slot_ordinal[gi];
-                                        got_addr + nb as u64 * 8
-                                    };
-                                    if std::env::var("LCCC_DEBUG_GOT").is_ok() {
-                                        let nb = got_slot_ordinal[gi];
-                                        eprintln!(
-                                            "[GOTREL] name={:?} gi={} is_plt={} nb={} gea=0x{:x} got_addr=0x{:x} p=0x{:x} addend={}",
-                                            sym.name, gi, entry.1, nb, gea, got_addr, p, a
-                                        );
-                                    }
-                                    w32_checked(
-                                        &mut out,
-                                        fp,
-                                        gea as i64 + a - p as i64,
-                                        rela.rela_type,
-                                        &sym.name,
-                                        &objects[obj_idx].source_name,
-                                    )?;
-                                    continue;
+                        let gea = match global {
+                            Some(g) => g.got_idx.map(|gi| {
+                                if got_entries[gi].1 {
+                                    got_plt_addr + 24 + g.plt_idx.unwrap_or(0) as u64 * 8
+                                } else {
+                                    got_addr + got_slot_ordinal[gi] as u64 * 8
                                 }
-                                if is_gotpcrelx_relaxable(rela.rela_type) && g.defined_in.is_some()
-                                {
-                                    if fp >= 2 && fp < out.len() && out[fp - 2] == 0x8b {
-                                        out[fp - 2] = 0x8d;
-                                    }
-                                    w32_checked(
-                                        &mut out,
-                                        fp,
-                                        s as i64 + a - p as i64,
-                                        rela.rela_type,
-                                        &sym.name,
-                                        &objects[obj_idx].source_name,
-                                    )?;
-                                    continue;
-                                }
-                            }
-                        }
-                        // No GOT slot exists for this symbol (typically a
-                        // LOCAL asm label reached via sym@GOTPCREL). The
-                        // instruction still DEREFERENCES its memory operand
-                        // (`movq sym@GOTPCREL(%rip), %reg` loads the slot's
-                        // CONTENTS), so pointing it straight at the symbol
-                        // loads the bytes AT the symbol instead of its
-                        // address — silent wrong code (an asm label's first
-                        // instruction bytes masqueraded as a pointer). Do
-                        // what GNU ld does: relax mov -> lea so the operand
-                        // becomes an address computation. Any other opcode
-                        // shape with a slotless GOT reference cannot be
-                        // fixed up locally — fail loudly rather than emit a
-                        // silently corrupt binary.
-                        if fp >= 2 && fp < out.len() && out[fp - 2] == 0x8b {
-                            out[fp - 2] = 0x8d;
-                            w32_checked(
-                                &mut out,
-                                fp,
-                                s as i64 + a - p as i64,
-                                rela.rela_type,
-                                &sym.name,
-                                &objects[obj_idx].source_name,
-                            )?;
-                        } else {
+                            }),
+                            None if sym.is_local() => local_got
+                                .get((obj_idx, si))
+                                .map(|i| got_addr + (got_globdat_count + i) as u64 * 8),
+                            None => None,
+                        };
+                        let Some(gea) = gea else {
                             return Err(format!(
-                                "GOTPCREL against '{}' has no GOT entry and the \
-                                 instruction is not a relaxable mov (opcode 0x{:02x}); \
-                                 refusing to emit a load of the symbol's bytes",
-                                sym.name,
-                                if fp >= 2 { out[fp - 2] } else { 0 }
+                                "{obj_name}: internal error: no GOT slot for {} against '{}'",
+                                reloc_field::name(rela.rela_type).unwrap_or("relocation"),
+                                sym.name
                             ));
+                        };
+                        if std::env::var_os("LCCC_DEBUG_GOT").is_some() {
+                            eprintln!(
+                                "[GOTREL] name={:?} gea=0x{gea:x} got_addr=0x{got_addr:x} p=0x{p:x} addend={a}",
+                                sym.name
+                            );
                         }
+                        w32_checked(
+                            &mut out,
+                            fp,
+                            gea as i64 + a - p as i64,
+                            rela.rela_type,
+                            &sym.name,
+                            obj_name,
+                        )?;
                     }
                     R_X86_64_PC64 => {
                         w64(&mut out, fp, (s as i64 + a - p as i64) as u64);
+                    }
+                    // ── Medium/large code model: offsets from the GOT origin,
+                    // `_GLOBAL_OFFSET_TABLE_` = `.got.plt` in an executable.
+                    // `s` already is the PLT entry for a library function
+                    // (`resolve_sym`), which is exactly PLTOFF64's L.
+                    R_X86_64_GOTPC32 => {
+                        w32_checked(
+                            &mut out,
+                            fp,
+                            got_plt_addr as i64 + a - p as i64,
+                            rela.rela_type,
+                            &sym.name,
+                            obj_name,
+                        )?;
+                    }
+                    R_X86_64_GOTPC64 => {
+                        w64(&mut out, fp, (got_plt_addr as i64 + a - p as i64) as u64);
+                    }
+                    R_X86_64_PLTOFF64 => {
+                        w64(&mut out, fp, (s as i64 + a - got_plt_addr as i64) as u64);
+                    }
+                    R_X86_64_GOTOFF64 => {
+                        // S + A - GOT needs S bound here: a copy-relocated
+                        // variable is (its copy), a library symbol is not.
+                        let global = (!sym.name.is_empty() && !sym.is_local())
+                            .then(|| globals_snap.get(sym.name.as_str()))
+                            .flatten();
+                        if global.is_some_and(|g| g.is_dynamic && !g.copy_reloc) {
+                            return Err(format!(
+                                "{obj_name}: relocation R_X86_64_GOTOFF64 against shared-library \
+                                 symbol '{}' has no link-time value; recompile with -fPIC",
+                                sym.name
+                            ));
+                        }
+                        w64(&mut out, fp, (s as i64 + a - got_plt_addr as i64) as u64);
+                    }
+                    t if is_got64_family(t) => {
+                        // Same slot choice as the GOTPCREL arm; the `movabs`
+                        // of a slot offset is never relaxed, so
+                        // `create_plt_got` gives every GOT64 reference a
+                        // slot, a LOCAL one included.
+                        let gea = if sym.is_local() {
+                            local_got
+                                .get((obj_idx, si))
+                                .map(|i| got_addr + (got_globdat_count + i) as u64 * 8)
+                        } else {
+                            (!sym.name.is_empty())
+                                .then(|| globals_snap.get(sym.name.as_str()))
+                                .flatten()
+                                .and_then(|g| {
+                                    let gi = g.got_idx?;
+                                    Some(if got_entries[gi].1 {
+                                        got_plt_addr + 24 + g.plt_idx.unwrap_or(0) as u64 * 8
+                                    } else {
+                                        got_addr + got_slot_ordinal[gi] as u64 * 8
+                                    })
+                                })
+                        };
+                        let Some(gea) = gea else {
+                            return Err(format!(
+                                "{obj_name}: internal error: no GOT slot for {} against '{}'",
+                                reloc_field::name(t).unwrap_or("relocation"),
+                                sym.name
+                            ));
+                        };
+                        let v = if t == R_X86_64_GOTPCREL64 {
+                            gea as i64 + a - p as i64
+                        } else {
+                            gea as i64 - got_plt_addr as i64 + a
+                        };
+                        w64(&mut out, fp, v as u64);
                     }
                     R_X86_64_TPOFF32 => {
                         // Initial Exec TLS: value = (sym_addr - tls_addr) - tls_mem_size
@@ -3815,6 +3915,29 @@ pub(super) fn emit_executable(
         let _ = std::fs::set_permissions(output_path, std::fs::Permissions::from_mode(0o755));
     }
     Ok(())
+}
+
+/// Section header index of the allocated output section holding address
+/// `v`, end inclusive (`_end` is one past `.bss`), the later one at a
+/// boundary.  Never a TLS template, which overlays ordinary addresses.  For
+/// symbols that belong to no input section: COPY-relocated variables,
+/// COMMON, linker-created addresses.
+fn containing_section_hdr(
+    output_sections: &[OutputSection],
+    out_sec_to_hdr: &FxHashMap<usize, u16>,
+    v: u64,
+) -> Option<u16> {
+    output_sections
+        .iter()
+        .enumerate()
+        .filter(|(_, sec)| {
+            sec.flags & SHF_ALLOC != 0
+                && sec.flags & SHF_TLS == 0
+                && sec.addr <= v
+                && v <= sec.addr + sec.mem_size
+        })
+        .max_by_key(|(_, sec)| sec.addr)
+        .and_then(|(i, _)| out_sec_to_hdr.get(&i).copied())
 }
 
 pub(super) fn resolve_sym(

@@ -78,9 +78,9 @@ pub struct LinkerArgs {
     /// no note produces binaries that look linked but cannot be symbolised
     /// after the fact.  `--build-id=none` (and `=0`) clears it, matching GNU ld.
     pub build_id: bool,
-    /// `-Bsymbolic` / `-Bsymbolic-functions`: bind global references inside a
-    /// shared library to its own definitions.
-    pub bsymbolic: bool,
+    /// `-Bsymbolic` / `-Bsymbolic-functions` / `-Bno-symbolic`, last one
+    /// wins (GNU ld `lexsup.c`); see [`Symbolic`].
+    pub symbolic: Symbolic,
     /// `--no-undefined` / `-z defs`: reject unresolved symbols in a shared
     /// library instead of deferring them to the loader.
     pub no_undefined: bool,
@@ -439,6 +439,100 @@ fn apply_z_keyword(result: &mut LinkerArgs, kw: &str) {
     }
 }
 
+/// How `-Bsymbolic*` binds a shared object's references to its own
+/// default-visibility definitions.  Only meaningful for `-shared`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Symbolic {
+    /// ELF default: such definitions are preemptible.
+    #[default]
+    None,
+    /// `-Bsymbolic-functions`: functions bind locally; data stays
+    /// preemptible, so an executable's copy relocation of a library
+    /// variable is still the one copy both see.  (Treating this like
+    /// `-Bsymbolic` -- as lccc-ld once did -- gives the library its own
+    /// copy of every such variable: two objects where C has one.)
+    Functions,
+    /// `-Bsymbolic`: every definition binds locally; DF_SYMBOLIC is set.
+    All,
+}
+
+impl Symbolic {
+    fn from_flag(flag: &str) -> Option<Self> {
+        match flag {
+            "-Bsymbolic" => Some(Self::All),
+            "-Bsymbolic-functions" => Some(Self::Functions),
+            "-Bno-symbolic" => Some(Self::None),
+            _ => None,
+        }
+    }
+
+    /// Whether a definition of ELF symbol type `st_type` binds inside the
+    /// library.  "Functions" are STT_FUNC and STT_GNU_IFUNC: lld binds
+    /// only STT_FUNC, GNU ld everything but data; an STT_NOTYPE symbol may
+    /// be either, and staying preemptible is always correct.
+    pub fn binds_locally(self, st_type: u8) -> bool {
+        const STT_FUNC: u8 = 2;
+        const STT_GNU_IFUNC: u8 = 10;
+        match self {
+            Self::None => false,
+            Self::Functions => st_type == STT_FUNC || st_type == STT_GNU_IFUNC,
+            Self::All => true,
+        }
+    }
+}
+
+/// DT_FLAGS / DT_FLAGS_1 bits (gABI; DF_1_* from GNU/Solaris).
+pub mod dyn_flags {
+    pub const DF_ORIGIN: u64 = 0x1;
+    pub const DF_SYMBOLIC: u64 = 0x2;
+    pub const DF_BIND_NOW: u64 = crate::backend::elf::DF_BIND_NOW as u64;
+    pub const DF_1_NOW: u64 = crate::backend::elf::DF_1_NOW as u64;
+    pub const DF_1_GLOBAL: u64 = 0x2;
+    pub const DF_1_NODELETE: u64 = 0x8;
+    pub const DF_1_INITFIRST: u64 = 0x20;
+    pub const DF_1_NOOPEN: u64 = 0x40;
+    pub const DF_1_ORIGIN: u64 = 0x80;
+    pub const DF_1_INTERPOSE: u64 = 0x400;
+    pub const DF_1_NODEFLIB: u64 = 0x800;
+    pub const DF_1_PIE: u64 = crate::backend::elf::DF_1_PIE as u64;
+}
+
+impl LinkerArgs {
+    /// `(DT_FLAGS, DT_FLAGS_1)` requested by the options -- `-z now` and the
+    /// `-z origin/nodelete/nodlopen/initfirst/interpose/nodefaultlib/global`
+    /// keywords -- common to executables and shared objects.  Emitters add
+    /// what depends on the output kind (DF_1_PIE, DF_SYMBOLIC).  Before,
+    /// the x86-64 emitters dropped all of these but `-z now` in
+    /// executables: `-z nodelete` libraries could be unloaded by
+    /// `dlclose` and `-Wl,-z,now` libraries bound lazily.
+    pub fn requested_dyn_flags(&self) -> (u64, u64) {
+        use dyn_flags::*;
+        let (mut flags, mut flags_1) = (0u64, 0u64);
+        if self.z_now {
+            flags |= DF_BIND_NOW;
+            flags_1 |= DF_1_NOW;
+        }
+        for kw in &self.z_dyn_flag_keywords {
+            match kw.as_str() {
+                "origin" => {
+                    flags |= DF_ORIGIN;
+                    flags_1 |= DF_1_ORIGIN;
+                }
+                "nodelete" => flags_1 |= DF_1_NODELETE,
+                "nodlopen" => flags_1 |= DF_1_NOOPEN,
+                "initfirst" => flags_1 |= DF_1_INITFIRST,
+                "interpose" => flags_1 |= DF_1_INTERPOSE,
+                "nodefaultlib" => flags_1 |= DF_1_NODEFLIB,
+                _ => {}
+            }
+        }
+        if self.z_other_keywords.iter().any(|k| k == "global") {
+            flags_1 |= DF_1_GLOBAL;
+        }
+        (flags, flags_1)
+    }
+}
+
 pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
     let mut result = LinkerArgs::default();
     // DT_RUNPATH is the default, not DT_RPATH: bfd (as configured by every
@@ -742,8 +836,8 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
                 } else if part == "-soname" && j + 1 < parts.len() {
                     j += 1;
                     result.soname = Some(parts[j].to_string());
-                } else if part == "-Bsymbolic" || part == "-Bsymbolic-functions" {
-                    result.bsymbolic = true;
+                } else if let Some(s) = Symbolic::from_flag(part) {
+                    result.symbolic = s;
                 } else if part == "--no-undefined" {
                     result.no_undefined = true;
                 } else if let Some(v) = part.strip_prefix("--hash-style=") {
@@ -774,8 +868,8 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
         } else if arg == "-soname" && i + 1 < args.len() {
             i += 1;
             result.soname = Some(args[i].to_string());
-        } else if arg == "-Bsymbolic" || arg == "-Bsymbolic-functions" {
-            result.bsymbolic = true;
+        } else if let Some(s) = Symbolic::from_flag(arg) {
+            result.symbolic = s;
         } else if arg == "--no-undefined" {
             result.no_undefined = true;
         } else if let Some(v) = arg.strip_prefix("--hash-style=") {
@@ -1142,6 +1236,69 @@ mod z_isa_level_tests {
                 "-z {kw} must land on the warn-and-ignore list"
             );
         }
+    }
+
+    /// `-Bsymbolic*` / `-Bno-symbolic`: the last spelling wins in either
+    /// order and in both the `-Wl,` group and bare (lccc-ld) forms --
+    /// GNU ld's `lexsup.c` just overwrites one mode variable.
+    #[test]
+    fn symbolic_last_spelling_wins() {
+        let cases: &[(&[&str], Symbolic)] = &[
+            (&[], Symbolic::None),
+            (&["-Wl,-Bsymbolic"], Symbolic::All),
+            (&["-Wl,-Bsymbolic-functions"], Symbolic::Functions),
+            (
+                &["-Wl,-Bsymbolic,-Bsymbolic-functions"],
+                Symbolic::Functions,
+            ),
+            (
+                &["-Wl,-Bsymbolic-functions", "-Wl,-Bsymbolic"],
+                Symbolic::All,
+            ),
+            (&["-Wl,-Bsymbolic", "-Wl,-Bno-symbolic"], Symbolic::None),
+            (&["-Bsymbolic-functions"], Symbolic::Functions),
+            (
+                &["-Bsymbolic-functions", "-Bno-symbolic", "-Bsymbolic"],
+                Symbolic::All,
+            ),
+        ];
+        for (a, want) in cases {
+            assert_eq!(parse_linker_args(&args(a)).symbolic, *want, "{a:?}");
+        }
+        // Functions mode binds exactly STT_FUNC and STT_GNU_IFUNC.
+        for t in 0u8..16 {
+            assert_eq!(
+                Symbolic::Functions.binds_locally(t),
+                t == 2 || t == 10,
+                "{t}"
+            );
+            assert!(Symbolic::All.binds_locally(t) && !Symbolic::None.binds_locally(t));
+        }
+    }
+
+    #[test]
+    fn requested_dyn_flags_cover_every_keyword() {
+        use super::dyn_flags::*;
+        let f = |a: &[&str]| parse_linker_args(&args(a)).requested_dyn_flags();
+        assert_eq!(f(&[]), (0, 0));
+        assert_eq!(f(&["-Wl,-z,now"]), (DF_BIND_NOW, DF_1_NOW));
+        assert_eq!(f(&["-Wl,-z,now,-z,lazy"]), (0, 0));
+        assert_eq!(f(&["-Wl,-z,origin"]), (DF_ORIGIN, DF_1_ORIGIN));
+        assert_eq!(
+            f(&[
+                "-Wl,-z,nodelete,-z,nodlopen,-z,initfirst",
+                "-Wl,-z,interpose,-z,nodefaultlib,-z,global",
+            ]),
+            (
+                0,
+                DF_1_NODELETE
+                    | DF_1_NOOPEN
+                    | DF_1_INITFIRST
+                    | DF_1_INTERPOSE
+                    | DF_1_NODEFLIB
+                    | DF_1_GLOBAL
+            )
+        );
     }
 
     /// The joined `-z<keyword>` spelling inside a `-Wl,` group behaves

@@ -562,3 +562,122 @@ pub fn parse_soname(data: &[u8]) -> Option<String> {
         Some(read_cstr(&data[strtab_file_off..], name_off))
     }
 }
+
+/// Every non-local name in a shared library's `.dynsym`, defined AND
+/// undefined, in table order (duplicates across versions included).
+///
+/// An executable must export its own definition of any such name -- GNU
+/// ld's `ref_dynamic`/`def_dynamic` rule, which lld follows too: a library
+/// that *references* `hook` calls back into the program only if the
+/// program's `hook` is in `.dynsym`, and a library that *defines* `malloc`
+/// binds its own interposable calls to the program's `malloc` only if that
+/// one is visible (otherwise `strdup` allocates from libc's heap and the
+/// program's `free` releases into its own).  `parse_shared_library_symbols`
+/// deliberately drops undefined entries, hence this separate walk; it
+/// returns an empty list for input it cannot parse (the caller has already
+/// validated the file as a library it links against).
+pub fn shared_library_dynsym_names(data: &[u8]) -> Vec<String> {
+    let Some((sym_off, count, strtab)) = locate_dynsym(data) else {
+        return Vec::new();
+    };
+    let mut names = Vec::with_capacity(count.saturating_sub(1));
+    for j in 1..count {
+        let Some(ent) = j
+            .checked_mul(24)
+            .and_then(|o| o.checked_add(sym_off))
+            .and_then(|o| slice_at(data, o, 24))
+        else {
+            break;
+        };
+        if ent[4] >> 4 == crate::backend::elf::STB_LOCAL {
+            continue;
+        }
+        let name_idx = read_u32(ent, 0) as usize;
+        if name_idx == 0 || name_idx >= strtab.len() {
+            continue;
+        }
+        names.push(read_cstr(strtab, name_idx));
+    }
+    names
+}
+
+/// (file offset of `.dynsym`, entry count, dynamic string table) of an
+/// ELF64 shared library, from the section headers or -- for a library
+/// without them -- from `PT_DYNAMIC`.
+fn locate_dynsym(data: &[u8]) -> Option<(usize, usize, &[u8])> {
+    if data.len() < 64 || data[0..4] != ELF_MAGIC || data[4] != ELFCLASS64 {
+        return None;
+    }
+    let e_shoff = read_u64(data, 40) as usize;
+    let e_shentsize = read_u16(data, 58) as usize;
+    let e_shnum = read_u16(data, 60) as usize;
+    if e_shoff != 0 && e_shnum != 0 && e_shentsize >= 64 {
+        let shdr = |i: usize| {
+            table_entry(data, e_shoff, i, e_shentsize).map(|_| e_shoff + i * e_shentsize)
+        };
+        for i in 0..e_shnum {
+            let off = shdr(i)?;
+            if read_u32(data, off + 4) != SHT_DYNSYM {
+                continue;
+            }
+            let (sym_off, sym_size) = (
+                read_u64(data, off + 24) as usize,
+                read_u64(data, off + 32) as usize,
+            );
+            let str_hdr = shdr(read_u32(data, off + 40) as usize)?;
+            let strtab = slice_at(
+                data,
+                read_u64(data, str_hdr + 24) as usize,
+                read_u64(data, str_hdr + 32) as usize,
+            )?;
+            slice_at(data, sym_off, sym_size)?;
+            return Some((sym_off, sym_size / 24, strtab));
+        }
+    }
+    let e_phoff = read_u64(data, 32) as usize;
+    let e_phentsize = read_u16(data, 54) as usize;
+    let e_phnum = read_u16(data, 56) as usize;
+    if e_phoff == 0 || e_phentsize < 56 {
+        return None;
+    }
+    let dyn_ph = (0..e_phnum)
+        .map_while(|i| {
+            table_entry(data, e_phoff, i, e_phentsize).map(|_| e_phoff + i * e_phentsize)
+        })
+        .find(|&ph| read_u32(data, ph) == PT_DYNAMIC)?;
+    let (dyn_off, dyn_size) = (
+        read_u64(data, dyn_ph + 8) as usize,
+        read_u64(data, dyn_ph + 32) as usize,
+    );
+    let (mut symtab, mut strtab, mut strsz, mut gnu_hash) = (0u64, 0u64, 0u64, 0u64);
+    let mut pos = dyn_off;
+    while pos.saturating_add(16) <= dyn_off.saturating_add(dyn_size)
+        && slice_at(data, pos, 16).is_some()
+    {
+        let (tag, val) = (read_i64(data, pos), read_u64(data, pos + 8));
+        match tag {
+            x if x == DT_NULL => break,
+            x if x == DT_SYMTAB => symtab = val,
+            x if x == DT_STRTAB => strtab = val,
+            x if x == DT_STRSZ => strsz = val,
+            x if x == DT_GNU_HASH => gnu_hash = val,
+            _ => {}
+        }
+        pos += 16;
+    }
+    if symtab == 0 || strtab == 0 {
+        return None;
+    }
+    let to_off = |va| vaddr_to_file_offset(data, e_phoff, e_phentsize, e_phnum, va);
+    let (sym_off, str_off) = (to_off(symtab), to_off(strtab));
+    let strtab = slice_at(data, str_off, strsz as usize)?;
+    // Same sizing rule as `parse_shared_library_symbols_from_phdrs`.
+    let count = if gnu_hash != 0 {
+        count_dynsyms_from_gnu_hash(data, to_off(gnu_hash))
+    } else if str_off > sym_off {
+        (str_off - sym_off) / 24
+    } else {
+        1024
+    };
+    Some((sym_off, count, strtab))
+}

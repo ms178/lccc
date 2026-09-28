@@ -522,7 +522,7 @@ fn make_script_dynamic_object(
     version: &linker_common::VersionScript,
     soname: Option<&str>,
     base_name: &str,
-    bsymbolic: bool,
+    dt_symbolic: bool,
     machine: ScriptMachine,
 ) -> (Object, ScriptDynamic) {
     // Every named version node is itself an absolute dynamic symbol. Linux's
@@ -669,7 +669,7 @@ fn make_script_dynamic_object(
 
     // Fixed tags plus optional SONAME and symbolic binding. Values that depend
     // on layout are patched after sections receive final virtual addresses.
-    let dynamic_entries = 10usize + usize::from(soname.is_some()) + if bsymbolic { 2 } else { 0 };
+    let dynamic_entries = 10usize + usize::from(soname.is_some()) + if dt_symbolic { 2 } else { 0 };
     let dynamic = vec![
         0u8;
         dynamic_entries
@@ -861,7 +861,7 @@ pub fn link_with_script(
     emit_relocs: bool,
     gc_sections: bool,
     soname: Option<&str>,
-    bsymbolic: bool,
+    dt_symbolic: bool,
     max_page_size: u64,
     defsym_defs: &[(String, String)],
 ) -> Result<(), String> {
@@ -874,7 +874,7 @@ pub fn link_with_script(
         emit_relocs,
         gc_sections,
         soname,
-        bsymbolic,
+        dt_symbolic,
         max_page_size,
         defsym_defs,
         ScriptMachine::X86_64,
@@ -893,7 +893,7 @@ pub fn link_with_script_i386(
     emit_relocs: bool,
     gc_sections: bool,
     soname: Option<&str>,
-    bsymbolic: bool,
+    dt_symbolic: bool,
     max_page_size: u64,
     defsym_defs: &[(String, String)],
 ) -> Result<(), String> {
@@ -906,7 +906,7 @@ pub fn link_with_script_i386(
         emit_relocs,
         gc_sections,
         soname,
-        bsymbolic,
+        dt_symbolic,
         max_page_size,
         defsym_defs,
         ScriptMachine::I386,
@@ -925,7 +925,7 @@ fn link_with_script_machine(
     emit_relocs: bool,
     gc_sections: bool,
     soname: Option<&str>,
-    bsymbolic: bool,
+    dt_symbolic: bool,
     max_page_size: u64,
     defsym_defs: &[(String, String)],
     machine: ScriptMachine,
@@ -1073,7 +1073,7 @@ fn link_with_script_machine(
                 version,
                 soname,
                 &output_base_name,
-                bsymbolic,
+                dt_symbolic,
                 machine,
             );
             all.push(dynamic_object);
@@ -3449,7 +3449,7 @@ fn link_with_script_machine(
             if let Some(soname_offset) = plan.soname_offset {
                 emit(DT_SONAME, soname_offset as u64)?;
             }
-            if bsymbolic {
+            if dt_symbolic {
                 emit(16, 0)?; // DT_SYMBOLIC
                 emit(DT_FLAGS, 0x2)?; // DF_SYMBOLIC
             }

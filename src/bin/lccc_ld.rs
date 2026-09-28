@@ -333,7 +333,7 @@ fn run(args: &[String]) -> Result<(), String> {
     let mut entry_override: Option<String> = None;
     let mut shared = false;
     let mut soname: Option<String> = None;
-    let mut bsymbolic = false;
+    let mut dt_symbolic = false;
     let mut max_page_size = 0x200000u64;
     let mut max_page_size_explicit = false;
     let mut elf_i386 = false;
@@ -557,8 +557,12 @@ fn run(args: &[String]) -> Result<(), String> {
                     passthrough.push(format!("-Wl,-u,{}", sym));
                 }
             }
-            "-Bsymbolic" | "-Bsymbolic-functions" => {
-                bsymbolic = true;
+            // Linker-script links bind every reference statically, so the
+            // only effect left is the DT_SYMBOLIC/DF_SYMBOLIC tag, which
+            // belongs to -Bsymbolic alone: under -Bsymbolic-functions ld.so
+            // must still look data up globally.  Last spelling wins (GNU).
+            "-Bsymbolic" | "-Bsymbolic-functions" | "-Bno-symbolic" => {
+                dt_symbolic = a == "-Bsymbolic";
                 passthrough.push(a.to_string());
             }
             // GNU ld accepts BOTH spellings and gcc's driver emits the
@@ -944,7 +948,7 @@ fn run(args: &[String]) -> Result<(), String> {
                 emit_relocs,
                 gc_sections,
                 soname.as_deref(),
-                bsymbolic,
+                dt_symbolic,
                 max_page_size,
                 &defsyms,
             );
@@ -958,7 +962,7 @@ fn run(args: &[String]) -> Result<(), String> {
             emit_relocs,
             gc_sections,
             soname.as_deref(),
-            bsymbolic,
+            dt_symbolic,
             max_page_size,
             &defsyms,
         );

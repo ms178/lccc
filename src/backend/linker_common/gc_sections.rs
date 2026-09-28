@@ -40,11 +40,36 @@ pub fn gc_collect_sections_elf64_roots_and_sections(
     extra_roots: &[String],
     extra_section_roots: &FxHashSet<(usize, usize)>,
 ) -> FxHashSet<(usize, usize)> {
+    gc_collect_sections_elf64_full(
+        objects,
+        extra_roots,
+        extra_section_roots,
+        &FxHashSet::default(),
+    )
+}
+
+/// The sweep proper.  `discarded` are sections already known not to be
+/// emitted -- the members of losing COMDAT groups.  They are neither roots
+/// nor reachable, and a reference to a symbol defined in one is a reference
+/// to the surviving definition of that name.  Without this the sweep, run
+/// before COMDAT selection, kept whichever copy of an inline function the
+/// *referencing* object carried, while COMDAT selection then kept the
+/// first object's copy: when that one was referenced only from dead code,
+/// both went and the program jumped into a hole.
+///
+/// Neither discarded nor dead sections are returned for `discarded`; the
+/// result is the set of sections the sweep found unreachable.
+pub fn gc_collect_sections_elf64_full(
+    objects: &[Elf64Object],
+    extra_roots: &[String],
+    extra_section_roots: &FxHashSet<(usize, usize)>,
+    discarded: &FxHashSet<(usize, usize)>,
+) -> FxHashSet<(usize, usize)> {
     // Build the set of all allocatable input sections
     let mut all_sections: FxHashSet<(usize, usize)> = FxHashSet::default();
     for (obj_idx, obj) in objects.iter().enumerate() {
         for (sec_idx, sec) in obj.sections.iter().enumerate() {
-            if sec.flags & SHF_ALLOC == 0 {
+            if sec.flags & SHF_ALLOC == 0 || discarded.contains(&(obj_idx, sec_idx)) {
                 continue;
             }
             if matches!(
@@ -60,28 +85,40 @@ pub fn gc_collect_sections_elf64_roots_and_sections(
         }
     }
 
-    // Build a map from symbol name -> (obj_idx, sec_idx) for defined symbols
-    let mut sym_to_section: FxHashMap<&str, (usize, usize)> = FxHashMap::default();
+    // Symbol name -> the section of the definition the link binds it to:
+    // the first strong definition, else the first weak one (ELF symbol
+    // resolution), ignoring discarded copies.
+    let mut sym_to_section: FxHashMap<&str, ((usize, usize), bool)> = FxHashMap::default();
     for (obj_idx, obj) in objects.iter().enumerate() {
         for sym in &obj.symbols {
             if sym.shndx == SHN_UNDEF || sym.shndx == SHN_ABS || sym.shndx == SHN_COMMON {
                 continue;
             }
             let binding = sym.info >> 4;
-            if binding != STB_GLOBAL && binding != STB_WEAK {
+            if !is_global_binding(binding) || sym.name.is_empty() {
                 continue;
             }
-            if sym.name.is_empty() {
+            let key = (obj_idx, sym.shndx as usize);
+            if key.1 >= obj.sections.len() || discarded.contains(&key) {
                 continue;
             }
-            let sec_idx = sym.shndx as usize;
-            if sec_idx < obj.sections.len() {
-                sym_to_section
-                    .entry(sym.name.as_str())
-                    .or_insert((obj_idx, sec_idx));
+            let strong = binding != STB_WEAK;
+            match sym_to_section.entry(sym.name.as_str()) {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert((key, strong));
+                }
+                std::collections::hash_map::Entry::Occupied(mut o) => {
+                    if strong && !o.get().1 {
+                        o.insert((key, true));
+                    }
+                }
             }
         }
     }
+    let sym_to_section: FxHashMap<&str, (usize, usize)> = sym_to_section
+        .into_iter()
+        .map(|(k, (v, _))| (k, v))
+        .collect();
 
     // Collect section names referenced via __start_<X> / __stop_<X> symbols.
     // GNU ld treats sections whose name is referenced this way as GC roots
@@ -166,37 +203,12 @@ pub fn gc_collect_sections_elf64_roots_and_sections(
         }
     }
 
-    // BFS: follow relocations from live sections to discover more live sections
-    while let Some((obj_idx, sec_idx)) = worklist.pop_front() {
-        let obj = &objects[obj_idx];
-        // `.eh_frame` relocations are handled by the FDE pass below, not here;
-        // see the root-marking comment.
-        let is_eh_frame = obj
-            .sections
-            .get(sec_idx)
-            .is_some_and(|s| s.name.starts_with(".eh_frame") && !s.name.ends_with("_hdr"));
-        // Follow relocations from this section
-        if sec_idx < obj.relocations.len() && !is_eh_frame {
-            for rela in &obj.relocations[sec_idx] {
-                let sym_idx = rela.sym_idx as usize;
-                if sym_idx >= obj.symbols.len() {
-                    continue;
-                }
-                let sym = &obj.symbols[sym_idx];
-
-                if sym.shndx != SHN_UNDEF && sym.shndx != SHN_ABS && sym.shndx != SHN_COMMON {
-                    // Symbol is defined in this object file
-                    let target = (obj_idx, sym.shndx as usize);
-                    mark_live(target, &mut live, &mut worklist);
-                } else if !sym.name.is_empty() {
-                    // Symbol is undefined here; look up in global symbol table
-                    if let Some(&target) = sym_to_section.get(sym.name.as_str()) {
-                        mark_live(target, &mut live, &mut worklist);
-                    }
-                }
-            }
-        }
-    }
+    let sweep = Sweep {
+        objects,
+        all_sections: &all_sections,
+        sym_to_section: &sym_to_section,
+    };
+    sweep.drain(&mut live, &mut worklist);
 
     // FDE pass: an `.eh_frame` record is only useful while the function it
     // describes is alive, and a *live* FDE drags its own dependencies in --
@@ -206,123 +218,159 @@ pub fn gc_collect_sections_elf64_roots_and_sections(
     // and re-run the closure.  Dropping them would leave a live FDE with an
     // LSDA pointer into a collected section, which turns a working
     // `catch` into undefined behaviour.
-    resurrect_fde_dependencies(objects, &all_sections, &mut live, &mut worklist);
+    sweep.resurrect_fde_dependencies(&mut live, &mut worklist);
 
     // Return the dead sections (all sections minus live ones)
     all_sections.difference(&live).copied().collect()
 }
 
-/// Re-run the relocation closure over `worklist` (factored out of the main
-/// sweep so the FDE pass can iterate to a fixed point).
-fn bfs_drain(
-    objects: &[Elf64Object],
-    all_sections: &FxHashSet<(usize, usize)>,
-    live: &mut FxHashSet<(usize, usize)>,
-    worklist: &mut VecDeque<(usize, usize)>,
-) {
-    while let Some((obj_idx, sec_idx)) = worklist.pop_front() {
-        let obj = &objects[obj_idx];
-        let is_eh_frame = obj
-            .sections
-            .get(sec_idx)
-            .is_some_and(|s| s.name.starts_with(".eh_frame") && !s.name.ends_with("_hdr"));
-        if is_eh_frame || sec_idx >= obj.relocations.len() {
-            continue;
+/// ELF bindings that take part in global symbol resolution.
+fn is_global_binding(binding: u8) -> bool {
+    const STB_GNU_UNIQUE: u8 = 10;
+    binding == STB_GLOBAL || binding == STB_WEAK || binding == STB_GNU_UNIQUE
+}
+
+fn is_eh_frame_section(name: &str) -> bool {
+    name.starts_with(".eh_frame") && !name.ends_with("_hdr")
+}
+
+/// The reachability graph: sections are nodes, relocations edges.
+struct Sweep<'a> {
+    objects: &'a [Elf64Object],
+    all_sections: &'a FxHashSet<(usize, usize)>,
+    sym_to_section: &'a FxHashMap<&'a str, (usize, usize)>,
+}
+
+impl Sweep<'_> {
+    /// The section a relocation against symbol `sym_idx` of `obj_idx`
+    /// reaches.  A named global goes wherever the link binds the name --
+    /// not to the referencing object's own copy, which may be a weak
+    /// definition that loses to a strong one, or a COMDAT loser; a local
+    /// (section symbols included) stays in its object.
+    fn target(&self, obj_idx: usize, sym_idx: u32) -> Option<(usize, usize)> {
+        let sym = self.objects[obj_idx].symbols.get(sym_idx as usize)?;
+        if is_global_binding(sym.info >> 4) && !sym.name.is_empty() {
+            if let Some(&t) = self.sym_to_section.get(sym.name.as_str()) {
+                return Some(t);
+            }
         }
-        for rela in &obj.relocations[sec_idx] {
-            let sym_idx = rela.sym_idx as usize;
-            if sym_idx >= obj.symbols.len() {
+        if sym.shndx == SHN_UNDEF || sym.shndx == SHN_ABS || sym.shndx == SHN_COMMON {
+            return None;
+        }
+        Some((obj_idx, sym.shndx as usize))
+    }
+
+    fn mark(
+        &self,
+        key: (usize, usize),
+        live: &mut FxHashSet<(usize, usize)>,
+        worklist: &mut VecDeque<(usize, usize)>,
+    ) -> bool {
+        let fresh = self.all_sections.contains(&key) && live.insert(key);
+        if fresh {
+            worklist.push_back(key);
+        }
+        fresh
+    }
+
+    /// Close `live` over relocations.  `.eh_frame` is not traversed here:
+    /// its FDEs carry a relocation against every function of the unit, so
+    /// following them would resurrect everything; see the FDE pass.
+    fn drain(&self, live: &mut FxHashSet<(usize, usize)>, worklist: &mut VecDeque<(usize, usize)>) {
+        while let Some((obj_idx, sec_idx)) = worklist.pop_front() {
+            let obj = &self.objects[obj_idx];
+            if obj
+                .sections
+                .get(sec_idx)
+                .is_some_and(|s| is_eh_frame_section(&s.name))
+            {
                 continue;
             }
-            let sym = &obj.symbols[sym_idx];
-            if sym.shndx != SHN_UNDEF && sym.shndx != SHN_ABS && sym.shndx != SHN_COMMON {
-                let target = (obj_idx, sym.shndx as usize);
-                if all_sections.contains(&target) && live.insert(target) {
-                    worklist.push_back(target);
+            let Some(relocs) = obj.relocations.get(sec_idx) else {
+                continue;
+            };
+            for rela in relocs {
+                if let Some(t) = self.target(obj_idx, rela.sym_idx) {
+                    self.mark(t, live, worklist);
                 }
             }
         }
     }
-}
 
-/// Keep the sections a *live* FDE depends on, then close the reachability
-/// graph again.  Iterates until no further section is resurrected.
-fn resurrect_fde_dependencies(
-    objects: &[Elf64Object],
-    all_sections: &FxHashSet<(usize, usize)>,
-    live: &mut FxHashSet<(usize, usize)>,
-    worklist: &mut VecDeque<(usize, usize)>,
-) {
-    loop {
-        let mut progress = false;
-        for (obj_idx, obj) in objects.iter().enumerate() {
-            for (sec_idx, sec) in obj.sections.iter().enumerate() {
-                if !sec.name.starts_with(".eh_frame") || sec.name.ends_with("_hdr") {
-                    continue;
-                }
-                if !live.contains(&(obj_idx, sec_idx)) {
-                    continue;
-                }
-                let data = obj.section_data.get(sec_idx).map(|d| d.as_slice());
-                let Some(data) = data else { continue };
-                let relocs = obj
-                    .relocations
-                    .get(sec_idx)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]);
-                if relocs.is_empty() {
-                    continue;
-                }
-                for rec in super::eh_frame::scan_eh_frame_records(data) {
-                    let Some(iloc) = rec.iloc_offset else {
-                        continue;
-                    };
-                    // Is the described function still alive?
-                    let target_live = match relocs.iter().find(|r| r.offset as usize == iloc) {
-                        None => true, // no relocation: assume it survives
-                        Some(rela) => match obj.symbols.get(rela.sym_idx as usize) {
-                            None => true,
-                            Some(sym) => {
-                                if sym.shndx == SHN_UNDEF
-                                    || sym.shndx == SHN_ABS
-                                    || sym.shndx == SHN_COMMON
-                                {
-                                    true
-                                } else {
-                                    live.contains(&(obj_idx, sym.shndx as usize))
-                                }
-                            }
-                        },
-                    };
-                    if !target_live {
+    /// Keep what a *live* FDE depends on: whatever its own relocations
+    /// reach (the LSDA) and whatever its CIE's reach (the personality
+    /// routine's `DW.ref` pointer, a COMDAT data section nothing else
+    /// references), then close the graph again, until nothing changes.
+    fn resurrect_fde_dependencies(
+        &self,
+        live: &mut FxHashSet<(usize, usize)>,
+        worklist: &mut VecDeque<(usize, usize)>,
+    ) {
+        // A live FDE stays live; remember which were handled so a fixed-point
+        // round only looks at FDEs whose function became live since.
+        let mut done: FxHashSet<(usize, usize, usize)> = FxHashSet::default();
+        loop {
+            let mut progress = false;
+            for (obj_idx, obj) in self.objects.iter().enumerate() {
+                for (sec_idx, sec) in obj.sections.iter().enumerate() {
+                    if !is_eh_frame_section(&sec.name) || !live.contains(&(obj_idx, sec_idx)) {
                         continue;
                     }
-                    // Keep everything else this FDE references (LSDA,
-                    // personality, and anything the LSDA needs is reached by
-                    // the closure re-run below).
-                    for rela in relocs.iter().filter(|r| {
-                        (r.offset as usize) >= rec.start && (r.offset as usize) < rec.end
-                    }) {
-                        let sym = match obj.symbols.get(rela.sym_idx as usize) {
-                            Some(s) => s,
-                            None => continue,
+                    let Some(data) = obj.section_data.get(sec_idx).map(|d| d.as_slice()) else {
+                        continue;
+                    };
+                    let relocs = obj
+                        .relocations
+                        .get(sec_idx)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    if relocs.is_empty() {
+                        continue;
+                    }
+                    // Relocations sorted by offset, for per-record ranges.
+                    let mut order: Vec<usize> = (0..relocs.len()).collect();
+                    order.sort_by_key(|&i| relocs[i].offset);
+                    let in_range = |lo: usize, hi: usize| {
+                        let first = order.partition_point(|&i| (relocs[i].offset as usize) < lo);
+                        order[first..]
+                            .iter()
+                            .take_while(move |&&i| (relocs[i].offset as usize) < hi)
+                            .map(move |&i| &relocs[i])
+                    };
+                    let records = super::eh_frame::scan_eh_frame_records(data);
+                    for (ri, rec) in records.iter().enumerate() {
+                        let Some(iloc) = rec.iloc_offset else {
+                            continue;
                         };
-                        if sym.shndx == SHN_UNDEF || sym.shndx == SHN_ABS || sym.shndx == SHN_COMMON
-                        {
+                        if done.contains(&(obj_idx, sec_idx, ri)) {
                             continue;
                         }
-                        let target = (obj_idx, sym.shndx as usize);
-                        if all_sections.contains(&target) && live.insert(target) {
-                            worklist.push_back(target);
-                            progress = true;
+                        // Is the described function alive?  (No relocation,
+                        // or one against an undefined/absolute symbol: the
+                        // FDE is kept, so its dependencies are too.)
+                        let func = in_range(iloc, iloc + 1)
+                            .next()
+                            .and_then(|r| self.target(obj_idx, r.sym_idx));
+                        if func.is_some_and(|f| !live.contains(&f)) {
+                            continue;
+                        }
+                        done.insert((obj_idx, sec_idx, ri));
+                        let cie = super::eh_frame::fde_cie_index(data, &records, ri)
+                            .map(|c| (records[c].start, records[c].end));
+                        for (lo, hi) in std::iter::once((rec.start, rec.end)).chain(cie) {
+                            for rela in in_range(lo, hi) {
+                                if let Some(t) = self.target(obj_idx, rela.sym_idx) {
+                                    progress |= self.mark(t, live, worklist);
+                                }
+                            }
                         }
                     }
                 }
             }
-        }
-        bfs_drain(objects, all_sections, live, worklist);
-        if !progress {
-            break;
+            self.drain(live, worklist);
+            if !progress {
+                break;
+            }
         }
     }
 }
