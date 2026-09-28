@@ -7172,6 +7172,10 @@ def main():
             and (not args.tag or args.tag == "script"):
         results.append(_script_undefined_archive_test(args, oracles))
         results.append(_script_undefined_archive_test_i386(args, oracles))
+    if not args.tag or args.tag == "shared":
+        # ELF32/i386 userspace links through `gcc -m32` (sibling module).
+        import i386_userspace  # noqa: PLC0415 - sibling module
+        results.extend(i386_userspace.run_all(args, CC, Result))
     if (not args.filter or "vdso" in args.filter) and (not args.tag or args.tag == "script"):
         results.append(_vdso_script_test(args, oracles))
         results.append(_vdso_note_phdr_test(args, oracles))

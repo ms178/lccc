@@ -2227,6 +2227,27 @@ pub enum IrType {
 }
 
 impl IrType {
+    /// Memory extent of one scalar `Load`/`Store` of this type, as
+    /// `(definitely, possibly)` accessed bytes from the address, for the
+    /// middle end's memory disambiguation (DSE, store-to-load forwarding,
+    /// aggregate copy forwarding).  An overwrite may only be proven with the
+    /// `definitely` extent of the killer and the `possibly` extent of the
+    /// victim; every conflict check uses `possibly`.
+    ///
+    /// The two differ only for the x87 long double (F128 on x86 targets):
+    /// `fldt`/`fstpt` touch its 10 value bytes, but a constant store writes
+    /// the whole 16-byte pattern.  Pointers are target-sized (4 bytes on
+    /// i686), never the host's 8.  `None` for `Void`.
+    pub fn access_extent(&self) -> Option<(i64, i64)> {
+        let exact = |n: usize| Some((n as i64, n as i64));
+        match self {
+            IrType::Void => None,
+            IrType::F128 if !target_long_double_is_f128() => Some((10, 16)),
+            IrType::F128 => exact(16),
+            _ => exact(self.size()),
+        }
+    }
+
     pub fn size(&self) -> usize {
         match self {
             IrType::I8 | IrType::U8 => 1,

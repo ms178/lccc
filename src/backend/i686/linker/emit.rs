@@ -3,11 +3,13 @@
 //! Phase 10: lays out segments, assigns addresses, applies relocations,
 //! builds PLT/GOT/dynamic sections, and writes the final ELF32 executable.
 
-use crate::common::fx_hash::FxHashMap;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use std::collections::BTreeSet;
 
 use super::DynStrTab;
+use super::dynamic::{DynamicDesc, option_entries};
 use super::gnu_hash::build_gnu_hash_32;
+use super::options::{DynValue, LinkOptions};
 use super::reloc::{self, RelocContext};
 use super::types::*;
 use crate::backend::linker_common;
@@ -19,7 +21,6 @@ pub(super) fn emit_executable(
     section_map: &SectionMap,
     global_symbols: &mut FxHashMap<String, LinkerSymbol>,
     _sym_resolution: &FxHashMap<(usize, usize), String>,
-    _dynlib_syms: &FxHashMap<String, (String, u8, u32, Option<String>, bool, u8)>,
     plt_symbols: &[String],
     got_dyn_symbols: &[String],
     got_local_symbols: &[String],
@@ -27,10 +28,12 @@ pub(super) fn emit_executable(
     _num_got_total: usize,
     ifunc_symbols: &[String],
     is_static: bool,
-    is_nostdlib: bool,
-    _needed_libs_param: &[&str],
+    needed: &[String],
+    opts: &LinkOptions,
+    dso_refs: &FxHashSet<String>,
     output_path: &str,
     pending_defsyms: &[(String, String, usize)],
+    interp: &[u8],
 ) -> Result<(), String> {
     let num_ifunc = ifunc_symbols.len();
 
@@ -40,23 +43,20 @@ pub(super) fn emit_executable(
     // PT_GNU_STACK flags. Mirror that here: any input marking its note
     // section SHF_EXECINSTR makes the final stack executable. Without this,
     // PIE-default builds segfault on the first indirect nested call.
-    let exec_stack = inputs.iter().any(|obj| {
-        obj.sections
-            .iter()
-            .any(|s| s.name == ".note.GNU-stack" && (s.flags & SHF_EXECINSTR) != 0)
-    });
+    // `-z execstack` / `-z noexecstack` override the input markers.
+    let exec_stack = opts
+        .exec_stack
+        .unwrap_or_else(|| inputs_want_exec_stack(inputs));
     let stack_flags = PF_R | PF_W | if exec_stack { PF_X } else { 0 };
 
     // ── Build dynamic symbol/string tables ────────────────────────────────
-    let mut needed_libs: Vec<String> = Vec::new();
-    if !is_static && !is_nostdlib {
-        needed_libs.push("libc.so.6".to_string());
-    }
-    for sym in global_symbols.values() {
-        if sym.is_dynamic && !sym.dynlib.is_empty() && !needed_libs.contains(&sym.dynlib) {
-            needed_libs.push(sym.dynlib.clone());
-        }
-    }
+    // DT_NEEDED is exactly what the input resolver linked, in command-line
+    // order (as-needed objects only when a reference bound to them).
+    let needed_libs: Vec<String> = if is_static {
+        Vec::new()
+    } else {
+        needed.to_vec()
+    };
 
     let mut dynstr = DynStrTab::new();
     let _ = dynstr.add("");
@@ -176,10 +176,45 @@ pub(super) fn emit_executable(
         dynsym_names.push(name.clone());
     }
 
-    // All hashed symbols = copy + textrel
+    // Definitions the executable exports (hashed): each name a linked
+    // shared object references — the loader must be able to bind the DSO's
+    // undefined symbol to the executable's definition, which GNU ld always
+    // arranges — and, with -E/--export-dynamic, every exportable global.
+    let mut export_syms_for_dynsym: Vec<String> = if is_static {
+        Vec::new()
+    } else {
+        global_symbols
+            .iter()
+            .filter(|(n, s)| {
+                !dynsym_map.contains_key(n.as_str())
+                    && is_exportable(n, s)
+                    && (opts.export_dynamic || dso_refs.contains(n.as_str()))
+            })
+            .map(|(n, _)| n.clone())
+            .collect()
+    };
+    export_syms_for_dynsym.sort();
+    for name in &export_syms_for_dynsym {
+        let idx = dynsym_entries.len();
+        let name_off = dynstr.add(name);
+        let sym = &global_symbols[name];
+        dynsym_entries.push(Elf32Sym {
+            name: name_off,
+            value: 0, // patched after layout
+            size: sym.size,
+            info: (sym.binding << 4) | sym.sym_type,
+            other: sym.visibility,
+            shndx: SHN_UNDEF, // patched after layout
+        });
+        dynsym_map.insert(name.clone(), idx);
+        dynsym_names.push(name.clone());
+    }
+
+    // All hashed symbols = copy + textrel + exported definitions
     let mut all_hashed_syms: Vec<String> = Vec::new();
     all_hashed_syms.extend(copy_syms_for_dynsym.iter().cloned());
     all_hashed_syms.extend(textrel_syms_for_dynsym.iter().cloned());
+    all_hashed_syms.extend(export_syms_for_dynsym.iter().cloned());
 
     // Build .gnu.hash and reorder hashed dynsym entries
     let (gnu_hash_data, sorted_indices) =
@@ -224,7 +259,13 @@ pub(super) fn emit_executable(
     let mut ver_index_map: FxHashMap<(String, String), u16> = FxHashMap::default();
     let mut ver_idx: u16 = 2;
     let mut lib_ver_list: Vec<(String, Vec<String>)> = Vec::new();
-    let mut sorted_libs: Vec<String> = lib_versions.keys().cloned().collect();
+    // Only linked (DT_NEEDED) objects get a Verneed record; a version index
+    // must never name a file the loader will not open.
+    let mut sorted_libs: Vec<String> = lib_versions
+        .keys()
+        .filter(|lib| needed_libs.contains(lib))
+        .cloned()
+        .collect();
     sorted_libs.sort();
     for lib in &sorted_libs {
         let vers: Vec<String> = lib_versions[lib].iter().cloned().collect();
@@ -253,6 +294,13 @@ pub(super) fn emit_executable(
     for (_, vers) in &lib_ver_list {
         for v in vers {
             dynstr2.add(v);
+        }
+    }
+    // Option-derived string tags (DT_SONAME, DT_RPATH/DT_RUNPATH).
+    let option_tags = opts.extra_dynamic_tags(false, false, false);
+    for (_, v) in &option_tags {
+        if let DynValue::Str(s) = v {
+            dynstr2.add(s);
         }
     }
     let dynstr_data = dynstr2.as_bytes().to_vec();
@@ -294,7 +342,9 @@ pub(super) fn emit_executable(
                         versym_data.extend_from_slice(&1u16.to_le_bytes());
                     }
                 } else {
-                    versym_data.extend_from_slice(&0u16.to_le_bytes());
+                    // A definition of this executable (copy/exported):
+                    // VER_NDX_GLOBAL, not VER_NDX_LOCAL.
+                    versym_data.extend_from_slice(&1u16.to_le_bytes());
                 }
             } else {
                 versym_data.extend_from_slice(&0u16.to_le_bytes());
@@ -345,6 +395,20 @@ pub(super) fn emit_executable(
         .iter()
         .any(|s| s.flags & SHF_TLS != 0 && s.flags & SHF_ALLOC != 0);
 
+    let note_sec_idx = section_name_to_idx.get(".note").copied();
+    let input_note_size = note_sec_idx
+        .map(|i| output_sections[i].data.len() as u32)
+        .unwrap_or(0);
+    let build_id_size = if opts.build_id {
+        linker_common::build_id::BUILD_ID_NOTE_SIZE as u32
+    } else {
+        0
+    };
+    let has_notes = input_note_size + build_id_size > 0;
+    // PT_GNU_RELRO is applied by the dynamic loader; a static executable
+    // has no RELRO-protected dynamic data (and its IRELATIVE slots must stay
+    // writable until the startup code has applied them).
+    let use_relro = !is_static && opts.relro;
     let mut num_phdrs: u32 = 1; // PHDR
     if !is_static {
         num_phdrs += 1;
@@ -358,10 +422,17 @@ pub(super) fn emit_executable(
     if has_tls_sections {
         num_phdrs += 1;
     }
+    if has_notes {
+        num_phdrs += 1; // NOTE
+    }
+    if use_relro {
+        num_phdrs += 1; // GNU_RELRO
+    }
 
     let phdrs_total_size = num_phdrs * phdr_size;
 
-    let interp_data = INTERP.to_vec();
+    // NUL-terminated PT_INTERP payload chosen by the caller (`link_builtin`).
+    let interp_data = interp.to_vec();
 
     // Section layout tracking
     let mut file_offset: u32 = ehdr_size;
@@ -381,19 +452,45 @@ pub(super) fn emit_executable(
         vaddr += interp_size;
     }
 
-    // Note section
-    let note_sec_idx = section_name_to_idx.get(".note").copied();
-    let note_size = note_sec_idx
-        .map(|i| output_sections[i].data.len() as u32)
-        .unwrap_or(0);
-    if note_size > 0 {
+    // Notes: the merged input `.note.*` records, then the build-id note,
+    // covered by one PT_NOTE.  Note records are 4-byte aligned, and the
+    // region follows the odd-length PT_INTERP string, so it is aligned
+    // explicitly (it used to start at whatever offset the string left).
+    let note_align = note_sec_idx
+        .map(|i| output_sections[i].align.max(4))
+        .unwrap_or(4);
+    file_offset = align_up(file_offset, note_align);
+    vaddr = align_up(vaddr, note_align);
+    let note_offset = file_offset;
+    let note_vaddr = vaddr;
+    if input_note_size > 0 {
         if let Some(idx) = note_sec_idx {
             output_sections[idx].file_offset = file_offset;
             output_sections[idx].addr = vaddr;
         }
-        file_offset += note_size;
-        vaddr += note_size;
+        file_offset += input_note_size;
+        vaddr += input_note_size;
     }
+    file_offset = align_up(file_offset, 4);
+    vaddr = align_up(vaddr, 4);
+    let build_id_offset = file_offset;
+    file_offset += build_id_size;
+    vaddr += build_id_size;
+    let note_total_size = file_offset - note_offset;
+
+    // .hash (SysV), over the final .dynsym order.
+    let sysv_hash = (!is_static && opts.hash_style.wants_sysv()).then(|| {
+        let names: Vec<&str> = dynsym_names.iter().map(String::as_str).collect();
+        linker_common::build_sysv_hash(&names)
+    });
+    file_offset = align_up(file_offset, 4);
+    vaddr = align_up(vaddr, 4);
+    let hash_offset = file_offset;
+    let hash_vaddr = vaddr;
+    let hash_size = sysv_hash.as_ref().map_or(0, |h| h.size() as u32);
+    file_offset += hash_size;
+    vaddr += hash_size;
+    let want_gnu_hash = !is_static && opts.hash_style.wants_gnu();
 
     // .gnu.hash
     file_offset = align_up(file_offset, 4);
@@ -401,7 +498,7 @@ pub(super) fn emit_executable(
     let gnu_hash_offset = file_offset;
     let gnu_hash_vaddr = vaddr;
     let gnu_hash_size = gnu_hash_data.len() as u32;
-    if !is_static {
+    if want_gnu_hash {
         file_offset += gnu_hash_size;
         vaddr += gnu_hash_size;
     }
@@ -661,7 +758,103 @@ pub(super) fn emit_executable(
     let data_seg_file_start = file_offset;
     let data_seg_vaddr_start = vaddr;
 
-    // .init_array
+    // Synthesized RW tables, sized before placement.
+    let got_reserved: usize = 1;
+    let got_non_plt_entries = got_dyn_symbols.len() + got_local_symbols.len();
+    let got_entry_size: u32 = 4;
+    let got_size = (got_reserved + got_non_plt_entries) as u32 * got_entry_size;
+    let needs_got_section = !is_static || got_non_plt_entries > 0 || num_plt > 0;
+    let gotplt_reserved: u32 = 3;
+    let gotplt_size = (gotplt_reserved + num_plt as u32) * 4;
+    let has_gotplt = !is_static && num_plt > 0;
+
+    // `.dynamic`: which entries exist is decided here; their values are
+    // filled in after layout (see `DynamicDesc`).
+    let textrel = num_text_relocs > 0;
+    if textrel && opts.z_text {
+        return Err(
+            "read-only segment has dynamic relocations (text relocations against weak shared-library data) and -z text was given"
+                .to_string(),
+        );
+    }
+    let sec_len = |name: &str| {
+        section_name_to_idx
+            .get(name)
+            .map_or(0, |&i| output_sections[i].data.len() as u32)
+    };
+    let (option_strings, option_numeric) =
+        option_entries(&opts.extra_dynamic_tags(textrel, false, false), |s| {
+            dynstr2.get_offset(s)
+        });
+    let mut dyn_desc = DynamicDesc {
+        needed: needed_offsets.clone(),
+        strings: option_strings,
+        init: (init_vaddr != 0 && init_size > 0).then_some(init_vaddr),
+        fini: (fini_vaddr != 0 && fini_size > 0).then_some(fini_vaddr),
+        preinit_array: (sec_len(".preinit_array") > 0).then_some((0, 0)),
+        init_array: (sec_len(".init_array") > 0).then_some((0, 0)),
+        fini_array: (sec_len(".fini_array") > 0).then_some((0, 0)),
+        hash: sysv_hash.as_ref().map(|_| hash_vaddr),
+        gnu_hash: want_gnu_hash.then_some(gnu_hash_vaddr),
+        strtab: dynstr_vaddr,
+        symtab: dynsym_vaddr,
+        strsz: dynstr_size,
+        debug: true,
+        plt: (num_plt > 0).then_some((0, rel_plt_vaddr, rel_plt_size)),
+        rel: (num_rel_dyn > 0).then_some((rel_dyn_vaddr, rel_dyn_size)),
+        relcount: None,
+        verneed: (verneed_size > 0).then_some((versym_vaddr, verneed_vaddr, verneed_count)),
+        numeric: option_numeric,
+    };
+    let dynamic_size = if is_static { 0 } else { dyn_desc.byte_size() };
+
+    // PT_GNU_RELRO covers the tables only the loader writes: the
+    // constructor arrays, .data.rel.ro, .dynamic, .got and — with -z now —
+    // .got.plt.  The loader rounds the region's END down to a page, so the
+    // segment start is shifted within its first page until the region ends
+    // exactly on a page boundary (GNU ld does the same); otherwise its last
+    // page, and for a small image the whole region, stayed writable.  The
+    // shift keeps every section's alignment (it is a multiple of the largest
+    // alignment in the region); `relro_end` below is measured, not assumed.
+    const RELRO_SECTIONS: [&str; 4] = [
+        ".preinit_array",
+        ".init_array",
+        ".fini_array",
+        ".data.rel.ro",
+    ];
+    if use_relro {
+        let mut len = 0u32;
+        let mut max_align = 4u32;
+        for name in RELRO_SECTIONS {
+            if let Some(&i) = section_name_to_idx.get(name) {
+                let a = output_sections[i].align.max(4);
+                max_align = max_align.max(a);
+                len = align_up(len, a) + output_sections[i].data.len() as u32;
+            }
+        }
+        len = align_up(len, 4) + dynamic_size;
+        if needs_got_section {
+            len += got_size;
+        }
+        if opts.bind_now && has_gotplt {
+            len += gotplt_size;
+        }
+        let pad = (PAGE_SIZE - len % PAGE_SIZE) % PAGE_SIZE;
+        let pad = pad - pad % max_align;
+        file_offset += pad;
+        vaddr += pad;
+    }
+    let relro_offset = file_offset;
+    let relro_vaddr = vaddr;
+
+    let (preinit_array_vaddr, preinit_array_size) = layout_section(
+        ".preinit_array",
+        section_name_to_idx,
+        output_sections,
+        &mut file_offset,
+        &mut vaddr,
+        4,
+    );
     let (init_array_vaddr, init_array_size) = layout_section(
         ".init_array",
         section_name_to_idx,
@@ -670,8 +863,6 @@ pub(super) fn emit_executable(
         &mut vaddr,
         4,
     );
-
-    // .fini_array
     let (fini_array_vaddr, fini_array_size) = layout_section(
         ".fini_array",
         section_name_to_idx,
@@ -680,14 +871,13 @@ pub(super) fn emit_executable(
         &mut vaddr,
         4,
     );
-
-    // Layout custom writable sections (for __start_/__stop_ symbol auto-generation)
-    layout_custom_sections(
+    let _ = layout_section(
+        ".data.rel.ro",
         section_name_to_idx,
         output_sections,
         &mut file_offset,
         &mut vaddr,
-        SHF_WRITE,
+        4,
     );
 
     // .dynamic
@@ -695,48 +885,27 @@ pub(super) fn emit_executable(
     vaddr = align_up(vaddr, 4);
     let dynamic_offset = file_offset;
     let dynamic_vaddr = vaddr;
-    let num_dynamic_entries = count_dynamic_entries(
-        &needed_libs,
-        init_vaddr,
-        init_size,
-        fini_vaddr,
-        fini_size,
-        init_array_size,
-        fini_array_size,
-        num_plt,
-        num_rel_dyn,
-        verneed_size,
-        num_text_relocs,
-    );
-    let dynamic_size = num_dynamic_entries * 8;
-    if !is_static {
-        file_offset += dynamic_size;
-        vaddr += dynamic_size;
-    }
+    file_offset += dynamic_size;
+    vaddr += dynamic_size;
 
     // .got
-    file_offset = align_up(file_offset, 4);
-    vaddr = align_up(vaddr, 4);
     let got_offset = file_offset;
     let got_vaddr = vaddr;
-    let got_reserved: usize = 1;
-    let got_non_plt_entries = got_dyn_symbols.len() + got_local_symbols.len();
-    let got_entry_size: u32 = 4;
-    let got_size = (got_reserved + got_non_plt_entries) as u32 * got_entry_size;
-    let needs_got_section = !is_static || got_non_plt_entries > 0 || num_plt > 0;
     if needs_got_section {
         file_offset += got_size;
         vaddr += got_size;
     }
+    let mut relro_end = vaddr;
 
     // .got.plt
     let gotplt_offset = file_offset;
     let gotplt_vaddr = vaddr;
-    let gotplt_reserved: u32 = 3;
-    let gotplt_size = (gotplt_reserved + num_plt as u32) * 4;
-    if !is_static && num_plt > 0 {
+    if has_gotplt {
         file_offset += gotplt_size;
         vaddr += gotplt_size;
+    }
+    if opts.bind_now {
+        relro_end = vaddr;
     }
 
     // IFUNC GOT
@@ -756,6 +925,16 @@ pub(super) fn emit_executable(
         file_offset += rel_iplt_size;
         vaddr += rel_iplt_size;
     }
+
+    // Custom writable sections (`__start_`/`__stop_` anchors); after the
+    // RELRO region, since the program may write them.
+    layout_custom_sections(
+        section_name_to_idx,
+        output_sections,
+        &mut file_offset,
+        &mut vaddr,
+        SHF_WRITE,
+    );
 
     // .data
     if let Some(idx) = section_name_to_idx.get(".data").copied() {
@@ -828,6 +1007,7 @@ pub(super) fn emit_executable(
         text_seg_vaddr_end,
         dynamic_vaddr,
         is_static,
+        (preinit_array_vaddr, preinit_array_size),
         init_array_vaddr,
         init_array_size,
         fini_array_vaddr,
@@ -877,6 +1057,7 @@ pub(super) fn emit_executable(
         plt_entry_size,
         gotplt_vaddr,
         gotplt_reserved,
+        PltAddressing::Absolute,
     );
 
     // ── Apply relocations ────────────────────────────────────────────────
@@ -924,19 +1105,9 @@ pub(super) fn emit_executable(
     let mut got_data: Vec<u8> = Vec::new();
     if needs_got_section {
         got_data.extend_from_slice(&(if is_static { 0u32 } else { dynamic_vaddr }).to_le_bytes());
-        // Dynamic GOT symbols first (filled by dynamic linker via GLOB_DAT)
-        for name in got_dyn_symbols {
-            if let Some(gs) = global_symbols.get(name) {
-                if has_tls && gs.sym_type == STT_TLS {
-                    let tpoff = gs.address as i32 - tls_addr as i32 - tls_mem_size as i32;
-                    got_data.extend_from_slice(&(tpoff as u32).to_le_bytes());
-                } else {
-                    got_data.extend_from_slice(&0u32.to_le_bytes());
-                }
-            } else {
-                got_data.extend_from_slice(&0u32.to_le_bytes());
-            }
-        }
+        // Dynamic GOT symbols first, filled by the dynamic linker (GLOB_DAT,
+        // or TLS_TPOFF for a DSO TLS variable); the implicit addend is 0.
+        got_data.resize(got_data.len() + 4 * got_dyn_symbols.len(), 0);
         // Local GOT symbols (filled at link time with resolved addresses).
         //
         // Absolute symbols (`--defsym k=100`, input SHN_ABS definitions,
@@ -986,12 +1157,17 @@ pub(super) fn emit_executable(
         rel_plt_data.extend_from_slice(&r_info.to_le_bytes());
     }
 
-    // .rel.dyn data (only dynamic GOT symbols need GLOB_DAT)
+    // .rel.dyn data: one GLOB_DAT per dynamic GOT symbol; a DSO TLS
+    // variable's slot takes its thread-pointer offset (TLS_TPOFF).
     let mut rel_dyn_data: Vec<u8> = Vec::new();
     for (i, name) in got_dyn_symbols.iter().enumerate() {
         let got_entry_addr = got_vaddr + (got_reserved as u32 + i as u32) * 4;
         let dynsym_idx = dynsym_map[name] as u32;
-        let r_info = (dynsym_idx << 8) | 6; // R_386_GLOB_DAT
+        let r_type = match global_symbols.get(name) {
+            Some(gs) if gs.sym_type == STT_TLS => R_386_TLS_TPOFF,
+            _ => R_386_GLOB_DAT,
+        };
+        let r_info = (dynsym_idx << 8) | r_type;
         rel_dyn_data.extend_from_slice(&got_entry_addr.to_le_bytes());
         rel_dyn_data.extend_from_slice(&r_info.to_le_bytes());
     }
@@ -1016,61 +1192,41 @@ pub(super) fn emit_executable(
     // .dynamic data
     let mut dynamic_data: Vec<u8> = Vec::new();
     if !is_static {
-        for &off in &needed_offsets {
-            push_dyn(&mut dynamic_data, DT_NEEDED, off);
+        if let Some(v) = dyn_desc.preinit_array.as_mut() {
+            *v = (preinit_array_vaddr, preinit_array_size);
         }
-        push_dyn(&mut dynamic_data, DT_GNU_HASH_TAG, gnu_hash_vaddr);
-        push_dyn(&mut dynamic_data, DT_STRTAB, dynstr_vaddr);
-        push_dyn(&mut dynamic_data, DT_SYMTAB, dynsym_vaddr);
-        push_dyn(&mut dynamic_data, DT_STRSZ, dynstr_size);
-        push_dyn(&mut dynamic_data, DT_SYMENT, dynsym_entsize);
-        if init_vaddr != 0 && init_size > 0 {
-            push_dyn(&mut dynamic_data, DT_INIT, init_vaddr);
+        if let Some(v) = dyn_desc.init_array.as_mut() {
+            *v = (init_array_vaddr, init_array_size);
         }
-        if fini_vaddr != 0 && fini_size > 0 {
-            push_dyn(&mut dynamic_data, DT_FINI, fini_vaddr);
+        if let Some(v) = dyn_desc.fini_array.as_mut() {
+            *v = (fini_array_vaddr, fini_array_size);
         }
-        if init_array_size > 0 {
-            push_dyn(&mut dynamic_data, DT_INIT_ARRAY, init_array_vaddr);
-            push_dyn(&mut dynamic_data, DT_INIT_ARRAYSZ, init_array_size);
+        if let Some(v) = dyn_desc.plt.as_mut() {
+            v.0 = gotplt_vaddr;
         }
-        if fini_array_size > 0 {
-            push_dyn(&mut dynamic_data, DT_FINI_ARRAY, fini_array_vaddr);
-            push_dyn(&mut dynamic_data, DT_FINI_ARRAYSZ, fini_array_size);
-        }
-        push_dyn(&mut dynamic_data, DT_DEBUG, 0);
-        if num_plt > 0 {
-            push_dyn(&mut dynamic_data, DT_PLTGOT, gotplt_vaddr);
-            push_dyn(&mut dynamic_data, DT_PLTRELSZ, rel_plt_size);
-            push_dyn(&mut dynamic_data, DT_PLTREL, 17);
-            push_dyn(&mut dynamic_data, DT_JMPREL, rel_plt_vaddr);
-        }
-        if num_rel_dyn > 0 {
-            push_dyn(&mut dynamic_data, DT_REL, rel_dyn_vaddr);
-            push_dyn(&mut dynamic_data, DT_RELSZ, rel_dyn_size);
-            push_dyn(&mut dynamic_data, DT_RELENT, 8);
-        }
-        if verneed_size > 0 {
-            push_dyn(&mut dynamic_data, DT_VERNEED, verneed_vaddr);
-            push_dyn(&mut dynamic_data, DT_VERNEEDNUM, verneed_count);
-            push_dyn(&mut dynamic_data, DT_VERSYM, versym_vaddr);
-        }
-        if num_text_relocs > 0 {
-            push_dyn(&mut dynamic_data, DT_TEXTREL, 0);
-        }
-        push_dyn(&mut dynamic_data, DT_NULL, 0);
+        dynamic_data = dyn_desc.serialize(dynamic_size)?;
     }
+    // Entry point: `-e SYMBOL` (or a hex address, as GNU ld), else
+    // `_start`; when neither resolves, GNU ld's fallback — warn and use the
+    // start of .text.
+    let text_start = section_name_to_idx
+        .get(".text")
+        .map_or(text_seg_vaddr_start, |&i| output_sections[i].addr);
+    let entry_point = resolve_entry_point(opts.entry.as_deref(), global_symbols, text_start);
 
-    // Entry point
-    let entry_point = global_symbols
-        .get("_start")
-        .map(|s| s.address)
-        .unwrap_or_else(|| {
-            global_symbols
-                .get("main")
-                .map(|s| s.address)
-                .unwrap_or(BASE_ADDR)
-        });
+    // Exported definitions get their final values.  `st_shndx` only has to
+    // be "defined" for the loader (this image carries no section headers);
+    // a TLS symbol's value is its offset in the PT_TLS block.
+    for name in &export_syms_for_dynsym {
+        if let (Some(sym), Some(&idx)) = (global_symbols.get(name), dynsym_map.get(name)) {
+            dynsym_entries[idx].value = if sym.sym_type == STT_TLS {
+                sym.address.wrapping_sub(tls_addr)
+            } else {
+                sym.address
+            };
+            dynsym_entries[idx].shndx = 1;
+        }
+    }
 
     // Patch dynsym for copy-reloc symbols
     for name in &copy_syms_for_dynsym {
@@ -1205,6 +1361,32 @@ pub(super) fn emit_executable(
             4,
         );
     }
+    if has_notes {
+        write_ph(
+            &mut output,
+            &mut phdr_pos,
+            PT_NOTE,
+            note_offset,
+            note_vaddr,
+            note_total_size,
+            note_total_size,
+            PF_R,
+            note_align,
+        );
+    }
+    if use_relro {
+        write_ph(
+            &mut output,
+            &mut phdr_pos,
+            PT_GNU_RELRO,
+            relro_offset,
+            relro_vaddr,
+            relro_end - relro_vaddr,
+            relro_end - relro_vaddr,
+            PF_R,
+            1,
+        );
+    }
     write_ph(
         &mut output,
         &mut phdr_pos,
@@ -1251,7 +1433,12 @@ pub(super) fn emit_executable(
 
     if !is_static {
         write_data(&mut output, interp_offset, &interp_data);
-        write_data(&mut output, gnu_hash_offset, &gnu_hash_data);
+        if want_gnu_hash {
+            write_data(&mut output, gnu_hash_offset, &gnu_hash_data);
+        }
+        if let Some(h) = &sysv_hash {
+            linker_common::write_sysv_hash(&mut output, hash_offset as usize, h);
+        }
         write_data(&mut output, dynsym_offset, &dynsym_data);
         write_data(&mut output, dynstr_offset, &dynstr_data);
         if !versym_data.is_empty() {
@@ -1283,6 +1470,7 @@ pub(super) fn emit_executable(
     }
 
     // Write all output sections
+    check_sections_placed(output_sections, "executable")?;
     for sec in output_sections.iter() {
         if sec.sh_type == SHT_NOBITS || sec.data.is_empty() {
             continue;
@@ -1292,6 +1480,12 @@ pub(super) fn emit_executable(
         if end <= output.len() {
             output[off..end].copy_from_slice(&sec.data);
         }
+    }
+
+    // Build-id last: the digest covers the complete image.
+    if build_id_size > 0 {
+        linker_common::build_id::write_build_id_skeleton(&mut output, build_id_offset as usize);
+        linker_common::build_id::patch_build_id(&mut output, build_id_offset as usize);
     }
 
     // Write to file
@@ -1307,6 +1501,34 @@ pub(super) fn emit_executable(
 }
 
 // ── Helpers for emit_executable ──────────────────────────────────────────────
+
+/// Placement invariant for the ELF32 emitters: every allocatable output
+/// section that carries bytes must have been assigned an address by the
+/// layout, or the section write loop copies it to file offset 0 — on top of
+/// the ELF header — and the link "succeeds" with a file that is not ELF at
+/// all (a `.note` section the shared-library layout never placed did exactly
+/// that).  Offset/address 0 is always the ELF header, so it can never be a
+/// real placement.  Failing loudly here turns any future layout omission
+/// into a diagnosable link error instead of silent corruption.
+pub(super) fn check_sections_placed(
+    output_sections: &[OutputSection],
+    what: &str,
+) -> Result<(), String> {
+    for sec in output_sections {
+        if sec.flags & SHF_ALLOC != 0
+            && !sec.data.is_empty()
+            && sec.addr == 0
+            && sec.file_offset == 0
+        {
+            return Err(format!(
+                "i686 {what} layout: allocatable section '{}' ({} bytes) was never placed",
+                sec.name,
+                sec.data.len()
+            ));
+        }
+    }
+    Ok(())
+}
 
 pub(super) fn layout_section(
     name: &str,
@@ -1357,8 +1579,10 @@ pub(super) fn layout_custom_sections(
         ".bss",
         ".init",
         ".fini",
+        ".preinit_array",
         ".init_array",
         ".fini_array",
+        ".data.rel.ro",
         ".eh_frame",
         ".note",
         ".tdata",
@@ -1408,45 +1632,45 @@ pub(super) fn layout_tls(
     file_offset: &mut u32,
     vaddr: &mut u32,
 ) -> (u32, u32, u32, u32, u32) {
-    let mut tls_addr = 0u32;
-    let mut tls_file_offset = 0u32;
-    let mut tls_file_size = 0u32;
+    let tdata = section_name_to_idx.get(".tdata").copied();
+    let tbss = section_name_to_idx.get(".tbss").copied();
+    let Some(tls_align) = [tdata, tbss]
+        .into_iter()
+        .flatten()
+        .map(|i| output_sections[i].align.max(4))
+        .max()
+    else {
+        return (0, 0, 0, 0, 1);
+    };
+    // PT_TLS starts at a multiple of its p_align: the loader places the
+    // block at thread-pointer offset `roundup(p_memsz, p_align)` only then
+    // (otherwise glibc also accounts for `p_vaddr % p_align`, the "first
+    // byte offset"), and that is the offset the link-time TP-relative
+    // values (`ntpoff`) assume.  Aligning only to `.tdata`'s own alignment
+    // shifted every variable when `.tbss` was more aligned.
+    *file_offset = align_up(*file_offset, tls_align);
+    *vaddr = align_up(*vaddr, tls_align);
+    let tls_addr = *vaddr;
+    let tls_file_offset = *file_offset;
     let mut tls_mem_size = 0u32;
-    let mut tls_align = 1u32;
-
-    if let Some(&idx) = section_name_to_idx.get(".tdata") {
-        let a = output_sections[idx].align.max(4);
-        *file_offset = align_up(*file_offset, a);
-        *vaddr = align_up(*vaddr, a);
-        output_sections[idx].addr = *vaddr;
-        output_sections[idx].file_offset = *file_offset;
-        tls_addr = *vaddr;
-        tls_file_offset = *file_offset;
-        tls_align = a;
+    if let Some(idx) = tdata {
+        output_sections[idx].addr = tls_addr;
+        output_sections[idx].file_offset = tls_file_offset;
         let sz = output_sections[idx].data.len() as u32;
-        tls_file_size = sz;
         tls_mem_size = sz;
         *file_offset += sz;
         *vaddr += sz;
     }
-
-    if let Some(&idx) = section_name_to_idx.get(".tbss") {
-        let a = output_sections[idx].align.max(4);
-        let aligned = align_up(tls_mem_size, a);
-        if tls_addr == 0 {
-            tls_addr = align_up(*vaddr, a);
-            tls_file_offset = *file_offset;
-            tls_align = a;
-        }
-        output_sections[idx].addr = tls_addr + aligned;
+    let tls_file_size = tls_mem_size;
+    if let Some(idx) = tbss {
+        // NOBITS: occupies TLS-image memory only, not the enclosing
+        // segment's address space.
+        tls_mem_size = align_up(tls_mem_size, output_sections[idx].align.max(4));
+        output_sections[idx].addr = tls_addr + tls_mem_size;
         output_sections[idx].file_offset = *file_offset;
-        tls_mem_size = aligned + output_sections[idx].data.len() as u32;
-        if a > tls_align {
-            tls_align = a;
-        }
+        tls_mem_size += output_sections[idx].data.len() as u32;
     }
-
-    tls_mem_size = align_up(tls_mem_size, tls_align);
+    let tls_mem_size = align_up(tls_mem_size, tls_align);
     (
         tls_addr,
         tls_file_offset,
@@ -1456,48 +1680,52 @@ pub(super) fn layout_tls(
     )
 }
 
-fn count_dynamic_entries(
-    needed_libs: &[String],
-    init_vaddr: u32,
-    init_size: u32,
-    fini_vaddr: u32,
-    fini_size: u32,
-    init_array_size: u32,
-    fini_array_size: u32,
-    num_plt: usize,
-    num_rel_dyn: usize,
-    verneed_size: u32,
-    num_text_relocs: usize,
+/// Whether any input marks its `.note.GNU-stack` executable (GNU C nested
+/// function trampolines); binutils ORs the markers into PT_GNU_STACK.
+pub(super) fn inputs_want_exec_stack(inputs: &[InputObject]) -> bool {
+    inputs.iter().any(|obj| {
+        obj.sections
+            .iter()
+            .any(|s| s.name == ".note.GNU-stack" && (s.flags & SHF_EXECINSTR) != 0)
+    })
+}
+
+/// A definition that may appear in the executable's `.dynsym`.
+fn is_exportable(name: &str, s: &LinkerSymbol) -> bool {
+    s.is_defined
+        && !s.is_dynamic
+        && !name.is_empty()
+        && (s.binding == STB_GLOBAL || s.binding == STB_WEAK)
+        && (s.visibility == STV_DEFAULT || s.visibility == STV_PROTECTED)
+        && s.sym_type != STT_SECTION
+        && s.sym_type != STT_FILE
+}
+
+/// GNU ld's entry-point rule (ldlang.c `lang_end`): the named symbol if it
+/// is defined in the output, else the name read as a hexadecimal address,
+/// else a warning and the start of `.text`.
+pub(super) fn resolve_entry_point(
+    entry: Option<&str>,
+    global_symbols: &FxHashMap<String, LinkerSymbol>,
+    text_start: u32,
 ) -> u32 {
-    let mut n: u32 = needed_libs.len() as u32;
-    n += 5; // GNU_HASH, STRTAB, SYMTAB, STRSZ, SYMENT
-    if init_vaddr != 0 && init_size > 0 {
-        n += 1;
+    let name = entry.unwrap_or("_start");
+    if let Some(s) = global_symbols.get(name) {
+        if s.is_defined && !s.is_dynamic {
+            return s.address;
+        }
     }
-    if fini_vaddr != 0 && fini_size > 0 {
-        n += 1;
+    if let Some(e) = entry {
+        let digits = e
+            .strip_prefix("0x")
+            .or_else(|| e.strip_prefix("0X"))
+            .unwrap_or(e);
+        if let Ok(v) = u32::from_str_radix(digits, 16) {
+            return v;
+        }
     }
-    if init_array_size > 0 {
-        n += 2;
-    }
-    if fini_array_size > 0 {
-        n += 2;
-    }
-    n += 1; // DEBUG
-    if num_plt > 0 {
-        n += 4;
-    }
-    if num_rel_dyn > 0 {
-        n += 3;
-    }
-    if verneed_size > 0 {
-        n += 3;
-    }
-    if num_text_relocs > 0 {
-        n += 1;
-    } // DT_TEXTREL
-    n += 1; // DT_NULL
-    n
+    eprintln!("lccc-ld: warning: cannot find entry symbol {name}; defaulting to {text_start:08x}");
+    text_start
 }
 
 fn assign_symbol_addresses(
@@ -1513,6 +1741,7 @@ fn assign_symbol_addresses(
     text_seg_vaddr_end: u32,
     dynamic_vaddr: u32,
     is_static: bool,
+    (preinit_array_vaddr, preinit_array_size): (u32, u32),
     init_array_vaddr: u32,
     init_array_size: u32,
     fini_array_vaddr: u32,
@@ -1560,8 +1789,8 @@ fn assign_symbol_addresses(
         init_array_size: init_array_size as u64,
         fini_array_start: fini_array_vaddr as u64,
         fini_array_size: fini_array_size as u64,
-        preinit_array_start: 0,
-        preinit_array_size: 0,
+        preinit_array_start: preinit_array_vaddr as u64,
+        preinit_array_size: preinit_array_size as u64,
         rela_iplt_start: rel_iplt_vaddr as u64,
         rela_iplt_size: rel_iplt_size as u64,
     };
@@ -1652,6 +1881,30 @@ fn assign_symbol_addresses(
     super::link::evaluate_pending_defsyms(global_symbols, pending_defsyms)
 }
 
+/// How PLT entries address their `.got.plt` slots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PltAddressing {
+    /// Position-dependent executable: `jmp *abs32` / `pushl abs32`.
+    Absolute,
+    /// Shared object: slots are addressed relative to `%ebx`, which the i386
+    /// psABI requires every PLT caller to load with the address of
+    /// `_GLOBAL_OFFSET_TABLE_` (the payload is that symbol's link-time
+    /// value).  Absolute slot addresses are wrong in a shared object: the
+    /// object is loaded at an arbitrary base, so `jmp *abs32` reads a
+    /// random (usually unmapped) address and faults.
+    EbxRelative { got_symbol: u32 },
+}
+
+/// Build the i386 lazy-binding PLT.
+///
+/// ```text
+///            Absolute                     EbxRelative (PIC)
+/// PLT0:      ff 35 <GOT.PLT+4>            ff b3 <GOT.PLT+4 - GOT>     pushl
+///            ff 25 <GOT.PLT+8>            ff a3 <GOT.PLT+8 - GOT>     jmp *
+/// PLTn:      ff 25 <slot>                 ff a3 <slot - GOT>          jmp *
+///            68 <n*8>                     68 <n*8>                    push reloc off
+///            e9 <PLT0 - next>             e9 <PLT0 - next>            jmp PLT0
+/// ```
 pub(super) fn build_plt(
     num_plt: usize,
     plt_vaddr: u32,
@@ -1659,20 +1912,29 @@ pub(super) fn build_plt(
     plt_entry_size: u32,
     gotplt_vaddr: u32,
     gotplt_reserved: u32,
+    addressing: PltAddressing,
 ) -> Vec<u8> {
     let mut plt_data: Vec<u8> = Vec::new();
     if num_plt == 0 {
         return plt_data;
     }
 
-    // PLT[0]: resolver stub
-    let got1 = gotplt_vaddr + 4;
-    let got2 = gotplt_vaddr + 8;
+    // (ModRM for `pushl m32`, ModRM for `jmp *m32`, bias subtracted from
+    // the slot address).  ModRM 0x35/0x25 = disp32 absolute; 0xb3/0xa3 =
+    // disp32(%ebx).
+    let (push_modrm, jmp_modrm, bias) = match addressing {
+        PltAddressing::Absolute => (0x35u8, 0x25u8, 0u32),
+        PltAddressing::EbxRelative { got_symbol } => (0xb3u8, 0xa3u8, got_symbol),
+    };
+
+    // PLT[0]: resolver stub — push GOT.PLT[1] (link_map), jump GOT.PLT[2].
+    let got1 = (gotplt_vaddr + 4).wrapping_sub(bias);
+    let got2 = (gotplt_vaddr + 8).wrapping_sub(bias);
     plt_data.push(0xff);
-    plt_data.push(0x35);
+    plt_data.push(push_modrm);
     plt_data.extend_from_slice(&got1.to_le_bytes());
     plt_data.push(0xff);
-    plt_data.push(0x25);
+    plt_data.push(jmp_modrm);
     plt_data.extend_from_slice(&got2.to_le_bytes());
     while plt_data.len() < plt_header_size as usize {
         plt_data.push(0x90);
@@ -1680,11 +1942,11 @@ pub(super) fn build_plt(
 
     // PLT[N]
     for i in 0..num_plt {
-        let gotplt_entry = gotplt_vaddr + (gotplt_reserved + i as u32) * 4;
+        let gotplt_entry = (gotplt_vaddr + (gotplt_reserved + i as u32) * 4).wrapping_sub(bias);
         let plt_entry_addr = plt_vaddr + plt_header_size + (i as u32) * plt_entry_size;
 
         plt_data.push(0xff);
-        plt_data.push(0x25);
+        plt_data.push(jmp_modrm);
         plt_data.extend_from_slice(&gotplt_entry.to_le_bytes());
         plt_data.push(0x68);
         plt_data.extend_from_slice(&(i as u32 * 8).to_le_bytes());
@@ -1715,4 +1977,90 @@ fn write_elf_header(output: &mut [u8], entry_point: u32, ehdr_size: u32, num_phd
     output[46..48].copy_from_slice(&40u16.to_le_bytes());
     output[48..50].copy_from_slice(&0u16.to_le_bytes());
     output[50..52].copy_from_slice(&0u16.to_le_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn disp32(bytes: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+    }
+
+    #[test]
+    fn absolute_plt_uses_absolute_slot_addresses() {
+        let plt = build_plt(2, 0x1000, 16, 16, 0x3000, 3, PltAddressing::Absolute);
+        assert_eq!(plt.len(), 48);
+        assert_eq!(&plt[0..2], &[0xff, 0x35]);
+        assert_eq!(disp32(&plt, 2), 0x3004);
+        assert_eq!(&plt[6..8], &[0xff, 0x25]);
+        assert_eq!(disp32(&plt, 8), 0x3008);
+        // PLT1 -> GOT.PLT[4], reloc offset 8, jmp back to PLT0.
+        assert_eq!(&plt[32..34], &[0xff, 0x25]);
+        assert_eq!(disp32(&plt, 34), 0x3010);
+        assert_eq!(plt[38], 0x68);
+        assert_eq!(disp32(&plt, 39), 8);
+        assert_eq!(plt[43], 0xe9);
+        assert_eq!(disp32(&plt, 44) as i32, 0x1000 - (0x1020 + 16));
+    }
+
+    #[test]
+    fn shared_plt_addresses_slots_relative_to_ebx_got_symbol() {
+        // `_GLOBAL_OFFSET_TABLE_` sits below .got.plt (it names .got in the
+        // shared-object layout), so the displacements are GOT-relative and
+        // must round-trip to the absolute slot address.
+        let got = 0x2ff0;
+        let plt = build_plt(
+            2,
+            0x1000,
+            16,
+            16,
+            0x3000,
+            3,
+            PltAddressing::EbxRelative { got_symbol: got },
+        );
+        assert_eq!(plt.len(), 48);
+        assert_eq!(&plt[0..2], &[0xff, 0xb3], "pushl disp32(%ebx)");
+        assert_eq!(got + disp32(&plt, 2), 0x3004);
+        assert_eq!(&plt[6..8], &[0xff, 0xa3], "jmp *disp32(%ebx)");
+        assert_eq!(got + disp32(&plt, 8), 0x3008);
+        for i in 0..2u32 {
+            let e = (16 + 16 * i) as usize;
+            assert_eq!(&plt[e..e + 2], &[0xff, 0xa3]);
+            assert_eq!(got + disp32(&plt, e + 2), 0x3000 + (3 + i) * 4);
+            assert_eq!(disp32(&plt, e + 7), i * 8);
+            let next = 0x1000 + e as u32 + 16;
+            assert_eq!(next.wrapping_add(disp32(&plt, e + 12)), 0x1000);
+        }
+    }
+
+    fn sec(name: &str, flags: u32, len: usize, addr: u32, off: u32) -> OutputSection {
+        OutputSection {
+            name: name.to_string(),
+            sh_type: SHT_PROGBITS,
+            flags,
+            data: vec![0; len],
+            align: 4,
+            addr,
+            file_offset: off,
+        }
+    }
+
+    #[test]
+    fn unplaced_allocatable_section_is_a_hard_error() {
+        let placed = [
+            sec(".text", SHF_ALLOC | SHF_EXECINSTR, 8, 0x1000, 0x1000),
+            // Empty and non-alloc sections never reach the write loop at 0.
+            sec(".note", SHF_ALLOC, 0, 0, 0),
+            sec(".comment", 0, 16, 0, 0),
+        ];
+        assert!(check_sections_placed(&placed, "shared library").is_ok());
+
+        let unplaced = [sec(".note", SHF_ALLOC, 0x30, 0, 0)];
+        let err = check_sections_placed(&unplaced, "shared library").unwrap_err();
+        assert!(
+            err.contains("'.note'") && err.contains("never placed"),
+            "{err}"
+        );
+    }
 }

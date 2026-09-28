@@ -570,7 +570,7 @@ pub(super) fn fuse_load_into_alu(store: &mut LineStore, infos: &mut [LineInfo]) 
                     format!("    {op}{suffix} {mem}, {}", REG_NAMES[width][dst as usize]);
                 mark_nop(&mut infos[i]);
                 replace_line(store, &mut infos[j], j, new_line);
-                lv.refresh_at(store, infos, j);
+                lv.refresh_span(store, infos, i, j);
                 changed = true;
                 i = j + 1;
                 continue;
@@ -596,7 +596,7 @@ pub(super) fn fuse_load_into_alu(store: &mut LineStore, infos: &mut [LineInfo]) 
                     format!("    {op}{suffix} {}, {mem}", REG_NAMES[width][src as usize]);
                 mark_nop(&mut infos[i]);
                 replace_line(store, &mut infos[j], j, new_line);
-                lv.refresh_at(store, infos, j);
+                lv.refresh_span(store, infos, i, j);
                 changed = true;
                 i = j + 1;
                 continue;
@@ -617,7 +617,7 @@ pub(super) fn fuse_load_into_alu(store: &mut LineStore, infos: &mut [LineInfo]) 
                 let new_line = format!("    {op}{suffix} {imm}, {mem}");
                 mark_nop(&mut infos[i]);
                 replace_line(store, &mut infos[j], j, new_line);
-                lv.refresh_at(store, infos, j);
+                lv.refresh_span(store, infos, i, j);
                 changed = true;
                 i = j + 1;
                 continue;
@@ -641,7 +641,7 @@ pub(super) fn fuse_load_into_alu(store: &mut LineStore, infos: &mut [LineInfo]) 
         ) {
             mark_nop(&mut infos[i]);
             replace_line(store, &mut infos[j], j, new_line);
-            lv.refresh_at(store, infos, j);
+            lv.refresh_span(store, infos, i, j);
             changed = true;
             i = j + 1;
             continue;
@@ -740,7 +740,7 @@ pub(super) fn fuse_load_into_alu(store: &mut LineStore, infos: &mut [LineInfo]) 
         mark_nop(&mut infos[i]);
         replace_line(store, &mut infos[j], j, copy_line);
         replace_line(store, &mut infos[k], k, op_new);
-        lv.refresh_at(store, infos, j);
+        lv.refresh_span(store, infos, i, k);
         changed = true;
         i = k + 1;
     }

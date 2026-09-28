@@ -478,6 +478,7 @@ impl Lowerer {
                 da.actual_alloc_size,
                 &object_struct_layout,
                 &da.array_dim_strides,
+                da.c_type.as_ref(),
             )
         } else {
             GlobalInit::Zero
@@ -842,78 +843,40 @@ impl Lowerer {
             return;
         }
         if let Some(initializer) = init {
-            match initializer {
-                Initializer::Expr(expr) => {
-                    if da.base_ty == IrType::I8 || da.base_ty == IrType::U8 {
-                        if let Expr::StringLiteral(s, _) = expr {
-                            da.alloc_size = s.chars().count() + 1;
-                            da.actual_alloc_size = da.alloc_size;
-                        }
-                        if let Expr::WideStringLiteral(s, _) | Expr::Char16StringLiteral(s, _) =
-                            expr
-                        {
-                            da.alloc_size = s.chars().count() + 1;
-                            da.actual_alloc_size = da.alloc_size;
-                        }
-                    }
-                    if da.base_ty == IrType::I32 || da.base_ty == IrType::U32 {
-                        if let Expr::WideStringLiteral(s, _) = expr {
-                            let char_count = s.chars().count() + 1;
-                            da.alloc_size = char_count * 4;
-                            da.actual_alloc_size = da.alloc_size;
-                        }
-                        if let Expr::StringLiteral(s, _) | Expr::Char16StringLiteral(s, _) = expr {
-                            let char_count = s.chars().count() + 1;
-                            da.alloc_size = char_count * 4;
-                            da.actual_alloc_size = da.alloc_size;
-                        }
-                    }
-                    if da.base_ty == IrType::I16 || da.base_ty == IrType::U16 {
-                        if let Expr::Char16StringLiteral(s, _)
-                        | Expr::StringLiteral(s, _)
-                        | Expr::WideStringLiteral(s, _) = expr
-                        {
-                            let char_count = s.chars().count() + 1;
-                            da.alloc_size = char_count * 2;
-                            da.actual_alloc_size = da.alloc_size;
-                        }
+            // Arrays of scalars (any rank) and character arrays initialized by
+            // a string take their bound from the array planner, which applies
+            // brace elision, designators and string rows exactly as the
+            // initializer lowering will.
+            let elem_ct = match da.c_type.as_ref() {
+                Some(CType::Array(elem, None)) => Some((**elem).clone()),
+                _ => None,
+            };
+            if let Some(elem) = &elem_ct {
+                if let Some(count) = self.unsized_array_len(initializer, elem) {
+                    da.alloc_size = count * self.resolve_ctype_size(elem);
+                    da.actual_alloc_size = da.alloc_size;
+                    if da.array_dim_strides.len() <= 1 {
+                        da.array_dim_strides = vec![da.elem_size];
                     }
                 }
-                Initializer::List(items) => {
-                    // For arrays of pointers (e.g., `const struct S *ptrs[] = {&a, &b}`),
-                    // struct_layout refers to the pointee struct, NOT the array element.
-                    // Each element is a pointer, not a struct, so use plain item counting.
-                    // Also, arrays of pointers must NOT use the char-array string literal
-                    // expansion path: `const char *a[] = {"hello"}` has 1 element (a pointer),
-                    // not 6 (the string length). Use plain item counting for pointer arrays.
-                    let actual_count = if da.is_array_of_pointers || da.is_array_of_func_ptrs {
-                        // Array of pointers/func ptrs: each init item is one pointer element.
-                        // Must not use char-array path which would expand string literals.
-                        self.compute_init_list_array_size(items)
-                    } else if let Some(ref layout) = da.struct_layout {
-                        self.compute_struct_array_init_count(items, layout)
+            }
+            // Arrays of aggregates: one element per braced item, or per
+            // struct's worth of scalars with elided braces.
+            if let (Initializer::List(items), Some(layout)) = (initializer, &da.struct_layout) {
+                if !da.is_array_of_pointers && !da.is_array_of_func_ptrs && da.elem_size > 0 {
+                    let count = self.compute_struct_array_init_count(items, layout);
+                    let has_nested_lists = items
+                        .iter()
+                        .any(|item| matches!(&item.init, Initializer::List(_)));
+                    let item_size = if da.array_dim_strides.len() > 1 && has_nested_lists {
+                        da.array_dim_strides[0]
                     } else {
-                        self.compute_init_list_array_size_for_char_array(items, da.base_ty)
+                        da.elem_size
                     };
-                    if da.elem_size > 0 {
-                        // For multi-dimensional arrays with nested brace init
-                        // (e.g., int*[][3] = {{&x,&y,&z}, {&w,0,0}}), each
-                        // top-level item spans the outermost stride.
-                        // For flat init (e.g., {&x,0,0,&y,0,0}), each item
-                        // is one element.
-                        let has_nested_lists = items
-                            .iter()
-                            .any(|item| matches!(&item.init, Initializer::List(_)));
-                        let item_size = if da.array_dim_strides.len() > 1 && has_nested_lists {
-                            da.array_dim_strides[0]
-                        } else {
-                            da.elem_size
-                        };
-                        da.alloc_size = actual_count * item_size;
-                        da.actual_alloc_size = da.alloc_size;
-                        if da.array_dim_strides.len() == 1 {
-                            da.array_dim_strides = vec![da.elem_size];
-                        }
+                    da.alloc_size = count * item_size;
+                    da.actual_alloc_size = da.alloc_size;
+                    if da.array_dim_strides.len() == 1 {
+                        da.array_dim_strides = vec![da.elem_size];
                     }
                 }
             }

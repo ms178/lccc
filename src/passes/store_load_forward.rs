@@ -43,14 +43,28 @@ struct FieldPath {
     offset: i64,
 }
 
+/// Bytes an access of `ty` may touch (`IrType::access_extent`; target-sized
+/// pointers).  Unmodeled types count as 16 bytes, which only widens the
+/// kill checks.
 fn type_size(ty: IrType) -> i64 {
-    use crate::common::types::IrType::*;
-    match ty {
-        I8 | U8 => 1,
-        I16 | U16 => 2,
-        I32 | U32 | F32 => 4,
-        I64 | U64 | F64 | Ptr => 8,
-        _ => 16,
+    ty.access_extent().map_or(16, |(_, may)| may)
+}
+
+/// Whether a load of `load_ty` reads exactly the bytes a store of
+/// `store_ty` wrote, so the stored operand can replace the load.  Equal
+/// sizes suffice for exactly-sized types (the forward is a same-width bit
+/// reinterpretation); the x87 long double writes 10 to 16 bytes, so it only
+/// forwards to a load of the same type.
+fn forwardable(store_ty: IrType, load_ty: IrType) -> bool {
+    match (store_ty.access_extent(), load_ty.access_extent()) {
+        (Some((sd, sm)), Some((ld, lm))) => {
+            if sd == sm && ld == lm {
+                sm == lm
+            } else {
+                store_ty == load_ty
+            }
+        }
+        _ => false,
     }
 }
 
@@ -191,7 +205,7 @@ fn build_field_paths(func: &IrFunction) -> FxHashMap<u32, FieldPath> {
 fn apply_inst(
     inst: &mut Instruction,
     paths: &FxHashMap<u32, FieldPath>,
-    map: &mut FxHashMap<FieldPath, (Operand, i64)>,
+    map: &mut FxHashMap<FieldPath, (Operand, IrType)>,
     rewrite: bool,
     changed: &mut usize,
     multi_def: &crate::common::fx_hash::FxHashSet<u32>,
@@ -214,13 +228,13 @@ fn apply_inst(
                 let size = type_size(*ty);
                 // Kill overlapping field entries (a wide store covers narrower
                 // fields starting within its range).
-                map.retain(|ofp, &mut (_v, fs)| {
+                map.retain(|ofp, &mut (_v, fty)| {
                     ofp.root != fp.root
-                        || ofp.offset + fs <= fp.offset
+                        || ofp.offset + type_size(fty) <= fp.offset
                         || fp.offset + size <= ofp.offset
                 });
                 if !*volatile {
-                    map.insert(fp, (*val, size));
+                    map.insert(fp, (*val, *ty));
                 }
             } else {
                 // Store through an untracked pointer may alias anything.
@@ -244,7 +258,7 @@ fn apply_inst(
                 return;
             }
             if let Some(fp) = paths.get(&ptr.0) {
-                if let Some(&(stored_op, store_size)) = map.get(fp) {
+                if let Some(&(stored_op, store_ty)) = map.get(fp) {
                     let is_self_copy = match stored_op {
                         Operand::Value(v) => v.0 == dest.0,
                         Operand::Const(_) => false,
@@ -253,8 +267,7 @@ fn apply_inst(
                         Operand::Value(v) => multi_def.contains(&v.0),
                         Operand::Const(_) => false,
                     };
-                    if rewrite && store_size == type_size(*ty) && !is_self_copy && !stored_multi_def
-                    {
+                    if rewrite && forwardable(store_ty, *ty) && !is_self_copy && !stored_multi_def {
                         *inst = Instruction::Copy {
                             dest: *dest,
                             src: stored_op,
@@ -267,8 +280,10 @@ fn apply_inst(
         Instruction::Memcpy { dest, size, .. } => match paths.get(&dest.0).copied() {
             Some(d) => {
                 let sz = *size as i64;
-                map.retain(|fp, &mut (_v, fs)| {
-                    fp.root != d.root || fp.offset + fs <= d.offset || d.offset + sz <= fp.offset
+                map.retain(|fp, &mut (_v, fty)| {
+                    fp.root != d.root
+                        || fp.offset + type_size(fty) <= d.offset
+                        || d.offset + sz <= fp.offset
                 });
             }
             None => map.clear(),
@@ -355,14 +370,14 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
     // agreement-intersection of OUT over all predecessors. Because the maps
     // only shrink at joins and kills, and grow only through stores, the
     // lattice is finite and the worklist terminates.
-    let mut in_map: Vec<FxHashMap<FieldPath, (Operand, i64)>> =
+    let mut in_map: Vec<FxHashMap<FieldPath, (Operand, IrType)>> =
         (0..n).map(|_| FxHashMap::default()).collect();
-    let mut out_map: Vec<FxHashMap<FieldPath, (Operand, i64)>> =
+    let mut out_map: Vec<FxHashMap<FieldPath, (Operand, IrType)>> =
         (0..n).map(|_| FxHashMap::default()).collect();
     let mut computed = vec![false; n];
     let mut worklist: Vec<usize> = (0..n).collect();
     while let Some(b) = worklist.pop() {
-        let mut acc: Option<FxHashMap<FieldPath, (Operand, i64)>> = None;
+        let mut acc: Option<FxHashMap<FieldPath, (Operand, IrType)>> = None;
         for &p in preds.row(b).iter() {
             let p = p as usize;
             acc = Some(match acc {

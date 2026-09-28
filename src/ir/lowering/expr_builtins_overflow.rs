@@ -85,6 +85,27 @@ impl Lowerer {
                 _ => IrType::I128,
             };
 
+            if Self::overflow_needs_u64_pair(
+                op,
+                compute_ty,
+                &[lhs_src_ir, rhs_src_ir, result_ir_ty],
+            ) {
+                let (truncated, overflow) = self.lower_overflow_u64_pair(
+                    op,
+                    (lhs_raw, lhs_src_ir),
+                    (rhs_raw, rhs_src_ir),
+                    result_ir_ty,
+                );
+                self.emit(Instruction::Store {
+                    volatile: false,
+                    val: Operand::Value(truncated),
+                    ptr: result_ptr,
+                    ty: result_ir_ty,
+                    seg_override: AddressSpace::Default,
+                });
+                return Some(Operand::Value(overflow));
+            }
+
             // Check if all operands can be represented exactly in compute_ty.
             // If an unsigned operand is the same size as compute_ty, it can't be
             // represented in the signed compute type (values > SIGNED_MAX are lost).
@@ -268,6 +289,23 @@ impl Lowerer {
             // Type-specific variants: operands already match the result type
             let (lhs_val, rhs_val) = (lhs_raw, rhs_raw);
 
+            if Self::overflow_needs_u64_pair(op, result_ir_ty, &[result_ir_ty]) {
+                let (truncated, overflow) = self.lower_overflow_u64_pair(
+                    op,
+                    (lhs_val, result_ir_ty),
+                    (rhs_val, result_ir_ty),
+                    result_ir_ty,
+                );
+                self.emit(Instruction::Store {
+                    volatile: false,
+                    val: Operand::Value(truncated),
+                    ptr: result_ptr,
+                    ty: result_ir_ty,
+                    seg_override: AddressSpace::Default,
+                });
+                return Some(Operand::Value(overflow));
+            }
+
             // Perform the operation in the result type
             let result = self.emit_binop_val(op, lhs_val, rhs_val, result_ir_ty);
 
@@ -344,6 +382,16 @@ impl Lowerer {
             8 => IrType::I64,
             _ => IrType::I128,
         };
+
+        if Self::overflow_needs_u64_pair(op, compute_ty, &[lhs_src_ir, rhs_src_ir, result_ir_ty]) {
+            let (_, overflow) = self.lower_overflow_u64_pair(
+                op,
+                (lhs_raw, lhs_src_ir),
+                (rhs_raw, rhs_src_ir),
+                result_ir_ty,
+            );
+            return Some(Operand::Value(overflow));
+        }
 
         let is_signed_result = result_ctype.is_signed();
         let all_operands_fit = (lhs_src_ctype.is_signed() || lhs_src_ir.size() < compute_ty.size())
@@ -433,6 +481,180 @@ impl Lowerer {
             };
             Some(Operand::Value(overflow))
         }
+    }
+
+    /// Whether an overflow builtin must take the 64-bit-pair lowering
+    /// (`lower_overflow_u64_pair`) instead of the double-width one.
+    ///
+    /// The generic lowering computes in a type wide enough for the exact
+    /// result, and `compute_{signed,unsigned}_overflow` widen a 64-bit
+    /// multiply to I128.  On 32-bit targets I128 is not an arithmetic type:
+    /// GCC has no `__int128` there and the i686 backend carries only the low
+    /// 64 bits of it (its i128 -> narrow cast even hit the scalar-cast
+    /// assertion).  So `__builtin_mul_overflow(i64, i64, &i64)` reported "no
+    /// overflow" for 2^40 * 2^30, `__builtin_add_overflow(~0ULL, 1, &u64)`
+    /// reported none either, and the u16-result forms ICEd (torture
+    /// pr91450-1/-2, pr93494).  Exactly those shapes need 128 bits: a
+    /// compute type wider than 64 bits, or a multiply that involves a
+    /// 64-bit operand or result.  Everything else keeps the existing
+    /// (cheaper) single-width lowering.  Operand or result types wider than
+    /// 64 bits are out of scope here (they are I128 by construction).
+    fn overflow_needs_u64_pair(op: IrBinOp, compute_ty: IrType, types: &[IrType]) -> bool {
+        target_is_32bit()
+            && types.iter().all(|t| t.size() <= 8)
+            && (compute_ty.size() > 8
+                || (op == IrBinOp::Mul && types.iter().any(|t| t.size() == 8)))
+    }
+
+    /// Split an integer operand of at most 64 bits into the two 64-bit halves
+    /// of its exact 128-bit two's-complement value: `lo` is the operand
+    /// extended per its own type, `hi` its sign fill (`None` = zero, for
+    /// unsigned operands).
+    fn overflow_wide_operand(&mut self, raw: Operand, ty: IrType) -> (Operand, Option<Operand>) {
+        let wide_ty = if ty.is_signed() {
+            IrType::I64
+        } else {
+            IrType::U64
+        };
+        let lo = if ty.size() == 8 {
+            raw
+        } else {
+            Operand::Value(self.emit_cast_val(raw, ty, wide_ty))
+        };
+        let hi = ty.is_signed().then(|| {
+            Operand::Value(self.emit_binop_val(
+                IrBinOp::AShr,
+                lo,
+                Operand::Const(IrConst::I64(63)),
+                IrType::I64,
+            ))
+        });
+        (lo, hi)
+    }
+
+    /// High 64 bits of the unsigned 64x64-bit product, from four 32x32->64
+    /// partial products (every intermediate fits in 64 bits: `mid` is at
+    /// most 3 * (2^32 - 1)).
+    fn overflow_umulhi64(&mut self, a: Operand, b: Operand) -> Value {
+        let u64t = IrType::U64;
+        let mask = Operand::Const(IrConst::I64(0xFFFF_FFFF));
+        let s32 = Operand::Const(IrConst::I64(32));
+        let bin = |this: &mut Self, op, l: Operand, r: Operand| {
+            Operand::Value(this.emit_binop_val(op, l, r, u64t))
+        };
+        let al = bin(self, IrBinOp::And, a, mask);
+        let ah = bin(self, IrBinOp::LShr, a, s32);
+        let bl = bin(self, IrBinOp::And, b, mask);
+        let bh = bin(self, IrBinOp::LShr, b, s32);
+        let ll = bin(self, IrBinOp::Mul, al, bl);
+        let lh = bin(self, IrBinOp::Mul, al, bh);
+        let hl = bin(self, IrBinOp::Mul, ah, bl);
+        let hh = bin(self, IrBinOp::Mul, ah, bh);
+        let ll_hi = bin(self, IrBinOp::LShr, ll, s32);
+        let lh_lo = bin(self, IrBinOp::And, lh, mask);
+        let hl_lo = bin(self, IrBinOp::And, hl, mask);
+        let mid = bin(self, IrBinOp::Add, ll_hi, lh_lo);
+        let mid = bin(self, IrBinOp::Add, mid, hl_lo);
+        let lh_hi = bin(self, IrBinOp::LShr, lh, s32);
+        let hl_hi = bin(self, IrBinOp::LShr, hl, s32);
+        let mid_hi = bin(self, IrBinOp::LShr, mid, s32);
+        let hi = bin(self, IrBinOp::Add, hh, lh_hi);
+        let hi = bin(self, IrBinOp::Add, hi, hl_hi);
+        let Operand::Value(hi) = bin(self, IrBinOp::Add, hi, mid_hi) else {
+            unreachable!()
+        };
+        hi
+    }
+
+    /// Exact add/sub/mul overflow for operands and result of at most 64 bits
+    /// using only 64-bit IR arithmetic (see `overflow_needs_u64_pair`).
+    ///
+    /// The exact result is formed as a 128-bit two's-complement pair
+    /// `(hi, lo)`: add/sub carry or borrow out of `lo`; a product is
+    /// `umulhi(alo, blo)` corrected by the sign fills
+    /// (`- (ahi & blo) - (bhi & alo)`, the standard signed-high-multiply
+    /// identity; the fills are 0 or all-ones).  Every exact result fits:
+    /// sums need 65 bits, and a product of two unsigned 64-bit values stays
+    /// below 2^128 - 2^65 + 2, so it can never alias a value that fits the
+    /// (at most 64-bit) result type.  The result type is then tested
+    /// directly: unsigned T fits iff `hi == 0` and `lo` survives the
+    /// truncation round trip; signed T iff `hi` is `lo`'s sign fill and `lo`
+    /// survives the round trip.  Returns (truncated result, overflow flag).
+    fn lower_overflow_u64_pair(
+        &mut self,
+        op: IrBinOp,
+        lhs: (Operand, IrType),
+        rhs: (Operand, IrType),
+        result_ty: IrType,
+    ) -> (Value, Value) {
+        let u64t = IrType::U64;
+        let zero = Operand::Const(IrConst::I64(0));
+        let (alo, ahi) = self.overflow_wide_operand(lhs.0, lhs.1);
+        let (blo, bhi) = self.overflow_wide_operand(rhs.0, rhs.1);
+        let (lo, hi) = match op {
+            IrBinOp::Add | IrBinOp::Sub => {
+                let lo = self.emit_binop_val(op, alo, blo, u64t);
+                // Add: carry iff lo < alo.  Sub: borrow iff alo < blo.
+                let flag = if op == IrBinOp::Add {
+                    self.emit_cmp_val(IrCmpOp::Ult, Operand::Value(lo), alo, u64t)
+                } else {
+                    self.emit_cmp_val(IrCmpOp::Ult, alo, blo, u64t)
+                };
+                let flag = self.emit_cast_val(Operand::Value(flag), IrType::I8, u64t);
+                let halves =
+                    self.emit_binop_val(op, ahi.unwrap_or(zero), bhi.unwrap_or(zero), u64t);
+                let hi =
+                    self.emit_binop_val(op, Operand::Value(halves), Operand::Value(flag), u64t);
+                (lo, hi)
+            }
+            IrBinOp::Mul => {
+                let lo = self.emit_binop_val(IrBinOp::Mul, alo, blo, u64t);
+                let mut hi = self.overflow_umulhi64(alo, blo);
+                for (fill, other) in [(ahi, blo), (bhi, alo)] {
+                    if let Some(fill) = fill {
+                        let corr = self.emit_binop_val(IrBinOp::And, fill, other, u64t);
+                        hi = self.emit_binop_val(
+                            IrBinOp::Sub,
+                            Operand::Value(hi),
+                            Operand::Value(corr),
+                            u64t,
+                        );
+                    }
+                }
+                (lo, hi)
+            }
+            _ => unreachable!("overflow only for add/sub/mul"),
+        };
+
+        let truncated = self.emit_cast_val(Operand::Value(lo), u64t, result_ty);
+        let expected_hi = if result_ty.is_signed() {
+            Operand::Value(self.emit_binop_val(
+                IrBinOp::AShr,
+                Operand::Value(lo),
+                Operand::Const(IrConst::I64(63)),
+                IrType::I64,
+            ))
+        } else {
+            zero
+        };
+        let hi_bad = self.emit_cmp_val(IrCmpOp::Ne, Operand::Value(hi), expected_hi, u64t);
+        if result_ty.size() == 8 {
+            return (truncated, hi_bad);
+        }
+        let back_ty = if result_ty.is_signed() {
+            IrType::I64
+        } else {
+            u64t
+        };
+        let back = self.emit_cast_val(Operand::Value(truncated), result_ty, back_ty);
+        let lo_bad = self.emit_cmp_val(IrCmpOp::Ne, Operand::Value(back), Operand::Value(lo), u64t);
+        let overflow = self.emit_binop_val(
+            IrBinOp::Or,
+            Operand::Value(hi_bad),
+            Operand::Value(lo_bad),
+            IrType::I32,
+        );
+        (truncated, overflow)
     }
 
     /// Determine the result IrType and signedness for an overflow builtin.

@@ -266,6 +266,29 @@ impl Lowerer {
             let field = &layout.fields[field_idx];
             let field_offset = base_offset + field.offset;
 
+            // Arrays of scalars of any rank (pointer elements included): the
+            // array planner resolves the member's initializer.
+            if desig_name.is_some() || sub_item.designators.is_empty() {
+                if let Some(geo) = self.scalar_array_geometry(&field.ty) {
+                    let rel: &[Designator] = if desig_name.is_some() {
+                        &sub_item.designators[1..]
+                    } else {
+                        &[]
+                    };
+                    let field_ty = field.ty.clone();
+                    let (member, consumed) =
+                        self.member_array_init(rel, &sub_items[item_idx..], &field_ty, &geo);
+                    let plan = self.plan_member_array(&member, &geo);
+                    self.plan_to_image(&plan, &geo, field_offset, bytes, ptr_ranges);
+                    item_idx += consumed;
+                    current_field_idx = field_idx + 1;
+                    if layout.is_union && desig_name.is_none() {
+                        break;
+                    }
+                    continue;
+                }
+            }
+
             if h::has_nested_field_designator(sub_item) {
                 self.fill_nested_designator_with_ptrs(
                     sub_item,

@@ -1377,7 +1377,21 @@ pub(super) fn emit_shared_library(
     let mut tls_file_offset = 0u64;
     let mut tls_file_size = 0u64;
     let mut tls_mem_size = 0u64;
-    let mut tls_align = 1u64;
+    // PT_TLS must start at a multiple of its p_align (the largest TLS
+    // section alignment): the loader puts the block at thread-pointer
+    // offset `roundup(p_memsz, p_align)` only then — glibc otherwise also
+    // accounts for `p_vaddr % p_align` — and that is the offset every
+    // link-time TPOFF value assumes.  Aligning to the first section's
+    // alignment alone shifted all variables when `.tbss` was more aligned.
+    let mut tls_align = output_sections
+        .iter()
+        .filter(|sec| sec.flags & SHF_TLS != 0 && sec.flags & SHF_ALLOC != 0)
+        .map(|sec| sec.alignment.max(1))
+        .max()
+        .unwrap_or(1);
+    if has_tls_sections {
+        offset = (offset + tls_align - 1) & !(tls_align - 1);
+    }
     for sec in output_sections.iter_mut() {
         if sec.flags & SHF_TLS != 0 && sec.flags & SHF_ALLOC != 0 && sec.sh_type != SHT_NOBITS {
             let a = sec.alignment.max(1);
@@ -1387,11 +1401,11 @@ pub(super) fn emit_shared_library(
             if tls_addr == 0 {
                 tls_addr = sec.addr;
                 tls_file_offset = offset;
-                tls_align = a;
             }
-            tls_file_size += sec.mem_size;
-            tls_mem_size += sec.mem_size;
             offset += sec.mem_size;
+            // Inter-section alignment padding is part of the TLS image.
+            tls_file_size = offset - tls_file_offset;
+            tls_mem_size = tls_file_size;
         }
     }
     if tls_addr == 0 && has_tls_sections {

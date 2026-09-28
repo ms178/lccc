@@ -14,16 +14,17 @@ pub(super) use crate::backend::elf::{
     PT_GNU_STACK, PT_INTERP, PT_LOAD, PT_PHDR, PT_TLS, SHN_ABS, SHN_COMMON, SHN_UNDEF, SHT_DYNSYM,
     SHT_FINI_ARRAY, SHT_GROUP, SHT_INIT_ARRAY, SHT_NOBITS, SHT_NULL, SHT_PROGBITS, SHT_REL,
     SHT_RELA, SHT_STRTAB, SHT_SYMTAB, STB_GLOBAL, STB_LOCAL, STB_WEAK, STT_FILE, STT_FUNC,
-    STT_GNU_IFUNC, STT_NOTYPE, STT_OBJECT, STT_SECTION, STT_TLS, STV_DEFAULT,
-    get_standard_linker_symbols, is_thin_archive, parse_archive_members,
-    parse_linker_script_entries, parse_thin_archive_members, read_cstr, read_i32, read_u16,
-    read_u32,
+    STT_GNU_IFUNC, STT_NOTYPE, STT_OBJECT, STT_SECTION, STT_TLS, STV_DEFAULT, STV_HIDDEN,
+    STV_INTERNAL, STV_PROTECTED, get_standard_linker_symbols, is_thin_archive,
+    parse_archive_members, parse_linker_script_entries, parse_thin_archive_members, read_cstr,
+    read_i32, read_u16, read_u32,
 };
 
 // ── ELF32-specific constants ──────────────────────────────────────────────────
 // These either differ in type (i32 vs i64 for DT_*) or aren't in the shared module.
 
 pub(super) const SHT_NOTE: u32 = 7;
+pub(super) const SHT_PREINIT_ARRAY: u32 = 16;
 #[expect(dead_code)] // ELF standard section type, defined for reference
 pub(super) const SHT_GNU_HASH: u32 = 0x6ffffff6;
 #[expect(dead_code)] // ELF standard section type, defined for reference
@@ -72,6 +73,11 @@ pub(super) const R_386_JMP_SLOT: u32 = 7;
 pub(super) const R_386_RELATIVE: u32 = 8;
 pub(super) const R_386_IRELATIVE: u32 = 42;
 pub(super) const R_386_GOT32X: u32 = 43;
+pub(super) const R_386_TLS_LDM: u32 = 19;
+pub(super) const R_386_TLS_LDO_32: u32 = 32;
+pub(super) const R_386_TLS_GOTDESC: u32 = 39;
+pub(super) const R_386_TLS_DESC_CALL: u32 = 40;
+pub(super) const R_386_TLS_DESC: u32 = 41;
 
 // Dynamic tags (i32 for ELF32, vs i64 in the shared module)
 pub(super) const DT_NULL: i32 = 0;
@@ -101,6 +107,11 @@ pub(super) const DT_GNU_HASH_TAG: i32 = 0x6ffffef5u32 as i32;
 pub(super) const DT_VERNEED: i32 = 0x6ffffffe_u32 as i32;
 pub(super) const DT_VERNEEDNUM: i32 = 0x6fffffff_u32 as i32;
 pub(super) const DT_VERSYM: i32 = 0x6ffffff0_u32 as i32;
+pub(super) const DT_HASH: i32 = 4;
+pub(super) const DT_PREINIT_ARRAY: i32 = 32;
+pub(super) const DT_PREINIT_ARRAYSZ: i32 = 33;
+pub(super) const PT_GNU_RELRO: u32 = 0x6474_e552;
+pub(super) const PT_NOTE: u32 = 4;
 
 pub(super) const PAGE_SIZE: u32 = 0x1000;
 pub(super) const BASE_ADDR: u32 = 0x08048000;
@@ -172,7 +183,7 @@ pub(super) struct InputSymbol {
     pub size: u32,
     pub binding: u8,
     pub sym_type: u8,
-    #[allow(dead_code)] // Parsed from ELF; needed for future STV_HIDDEN/STV_PROTECTED handling
+    /// `st_other & 3`.
     pub visibility: u8,
     pub section_index: u16,
 }
@@ -193,8 +204,9 @@ pub(super) struct LinkerSymbol {
     pub size: u32,
     pub sym_type: u8,
     pub binding: u8,
-    #[cfg_attr(not(feature = "gcc_linker"), expect(dead_code))]
-    // Tracked for future STV_HIDDEN/STV_PROTECTED handling
+    /// The most constraining visibility over the definition and every
+    /// reference (gABI: hidden/internal/protected on any of them applies to
+    /// the symbol).
     pub visibility: u8,
     pub is_defined: bool,
     pub needs_plt: bool,
@@ -303,11 +315,19 @@ pub(super) fn output_section_name(name: &str, flags: u32, sh_type: u32) -> Optio
             Some(".tdata".to_string())
         };
     }
+    // Pointer data that is only written by dynamic relocations: kept apart
+    // from `.data` so it can sit inside PT_GNU_RELRO.
+    if name == ".data.rel.ro" || name.starts_with(".data.rel.ro.") {
+        return Some(".data.rel.ro".to_string());
+    }
     if name.starts_with(".data") {
         return Some(".data".to_string());
     }
     if name.starts_with(".bss") || sh_type == SHT_NOBITS {
         return Some(".bss".to_string());
+    }
+    if name == ".preinit_array" || name.starts_with(".preinit_array.") {
+        return Some(".preinit_array".to_string());
     }
     if name == ".init_array" || name.starts_with(".init_array.") {
         return Some(".init_array".to_string());

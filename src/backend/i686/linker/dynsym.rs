@@ -32,11 +32,57 @@ pub(super) fn read_dynsyms_with_search(
 }
 
 fn read_dynsyms_file(path: &str, lib_search_paths: &[&str]) -> Result<Vec<DynSymInfo>, String> {
+    read_dynsyms_file_ext(path, lib_search_paths, &mut None)
+}
+
+/// The dynamic symbol interface of one ELF32 shared object (not a script).
+pub(super) struct Elf32Dso {
+    /// `DT_SONAME`, when the object has one.
+    pub soname: Option<String>,
+    /// Defined global/weak dynamic symbols.
+    pub defs: Vec<DynSymInfo>,
+    /// The object's own undefined global/weak dynamic symbols as
+    /// `(name, is_weak)` — references an executable (or an archive member
+    /// it pulls in) may have to satisfy and export, exactly as GNU ld
+    /// treats a shared library's undefined symbols.
+    pub undefs: Vec<(String, bool)>,
+}
+
+/// Read one ELF32 `ET_DYN` object.  Linker scripts are the caller's job
+/// (the i686 input resolver expands them in command-line order).
+pub(super) fn read_elf32_dso(path: &str) -> Result<Elf32Dso, String> {
+    let mut undefs = Some(Vec::new());
+    let mut defs = read_dynsyms_file_ext(path, &[], &mut undefs)?;
+    // Sectionless images stamp DT_SONAME on every symbol; sectioned ones
+    // are read through their section headers.
+    let soname = defs
+        .iter()
+        .find_map(|d| d.soname.clone())
+        .or_else(|| parse_soname_elf32(path))
+        .or_else(|| soname_from_dynamic(path));
+    for d in &mut defs {
+        d.soname = None;
+    }
+    Ok(Elf32Dso {
+        soname,
+        defs,
+        undefs: undefs.unwrap_or_default(),
+    })
+}
+
+fn read_dynsyms_file_ext(
+    path: &str,
+    lib_search_paths: &[&str],
+    undefs: &mut Option<Vec<(String, bool)>>,
+) -> Result<Vec<DynSymInfo>, String> {
     const LOCAL_SHT_GNU_VERSYM: u32 = 0x6fffffff;
     const SHT_GNU_VERDEF: u32 = 0x6ffffffd;
 
     let data = std::fs::read(path).map_err(|e| format!("cannot read {}: {}", path, e))?;
     if data.len() < 52 || data[0..4] != ELF_MAGIC || data[4] != ELFCLASS32 {
+        if undefs.is_some() {
+            return Err(format!("{}: not an ELF32 shared object", path));
+        }
         // Check if this is a linker script
         if let Ok(text) = std::str::from_utf8(&data) {
             if let Some(entries) = parse_linker_script_entries(text) {
@@ -59,7 +105,7 @@ fn read_dynsyms_file(path: &str, lib_search_paths: &[&str]) -> Result<Vec<DynSym
     // but zero symbols and fail every reference as undefined.  Fall back to
     // locating the tables through the `.dynamic` segment.
     if e_shnum == 0 {
-        return read_dynsyms_from_dynamic(&data);
+        return read_dynsyms_from_dynamic(&data, undefs);
     }
 
     // First pass: find dynsym, versym, verdef sections
@@ -139,6 +185,15 @@ fn read_dynsyms_file(path: &str, lib_search_paths: &[&str]) -> Result<Vec<DynSym
         let st_shndx = read_u16(&data, sym_off + 14);
 
         if st_shndx == SHN_UNDEF {
+            let bind = st_info >> 4;
+            if let Some(list) = undefs.as_mut() {
+                if j != 0 && (bind == STB_GLOBAL || bind == STB_WEAK) && st_name < strtab.len() {
+                    let name = read_cstr(strtab, st_name);
+                    if !name.is_empty() {
+                        list.push((name, bind == STB_WEAK));
+                    }
+                }
+            }
             continue;
         }
         let binding = st_info >> 4;
@@ -179,7 +234,10 @@ fn read_dynsyms_file(path: &str, lib_search_paths: &[&str]) -> Result<Vec<DynSym
 /// the `PT_LOAD` segments.  There is no symbol count in `.dynamic`, so the
 /// scan stops at the first entry whose `st_name` is out of range for the
 /// string table (every genuine entry satisfies `st_name < STRSZ`).
-fn read_dynsyms_from_dynamic(data: &[u8]) -> Result<Vec<DynSymInfo>, String> {
+fn read_dynsyms_from_dynamic(
+    data: &[u8],
+    undefs: &mut Option<Vec<(String, bool)>>,
+) -> Result<Vec<DynSymInfo>, String> {
     const DT_NULL: u32 = 0;
     const DT_STRTAB: u32 = 5;
     const DT_SYMTAB: u32 = 6;
@@ -274,8 +332,17 @@ fn read_dynsyms_from_dynamic(data: &[u8]) -> Result<Vec<DynSymInfo>, String> {
         let st_shndx = read_u16(data, sym_off + 14);
         let binding = st_info >> 4;
         j += 1;
-        if j == 1 || st_shndx == SHN_UNDEF {
-            continue; // null entry / undefined import
+        if j == 1 {
+            continue; // null entry
+        }
+        if st_shndx == SHN_UNDEF {
+            if let Some(list) = undefs.as_mut() {
+                let name = read_cstr(strtab, st_name);
+                if (binding == STB_GLOBAL || binding == STB_WEAK) && !name.is_empty() {
+                    list.push((name, binding == STB_WEAK));
+                }
+            }
+            continue; // undefined import
         }
         if binding != STB_GLOBAL && binding != STB_WEAK {
             continue;
@@ -517,4 +584,66 @@ fn resolve_script_path(
         }
     }
     None
+}
+
+/// `DT_SONAME` of an ELF32 image read through its program headers (images
+/// without a section header table, such as lccc's own i686 `.so` output,
+/// that export no symbols to carry the name).
+fn soname_from_dynamic(path: &str) -> Option<String> {
+    const DT_NULL: u32 = 0;
+    const DT_STRTAB: u32 = 5;
+    const DT_SONAME: u32 = 14;
+    const PT_LOAD: u32 = 1;
+    const PT_DYNAMIC: u32 = 2;
+    let data = std::fs::read(path).ok()?;
+    if data.len() < 52 {
+        return None;
+    }
+    let e_phoff = read_u32(&data, 28) as usize;
+    let e_phentsize = read_u16(&data, 42) as usize;
+    let e_phnum = read_u16(&data, 44) as usize;
+    if e_phentsize < 32 {
+        return None;
+    }
+    let mut loads: Vec<(u32, u32, u32)> = Vec::new();
+    let mut dynamic: Option<(usize, usize)> = None;
+    for i in 0..e_phnum {
+        let off = e_phoff.checked_add(i.checked_mul(e_phentsize)?)?;
+        if off + 32 > data.len() {
+            return None;
+        }
+        match read_u32(&data, off) {
+            PT_LOAD => loads.push((
+                read_u32(&data, off + 8),
+                read_u32(&data, off + 4),
+                read_u32(&data, off + 16),
+            )),
+            PT_DYNAMIC => {
+                dynamic = Some((
+                    read_u32(&data, off + 4) as usize,
+                    read_u32(&data, off + 16) as usize,
+                ))
+            }
+            _ => {}
+        }
+    }
+    let (doff, dsize) = dynamic?;
+    let (mut strtab, mut soname) = (None, None);
+    let mut pos = doff;
+    while pos + 8 <= data.len().min(doff.saturating_add(dsize)) {
+        let (tag, val) = (read_u32(&data, pos), read_u32(&data, pos + 4));
+        pos += 8;
+        match tag {
+            DT_NULL => break,
+            DT_STRTAB => strtab = Some(val),
+            DT_SONAME => soname = Some(val),
+            _ => {}
+        }
+    }
+    let str_va = strtab?;
+    let str_off = loads.iter().find_map(|&(va, off, filesz)| {
+        (str_va >= va && str_va - va < filesz).then(|| (off + (str_va - va)) as usize)
+    })?;
+    let name = read_cstr(data.get(str_off..)?, soname? as usize);
+    (!name.is_empty()).then_some(name)
 }

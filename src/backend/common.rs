@@ -953,7 +953,47 @@ fn link_builtin_native(
                 riscv::linker::link_shared(object_files, output_path, user_args, &refs.lib_paths)
             }
             EM_386 => {
-                i686::linker::link_shared(object_files, output_path, user_args, &refs.lib_paths)
+                // gcc's -shared spec: crti.o crtbeginS.o ... crtendS.o crtn.o
+                // with -lgcc, as-needed -lgcc_s and -lc (the backend applies
+                // the per-library linking mode).  Without crtbeginS.o the
+                // object has no `__dso_handle`, so `atexit`/`__cxa_atexit`
+                // registrations in it cannot be tied to its unloading.
+                let has = |f: &str| user_args.iter().any(|a| a == f);
+                let no_start_files = is_nostdlib || has("-nostartfiles");
+                let no_default_libs = is_nostdlib || has("-nodefaultlibs");
+                let crt = resolve_builtin_link_setup(arch, user_args, no_start_files, false);
+                let pic_crt = |objs: &[String]| -> Vec<String> {
+                    objs.iter()
+                        .filter(|p| !p.ends_with("/crt1.o"))
+                        .map(|p| {
+                            p.strip_suffix("/crtbegin.o")
+                                .map(|d| format!("{d}/crtbeginS.o"))
+                                .or_else(|| {
+                                    p.strip_suffix("/crtend.o")
+                                        .map(|d| format!("{d}/crtendS.o"))
+                                })
+                                .unwrap_or_else(|| p.clone())
+                        })
+                        .collect()
+                };
+                let before = pic_crt(&crt.crt_before);
+                let after = pic_crt(&crt.crt_after);
+                let before: Vec<&str> = before.iter().map(String::as_str).collect();
+                let after: Vec<&str> = after.iter().map(String::as_str).collect();
+                let libs: &[&str] = if no_default_libs {
+                    &[]
+                } else {
+                    &["gcc", "gcc_s", "c"]
+                };
+                i686::linker::link_shared(
+                    object_files,
+                    output_path,
+                    user_args,
+                    &refs.lib_paths,
+                    &before,
+                    &after,
+                    libs,
+                )
             }
             _ => Err(format!(
                 "No shared library linker for {} (elf_machine={})",

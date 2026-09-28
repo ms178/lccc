@@ -1,7 +1,7 @@
 //! Shared CFG and dominator tree analysis utilities.
 //!
 //! These functions compute control flow graph (CFG) information and dominator
-//! trees using the Cooper-Harvey-Kennedy algorithm. They are used by mem2reg
+//! trees (Semi-NCA, see [`compute_dominators`]). They are used by mem2reg
 //! for SSA construction and by optimization passes (e.g., GVN) that need
 //! dominator information.
 //!
@@ -220,80 +220,107 @@ pub fn compute_reverse_postorder(num_blocks: usize, succs: &FlatAdj) -> Vec<usiz
 
 // ── Dominator computation ─────────────────────────────────────────────────────
 
-/// Intersect two dominators using RPO numbering (Cooper-Harvey-Kennedy).
-fn intersect(
-    mut finger1: usize,
-    mut finger2: usize,
-    idom: &[usize],
-    rpo_number: &[usize],
-) -> usize {
-    while finger1 != finger2 {
-        while rpo_number[finger1] > rpo_number[finger2] {
-            finger1 = idom[finger1];
-        }
-        while rpo_number[finger2] > rpo_number[finger1] {
-            finger2 = idom[finger2];
-        }
-    }
-    finger1
-}
-
-/// Compute immediate dominators using the Cooper-Harvey-Kennedy algorithm.
+/// Compute immediate dominators.
 /// Returns idom[i] = immediate dominator of block i (idom[0] = 0 for entry).
 /// Uses usize::MAX as sentinel for undefined/unreachable blocks.
+///
+/// Algorithm: Semi-NCA (Lengauer-Tarjan semidominators with path
+/// compression, then the nearest-common-ancestor pass of Georgiadis et al.;
+/// the variant LLVM's `GenericDomTreeConstruction` uses).  O(E log V)
+/// independent of CFG shape.  The iterative Cooper-Harvey-Kennedy scheme
+/// this replaces is fast on typical CFGs but walks the dominator chain once
+/// per predecessor of a join: a join with P predecessors at depth D costs
+/// O(P * D) per sweep, and a long compare-and-branch chain whose exits all
+/// meet at one label (gcc.c-torture/compile 20001226-1: 8192 branches, two
+/// joins of 4096 predecessors each) made every dominator build quadratic.
+/// Immediate dominators are unique, so the result is identical; the CHK
+/// version is kept as the test oracle.
 pub fn compute_dominators(num_blocks: usize, preds: &FlatAdj, succs: &FlatAdj) -> Vec<usize> {
     const UNDEF: usize = usize::MAX;
-
-    let rpo = compute_reverse_postorder(num_blocks, succs);
-    let mut rpo_number = vec![UNDEF; num_blocks];
-    for (order, &block) in rpo.iter().enumerate() {
-        rpo_number[block] = order;
-    }
-
+    const NONE: u32 = u32::MAX;
     let mut idom = vec![UNDEF; num_blocks];
-    if rpo.is_empty() {
+    if num_blocks == 0 {
         return idom;
     }
-    idom[rpo[0]] = rpo[0]; // Entry dominates itself
 
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for &b in rpo.iter().skip(1) {
-            if rpo_number[b] == UNDEF {
-                continue;
+    // Depth-first preorder from the entry (block 0), iteratively: CFG depth
+    // reaches the tens of thousands on generated code.
+    let mut pre = vec![NONE; num_blocks]; // block -> preorder number
+    let mut vertex: Vec<usize> = Vec::with_capacity(num_blocks); // number -> block
+    let mut parent: Vec<u32> = Vec::with_capacity(num_blocks); // number -> parent number
+    let mut stack: Vec<(usize, usize)> = vec![(0, 0)]; // (block, next succ index)
+    pre[0] = 0;
+    vertex.push(0);
+    parent.push(0);
+    while let Some(&mut (b, ref mut next)) = stack.last_mut() {
+        let row = succs.row(b);
+        if let Some(&s) = row.get(*next) {
+            *next += 1;
+            let s = s as usize;
+            if pre[s] == NONE {
+                pre[s] = vertex.len() as u32;
+                parent.push(pre[b]);
+                vertex.push(s);
+                stack.push((s, 0));
             }
-
-            let mut new_idom = UNDEF;
-            for &p in preds.row(b) {
-                let p = p as usize;
-                if idom[p] != UNDEF {
-                    new_idom = p;
-                    break;
-                }
-            }
-
-            if new_idom == UNDEF {
-                continue;
-            }
-
-            for &p in preds.row(b) {
-                let p = p as usize;
-                if p == new_idom {
-                    continue;
-                }
-                if idom[p] != UNDEF {
-                    new_idom = intersect(new_idom, p, &idom, &rpo_number);
-                }
-            }
-
-            if idom[b] != new_idom {
-                idom[b] = new_idom;
-                changed = true;
-            }
+        } else {
+            stack.pop();
         }
     }
+    let n = vertex.len();
 
+    // Semidominators in reverse preorder.  `ancestor`/`label` form the
+    // link-eval forest over already-processed vertices; `eval` compresses
+    // paths iteratively (the forest can be as deep as the CFG).
+    let mut semi: Vec<u32> = (0..n as u32).collect();
+    let mut label: Vec<u32> = (0..n as u32).collect();
+    let mut ancestor: Vec<u32> = vec![NONE; n];
+    let mut path: Vec<u32> = Vec::new();
+    for w in (1..n).rev() {
+        for &p in preds.row(vertex[w]) {
+            let v = pre[p as usize];
+            if v == NONE {
+                continue; // unreachable predecessor
+            }
+            let u = if ancestor[v as usize] == NONE {
+                v
+            } else {
+                // Compress the path from `v` to its forest root.
+                path.clear();
+                let mut x = v;
+                while ancestor[ancestor[x as usize] as usize] != NONE {
+                    path.push(x);
+                    x = ancestor[x as usize];
+                }
+                for &x in path.iter().rev() {
+                    let a = ancestor[x as usize] as usize;
+                    if semi[label[a] as usize] < semi[label[x as usize] as usize] {
+                        label[x as usize] = label[a];
+                    }
+                    ancestor[x as usize] = ancestor[a];
+                }
+                label[v as usize]
+            };
+            if semi[u as usize] < semi[w] {
+                semi[w] = semi[u as usize];
+            }
+        }
+        ancestor[w] = parent[w];
+    }
+
+    // NCA pass: the idom of `w` is the nearest ancestor of `parent[w]` in
+    // the (already final) dominator tree whose number is at most semi[w].
+    let mut idom_num: Vec<u32> = parent;
+    for w in 1..n {
+        let mut d = idom_num[w];
+        while d > semi[w] {
+            d = idom_num[d as usize];
+        }
+        idom_num[w] = d;
+    }
+    for (w, &b) in vertex.iter().enumerate() {
+        idom[b] = vertex[idom_num[w] as usize];
+    }
     idom
 }
 
@@ -373,6 +400,170 @@ impl CfgAnalysis {
             idom,
             dom_children,
             num_blocks,
+        }
+    }
+}
+
+/// Cooper-Harvey-Kennedy iterative dominators: the former implementation,
+/// kept as an independent oracle for [`compute_dominators`].
+#[cfg(test)]
+fn compute_dominators_chk(num_blocks: usize, preds: &FlatAdj, succs: &FlatAdj) -> Vec<usize> {
+    fn intersect(
+        mut finger1: usize,
+        mut finger2: usize,
+        idom: &[usize],
+        rpo_number: &[usize],
+    ) -> usize {
+        while finger1 != finger2 {
+            while rpo_number[finger1] > rpo_number[finger2] {
+                finger1 = idom[finger1];
+            }
+            while rpo_number[finger2] > rpo_number[finger1] {
+                finger2 = idom[finger2];
+            }
+        }
+        finger1
+    }
+    const UNDEF: usize = usize::MAX;
+
+    let rpo = compute_reverse_postorder(num_blocks, succs);
+    let mut rpo_number = vec![UNDEF; num_blocks];
+    for (order, &block) in rpo.iter().enumerate() {
+        rpo_number[block] = order;
+    }
+
+    let mut idom = vec![UNDEF; num_blocks];
+    if rpo.is_empty() {
+        return idom;
+    }
+    idom[rpo[0]] = rpo[0]; // Entry dominates itself
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &b in rpo.iter().skip(1) {
+            let mut new_idom = UNDEF;
+            for &p in preds.row(b) {
+                let p = p as usize;
+                if idom[p] != UNDEF {
+                    new_idom = p;
+                    break;
+                }
+            }
+            if new_idom == UNDEF {
+                continue;
+            }
+            for &p in preds.row(b) {
+                let p = p as usize;
+                if p != new_idom && idom[p] != UNDEF {
+                    new_idom = intersect(new_idom, p, &idom, &rpo_number);
+                }
+            }
+            if idom[b] != new_idom {
+                idom[b] = new_idom;
+                changed = true;
+            }
+        }
+    }
+    idom
+}
+
+#[cfg(test)]
+mod dominator_tests {
+    use super::*;
+
+    fn preds_of(succs: &[Vec<usize>]) -> Vec<Vec<usize>> {
+        let mut preds = vec![Vec::new(); succs.len()];
+        for (b, row) in succs.iter().enumerate() {
+            for &s in row {
+                preds[s].push(b);
+            }
+        }
+        preds
+    }
+
+    fn both(succs: &[Vec<usize>]) -> (Vec<usize>, Vec<usize>) {
+        let n = succs.len();
+        let s = FlatAdj::from_vecs_usize(succs);
+        let p = FlatAdj::from_vecs_usize(&preds_of(succs));
+        (
+            compute_dominators(n, &p, &s),
+            compute_dominators_chk(n, &p, &s),
+        )
+    }
+
+    #[test]
+    fn textbook_shapes() {
+        const U: usize = usize::MAX;
+        // Diamond with an unreachable block 4 (which branches into the join).
+        let (snca, chk) = both(&[vec![1, 2], vec![3], vec![3], vec![], vec![3]]);
+        assert_eq!(snca, vec![0, 0, 0, 0, U]);
+        assert_eq!(snca, chk);
+        // Irreducible loop entered at both 1 and 2.
+        let (snca, chk) = both(&[vec![1, 2], vec![2], vec![1, 3], vec![]]);
+        assert_eq!(snca, vec![0, 0, 0, 2]);
+        assert_eq!(snca, chk);
+        // Self loop on the entry, duplicate edges.
+        let (snca, chk) = both(&[vec![0, 1, 1], vec![]]);
+        assert_eq!(snca, vec![0, 0]);
+        assert_eq!(snca, chk);
+        // Single block, and the empty CFG.
+        assert_eq!(both(&[vec![]]).0, vec![0]);
+        assert_eq!(both(&[]).0, Vec::<usize>::new());
+    }
+
+    /// The 20001226-1 shape: a chain of N two-way branches whose early
+    /// exits all meet at two join blocks.  Also a depth test for the
+    /// iterative DFS and path compression.
+    #[test]
+    fn long_branch_chain_with_shared_exits() {
+        let n = 20_000;
+        let (gt, lt, ret) = (n, n + 1, n + 2);
+        let mut succs = vec![Vec::new(); n + 3];
+        for (i, row) in succs.iter_mut().enumerate().take(n) {
+            row.push(if i % 2 == 0 { gt } else { lt });
+            row.push(if i + 1 < n { i + 1 } else { ret });
+        }
+        let s = FlatAdj::from_vecs_usize(&succs);
+        let p = FlatAdj::from_vecs_usize(&preds_of(&succs));
+        let idom = compute_dominators(n + 3, &p, &s);
+        for (i, &d) in idom.iter().enumerate().take(n).skip(1) {
+            assert_eq!(d, i - 1);
+        }
+        assert_eq!(idom[gt], 0);
+        assert_eq!(idom[lt], 1);
+        assert_eq!(idom[ret], n - 1);
+    }
+
+    /// Differential test against the CHK oracle on pseudo-random CFGs
+    /// (reducible and irreducible, with unreachable blocks, self loops and
+    /// duplicate edges).
+    #[test]
+    fn matches_cooper_harvey_kennedy_on_random_cfgs() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rnd = |m: usize| -> usize {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % m as u64) as usize
+        };
+        for _ in 0..2000 {
+            let n = 1 + rnd(40);
+            let mut succs = vec![Vec::new(); n];
+            for (b, row) in succs.iter_mut().enumerate() {
+                let k = rnd(4);
+                for _ in 0..k {
+                    // Bias toward forward edges so most blocks are reachable.
+                    let t = if rnd(3) == 0 {
+                        rnd(n)
+                    } else {
+                        (b + 1 + rnd(3)).min(n - 1)
+                    };
+                    row.push(t);
+                }
+            }
+            let (snca, chk) = both(&succs);
+            assert_eq!(snca, chk, "succs = {succs:?}");
         }
     }
 }

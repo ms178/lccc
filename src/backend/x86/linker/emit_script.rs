@@ -2381,20 +2381,32 @@ fn link_with_script_machine(
     // because %fs:0 points just past it on x86-64. The block spans every
     // SHF_TLS output section; .tbss contributes to the memory size but not to
     // the file image, exactly as in a PT_TLS program header.
+    //
+    // `tls_mem_size` below is the thread-pointer offset of the block start,
+    // which is what the loader computes, not the raw p_memsz: the smallest
+    // offset >= p_memsz that keeps the block congruent to p_vaddr modulo
+    // p_align (glibc `_dl_determine_tlsoffset`: `roundup(memsz - fb, align)
+    // + fb` with `fb = -p_vaddr & (align - 1)`; musl computes the same).
+    // The script controls placement, so p_vaddr need not be aligned, and
+    // p_memsz need not be a multiple of p_align.
     let (tls_addr, tls_mem_size) = {
         let mut lo = u64::MAX;
         let mut hi = 0u64;
+        let mut align = 1u64;
         for os in out_secs
             .iter()
             .filter(|o| (o.flags & SHF_TLS_) != 0 && o.is_alloc)
         {
             lo = lo.min(os.vaddr);
             hi = hi.max(os.vaddr + os.size);
+            align = align.max(os.align.max(1));
         }
         if lo == u64::MAX {
             (0u64, 0u64)
         } else {
-            (lo, hi - lo)
+            let memsz = hi - lo;
+            let first_byte = lo.wrapping_neg() & (align - 1);
+            (lo, memsz + (first_byte.wrapping_sub(memsz) & (align - 1)))
         }
     };
 

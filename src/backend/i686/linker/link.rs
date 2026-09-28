@@ -1,18 +1,123 @@
 //! i686 linker orchestration.
 //!
 //! Contains the two public entry points (`link_builtin` and `link_shared`) that
-//! orchestrate the linking pipeline: parse arguments, load inputs, merge sections,
-//! resolve symbols, build PLT/GOT, and emit the ELF32 executable or shared library.
+//! orchestrate the linking pipeline: validate options, resolve the ordered
+//! inputs, merge sections, resolve symbols, build PLT/GOT, and emit the ELF32
+//! executable or shared library.
 
-use crate::common::fx_hash::FxHashMap;
-use std::path::Path;
+use crate::backend::linker_common::{self, LinkerArgs};
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 use super::emit::emit_executable;
 use super::input::*;
+use super::options::{LinkOptions, check_capabilities};
 use super::sections::merge_sections;
-use super::shared::{emit_shared_library_32, resolve_dynamic_symbols_for_shared};
+use super::shared::emit_shared_library_32;
 use super::symbols::*;
 use super::types::*;
+
+/// How the compiler driver's implicit libraries are linked.  Mirrors gcc's
+/// libgcc spec: `-lgcc` is always the static archive (there is no
+/// `libgcc.so`), the unwinder `gcc_s` is `--as-needed`, libc is
+/// unconditional, and lccc's convenience `-lm` is as-needed and optional.
+fn driver_lib_item(name: &str, link_static: bool) -> LinkItem {
+    let mut item = match name {
+        "gcc" | "gcc_eh" => LinkItem::lib(name, false, true),
+        "gcc_s" => LinkItem::lib(name, true, false),
+        "c" => {
+            let mut it = LinkItem::lib(name, false, false);
+            it.driver_libc = true;
+            it
+        }
+        "m" => {
+            let mut it = LinkItem::lib(name, true, false);
+            it.optional = true;
+            it
+        }
+        other => LinkItem::lib(other, false, false),
+    };
+    item.static_search |= link_static;
+    item
+}
+
+/// Build the ordered input list: CRT start files, the driver's compiled
+/// objects, the user's operands in command-line order, CRT end files, then
+/// the driver's implicit libraries.  A user operand naming a file the
+/// driver already passed as an object is not linked twice.
+fn ordered_items(
+    object_files: &[&str],
+    args: &LinkerArgs,
+    crt_before: &[&str],
+    crt_after: &[&str],
+    driver_libs: &[&str],
+    link_static: bool,
+) -> Vec<LinkItem> {
+    let canon = |p: &str| std::fs::canonicalize(p).unwrap_or_else(|_| p.into());
+    let driver_objs: FxHashSet<std::path::PathBuf> =
+        object_files.iter().map(|p| canon(p)).collect();
+    let mut items: Vec<LinkItem> = Vec::new();
+    // CRT paths come from toolchain probing that may name a file a minimal
+    // sysroot lacks (crtbeginT.o fallback, crti.o in the GCC dir): only
+    // existing ones are linked.
+    let existing = |p: &&&str| std::path::Path::new(**p).exists();
+    items.extend(
+        crt_before
+            .iter()
+            .filter(existing)
+            .map(|p| LinkItem::file(p)),
+    );
+    items.extend(object_files.iter().map(|p| LinkItem::file(p)));
+    for input in &args.inputs {
+        if !input.is_lib && driver_objs.contains(&canon(&input.name)) {
+            continue;
+        }
+        let mut item = LinkItem::from_input(input);
+        item.static_search |= link_static;
+        items.push(item);
+    }
+    items.extend(crt_after.iter().filter(existing).map(|p| LinkItem::file(p)));
+    items.extend(driver_libs.iter().map(|l| driver_lib_item(l, link_static)));
+    items
+}
+
+/// Library search path: `-L` directories in command-line order, then the
+/// driver's directories, without duplicates.
+fn search_dirs(args: &LinkerArgs, lib_paths: &[&str]) -> Vec<String> {
+    let mut dirs: Vec<String> = Vec::new();
+    for d in args
+        .extra_lib_paths
+        .iter()
+        .map(String::as_str)
+        .chain(lib_paths.iter().copied())
+    {
+        if !dirs.iter().any(|x| x == d) {
+            dirs.push(d.to_string());
+        }
+    }
+    dirs
+}
+
+/// Parse and validate the arguments common to both entry points.
+fn prepare(user_args: &[String], is_shared: bool) -> Result<(LinkerArgs, LinkOptions), String> {
+    let args = linker_common::parse_linker_args(user_args);
+    let opts = check_capabilities(&args, user_args, is_shared)?;
+    if let Some(missing) = args.missing_inputs.first() {
+        return Err(format!(
+            "cannot find {}: No such file or directory",
+            missing
+        ));
+    }
+    Ok((args, opts))
+}
+
+/// Sonames the resolved symbols bind to (for as-needed DT_NEEDED).
+fn referenced_sonames(global_symbols: &FxHashMap<String, LinkerSymbol>) -> FxHashSet<String> {
+    global_symbols
+        .values()
+        .filter(|s| s.is_dynamic && !s.dynlib.is_empty())
+        .map(|s| s.dynlib.clone())
+        .collect()
+}
 
 /// Built-in linker entry point with pre-resolved CRT objects and library paths.
 pub fn link_builtin(
@@ -24,61 +129,50 @@ pub fn link_builtin(
     crt_objects_before: &[&str],
     crt_objects_after: &[&str],
 ) -> Result<(), String> {
-    let is_nostdlib = user_args.iter().any(|a| a == "-nostdlib");
+    let (args, opts) = prepare(user_args, false)?;
     // The driver normalizes `-static` to the single-letter token `n`
     // (cli.rs: `"n" => self.static_link = true`) before the backend sees
-    // it; accept both spellings.  Missing the `n` form made every
-    // `-static` i686 link emit a DYNAMIC executable (PT_INTERP pointing
-    // at /lib/ld-linux.so.2) — the exact failure of the i686 regression
-    // cluster on loader-less hosts.
-    let is_static = user_args
-        .iter()
-        .any(|a| a == "-static" || a == "n" || a == "-n");
+    // it; accept both spellings.
+    let user_static = args.is_static || user_args.iter().any(|a| a == "n" || a == "-n");
 
-    // Phase 1: Parse arguments and collect file lists
-    let (extra_libs, extra_lib_files, extra_lib_paths, extra_objects, defsym_defs) =
-        parse_user_args(user_args);
-
-    let all_lib_dirs: Vec<String> = extra_lib_paths
-        .into_iter()
-        .chain(lib_paths.iter().map(|s| s.to_string()))
-        .collect();
-
-    // Phase 2: Collect all input objects in link order
-    let all_objects = collect_input_files(
+    let dirs = search_dirs(&args, lib_paths);
+    let items = ordered_items(
         object_files,
-        &extra_objects,
+        &args,
         crt_objects_before,
         crt_objects_after,
-        is_nostdlib,
-        is_static,
-        lib_paths,
-    );
-
-    // Phase 3: Load dynamic library symbols and resolve static libs from -l flags
-    let (dynlib_syms, static_lib_objects) = load_libraries(
-        is_static,
-        is_nostdlib,
         needed_libs_param,
-        &extra_libs,
-        &extra_lib_files,
-        &all_lib_dirs,
+        user_static,
     );
-
-    // Phase 4: Parse all input objects and archives
-    let mut all_objs = all_objects;
-    for lib_path in &static_lib_objects {
-        all_objs.push(lib_path.clone());
-    }
-
-    let (mut inputs, _archive_pool) = load_and_parse_objects(&all_objs, &defsym_defs)?;
+    let mut resolved = resolve_inputs(&ResolveRequest {
+        items: &items,
+        lib_dirs: &dirs,
+        undefined: &args.undefined_symbols,
+        defsyms: &args.defsym_defs,
+        allow_shared: !user_static,
+        wrap: &opts.wrap,
+    })?;
+    // GNU ld: an executable is dynamic exactly when a shared object takes
+    // part in the link.  A `-nostdlib` link of plain objects is static (no
+    // PT_INTERP, no .dynamic) even without `-static`.
+    let is_static = user_static || resolved.shared_libs.is_empty();
+    let dso_refs = if is_static {
+        FxHashSet::default()
+    } else {
+        resolved.dso_visible_names()
+    };
+    let mut inputs = std::mem::take(&mut resolved.objects);
 
     // Phase 5: Merge sections
     let (mut output_sections, mut section_name_to_idx, section_map) = merge_sections(&mut inputs);
 
     // Phase 6: Resolve symbols
-    let (mut global_symbols, sym_resolution) =
-        resolve_symbols(&inputs, &output_sections, &section_map, &dynlib_syms);
+    let (mut global_symbols, sym_resolution) = resolve_symbols(
+        &inputs,
+        &output_sections,
+        &section_map,
+        &resolved.dynlib_syms,
+    );
 
     // Phase 6b: Allocate COMMON symbols in .bss
     allocate_common_symbols(
@@ -97,7 +191,7 @@ pub fn link_builtin(
     // scans the input relocations. A defsym'd symbol referenced from PIC code
     // (GOT load) needs a GOT slot; created after the scan it never gets one
     // and the link silently emits a load from an unallocated slot.
-    let pending_defsyms = apply_defsyms(&mut global_symbols, &defsym_defs)?;
+    let pending_defsyms = apply_defsyms(&mut global_symbols, &args.defsym_defs)?;
 
     // Phase 7: Mark PLT/GOT needs and check undefined
     mark_plt_got_needs(&inputs, &mut global_symbols, is_static);
@@ -132,7 +226,23 @@ pub fn link_builtin(
     // Phase 9: Collect IFUNC symbols for static linking
     let ifunc_symbols = collect_ifunc_symbols(&global_symbols, is_static);
 
+    let needed = resolved.needed_sonames(&referenced_sonames(&global_symbols));
+
     // Phase 10: Layout + emit
+    // PT_INTERP: honour `--dynamic-linker=PATH` (lccc-ld normalises every
+    // GNU spelling to it; the compiler driver forwards `-Wl,…` forms, which
+    // the shared parser also understands) instead of hard-wiring the ABI
+    // loader — a staging/sysroot link must bind against the libc it names.
+    let interp = args
+        .dynamic_linker
+        .clone()
+        .map(|path| {
+            let mut bytes = path.into_bytes();
+            bytes.push(0);
+            bytes
+        })
+        .unwrap_or_else(|| INTERP.to_vec());
+
     emit_executable(
         &inputs,
         &mut output_sections,
@@ -140,7 +250,6 @@ pub fn link_builtin(
         &section_map,
         &mut global_symbols,
         &sym_resolution,
-        &dynlib_syms,
         &plt_symbols,
         &got_dyn_symbols,
         &got_local_symbols,
@@ -148,10 +257,12 @@ pub fn link_builtin(
         num_got_total,
         &ifunc_symbols,
         is_static,
-        is_nostdlib,
-        needed_libs_param,
+        &needed,
+        &opts,
+        &dso_refs,
         output_path,
         &pending_defsyms,
+        &interp,
     )
 }
 
@@ -291,137 +402,98 @@ pub(super) fn evaluate_pending_defsyms(
 
 /// Create a shared library (.so) from ELF32 object files.
 ///
-/// Produces an ELF32 `ET_DYN` file with base address 0, exporting all defined
-/// global symbols. Used when the compiler is invoked with `-shared`.
+/// Produces an ELF32 `ET_DYN` file with base address 0.  Inputs are resolved
+/// exactly like an executable's (ordered operands, `-l` search with `.so`
+/// before `.a`, archive-member extraction, linker scripts); the shared
+/// objects that end up linked supply the `DT_NEEDED` entries.
 pub fn link_shared(
     object_files: &[&str],
     output_path: &str,
     user_args: &[String],
     lib_paths: &[&str],
+    crt_objects_before: &[&str],
+    crt_objects_after: &[&str],
+    driver_libs: &[&str],
 ) -> Result<(), String> {
-    // Parse user args for -L, -l, -Wl,-soname=, bare .o/.a files
-    let mut extra_lib_paths: Vec<String> = Vec::new();
-    let mut libs_to_load: Vec<String> = Vec::new();
-    let mut extra_object_files: Vec<String> = Vec::new();
-    let mut soname: Option<String> = None;
-    let mut defsym_defs: Vec<(String, String)> = Vec::new();
-    let mut i = 0;
-    let args: Vec<&str> = user_args.iter().map(|s| s.as_str()).collect();
-    while i < args.len() {
-        let arg = args[i];
-        if let Some(path) = arg.strip_prefix("-L") {
-            let p = if path.is_empty() && i + 1 < args.len() {
-                i += 1;
-                args[i]
-            } else {
-                path
-            };
-            extra_lib_paths.push(p.to_string());
-        } else if let Some(lib) = arg.strip_prefix("-l") {
-            let l = if lib.is_empty() && i + 1 < args.len() {
-                i += 1;
-                args[i]
-            } else {
-                lib
-            };
-            libs_to_load.push(l.to_string());
-        } else if let Some(wl_arg) = arg.strip_prefix("-Wl,") {
-            let parts: Vec<&str> = wl_arg.split(',').collect();
-            let mut j = 0;
-            while j < parts.len() {
-                let part = parts[j];
-                if let Some(sn) = part.strip_prefix("-soname=") {
-                    soname = Some(sn.to_string());
-                } else if part == "-soname" && j + 1 < parts.len() {
-                    j += 1;
-                    soname = Some(parts[j].to_string());
-                } else if let Some(lpath) = part.strip_prefix("-L") {
-                    extra_lib_paths.push(lpath.to_string());
-                } else if let Some(lib) = part.strip_prefix("-l") {
-                    libs_to_load.push(lib.to_string());
-                } else if let Some(defsym_arg) = part.strip_prefix("--defsym=") {
-                    // --defsym=SYM=EXPR: alias, constant or arithmetic
-                    // expression (same semantics as the executable path).
-                    if let Some(eq_pos) = defsym_arg.find('=') {
-                        defsym_defs.push((
-                            defsym_arg[..eq_pos].to_string(),
-                            defsym_arg[eq_pos + 1..].to_string(),
-                        ));
-                    }
-                } else if part == "--defsym" && j + 1 < parts.len() {
-                    // Two-argument form: --defsym SYM=EXPR
-                    j += 1;
-                    if let Some(eq_pos) = parts[j].find('=') {
-                        defsym_defs.push((
-                            parts[j][..eq_pos].to_string(),
-                            parts[j][eq_pos + 1..].to_string(),
-                        ));
-                    }
-                }
-                j += 1;
-            }
-        } else if arg == "-shared" || arg == "-nostdlib" || arg == "-o" {
-            if arg == "-o" {
-                i += 1;
-            }
-        } else if !arg.starts_with('-') && Path::new(arg).exists() {
-            extra_object_files.push(arg.to_string());
-        }
-        i += 1;
-    }
-
-    // Collect all objects to parse
-    let mut all_objs: Vec<String> = object_files.iter().map(|s| s.to_string()).collect();
-    all_objs.extend(extra_object_files);
-
-    // Parse all input objects
-    let (mut inputs, _archive_pool) = load_and_parse_objects(&all_objs, &defsym_defs)?;
+    let (args, opts) = prepare(user_args, true)?;
+    let dirs = search_dirs(&args, lib_paths);
+    let items = ordered_items(
+        object_files,
+        &args,
+        crt_objects_before,
+        crt_objects_after,
+        driver_libs,
+        false,
+    );
+    let mut resolved = resolve_inputs(&ResolveRequest {
+        items: &items,
+        lib_dirs: &dirs,
+        undefined: &args.undefined_symbols,
+        defsyms: &args.defsym_defs,
+        allow_shared: true,
+        wrap: &opts.wrap,
+    })?;
+    let mut inputs = std::mem::take(&mut resolved.objects);
 
     // Merge sections
-    let (mut output_sections, section_name_to_idx, section_map) = merge_sections(&mut inputs);
+    let (mut output_sections, mut section_name_to_idx, section_map) = merge_sections(&mut inputs);
 
-    // Resolve symbols (no dynamic library symbols for shared lib output)
-    let dynlib_syms: FxHashMap<String, (String, u8, u32, Option<String>, bool, u8)> =
-        FxHashMap::default();
+    // Resolve symbols.  The output's undefined references stay undefined
+    // (they are bound at load time); the linked shared objects' dynamic
+    // symbols decide DT_NEEDED and `--no-undefined` only.
+    let no_dynlib_syms: DynlibSyms = FxHashMap::default();
     let (mut global_symbols, _sym_resolution) =
-        resolve_symbols(&inputs, &output_sections, &section_map, &dynlib_syms);
+        resolve_symbols(&inputs, &output_sections, &section_map, &no_dynlib_syms);
+    // Tentative definitions (`-fcommon`) get .bss space, as in executables.
+    allocate_common_symbols(
+        &inputs,
+        &mut output_sections,
+        &mut section_name_to_idx,
+        &mut global_symbols,
+    );
 
     // Apply --defsym definitions (same order and rationale as the executable
     // path: aliases/constants take effect here, expressions are evaluated
     // after the layout in `emit_shared_library_32`).
-    let pending_defsyms = apply_defsyms(&mut global_symbols, &defsym_defs)?;
+    let pending_defsyms = apply_defsyms(&mut global_symbols, &args.defsym_defs)?;
 
-    // Load -l libraries (resolve into archives and load them)
-    let lib_path_strings: Vec<String> = lib_paths.iter().map(|s| s.to_string()).collect();
-    let mut all_lib_paths: Vec<String> = extra_lib_paths;
-    all_lib_paths.extend(lib_path_strings.iter().cloned());
-
-    if !libs_to_load.is_empty() {
-        for lib_name in &libs_to_load {
-            // Search for static archive only in shared library mode
-            for dir in &all_lib_paths {
-                let cand = format!("{}/lib{}.a", dir, lib_name);
-                if Path::new(&cand).exists() {
-                    let objs = vec![cand];
-                    let (extra_inputs, _) = load_and_parse_objects(&objs, &defsym_defs)?;
-                    // Add symbols from these archives
-                    for _inp in &extra_inputs {
-                        // TODO: properly merge archive objects
-                    }
-                    break;
-                }
+    // Undefined non-local references of the output, and which linked shared
+    // object (first in command-line order) satisfies each.
+    let mut referenced: FxHashSet<String> = FxHashSet::default();
+    let mut unresolved: Vec<&str> = Vec::new();
+    let mut seen: FxHashSet<&str> = FxHashSet::default();
+    for sym in inputs.iter().flat_map(|o| o.symbols.iter()) {
+        if sym.section_index != SHN_UNDEF
+            || sym.name.is_empty()
+            || sym.binding == STB_LOCAL
+            || global_symbols
+                .get(sym.name.as_str())
+                .is_some_and(|g| g.is_defined)
+            || !seen.insert(sym.name.as_str())
+        {
+            continue;
+        }
+        match resolved.dynlib_syms.get(sym.name.as_str()) {
+            Some(entry) => {
+                referenced.insert(entry.0.clone());
             }
+            None if sym.binding != STB_WEAK
+                && !super::shared::is_emitter_defined(&sym.name, &section_name_to_idx) =>
+            {
+                unresolved.push(&sym.name);
+            }
+            None => {}
         }
     }
-
-    // Discover NEEDED dependencies by scanning for undefined symbols
-    let mut needed_sonames: Vec<String> = Vec::new();
-    resolve_dynamic_symbols_for_shared(
-        &inputs,
-        &global_symbols,
-        &mut needed_sonames,
-        &all_lib_paths,
-    );
+    if opts.no_undefined && !unresolved.is_empty() {
+        unresolved.sort_unstable();
+        return Err(unresolved
+            .iter()
+            .map(|n| format!("undefined reference to `{n}' (--no-undefined)"))
+            .collect::<Vec<_>>()
+            .join("\n"));
+    }
+    let needed_sonames = resolved.needed_sonames(&referenced);
 
     // Emit shared library
     emit_shared_library_32(
@@ -432,7 +504,7 @@ pub fn link_shared(
         &section_map,
         &needed_sonames,
         output_path,
-        soname,
+        &opts,
         &pending_defsyms,
     )
 }

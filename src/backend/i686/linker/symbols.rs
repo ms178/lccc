@@ -4,7 +4,7 @@
 //! PLT/GOT marking, undefined symbol checking, PLT/GOT list building,
 //! and IFUNC collection.
 
-use crate::common::fx_hash::FxHashMap;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 use super::types::*;
 use crate::backend::linker_common;
@@ -139,7 +139,10 @@ pub(super) fn resolve_symbols(
                             got_index: 0,
                             is_dynamic: true,
                             dynlib: lib.clone(),
-                            needs_copy: !is_func,
+                            // A DSO TLS variable lives in its module's TLS
+                            // block: it is reached through TLS_TPOFF GOT
+                            // slots, never copied into the executable.
+                            needs_copy: !is_func && *dyn_sym_type != STT_TLS,
                             copy_addr: 0,
                             version: dyn_ver.clone(),
                             uses_textrel: false,
@@ -168,6 +171,24 @@ pub(super) fn resolve_symbols(
                             version: None,
                             uses_textrel: false,
                         });
+                }
+            }
+        }
+    }
+
+    // gABI: the most constraining visibility over the definition and all
+    // references applies to the symbol (INTERNAL > HIDDEN > PROTECTED >
+    // DEFAULT, i.e. the smallest non-zero value).
+    for obj in inputs {
+        for sym in &obj.symbols {
+            if sym.binding == STB_LOCAL || sym.visibility == STV_DEFAULT || sym.name.is_empty() {
+                continue;
+            }
+            if let Some(gs) = global_symbols.get_mut(sym.name.as_str()) {
+                if gs.binding != STB_LOCAL
+                    && (gs.visibility == STV_DEFAULT || sym.visibility < gs.visibility)
+                {
+                    gs.visibility = sym.visibility;
                 }
             }
         }
@@ -282,7 +303,11 @@ pub(super) fn mark_plt_got_needs(
 ) {
     for obj in inputs.iter() {
         for sec in &obj.sections {
-            for &(_, rel_type, sym_idx, _) in &sec.relocations {
+            // Executables transition every GD/LDM sequence (see tls.rs), so
+            // their `___tls_get_addr` calls disappear and need no PLT/GOT.
+            let dead_calls: FxHashSet<u32> =
+                super::tls::transitioned_call_fields(&sec.data, &sec.relocations).collect();
+            for &(rel_offset, rel_type, sym_idx, _) in &sec.relocations {
                 let sym = if (sym_idx as usize) < obj.symbols.len() {
                     &obj.symbols[sym_idx as usize]
                 } else {
@@ -290,6 +315,9 @@ pub(super) fn mark_plt_got_needs(
                 };
 
                 if sym.sym_type == STT_SECTION || sym.name.is_empty() {
+                    continue;
+                }
+                if dead_calls.contains(&rel_offset) {
                     continue;
                 }
 
@@ -307,9 +335,14 @@ pub(super) fn mark_plt_got_needs(
                             gs.needs_got = true;
                         }
                     }
-                    R_386_TLS_GOTIE | R_386_TLS_IE => {
+                    // Main-image TLS transitions to local exec; a DSO TLS
+                    // variable needs one TLS_TPOFF slot for all of IE,
+                    // GOTIE, GD→IE and TLSDESC→IE.
+                    R_386_TLS_GOTIE | R_386_TLS_IE | R_386_TLS_GD | R_386_TLS_GOTDESC => {
                         if let Some(gs) = global_symbols.get_mut(sym.name.as_str()) {
-                            gs.needs_got = true;
+                            if gs.is_dynamic {
+                                gs.needs_got = true;
+                            }
                         }
                     }
                     _ => {}

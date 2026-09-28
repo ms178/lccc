@@ -277,10 +277,6 @@ fn warn_unimplemented(a: &str) {
 }
 
 fn is_benign_ignorable(a: &str) -> bool {
-    // gcc's driver state stack around --as-needed groups.
-    if a == "--push-state" || a == "--pop-state" {
-        return true;
-    }
     // Diagnostic / bookkeeping switches with no layout effect.
     matches!(
         a,
@@ -304,6 +300,27 @@ fn is_benign_ignorable(a: &str) -> bool {
         | "-nostdlib" | "-nostartfiles" | "-nodefaultlibs"
         | "-O0" | "-O1" | "-O2" | "-O3" // ld's own -O is a size/speed hint
     ) || a.starts_with("-plugin-opt=")
+}
+
+/// The elf_i386 argument list: `passthrough` with the position-sensitive
+/// tokens re-inserted where they appeared (see `i386_positional` in `run`).
+fn i386_ordered_args(
+    passthrough: &[String],
+    positional: &[(usize, String)],
+    bstatic_alias_at: &[usize],
+) -> Vec<String> {
+    let mut out = Vec::with_capacity(passthrough.len() + positional.len());
+    let mut pending = positional.iter().peekable();
+    for (idx, tok) in passthrough.iter().enumerate() {
+        while let Some((_, t)) = pending.next_if(|(at, _)| *at == idx) {
+            out.push(t.clone());
+        }
+        if !bstatic_alias_at.contains(&idx) {
+            out.push(tok.clone());
+        }
+    }
+    out.extend(pending.map(|(_, t)| t.clone()));
+    out
 }
 
 fn run(args: &[String]) -> Result<(), String> {
@@ -337,6 +354,17 @@ fn run(args: &[String]) -> Result<(), String> {
     let mut undefined_symbols: Vec<String> = Vec::new();
     // Set when gcc handed us the LTO plugin; see the -plugin arm below.
     let mut saw_lto_plugin = false;
+    // elf_i386 only: tokens that must keep their command-line position
+    // relative to `passthrough` (positional files, `-Bstatic`/`-Bdynamic`),
+    // tagged with the `passthrough` length at the time they appeared.  The
+    // i386 pipeline resolves one ordered input list (archive extraction and
+    // library search depend on position); the x86-64 path keeps consuming
+    // `inputs` + `passthrough` separately.  See `i386_ordered_args`.
+    let mut i386_positional: Vec<(usize, String)> = Vec::new();
+    // `passthrough` indices of the `-static` that `-Bstatic` is translated
+    // to for x86-64 (which has no positional static search); the i386 list
+    // carries the raw `-Bstatic` instead.
+    let mut bstatic_alias_at: Vec<usize> = Vec::new();
 
     let mut i = 0;
     while i < args.len() {
@@ -439,7 +467,10 @@ fn run(args: &[String]) -> Result<(), String> {
             }
             "--help" => {
                 println!("Usage: lccc-ld [options] file...");
-                println!("  Standard userspace, -r relocatable, and -T script links supported.");
+                println!(
+                    "  Standard userspace (elf_x86_64, elf_i386), -r relocatable (elf_x86_64),"
+                );
+                println!("  and -T script links (both) supported.");
                 return Ok(());
             }
             "-e" | "--entry" => {
@@ -491,11 +522,27 @@ fn run(args: &[String]) -> Result<(), String> {
                     );
                 }
             }
-            "-static" | "-Bstatic" | "-dn" | "-non_shared" => {
+            "-static" => {
                 is_static = true;
                 passthrough.push("-static".to_string());
             }
-            "-Bdynamic" | "-dy" | "-call_shared" => {}
+            // GNU ld: `-Bstatic` is positional — it restricts the `-l`
+            // searches that follow to `libNAME.a` until `-Bdynamic`.  The
+            // i386 pipeline implements exactly that; x86-64 still treats it
+            // as `-static`.
+            "-Bstatic" | "-dn" | "-non_shared" => {
+                is_static = true;
+                i386_positional.push((passthrough.len(), a.to_string()));
+                bstatic_alias_at.push(passthrough.len());
+                passthrough.push("-static".to_string());
+            }
+            "-Bdynamic" | "-dy" | "-call_shared" => {
+                i386_positional.push((passthrough.len(), a.to_string()));
+            }
+            // gcc's specs save/restore the positional state around groups
+            // (`--push-state --as-needed -lgcc_s --pop-state`); dropping the
+            // pair leaked `--as-needed` into every later library.
+            "--push-state" | "--pop-state" => passthrough.push(a.to_string()),
             "--gc-sections" => {
                 gc_sections = true;
                 passthrough.push("-Wl,--gc-sections".to_string());
@@ -641,6 +688,14 @@ fn run(args: &[String]) -> Result<(), String> {
                         undefined_symbols.push(sym.clone());
                         passthrough.push(format!("-Wl,-u,{}", sym));
                     }
+                } else if a.starts_with("-rpath-link") || a.starts_with("--rpath-link") {
+                    // Search path for the DT_NEEDED dependencies of input
+                    // shared objects.  lccc-ld never loads indirect
+                    // dependencies (no --copy-dt-needed-entries, no
+                    // shared-object undefined check), so it cannot change
+                    // the output; consume the value so it is not mistaken
+                    // for an input file.
+                    let _ = two_arg(a, args, &mut i);
                 } else if let Some(rest) = a.strip_prefix("-rpath=") {
                     passthrough.push(format!("-Wl,-rpath={}", rest));
                 } else if a == "-rpath" {
@@ -789,6 +844,7 @@ fn run(args: &[String]) -> Result<(), String> {
                     // The userspace mode re-derives its passthrough sandwich
                     // from this flag below.
                     inputs.push((a.to_string(), whole_archive));
+                    i386_positional.push((passthrough.len(), a.to_string()));
                 }
             }
         }
@@ -913,10 +969,6 @@ fn run(args: &[String]) -> Result<(), String> {
         );
     }
 
-    if elf_i386 {
-        return Err("ELF32/i386 output without a linker script is not implemented in lccc-ld; use the i686 compiler driver or pass -T".into());
-    }
-
     // ------------------------------------------------------------------
     // Mode 3: standard userspace link — same pipeline as the compiler
     // driver (`link_builtin`/`link_shared`). CRT objects arrive as
@@ -930,6 +982,28 @@ fn run(args: &[String]) -> Result<(), String> {
     // time, so the relocatable and script modes keep seeing the archive in
     // `inputs`. The archive is deliberately NOT also added to object_files:
     // that would load it twice (duplicate symbols).
+    // ELF32/i386 userspace links (`gcc -m32 -fuse-ld=…` spawns `ld -m
+    // elf_i386 … crt1.o crti.o crtbegin.o … -lc … crtend.o crtn.o`) drive
+    // the SAME i686 pipeline the `lccc-i686` compiler driver links with,
+    // with every file and library arriving positionally, in order.
+    if elf_i386 {
+        let i386_args = i386_ordered_args(&passthrough, &i386_positional, &bstatic_alias_at);
+        if shared {
+            return lccc::linker_entry::link_shared_i386(&output, &i386_args);
+        }
+        // The i686 executable emitter produces ET_EXEC at the ABI base
+        // address only.  A PIE needs a load-address-independent image plus
+        // R_386_RELATIVE for every absolute word; emitting ET_EXEC anyway
+        // would silently hand the caller a non-PIE (ASLR-less) binary it did
+        // not ask for, so refuse — exactly like the -static-pie refusal
+        // below.  (`gcc -m32` on PIE-default distributions: pass -no-pie.)
+        if is_pie {
+            return Err("ELF32/i386 -pie output is not implemented: lccc-ld emits \
+                 ET_EXEC for i386 (link with -no-pie)"
+                .to_string());
+        }
+        return lccc::linker_entry::link_builtin_i386(&output, &i386_args);
+    }
     let mut object_files: Vec<String> = Vec::new();
     for (path, wa) in &inputs {
         if *wa && path.ends_with(".a") {

@@ -683,10 +683,19 @@ if [ -x target/fastbuild/lccc-ld ]; then
     gate "linker-elf-grammar-fuzz" fast \
         python3 tests/linker/fuzz_elf_grammar.py \
             --lccc "$PWD/target/fastbuild/lccc-ld" --iters 64 --seed 20260906
+    # ELF32/i386 userspace links through lccc-ld (mirrors the ci.yml step):
+    # LCCC_REQUIRE_I386=1 makes a missing -m32 toolchain a FAIL, not a SKIP.
+    gate "i386-userspace-link" fast env LCCC_REQUIRE_I386=1 \
+        python3 tests/linker/run_linker_tests.py --lccc target/fastbuild/lccc --filter i386_
 else
-    echo "SKIP  linker fuzz (target/fastbuild/lccc-ld not built)"
-    SKIPPED=$((SKIPPED + 2))
+    echo "SKIP  linker fuzz + i386 userspace link (target/fastbuild/lccc-ld not built)"
+    SKIPPED=$((SKIPPED + 3))
 fi
+
+# Torture-corpus provisioning contract: stamp trust, integrity manifest,
+# auto-repair, invalidate-before-replace (synthetic tarball, no network).
+gate "ensure-gcc-torture-contract" fast \
+    bash tests/regression/check_ensure_gcc_torture.sh
 
 # --------------------------------------------------------------- job:bench --
 # The bench workflow carries the CODEGEN-QUALITY gate, which the test job does

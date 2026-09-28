@@ -505,6 +505,20 @@ fn analyze_accumulator_assignments_impl(
             .for_each_used_value(|id| uses.entry(id).or_default().push(pp));
         pp += 1;
     }
+    // 64-bit targets do not consume scalar returns from the accumulator.
+    // Collected once: a per-candidate scan of every terminator was
+    // O(candidates x blocks) (gcc.c-torture/compile 20001226-1).
+    let returned: FxHashSet<u32> = if policy.return_consumes_accumulator {
+        FxHashSet::default()
+    } else {
+        func.blocks
+            .iter()
+            .filter_map(|b| match &b.terminator {
+                Terminator::Return(Some(Operand::Value(v))) => Some(v.0),
+                _ => None,
+            })
+            .collect()
+    };
     let mut out = Vec::new();
     for value_id in candidates {
         let (Some(&def_point), Some(points)) = (defs.get(&value_id), uses.get(&value_id)) else {
@@ -513,14 +527,8 @@ fn analyze_accumulator_assignments_impl(
         if points.len() != 1 || points[0] != def_point + 1 {
             continue;
         }
-        // 64-bit targets do not consume scalar returns from the accumulator.
-        if !policy.return_consumes_accumulator {
-            let is_return = func.blocks.iter().any(|b| {
-                matches!(&b.terminator, Terminator::Return(Some(Operand::Value(v))) if v.0 == value_id)
-            });
-            if is_return {
-                continue;
-            }
+        if returned.contains(&value_id) {
+            continue;
         }
         out.push(AccumulatorAssignment {
             value_id,

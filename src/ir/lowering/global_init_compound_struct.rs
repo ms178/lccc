@@ -33,6 +33,8 @@ impl Lowerer {
         // Build a map of field_idx -> list of initializer items.
         // For array fields with flat init, multiple items may map to the same field.
         let mut field_inits: Vec<Vec<&InitializerItem>> = vec![Vec::new(); layout.fields.len()];
+        // Array-of-scalars members, already resolved into images.
+        let mut field_images: Vec<Option<GlobalInit>> = vec![None; layout.fields.len()];
         let mut current_field_idx = 0usize;
 
         // Collect items targeting anonymous members that need synthetic sub-inits.
@@ -89,6 +91,44 @@ impl Lowerer {
             }
 
             let field_ty = &layout.fields[field_idx].ty;
+
+            // Arrays of scalars of any rank (pointer elements included): the
+            // array planner resolves the member's initializer into an image.
+            if designator_name.is_some() || item.designators.is_empty() {
+                if let Some(geo) = self.scalar_array_geometry(field_ty) {
+                    let rel: &[Designator] = if designator_name.is_some() {
+                        &item.designators[1..]
+                    } else {
+                        &[]
+                    };
+                    let field_ty = field_ty.clone();
+                    let (member, consumed) =
+                        self.member_array_init(rel, &items[item_idx..], &field_ty, &geo);
+                    let plan = self.plan_member_array(&member, &geo);
+                    let size = geo.total * geo.elem_size();
+                    let mut bytes = vec![0u8; size];
+                    let mut ptr_ranges = Vec::new();
+                    self.plan_to_image(&plan, &geo, 0, &mut bytes, &mut ptr_ranges);
+                    field_images[field_idx] = Some(Self::build_compound_from_bytes_and_ptrs(
+                        bytes, ptr_ranges, size,
+                    ));
+                    // A union keeps only its latest member.
+                    if layout.is_union {
+                        field_inits.iter_mut().for_each(Vec::clear);
+                        for (i, img) in field_images.iter_mut().enumerate() {
+                            if i != field_idx {
+                                *img = None;
+                            }
+                        }
+                    }
+                    item_idx += consumed;
+                    current_field_idx = field_idx + 1;
+                    if layout.is_union && item.designators.is_empty() {
+                        break;
+                    }
+                    continue;
+                }
+            }
 
             // Check if this is a flat init filling an array field.
             // A string literal initializing a char array is NOT flat init - it's a single
@@ -167,6 +207,9 @@ impl Lowerer {
                 }
             }
 
+            if layout.is_union {
+                field_images.iter_mut().for_each(|img| *img = None);
+            }
             field_inits[field_idx].push(item);
             current_field_idx = field_idx + 1;
             item_idx += 1;
@@ -182,7 +225,7 @@ impl Lowerer {
             // Find which field (if any) has an initializer
             let mut init_fi = None;
             for (i, inits) in field_inits.iter().enumerate() {
-                if !inits.is_empty() {
+                if !inits.is_empty() || field_images[i].is_some() {
                     init_fi = Some(i);
                     break;
                 }
@@ -198,7 +241,9 @@ impl Lowerer {
             if let Some(fi) = init_fi {
                 let inits = &field_inits[fi];
                 let field_size = self.resolve_ctype_size(&layout.fields[fi].ty);
-                if !inits.is_empty() {
+                if let Some(image) = field_images[fi].take() {
+                    Self::append_nested_compound(&mut elements, image, field_size);
+                } else if !inits.is_empty() {
                     self.emit_field_inits_compound(
                         &mut elements,
                         inits,
@@ -327,6 +372,13 @@ impl Lowerer {
 
                 let inits = &field_inits[fi];
 
+                if let Some(image) = field_images[fi].take() {
+                    Self::append_nested_compound(&mut elements, image, field_size);
+                    current_offset += field_size;
+                    fi += 1;
+                    continue;
+                }
+
                 // Flexible array member (FAM): use fam_extra as the actual data size
                 if let CType::Array(ref elem_ty, None) = layout.fields[fi].ty {
                     if fam_extra > 0 && !inits.is_empty() {
@@ -386,6 +438,20 @@ impl Lowerer {
         elem_ty: &CType,
         fam_data_size: usize,
     ) {
+        // Scalar elements (pointers included), braced or from a (wide)
+        // string: the array planner, relocations resolved by `plan_to_image`.
+        if let [item] = inits {
+            if let Some(geo) = self.fam_scalar_geometry(elem_ty, &item.init) {
+                let size = geo.total * geo.elem_size();
+                let plan = self.plan_array_initializer(&item.init, &geo);
+                let mut bytes = vec![0u8; size];
+                let mut ptr_ranges = Vec::new();
+                self.plan_to_image(&plan, &geo, 0, &mut bytes, &mut ptr_ranges);
+                let image = Self::build_compound_from_bytes_and_ptrs(bytes, ptr_ranges, size);
+                Self::append_nested_compound(elements, image, fam_data_size);
+                return;
+            }
+        }
         let elem_size = self.resolve_ctype_size(elem_ty);
         if elem_size == 0 {
             return;

@@ -677,11 +677,39 @@ impl SemanticAnalyzer {
                 decl.alignment
             };
 
+            // Composite type (C11 6.2.7p4): a redeclaration of an object with
+            // linkage as an array of unknown size takes the size from the
+            // prior visible declaration.  gcc.c-torture/compile 20001018-1:
+            // `extern char i[10]; { extern char i[]; sizeof (i) == 10 }`
+            // was rejected ("size of array is negative") because the inner
+            // declaration shadowed the complete type.  Only `extern`
+            // redeclarations and file-scope ones (tentative `int a[];`)
+            // qualify, and only against a declaration with linkage: an
+            // `extern` in a block whose visible `i` is a local refers to a
+            // different object.
+            let links = decl.is_extern() || self.symbol_table.at_file_scope();
+            if links {
+                if let CType::Array(ref elem, None) = full_type {
+                    let prior = self
+                        .symbol_table
+                        .lookup_linked(&init_decl.name)
+                        .map(|s| s.ty.clone());
+                    if let Some(CType::Array(prior_elem, Some(n))) = prior {
+                        if prior_elem == *elem {
+                            full_type = CType::Array(prior_elem, Some(n));
+                        }
+                    }
+                }
+            }
+
             self.symbol_table.declare(Symbol {
                 name: init_decl.name.clone(),
                 ty: full_type,
                 explicit_alignment,
             });
+            if links && !self.symbol_table.at_file_scope() {
+                self.symbol_table.mark_linked(&init_decl.name);
+            }
 
             // Analyze array size expressions in derived declarators
             // (catches undeclared identifiers in e.g. `int arr[UNDECLARED];`)
@@ -749,7 +777,8 @@ impl SemanticAnalyzer {
                     // char16_t array: unsigned short c[] = {u"hello"}
                     if matches!(elem_ty, CType::UShort | CType::Short) {
                         if let Initializer::Expr(Expr::Char16StringLiteral(s, _)) = &items[0].init {
-                            return Some(s.chars().count() + 1);
+                            // One element per UTF-16 code unit (C11 6.4.5p6).
+                            return Some(s.encode_utf16().count() + 1);
                         }
                     }
                 }
@@ -840,8 +869,9 @@ impl SemanticAnalyzer {
                         Some(s.chars().count() + 1)
                     }
                     (CType::UShort | CType::Short, Expr::Char16StringLiteral(s, _)) => {
-                        // For char16_t arrays, each Unicode codepoint is one element
-                        Some(s.chars().count() + 1)
+                        // char16_t arrays hold UTF-16 code units (C11 6.4.5p6):
+                        // a code point above U+FFFF takes a surrogate pair.
+                        Some(s.encode_utf16().count() + 1)
                     }
                     _ => None,
                 }

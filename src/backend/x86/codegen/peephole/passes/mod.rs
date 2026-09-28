@@ -5029,4 +5029,77 @@ mod regression_tests {
         let out = peephole_optimize(asm.to_string());
         assert!(out.contains("pushq %r13"), "{out}");
     }
+
+    /// gcc.c-torture postmod-1.c at -O1: the prologue pinned
+    /// `movq %r9, %rbx` as a "parameter pre-store" (r9 was really a scratch
+    /// holding `(long)x`).  `fold_movslq_relay` retargeted the extension to
+    /// %rbx, then `mark_nop` refused to delete the pinned copy, leaving
+    /// `movslq %edi, %rbx; movq %r9, %rbx` — %rbx loaded from an undefined
+    /// %r9 and the loop dereferenced garbage.
+    fn slq_relay_lines(pin_copy: bool) -> (LineStore, Vec<LineInfo>) {
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movslq %edi, %r9\n",
+            "    movq %r9, %rbx\n",
+            "    shlq $2, %rbx\n",
+            "    leaq array0(%rip), %r9\n",
+            "    movq %rbx, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        if pin_copy {
+            infos[3].pinned = true;
+        }
+        (store, infos)
+    }
+
+    #[test]
+    fn movslq_relay_fold_refuses_a_pinned_copy() {
+        let (mut store, mut infos) = slq_relay_lines(true);
+        assert!(!memory_fold::fold_movslq_relay(&mut store, &mut infos));
+        let out = store.build_result(|i| infos[i].is_nop());
+        assert!(
+            out.contains("movslq %edi, %r9\n    movq %r9, %rbx"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn movslq_relay_fold_still_fires_on_an_unpinned_copy() {
+        let (mut store, mut infos) = slq_relay_lines(false);
+        assert!(memory_fold::fold_movslq_relay(&mut store, &mut infos));
+        let out = store.build_result(|i| infos[i].is_nop());
+        assert!(out.contains("movslq %edi, %rbx"), "{out}");
+        assert!(!out.contains("movq %r9, %rbx"), "{out}");
+    }
+
+    #[test]
+    fn prologue_prestore_shape_never_reads_an_undefined_scratch() {
+        // End to end through the driver's own pinning: whatever the passes
+        // do, a surviving `movq %r9, %rbx` must still be preceded by the
+        // definition of %r9.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbx\n",
+            "    movslq %edi, %r9\n",
+            "    movq %r9, %rbx\n",
+            "    shlq $2, %rbx\n",
+            "    leaq array0(%rip), %r9\n",
+            "    addq %rbx, %r9\n",
+            "    movss (%r9), %xmm0\n",
+            "    popq %rbx\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        if let Some(copy) = out.find("movq %r9, %rbx") {
+            assert!(out[..copy].contains("movslq %edi, %r9"), "{out}");
+        }
+    }
 }

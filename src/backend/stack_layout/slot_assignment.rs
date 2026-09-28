@@ -746,8 +746,19 @@ fn classify_value(
     // frame ballooned to 131 KB, the boot stack ran out of .bss, spilled
     // frames landed INSIDE .text, and the overwritten code triple-faulted
     // the preboot decompressor (session-35 kernel boot failure).
+    //
+    // The widened size is rounded up to a canonical slot class (8/16/32).
+    // The block-local (Tier-3) pool packs entries at their exact size, while
+    // every arch closure reserves `size` rounded up to 4 or 8 when the final
+    // mapping `assign_slot(base + offset, size, ..)` runs.  A raw width such
+    // as 5 (an i686 pointer that feeds a 5-byte `__builtin_memcpy`) therefore
+    // advanced the pool by 5 but was placed 8 deep: the second such value
+    // landed 4 bytes below the emitted `subl $N, %esp`, where the memcpy's own
+    // `pushl %esi` overwrote the source pointer (torture memcpy-a1/a2 -O1,
+    // i686).  Canonical classes are also the only sizes the pool's free
+    // lists can share.
     if memcpy_width > slot_size && memcpy_width <= 32 {
-        slot_size = memcpy_width;
+        slot_size = (memcpy_width as u64).next_power_of_two().max(8) as i64;
     }
 
     if is_i128 {
@@ -1124,8 +1135,8 @@ pub(super) fn assign_tier3_block_local_slots(
             // emitted `subl $N` frame — where the prologue's push-staging
             // (push %esi/%edi) clobbers it (stdarg-3 va_arg temp: s2 written
             // to fini_array instead of the global). Non-canonical sizes are
-            // never freed into a list they can safely share: allocate fresh
-            // (block_peak grows by the exact size — accounting stays sound).
+            // never freed into a list they can safely share: allocate fresh,
+            // reserving what the arch closure will actually occupy (below).
             let can_reuse = !state.protected_slot_values.contains(&dest_id)
                 && matches!(slot_size, 4 | 8 | 16 | 32);
             let free_list = if slot_size >= 32 {
@@ -1180,17 +1191,35 @@ pub(super) fn assign_tier3_block_local_slots(
                 // vector home require it. Reused 16-class offsets inherit
                 // the alignment because every 16-class slot entered the
                 // free list from this same 16-aligned placement.
+                //
+                // The reservation must also cover what the finalize-time
+                // `assign_slot` occupies, not just `slot_size`: every arch
+                // closure rounds a non-4-byte allocation up to a multiple of
+                // 8 (and places it at an 8-aligned depth), so a size outside
+                // the canonical classes (none are produced today; see the
+                // memcpy-width note in `classify_value`) is placed 8-aligned
+                // and reserves its rounded extent.  Packing it at its exact
+                // size let the finalize mapping push the deepest slot below
+                // the frame.
+                let canonical = matches!(slot_size, 4 | 8 | 16 | 32);
                 let off = if slot_size >= 16 {
                     (block_peak + 15) & !15
-                } else if slot_size >= 8 && block_peak % 8 != 0 {
+                } else if (slot_size >= 8 || !canonical) && block_peak % 8 != 0 {
                     (block_peak + 7) & !7
                 } else {
                     block_peak
                 };
+                let extent = if slot_size >= 16 {
+                    (slot_size + 15) & !15
+                } else if canonical {
+                    slot_size
+                } else {
+                    (slot_size + 7) & !7
+                };
                 // Absorb the FPO address shift into the block space so the
                 // NEXT entry's reservation starts past this entry's shifted
                 // window (mirrors assign_slot's new_space bookkeeping).
-                block_peak = off + slot_size + if slot_size >= 16 { fpo_vec_shift } else { 0 };
+                block_peak = off + extent + if slot_size >= 16 { fpo_vec_shift } else { 0 };
                 if debug_protect && !can_reuse {
                     eprintln!(
                         "[PROTECT-T3] SSA {} is protected, forced new slot at offset {}",
@@ -1382,8 +1411,27 @@ pub(super) fn finalize_deferred_slots(
                 deferred_slots.len()
             );
         }
+        // The pool accounting (`max_block_local_space`) and the placement
+        // below must agree: a slot whose extent reaches past the returned
+        // space lies outside the emitted frame, where pushes, calls and
+        // signal frames overwrite it.  The returned space therefore covers
+        // the deepest placement unconditionally; debug builds additionally
+        // insist that the pool accounting already did.
+        let pool_end = aligned_nls + max_block_local_space;
+        let mut deepest_end = pool_end;
         for ds in deferred_slots {
-            let (slot, _) = assign_slot(aligned_nls + ds.block_offset, ds.size, ds.align);
+            let (slot, end) = assign_slot(aligned_nls + ds.block_offset, ds.size, ds.align);
+            debug_assert!(
+                end <= pool_end,
+                "deferred slot v{} (pool offset {}, size {}) ends at {} past the block-local \
+                 region end {}",
+                ds.dest_id,
+                ds.block_offset,
+                ds.size,
+                end,
+                pool_end
+            );
+            deepest_end = deepest_end.max(end);
             if std::env::var("CCC_DEBUG_SLOTS").is_ok() {
                 eprintln!(
                     "[SLOTS]   deferred v{} block_offset={} size={} align={} -> slot {}",
@@ -1392,7 +1440,7 @@ pub(super) fn finalize_deferred_slots(
             }
             state.value_locations.insert(ds.dest_id, StackSlot(slot));
         }
-        aligned_nls + max_block_local_space
+        deepest_end
     } else {
         non_local_space
     }

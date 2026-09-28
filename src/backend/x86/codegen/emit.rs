@@ -644,6 +644,95 @@ pub(super) fn shiftx_mnemonic(op: IrBinOp) -> (&'static str, &'static str) {
 
 /// x86-64 code generator. Implements the ArchCodegen trait for the shared framework.
 /// Uses System V AMD64 ABI with linear scan register allocation for callee-saved registers.
+
+/// A value's live program points: sorted, disjoint, non-adjacent inclusive
+/// ranges, so a point query is one binary search.  Built from the RA's
+/// hole-aware segments; normalisation preserves the covered point set,
+/// which is all `note_reg_clobbered` asks about.  (A linear scan per sharer
+/// per clobber was O(clobbers x sharers x segments): values live across a
+/// long branch chain carry one segment per block, and it dominated -O2
+/// codegen of gcc.c-torture/compile 20001226-1.)
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct LiveSpans(Vec<(u32, u32)>);
+
+impl LiveSpans {
+    pub(super) fn from_ranges(mut ranges: Vec<(u32, u32)>) -> Self {
+        ranges.retain(|&(s, e)| s <= e); // an inverted range covers nothing
+        ranges.sort_unstable();
+        let mut out: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
+        for (s, e) in ranges {
+            match out.last_mut() {
+                Some(last) if s <= last.1.saturating_add(1) => last.1 = last.1.max(e),
+                _ => out.push((s, e)),
+            }
+        }
+        LiveSpans(out)
+    }
+
+    pub(super) fn contains(&self, point: u32) -> bool {
+        let i = self.0.partition_point(|&(s, _)| s <= point);
+        i > 0 && self.0[i - 1].1 >= point
+    }
+}
+
+/// Stabbing index over the live spans of every value homed in one register:
+/// `stab(p)` lists the sharers live at `p` in O((1 + answers) log spans)
+/// instead of testing every sharer (a register can home thousands of
+/// values in a large function and every clobber asked about all of them).
+/// Spans are sorted by start; `max_end` is a max segment tree over their
+/// ends, so a subtree whose spans all end before `p` is skipped whole.
+#[derive(Clone, Debug, Default)]
+pub(super) struct SharerLiveIndex {
+    starts: Vec<u32>,
+    owner: Vec<u32>,
+    /// Implicit binary tree, leaves at `cap..cap + len`.
+    max_end: Vec<u32>,
+    cap: usize,
+}
+
+impl SharerLiveIndex {
+    fn build(mut spans: Vec<(u32, u32, u32)>) -> Self {
+        spans.sort_unstable();
+        let cap = spans.len().next_power_of_two();
+        let mut max_end = vec![0u32; 2 * cap];
+        for (i, &(_, e, _)) in spans.iter().enumerate() {
+            max_end[cap + i] = e;
+        }
+        for node in (1..cap).rev() {
+            max_end[node] = max_end[2 * node].max(max_end[2 * node + 1]);
+        }
+        SharerLiveIndex {
+            starts: spans.iter().map(|&(s, _, _)| s).collect(),
+            owner: spans.iter().map(|&(_, _, v)| v).collect(),
+            max_end,
+            cap,
+        }
+    }
+
+    /// Append every owner with a span `s <= point <= e` to `out` (each
+    /// owner at most once: one value's spans are disjoint).
+    fn stab(&self, point: u32, out: &mut Vec<u32>) {
+        // Only spans starting at or before `point` qualify: leaves `0..k`.
+        let k = self.starts.partition_point(|&s| s <= point);
+        if k == 0 {
+            return;
+        }
+        let mut stack = vec![(1usize, 0usize, self.cap)];
+        while let Some((node, lo, hi)) = stack.pop() {
+            if lo >= k || self.max_end[node] < point {
+                continue;
+            }
+            if hi - lo == 1 {
+                out.push(self.owner[lo]);
+                continue;
+            }
+            let mid = (lo + hi) / 2;
+            stack.push((2 * node + 1, mid, hi));
+            stack.push((2 * node, lo, mid));
+        }
+    }
+}
+
 pub struct X86Codegen {
     pub(crate) state: CodegenState,
     pub(super) current_return_type: IrType,
@@ -775,7 +864,11 @@ pub struct X86Codegen {
     /// a dead sharer's consumers are unreachable from the clobber, so its
     /// home stays readable (RA interference keeps the register's next
     /// real holder's def on a path where this value is already dead).
-    pub(super) value_live_segments: FxHashMap<u32, Vec<(u32, u32)>>,
+    pub(super) value_live_segments: FxHashMap<u32, LiveSpans>,
+    /// Per home register, the stabbing index over its sharers'
+    /// `value_live_segments` ([`Self::index_home_liveness`]); the clobber
+    /// eviction's liveness gate reads it.
+    pub(super) home_live_index: FxHashMap<u8, SharerLiveIndex>,
     /// Inverse of `reg_assignments`: physical register id -> value IDs homed
     /// there. Lets `note_dest_defined` evict every OTHER sharer of a
     /// destination's home in O(sharers) instead of scanning the whole map.
@@ -1333,6 +1426,7 @@ impl X86Codegen {
             home_dbg_block: u32::MAX,
             phi_chain: FxHashMap::default(),
             value_live_segments: FxHashMap::default(),
+            home_live_index: FxHashMap::default(),
             home_sharers: FxHashMap::default(),
             call_fresh_snapshot: Vec::new(),
             used_callee_saved: Vec::new(),
@@ -1937,6 +2031,24 @@ impl X86Codegen {
     /// (kernel 6.18.50 free_area_init_node: `imulq $1216, %r11, %r11` left the
     /// ZONE POINTER in the loop index's home and the fused mul-add consumed
     /// it as the index).
+    /// Rebuild `home_live_index` from `home_sharers` and
+    /// `value_live_segments`; call after changing either.
+    pub(super) fn index_home_liveness(&mut self) {
+        self.home_live_index = self
+            .home_sharers
+            .iter()
+            .map(|(&phys, sharers)| {
+                let mut spans: Vec<(u32, u32, u32)> = Vec::new();
+                for &v in sharers {
+                    if let Some(live) = self.value_live_segments.get(&v) {
+                        spans.extend(live.0.iter().map(|&(s, e)| (s, e, v)));
+                    }
+                }
+                (phys, SharerLiveIndex::build(spans))
+            })
+            .collect();
+    }
+
     pub(super) fn note_reg_clobbered(&mut self, phys: u8) {
         // Write-state law: whatever the eviction outcome, the register's
         // last write is now a non-definition write.
@@ -1947,22 +2059,15 @@ impl X86Codegen {
                 self.home_dbg_block, self.state.current_program_point, phys
             );
         }
-        if let Some(sharers) = self.home_sharers.get(&phys) {
+        if let Some(index) = self.home_live_index.get(&phys) {
             let point = self.state.current_program_point;
             // Liveness gate: only sharers LIVE at the clobber point lose
             // their home. A dead sharer has no reachable consumer past this
             // point (segments are hole-aware, so a value live on ANOTHER
             // branch path is not live HERE) and its home content is
             // irrelevant until its own redefinition re-marks it.
-            let stale: Vec<u32> = sharers
-                .iter()
-                .copied()
-                .filter(|v| {
-                    self.value_live_segments
-                        .get(v)
-                        .is_some_and(|segs| segs.iter().any(|&(s, e)| s <= point && point <= e))
-                })
-                .collect();
+            let mut stale: Vec<u32> = Vec::new();
+            index.stab(point, &mut stale);
             // Cheap test first: the eviction list is empty for the vast
             // majority of clobbers, and only a non-empty one can trace.
             if !stale.is_empty() && trace_notes_enabled() {
@@ -9433,6 +9538,75 @@ mod alias_freshness_tests {
         }
     }
 
+    /// `LiveSpans` normalisation keeps exactly the covered point set of the
+    /// raw hole-aware segments (the linear containment test it replaced).
+    #[test]
+    fn live_spans_match_linear_containment() {
+        let cases: Vec<Vec<(u32, u32)>> = vec![
+            vec![],
+            vec![(5, 5)],
+            vec![(10, 20), (0, 3)],         // unsorted
+            vec![(0, 4), (5, 9)],           // adjacent: merged
+            vec![(0, 10), (2, 3), (4, 12)], // nested and overlapping
+            vec![(7, 3), (1, 1)],           // inverted range covers nothing
+            vec![(u32::MAX - 1, u32::MAX), (0, 0)],
+        ];
+        for raw in cases {
+            let spans = LiveSpans::from_ranges(raw.clone());
+            for w in spans.0.windows(2) {
+                assert!(w[0].1.saturating_add(1) < w[1].0, "{raw:?} -> {spans:?}");
+            }
+            let probes = (0u32..25).chain([u32::MAX - 2, u32::MAX - 1, u32::MAX]);
+            for p in probes {
+                let linear = raw.iter().any(|&(s, e)| s <= p && p <= e);
+                assert_eq!(spans.contains(p), linear, "{raw:?} at {p}");
+            }
+        }
+    }
+
+    /// The sharer stabbing index answers exactly the per-sharer linear
+    /// containment test, for random span sets (overlapping owners, shared
+    /// endpoints, point spans) and every probe point.
+    #[test]
+    fn sharer_live_index_matches_linear_scan() {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut rnd = |m: u32| -> u32 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % u64::from(m)) as u32
+        };
+        for _ in 0..300 {
+            let owners = 1 + rnd(12);
+            let mut per_owner: Vec<(u32, LiveSpans)> = Vec::new();
+            for v in 0..owners {
+                let raw: Vec<(u32, u32)> = (0..rnd(5))
+                    .map(|_| {
+                        let s = rnd(60);
+                        (s, s + rnd(8))
+                    })
+                    .collect();
+                per_owner.push((100 + v, LiveSpans::from_ranges(raw)));
+            }
+            let spans: Vec<(u32, u32, u32)> = per_owner
+                .iter()
+                .flat_map(|(v, l)| l.0.iter().map(move |&(s, e)| (s, e, *v)))
+                .collect();
+            let index = SharerLiveIndex::build(spans);
+            for p in 0..72 {
+                let mut got = Vec::new();
+                index.stab(p, &mut got);
+                got.sort_unstable();
+                let want: Vec<u32> = per_owner
+                    .iter()
+                    .filter(|(_, l)| l.contains(p))
+                    .map(|(v, _)| *v)
+                    .collect();
+                assert_eq!(got, want, "point {p}");
+            }
+        }
+    }
+
     // ── the exact alias-freshness law (audit-of-#603 H1) ─────────────────────
 
     /// A two-member same-value class homed in r13, both definitions emitted
@@ -9443,8 +9617,11 @@ mod alias_freshness_tests {
         cg.reg_assignments.insert(104, PhysReg(3));
         cg.home_sharers.insert(3, vec![103, 104]);
         cg.phi_chain.insert(104, 103);
-        cg.value_live_segments.insert(103, vec![(0, 100)]);
-        cg.value_live_segments.insert(104, vec![(0, 100)]);
+        cg.value_live_segments
+            .insert(103, LiveSpans::from_ranges(vec![(0, 100)]));
+        cg.value_live_segments
+            .insert(104, LiveSpans::from_ranges(vec![(0, 100)]));
+        cg.index_home_liveness();
         cg.state.current_program_point = 10;
         // Definitions in emission order, then the workqueue composition: a
         // clobber evicts both sharers and the in-place chain update
@@ -9485,7 +9662,9 @@ mod alias_freshness_tests {
         // reload instead of reading whatever the clobber left in r13.
         let mut cg = seeded_codegen();
         // v104 dies before the clobber.
-        cg.value_live_segments.insert(104, vec![(0, 5)]);
+        cg.value_live_segments
+            .insert(104, LiveSpans::from_ranges(vec![(0, 5)]));
+        cg.index_home_liveness();
         cg.state.current_program_point = 70;
         cg.note_reg_clobbered(3);
         assert!(
@@ -9689,7 +9868,9 @@ mod alias_freshness_tests {
         let mut cg = seeded_codegen();
         cg.reg_assignments.insert(105, PhysReg(3));
         cg.home_sharers.insert(3, vec![103, 104, 105]);
-        cg.value_live_segments.insert(105, vec![(0, 100)]);
+        cg.value_live_segments
+            .insert(105, LiveSpans::from_ranges(vec![(0, 100)]));
+        cg.index_home_liveness();
         // Edge A ends with Def(103); edge B with Def(105) — same group,
         // different canonical classes.
         let mut snap_a = FxHashMap::default();
@@ -9715,7 +9896,9 @@ mod alias_freshness_tests {
         let mut cg = seeded_codegen();
         cg.reg_assignments.insert(105, PhysReg(3));
         cg.home_sharers.insert(3, vec![103, 104, 105]);
-        cg.value_live_segments.insert(105, vec![(0, 100)]);
+        cg.value_live_segments
+            .insert(105, LiveSpans::from_ranges(vec![(0, 100)]));
+        cg.index_home_liveness();
         let mut snap_a = FxHashMap::default();
         snap_a.insert(3u8, HomeWrite::Def(103));
         cg.home_branch_snapshots.insert(12, vec![snap_a]);
@@ -9773,7 +9956,9 @@ mod alias_freshness_tests {
         // 105 shares the register but is dead at the clobber point: the
         // liveness gate must NOT evict it (its next def re-marks it).
         cg.home_sharers.insert(3, vec![103, 104, 105]);
-        cg.value_live_segments.insert(105, vec![(50, 60)]);
+        cg.value_live_segments
+            .insert(105, LiveSpans::from_ranges(vec![(50, 60)]));
+        cg.index_home_liveness();
         cg.note_reg_clobbered(3);
         assert!(
             !cg.home_clobbered.contains(&105),

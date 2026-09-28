@@ -1054,7 +1054,7 @@ impl<'a> SemaConstEval<'a> {
             // L"hello" is wchar_t[6] (int[6] on Linux) -- sizeof gives array size
             Expr::WideStringLiteral(s, _) => return Some((s.chars().count() + 1) * 4),
             // u"hello" is char16_t[6] (unsigned short[6]) -- sizeof gives array size
-            Expr::Char16StringLiteral(s, _) => return Some((s.chars().count() + 1) * 2),
+            Expr::Char16StringLiteral(s, _) => return Some((s.encode_utf16().count() + 1) * 2),
             _ => {}
         }
         let ctype = self.infer_expr_ctype(expr)?;

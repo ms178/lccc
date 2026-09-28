@@ -1603,13 +1603,19 @@ impl X86Codegen {
             self.home_sharers.entry(reg.0).or_default().push(v);
         }
         if let Some(liv) = &cached_liveness {
+            let mut by_value: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
             for seg in &liv.segments {
-                self.value_live_segments
+                by_value
                     .entry(seg.value_id)
                     .or_default()
                     .push((seg.start, seg.end));
             }
+            self.value_live_segments = by_value
+                .into_iter()
+                .map(|(v, ranges)| (v, super::emit::LiveSpans::from_ranges(ranges)))
+                .collect();
         }
+        self.index_home_liveness();
         self.call_fresh_snapshot.clear();
 
         // ── PF-07 post-RA demotion (dead-materialisation cleanup) ─────────
@@ -1661,13 +1667,23 @@ impl X86Codegen {
                 } else {
                     &liv.segments
                 };
+                // Segments grouped by value once (in segment order), not
+                // rescanned per assigned value: O(values x segments) was a
+                // measurable share of whole compiles on large functions.
+                let mut by_value: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
+                for seg in segs {
+                    by_value
+                        .entry(seg.value_id)
+                        .or_default()
+                        .push((seg.start, seg.end));
+                }
                 for (&v, &reg) in &self.reg_assignments {
                     if reg.0 >= 20 {
                         continue; // XMM bank: not in the GPR window pool
                     }
                     let spans = self.machine_reg_busy.entry(reg.0).or_default();
-                    for seg in segs.iter().filter(|s| s.value_id == v) {
-                        spans.push((seg.start, seg.end));
+                    if let Some(own) = by_value.get(&v) {
+                        spans.extend_from_slice(own);
                     }
                 }
             }

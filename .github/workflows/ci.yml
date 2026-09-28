@@ -646,6 +646,9 @@ jobs:
           # operand parser fails CI even if the wrapper gate is skipped.
           python3 scripts/peephole_trace_bisect.py --selftest
           bash tests/regression/check_atomic_backends.sh
+          # Torture-corpus provisioning: stamp trust, integrity manifest,
+          # auto-repair and invalidate-before-replace (synthetic tarball).
+          bash tests/regression/check_ensure_gcc_torture.sh
           # Indexed SIB fold with a scratch-homed index: the x86-64 fold
           # decider must accept %rdx/%r11-homed SIB operands (S13
           # sqlite_varint golden-gate regression pin).
@@ -678,6 +681,33 @@ jobs:
             --lccc "$LCCC_LD" \
             --iters 64 \
             --seed "$FUZZ_SEED"
+
+      # ELF32/i386 userspace links through lccc-ld, driven by `gcc -m32`
+      # with lccc-ld as its `ld` (tests/linker/i386_userspace.py): the TLS
+      # transition matrix (4-way reference/LCCC exe x .so, lazy and
+      # LD_BIND_NOW binding), DSO chains with DT_NEEDED and archive members
+      # satisfying DSO references, positional archive semantics, and the
+      # option -> ELF entry/dynamic-tag parity against GNU ld.  The job
+      # installs gcc-multilib above, so LCCC_REQUIRE_I386=1 turns the
+      # multilib probe's SKIP into a FAIL: an unusable -m32 toolchain here
+      # is a broken runner, not a reason to test nothing.
+      - name: Verify i386 userspace linking (lccc-ld vs GNU ld)
+        env:
+          LCCC_REQUIRE_I386: "1"
+          LCCC_I386_SCRATCH_ROOT: ${{ runner.temp }}/i386-linker-scratch
+        run: |
+          python3 tests/linker/run_linker_tests.py \
+            --lccc target/fastbuild/lccc --filter i386_ -v
+
+      # Passing cases delete their scratch directories, so what remains is
+      # the sources, objects, links and outputs of exactly the failing cases.
+      - name: Upload i386 linker scratch on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: i386-linker-scratch
+          path: ${{ runner.temp }}/i386-linker-scratch
+          if-no-files-found: ignore
 
       # Every corpus gate above runs a compiler binary whose fastbuild
       # profile compiles debug_assertions OUT - so the %rax shadow-epoch

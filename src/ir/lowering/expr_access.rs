@@ -5,6 +5,7 @@
 //! Extracted from expr.rs to keep expression lowering manageable.
 
 use super::lower::Lowerer;
+use super::string_init::StringInit;
 use crate::common::types::{AddressSpace, CType, IrType, SsoMode};
 use crate::frontend::parser::ast::{
     BlockItem, CompoundStmt, Designator, Expr, GenericAssociation, Initializer, InitializerItem,
@@ -299,39 +300,28 @@ impl Lowerer {
     /// Compute the byte size of a compound literal, handling incomplete array types.
     /// For incomplete arrays (e.g., `(int[]){1,2,3}`), sizeof_type returns 0, so we
     /// compute the size from element_size * initializer_count instead.
-    fn compound_literal_size(&self, type_spec: &TypeSpecifier, init: &Initializer) -> usize {
+    pub(super) fn compound_literal_size(
+        &self,
+        type_spec: &TypeSpecifier,
+        init: &Initializer,
+    ) -> usize {
         let ctype = self.type_spec_to_ctype(type_spec);
         match (&ctype, init) {
+            (CType::Array(elem_ct, None), Initializer::Expr(_)) => {
+                let elem_size = self.ctype_size(elem_ct).max(1);
+                self.unsized_array_len(init, elem_ct)
+                    .map_or_else(|| self.sizeof_type(type_spec), |n| n * elem_size)
+            }
             (CType::Array(elem_ct, None), Initializer::List(items)) => {
                 let elem_size = elem_ct
                     .size_ctx(&*self.types.borrow_struct_layouts())
                     .max(1);
-                // For char/unsigned char arrays with a single string literal initializer,
-                // the array size is the string length + 1 (null terminator)
-                if elem_size == 1 && items.len() == 1 {
-                    if let Initializer::Expr(ref expr) = items[0].init {
-                        if let Expr::StringLiteral(s, _)
-                        | Expr::WideStringLiteral(s, _)
-                        | Expr::Char16StringLiteral(s, _) = expr
-                        {
-                            if matches!(expr, Expr::StringLiteral(_, _)) {
-                                s.chars().count() + 1
-                            } else if matches!(expr, Expr::Char16StringLiteral(_, _)) {
-                                (s.chars().count() + 1) * 2
-                            } else {
-                                (s.chars().count() + 1) * 4
-                            }
-                        } else {
-                            elem_size * items.len()
-                        }
-                    } else {
-                        elem_size * items.len()
-                    }
-                } else {
-                    // Use compute_init_list_array_size to correctly handle designated
-                    // initializers like (int[]){[1]=10, [8]=80} which need 9 elements,
-                    // not just items.len() (4 in this example).
-                    elem_size * self.compute_init_list_array_size(items)
+                // The bound the initializer gives (C11 6.7.9p22): strings,
+                // brace elision and designators as the array planner applies
+                // them; arrays of aggregates count their top-level items.
+                match self.unsized_array_len(init, elem_ct) {
+                    Some(n) => n * elem_size,
+                    None => elem_size * self.compute_init_list_array_size(items),
                 }
             }
             _ => self.sizeof_type(type_spec),
@@ -841,6 +831,23 @@ impl Lowerer {
             volatile: false,
             semantic_volatile: false,
         });
+        // Arrays of scalars of any rank (strings for character arrays
+        // included): resolved by the array planner.
+        let full_ty = self.complete_array_ctype(&self.type_spec_to_ctype(type_spec), size);
+        if let Some(geo) = self.scalar_array_geometry(&full_ty) {
+            let plan = self.plan_array_initializer(init, &geo);
+            self.store_array_plan(&plan, &geo, alloca, 0, false);
+            return alloca;
+        }
+        // Struct/union and array-of-aggregate lists: resolved once into the
+        // canonical form (`init_canon`).
+        let canonical = match init {
+            Initializer::List(items) => self
+                .canonical_init_items(items, &full_ty, None)
+                .map(Initializer::List),
+            Initializer::Expr(_) => None,
+        };
+        let init = canonical.as_ref().unwrap_or(init);
         let struct_layout = self.get_struct_layout_for_type(type_spec);
         match init {
             Initializer::Expr(expr) => {
