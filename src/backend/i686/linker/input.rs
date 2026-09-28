@@ -37,7 +37,36 @@ use super::types::*;
 
 /// Dynamic symbols visible to the link:
 /// name → (soname, st_type, st_size, version, is_default_version, binding).
-pub(super) type DynlibSyms = FxHashMap<String, (String, u8, u32, Option<String>, bool, u8)>;
+/// One shared-library export, as symbol resolution sees it.
+#[derive(Clone, Debug)]
+pub(super) struct DynlibSym {
+    /// DT_SONAME (or file name) of the defining library.
+    pub lib: String,
+    pub sym_type: u8,
+    pub size: u32,
+    pub version: Option<String>,
+    pub is_default_ver: bool,
+    pub binding: u8,
+    /// `st_value` inside the library (see `DynSymInfo::value`).
+    pub value: u32,
+}
+
+impl DynlibSym {
+    fn new(sym: DynSymInfo, lib_soname: &str) -> Self {
+        DynlibSym {
+            lib: lib_soname.to_string(),
+            sym_type: sym.sym_type,
+            size: sym.size,
+            version: sym.version,
+            is_default_ver: sym.is_default_ver,
+            binding: sym.binding,
+            value: sym.value,
+        }
+    }
+}
+
+/// Shared-library exports by name (the first library defining a name wins).
+pub(super) type DynlibSyms = FxHashMap<String, DynlibSym>;
 
 /// Linker scripts may include other linker scripts; GNU ld has no fixed
 /// limit, but a cycle must not hang the link.  Real toolchains nest at most
@@ -790,28 +819,14 @@ pub(super) fn insert_dynsym(dynlib_syms: &mut DynlibSyms, sym: DynSymInfo, lib_s
     use std::collections::hash_map::Entry;
     match dynlib_syms.entry(sym.name.clone()) {
         Entry::Vacant(e) => {
-            e.insert((
-                lib_soname.to_string(),
-                sym.sym_type,
-                sym.size,
-                sym.version,
-                sym.is_default_ver,
-                sym.binding,
-            ));
+            e.insert(DynlibSym::new(sym, lib_soname));
         }
         // The same name exported under several versions by the SAME object
         // binds to the default (`@@`) one; a later object never overrides
         // an earlier one.
         Entry::Occupied(mut e) => {
-            if e.get().0 == lib_soname && sym.is_default_ver && !e.get().4 {
-                e.insert((
-                    lib_soname.to_string(),
-                    sym.sym_type,
-                    sym.size,
-                    sym.version,
-                    sym.is_default_ver,
-                    sym.binding,
-                ));
+            if e.get().lib == lib_soname && sym.is_default_ver && !e.get().is_default_ver {
+                e.insert(DynlibSym::new(sym, lib_soname));
             }
         }
     }

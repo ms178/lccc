@@ -233,6 +233,32 @@ pub(super) fn exec_got_target(g: &GlobalSymbol) -> Option<GotTarget> {
     (g.defined_in != Some(usize::MAX)).then_some(GotTarget::Absolute(g.value))
 }
 
+/// Whether an executable's Initial-Exec reference to `g` may become
+/// Local-Exec (`elf::gottpoff_ie_to_le` decides the instruction side): the
+/// TLS symbol is defined in the executable, so its offset from the thread
+/// pointer is a link-time constant.  A shared library's TLS keeps its slot
+/// and `R_X86_64_TPOFF64`; so does an undefined weak one, whose slot stays
+/// zero.  Like [`exec_got_target`], `create_plt_got` and the relocation pass
+/// both ask this, so every reference left unrelaxed has a slot.  (Every
+/// LOCAL TLS symbol qualifies.)
+pub(super) fn exec_ie_target_local(g: &GlobalSymbol) -> bool {
+    !g.is_dynamic && g.defined_in.is_some()
+}
+
+/// Whether a LOCAL symbol is thread-local: an `STT_TLS` symbol, or a
+/// section symbol of a TLS section (an assembler may relocate against
+/// either).  Its GOT slot holds a TP offset rather than an address.
+pub(super) fn local_is_tls(
+    obj: &crate::backend::linker_common::Elf64Object,
+    sym: &crate::backend::linker_common::Elf64Symbol,
+) -> bool {
+    sym.sym_type() == STT_TLS
+        || obj
+            .sections
+            .get(sym.shndx as usize)
+            .is_some_and(|sec| sym.shndx != SHN_ABS && sec.flags & SHF_TLS != 0)
+}
+
 /// The relaxation target of a GOT-indirect reference through a LOCAL
 /// symbol (never preemptible; a local IFUNC resolves to its IPLT stub).
 /// Shared by the executable and shared-object planners and appliers.
@@ -327,7 +353,18 @@ pub(super) fn create_plt_got(
                 }
                 if sym.is_local() {
                     let t = rela.rela_type;
+                    // An Initial-Exec reference to a local TLS symbol the
+                    // rewrite does not cover (a hand-encoded non-REX.W
+                    // form, EVEX with an operand-size prefix, ...) loads its
+                    // TP offset from a slot, filled at link time.
                     let needs_slot = is_got64_family(t)
+                        || (is_gottpoff_family(t)
+                            && gottpoff_ie_to_le(
+                                t,
+                                obj.section_data[sec_idx].as_slice(),
+                                rela.offset as usize,
+                            )
+                            .is_none())
                         || (is_gotpcrel_family(t)
                             && gotpcrelx_relaxation(
                                 t,
@@ -380,6 +417,7 @@ pub(super) fn create_plt_got(
                     | R_X86_64_GOTPCRELX
                     | R_X86_64_REX_GOTPCRELX
                     | R_X86_64_CODE_4_GOTPCRELX
+                    | R_X86_64_CODE_5_GOTPCRELX
                     | R_X86_64_CODE_6_GOTPCRELX => {
                         // A reference the relocation pass rewrites to address
                         // the symbol directly (`mov` -> `lea`, `call *` ->
@@ -427,8 +465,21 @@ pub(super) fn create_plt_got(
                             plt_names.push(sym.name.to_string());
                         }
                     }
-                    R_X86_64_GOTTPOFF | R_X86_64_CODE_4_GOTTPOFF | R_X86_64_CODE_6_GOTTPOFF => {
-                        if !plt_set.contains(sym.name.as_str())
+                    t if is_gottpoff_family(t) => {
+                        // Rewritten to `mov/add $tpoff` when the target is
+                        // this executable's own TLS and the instruction is
+                        // one the rewrite covers; only the rest need a slot.
+                        let relaxed = globals
+                            .get(sym.name.as_str())
+                            .is_some_and(exec_ie_target_local)
+                            && gottpoff_ie_to_le(
+                                t,
+                                obj.section_data[sec_idx].as_slice(),
+                                rela.offset as usize,
+                            )
+                            .is_some();
+                        if !relaxed
+                            && !plt_set.contains(sym.name.as_str())
                             && got_only_set.insert(sym.name.to_string())
                         {
                             got_only_names.push(sym.name.to_string());

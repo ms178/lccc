@@ -196,6 +196,8 @@ pub(super) fn emit_shared_library(
     z_relro: bool,
     // `-z now`: the lazy-binding `.got.plt` joins the RELRO window.
     z_now: bool,
+    // `-z text` / `-z notext`: what a relocation into code does.
+    textrel_policy: linker_common::TextrelPolicy,
     // `--exclude-libs`: archives whose symbols must not be re-exported.
     exclude_libs: &[String],
     // `-Map=FILE`: write a GNU-ld-compatible link map. Previously reachable
@@ -1321,7 +1323,6 @@ pub(super) fn emit_shared_library(
     if verneed_count > 0 {
         dyn_count += 2; // DT_VERNEED, DT_VERNEEDNUM
     }
-    let dynamic_size = dyn_count * 16;
 
     let has_tls_sections = output_sections
         .iter()
@@ -1332,17 +1333,11 @@ pub(super) fn emit_shared_library(
     // dynamic linker can patch them. We track them by output section index.
     let mut sections_with_abs_relocs: crate::common::fx_hash::FxHashSet<usize> =
         crate::common::fx_hash::FxHashSet::default();
-    for obj in objects.iter() {
+    for (oi, obj) in objects.iter().enumerate() {
         for (sec_idx, sec_relas) in obj.relocations.iter().enumerate() {
-            for rela in sec_relas {
-                if rela.rela_type == R_X86_64_64 {
-                    // Find which output section this input section maps to
-                    let obj_idx_search = objects.iter().position(|o| std::ptr::eq(o, obj));
-                    if let Some(oi) = obj_idx_search {
-                        if let Some(&(out_idx, _)) = section_map.get(&(oi, sec_idx)) {
-                            sections_with_abs_relocs.insert(out_idx);
-                        }
-                    }
+            if sec_relas.iter().any(|r| r.rela_type == R_X86_64_64) {
+                if let Some(&(out_idx, _)) = section_map.get(&(oi, sec_idx)) {
+                    sections_with_abs_relocs.insert(out_idx);
                 }
             }
         }
@@ -1366,6 +1361,26 @@ pub(super) fn emit_shared_library(
             && sec.sh_type != SHT_NOBITS
             && sections_with_abs_relocs.contains(&idx)
     };
+    // Read-only storage that stays in a read-only segment: code.  (A
+    // read-only non-code section with absolute relocations is placed in the
+    // RELRO window by `is_relro_rodata` instead.)  A dynamic relocation here
+    // is a text relocation, decided by `textrel_policy` once the relocation
+    // walk below knows whether one is really emitted -- an `R_X86_64_64`
+    // against an absolute symbol or a hidden undefined weak one is not.
+    let lands_in_text = |idx: usize, sec: &OutputSection| -> bool {
+        sec.flags & SHF_ALLOC != 0 && sec.flags & SHF_WRITE == 0 && !is_relro_rodata(idx, sec)
+    };
+    // `.dynamic` is sized before that walk, so it reserves the DT_TEXTREL
+    // entry (and a DT_FLAGS entry, for DF_TEXTREL, when no other flag
+    // creates one) whenever such a relocation exists.  An unused
+    // reservation lands after DT_NULL, where the loader never reads.
+    let textrel_possible = sections_with_abs_relocs
+        .iter()
+        .any(|&idx| lands_in_text(idx, &output_sections[idx]));
+    if textrel_possible {
+        dyn_count += 1 + u64::from(dt_flags == 0);
+    }
+    let dynamic_size = dyn_count * 16;
 
     // phdrs: PHDR, LOAD(ro), LOAD(text), LOAD(rodata), LOAD(rw), DYNAMIC,
     // NOTE* + GNU_PROPERTY, GNU_STACK, [GNU_RELRO], [TLS]
@@ -2433,6 +2448,8 @@ pub(super) fn emit_shared_library(
     // offset of a shared library's block is only known to ld.so.
     let mut tpoff64_entries: Vec<(u64, String, u64)> = Vec::new();
     let mut abs64_entries: Vec<(u64, String, i64)> = Vec::new(); // (offset, sym_name, addend) for R_X86_64_64 relocs
+    // First dynamic relocation into code (see `lands_in_text`).
+    let mut textrel_site: Option<String> = None;
     // (offset, type, sym_name or "" for symbol 0, addend): R_X86_64_PC32 /
     // R_X86_64_PC64 left to ld.so -- see `pc_rel_to_loader` below.
     let mut pcrel_entries: Vec<(u64, u32, String, i64)> = Vec::new();
@@ -2610,6 +2627,7 @@ pub(super) fn emit_shared_library(
             let in_sec = &objects[obj_idx].sections[sec_idx];
             let (sec_size, sec_name) = (in_sec.size, in_sec.name.as_str());
             let obj_name = objects[obj_idx].source_name.as_str();
+            let in_text = lands_in_text(out_idx, &output_sections[out_idx]);
 
             for rela in relas {
                 let si = rela.sym_idx as usize;
@@ -2670,10 +2688,18 @@ pub(super) fn emit_shared_library(
                                 Some(g) => g.absolute,
                                 None => sym.shndx == SHN_ABS,
                             };
+                        let dynamic = symbolic || (s != 0 && !absolute);
                         if symbolic {
                             abs64_entries.push((p, sym.name.to_string(), a));
-                        } else if s != 0 && !absolute {
+                        } else if dynamic {
                             rela_dyn_entries.push((p, val));
+                        }
+                        if dynamic && in_text && textrel_site.is_none() {
+                            textrel_site = Some(linker_common::TextrelPolicy::site(
+                                obj_name,
+                                (!sym.is_local()).then_some(sym.name.as_str()),
+                                sec_name,
+                            ));
                         }
                     }
                     R_X86_64_PC32 | R_X86_64_PLT32 => {
@@ -3103,6 +3129,21 @@ pub(super) fn emit_shared_library(
             format!("internal error: dynamic relocation against '{name}', which is not in .dynsym")
         })
     };
+    // Text relocations: GNU's policy (see `TextrelPolicy`).  Only
+    // `R_X86_64_64` reaches here -- every other relocation that would need
+    // a loader write into read-only storage is refused as non-PIC above.
+    let textrel = match &textrel_site {
+        Some(site) => {
+            textrel_policy.apply(site, "shared object")?;
+            true
+        }
+        None => false,
+    };
+    let dt_flags = if textrel {
+        dt_flags | crate::backend::linker_common::dyn_flags::DF_TEXTREL
+    } else {
+        dt_flags
+    };
     let relative_count = rela_dyn_entries.len();
     let total_rela_count = relative_count
         + glob_dat_entries.len()
@@ -3250,7 +3291,6 @@ pub(super) fn emit_shared_library(
         // early predicate exists; ld.so treats a zero count exactly like
         // an absent tag, and every real-world .so has relatives anyway.
         (DT_RELACOUNT, relative_count as u64),
-        // DT_TEXTREL not needed since we use PIC
     ] {
         w64(&mut out, dd, tag as u64);
         w64(&mut out, dd + 8, val);
@@ -3277,13 +3317,18 @@ pub(super) fn emit_shared_library(
         w64(&mut out, dd + 8, 0);
         dd += 16; // DT_SYMBOLIC
     }
+    if textrel {
+        w64(&mut out, dd, DT_TEXTREL as u64);
+        w64(&mut out, dd + 8, 0);
+        dd += 16;
+    }
     if dt_flags != 0 {
         w64(&mut out, dd, DT_FLAGS as u64);
         w64(&mut out, dd + 8, dt_flags);
         dd += 16;
     }
     if dt_flags_1 != 0 {
-        w64(&mut out, dd, 0x6fff_fffb); // DT_FLAGS_1
+        w64(&mut out, dd, DT_FLAGS_1 as u64);
         w64(&mut out, dd + 8, dt_flags_1);
         dd += 16;
     }

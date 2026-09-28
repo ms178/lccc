@@ -180,6 +180,7 @@ fn read_dynsyms_file_ext(
             break;
         }
         let st_name = read_u32(&data, sym_off) as usize;
+        let st_value = read_u32(&data, sym_off + 4);
         let st_size = read_u32(&data, sym_off + 8);
         let st_info = data[sym_off + 12];
         let st_shndx = read_u16(&data, sym_off + 14);
@@ -219,6 +220,7 @@ fn read_dynsyms_file_ext(
                     binding,
                     version,
                     is_default_ver,
+                    value: st_value,
                     soname: None,
                 });
             }
@@ -327,6 +329,7 @@ fn read_dynsyms_from_dynamic(
         if st_name >= strtab.len() {
             break; // ran past the end of the array
         }
+        let st_value = read_u32(data, sym_off + 4);
         let st_size = read_u32(data, sym_off + 8);
         let st_info = data[sym_off + 12];
         let st_shndx = read_u16(data, sym_off + 14);
@@ -363,6 +366,7 @@ fn read_dynsyms_from_dynamic(
             binding,
             version: None,
             is_default_ver: false,
+            value: st_value,
             soname: None,
         });
     }

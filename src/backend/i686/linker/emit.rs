@@ -163,16 +163,21 @@ pub(super) fn emit_executable(
         .map(|(n, _)| n.clone())
         .collect();
     copy_syms_for_dynsym.sort();
+    // One `.bss` slot and one `R_386_COPY` per copied OBJECT: aliases (see
+    // `link::register_copy_aliases`) share their group's.
+    let (copy_reps, copy_group) = copy_groups(global_symbols, &copy_syms_for_dynsym);
 
     for name in &copy_syms_for_dynsym {
         let idx = dynsym_entries.len();
         let name_off = dynstr.add(name);
         let sym = &global_symbols[name];
+        // The library's binding, as GNU ld keeps it: glibc's `environ` stays
+        // WEAK next to its GLOBAL alias `__environ`.
         dynsym_entries.push(Elf32Sym {
             name: name_off,
             value: 0,
             size: sym.size,
-            info: (STB_GLOBAL << 4) | STT_OBJECT,
+            info: (sym.binding << 4) | STT_OBJECT,
             other: 0,
             shndx: SHN_UNDEF,
         });
@@ -196,30 +201,6 @@ pub(super) fn emit_executable(
             value: 0,
             size: 0,
             info: (import_binding(name) << 4) | STT_FUNC,
-            other: 0,
-            shndx: SHN_UNDEF,
-        });
-        dynsym_map.insert(name.clone(), idx);
-        dynsym_names.push(name.clone());
-    }
-
-    // Textrel symbols (hashed: need dynamic R_386_32 relocs)
-    let mut textrel_syms_for_dynsym: Vec<String> = global_symbols
-        .iter()
-        .filter(|(_, s)| s.uses_textrel && s.is_dynamic)
-        .map(|(n, _)| n.clone())
-        .collect();
-    textrel_syms_for_dynsym.sort();
-
-    for name in &textrel_syms_for_dynsym {
-        let idx = dynsym_entries.len();
-        let name_off = dynstr.add(name);
-        let sym = &global_symbols[name];
-        dynsym_entries.push(Elf32Sym {
-            name: name_off,
-            value: 0,
-            size: sym.size,
-            info: (sym.binding << 4) | sym.sym_type,
             other: 0,
             shndx: SHN_UNDEF,
         });
@@ -261,11 +242,10 @@ pub(super) fn emit_executable(
         dynsym_names.push(name.clone());
     }
 
-    // All hashed symbols = copy + textrel + exported definitions
+    // All hashed symbols = copy + canonical PLT + exported definitions
     let mut all_hashed_syms: Vec<String> = Vec::new();
     all_hashed_syms.extend(copy_syms_for_dynsym.iter().cloned());
     all_hashed_syms.extend(canonical_syms_for_dynsym.iter().cloned());
-    all_hashed_syms.extend(textrel_syms_for_dynsym.iter().cloned());
     all_hashed_syms.extend(export_syms_for_dynsym.iter().cloned());
 
     // Build .gnu.hash and reorder hashed dynsym entries
@@ -616,30 +596,8 @@ pub(super) fn emit_executable(
     vaddr = align_up(vaddr, 4);
     let rel_dyn_offset = file_offset;
     let rel_dyn_vaddr = vaddr;
-    let num_copy_relocs = copy_syms_for_dynsym.len();
-    // Count actual R_386_32 relocations against textrel symbols
-    let num_text_relocs: usize = if textrel_syms_for_dynsym.is_empty() {
-        0
-    } else {
-        let mut count = 0usize;
-        for obj in inputs {
-            for sec in &obj.sections {
-                for &(_, rel_type, sym_idx, _) in &sec.relocations {
-                    if rel_type == R_386_32 {
-                        if let Some(sym) = obj.symbols.get(sym_idx as usize) {
-                            if let Some(gs) = global_symbols.get(sym.name.as_str()) {
-                                if gs.uses_textrel {
-                                    count += 1;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        count
-    };
-    let num_rel_dyn = got_dyn_symbols.len() + num_copy_relocs + num_text_relocs;
+    let num_copy_relocs = copy_reps.len();
+    let num_rel_dyn = got_dyn_symbols.len() + num_copy_relocs;
     let rel_dyn_size = (num_rel_dyn as u32) * 8;
     if !is_static {
         file_offset += rel_dyn_size;
@@ -838,20 +796,16 @@ pub(super) fn emit_executable(
 
     // `.dynamic`: which entries exist is decided here; their values are
     // filled in after layout (see `DynamicDesc`).
-    let textrel = num_text_relocs > 0;
-    if textrel && opts.z_text {
-        return Err(
-            "read-only segment has dynamic relocations (text relocations against weak shared-library data) and -z text was given"
-                .to_string(),
-        );
-    }
+    // No DT_TEXTREL: a position-dependent executable never needs a dynamic
+    // relocation in read-only storage (shared-library data is copied, a
+    // function's address is its canonical PLT entry).
     let sec_len = |name: &str| {
         section_name_to_idx
             .get(name)
             .map_or(0, |&i| output_sections[i].data.len() as u32)
     };
     let (option_strings, option_numeric) =
-        option_entries(&opts.extra_dynamic_tags(textrel, false, false), |s| {
+        option_entries(&opts.extra_dynamic_tags(false, false, false), |s| {
             dynstr2.get_offset(s)
         });
     let mut dyn_desc = DynamicDesc {
@@ -1039,21 +993,31 @@ pub(super) fn emit_executable(
         bss_vaddr = vaddr;
     }
 
-    // Allocate BSS space for copy relocations
-    let mut copy_reloc_symbols: Vec<String> = global_symbols
-        .iter()
-        .filter(|(_, s)| s.needs_copy && s.is_dynamic)
-        .map(|(n, _)| n.clone())
-        .collect();
-    copy_reloc_symbols.sort();
-
-    for name in &copy_reloc_symbols {
+    // Allocate BSS space for copy relocations: one slot per group, sized
+    // for its largest member, and every member placed there.
+    let mut group_addr: Vec<Option<u32>> = vec![None; copy_reps.len()];
+    for name in &copy_syms_for_dynsym {
+        let g = copy_group[name];
+        let addr = match group_addr[g] {
+            Some(a) => a,
+            None => {
+                let size = copy_syms_for_dynsym
+                    .iter()
+                    .filter(|n| copy_group[*n] == g)
+                    .map(|n| global_symbols[n].size)
+                    .max()
+                    .unwrap_or(0);
+                let al = if size >= 4 { 4 } else { 1 };
+                vaddr = align_up(vaddr, al);
+                let a = vaddr;
+                vaddr += size.max(4);
+                group_addr[g] = Some(a);
+                a
+            }
+        };
         if let Some(sym) = global_symbols.get_mut(name) {
-            let al = if sym.size >= 4 { 4 } else { 1 };
-            vaddr = align_up(vaddr, al);
-            sym.copy_addr = vaddr;
-            sym.address = vaddr;
-            vaddr += sym.size.max(4);
+            sym.copy_addr = addr;
+            sym.address = addr;
         }
     }
 
@@ -1129,7 +1093,6 @@ pub(super) fn emit_executable(
     );
 
     // ── Apply relocations ────────────────────────────────────────────────
-    let text_relocs;
     {
         let mut reloc_ctx = RelocContext {
             global_symbols,
@@ -1149,7 +1112,7 @@ pub(super) fn emit_executable(
             has_tls,
             tls_relaxed_call_slots: Default::default(),
         };
-        text_relocs = reloc::apply_relocations(inputs, &mut reloc_ctx)?;
+        reloc::apply_relocations(inputs, &mut reloc_ctx)?;
     }
 
     // Build .eh_frame_hdr from relocated .eh_frame data
@@ -1239,21 +1202,13 @@ pub(super) fn emit_executable(
         rel_dyn_data.extend_from_slice(&got_entry_addr.to_le_bytes());
         rel_dyn_data.extend_from_slice(&r_info.to_le_bytes());
     }
-    for name in &copy_reloc_symbols {
+    for name in &copy_reps {
         if let Some(gs) = global_symbols.get(name) {
             if let Some(&dynsym_idx) = dynsym_map.get(name) {
                 let r_info = ((dynsym_idx as u32) << 8) | 5; // R_386_COPY
                 rel_dyn_data.extend_from_slice(&gs.copy_addr.to_le_bytes());
                 rel_dyn_data.extend_from_slice(&r_info.to_le_bytes());
             }
-        }
-    }
-    // Text relocations for WEAK dynamic data symbols (R_386_32)
-    for (addr, name) in &text_relocs {
-        if let Some(&dynsym_idx) = dynsym_map.get(name) {
-            let r_info = ((dynsym_idx as u32) << 8) | R_386_32;
-            rel_dyn_data.extend_from_slice(&addr.to_le_bytes());
-            rel_dyn_data.extend_from_slice(&r_info.to_le_bytes());
         }
     }
 
@@ -1863,7 +1818,7 @@ fn assign_symbol_addresses(
             needs_copy: false,
             copy_addr: 0,
             version: None,
-            uses_textrel: false,
+            lib_value: 0,
             canonical_plt: false,
         });
     if let Some(sym) = global_symbols.get_mut("_GLOBAL_OFFSET_TABLE_") {
@@ -1922,7 +1877,7 @@ fn assign_symbol_addresses(
                 needs_copy: false,
                 copy_addr: 0,
                 version: None,
-                uses_textrel: false,
+                lib_value: 0,
                 canonical_plt: false,
             });
     }
@@ -2072,6 +2027,40 @@ fn write_elf_header(output: &mut [u8], entry_point: u32, ehdr_size: u32, num_phd
     output[46..48].copy_from_slice(&40u16.to_le_bytes());
     output[48..50].copy_from_slice(&0u16.to_le_bytes());
     output[50..52].copy_from_slice(&0u16.to_le_bytes());
+}
+
+/// Group copy-relocated symbols by the object they name: same library, same
+/// `st_value` there (`LinkerSymbol::lib_value`).  Returns one representative
+/// per group -- a non-weak member if any, else the first name, so the
+/// `R_386_COPY` names the object's real definition as GNU ld's does -- and
+/// each name's group index.  `names` must be sorted, which makes the result
+/// deterministic.
+fn copy_groups(
+    global_symbols: &FxHashMap<String, LinkerSymbol>,
+    names: &[String],
+) -> (Vec<String>, FxHashMap<String, usize>) {
+    let mut reps: Vec<String> = Vec::new();
+    let mut group: FxHashMap<String, usize> = FxHashMap::default();
+    let mut by_object: FxHashMap<(&str, u32), usize> = FxHashMap::default();
+    for name in names {
+        let sym = &global_symbols[name];
+        let g = if sym.lib_value != 0 {
+            *by_object
+                .entry((sym.dynlib.as_str(), sym.lib_value))
+                .or_insert_with(|| {
+                    reps.push(name.clone());
+                    reps.len() - 1
+                })
+        } else {
+            reps.push(name.clone());
+            reps.len() - 1
+        };
+        if global_symbols[&reps[g]].binding == STB_WEAK && sym.binding != STB_WEAK {
+            reps[g] = name.clone();
+        }
+        group.insert(name.clone(), g);
+    }
+    (reps, group)
 }
 
 #[cfg(test)]

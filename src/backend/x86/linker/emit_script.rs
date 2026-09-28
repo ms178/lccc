@@ -2260,121 +2260,6 @@ fn link_with_script_machine(
         }
     }
 
-    /// Relax a GOT-relative reference into direct addressing.
-    ///
-    /// A linker-script link has no GOT: every address is known, so the
-    /// *indirection through a GOT slot* that the compiler emitted must be
-    /// removed rather than satisfied. The x86-64 psABI ("GOTPCRELX
-    /// relaxations") specifies the legal rewrites; this implements the forms
-    /// GCC and Clang actually emit for `-fPIC` code:
-    ///
-    /// | before                              | after                        |
-    /// |-------------------------------------|------------------------------|
-    /// | `mov  sym@GOTPCREL(%rip), %reg` 8b  | `lea sym(%rip), %reg`    8d  |
-    /// | `cmp  %reg, sym@GOTPCREL(%rip)` 3b  | `cmp $sym, %reg`   81 /7 imm |
-    /// | `call *sym@GOTPCREL(%rip)`   ff /2  | `call sym` (e8) + nop        |
-    /// | `jmp  *sym@GOTPCREL(%rip)`   ff /4  | `jmp  sym` (e9) + nop        |
-    ///
-    /// `mov` -> `lea` keeps the operand PC-relative, so it is position
-    /// independent and needs no range beyond the usual +/-2 GiB. The `cmp`
-    /// and indirect-branch forms become absolute/direct and are therefore
-    /// only valid when the target fits the encoding; that is checked.
-    ///
-    /// Returns `Err(<opcode bytes>)` when the form is not one of the above,
-    /// so the caller can produce a precise diagnostic instead of emitting a
-    /// silently corrupt image.
-    fn relax_gotpcrel(out: &mut [u8], fp: usize, s: u64, a: i64, p: u64) -> Result<(), String> {
-        // Displacement for a rewritten PC-relative operand. The instruction
-        // length is unchanged by every rewrite below, so `p` still names the
-        // end of the 4-byte field.
-        let pcrel = s as i64 + a - p as i64;
-        let describe = |o: &[u8]| {
-            o.iter()
-                .map(|b| format!("{:02x}", b))
-                .collect::<Vec<_>>()
-                .join(" ")
-        };
-
-        if fp < 2 || fp + 4 > out.len() {
-            return Err("<truncated>".to_string());
-        }
-        let modrm = out[fp - 1];
-        let op = out[fp - 2];
-
-        // mov m64, r64  ->  lea m64, r64   (opcode 8b -> 8d, ModRM unchanged)
-        if op == 0x8b {
-            out[fp - 2] = 0x8d;
-            w32(out, fp, pcrel as u32);
-            return Ok(());
-        }
-
-        // ALU r64, m64  ->  ALU r64, imm32.
-        //
-        // The x86-64 psABI relaxes the whole `op r64, sym@GOTPCREL(%rip)`
-        // family to the group-1 immediate form `81 /ext id`, where `ext`
-        // selects the operation. Handling only `cmp` here meant an ordinary
-        // `sub`/`add` against a GOT-relative address -- which GCC emits for
-        // pointer arithmetic on an external symbol -- failed the link with an
-        // "instruction form this linker cannot relax" error while GNU ld
-        // accepted it.
-        //
-        //   opcode  operation   group-1 /ext
-        //     03      add            0
-        //     0b      or             1
-        //     13      adc            2
-        //     1b      sbb            3
-        //     23      and            4
-        //     2b      sub            5
-        //     33      xor            6
-        //     3b      cmp            7
-        let alu_ext: Option<u8> = match op {
-            0x03 => Some(0),
-            0x0b => Some(1),
-            0x13 => Some(2),
-            0x1b => Some(3),
-            0x23 => Some(4),
-            0x2b => Some(5),
-            0x33 => Some(6),
-            0x3b => Some(7),
-            _ => None,
-        };
-        if let Some(ext) = alu_ext {
-            // The addend is -4 for a rip-relative operand; undo it to recover
-            // the absolute address the immediate must carry.
-            let abs = s as i64 + a + 4;
-            if (i32::MIN as i64..=i32::MAX as i64).contains(&abs) {
-                let reg = (modrm >> 3) & 7;
-                out[fp - 2] = 0x81;
-                out[fp - 1] = 0xc0 | (ext << 3) | reg; // mod=11, /ext, rm=reg
-                w32(out, fp, abs as u32);
-                return Ok(());
-            }
-            return Err(describe(&out[fp - 2..fp]));
-        }
-
-        // call/jmp *m64 -> direct call/jmp. ff /2 = call, ff /4 = jmp.
-        // The indirect form is 6 bytes (ff /r + disp32) and the direct form is
-        // 5 (e8/e9 + rel32), so a leading nop keeps the length identical --
-        // exactly what GNU ld does.
-        if op == 0xff && fp >= 2 {
-            let ext = (modrm >> 3) & 7;
-            if ext == 2 || ext == 4 {
-                // The rel32 is measured from the end of the 5-byte direct
-                // instruction, which now starts one byte later.
-                let rel = s as i64 + a + 1 - p as i64;
-                if !(i32::MIN as i64..=i32::MAX as i64).contains(&rel) {
-                    return Err(describe(&out[fp - 2..fp]));
-                }
-                out[fp - 2] = 0x90; // nop
-                out[fp - 1] = if ext == 2 { 0xe8 } else { 0xe9 };
-                w32(out, fp, rel as u32);
-                return Ok(());
-            }
-        }
-
-        Err(describe(&out[fp - 2..fp]))
-    }
-
     // ── TLS segment bounds ──
     //
     // Initial-Exec TLS offsets are measured from the *end* of the TLS block,
@@ -2780,31 +2665,76 @@ fn link_with_script_machine(
                     // exactly what GNU ld does for -no-pie/static links, and it
                     // is what the kernel's vDSO and early-boot objects rely on:
                     // they are compiled -fPIC but linked to fixed addresses.
-                    R_X86_64_GOTPCREL
-                    | R_X86_64_GOTPCRELX
-                    | R_X86_64_REX_GOTPCRELX
-                    | R_X86_64_CODE_4_GOTPCRELX
-                    | R_X86_64_CODE_6_GOTPCRELX => {
+                    t if is_gotpcrel_family(t) => {
                         // A -T link produces a fully-resolved image with no
                         // dynamic loader and no GOT, so every GOT reference
-                        // must be relaxed into direct addressing. The x86-64
-                        // psABI defines exactly which instruction forms may be
-                        // rewritten; anything else is a hard error, because
-                        // pointing a LOAD at the symbol would read the bytes
-                        // stored there and treat them as a pointer.
-                        match relax_gotpcrel(&mut out, fp, s, a, p) {
-                            Ok(()) => {}
-                            Err(op) => {
-                                return Err(format!(
-                                    "script link: GOTPCREL against '{}' in {} uses an \
-                                     instruction form this linker cannot relax \
-                                     (opcode bytes {}); a -T link has no GOT, and \
-                                     pointing the load at the symbol would read its \
-                                     bytes instead of its address",
-                                    sym.name, obj.source_name, op
-                                ));
+                        // must address its target directly.  The decision
+                        // and the rewrite are the executable emitter's
+                        // (`elf::gotpcrelx_relaxation` on the section's
+                        // ORIGINAL bytes, `elf::rewrite_got_relax`): the
+                        // prefix is verified and ModRM.reg moves to ModRM.rm
+                        // with its REX/REX2 R bits.  This path used to patch
+                        // the opcode and ModRM alone -- `addq
+                        // foo@GOTPCREL(%rip), %r12` became `add $foo, %rsp`,
+                        // and REX2/EVEX/MOVRS forms were garbled.
+                        //
+                        // The image does not move unless it is a PIE, so an
+                        // absolute symbol is an ordinary target then (its
+                        // RIP-relative form is exact); in a PIE it must stay
+                        // an immediate.  A plain R_X86_64_GOTPCREL promises
+                        // nothing about the instruction (GNU ld gives it a
+                        // GOT slot): only the rewrites that touch no prefix
+                        // byte are applied -- `mov` -> `lea` and the branch
+                        // forms -- by deciding it as a prefix-free
+                        // GOTPCRELX and never taking the immediate `mov`.
+                        let absolute = if sym.is_local() {
+                            sym.shndx == SHN_ABS
+                        } else {
+                            def_syms
+                                .get(sym.name.as_str())
+                                .is_some_and(|&(_, shndx, _, _, _)| shndx == SHN_ABS)
+                        };
+                        let target = if is_pie && absolute {
+                            GotTarget::Absolute(s)
+                        } else {
+                            GotTarget::Image
+                        };
+                        let as_type = if t == R_X86_64_GOTPCREL {
+                            R_X86_64_GOTPCRELX
+                        } else {
+                            t
+                        };
+                        let kind = gotpcrelx_relaxation(
+                            as_type,
+                            a,
+                            obj.section_data[si].as_slice(),
+                            rela.offset as usize,
+                            is_pie,
+                            target,
+                        )
+                        .map(|k| match k {
+                            GotRelax::Load { .. } if t == R_X86_64_GOTPCREL => {
+                                GotRelax::Load { imm: false }
                             }
-                        }
+                            k => k,
+                        });
+                        let Some(kind) = kind else {
+                            let lo = (rela.offset as usize).saturating_sub(2);
+                            let hi = (rela.offset as usize).min(obj.section_data[si].len());
+                            return Err(format!(
+                                "script link: {} against '{}' in {} at offset {:#x} uses an \
+                                 instruction form this linker cannot relax (opcode bytes \
+                                 {:02x?}); a -T link has no GOT, and pointing the load at \
+                                 the symbol would read its bytes instead of its address",
+                                reloc_field::name(t).unwrap_or("relocation"),
+                                sym.name,
+                                obj.source_name,
+                                rela.offset,
+                                &obj.section_data[si][lo..hi]
+                            ));
+                        };
+                        let (at, v) = rewrite_got_relax(&mut out, fp, kind, as_type, s, p);
+                        w32_checked(&mut out, at, v, t, &sym.name, &obj.source_name)?;
                     }
                     // GOTPC32: distance from the reference to the GOT origin.
                     // With no GOT, GNU ld still defines _GLOBAL_OFFSET_TABLE_;
@@ -2944,32 +2874,42 @@ fn link_with_script_machine(
                             out[fp + 1] = 0x90;
                         }
                     }
-                    R_X86_64_GOTTPOFF | R_X86_64_CODE_4_GOTTPOFF | R_X86_64_CODE_6_GOTTPOFF => {
-                        // Initial-Exec through a GOT slot. With no GOT, relax
-                        //   mov sym@gottpoff(%rip),%reg   48 8b ..
-                        // into
-                        //   mov $tpoff,%reg               48 c7 c0|..
+                    t if is_gottpoff_family(t) => {
+                        // Initial-Exec through a GOT slot.  A -T link has no
+                        // GOT, so the instruction must be one the IE -> LE
+                        // rewrite covers (the executable emitter's exact
+                        // test and rewrite, on the section's ORIGINAL bytes:
+                        // REX.W / REX2 / EVEX, destination moved to
+                        // ModRM.rm with its REX/REX2/EVEX R bits -- the old
+                        // opcode-only patch here turned `%r12` into `%rsp`
+                        // and garbled REX2/EVEX forms).  The -4 of the
+                        // RIP-relative addend is not part of the immediate.
+                        let kind = gottpoff_ie_to_le(
+                            t,
+                            obj.section_data[si].as_slice(),
+                            rela.offset as usize,
+                        )
+                        .ok_or_else(|| {
+                            format!(
+                                "script link: {} against '{}' in {} at offset {:#x} is not a \
+                                 movq/addq sym@gottpoff(%rip), %reg form this linker can \
+                                 convert to Local-Exec, and a -T link has no GOT",
+                                reloc_field::name(t).unwrap_or("relocation"),
+                                sym.name,
+                                obj.source_name,
+                                rela.offset
+                            )
+                        })?;
+                        rewrite_ie_to_le(&mut out, fp, kind);
                         let tpoff = (s as i64 - tls_addr as i64) - tls_mem_size as i64;
-                        if fp >= 3 && out[fp - 2] == 0x8b {
-                            let modrm = out[fp - 1];
-                            let reg = (modrm >> 3) & 7;
-                            out[fp - 2] = 0xc7;
-                            out[fp - 1] = 0xc0 | reg;
-                            w32_checked(
-                                &mut out,
-                                fp,
-                                tpoff,
-                                rela.rela_type,
-                                &sym.name,
-                                &obj.source_name,
-                            )?;
-                        } else {
-                            return Err(format!(
-                                "script link: GOTTPOFF relaxation failed for '{}' in {}: \
-                                 unrecognised code sequence",
-                                sym.name, obj.source_name
-                            ));
-                        }
+                        w32_checked(
+                            &mut out,
+                            fp,
+                            tpoff + a + 4,
+                            rela.rela_type,
+                            &sym.name,
+                            &obj.source_name,
+                        )?;
                     }
                     R_X86_64_TPOFF32 => {
                         if tls_mem_size == 0 {
@@ -3268,6 +3208,9 @@ fn link_with_script_machine(
             vhi - vlo,
             talign,
         )?;
+        // Without this the first PT_NOTE below overwrote the PT_TLS header
+        // (and a NULL header was left at the end of the table).
+        ph_off += machine.phdr_size() as usize;
     }
     // One PT_NOTE segment per allocated note output section (each spanning
     // exactly its own section, aligned to at least 4 as in GNU ld), plus

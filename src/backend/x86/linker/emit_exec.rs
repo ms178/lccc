@@ -8,7 +8,7 @@ use crate::common::fx_hash::FxHashMap;
 use std::collections::BTreeSet;
 
 use super::elf::*;
-use super::plt_got::{exec_got_target, local_got_target};
+use super::plt_got::{exec_got_target, exec_ie_target_local, local_got_target, local_is_tls};
 use super::reloc_field::{self, w8_checked, w16_checked, w32_checked};
 use super::types::{BASE_ADDR, GlobalSymbol, LocalSlots, PAGE_SIZE};
 use crate::backend::elf::{STV_PROTECTED, elf64_sym_entry, push_strtab_name};
@@ -77,6 +77,8 @@ pub(super) fn emit_executable(
     entry_symbol: Option<&str>,
     z_now: bool,
     z_relro: bool,
+    // `-z text` / `-z notext`: what a PIE relocation into code does.
+    textrel_policy: linker_common::TextrelPolicy,
     // `(DT_FLAGS, DT_FLAGS_1)` bits the options request
     // (`LinkerArgs::requested_dyn_flags`: `-z now`, `-z origin`, ...);
     // DF_1_PIE is added here.
@@ -390,6 +392,51 @@ pub(super) fn emit_executable(
             })
             .collect()
     };
+    // Where those RELATIVE entries land decides the layout.  In writable
+    // storage nothing changes.  A read-only non-code section (a `.rodata`
+    // pointer table from non-PIC code, `.quad sym` in hand-written assembly)
+    // moves to the head of the RELRO window, as `emit_shared` does: the
+    // loader applies the relocation while the page is still writable, then
+    // `PT_GNU_RELRO` makes it read-only -- the same protection with no text
+    // relocation.  Before, such a section stayed in the read-only segment
+    // with no DT_TEXTREL, and ld.so faulted writing it before `main`.  Code
+    // cannot move (`movabs $sym` under -mcmodel=large -fno-pic): that is a
+    // text relocation, decided by `textrel_policy` exactly like GNU ld.
+    let mut relro_ro_sections: crate::common::fx_hash::FxHashSet<usize> =
+        crate::common::fx_hash::FxHashSet::default();
+    let mut textrel_site: Option<String> = None;
+    for pr in &pie_relative {
+        let Some(&(out_idx, _)) = section_map.get(&(pr.obj_idx, pr.sec_idx)) else {
+            continue;
+        };
+        let osec = &output_sections[out_idx];
+        if osec.flags & SHF_WRITE != 0 {
+            continue;
+        }
+        if osec.flags & (SHF_EXECINSTR | SHF_TLS) == 0 && osec.sh_type != SHT_NOBITS {
+            relro_ro_sections.insert(out_idx);
+        } else if textrel_site.is_none() {
+            let obj = &objects[pr.obj_idx];
+            let sym = &obj.symbols[pr.sym_idx];
+            textrel_site = Some(linker_common::TextrelPolicy::site(
+                &obj.source_name,
+                (!sym.is_local()).then_some(sym.name.as_str()),
+                &obj.sections[pr.sec_idx].name,
+            ));
+        }
+    }
+    let textrel = match &textrel_site {
+        Some(site) => {
+            textrel_policy.apply(site, "PIE")?;
+            true
+        }
+        None => false,
+    };
+    let dt_flags = if textrel {
+        dt_flags | linker_common::dyn_flags::DF_TEXTREL
+    } else {
+        dt_flags
+    };
     // A PIE also has to slide the GOT slots that hold the address of a symbol
     // *defined in this output*.  crt1.o reaches `main` through
     // R_X86_64_REX_GOTPCRELX, so `_start` loads it out of a GOT slot; in an
@@ -418,9 +465,11 @@ pub(super) fn emit_executable(
             ord += 1;
         }
         // Local slots follow the named ones and hold an address in this
-        // output unless the symbol is absolute.
+        // output unless the symbol is absolute or thread-local (a TP
+        // offset, the same in every thread and at every load address).
         for (i, &(obj_idx, si)) in local_got.keys().iter().enumerate() {
-            if objects[obj_idx].symbols[si].shndx != SHN_ABS {
+            let sym = &objects[obj_idx].symbols[si];
+            if sym.shndx != SHN_ABS && !local_is_tls(&objects[obj_idx], sym) {
                 v.push(ord + i);
             }
         }
@@ -657,7 +706,7 @@ pub(super) fn emit_executable(
         }
         // DT_FLAGS / DT_FLAGS_1: sized from the same two values the writer
         // emits (`dt_flags`, `dt_flags_1`), so count and bytes agree.
-        dyn_count += u64::from(dt_flags != 0) + u64::from(dt_flags_1 != 0);
+        dyn_count += u64::from(dt_flags != 0) + u64::from(dt_flags_1 != 0) + u64::from(textrel);
         if rpath_string.is_some() {
             dyn_count += 1;
         }
@@ -921,11 +970,12 @@ pub(super) fn emit_executable(
     } else {
         (0u64, 0u64)
     };
-    for sec in output_sections.iter_mut() {
+    for (idx, sec) in output_sections.iter_mut().enumerate() {
         if sec.flags & SHF_ALLOC != 0
             && sec.flags & SHF_EXECINSTR == 0
             && sec.flags & SHF_WRITE == 0
             && sec.sh_type != SHT_NOBITS
+            && !relro_ro_sections.contains(&idx)
         {
             let a = sec.alignment.max(1);
             offset = (offset + a - 1) & !(a - 1);
@@ -985,9 +1035,20 @@ pub(super) fn emit_executable(
         }
     }
 
-    // .data.rel.ro joins the RELRO window: it is const-after-relocation by
-    // construction, so leaving it in the generic RW loop below kept it
-    // writable at runtime for no reason (its entire purpose defeated).
+    // Read-only sections that need RELATIVE entries (see
+    // `relro_ro_sections`), then .data.rel.ro: both are
+    // const-after-relocation.  Leaving .data.rel.ro in the generic RW loop
+    // below kept it writable at runtime for no reason (its entire purpose
+    // defeated).
+    for (idx, sec) in output_sections.iter_mut().enumerate() {
+        if relro_ro_sections.contains(&idx) {
+            let a = sec.alignment.max(1);
+            offset = (offset + a - 1) & !(a - 1);
+            sec.addr = vaddr!(offset);
+            sec.file_offset = offset;
+            offset += sec.mem_size;
+        }
+    }
     for sec in output_sections.iter_mut() {
         if sec.name == ".data.rel.ro" {
             let a = sec.alignment.max(1);
@@ -1330,24 +1391,30 @@ pub(super) fn emit_executable(
         );
     }
     // What each local GOT slot holds: the address the relocation pass would
-    // compute for the symbol -- its IPLT stub for a local IFUNC.
+    // compute for the symbol -- its IPLT stub for a local IFUNC -- or, for a
+    // TLS symbol (an Initial-Exec reference the LE rewrite does not cover),
+    // its TP offset, like a named TLS slot below.
     let local_got_values: Vec<u64> = local_got
         .keys()
         .iter()
         .map(|&(obj_idx, si)| {
-            local_ifunc_slots
-                .get(&(obj_idx, si))
-                .copied()
-                .unwrap_or_else(|| {
-                    resolve_sym(
-                        obj_idx,
-                        &objects[obj_idx].symbols[si],
-                        globals,
-                        section_map,
-                        output_sections,
-                        plt_addr,
-                    )
-                })
+            let sym = &objects[obj_idx].symbols[si];
+            if let Some(&stub) = local_ifunc_slots.get(&(obj_idx, si)) {
+                return stub;
+            }
+            let addr = resolve_sym(
+                obj_idx,
+                sym,
+                globals,
+                section_map,
+                output_sections,
+                plt_addr,
+            );
+            if local_is_tls(&objects[obj_idx], sym) {
+                addr.wrapping_sub(tls_addr).wrapping_sub(tls_mem_size)
+            } else {
+                addr
+            }
         })
         .collect();
 
@@ -2474,6 +2541,11 @@ pub(super) fn emit_executable(
             w64(&mut out, dd + 8, verneed_count as u64);
             dd += 16;
         }
+        if textrel {
+            w64(&mut out, dd, DT_TEXTREL as u64);
+            w64(&mut out, dd + 8, 0);
+            dd += 16;
+        }
         if dt_flags != 0 {
             w64(&mut out, dd, DT_FLAGS as u64);
             w64(&mut out, dd + 8, dt_flags);
@@ -2826,53 +2898,33 @@ pub(super) fn emit_executable(
                         }
                         w32(&mut out, fp, v as u32);
                     }
-                    R_X86_64_GOTTPOFF | R_X86_64_CODE_4_GOTTPOFF | R_X86_64_CODE_6_GOTTPOFF => {
-                        // Initial Exec TLS via GOT: GOT entry contains TPOFF value
-                        let mut resolved = false;
-                        if !sym.name.is_empty() && !sym.is_local() {
-                            if let Some(g) = globals_snap.get(sym.name.as_str()) {
-                                if let Some(gi) = g.got_idx {
-                                    let entry = &got_entries[gi];
-                                    let gea = if entry.1 {
-                                        got_plt_addr + 24 + g.plt_idx.unwrap_or(0) as u64 * 8
-                                    } else {
-                                        let nb = got_slot_ordinal[gi];
-                                        got_addr + nb as u64 * 8
-                                    };
-                                    w32_checked(
-                                        &mut out,
-                                        fp,
-                                        gea as i64 + a - p as i64,
-                                        rela.rela_type,
-                                        &sym.name,
-                                        &objects[obj_idx].source_name,
-                                    )?;
-                                    resolved = true;
-                                }
-                            }
-                        }
-                        if !resolved {
-                            // IE -> LE: `movq/addq sym@gottpoff(%rip), %reg`
-                            // becomes `movq/addq $tpoff, %reg`.  The form is
-                            // verified in the ORIGINAL section bytes (REX.W
-                            // inside the section, RIP-relative ModRM); REX2
-                            // and APX forms keep a GOT slot when they have
-                            // one and are refused otherwise.
-                            let kind = gottpoff_ie_to_le(
-                                rela.rela_type,
+                    t if is_gottpoff_family(t) => {
+                        // Initial-Exec.  The planner's exact question, per
+                        // reference: this executable's own TLS behind an
+                        // instruction the rewrite covers becomes
+                        // `mov/add $tpoff, %reg` (IE -> LE, no load) -- also
+                        // when some other reference gave the symbol a slot;
+                        // everything else loads the TP offset from its slot
+                        // (filled at link time, or by R_X86_64_TPOFF64 for a
+                        // shared library's TLS).  A missing slot is a planner
+                        // bug, never patched up here.
+                        let global = (!sym.name.is_empty() && !sym.is_local())
+                            .then(|| globals_snap.get(sym.name.as_str()))
+                            .flatten();
+                        let target_local = match global {
+                            Some(g) => exec_ie_target_local(g),
+                            None => sym.is_local(),
+                        };
+                        let rewrite = if target_local {
+                            gottpoff_ie_to_le(
+                                t,
                                 objects[obj_idx].section_data[sec_idx].as_slice(),
                                 rela.offset as usize,
                             )
-                            .ok_or_else(|| {
-                                format!(
-                                    "{obj_name}: {} against '{}' at offset {:#x} is not a \
-                                     REX.W movq/addq sym@gottpoff(%rip), %reg and the symbol \
-                                     has no GOT slot: cannot convert Initial-Exec to Local-Exec",
-                                    reloc_field::name(rela.rela_type).unwrap_or("relocation"),
-                                    sym.name,
-                                    rela.offset
-                                )
-                            })?;
+                        } else {
+                            None
+                        };
+                        if let Some(kind) = rewrite {
                             rewrite_ie_to_le(&mut out, fp, kind);
                             // The -4 in the addend belonged to the RIP-relative
                             // field; the immediate is the symbol's own TP
@@ -2886,12 +2938,44 @@ pub(super) fn emit_executable(
                                 &sym.name,
                                 obj_name,
                             )?;
+                        } else {
+                            let gea = match global {
+                                Some(g) => g.got_idx.map(|gi| {
+                                    if got_entries[gi].1 {
+                                        got_plt_addr + 24 + g.plt_idx.unwrap_or(0) as u64 * 8
+                                    } else {
+                                        got_addr + got_slot_ordinal[gi] as u64 * 8
+                                    }
+                                }),
+                                None if sym.is_local() => local_got
+                                    .get((obj_idx, si))
+                                    .map(|i| got_addr + (got_globdat_count + i) as u64 * 8),
+                                None => None,
+                            };
+                            let Some(gea) = gea else {
+                                return Err(format!(
+                                    "{obj_name}: internal error: no GOT slot for {} against '{}' \
+                                     at offset {:#x}",
+                                    reloc_field::name(rela.rela_type).unwrap_or("relocation"),
+                                    sym.name,
+                                    rela.offset
+                                ));
+                            };
+                            w32_checked(
+                                &mut out,
+                                fp,
+                                gea as i64 + a - p as i64,
+                                rela.rela_type,
+                                &sym.name,
+                                obj_name,
+                            )?;
                         }
                     }
                     R_X86_64_GOTPCREL
                     | R_X86_64_GOTPCRELX
                     | R_X86_64_REX_GOTPCRELX
                     | R_X86_64_CODE_4_GOTPCRELX
+                    | R_X86_64_CODE_5_GOTPCRELX
                     | R_X86_64_CODE_6_GOTPCRELX => {
                         // Address the target directly whenever the instruction
                         // and the target allow it -- also when the symbol has a
@@ -3200,8 +3284,13 @@ pub(super) fn emit_executable(
                     R_X86_64_NONE => {}
                     other => {
                         return Err(format!(
-                            "unsupported x86-64 relocation type {} for '{}' in {}",
-                            other, sym.name, objects[obj_idx].source_name
+                            "unsupported x86-64 relocation {} for '{}' in {}",
+                            crate::backend::linker_common::reloc_field::type_label(
+                                reloc_field::name(other),
+                                other
+                            ),
+                            sym.name,
+                            objects[obj_idx].source_name
                         ));
                     }
                 }

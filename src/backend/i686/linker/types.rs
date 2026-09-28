@@ -219,14 +219,53 @@ pub(super) struct LinkerSymbol {
     pub needs_copy: bool,
     pub copy_addr: u32,
     pub version: Option<String>,
-    /// Whether this dynamic data symbol uses text relocations instead of COPY.
-    pub uses_textrel: bool,
+    /// `st_value` of a shared-library definition inside its library (0 for
+    /// anything else): copy-relocated data exports at the same value in the
+    /// same library are one object and share one copy (see
+    /// `link::register_copy_aliases`).
+    pub lib_value: u32,
     /// A shared-library function whose PLT entry is its address in this
     /// executable (an `R_386_32`, or an `R_386_PC32` that is not a branch):
     /// `.dynsym` then publishes the PLT entry as the undefined symbol's
     /// value, so ld.so resolves every other module's references to the same
     /// address and `&f` compares equal everywhere (the psABI "canonical PLT").
     pub canonical_plt: bool,
+}
+
+impl LinkerSymbol {
+    /// A reference bound to shared-library export `d`.  Data (not functions,
+    /// not TLS) starts out copy-relocated; `mark_plt_got_needs` and the
+    /// canonical-PLT logic refine the rest per reference.
+    pub fn dynamic_import(d: &super::input::DynlibSym) -> Self {
+        let is_func = d.sym_type == STT_FUNC || d.sym_type == STT_GNU_IFUNC;
+        LinkerSymbol {
+            address: 0,
+            size: d.size,
+            sym_type: d.sym_type,
+            binding: d.binding,
+            visibility: STV_DEFAULT,
+            is_defined: false,
+            // Decided per reference by `mark_plt_got_needs`: a PLT only for
+            // calls and address-of, a GOT slot only for GOT-relative
+            // references.
+            needs_plt: false,
+            needs_got: false,
+            output_section: usize::MAX,
+            section_offset: 0,
+            plt_index: 0,
+            got_index: 0,
+            is_dynamic: true,
+            dynlib: d.lib.clone(),
+            // A DSO TLS variable lives in its module's TLS block: it is
+            // reached through TLS_TPOFF GOT slots, never copied into the
+            // executable.
+            needs_copy: !is_func && d.sym_type != STT_TLS,
+            copy_addr: 0,
+            version: d.version.clone(),
+            lib_value: d.value,
+            canonical_plt: false,
+        }
+    }
 }
 
 /// A merged output section.
@@ -248,10 +287,14 @@ pub(super) struct DynSymInfo {
     pub name: String,
     pub sym_type: u8,
     pub size: u32,
-    #[allow(dead_code)] // Parsed from .so; needed for future weak-vs-global symbol preference
     pub binding: u8,
     pub version: Option<String>,
     pub is_default_ver: bool,
+    /// `st_value`: the symbol's address inside the library.  Two data
+    /// exports at the same address are aliases of one object (glibc's weak
+    /// `environ` and strong `__environ`), which a copy relocation must move
+    /// together.
+    pub value: u32,
     /// DT_SONAME of the shared object defining the symbol (None when it has
     /// none; the caller then falls back to the name the library was found by).
     pub soname: Option<String>,

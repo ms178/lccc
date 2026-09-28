@@ -30,7 +30,7 @@
 /// Shared with the x86-64 linker, which parses the options identically.
 pub(super) use crate::backend::linker_common::Symbolic;
 use crate::backend::linker_common::cet::PropertyLinkFlags;
-use crate::backend::linker_common::{HashStyle, LinkerArgs};
+use crate::backend::linker_common::{HashStyle, LinkerArgs, TextrelPolicy};
 
 // DT_FLAGS bits the emitters derive themselves; the keyword-requested ones
 // come from `LinkerArgs::requested_dyn_flags`.
@@ -58,8 +58,8 @@ pub(super) struct LinkOptions {
     pub hash_style: HashStyle,
     pub symbolic: Symbolic,
     pub no_undefined: bool,
-    /// `-z text`: text relocations are an error.
-    pub z_text: bool,
+    /// `-z text` / `-z notext`: what a text relocation does.
+    pub textrel: TextrelPolicy,
     /// DT_FLAGS / DT_FLAGS_1 bits requested by `-z` keywords (BIND_NOW,
     /// SYMBOLIC and TEXTREL are derived separately).
     pub dt_flags: u32,
@@ -266,7 +266,6 @@ pub(super) fn check_capabilities(
         let (f, f1) = args.requested_dyn_flags();
         (f as u32, f1 as u32)
     };
-    let mut z_text = false;
     for kw in &args.z_other_keywords {
         let (key, val) = match kw.split_once('=') {
             Some((k, v)) => (k, Some(v)),
@@ -275,8 +274,6 @@ pub(super) fn check_capabilities(
         match (key, val) {
             // DF_1_GLOBAL: already in `requested_dyn_flags`.
             ("global", None) => {}
-            ("text", None) => z_text = true,
-            ("notext" | "textoff", None) => z_text = false,
             // The layout always keeps headers, code and read-only data in
             // separate segments; `noseparate-code` would only save a page.
             ("separate-code" | "noseparate-code" | "combreloc" | "nocombreloc", None) => {}
@@ -336,7 +333,7 @@ pub(super) fn check_capabilities(
         hash_style: args.hash_style,
         symbolic,
         no_undefined: args.no_undefined,
-        z_text,
+        textrel: args.z_text,
         dt_flags,
         dt_flags_1,
         wrap: args.wrap_symbols.clone(),
@@ -462,7 +459,7 @@ mod tests {
             false,
         )
         .unwrap();
-        assert!(o.z_text);
+        assert_eq!(o.textrel, TextrelPolicy::Error);
         assert_eq!(o.exec_stack, Some(false));
     }
 }

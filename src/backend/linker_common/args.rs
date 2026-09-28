@@ -53,6 +53,10 @@ pub struct LinkerArgs {
     pub z_now: bool,
     /// `-z relro` (default true, `-z norelro` clears): emit PT_GNU_RELRO.
     pub z_relro: bool,
+    /// `-z text` / `-z notext` / `-z textoff`: what to do when a dynamic
+    /// relocation would have to patch a read-only segment (see
+    /// [`TextrelPolicy`]).  Last spelling wins, as in GNU ld.
+    pub z_text: TextrelPolicy,
     /// `-Map=FILE` / `-Map FILE`: write a GNU-ld-compatible link map.
     pub map_path: Option<String>,
     /// `--exclude-libs=LIST`: archives whose symbols must NOT be re-exported
@@ -430,12 +434,81 @@ fn apply_z_keyword(result: &mut LinkerArgs, kw: &str) {
             // `-z ibt=func` & co: accepted, ignored, warned.
             result.z_ignored_keywords.push(k.to_string());
         }
+        "text" => result.z_text = TextrelPolicy::Error,
+        "notext" | "textoff" => result.z_text = TextrelPolicy::Allow,
         "execstack" => result.z_execstack = Some(true),
         "noexecstack" => result.z_execstack = Some(false),
         "origin" | "nodelete" | "nodlopen" | "initfirst" | "interpose" | "nodefaultlib" => {
             result.z_dyn_flag_keywords.push(kw.to_string());
         }
         _ => result.z_other_keywords.push(kw.to_string()),
+    }
+}
+
+/// What the linker does when an output would need a dynamic relocation
+/// that patches a read-only segment (a "text relocation").
+///
+/// The x86 linkers first avoid the situation where that is free: a
+/// non-executable read-only section that needs load-time relocation is
+/// placed at the head of the `PT_GNU_RELRO` window instead of in the
+/// read-only segment (the dynamic loader writes it, then `mprotect`s it
+/// read-only -- the same end state, and it works on loaders without text
+/// relocation support such as musl).  Only code, which cannot move out of
+/// the executable segment, is left; for that the policy mirrors GNU ld
+/// (`bfd/elflink.c`, `bfd_elf_final_link` and `_bfd_elf_maybe_set_textrel`):
+///
+/// * default -- warn about the first offending site, then that
+///   `DT_TEXTREL` is being created, and emit `DT_TEXTREL` + `DF_TEXTREL`;
+/// * `-z text` -- the same site warning, then the fatal
+///   `read-only segment has dynamic relocations`;
+/// * `-z notext` / `-z textoff` -- emit the tags silently.
+///
+/// Without `DT_TEXTREL` glibc maps the code read-only and faults applying
+/// the relocation, so emitting it silently -- what this linker used to do
+/// -- was never an option.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TextrelPolicy {
+    /// GNU default: warn, then emit `DT_TEXTREL`.
+    #[default]
+    Warn,
+    /// `-z notext` / `-z textoff`: emit `DT_TEXTREL` silently.
+    Allow,
+    /// `-z text`: refuse the link.
+    Error,
+}
+
+impl TextrelPolicy {
+    /// The site part of GNU's warning: `FILE: warning: relocation against
+    /// `SYM' in read-only section `SEC'`, or without the symbol when the
+    /// relocation is against a local.
+    pub fn site(file: &str, sym: Option<&str>, section: &str) -> String {
+        match sym {
+            Some(sym) if !sym.is_empty() => {
+                format!(
+                    "{file}: warning: relocation against `{sym}' in read-only section `{section}'"
+                )
+            }
+            _ => format!("{file}: warning: relocation in read-only section `{section}'"),
+        }
+    }
+
+    /// Decide an output that needs text relocations.  `site` is the first
+    /// offending relocation ([`TextrelPolicy::site`]); `output` names the
+    /// output kind the way GNU does (`shared object`, `PIE`, `PDE`).
+    /// `Ok(())` means: emit `DT_TEXTREL` and `DF_TEXTREL`.
+    pub fn apply(self, site: &str, output: &str) -> Result<(), String> {
+        match self {
+            Self::Allow => Ok(()),
+            Self::Warn => {
+                eprintln!("lccc-ld: {site}");
+                eprintln!("lccc-ld: warning: creating DT_TEXTREL in a {output}");
+                Ok(())
+            }
+            Self::Error => {
+                eprintln!("lccc-ld: {site}");
+                Err("read-only segment has dynamic relocations".to_string())
+            }
+        }
     }
 }
 
@@ -485,6 +558,7 @@ impl Symbolic {
 pub mod dyn_flags {
     pub const DF_ORIGIN: u64 = 0x1;
     pub const DF_SYMBOLIC: u64 = 0x2;
+    pub const DF_TEXTREL: u64 = crate::backend::elf::DF_TEXTREL as u64;
     pub const DF_BIND_NOW: u64 = crate::backend::elf::DF_BIND_NOW as u64;
     pub const DF_1_NOW: u64 = crate::backend::elf::DF_1_NOW as u64;
     pub const DF_1_GLOBAL: u64 = 0x2;
@@ -1299,6 +1373,37 @@ mod z_isa_level_tests {
                     | DF_1_GLOBAL
             )
         );
+    }
+
+    /// `-z text` / `-z notext` / `-z textoff`: the last spelling wins, the
+    /// keywords never reach the unknown-keyword list (i686 would warn
+    /// `-z text ignored`), and the default is GNU's warn-and-emit.
+    #[test]
+    fn z_text_family_last_wins() {
+        let p = |a: &[&str]| parse_linker_args(&args(a));
+        assert_eq!(p(&[]).z_text, TextrelPolicy::Warn);
+        assert_eq!(p(&["-Wl,-z,text"]).z_text, TextrelPolicy::Error);
+        assert_eq!(p(&["-Wl,-ztext"]).z_text, TextrelPolicy::Error);
+        assert_eq!(p(&["-Wl,-z,notext"]).z_text, TextrelPolicy::Allow);
+        assert_eq!(p(&["-Wl,-z,textoff"]).z_text, TextrelPolicy::Allow);
+        assert_eq!(p(&["-Wl,-z,text,-z,notext"]).z_text, TextrelPolicy::Allow);
+        assert_eq!(
+            p(&["-Wl,-z,notext", "-Wl,-z,text"]).z_text,
+            TextrelPolicy::Error
+        );
+        let r = p(&["-Wl,-z,text,-z,notext,-z,textoff"]);
+        assert!(r.z_other_keywords.is_empty(), "{:?}", r.z_other_keywords);
+        // The site wording is GNU's, with and without a symbol.
+        assert_eq!(
+            TextrelPolicy::site("a.o", Some("f"), ".text"),
+            "a.o: warning: relocation against `f' in read-only section `.text'"
+        );
+        assert_eq!(
+            TextrelPolicy::site("a.o", None, ".text"),
+            "a.o: warning: relocation in read-only section `.text'"
+        );
+        assert!(TextrelPolicy::Error.apply("s", "PIE").is_err());
+        assert!(TextrelPolicy::Allow.apply("s", "PIE").is_ok());
     }
 
     /// The joined `-z<keyword>` spelling inside a `-Wl,` group behaves

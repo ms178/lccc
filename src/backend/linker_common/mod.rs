@@ -151,7 +151,8 @@ pub use write::{align_up_64, pad_to, write_elf64_phdr, write_elf64_phdr_at, writ
 
 // args.rs
 pub use args::{
-    HashStyle, InputItem, LinkerArgs, Symbolic, dyn_flags, exclude_libs_matches, parse_linker_args,
+    HashStyle, InputItem, LinkerArgs, Symbolic, TextrelPolicy, dyn_flags, exclude_libs_matches,
+    parse_linker_args,
 };
 
 // check.rs
