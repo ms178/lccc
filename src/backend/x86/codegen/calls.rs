@@ -293,6 +293,17 @@ impl X86Codegen {
                     .emit_instr_imm_reg("    subq", parity_pad, "rsp");
                 sp_adjust += parity_pad;
             }
+            // S20 F-CC11: the realignment scratch above overwrites BOTH cached
+            // registers (%rcx = R0, %rax = the modulo chain), and Phase 2 has
+            // no exit invalidate — the per-argument fix (previous_arg_wrote_rcx
+            // below) only covers writes INSIDE the Phase-3 register loop, so
+            // without this a SEC/ACC park from before the call would outlive
+            // the scratch and misfire on the first Phase-3 SEC/ACC consume.
+            // Narrow in practice (over-aligned dynamic realignment), but the
+            // contract is unconditional: every cached-register write maintains
+            // the caches. Placed inside the arm so non-realigned calls pay
+            // nothing — not even the metadata store.
+            self.state.reg_cache.invalidate_all();
             self.dyn_align_cleanup = true;
         } else if stack_arg_space % 16 != 0 {
             // Parity pad below the outgoing area. `pushq $0` (6A 00, 2 B)
@@ -566,7 +577,7 @@ impl X86Codegen {
                     return true;
                 }
                 // (2) secondary cache (%rcx): same law.
-                if self.state.reg_cache.sec_has(v.0, is_alloca) {
+                if self.state.sec_has_verified(v.0, is_alloca) {
                     self.state.emit("    pushq %rcx");
                     return true;
                 }

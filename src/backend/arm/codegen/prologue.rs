@@ -736,7 +736,7 @@ impl ArmCodegen {
             IrType::I16 => "ldrsh",
             IrType::U16 => "ldrh",
             IrType::I32 => "ldrsw",
-            IrType::U32 | IrType::F32 => "ldr32",
+            IrType::U32 | IrType::F32 | IrType::D32 => "ldr32",
             _ => "ldr64",
         }
     }

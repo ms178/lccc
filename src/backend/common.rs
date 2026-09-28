@@ -1101,6 +1101,28 @@ pub struct AsmOutput {
     /// scopes the semantics to the x86 family.
     #[cfg(debug_assertions)]
     pub(crate) rax_epoch_active: bool,
+    /// DEBUG-ONLY: the %rcx shadow epoch — the %rcx mirror of
+    /// [`rax_write_epoch`](Self::rax_write_epoch), bumped by the same
+    /// [`debug_scan_tail`](Self::debug_scan_tail) pass for every line that
+    /// writes any part of %rcx. The secondary-cache verifier
+    /// (`CodegenState::sec_has_verified`) snapshots it at park time and
+    /// asserts stillness at consume time; gated by the same
+    /// `rax_epoch_active` opt-in (the flag means "x86-family target whose
+    /// cached registers are %rax/%rcx"). Does not exist in release.
+    #[cfg(debug_assertions)]
+    pub(crate) rcx_write_epoch: u64,
+    /// DEBUG-ONLY: the most recent classified %rax-writing line (trimmed),
+    /// for the acc-epoch assertion's context. Where `last_unclassified`
+    /// names the line the analyzer could NOT place (usually `None` when
+    /// the clobberer is a plain classified write), this names the actual
+    /// clobberer — the triage hint that closes the gap.
+    #[cfg(debug_assertions)]
+    pub(crate) last_rax_write: Option<String>,
+    /// DEBUG-ONLY: the most recent classified %rcx-writing line (trimmed),
+    /// for the sec-epoch assertion's context. The %rcx mirror of
+    /// `last_rax_write`.
+    #[cfg(debug_assertions)]
+    pub(crate) last_rcx_write: Option<String>,
     /// DEBUG-ONLY: byte offset through which the sink's line classifier has
     /// consumed the buffer. `debug_scan_tail` classifies every complete line
     /// not yet covered (not just the last one — an emit may carry embedded
@@ -1250,6 +1272,49 @@ const BOTH_OPERAND_WRITES: [&str; 2] = ["xchg", "xadd"];
 /// implicit register (%rdx) is the source.
 const LAST_TWO_WRITES: [&str; 3] = ["mulx", "mulxl", "mulxq"];
 
+/// The %rcx family: full/32/16/8-bit names (including the high-byte %ch,
+/// which has no REX form but is still a %rcx write).
+const RCX_FAMILY: [&str; 5] = ["rcx", "ecx", "cx", "cl", "ch"];
+
+/// Mnemonics (already prefix-stripped, suffix-normalized) that write some
+/// part of %rcx implicitly, regardless of their explicit operands. The %rcx
+/// mirror of [`IMPLICIT_RAX_WRITES`] — deliberately NOT a copy: most
+/// one-operand %rax writers (div/idiv/mul/lods/cmpxchg/rdtsc/xgetbv/rdmsr,
+/// the cwtl family, cmpxchg8b/16b, fstsw) never touch %rcx, while the
+/// `loop` family writes the %rcx COUNTER without naming it. The `rep`-ed
+/// string ops are likewise counter writers, but that rule lives in the
+/// prefix chain ([`classify_rcx_line`]), not here: bare `stos`/`movs` leave
+/// %rcx alone, so only a `rep*` prefix on a string-op base turns them into
+/// writers — exactly like the hardware (and `rep ret`/`rep nop`, where the
+/// prefix is a hint the CPU ignores, are NOT writers).
+const IMPLICIT_RCX_WRITES: [&str; 10] = [
+    "call",     // caller-saved clobber includes %rcx (direct and indirect)
+    "syscall",  // saves RIP into %rcx
+    "sysenter", // saves return state; %rcx clobbered
+    "cpuid",    // writes eax:ebx:ecx:edx
+    "rdtscp",   // writes edx:eax AND ecx (IA32_TSC_AUX) — unlike rdtsc
+    "loop", "loope", "loopz", "loopne", "loopnz", // the counter family
+];
+
+/// String-op bases for the `rep*`-prefix rule: with a `rep*` prefix these
+/// consume the %rcx counter (a write); without one they leave %rcx alone.
+/// Checked against both the exact token and the suffix-normalized base.
+/// (`lods` is included for totality — `rep lods` consumes the counter
+/// like every other string op — even though no sane emitter produces it
+/// (only the last load survives); bare `lods` still classifies `false`
+/// through the zero-operand rule, exactly like `stos` without `rep`.)
+const REP_STRING_BASES: [&str; 7] = ["movs", "stos", "cmps", "scas", "ins", "outs", "lods"];
+
+/// Mnemonics that name %rcx-family registers among their operands without
+/// ever writing %rcx: compare/test write flags only, push reads, jumps and
+/// returns read or transfer control, and the cqo/cdq family extends %rax
+/// INTO %rdx while leaving %rcx itself intact. The %rcx mirror of
+/// [`NEVER_RAX_WRITES`] — every entry is equally %rcx-silent.
+const NEVER_RCX_WRITES: [&str; 13] = [
+    "cmp", "test", "push", "jmp", "ret", "leave", "cqo", "cqto", "cdq", "cltd", "cwd", "cwtd",
+    "enter",
+];
+
 #[inline]
 fn is_mnemonic_byte(c: char) -> bool {
     c.is_ascii_alphanumeric()
@@ -1304,6 +1369,45 @@ fn operand_references_rax(op: &str) -> bool {
                 j += 1;
             }
             if RAX_FAMILY.contains(&&op[i + 1..j]) {
+                return true;
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+/// A pure register operand: exactly `%reg` — no memory parens, no immediate
+/// `$`, no segment `:` — whose register token names a %rcx family member.
+/// The %rcx mirror of [`pure_rax_reg`].
+fn pure_rcx_reg(op: &str) -> bool {
+    let op = op.trim();
+    if !op.starts_with('%') || op.len() < 2 {
+        return false;
+    }
+    if op[1..].contains(|c: char| !is_mnemonic_byte(c)) {
+        return false;
+    }
+    RCX_FAMILY.contains(&&op[1..])
+}
+
+/// Does an operand token (register or memory) REFERENCE %rcx at all — used
+/// only by the both-operand and last-two write classes, where a memory
+/// operand can never appear (xchg/xadd/mulx register forms). The %rcx
+/// mirror of [`operand_references_rax`].
+fn operand_references_rcx(op: &str) -> bool {
+    let op = op.trim();
+    let bytes = op.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let mut j = i + 1;
+            while j < bytes.len() && is_mnemonic_byte(bytes[j] as char) {
+                j += 1;
+            }
+            if RCX_FAMILY.contains(&&op[i + 1..j]) {
                 return true;
             }
             i = j;
@@ -1463,6 +1567,171 @@ pub(crate) fn asm_line_writes_rax(line: &str) -> bool {
     classify_rax_line(line).0
 }
 
+/// Does this AT&T-syntax assembly line write any part of %rcx?
+///
+/// The %rcx mirror of [`classify_rax_line`] (same purity, same fail-loud
+/// contract: an UNKNOWN mnemonic carrying operands is treated as a write;
+/// labels, directives and empty lines are ignored). Shares the helpers
+/// (`split_operands_top_level`, `mnemonic_base`, the both-operand and
+/// last-two tables); differs where the ISA differs:
+///
+/// * The implicit table is NOT a copy: one-operand div/idiv/mul, lods,
+///   cmpxchg, rdtsc, xgetbv, rdmsr, the cwtl family, cmpxchg8b/16b and
+///   fstsw all write %rax-family state while leaving %rcx alone, so none
+///   of them is an implicit %rcx writer. Conversely `syscall` (RIP into
+///   %rcx), `cpuid`, `rdtscp` (IA32_TSC_AUX into %ecx) and the `loop`
+///   family (the %rcx counter) are.
+/// * `rep*`-prefixed string ops write the %rcx counter — but the prefix is
+///   only a counter-user on string-op bases. `rep ret` / `rep nop`
+///   (`pause`) carry an ignored hint prefix and fall through to normal
+///   classification instead of reporting a write.
+/// * One-operand `mul`/`div`/`idiv` and one-operand `imul` multiply INTO
+///   the implicit rax:rdx pair: their explicit operand is the SOURCE, so a
+///   `%rcx`-looking operand there must NOT report a write (the dest-last
+///   generic rule would false-positive it). Mirrored inversely from the
+///   %rax side, where one-operand `imul` reports `true`.
+fn classify_rcx_line(line: &str) -> (bool, Option<String>) {
+    let line = line.trim_start();
+    if line.is_empty() || line.ends_with(':') || line.starts_with('.') {
+        return (false, None);
+    }
+    let mut rest = line;
+    let mut saw_rep = false;
+    // Prefix chain: lock/rep/segment/bnd hints precede the real mnemonic.
+    loop {
+        let end = rest
+            .find(|c: char| !is_mnemonic_byte(c))
+            .unwrap_or(rest.len());
+        let token = &rest[..end];
+        match token {
+            "rep" | "repe" | "repz" | "repne" | "repnz" => {
+                saw_rep = true;
+                rest = rest[end..].trim_start();
+                if rest.is_empty() {
+                    return (false, None);
+                }
+            }
+            "lock" | "bnd" | "data16" | "notrack" | "xacquire" | "xrelease" | "cs" | "ds"
+            | "es" | "ss" => {
+                rest = rest[end..].trim_start();
+                if rest.is_empty() {
+                    return (false, None);
+                }
+            }
+            _ => break,
+        }
+    }
+    let end = rest
+        .find(|c: char| !is_mnemonic_byte(c))
+        .unwrap_or(rest.len());
+    let token = &rest[..end];
+    let operands_part = rest[end..].trim_start();
+    let base = mnemonic_base(token);
+
+    // A `rep*` prefix on a string-op base consumes the %rcx counter. Any
+    // other base (`rep ret`, `rep nop`) ignores the prefix: fall through.
+    if saw_rep && (REP_STRING_BASES.contains(&token) || REP_STRING_BASES.contains(&base)) {
+        return (true, None);
+    }
+    if IMPLICIT_RCX_WRITES.contains(&token) || IMPLICIT_RCX_WRITES.contains(&base) {
+        return (true, None);
+    }
+    if NEVER_RCX_WRITES.contains(&token) || NEVER_RCX_WRITES.contains(&base) {
+        return (false, None);
+    }
+    // Jump family (ja/jb/jmp/jcc/jecxz/jrcxz/...): control transfer only.
+    // (`loop*` never reaches here: it is answered by the implicit table.)
+    if base.starts_with('j') {
+        return (false, None);
+    }
+    // x87 operates on st(0)/memory and never touches GP registers;
+    // prefetch streams to memory. (No x87 mnemonic writes %rcx — fstsw
+    // targets %ax, which is the RAX table's business, not this one's.)
+    if base.starts_with('f') || base.starts_with("prefetch") || base == "bt" {
+        return (false, None);
+    }
+    if BOTH_OPERAND_WRITES.contains(&token) || BOTH_OPERAND_WRITES.contains(&base) {
+        let ops = split_operands_top_level(operands_part);
+        return (ops.iter().any(|o| operand_references_rcx(o)), None);
+    }
+    if LAST_TWO_WRITES.contains(&token) || LAST_TWO_WRITES.contains(&base) {
+        let ops = split_operands_top_level(operands_part);
+        return (
+            ops.len() >= 2 && ops[ops.len() - 2..].iter().any(|o| pure_rcx_reg(o)),
+            None,
+        );
+    }
+    // mul/div/idiv have ONLY one-operand AT&T forms, multiplying/dividing
+    // INTO the implicit rax:rdx pair: the explicit operand is the source,
+    // never a %rcx destination. Unconditional: no multi-operand form can
+    // reach the generic rule below.
+    if token == "mul"
+        || base == "mul"
+        || token == "div"
+        || base == "div"
+        || token == "idiv"
+        || base == "idiv"
+    {
+        return (false, None);
+    }
+    // imul's one-operand form multiplies INTO rax:rdx (its explicit operand
+    // is the source, so NOT a %rcx write); its two/three-operand forms
+    // write only the explicit destination (handled by the generic rule).
+    if (token == "imul" || base == "imul") && !operands_part.is_empty() {
+        let ops = split_operands_top_level(operands_part);
+        if ops.len() == 1 {
+            return (false, None);
+        }
+    }
+    if operands_part.is_empty() {
+        // Zero-operand instruction outside every table (vzeroupper, wait,
+        // fchs, ...): none of the emitted vocabulary writes %rcx.
+        return (false, None);
+    }
+    // Generic AT&T rule: the destination is the LAST operand, and a write
+    // to %rcx happens exactly when that operand is a pure %rcx-family
+    // register. Memory destinations (parens) and immediates never write —
+    // for ANY AT&T instruction, known or not (implicit writers are the
+    // table's job, answered above). An UNKNOWN mnemonic whose destination
+    // is rcx-shaped still reports the write (dest-last is universal) and
+    // is recorded so the table can name it; an unknown mnemonic with a
+    // non-rcx destination is soundly `false`. (Foreign-ISA safety is the
+    // opt-in flag's job — see `classify_rax_line` — not this rule's.)
+    let ops = split_operands_top_level(operands_part);
+    match ops.last() {
+        Some(last) if pure_rcx_reg(last) => {
+            let known = IMPLICIT_RCX_WRITES.contains(&token)
+                || IMPLICIT_RCX_WRITES.contains(&base)
+                || NEVER_RCX_WRITES.contains(&token)
+                || NEVER_RCX_WRITES.contains(&base)
+                || BOTH_OPERAND_WRITES.contains(&token)
+                || BOTH_OPERAND_WRITES.contains(&base)
+                || LAST_TWO_WRITES.contains(&token)
+                || LAST_TWO_WRITES.contains(&base)
+                || base.starts_with('j')
+                || base.starts_with('f')
+                || base.starts_with("prefetch")
+                || base == "bt"
+                || base == "imul"
+                || base == "mul"
+                || base == "div"
+                || base == "idiv"
+                || REP_STRING_BASES.contains(&token)
+                || REP_STRING_BASES.contains(&base);
+            (true, (!known).then(|| token.to_string()))
+        }
+        _ => (false, None),
+    }
+}
+
+/// Pure classification predicate over one emitted line (see
+/// [`classify_rcx_line`] for the full contract). Tests assert through this
+/// thin wrapper; production records through `debug_scan_tail`, which owns
+/// the diagnostics. The %rcx mirror of [`asm_line_writes_rax`].
+pub(crate) fn asm_line_writes_rcx(line: &str) -> bool {
+    classify_rcx_line(line).0
+}
+
 impl AsmOutput {
     pub fn new() -> Self {
         // Pre-allocate 256KB to avoid repeated reallocations during codegen.
@@ -1473,11 +1742,17 @@ impl AsmOutput {
             #[cfg(debug_assertions)]
             rax_write_epoch: 0,
             #[cfg(debug_assertions)]
+            rcx_write_epoch: 0,
+            #[cfg(debug_assertions)]
             rax_epoch_active: false,
             #[cfg(debug_assertions)]
             scanned_len: 0,
             #[cfg(debug_assertions)]
             last_unclassified: None,
+            #[cfg(debug_assertions)]
+            last_rax_write: None,
+            #[cfg(debug_assertions)]
+            last_rcx_write: None,
             #[cfg(debug_assertions)]
             unclassified_mnemonics: Vec::new(),
         }
@@ -1525,11 +1800,30 @@ impl AsmOutput {
                     // form matches the assertion message's convention (no
                     // indentation noise), and the vocabulary list dedups so
                     // the message names each new mnemonic exactly once.
+                    // Both shadow epochs ride the SAME line walk: one split of
+                    // the tail, two pure classifications (a line may write
+                    // both registers — `xchg %rax,%rcx` — and must then move
+                    // both epochs). The unclassified vocabulary is shared:
+                    // either classifier's fallback records the mnemonic, so
+                    // the assertion's "extend the analyzer tables"
+                    // instruction names it exactly once.
                     let (writes_rax, unclassified) = classify_rax_line(complete);
+                    let (writes_rcx, unclassified_rcx) = classify_rcx_line(complete);
                     if writes_rax {
                         writes += 1;
+                        self.last_rax_write = Some(complete.trim_start().to_string());
+                    }
+                    if writes_rcx {
+                        self.rcx_write_epoch += 1;
+                        self.last_rcx_write = Some(complete.trim_start().to_string());
                     }
                     if let Some(token) = unclassified {
+                        self.last_unclassified = Some(complete.trim_start().to_string());
+                        if !self.unclassified_mnemonics.iter().any(|m| m == &token) {
+                            self.unclassified_mnemonics.push(token);
+                        }
+                    }
+                    if let Some(token) = unclassified_rcx {
                         self.last_unclassified = Some(complete.trim_start().to_string());
                         if !self.unclassified_mnemonics.iter().any(|m| m == &token) {
                             self.unclassified_mnemonics.push(token);
@@ -1587,6 +1881,51 @@ impl AsmOutput {
         #[cfg(not(debug_assertions))]
         {
             0
+        }
+    }
+
+    /// DEBUG-ONLY: the current %rcx shadow epoch (always 0 in release).
+    /// The %rcx mirror of [`debug_rax_epoch`](Self::debug_rax_epoch).
+    #[inline]
+    pub(crate) fn debug_rcx_epoch(&self) -> u64 {
+        #[cfg(debug_assertions)]
+        {
+            self.rcx_write_epoch
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            0
+        }
+    }
+
+    /// DEBUG-ONLY: this stream's most recent classified %rax-writing line,
+    /// for the acc-epoch assertion's context (the actual clobberer, where
+    /// `last_unclassified` can only name lines the analyzer could NOT
+    /// place). `None` when no %rax write has been scanned yet.
+    #[inline]
+    pub(crate) fn debug_last_rax_write(&self) -> Option<String> {
+        #[cfg(debug_assertions)]
+        {
+            self.last_rax_write.clone()
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            None
+        }
+    }
+
+    /// DEBUG-ONLY: this stream's most recent classified %rcx-writing line,
+    /// for the sec-epoch assertion's context. The %rcx mirror of
+    /// [`debug_last_rax_write`](Self::debug_last_rax_write).
+    #[inline]
+    pub(crate) fn debug_last_rcx_write(&self) -> Option<String> {
+        #[cfg(debug_assertions)]
+        {
+            self.last_rcx_write.clone()
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            None
         }
     }
 
@@ -3917,5 +4256,177 @@ mod rax_epoch_sink_coverage_tests {
             Some("movq %rbx, %rax")
         );
         assert_eq!(out.debug_unclassified_mnemonics().len(), 2);
+    }
+}
+
+/// The %rcx shadow-epoch analyzer's tests: the %rcx mirror of
+/// `rax_epoch_analyzer_tests`. Same shape (explicit writes, implicit
+/// writes, non-writes, shared-scan integration); the line lists differ
+/// exactly where the ISA differs (see `classify_rcx_line`).
+#[cfg(test)]
+mod rcx_epoch_analyzer_tests {
+    use super::asm_line_writes_rcx;
+
+    #[test]
+    fn rcx_explicit_destination_writes() {
+        for line in [
+            "    movq %rbx, %rcx",
+            "    addl %eax, %ecx",
+            "    movl $5, %ecx",
+            "    movslq %ecx, %rcx",
+            "    movzbl %cl, %ecx",
+            "    xorl %ecx, %ecx",
+            "    shlq $3, %rcx",
+            "    leaq 48(%rbp,%rax,8), %rcx",
+            "    bswap %ecx",
+            "    negq %rcx",
+            "    imulq %rax, %rcx",
+            "    imulq $3, %rax, %rcx",
+            "    popq %rcx",
+            "    sete %cl",
+            "    movd %xmm0, %ecx",
+            "    vcvttsd2siq %xmm0, %rcx",
+            "    movabsq $8826686330870431363, %rcx",
+            "    movq %fs:0, %rcx",
+            // bts/btr/btc WRITE the destination bit (unlike bt, which only
+            // reads — see the non-writes list).
+            "    btsq %rax, %rcx",
+            "    btrq %rax, %rcx",
+            "    mulxq %rbx, %rax, %rcx",
+            "    rdrand %ecx",
+        ] {
+            assert!(asm_line_writes_rcx(line), "must WRITE rcx: {line:?}");
+        }
+    }
+
+    #[test]
+    fn rcx_implicit_writes() {
+        for line in [
+            "    call printf",
+            "    call *%r10",
+            "    call __x86_indirect_thunk_r10",
+            "    syscall",
+            "    sysenter",
+            "    cpuid",
+            "    rdtscp",
+            // The counter family writes %rcx without naming it.
+            "    loop .L1",
+            "    loope .L2",
+            "    loopz .L2",
+            "    loopne .L3",
+            "    loopnz .L3",
+            // `rep*` on a string-op base consumes the %rcx counter.
+            "    rep stosq",
+            "    rep movsb",
+            "    repz cmpsb",
+            "    repne scasb",
+            "    rep lodsl",
+            // Both-operand class with a %rcx operand.
+            "    lock xaddl %ecx, (%rsp)",
+            "    xchgq %rax, %rcx",
+            "    xchgq %rcx, (%rbx)",
+        ] {
+            assert!(asm_line_writes_rcx(line), "must WRITE rcx: {line:?}");
+        }
+    }
+
+    #[test]
+    fn rcx_non_writes() {
+        for line in [
+            "    movq %rcx, -8(%rbp)",
+            "    movl %ecx, 16(%rsp)",
+            "    movq %rbx, (%rsp,%rcx,8)",
+            "    orq %rcx, (%rbx)",
+            "    movq %rcx, %fs:8(%rbx)",
+            "    cmpq %rcx, %rbx",
+            "    cmpq $0, %rcx",
+            "    testb %cl, %cl",
+            "    pushq %rcx",
+            "    jmpq *%rcx",
+            "    jne .L3",
+            "    ret",
+            // The `rep` prefix on a non-string base is an ignored hint.
+            "    rep ret",
+            "    rep nop",
+            // One-operand mul/div/idiv/imul write the implicit rax:rdx
+            // pair; the explicit %rcx-looking operand is the SOURCE.
+            "    divq %rcx",
+            "    idivl %ecx",
+            "    divb %cl",
+            "    mulq %rcx",
+            "    imulq %rcx",
+            // %rax-family writers that leave %rcx alone.
+            "    lodsq",
+            "    cmpxchgq %rcx, (%rbx)",
+            "    cltq",
+            "    fnstsw %ax",
+            "    rdtsc",
+            "    xgetbv",
+            "    rdmsr",
+            "    cqo",
+            // bt reads the bit (unlike bts/btr/btc, which write it).
+            "    btq %rax, %rcx",
+            // Control transfer that only READS %rcx.
+            "    jecxz .L4",
+            "    jrcxz .L5",
+            // Both-operand / last-two class WITHOUT a %rcx operand.
+            "    xchgq %rax, %rbx",
+            "    xaddl %eax, (%rsp)",
+            "    mulxq %rbx, %rax, %rdx",
+            // %rax writes are NOT %rcx writes (epoch independence).
+            "    movq %rbx, %rax",
+            "    leaq (%rcx), %rax",
+        ] {
+            assert!(!asm_line_writes_rcx(line), "must NOT write rcx: {line:?}");
+        }
+    }
+}
+
+/// The %rcx scan-integration test: the %rcx mirror of the
+/// `rax_epoch_sink_coverage_tests` scan tests. Debug-gated like them:
+/// it drives the scan machinery (`rax_epoch_active`, the epochs), which
+/// does not exist in release builds.
+#[cfg(all(test, debug_assertions))]
+mod rcx_epoch_sink_coverage_tests {
+    use super::AsmOutput;
+
+    /// Both shadow epochs ride the SAME line walk: a %rcx write moves only
+    /// the %rcx epoch, a %rax write only the %rax epoch, and a
+    /// both-operand write (`xchg %rax,%rcx`) moves both. The last-write
+    /// records name the actual clobberer for the assertion's context.
+    #[test]
+    fn rcx_epoch_rides_the_shared_scan() {
+        let mut out = AsmOutput::new();
+        out.rax_epoch_active = true;
+        out.emit("    movq %rbx, %rcx");
+        assert_eq!(out.debug_rcx_epoch(), 1);
+        assert_eq!(
+            out.debug_rax_epoch(),
+            0,
+            "a %rcx write must not move the %rax epoch"
+        );
+        out.emit("    movq %rbx, %rax");
+        assert_eq!(out.debug_rax_epoch(), 1);
+        assert_eq!(
+            out.debug_rcx_epoch(),
+            1,
+            "a %rax write must not move the %rcx epoch"
+        );
+        out.emit("    xchgq %rax, %rcx");
+        assert_eq!(out.debug_rax_epoch(), 2);
+        assert_eq!(out.debug_rcx_epoch(), 2);
+        assert_eq!(
+            out.debug_last_rcx_write().as_deref(),
+            Some("xchgq %rax, %rcx")
+        );
+        assert_eq!(
+            out.debug_last_rax_write().as_deref(),
+            Some("xchgq %rax, %rcx")
+        );
+        // A read is silent on both epochs.
+        out.emit("    pushq %rcx");
+        assert_eq!(out.debug_rcx_epoch(), 2);
+        assert_eq!(out.debug_rax_epoch(), 2);
+        out.debug_assert_fully_scanned();
     }
 }

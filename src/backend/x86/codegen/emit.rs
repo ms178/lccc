@@ -3017,7 +3017,7 @@ impl X86Codegen {
                 }
                 // Check secondary cache: if value is in %rcx, use movq %rcx, %rax
                 // (3 bytes) instead of loading from stack (7-8 bytes)
-                if self.state.reg_cache.sec_has(v.0, is_alloca) {
+                if self.state.sec_has_verified(v.0, is_alloca) {
                     self.state.out.emit_instr_reg_reg("    movq", "rcx", "rax");
                     self.state.park_acc(v.0, is_alloca);
                     return;
@@ -3112,8 +3112,7 @@ impl X86Codegen {
                                         .acc_has_verified(src_v.0, self.state.is_alloca(src_v.0))
                                     || self
                                         .state
-                                        .reg_cache
-                                        .sec_has(src_v.0, self.state.is_alloca(src_v.0))
+                                        .sec_has_verified(src_v.0, self.state.is_alloca(src_v.0))
                             }
                             crate::ir::reexports::Operand::Const(_) => true,
                         };
@@ -3244,7 +3243,7 @@ impl X86Codegen {
                 if self.state.acc_has_verified(v.0, is_alloca) {
                     return;
                 }
-                if self.state.reg_cache.sec_has(v.0, is_alloca) {
+                if self.state.sec_has_verified(v.0, is_alloca) {
                     self.state.emit("    movl %ecx, %eax");
                     self.state.park_acc(v.0, is_alloca);
                     return;
@@ -3853,7 +3852,7 @@ impl X86Codegen {
             }
             Operand::Value(v) => {
                 let is_alloca = self.state.is_alloca(v.0);
-                if self.state.reg_cache.sec_has(v.0, is_alloca) {
+                if self.state.sec_has_verified(v.0, is_alloca) {
                     // Already staged in %rcx by an earlier consumer; %cl is
                     // ready regardless of which bits the cache entry claims.
                     return;
@@ -4098,7 +4097,7 @@ impl X86Codegen {
             Operand::Value(v) => {
                 let is_alloca = self.state.is_alloca(v.0);
                 // Check if already in %rcx (sec cache hit)
-                if self.state.reg_cache.sec_has(v.0, is_alloca) {
+                if self.state.sec_has_verified(v.0, is_alloca) {
                     // Already in %rcx — nothing to do
                     return;
                 }
@@ -4128,7 +4127,7 @@ impl X86Codegen {
                     self.value_to_reg(v, "rcx");
                 }
                 // Record what's now in %rcx
-                self.state.reg_cache.set_sec(v.0, is_alloca);
+                self.state.park_sec(v.0, is_alloca);
             }
         }
     }

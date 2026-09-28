@@ -55,14 +55,6 @@ impl ArmCodegen {
         let Some(addr) = self.indexed_addr(base, index, shift, ty) else {
             return false;
         };
-        // Width-honesty gate (mirror of the decider's type allowlist): D32
-        // would ride the 64-bit `ldr` arms below (over-read). The decider
-        // already refuses it, so this only fires if the decider ever
-        // widens without arming the emitter — and refusing (unfold) is
-        // strictly safer than a silent wrong-width load.
-        if ty == IrType::D32 {
-            return false;
-        }
         // FP dest with an FP register assignment: load straight into it.
         if matches!(ty, IrType::F32 | IrType::F64) {
             if let Some(&dphys) = self.reg_assignments.get(&dest.0) {
@@ -99,10 +91,19 @@ impl ArmCodegen {
             // a word into 64 bits); using the W name is an assembler error.
             // ldrsb/ldrsh accept W (sign-extend within 32 bits), matching the
             // unassigned-dest path below (w0 for ldrsb/ldrsh, x0 for ldrsw).
+            // D32 loads through the w view exactly like U32 (zero-extending
+            // `ldr wN`); D32 is never FP-homed, so the FP arm above cannot
+            // have claimed it.
             let wide = instr == "ldrsw"
                 || !matches!(
                     ty,
-                    IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32
+                    IrType::I8
+                        | IrType::U8
+                        | IrType::I16
+                        | IrType::U16
+                        | IrType::I32
+                        | IrType::U32
+                        | IrType::D32
                 );
             let dname = if wide {
                 callee_saved_name(dphys)
@@ -121,7 +122,7 @@ impl ArmCodegen {
             IrType::I16 => ("ldrsh", "w0"),
             IrType::U16 => ("ldrh", "w0"),
             IrType::I32 => ("ldrsw", "x0"),
-            IrType::U32 => ("ldr", "w0"),
+            IrType::U32 | IrType::D32 => ("ldr", "w0"),
             _ => ("ldr", "x0"),
         };
         self.state
@@ -141,14 +142,6 @@ impl ArmCodegen {
         let Some(addr) = self.indexed_addr(base, index, shift, ty) else {
             return false;
         };
-        // Width-honesty gate (mirror of the decider's type allowlist): D32
-        // would ride the 64-bit `str` arms below (over-store). The decider
-        // already refuses it, so this only fires if the decider ever
-        // widens without arming the emitter — and refusing (unfold) is
-        // strictly safer than a silent wrong-width store.
-        if ty == IrType::D32 {
-            return false;
-        }
         // FP value with an FP register assignment: store it directly.
         if matches!(ty, IrType::F32 | IrType::F64) {
             if let Operand::Value(v) = val {
@@ -169,9 +162,17 @@ impl ArmCodegen {
                 .get_phys_reg_for_value(v.0)
                 .filter(|r| !is_arm_fp_phys(*r))
             {
+                // D32 stores through the w view exactly like U32; D32 is
+                // never FP-homed, so the FP arm above cannot have claimed it.
                 let wide = !matches!(
                     ty,
-                    IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32
+                    IrType::I8
+                        | IrType::U8
+                        | IrType::I16
+                        | IrType::U16
+                        | IrType::I32
+                        | IrType::U32
+                        | IrType::D32
                 );
                 let sname = if wide {
                     callee_saved_name(sphys)
@@ -189,20 +190,27 @@ impl ArmCodegen {
                 return true;
             }
         }
-        // Constant-zero integer stores go through the zero register —
-        // no per-iteration `mov x0, #0` materialization (sieve's marking loop).
+        // Constant-zero stores go through the zero register — no
+        // per-iteration `mov x0, #0` materialization (sieve's marking
+        // loop). Decimal zero-bit-patterns ride along: `D32(0)`/`D64(0)`
+        // carry the exact zero bits, so `str wzr`/`str xzr` are exact.
         if let Operand::Const(c) = val {
             let is_zero = matches!(c, IrConst::Zero)
                 || matches!(
                     c,
-                    IrConst::I8(0) | IrConst::I16(0) | IrConst::I32(0) | IrConst::I64(0)
+                    IrConst::I8(0)
+                        | IrConst::I16(0)
+                        | IrConst::I32(0)
+                        | IrConst::I64(0)
+                        | IrConst::D32(0)
+                        | IrConst::D64(0)
                 );
             if is_zero {
                 let (instr, zr) = match ty {
                     IrType::I8 | IrType::U8 => ("strb", "wzr"),
                     IrType::I16 | IrType::U16 => ("strh", "wzr"),
-                    IrType::I32 | IrType::U32 => ("str", "wzr"),
-                    IrType::I64 | IrType::U64 | IrType::Ptr => ("str", "xzr"),
+                    IrType::I32 | IrType::U32 | IrType::D32 => ("str", "wzr"),
+                    IrType::I64 | IrType::U64 | IrType::Ptr | IrType::D64 => ("str", "xzr"),
                     _ => ("", ""),
                 };
                 if !instr.is_empty() {
@@ -225,7 +233,9 @@ impl ArmCodegen {
             }
             IrType::I8 | IrType::U8 => self.state.emit_fmt(format_args!("    strb w0, {}", addr)),
             IrType::I16 | IrType::U16 => self.state.emit_fmt(format_args!("    strh w0, {}", addr)),
-            IrType::I32 | IrType::U32 => self.state.emit_fmt(format_args!("    str w0, {}", addr)),
+            IrType::I32 | IrType::U32 | IrType::D32 => {
+                self.state.emit_fmt(format_args!("    str w0, {}", addr))
+            }
             _ => self.state.emit_fmt(format_args!("    str x0, {}", addr)),
         }
         self.state.reg_cache.invalidate_acc();
@@ -380,10 +390,18 @@ impl ArmCodegen {
         // Integer constant-zero stores use the zero register — no x0
         // materialization (`mov x0, #0` per store in e.g. sieve's marking loop).
         if let Operand::Const(c) = val {
+            // Decimal zero-bit-patterns (`D32(0)`/`D64(0)` carry the exact
+            // zero bits by construction) store through the zero register
+            // exactly like their integer carrier twins.
             let is_zero = matches!(c, IrConst::Zero)
                 || matches!(
                     c,
-                    IrConst::I8(0) | IrConst::I16(0) | IrConst::I32(0) | IrConst::I64(0)
+                    IrConst::I8(0)
+                        | IrConst::I16(0)
+                        | IrConst::I32(0)
+                        | IrConst::I64(0)
+                        | IrConst::D32(0)
+                        | IrConst::D64(0)
                 );
             if is_zero {
                 let width_ok = matches!(
@@ -397,10 +415,15 @@ impl ArmCodegen {
                         | IrType::I64
                         | IrType::U64
                         | IrType::Ptr
+                        | IrType::D32
+                        | IrType::D64
                 );
                 if width_ok {
                     if let Some(addr) = self.state.resolve_slot_addr(base.0) {
-                        let zr = if matches!(ty, IrType::I64 | IrType::U64 | IrType::Ptr) {
+                        let zr = if matches!(
+                            ty,
+                            IrType::I64 | IrType::U64 | IrType::Ptr | IrType::D64
+                        ) {
                             "xzr"
                         } else {
                             "wzr"

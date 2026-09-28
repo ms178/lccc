@@ -684,6 +684,8 @@ gate "indexed-fold-scratch-index" fast \
 # step of the same script; ci-gate-parity fails if the two drift apart).
 gate "decimal64-indexed-fold" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_decimal64_indexed_fold.sh
+gate "decimal32-arm-width" fast \
+    env CCC_ARM=target/fastbuild/lccc-arm bash tests/regression/check_decimal32_indexed_fold_arm.sh
 
 if [ -x target/fastbuild/lccc-ld ]; then
     gate "linker-fuzz" fast env \
