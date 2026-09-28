@@ -97,6 +97,28 @@ class AsmDiffParityTest(unittest.TestCase):
                 self.local.replace(needle, "echo installer removed", 1), self.hosted), 1)
 
 
+class FuzzDiscoveryParityTest(unittest.TestCase):
+    def test_real_mirrors_and_negative_mutations(self):
+        local = parity.LOCAL.read_text()
+        hosted = "\n".join(parity.run_script_bodies(p)
+                           for p in sorted(parity.WORKFLOWS.glob("*.yml")))
+        self.assertEqual(parity.check_fuzz_test_gate_parity(local, hosted), 0)
+        command = "python3 -m unittest discover -s tests/fuzz -p 'test_*.py'"
+        self.assertIn(command, local)
+        self.assertIn(command, hosted)
+        for replacement in ("# " + command, "echo " + command,
+                            command.replace("test_*.py", "test_phi_cfg_fuzz.py"),
+                            command + " || true"):
+            for side in ("local", "hosted"):
+                with self.subTest(side=side, replacement=replacement), redirect_stderr(StringIO()):
+                    self.assertEqual(parity.check_fuzz_test_gate_parity(
+                        local.replace(command, replacement) if side == "local" else local,
+                        hosted.replace(command, replacement) if side == "hosted" else hosted), 1)
+        with redirect_stderr(StringIO()):
+            self.assertEqual(parity.check_fuzz_test_gate_parity(
+                local.replace('gate "fuzz-harness-tests" fast', 'gate "fuzz-harness-tests" slow'), hosted), 1)
+
+
 class HostedStepsMirroredTest(unittest.TestCase):
     """check_hosted_steps_mirrored: every hosted command must run locally."""
 

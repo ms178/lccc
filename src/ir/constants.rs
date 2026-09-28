@@ -167,7 +167,10 @@ impl IrConst {
             | IrConst::I128(0) => true,
             IrConst::F32(v) => *v == 0.0,
             IrConst::F64(v) => *v == 0.0,
-            IrConst::LongDouble(v, _) => *v == 0.0,
+            // The approximation may underflow while the binary128 payload is
+            // nonzero. Mask only the sign bit: both zeros compare equal to 0,
+            // while every subnormal, normal, infinity and NaN is nonzero.
+            IrConst::LongDouble(_, bytes) => (u128::from_le_bytes(*bytes) << 1) == 0,
             // C23 decimals: BID-decoded truthiness (+0 == -0 in any
             // quantum; Inf/NaN nonzero). Powers branch/logical folding
             // over decimal constants. (D128 rides I128 and stays
@@ -1135,5 +1138,32 @@ mod float_narrow_tests {
         let c2 = IrConst::I64(42);
         let coerced2 = c2.coerce_to(IrType::F32);
         assert!(matches!(coerced2, IrConst::F32(v) if v == 42.0f32));
+    }
+}
+
+#[cfg(test)]
+mod full_precision_truth_tests {
+    use super::IrConst;
+
+    #[test]
+    fn long_double_truth_uses_payload_not_approximation() {
+        // binary128 smallest subnormal, smallest normal, infinity and NaN.
+        for bits in [
+            1u128,
+            1u128 << 112,
+            0x7fffu128 << 112,
+            (0x7fffu128 << 112) | 1,
+        ] {
+            for sign in [0, 1u128 << 127] {
+                let c = IrConst::LongDouble(0.0, (bits | sign).to_le_bytes());
+                assert!(!c.is_zero());
+                assert!(c.is_nonzero());
+            }
+        }
+        for bits in [0u128, 1u128 << 127] {
+            let c = IrConst::LongDouble(1.0, bits.to_le_bytes());
+            assert!(c.is_zero());
+            assert!(!c.is_nonzero());
+        }
     }
 }

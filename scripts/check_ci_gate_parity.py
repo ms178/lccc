@@ -375,6 +375,28 @@ def check_hosted_steps_mirrored(local_text: str, hosted: str) -> int:
     return 1 if missing or stale else 0
 
 
+# Corpus metadata: discovery must cover future test modules, not one pinned file.
+FUZZ_TEST_COMMAND = ("python3", "-m", "unittest", "discover", "-s", "tests/fuzz", "-p", "test_*.py")
+
+
+def check_fuzz_test_gate_parity(local_text: str, hosted: str) -> int:
+    """Require executable discovery in both mirrors, and a FAST local gate."""
+    for where, text, wanted in (
+        ("local", local_text, ("gate", "fuzz-harness-tests", "fast", *FUZZ_TEST_COMMAND)),
+        ("hosted", hosted, FUZZ_TEST_COMMAND),
+    ):
+        commands = []
+        for line in text.replace("\\\n", " ").splitlines():
+            try:
+                commands.append(tuple(shlex.split(line, comments=True)))
+            except ValueError:
+                continue
+        if wanted not in commands:
+            print(f"missing {where} fuzz-harness discovery gate", file=sys.stderr)
+            return 1
+    return 0
+
+
 def main() -> int:
     local_text = LOCAL.read_text()
     local_paths = set(COMMAND.findall(local_text))
@@ -391,6 +413,8 @@ def main() -> int:
     rc = check_orphaned_gates(local_text, hosted)
     if rc != 0:
         return rc
+    if check_fuzz_test_gate_parity(local_text, hosted) != 0:
+        return 1
     if check_asmdiff_gate_parity(local_text, hosted) != 0:
         return 1
     if check_hosted_steps_mirrored(local_text, hosted) != 0:

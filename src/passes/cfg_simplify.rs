@@ -14,8 +14,9 @@
 //! Phi nodes in successor blocks are updated when edges are redirected.
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::common::types::IrType;
 use crate::ir::reexports::{
-    BasicBlock, BlockId, Instruction, IrConst, IrFunction, Operand, Terminator, Value,
+    BasicBlock, BlockId, Instruction, IrCmpOp, IrConst, IrFunction, Operand, Terminator, Value,
 };
 
 /// Maximum depth for resolving transitive jump chains (A→B→C→...),
@@ -385,7 +386,7 @@ fn fold_constant_switches(
             val,
             cases,
             default,
-            ..
+            ty,
         } = &block.terminator
         {
             let resolved_const = match val {
@@ -393,13 +394,7 @@ fn fold_constant_switches(
                 Operand::Value(v) => resolve_value_to_const_in_block(block, *v),
             };
             if let Some(c) = resolved_const {
-                if let Some(switch_int) = c.to_i64() {
-                    let taken = cases
-                        .iter()
-                        .find(|(cv, _)| *cv == switch_int)
-                        .map(|(_, label)| *label)
-                        .unwrap_or(*default);
-
+                if let Some(taken) = constant_switch_target(&c, *ty, cases, *default) {
                     // Collect unique not-taken targets.
                     let mut not_taken = Vec::with_capacity(16);
                     if *default != taken && !not_taken.contains(default) {
@@ -829,25 +824,7 @@ fn fold_constant_terminators(func: &mut IrFunction) -> usize {
                 ty,
             } => {
                 if let Operand::Const(c) = val {
-                    // Normalize to the switch width. Case values are i64;
-                    // sign-extend into i128 and mask both sides to the type
-                    // width so e.g. a 32-bit switch on 0xFFFFFFFFu matches a
-                    // stored I32(-1) exactly like the hardware compare does.
-                    if let Some(val_bits) = const_as_u128_masked(c, *ty) {
-                        let width_bits = (*ty).size() as u32 * 8;
-                        let mask = if width_bits >= 128 {
-                            u128::MAX
-                        } else {
-                            (1u128 << width_bits) - 1
-                        };
-                        let mut target = *default;
-                        for &(case_val, case_target) in cases {
-                            let case_bits = ((case_val as i128) as u128) & mask;
-                            if case_bits == val_bits {
-                                target = case_target;
-                                break;
-                            }
-                        }
+                    if let Some(target) = constant_switch_target(c, *ty, cases, *default) {
                         block.terminator = Terminator::Branch(target);
                         folded += 1;
                     }
@@ -861,23 +838,80 @@ fn fold_constant_terminators(func: &mut IrFunction) -> usize {
 
 /// Integer constant as u128 two's-complement bit pattern. `None` for float
 /// constants (no valid Switch producer; conservative no-fold).
-fn const_as_u128_masked(c: &IrConst, ty: crate::common::types::IrType) -> Option<u128> {
-    let raw: i128 = match c {
-        IrConst::I8(v) => *v as i128,
-        IrConst::I16(v) => *v as i128,
-        IrConst::I32(v) => *v as i128,
-        IrConst::I64(v) => *v as i128,
-        IrConst::I128(v) => *v,
-        IrConst::Zero => 0,
-        _ => return None,
+fn const_as_u128_masked(c: &IrConst, ty: IrType) -> Option<u128> {
+    if !ty.is_integer() && ty != IrType::Ptr {
+        return None;
+    }
+    let bits = ty.size() * 8;
+    let mask = u128::MAX >> (128 - bits);
+    Some((c.to_i128()? as u128) & mask)
+}
+
+fn constant_switch_target(
+    c: &IrConst,
+    ty: IrType,
+    cases: &[(i64, BlockId)],
+    default: BlockId,
+) -> Option<BlockId> {
+    if !ty.is_integer() {
+        return None;
+    }
+    let bits = const_as_u128_masked(c, ty)?;
+    Some(
+        cases
+            .iter()
+            .find(|(value, _)| const_as_u128_masked(&IrConst::I64(*value), ty) == Some(bits))
+            .map_or(default, |(_, target)| *target),
+    )
+}
+
+/// Opcode selects signed/unsigned ordering; type selects the operand width.
+/// IrConst's signed carrier does not determine either. No floating evaluation.
+fn cmp_integer_consts(op: IrCmpOp, ty: IrType, lhs: IrConst, rhs: IrConst) -> Option<bool> {
+    let l = const_as_u128_masked(&lhs, ty)?;
+    let r = const_as_u128_masked(&rhs, ty)?;
+    let shift = 128 - ty.size() * 8;
+    let signed = matches!(
+        op,
+        IrCmpOp::Slt | IrCmpOp::Sle | IrCmpOp::Sgt | IrCmpOp::Sge
+    );
+    let extend = |v: u128| {
+        if signed {
+            ((v << shift) as i128) >> shift
+        } else {
+            v as i128
+        }
     };
-    let width_bits = ty.size() as u32 * 8;
-    let mask = if width_bits >= 128 {
-        u128::MAX
+    Some(op.eval_i128(extend(l), extend(r)))
+}
+
+/// Integer conversion: normalize the source, extend according to its type,
+/// then reduce modulo the destination width. Retain the IR's canonical carrier
+/// convention (unsigned sub-64-bit values use nonnegative I64 constants).
+fn cast_integer_const(c: IrConst, from: IrType, to: IrType) -> Option<IrConst> {
+    let bits = const_as_u128_masked(&c, from)?;
+    let shift = 128 - from.size() * 8;
+    let extended = if from.is_signed() {
+        (((bits << shift) as i128) >> shift) as u128
     } else {
-        (1u128 << width_bits) - 1
+        bits
     };
-    Some((raw as u128) & mask)
+    let bits = const_as_u128_masked(&IrConst::I128(extended as i128), to)?;
+    Some(match to {
+        IrType::I8 => IrConst::I8(bits as i8),
+        IrType::I16 => IrConst::I16(bits as i16),
+        IrType::I32 => IrConst::I32(bits as i32),
+        IrType::I64 | IrType::U8 | IrType::U16 | IrType::U32 | IrType::U64 => {
+            IrConst::I64(bits as i64)
+        }
+        IrType::I128 | IrType::U128 => IrConst::I128(bits as i128),
+        IrType::Ptr => IrConst::ptr_int(bits as i64),
+        _ => return None,
+    })
+}
+
+fn integer_truth(c: IrConst) -> Option<bool> {
+    Some(c.to_i128()? != 0)
 }
 
 /// Backend IR-integrity gate: remove every block unreachable from the entry
@@ -1344,35 +1378,17 @@ fn resolve_value_globally(
         } => {
             let l = resolve_operand_globally(func, lhs, val_map, depth + 1)?;
             let r = resolve_operand_globally(func, rhs, val_map, depth + 1)?;
-            let result = op.eval_i64(ty.truncate_i64(l), ty.truncate_i64(r));
+            let result = cmp_integer_consts(*op, *ty, l, r)?;
             Some(IrConst::I32(if result { 1 } else { 0 }))
         }
         Instruction::Cast {
-            dest: _,
-            src: Operand::Const(c),
+            src,
             from_ty,
             to_ty,
+            ..
         } => {
-            // Apply the source->target width/signedness semantics. Returning the
-            // raw source constant would ignore the truncation (e.g. `(char)512`
-            // is 0, not 512), which would fold the branch to the wrong target.
-            let v = c.to_i64()?;
-            Some(IrConst::from_i64(
-                to_ty.truncate_i64(from_ty.truncate_i64(v)),
-                *to_ty,
-            ))
-        }
-        Instruction::Cast {
-            dest: _,
-            src: Operand::Value(sv),
-            from_ty,
-            to_ty,
-        } => {
-            let base = resolve_value_globally(func, *sv, val_map, depth + 1)?;
-            Some(IrConst::from_i64(
-                to_ty.truncate_i64(from_ty.truncate_i64(base.to_i64()?)),
-                *to_ty,
-            ))
+            let c = resolve_operand_globally(func, src, val_map, depth + 1)?;
+            cast_integer_const(c, *from_ty, *to_ty)
         }
         Instruction::Select {
             cond,
@@ -1381,7 +1397,11 @@ fn resolve_value_globally(
             ..
         } => {
             let cond_val = resolve_operand_globally(func, cond, val_map, depth + 1)?;
-            let chosen = if cond_val != 0 { true_val } else { false_val };
+            let chosen = if integer_truth(cond_val)? {
+                true_val
+            } else {
+                false_val
+            };
             match chosen {
                 Operand::Const(c) => Some(*c),
                 Operand::Value(cv) => resolve_value_globally(func, *cv, val_map, depth + 1),
@@ -1391,16 +1411,16 @@ fn resolve_value_globally(
     }
 }
 
-/// Resolve an operand to an i64 constant using global cross-block resolution.
+/// Resolve an operand without discarding its carrier or high bits.
 fn resolve_operand_globally(
     func: &IrFunction,
     op: &Operand,
     val_map: &FxHashMap<Value, (usize, usize)>,
     depth: usize,
-) -> Option<i64> {
+) -> Option<IrConst> {
     match op {
-        Operand::Const(c) => c.to_i64(),
-        Operand::Value(v) => resolve_value_globally(func, *v, val_map, depth)?.to_i64(),
+        Operand::Const(c) => Some(*c),
+        Operand::Value(v) => resolve_value_globally(func, *v, val_map, depth),
     }
 }
 
@@ -1409,6 +1429,13 @@ fn resolve_operand_globally(
 /// through instructions created by previous simplifications within the same
 /// cfg_simplify fixpoint loop, without waiting for a separate copy_prop pass.
 fn resolve_value_to_const_in_block(block: &BasicBlock, v: Value) -> Option<IrConst> {
+    resolve_value_in_block(block, v, 0)
+}
+
+fn resolve_value_in_block(block: &BasicBlock, v: Value, depth: usize) -> Option<IrConst> {
+    if depth > MAX_GLOBAL_RESOLVE_DEPTH {
+        return None;
+    }
     for inst in &block.instructions {
         match inst {
             Instruction::Copy {
@@ -1446,9 +1473,9 @@ fn resolve_value_to_const_in_block(block: &BasicBlock, v: Value) -> Option<IrCon
                 rhs,
                 ty,
             } if *dest == v => {
-                let l = resolve_operand_to_i64_in_block(block, lhs)?;
-                let r = resolve_operand_to_i64_in_block(block, rhs)?;
-                let result = op.eval_i64(ty.truncate_i64(l), ty.truncate_i64(r));
+                let l = resolve_operand_in_block(block, lhs, depth + 1)?;
+                let r = resolve_operand_in_block(block, rhs, depth + 1)?;
+                let result = cmp_integer_consts(*op, *ty, l, r)?;
                 return Some(IrConst::I32(if result { 1 } else { 0 }));
             }
             Instruction::Select {
@@ -1458,11 +1485,15 @@ fn resolve_value_to_const_in_block(block: &BasicBlock, v: Value) -> Option<IrCon
                 false_val,
                 ..
             } if *dest == v => {
-                let cond_const = resolve_operand_to_i64_in_block(block, cond)?;
-                let chosen = if cond_const != 0 { true_val } else { false_val };
+                let cond_const = resolve_operand_in_block(block, cond, depth + 1)?;
+                let chosen = if integer_truth(cond_const)? {
+                    true_val
+                } else {
+                    false_val
+                };
                 return match chosen {
                     Operand::Const(c) => Some(*c),
-                    Operand::Value(cv) => resolve_value_to_const_in_block(block, *cv),
+                    Operand::Value(cv) => resolve_value_in_block(block, *cv, depth + 1),
                 };
             }
             _ => {}
@@ -1471,11 +1502,11 @@ fn resolve_value_to_const_in_block(block: &BasicBlock, v: Value) -> Option<IrCon
     None
 }
 
-/// Resolve an operand to an i64 constant within a single block.
-fn resolve_operand_to_i64_in_block(block: &BasicBlock, op: &Operand) -> Option<i64> {
+/// Resolve an operand within a single block, retaining full precision.
+fn resolve_operand_in_block(block: &BasicBlock, op: &Operand, depth: usize) -> Option<IrConst> {
     match op {
-        Operand::Const(c) => c.to_i64(),
-        Operand::Value(v) => resolve_value_to_const_in_block(block, *v)?.to_i64(),
+        Operand::Const(c) => Some(*c),
+        Operand::Value(v) => resolve_value_in_block(block, *v, depth),
     }
 }
 
@@ -1510,8 +1541,6 @@ fn consts_equal_for_phi(a: &IrConst, b: &IrConst) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::types::IrType;
-    use crate::ir::reexports::IrCmpOp;
 
     /// Create a basic block for testing. Reduces boilerplate since
     /// `source_spans` is always empty in tests.
@@ -1528,6 +1557,292 @@ mod tests {
         }
     }
 
+    // Each resolver sees the same legal, straight-line definition. Compare
+    // results independently so a local failure cannot mask the global result.
+    fn resolved_instruction(inst: Instruction, global: bool) -> Option<IrConst> {
+        let mut f = IrFunction::new("constant_probe".into(), IrType::Void, vec![], false);
+        f.blocks
+            .push(make_block(BlockId(0), vec![inst], Terminator::Return(None)));
+        f.next_label = 1;
+        let mut violations = Vec::new();
+        crate::passes::verify::verify_function(&f, "constant-probe", &mut violations);
+        assert!(violations.is_empty(), "{violations:?}");
+        if global {
+            resolve_value_globally(&f, Value(0), &build_global_value_map(&f), 0)
+        } else {
+            resolve_value_to_const_in_block(&f.blocks[0], Value(0))
+        }
+    }
+
+    #[test]
+    fn wide_comparisons_local() {
+        check_wide_comparisons(false);
+    }
+
+    #[test]
+    fn wide_comparisons_global() {
+        check_wide_comparisons(true);
+    }
+
+    fn check_wide_comparisons(global: bool) {
+        for (lhs, rhs) in [(0, 1i128 << 64), (1i128 << 64, 0)] {
+            for (op, expected) in [(IrCmpOp::Eq, false), (IrCmpOp::Ne, true)] {
+                let result = resolved_instruction(
+                    Instruction::Cmp {
+                        dest: Value(0),
+                        op,
+                        ty: IrType::I128,
+                        lhs: Operand::Const(IrConst::I128(lhs)),
+                        rhs: Operand::Const(IrConst::I128(rhs)),
+                    },
+                    global,
+                );
+                assert_eq!(result, Some(IrConst::I32(i32::from(expected))));
+            }
+        }
+    }
+
+    #[test]
+    fn wide_select_local() {
+        check_wide_select(false);
+    }
+
+    #[test]
+    fn wide_select_global() {
+        check_wide_select(true);
+    }
+
+    fn check_wide_select(global: bool) {
+        let result = resolved_instruction(
+            Instruction::Select {
+                dest: Value(0),
+                ty: IrType::I128,
+                cond: Operand::Const(IrConst::I128(1i128 << 64)),
+                true_val: Operand::Const(IrConst::I128(17)),
+                false_val: Operand::Const(IrConst::I128(29)),
+            },
+            global,
+        );
+        assert_eq!(result, Some(IrConst::I128(17)));
+    }
+
+    #[test]
+    fn unsigned_widening_cast_preserves_source_width() {
+        let result = resolved_instruction(
+            Instruction::Cast {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I64(-1)),
+                from_ty: IrType::U64,
+                to_ty: IrType::U128,
+            },
+            true,
+        );
+        assert_eq!(result, Some(IrConst::I128(u64::MAX as i128)));
+    }
+
+    #[test]
+    fn wide_switch_does_not_alias_case_zero() {
+        let mut f = IrFunction::new("switch_probe".into(), IrType::I32, vec![], false);
+        f.blocks = vec![
+            make_block(
+                BlockId(0),
+                vec![],
+                Terminator::Switch {
+                    val: Operand::Const(IrConst::I128(1i128 << 64)),
+                    ty: IrType::I128,
+                    cases: vec![(0, BlockId(1))],
+                    default: BlockId(2),
+                },
+            ),
+            make_block(
+                BlockId(1),
+                vec![],
+                Terminator::Return(Some(Operand::Const(IrConst::I32(1)))),
+            ),
+            make_block(
+                BlockId(2),
+                vec![],
+                Terminator::Return(Some(Operand::Const(IrConst::I32(2)))),
+            ),
+        ];
+        let indices = build_label_to_idx(&f);
+        assert_eq!(fold_constant_switches(&mut f, &indices), 1);
+        assert!(matches!(
+            f.blocks[0].terminator,
+            Terminator::Branch(BlockId(2))
+        ));
+    }
+
+    #[test]
+    fn integer_comparison_width_and_opcode_matrix() {
+        for ty in [
+            IrType::I8,
+            IrType::U8,
+            IrType::I16,
+            IrType::U16,
+            IrType::I32,
+            IrType::U32,
+            IrType::I64,
+            IrType::U64,
+            IrType::I128,
+            IrType::U128,
+        ] {
+            let sign = IrConst::I128((1u128 << (ty.size() * 8 - 1)) as i128);
+            let mask = u128::MAX >> (128 - ty.size() * 8);
+            // IR predicate, not the signedness of the carrier or type, chooses
+            // the order. Type supplies width, including truncation at 8/16/32.
+            assert_eq!(
+                cmp_integer_consts(IrCmpOp::Slt, ty, sign, IrConst::Zero),
+                Some(true)
+            );
+            assert_eq!(
+                cmp_integer_consts(IrCmpOp::Ult, ty, sign, IrConst::Zero),
+                Some(false)
+            );
+            assert_eq!(
+                cmp_integer_consts(
+                    IrCmpOp::Eq,
+                    ty,
+                    IrConst::I8(-1),
+                    IrConst::I128(mask as i128)
+                ),
+                Some(true)
+            );
+            assert_eq!(
+                cmp_integer_consts(IrCmpOp::Sgt, ty, IrConst::Zero, sign),
+                Some(true)
+            );
+        }
+        assert_eq!(
+            cmp_integer_consts(
+                IrCmpOp::Eq,
+                IrType::I128,
+                IrConst::I128(u32::MAX as i128),
+                IrConst::I32(-1)
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            cmp_integer_consts(
+                IrCmpOp::Eq,
+                IrType::F64,
+                IrConst::F64(1.0),
+                IrConst::F64(1.0)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn integer_cast_boundary_matrix() {
+        for (src, from, to, expected) in [
+            (
+                IrConst::I64(-1),
+                IrType::U64,
+                IrType::I128,
+                IrConst::I128(u64::MAX as i128),
+            ),
+            (
+                IrConst::I64(-1),
+                IrType::I64,
+                IrType::U128,
+                IrConst::I128(-1),
+            ),
+            (
+                IrConst::I8(-1),
+                IrType::U8,
+                IrType::I128,
+                IrConst::I128(255),
+            ),
+            (
+                IrConst::I128(255),
+                IrType::I8,
+                IrType::U128,
+                IrConst::I128(-1),
+            ),
+            (
+                IrConst::I128(1i128 << 64),
+                IrType::I128,
+                IrType::U64,
+                IrConst::I64(0),
+            ),
+            (IrConst::I128(-1), IrType::U128, IrType::I8, IrConst::I8(-1)),
+        ] {
+            assert_eq!(cast_integer_const(src, from, to), Some(expected));
+            let mut f = IrFunction::new("cast_copy".into(), to, vec![], false);
+            f.blocks.push(make_block(
+                BlockId(0),
+                vec![
+                    Instruction::Copy {
+                        dest: Value(1),
+                        src: Operand::Const(src),
+                    },
+                    Instruction::Cast {
+                        dest: Value(0),
+                        src: Operand::Value(Value(1)),
+                        from_ty: from,
+                        to_ty: to,
+                    },
+                ],
+                Terminator::Return(Some(Operand::Value(Value(0)))),
+            ));
+            assert_eq!(
+                resolve_value_globally(&f, Value(0), &build_global_value_map(&f), 0),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            cast_integer_const(IrConst::I128(3), IrType::I128, IrType::F64),
+            None
+        );
+    }
+
+    #[test]
+    fn switch_normalization_and_truth_are_full_width() {
+        let cases = [(u32::MAX as i64, BlockId(1)), (-1, BlockId(2))];
+        assert_eq!(
+            constant_switch_target(&IrConst::I32(-1), IrType::U32, &cases, BlockId(3)),
+            Some(BlockId(1))
+        );
+        assert_eq!(
+            constant_switch_target(&IrConst::I128(-1), IrType::I128, &cases, BlockId(3)),
+            Some(BlockId(2))
+        );
+        assert_eq!(
+            constant_switch_target(
+                &IrConst::I128(1i128 << 64),
+                IrType::I128,
+                &cases,
+                BlockId(3)
+            ),
+            Some(BlockId(3))
+        );
+        assert_eq!(
+            constant_switch_target(&IrConst::I32(0), IrType::Void, &cases, BlockId(3)),
+            None
+        );
+        assert_eq!(integer_truth(IrConst::I128(1i128 << 64)), Some(true));
+        assert_eq!(integer_truth(IrConst::I128(0)), Some(false));
+        assert_eq!(integer_truth(IrConst::F64(1.0)), None);
+    }
+
+    #[test]
+    fn cyclic_local_select_is_not_resolved() {
+        // Invalid SSA must not make a defensive evaluator recurse forever.
+        let b = make_block(
+            BlockId(0),
+            vec![Instruction::Select {
+                dest: Value(0),
+                ty: IrType::I32,
+                cond: Operand::Const(IrConst::I32(1)),
+                true_val: Operand::Value(Value(0)),
+                false_val: Operand::Const(IrConst::I32(0)),
+            }],
+            Terminator::Return(None),
+        );
+        assert!(resolve_value_to_const_in_block(&b, Value(0)).is_none());
+    }
+
     #[test]
     fn redteam_phi_equality_preserves_high_integer_bits() {
         let low = IrConst::I128(0);
@@ -1539,8 +1854,22 @@ mod tests {
     #[test]
     fn redteam_phi_resolution_preserves_high_integer_bits() {
         let mut func = IrFunction::new("wide_phi".into(), IrType::I128, vec![], false);
+        func.blocks.extend([
+            make_block(
+                BlockId(0),
+                vec![],
+                Terminator::CondBranch {
+                    cond: Operand::Const(IrConst::I32(1)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            make_block(BlockId(1), vec![], Terminator::Branch(BlockId(3))),
+            make_block(BlockId(2), vec![], Terminator::Branch(BlockId(3))),
+        ]);
+        func.next_label = 4;
         func.blocks.push(make_block(
-            BlockId(0),
+            BlockId(3),
             vec![Instruction::Phi {
                 dest: Value(0),
                 ty: IrType::I128,
@@ -1551,7 +1880,10 @@ mod tests {
             }],
             Terminator::Return(Some(Operand::Value(Value(0)))),
         ));
-        assert!(resolve_value_to_const_in_block(&func.blocks[0], Value(0)).is_none());
+        let mut violations = Vec::new();
+        crate::passes::verify::verify_function(&func, "wide-phi-fixture", &mut violations);
+        assert!(violations.is_empty(), "{violations:?}");
+        assert!(resolve_value_to_const_in_block(&func.blocks[3], Value(0)).is_none());
         assert!(
             resolve_value_globally(&func, Value(0), &build_global_value_map(&func), 0).is_none()
         );
