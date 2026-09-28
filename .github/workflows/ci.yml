@@ -650,6 +650,9 @@ jobs:
           # decider must accept %rdx/%r11-homed SIB operands (S13
           # sqlite_varint golden-gate regression pin).
           bash tests/regression/check_indexed_fold_scratch_index.sh
+          # _Decimal64 indexed fold (S15): SIB-movsd load+store assertions
+          # plus an integer-checksum gcc differential.
+          bash tests/regression/check_decimal64_indexed_fold.sh
           # FMA-negation peel deletion invariant, re-derived over the enumerated
           # shape space: a pure model check (no compiler, sub-second) so a
           # regression of the absorbability classification is caught even where

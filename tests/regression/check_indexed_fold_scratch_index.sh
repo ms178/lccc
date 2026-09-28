@@ -31,10 +31,13 @@ awk 'BEGIN{on=0} /^\.type sqlite_put_varint, @function/{on=1;next} /^\.type /{on
 test -s "$tmp/put.s"
 
 # No rematerialisation LEA may survive inside the function: pre-fix this
-# held exactly `leaq 8(%rsp), %rcx`.
-if grep -qE '^[[:space:]]+leaq' "$tmp/put.s"; then
+# held exactly `leaq 8(%rsp), %rcx`. The ban is the remat SIGNATURE
+# (frame-anchored LEA), not every LEA: a future legitimate non-frame LEA
+# (alloca arithmetic, PIC) must not trip the fold pin; the positive SIB
+# pin below carries the fold proof either way.
+if grep -qE '^[[:space:]]+leaq +-?[0-9]*\(%(rsp|rbp)\)' "$tmp/put.s"; then
     echo "FAIL: rematerialisation LEA inside sqlite_put_varint:" >&2
-    grep -E '^[[:space:]]+leaq' "$tmp/put.s" >&2
+    grep -E '^[[:space:]]+leaq +-?[0-9]*\(%(rsp|rbp)\)' "$tmp/put.s" >&2
     exit 1
 fi
 

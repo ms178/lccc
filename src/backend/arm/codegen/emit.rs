@@ -2729,6 +2729,35 @@ impl ArchCodegen for ArmCodegen {
         if info.disp != 0 || info.shift > 3 {
             return false;
         }
+        // Type mirror of the indexed emitters: the `ldr`/`str` general
+        // arms move 64-bit carriers, so D64 folds width-exactly, but D32
+        // would ride the same 64-bit arms (over-read on load, over-store
+        // on store — the AArch64 D32 width bug is global to every
+        // load/store path, indexed or not; refusing the fold keeps D32 on
+        // the non-indexed path with identical behavior, no regression).
+        // F128 and wide ints are map-excluded upstream
+        // (`is_foldable_mem_ty`) and refused here too, so the decider
+        // stays honest if that guarantee ever widens.
+        let types_ok = info.access_tys.iter().all(|t| {
+            matches!(
+                t,
+                IrType::F64
+                    | IrType::F32
+                    | IrType::D64
+                    | IrType::I8
+                    | IrType::U8
+                    | IrType::I16
+                    | IrType::U16
+                    | IrType::I32
+                    | IrType::U32
+                    | IrType::I64
+                    | IrType::U64
+                    | IrType::Ptr
+            )
+        });
+        if !types_ok {
+            return false;
+        }
         let sub_word = info
             .access_tys
             .iter()
@@ -3539,5 +3568,86 @@ mod compare_immediate_tests {
             ArmCodegen::const_as_cmn_imm12(&IrConst::I64(-2), IrType::U64),
             Some((2, 0))
         );
+    }
+}
+
+#[cfg(test)]
+mod indexed_fold_contract_tests {
+    use super::*;
+    use crate::backend::generation::IndexedGepInfo;
+
+    fn gep_info(access_tys: Vec<IrType>, shift: u8) -> IndexedGepInfo {
+        IndexedGepInfo {
+            base: Value(1),
+            index: Value(2),
+            shift,
+            disp: 0,
+            orig_offset: Value(3),
+            access_tys,
+            feeds_store: false,
+        }
+    }
+
+    /// GPR-homed address registers (PhysReg 0/1 are outside the
+    /// `is_arm_fp_phys` ranges), isolating the TYPE verdict from the
+    /// home checks.
+    fn gpr_homed_cg() -> ArmCodegen {
+        let mut cg = ArmCodegen::new();
+        cg.reg_assignments.insert(1, PhysReg(0));
+        cg.reg_assignments.insert(2, PhysReg(1));
+        cg
+    }
+
+    #[test]
+    fn decider_accepts_every_emitter_armed_type() {
+        let cg = gpr_homed_cg();
+        // Sub-word types fold only unshifted (no shifted register-offset
+        // form); the rest take shift 2 (scale 4).
+        for ty in [IrType::F64, IrType::F32, IrType::D64] {
+            assert!(
+                cg.indexed_fold_ok(&gep_info(vec![ty], 2)),
+                "{ty:?} must fold: the emitter's 64-bit arms move it width-exactly"
+            );
+        }
+        for ty in [IrType::I64, IrType::U64, IrType::Ptr] {
+            assert!(
+                cg.indexed_fold_ok(&gep_info(vec![ty], 2)),
+                "{ty:?} must fold"
+            );
+        }
+        for ty in [
+            IrType::I8,
+            IrType::U8,
+            IrType::I16,
+            IrType::U16,
+            IrType::I32,
+            IrType::U32,
+        ] {
+            assert!(
+                cg.indexed_fold_ok(&gep_info(vec![ty], 0)),
+                "{ty:?} must fold unshifted"
+            );
+        }
+    }
+
+    #[test]
+    fn decider_refuses_d32_and_map_excluded_types() {
+        let cg = gpr_homed_cg();
+        // D32 would ride the emitter's 64-bit `ldr`/`str` arms
+        // (over-read/over-store); F128 and wide ints are map-excluded
+        // upstream and refused here too.
+        for ty in [IrType::D32, IrType::F128, IrType::I128, IrType::U128] {
+            assert!(
+                !cg.indexed_fold_ok(&gep_info(vec![ty], 2)),
+                "{ty:?} must be refused before the fold is guaranteed"
+            );
+        }
+    }
+
+    #[test]
+    fn decider_mirrors_the_shift_guard() {
+        let cg = gpr_homed_cg();
+        assert!(cg.indexed_fold_ok(&gep_info(vec![IrType::F32], 3)));
+        assert!(!cg.indexed_fold_ok(&gep_info(vec![IrType::F32], 4)));
     }
 }

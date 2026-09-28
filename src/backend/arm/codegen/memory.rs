@@ -55,6 +55,14 @@ impl ArmCodegen {
         let Some(addr) = self.indexed_addr(base, index, shift, ty) else {
             return false;
         };
+        // Width-honesty gate (mirror of the decider's type allowlist): D32
+        // would ride the 64-bit `ldr` arms below (over-read). The decider
+        // already refuses it, so this only fires if the decider ever
+        // widens without arming the emitter — and refusing (unfold) is
+        // strictly safer than a silent wrong-width load.
+        if ty == IrType::D32 {
+            return false;
+        }
         // FP dest with an FP register assignment: load straight into it.
         if matches!(ty, IrType::F32 | IrType::F64) {
             if let Some(&dphys) = self.reg_assignments.get(&dest.0) {
@@ -133,6 +141,14 @@ impl ArmCodegen {
         let Some(addr) = self.indexed_addr(base, index, shift, ty) else {
             return false;
         };
+        // Width-honesty gate (mirror of the decider's type allowlist): D32
+        // would ride the 64-bit `str` arms below (over-store). The decider
+        // already refuses it, so this only fires if the decider ever
+        // widens without arming the emitter — and refusing (unfold) is
+        // strictly safer than a silent wrong-width store.
+        if ty == IrType::D32 {
+            return false;
+        }
         // FP value with an FP register assignment: store it directly.
         if matches!(ty, IrType::F32 | IrType::F64) {
             if let Operand::Value(v) = val {

@@ -9,12 +9,19 @@
 # subnormal 2.495e-101DF, large+expMSB steering (9000000e27DF,
 # 8388608e27DF, 99000000000000000e114DD, DF->DD conversion of 9000000e27),
 # exponent-overflow sign (1e+-99999999999999999999DF).
+# F9: canonical-zero spelling (0.000DF written-exp zero), tiny literal
+# (0.00000001DF stays nonzero — the unnormalized-entry witness),
+# computed subnormal (1.5e-102DF half-even step).
 # Fails loud on any divergence (no XFAILs: every case must match).
 set -u
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 LCCC="${LCCC:-$REPO_ROOT/target/fastbuild/lccc}"
-WORK="${WORK:-/tmp/dec-battery}"
+# Scratch dir: concurrent-safe (the CI matrix runs this beside itself) and
+# self-cleaning. An explicit $WORK override is honored but still removed
+# on exit — it is scratch by contract.
+WORK="${WORK:-$(mktemp -d "${TMPDIR:-/tmp}/dec-battery.XXXXXX")}"
+trap 'rm -rf "$WORK"' EXIT HUP INT TERM
 mkdir -p "$WORK"
 cd "$WORK" || exit 1
 PASS=0; FAIL=0
@@ -22,6 +29,30 @@ fail() { echo "FAIL: $1"; FAIL=$((FAIL+1)); }
 pass() { PASS=$((PASS+1)); }
 
 [ -x "$LCCC" ] || { echo "FAIL: lccc binary missing: $LCCC"; exit 1; }
+
+# Loud capability probe: skip (exit 0, bannered) when the oracle toolchain
+# lacks decimal FP — never fail, never pass silently. Distinguish "no
+# decimal" (plain C parses, _Decimal32 does not) from a broken compiler
+# (plain C fails too): the latter still fails loud. -fsyntax-only is the
+# precise probe: the oracle's decimal *codegen* is trusted by definition
+# (it is the reference); only *acceptance* is in doubt on exotic toolchains.
+# (Verified non-vacuous on Debian GCC 14.2 and GCC 13.3: both accept.)
+cat > dfp-probe-plain.c <<'EOF'
+int main(void) { return 0; }
+EOF
+cat > dfp-probe.c <<'EOF'
+_Decimal32 x = 1.5DF;
+_Decimal64 y = 2.5DD;
+_Decimal128 z = 0.1DL;
+int main(void) { return (int)(x + y + z) - 4; }
+EOF
+if ! gcc -fsyntax-only dfp-probe-plain.c 2>/dev/null; then
+    echo "FAIL: system gcc cannot parse plain C" >&2; exit 1
+fi
+if ! gcc -fsyntax-only dfp-probe.c 2>/dev/null; then
+    echo "SKIP: system gcc lacks decimal floating-point; oracle vacuous on this toolchain"
+    exit 0
+fi
 
 # ---------- rodata battery ----------
 cat > rod.c <<'EOF'
@@ -53,6 +84,7 @@ _Decimal32 rr451 = 1.000000451DF, rr4999 = 1.0000004999DF, rr501 = 1.000000501DF
 _Decimal32 sub2495 = 2.495e-101DF;
 _Decimal32 lg9e27 = 9000000e27DF, lg8e27 = 8388608e27DF;
 _Decimal32 peUnder = 1e-99999999999999999999DF, peOver = 1e+99999999999999999999DF;
+_Decimal32 z8 = 0.00000001DF, s6 = 1.5e-102DF, z3 = 0.000DF;
 _Decimal64 lg99e114 = 99000000000000000e114DD;
 _Decimal64 cvDfDd = 9000000e27DF;
 EOF
@@ -62,8 +94,9 @@ timeout 300 "$LCCC" -O2 -S -o rod-lccc.s rod.c || { fail "lccc -S rod.c"; }
 # Quantum cohorts (same value, different written quantum): value-compare.
 # Everything else: bit-exact.
 VALUE_CASES="f5p0 g5p0"
+export VALUE_CASES
 python3 - > rod.out 2>&1 <<'PYEOF'
-import re, sys
+import os, re, sys
 from decimal import Decimal
 # Large form <=> top bits 11 (non-special); the next bit down (D32 bit 28,
 # D64 bit 60) is the exponent MSB, not steering (F33: requiring it clear
@@ -105,13 +138,13 @@ names32 = """i0 i1 i5 in5 i42 i127 i255 i1234567 i8388607 i8388608 i9999999
  in9999999 i1e7 i12345670 ibig imax imin f1p5 fn0p5 f0p1 f123p456 f5p0 f0
  fhdn fhup fh1 fh2 e90 e91 en91 en101 en102 e5n102 e6n102
  f30 fh7 fz0 fnz fsd fq1 fb96 fb97 f1e7d ffi ffn
- rr451 rr4999 rr501 sub2495 lg9e27 lg8e27 peUnder peOver""".split()
+ rr451 rr4999 rr501 sub2495 lg9e27 lg8e27 peUnder peOver z8 s6 z3""".split()
 names64 = """k0 k1 kn1 k5 kn42 k2p53m1 k2p53 k10p16m1 k10p16 k10p18 kbig kmax
  g1p5 g0p1 g5p0 g0 ghdn ghup E369 E370 En370 En398 En399 E6n399
  gd30 gd05 gdy gz0 gnz gd5 gq gb384 gb385 gffi gffn
  lg99e114 cvDfDd""".split()
 names128 = "t0 t1 t1p5 t0p1 tn5 td05 tdz tdnz tb6144 tb6145 tffi tffn".split()
-value_cases = set("f5p0 g5p0".split())
+value_cases = set(os.environ.get("VALUE_CASES", "").split())
 bad = 0
 def chk(name, w):
     global bad
@@ -172,9 +205,11 @@ int main(void) {
     _Decimal32 f = 1.5DF, g = -0.5DF, h = 0.1DF, big = 123456789, mx = 2147483647;
     _Decimal32 s = b + d, t = d - b, u = b * g, v = d / b;
     _Decimal32 cv = (int)h + (int)f;
+    _Decimal32 z8 = 0.00000001DF, s6 = 1.5e-102DF, z3 = 0.000DF;
     p32("a", a); p32("b", b); p32("c", c); p32("d", d); p32("e", e);
     p32("f", f); p32("g", g); p32("h", h); p32("big", big); p32("mx", mx);
     p32("add", s); p32("sub", t); p32("mul", u); p32("div", v); p32("cv", cv);
+    p32("z8", z8); p32("s6", s6); p32("z3", z3);
     _Decimal64 A = 0, B = 9007199254740992LL, C = 9999999999999999LL;
     _Decimal64 D = 1.5DD, E = B + C, F = C - B;
     _Decimal64 G = 123456789012345678LL, H = 9223372036854775807LL;
