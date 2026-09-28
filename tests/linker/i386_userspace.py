@@ -34,7 +34,9 @@ import textwrap
 # section headers, and the dynamic linker never reads them either) ────────
 
 PT_LOAD, PT_DYNAMIC, PT_NOTE, PT_TLS = 1, 2, 4, 7
-PT_GNU_STACK, PT_GNU_RELRO = 0x6474E551, 0x6474E552
+PT_GNU_EH_FRAME, PT_GNU_STACK, PT_GNU_RELRO = 0x6474E550, 0x6474E551, 0x6474E552
+PT_GNU_PROPERTY = 0x6474E553
+NT_GNU_PROPERTY_TYPE_0 = 5
 DT = {
     "NEEDED": 1, "PLTRELSZ": 2, "HASH": 4, "STRTAB": 5, "SYMTAB": 6,
     "INIT": 12, "FINI": 13, "SONAME": 14, "RPATH": 15, "SYMBOLIC": 16,
@@ -96,6 +98,44 @@ class Elf32:
 
     def flags_1(self):
         return (self.tag("FLAGS_1") or [0])[0]
+
+    def notes(self):
+        """(type, name, desc) of every note in every PT_NOTE segment."""
+        out = []
+        for p in self.phdrs:
+            if p[0] != PT_NOTE:
+                continue
+            off, end = p[1], p[1] + p[4]
+            while off + 12 <= end:
+                namesz, descsz, ntype = struct.unpack_from("<III", self.d, off)
+                name_end = off + 12 + ((namesz + 3) & ~3)
+                out.append((ntype, self.d[off + 12:off + 12 + namesz],
+                            self.d[name_end:name_end + descsz]))
+                off = name_end + ((descsz + 3) & ~3)
+        return out
+
+    def properties(self):
+        """{pr_type: value} of the one GNU property note, None without one.
+
+        ELF32 property entries are type(4) + datasz(4) + data padded to 4,
+        i.e. 12 bytes per x86 bitmask; a 4-byte value maps to an int, any
+        other size to (datasz, value).  More than one property note is
+        itself malformed (the loader reads only the PT_GNU_PROPERTY one), so
+        it is reported as a list of maps for the caller to reject."""
+        maps = []
+        for ntype, name, desc in self.notes():
+            if ntype != NT_GNU_PROPERTY_TYPE_0 or name != b"GNU\0":
+                continue
+            m, o = {}, 0
+            while o + 8 <= len(desc):
+                t, sz = struct.unpack_from("<II", desc, o)
+                v = int.from_bytes(desc[o + 8:o + 8 + sz], "little")
+                m[t] = v if sz == 4 else (sz, v)
+                o += 8 + ((sz + 3) & ~3)
+            maps.append(m)
+        if not maps:
+            return None
+        return maps[0] if len(maps) == 1 else maps
 
     def build_id(self):
         for p in self.phdrs:
@@ -565,12 +605,141 @@ def case_options_and_tags(e):
                        f"{err[:300]!r}")
 
 
+FEATURE_1_AND, ISA_1_NEEDED, ISA_1_USED = 0xC0000002, 0xC0008002, 0xC0010002
+
+
+def _prop_asm(entries, body, *more_notes):
+    """`body` plus a `.note.gnu.property` section holding one
+    NT_GNU_PROPERTY_TYPE_0 note per entry list (`entries`, then
+    `more_notes`, all in the SAME section — the shape gas 2.47 produces when
+    it appends its x86 used-note to a hand-written one).  Entries are
+    (type, value) 4-byte bitmasks or (type, value, datasz) with datasz 0
+    (marker); ELF32 pads each entry's data to 4."""
+    out = ['    .section .note.gnu.property,"a"', "    .p2align 2"]
+    for note in (entries,) + more_notes:
+        out += ["    .long 4", "    .long 2f - 1f", "    .long 5", '    .asciz "GNU"', "1:"]
+        for ent in note:
+            t, v, sz = ent if len(ent) == 3 else (ent[0], ent[1], 4)
+            out += [f"    .long {t:#x}", f"    .long {sz}"] + ([f"    .long {v:#x}"] if sz else [])
+        out += ["2:"]
+    return "\n".join(out + ["    .text", body]) + "\n"
+
+
+def _check_property_image(img, label):
+    """The shape every property-note output must have: at most one GNU
+    property note; when present, a PT_GNU_PROPERTY covering exactly that
+    note inside a PT_NOTE; and no PT_GNU_EH_FRAME outside the image."""
+    props = img.properties()
+    if isinstance(props, list):
+        raise Fail(f"{label}: {len(props)} GNU property notes (one merged note expected): {props}")
+    gp = img.phdr(PT_GNU_PROPERTY)
+    if (props is None) != (gp is None):
+        raise Fail(f"{label}: property note {props} but PT_GNU_PROPERTY {gp}")
+    if gp is not None:
+        if not any(p[0] == PT_NOTE and p[1] <= gp[1] and gp[1] + gp[4] <= p[1] + p[4]
+                   for p in img.phdrs):
+            raise Fail(f"{label}: PT_GNU_PROPERTY {gp} outside every PT_NOTE")
+        namesz, descsz, ntype = struct.unpack_from("<III", img.d, gp[1])
+        if ntype != NT_GNU_PROPERTY_TYPE_0 or gp[4] != 12 + ((namesz + 3) & ~3) + descsz:
+            raise Fail(f"{label}: PT_GNU_PROPERTY does not cover exactly the property note")
+    for p in img.phdrs:
+        if p[0] == PT_GNU_EH_FRAME and (p[5] == 0 or not any(
+                q[0] == PT_LOAD and q[2] <= p[2] and p[2] + p[5] <= q[2] + q[5]
+                for q in img.phdrs)):
+            raise Fail(f"{label}: PT_GNU_EH_FRAME {p} does not describe an .eh_frame_hdr")
+    return props
+
+
+def case_property_notes(e):
+    """GNU property notes (CET / ISA level) are merged, not concatenated.
+
+    Differential against GNU ld on identical objects: the output carries
+    exactly one NT_GNU_PROPERTY_TYPE_0 note with GNU's merged value, covered
+    by PT_GNU_PROPERTY.  The ELF32 linker used to append every input's note
+    to the note region (three notes for one -fcf-protection object on
+    Debian, claiming IBT|SHSTK although crti.o carries no note and vetoes
+    both), emitted no PT_GNU_PROPERTY, and ignored -z ibt / -z shstk /
+    -z x86-64-* — which elf_i386 supports (binutils sources cet.sh and
+    x86-64-level.sh for it; only -z lam-* is x86-64-only and warned about).
+    Also pinned: an image without FDEs has no PT_GNU_EH_FRAME (it used to
+    get one at p_vaddr 0, which libgcc's unwinder dereferences)."""
+    # 1. Every input annotated (-nostdlib): AND intersects, OR accumulates.
+    _w(e.td, "pa.s", _prop_asm([(FEATURE_1_AND, 3), (ISA_1_NEEDED, 4)],
+                               "    .globl _start\n_start:\n    movl $1, %eax\n"
+                               "    xorl %ebx, %ebx\n    int $0x80"))
+    _w(e.td, "pb.s", _prop_asm([(FEATURE_1_AND, 1)], "    .globl pb\npb:\n    ret"))
+    # Two notes in one section: every note counts (the second one's
+    # ISA_1_NEEDED ORs with the first's inside the object), the all-zero
+    # OR-AND ISA_1_USED is kept when every input has it, the generic OR type
+    # 0xb0008000 and the NO_COPY_ON_PROTECTED marker survive from one input,
+    # STACK_SIZE takes the maximum and the unknown 0xc0028000 is dropped.
+    # lccc used to read only the first note.
+    _w(e.td, "pm.s", _prop_asm([(FEATURE_1_AND, 3), (ISA_1_NEEDED, 1)],
+                               "    .globl _start\n_start:\n    movl $1, %eax\n"
+                               "    xorl %ebx, %ebx\n    int $0x80",
+                               [(ISA_1_NEEDED, 2), (ISA_1_USED, 0), (0xB0008000, 2),
+                                (1, 0x1000)]))
+    _w(e.td, "pn.s", _prop_asm([(1, 0x3000), (2, 0, 0), (FEATURE_1_AND, 1), (ISA_1_USED, 0),
+                                (0xC0028000, 7)], "    .globl pn\npn:\n    ret"))
+    for src in ("pa", "pb", "pm", "pn"):
+        _ok(e.gcc("-c", f"{src}.s", "-o", f"{src}.o", lccc=False), f"assemble {src}.s")
+    variants = [
+        ("all-annotated", ["-nostdlib", "-static", "pa.o", "pb.o"], []),
+        ("-z ibt,shstk,x86-64-v2", ["-nostdlib", "-static", "pa.o", "pb.o"],
+         ["-Wl,-z,shstk,-z,x86-64-v2"]),
+        ("multi-note", ["-nostdlib", "-static", "pm.o", "pn.o"], []),
+    ]
+    # 2. Driver links of a -fcf-protection object (crt files decide the veto:
+    #    Debian's crti.o has no note, Ubuntu's does) — executables and DSOs.
+    _w(e.td, "cf.c", '#include <stdio.h>\nint cf(void){ return 3; }\n'
+                     'int main(void){ printf("cf %d\\n", cf()); return 0; }\n')
+    _ok(e.gcc("-O1", "-fcf-protection", "-fPIC", "-c", "cf.c", "-o", "cf.o", lccc=False),
+        "compile cf.c")
+    for tag, extra in (("exe", ["-no-pie"]), ("dso", ["-shared"])):
+        variants += [
+            (f"{tag} default", extra + ["cf.o"], []),
+            (f"{tag} -z ibt -z x86-64-v3", extra + ["cf.o"], ["-Wl,-z,ibt", "-Wl,-z,x86-64-v3"]),
+            (f"{tag} -z shstk", extra + ["cf.o"], ["-Wl,-z,shstk"]),
+        ]
+    for label, argv, zflags in variants:
+        imgs = {}
+        for sub, lccc in (("ref", False), ("new", True)):
+            out = f"prop_{sub}"
+            _ok(e.gcc(*argv, *zflags, "-o", out, lccc=lccc), f"{label}: {sub} link")
+            imgs[sub] = Elf32(e.path(out))
+            if "-shared" not in argv:
+                r = e.run(e.path(out), False)
+                if r.returncode != 0:
+                    raise Fail(f"{label}: {sub} run rc={r.returncode}")
+        want = imgs["ref"].properties()
+        got = _check_property_image(imgs["new"], label)
+        if got != want:
+            raise Fail(f"{label}: property note {got} != GNU ld's {want}")
+        if label == "all-annotated" and imgs["new"].phdr(PT_GNU_EH_FRAME) is not None:
+            raise Fail(f"{label}: PT_GNU_EH_FRAME without any FDE")
+    # 3. -z lam-u48 is not an elf_i386 keyword: warned about (GNU's wording)
+    #    and ignored; an invalid ISA level is fatal on both linkers.
+    r = _ok(e.gcc("-no-pie", "cf.o", "-Wl,-z,lam-u48", "-o", "lam"), "-z lam-u48 link")
+    if b"-z lam-u48 ignored" not in r.stderr:
+        raise Fail(f"-z lam-u48: expected GNU's 'ignored' warning, got {r.stderr[:200]!r}")
+    lam = _check_property_image(Elf32(e.path("lam")), "-z lam-u48")
+    _ok(e.gcc("-no-pie", "cf.o", "-o", "lam_ref", lccc=False), "reference link")
+    if lam != Elf32(e.path("lam_ref")).properties():
+        raise Fail(f"-z lam-u48 changed the property note: {lam}")
+    for lccc in (False, True):
+        r = e.gcc("-no-pie", "cf.o", "-Wl,-z,x86-64-v9", "-o", "bad", lccc=lccc)
+        if r.returncode == 0 or b"invalid x86-64 ISA level" not in r.stderr:
+            raise Fail(f"-z x86-64-v9 ({'lccc' if lccc else 'GNU'}): rc={r.returncode} "
+                       f"{r.stderr[:200]!r}")
+
+
 CASES = [
     ("i386_tls_matrix", case_tls_matrix),
     ("i386_exe_tls_transitions", case_exe_tls_transitions),
     ("i386_dso_chain_archive", case_dso_chain_and_archive),
     ("i386_archive_semantics", case_archive_semantics),
     ("i386_options_and_tags", case_options_and_tags),
+    ("i386_property_notes", case_property_notes),
 ]
 
 

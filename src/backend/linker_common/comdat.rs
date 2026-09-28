@@ -98,10 +98,18 @@ fn members(words: &[u8]) -> impl Iterator<Item = usize> + '_ {
 /// lookup. The set derefs to a SLICE, never to the `Vec`: element contents
 /// may be edited by later link phases, but the object list can only grow
 /// through `push`, so the claims can never go stale.
+///
+/// It also carries the one fact about the link's shared libraries that
+/// outlives loading them: the names in their `.dynsym` (see
+/// `shared_library_dynsym_names`), which decide which of the executable's
+/// definitions are exported.  Every input -- object, archive member or
+/// library, also those named by a linker script -- passes through the code
+/// that owns this set, so this is the one place that sees them all.
 #[derive(Debug, Default)]
 pub struct ObjectSet {
     objects: Vec<Elf64Object>,
     claimed: FxHashSet<String>,
+    dso_names: FxHashSet<String>,
 }
 
 impl ObjectSet {
@@ -123,6 +131,16 @@ impl ObjectSet {
     /// Did an object in the set claim COMDAT signature `sig`?
     pub fn claims(&self, sig: &str) -> bool {
         self.claimed.contains(sig)
+    }
+
+    /// Record the `.dynsym` names of a shared library in the link.
+    pub fn note_dso_names(&mut self, names: Vec<String>) {
+        self.dso_names.extend(names);
+    }
+
+    /// Names some shared library of the link defines or references.
+    pub fn dso_names(&self) -> &FxHashSet<String> {
+        &self.dso_names
     }
 
     pub fn into_vec(self) -> Vec<Elf64Object> {

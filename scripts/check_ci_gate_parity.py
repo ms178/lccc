@@ -25,6 +25,7 @@ WORKFLOWS = ROOT / ".github" / "workflows"
 
 COMMAND = re.compile(
     r"(?:tests/regression/[A-Za-z0-9_./-]+\.sh|"
+    r"tests/linker/[A-Za-z0-9_./-]+\.(?:py|sh)|"
     r"scripts/[A-Za-z0-9_./-]+\.py|"
     r"\.github/scripts/[A-Za-z0-9_./-]+\.py)"
 )
@@ -227,6 +228,84 @@ def check_asmdiff_gate_parity(local_text: str, hosted: str) -> int:
     return 0
 
 
+def shell_commands(script: str, program: str) -> list[list[str]]:
+    """Tokens of every logical shell line that executes `program`.
+
+    `\\` continuations are joined first, so an environment assignment on a
+    line of its own still belongs to the command it prefixes.  Only a
+    command position counts: leading `env`/`gate NAME fast env` wrappers,
+    VAR=value assignments and the interpreter may precede it, prose may not.
+    """
+    commands = []
+    lines = script.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        i += 1
+        while line.rstrip().endswith("\\") and i < len(lines):
+            line = line.rstrip()[:-1] + " " + lines[i]
+            i += 1
+        if program not in line:
+            continue
+        try:
+            tokens = shlex.split(line, comments=True)
+        except ValueError:
+            continue
+        if program not in tokens:
+            continue
+        head = tokens[: tokens.index(program)]
+        if head[:1] == ["gate"]:
+            head = head[3:]  # gate NAME fast|slow
+        if head[:1] == ["env"]:
+            head = head[1:]
+        if head and head[-1] in ("python3", "bash"):
+            head = head[:-1]
+        if all(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", t) for t in head):
+            commands.append(tokens)
+    return commands
+
+
+def check_linker_suite_parity(local_text: str, hosted: str) -> int:
+    """Both sides run the WHOLE linker suite, strictly, i386 included.
+
+    Path parity alone accepted `run_linker_tests.py --filter i386_` -- a
+    handful of the suite's tests -- as "the linker suite runs in CI".
+    Require on each side a real invocation with --strict (SKIP/WARN fail),
+    no --filter/--tag/--list, LCCC_REQUIRE_I386=1, the kernel relocs tool
+    and the pinned GNU as 2.47 first in PATH.
+    """
+    program = "tests/linker/run_linker_tests.py"
+    missing = []
+    for where, text in (("local", local_text), ("hosted", hosted)):
+        ok = False
+        for tokens in shell_commands(text, program):
+            args = tokens[tokens.index(program) + 1 :]
+            env = tokens[: tokens.index(program)]
+            if (
+                "--strict" in args
+                and not any(a.split("=", 1)[0] in ("--filter", "--tag", "--list") for a in args)
+                and "LCCC_REQUIRE_I386=1" in env
+                and any(t.startswith("LCCC_RELOCS_TOOL=") for t in env)
+                and any(
+                    t.startswith("PATH=") and "gas-2.47-x86_64-linux-gnu/bin:" in t for t in env
+                )
+            ):
+                ok = True
+        if not ok:
+            missing.append(
+                f"{where}: full-suite `{program} --strict` with LCCC_REQUIRE_I386=1, "
+                "LCCC_RELOCS_TOOL and the GNU as 2.47 PATH (no --filter/--tag)"
+            )
+        if not shell_commands(text, "tests/linker/setup_kernel_tools.sh"):
+            missing.append(f"{where}: bash tests/linker/setup_kernel_tools.sh")
+    if missing:
+        print("linker suite is not run in full on both sides:", file=sys.stderr)
+        for item in missing:
+            print(f"  {item}", file=sys.stderr)
+        return 1
+    return 0
+
+
 HOSTED_ONLY = ROOT / "scripts" / "ci_hosted_only.txt"
 CARGO_SUBCOMMAND = re.compile(r"\bcargo\s+(?:\+\S+\s+)?([a-z][a-z-]*)")
 CARGO_CONFIG = re.compile(r"""--config[\s=]+(['"]?)([A-Za-z0-9_.-]+=[^'"\s]+)\1""")
@@ -316,9 +395,12 @@ def main() -> int:
         return 1
     if check_hosted_steps_mirrored(local_text, hosted) != 0:
         return 1
+    if check_linker_suite_parity(local_text, hosted) != 0:
+        return 1
     print(
         f"CI/local standalone gate parity: PASS ({len(local_paths)} commands, "
-        "2 mode/corpus-specific asm-diff gates, hosted steps mirrored)"
+        "2 mode/corpus-specific asm-diff gates, strict full linker suite, "
+        "hosted steps mirrored)"
     )
     return 0
 

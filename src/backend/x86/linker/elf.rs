@@ -95,123 +95,189 @@ pub fn is_gotpcrelx_relaxable(t: u32) -> bool {
     )
 }
 
+/// What a GOT-indirect reference's target is, as far as relaxing the
+/// reference is concerned.  Whether the target may be relaxed to at all
+/// (defined here, not preemptible, not an IFUNC, not copy-relocated) is the
+/// caller's decision; this says how its value relates to the load address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GotTarget {
+    /// An address inside this output: moves with the load base of a PIE or
+    /// shared object.  The RIP-relative forms always work; the immediate
+    /// forms only without PIC.
+    Image,
+    /// A link-time constant (an `SHN_ABS` definition) with this value.  It
+    /// never moves, so the immediate forms work even with PIC, provided the
+    /// value fits the imm32.  The RIP-relative forms never: with PIC the
+    /// result would slide (GNU ld 2.47 makes exactly that mistake for a
+    /// `--defsym` constant), and without PIC whether an arbitrary constant
+    /// is within +-2 GiB of the instruction is unknown until layout -- a
+    /// reference the planner elided a slot for must never turn out
+    /// unencodable.  A constant that does not fit keeps its slot.
+    Absolute(u64),
+}
+
+/// Whether `v` is representable by the imm32 of every immediate form used
+/// below: sign-extended (REX.W) and zero-extended (32-bit) alike.
+#[inline]
+fn fits_imm32(v: u64) -> bool {
+    v <= i32::MAX as u64
+}
+
 /// How a GOT-indirect reference can address its target directly (x86-64
 /// psABI, "Optimize GOTPCRELX Relocations"; the transformations GNU ld and
-/// lld perform).  Decided from the relocation and the ORIGINAL instruction
-/// bytes by [`gotpcrelx_relaxation`]; applied by [`rewrite_got_relax`].
+/// lld perform).  Decided from the relocation and the ORIGINAL section bytes
+/// by [`gotpcrelx_relaxation`], which also validates every byte
+/// [`rewrite_got_relax`] later rewrites, so the rewriter never has to
+/// re-derive (or trust) the encoding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GotRelax {
-    /// `mov foo@GOTPCREL(%rip), %reg` -> `lea foo(%rip), %reg`.
-    Lea,
+    /// `mov foo@GOTPCREL(%rip), %reg` -> `mov $foo, %reg` when `imm` and
+    /// the final value fits the imm32, else `lea foo(%rip), %reg`.  (For an
+    /// image address the value is only known after layout, so the choice is
+    /// the rewriter's; `imm` says whether the immediate form is allowed.)
+    Load { imm: bool },
     /// `call *foo@GOTPCREL(%rip)` -> `addr32 call foo` (same 6 bytes).
     Call,
     /// `jmp *foo@GOTPCREL(%rip)` -> `jmp foo; nop`.
     Jmp,
-    /// `test %reg, foo@GOTPCREL(%rip)` -> `test $foo, %reg` (non-PIC only).
+    /// `test %reg, foo@GOTPCREL(%rip)` -> `test $foo, %reg`.
     Test,
     /// `add/or/adc/sbb/and/sub/xor/cmp foo@GOTPCREL(%rip), %reg` ->
-    /// `<op> $foo, %reg` (non-PIC only).
+    /// `<op> $foo, %reg`.
     Binop,
 }
 
-/// The relaxation available for a GOT-indirect relocation at `off` in
-/// `code`, or `None` when the reference must go through a GOT slot.
+/// The relaxation available for a GOT-indirect relocation whose 32-bit
+/// field is at section offset `off` of `code` (the input section's bytes),
+/// or `None` when the reference must go through a GOT slot.
 ///
 /// Only the `*GOTPCRELX` types promise a relaxable instruction, and only
 /// with addend -4: any other addend means the 32-bit field is not the last
 /// thing in the instruction or the instruction reads part of the slot
-/// (`movl foo@GOTPCREL+4(%rip), %eax` loads its HIGH half), so the bytes
-/// cannot be rewritten.  The ModRM byte must be the RIP-relative form.  The
-/// immediate forms (test/binop) turn the operand into the target's absolute
-/// address, which is only link-time constant without PIC, and need the
-/// REX.W prefix `R_X86_64_REX_GOTPCRELX` guarantees: the imm32 of a 64-bit
-/// op is sign-extended, so the value range is checked when it is written.
-/// REX2/APX encodings (`CODE_4`) get the opcode-preserving forms only; the
-/// REX2 payload layout of the immediate forms differs.  Whether the TARGET
-/// qualifies (non-preemptible, not IFUNC, not absolute) is the caller's
-/// decision.
+/// (`movl foo@GOTPCREL+4(%rip), %eax` loads its HIGH half).  The ModRM byte
+/// must be the RIP-relative form.  Each type fixes the prefix layout, and
+/// the prefix is VERIFIED inside the section, never assumed:
+///
+/// * `GOTPCRELX`: no prefix (the relocation promises none) -- `mov`, and
+///   `call`/`jmp`, which are rewritten into prefix-free encodings.
+/// * `REX_GOTPCRELX`: a REX byte (0x40-0x4f) at `off - 3` -- `mov`, and
+///   the immediate `test`/binop forms, which also need REX.W (their imm32 is
+///   sign-extended to the 64-bit operation).  Not `call`/`jmp`: the rewrite
+///   would leave the REX byte in front of the `addr32` prefix.
+/// * `CODE_4_GOTPCRELX`: a REX2 prefix (`d5 xx`) at `off - 4` -- the
+///   opcode-preserving `lea` only; the REX2 payload of the immediate forms
+///   is laid out differently, and `call`/`jmp` cannot carry it.
+///
+/// A type whose prefix is absent (a misdescribed or truncated instruction,
+/// e.g. `REX_GOTPCRELX` two bytes into its section) is never relaxed: its
+/// GOT slot is always correct, and rewriting would touch bytes outside the
+/// instruction.
 pub fn gotpcrelx_relaxation(
     rela_type: u32,
     addend: i64,
     code: &[u8],
     off: usize,
     is_pic: bool,
+    target: GotTarget,
 ) -> Option<GotRelax> {
-    if addend != -4
-        || !matches!(
-            rela_type,
-            R_X86_64_GOTPCRELX | R_X86_64_REX_GOTPCRELX | R_X86_64_CODE_4_GOTPCRELX
-        )
-        || off < 2
-        || off.checked_add(4)? > code.len()
-    {
+    if addend != -4 || off < 2 || off.checked_add(4)? > code.len() {
         return None;
     }
     let (op, modrm) = (code[off - 2], code[off - 1]);
     if modrm & 0xc7 != 0x05 {
         return None;
     }
-    match op {
-        0x8b => Some(GotRelax::Lea),
-        0xff if modrm == 0x15 => Some(GotRelax::Call),
-        0xff if modrm == 0x25 => Some(GotRelax::Jmp),
-        _ if is_pic
-            || rela_type != R_X86_64_REX_GOTPCRELX
-            || off < 3
-            || code[off - 3] & 0xf8 != 0x48 =>
-        {
-            None
+    // Which families a target admits: RIP-relative (`lea`, `call`, `jmp`)
+    // and immediate (`mov $`, `test $`, `<op> $`).
+    let (rip_ok, imm_ok) = match target {
+        GotTarget::Image => (true, !is_pic),
+        GotTarget::Absolute(v) => (false, fits_imm32(v)),
+    };
+    // An image address is only known after layout: the rewriter uses the
+    // immediate when allowed and the address fits, else `lea` (always in
+    // reach: the small code model keeps the image within 2 GiB).  An
+    // absolute value is known now and fits, or the load is not relaxed.
+    let load = || (rip_ok || imm_ok).then_some(GotRelax::Load { imm: imm_ok });
+    match rela_type {
+        R_X86_64_GOTPCRELX => match op {
+            0x8b => load(),
+            0xff if modrm == 0x15 && rip_ok => Some(GotRelax::Call),
+            0xff if modrm == 0x25 && rip_ok => Some(GotRelax::Jmp),
+            _ => None,
+        },
+        R_X86_64_REX_GOTPCRELX => {
+            let rex = *code.get(off.checked_sub(3)?)?;
+            if rex & 0xf0 != 0x40 {
+                return None;
+            }
+            let rex_w = rex & 0x08 != 0;
+            match op {
+                0x8b => load(),
+                0x85 if rex_w && imm_ok => Some(GotRelax::Test),
+                0x03 | 0x0b | 0x13 | 0x1b | 0x23 | 0x2b | 0x33 | 0x3b if rex_w && imm_ok => {
+                    Some(GotRelax::Binop)
+                }
+                _ => None,
+            }
         }
-        0x85 => Some(GotRelax::Test),
-        0x03 | 0x0b | 0x13 | 0x1b | 0x23 | 0x2b | 0x33 | 0x3b => Some(GotRelax::Binop),
+        R_X86_64_CODE_4_GOTPCRELX => {
+            if off < 4 || code[off - 4] != 0xd5 || op != 0x8b || !rip_ok {
+                return None;
+            }
+            Some(GotRelax::Load { imm: false })
+        }
         _ => None,
     }
 }
 
+/// REX byte after moving ModRM.reg into ModRM.rm: REX.R becomes REX.B.  The
+/// old REX.B MUST be cleared, not kept: in the RIP-relative source form it
+/// selects nothing (ModRM.rm = 101 with mod = 00 means RIP whatever REX.B
+/// says), but in the register form it selects the destination -- keeping it
+/// turned `49 8b 05` (load into %rax) into `49 c7 c0` (store into %r8).
+/// W and X are kept (X is ignored by both forms).
+#[inline]
+fn rex_r_to_b(rex: u8) -> u8 {
+    (rex & !0x05) | ((rex & 0x04) >> 2)
+}
+
 /// Rewrite the instruction whose 32-bit GOTPCRELX field (relocation type
-/// `rela_type`) is at `fp` for a target at `s` (the field's address is `p`);
-/// returns the position and value of the 32-bit field to store, for the
-/// caller's range-checked write.  `is_pic` must be the value
-/// `gotpcrelx_relaxation` was asked with.
+/// `rela_type`) is at `fp` for a target whose final value is `s` (the
+/// field's address is `p`); returns the position and value of the 32-bit
+/// field to store, for the caller's range-checked write.  `kind` must come
+/// from [`gotpcrelx_relaxation`] over the same instruction bytes: it has
+/// verified the prefix this touches.
 pub fn rewrite_got_relax(
     buf: &mut [u8],
     fp: usize,
     kind: GotRelax,
     rela_type: u32,
-    is_pic: bool,
     s: u64,
     p: u64,
 ) -> (usize, i64) {
     // The GOTPCRELX addend is -4 (checked by `gotpcrelx_relaxation`).
     let pcrel = s as i64 - 4 - p as i64;
-    let rex_r_to_b = |rex: u8| (rex & !0x04) | ((rex & 0x04) >> 2);
+    let has_rex = rela_type == R_X86_64_REX_GOTPCRELX;
+    debug_assert!(
+        !has_rex || buf[fp - 3] & 0xf0 == 0x40,
+        "unverified REX prefix"
+    );
     match kind {
-        // Without PIC the address is a link-time constant, so the load
-        // becomes `mov $foo, %reg` (`c7 /0 imm32`, same 7/6 bytes): an
-        // immediate move depends on nothing, where the RIP-relative `lea`
-        // still needs an address generation.  GNU ld makes the same choice.
-        // The imm32 of the REX.W form is sign-extended and that of the 32-bit
-        // form zero-extended; `s <= i32::MAX` fits both (and the signed field
-        // check of the caller's write), anything larger keeps the `lea`,
-        // which reaches any target of the small code model.  Only the
-        // `REX_GOTPCRELX` type promises that fp-3 is this instruction's REX
-        // prefix; there ModRM.reg moves into ModRM.rm, so REX.R must become
-        // REX.B.  APX (`CODE_4`) forms keep the `lea`.
-        GotRelax::Lea
-            if !is_pic
-                && s <= i32::MAX as u64
-                && (rela_type == R_X86_64_GOTPCRELX
-                    || (rela_type == R_X86_64_REX_GOTPCRELX && buf[fp - 3] & 0xf0 == 0x40)) =>
-        {
+        // `mov $foo, %reg` (`c7 /0 imm32`, same 7/6 bytes): an immediate
+        // move depends on nothing, where the RIP-relative `lea` still needs
+        // an address generation.  The imm32 of the REX.W form is
+        // sign-extended and that of the 32-bit form zero-extended;
+        // `fits_imm32` holds for both.  ModRM.reg moves into ModRM.rm.
+        GotRelax::Load { imm: true } if fits_imm32(s) => {
             let modrm = buf[fp - 1];
             buf[fp - 1] = 0xc0 | ((modrm & 0x38) >> 3);
             buf[fp - 2] = 0xc7;
-            if rela_type == R_X86_64_REX_GOTPCRELX {
+            if has_rex {
                 buf[fp - 3] = rex_r_to_b(buf[fp - 3]);
             }
             (fp, s as i64)
         }
-        GotRelax::Lea => {
+        GotRelax::Load { .. } => {
             buf[fp - 2] = 0x8d;
             (fp, pcrel)
         }
@@ -244,6 +310,46 @@ pub fn rewrite_got_relax(
     }
 }
 
+/// Initial-Exec -> Local-Exec: the instruction an `R_X86_64_GOTTPOFF` at
+/// section offset `off` of `code` belongs to, if it is one of the two the
+/// psABI defines (`movq foo@gottpoff(%rip), %reg` / `addq ..., %reg`, REX.W
+/// at `off - 3`, RIP-relative ModRM).  Verified inside the section, as for
+/// [`gotpcrelx_relaxation`]; REX2/APX forms are not rewritten.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IeToLe {
+    Mov,
+    Add,
+}
+
+pub fn gottpoff_ie_to_le(rela_type: u32, code: &[u8], off: usize) -> Option<IeToLe> {
+    if rela_type != R_X86_64_GOTTPOFF || off < 3 || off.checked_add(4)? > code.len() {
+        return None;
+    }
+    let (rex, op, modrm) = (code[off - 3], code[off - 2], code[off - 1]);
+    if rex & 0xf8 != 0x48 || modrm & 0xc7 != 0x05 {
+        return None;
+    }
+    match op {
+        0x8b => Some(IeToLe::Mov),
+        0x03 => Some(IeToLe::Add),
+        _ => None,
+    }
+}
+
+/// Apply an [`IeToLe`] rewrite at field position `fp`: `REX' c7 /0` or
+/// `REX' 81 /0` with the destination moved into ModRM.rm (REX.R -> REX.B,
+/// see [`rex_r_to_b`]; without it `%r12` silently became `%rsp`).  The
+/// caller stores the TP offset into the imm32 at `fp`.
+pub fn rewrite_ie_to_le(buf: &mut [u8], fp: usize, kind: IeToLe) {
+    let modrm = buf[fp - 1];
+    buf[fp - 1] = 0xc0 | ((modrm & 0x38) >> 3);
+    buf[fp - 2] = match kind {
+        IeToLe::Mov => 0xc7,
+        IeToLe::Add => 0x81,
+    };
+    buf[fp - 3] = rex_r_to_b(buf[fp - 3]);
+}
+
 /// TLS Initial-Exec through a GOT slot (classic / REX2 / APX EVEX).
 #[inline]
 pub fn is_gottpoff_family(t: u32) -> bool {
@@ -274,14 +380,22 @@ pub const R_X86_64_GOTPLT64: u32 = 30;
 pub const R_X86_64_PLTOFF64: u32 = 31;
 pub const R_X86_64_RELATIVE64: u32 = 38;
 
+/// Large-code-model references that address a GOT slot by a 64-bit offset
+/// (`movabs $sym@GOT, %rax` = G + A from `_GLOBAL_OFFSET_TABLE_`, or
+/// GOTPCREL64 = G + GOT + A - P).  Unlike the 32-bit GOTPCREL family they
+/// can never be relaxed -- the instruction is a `movabs` of an offset, not
+/// a memory operand -- so every one of them needs a slot.  GOTPLT64 is
+/// GOT64 whose slot may be the PLT's; one ordinary slot serves both.
+pub fn is_got64_family(t: u32) -> bool {
+    matches!(t, R_X86_64_GOT64 | R_X86_64_GOTPCREL64 | R_X86_64_GOTPLT64)
+}
+
 // DT_* constants now in shared module - re-export them
 pub use crate::backend::elf::{
-    DF_1_NOW, DF_1_PIE, DT_DEBUG, DT_FINI_ARRAY, DT_FINI_ARRAYSZ, DT_FLAGS, DT_FLAGS_1,
-    DT_INIT_ARRAY, DT_INIT_ARRAYSZ, DT_PREINIT_ARRAY, DT_PREINIT_ARRAYSZ, DT_RELACOUNT, DT_RPATH,
-    DT_RUNPATH, DT_SONAME, DT_VERDEF, DT_VERDEFNUM, DT_VERNEED, DT_VERNEEDNUM, DT_VERSYM,
+    DT_DEBUG, DT_FINI_ARRAY, DT_FINI_ARRAYSZ, DT_FLAGS, DT_FLAGS_1, DT_INIT_ARRAY, DT_INIT_ARRAYSZ,
+    DT_PREINIT_ARRAY, DT_PREINIT_ARRAYSZ, DT_RELACOUNT, DT_RPATH, DT_RUNPATH, DT_SONAME, DT_VERDEF,
+    DT_VERDEFNUM, DT_VERNEED, DT_VERNEEDNUM, DT_VERSYM,
 };
-
-pub const DF_BIND_NOW: i64 = 0x8;
 
 // ── Type aliases ─────────────────────────────────────────────────────────
 // Re-export shared types under the names the x86 linker already uses.
@@ -326,12 +440,22 @@ mod tests {
     /// field), placed after a one-byte stand-in for the previous instruction
     /// so an out-of-bounds read of "fp-3" on a non-REX form would be visible.
     fn relax(insn: &[u8], rela_type: u32, is_pic: bool, s: u64) -> Option<Vec<u8>> {
+        relax_to(insn, rela_type, is_pic, GotTarget::Image, s)
+    }
+
+    fn relax_to(
+        insn: &[u8],
+        rela_type: u32,
+        is_pic: bool,
+        target: GotTarget,
+        s: u64,
+    ) -> Option<Vec<u8>> {
         let mut buf = vec![0xc3];
         buf.extend_from_slice(insn);
         let fp = buf.len() - 4;
-        let kind = gotpcrelx_relaxation(rela_type, -4, &buf, fp, is_pic)?;
+        let kind = gotpcrelx_relaxation(rela_type, -4, &buf, fp, is_pic, target)?;
         let p = 0x1000 + fp as u64;
-        let (pos, v) = rewrite_got_relax(&mut buf, fp, kind, rela_type, is_pic, s, p);
+        let (pos, v) = rewrite_got_relax(&mut buf, fp, kind, rela_type, s, p);
         buf[pos..pos + 4].copy_from_slice(&(v as i32).to_le_bytes());
         assert_eq!(buf[0], 0xc3, "rewrite touched the previous instruction");
         Some(buf[1..].to_vec())
@@ -465,34 +589,247 @@ mod tests {
         let buf = [&[0xc3][..], &mov[..]].concat();
         // Plain GOTPCREL promises nothing about the instruction.
         assert_eq!(
-            gotpcrelx_relaxation(R_X86_64_GOTPCREL, -4, &buf, 4, false),
+            gotpcrelx_relaxation(R_X86_64_GOTPCREL, -4, &buf, 4, false, GotTarget::Image),
             None
         );
         // A non -4 addend reads part of the slot (e.g. its high half).
         assert_eq!(
-            gotpcrelx_relaxation(R_X86_64_REX_GOTPCRELX, 0, &buf, 4, false),
+            gotpcrelx_relaxation(R_X86_64_REX_GOTPCRELX, 0, &buf, 4, false, GotTarget::Image),
             None
         );
         // Immediate forms need a link-time-constant address and REX.W.
         let test = [&[0xc3][..], &[0x48, 0x85, 0x0d], &Z[..]].concat();
         assert_eq!(
-            gotpcrelx_relaxation(R_X86_64_REX_GOTPCRELX, -4, &test, 4, true),
+            gotpcrelx_relaxation(R_X86_64_REX_GOTPCRELX, -4, &test, 4, true, GotTarget::Image),
             None
         );
         let test32 = [&[0xc3][..], &[0x44, 0x85, 0x0d], &Z[..]].concat();
         assert_eq!(
-            gotpcrelx_relaxation(R_X86_64_REX_GOTPCRELX, -4, &test32, 4, false),
+            gotpcrelx_relaxation(
+                R_X86_64_REX_GOTPCRELX,
+                -4,
+                &test32,
+                4,
+                false,
+                GotTarget::Image
+            ),
             None
         );
         // Not a RIP-relative ModRM.
         let reg = [&[0xc3][..], &[0x48, 0x8b, 0x04], &Z[..]].concat();
         assert_eq!(
-            gotpcrelx_relaxation(R_X86_64_REX_GOTPCRELX, -4, &reg, 4, false),
+            gotpcrelx_relaxation(R_X86_64_REX_GOTPCRELX, -4, &reg, 4, false, GotTarget::Image),
             None
         );
         // Field running past the end of the section.
         assert_eq!(
-            gotpcrelx_relaxation(R_X86_64_REX_GOTPCRELX, -4, &buf[..6], 4, false),
+            gotpcrelx_relaxation(
+                R_X86_64_REX_GOTPCRELX,
+                -4,
+                &buf[..6],
+                4,
+                false,
+                GotTarget::Image
+            ),
+            None
+        );
+    }
+
+    /// REX.B selects nothing in the RIP-relative source form but the
+    /// destination in the register form: it must be REPLACED by REX.R,
+    /// never OR-ed with it.  Every R/B/W/X combination, exact bytes.
+    #[test]
+    fn rex_b_of_the_source_is_replaced_not_kept() {
+        for rex in 0x40u8..=0x4f {
+            let reg = 2u8; // ModRM.reg = %rdx / %r10
+            let mov = [rex, 0x8b, 0x05 | (reg << 3), 0, 0, 0, 0];
+            let got = relax(&mov, R_X86_64_REX_GOTPCRELX, false, 0x404020).unwrap();
+            let want_rex = (rex & 0x0a) | 0x40 | ((rex & 0x04) >> 2);
+            assert_eq!(
+                got,
+                with_imm(&[want_rex, 0xc7, 0xc0 | reg], 0x404020),
+                "rex {rex:#x}"
+            );
+            // The destination register number is preserved exactly.
+            let src_dst = ((rex & 0x04) << 1) | reg;
+            let out_dst = ((got[0] & 0x01) << 3) | (got[2] & 7);
+            assert_eq!(src_dst, out_dst, "rex {rex:#x}");
+            if rex & 0x08 != 0 {
+                for (op, new_op) in [(0x85u8, 0xf7u8), (0x3b, 0x81)] {
+                    let insn = [rex, op, 0x05 | (reg << 3), 0, 0, 0, 0];
+                    let got = relax(&insn, R_X86_64_REX_GOTPCRELX, false, 0x4000).unwrap();
+                    assert_eq!(got[0], want_rex, "op {op:#x} rex {rex:#x}");
+                    assert_eq!(got[1], new_op);
+                    assert_eq!(((got[0] & 1) << 3) | (got[2] & 7), src_dst);
+                }
+            }
+        }
+        // The reviewer's case: 49 8b 05 loads %rax; it must stay %rax.
+        let got = relax(
+            &[0x49, 0x8b, 0x05, 0, 0, 0, 0],
+            R_X86_64_REX_GOTPCRELX,
+            false,
+            0x10,
+        );
+        assert_eq!(got.unwrap(), with_imm(&[0x48, 0xc7, 0xc0], 0x10));
+    }
+
+    /// The prefix a relocation type promises is checked inside the section:
+    /// `REX_GOTPCRELX` two bytes into its section has no REX byte to fix, a
+    /// REX-typed field behind a non-REX byte is misdescribed, and REX2 must
+    /// really be there.  All stay on their (always correct) GOT slot.
+    #[test]
+    fn misdescribed_or_truncated_prefixes_are_not_relaxed() {
+        let at_start = [0x8b, 0x05, 0, 0, 0, 0];
+        for t in [R_X86_64_REX_GOTPCRELX, R_X86_64_CODE_4_GOTPCRELX] {
+            assert_eq!(
+                gotpcrelx_relaxation(t, -4, &at_start, 2, false, GotTarget::Image),
+                None
+            );
+        }
+        // Well-formed without a prefix: GOTPCRELX at offset 2 is fine.
+        assert_eq!(
+            gotpcrelx_relaxation(
+                R_X86_64_GOTPCRELX,
+                -4,
+                &at_start,
+                2,
+                false,
+                GotTarget::Image
+            ),
+            Some(GotRelax::Load { imm: true })
+        );
+        let no_rex = [0x90, 0x8b, 0x05, 0, 0, 0, 0];
+        assert_eq!(
+            gotpcrelx_relaxation(
+                R_X86_64_REX_GOTPCRELX,
+                -4,
+                &no_rex,
+                3,
+                false,
+                GotTarget::Image
+            ),
+            None
+        );
+        let no_rex2 = [0x90, 0x48, 0x8b, 0x05, 0, 0, 0, 0];
+        assert_eq!(
+            gotpcrelx_relaxation(
+                R_X86_64_CODE_4_GOTPCRELX,
+                -4,
+                &no_rex2,
+                4,
+                false,
+                GotTarget::Image
+            ),
+            None
+        );
+        // REX2 call/jmp and REX call: no prefix-preserving rewrite exists.
+        for insn in [&[0xd5, 0x00, 0xff, 0x15][..], &[0xd5, 0x00, 0xff, 0x25][..]] {
+            let b = [insn, &Z[..]].concat();
+            assert_eq!(
+                gotpcrelx_relaxation(R_X86_64_CODE_4_GOTPCRELX, -4, &b, 4, true, GotTarget::Image),
+                None
+            );
+        }
+        let rex_call = [0x48, 0xff, 0x15, 0, 0, 0, 0];
+        assert_eq!(
+            gotpcrelx_relaxation(
+                R_X86_64_REX_GOTPCRELX,
+                -4,
+                &rex_call,
+                3,
+                true,
+                GotTarget::Image
+            ),
+            None
+        );
+    }
+
+    /// An absolute target never moves: immediate forms are valid even with
+    /// PIC when the value fits; RIP-relative ones are never chosen (they
+    /// would slide with PIC, and may be out of reach without it).
+    #[test]
+    fn absolute_targets() {
+        let mov = [0x48, 0x8b, 0x05, 0, 0, 0, 0];
+        let abs = |v| GotTarget::Absolute(v);
+        // PIE/.so: mov $imm for a small constant, a slot for a large one.
+        let got = relax_to(&mov, R_X86_64_REX_GOTPCRELX, true, abs(0x1234), 0x1234);
+        assert_eq!(got.unwrap(), with_imm(&[0x48, 0xc7, 0xc0], 0x1234));
+        assert_eq!(
+            relax_to(&mov, R_X86_64_REX_GOTPCRELX, true, abs(1 << 40), 1 << 40),
+            None
+        );
+        // ... and no lea/call/jmp, whose RIP-relative result would slide.
+        let call = [0xff, 0x15, 0, 0, 0, 0];
+        assert_eq!(
+            relax_to(&call, R_X86_64_GOTPCRELX, true, abs(0x1234), 0x1234),
+            None
+        );
+        let rex2 = [0xd5, 0x48, 0x8b, 0x05, 0, 0, 0, 0];
+        assert_eq!(
+            relax_to(&rex2, R_X86_64_CODE_4_GOTPCRELX, true, abs(0x10), 0x10),
+            None
+        );
+        // test/binop immediates are position-independent for a constant.
+        let test = [0x48, 0x85, 0x05, 0, 0, 0, 0];
+        let got = relax_to(&test, R_X86_64_REX_GOTPCRELX, true, abs(0x80), 0x80);
+        assert_eq!(got.unwrap(), with_imm(&[0x48, 0xf7, 0xc0], 0x80));
+        // Without PIC too: a large constant keeps its slot, and a small one
+        // becomes an immediate, never a RIP-relative form.
+        let big = 0x9000_0000u64;
+        assert_eq!(
+            relax_to(&mov, R_X86_64_REX_GOTPCRELX, false, abs(big), big),
+            None
+        );
+        let got = relax_to(&mov, R_X86_64_REX_GOTPCRELX, false, abs(0x1234), 0x1234);
+        assert_eq!(got.unwrap(), with_imm(&[0x48, 0xc7, 0xc0], 0x1234));
+        assert_eq!(
+            relax_to(&call, R_X86_64_GOTPCRELX, false, abs(0x1234), 0x1234),
+            None
+        );
+    }
+
+    #[test]
+    fn ie_to_le_validates_and_moves_rex_r_to_b() {
+        // movq foo@gottpoff(%rip), %r12  ->  movq $tpoff, %r12
+        let mut b = vec![0xc3, 0x4c, 0x8b, 0x25, 0, 0, 0, 0];
+        assert_eq!(
+            gottpoff_ie_to_le(R_X86_64_GOTTPOFF, &b, 4),
+            Some(IeToLe::Mov)
+        );
+        rewrite_ie_to_le(&mut b, 4, IeToLe::Mov);
+        assert_eq!(&b[..4], &[0xc3, 0x49, 0xc7, 0xc4]);
+        // addq foo@gottpoff(%rip), %rax with a stray REX.B
+        let mut b = vec![0x49, 0x03, 0x05, 0, 0, 0, 0];
+        assert_eq!(
+            gottpoff_ie_to_le(R_X86_64_GOTTPOFF, &b, 3),
+            Some(IeToLe::Add)
+        );
+        rewrite_ie_to_le(&mut b, 3, IeToLe::Add);
+        assert_eq!(&b[..3], &[0x48, 0x81, 0xc0]);
+        // At the section start, without REX.W, not RIP-relative, other op.
+        assert_eq!(
+            gottpoff_ie_to_le(R_X86_64_GOTTPOFF, &[0x8b, 0x05, 0, 0, 0, 0], 2),
+            None
+        );
+        assert_eq!(
+            gottpoff_ie_to_le(R_X86_64_GOTTPOFF, &[0x44, 0x8b, 0x05, 0, 0, 0, 0], 3),
+            None
+        );
+        assert_eq!(
+            gottpoff_ie_to_le(R_X86_64_GOTTPOFF, &[0x48, 0x8b, 0x04, 0, 0, 0, 0], 3),
+            None
+        );
+        assert_eq!(
+            gottpoff_ie_to_le(R_X86_64_GOTTPOFF, &[0x48, 0x2b, 0x05, 0, 0, 0, 0], 3),
+            None
+        );
+        assert_eq!(
+            gottpoff_ie_to_le(
+                R_X86_64_CODE_4_GOTTPOFF,
+                &[0xd5, 0x48, 0x8b, 0x05, 0, 0, 0, 0],
+                4
+            ),
             None
         );
     }

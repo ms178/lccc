@@ -333,7 +333,7 @@ fn run(args: &[String]) -> Result<(), String> {
     let mut entry_override: Option<String> = None;
     let mut shared = false;
     let mut soname: Option<String> = None;
-    let mut bsymbolic = false;
+    let mut dt_symbolic = false;
     let mut max_page_size = 0x200000u64;
     let mut max_page_size_explicit = false;
     let mut elf_i386 = false;
@@ -557,8 +557,12 @@ fn run(args: &[String]) -> Result<(), String> {
                     passthrough.push(format!("-Wl,-u,{}", sym));
                 }
             }
-            "-Bsymbolic" | "-Bsymbolic-functions" => {
-                bsymbolic = true;
+            // Linker-script links bind every reference statically, so the
+            // only effect left is the DT_SYMBOLIC/DF_SYMBOLIC tag, which
+            // belongs to -Bsymbolic alone: under -Bsymbolic-functions ld.so
+            // must still look data up globally.  Last spelling wins (GNU).
+            "-Bsymbolic" | "-Bsymbolic-functions" | "-Bno-symbolic" => {
+                dt_symbolic = a == "-Bsymbolic";
                 passthrough.push(a.to_string());
             }
             // GNU ld accepts BOTH spellings and gcc's driver emits the
@@ -903,31 +907,28 @@ fn run(args: &[String]) -> Result<(), String> {
             lccc::linker_entry::load_inputs_x86(&inputs, &mut objects, &undefined_symbols)?;
             objects
         };
+        // Everything appended from here on is linker-synthesized and must
+        // stay out of the property merge's "real inputs" (an object without
+        // the note would veto every AND-class type).
+        let real_inputs = objects.len();
         if build_id {
             lccc::linker_entry::append_build_id_object(&mut objects);
         }
-        // GNU property note merge (CET/ISA) for script links: done here,
-        // where the synthetic build-id object's index is known, so it is
-        // excluded from the "real inputs" (a synthetic object without the
-        // note would veto every AND-class type).  The merged note then
-        // flows through the script layout like any other input section.
+        // GNU property note merge (CET/ISA) for script links.  The merged
+        // note then flows through the script layout like any other input
+        // section.
         let (cet_flags, z_ignored) = passthrough_property_flags(&passthrough)?;
         for kw in z_ignored {
             eprintln!("lccc-ld: warning: -z {kw} ignored");
-        }
-        let mut synthetic: lccc::linker_entry::FxHashSet<usize> = Default::default();
-        if build_id {
-            synthetic.insert(objects.len() - 1);
         }
         // `elf_i386` selects the note's entry stride (12-byte entries on
         // 32-bit targets, 16 on 64-bit ones — see `cet::parse_property_note`).
         if let Some(carrier) = lccc::linker_entry::merge_property_into_objects(
             &mut objects,
-            &synthetic,
+            real_inputs,
             &cet_flags,
             elf_i386,
         )? {
-            synthetic.insert(objects.len());
             objects.push(carrier);
         }
         if let Some(e) = entry_override {
@@ -944,7 +945,7 @@ fn run(args: &[String]) -> Result<(), String> {
                 emit_relocs,
                 gc_sections,
                 soname.as_deref(),
-                bsymbolic,
+                dt_symbolic,
                 max_page_size,
                 &defsyms,
             );
@@ -958,7 +959,7 @@ fn run(args: &[String]) -> Result<(), String> {
             emit_relocs,
             gc_sections,
             soname.as_deref(),
-            bsymbolic,
+            dt_symbolic,
             max_page_size,
             &defsyms,
         );

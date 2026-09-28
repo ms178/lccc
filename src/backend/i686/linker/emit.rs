@@ -457,6 +457,9 @@ pub(super) fn emit_executable(
         0
     };
     let has_notes = input_note_size + build_id_size > 0;
+    // The merged GNU property note (`merge_gnu_properties`), covered by
+    // PT_GNU_PROPERTY as well as PT_NOTE, like GNU ld does for elf_i386.
+    let property_note = super::sections::property_note_extent(inputs, section_map, note_sec_idx);
     // PT_GNU_RELRO is applied by the dynamic loader; a static executable
     // has no RELRO-protected dynamic data (and its IRELATIVE slots must stay
     // writable until the startup code has applied them).
@@ -470,12 +473,26 @@ pub(super) fn emit_executable(
         num_phdrs += 1;
     } // DYNAMIC
     num_phdrs += 1; // GNU_STACK
-    num_phdrs += 1; // GNU_EH_FRAME
+    // `.eh_frame_hdr` (and so PT_GNU_EH_FRAME) exists exactly when the
+    // merged `.eh_frame` holds an FDE, as in the shared-library emitter
+    // and GNU ld.  An unconditional header used to be written as
+    // {p_vaddr 0, p_memsz 0} without FDEs; libgcc's dl_iterate_phdr
+    // unwinder dereferences p_vaddr + load bias of the PT_GNU_EH_FRAME of
+    // any object whose PT_LOAD holds the pc, i.e. address 0 there.
+    let eh_frame_fde_count = section_name_to_idx.get(".eh_frame").map_or(0, |&i| {
+        crate::backend::linker_common::count_eh_frame_fdes(&output_sections[i].data)
+    });
+    if eh_frame_fde_count > 0 {
+        num_phdrs += 1; // GNU_EH_FRAME
+    }
     if has_tls_sections {
         num_phdrs += 1;
     }
     if has_notes {
         num_phdrs += 1; // NOTE
+    }
+    if property_note.is_some() {
+        num_phdrs += 1; // GNU_PROPERTY
     }
     if use_relro {
         num_phdrs += 1; // GNU_RELRO
@@ -773,9 +790,8 @@ pub(super) fn emit_executable(
     let mut eh_frame_hdr_vaddr = 0u32;
     let mut eh_frame_hdr_offset = 0u32;
     let mut eh_frame_hdr_size = 0u32;
-    if let Some(idx) = eh_frame_sec_idx {
-        let fde_count =
-            crate::backend::linker_common::count_eh_frame_fdes(&output_sections[idx].data);
+    if eh_frame_sec_idx.is_some() {
+        let fde_count = eh_frame_fde_count;
         if fde_count > 0 {
             eh_frame_hdr_size = (12 + 8 * fde_count) as u32;
             file_offset = align_up(file_offset, 4);
@@ -1436,6 +1452,19 @@ pub(super) fn emit_executable(
             note_align,
         );
     }
+    if let Some((off, size)) = property_note {
+        write_ph(
+            &mut output,
+            &mut phdr_pos,
+            PT_GNU_PROPERTY,
+            note_offset + off,
+            note_vaddr + off,
+            size,
+            size,
+            PF_R,
+            4,
+        );
+    }
     if use_relro {
         write_ph(
             &mut output,
@@ -1460,17 +1489,19 @@ pub(super) fn emit_executable(
         stack_flags,
         0x10,
     );
-    write_ph(
-        &mut output,
-        &mut phdr_pos,
-        PT_GNU_EH_FRAME,
-        eh_frame_hdr_offset,
-        eh_frame_hdr_vaddr,
-        eh_frame_hdr_size,
-        eh_frame_hdr_size,
-        PF_R,
-        4,
-    );
+    if eh_frame_hdr_size > 0 {
+        write_ph(
+            &mut output,
+            &mut phdr_pos,
+            PT_GNU_EH_FRAME,
+            eh_frame_hdr_offset,
+            eh_frame_hdr_vaddr,
+            eh_frame_hdr_size,
+            eh_frame_hdr_size,
+            PF_R,
+            4,
+        );
+    }
     if has_tls {
         write_ph(
             &mut output,

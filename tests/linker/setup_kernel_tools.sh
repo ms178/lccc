@@ -23,20 +23,33 @@
 #   tests/linker/setup_kernel_tools.sh [--kver v6.12] [--prefix DIR]
 #
 # The suite picks the tool up from $LCCC_RELOCS_TOOL, defaulting to
-# <prefix>/bin/relocs, and SKIPs cleanly when it is absent.
+# ${LCCC_ORACLE_PREFIX:-$HOME/tools}/bin/relocs; without it the test reports
+# SKIP, which `run_linker_tests.py --strict` (CI) turns into a failure.
+#
+# Every fetched file is pinned by SHA-256 (the v6.12 contents), so a changed
+# tag, a proxy or an HTML error page fails here instead of building something
+# else.  Another --kver needs its own pins: --no-verify is for exploration
+# only, never CI.
 # ============================================================================
 set -euo pipefail
 
 KVER=${KVER:-v6.12}
-PREFIX=${LCCC_ORACLE_PREFIX:-/home/user/tools}
+PREFIX=${LCCC_ORACLE_PREFIX:-$HOME/tools}
+VERIFY=1
 
 while [[ $# -gt 0 ]]; do
   case $1 in
     --kver)   KVER=$2; shift 2 ;;
     --prefix) PREFIX=$2; shift 2 ;;
+    --no-verify) VERIFY=0; shift ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
+
+if [[ $VERIFY == 1 && $KVER != v6.12 ]]; then
+  echo "error: no SHA-256 pins for $KVER (pins cover v6.12; --no-verify to explore)" >&2
+  exit 1
+fi
 
 BIN="$PREFIX/bin"
 SRC="$PREFIX/kernel-tools"
@@ -63,6 +76,17 @@ if ! head -1 "$SRC/relocs.c" | grep -q "SPDX-License-Identifier"; then
   echo "error: relocs.c does not look like kernel source (download blocked?)" >&2
   head -3 "$SRC/relocs.c" >&2
   exit 1
+fi
+
+if [[ $VERIFY == 1 ]]; then
+  ( cd "$SRC" && sha256sum -c --quiet - ) <<'PINS' || { echo "error: kernel tool sources do not match the v6.12 pins" >&2; exit 1; }
+e23d46f4cb098aef1c80862a4aaa176c21b53ba12699576ec23e366428897f8f  relocs.c
+61783eeddcf582c6f8c74c63f8f5170df51e34819a8b8dad9af68117f5c185d0  relocs.h
+a49f30d39b362c29bdd27f19cadffdcfefefe5ad35511dd4b8f00d002a1cf08f  relocs_common.c
+ae8b4ffcfe0367bb457a73b9a9534bf2ec495e2f7d99e23b1257b0009d693680  relocs_32.c
+88e45459755585c934a9e24ebb9f6b71fd27f8d10c2fa9cc4a4d51fe3719166b  relocs_64.c
+87b40e54fed5b27a9acd784e41521d8bbf95922448d07bea17be6b4bb5fa7925  tools/le_byteshift.h
+PINS
 fi
 
 echo "building relocs"

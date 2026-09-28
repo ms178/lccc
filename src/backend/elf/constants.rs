@@ -113,8 +113,9 @@ pub const PT_PHDR: u32 = 6;
 pub const PT_TLS: u32 = 7;
 pub const PT_GNU_EH_FRAME: u32 = 0x6474_e550;
 pub const PT_GNU_STACK: u32 = 0x6474_e551;
-/// `PT_GNU_PROPERTY`: carries the 64-bit property note
-/// (`.note.gnu.property`), aliasing the PT_NOTE segment that holds it.
+/// `PT_GNU_PROPERTY`: covers the merged property note
+/// (`.note.gnu.property`) inside the PT_NOTE segment that holds it, on
+/// ELF64 and ELF32 alike.
 pub const PT_GNU_PROPERTY: u32 = 0x6474_e553;
 pub const PT_GNU_RELRO: u32 = 0x6474_e552;
 

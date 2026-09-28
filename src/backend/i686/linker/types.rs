@@ -11,11 +11,11 @@ use crate::common::fx_hash::FxHashMap;
 pub(super) use crate::backend::elf::{
     ELF_MAGIC, ELFCLASS32, ELFDATA2LSB, EM_386, ET_DYN, ET_EXEC, ET_REL, EV_CURRENT,
     LinkerScriptEntry, LinkerSymbolAddresses, PF_R, PF_W, PF_X, PT_DYNAMIC, PT_GNU_EH_FRAME,
-    PT_GNU_STACK, PT_INTERP, PT_LOAD, PT_PHDR, PT_TLS, SHN_ABS, SHN_COMMON, SHN_UNDEF, SHT_DYNSYM,
-    SHT_FINI_ARRAY, SHT_GROUP, SHT_INIT_ARRAY, SHT_NOBITS, SHT_NULL, SHT_PROGBITS, SHT_REL,
-    SHT_RELA, SHT_STRTAB, SHT_SYMTAB, STB_GLOBAL, STB_LOCAL, STB_WEAK, STT_FILE, STT_FUNC,
-    STT_GNU_IFUNC, STT_NOTYPE, STT_OBJECT, STT_SECTION, STT_TLS, STV_DEFAULT, STV_HIDDEN,
-    STV_INTERNAL, STV_PROTECTED, get_standard_linker_symbols, is_thin_archive,
+    PT_GNU_PROPERTY, PT_GNU_STACK, PT_INTERP, PT_LOAD, PT_PHDR, PT_TLS, SHN_ABS, SHN_COMMON,
+    SHN_UNDEF, SHT_DYNSYM, SHT_FINI_ARRAY, SHT_GROUP, SHT_INIT_ARRAY, SHT_NOBITS, SHT_NULL,
+    SHT_PROGBITS, SHT_REL, SHT_RELA, SHT_STRTAB, SHT_SYMTAB, STB_GLOBAL, STB_LOCAL, STB_WEAK,
+    STT_FILE, STT_FUNC, STT_GNU_IFUNC, STT_NOTYPE, STT_OBJECT, STT_SECTION, STT_TLS, STV_DEFAULT,
+    STV_HIDDEN, STV_INTERNAL, STV_PROTECTED, get_standard_linker_symbols, is_thin_archive,
     parse_archive_members, parse_linker_script_entries, parse_thin_archive_members, read_cstr,
     read_i32, read_u16, read_u32,
 };
@@ -40,7 +40,6 @@ pub(super) const SHF_EXECINSTR: u32 = 0x4;
 pub(super) const SHF_MERGE: u32 = 0x10;
 #[expect(dead_code)] // ELF standard section flag, defined for reference
 pub(super) const SHF_STRINGS: u32 = 0x20;
-#[expect(dead_code)] // ELF standard section flag, defined for reference
 pub(super) const SHF_INFO_LINK: u32 = 0x40;
 pub(super) const SHF_GROUP: u32 = 0x200;
 pub(super) const SHF_TLS: u32 = 0x400;
