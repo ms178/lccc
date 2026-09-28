@@ -88,7 +88,11 @@ def one(args):
     if gr!=0 or cr!=0:
         return {'seed':seed,'level':level,'status':'compile','gcc_rc':gr,'ccc_rc':cr,'detail':(ge+'\n'+ce)[-1000:]}
     gr,go,ge=call([str(gb)],10); cr,co,ce=call([str(cb)],10)
-    if gr==cr and go==co:
+    # Generated main returns zero. Equal crashes/timeouts are not evidence of
+    # correctness and must never delete the reproducer as a passing case.
+    if gr != 0 or cr != 0:
+        return {'seed':seed,'level':level,'status':'runtime','gcc_rc':gr,'ccc_rc':cr,'gcc_out':go,'ccc_out':co,'detail':(ge+'\n'+ce)[-1000:]}
+    if go==co:
         for p in (src,cb,gb): p.unlink(missing_ok=True)
         try:d.rmdir()
         except OSError:pass

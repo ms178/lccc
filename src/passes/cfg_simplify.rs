@@ -1315,7 +1315,7 @@ fn resolve_value_globally(
         } => resolve_value_globally(func, *sv, val_map, depth + 1),
         Instruction::Phi { incoming, .. } => {
             // All incoming must be the same constant.
-            let mut common_val: Option<i64> = None;
+            let mut common_val: Option<i128> = None;
             let mut first_const: Option<IrConst> = None;
             for (op, _) in incoming {
                 let c = match op {
@@ -1324,7 +1324,7 @@ fn resolve_value_globally(
                 };
                 match c {
                     Some(c) => {
-                        let ci = c.to_i64()?;
+                        let ci = c.to_i128()?;
                         if let Some(prev) = common_val {
                             if prev != ci {
                                 return None;
@@ -1419,12 +1419,12 @@ fn resolve_value_to_const_in_block(block: &BasicBlock, v: Value) -> Option<IrCon
             }
             Instruction::Phi { dest, incoming, .. } if *dest == v => {
                 // Check if all incoming values are the same constant.
-                let mut common_val: Option<i64> = None;
+                let mut common_val: Option<i128> = None;
                 let mut first_const: Option<IrConst> = None;
                 for (op, _) in incoming {
                     match op {
                         Operand::Const(c) => {
-                            let ci = c.to_i64()?;
+                            let ci = c.to_i128()?;
                             if let Some(prev) = common_val {
                                 if prev != ci {
                                     return None;
@@ -1490,12 +1490,14 @@ fn operands_equal(a: &Operand, b: &Operand) -> bool {
 
 /// Compare two IR constants for phi simplification.
 /// Integer constants of different widths but same numeric value are considered
-/// equal (e.g., I32(0) == I64(0)).
+/// equal (e.g., I32(0) == I64(0)). Compare the full 128-bit value: narrowing
+/// here would equate constants whose low 64 bits agree but whose truth values
+/// differ. Floating constants only compare equal through their exact hash keys.
 fn consts_equal_for_phi(a: &IrConst, b: &IrConst) -> bool {
     if a.to_hash_key() == b.to_hash_key() {
         return true;
     }
-    match (a.to_i64(), b.to_i64()) {
+    match (a.to_i128(), b.to_i128()) {
         (Some(va), Some(vb)) => va == vb,
         _ => false,
     }
@@ -1524,6 +1526,50 @@ mod tests {
             terminator,
             source_spans: Vec::new(),
         }
+    }
+
+    #[test]
+    fn redteam_phi_equality_preserves_high_integer_bits() {
+        let low = IrConst::I128(0);
+        let high = IrConst::I128(1i128 << 64);
+        assert!(!consts_equal_for_phi(&low, &high));
+        assert!(!consts_equal_for_phi(&IrConst::I64(0), &high));
+    }
+
+    #[test]
+    fn redteam_phi_resolution_preserves_high_integer_bits() {
+        let mut func = IrFunction::new("wide_phi".into(), IrType::I128, vec![], false);
+        func.blocks.push(make_block(
+            BlockId(0),
+            vec![Instruction::Phi {
+                dest: Value(0),
+                ty: IrType::I128,
+                incoming: vec![
+                    (Operand::Const(IrConst::I128(0)), BlockId(1)),
+                    (Operand::Const(IrConst::I128(1i128 << 64)), BlockId(2)),
+                ],
+            }],
+            Terminator::Return(Some(Operand::Value(Value(0)))),
+        ));
+        assert!(resolve_value_to_const_in_block(&func.blocks[0], Value(0)).is_none());
+        assert!(
+            resolve_value_globally(&func, Value(0), &build_global_value_map(&func), 0).is_none()
+        );
+        assert_eq!(simplify_trivial_phis(&mut func), 0);
+    }
+
+    #[test]
+    fn redteam_phi_float_identity_is_bit_exact() {
+        assert!(!consts_equal_for_phi(
+            &IrConst::F64(0.0),
+            &IrConst::F64(-0.0)
+        ));
+        let nan = IrConst::F64(f64::from_bits(0x7ff8_0000_0000_0001));
+        assert!(consts_equal_for_phi(&nan, &nan));
+        assert!(!consts_equal_for_phi(
+            &nan,
+            &IrConst::F64(f64::from_bits(0x7ff8_0000_0000_0002))
+        ));
     }
 
     #[test]

@@ -344,6 +344,7 @@ rm -rf "$series_backup"
 # mid-copy would publish a truncated tarball, breaking the header invariant).
 tar_tmp=$(mktemp "$BULK/.lccc-src.tar.gz.tmp.XXXXXX")
 if ! tar --exclude=.git --exclude=target --exclude=node_modules \
+    --exclude=__pycache__ --exclude='*.pyc' \
     -czf "$tar_tmp" -C "$(dirname "$REPO")" "$(basename "$REPO")"; then
   rm -f "$tar_tmp"
   echo "source tarball creation failed; preserving prior archive" >&2

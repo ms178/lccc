@@ -57,6 +57,8 @@ bench_*
 !.github/scripts/test_ci_codegen_gate.py
 # CI's executable mode/corpus parity mutation tests are source, not outputs.
 !scripts/test_ci_gate_parity.py
+# CFG fuzzer verdict regression tests are source, not scratch executables.
+!tests/fuzz/test_phi_cfg_fuzz.py
 
 # Benchmark / test output
 /test-results/
