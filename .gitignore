@@ -39,11 +39,8 @@ Thumbs.db
 *.dylib
 *.exe
 a.out
-test_*
-# ...except the crate's own test-support module: `test_*` above would
-# silently drop src/test_support.rs from every `git add -A`, and a patch
-# emitted without it does not build.
-!src/test_support.rs
+# Root scratch test executables only; source tests in subdirectories are tracked.
+/test_*
 bench_*
 # ...but the benchmark HARNESS is source, not a build artifact. Without this
 # negation `bench_*` silently swallows it: tests/bench/ (the kernels and the
@@ -52,14 +49,6 @@ bench_*
 !scripts/bench_kernels.py
 !scripts/bench_iv_widen_ab.sh
 !scripts/bench_rank.py
-# Likewise the codegen-gate self-test is CI source, not a scratch test
-# binary: without this negation `test_*` swallows it.
-!.github/scripts/test_ci_codegen_gate.py
-# CI's executable mode/corpus parity mutation tests are source, not outputs.
-!scripts/test_ci_gate_parity.py
-# CFG fuzzer verdict regression tests are source, not scratch executables.
-!tests/fuzz/test_phi_cfg_fuzz.py
-
 # Benchmark / test output
 /test-results/
 /tmp-results/

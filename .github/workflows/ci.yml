@@ -190,6 +190,9 @@ jobs:
       # advertised engine must be a real implementation.  This exists because
       # the csmith/yarpgen engines once regressed to silent no-op stubs that
       # reported TOTAL: 0 with exit status 0 — a validation vacuum.
+      - name: Fuzz harness verdict tests
+        run: python3 -m unittest discover -s tests/fuzz -p 'test_*.py'
+
       - name: Verify differential-fuzz engine wiring
         run: python3 scripts/fuzz_diff.py --check-engines
 

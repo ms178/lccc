@@ -248,6 +248,9 @@ gate "differential-correctness-oracle" fast \
 gate "loop-alignment-contract" fast \
     python3 scripts/check_loop_alignment.py --lccc "$LCCC"
 
+gate "fuzz-harness-tests" fast \
+    python3 -m unittest discover -s tests/fuzz -p 'test_*.py'
+
 gate "fuzz-engine-wiring" fast \
     python3 scripts/fuzz_diff.py --check-engines
 

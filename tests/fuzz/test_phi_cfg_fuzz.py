@@ -15,8 +15,12 @@ class ExecutionVerdictTests(unittest.TestCase):
             # one() compiles reference, candidate, then executes both.
             with patch.object(phi_cfg_fuzz, "call", side_effect=[
                 (0, "", ""), (0, "", ""), reference, candidate
-            ]):
+            ]) as runner:
                 result = phi_cfg_fuzz.one((0, "O2", "lccc", "gcc", root))
+                self.assertEqual(runner.call_count, 4)
+                commands = [c.args[0] for c in runner.call_args_list]
+                self.assertEqual([c[0] for c in commands[:2]], ["gcc", "lccc"])
+                self.assertEqual([Path(c[0]).name for c in commands[2:]], ["g", "c"])
             retained = (root / "00000-O2" / "x.c").exists()
             return result, retained
 
@@ -29,14 +33,14 @@ class ExecutionVerdictTests(unittest.TestCase):
         for code in (1, 139, -11, "TIMEOUT"):
             with self.subTest(code=code):
                 result, retained = self.run_case((code, "", ""), (code, "", ""))
-                self.assertEqual(result["status"], "runtime")
+                self.assertEqual(result["status"], "both-fail")
                 self.assertTrue(retained)
 
     def test_one_sided_failure_is_runtime_failure(self):
         for a, b in ((0, -11), (-11, 0), (0, "TIMEOUT")):
             with self.subTest(a=a, b=b):
                 result, retained = self.run_case((a, "ok", ""), (b, "ok", ""))
-                self.assertEqual(result["status"], "runtime")
+                self.assertEqual(result["status"], "reference-fail" if a else "candidate-fail")
                 self.assertTrue(retained)
 
     def test_output_mismatch_keeps_reproducer(self):

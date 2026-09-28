@@ -91,7 +91,8 @@ def one(args):
     # Generated main returns zero. Equal crashes/timeouts are not evidence of
     # correctness and must never delete the reproducer as a passing case.
     if gr != 0 or cr != 0:
-        return {'seed':seed,'level':level,'status':'runtime','gcc_rc':gr,'ccc_rc':cr,'gcc_out':go,'ccc_out':co,'detail':(ge+'\n'+ce)[-1000:]}
+        status = 'both-fail' if gr != 0 and cr != 0 else ('reference-fail' if gr != 0 else 'candidate-fail')
+        return {'seed':seed,'level':level,'status':status,'gcc_rc':gr,'ccc_rc':cr,'gcc_out':go,'ccc_out':co,'detail':(ge+'\n'+ce)[-1000:]}
     if go==co:
         for p in (src,cb,gb): p.unlink(missing_ok=True)
         try:d.rmdir()
