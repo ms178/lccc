@@ -15,7 +15,8 @@ mod x87_misc;
 mod xop;
 
 pub(crate) use gp_integer::{
-    addr_hint_is32, has_reg_operand, is_explicit_string_op, string_op_size,
+    addr_hint_is32, check_monitor_hint, has_reg_operand, is_explicit_string_op,
+    monitor_hint_needs_addr32, string_op_size,
 };
 pub(crate) use registers::*;
 
@@ -872,6 +873,49 @@ impl InstructionEncoder {
         // `movb` instead reports `` `%eax' not allowed with `movb' ``).
         // The range error itself is stemmed, except that `movq` keeps
         // its name (GAS opcode-entry quirk, verified 2.47).
+        //
+        // Pre-scan the prefix stack for the GAS override words and the
+        // explicit-REX floor BEFORE the moffs gate: `addr32` makes the
+        // accumulator-absolute moves take the 32-bit moffs rows (GAS:
+        // `addr32 mov %eax,0x600898` = `67 a3 98 08 60 00`). GAS 2.47
+        // rejects `addr16`/`data32` outright in 64-bit mode, accepts a
+        // single `addr32`/`data16` word (even when redundant on
+        // register-only forms: `addr32 nop` = `67 90`), and provides
+        // `rex`/`rex.x` as the explicit legacy-REX spellings whose bits
+        // OR-merge with the body's REX (`rex.x mov %r8d,%ebx` =
+        // `46 89 c3`); the `.y/.xy/.z` spellings do not exist.
+        let mut explicit_addr32 = false;
+        let mut explicit_data16 = false;
+        let mut rex_floor: u8 = 0;
+        for p in &instr.prefixes {
+            match p.as_str() {
+                "addr16" => return Err("addr16 is not supported in 64-bit mode".to_string()),
+                "addr32" => {
+                    if explicit_addr32 {
+                        return Err("same type of prefix used twice".to_string());
+                    }
+                    explicit_addr32 = true;
+                }
+                "data16" => {
+                    if explicit_data16 {
+                        return Err("same type of prefix used twice".to_string());
+                    }
+                    explicit_data16 = true;
+                }
+                "data32" => return Err("`data32' is not supported in 64-bit mode".to_string()),
+                "rex" => rex_floor |= 0x40,
+                "rex.x" => rex_floor |= 0x42,
+                _ => {}
+            }
+        }
+        // The `addr32` word COALESCES with the body's address-size
+        // override: GAS `addr32 mov %eax,(%eax)' = 67 89 00 (one byte,
+        // not two — the 0x67 the 32-bit base itself needs IS the
+        // addr32 request). The seg_pre 0x67 emitted below covers it,
+        // so the central splice must not add a second one. Mnemonic-
+        // implicit overrides (jecxz's counter-size 67) keep firing and
+        // are rejected by the duplicate scan below, exactly like GAS.
+        let need67 = need67 && !explicit_addr32;
         let mut moffs_redirect = false;
         for op in &instr.operands {
             if let Operand::Memory(mem) = op {
@@ -890,6 +934,15 @@ impl InstructionEncoder {
                                 };
                                 return Err(format!("operand type mismatch for `{name}'"));
                             }
+                            break;
+                        }
+                        // `addr32` moves the accumulator-absolute forms to
+                        // the 32-bit moffs rows even when the address fits
+                        // disp32 (GAS: `addr32 mov %rax,0x600898` =
+                        // `67 48 a1 98 08 60 00`). Non-accumulator shapes
+                        // keep the SIB body; the 0x67 prefix covers them.
+                        if explicit_addr32 && is_moffs_shape(&instr.mnemonic, &instr.operands) {
+                            moffs_redirect = true;
                             break;
                         }
                     }
@@ -954,6 +1007,11 @@ impl InstructionEncoder {
                 "rep" | "repz" | "repe" => group1.push(0xF3),
                 "repnz" | "repne" => group1.push(0xF2),
                 "notrack" => seg_pre.push(0x3E),
+                // The override words classified in the pre-scan; the
+                // addr32 0x67 byte is appended to seg_pre AFTER the loop
+                // so segment overrides always precede it (GAS:
+                // `fs addr32 mov %eax,(%ebx)' = 64 67 89 03).
+                "addr32" | "data16" | "rex" | "rex.x" => {}
                 // Segment overrides used as standalone prefixes. The kernel's
                 // `ds wrmsr` relies on the byte being emitted so an
                 // ALTERNATIVE can patch the instruction in place.
@@ -1114,12 +1172,56 @@ impl InstructionEncoder {
             }
             self.bytes.push(b);
         }
+        // Canonical position of the address-size override from the `addr32`
+        // prefix word: after every segment override, before 0x66/group-1/
+        // REX/VEX. Emitted even when redundant (GAS: `addr32 nop` = 67 90,
+        // `addr32 mov %eax,%ebx` = 67 89 c3).
+        if explicit_addr32 {
+            seg_pre.push(0x67);
+        }
         for &b in &seg_pre {
             self.bytes.push(b);
         }
 
+        // 32-bit addressing rejects 64-bit-only base/index registers
+        // (GAS: `addr32 mov %eax,(%rax)' → "(%rax)' is not a valid
+        // base/index expression"). Vector (VSIB) indexes stay legal.
+        if explicit_addr32 {
+            for op in &instr.operands {
+                let mem = match op {
+                    Operand::Memory(mem) => Some(mem),
+                    Operand::Indirect(inner) => match inner.as_ref() {
+                        Operand::Memory(mem) => Some(mem),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(mem) = mem {
+                    for slot in [&mem.base, &mem.index].into_iter().flatten() {
+                        let n = slot.name.to_ascii_lowercase();
+                        if !matches!(
+                            n.as_str(),
+                            "eax" | "ebx" | "ecx" | "edx" | "esi" | "edi" | "ebp" | "esp"
+                        ) && !n.starts_with("xmm")
+                            && !n.starts_with("ymm")
+                            && !n.starts_with("zmm")
+                        {
+                            return Err(format!(
+                                "`(%{})' is not a valid base/index expression",
+                                slot.name
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
         let mut result = if moffs_redirect {
-            self.encode_movabs(&instr.operands)
+            if explicit_addr32 {
+                self.encode_addr32_moffs(&instr.operands)
+            } else {
+                self.encode_movabs(&instr.operands)
+            }
         } else {
             self.encode_mnemonic(instr)
         };
@@ -1191,11 +1293,28 @@ impl InstructionEncoder {
         // Central 0x67 splice: after any segment bytes, before 0x66 /
         // group-1 / REX / VEX / EVEX (`65 67 66 8b`, `64 67 c5 ..`).
         // Runs before the group-1 splice, whose skipper already steps
-        // over 0x67.
+        // over 0x67.  Leading 0x9B (the x87 WAIT half of the fstenv/fsave
+        // family) also precedes 0x67: GAS 2.47 emits `9b 67 d9 ...' for
+        // `fstenv (%ebp)' — the WAIT prefix is a separate instruction, so
+        // the address-size prefix lands on the x87 body, not on it.
         if result.is_ok() && need67 {
+            // Normalize a [segment][9b] head to [9b][segment]: the
+            // operand-segment chokepoint above runs before the encoder
+            // body pushed the WAIT byte, but GAS orders the WAIT first
+            // (`fstenv %fs:(%ebp)' = 9b 64 67 d9 75 00).
+            if self.bytes.len() >= start_len + 2 {
+                let a = self.bytes[start_len];
+                let b = self.bytes[start_len + 1];
+                if matches!(a, 0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65) && b == 0x9B {
+                    self.bytes.swap(start_len, start_len + 1);
+                }
+            }
             let mut at = start_len;
             while at < self.bytes.len() {
-                if matches!(self.bytes[at], 0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65) {
+                if matches!(
+                    self.bytes[at],
+                    0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x9B
+                ) {
                     at += 1;
                 } else {
                     break;
@@ -1204,6 +1323,93 @@ impl InstructionEncoder {
             self.bytes.insert(at, 0x67);
             for r in &mut self.relocations[reloc_base..] {
                 r.offset += 1;
+            }
+        }
+
+        // Explicit `addr32` word + a body that carries its OWN 0x67
+        // (`jecxz` under 64-bit) is the GAS "same type of prefix used
+        // twice" error. `jrcxz` normalizes to the 32-bit-counter spelling
+        // with the single override from seg_pre (67 e3).
+        if result.is_ok() && explicit_addr32 {
+            let mut at = start_len;
+            let mut count67 = 0usize;
+            while at < self.bytes.len() {
+                if self.bytes[at] == 0x67 {
+                    count67 += 1;
+                    at += 1;
+                } else if matches!(
+                    self.bytes[at],
+                    0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x9B
+                ) {
+                    at += 1;
+                } else {
+                    break;
+                }
+            }
+            if count67 >= 2 {
+                result = Err("same type of prefix used twice".to_string());
+            }
+        }
+
+        // `data16` word: splice the forced 0x66 after any segment/0x67 run
+        // and before group-1/REX/opcode (GAS: `data16 mov %eax,(%eax)` =
+        // 66 89 00, `data16 nop` = 66 90). A body that already carries
+        // 0x66, or a VEX/EVEX body (a legacy 0x66 ahead of VEX/EVEX is
+        // ignored or #UD depending on class), is rejected — matching the
+        // GAS duplicate-prefix diagnostic.
+        if result.is_ok() && explicit_data16 {
+            let mut at = start_len;
+            while at < self.bytes.len()
+                && matches!(
+                    self.bytes[at],
+                    0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x67 | 0x9B
+                )
+            {
+                at += 1;
+            }
+            match self.bytes.get(at) {
+                Some(0x66) | Some(0x62) | Some(0xC4) | Some(0xC5) | Some(0xD5) => {
+                    result = Err("same type of prefix used twice".to_string());
+                }
+                _ => {
+                    self.bytes.insert(at, 0x66);
+                    for r in &mut self.relocations[reloc_base..] {
+                        r.offset += 1;
+                    }
+                }
+            }
+        }
+
+        // `rex`/`rex.x` floor: OR-merge into a body-carried REX byte, or
+        // splice a standalone one before the opcode (GAS 2.47:
+        // `rex mov %eax,%ebx` = 40 89 c3, `rex.x mov %r8d,%ebx` =
+        // 46 89 c3, `rex mov %rax,%rbx` = 48 89 c3 — the bare 0x40 is
+        // absorbed by the body's REX.W). The group-1 splice below lands
+        // F0/F2/F3 in front of the merged/inserted REX byte, so the
+        // canonical [seg][67][66][F0/F2/F3][REX] order holds.
+        if result.is_ok() && rex_floor != 0 {
+            let mut at = start_len;
+            while at < self.bytes.len()
+                && matches!(
+                    self.bytes[at],
+                    0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x67 | 0x66 | 0x9B
+                )
+            {
+                at += 1;
+            }
+            match self.bytes.get(at) {
+                Some(b) if (0x40..=0x4F).contains(b) => {
+                    self.bytes[at] |= rex_floor & 0x0F;
+                }
+                Some(0x62) | Some(0xC4) | Some(0xC5) | Some(0xD5) => {
+                    result = Err("REX prefix is not valid before a VEX/EVEX encoding".to_string());
+                }
+                _ => {
+                    self.bytes.insert(at, rex_floor);
+                    for r in &mut self.relocations[reloc_base..] {
+                        r.offset += 1;
+                    }
+                }
             }
         }
 
@@ -4049,15 +4255,52 @@ impl InstructionEncoder {
                 self.encode_crc32(ops, size)
             }
             // AMD MONITORX/MWAITX (kernel delay_mwaitx; implicit operands):
-            // 0F 01 FA / 0F 01 FB.
+            // 0F 01 FA / 0F 01 FB.  MWAITX pins all three spellings to
+            // eax/ecx/ebx exactly (GAS 2.47 rejects `mwaitx %rax,...' with
+            // "register type mismatch").
             "monitorx" => {
-                if addr_hint_is32(ops) {
+                // Bare form first (GAS: `monitorx` = 0f01fa); the hint
+                // spellings are exactly 3 operands (GAS rejects partial
+                // hints with "operand type mismatch") and keep the 0x67
+                // address-size law via the first operand.
+                if ops.is_empty() {
+                    self.bytes.extend_from_slice(&[0x0F, 0x01, 0xFA]);
+                    return Ok(());
+                }
+                if ops.len() != 3 {
+                    return Err("operand type mismatch for `monitorx'".to_string());
+                }
+                check_monitor_hint(ops, "monitorx")?;
+                if monitor_hint_needs_addr32(ops) {
                     self.bytes.push(0x67);
                 }
                 self.bytes.extend_from_slice(&[0x0F, 0x01, 0xFA]);
                 Ok(())
             }
             "mwaitx" => {
+                // GAS 2.47 pins the implicit spellings: only the exact
+                // 32-bit forms (%eax,%ecx,%ebx) are accepted.
+                let is_a = |n: &str| matches!(n, "eax" | "ax" | "al");
+                let is_c = |n: &str| matches!(n, "ecx" | "cx" | "cl");
+                let is_b = |n: &str| matches!(n, "ebx" | "bx" | "bl");
+                let regs: Vec<&str> = ops
+                    .iter()
+                    .filter_map(|op| match op {
+                        Operand::Register(r) => Some(r.name.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                if ops.is_empty() {
+                    // Bare spelling (GAS: `mwaitx` = 0f01fb).
+                    self.bytes.extend_from_slice(&[0x0F, 0x01, 0xFB]);
+                    return Ok(());
+                }
+                if ops.len() != 3
+                    || regs.len() != 3
+                    || !(is_a(regs[0]) && is_c(regs[1]) && is_b(regs[2]))
+                {
+                    return Err("register type mismatch for `mwaitx'".to_string());
+                }
                 self.bytes.extend_from_slice(&[0x0F, 0x01, 0xFB]);
                 Ok(())
             }
@@ -4155,21 +4398,59 @@ impl InstructionEncoder {
                 Ok(())
             }
             // MONITOR/MWAIT (implicit operands rax/ecx/edx, eax/ecx).
-            // MONITOR/MONITORX/MWAIT/MWAITX take implicit operands; GAS
-            // accepts the register spellings as ADDRESS-SIZE hints and
-            // emits 0x67 when the address operand is 32-bit (`monitor
-            // %eax,%rcx,%rdx` = 67 0f 01 c8, `monitor %rax,..` = 0f 01 c8 —
-            // byte-probed). The other operands are ignored beyond that.
+            // GAS 2.47 law (byte-probed on the full spelling matrix): the
+            // FIRST operand alone is the ADDRESS-SIZE hint — `monitor
+            // %eax,%rcx,%rdx' = 67 0f 01 c8 but `monitor %rax,%ecx,%edx' =
+            // 0f 01 c8 (the trailing 32-bit spellings are ignored).  Only
+            // the canonical 8 GPRs are accepted as the hint; EGPR spellings
+            // are rejected ("operand type mismatch").
             "monitor" => {
-                if addr_hint_is32(ops) {
+                // Bare form first (GAS: `monitor` = 0f01c8); the hint
+                // spellings are exactly 3 operands (GAS rejects partial
+                // hints: `monitor %eax` and `monitor %eax,%ecx` are
+                // "operand type mismatch").
+                if ops.is_empty() {
+                    self.bytes.extend_from_slice(&[0x0F, 0x01, 0xC8]);
+                    return Ok(());
+                }
+                if ops.len() != 3 {
+                    return Err("operand type mismatch for `monitor'".to_string());
+                }
+                check_monitor_hint(ops, "monitor")?;
+                if monitor_hint_needs_addr32(ops) {
                     self.bytes.push(0x67);
                 }
                 self.bytes.extend_from_slice(&[0x0F, 0x01, 0xC8]);
                 Ok(())
             }
             "mwait" => {
-                self.bytes.extend_from_slice(&[0x0F, 0x01, 0xC9]);
-                Ok(())
+                // 0 or exactly (%eax,%ecx): GAS rejects other/shorter
+                // spellings (`mwait %eax`, `mwait %ebx,%ecx`).
+                match ops.len() {
+                    0 => {
+                        self.bytes.extend_from_slice(&[0x0F, 0x01, 0xC9]);
+                        Ok(())
+                    }
+                    2 => {
+                        let names: Vec<&str> = ops
+                            .iter()
+                            .filter_map(|op| match op {
+                                Operand::Register(r) => Some(r.name.as_str()),
+                                _ => None,
+                            })
+                            .collect();
+                        if names.len() == 2
+                            && matches!(names[0], "eax" | "ax" | "al")
+                            && matches!(names[1], "ecx" | "cx" | "cl")
+                        {
+                            self.bytes.extend_from_slice(&[0x0F, 0x01, 0xC9]);
+                            Ok(())
+                        } else {
+                            Err("register type mismatch for `mwait'".to_string())
+                        }
+                    }
+                    _ => Err("operand type mismatch for `mwait'".to_string()),
+                }
             }
             // Cache maintenance.
             "wbnoinvd" => {
@@ -4662,7 +4943,21 @@ impl InstructionEncoder {
             "vpsravd" => self.encode_avx_3op_38(ops, 0x46, true),
             "vmovntdqa" => self.encode_avx_2op_38(ops, 0x2A, true),
             "vpmovmskb" => self.encode_avx_extract_gp(ops, 0xD7, true),
-            "vmovd" => self.encode_avx_movd(ops),
+            "vmovd" => {
+                // xmm -> xmm (any width): GAS 2.47 encodes the register
+                // pair through the EVEX-promoted row even for low xmm
+                // (`vmovd %xmm4,%xmm6' = 62 f1 7e 08 7e f4, plain F3/7E
+                // load row; `.s` flips to D6).  The VEX path below covers
+                // the GP/mem sides only.
+                if ops.len() == 2
+                    && ops
+                        .iter()
+                        .all(|op| matches!(op, Operand::Register(r) if is_xmm(&r.name)))
+                {
+                    return self.encode_evex_vmovd_vmovq(ops, 1, 0, "vmovd");
+                }
+                self.encode_avx_movd(ops)
+            }
             "vmovq" => self.encode_avx_movq(ops),
             "vpunpcklbw" => self.encode_avx_3op(ops, 0x60, true),
             "vpunpckhbw" => self.encode_avx_3op(ops, 0x68, true),

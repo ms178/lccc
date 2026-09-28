@@ -433,6 +433,46 @@ impl super::InstructionEncoder {
         Ok(())
     }
 
+    /// `addr32`-forced accumulator moffs rows (GAS 2.47): 67 [66] [REX.W]
+    /// A0–A3 + moffs32. The `addr32` prefix word moves the bare-absolute
+    /// accumulator moves off the SIB body onto the moffs rows with a
+    /// 32-bit address field (`addr32 mov %eax,0x600898` = `67 a3 98 08
+    /// 60 00`; the rax forms keep REX.W: `67 48 a1 ...`). Integer
+    /// addresses only — a symbolic absolute switches the relocation
+    /// class (R_X86_64_32/32S), which the body's SIB form encodes
+    /// correctly, so symbols stay on the SIB path.
+    pub(crate) fn encode_addr32_moffs(&mut self, ops: &[Operand]) -> Result<(), String> {
+        if ops.len() != 2 {
+            return Err("mov requires 2 operands".to_string());
+        }
+        let (acc, disp, store) = match (&ops[0], &ops[1]) {
+            (Operand::Memory(mem), Operand::Register(r)) => (&r.name, &mem.displacement, false),
+            (Operand::Register(r), Operand::Memory(mem)) => (&r.name, &mem.displacement, true),
+            _ => return Err("operand type mismatch for `mov'".to_string()),
+        };
+        if !registers::is_accum(&acc.to_ascii_lowercase()) {
+            return Err("operand type mismatch for `mov'".to_string());
+        }
+        let Displacement::Integer(v) = disp else {
+            return Err("operand type mismatch for `mov'".to_string());
+        };
+        let size = registers::infer_reg_size(acc);
+        if size == 2 {
+            self.bytes.push(0x66);
+        }
+        if size == 8 {
+            self.emit_rex_unary(8, acc);
+        }
+        self.bytes.push(match (store, size == 1) {
+            (false, true) => 0xA0,
+            (false, false) => 0xA1,
+            (true, true) => 0xA2,
+            (true, false) => 0xA3,
+        });
+        self.bytes.extend_from_slice(&(*v as i32).to_le_bytes());
+        Ok(())
+    }
+
     pub(crate) fn encode_movabs(&mut self, ops: &[Operand]) -> Result<(), String> {
         if ops.len() != 2 {
             return Err("movabsq requires 2 operands".to_string());
@@ -737,14 +777,28 @@ impl super::InstructionEncoder {
             }
             Operand::Immediate(ImmediateValue::Integer(val)) => {
                 if want16 {
-                    // PUSH imm16: value must fit; GAS rejects wider ones.
-                    if !(-32768..=65535).contains(val) {
+                    // PUSH imm16: GAS 2.47 first truncates the expression
+                    // value to the 16-bit operand width, THEN applies the
+                    // shortest-form law: a truncated value that fits a
+                    // SIGNED byte uses the imm8 form (`pushw $10' =
+                    // 66 6a 0a; `pushw $0xffffff90' truncates to 0xff90 =
+                    // -112 -> 66 6a 90); only values outside imm8 after
+                    // truncation take 66 68 imm16 (`pushw $0x1234' =
+                    // 66 68 34 12).  A value that survives neither the
+                    // truncation check nor the byte check is out of range.
+                    if !(-32768..=65535).contains(val) && !(0..=0xFFFF_FFFF).contains(val) {
                         return Err(format!(
                             "operand type mismatch: pushw immediate out of 16-bit range"
                         ));
                     }
-                    self.bytes.push(0x68);
-                    self.bytes.extend_from_slice(&(*val as u16).to_le_bytes());
+                    let v16 = *val as i16;
+                    if (-128..=127).contains(&v16) {
+                        self.bytes.push(0x6A);
+                        self.bytes.push(v16 as u8);
+                    } else {
+                        self.bytes.push(0x68);
+                        self.bytes.extend_from_slice(&v16.to_le_bytes());
+                    }
                     return Ok(());
                 }
                 // push imm is a 64-bit operation in long mode: imm32 is
@@ -914,6 +968,20 @@ impl super::InstructionEncoder {
 
                 if size == 2 {
                     self.bytes.push(0x66);
+                }
+                // `.s` on a register-register ALU pair selects the
+                // store-direction encoding (GAS 2.47: `add.s %edx,%ecx'
+                // = 03 ca, not 01 d1; `add.s %r8d,%r9d' = 45 03 c8 — the
+                // D=1 form even when both extensions are needed).  The
+                // roles swap with the opcode; memory/immediate forms
+                // ignore `.s` (its direction is forced by the memory
+                // operand there), which the other arms below never touch.
+                if self.s_flip {
+                    self.emit_rex_rr(size, &dst.name, &src.name);
+                    self.bytes
+                        .push(if size == 1 { 0x02 } else { 0x03 } + alu_op * 8);
+                    self.bytes.push(self.modrm(3, dst_num, src_num));
+                    return Ok(());
                 }
                 self.emit_rex_rr(size, &src.name, &dst.name);
                 self.bytes
@@ -1387,9 +1455,18 @@ impl super::InstructionEncoder {
                 if size == 2 {
                     self.bytes.push(0x66);
                 }
-                self.emit_rex_rr(size, &src.name, &dst.name);
+                // `test` has no direction bit, but `.s` still swaps the
+                // modrm roles (GAS 2.47: `test %edx,%ecx' = 85 d1,
+                // `test.s %edx,%ecx' = 85 ca).  The opcode byte itself
+                // never changes.
+                let ((a, a_num), (b, b_num)) = if self.s_flip {
+                    ((&dst.name, dst_num), (&src.name, src_num))
+                } else {
+                    ((&src.name, src_num), (&dst.name, dst_num))
+                };
+                self.emit_rex_rr(size, a, b);
                 self.bytes.push(if size == 1 { 0x84 } else { 0x85 });
-                self.bytes.push(self.modrm(3, src_num, dst_num));
+                self.bytes.push(self.modrm(3, a_num, b_num));
                 Ok(())
             }
             (Operand::Immediate(ImmediateValue::Integer(val)), Operand::Register(dst)) => {
@@ -3185,8 +3262,8 @@ pub(crate) fn string_op_size(mnemonic: &str) -> Result<u8, String> {
     })
 }
 
-/// True when any operand is a 32-bit GP register — the address-size hint
-/// MONITOR/MONITORX spellings carry (`monitor %eax,%rcx,%rdx` → 0x67).
+/// True when any operand is a 32-bit GP register — legacy helper kept for
+/// callers that want a blunt "is a 32-bit spelling present" predicate.
 pub(crate) fn addr_hint_is32(ops: &[Operand]) -> bool {
     ops.iter().any(|op| match op {
         Operand::Register(r) => {
@@ -3197,6 +3274,71 @@ pub(crate) fn addr_hint_is32(ops: &[Operand]) -> bool {
         }
         _ => false,
     })
+}
+
+/// GAS 2.47 MONITOR/MONITORX law: the FIRST operand alone is the
+/// address-size hint, and only the canonical 8 GPR spellings are accepted
+/// (EGPR hints are rejected with "operand type mismatch").
+fn monitor_hint_ok(ops: &[Operand]) -> bool {
+    match ops.first() {
+        Some(Operand::Register(r)) => matches!(
+            r.name.to_ascii_lowercase().as_str(),
+            "rax"
+                | "eax"
+                | "ax"
+                | "al"
+                | "rbx"
+                | "ebx"
+                | "bx"
+                | "bl"
+                | "rcx"
+                | "ecx"
+                | "cx"
+                | "cl"
+                | "rdx"
+                | "edx"
+                | "dx"
+                | "dl"
+                | "rsi"
+                | "esi"
+                | "si"
+                | "rdi"
+                | "edi"
+                | "di"
+                | "rbp"
+                | "ebp"
+                | "bp"
+                | "rsp"
+                | "esp"
+                | "sp"
+        ),
+        _ => false,
+    }
+}
+
+/// Validate the MONITOR/MONITORX hint spelling (GAS: EGPR hints are
+/// `operand type mismatch`).
+pub(crate) fn check_monitor_hint(ops: &[Operand], mnemonic: &str) -> Result<(), String> {
+    if monitor_hint_ok(ops) {
+        Ok(())
+    } else {
+        Err(format!("operand type mismatch for `{mnemonic}'"))
+    }
+}
+
+/// 0x67 is emitted iff the hint register's width is BELOW the mode default
+/// (64-bit code: `monitor %eax,...' = 67 ..., `monitor %rax,...` = no 67).
+pub(crate) fn monitor_hint_needs_addr32(ops: &[Operand]) -> bool {
+    match ops.first() {
+        Some(Operand::Register(r)) => {
+            let n = r.name.to_ascii_lowercase();
+            matches!(
+                n.as_str(),
+                "eax" | "ebx" | "ecx" | "edx" | "esi" | "edi" | "ebp" | "esp"
+            )
+        }
+        _ => false,
+    }
 }
 
 /// True when any operand is a register — used to route `movs{b,w,l}` with

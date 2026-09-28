@@ -1,0 +1,25 @@
+# i686 symbol immediates and GOT-class relocations.
+# Byte AND relocation pairs were GAS 2.47.20260726-probed (objdump -dr):
+# the R_386_GOTPC addend equals the displacement field's instruction-
+# relative offset (mov +1, lea +2, moffs +1, %fs-prefixed +3).
+;;; sym_imm_sizes
+.text
+mov $sym, %eax
+mov $sym, %ax
+mov $sym, %al
+mov $sym+4, %ebx
+movw $sym, %dx
+addl $sym, %eax
+subl $sym, %ebx
+;;; got_immediates
+.text
+mov $sym@GOT, %eax
+mov $sym@GOTOFF, %eax
+mov $_GLOBAL_OFFSET_TABLE_, %eax
+;;; gotpc_displacements
+.text
+lea _GLOBAL_OFFSET_TABLE_(%eax), %eax
+mov _GLOBAL_OFFSET_TABLE_, %eax
+mov %fs:_GLOBAL_OFFSET_TABLE_(%eax), %eax
+addl $_GLOBAL_OFFSET_TABLE_, %esi
+addl $_GLOBAL_OFFSET_TABLE_, %ebx

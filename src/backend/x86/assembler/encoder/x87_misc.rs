@@ -444,11 +444,13 @@ impl super::InstructionEncoder {
             (Operand::Register(src), Operand::Register(dst)) if is_segment_reg(&dst.name) => {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad seg register")?;
-                // 8E /r - MOV Sreg, r/m16
-                let sz = infer(&src.name);
-                if sz == 2 {
-                    self.bytes.push(0x66);
-                }
+                // 8E /r - MOV Sreg, r/m16.  The SOURCE operand size is
+                // architecturally fixed at 16 bits: GAS 2.47 never emits
+                // 0x66 here (`mov %ax,%ds' = 8e d8, `movw %ax,%ds' =
+                // 8e d8, `mov %eax,%ds' = 8e d8) — a 0x66 would be a
+                // redundant lengthening.  REX still tracks the r/m-side
+                // GP register (`mov %r8d,%ds' = 41 8e d0), never REX.W.
+                let _ = infer(&src.name);
                 self.emit_rex_unary(4, &src.name);
                 self.bytes.push(0x8E);
                 self.bytes.push(self.modrm(3, dst_num, src_num));
@@ -481,14 +483,21 @@ impl super::InstructionEncoder {
             return Err("mmx movq requires 2 operands".to_string());
         }
         match (&ops[0], &ops[1]) {
-            // movq %mm, %mm
+            // movq %mm, %mm — `.s` selects the store-direction row
+            // 0F 7F (GAS 2.47: `movq.s %mm0,%mm4' = 0f 7f c4; plain
+            // movq keeps the 0F 6F load row).
             (Operand::Register(src), Operand::Register(dst))
                 if is_mmx(&src.name) && is_mmx(&dst.name) =>
             {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                self.bytes.extend_from_slice(&[0x0F, 0x6F]);
-                self.bytes.push(self.modrm(3, dst_num, src_num));
+                if self.s_flip {
+                    self.bytes.extend_from_slice(&[0x0F, 0x7F]);
+                    self.bytes.push(self.modrm(3, src_num, dst_num));
+                } else {
+                    self.bytes.extend_from_slice(&[0x0F, 0x6F]);
+                    self.bytes.push(self.modrm(3, dst_num, src_num));
+                }
                 Ok(())
             }
             // movq mem, %mm

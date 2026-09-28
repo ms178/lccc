@@ -62,7 +62,13 @@ impl super::InstructionEncoder {
         // AT&T order: (src, dst). Exactly one side must be an xmm.
         match (vec_name(&ops[0]), vec_name(&ops[1])) {
             (None, Some(dst)) => {
-                // gp/mem -> xmm: opcode 6E, xmm in ModRM.reg.
+                // gp/mem -> xmm: opcode 6E, xmm in ModRM.reg, the W-sized
+                // 66-family row (pp from the caller).  NOTE: the VEX and
+                // EVEX canonical rows DIFFER here — VEX `vmovq (%rax),%xmm0'
+                // = c5 fa 7e 00 (F3 7E), but the EVEX spelling uses the
+                // W1 66 6E row (GAS 2.47: `{evex} vmovq (%rax),%xmm0' =
+                // 62 f1 fd 08 6e 00).  Do not port VEX rows into this EVEX
+                // path; every form below is GAS-2.47-probed.
                 match &ops[0] {
                     Operand::Register(gp) => {
                         let (dst_num, rm_num) =
@@ -82,7 +88,12 @@ impl super::InstructionEncoder {
                 }
             }
             (Some(src), None) => {
-                // xmm -> gp/mem: opcode 7E, xmm in ModRM.reg.
+                // xmm -> gp/mem: opcode 7E, xmm in ModRM.reg, W-sized
+                // 66-family row.  Again VEX and EVEX disagree: VEX
+                // `vmovq %xmm0,(%rax)' = c5 f9 d6 00 (66 D6 store row),
+                // while the EVEX spelling keeps 7E (GAS 2.47:
+                // `{evex} vmovq %xmm0,(%rax)' = 62 f1 fd 08 7e 00;
+                // `{evex} vmovd %xmm0,(%rax)' = 62 f1 7d 08 7e 00).
                 match &ops[1] {
                     Operand::Register(gp) => {
                         let (dst_num, rm_num) =
@@ -102,6 +113,18 @@ impl super::InstructionEncoder {
             }
             (Some(src), Some(dst)) => {
                 // xmm -> xmm: pp flips to F3 (the vmovdqa-family row).
+                // `.s` instead selects the D6 store row (GAS 2.47:
+                // `vmovq.s %xmm29,%xmm30' = 62 01 fd 08 d6 ee — W=1, pp=66,
+                // reg=src, r/m=dst; `vmovd.s %xmm1,%xmm2' = 62 f1 7d 08 d6 e6
+                // — W=0), unlocking an xmm-xmm spelling for the otherwise
+                // gp/mem-only store row.
+                if self.s_flip {
+                    let (src_num, dst_num) =
+                        self.emit_evex_mod3(src, dst, None, 1, w, 1, 0, false, 0, false)?;
+                    self.bytes.push(0xD6);
+                    self.bytes.push(self.modrm(3, src_num, dst_num));
+                    return Ok(());
+                }
                 let (dst_num, rm_num) =
                     self.emit_evex_mod3(dst, src, None, 1, w, 2, 0, false, 0, false)?;
                 self.bytes.push(0x7E);

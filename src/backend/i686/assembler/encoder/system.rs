@@ -179,8 +179,13 @@ impl super::InstructionEncoder {
             (Operand::Register(src), Operand::Register(dst)) => {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                // The operand size follows the DESTINATION (GAS 2.47:
+                // `lsl (%edx),%dx` = 66 0f 03 12 but `lsl %dx,%edx` =
+                // 0f 03 d2 — a 16-bit SOURCE with a 32-bit destination
+                // takes NO 66).  The old source-driven check lengthened
+                // the 32-bit-destination form.
                 let is_16 = matches!(
-                    src.name.as_str(),
+                    dst.name.as_str(),
                     "ax" | "bx" | "cx" | "dx" | "si" | "di" | "sp" | "bp"
                 );
                 if is_16 {
@@ -264,6 +269,16 @@ impl super::InstructionEncoder {
                 let rm = reg_num(&reg.name).ok_or_else(|| {
                     format!("bad register for system segment instruction: {}", reg.name)
                 })?;
+                // GAS 2.47 emits 0x66 for the 16-bit register spellings
+                // (`str %ax` = 66 0f 00 c8, `sldt %ax` = 66 0f 00 c0) and
+                // none for the 32-bit ones (`str %eax` = 0f 00 c8).
+                if matches!(
+                    reg.name.as_str(),
+                    "ax" | "cx" | "dx" | "bx" | "sp" | "bp" | "si" | "di"
+                ) {
+                    self.sized_op = true;
+                    self.bytes.push(0x66);
+                }
                 self.bytes.extend_from_slice(&[0x0F, 0x00]);
                 self.bytes.push(self.modrm(3, reg_ext, rm));
                 Ok(())

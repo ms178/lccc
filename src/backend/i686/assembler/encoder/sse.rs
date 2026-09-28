@@ -24,8 +24,17 @@ impl super::InstructionEncoder {
             {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                self.bytes.extend_from_slice(load_opcode);
-                self.bytes.push(self.modrm(3, dst_num, src_num));
+                // `.s` picks the store row with the roles unchanged:
+                // reg = data source, r/m = destination (GAS 2.47:
+                // `movaps.s %xmm4,%xmm6` = 0f 29 e6).  The load row keeps
+                // reg=dst, r/m=src.  Identical law to the x86-64 core.
+                let (opcode, reg_num_v, rm_num_v) = if self.s_flip {
+                    (store_opcode, src_num, dst_num)
+                } else {
+                    (load_opcode, dst_num, src_num)
+                };
+                self.bytes.extend_from_slice(opcode);
+                self.bytes.push(self.modrm(3, reg_num_v, rm_num_v));
                 Ok(())
             }
             (Operand::Memory(mem), Operand::Register(dst)) if is_xmm(&dst.name) => {
@@ -46,6 +55,22 @@ impl super::InstructionEncoder {
         if ops.len() != 2 {
             return Err("SSE op requires 2 operands".to_string());
         }
+
+        // MMX-register operands encode through the plain 0F rows: the
+        // 0x66 prefix baked into the opcode selects the SSE2 xmm row and
+        // is DROPPED when either operand is an mm register (GAS 2.47:
+        // `paddb 0x90909090(%eax),%mm2' = 0f fc 90 ..., `pabsb %mm1,%mm0'
+        // = 0f 38 1c c1 — the old stream kept the 66, an invalid
+        // #UD-producing mixture of the two ISAs).
+        let prefix_len = opcode.iter().position(|&b| b == 0x0F).unwrap_or(0);
+        let use_mmx = ops
+            .iter()
+            .any(|op| matches!(op, Operand::Register(r) if is_mm(&r.name)));
+        let opcode: &[u8] = if use_mmx && prefix_len > 0 {
+            &opcode[prefix_len..]
+        } else {
+            opcode
+        };
 
         match (&ops[0], &ops[1]) {
             (Operand::Register(src), Operand::Register(dst)) => {
@@ -280,14 +305,21 @@ impl super::InstructionEncoder {
             return Err("movq requires 2 operands".to_string());
         }
         match (&ops[0], &ops[1]) {
-            // movq xmm -> xmm or mem -> xmm (load): F3 0F 7E
+            // movq xmm -> xmm (load): F3 0F 7E — `.s` selects the store
+            // row 66 0F D6 with reg=src, r/m=dst (GAS 2.47: `movq.s
+            // %xmm4,%xmm6` = 66 0f d6 e6)
             (Operand::Register(src), Operand::Register(dst))
                 if is_xmm(&src.name) && is_xmm(&dst.name) =>
             {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x7E]);
-                self.bytes.push(self.modrm(3, dst_num, src_num));
+                if self.s_flip {
+                    self.bytes.extend_from_slice(&[0x66, 0x0F, 0xD6]);
+                    self.bytes.push(self.modrm(3, src_num, dst_num));
+                } else {
+                    self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x7E]);
+                    self.bytes.push(self.modrm(3, dst_num, src_num));
+                }
                 Ok(())
             }
             (Operand::Memory(mem), Operand::Register(dst)) if is_xmm(&dst.name) => {
@@ -307,6 +339,13 @@ impl super::InstructionEncoder {
             {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                // `.s` forces the store row 0F 7F with reg=src, r/m=dst
+                // (GAS 2.47: `movq.s %mm0,%mm4` = 0f 7f c4)
+                if self.s_flip {
+                    self.bytes.extend_from_slice(&[0x0F, 0x7F]);
+                    self.bytes.push(self.modrm(3, src_num, dst_num));
+                    return Ok(());
+                }
                 if is_mm(&dst.name) {
                     // load: 0F 6F
                     self.bytes.extend_from_slice(&[0x0F, 0x6F]);
@@ -454,7 +493,14 @@ impl super::InstructionEncoder {
             ) => {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                self.bytes.extend_from_slice(&[0x66, 0x0F, 0xC5]);
+                // MMX source takes the plain 0F C5 row (GAS 2.47:
+                // `pextrw $0x0,%mm1,%eax` = 0f c5 c1 00); the 0x66 prefix
+                // selects the SSE2 xmm row.
+                if is_mm(&src.name) {
+                    self.bytes.extend_from_slice(&[0x0F, 0xC5]);
+                } else {
+                    self.bytes.extend_from_slice(&[0x66, 0x0F, 0xC5]);
+                }
                 self.bytes.push(self.modrm(3, dst_num, src_num));
                 self.bytes.push(*imm as u8);
                 Ok(())
@@ -489,7 +535,13 @@ impl super::InstructionEncoder {
             ) => {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                self.bytes.extend_from_slice(&[0x66, 0x0F, 0xC4]);
+                // MMX destination takes the plain 0F C4 row (GAS 2.47:
+                // `pinsrw $0x1,(%ecx),%mm1` = 0f c4 09 01).
+                if is_mm(&dst.name) {
+                    self.bytes.extend_from_slice(&[0x0F, 0xC4]);
+                } else {
+                    self.bytes.extend_from_slice(&[0x66, 0x0F, 0xC4]);
+                }
                 self.bytes.push(self.modrm(3, dst_num, src_num));
                 self.bytes.push(*imm as u8);
                 Ok(())
@@ -500,7 +552,11 @@ impl super::InstructionEncoder {
                 Operand::Register(dst),
             ) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                self.bytes.extend_from_slice(&[0x66, 0x0F, 0xC4]);
+                if is_mm(&dst.name) {
+                    self.bytes.extend_from_slice(&[0x0F, 0xC4]);
+                } else {
+                    self.bytes.extend_from_slice(&[0x66, 0x0F, 0xC4]);
+                }
                 self.encode_modrm_mem(dst_num, mem)?;
                 self.bytes.push(*imm as u8);
                 Ok(())

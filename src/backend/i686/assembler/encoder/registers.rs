@@ -64,6 +64,8 @@ pub(crate) fn is_mm(name: &str) -> bool {
     name.starts_with("mm") && !name.starts_with("mmx")
 }
 
+use crate::backend::x86::assembler::parser::Operand;
+
 /// Infer operand size from register name for unsuffixed instructions.
 pub(crate) fn reg_size(name: &str) -> u8 {
     match name {
@@ -74,6 +76,68 @@ pub(crate) fn reg_size(name: &str) -> u8 {
     }
 }
 
+/// i686 accumulator: %al/%ax/%eax only (ModRM 000 short forms
+/// 04+op*8 / 05+op*8 / A8 / A9 / 90+r). AH/BH/CH/DH never qualify.
+pub(crate) fn is_accum(name: &str) -> bool {
+    matches!(name.to_ascii_lowercase().as_str(), "al" | "ax" | "eax")
+}
+
+/// Immediates are *modular*: for a 16-bit operand `$65535`, `$-1` and
+/// `$0xffff` denote the same value, so the compact imm8 form must be
+/// tested against the value TAKEN MODULO THE OPERAND WIDTH (GAS 2.47:
+/// `add $0xffffff90,%eax' = 83 c0 90 — the 32-bit truncation -112 fits
+/// the sign-extended imm8 form).
+pub(crate) fn canonical_imm(val: i64, size: u8) -> i64 {
+    match size {
+        1 => val as u8 as i8 as i64,
+        2 => val as u16 as i16 as i64,
+        _ => val as u32 as i32 as i64,
+    }
+}
+
+/// Whether `val`, taken modulo the operand width, fits the sign-extended
+/// 8-bit immediate form (opcode `0x83` / `0x6b`).
+pub(crate) fn fits_imm8(val: i64, size: u8) -> bool {
+    (-128..=127).contains(&canonical_imm(val, size))
+}
+
+/// GAS 2.47 unsuffixed operand-size inference for two-operand integer
+/// instructions: the REGISTER operands decide (`add %dl,%cl` = 00 d1,
+/// `add %dl,(%eax)` = 00 10 — one register is enough), and mixed-width
+/// register operands are a hard error (`add %dl,%ecx` -> "register type
+/// mismatch").  Memory-only operands default to the 32-bit operand size.
+/// An explicit mnemonic suffix (`forced`) always wins.
+pub(crate) fn infer_op_size(
+    mnemonic: &str,
+    ops: &[Operand],
+    forced: Option<u8>,
+) -> Result<u8, String> {
+    if let Some(s) = forced {
+        return Ok(s);
+    }
+    let mut seen: Option<u8> = None;
+    for op in ops {
+        if let Operand::Register(r) = op {
+            // Segment registers carry no operand width of their own.
+            if matches!(
+                r.name.to_ascii_lowercase().as_str(),
+                "es" | "cs" | "ss" | "ds" | "fs" | "gs"
+            ) {
+                continue;
+            }
+            let s = reg_size(&r.name);
+            match seen {
+                None => seen = Some(s),
+                Some(prev) if prev != s => {
+                    return Err(format!("register type mismatch for `{mnemonic}'"));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(seen.unwrap_or(4))
+}
+
 /// Get operand size from mnemonic suffix.
 pub(crate) fn mnemonic_size_suffix(mnemonic: &str) -> Option<u8> {
     match mnemonic {
@@ -81,8 +145,12 @@ pub(crate) fn mnemonic_size_suffix(mnemonic: &str) -> Option<u8> {
         | "mfence" | "lfence" | "sfence" | "clflush"
         | "ldmxcsr" | "stmxcsr"
         | "syscall" | "sysenter" | "cpuid" | "rdtsc" | "rdtscp" | "xgetbv"
-        // Base ALU/shift mnemonics whose last letter is NOT a size suffix
+        // Base ALU/shift mnemonics whose last letter is NOT a size suffix.
+        // `imul`/`mul`/`sal` end in `l` yet are unsuffixed spellings —
+        // treating them as l-suffixed forces the 32-bit width and breaks
+        // the register-driven inference (`imul $0x9090,(%eax),%dx`).
         | "sub" | "sbb" | "add" | "and" | "shl" | "rol" | "xadd"
+        | "imul" | "mul" | "sal"
         | "insb" | "insw" | "insl" | "outsb" | "outsw" | "outsl"
         | "outb" | "outw" | "outl" | "inb" | "inw" | "inl"
         | "verw" | "lsl" | "sgdt" | "sidt" | "lgdt" | "lidt"

@@ -2429,6 +2429,25 @@ impl super::InstructionEncoder {
             {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                // `.s` forces the store-direction row with reg=src, r/m=dst
+                // (GAS 2.47: `vmovdqa.s %xmm4,%xmm6' = c5 f9 7f e6; 3-byte
+                // VEX when the r/m needs B).  Same role law as the
+                // packed `encode_avx_mov_np` `.s` branch.
+                if self.s_flip {
+                    self.emit_vex(
+                        needs_vex_ext(&src.name),
+                        false,
+                        needs_vex_ext(&dst.name),
+                        1,
+                        0,
+                        0,
+                        l,
+                        pp,
+                    );
+                    self.bytes.push(store_op);
+                    self.bytes.push(self.modrm(3, src_num, dst_num));
+                    return Ok(());
+                }
                 // Register-to-register moves can be spelled either direction:
                 // the load form (opcode 28/6F/10) with reg=dst,rm=src, or the
                 // store form (29/7F/11) with reg=src,rm=dst.  They differ only
@@ -2524,6 +2543,25 @@ impl super::InstructionEncoder {
             {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                // `.s` forces the store-direction row with the roles kept
+                // in place (GAS 2.47: `vmovaps.s %xmm4,%xmm6' = c5 f9 29 e6;
+                // a 3-byte VEX when the r/m needs B, as with `vmovaps.s
+                // %xmm2,%xmm8' = c4 c1 78 29 d0).
+                if self.s_flip {
+                    self.emit_vex(
+                        needs_vex_ext(&src.name),
+                        false,
+                        needs_vex_ext(&dst.name),
+                        1,
+                        0,
+                        0,
+                        l,
+                        pp,
+                    );
+                    self.bytes.push(store_op);
+                    self.bytes.push(self.modrm(3, src_num, dst_num));
+                    return Ok(());
+                }
                 // Prefer the store direction when it avoids a 3-byte VEX; see
                 // the matching comment in `encode_avx_mov`.
                 let src_ext = needs_vex_ext(&src.name);
@@ -3793,6 +3831,24 @@ impl super::InstructionEncoder {
                         let vvvv_num = reg_num(&vvvv.name).ok_or("bad register")?;
                         let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                         let vvvv_enc = vvvv_num | u8::from(needs_vex_ext(&vvvv.name)) * 8;
+                        // `.s` forces the store direction with reg=src2,
+                        // r/m=dst (GAS 2.47: `vmovsd.s %xmm4,%xmm6,%xmm2'
+                        // = c5 cb 11 e2; 3-byte VEX when the r/m needs B).
+                        if self.s_flip {
+                            self.emit_vex(
+                                needs_vex_ext(&src.name),
+                                false,
+                                needs_vex_ext(&dst.name),
+                                1,
+                                0,
+                                vvvv_enc,
+                                0,
+                                pp,
+                            );
+                            self.bytes.push(store_op);
+                            self.bytes.push(self.modrm(3, src_num, dst_num));
+                            return Ok(());
+                        }
                         if !needs_vex_ext(&dst.name) && needs_vex_ext(&src.name) {
                             // Store direction: reg=src2 (VEX.R), r/m=dst (no B).
                             self.emit_vex(
@@ -5068,6 +5124,25 @@ impl super::InstructionEncoder {
             {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                // `.s` forces the store-direction D6 row unconditionally
+                // (GAS 2.47: `vmovq.s %xmm4,%xmm6' = c5 f9 d6 e6,
+                // `vmovq.s %xmm2,%xmm8' = c4 c1 79 d6 d0 — 3-byte VEX when
+                // the r/m needs the B extension).
+                if self.s_flip {
+                    self.emit_vex(
+                        needs_vex_ext(&src.name),
+                        false,
+                        needs_vex_ext(&dst.name),
+                        1,
+                        0,
+                        0,
+                        0,
+                        1,
+                    );
+                    self.bytes.push(0xD6);
+                    self.bytes.push(self.modrm(3, src_num, dst_num));
+                    return Ok(());
+                }
                 if !needs_vex_ext(&dst.name) && needs_vex_ext(&src.name) {
                     // 66/D6 row: reg=src (VEX.R), r/m=dst (no B), pp=66.
                     self.emit_vex(needs_vex_ext(&src.name), false, false, 1, 0, 0, 0, 1);

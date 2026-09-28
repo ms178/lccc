@@ -115,11 +115,19 @@ impl I686AddressValue {
             Self::Relocatable => return (0, false),
         };
 
+        // GAS 2.47 union law (byte-probed): a displacement is
+        // representable at width N only inside the SIGNED/UNSIGNED N-bit
+        // union [-2^(N-1), 2^N - 1]; anything else takes the full-width
+        // field with the value's modular reduction as the bits (GAS:
+        // `mov -32769(%eax),%al` = 8a 80 ff 7f ff ff — disp32 forced,
+        // NOT the disp8 the reduction 0x7fff would suggest; likewise
+        // `mov -0xffffffff(%eax),%al` = 8a 80 01 00 00 00).  The union
+        // flag gates the shortened disp8/disp0 encodings only.
         if address16 {
-            let in_union = (i16::MIN as i64..=u16::MAX as i64).contains(&value);
+            let in_union = (-(i16::MAX as i64 + 1)..=u16::MAX as i64).contains(&value);
             (value as u16 as u32, in_union)
         } else {
-            let in_union = (i32::MIN as i64..=u32::MAX as i64).contains(&value);
+            let in_union = (-(i32::MAX as i64 + 1)..=u32::MAX as i64).contains(&value);
             (value as u32, in_union)
         }
     }
@@ -989,7 +997,20 @@ impl super::InstructionEncoder {
     /// follows the code mode exactly like every other absolute address.
     pub(super) fn encode_i686_moffs(&mut self, displacement: &Displacement) -> Result<(), String> {
         let (displacement, relocation) = i686_memory_displacement(displacement);
-        let plan = i686_plan_memory_address(self.code16, 0, None, None, None, displacement)?;
+        // The `addr16` prefix word shrinks the absolute address field to
+        // 16 bits (GAS 2.47: `addr16 mov %eax,0x0898` = `67 a3 98 08`):
+        // planning with the 16-bit code mode yields the disp16 form and
+        // the resolve step requests the 0x67 override for the width
+        // mismatch with the 32-bit mode default. .code16 needs no
+        // override either way.
+        let plan = i686_plan_memory_address(
+            self.code16 || self.explicit_addr16,
+            0,
+            None,
+            None,
+            None,
+            displacement,
+        )?;
 
         self.i686_resolve_and_emit(&plan, relocation, false)
     }

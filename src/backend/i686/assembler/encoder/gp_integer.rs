@@ -267,7 +267,16 @@ impl super::InstructionEncoder {
                 if size == 4 {
                     self.sized_op = true;
                     self.bytes.push(0xB8 + dst_num);
-                    self.add_relocation(sym, R_386_32, addend);
+                    if sym == "_GLOBAL_OFFSET_TABLE_" {
+                        // GOT-base immediate (PIC prologue idiom): R_386_GOTPC.
+                        // The addend is finalized centrally in `encode()` as
+                        // the field's instruction-relative offset (GAS 2.47:
+                        // `mov $_GLOBAL_OFFSET_TABLE_,%eax' = b8 01000000,
+                        // i.e. linked value GOT - insn_start).
+                        self.add_relocation(sym, R_386_GOTPC, 0);
+                    } else {
+                        self.add_relocation(sym, R_386_32, addend);
+                    }
                     self.bytes.extend_from_slice(&[0, 0, 0, 0]);
                 } else if size == 2 {
                     // Real-mode boot code (header.S with .code16 semantics):
@@ -275,14 +284,48 @@ impl super::InstructionEncoder {
                     // GAS emits B8+rd iw with R_386_16 / R_X86_64_16 on the
                     // 2-byte field; the kernel's build-time relocs tool
                     // whitelists 16-bit relocs in the realmode blob.
-                    // (The caller has already emitted the 0x66 prefix in
-                    // 32-bit code mode when needed.)
+                    // The operand-size override + sized_op marker mirror the
+                    // integer path above exactly: without the 0x66 the
+                    // 32-bit-mode spelling collapses into the 3-byte
+                    // malformed stream `b8 iw' instead of `66 b8 iw'
+                    // (GAS 2.47: `mov $sym,%ax' = 66 b8 0000).
+                    self.sized_op = true;
+                    self.bytes.push(0x66);
                     self.bytes.push(0xB8 + dst_num);
                     self.add_relocation(sym, R_386_16, addend);
                     self.bytes.extend_from_slice(&[0, 0]);
                 } else {
-                    return Err("symbol immediate only supported for 16/32-bit mov".to_string());
+                    // 8-bit: `mov $sym,%al' = B0+r with an R_386_8 absolute
+                    // byte relocation (GAS 2.47: `mov $sym,%al` = b0 00).
+                    self.bytes.push(0xB0 + dst_num);
+                    self.add_relocation(sym, R_386_8, addend);
+                    self.bytes.push(0);
                 }
+            }
+            ImmediateValue::SymbolMod(sym, modifier) => {
+                // `$sym@GOT' / `$sym@GOTOFF' / `$sym@GOTPC' immediates
+                // (GAS 2.47: `mov $sym@GOT,%eax' = b8 00000000 with
+                // R_386_GOT32 on the field). 32-bit fields only; the
+                // GOTPC addend follows the same field-offset law as the
+                // displacement forms (+1: the field sits at offset 1).
+                if size != 4 {
+                    return Err("symbol immediate only supported for 32-bit mov".to_string());
+                }
+                let got_reloc = match modifier.as_str() {
+                    "GOT" => R_386_GOT32,
+                    "GOTOFF" => R_386_GOTOFF,
+                    "GOTPC" => R_386_GOTPC,
+                    other => {
+                        return Err(format!(
+                            "unsupported immediate modifier for mov: @{}",
+                            other
+                        ));
+                    }
+                };
+                self.sized_op = true;
+                self.bytes.push(0xB8 + dst_num);
+                self.add_relocation(sym, got_reloc, 0);
+                self.bytes.extend_from_slice(&[0, 0, 0, 0]);
             }
             ImmediateValue::SymbolDiff(sym_a, sym_b) => {
                 // head_64.S (compressed boot, .code32): `movl $(_bss -
@@ -299,9 +342,6 @@ impl super::InstructionEncoder {
                         "symbol-difference immediate only supported for 32-bit mov".to_string()
                     );
                 }
-            }
-            ImmediateValue::SymbolMod(_, _) => {
-                return Err("unsupported immediate type for mov".to_string());
             }
         }
         Ok(())
@@ -334,6 +374,14 @@ impl super::InstructionEncoder {
         }
         if size == 2 {
             self.bytes.push(0x66);
+        }
+        // `.s` selects the load-direction row (8A/8B) with the roles
+        // swapped — `movl.s %eax,%ebx` = 8b d8, not 89 c3 (GAS 2.47;
+        // identical law to the x86-64 core).
+        if self.s_flip {
+            self.bytes.push(if size == 1 { 0x8A } else { 0x8B });
+            self.bytes.push(self.modrm(3, dst_num, src_num));
+            return Ok(());
         }
         if size == 1 {
             self.bytes.push(0x88);
@@ -565,8 +613,48 @@ impl super::InstructionEncoder {
             return Err("lea requires 2 operands".to_string());
         }
         match (&ops[0], &ops[1]) {
+            (Operand::Label(label), Operand::Register(dst)) => {
+                // Bare absolute: `lea sym,%eax` = 8D /5 disp32 (no SIB)
+                // with R_386_32; under addr16 the 16-bit rm=110 form is
+                // 8D /6 disp16 (GAS 2.47: 67 8d 06 0000 + R_386_16).
+                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
+                self.bytes.push(0x8D);
+                if self.explicit_addr16 {
+                    self.bytes.push(self.modrm(0, dst_num, 6));
+                    self.add_relocation(label.as_str(), R_386_16, 0);
+                    self.bytes.extend_from_slice(&[0, 0]);
+                } else {
+                    self.bytes.push(self.modrm(0, dst_num, 5));
+                    self.add_relocation(label.as_str(), R_386_32, 0);
+                    self.bytes.extend_from_slice(&[0, 0, 0, 0]);
+                }
+                Ok(())
+            }
             (Operand::Memory(mem), Operand::Register(dst)) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
+                if self.explicit_addr16 && mem.base.is_none() && mem.index.is_none() {
+                    // `addr16 lea 1,%eax`: 16-bit addressing has no SIB, so
+                    // a bare absolute is mod=00 rm=110 + disp16 (GAS 2.47:
+                    // 67 8d 06 0100; `lea sym` takes R_386_16).
+                    self.bytes.push(0x8D);
+                    self.bytes.push(self.modrm(0, dst_num, 6));
+                    match &mem.displacement {
+                        Displacement::Integer(v) => {
+                            self.bytes.extend_from_slice(&(*v as i16).to_le_bytes());
+                        }
+                        Displacement::Symbol(sym) => {
+                            self.add_relocation(sym, R_386_16, 0);
+                            self.bytes.extend_from_slice(&[0, 0]);
+                        }
+                        Displacement::SymbolPlusOffset(sym, a)
+                        | Displacement::SymbolAddend(sym, a) => {
+                            self.add_relocation(sym, R_386_16, *a);
+                            self.bytes.extend_from_slice(&[0, 0]);
+                        }
+                        _ => return Err("unsupported addr16 lea displacement".to_string()),
+                    }
+                    return Ok(());
+                }
                 self.bytes.push(0x8D);
                 self.encode_modrm_mem(dst_num, mem)
             }
@@ -609,12 +697,17 @@ impl super::InstructionEncoder {
                 Ok(())
             }
             Operand::Immediate(ImmediateValue::Integer(val)) => {
-                if *val >= -128 && *val <= 127 {
+                // GAS 2.47 truncates the expression to the 32-bit push
+                // width first, then takes the shortest form: `push
+                // $0xffffff90' (= -112) = 6a 90; only values outside the
+                // signed imm8 after truncation take 68 imm32.
+                let v32 = *val as i32;
+                if (-128..=127).contains(&v32) {
                     self.bytes.push(0x6A);
-                    self.bytes.push(*val as u8);
+                    self.bytes.push(v32 as u8);
                 } else {
                     self.bytes.push(0x68);
-                    self.bytes.extend_from_slice(&(*val as i32).to_le_bytes());
+                    self.bytes.extend_from_slice(&v32.to_le_bytes());
                 }
                 Ok(())
             }
@@ -696,12 +789,16 @@ impl super::InstructionEncoder {
             Operand::Immediate(ImmediateValue::Integer(val)) => {
                 self.sized_op = true;
                 self.bytes.push(0x66);
-                if *val >= -128 && *val <= 127 {
+                // Truncate to the 16-bit width first, then shortest-form:
+                // `pushw $0xffffff90' truncates to 0xff90 = -112 -> 66 6a 90
+                // (GAS 2.47).
+                let v16 = *val as i16;
+                if (-128..=127).contains(&v16) {
                     self.bytes.push(0x6A);
-                    self.bytes.push(*val as u8);
+                    self.bytes.push(v16 as u8);
                 } else {
                     self.bytes.push(0x68);
-                    self.bytes.extend_from_slice(&(*val as i16).to_le_bytes());
+                    self.bytes.extend_from_slice(&v16.to_le_bytes());
                 }
                 Ok(())
             }
@@ -785,7 +882,12 @@ impl super::InstructionEncoder {
             return Err(format!("{} requires 2 operands", mnemonic));
         }
 
-        let size = mnemonic_size_suffix(mnemonic).unwrap_or(4);
+        // GAS 2.47 unsuffixed inference: the register operands decide the
+        // width (`add %dl,%cl` = 00 d1); mixed widths are a hard error;
+        // an explicit suffix wins.  The old `unwrap_or(4)` silently
+        // widened byte/word operands to 32 bits — a wrong-code class
+        // (`add $-0x100,%cl` emitted the 32-bit imm32 form).
+        let size = infer_op_size(mnemonic, ops, mnemonic_size_suffix(mnemonic))?;
 
         match (&ops[0], &ops[1]) {
             (Operand::Immediate(ImmediateValue::Integer(val)), Operand::Register(dst)) => {
@@ -800,18 +902,27 @@ impl super::InstructionEncoder {
                 }
 
                 if size == 1 {
-                    self.bytes.push(0x80);
-                    self.bytes.push(self.modrm(3, alu_op, dst_num));
+                    if is_accum(&dst.name) {
+                        // Short form: op al, imm8 (04+op*8).
+                        self.bytes.push(0x04 + alu_op * 8);
+                    } else {
+                        self.bytes.push(0x80);
+                        self.bytes.push(self.modrm(3, alu_op, dst_num));
+                    }
                     self.bytes.push(val as u8);
-                } else if (-128..=127).contains(&val) {
+                } else if fits_imm8(val, size) {
+                    // Sign-extended imm8 (83 form).  The value is
+                    // canonicalized to the operand width first, so the
+                    // unsigned spelling of the same value picks the
+                    // compact form too (GAS: `addw $65535,%ax` =
+                    // 66 83 c0 ff).
                     self.bytes.push(0x83);
                     self.bytes.push(self.modrm(3, alu_op, dst_num));
-                    self.bytes.push(val as u8);
+                    self.bytes.push(canonical_imm(val, size) as u8);
                 } else {
                     if dst_num == 0 {
-                        // Short form: op eax, imm32
-                        self.bytes
-                            .push(if size == 1 { 0x04 } else { 0x05 } + alu_op * 8);
+                        // Short form: op eAX, imm (05+op*8)
+                        self.bytes.push(0x05 + alu_op * 8);
                     } else {
                         self.bytes.push(0x81);
                         self.bytes.push(self.modrm(3, alu_op, dst_num));
@@ -840,23 +951,54 @@ impl super::InstructionEncoder {
                 if size == 2 {
                     self.bytes.push(0x66);
                 }
-                let opcode_len = if dst_num == 0 {
-                    self.bytes.push(0x05 + alu_op * 8);
-                    1u32
+                // Width-matched accumulator short form + matching relocation
+                // class (GAS 2.47: `addb $early,%al` = 04 00 with R_386_8,
+                // `addw $early,%ax` = 66 05 00 00 with R_386_16, `addl
+                // $xtrn,%eax` = 05 00 00 00 00 with R_386_32).  The old
+                // path always took the 05 + imm32 shape — for a byte
+                // destination the decoder then sees op eAX, imm32 and the
+                // stream desynchronizes.
+                let (opcode_len, imm_len) = if dst_num == 0 {
+                    match size {
+                        1 => {
+                            self.bytes.push(0x04 + alu_op * 8);
+                            (1u32, 1u32)
+                        }
+                        2 => {
+                            self.bytes.push(0x05 + alu_op * 8);
+                            (2u32, 2u32)
+                        }
+                        _ => {
+                            self.bytes.push(0x05 + alu_op * 8);
+                            (1u32, 4u32)
+                        }
+                    }
                 } else {
                     self.bytes.push(0x81);
                     self.bytes.push(self.modrm(3, alu_op, dst_num));
-                    2u32
+                    (2u32, if size == 2 { 2u32 } else { 4u32 })
                 };
                 // _GLOBAL_OFFSET_TABLE_ requires R_386_GOTPC (PC-relative to GOT).
                 // The implicit addend = opcode length so the PC correction works:
                 // ebx (= return addr of thunk call) + (GOT + addend - P) = GOT
                 if sym == "_GLOBAL_OFFSET_TABLE_" {
+                    // R_386_GOTPC; the field addend is finalized centrally
+                    // in `encode()` as the field's instruction-relative
+                    // offset (== opcode_len here). The field bytes are
+                    // written as zeros because the object writer applies
+                    // the metadata addend ADDITIVELY — pre-writing the
+                    // addend here would double-count (the old 04-vs-02
+                    // field bug against GAS).
                     self.add_relocation(sym, R_386_GOTPC, 0);
-                    self.bytes.extend_from_slice(&opcode_len.to_le_bytes());
-                } else {
-                    self.add_relocation(sym, R_386_32, addend);
                     self.bytes.extend_from_slice(&[0, 0, 0, 0]);
+                } else {
+                    let reloc = match imm_len {
+                        1 => R_386_8,
+                        2 => R_386_16,
+                        _ => R_386_32,
+                    };
+                    self.add_relocation(sym, reloc, addend);
+                    self.bytes.extend_from_slice(&vec![0u8; imm_len as usize]);
                 }
                 Ok(())
             }
@@ -869,6 +1011,15 @@ impl super::InstructionEncoder {
                 }
                 if size == 2 {
                     self.bytes.push(0x66);
+                }
+                // `.s` selects the store-direction encoding with the roles
+                // swapped (GAS 2.47: `add.s %edx,%ecx` = 03 ca); memory and
+                // immediate forms ignore `.s`.
+                if self.s_flip {
+                    self.bytes
+                        .push(if size == 1 { 0x02 } else { 0x03 } + alu_op * 8);
+                    self.bytes.push(self.modrm(3, dst_num, src_num));
+                    return Ok(());
                 }
                 self.bytes
                     .push(if size == 1 { 0x00 } else { 0x01 } + alu_op * 8);
@@ -912,10 +1063,13 @@ impl super::InstructionEncoder {
                     self.bytes.push(0x80);
                     self.encode_modrm_mem(alu_op, mem)?;
                     self.bytes.push(val as u8);
-                } else if (-128..=127).contains(&val) {
+                } else if fits_imm8(val, size) {
+                    // Truncate-then-shortest (GAS 2.47: `adcl
+                    // $0xffffff90,mem' = 83 /2 90 — the 32-bit truncation
+                    // -112 fits the sign-extended imm8 form).
                     self.bytes.push(0x83);
                     self.encode_modrm_mem(alu_op, mem)?;
-                    self.bytes.push(val as u8);
+                    self.bytes.push(canonical_imm(val, size) as u8);
                 } else {
                     self.bytes.push(0x81);
                     self.encode_modrm_mem(alu_op, mem)?;
@@ -1091,7 +1245,7 @@ impl super::InstructionEncoder {
             return Err(format!("{} requires 2 operands", mnemonic));
         }
 
-        let size = mnemonic_size_suffix(mnemonic).unwrap_or(4);
+        let size = infer_op_size(mnemonic, ops, mnemonic_size_suffix(mnemonic))?;
 
         match (&ops[0], &ops[1]) {
             (Operand::Register(src), Operand::Register(dst)) => {
@@ -1192,6 +1346,14 @@ impl super::InstructionEncoder {
         if ops.len() >= 2 {
             self.sized_op = true;
         }
+        // 16-bit forms take 0x66 and an imm16 immediate (GAS 2.47:
+        // `imul $0x9090,(%eax),%dx` = 66 69 10 90 90; `imul $0x90,%edx,%ecx`
+        // = 69 ca 90 00 00 00 — $0x90 does not fit the SIGNED imm8, so the
+        // full-width row wins).
+        let word = size == 2;
+        if word {
+            self.bytes.push(0x66);
+        }
         match ops.len() {
             1 => self.encode_unary_rm(ops, 5, size),
             2 => {
@@ -1211,14 +1373,18 @@ impl super::InstructionEncoder {
                     // imul $imm, %reg  =>  imul $imm, %reg, %reg (dst = src * imm)
                     (Operand::Immediate(ImmediateValue::Integer(val)), Operand::Register(dst)) => {
                         let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                        if *val >= -128 && *val <= 127 {
+                        if fits_imm8(*val, size) {
                             self.bytes.push(0x6B);
                             self.bytes.push(self.modrm(3, dst_num, dst_num));
-                            self.bytes.push(*val as u8);
+                            self.bytes.push(canonical_imm(*val, size) as u8);
                         } else {
                             self.bytes.push(0x69);
                             self.bytes.push(self.modrm(3, dst_num, dst_num));
-                            self.bytes.extend_from_slice(&(*val as i32).to_le_bytes());
+                            if word {
+                                self.bytes.extend_from_slice(&(*val as i16).to_le_bytes());
+                            } else {
+                                self.bytes.extend_from_slice(&(*val as i32).to_le_bytes());
+                            }
                         }
                         Ok(())
                     }
@@ -1233,14 +1399,18 @@ impl super::InstructionEncoder {
                 ) => {
                     let src_num = reg_num(&src.name).ok_or("bad register")?;
                     let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                    if *val >= -128 && *val <= 127 {
+                    if fits_imm8(*val, size) {
                         self.bytes.push(0x6B);
                         self.bytes.push(self.modrm(3, dst_num, src_num));
-                        self.bytes.push(*val as u8);
+                        self.bytes.push(canonical_imm(*val, size) as u8);
                     } else {
                         self.bytes.push(0x69);
                         self.bytes.push(self.modrm(3, dst_num, src_num));
-                        self.bytes.extend_from_slice(&(*val as i32).to_le_bytes());
+                        if word {
+                            self.bytes.extend_from_slice(&(*val as i16).to_le_bytes());
+                        } else {
+                            self.bytes.extend_from_slice(&(*val as i32).to_le_bytes());
+                        }
                     }
                     Ok(())
                 }
@@ -1250,14 +1420,18 @@ impl super::InstructionEncoder {
                     Operand::Register(dst),
                 ) => {
                     let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                    if *val >= -128 && *val <= 127 {
+                    if fits_imm8(*val, size) {
                         self.bytes.push(0x6B);
                         self.encode_modrm_mem(dst_num, mem)?;
-                        self.bytes.push(*val as u8);
+                        self.bytes.push(canonical_imm(*val, size) as u8);
                     } else {
                         self.bytes.push(0x69);
                         self.encode_modrm_mem(dst_num, mem)?;
-                        self.bytes.extend_from_slice(&(*val as i32).to_le_bytes());
+                        if word {
+                            self.bytes.extend_from_slice(&(*val as i16).to_le_bytes());
+                        } else {
+                            self.bytes.extend_from_slice(&(*val as i32).to_le_bytes());
+                        }
                     }
                     Ok(())
                 }
@@ -1369,7 +1543,7 @@ impl super::InstructionEncoder {
         mnemonic: &str,
         shift_op: u8,
     ) -> Result<(), String> {
-        let size = mnemonic_size_suffix(mnemonic).unwrap_or(4);
+        let size = infer_op_size(mnemonic, ops, mnemonic_size_suffix(mnemonic))?;
 
         // Handle 1-operand form: shrl %eax means shift right by 1
         if ops.len() == 1 {
@@ -1572,6 +1746,18 @@ impl super::InstructionEncoder {
             _ => return Err(format!("unknown bit scan: {}", mnemonic)),
         };
 
+        // Width from the DESTINATION register (GAS 2.47: `bsf (%eax),%dx`
+        // = 66 0f bc 10, `bsf (%eax),%ecx` = 0f bc 08 — an unsuffixed
+        // spelling with a 16-bit destination takes the 66 word form).
+        let size = match ops.get(1) {
+            Some(Operand::Register(r)) => reg_size(&r.name),
+            _ => 4,
+        };
+        if size == 2 {
+            self.sized_op = true;
+            self.bytes.push(0x66);
+        }
+
         match (&ops[0], &ops[1]) {
             (Operand::Register(src), Operand::Register(dst)) => {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
@@ -1604,6 +1790,25 @@ impl super::InstructionEncoder {
             "btcl" | "btc" => (0xBB, 7),
             _ => return Err(format!("unknown bt instruction: {}", mnemonic)),
         };
+
+        // Width from the destination/base operand (GAS 2.47: `bt $15,%ax`
+        // = 66 0f ba e0 0f, `bt $3,%ecx` = 0f ba e1 03 — the unsuffixed
+        // spelling follows the register width; the imm8 is the unsigned
+        // truncation, so $16 -> 0x10).
+        let dst_size = match ops.get(1) {
+            Some(Operand::Register(r)) => Some(reg_size(&r.name)),
+            Some(Operand::Memory(_)) | Some(Operand::Label(_)) => None,
+            _ => None,
+        };
+        let reg_size_is16 = dst_size == Some(2);
+        let src_reg_is16 = matches!(
+            ops.first(),
+            Some(Operand::Register(r)) if reg_size(&r.name) == 2
+        );
+        if reg_size_is16 || (!dst_size.is_some() && src_reg_is16) {
+            self.sized_op = true;
+            self.bytes.push(0x66);
+        }
 
         match (&ops[0], &ops[1]) {
             (Operand::Register(src), Operand::Register(dst)) => {
@@ -1679,21 +1884,31 @@ impl super::InstructionEncoder {
         }
 
         let without_prefix = &mnemonic[4..];
-        // Strip size suffix if present, otherwise use as-is (unsuffixed = 32-bit default)
-        let (cc_str, is_16bit) = if without_prefix.ends_with('w')
+        // Strip size suffix if present; the UNSUFFIXED spelling infers the
+        // width from the destination register (GAS 2.47: `cmova (%eax),%dx`
+        // = 66 0f 47 10, `cmova (%eax),%ecx` = 0f 47 08 — the old fixed
+        // 32-bit default silently widened 16-bit conditional moves).
+        let (cc_str, forced_16bit) = if without_prefix.ends_with('w')
             && without_prefix != "w"
             && cc_from_mnemonic(&without_prefix[..without_prefix.len() - 1]).is_ok()
         {
-            (&without_prefix[..without_prefix.len() - 1], true)
+            (&without_prefix[..without_prefix.len() - 1], Some(true))
         } else if without_prefix.ends_with('l')
             && without_prefix != "l"
             && cc_from_mnemonic(&without_prefix[..without_prefix.len() - 1]).is_ok()
         {
-            (&without_prefix[..without_prefix.len() - 1], false)
+            (&without_prefix[..without_prefix.len() - 1], Some(false))
         } else {
-            (without_prefix, false)
+            (without_prefix, None)
         };
         let cc = cc_from_mnemonic(cc_str)?;
+        let is_16bit = match forced_16bit {
+            Some(f) => f,
+            None => match ops.get(1) {
+                Some(Operand::Register(r)) => reg_size(&r.name) == 2,
+                _ => false,
+            },
+        };
 
         match (&ops[0], &ops[1]) {
             (Operand::Register(src), Operand::Register(dst)) => {
@@ -1745,6 +1960,16 @@ impl super::InstructionEncoder {
                     self.bytes.extend_from_slice(&[0, 0]);
                     return Ok(());
                 }
+                if self.explicit_data16 {
+                    // `data16 jmp foo` shrinks the displacement to rel16
+                    // (GAS 2.47: 66 e9 feff + R_386_PC16 -2). The 0x66 is
+                    // inserted by the forced-data16 fixup, not here.
+                    self.sized_op = true;
+                    self.bytes.push(0xE9);
+                    self.add_relocation(label, R_386_PC16, -2);
+                    self.bytes.extend_from_slice(&[0, 0]);
+                    return Ok(());
+                }
                 self.bytes.push(0xE9);
                 // The i386 psABI spelling: a bare branch target is R_386_PC32
                 // and only `sym@PLT` asks for R_386_PLT32 (i686_make_relocation
@@ -1757,6 +1982,18 @@ impl super::InstructionEncoder {
                 Ok(())
             }
             Operand::Indirect(inner) => {
+                if let Operand::Register(reg) = inner.as_ref() {
+                    // `jmp *%ax` / `jmp *%si`: the 16-bit indirect form is
+                    // 66 FF /4 (GAS 2.47: `jmp *%ax` = 66 ff e0).
+                    if reg_size(&reg.name) == 2 {
+                        self.sized_op = true;
+                        self.bytes.push(0x66);
+                        self.bytes.push(0xFF);
+                        let num = reg_num(&reg.name).ok_or("bad register")?;
+                        self.bytes.push(self.modrm(3, 4, num));
+                        return Ok(());
+                    }
+                }
                 match inner.as_ref() {
                     Operand::Register(reg) => {
                         let num = reg_num(&reg.name).ok_or("bad register")?;
@@ -1878,14 +2115,24 @@ impl super::InstructionEncoder {
                     ) => {
                         // .code16: offset width follows the suffix — ljmpl
                         // marks sized_op (66-prefixed via the inversion) and
-                        // keeps imm32; ljmp/ljmpw emit imm16. .code32: imm32.
+                        // keeps imm32; ljmp/ljmpw emit imm16. .code32: the
+                        // explicit `ljmpw' spelling forces the 66 EA imm16
+                        // form too (GAS 2.47: `ljmpw $0x9090,$0x9090` =
+                        // 66 ea 90 90 90 90); only ljmpl takes imm32.
                         if self.code16 && !self.ljmp_wide {
                             self.bytes.push(0xEA);
                             self.bytes.extend_from_slice(&(*off as u16).to_le_bytes());
+                        } else if self.ljmp_narrow {
+                            self.sized_op = true;
+                            self.bytes.push(0x66);
+                            self.bytes.push(0xEA);
+                            self.bytes.extend_from_slice(&(*off as u16).to_le_bytes());
+                        } else if self.ljmp_wide {
+                            self.sized_op = true;
+                            self.bytes.push(0x66);
+                            self.bytes.push(0xEA);
+                            self.bytes.extend_from_slice(&(*off as u16).to_le_bytes());
                         } else {
-                            if self.code16 {
-                                self.sized_op = true;
-                            }
                             self.bytes.push(0xEA);
                             self.bytes.extend_from_slice(&(*off as u32).to_le_bytes());
                         }
@@ -1955,6 +2202,15 @@ impl super::InstructionEncoder {
                     self.bytes.extend_from_slice(&[0, 0]);
                     return Ok(());
                 }
+                if self.explicit_data16 {
+                    // `data16 je foo`: 66 0F 8x rel16 (GAS 2.47). The 0x66
+                    // is inserted by the forced-data16 fixup, not here.
+                    self.sized_op = true;
+                    self.bytes.extend_from_slice(&[0x0F, 0x80 + cc]);
+                    self.add_relocation(label, R_386_PC16, -2);
+                    self.bytes.extend_from_slice(&[0, 0]);
+                    return Ok(());
+                }
                 self.bytes.extend_from_slice(&[0x0F, 0x80 + cc]);
                 // The i386 psABI spelling: a bare branch target is R_386_PC32
                 // and only `sym@PLT` asks for R_386_PLT32 (i686_make_relocation
@@ -1995,6 +2251,27 @@ impl super::InstructionEncoder {
                     }
                     return Ok(());
                 }
+                // `callw` forces the 16-bit call in .code32 too: 66 E8
+                // rel16 + R_386_PC16 (GAS 2.47).  sized_op is set by the
+                // dispatch arm for the callw spelling.
+                if self.sized_op_callw {
+                    self.sized_op = true;
+                    self.bytes.push(0x66);
+                    self.bytes.push(0xE8);
+                    self.add_relocation(sym, R_386_PC16, -2);
+                    self.bytes.extend_from_slice(&[0, 0]);
+                    return Ok(());
+                }
+                if self.explicit_data16 {
+                    // `data16 call foo` shrinks the displacement to rel16
+                    // (GAS 2.47: 66 e8 feff + R_386_PC16 -2). The 0x66 is
+                    // inserted by the forced-data16 fixup, not here.
+                    self.sized_op = true;
+                    self.bytes.push(0xE8);
+                    self.add_relocation(label, R_386_PC16, -2);
+                    self.bytes.extend_from_slice(&[0, 0]);
+                    return Ok(());
+                }
                 self.bytes.push(0xE8);
                 // The i386 psABI spelling: a bare branch target is R_386_PC32
                 // and only `sym@PLT` asks for R_386_PLT32 (i686_make_relocation
@@ -2007,9 +2284,20 @@ impl super::InstructionEncoder {
                 Ok(())
             }
             Operand::Indirect(inner) => {
+                // `callw *%ax' / `callw *mem': the 16-bit indirect call
+                // takes 0x66 ahead of FF /2 (GAS 2.47). `call *%ax' (no
+                // callw spelling) needs the same 66 (GAS: 66 ff d0).
+                if self.sized_op_callw {
+                    self.sized_op = true;
+                    self.bytes.push(0x66);
+                }
                 match inner.as_ref() {
                     Operand::Register(reg) => {
                         let num = reg_num(&reg.name).ok_or("bad register")?;
+                        if reg_size(&reg.name) == 2 && !self.bytes.ends_with(&[0x66]) {
+                            self.sized_op = true;
+                            self.bytes.push(0x66);
+                        }
                         self.bytes.push(0xFF);
                         self.bytes.push(self.modrm(3, 2, num));
                         Ok(())
@@ -2039,7 +2327,32 @@ impl super::InstructionEncoder {
         if ops.len() != 2 {
             return Err("xchg requires 2 operands".to_string());
         }
-        let size = mnemonic_size_suffix(mnemonic).unwrap_or(4);
+        let size = infer_op_size(mnemonic, ops, mnemonic_size_suffix(mnemonic))?;
+
+        // Accumulator short form (GAS 2.47, both operand orders): when
+        // EITHER operand is the size-matched accumulator, xchg encodes as
+        // the one-byte 0x90 + r (`xchg %eax,%esi' = 96, `xchg %esi,%eax' =
+        // 96, `xchg %ax,%si' = 66 96, `xchg %eax,%eax' = 90 — the classic
+        // NOP).  Byte pairs take 86 with reg=src, r/m=dst (`xchg %cl,%cl'
+        // = 86 c9); wider pairs take 87 with reg=src, r/m=dst
+        // (`xchg %edx,%ecx' = 87 d1); a memory operand always rides r/m
+        // (`xchg (%eax),%edx' = 87 10).
+        match (&ops[0], &ops[1]) {
+            (Operand::Register(a), Operand::Register(b)) if size == 2 || size == 4 => {
+                let a_acc = is_accum(&a.name);
+                let b_acc = is_accum(&b.name);
+                if a_acc || b_acc {
+                    let other = reg_num(&(if a_acc { b } else { a }).name).ok_or("bad register")?;
+                    self.sized_op = true;
+                    if size == 2 {
+                        self.bytes.push(0x66);
+                    }
+                    self.bytes.push(0x90 + (other & 7));
+                    return Ok(());
+                }
+            }
+            _ => {}
+        }
 
         match (&ops[0], &ops[1]) {
             (Operand::Register(src), Operand::Memory(mem)) => {
@@ -2074,7 +2387,7 @@ impl super::InstructionEncoder {
         if ops.len() != 2 {
             return Err("cmpxchg requires 2 operands".to_string());
         }
-        let size = mnemonic_size_suffix(mnemonic).unwrap_or(4);
+        let size = infer_op_size(mnemonic, ops, mnemonic_size_suffix(mnemonic))?;
 
         match (&ops[0], &ops[1]) {
             (Operand::Register(src), Operand::Memory(mem)) => {
@@ -2097,7 +2410,7 @@ impl super::InstructionEncoder {
         if ops.len() != 2 {
             return Err("xadd requires 2 operands".to_string());
         }
-        let size = mnemonic_size_suffix(mnemonic).unwrap_or(4);
+        let size = infer_op_size(mnemonic, ops, mnemonic_size_suffix(mnemonic))?;
 
         match (&ops[0], &ops[1]) {
             (Operand::Register(src), Operand::Memory(mem)) => {

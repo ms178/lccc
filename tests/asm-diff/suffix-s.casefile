@@ -1,0 +1,138 @@
+# The `.s` (swap/store-direction) suffix across every direction-bit family.
+# Every line's expected bytes were GAS 2.47.20260726-probed while wiring
+# `s_flip`; asmdiff re-derives both sides per run.
+;;; alu_s_reg_reg
+.text
+add.s %dl,%cl
+add.s %dx,%cx
+add.s %edx,%ecx
+add.s %rdx,%rcx
+or.s %edx,%ecx
+adc.s %edx,%ecx
+sbb.s %edx,%ecx
+and.s %edx,%ecx
+sub.s %edx,%ecx
+xor.s %edx,%ecx
+cmp.s %edx,%ecx
+sub.s %r8d,%r9d
+cmp.s %r9d,%r8d
+add.s %r8,%r9
+;;; alu_s_suffixed
+.text
+addb.s %dl,%cl
+addw.s %dx,%cx
+addl.s %edx,%ecx
+addq.s %rdx,%rcx
+cmpb.s %dl,%cl
+xorq.s %rdx,%rcx
+;;; alu_s_ignored_forms
+.text
+add.s %edx,(%rax)
+add.s (%rax),%edx
+add.s $5,%edx
+subl.s $-1,(%rcx)
+or.s $0x7f,%al
+;;; test_s
+.text
+test.s %edx,%ecx
+test.s %dl,%cl
+test.s %r9d,%r8d
+test %edx,%ecx
+testb.s %dl,%cl
+;;; sse_s_reg_reg
+.text
+movaps.s %xmm4,%xmm6
+movaps.s %xmm2,%xmm8
+movapd.s %xmm4,%xmm6
+movups.s %xmm4,%xmm6
+movupd.s %xmm4,%xmm6
+movdqa.s %xmm4,%xmm6
+movdqu.s %xmm4,%xmm6
+movss.s %xmm4,%xmm6
+movsd.s %xmm4,%xmm6
+movaps.s %xmm8,%xmm2
+movups.s %xmm15,%xmm8
+;;; sse_s_ignored_mem
+.text
+movaps.s %xmm6,(%rax)
+movaps.s (%rax),%xmm6
+movsd.s %xmm6,(%rax)
+movsd.s (%rax),%xmm6
+;;; sse_s_mmx
+.text
+movq.s %mm0,%mm4
+movq.s %xmm4,%xmm6
+movq.s %xmm2,%xmm8
+movq %xmm4,%xmm6
+movq %mm0,%mm4
+;;; vex_s
+.text
+vmovaps.s %xmm4,%xmm6
+vmovaps.s %ymm4,%ymm6
+vmovaps.s %xmm2,%xmm8
+vmovapd.s %xmm4,%xmm6
+vmovupd.s %ymm4,%ymm6
+vmovups.s %xmm4,%xmm6
+vmovdqa.s %xmm4,%xmm6
+vmovdqa.s %ymm4,%ymm6
+vmovdqu.s %xmm4,%xmm6
+vmovq.s %xmm4,%xmm6
+vmovq.s %xmm2,%xmm8
+vmovq.s %xmm29,%xmm30
+vmovsd.s %xmm4,%xmm6,%xmm2
+vmovss.s %xmm4,%xmm6,%xmm2
+vmovsd.s %xmm4,%xmm6,%xmm2{%k7}
+;;; evex_s
+.text
+vmovaps.s %xmm29,%xmm30
+vmovapd.s %xmm29,%xmm30
+vmovdqa32.s %xmm29,%xmm30
+vmovdqu64.s %zmm29,%zmm30
+vmovq.s %xmm29,%xmm30
+vmovd.s %xmm29,%xmm30
+vmovsd.s %xmm29,%xmm30,%xmm28
+;;; monitor_family
+.text
+monitor %rax,%ecx,%edx
+monitor %eax,%ecx,%edx
+monitor %eax,%rcx,%rdx
+monitorx %rax,%ecx,%edx
+monitorx %eax,%ecx,%edx
+mwaitx %eax,%ecx,%ebx
+;;; user_msr
+.text
+urdmsr %rdx,%rax
+urdmsr %r12,%rax
+urdmsr %rax,%r12
+urdmsr %r22,%rax
+urdmsr %r31,%r16
+uwrmsr %rax,%rdx
+uwrmsr %r12,%rdx
+uwrmsr %rdx,%r12
+uwrmsr %r22,%rdx
+uwrmsr %rdx,%r22
+uwrmsr %rax,%r24
+uwrmsr %r16,%r31
+;;; segmov
+.text
+mov %ax,%ds
+mov %eax,%ds
+mov %r8d,%ds
+movw %ax,%ds
+mov %ds,%ax
+mov %ds,%eax
+mov %ds,%r8
+;;; push_imm
+.text
+pushw $10
+pushw $0x1234
+pushw $0xffffff90
+push $0x1234
+pushq $10
+;;; x87_wait_order
+.text
+fstenv (%ebp)
+fstenv %fs:(%ebp)
+fsave (%ebp)
+fstsw (%ebp)
+fldenv (%rbp)
