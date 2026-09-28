@@ -28,12 +28,21 @@ reports divergences both in the accept/reject verdict and in the bytes written.
 
 ## `setup_oracles.sh` — build the corroborating linkers
 
-mold and wild from git HEAD (never release tarballs: a stale tarball oracle
-produced two false lccc failures earlier in this series), lld pinned to
-release/23.x with `LLVM_TARGETS_TO_BUILD=X86`, all `-march=native`. Idempotent.
-GNU ld is assumed present and is the *primary* oracle — every "matches GNU ld"
-claim in this series was produced with it, because it is the only one guaranteed
-to be installed. The others corroborate; they are not required.
+Pinned oracles (user directive): **GNU ld 2.47** (bfd + ld only), **mold
+2.42.1** built with `-DMOLD_TARGETS='X86_64;I386'` (mold's own CMake cache
+variable — the x86 preset cuts template instantiation ~10x on the 2-vCPU host),
+**LLVM lld 23.1.x** (apt.llvm.org release build; the script asserts the `23.1.`
+banner) and wild at git HEAD. `WITH_WILD=0` removes wild from the oracle set
+for that run: no build, no `wild` wrapper (a stale one is deleted) and no
+inventory entry; an already-built binary stays cached for a later
+`WITH_WILD=1` run. Installed binaries live
+in the persisted `/home/user/artifacts/oracles`; tarballs and build trees go to
+the snapshot-excluded `~/.cache/lccc-oracle-src` and are deleted after install.
+`ORACLES.lock` is a generated inventory, not an input: every run rewrites it
+with the exact `--version` banners of the oracles it exposed (exactly those
+with wrappers in `/home/user/artifacts/bin`); the pins live in the script. GNU ld is
+the *primary* oracle — every "matches GNU ld" claim in this series was produced
+with it; the others corroborate. Idempotent.
 
     bash tools/linker/setup_oracles.sh
 

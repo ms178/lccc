@@ -445,9 +445,11 @@ fn sink_conditional_stores(func: &mut IrFunction) -> usize {
 
     let mut sunk = 0;
     for merge_idx in 0..num_blocks {
-        let pred_list: Vec<usize> = (0..num_blocks)
-            .filter(|&p| preds.row(merge_idx).iter().any(|&q| q as usize == p))
-            .collect();
+        // Distinct predecessors in ascending block order (a filter over
+        // every block per merge was O(blocks^2)).
+        let mut pred_list: Vec<usize> = preds.row(merge_idx).iter().map(|&q| q as usize).collect();
+        pred_list.sort_unstable();
+        pred_list.dedup();
         if pred_list.len() < 2 || pred_list.contains(&merge_idx) {
             continue;
         }

@@ -47,19 +47,12 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{AddressSpace, IrType};
 use crate::ir::reexports::{Instruction, IrFunction, Operand, Value};
 
-/// Byte size of an IR access type for cell overlap math. `-1` marks types
-/// whose cell extent is not modeled (vectors and anything unexpected):
-/// such stores are never elimination targets and conservatively kill
-/// same-root pending entries.
-fn access_size(ty: IrType) -> i64 {
-    match ty {
-        IrType::I8 | IrType::U8 => 1,
-        IrType::I16 | IrType::U16 => 2,
-        IrType::I32 | IrType::U32 | IrType::F32 => 4,
-        IrType::I64 | IrType::U64 | IrType::F64 | IrType::Ptr => 8,
-        IrType::I128 | IrType::U128 | IrType::F128 => 16,
-        _ => -1,
-    }
+/// `(definitely, possibly)` written/read bytes of an IR access type for cell
+/// overlap math (`IrType::access_extent`).  `None` marks types whose cell
+/// extent is not modeled: such stores are never elimination targets and
+/// conservatively kill same-root pending entries.
+fn access_extent(ty: IrType) -> Option<(i64, i64)> {
+    ty.access_extent()
 }
 
 /// Identity of the object a cell lives in.
@@ -105,6 +98,8 @@ struct CellAddr {
 struct Pending {
     root: CellRoot,
     offset: i64,
+    /// Bytes the later store DEFINITELY writes (the `access_extent` lower
+    /// bound): only those prove an earlier store dead.
     size: i64,
 }
 
@@ -380,7 +375,7 @@ fn dse_block(block: &crate::ir::reexports::BasicBlock, ctx: &DseContext) -> Vec<
                 if *seg_override != AddressSpace::Default {
                     continue; // other address space: isolated
                 }
-                let size = access_size(*ty);
+                let extent = access_extent(*ty);
                 let addr = match ctx.resolve(*ptr) {
                     Some(a) => a,
                     None => {
@@ -391,13 +386,13 @@ fn dse_block(block: &crate::ir::reexports::BasicBlock, ctx: &DseContext) -> Vec<
                     }
                 };
                 if let Some(off) = addr.offset {
-                    if size >= 0 {
-                        // Exact cell: is a pending later store fully covering it?
+                    if let Some((written, may_write)) = extent {
+                        // Exact cell: does a pending later store definitely
+                        // overwrite every byte this one may write?
                         if !*volatile {
-                            if let Some(_p) = pending
-                                .iter()
-                                .find(|p| p.root == addr.root && p.offset == off && p.size >= size)
-                            {
+                            if let Some(_p) = pending.iter().find(|p| {
+                                p.root == addr.root && p.offset == off && p.size >= may_write
+                            }) {
                                 dead.push(ii);
                                 // The dead store is removed, but the pending
                                 // overwriter stays: an even earlier store to
@@ -408,7 +403,7 @@ fn dse_block(block: &crate::ir::reexports::BasicBlock, ctx: &DseContext) -> Vec<
                         pending.push(Pending {
                             root: addr.root,
                             offset: off,
-                            size,
+                            size: written,
                         });
                         continue;
                     }
@@ -435,8 +430,7 @@ fn dse_block(block: &crate::ir::reexports::BasicBlock, ctx: &DseContext) -> Vec<
                         root,
                         offset: Some(off),
                     }) => {
-                        let sz = access_size(*ty);
-                        let sz = if sz >= 0 { sz } else { 16 };
+                        let sz = access_extent(*ty).map_or(16, |(_, may_read)| may_read);
                         pending.retain(|p| {
                             if roots_may_alias(&p.root, &root) {
                                 // Same object (or unknown overlap): kill on

@@ -19,16 +19,19 @@
 //! - `emit` - Phase 10: executable layout and ELF32 emission
 //! - `link` - Orchestration: `link_builtin` and `link_shared` entry points
 
+mod dynamic;
 mod dynsym;
 mod emit;
 mod gnu_hash;
 mod input;
 mod link;
+mod options;
 mod parse;
 mod reloc;
 mod sections;
 mod shared;
 mod symbols;
+mod tls;
 #[expect(dead_code)] // ELF constants defined for completeness; not all used yet
 mod types;
 
@@ -101,7 +104,7 @@ pub fn load_inputs_for_script(
             direct.push(parse_elf32(&data, path)?);
         }
     }
-    input::resolve_archive_members(&mut direct, &mut archive_pool, &[], extra_undefined);
+    input::resolve_archive_members(&mut direct, &mut archive_pool, extra_undefined);
 
     Ok(direct
         .into_iter()

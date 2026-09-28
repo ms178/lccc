@@ -33,6 +33,7 @@
 
 use super::super::types::*;
 use super::helpers::{get_dest_reg, is_read_modify_write, src_mentions_family};
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 /// All 16 GP families.
 const ALL: u16 = 0xFFFF;
@@ -216,8 +217,62 @@ pub(super) struct FileLiveness {
     /// Registers live immediately AFTER each line, when its function could be
     /// analysed.
     live_out: Vec<u16>,
+    /// Registers live immediately BEFORE each line (same validity as
+    /// `live_out`).  Kept so `refresh_span` can splice a local recomputation
+    /// into the function's solution and prove it changed nothing outside.
+    live_in: Vec<u16>,
     /// Whether the line belongs to an analysable function.
     known: Vec<bool>,
+    /// Whether the line shaped the CFG or the function-wide context at the
+    /// last analysis (see `is_structural`).  `refresh_span` must know the
+    /// PRE-edit shape of the lines it re-derives, and the edit has already
+    /// replaced their text.
+    structural: Vec<bool>,
+    /// `(reads, writes)` of each known line at the last analysis: the
+    /// PRE-edit transfer functions `refresh_span`'s exactness test needs.
+    effect: Vec<(u16, u16)>,
+    /// `(start, end)` of the function each line belongs to (`start` is the
+    /// `.cfi_startproc` line, `end` the `.cfi_endproc` line or the file
+    /// length), `None` outside every function.
+    func_of: Vec<Option<(u32, u32)>>,
+    /// Functions whose `ret` read set was inferred from their text (no
+    /// legible `# LCCC_RET_RDX` marker): any edit can change it.
+    textual_ret: FxHashSet<usize>,
+}
+
+/// `CCC_VERIFY_LIVENESS_SPAN` (see `FileLiveness::assert_matches_full_analysis`).
+fn verify_span_refresh() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("CCC_VERIFY_LIVENESS_SPAN").is_some())
+}
+
+/// Whether line `n` influences the analysis beyond its own read/write
+/// effect: control transfers and labels (CFG edges), calls (their read set
+/// depends on the marker lines after them, a local target adds an edge),
+/// inline asm, comment lines (the `# LCCC_*` markers consulted by call and
+/// ret modelling) and every directive except the byte-neutral annotation
+/// and alignment ones (`.long`/`.quad` jump-table entries and section
+/// switches are read by `resolve_jump_tables`).
+fn is_structural(store: &LineStore, infos: &[LineInfo], n: usize) -> bool {
+    if infos[n].is_nop() {
+        return false;
+    }
+    match infos[n].kind {
+        LineKind::Label
+        | LineKind::Jmp
+        | LineKind::CondJmp
+        | LineKind::JmpIndirect
+        | LineKind::Call
+        | LineKind::Ret
+        | LineKind::InlineAsm => true,
+        LineKind::Directive => {
+            let t = infos[n].trimmed(store.get(n));
+            ![".cfi_", ".loc ", ".p2align ", ".balign ", ".align "]
+                .iter()
+                .any(|p| t.starts_with(p))
+        }
+        _ => infos[n].trimmed(store.get(n)).starts_with('#'),
+    }
 }
 
 /// Read/write sets of one instruction.
@@ -380,7 +435,12 @@ impl FileLiveness {
         let len = store.len();
         let mut lv = FileLiveness {
             live_out: vec![ALL; len],
+            live_in: vec![ALL; len],
             known: vec![false; len],
+            structural: vec![false; len],
+            effect: vec![(0, 0); len],
+            func_of: vec![None; len],
+            textual_ret: FxHashSet::default(),
         };
         let mut i = 0;
         while i < len {
@@ -395,6 +455,9 @@ impl FileLiveness {
                     end = n;
                     break;
                 }
+            }
+            for slot in &mut lv.func_of[i..end] {
+                *slot = Some((i as u32, end as u32));
             }
             lv.analyse_function(store, infos, i, end);
             i = end.max(i + 1);
@@ -419,6 +482,12 @@ impl FileLiveness {
     /// not see stale data.
     #[expect(clippy::needless_range_loop)]
     pub(super) fn refresh_at(&mut self, store: &LineStore, infos: &[LineInfo], idx: usize) {
+        // The bounds recorded by `new` stay valid as long as the delimiting
+        // CFI lines are intact (no pass edits them); re-derive otherwise.
+        if let Some((start, end)) = self.recorded_function(store, infos, idx) {
+            self.reanalyse(store, infos, start, end);
+            return;
+        }
         let len = store.len();
         let mut start = None;
         for n in (0..=idx.min(len.saturating_sub(1))).rev() {
@@ -442,11 +511,241 @@ impl FileLiveness {
                 break;
             }
         }
+        self.reanalyse(store, infos, start, end);
+    }
+
+    /// Forget and recompute the function `[start, end)`.
+    fn reanalyse(&mut self, store: &LineStore, infos: &[LineInfo], start: usize, end: usize) {
         for n in start..end {
             self.known[n] = false;
             self.live_out[n] = ALL;
+            self.live_in[n] = ALL;
+            self.structural[n] = false;
+            self.effect[n] = (0, 0);
         }
+        self.textual_ret.remove(&start);
         self.analyse_function(store, infos, start, end);
+    }
+
+    /// The recorded `(start, end)` of the function containing `idx`, if its
+    /// delimiting CFI lines are still in place.
+    fn recorded_function(
+        &self,
+        store: &LineStore,
+        infos: &[LineInfo],
+        idx: usize,
+    ) -> Option<(usize, usize)> {
+        let (start, end) = (*self.func_of.get(idx)?)?;
+        let (start, end) = (start as usize, end as usize);
+        let intact = |n: usize, what: &str| {
+            !infos[n].is_nop() && infos[n].trimmed(store.get(n)).starts_with(what)
+        };
+        (start < store.len()
+            && intact(start, ".cfi_startproc")
+            && (end == store.len() || (end < store.len() && intact(end, ".cfi_endproc"))))
+        .then_some((start, end))
+    }
+
+    /// Bring the solution up to date after a pass edited ONLY lines in
+    /// `lo..=hi` (rewrote, deleted or re-typed them) -- the incremental form
+    /// of `refresh_at`, identical in result.
+    ///
+    /// A peephole pass folds thousands of times per large function, and a
+    /// whole-function re-analysis per fold made such passes quadratic
+    /// (gcc.c-torture/compile 20001226-1: 8192 compare-and-branch pairs ran
+    /// for minutes in `fuse_load_into_alu`).  Most edits are local:
+    ///
+    /// * when the span is straight-line code both before and after the edit
+    ///   (no line of it is `is_structural`, now or at the last analysis),
+    ///   the CFG and every other line's effect are unchanged;
+    /// * the span is then re-derived backwards from the live-in of the first
+    ///   real line after it, which the edit did not touch;
+    /// * the splice is then a fixpoint of the edited function whenever the
+    ///   span's new entry live-in equals the old one (no predecessor's
+    ///   live-out changes; nothing can branch into the span, it has no
+    ///   labels).  It is the LEAST fixpoint -- the exact analysis -- when in
+    ///   addition no register live after the span lost an upward-exposed
+    ///   read in it: with `gen` the span's composite read set (its live-in
+    ///   for an empty live-out), `(gen_old & !gen_new) & anchor == 0`
+    ///   (minus registers the code right after the span reads first: those
+    ///   are live at the anchor in every solution).
+    ///   Liveness is a per-register problem; for a register outside the
+    ///   anchor set, or one whose composite transfer only grew, the least
+    ///   solution N of the edited function also satisfies the OLD
+    ///   equations, so the old (least) solution is below N, and it equals
+    ///   the splice everywhere outside the span.  A register failing the
+    ///   test is one a loop might have kept live only through the removed
+    ///   read (entry equality alone misses it: the register then passes
+    ///   straight through the span and stays live);
+    /// * the one intended difference: a full re-analysis that would not
+    ///   converge within its round cap leaves the function unknown, while
+    ///   the splice keeps the (exact) solution.
+    ///
+    /// Anything else (a structural line involved, a jump-table dispatch
+    /// within reach, a `ret` read set inferred from text, either check
+    /// failing) falls back to `refresh_at`.
+    pub(super) fn refresh_span(
+        &mut self,
+        store: &LineStore,
+        infos: &[LineInfo],
+        lo: usize,
+        hi: usize,
+    ) {
+        if !self.try_refresh_span(store, infos, lo, hi) {
+            self.refresh_at(store, infos, lo);
+        } else if verify_span_refresh() {
+            self.assert_matches_full_analysis(store, infos, lo, hi);
+        }
+    }
+
+    /// `CCC_VERIFY_LIVENESS_SPAN=1`: after every spliced refresh, recompute
+    /// the function from scratch and abort on any difference.  The
+    /// exactness argument of `refresh_span` is checked this way over whole
+    /// corpora (torture suites, regression tests); it costs a full analysis
+    /// per edit, so it is off by default.
+    fn assert_matches_full_analysis(
+        &self,
+        store: &LineStore,
+        infos: &[LineInfo],
+        lo: usize,
+        hi: usize,
+    ) {
+        let Some((start, end)) = self.recorded_function(store, infos, lo) else {
+            return;
+        };
+        let mut fresh = FileLiveness {
+            live_out: self.live_out.clone(),
+            live_in: self.live_in.clone(),
+            known: self.known.clone(),
+            structural: self.structural.clone(),
+            effect: self.effect.clone(),
+            func_of: Vec::new(),
+            textual_ret: FxHashSet::default(),
+        };
+        fresh.reanalyse(store, infos, start, end);
+        for n in start..end {
+            let spliced = (
+                self.known[n],
+                self.live_in[n],
+                self.live_out[n],
+                self.effect[n],
+            );
+            let full = (
+                fresh.known[n],
+                fresh.live_in[n],
+                fresh.live_out[n],
+                fresh.effect[n],
+            );
+            // Where the full analysis gives up (round cap), the splice may
+            // legitimately stay known; everywhere else it must agree.
+            assert!(
+                !fresh.known[n] || spliced == full,
+                "refresh_span({lo}, {hi}) diverged from a full analysis at line {n} \
+                 `{}`: spliced (known, in, out) = {spliced:?}, full = {full:?}",
+                infos[n].trimmed(store.get(n))
+            );
+        }
+    }
+
+    fn try_refresh_span(
+        &mut self,
+        store: &LineStore,
+        infos: &[LineInfo],
+        lo: usize,
+        hi: usize,
+    ) -> bool {
+        if lo > hi || hi >= store.len() {
+            return false;
+        }
+        let Some((start, end)) = self.recorded_function(store, infos, lo) else {
+            return false;
+        };
+        if hi >= end || lo <= start || self.textual_ret.contains(&start) {
+            return false;
+        }
+        if (lo..=hi).any(|p| self.structural[p] || is_structural(store, infos, p)) {
+            return false;
+        }
+        let real = |n: usize| !infos[n].is_nop() && infos[n].kind != LineKind::Directive;
+        // A call's read set comes from the marker window after it
+        // (`call_site_reads` looks at most 4 lines ahead).
+        if (lo.saturating_sub(5).max(start)..lo)
+            .any(|p| !infos[p].is_nop() && infos[p].kind == LineKind::Call)
+        {
+            return false;
+        }
+        // The first real line after the span, whose live-in anchors the
+        // re-derivation.  A jump-table dispatch matches its three preceding
+        // real lines, so one that close could see the span.
+        let mut after = (hi + 1..end).filter(|&n| real(n));
+        let Some(succ) = after.next() else {
+            return false;
+        };
+        if !self.known[succ] {
+            return false;
+        }
+        if std::iter::once(succ)
+            .chain(after.take(2))
+            .any(|n| infos[n].kind == LineKind::JmpIndirect)
+        {
+            return false;
+        }
+
+        let anchor = self.live_in[succ];
+        // Walk the span backwards once, deriving the new solution from the
+        // anchor and both composite read sets (`gen`, live-in for an empty
+        // live-out): the new one from the edited text, the old one from the
+        // effects recorded at the last analysis.
+        let mut fresh: Vec<(usize, u16, u16, u16, u16)> = Vec::with_capacity(hi - lo + 1);
+        let mut out = anchor;
+        let mut gen_new = 0u16;
+        let mut gen_old = 0u16;
+        let mut old_entry = anchor;
+        for p in (lo..=hi).rev() {
+            if real(p) {
+                let t = infos[p].trimmed(store.get(p));
+                let eff = Self::straight_effect(infos, p, t);
+                let inn = eff.reads | (out & !eff.writes);
+                fresh.push((p, out, inn, eff.reads, eff.writes));
+                out = inn;
+                gen_new = eff.reads | (gen_new & !eff.writes);
+            }
+            if self.known[p] {
+                let (reads, writes) = self.effect[p];
+                gen_old = reads | (gen_old & !writes);
+                old_entry = self.live_in[p];
+            }
+        }
+        // A register the straight run after the span reads before writing
+        // is live at the anchor in EVERY solution, whatever the span does,
+        // so losing a read of it in the span cannot matter.  (Bounded: this
+        // only sharpens a sufficient condition.)
+        let mut gen_after = 0u16;
+        let mut killed_after = 0u16;
+        for n in (succ..end).filter(|&n| real(n)).take(8) {
+            if is_structural(store, infos, n) {
+                break;
+            }
+            let eff = Self::straight_effect(infos, n, infos[n].trimmed(store.get(n)));
+            gen_after |= eff.reads & !killed_after;
+            killed_after |= eff.writes;
+        }
+        if out != old_entry || (gen_old & !gen_new & anchor & !gen_after) != 0 {
+            return false;
+        }
+        for p in lo..=hi {
+            self.known[p] = false;
+            self.live_out[p] = ALL;
+            self.live_in[p] = ALL;
+            self.effect[p] = (0, 0);
+        }
+        for (p, lo_out, lo_in, reads, writes) in fresh {
+            self.known[p] = true;
+            self.live_out[p] = lo_out;
+            self.live_in[p] = lo_in;
+            self.effect[p] = (reads, writes);
+        }
+        true
     }
 
     /// `true` when every `ret` in the range is preceded, inside its own tail
@@ -574,7 +873,11 @@ impl FileLiveness {
         start: usize,
         end: usize,
     ) {
-        let ret_live = match Self::ret_rdx_marker(store, infos, start, end) {
+        let rdx_marker = Self::ret_rdx_marker(store, infos, start, end);
+        if rdx_marker.is_none() {
+            self.textual_ret.insert(start);
+        }
+        let ret_live = match rdx_marker {
             // The prologue marker is authoritative: it was computed from the
             // signature's return classification, which no tail-block shape
             // can defeat (a shared epilogue, `%rdx` traffic that is a mere
@@ -604,21 +907,21 @@ impl FileLiveness {
             _ => ret_live,
         };
         // ── labels ───────────────────────────────────────────────────────────
-        let mut labels: Vec<(String, usize)> = Vec::new();
+        // Hashed: every branch resolves its target here, and a linear scan
+        // made the analysis O(branches x labels) -- 8192 compare-and-branch
+        // pairs (gcc.c-torture/compile 20001226-1) spent minutes in string
+        // compares, once per `refresh_at`.  The FIRST definition wins, as
+        // with the scan it replaces.
+        let mut label_index: FxHashMap<&str, usize> = FxHashMap::default();
         for n in start..end {
-            if infos[n].is_nop() {
+            if infos[n].is_nop() || infos[n].kind != LineKind::Label {
                 continue;
             }
-            let t = infos[n].trimmed(store.get(n));
-            if infos[n].kind == LineKind::Label {
-                if let Some(name) = t.strip_suffix(':') {
-                    labels.push((name.to_string(), n));
-                }
+            if let Some(name) = infos[n].trimmed(store.get(n)).strip_suffix(':') {
+                label_index.entry(name).or_insert(n);
             }
         }
-        let resolve = |name: &str| -> Option<usize> {
-            labels.iter().find(|(l, _)| l == name).map(|&(_, idx)| idx)
-        };
+        let resolve = |name: &str| -> Option<usize> { label_index.get(name).copied() };
 
         // ── instruction effects + successor edges ────────────────────────────
         let mut effects: Vec<Option<Effect>> = vec![None; end.saturating_sub(start)];
@@ -650,7 +953,7 @@ impl FileLiveness {
         // jump (computed goto, tail call through a register) still
         // refuses analysis.
         let jump_table_succs: Vec<Option<Vec<usize>>> =
-            Self::resolve_jump_tables(store, infos, &lines, &labels, start, end);
+            Self::resolve_jump_tables(store, infos, &lines, &label_index, start, end);
         for (pos, &n) in lines.iter().enumerate() {
             let t = infos[n].trimmed(store.get(n));
             let next = lines.get(pos + 1).copied();
@@ -705,7 +1008,14 @@ impl FileLiveness {
 
         for &n in &lines {
             self.live_out[n] = live_out[n - start];
+            self.live_in[n] = live_in[n - start];
             self.known[n] = true;
+            if let Some(eff) = effects[n - start] {
+                self.effect[n] = (eff.reads, eff.writes);
+            }
+        }
+        for n in start..end {
+            self.structural[n] = is_structural(store, infos, n);
         }
     }
 
@@ -721,14 +1031,12 @@ impl FileLiveness {
         store: &LineStore,
         infos: &[LineInfo],
         lines: &[usize],
-        labels: &[(String, usize)],
+        label_index: &FxHashMap<&str, usize>,
         start: usize,
         end: usize,
     ) -> Vec<Option<Vec<usize>>> {
         let mut out: Vec<Option<Vec<usize>>> = vec![None; end.saturating_sub(start)];
-        let resolve = |name: &str| -> Option<usize> {
-            labels.iter().find(|(l, _)| l == name).map(|&(_, idx)| idx)
-        };
+        let resolve = |name: &str| -> Option<usize> { label_index.get(name).copied() };
         for (pos, &n) in lines.iter().enumerate() {
             if infos[n].kind != LineKind::JmpIndirect {
                 continue;
@@ -809,7 +1117,7 @@ impl FileLiveness {
             // arm labels (interleaved sections), still inside
             // [start, end). Directives are skipped from `lines`, so scan
             // the RAW line range for the label.
-            let Some(&(_, tbl_line)) = labels.iter().find(|(l, _)| l == table_name) else {
+            let Some(tbl_line) = resolve(table_name) else {
                 continue;
             };
             let mut targets: Vec<usize> = Vec::new();
@@ -980,26 +1288,30 @@ impl FileLiveness {
                     edges,
                 ))
             }
-            LineKind::Push { .. } => Some((
-                Effect {
-                    reads: mentioned | RSP,
-                    writes: RSP,
-                },
-                fall,
-            )),
+            _ => Some((Self::straight_effect(infos, n, t), fall)),
+        }
+    }
+
+    /// Register effect of a line that is not a control transfer, label,
+    /// call, `ret` or inline asm: a function of the line's own text alone,
+    /// which is what lets `refresh_span` re-derive it in isolation.
+    fn straight_effect(infos: &[LineInfo], n: usize, t: &str) -> Effect {
+        let mentioned = infos[n].reg_refs;
+        match infos[n].kind {
+            LineKind::Push { .. } => Effect {
+                reads: mentioned | RSP,
+                writes: RSP,
+            },
             LineKind::Pop { reg } => {
                 let w = if reg != REG_NONE && reg <= REG_GP_MAX {
                     1u16 << reg
                 } else {
                     0
                 };
-                Some((
-                    Effect {
-                        reads: RSP,
-                        writes: w | RSP,
-                    },
-                    fall,
-                ))
+                Effect {
+                    reads: RSP,
+                    writes: w | RSP,
+                }
             }
             _ => {
                 if is_string_instruction(t) {
@@ -1007,23 +1319,17 @@ impl FileLiveness {
                     // update the count.  Treating the data register as both
                     // read and written is conservative for `lods`/`stos`.
                     const STRING_REGS: u16 = RAX | RCX | (1 << 6) | (1 << 7);
-                    return Some((
-                        Effect {
-                            reads: STRING_REGS | mentioned,
-                            writes: STRING_REGS,
-                        },
-                        fall,
-                    ));
+                    return Effect {
+                        reads: STRING_REGS | mentioned,
+                        writes: STRING_REGS,
+                    };
                 }
                 if !mnemonic_is_known(t) {
                     // Unknown: keep every mentioned register live.
-                    return Some((
-                        Effect {
-                            reads: mentioned,
-                            writes: 0,
-                        },
-                        fall,
-                    ));
+                    return Effect {
+                        reads: mentioned,
+                        writes: 0,
+                    };
                 }
                 let mut reads = mentioned;
                 let mut writes = 0u16;
@@ -1110,8 +1416,7 @@ impl FileLiveness {
                     reads |= mentioned;
                     writes |= mentioned;
                 }
-                let _ = store;
-                Some((Effect { reads, writes }, fall))
+                Effect { reads, writes }
             }
         }
     }
@@ -1226,6 +1531,138 @@ mod tests {
             .collect();
         let lv = FileLiveness::new(&store, &infos);
         (store, infos, lv)
+    }
+
+    /// Every line's (known, live-in, live-out, effect) equals a from-scratch
+    /// analysis of the edited text.
+    fn assert_same_as_fresh(store: &LineStore, infos: &[LineInfo], lv: &FileLiveness) {
+        let full = FileLiveness::new(store, infos);
+        for n in 0..store.len() {
+            let got = (
+                lv.known[n],
+                lv.known[n].then(|| (lv.live_in[n], lv.live_out[n], lv.effect[n])),
+            );
+            let want = (
+                full.known[n],
+                full.known[n].then(|| (full.live_in[n], full.live_out[n], full.effect[n])),
+            );
+            assert_eq!(got, want, "line {n} `{}`", store.get(n));
+        }
+    }
+
+    fn edit(store: &mut LineStore, infos: &mut [LineInfo], n: usize, text: &str) {
+        replace_line(store, &mut infos[n], n, format!("    {text}"));
+    }
+
+    /// Straight-line fold (the copy-propagation shape): spliced, exact.
+    #[test]
+    fn refresh_span_splices_a_straight_line_fold() {
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "# LCCC_RET_RDX 0\n",
+            "    movq %rdi, %rcx\n",
+            "    movq %rcx, %rax\n",
+            "    addq %rsi, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (mut store, mut infos, mut lv) = build(asm);
+        let lo = line_of(&store, "movq %rdi, %rcx");
+        let hi = line_of(&store, "movq %rcx, %rax");
+        mark_nop(&mut infos[lo]);
+        edit(&mut store, &mut infos, hi, "movq %rdi, %rax");
+        assert!(
+            lv.try_refresh_span(&store, &infos, lo, hi),
+            "local edit must splice"
+        );
+        assert_same_as_fresh(&store, &infos, &lv);
+    }
+
+    /// Deleting a dead copy inside a loop whose source the next line reads:
+    /// the lost read is covered by the code after the span, so it splices.
+    #[test]
+    fn refresh_span_splices_a_nop_in_a_loop() {
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "# LCCC_RET_RDX 0\n",
+            "    movq $0, %rax\n",
+            ".Lloop:\n",
+            "    movq %rax, %r9\n",
+            "    addq %r8, %rax\n",
+            "    subq $1, %rcx\n",
+            "    jne .Lloop\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (store, mut infos, mut lv) = build(asm);
+        let n = line_of(&store, "movq %rax, %r9");
+        mark_nop(&mut infos[n]);
+        assert!(lv.try_refresh_span(&store, &infos, n, n));
+        assert_same_as_fresh(&store, &infos, &lv);
+    }
+
+    /// The loop-carried case the entry-equality test alone gets wrong:
+    /// `%r8` is read only by the edited line, so after the edit it is dead
+    /// in the whole loop -- but it passes straight through the span from
+    /// the stale anchor, so the entry live-in looks unchanged.  The splice
+    /// must refuse, and `refresh_span` must still produce the exact result.
+    #[test]
+    fn refresh_span_refuses_a_loop_sustained_register() {
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "# LCCC_RET_RDX 0\n",
+            "    movq $0, %rax\n",
+            ".Lloop:\n",
+            "    addq %r8, %rax\n",
+            "    subq $1, %rcx\n",
+            "    jne .Lloop\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (mut store, mut infos, mut lv) = build(asm);
+        let n = line_of(&store, "addq %r8, %rax");
+        assert_eq!(
+            lv.live_after(n, 8),
+            Some(true),
+            "loop-carried before the edit"
+        );
+        edit(&mut store, &mut infos, n, "addq $1, %rax");
+        assert!(
+            !lv.try_refresh_span(&store, &infos, n, n),
+            "must not splice"
+        );
+        lv.refresh_span(&store, &infos, n, n);
+        assert_same_as_fresh(&store, &infos, &lv);
+        assert_eq!(lv.live_after(n, 8), Some(false));
+    }
+
+    /// An edit that changes the span's live-in (a new upward-exposed read)
+    /// changes predecessors' solutions: refused, then recomputed exactly.
+    /// So is any span touching a structural line.
+    #[test]
+    fn refresh_span_refuses_entry_changes_and_structural_lines() {
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "# LCCC_RET_RDX 0\n",
+            "    movq $1, %rax\n",
+            "    movq $2, %rdx\n",
+            ".Lnext:\n",
+            "    addq %rdx, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (mut store, mut infos, mut lv) = build(asm);
+        let n = line_of(&store, "movq $2, %rdx");
+        edit(&mut store, &mut infos, n, "movq %r11, %rdx");
+        assert!(!lv.try_refresh_span(&store, &infos, n, n));
+        lv.refresh_span(&store, &infos, n, n);
+        assert_same_as_fresh(&store, &infos, &lv);
+        let label = line_of(&store, ".Lnext:");
+        assert!(!lv.try_refresh_span(&store, &infos, n, label));
     }
 
     fn line_of(store: &LineStore, needle: &str) -> usize {

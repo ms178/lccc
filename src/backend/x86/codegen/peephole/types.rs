@@ -1142,6 +1142,24 @@ pub(super) fn replace_line(
     *info = classify_line(store.get(idx));
 }
 
+/// Commit gate for multi-line rewrites: true when every line in `lines` may
+/// be edited or deleted.
+///
+/// `mark_nop` silently keeps a pinned line (parameter pre-stores, inline-asm
+/// regions, volatile/address-taken slot accesses, ABI parameter reads), and
+/// `replace_line` re-classifies a line — dropping its pin.  A fold that
+/// rewrites one line and deletes another is therefore only sound when
+/// neither is pinned; otherwise the deletion is refused AFTER the rewrite
+/// already happened and the pair is left half-applied.  Observed:
+/// `fold_movslq_relay` turned `movslq %edi, %r9; movq %r9, %rbx` (the copy
+/// pinned as a presumed parameter pre-store) into `movslq %edi, %rbx;
+/// movq %r9, %rbx`, reading an undefined %r9 (gcc.c-torture postmod-1.c
+/// at -O1, SIGSEGV).  Check this BEFORE the first edit of a multi-line fold.
+#[inline]
+pub(super) fn all_editable(infos: &[LineInfo], lines: &[usize]) -> bool {
+    lines.iter().all(|&l| !infos[l].pinned)
+}
+
 /// Find the next non-NOP line at or after `start`, returning its index.
 /// Returns `len` (infos.len()) if no non-NOP line is found before `limit`.
 #[inline]

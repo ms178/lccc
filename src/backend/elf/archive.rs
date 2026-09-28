@@ -610,6 +610,36 @@ pub fn parse_linker_script(content: &str) -> Option<Vec<String>> {
 /// Intentionally a focused extractor, not a full ld script engine
 /// (`SECTIONS` / `PHDRS` etc. are out of scope).
 pub fn parse_linker_script_entries(content: &str) -> Option<Vec<LinkerScriptEntry>> {
+    let entries: Vec<LinkerScriptEntry> = parse_linker_script_inputs(content)?
+        .into_iter()
+        .filter(|input| !input.as_needed)
+        .map(|input| input.entry)
+        .collect();
+    if entries.is_empty() {
+        None
+    } else {
+        Some(entries)
+    }
+}
+
+/// One input named by a `GROUP` / `INPUT` directive, with its `AS_NEEDED`
+/// context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkerScriptInput {
+    pub entry: LinkerScriptEntry,
+    /// True when the entry sits inside `AS_NEEDED ( ... )` (at any nesting
+    /// depth): a shared object named there gets a `DT_NEEDED` only if it
+    /// resolves a reference.  Static inputs inside `AS_NEEDED` are linked
+    /// normally (GNU ld applies the flag to shared objects only).
+    pub as_needed: bool,
+}
+
+/// Like [`parse_linker_script_entries`], but keeps `AS_NEEDED` contents
+/// (flagged) in directive order — the form a linker that resolves
+/// `GROUP ( libc.so.6 libc_nonshared.a AS_NEEDED ( ld-linux.so.2 ) )`
+/// itself needs.  Returns `None` when the text names no inputs at all
+/// (i.e. it is not an input script).
+pub fn parse_linker_script_inputs(content: &str) -> Option<Vec<LinkerScriptInput>> {
     let content = strip_block_comments(content);
 
     let mut entries = Vec::new();
@@ -630,7 +660,7 @@ pub fn parse_linker_script_entries(content: &str) -> Option<Vec<LinkerScriptEntr
             continue;
         };
 
-        collect_region_entries(&rest[open + 1..close], &mut entries);
+        collect_region_inputs(&rest[open + 1..close], &mut entries);
         search_from = directive_start + close + 1;
     }
 
@@ -659,8 +689,9 @@ fn find_matching_paren(s: &str, open: usize) -> Option<usize> {
     None
 }
 
-/// Classify the tokens of one `GROUP`/`INPUT` body into entries.
-fn collect_region_entries(region: &str, entries: &mut Vec<LinkerScriptEntry>) {
+/// Classify the tokens of one `GROUP`/`INPUT` body into entries, flagging
+/// those inside `AS_NEEDED ( ... )`.
+fn collect_region_inputs(region: &str, entries: &mut Vec<LinkerScriptInput>) {
     let mut as_needed_depth: usize = 0;
 
     for token in tokenize_linker_script_region(region) {
@@ -676,32 +707,32 @@ fn collect_region_entries(region: &str, entries: &mut Vec<LinkerScriptEntry>) {
                 continue;
             }
             t if is_ignored_ld_keyword(t) => continue,
-            t if as_needed_depth > 0 => continue, // DT_NEEDED only
-            t => classify_token(t, entries),
+            t => {
+                if let Some(entry) = classify_token(t) {
+                    entries.push(LinkerScriptInput {
+                        entry,
+                        as_needed: as_needed_depth > 0,
+                    });
+                }
+            }
         }
     }
 }
 
 /// Turn one non-keyword token into an entry (`-l…` special-cased, else path).
 #[inline]
-fn classify_token(token: &str, entries: &mut Vec<LinkerScriptEntry>) {
+fn classify_token(token: &str) -> Option<LinkerScriptEntry> {
     if let Some(rest) = token.strip_prefix("-l") {
         if let Some(filename) = rest.strip_prefix(':') {
             // `-l:filename` — link against this exact file name.
-            if !filename.is_empty() {
-                entries.push(LinkerScriptEntry::Path(filename.to_string()));
-            }
-        } else if !rest.is_empty() {
-            entries.push(LinkerScriptEntry::Lib(rest.to_string()));
+            return (!filename.is_empty()).then(|| LinkerScriptEntry::Path(filename.to_string()));
         }
-        return;
+        return (!rest.is_empty()).then(|| LinkerScriptEntry::Lib(rest.to_string()));
     }
     // Everything else is a path: crt*.o, relative, versioned .so, absolute,
     // libfoo.a. Strip surrounding quotes if present.
     let path = token.trim_matches('"').trim_matches('\'');
-    if !path.is_empty() {
-        entries.push(LinkerScriptEntry::Path(path.to_string()));
-    }
+    (!path.is_empty()).then(|| LinkerScriptEntry::Path(path.to_string()))
 }
 
 /// Other ld keywords that may appear inside a directive body; ignored.

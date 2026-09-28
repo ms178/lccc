@@ -301,7 +301,7 @@ impl Lowerer {
             // Wide string literal: array of wchar_t (4 bytes each), size = (chars + 1) * 4
             Expr::WideStringLiteral(s, _) => (s.chars().count() + 1) * 4,
             // char16_t string literal: array of char16_t (2 bytes each), size = (chars + 1) * 2
-            Expr::Char16StringLiteral(s, _) => (s.chars().count() + 1) * 2,
+            Expr::Char16StringLiteral(s, _) => (s.encode_utf16().count() + 1) * 2,
 
             // Variable: look up its alloc_size or type
             Expr::Identifier(name, _) => self.sizeof_identifier(name),
@@ -391,44 +391,7 @@ impl Lowerer {
             }
 
             // Compound literal: size of the type (handle incomplete array types)
-            Expr::CompoundLiteral(ts, init, _) => {
-                let ctype = self.type_spec_to_ctype(ts);
-                match (&ctype, init.as_ref()) {
-                    (CType::Array(elem_ct, None), Initializer::List(items)) => {
-                        // Char arrays may hold a brace-wrapped string literal,
-                        // which contributes len+1 elements, not 1.
-                        let base_ty = match elem_ct.as_ref() {
-                            CType::Char => IrType::I8,
-                            CType::UChar => IrType::U8,
-                            CType::Int => IrType::I32,
-                            CType::UInt => IrType::U32,
-                            CType::Short => IrType::I16,
-                            CType::UShort => IrType::U16,
-                            _ => IrType::I8,
-                        };
-                        self.ctype_size(elem_ct).max(1)
-                            * self.compute_init_list_array_size_for_char_array(items, base_ty)
-                    }
-                    // sizeof((char[]){"..."}) — the array sized by the literal
-                    // (bytes + NUL). Narrow literals store one C byte per char.
-                    (CType::Array(elem_ct, None), Initializer::Expr(init_expr)) => {
-                        let elem_size = self.ctype_size(elem_ct).max(1);
-                        match (elem_ct.as_ref(), init_expr) {
-                            (CType::Char | CType::UChar, Expr::StringLiteral(s, _)) => {
-                                elem_size * (s.chars().count() + 1)
-                            }
-                            (CType::Int | CType::UInt, Expr::WideStringLiteral(s, _)) => {
-                                elem_size * (s.chars().count() + 1)
-                            }
-                            (CType::Short | CType::UShort, Expr::Char16StringLiteral(s, _)) => {
-                                elem_size * (s.chars().count() + 1)
-                            }
-                            _ => self.sizeof_type(ts),
-                        }
-                    }
-                    _ => self.sizeof_type(ts),
-                }
-            }
+            Expr::CompoundLiteral(ts, init, _) => self.compound_literal_size(ts, init),
 
             // _Generic selection: resolve the matching association and compute its size
             Expr::GenericSelection(controlling, associations, _) => {

@@ -23,6 +23,7 @@ enum StringLitKind {
     Wide,
     Char16,
 }
+use super::array_init_plan::ArrayGeometry;
 use super::global_init_helpers as h;
 use super::lower::Lowerer;
 use crate::common::types::{CType, IrType, RcLayout, StructLayout};
@@ -46,6 +47,7 @@ impl Lowerer {
         total_size: usize,
         struct_layout: &Option<RcLayout>,
         array_dim_strides: &[usize],
+        obj_ty: Option<&CType>,
     ) -> GlobalInit {
         let is_long_double_target = self.is_type_spec_long_double(type_spec);
         let is_bool_target = self.is_type_bool(type_spec);
@@ -60,18 +62,29 @@ impl Lowerer {
                 is_long_double_target,
                 is_bool_target,
             ),
-            Initializer::List(items) => self.lower_global_init_list(
-                items,
-                type_spec,
-                base_ty,
-                is_array,
-                elem_size,
-                total_size,
-                struct_layout,
-                array_dim_strides,
-                is_long_double_target,
-                is_bool_target,
-            ),
+            Initializer::List(items) => {
+                // Resolve brace elision, designator chains and overrides of
+                // struct/union and array-of-aggregate initializers once
+                // (`init_canon`); canonical lists are lowered as written.
+                let canonical = obj_ty.and_then(|t| {
+                    let t = self.complete_array_ctype(t, total_size);
+                    self.canonical_init_items(items, &t, None)
+                });
+                let items = canonical.as_deref().unwrap_or(items);
+                self.lower_global_init_list(
+                    items,
+                    type_spec,
+                    base_ty,
+                    is_array,
+                    elem_size,
+                    total_size,
+                    struct_layout,
+                    array_dim_strides,
+                    is_long_double_target,
+                    is_bool_target,
+                    obj_ty,
+                )
+            }
         }
     }
 }
@@ -402,9 +415,7 @@ impl Lowerer {
                 IrType::I32 | IrType::U32 => {
                     GlobalInit::WideString(s.chars().map(|c| c as u32).collect())
                 }
-                IrType::I16 | IrType::U16 => {
-                    GlobalInit::Char16String(s.chars().map(|c| c as u16).collect())
-                }
+                IrType::I16 | IrType::U16 => GlobalInit::Char16String(s.encode_utf16().collect()),
                 _ => {
                     // Unexpected element type for string init - treat as pointer
                     self.intern_string_as_global_addr(s, kind)
@@ -469,6 +480,7 @@ impl Lowerer {
             cl_size,
             &cl_layout,
             &[],
+            Some(&cl_ctype),
         )
     }
 }
@@ -494,6 +506,7 @@ impl Lowerer {
         array_dim_strides: &[usize],
         is_long_double_target: bool,
         is_bool_target: bool,
+        obj_ty: Option<&CType>,
     ) -> GlobalInit {
         // Brace-wrapped string literal: char c[] = {"hello"}
         let is_char_not_ptr_array = elem_size <= base_ty.size().max(1);
@@ -507,6 +520,16 @@ impl Lowerer {
         let complex_ctype = self.type_spec_to_ctype(type_spec);
         if is_array && complex_ctype.is_complex() {
             return self.lower_complex_array_init(items, &complex_ctype, total_size, elem_size);
+        }
+
+        // Array of scalars of any rank: resolved by the array planner.
+        if is_array {
+            if let Some(geo) = obj_ty
+                .map(|t| self.complete_array_ctype(t, total_size))
+                .and_then(|t| self.scalar_array_geometry(&t))
+            {
+                return self.lower_scalar_array_plan(items, &geo, total_size);
+            }
         }
 
         // Array with elements
@@ -568,9 +591,7 @@ impl Lowerer {
             IrType::I32 | IrType::U32 => {
                 GlobalInit::WideString(s.chars().map(|c| c as u32).collect())
             }
-            IrType::I16 | IrType::U16 => {
-                GlobalInit::Char16String(s.chars().map(|c| c as u16).collect())
-            }
+            IrType::I16 | IrType::U16 => GlobalInit::Char16String(s.encode_utf16().collect()),
             _ => return None,
         })
     }
@@ -795,6 +816,28 @@ impl Lowerer {
                 && items
                     .iter()
                     .any(|item| h::init_contains_string_literal(item)))
+    }
+
+    /// A static array of scalars from its braced initializer list: a
+    /// constant list, or per-element `GlobalInit`s when an element is an
+    /// address.
+    fn lower_scalar_array_plan(
+        &mut self,
+        items: &[InitializerItem],
+        geo: &ArrayGeometry,
+        total_size: usize,
+    ) -> GlobalInit {
+        let plan = self.plan_array_init(items, geo);
+        if !self.plan_needs_relocations(&plan, geo) {
+            return GlobalInit::Array(self.plan_to_consts(&plan, geo));
+        }
+        let elements = self.plan_to_global_elems(&plan, geo);
+        // Where a pointer is narrower than the element (`uint64_t` holding an
+        // address on i686), the element's upper bytes are explicit zeros.
+        if geo.elem_size() > crate::common::types::target_ptr_size() {
+            return self.convert_compound_to_bytes_and_ptrs(elements, geo.elem_size(), total_size);
+        }
+        GlobalInit::Compound(elements)
     }
 
     /// Lower a pointer array or array with address relocations.
@@ -1333,21 +1376,31 @@ impl Lowerer {
 
         let is_array = matches!(type_spec, TypeSpecifier::Array(_, _));
         let (elem_size, base_ty, computed_alloc_size) =
-            if let TypeSpecifier::Array(elem_ts, _) = type_spec {
+            if let TypeSpecifier::Array(elem_ts, bound) = type_spec {
                 let elem_ir_ty = self.type_spec_to_ir(elem_ts);
                 let e_size = self.sizeof_type(elem_ts);
-                let num_elems = if let Initializer::List(items) = init {
-                    items.len()
+                // A sized array literal has its declared size whatever the
+                // initializer covers: `(int[4]){ 1 }` is 16 bytes.
+                let size = if bound.is_some() {
+                    self.sizeof_type(type_spec)
                 } else {
-                    1
+                    let elem_ct = self.type_spec_to_ctype(elem_ts);
+                    match (self.unsized_array_len(init, &elem_ct), init) {
+                        (Some(n), _) => e_size * n,
+                        (None, Initializer::List(items)) => {
+                            e_size * self.compute_init_list_array_size(items)
+                        }
+                        (None, Initializer::Expr(_)) => e_size,
+                    }
                 };
-                (e_size, elem_ir_ty, e_size * num_elems)
+                (e_size, elem_ir_ty, size)
             } else {
                 let ty = self.type_spec_to_ir(type_spec);
                 let size = self.sizeof_type(type_spec);
                 (0, ty, size)
             };
 
+        let ctype = self.type_spec_to_ctype(type_spec);
         let struct_layout = self.get_struct_layout_for_type(type_spec);
         // For arrays, struct_layout is for the element type, not the whole array,
         // so always use computed_alloc_size which accounts for the element count.
@@ -1371,6 +1424,7 @@ impl Lowerer {
             alloc_size,
             &struct_layout,
             &[],
+            Some(&ctype),
         );
 
         let global_ty = if matches!(&global_init, GlobalInit::Array(vals) if !vals.is_empty() && matches!(vals[0], IrConst::I8(_)))
@@ -1445,6 +1499,9 @@ impl Lowerer {
         for (item_idx, item) in items.iter().enumerate() {
             let field_idx = self.resolve_struct_init_field_idx(item, layout, current_field_idx);
             if field_idx == last_field_idx {
+                if let Some(geo) = self.fam_scalar_geometry(elem_ty, &item.init) {
+                    return geo.total * geo.elem_size();
+                }
                 let num_elems = match &item.init {
                     Initializer::List(sub_items) => sub_items.len(),
                     Initializer::Expr(Expr::StringLiteral(s, _)) => {
@@ -1489,6 +1546,28 @@ impl Lowerer {
             }
 
             let field_ty = &layout.fields[field_idx].ty;
+
+            // Arrays of scalars: consume the member's initializer exactly as
+            // the writers do (`member_array_init`) and ask the plan.
+            let desig = h::first_field_designator(item);
+            if desig.is_some() || item.designators.is_empty() {
+                if let Some(geo) = self.scalar_array_geometry(field_ty) {
+                    let rel: &[Designator] = if desig.is_some() {
+                        &item.designators[1..]
+                    } else {
+                        &[]
+                    };
+                    let (member, consumed) =
+                        self.member_array_init(rel, &items[item_idx..], field_ty, &geo);
+                    let plan = self.plan_member_array(&member, &geo);
+                    if self.plan_needs_relocations(&plan, &geo) {
+                        return true;
+                    }
+                    item_idx += consumed;
+                    current_field_idx = field_idx + 1;
+                    continue;
+                }
+            }
 
             if h::has_nested_field_designator(item) {
                 if self.nested_designator_has_addr_fields(item, field_ty) {
@@ -2037,7 +2116,7 @@ impl Lowerer {
     }
 
     /// Conditionally promote a value to long double.
-    fn maybe_promote_long_double(val: IrConst, is_long_double: bool) -> IrConst {
+    pub(super) fn maybe_promote_long_double(val: IrConst, is_long_double: bool) -> IrConst {
         if is_long_double {
             Self::promote_to_long_double(val)
         } else {
@@ -2046,7 +2125,7 @@ impl Lowerer {
     }
 
     /// Get the appropriate zero constant for a type, considering long double.
-    fn typed_zero_const(&self, base_ty: IrType, is_long_double: bool) -> IrConst {
+    pub(super) fn typed_zero_const(&self, base_ty: IrType, is_long_double: bool) -> IrConst {
         if is_long_double {
             IrConst::long_double(0.0)
         } else {
@@ -2055,7 +2134,7 @@ impl Lowerer {
     }
 
     /// Collect a single compound initializer element, handling nested lists.
-    fn collect_compound_init_element(
+    pub(super) fn collect_compound_init_element(
         &mut self,
         init: &Initializer,
         elements: &mut Vec<GlobalInit>,

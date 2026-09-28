@@ -1491,7 +1491,7 @@ impl Lowerer {
         }
         let label = format!(".Lc16str{}", self.next_string);
         self.next_string += 1;
-        let mut chars: Vec<u16> = s.chars().map(|c| c as u16).collect();
+        let mut chars: Vec<u16> = s.encode_utf16().collect();
         chars.push(0); // null terminator
         self.module
             .char16_string_literals
@@ -2683,62 +2683,77 @@ impl Lowerer {
         }
     }
 
-    /// Emit a wide string (L"...") to a local alloca. Each character is stored as I32 (wchar_t).
+    /// Emit a wide string (L"..." / U"...") to a local alloca: each
+    /// character as a 4-byte unit, then the terminator.  Bounded by
+    /// `max_bytes` exactly like [`Self::emit_string_to_alloca`]: C11 6.7.9p14
+    /// drops the terminator when the array has room only for the characters
+    /// (`wchar_t w[2] = L"ab";`), and nothing is ever written past the
+    /// object (the unbounded form stored the terminator one unit beyond
+    /// such an array, over whatever the frame placed next).
     pub(super) fn emit_wide_string_to_alloca(
         &mut self,
         alloca: Value,
         s: &str,
         base_offset: usize,
+        max_bytes: usize,
     ) {
-        for (j, ch) in s.chars().enumerate() {
-            let val = Operand::Const(IrConst::I32(ch as i32));
-            let byte_offset = base_offset + j * 4;
-            let offset = Operand::Const(IrConst::ptr_int(byte_offset as i64));
-            let addr = self.fresh_value();
-            self.emit(Instruction::GetElementPtr {
-                dest: addr,
-                base: alloca,
-                offset,
-                ty: IrType::I8,
-            });
-            self.emit(Instruction::Store {
-                volatile: false,
-                val,
-                ptr: addr,
-                ty: IrType::I32,
-                seg_override: AddressSpace::Default,
-            });
-        }
-        // Null terminator
-        let null_byte_offset = base_offset + s.chars().count() * 4;
-        let null_offset = Operand::Const(IrConst::ptr_int(null_byte_offset as i64));
-        let null_addr = self.fresh_value();
-        self.emit(Instruction::GetElementPtr {
-            dest: null_addr,
-            base: alloca,
-            offset: null_offset,
-            ty: IrType::I8,
-        });
-        self.emit(Instruction::Store {
-            volatile: false,
-            val: Operand::Const(IrConst::I32(0)),
-            ptr: null_addr,
-            ty: IrType::I32,
-            seg_override: AddressSpace::Default,
-        });
+        let units: Vec<IrConst> = s.chars().map(|c| IrConst::I32(c as i32)).collect();
+        self.emit_code_units_to_alloca(
+            alloca,
+            &units,
+            IrConst::I32(0),
+            IrType::I32,
+            4,
+            base_offset,
+            max_bytes,
+        );
     }
 
-    /// Emit a char16_t string (u"...") to a local alloca. Each character is stored as U16.
+    /// Emit a char16_t string (u"...") to a local alloca: each character as
+    /// a 2-byte unit, then the terminator; bounded like
+    /// [`Self::emit_wide_string_to_alloca`].
     pub(super) fn emit_char16_string_to_alloca(
         &mut self,
         alloca: Value,
         s: &str,
         base_offset: usize,
+        max_bytes: usize,
     ) {
-        for (j, ch) in s.chars().enumerate() {
-            let val = Operand::Const(IrConst::I16(ch as u16 as i16));
-            let byte_offset = base_offset + j * 2;
-            let offset = Operand::Const(IrConst::ptr_int(byte_offset as i64));
+        let units: Vec<IrConst> = s.encode_utf16().map(|u| IrConst::I16(u as i16)).collect();
+        self.emit_code_units_to_alloca(
+            alloca,
+            &units,
+            IrConst::I16(0),
+            IrType::U16,
+            2,
+            base_offset,
+            max_bytes,
+        );
+    }
+
+    /// Store `units` (each `unit_size` bytes wide, of IR type `ty`) and a
+    /// terminator at `base_offset`, writing only the whole units that fit in
+    /// `max_bytes`.
+    #[expect(clippy::too_many_arguments)]
+    fn emit_code_units_to_alloca(
+        &mut self,
+        alloca: Value,
+        units: &[IrConst],
+        terminator: IrConst,
+        ty: IrType,
+        unit_size: usize,
+        base_offset: usize,
+        max_bytes: usize,
+    ) {
+        let room = max_bytes / unit_size;
+        let terminated = units.len() < room;
+        let stores = units
+            .iter()
+            .take(room)
+            .cloned()
+            .chain(terminated.then_some(terminator));
+        for (j, val) in stores.enumerate() {
+            let offset = Operand::Const(IrConst::ptr_int((base_offset + j * unit_size) as i64));
             let addr = self.fresh_value();
             self.emit(Instruction::GetElementPtr {
                 dest: addr,
@@ -2748,29 +2763,36 @@ impl Lowerer {
             });
             self.emit(Instruction::Store {
                 volatile: false,
-                val,
+                val: Operand::Const(val),
                 ptr: addr,
-                ty: IrType::U16,
+                ty,
                 seg_override: AddressSpace::Default,
             });
         }
-        // Null terminator
-        let null_byte_offset = base_offset + s.chars().count() * 2;
-        let null_offset = Operand::Const(IrConst::ptr_int(null_byte_offset as i64));
-        let null_addr = self.fresh_value();
-        self.emit(Instruction::GetElementPtr {
-            dest: null_addr,
-            base: alloca,
-            offset: null_offset,
-            ty: IrType::I8,
-        });
-        self.emit(Instruction::Store {
-            volatile: false,
-            val: Operand::Const(IrConst::I16(0)),
-            ptr: null_addr,
-            ty: IrType::U16,
-            seg_override: AddressSpace::Default,
-        });
+    }
+
+    /// Zero bytes `[from, to)` of an alloca after a string initializer
+    /// (C11 6.7.9p21: the rest of the array is initialized as if static).
+    /// Bytes up to the next 8-byte boundary are stored singly so the bulk
+    /// goes through [`Self::zero_init_region`] at the same alignment as a
+    /// whole-object `= {0}` (its 8-byte ladder, or one `memset` for large
+    /// tails).  Per-element stores emitted one instruction per byte:
+    /// `char t[32753] = "A";` (gcc.c-torture/compile/20151204.c) became
+    /// 32751 `movb $0` and minutes of back-end time.
+    pub(super) fn zero_fill_after_string(&mut self, alloca: Value, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        let head_end = from.next_multiple_of(8).min(to);
+        if to - from > ZERO_INIT_STORE_LADDER_MAX {
+            // One call covers it all; no alignment ladder to protect.
+            self.zero_init_region(alloca, from, to - from);
+            return;
+        }
+        for off in from..head_end {
+            self.emit_store_at_offset(alloca, off, Operand::Const(IrConst::I8(0)), IrType::I8);
+        }
+        self.zero_init_region(alloca, head_end, to - head_end);
     }
 
     /// Emit a single element store at a given byte offset in an alloca.

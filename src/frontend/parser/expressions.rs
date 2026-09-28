@@ -369,12 +369,24 @@ impl Parser {
                     // If __attribute__((vector_size(N))) was parsed, wrap the type
                     result_type = self.apply_pending_vector_attr(result_type);
                     if matches!(self.peek(), TokenKind::RParen) {
+                        let lit_span = self.peek_span();
                         self.expect(&TokenKind::RParen);
+                        // `sizeof (T){...}` is `sizeof unary-expression`
+                        // applied to a compound literal (C11 6.5.3, 6.5.2.5),
+                        // postfix operators included: `sizeof (T[]){1, 2}`
+                        // is the literal's size, `sizeof (S){0}.m` a member's.
+                        let arg = if matches!(self.peek(), TokenKind::LBrace) {
+                            let init = self.parse_initializer();
+                            let lit = Expr::CompoundLiteral(result_type, Box::new(init), lit_span);
+                            SizeofArg::Expr(self.parse_postfix_ops(lit))
+                        } else {
+                            SizeofArg::Type(result_type)
+                        };
                         self.attrs.set_const(save_const);
                         // Restore outer vector attrs so the enclosing declaration can use them
                         self.attrs.parsing_vector_size = save_vector_size;
                         self.attrs.parsing_ext_vector_nelem = save_ext_vector;
-                        return Expr::Sizeof(Box::new(SizeofArg::Type(result_type)), span);
+                        return Expr::Sizeof(Box::new(arg), span);
                     }
                 }
             }

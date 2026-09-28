@@ -130,6 +130,24 @@ pub struct LinkerArgs {
     /// `--emit-relocs` / `-q`: keep the applied relocations in `.rela.*`
     /// sections (the kernel's arch/x86/tools/relocs pass consumes them).
     pub emit_relocs: bool,
+    /// `-z execstack` (Some(true)) / `-z noexecstack` (Some(false)); None
+    /// leaves the decision to the inputs' `.note.GNU-stack` markers.
+    pub z_execstack: Option<bool>,
+    /// `-z` keywords that only set `DF_1_*` / `DF_*` dynamic flags:
+    /// origin, nodelete, nodlopen, initfirst, interpose, nodefaultlib.
+    pub z_dyn_flag_keywords: Vec<String>,
+    /// Other `-z KEYWORD[=VALUE]` spellings the shared parser does not act
+    /// on (max-page-size=, common-page-size=, separate-code, text, ...),
+    /// kept verbatim so a backend can implement or reject them instead of
+    /// the keyword silently vanishing.
+    pub z_other_keywords: Vec<String>,
+    /// Positional file operands that do not exist.  GNU ld reports
+    /// `cannot find FILE: No such file or directory`; callers that resolve
+    /// the ordered input list themselves turn these into that error.
+    pub missing_inputs: Vec<String>,
+    /// The `--build-id=STYLE` style when one was given (`sha1`, `md5`,
+    /// `uuid`, `0xHEX`, `tree`, `none`), for backends implementing only some.
+    pub build_id_style: Option<String>,
     /// `--threads=N`: recorded for interface compatibility; lccc links
     /// single-threaded, so the value is accepted and not acted on.
     #[allow(dead_code)]
@@ -184,6 +202,58 @@ pub struct InputItem {
     /// something; one tagged no-as-needed is recorded unconditionally, which is
     /// how a program pulls in a library purely for its ELF constructors.
     pub as_needed: bool,
+    /// True when `-Bstatic` (or its aliases `-dn`, `-non_shared`, `-static`)
+    /// was in effect at this position: a `-l` search considers only
+    /// `libNAME.a`, never `libNAME.so`.  `-Bdynamic` (`-dy`,
+    /// `-call_shared`) turns it back off.  Positional, like
+    /// `--whole-archive`; it has no effect on plain file operands.
+    pub static_search: bool,
+}
+
+/// Positional input state that `--push-state` saves and `--pop-state`
+/// restores (GNU ld: `--as-needed`, `--whole-archive`, `-Bstatic`/`-Bdynamic`
+/// and friends).  gcc's specs rely on it: `--push-state --as-needed -lgcc_s
+/// --pop-state` must leave the caller's `--as-needed` setting untouched.
+#[derive(Debug, Clone, Copy, Default)]
+struct PositionalState {
+    whole_archive: bool,
+    as_needed: bool,
+    static_search: bool,
+}
+
+impl PositionalState {
+    /// Apply one positional flag; returns false when `tok` is not one.
+    fn apply(&mut self, tok: &str, stack: &mut Vec<PositionalState>) -> bool {
+        match tok {
+            "--whole-archive" => self.whole_archive = true,
+            "--no-whole-archive" => self.whole_archive = false,
+            "--as-needed" => self.as_needed = true,
+            "--no-as-needed" => self.as_needed = false,
+            "-Bstatic" | "-dn" | "-non_shared" | "-static" => self.static_search = true,
+            "-Bdynamic" | "-dy" | "-call_shared" => self.static_search = false,
+            "--push-state" => stack.push(*self),
+            // GNU ld errors on an unbalanced --pop-state; this parser has no
+            // error channel, so an unmatched pop keeps the current state
+            // instead of inventing one.
+            "--pop-state" => {
+                if let Some(saved) = stack.pop() {
+                    *self = saved;
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn item(&self, name: &str, is_lib: bool) -> InputItem {
+        InputItem {
+            name: name.to_string(),
+            is_lib,
+            whole_archive: self.whole_archive,
+            as_needed: self.as_needed,
+            static_search: self.static_search,
+        }
+    }
 }
 
 /// Which dynamic symbol hash tables to emit.
@@ -360,7 +430,12 @@ fn apply_z_keyword(result: &mut LinkerArgs, kw: &str) {
             // `-z ibt=func` & co: accepted, ignored, warned.
             result.z_ignored_keywords.push(k.to_string());
         }
-        _ => {} // noexecstack, origin, ... not layout-affecting
+        "execstack" => result.z_execstack = Some(true),
+        "noexecstack" => result.z_execstack = Some(false),
+        "origin" | "nodelete" | "nodlopen" | "initfirst" | "interpose" | "nodefaultlib" => {
+            result.z_dyn_flag_keywords.push(kw.to_string());
+        }
+        _ => result.z_other_keywords.push(kw.to_string()),
     }
 }
 
@@ -390,6 +465,8 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
         "--version-script",
         "--exclude-libs",
         "-rpath",
+        "-rpath-link",
+        "--rpath-link",
         "--hash-style",
         "--dynamic-linker",
         "-dynamic-linker",
@@ -438,11 +515,11 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
     // does not merge.
     let mut pending_rpath = false;
     // Positional state: --whole-archive applies to archives that FOLLOW it,
-    // until --no-whole-archive turns it back off.
-    let mut whole_archive = false;
-    // GNU ld defaults to --no-as-needed; gcc's driver passes --as-needed
-    // explicitly when it wants it.
-    let mut as_needed = false;
+    // until --no-whole-archive turns it back off; likewise --as-needed and
+    // -Bstatic.  GNU ld defaults to --no-as-needed / -Bdynamic; gcc's driver
+    // passes --as-needed explicitly when it wants it.
+    let mut pos = PositionalState::default();
+    let mut pos_stack: Vec<PositionalState> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         let arg = args[i];
@@ -480,6 +557,19 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
             }
         } else if arg == "-static" {
             result.is_static = true;
+            pos.apply(arg, &mut pos_stack);
+        } else if pos.apply(arg, &mut pos_stack) {
+            // positional toggle consumed
+        } else if let Some(sym) = arg.strip_prefix("--entry=") {
+            result.entry_symbol = Some(sym.to_string());
+        } else if (arg == "--entry" || arg == "-e") && i + 1 < args.len() {
+            i += 1;
+            result.entry_symbol = Some(args[i].to_string());
+        } else if let Some(sym) = arg.strip_prefix("--undefined=") {
+            result.undefined_symbols.push(sym.to_string());
+        } else if (arg == "--undefined" || arg == "-u") && i + 1 < args.len() {
+            i += 1;
+            result.undefined_symbols.push(args[i].to_string());
         } else if let Some(path) = arg.strip_prefix("-L") {
             let p = if path.is_empty() && i + 1 < args.len() {
                 i += 1;
@@ -496,12 +586,7 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
                 lib
             };
             result.libs_to_load.push(l.to_string());
-            result.inputs.push(InputItem {
-                name: l.to_string(),
-                is_lib: true,
-                whole_archive,
-                as_needed,
-            });
+            result.inputs.push(pos.item(l, true));
         } else if let Some(wl_arg) = arg.strip_prefix("-Wl,") {
             let parts: Vec<&str> = wl_arg.split(',').collect();
             // Handle -Wl,-rpath -Wl,/path two-arg form
@@ -531,6 +616,16 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
                     if !parts[j].is_empty() {
                         result.dynamic_linker = Some(parts[j].to_string());
                     }
+                } else if part.starts_with("-rpath-link") || part.starts_with("--rpath-link") {
+                    // `-rpath-link DIR` only tells the linker where to find
+                    // the DT_NEEDED dependencies of input shared objects.
+                    // lccc's linkers never load indirect dependencies (no
+                    // --copy-dt-needed-entries, no shared-object undefined
+                    // check), so the option cannot change the output; its
+                    // value must still be consumed, not taken as an input.
+                    if !part.contains('=') && j + 1 < parts.len() {
+                        j += 1;
+                    }
                 } else if let Some(rp) = part.strip_prefix("-rpath=") {
                     result.rpath_entries.push(rp.to_string());
                 } else if part == "-rpath" && j + 1 < parts.len() {
@@ -548,12 +643,7 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
                     result.extra_lib_paths.push(lpath.to_string());
                 } else if let Some(lib) = part.strip_prefix("-l") {
                     result.libs_to_load.push(lib.to_string());
-                    result.inputs.push(InputItem {
-                        name: lib.to_string(),
-                        is_lib: true,
-                        whole_archive,
-                        as_needed,
-                    });
+                    result.inputs.push(pos.item(lib, true));
                 } else if let Some(defsym_arg) = part.strip_prefix("--defsym=") {
                     if let Some(eq_pos) = defsym_arg.find('=') {
                         result.defsym_defs.push((
@@ -600,6 +690,9 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
                     result.gc_sections = false;
                 } else if part == "-static" {
                     result.is_static = true;
+                    pos.apply(part, &mut pos_stack);
+                } else if pos.apply(part, &mut pos_stack) {
+                    // positional toggle consumed
                 } else if part == "-z" && j + 1 < parts.len() {
                     j += 1;
                     apply_z_keyword(&mut result, parts[j]);
@@ -653,14 +746,6 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
                     result.bsymbolic = true;
                 } else if part == "--no-undefined" {
                     result.no_undefined = true;
-                } else if part == "--whole-archive" {
-                    whole_archive = true;
-                } else if part == "--no-whole-archive" {
-                    whole_archive = false;
-                } else if part == "--as-needed" {
-                    as_needed = true;
-                } else if part == "--no-as-needed" {
-                    as_needed = false;
                 } else if let Some(v) = part.strip_prefix("--hash-style=") {
                     if let Some(h) = parse_hash_style(v) {
                         result.hash_style = h;
@@ -676,6 +761,7 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
                     // consumed
                 } else if let Some(style) = part.strip_prefix("--build-id=") {
                     result.build_id = !matches!(style, "none" | "0");
+                    result.build_id_style = Some(style.to_string());
                 } else if part == "--build-id" {
                     result.build_id = true;
                 } else if part == "--no-build-id" {
@@ -692,14 +778,6 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
             result.bsymbolic = true;
         } else if arg == "--no-undefined" {
             result.no_undefined = true;
-        } else if arg == "--whole-archive" {
-            whole_archive = true;
-        } else if arg == "--no-whole-archive" {
-            whole_archive = false;
-        } else if arg == "--as-needed" {
-            as_needed = true;
-        } else if arg == "--no-as-needed" {
-            as_needed = false;
         } else if let Some(v) = arg.strip_prefix("--hash-style=") {
             if let Some(h) = parse_hash_style(v) {
                 result.hash_style = h;
@@ -720,18 +798,16 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
             // consumed
         } else if let Some(style) = arg.strip_prefix("--build-id=") {
             result.build_id = !matches!(style, "none" | "0");
+            result.build_id_style = Some(style.to_string());
         } else if arg == "--build-id" {
             result.build_id = true;
         } else if arg == "--no-build-id" {
             result.build_id = false;
         } else if !arg.starts_with('-') && Path::new(arg).exists() {
             result.extra_object_files.push(arg.to_string());
-            result.inputs.push(InputItem {
-                name: arg.to_string(),
-                is_lib: false,
-                whole_archive,
-                as_needed,
-            });
+            result.inputs.push(pos.item(arg, false));
+        } else if !arg.starts_with('-') && !arg.is_empty() {
+            result.missing_inputs.push(arg.to_string());
         }
         i += 1;
     }

@@ -16,7 +16,7 @@
 //! rcx=1, rdx=2) to avoid breaking live register values.
 
 use super::super::types::*;
-use super::dead_writes::label_is_fallthrough_only;
+use super::dead_writes::LabelRefs;
 use super::fma_forms::{FmaWidth, parse_scalar_fma};
 use super::fp_liveness::FpLiveness;
 use super::helpers::{
@@ -410,6 +410,10 @@ pub(super) fn fold_load_relay(store: &mut LineStore, infos: &mut [LineInfo]) -> 
             let mnemonic = size.mnemonic();
             let new_load = format!("    {} {}, {}", mnemonic, mem_op, dest_name);
 
+            if !all_editable(infos, &[i, j]) {
+                i += 1;
+                continue;
+            }
             replace_line(store, &mut infos[i], i, new_load);
             mark_nop(&mut infos[j]);
             changed = true;
@@ -526,6 +530,10 @@ pub(super) fn fold_leaq_relay(store: &mut LineStore, infos: &mut [LineInfo]) -> 
             let new_load = format!("    movq {}, {}", mem_op, dest_64);
             let new_leaq = format!("    leaq {}({}), {}", leaq_offset, dest_64, dest_64);
 
+            if !all_editable(infos, &[i, j, k]) {
+                i += 1;
+                continue;
+            }
             replace_line(store, &mut infos[i], i, new_load);
             replace_line(store, &mut infos[j], j, new_leaq);
             mark_nop(&mut infos[k]);
@@ -630,6 +638,10 @@ pub(super) fn fold_cltq_relay(store: &mut LineStore, infos: &mut [LineInfo]) -> 
             let dest_64 = REG_NAMES[0][dest_reg as usize];
             let new_inst = format!("    movslq {}, {}", mem_op, dest_64);
 
+            if !all_editable(infos, &[i, j, k]) {
+                i += 1;
+                continue;
+            }
             replace_line(store, &mut infos[i], i, new_inst);
             mark_nop(&mut infos[j]);
             mark_nop(&mut infos[k]);
@@ -740,6 +752,10 @@ pub(super) fn fold_extend_relay(store: &mut LineStore, infos: &mut [LineInfo]) -
             };
             let new_inst = format!("    {} {}, {}", op, src_name, dest);
 
+            if !all_editable(infos, &[i, j]) {
+                i += 1;
+                continue;
+            }
             replace_line(store, &mut infos[i], i, new_inst);
             mark_nop(&mut infos[j]);
             changed = true;
@@ -888,6 +904,10 @@ pub(super) fn fold_general_relay(store: &mut LineStore, infos: &mut [LineInfo]) 
             };
 
             if let Some(new_text) = new_inst {
+                if !all_editable(infos, &[i, j]) {
+                    i += 1;
+                    continue;
+                }
                 replace_line(store, &mut infos[i], i, new_text);
                 mark_nop(&mut infos[j]);
                 changed = true;
@@ -998,7 +1018,13 @@ pub(super) fn fold_movslq_relay(store: &mut LineStore, infos: &mut [LineInfo]) -
             continue;
         }
 
-        // Step 4: retarget the extension and delete the relay copy.
+        // Step 4: retarget the extension and delete the relay copy.  Both
+        // lines must be editable: a pinned copy would survive `mark_nop`
+        // and read the no-longer-written %rT (see `all_editable`).
+        if !all_editable(infos, &[i, j]) {
+            i += 1;
+            continue;
+        }
         let new_inst = format!("    movslq %{}, %{}", src32, relay_dst);
         replace_line(store, &mut infos[i], i, new_inst);
         mark_nop(&mut infos[j]);
@@ -1114,6 +1140,10 @@ pub(super) fn fold_store_relay(store: &mut LineStore, infos: &mut [LineInfo]) ->
                     // REG_NAMES entries already include the leading '%' — do NOT add
                     // another one (the old double-'%' produced `movl %%ebp, ...`).
                     let new_inst = format!("    {} {}, {}", mnem, reg_name, mem_part);
+                    if !all_editable(infos, &[i, j]) {
+                        i += 1;
+                        continue;
+                    }
                     replace_line(store, &mut infos[j], j, new_inst);
                     mark_nop(&mut infos[i]);
                     changed = true;
@@ -1571,6 +1601,10 @@ fn is_transparent_for_store_fold(
 pub(super) fn fold_store_alu_memop(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let lv = FpLiveness::new(store, infos);
+    // Built on the first label the scan meets.  The folds below substitute
+    // registers for slot operands and delete stores; they never add a label
+    // reference (the `LabelRefs` staleness contract).
+    let mut label_refs: Option<LabelRefs> = None;
     let mut changed = false;
     let mut i = 0;
     while i < len {
@@ -1636,7 +1670,9 @@ pub(super) fn fold_store_alu_memop(store: &mut LineStore, infos: &mut [LineInfo]
                     // predecessor paths the textual scan cannot inspect, and
                     // terminates the scan like every other opaque line.
                     if infos[j].kind == LineKind::Label
-                        && label_is_fallthrough_only(store, infos, j)
+                        && label_refs
+                            .get_or_insert_with(|| LabelRefs::build(store, infos))
+                            .is_fallthrough_only(store, infos, j)
                     {
                         j += 1;
                         continue;

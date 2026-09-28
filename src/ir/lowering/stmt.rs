@@ -1,5 +1,6 @@
 use super::definitions::{DeclAnalysis, FuncSig, GlobalInfo, LocalInfo};
 use super::lower::Lowerer;
+use super::string_init::StringInit;
 use super::structs::VlaDynCursor;
 use crate::common::types::{AddressSpace, CType, IrType, StructLayout, target_int_ir_type};
 use crate::frontend::parser::ast::{
@@ -556,6 +557,7 @@ impl Lowerer {
                 da.actual_alloc_size,
                 &da.struct_layout,
                 &da.array_dim_strides,
+                da.c_type.as_ref(),
             )
         } else {
             GlobalInit::Zero
@@ -935,6 +937,29 @@ impl Lowerer {
                 continue;
             }
 
+            // Arrays of scalars of any rank: the array planner resolves the
+            // member's initializer (see `emit_struct_init`).  Callers zero-fill
+            // the object first.
+            if desig_name.is_some() || item.designators.is_empty() {
+                if let Some(geo) = self.scalar_array_geometry(&field.ty) {
+                    let rel: &[Designator] = if desig_name.is_some() {
+                        &item.designators[1..]
+                    } else {
+                        &[]
+                    };
+                    let (member, consumed) =
+                        self.member_array_init(rel, &items[item_idx..], &field.ty, &geo);
+                    let plan = self.plan_member_array(&member, &geo);
+                    self.store_array_plan(&plan, &geo, base, field_offset, true);
+                    item_idx += consumed;
+                    current_field_idx = field_idx + 1;
+                    if layout.is_union && desig_name.is_none() {
+                        break;
+                    }
+                    continue;
+                }
+            }
+
             let field_ty = IrType::from_ctype(&field.ty);
 
             match &item.init {
@@ -1112,30 +1137,25 @@ impl Lowerer {
                 }
             }
             CType::Array(elem_ty, arr_size_opt) => {
-                // Check for char array initialized by a brace-wrapped string literal:
+                // Array initialized by a brace-wrapped string literal:
                 // e.g., struct field `char a[10]` initialized as `{"hello"}`
-                let is_char_array = matches!(**elem_ty, CType::Char | CType::UChar);
-                if is_char_array && items.len() == 1 {
-                    if let Initializer::Expr(Expr::StringLiteral(ref s, _)) = items[0].init {
-                        let max_bytes = match arr_size_opt {
-                            Some(sz) => *sz,
-                            None => usize::MAX,
-                        };
-                        self.emit_string_to_alloca(base, s, 0, max_bytes);
-                        // Zero-fill remaining bytes if string is shorter than array
-                        if let Some(arr_size) = arr_size_opt {
-                            let str_len = s.chars().count() + 1; // +1 for null terminator
-                            for i in str_len..*arr_size {
-                                let val = Operand::Const(IrConst::I8(0));
-                                self.emit_store_at_offset(base, i, val, IrType::I8);
-                            }
-                        }
-                        return;
+                let elem_size = self.resolve_ctype_size(elem_ty);
+                if let Some(init) = StringInit::sole_item(items)
+                    .and_then(|e| StringInit::for_elem_ctype(e, elem_ty))
+                {
+                    let max_bytes = match arr_size_opt {
+                        Some(n) => n * elem_size,
+                        None => usize::MAX,
+                    };
+                    let len = self.emit_string_init_to_alloca(base, init, 0, max_bytes);
+                    // Zero-fill remaining bytes if string is shorter than array
+                    if arr_size_opt.is_some() {
+                        self.zero_fill_after_string(base, len, max_bytes);
                     }
+                    return;
                 }
                 // Array field: init elements with [idx]=val designator support
                 let elem_ir_ty = IrType::from_ctype(elem_ty);
-                let elem_size = self.resolve_ctype_size(elem_ty);
                 let mut ai = 0usize;
                 for item in items {
                     // Check for index designator: [idx]=val
@@ -1145,7 +1165,21 @@ impl Lowerer {
                         }
                     }
                     let elem_is_bool = **elem_ty == CType::Bool;
+                    // A literal for a row of a multi-dimensional array field
+                    // (`struct { char a[2][4]; } s = { { "ab", "c" } };`).
+                    let row_string = match (&**elem_ty, &item.init) {
+                        (CType::Array(inner, Some(_)), Initializer::Expr(e)) => {
+                            StringInit::for_elem_ctype(e, inner)
+                        }
+                        _ => None,
+                    };
                     match &item.init {
+                        _ if row_string.is_some() => {
+                            let init = row_string.expect("guarded");
+                            let at = ai * elem_size;
+                            let len = self.emit_string_init_to_alloca(base, init, at, elem_size);
+                            self.zero_fill_after_string(base, at + len, at + elem_size);
+                        }
                         Initializer::Expr(e) => {
                             let val = self.lower_init_expr_bool_aware(e, elem_ir_ty, elem_is_bool);
                             self.emit_store_at_offset(base, ai * elem_size, val, elem_ir_ty);
@@ -1208,6 +1242,80 @@ impl Lowerer {
         self.lower_array_init_recursive(items, alloca, base_ty, array_dim_strides, &mut flat_index);
     }
 
+    /// Base element type and per-dimension byte strides (the
+    /// `DeclAnalysis::array_dim_strides` shape: stride of each index, the
+    /// last being the element size) of a sized multi-dimensional array whose
+    /// innermost element is a plain scalar, plus its total element count.
+    /// Those are exactly the objects [`Self::lower_array_init_recursive`]
+    /// initializes; `None` for anything else (1-D arrays, which have their
+    /// own paths, and arrays of aggregates).
+    pub(super) fn multidim_scalar_array_geometry(
+        &self,
+        arr: &CType,
+    ) -> Option<(IrType, Vec<usize>, usize)> {
+        let CType::Array(elem, Some(n)) = arr else {
+            return None;
+        };
+        if !matches!(**elem, CType::Array(..)) {
+            return None;
+        }
+        let mut strides = Vec::new();
+        let mut total = *n;
+        let mut cur: &CType = elem;
+        loop {
+            strides.push(self.resolve_ctype_size(cur));
+            match cur {
+                CType::Array(inner, Some(m)) => {
+                    total *= *m;
+                    cur = inner;
+                }
+                CType::Array(_, None) => return None,
+                _ => break,
+            }
+        }
+        let scalar = cur.is_integer()
+            || matches!(
+                cur,
+                CType::Pointer(..) | CType::Float | CType::Double | CType::LongDouble
+            );
+        if !scalar || cur.is_complex() || strides.last().copied().unwrap_or(0) == 0 {
+            return None;
+        }
+        Some((IrType::from_ctype(cur), strides, total))
+    }
+
+    /// Initialize a multi-dimensional array member from the initializers of
+    /// the ENCLOSING list with its braces elided (C11 6.7.9p20): take items
+    /// from the front of `items` until the member is full or an item carries
+    /// a designator (which belongs to the enclosing aggregate).  Returns the
+    /// number of items consumed; at least the first is.  `base` addresses the
+    /// member.
+    pub(super) fn lower_array_member_elided(
+        &mut self,
+        items: &[InitializerItem],
+        base: Value,
+        base_ty: IrType,
+        array_dim_strides: &[usize],
+        total_elems: usize,
+    ) -> usize {
+        let mut flat_index = 0usize;
+        let mut consumed = 0usize;
+        while consumed < items.len() && flat_index < total_elems {
+            if consumed > 0 && !items[consumed].designators.is_empty() {
+                break;
+            }
+            self.lower_array_init_recursive(
+                &items[consumed..consumed + 1],
+                base,
+                base_ty,
+                array_dim_strides,
+                &mut flat_index,
+            );
+            consumed += 1;
+        }
+        consumed.max(1)
+    }
+
     /// Recursive helper for multi-dimensional array initialization.
     /// Processes each initializer item, recursing for nested braces and
     /// advancing the flat_index to track the current element position.
@@ -1262,6 +1370,22 @@ impl Lowerer {
                             .saturating_sub(index_designators.len());
                         let sub_strides =
                             &array_dim_strides[array_dim_strides.len() - remaining_dims..];
+                        if remaining_dims == 1 && array_dim_strides.len() >= 2 {
+                            // The designated subobject is one row: `[1] = { "ab" }`.
+                            let row_bytes = array_dim_strides[array_dim_strides.len() - 2];
+                            if let Some(init) = StringInit::sole_item(sub_items)
+                                .and_then(|e| StringInit::for_elem_ir(e, base_ty))
+                            {
+                                self.emit_string_init_to_alloca(
+                                    alloca,
+                                    init,
+                                    target_flat * elem_size,
+                                    row_bytes,
+                                );
+                                *flat_index = target_flat + row_bytes / elem_size;
+                                continue;
+                            }
+                        }
                         if remaining_dims > 0 {
                             self.lower_array_init_recursive(
                                 sub_items,
@@ -1286,15 +1410,24 @@ impl Lowerer {
                         }
                     }
                     Initializer::Expr(e) => {
-                        if base_ty == IrType::I8 || base_ty == IrType::U8 {
-                            if let Expr::StringLiteral(s, _) = e {
-                                self.emit_string_to_alloca(
+                        // `[i] = "..."` (or `[i][j] = ...` on a deeper array):
+                        // the literal initializes the first row of the
+                        // designated subobject.  Without braces the next
+                        // initializer continues INSIDE that subobject, at its
+                        // next row (C11 6.7.9p17/p20; `char v[2][2][3] =
+                        // { [0] = "ab", "cd" }` puts "cd" in v[0][1]), exactly
+                        // as a designated scalar continues at the next element.
+                        let depth = index_designators.len();
+                        if depth < array_dim_strides.len() {
+                            if let Some(init) = StringInit::for_elem_ir(e, base_ty) {
+                                let row_bytes = array_dim_strides[array_dim_strides.len() - 2];
+                                self.emit_string_init_to_alloca(
                                     alloca,
-                                    s,
+                                    init,
                                     target_flat * elem_size,
-                                    sub_elem_count * elem_size,
+                                    row_bytes,
                                 );
-                                *flat_index = target_flat + sub_elem_count;
+                                *flat_index = target_flat + row_bytes / elem_size;
                                 continue;
                             }
                         }
@@ -1314,6 +1447,23 @@ impl Lowerer {
             let start_index = *flat_index;
             match &item.init {
                 Initializer::List(sub_items) => {
+                    // A braced literal for a row: `char a[2][3] = { { "ab" }, ... }`.
+                    // Recursing would meet the literal at the element level,
+                    // where it is one scalar wide.
+                    if array_dim_strides.len() == 2 {
+                        if let Some(init) = StringInit::sole_item(sub_items)
+                            .and_then(|e| StringInit::for_elem_ir(e, base_ty))
+                        {
+                            self.emit_string_init_to_alloca(
+                                alloca,
+                                init,
+                                *flat_index * elem_size,
+                                array_dim_strides[0],
+                            );
+                            *flat_index = start_index + sub_elem_count;
+                            continue;
+                        }
+                    }
                     if array_dim_strides.len() > 1 {
                         self.lower_array_init_recursive(
                             sub_items,
@@ -1348,22 +1498,21 @@ impl Lowerer {
                     }
                 }
                 Initializer::Expr(e) => {
-                    // String literal fills a sub-array in char arrays
-                    if base_ty == IrType::I8 || base_ty == IrType::U8 {
-                        if let Expr::StringLiteral(s, _) = e {
-                            let max_str_bytes = sub_elem_count * elem_size;
-                            self.emit_string_to_alloca(
+                    // A literal met with braces elided initializes the next
+                    // innermost row (the subobject brace elision descends
+                    // to).  Both the bound and the advance are that row's —
+                    // in elements, not bytes: the stride table is in bytes,
+                    // and on a wide row the two differ.
+                    if array_dim_strides.len() >= 2 {
+                        if let Some(init) = StringInit::for_elem_ir(e, base_ty) {
+                            let row_bytes = array_dim_strides[array_dim_strides.len() - 2];
+                            self.emit_string_init_to_alloca(
                                 alloca,
-                                s,
+                                init,
                                 *flat_index * elem_size,
-                                max_str_bytes,
+                                row_bytes,
                             );
-                            let string_stride = if array_dim_strides.len() >= 2 {
-                                array_dim_strides[array_dim_strides.len() - 2]
-                            } else {
-                                sub_elem_count
-                            };
-                            *flat_index += string_stride;
+                            *flat_index += row_bytes / elem_size;
                             continue;
                         }
                     }

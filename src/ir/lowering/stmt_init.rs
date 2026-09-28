@@ -499,10 +499,7 @@ impl Lowerer {
                 self.emit_string_to_alloca(alloca, s, 0, arr_size);
                 // Zero-fill remaining bytes if string is shorter than array
                 let str_len = s.chars().count() + 1; // +1 for null terminator
-                for i in str_len..arr_size {
-                    let val = Operand::Const(IrConst::I8(0));
-                    self.emit_store_at_offset(alloca, i, val, IrType::I8);
-                }
+                self.zero_fill_after_string(alloca, str_len, arr_size);
             }
             _ => {
                 let val = self.lower_expr(expr);
@@ -523,7 +520,12 @@ impl Lowerer {
             Expr::WideStringLiteral(s, _)
             | Expr::StringLiteral(s, _)
             | Expr::Char16StringLiteral(s, _) => {
-                self.emit_wide_string_to_alloca(alloca, s, 0);
+                let arr_size = da.alloc_size;
+                self.emit_wide_string_to_alloca(alloca, s, 0, arr_size);
+                // The elements after the terminator are zero (C11 6.7.9p21);
+                // nothing wrote them before this fix.
+                let str_len = (s.chars().count() + 1) * 4;
+                self.zero_fill_after_string(alloca, str_len, arr_size);
             }
             _ => {
                 let val = self.lower_expr(expr);
@@ -544,17 +546,11 @@ impl Lowerer {
             Expr::Char16StringLiteral(s, _)
             | Expr::StringLiteral(s, _)
             | Expr::WideStringLiteral(s, _) => {
-                self.emit_char16_string_to_alloca(alloca, s, 0);
-                // Zero-fill remaining bytes if string is shorter than array
-                let str_len = (s.chars().count() + 1) * 2; // +1 for null, *2 for u16
                 let arr_size = da.alloc_size;
-                if arr_size > str_len {
-                    // Zero remaining bytes
-                    for i in (str_len..arr_size).step_by(2) {
-                        let val = Operand::Const(IrConst::I16(0));
-                        self.emit_store_at_offset(alloca, i, val, IrType::U16);
-                    }
-                }
+                self.emit_char16_string_to_alloca(alloca, s, 0, arr_size);
+                // Zero-fill remaining bytes if string is shorter than array
+                let str_len = (s.encode_utf16().count() + 1) * 2; // UTF-16 units + NUL
+                self.zero_fill_after_string(alloca, str_len, arr_size);
             }
             _ => {
                 let val = self.lower_expr(expr);
@@ -690,6 +686,14 @@ impl Lowerer {
         decl: &Declaration,
         declarator_name: &str,
     ) {
+        // Resolve brace elision, designator chains and overrides of
+        // struct/union and array-of-aggregate initializers once
+        // (`init_canon`); canonical lists are lowered as written.
+        let canonical = da.c_type.as_ref().and_then(|t| {
+            let t = self.complete_array_ctype(t, da.alloc_size);
+            self.canonical_init_items(items, &t, None)
+        });
+        let items = canonical.as_deref().unwrap_or(items);
         if is_complex {
             self.lower_complex_init_list(items, alloca, decl);
         } else if da.is_struct {
@@ -810,49 +814,17 @@ impl Lowerer {
         decl: &Declaration,
         declarator_name: &str,
     ) {
-        // Handle brace-wrapped string literal for char arrays: char b[5] = {"def"}
-        // The C standard (C11 6.7.9 p14) allows a string literal optionally enclosed
-        // in braces as an initializer for an array of character type. Redirect to
-        // lower_char_array_init_expr which uses the full array size (da.alloc_size)
-        // rather than the per-element size (da.elem_size = 1).
-        if (da.base_ty == IrType::I8 || da.base_ty == IrType::U8)
-            && !da.is_array_of_pointers
-            && items.len() == 1
-            && items[0].designators.is_empty()
+        // Arrays of scalars of any rank, including `{ "str" }` for character
+        // arrays: resolved by the array planner.
+        if let Some(geo) = da
+            .c_type
+            .as_ref()
+            .map(|t| self.complete_array_ctype(t, da.alloc_size))
+            .and_then(|t| self.scalar_array_geometry(&t))
         {
-            if let Initializer::Expr(ref expr) = items[0].init {
-                match expr {
-                    Expr::StringLiteral(..)
-                    | Expr::WideStringLiteral(..)
-                    | Expr::Char16StringLiteral(..) => {
-                        self.lower_char_array_init_expr(expr, alloca, da);
-                        return;
-                    }
-                    _ => {}
-                }
-            }
-        }
-        // Also handle brace-wrapped wide string for wchar_t (I32/U32) arrays
-        if (da.base_ty == IrType::I32 || da.base_ty == IrType::U32)
-            && !da.is_array_of_pointers
-            && items.len() == 1
-            && items[0].designators.is_empty()
-        {
-            if let Initializer::Expr(ref expr @ Expr::WideStringLiteral(..)) = items[0].init {
-                self.lower_wchar_array_init_expr(expr, alloca, da);
-                return;
-            }
-        }
-        // Also handle brace-wrapped char16_t string for char16_t (I16/U16) arrays
-        if (da.base_ty == IrType::I16 || da.base_ty == IrType::U16)
-            && !da.is_array_of_pointers
-            && items.len() == 1
-            && items[0].designators.is_empty()
-        {
-            if let Initializer::Expr(ref expr @ Expr::Char16StringLiteral(..)) = items[0].init {
-                self.lower_char16_array_init_expr(expr, alloca, da);
-                return;
-            }
+            let plan = self.plan_array_init(items, &geo);
+            self.store_array_plan(&plan, &geo, alloca, 0, false);
+            return;
         }
 
         // For arrays of function pointers or pointer arrays, the struct layout
@@ -1363,7 +1335,9 @@ impl Lowerer {
                     && (da.elem_ir_ty == IrType::I32 || da.elem_ir_ty == IrType::U32)
                 {
                     if let Expr::WideStringLiteral(s, _) = e {
-                        self.emit_wide_string_to_alloca(alloca, s, current_idx * da.elem_size);
+                        let at = current_idx * da.elem_size;
+                        let room = da.alloc_size.saturating_sub(at);
+                        self.emit_wide_string_to_alloca(alloca, s, at, room);
                         current_idx += 1;
                         continue;
                     }
@@ -1373,7 +1347,9 @@ impl Lowerer {
                     && (da.elem_ir_ty == IrType::I16 || da.elem_ir_ty == IrType::U16)
                 {
                     if let Expr::Char16StringLiteral(s, _) = e {
-                        self.emit_char16_string_to_alloca(alloca, s, current_idx * da.elem_size);
+                        let at = current_idx * da.elem_size;
+                        let room = da.alloc_size.saturating_sub(at);
+                        self.emit_char16_string_to_alloca(alloca, s, at, room);
                         current_idx += 1;
                         continue;
                     }

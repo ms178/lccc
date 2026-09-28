@@ -186,6 +186,30 @@ pub fn link_shared_x86(
     crate::backend::x86::linker::link_shared(object_files, output, user_args, &[], &[])
 }
 
+/// Standard ELF32/i386 userspace executable link for `lccc-ld -m elf_i386`.
+///
+/// The i686 backend's `link_builtin` — the pipeline the `lccc-i686`
+/// compiler driver uses.  Every operand (CRT objects, objects, archives,
+/// `-l` libraries, positional flags) is in `user_args` in command-line
+/// order, so no CRT, library path or implicit library injection happens
+/// here and link order is preserved exactly.
+pub fn link_builtin_i386(output: &str, user_args: &[String]) -> Result<(), String> {
+    crate::backend::i686::linker::link_builtin(
+        &[], // every operand is positional in user_args
+        output,
+        user_args,
+        &[], // lib paths come from -L in user_args
+        &[], // no implicit libs: the caller lists -lc etc. explicitly
+        &[], // CRT before: positional
+        &[], // CRT after: positional
+    )
+}
+
+/// ELF32/i386 shared-library link for `lccc-ld -m elf_i386 -shared`.
+pub fn link_shared_i386(output: &str, user_args: &[String]) -> Result<(), String> {
+    crate::backend::i686::linker::link_shared(&[], output, user_args, &[], &[], &[], &[])
+}
+
 #[cfg(test)]
 mod version_tests {
     use super::GNU_LD_VERSION_OUTPUT;

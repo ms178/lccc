@@ -44,8 +44,9 @@ pub use io::*;
 // archive
 #[expect(unused_imports)]
 pub use archive::{
-    LinkerScriptEntry, is_thin_archive, parse_archive_members, parse_linker_script,
-    parse_linker_script_entries, parse_thin_archive_members,
+    LinkerScriptEntry, LinkerScriptInput, is_thin_archive, parse_archive_members,
+    parse_linker_script, parse_linker_script_entries, parse_linker_script_inputs,
+    parse_thin_archive_members,
 };
 
 // linker_symbols

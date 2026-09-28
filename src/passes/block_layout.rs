@@ -618,17 +618,46 @@ pub(crate) fn relayout_blocks_static_chain(func: &mut IrFunction) -> usize {
     // after the loop, where the latch's fall-through lands).
     let mut last_pred_pos = vec![0usize; n];
     let mut placed: Vec<usize> = Vec::with_capacity(n);
+    // Trace-head priority: frontier blocks (a placed predecessor keeps the
+    // chain geodesic) first, then nesting depth, then LIFO recency of the
+    // newest placed predecessor, then original position -- all static, all
+    // total (the `Reverse(b)` component makes every key distinct).
+    type HeadKey = (bool, u64, usize, std::cmp::Reverse<usize>);
+    let head_key = |b: usize, placed_pred: &[usize], last_pred_pos: &[usize]| -> HeadKey {
+        (
+            placed_pred[b] > 0,
+            freq(b),
+            last_pred_pos[b],
+            std::cmp::Reverse(b),
+        )
+    };
+    // Max-heap of trace-head candidates with lazy invalidation.  A block's
+    // key only ever grows (`placed_pred` and `last_pred_pos` are raised by
+    // placements, `freq` is fixed), and every change pushes the new key, so
+    // the largest entry that is unplaced and still current IS the maximum
+    // over all unplaced reachable blocks -- the exact answer the former
+    // linear rescan per trace end gave, at O(log n) instead of O(n) (the
+    // rescan made this pass quadratic on long branch chains:
+    // gcc.c-torture/compile 20001226-1).
+    let mut heads: std::collections::BinaryHeap<HeadKey> = (0..n)
+        .filter(|b| reachable.contains(b))
+        .map(|b| head_key(b, &placed_pred, &last_pred_pos))
+        .collect();
     let mut place = |b: usize,
                      is_placed: &mut Vec<bool>,
                      placed_pred: &mut Vec<usize>,
                      last_pred_pos: &mut Vec<usize>,
-                     placed: &mut Vec<usize>| {
+                     placed: &mut Vec<usize>,
+                     heads: &mut std::collections::BinaryHeap<HeadKey>| {
         let pos = placed.len();
         is_placed[b] = true;
         placed.push(b);
         for &t in &succs[b] {
             placed_pred[t] += 1;
             last_pred_pos[t] = pos;
+            if !is_placed[t] && reachable.contains(&t) {
+                heads.push(head_key(t, placed_pred, last_pred_pos));
+            }
         }
     };
 
@@ -640,6 +669,7 @@ pub(crate) fn relayout_blocks_static_chain(func: &mut IrFunction) -> usize {
         &mut placed_pred,
         &mut last_pred_pos,
         &mut placed,
+        &mut heads,
     );
     let reachable_count = reachable.iter().filter(|b| **b < n).count();
     let mut cur = entry;
@@ -655,21 +685,17 @@ pub(crate) fn relayout_blocks_static_chain(func: &mut IrFunction) -> usize {
         {
             best
         } else {
-            // Trace head: frontier blocks (a placed predecessor keeps the
-            // chain geodesic) first, then nesting depth, then LIFO recency
-            // of the newest placed predecessor, then original position —
-            // all static, all total.
-            (0..n)
-                .filter(|b| reachable.contains(b) && !is_placed[*b])
-                .max_by_key(|&b| {
-                    (
-                        placed_pred[b] > 0,
-                        freq(b),
-                        last_pred_pos[b],
-                        std::cmp::Reverse(b),
-                    )
-                })
-                .expect("reachable_count guards non-empty candidate set")
+            // Trace head (see `head_key`): discard placed blocks and keys
+            // superseded by a later push.
+            loop {
+                let key = heads
+                    .pop()
+                    .expect("reachable_count guards non-empty candidate set");
+                let b = key.3.0;
+                if !is_placed[b] && key == head_key(b, &placed_pred, &last_pred_pos) {
+                    break b;
+                }
+            }
         };
         place(
             next,
@@ -677,6 +703,7 @@ pub(crate) fn relayout_blocks_static_chain(func: &mut IrFunction) -> usize {
             &mut placed_pred,
             &mut last_pred_pos,
             &mut placed,
+            &mut heads,
         );
         cur = next;
     }

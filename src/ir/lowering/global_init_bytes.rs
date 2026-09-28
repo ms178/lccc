@@ -4,6 +4,7 @@
 //! variable initialization lowering. It handles writing constants, bitfields,
 //! complex numbers, struct layouts, and array fills into byte buffers.
 
+use super::array_init_plan::MemberArrayInit;
 use super::global_init_helpers as h;
 use super::lower::Lowerer;
 use crate::common::types::{CType, IrType, StructLayout};
@@ -100,6 +101,36 @@ impl Lowerer {
             let is_anon =
                 h::is_anon_member_designator(designator_name, &field_layout.name, &field_layout.ty);
             let has_nested = h::has_nested_field_designator(item);
+
+            // Arrays of scalars of any rank: the array planner resolves the
+            // member's initializer (its own list or string, or a brace-elided
+            // run of this list, possibly designated into the member).
+            if !is_anon && (designator_name.is_some() || item.designators.is_empty()) {
+                if let Some(geo) = self.scalar_array_geometry(&field_layout.ty) {
+                    let rel: &[Designator] = if designator_name.is_some() {
+                        &item.designators[1..]
+                    } else {
+                        &[]
+                    };
+                    let (member, consumed) =
+                        self.member_array_init(rel, &items[item_idx..], &field_layout.ty, &geo);
+                    if matches!(member, MemberArrayInit::Whole(_)) {
+                        // The member's own initializer replaces all of it (p19).
+                        let end = (field_offset + geo.total * geo.elem_size()).min(bytes.len());
+                        if let Some(span) = bytes.get_mut(field_offset..end) {
+                            span.fill(0);
+                        }
+                    }
+                    let plan = self.plan_member_array(&member, &geo);
+                    self.plan_to_bytes(&plan, &geo, bytes, field_offset);
+                    item_idx += consumed;
+                    current_field_idx = field_idx + 1;
+                    if layout.is_union && designator_name.is_none() {
+                        break;
+                    }
+                    continue;
+                }
+            }
 
             match &field_layout.ty {
                 // Nested designator or anonymous member designator into struct/union
@@ -998,6 +1029,16 @@ impl Lowerer {
         bytes: &mut [u8],
         field_offset: usize,
     ) -> ArrayFillResult {
+        // Scalar elements, braced or from a (wide) string: the array planner,
+        // sized exactly as `compute_fam_extra_size` sized the object.
+        if let Some(geo) = self.fam_scalar_geometry(elem_ty, &items[item_idx].init) {
+            let plan = self.plan_array_initializer(&items[item_idx].init, &geo);
+            self.plan_to_bytes(&plan, &geo, bytes, field_offset);
+            return ArrayFillResult {
+                new_item_idx: item_idx + 1,
+                skip_update: false,
+            };
+        }
         let elem_size = self.resolve_ctype_size(elem_ty);
         let elem_ir_ty = IrType::from_ctype(elem_ty);
 

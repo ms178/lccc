@@ -18,10 +18,9 @@ use super::dead_writes::{frame_slot_stable_in_range, parse_frame_slot};
 use super::flag_peepholes::flags_dead_after;
 use super::fp_liveness::FpLiveness;
 use super::helpers::{
-    extract_jump_target, get_dest_reg, has_implicit_reg_usage, implicit_read_reg_family,
-    is_callee_saved_reg, is_read_modify_write, is_valid_gp_reg, replace_reg_family,
-    replace_reg_name_exact, self_zeroing_full_write, src_mentions_family, writes_family,
-    writes_family_full,
+    get_dest_reg, has_implicit_reg_usage, implicit_read_reg_family, is_callee_saved_reg,
+    is_read_modify_write, is_valid_gp_reg, replace_reg_family, replace_reg_name_exact,
+    self_zeroing_full_write, src_mentions_family, writes_family, writes_family_full,
 };
 use super::liveness::FileLiveness;
 use super::relay_and_lea::{
@@ -694,13 +693,14 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                 let mut j = next_live(i + 1);
                 // Block emission may name the otherwise-unreferenced
                 // fall-through arm. Hoisting across that label is safe only
-                // when no control-flow edge targets it.
-                let mut fallthrough_label_ok = true;
+                // when nothing else names it (checked last: it scans the
+                // whole file, and the shape test below rejects almost every
+                // conditional jump first -- per-jump scans made this pass
+                // quadratic on long branch chains, gcc.c-torture/compile
+                // 20001226-1).
+                let mut fallthrough_label = None;
                 if j < len && infos[j].kind == LineKind::Label {
-                    let name = infos[j].trimmed(store.get(j)).trim_end_matches(':');
-                    fallthrough_label_ok = !(0..len).any(|q| {
-                        q != j && extract_jump_target(infos[q].trimmed(store.get(q))) == Some(name)
-                    });
+                    fallthrough_label = Some(j);
                     j = next_live(j + 1);
                 }
                 let k = next_live(j + 1);
@@ -708,10 +708,15 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                 let m = next_live(l + 1);
                 let n = next_live(m + 1);
                 if n < len
-                    && fallthrough_label_ok
                     && infos[k].kind == LineKind::Jmp
                     && infos[l].kind == LineKind::Label
                     && infos[n].kind == LineKind::Label
+                    // Any mention counts, not just direct jumps: a
+                    // jump-table entry (`.long .LBBn - .Ljt`) is an edge
+                    // too, and `extract_jump_target` does not see it.
+                    && fallthrough_label.is_none_or(|fl| {
+                        super::dead_writes::label_is_fallthrough_only(store, infos, fl)
+                    })
                 {
                     let init = infos[j].trimmed(store.get(j));
                     let alt = infos[m].trimmed(store.get(m));

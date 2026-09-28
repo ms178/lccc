@@ -149,7 +149,7 @@ pub use resolve_lib::resolve_lib;
 pub use write::{align_up_64, pad_to, write_elf64_phdr, write_elf64_phdr_at, write_elf64_shdr};
 
 // args.rs
-pub use args::{HashStyle, exclude_libs_matches, parse_linker_args};
+pub use args::{HashStyle, InputItem, LinkerArgs, exclude_libs_matches, parse_linker_args};
 
 // check.rs
 pub use check::{check_undefined_symbols_elf64, check_undefined_symbols_elf64_verbose};

@@ -149,6 +149,30 @@ impl Lowerer {
             let has_nested_designator = item.designators.len() > 1
                 && matches!(item.designators.first(), Some(Designator::Field(_)));
 
+            // Arrays of scalars of any rank: the array planner resolves the
+            // member's initializer (its own list or string, or a brace-elided
+            // run of the enclosing list, possibly designated into the member).
+            // The enclosing object is zero-filled by every caller.
+            if !is_anon_member_designator && (desig_name.is_some() || item.designators.is_empty()) {
+                if let Some(geo) = self.scalar_array_geometry(&field.ty) {
+                    let rel: &[Designator] = if desig_name.is_some() {
+                        &item.designators[1..]
+                    } else {
+                        &[]
+                    };
+                    let (member, consumed) =
+                        self.member_array_init(rel, &items[item_idx..], &field.ty, &geo);
+                    let plan = self.plan_member_array(&member, &geo);
+                    self.store_array_plan(&plan, &geo, base_alloca, field_offset, true);
+                    item_idx += consumed;
+                    current_field_idx = field_idx + 1;
+                    if layout.is_union && desig_name.is_none() {
+                        break;
+                    }
+                    continue;
+                }
+            }
+
             // Dispatch to per-field-type handler
             match &field.ty {
                 CType::Struct(key) | CType::Union(key)
@@ -635,6 +659,40 @@ impl Lowerer {
     // Array field sub-handlers
     // ========================================================================
 
+    /// A `wchar_t`/`char32_t` (4-byte) or `char16_t` (2-byte) array member
+    /// initialized from the matching wide string literal (C11 6.7.9p15),
+    /// braced or not.  Only `char` members were recognised: a wide literal
+    /// fell through to the scalar path, which stored the literal's ADDRESS
+    /// into the first elements and let the store spill over the following
+    /// members.  The enclosing aggregate is zero-filled before its members
+    /// are stored (as the `char` form relies on), so the elements after the
+    /// terminator need no stores here.  Returns whether it handled `e`.
+    fn emit_wide_member_string(
+        &mut self,
+        e: &Expr,
+        base_alloca: Value,
+        elem_ty: &CType,
+        field_offset: usize,
+        arr_size: usize,
+        elem_size: usize,
+    ) -> bool {
+        if !elem_ty.is_integer() || matches!(elem_ty, CType::Bool | CType::Enum(_)) {
+            return false;
+        }
+        let bytes = arr_size * elem_size;
+        match e {
+            Expr::WideStringLiteral(s, _) if elem_size == 4 => {
+                self.emit_wide_string_to_alloca(base_alloca, s, field_offset, bytes);
+                true
+            }
+            Expr::Char16StringLiteral(s, _) if elem_size == 2 => {
+                self.emit_char16_string_to_alloca(base_alloca, s, field_offset, bytes);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Handle array field from an Initializer::List.
     fn emit_array_field_list_init(
         &mut self,
@@ -650,6 +708,18 @@ impl Lowerer {
             if let Initializer::Expr(Expr::StringLiteral(s, _)) = &sub_items[0].init {
                 if matches!(elem_ty, CType::Char | CType::UChar) {
                     self.emit_string_to_alloca(base_alloca, s, field_offset, arr_size * elem_size);
+                    return;
+                }
+            }
+            if let Initializer::Expr(e) = &sub_items[0].init {
+                if self.emit_wide_member_string(
+                    e,
+                    base_alloca,
+                    elem_ty,
+                    field_offset,
+                    arr_size,
+                    elem_size,
+                ) {
                     return;
                 }
             }
@@ -701,9 +771,33 @@ impl Lowerer {
     ) {
         let mut ai = 0;
         let mut si = 0;
-        while si < sub_items.len() && ai < arr_size {
+        while si < sub_items.len() {
+            // `[i] = ...` (the canonical form designates skipped elements).
+            let designated = match sub_items[si].designators.as_slice() {
+                [Designator::Index(e)] => match self.eval_const_expr_for_designator(e) {
+                    Some(i) => {
+                        ai = i;
+                        true
+                    }
+                    None => false,
+                },
+                _ => false,
+            };
+            if ai >= arr_size {
+                break;
+            }
             let elem_offset = field_offset + ai * elem_size;
             match &sub_items[si].init {
+                Initializer::Expr(e) if designated && self.struct_value_size(e).is_none() => {
+                    // `[i] = x, ...` with the element's braces elided: the
+                    // run starts at the element's first member.
+                    let mut run = sub_items[si..].to_vec();
+                    run[0].designators.clear();
+                    let consumed =
+                        self.emit_struct_init(&run, base_alloca, sub_layout, elem_offset);
+                    si += consumed.max(1);
+                    ai += 1;
+                }
                 Initializer::List(struct_items) => {
                     self.emit_struct_init(struct_items, base_alloca, sub_layout, elem_offset);
                     si += 1;
@@ -900,6 +994,11 @@ impl Lowerer {
                 *item_idx += 1;
                 return;
             }
+        }
+        if self.emit_wide_member_string(e, base_alloca, elem_ty, field_offset, arr_size, elem_size)
+        {
+            *item_idx += 1;
+            return;
         }
 
         if let CType::Struct(key) | CType::Union(key) = elem_ty {

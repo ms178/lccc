@@ -9,15 +9,11 @@
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::ir::reexports::{BlockId, Instruction, IrFunction, Operand, Value};
 
+/// Bytes an access of `ty` may touch (`IrType::access_extent`; target-sized
+/// pointers).  Every use is a conflict or containment check, where the
+/// upper bound is the conservative one; unmodeled types count as 16 bytes.
 fn type_size(ty: crate::common::types::IrType) -> i64 {
-    use crate::common::types::IrType::*;
-    match ty {
-        I8 | U8 => 1,
-        I16 | U16 => 2,
-        I32 | U32 | F32 => 4,
-        I64 | U64 | F64 | Ptr => 8,
-        _ => 16,
-    }
+    ty.access_extent().map_or(16, |(_, may)| may)
 }
 
 /// Remove stores to fields of non-escaping stack aggregates that are never read.
