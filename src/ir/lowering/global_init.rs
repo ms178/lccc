@@ -402,9 +402,7 @@ impl Lowerer {
                 IrType::I32 | IrType::U32 => {
                     GlobalInit::WideString(s.chars().map(|c| c as u32).collect())
                 }
-                IrType::I16 | IrType::U16 => {
-                    GlobalInit::Char16String(s.chars().map(|c| c as u16).collect())
-                }
+                IrType::I16 | IrType::U16 => GlobalInit::Char16String(s.encode_utf16().collect()),
                 _ => {
                     // Unexpected element type for string init - treat as pointer
                     self.intern_string_as_global_addr(s, kind)
@@ -568,9 +566,7 @@ impl Lowerer {
             IrType::I32 | IrType::U32 => {
                 GlobalInit::WideString(s.chars().map(|c| c as u32).collect())
             }
-            IrType::I16 | IrType::U16 => {
-                GlobalInit::Char16String(s.chars().map(|c| c as u16).collect())
-            }
+            IrType::I16 | IrType::U16 => GlobalInit::Char16String(s.encode_utf16().collect()),
             _ => return None,
         })
     }

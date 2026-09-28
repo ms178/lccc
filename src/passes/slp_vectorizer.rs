@@ -2128,12 +2128,19 @@ fn slp_block_once(
     // is borrow-clean.
     let (candidates, plans): (Vec<SeedCandidate>, Vec<Option<Plan>>) = {
         let ctx = build_ctx(func, block_idx, cross, fp_contract);
-        let bases = RestrictBases::build(func);
         let candidates = collect_seed_candidates(&ctx);
-        let plans = candidates
-            .iter()
-            .map(|c| build_plan(&ctx, c, &bases))
-            .collect();
+        // The alias facts scan the whole function: build them only for a
+        // block that has seeds (this runs once per block per fixpoint
+        // round, so an eager build was O(blocks x function size)).
+        let plans = if candidates.is_empty() {
+            Vec::new()
+        } else {
+            let bases = RestrictBases::build(func);
+            candidates
+                .iter()
+                .map(|c| build_plan(&ctx, c, &bases))
+                .collect()
+        };
         (candidates, plans)
     };
     for (cand, plan) in candidates.iter().zip(plans) {

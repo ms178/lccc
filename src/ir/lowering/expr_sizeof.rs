@@ -301,7 +301,7 @@ impl Lowerer {
             // Wide string literal: array of wchar_t (4 bytes each), size = (chars + 1) * 4
             Expr::WideStringLiteral(s, _) => (s.chars().count() + 1) * 4,
             // char16_t string literal: array of char16_t (2 bytes each), size = (chars + 1) * 2
-            Expr::Char16StringLiteral(s, _) => (s.chars().count() + 1) * 2,
+            Expr::Char16StringLiteral(s, _) => (s.encode_utf16().count() + 1) * 2,
 
             // Variable: look up its alloc_size or type
             Expr::Identifier(name, _) => self.sizeof_identifier(name),
@@ -421,7 +421,7 @@ impl Lowerer {
                                 elem_size * (s.chars().count() + 1)
                             }
                             (CType::Short | CType::UShort, Expr::Char16StringLiteral(s, _)) => {
-                                elem_size * (s.chars().count() + 1)
+                                elem_size * (s.encode_utf16().count() + 1)
                             }
                             _ => self.sizeof_type(ts),
                         }

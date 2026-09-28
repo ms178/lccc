@@ -54,12 +54,12 @@ impl Lowerer {
             && items[0].designators.is_empty()
         {
             if let Initializer::Expr(Expr::Char16StringLiteral(s, _)) = &items[0].init {
-                return s.chars().count() + 1; // +1 for null terminator (count in char16_t elements)
+                return s.encode_utf16().count() + 1; // +1 for null terminator (count in char16_t elements)
             }
             if let Initializer::Expr(Expr::WideStringLiteral(s, _) | Expr::StringLiteral(s, _)) =
                 &items[0].init
             {
-                return s.chars().count() + 1; // string to char16_t array
+                return s.encode_utf16().count() + 1; // string to char16_t array
             }
         }
         self.compute_init_list_array_size(items)

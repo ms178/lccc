@@ -499,10 +499,7 @@ impl Lowerer {
                 self.emit_string_to_alloca(alloca, s, 0, arr_size);
                 // Zero-fill remaining bytes if string is shorter than array
                 let str_len = s.chars().count() + 1; // +1 for null terminator
-                for i in str_len..arr_size {
-                    let val = Operand::Const(IrConst::I8(0));
-                    self.emit_store_at_offset(alloca, i, val, IrType::I8);
-                }
+                self.zero_fill_after_string(alloca, str_len, arr_size);
             }
             _ => {
                 let val = self.lower_expr(expr);
@@ -523,7 +520,12 @@ impl Lowerer {
             Expr::WideStringLiteral(s, _)
             | Expr::StringLiteral(s, _)
             | Expr::Char16StringLiteral(s, _) => {
-                self.emit_wide_string_to_alloca(alloca, s, 0);
+                let arr_size = da.alloc_size;
+                self.emit_wide_string_to_alloca(alloca, s, 0, arr_size);
+                // The elements after the terminator are zero (C11 6.7.9p21);
+                // nothing wrote them before this fix.
+                let str_len = (s.chars().count() + 1) * 4;
+                self.zero_fill_after_string(alloca, str_len, arr_size);
             }
             _ => {
                 let val = self.lower_expr(expr);
@@ -544,17 +546,11 @@ impl Lowerer {
             Expr::Char16StringLiteral(s, _)
             | Expr::StringLiteral(s, _)
             | Expr::WideStringLiteral(s, _) => {
-                self.emit_char16_string_to_alloca(alloca, s, 0);
-                // Zero-fill remaining bytes if string is shorter than array
-                let str_len = (s.chars().count() + 1) * 2; // +1 for null, *2 for u16
                 let arr_size = da.alloc_size;
-                if arr_size > str_len {
-                    // Zero remaining bytes
-                    for i in (str_len..arr_size).step_by(2) {
-                        let val = Operand::Const(IrConst::I16(0));
-                        self.emit_store_at_offset(alloca, i, val, IrType::U16);
-                    }
-                }
+                self.emit_char16_string_to_alloca(alloca, s, 0, arr_size);
+                // Zero-fill remaining bytes if string is shorter than array
+                let str_len = (s.encode_utf16().count() + 1) * 2; // UTF-16 units + NUL
+                self.zero_fill_after_string(alloca, str_len, arr_size);
             }
             _ => {
                 let val = self.lower_expr(expr);
@@ -1363,7 +1359,9 @@ impl Lowerer {
                     && (da.elem_ir_ty == IrType::I32 || da.elem_ir_ty == IrType::U32)
                 {
                     if let Expr::WideStringLiteral(s, _) = e {
-                        self.emit_wide_string_to_alloca(alloca, s, current_idx * da.elem_size);
+                        let at = current_idx * da.elem_size;
+                        let room = da.alloc_size.saturating_sub(at);
+                        self.emit_wide_string_to_alloca(alloca, s, at, room);
                         current_idx += 1;
                         continue;
                     }
@@ -1373,7 +1371,9 @@ impl Lowerer {
                     && (da.elem_ir_ty == IrType::I16 || da.elem_ir_ty == IrType::U16)
                 {
                     if let Expr::Char16StringLiteral(s, _) = e {
-                        self.emit_char16_string_to_alloca(alloca, s, current_idx * da.elem_size);
+                        let at = current_idx * da.elem_size;
+                        let room = da.alloc_size.saturating_sub(at);
+                        self.emit_char16_string_to_alloca(alloca, s, at, room);
                         current_idx += 1;
                         continue;
                     }

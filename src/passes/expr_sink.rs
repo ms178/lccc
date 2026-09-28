@@ -173,6 +173,82 @@ fn blocks_between(
     fwd.intersection(&back).copied().collect()
 }
 
+/// Dominator queries over `CfgAnalysis::idom`, answering exactly what the
+/// former per-block dominator SETS (`dom[b]` = every block on `b`'s idom
+/// chain, `{b}` alone for an unreachable block) answered, without
+/// materialising them: those sets cost O(blocks x dominator depth) to build
+/// and each candidate cloned one, which made every sink round quadratic on
+/// long branch chains (gcc.c-torture/compile 20001226-1, depth 8192).
+struct SinkDom {
+    idom: Vec<usize>,
+    /// Length of the idom chain including the block itself (`dom[b].len()`);
+    /// 1 for unreachable blocks.
+    chain_len: Vec<u32>,
+    reachable: Vec<bool>,
+}
+
+impl SinkDom {
+    fn new(cfg: &analysis::CfgAnalysis) -> Self {
+        let n = cfg.num_blocks;
+        let idom = cfg.idom.clone();
+        let reachable: Vec<bool> = (0..n).map(|b| idom[b] < n).collect();
+        // Preorder over the dominator tree: parents before children.
+        let mut chain_len = vec![1u32; n];
+        let mut stack: Vec<usize> = (0..n).filter(|&b| reachable[b] && idom[b] == b).collect();
+        while let Some(b) = stack.pop() {
+            for &c in &cfg.dom_children[b] {
+                if c != b {
+                    chain_len[c] = chain_len[b] + 1;
+                    stack.push(c);
+                }
+            }
+        }
+        SinkDom {
+            idom,
+            chain_len,
+            reachable,
+        }
+    }
+
+    /// Whether `a` lies on `b`'s idom chain (`dom[b].contains(&a)`).
+    fn dominates(&self, a: usize, b: usize) -> bool {
+        if !self.reachable[b] || !self.reachable[a] {
+            return a == b;
+        }
+        let mut x = b;
+        while self.chain_len[x] > self.chain_len[a] {
+            x = self.idom[x];
+        }
+        x == a
+    }
+
+    /// The deepest block dominating every block in `blocks` (the element of
+    /// the intersection of their dominator sets with the largest set).
+    fn common_dominator(&self, mut blocks: impl Iterator<Item = usize>) -> Option<usize> {
+        let mut acc = blocks.next()?;
+        for b in blocks {
+            if b == acc {
+                continue;
+            }
+            if !self.reachable[b] || !self.reachable[acc] {
+                return None; // `{b}` meets a different chain: empty
+            }
+            let mut x = b;
+            while self.chain_len[acc] > self.chain_len[x] {
+                acc = self.idom[acc];
+            }
+            while self.chain_len[x] > self.chain_len[acc] {
+                x = self.idom[x];
+            }
+            while x != acc {
+                x = self.idom[x];
+                acc = self.idom[acc];
+            }
+        }
+        Some(acc)
+    }
+}
+
 struct UseSite {
     block: usize,
     /// `usize::MAX` = the block's terminator.
@@ -288,7 +364,7 @@ fn root_sink_target(
     root_idx: usize,
     uses: &FxHashMap<u32, Vec<UseSite>>,
     def_count: &FxHashMap<u32, u32>,
-    dom: &[FxHashSet<usize>],
+    dom: &SinkDom,
     depth: &[usize],
     freq: &[f64],
     loops: &[crate::passes::loop_analysis::NaturalLoop],
@@ -306,12 +382,8 @@ fn root_sink_target(
         return None;
     }
 
-    let mut common = dom[root_uses[0].block].clone();
-    for site in &root_uses[1..] {
-        common = common.intersection(&dom[site.block]).copied().collect();
-    }
-    let &target = common.iter().max_by_key(|&&block| dom[block].len())?;
-    if target == source || !dom[target].contains(&source) {
+    let target = dom.common_dominator(root_uses.iter().map(|site| site.block))?;
+    if target == source || !dom.dominates(source, target) {
         return None;
     }
     if depth.get(target).copied().unwrap_or(0) > depth.get(source).copied().unwrap_or(0) {
@@ -409,7 +481,7 @@ fn make_chain_plan(
     uses: &FxHashMap<u32, Vec<UseSite>>,
     def_count: &FxHashMap<u32, u32>,
     def_sites: &FxHashMap<u32, Vec<(usize, usize)>>,
-    dom: &[FxHashSet<usize>],
+    dom: &SinkDom,
     depth: &[usize],
     freq: &[f64],
     loops: &[crate::passes::loop_analysis::NaturalLoop],
@@ -694,7 +766,7 @@ fn strictly_improves_live_range(before: LiveRangeCost, after: LiveRangeCost) -> 
 fn try_sink_atomic_chain(
     func: &mut IrFunction,
     cfg: &analysis::CfgAnalysis,
-    dom: &[FxHashSet<usize>],
+    dom: &SinkDom,
     loops: &[crate::passes::loop_analysis::NaturalLoop],
     depth: &[usize],
     frequency: &[f64],
@@ -778,18 +850,7 @@ fn sink_round(func: &mut IrFunction) -> usize {
     }
     let cfg = analysis::CfgAnalysis::build(func);
 
-    let mut dom: Vec<FxHashSet<usize>> = vec![FxHashSet::default(); n];
-    for b in 0..n {
-        let mut cur = b;
-        for _ in 0..=n {
-            dom[b].insert(cur);
-            let next = cfg.idom[cur];
-            if next == cur || next >= n {
-                break;
-            }
-            cur = next;
-        }
-    }
+    let dom = SinkDom::new(&cfg);
     // Static block frequency, relative to the function entry.
     //
     // Post-dominance was the previous guard and it is the WRONG invariant:
@@ -963,14 +1024,10 @@ fn sink_round(func: &mut IrFunction) -> usize {
             if u.is_empty() || u.iter().any(|s| s.is_phi) {
                 continue;
             }
-            let mut common: FxHashSet<usize> = dom[u[0].block].clone();
-            for s in &u[1..] {
-                common = common.intersection(&dom[s.block]).copied().collect();
-            }
-            let Some(&target) = common.iter().max_by_key(|&&c| dom[c].len()) else {
+            let Some(target) = dom.common_dominator(u.iter().map(|s| s.block)) else {
                 continue;
             };
-            if target == bi || !dom[target].contains(&bi) {
+            if target == bi || !dom.dominates(bi, target) {
                 continue;
             }
             if depth.get(target).copied().unwrap_or(0) > depth.get(bi).copied().unwrap_or(0) {

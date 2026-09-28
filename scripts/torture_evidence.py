@@ -8,8 +8,10 @@ Output: ``engineering/evidence/session/evidence.json`` (consumed by the
         Markdown table on stdout for follow-up documents.
 
 Reference skips (``reference-compile-skip`` / ``reference-run-skip``) are tests
-the host GCC itself cannot build or run; they are excluded from the
-denominator because they say nothing about LCCC.  Everything else is either
+the host GCC itself cannot build or run, and ``unsupported`` tests are the ones
+gcc's own harness would not run either (``run_expensive_tests`` without
+``GCC_TEST_RUN_EXPENSIVE``); all are excluded from the denominator because
+they say nothing about LCCC.  Everything else is either
 ``pass`` or an LCCC failure, so ``pass + fail == total``.
 
 Usage:
@@ -27,7 +29,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 DEFAULT_OUT = REPO / "engineering" / "evidence" / "session" / "evidence.json"
-SKIPS = {"reference-compile-skip", "reference-run-skip"}
+SKIPS = {"reference-compile-skip", "reference-run-skip", "unsupported"}
 
 
 def summarise(path: Path, target: str) -> tuple[list[dict], list[str]]:

@@ -133,6 +133,19 @@ pub fn link_builtin(
     let ifunc_symbols = collect_ifunc_symbols(&global_symbols, is_static);
 
     // Phase 10: Layout + emit
+    // PT_INTERP: honour `--dynamic-linker=PATH` (lccc-ld normalises every
+    // GNU spelling to it; the compiler driver forwards `-Wl,…` forms, which
+    // the shared parser also understands) instead of hard-wiring the ABI
+    // loader — a staging/sysroot link must bind against the libc it names.
+    let interp = crate::backend::linker_common::parse_linker_args(user_args)
+        .dynamic_linker
+        .map(|path| {
+            let mut bytes = path.into_bytes();
+            bytes.push(0);
+            bytes
+        })
+        .unwrap_or_else(|| INTERP.to_vec());
+
     emit_executable(
         &inputs,
         &mut output_sections,
@@ -152,6 +165,7 @@ pub fn link_builtin(
         needed_libs_param,
         output_path,
         &pending_defsyms,
+        &interp,
     )
 }
 

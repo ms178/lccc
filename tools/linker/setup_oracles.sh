@@ -2,22 +2,40 @@
 # Build/restore the comparison linkers used by tests/linker/run_linker_tests.py
 # and the differential/ICF tooling.
 #
-# Pinning policy (2026-09-15, user directive): the ONLY oracles are
-#   * GNU ld from binutils 2.47   (release tarball, ftp.gnu.org)
-#   * mold 2.42.1                 (release tarball, github.com/rui314/mold)
-#   * wild at git HEAD            (clone of github.com/davidlattimore/wild)
-# lld and the distro-default ld are NOT oracles: two false "lccc is broken"
-# verdicts earlier in this series came from stale oracle revisions, and an
-# oracle you cannot date is not an oracle. binutils/mold are pinned releases so
-# every verdict is reproducible; wild stays at HEAD because the project ships no
-# releases and we deliberately track its moving target (its REVISION file
-# records the exact commit every build/restore came from).
+# Pinning policy (user directive, refreshed 2026-09-27): the oracles are
+#   * GNU ld (bfd) from binutils 2.47  (release tarball, ftp.gnu.org)
+#   * mold 2.42.1                      (release tarball, github.com/rui314/mold),
+#                                      built with -DMOLD_TARGETS='X86_64;I386'
+#   * LLVM lld 23.1.x                  (apt.llvm.org llvm-toolchain-<codename>-23;
+#                                      the installed version is asserted to be
+#                                      23.1.* and recorded in ORACLES.lock)
+#   * wild at git HEAD                 (clone of github.com/davidlattimore/wild;
+#                                      skip with WITH_WILD=0)
+# The distro-default ld is NOT an oracle: two false "lccc is broken" verdicts
+# earlier in this series came from stale oracle revisions, and an oracle you
+# cannot date is not an oracle.  Every build/restore appends the exact
+# `--version` banners to $ARTIFACTS/ORACLES.lock.
 #
-# The harness wipes everything outside /home/user mid-session, so binaries live
-# under ARTIFACTS (= /home/user/artifacts/oracles by default): that tree is
-# part of the workspace snapshot and survives. Restoring = re-pointing symlinks;
-# full source rebuilds happen only when the pinned binaries are missing or the
-# checksums in ORACLES.md changed.
+# Build-time preset (2-vCPU / 2 GB host, -j2 research policy):
+#   * mold: MOLD_TARGETS is mold's own CMake cache variable (CMakeLists.txt,
+#     v2.42.1: `set(MOLD_TARGETS X86_64 I386 ARM64LE ... CACHE STRING ...)`);
+#     every source file is instantiated once per listed target, so restricting
+#     it to the two x86 ELF targets cuts the template instantiation work by
+#     ~10x.  X86_64 must stay first (MOLD_FIRST_TARGET).
+#   * binutils: only bfd + ld are configured/built (`all-ld`,
+#     `install-strip-ld`) — gas/binutils/gprof/gdb are not linker oracles
+#     (GNU as 2.47 has its own provisioner, scripts/ensure_gas_247.sh).
+#   * lld: a source build of LLVM is hours on this host; the apt.llvm.org
+#     release build of the same 23.1 branch is used instead.
+#
+# Storage layout (harness snapshot caps: ~128 MB / ~10k files):
+#   * installed oracle binaries -> $ARTIFACTS (= /home/user/artifacts/oracles):
+#     persisted, so a restore is just re-pointing wrappers;
+#   * tarballs + build trees     -> $SRC (= /home/user/.cache/lccc-oracle-src):
+#     snapshot-EXCLUDED and deleted after a successful install — a binutils
+#     build tree alone is several hundred MB and would push the whole
+#     workspace snapshot over its cap;
+#   * lld lives in /usr (apt) and is re-installed after a wipe (~30 s).
 #
 # Idempotent: re-running verifies and skips whatever already checks out.
 set -euo pipefail
@@ -25,12 +43,17 @@ set -euo pipefail
 JOBS="${JOBS:-2}"                      # research policy: -j2
 ARTIFACTS="${ARTIFACTS:-/home/user/artifacts/oracles}"
 PREFIX="${PREFIX:-$ARTIFACTS}"         # install root == persistent root
-SRC="${SRC:-$ARTIFACTS/src}"
+SRC="${SRC:-/home/user/.cache/lccc-oracle-src}"
 LINKDIR="${LINKDIR:-/home/user/artifacts/bin}"
 
 BINUTILS_VER=2.47
 MOLD_VER=2.42.1
+MOLD_TARGETS='X86_64;I386'
+LLD_MAJOR=23
+LLD_MINOR_PIN=23.1
+WITH_WILD="${WITH_WILD:-1}"
 WILD_REPO=https://github.com/davidlattimore/wild.git
+LOCK="$ARTIFACTS/ORACLES.lock"
 
 mkdir -p "$PREFIX" "$SRC" "$LINKDIR"
 
@@ -50,7 +73,8 @@ else
           --disable-nls --disable-gdb --disable-gdbserver --disable-sim \
           --disable-libquadmath --enable-64-bit-bfd --disable-werror \
           CFLAGS='-O2 -g0' CXXFLAGS='-O2 -g0'
-      make -j"$JOBS" && make install-strip )
+      make -j"$JOBS" all-ld && make install-strip-ld )
+    rm -rf "$BT"
     note "ld    : $("$PREFIX/bfd-$BINUTILS_VER/bin/ld" --version | head -1) (built)"
 fi
 
@@ -67,15 +91,39 @@ else
       cmake -B build -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
             -DCMAKE_CXX_FLAGS='-march=native' \
-            -DMOLD_TARGETS='X86_64;I386' \
+            -DMOLD_TARGETS="$MOLD_TARGETS" \
             -DCMAKE_INSTALL_PREFIX="$PREFIX/mold-$MOLD_VER"
       cmake --build build -j "$JOBS" && cmake --install build
-      strip "build/mold" 2>/dev/null || true )
-    note "mold  : $("$PREFIX/mold-$MOLD_VER/bin/mold" --version) (built)"
+      strip "$PREFIX/mold-$MOLD_VER/bin/mold" 2>/dev/null || true )
+    rm -rf "$MT"
+    note "mold  : $("$PREFIX/mold-$MOLD_VER/bin/mold" --version) (built, targets $MOLD_TARGETS)"
 fi
 
+# ── LLVM lld 23.1.x (apt.llvm.org release build) ───────────────────────────
+LLD_BIN=/usr/bin/ld.lld-$LLD_MAJOR
+if [ ! -x "$LLD_BIN" ]; then
+    codename=$( . /etc/os-release && echo "${VERSION_CODENAME:-}" )
+    [ -n "$codename" ] || { note "lld   : cannot determine distro codename"; exit 1; }
+    note "lld   : installing lld-$LLD_MAJOR from apt.llvm.org ($codename)"
+    sudo install -d -m 0755 /etc/apt/keyrings
+    curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
+        | sudo tee /etc/apt/keyrings/apt.llvm.org.asc >/dev/null
+    echo "deb [signed-by=/etc/apt/keyrings/apt.llvm.org.asc] https://apt.llvm.org/$codename/ llvm-toolchain-$codename-$LLD_MAJOR main" \
+        | sudo tee /etc/apt/sources.list.d/llvm-$LLD_MAJOR.list >/dev/null
+    sudo apt-get update -qq -o Dir::Etc::sourcelist=sources.list.d/llvm-$LLD_MAJOR.list \
+        -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 >/dev/null
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "lld-$LLD_MAJOR" >/dev/null
+fi
+lld_banner=$("$LLD_BIN" --version | head -1)
+case "$lld_banner" in
+    *" $LLD_MINOR_PIN."*) note "lld   : $lld_banner" ;;
+    *) note "lld   : version pin violated (want $LLD_MINOR_PIN.*): $lld_banner"; exit 1 ;;
+esac
+
 # ── wild, git HEAD (Rust; revision stamped in REVISION) ─────────────────────
-if [ -x "$PREFIX/wild-git/bin/wild" ] && [ -f "$PREFIX/wild-git/REVISION" ]; then
+if [ "$WITH_WILD" != 1 ]; then
+    note "wild  : skipped (WITH_WILD=0)"
+elif [ -x "$PREFIX/wild-git/bin/wild" ] && [ -f "$PREFIX/wild-git/REVISION" ]; then
     note "wild  : $("$PREFIX/wild-git/bin/wild" --version 2>&1 | head -1) (restored from $ARTIFACTS; rev $(cat "$PREFIX/wild-git/REVISION"))"
 else
     WT="$SRC/wild"
@@ -86,18 +134,32 @@ else
       RUSTFLAGS='-C target-cpu=native' cargo build --release --locked -j "$JOBS"
       mkdir -p "$PREFIX/wild-git/bin" && install -s target/release/wild "$PREFIX/wild-git/bin/wild"
       echo "$REV" > "$PREFIX/wild-git/REVISION" )
+    rm -rf "$WT"
     note "wild  : $("$PREFIX/wild-git/bin/wild" --version 2>&1 | head -1) (built)"
 fi
 
 # ── convenience wrappers (stable names on PATH) ─────────────────────────────
-for pair in "ld-2.47:$PREFIX/bfd-$BINUTILS_VER/bin/ld" \
-            "mold-2.42.1:$PREFIX/mold-$MOLD_VER/bin/mold" \
+for pair in "ld-$BINUTILS_VER:$PREFIX/bfd-$BINUTILS_VER/bin/ld" \
+            "mold-$MOLD_VER:$PREFIX/mold-$MOLD_VER/bin/mold" \
+            "ld.lld-$LLD_MINOR_PIN:$LLD_BIN" \
             "wild:$PREFIX/wild-git/bin/wild"; do
     name="${pair%%:*}"; target="${pair#*:}"
+    [ -x "$target" ] || continue
     printf '#!/bin/sh\nexec %s "$@"\n' "$target" > "$LINKDIR/$name"
     chmod +x "$LINKDIR/$name"
 done
 
+# ── lock file: exact banners of every oracle this restore resolved ─────────
+{
+    printf '# %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ) setup_oracles.sh"
+    printf 'ld      %s\n' "$("$PREFIX/bfd-$BINUTILS_VER/bin/ld" --version | head -1)"
+    printf 'mold    %s (MOLD_TARGETS=%s)\n' "$("$PREFIX/mold-$MOLD_VER/bin/mold" --version)" "$MOLD_TARGETS"
+    printf 'ld.lld  %s\n' "$lld_banner"
+    if [ -x "$PREFIX/wild-git/bin/wild" ]; then
+        printf 'wild    %s (rev %s)\n' "$("$PREFIX/wild-git/bin/wild" --version 2>&1 | head -1)" \
+            "$(cat "$PREFIX/wild-git/REVISION" 2>/dev/null || echo unknown)"
+    fi
+} > "$LOCK.tmp" && mv -f "$LOCK.tmp" "$LOCK"
+
 echo
-note "Oracles under $PREFIX (wipe-safe); wrappers in $LINKDIR."
-note "Record new checksums in $PREFIX/ORACLES.md whenever a pin moves."
+note "Oracles under $PREFIX (wipe-safe); wrappers in $LINKDIR; banners in $LOCK."

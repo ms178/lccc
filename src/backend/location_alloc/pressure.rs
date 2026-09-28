@@ -127,20 +127,39 @@ impl Pressure {
         values: &FxHashSet<u32>,
         classes: &ColorClasses,
     ) -> Self {
-        let mut per_block = Vec::with_capacity(func.blocks.len());
+        // Bucket each eligible segment into the blocks it overlaps, once.
+        // Block point ranges are disjoint and laid out in block order
+        // (`LivenessResult::block_starts` is sorted and every point belongs
+        // to exactly one block), so the first overlapped block is a binary
+        // search on `block_ends` and the walk stops at the first block that
+        // starts past the segment.  Scanning every segment for every block
+        // instead cost O(blocks x segments), which dominated whole compiles
+        // of long branch chains (gcc.c-torture/compile 20001226-1: ~40 s of
+        // a 50 s -O0 compile).  Buckets keep segment order, so each point's
+        // root list is built from the same pushes as before.
+        let nblocks = func.blocks.len();
+        let mut overlapping: Vec<Vec<usize>> = vec![Vec::new(); nblocks];
+        for (si, iv) in live.segments.iter().enumerate() {
+            if !values.contains(&iv.value_id) {
+                continue;
+            }
+            let first = live.block_ends[..nblocks].partition_point(|&ge| ge < iv.start);
+            for (bi, bucket) in overlapping.iter_mut().enumerate().skip(first) {
+                if live.block_starts[bi] > iv.end {
+                    break;
+                }
+                bucket.push(si);
+            }
+        }
+        let mut per_block = Vec::with_capacity(nblocks);
         for (bi, b) in func.blocks.iter().enumerate() {
             let npts = b.instructions.len() + 1;
             // Roots resident at each point (duplicates deduped afterwards).
             let mut at_point: Vec<Vec<u32>> = (0..npts).map(|_| Vec::new()).collect();
             let gs = live.block_starts[bi];
             let ge = live.block_ends[bi];
-            for iv in &live.segments {
-                if !values.contains(&iv.value_id) {
-                    continue;
-                }
-                if iv.end < gs || iv.start > ge {
-                    continue;
-                }
+            for &si in &overlapping[bi] {
+                let iv = &live.segments[si];
                 let lo = (iv.start.max(gs) - gs) as usize;
                 let hi = (iv.end.min(ge) - gs) as usize;
                 let root = classes.root(iv.value_id);

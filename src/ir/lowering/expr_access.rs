@@ -317,7 +317,7 @@ impl Lowerer {
                             if matches!(expr, Expr::StringLiteral(_, _)) {
                                 s.chars().count() + 1
                             } else if matches!(expr, Expr::Char16StringLiteral(_, _)) {
-                                (s.chars().count() + 1) * 2
+                                (s.encode_utf16().count() + 1) * 2
                             } else {
                                 (s.chars().count() + 1) * 4
                             }

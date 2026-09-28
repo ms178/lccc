@@ -961,7 +961,9 @@ impl Lexer {
 
     /// Lex a u"..." char16_t string literal. Same parsing as wide string but produces
     /// Char16StringLiteral token. The Rust String stores Unicode chars; the downstream
-    /// pipeline converts each to a u16 value (truncating code points > 0xFFFF).
+    /// pipeline stores their UTF-16 encoding (`str::encode_utf16`, C11 6.4.5p6), so a
+    /// code point above U+FFFF becomes a surrogate pair and every length is counted
+    /// in code units.
     fn lex_char16_string(&mut self, start: usize) -> Token {
         self.pos += 1; // skip opening "
         let mut s = String::with_capacity(32);

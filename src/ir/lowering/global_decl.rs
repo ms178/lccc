@@ -873,7 +873,8 @@ impl Lowerer {
                         | Expr::StringLiteral(s, _)
                         | Expr::WideStringLiteral(s, _) = expr
                         {
-                            let char_count = s.chars().count() + 1;
+                            // UTF-16 code units, as the Char16String init stores them.
+                            let char_count = s.encode_utf16().count() + 1;
                             da.alloc_size = char_count * 2;
                             da.actual_alloc_size = da.alloc_size;
                         }

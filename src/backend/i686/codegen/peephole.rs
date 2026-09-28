@@ -8474,6 +8474,10 @@ fn parse_narrow_zext_src(
 /// `cmpb $0, mem` sets CF when the operand is 0):
 const NARROW_ZF_JCC: &[&str] = &["je ", "jne ", "jz ", "jnz "];
 const NARROW_ZF_SETCC: &[&str] = &["sete ", "setne ", "setz ", "setnz "];
+/// ZF/SF set: the conditions two compares of the same 32-bit difference
+/// always agree on (Pattern 7's re-associated `subl`/`cmpl` immediates).
+const ZF_SF_JCC: &[&str] = &["je ", "jne ", "jz ", "jnz ", "js ", "jns "];
+const ZF_SF_SETCC: &[&str] = &["sete ", "setne ", "setz ", "setnz ", "sets ", "setns "];
 /// ZF/CF set (the `cmpl $I, %R` form):
 const NARROW_CF_ZF_JCC: &[&str] = &[
     "je ", "jne ", "jz ", "jnz ", "jb ", "jbe ", "ja ", "jae ", "jc ", "jnc ",
@@ -10606,13 +10610,19 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                 }
             }
 
-            // Pattern 7: range check via subtract-then-compare
+            // Pattern 7: subtract-then-compare through a dead copy
             // (`movl %A,%B; subl $a,%B; cmpl $b,%B; jCC L`)
-            // -> `cmpl $(a+b),%A; jCC L`.  (x-a) CMP b and x CMP a+b set
-            // identical flags for every condition code: both are the
-            // comparison of the same two mathematical values, and the
-            // borrow/overflow chains agree because the fused immediate
-            // encodes exactly the same subtraction.  The staging pair is
+            // -> `cmpl $(a+b),%A; jCC L`.  Both compares compute the same
+            // 32-bit difference `x - a - b`, so ZF, SF and PF agree -- but
+            // ONLY those.  CF and OF describe the borrow/overflow of each
+            // subtraction separately: `(x-a) - b` borrows iff
+            // `(x-a) mod 2^32 <u b`, `x - (a+b)` iff `x <u (a+b) mod 2^32`.
+            // The unsigned range check `(unsigned)(y + 128) > 255` (a=-128,
+            // b=255) became `cmpl $127, y; ja`, i.e. `y >u 127`, which is
+            // true for every negative y (torture pr45034 -O2/-O3/-Os,
+            // i686).  So every reader of the fused compare's flags must be
+            // ZF/SF-only (`flags_reader_window_ok` walks the fallthrough
+            // chain, not just the adjacent jCC).  The staging pair is
             // deleted under the dominance proof for %B.
             if let Some((op_src, op_dst)) = parse_mov_reg_reg(&s) {
                 let i1 = next_non_nop(infos, i + 1);
@@ -10634,7 +10644,9 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                         parse_cmpl_imm_reg(t2, op_dst),
                     ) {
                         let cond = trimmed(store, &infos[i3], i3);
-                        if is_cond_jcc(cond) {
+                        if is_cond_jcc(cond)
+                            && flags_reader_window_ok(store, infos, i2, ZF_SF_JCC, ZF_SF_SETCC)
+                        {
                             let fused = a.wrapping_add(b);
                             if (-128..=127).contains(&fused)
                                 && staging_reads_safe(
@@ -14633,10 +14645,54 @@ mod tests {
         assert!(result.contains("cmpl $97, %esi"), "{result}");
     }
 
+    /// Pattern 7 body shared by the tests below: `x - 48` compared with 9
+    /// through a dead staging copy, branching on `jcc`.
+    fn range_check_asm(jcc: &str) -> String {
+        format!(
+            "f:\n.cfi_startproc\n    movl 4(%esp), %esi\n    movl %esi, %eax\n    \
+             subl $48, %eax\n    cmpl $9, %eax\n    {jcc} .L1\n    movl $1, %eax\n    \
+             ret\n.L1:\n    movl $2, %eax\n    ret\n.cfi_endproc\n.size f, .-f\n"
+        )
+    }
+
     #[test]
-    fn fold_reg_copy_range_check_fuses_sub_cmp() {
-        // `movl %esi,%eax; subl $48,%eax; cmpl $9,%eax; ja` ->
-        // `cmpl $57,%esi; ja` (identical flags, staging pair dead).
+    fn fold_reg_copy_sub_cmp_fuses_for_equality() {
+        // `movl %esi,%eax; subl $48,%eax; cmpl $9,%eax; jne` ->
+        // `cmpl $57,%esi; jne`: both compares compute the same difference,
+        // so ZF agrees and the staging pair is dead.
+        for jcc in ["je", "jne"] {
+            let result = peephole_optimize(range_check_asm(jcc));
+            assert!(
+                !result.contains("subl $48, %eax"),
+                "{jcc}: staging must fold:\n{result}"
+            );
+            // The fused compare then meets the compare-with-memory fold:
+            // the slot load itself disappears.
+            assert!(result.contains("cmpl $57, 4(%esp)"), "{jcc}: {result}");
+        }
+    }
+
+    #[test]
+    fn fold_reg_copy_sub_cmp_keeps_ordered_range_check() {
+        // `(unsigned)(x - 48) > 9` is NOT `x >u 57`: CF of the two compares
+        // differs whenever `x - 48` wraps (every x < 48 passes the fused
+        // form).  The same re-association turned the signed range check of
+        // torture pr45034 into `cmpl $127, y; ja` (-O2, i686).  Ordered
+        // conditions must keep the subtract.
+        for jcc in ["ja", "jbe", "jb", "jae", "jg", "jl", "jle", "jge", "jo"] {
+            let result = peephole_optimize(range_check_asm(jcc));
+            assert!(
+                result.contains("subl $48,") && result.contains("cmpl $9,"),
+                "{jcc}: ordered compare must not be re-associated:\n{result}"
+            );
+            assert!(!result.contains("cmpl $57"), "{jcc}: {result}");
+        }
+    }
+
+    #[test]
+    fn fold_reg_copy_sub_cmp_vets_every_flags_reader() {
+        // `jne` is admissible, but the fallthrough `ja` reads CF of the same
+        // compare: the window must refuse the fusion.
         let asm = concat!(
             "f:\n",
             ".cfi_startproc\n",
@@ -14644,24 +14700,21 @@ mod tests {
             "    movl %esi, %eax\n",
             "    subl $48, %eax\n",
             "    cmpl $9, %eax\n",
-            "    ja .L1\n",
+            "    jne .L1\n",
+            "    ja .L2\n",
             "    movl $1, %eax\n",
             "    ret\n",
             ".L1:\n",
             "    movl $2, %eax\n",
             "    ret\n",
+            ".L2:\n",
+            "    movl $3, %eax\n",
+            "    ret\n",
             ".cfi_endproc\n",
             ".size f, .-f\n",
-        )
-        .to_string();
-        let result = peephole_optimize(asm.to_string());
-        assert!(
-            !result.contains("subl $48, %eax"),
-            "range-check staging must fold:\n{result}"
         );
-        // The fused compare then meets the existing compare-with-memory
-        // fold: the slot load itself disappears.
-        assert!(result.contains("cmpl $57, 4(%esp)"), "{result}");
+        let result = peephole_optimize(asm.to_string());
+        assert!(!result.contains("cmpl $57"), "{result}");
     }
 
     #[test]

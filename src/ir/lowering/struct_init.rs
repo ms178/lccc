@@ -635,6 +635,40 @@ impl Lowerer {
     // Array field sub-handlers
     // ========================================================================
 
+    /// A `wchar_t`/`char32_t` (4-byte) or `char16_t` (2-byte) array member
+    /// initialized from the matching wide string literal (C11 6.7.9p15),
+    /// braced or not.  Only `char` members were recognised: a wide literal
+    /// fell through to the scalar path, which stored the literal's ADDRESS
+    /// into the first elements and let the store spill over the following
+    /// members.  The enclosing aggregate is zero-filled before its members
+    /// are stored (as the `char` form relies on), so the elements after the
+    /// terminator need no stores here.  Returns whether it handled `e`.
+    fn emit_wide_member_string(
+        &mut self,
+        e: &Expr,
+        base_alloca: Value,
+        elem_ty: &CType,
+        field_offset: usize,
+        arr_size: usize,
+        elem_size: usize,
+    ) -> bool {
+        if !elem_ty.is_integer() || matches!(elem_ty, CType::Bool | CType::Enum(_)) {
+            return false;
+        }
+        let bytes = arr_size * elem_size;
+        match e {
+            Expr::WideStringLiteral(s, _) if elem_size == 4 => {
+                self.emit_wide_string_to_alloca(base_alloca, s, field_offset, bytes);
+                true
+            }
+            Expr::Char16StringLiteral(s, _) if elem_size == 2 => {
+                self.emit_char16_string_to_alloca(base_alloca, s, field_offset, bytes);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Handle array field from an Initializer::List.
     fn emit_array_field_list_init(
         &mut self,
@@ -650,6 +684,18 @@ impl Lowerer {
             if let Initializer::Expr(Expr::StringLiteral(s, _)) = &sub_items[0].init {
                 if matches!(elem_ty, CType::Char | CType::UChar) {
                     self.emit_string_to_alloca(base_alloca, s, field_offset, arr_size * elem_size);
+                    return;
+                }
+            }
+            if let Initializer::Expr(e) = &sub_items[0].init {
+                if self.emit_wide_member_string(
+                    e,
+                    base_alloca,
+                    elem_ty,
+                    field_offset,
+                    arr_size,
+                    elem_size,
+                ) {
                     return;
                 }
             }
@@ -900,6 +946,11 @@ impl Lowerer {
                 *item_idx += 1;
                 return;
             }
+        }
+        if self.emit_wide_member_string(e, base_alloca, elem_ty, field_offset, arr_size, elem_size)
+        {
+            *item_idx += 1;
+            return;
         }
 
         if let CType::Struct(key) | CType::Union(key) = elem_ty {

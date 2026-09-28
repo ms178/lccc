@@ -21,6 +21,7 @@ use super::liveness::FileLiveness;
 use super::relay_and_lea::{
     is_relayable_family, plain_gp_operand, provably_dead_lv, split_two_operands,
 };
+use crate::common::fx_hash::FxHashMap;
 
 /// Instructions whose ONLY effect is the register they write: no flags, no
 /// memory write, no implicit operand. `cmov` is included (it reads flags but
@@ -97,42 +98,107 @@ pub(super) fn eliminate_dead_pure_writes(store: &LineStore, infos: &mut [LineInf
     changed
 }
 
+/// The assembler symbol alphabet the reference tokenizer splits on.
+fn is_symbol_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '$'
+}
+
 /// True when `label_idx` (a label line) has no incoming branch: the only way
 /// to reach it is to fall through the preceding instruction. Such a label
 /// starts a block dominated by its predecessor, so a value cached before it is
 /// still valid after it.
-#[expect(clippy::needless_range_loop)]
+///
+/// One-shot form (a whole-file scan per call); a pass that asks for many
+/// labels builds a [`LabelRefs`] once instead.
 pub(super) fn label_is_fallthrough_only(
     store: &LineStore,
     infos: &[LineInfo],
     label_idx: usize,
 ) -> bool {
-    let t = infos[label_idx].trimmed(store.get(label_idx));
-    let Some(name) = t.strip_suffix(':').map(str::trim) else {
-        return false;
-    };
-    // A label has a non-fallthrough predecessor when ANY other line names
-    // it. Direct `jmp`/`jcc` are the common case, but switch lowering reaches
-    // case blocks through an indirect `jmpq *%rdx` whose targets are spelled
-    // only in jump-table data (`.long .LBB4 - .Ljt_0`, `.quad .LBBn`):
-    // scanning jump mnemonics alone mislabels every jump-table target as
-    // fallthrough-only and would let folds/cascades cross into a block that
-    // is entered with different register state. Tokenise on the assembler
-    // symbol alphabet so `.L1` cannot match `.L10`; over-matching only ever
-    // fails closed (label treated as targeted, fold refused).
-    for n in 0..store.len() {
-        if infos[n].is_nop() || n == label_idx {
-            continue;
+    LabelRefs::build(store, infos).is_fallthrough_only(store, infos, label_idx)
+}
+
+/// Which defined labels are named by some line other than their definition.
+///
+/// A label has a non-fallthrough predecessor when ANY other line names it.
+/// Direct `jmp`/`jcc` are the common case, but switch lowering reaches case
+/// blocks through an indirect `jmpq *%rdx` whose targets are spelled only in
+/// jump-table data (`.long .LBB4 - .Ljt_0`, `.quad .LBBn`): scanning jump
+/// mnemonics alone would mislabel every jump-table target as fallthrough-only
+/// and let folds/cascades cross into a block entered with different register
+/// state. Lines are tokenised on the assembler symbol alphabet so `.L1`
+/// cannot match `.L10`; over-matching only ever fails closed.
+///
+/// Built once per pass invocation: the per-label whole-file scan it replaces
+/// ran for every label a forward scan crossed, which made
+/// `reuse_redundant_loads` cubic on long compare-and-branch chains
+/// (gcc.c-torture/compile 20001226-1).
+///
+/// Staleness contract: the index reflects the lines at `build` time. A pass
+/// that only deletes or rewrites lines without ADDING label references (both
+/// current users) can only make a count too high, which answers "targeted"
+/// -- the conservative direction.
+pub(super) struct LabelRefs {
+    /// Defined label name -> number of non-nop lines whose token stream
+    /// contains it (the definition line included).
+    lines_naming: FxHashMap<String, u32>,
+}
+
+impl LabelRefs {
+    pub(super) fn build(store: &LineStore, infos: &[LineInfo]) -> Self {
+        let mut lines_naming: FxHashMap<String, u32> = FxHashMap::default();
+        for n in 0..store.len() {
+            if infos[n].is_nop() || infos[n].kind != LineKind::Label {
+                continue;
+            }
+            if let Some(name) = infos[n].trimmed(store.get(n)).strip_suffix(':') {
+                lines_naming.insert(name.trim().to_string(), 0);
+            }
         }
-        let tn = infos[n].trimmed(store.get(n));
-        if tn
-            .split(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '_' && c != '$')
-            .any(|tok| tok == name)
-        {
+        let mut seen: Vec<&str> = Vec::new();
+        for n in 0..store.len() {
+            if infos[n].is_nop() {
+                continue;
+            }
+            seen.clear();
+            for tok in infos[n]
+                .trimmed(store.get(n))
+                .split(|c: char| !is_symbol_char(c))
+            {
+                if tok.is_empty() || seen.contains(&tok) {
+                    continue;
+                }
+                if let Some(count) = lines_naming.get_mut(tok) {
+                    *count += 1;
+                    seen.push(tok);
+                }
+            }
+        }
+        Self { lines_naming }
+    }
+
+    /// See [`label_is_fallthrough_only`].
+    pub(super) fn is_fallthrough_only(
+        &self,
+        store: &LineStore,
+        infos: &[LineInfo],
+        label_idx: usize,
+    ) -> bool {
+        let t = infos[label_idx].trimmed(store.get(label_idx));
+        let Some(name) = t.strip_suffix(':').map(str::trim) else {
+            return false;
+        };
+        // A name outside the symbol alphabet (a quoted symbol) can never be
+        // matched as a token, so references to it are invisible: refuse.
+        if name.is_empty() || !name.chars().all(is_symbol_char) {
             return false;
         }
+        // The definition line itself names the label exactly once.
+        let own = u32::from(!infos[label_idx].is_nop());
+        self.lines_naming
+            .get(name)
+            .is_some_and(|&count| count <= own)
     }
-    true
 }
 
 /// Memory operand of a simple load `mov* MEM, %reg`, plus the register families
@@ -220,6 +286,9 @@ fn reuse_redundant_loads_with(
     let redundant_same_dst_reload = policy.same_dst_reload;
     let frame_slot_aliasing = policy.frame_slot_aliasing;
     let len = store.len();
+    // Built once: this pass rewrites loads into copies and deletes reloads,
+    // never adding a label reference (the `LabelRefs` staleness contract).
+    let label_refs = LabelRefs::build(store, infos);
     let mut changed = false;
     let mut i = 0;
     while i < len {
@@ -314,7 +383,7 @@ fn reuse_redundant_loads_with(
                 // have stored to this address. A label nobody branches to is
                 // reached only by falling through, so the cached value holds.
                 LineKind::Label => {
-                    if !label_is_fallthrough_only(store, infos, j) {
+                    if !label_refs.is_fallthrough_only(store, infos, j) {
                         break;
                     }
                     j += 1;
