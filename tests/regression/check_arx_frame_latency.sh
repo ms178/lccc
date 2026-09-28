@@ -29,6 +29,29 @@ trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp"
 fail=0
 
+# Consume the complete awk output. With pipefail, grep -q can close the pipe
+# early and make awk die with SIGPIPE (141), turning a match into a flaky FAIL.
+has_lane_shuffle() {
+  awk "/^$1:/,/^\\.size $1/" "$2" | grep pshufd >/dev/null
+}
+
+# A stream larger than a pipe buffer makes the old early-exit predicate fail
+# reliably. Check both outcomes before trusting the code-generation gate.
+awk 'BEGIN {
+  print "core:"; print " vpshufd $0, %xmm0, %xmm1";
+  for (i = 0; i < 20000; ++i) print " addl %eax, %eax";
+  print ".size core, .-core"
+}' > "$tmp/predicate.s"
+if ! has_lane_shuffle core "$tmp/predicate.s"; then
+  echo "FAIL: lane-shuffle predicate rejected a matching large stream" >&2
+  exit 1
+fi
+sed 's/vpshufd/movdqa/' "$tmp/predicate.s" > "$tmp/predicate-negative.s"
+if has_lane_shuffle core "$tmp/predicate-negative.s"; then
+  echo "FAIL: lane-shuffle predicate accepted a stream without a shuffle" >&2
+  exit 1
+fi
+
 cp "$repo/tests/benchmark/programs/chacha20_block.c" "$tmp/array.c"
 cat >"$tmp/locals.c" <<'C'
 typedef unsigned int u32;
@@ -72,7 +95,7 @@ check() {
   local tag="$form ${flags:-(default v3)}"
   # shellcheck disable=SC2086
   "$CCC" -O2 $flags -DBLOCK_COUNT=4096U -DPASSES=2U -S "$tmp/$form.c" -o "$tmp/$form.s"
-  if ! awk "/^$func:/,/^\\.size $func/" "$tmp/$form.s" | grep -q pshufd; then
+  if ! has_lane_shuffle "$func" "$tmp/$form.s"; then
     echo "FAIL [$tag]: $func is not lane-vectorized (no pshufd)"
     fail=1
     return
