@@ -2310,7 +2310,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     Displacement::Symbol(s)
                     | Displacement::SymbolPlusOffset(s, _)
                     | Displacement::SymbolAddend(s, _)
-                    | Displacement::SymbolMod(s, _) => sub(self, s)?,
+                    | Displacement::SymbolMod(s, _)
+                    | Displacement::SymbolModAddend(s, _, _) => sub(self, s)?,
                     Displacement::SymbolDiff(a, b) | Displacement::SymbolDiffAddend(a, b, _) => {
                         sub(self, a)?;
                         sub(self, b)?;
@@ -5022,7 +5023,8 @@ fn instr_operands_mention_dot(instr: &Instruction) -> bool {
             Displacement::Symbol(s)
             | Displacement::SymbolPlusOffset(s, _)
             | Displacement::SymbolAddend(s, _)
-            | Displacement::SymbolMod(s, _) => standalone_dot(s),
+            | Displacement::SymbolMod(s, _)
+            | Displacement::SymbolModAddend(s, _, _) => standalone_dot(s),
             Displacement::SymbolDiff(a, b) | Displacement::SymbolDiffAddend(a, b, _) => {
                 standalone_dot(a) || standalone_dot(b)
             }

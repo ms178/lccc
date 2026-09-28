@@ -143,7 +143,14 @@ impl X86Codegen {
         // Only external TLS symbols need the GOT-based General-Dynamic sequence
         // in PIC mode (globals_tls regression: static __thread read garbage
         // when GOTTPOFF was forced for a local symbol).
-        if self.state.pic_mode && !self.state.local_symbols.contains(name) {
+        // A shared object must not use Local-Exec even for a symbol it owns:
+        // the linker rejects `R_X86_64_TPOFF32` when producing `ET_DYN`
+        // (lccc -fPIC -shared on any `static __thread` failed to link at all
+        // before this; GCC links the same source). Initial-Exec through the
+        // GOT is valid there, so `-shared` routes local TLS symbols to it.
+        if (self.state.pic_mode && !self.state.local_symbols.contains(name))
+            || self.state.shared_lib
+        {
             self.state
                 .emit_fmt(format_args!("    movq {}@GOTTPOFF(%rip), %rax", name));
             self.state.emit("    addq %fs:0, %rax");
@@ -173,7 +180,9 @@ impl X86Codegen {
     /// only for external TLS symbols in PIC mode.
     pub(super) fn emit_global_addr_into_reg(&mut self, name: &str, reg: &str) {
         if self.state.tls_symbols.contains(name) {
-            if self.state.pic_mode && !self.state.local_symbols.contains(name) {
+            if (self.state.pic_mode && !self.state.local_symbols.contains(name))
+                || self.state.shared_lib
+            {
                 self.state
                     .emit_fmt(format_args!("    movq {}@GOTTPOFF(%rip), %{}", name, reg));
                 self.state

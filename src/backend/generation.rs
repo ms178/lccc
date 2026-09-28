@@ -6230,6 +6230,15 @@ fn generate_load(
         cg.emit_seg_load(dest, ptr, ty, seg_override);
         return;
     }
+    // PF-TLS-1: a Local-Exec `__thread` access folds into ONE instruction
+    // (`movX %fs:sym@TPOFF+N, %dst`) instead of the two-instruction base
+    // materialization plus the access. Tried before the RIP-relative global
+    // fold because a TLS symbol is never RIP-addressable; the helper answers
+    // false for every non-TLS, PIC or non-local symbol, so the ladder below
+    // is untouched for everything else.
+    if cg.try_emit_tls_direct_load(dest, ptr, 0, ty) {
+        return;
+    }
     if cg.supports_global_addr_fold() && is_foldable_mem_ty(ty) {
         if let Some(sym) = global_addr_map.get(&ptr.0) {
             if !rip_rel_blocked(cg, sym) {
@@ -6240,6 +6249,11 @@ fn generate_load(
     }
     if let Some(gep_info) = gep_fold_map.get(&ptr.0) {
         if !is_wide_int_type(ty) && can_const_addr_fold(cg, gep_info) {
+            // TLS arrays: `tls_array[CONST]` folds the same way, with the
+            // constant offset carried by the TPOFF relocation's addend.
+            if cg.try_emit_tls_direct_load(dest, &gep_info.base, gep_info.offset, ty) {
+                return;
+            }
             cg.emit_load_with_const_offset(dest, &gep_info.base, gep_info.offset, ty);
             return;
         }
@@ -6299,6 +6313,10 @@ fn generate_store(
         cg.emit_seg_store(val, ptr, ty, seg_override);
         return;
     }
+    // PF-TLS-1, store side: see the load ladder above for the legality rule.
+    if cg.try_emit_tls_direct_store(val, ptr, 0, ty) {
+        return;
+    }
     if cg.supports_global_addr_fold() && is_foldable_mem_ty(ty) {
         if let Some(sym) = global_addr_map.get(&ptr.0) {
             if !rip_rel_blocked(cg, sym) {
@@ -6309,6 +6327,9 @@ fn generate_store(
     }
     if let Some(gep_info) = gep_fold_map.get(&ptr.0) {
         if !is_wide_int_type(ty) && can_const_addr_fold(cg, gep_info) {
+            if cg.try_emit_tls_direct_store(val, &gep_info.base, gep_info.offset, ty) {
+                return;
+            }
             cg.emit_store_with_const_offset(val, &gep_info.base, gep_info.offset, ty);
             return;
         }

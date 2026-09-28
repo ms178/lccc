@@ -761,11 +761,33 @@ impl super::InstructionEncoder {
         }
     }
 
+    /// Relocation type for a non-RIP `sym@MOD` displacement.
+    ///
+    /// Non-RIP `sym@GOTPCREL(%reg)` is not relaxable: GAS 2.47 emits plain
+    /// `R_X86_64_GOTPCREL` (9) even when the insn is REX2 (`addq
+    /// foo@GOTPCREL(%rax), %r16` → type 9, not 43).  GOTTPOFF/TLSDESC
+    /// without %rip are rejected by GAS; keep the classic types if they ever
+    /// reach the encoder.  Shared by the plain and the addend-carrying
+    /// (`sym@MOD+N`) displacement forms so the two can never drift.
+    fn symbol_mod_reloc_type(modifier: &str) -> u32 {
+        match modifier.to_ascii_lowercase().as_str() {
+            "tpoff" => R_X86_64_TPOFF32,
+            "gotpcrel" => R_X86_64_GOTPCREL,
+            "gottpoff" => R_X86_64_GOTTPOFF,
+            "tlsdesc" => R_X86_64_GOTPC32_TLSDESC,
+            _ => R_X86_64_32S,
+        }
+    }
+
     /// Displacement value + deferred relocation for the non-RIP address
     /// paths, shared by the legacy/VEX (`encode_modrm_mem`) and EVEX
     /// (`encode_evex_mem`) encoders so both agree on reloc types. Returns
     /// `(disp_val, has_symbol, deferred_reloc, diff_sym)`; `disp_val` is
     /// the placeholder (symbols always emit disp32 = 0, never compressed).
+    ///
+    /// The RIP-relative path has its own (relaxable) modifier mapping below;
+    /// an addend-carrying `sym@MOD+N` rides along in the relocation's addend,
+    /// exactly as GNU as folds it.
     pub(crate) fn symbol_disp_parts(
         disp: &Displacement,
     ) -> (i64, bool, Option<(String, u32, i64)>, Option<String>) {
@@ -791,21 +813,16 @@ impl super::InstructionEncoder {
                 diff_sym = Some(diff.clone());
                 (0i64, true, Some((sym.clone(), R_X86_64_32, *addend)))
             }
-            Displacement::SymbolMod(sym, modifier) => {
-                // Non-RIP `sym@GOTPCREL(%reg)` is not relaxable: GAS 2.47
-                // emits plain `R_X86_64_GOTPCREL` (9) even when the insn is
-                // REX2 (`addq foo@GOTPCREL(%rax), %r16` → type 9, not 43).
-                // GOTTPOFF/TLSDESC without %rip are rejected by GAS; keep
-                // the classic types if they ever reach the encoder.
-                let reloc_type = match modifier.to_ascii_lowercase().as_str() {
-                    "tpoff" => R_X86_64_TPOFF32,
-                    "gotpcrel" => R_X86_64_GOTPCREL,
-                    "gottpoff" => R_X86_64_GOTTPOFF,
-                    "tlsdesc" => R_X86_64_GOTPC32_TLSDESC,
-                    _ => R_X86_64_32S,
-                };
-                (0i64, true, Some((sym.clone(), reloc_type, 0i64)))
-            }
+            Displacement::SymbolModAddend(sym, modifier, addend) => (
+                0i64,
+                true,
+                Some((sym.clone(), Self::symbol_mod_reloc_type(modifier), *addend)),
+            ),
+            Displacement::SymbolMod(sym, modifier) => (
+                0i64,
+                true,
+                Some((sym.clone(), Self::symbol_mod_reloc_type(modifier), 0i64)),
+            ),
         };
 
         (disp_val, has_symbol, deferred_reloc, diff_sym)
@@ -875,6 +892,25 @@ impl super::InstructionEncoder {
                             _ => R_X86_64_PC32,
                         };
                         self.add_relocation(sym, reloc_type, -4);
+                        self.bytes.extend_from_slice(&[0, 0, 0, 0]);
+                    }
+                    Displacement::SymbolModAddend(sym, modifier, addend) => {
+                        // `sym@MOD+N(%rip)`: same relaxable modifier mapping
+                        // as the plain form, with N folded into the addend
+                        // (GAS semantics: the relocation addend carries it).
+                        let reloc_type = match modifier.to_ascii_lowercase().as_str() {
+                            "gotpcrel" => self.gotpcrel_x_type(),
+                            "gotpcrelx" => R_X86_64_GOTPCRELX,
+                            "rex_gotpcrelx" => R_X86_64_REX_GOTPCRELX,
+                            "code_4_gotpcrelx" => R_X86_64_CODE_4_GOTPCRELX,
+                            "code_6_gotpcrelx" => R_X86_64_CODE_6_GOTPCRELX,
+                            "gottpoff" => self.gottpoff_type(),
+                            "tlsdesc" => self.tlsdesc_type(),
+                            "tpoff" => R_X86_64_TPOFF32,
+                            "plt" => R_X86_64_PLT32,
+                            _ => R_X86_64_PC32,
+                        };
+                        self.add_relocation(sym, reloc_type, addend - 4);
                         self.bytes.extend_from_slice(&[0, 0, 0, 0]);
                     }
                     Displacement::Integer(val) => {
@@ -1152,6 +1188,12 @@ fn mem_expr_echo(mem: &MemoryOperand) -> String {
             s.push_str(x);
             s.push('@');
             s.push_str(m);
+        }
+        Displacement::SymbolModAddend(x, m, a) => {
+            s.push_str(x);
+            s.push('@');
+            s.push_str(m);
+            s.push_str(&format!("{a:+}"));
         }
         Displacement::SymbolDiff(a, b) => {
             s.push_str(a);

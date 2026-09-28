@@ -306,6 +306,12 @@ gate "gvn-cross-block-mul-dot" fast \
 gate "segfs-declarator-codegen" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_segfs_typeof_nosteal.sh
 
+gate "tls-model-selection" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_tls_model_selection.sh
+
+gate "call-secondary-cache" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_call_secondary_cache.sh
+
 gate "phi-acyclic-copy-order" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_phi_acyclic_order.sh
 

@@ -2506,6 +2506,7 @@ impl Driver {
             // use canonical stack homes until an SSA-aware O0 allocator exists.
             disable_regalloc: self.opt_level == 0,
             pic: self.pic || self.shared_lib,
+            shared_lib: self.shared_lib,
             pie: self.pie && !self.pic && !self.shared_lib,
             function_return_thunk: self.function_return_thunk,
             indirect_branch_thunk: self.indirect_branch_thunk,

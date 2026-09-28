@@ -876,7 +876,32 @@ impl X86Codegen {
             }
         }
 
+        let mut previous_arg_wrote_rcx = false;
         for (i, arg) in args.iter().enumerate() {
+            // %rcx is both the secondary value cache and SysV's fourth GP
+            // argument. Staging an argument into it invalidates the cached
+            // identity, even if that write bypasses operand_to_reg. Defer the
+            // invalidation until AFTER the previous argument has consumed its
+            // source, and put it before every next argument (including the
+            // hazard/global-address paths that continue early below).
+            // Otherwise a later aggregate pointer can be "reloaded" from the
+            // scalar fourth argument and dereferenced (CC-O0CALL-1).
+            if previous_arg_wrote_rcx {
+                self.state.reg_cache.invalidate_sec();
+            }
+            previous_arg_wrote_rcx = match arg_classes[i] {
+                CallArgClass::IntReg { reg_idx } => reg_idx == 3,
+                CallArgClass::I128RegPair { base_reg_idx }
+                | CallArgClass::I64RegPair { base_reg_idx } => {
+                    base_reg_idx <= 3 && 3 < base_reg_idx + 2
+                }
+                CallArgClass::StructByValReg { base_reg_idx, size } => {
+                    base_reg_idx <= 3 && 3 < base_reg_idx + size.div_ceil(8)
+                }
+                CallArgClass::StructMixedIntSseReg { int_reg_idx, .. }
+                | CallArgClass::StructMixedSseIntReg { int_reg_idx, .. } => int_reg_idx == 3,
+                _ => false,
+            };
             // Hazard arguments read their pre-spilled slot instead of the
             // (already-overwritten) argument-register home.
             if let Some(&off) = hazard_slot.get(&i) {

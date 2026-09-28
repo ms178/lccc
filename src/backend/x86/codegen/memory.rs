@@ -617,6 +617,11 @@ impl X86Codegen {
     // ---- Store/Load overrides ----
 
     pub(super) fn emit_store_impl(&mut self, val: &Operand, ptr: &Value, ty: IrType) {
+        // PF-TLS-1: a store into a Local-Exec `__thread` slot folds into one
+        // instruction with the TPOFF relocation in the memory operand.
+        if self.try_emit_tls_direct_store_impl(val, ptr, 0, ty) {
+            return;
+        }
         // Over-aligned-param homing-store elision: `store %p, %a` where %a is
         // an over-aligned param alloca. The prologue capture already wrote the
         // incoming value to the alloca's EFFECTIVE aligned address, so this
@@ -918,6 +923,11 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_load_impl(&mut self, dest: &Value, ptr: &Value, ty: IrType) {
+        // PF-TLS-1: a load out of a Local-Exec `__thread` slot folds into one
+        // instruction with the TPOFF relocation in the memory operand.
+        if self.try_emit_tls_direct_load_impl(dest, ptr, 0, ty) {
+            return;
+        }
         // W2 fold handshake: only a redirecting path below may re-arm the
         // cast-skip; anything else leaves it None so the adjacent cast emits.
         self.fold_skip_cast = None;
@@ -1229,6 +1239,11 @@ impl X86Codegen {
         offset: i64,
         ty: IrType,
     ) {
+        // PF-TLS-1: `tls_array[CONST] = v` folds into
+        // `movX %v, %fs:sym@TPOFF+N`.
+        if self.try_emit_tls_direct_store_impl(val, base, offset, ty) {
+            return;
+        }
         if ty == IrType::F128 {
             if let Operand::Const(IrConst::LongDouble(_, f128_bytes)) = val {
                 let x87 = crate::common::long_double::f128_bytes_to_x87_bytes(f128_bytes);
@@ -1645,6 +1660,11 @@ impl X86Codegen {
         offset: i64,
         ty: IrType,
     ) {
+        // PF-TLS-1: `v = tls_array[CONST]` folds into
+        // `movX %fs:sym@TPOFF+N, %dst`.
+        if self.try_emit_tls_direct_load_impl(dest, base, offset, ty) {
+            return;
+        }
         if ty == IrType::F128 {
             if let Some(addr) = self.state.resolve_slot_addr(base.0) {
                 self.emit_f128_fldt(&addr, base.0, offset);
@@ -3876,6 +3896,213 @@ impl X86Codegen {
             seg_prefix,
             addr
         ));
+        self.state.reg_cache.invalidate_acc();
+        true
+    }
+
+    // ---- Local-Exec TLS direct accesses (`%fs:symbol@TPOFF+N`) ----
+    //
+    // PF-TLS-1. Every TLS access through a materialized address costs the
+    // two-instruction Local-Exec base (`movq %fs:0,%r` + `leaq sym@TPOFF(%r)`)
+    // plus the access itself. GCC and Clang fold the whole thing into ONE
+    // instruction with the segment override and the link-time-constant TPOFF
+    // relocation in the memory operand:
+    //
+    //     lccc:  movq %fs:0, %rax
+    //            leaq a@TPOFF(%rax), %rax      GCC:  movq %rdi, %fs:a@tpoff
+    //            movq %rdi, (%rax)
+    //
+    // The fold is only legal when the offset really is a link-time constant:
+    //   * NOT for shared-object output — the linker rejects
+    //     `R_X86_64_TPOFF32` for `ET_DYN` (GCC switches to the GD/IE
+    //     sequences there for exactly this reason). A PIE executable is
+    //     fine, which is why the gate is the dedicated `shared_lib` flag and
+    //     not `pic_mode`: lccc codegen defaults to PIC and links PIE.
+    //   * only for a symbol this module owns (a `static`/hidden `__thread`):
+    //     GCC keeps Initial-Exec for an external TLS symbol even non-PIC, and
+    //     a preemptible symbol's block offset is not a link-time constant;
+    //   * only at optimized levels — `-O0` keeps non-SSA value identities
+    //     after phi elimination, so `get_defining_instruction` may name a
+    //     definition that does not reach this access (the same restriction
+    //     the accumulator-address fast path carries).
+
+    /// Resolve `ptr` (+ `extra`) to `(symbol, total_offset)` for a legal
+    /// Local-Exec direct access, walking constant-offset GEP hops.
+    pub(super) fn tls_local_exec_access(&self, ptr: u32, extra: i64) -> Option<(String, i64)> {
+        // Shared objects only: `R_X86_64_TPOFF32` cannot be resolved by the
+        // linker for `ET_DYN`. A PIE executable is fine (and is lccc's
+        // default), so the gate is `-shared`, not `pic_mode`.
+        if self.state.shared_lib || self.state.disable_regalloc {
+            return None;
+        }
+        let mut cur = ptr;
+        let mut total = extra;
+        // A GEP chain off a TLS symbol is constant-folded by the optimizer,
+        // but `-O1` still leaves short chains; bound the walk so a pathological
+        // IR shape can never make emission quadratic.
+        for _ in 0..8 {
+            let step = {
+                let inst = self.get_defining_instruction(cur)?;
+                match inst {
+                    crate::ir::reexports::Instruction::GlobalAddr { name, .. } => {
+                        if !self.state.tls_symbols.contains(name)
+                            || !self.state.local_symbols.contains(name)
+                        {
+                            return None;
+                        }
+                        return Some((name.clone(), total));
+                    }
+                    crate::ir::reexports::Instruction::GetElementPtr { base, offset, .. } => {
+                        match offset {
+                            Operand::Const(c) => match c.to_i64() {
+                                Some(off) => (base.0, off),
+                                None => return None,
+                            },
+                            _ => return None,
+                        }
+                    }
+                    // CSE/hoisting hands the access a Copy of the address
+                    // (global_addr_cse does exactly this for TLS bases). The
+                    // copied value still denotes the same link-time-constant
+                    // address, so the chain is followed.
+                    crate::ir::reexports::Instruction::Copy { src, .. } => match src {
+                        Operand::Value(v) => (v.0, 0),
+                        _ => return None,
+                    },
+                    _ => return None,
+                }
+            };
+            cur = step.0;
+            total += step.1;
+        }
+        None
+    }
+
+    /// The GAS/objdump spelling of the operand: `%fs:sym@TPOFF` or
+    /// `%fs:sym@TPOFF+N` (the addend rides in the relocation, see the
+    /// assembler's `SymbolModAddend`).
+    fn tls_local_exec_operand(sym: &str, off: i64) -> String {
+        if off == 0 {
+            format!("%fs:{}@TPOFF", sym)
+        } else {
+            format!("%fs:{}@TPOFF{:+}", sym, off)
+        }
+    }
+
+    /// Integer/pointer types: everything the direct form can carry. FP and
+    /// wide (i128/f128) accesses keep their dedicated paths.
+    pub(super) fn tls_direct_type_ok(ty: IrType) -> bool {
+        matches!(
+            ty,
+            IrType::I8
+                | IrType::U8
+                | IrType::I16
+                | IrType::U16
+                | IrType::I32
+                | IrType::U32
+                | IrType::I64
+                | IrType::U64
+                | IrType::Ptr
+        )
+    }
+
+    /// Emit a load straight out of a Local-Exec TLS slot. Returns false when
+    /// the access is not a legal direct form, leaving the caller unchanged.
+    pub(super) fn try_emit_tls_direct_load_impl(
+        &mut self,
+        dest: &Value,
+        ptr: &Value,
+        offset: i64,
+        ty: IrType,
+    ) -> bool {
+        if !Self::tls_direct_type_ok(ty) {
+            return false;
+        }
+        let (sym, off) = match self.tls_local_exec_access(ptr.0, offset) {
+            Some(v) => v,
+            None => return false,
+        };
+        let operand = Self::tls_local_exec_operand(&sym, off);
+        // 64-bit loads straight into a GPR home skip the rax round-trip.
+        if matches!(ty, IrType::I64 | IrType::U64 | IrType::Ptr) {
+            if let Some(&reg) = self.reg_assignments.get(&dest.0) {
+                if !is_xmm_reg(reg) {
+                    let name = phys_reg_name(reg);
+                    self.state
+                        .emit_fmt(format_args!("    movq {}, %{}", operand, name));
+                    // The load wrote the home directly, so the home now holds
+                    // THIS definition — the same accounting the register-direct
+                    // load path performs. Without it the home reads as stale
+                    // and a later use could reload the value from a slot the
+                    // load never wrote.
+                    self.note_inplace_compute(reg, dest.0);
+                    self.state.reg_cache.invalidate_acc();
+                    return true;
+                }
+            }
+        }
+        let load_instr = Self::mov_load_for_type(ty);
+        let dest_reg = Self::load_dest_reg(ty);
+        self.state
+            .emit_fmt(format_args!("    {} {}, {}", load_instr, operand, dest_reg));
+        self.store_rax_to(dest);
+        true
+    }
+
+    /// Emit a store straight into a Local-Exec TLS slot. Returns false when
+    /// the access is not a legal direct form, leaving the caller unchanged.
+    pub(super) fn try_emit_tls_direct_store_impl(
+        &mut self,
+        val: &Operand,
+        ptr: &Value,
+        offset: i64,
+        ty: IrType,
+    ) -> bool {
+        if !Self::tls_direct_type_ok(ty) {
+            return false;
+        }
+        let (sym, off) = match self.tls_local_exec_access(ptr.0, offset) {
+            Some(v) => v,
+            None => return false,
+        };
+        let operand = Self::tls_local_exec_operand(&sym, off);
+        let store_instr = Self::mov_store_for_type(ty);
+        // Immediate store: `movl $imm, %fs:sym@TPOFF` — zero register pressure.
+        if let Operand::Const(c) = val {
+            let is_32 = !matches!(ty, IrType::I64 | IrType::U64 | IrType::Ptr);
+            if let Some(imm) = Self::const_as_imm32_typed(&Operand::Const(c.clone()), is_32) {
+                self.state
+                    .emit_fmt(format_args!("    {} ${}, {}", store_instr, imm, operand));
+                return true;
+            }
+        }
+        // Register-homed value: store straight from its home. The value is
+        // read BEFORE the operand text is assembled, so no scratch register
+        // can clobber it (the segment-store ordering hazard).
+        if let Operand::Value(v) = val {
+            if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                if !is_xmm_reg(reg) {
+                    // The WIDTH follows the mnemonic, and the sized name must
+                    // come from the physical-register helpers: `reg_for_type`
+                    // only knows rax/rcx/rdx/rdi/rsi/r8/r9 and silently
+                    // answers "rax" for r10-r15, which would store the wrong
+                    // register (observed: `movl %rax, %fs:ui@TPOFF` for a
+                    // value homed in %r11).
+                    let rname = match store_instr {
+                        "movl" => phys_reg_name_32(reg),
+                        "movw" | "movb" => typed_phys_reg_name(reg, ty),
+                        _ => phys_reg_name(reg),
+                    };
+                    self.state
+                        .emit_fmt(format_args!("    {} %{}, {}", store_instr, rname, operand));
+                    return true;
+                }
+            }
+        }
+        self.operand_to_rax(val);
+        let rname = Self::reg_for_type("rax", ty);
+        self.state
+            .emit_fmt(format_args!("    {} %{}, {}", store_instr, rname, operand));
         self.state.reg_cache.invalidate_acc();
         true
     }

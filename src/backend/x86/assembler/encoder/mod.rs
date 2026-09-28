@@ -246,6 +246,33 @@ fn mnemonic_takes_label(mnemonic: &str) -> bool {
 /// (a bogus name fails loudly at link time).
 fn label_to_disp(s: &str) -> Displacement {
     if let Some(at) = s.find('@') {
+        // `sym@MOD+N` / `sym@MOD-N`: the addend belongs to the relocation, not
+        // to the symbol name — splitting it here the way GNU as does keeps a
+        // TLS/GOT relocation from degrading into an absolute one.
+        //
+        // ONLY a KNOWN modifier may take the addend. A versioned symbol
+        // (`sym@VER+8`) keeps its `@` in the NAME, so an unknown modifier
+        // falls through and the ordinary `symbol+offset` split below handles
+        // the addend (`sym@VER` as the symbol). Splitting blindly would emit a
+        // relocation against `sym` instead of `sym@VER` — a different symbol.
+        let tail = &s[at + 1..];
+        if let Some(cut) = tail
+            .char_indices()
+            .skip(1)
+            .find(|(_, c)| *c == '+' || *c == '-')
+            .map(|(i, _)| i)
+        {
+            let modifier = &tail[..cut];
+            if is_known_reloc_modifier(modifier) {
+                if let Ok(addend) = crate::backend::asm_expr::parse_integer_expr(&tail[cut..]) {
+                    return Displacement::SymbolModAddend(
+                        s[..at].to_string(),
+                        modifier.to_string(),
+                        addend,
+                    );
+                }
+            }
+        }
         return Displacement::SymbolMod(s[..at].to_string(), s[at + 1..].to_string());
     }
     if let Some(i) = s
