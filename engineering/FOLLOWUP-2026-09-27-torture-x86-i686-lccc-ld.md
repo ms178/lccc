@@ -408,16 +408,16 @@ Other brace-elision fixes:
 
 About 900 lines of per-path flattening were deleted.
 
-*Tests.* `static_pointer_array_members.c` (x86-64 and i686) covers pointer
-members of any rank: elided, designated, overridden (relocation → 0,
-constant → relocation), row reset, excess, nested, arrays of pointer structs
-with elided braces (1-D and 2-D), unions and arrays of structs. It compares
-pointers and never prints them. `tests/regression/gen_array_init_matrix.py`
-generates `array_init_matrix.c`: 432 objects crossing the element kinds with the
-shapes and storage classes above. Every object is hashed bytewise and
+*Tests.* `aggregate_init_edge.c` and `aggregate_init_canonical.c` (x86-64 and
+i686) cover pointer members of any rank: elided, designated, overridden
+(relocation → 0, constant → relocation), row reset, excess, nested, arrays of
+pointer-carrying structs, unions and arrays of structs. The matrix generator
+is `tests/regression/gen_string_init_matrix.py`, which produces
+`array_string_init_matrix.c`: objects crossing every character element width
+with the shapes and storage classes above. Every object is hashed bytewise and
 block-scope objects sit on a stack pre-filled with 0x5a. It runs at -O2 and
--O0 on x86-64 and i686 (`{,i686_}array_init_matrix{,_O0}`), and gcc is the
-oracle.
+-O0 on x86-64 and at -O2 on i686 (`array_string_init_matrix{,_O0}`,
+`i686_array_string_init_matrix`), and gcc is the oracle.
 
 ---
 
@@ -497,9 +497,10 @@ Progression on the same suite:
    by one (O(skips × records)). Batch it like §2.4 if a workload with many
    `.skip` expressions shows up.
 
-10. **Designator continuation and struct-level overrides** (repros are
-    the matrix entries generated with `gen_array_init_matrix.py
-    --include-known-gaps`, plus the cases below). These are gcc results;
+10. **Designator continuation and struct-level overrides** (repros are the
+    matrix entries a future `--include-known-gaps` mode of
+    `gen_string_init_matrix.py` would emit, plus the cases below). These are
+    gcc results;
     lccc differs in each:
     * `struct O { struct I { int a, b; } in; int c, d; }`:
       `{ .in.a = 1, 2, 3, 4 }` gives `1 2 3 4`. The item after a nested
