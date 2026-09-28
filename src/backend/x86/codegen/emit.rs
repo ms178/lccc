@@ -7714,6 +7714,20 @@ impl ArchCodegen for X86Codegen {
         // boolean is never needlessly materialized (gzip huft_build regression).
         match inst {
             crate::ir::reexports::Instruction::Select { .. } => return false,
+            // MachInst's `LeaSym` is a bare `leaq sym(%rip)`: only valid
+            // for a symbol the output binds locally.  An interposable one
+            // (default-visibility data under -fPIC, a weak or function
+            // import under PIE) must take the mature emitter's GOTPCREL
+            // load.  Without this gate every -O1+ -fPIC access to a global
+            // variable bypassed the GOT: a shared library read its own copy
+            // while the executable's copy relocation held the real one (and
+            // the result could not even be linked: bfd and lccc-ld refuse
+            // the R_X86_64_PC32 against a preemptible symbol).
+            crate::ir::reexports::Instruction::GlobalAddr { name, .. }
+                if self.state.needs_got_for_addr(name) =>
+            {
+                return false;
+            }
             // PF-15: single-use widening casts from byte/half types stay on
             // the mature path, where try_record_pending_widen can defer them
             // into a narrow compare. MachInst would emit the extending move

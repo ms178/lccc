@@ -4,9 +4,93 @@
 //! into output sections, handling COMDAT group deduplication and section
 //! type/flag assignment.
 
+use crate::backend::linker_common::cet::{self, PROPERTY_SECTION, PropertyLinkFlags};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 use super::types::*;
+
+/// GNU property note merge (CET / ISA level) over the real inputs, applied
+/// to the inputs before the section merge — the ELF32 counterpart of the
+/// x86-64 linker's `cet::merge_property_into_objects` call, with the same
+/// semantics (`linker_common::cet`, verified against binutils 2.47) and
+/// 12-byte ELF32 property entries.
+///
+/// Every input's `.note.gnu.property` used to be concatenated into the
+/// output note region: an i386 link of CET-marked objects emitted one
+/// property note per input (the output then claimed IBT|SHSTK even when
+/// `crti.o` carried no note and therefore vetoed both), and `-z ibt`,
+/// `-z shstk` and `-z x86-64-*` were ignored.  Now the first input that
+/// carries the section keeps the merged note, every other copy is emptied,
+/// and when no input carried one but `-z` flags create a property, a
+/// synthetic carrier object is appended.  Must run before
+/// [`merge_sections`]; [`property_note_extent`] finds the merged note for
+/// PT_GNU_PROPERTY afterwards.
+pub(super) fn merge_gnu_properties(inputs: &mut Vec<InputObject>, flags: &PropertyLinkFlags) {
+    let find = |o: &InputObject| o.sections.iter().position(|s| s.name == PROPERTY_SECTION);
+    let notes: Vec<Option<cet::PropertySection<'_>>> = inputs
+        .iter()
+        .map(|o| {
+            find(o).map(|si| {
+                (
+                    o.sections[si].data.as_slice(),
+                    u64::from(o.sections[si].align),
+                )
+            })
+        })
+        .collect();
+    let merged = cet::merge_property_notes(&notes, flags, true);
+    let carrier = inputs.iter().position(|o| find(o).is_some());
+    for o in inputs.iter_mut() {
+        if let Some(si) = find(o) {
+            o.sections[si].data.clear();
+        }
+    }
+    let Some(note) = merged else { return };
+    match carrier {
+        Some(oi) => {
+            let si = find(&inputs[oi]).expect("carrier has the section");
+            let sec = &mut inputs[oi].sections[si];
+            sec.data = note;
+            sec.sh_type = SHT_NOTE;
+            sec.align = sec.align.max(4);
+        }
+        None => inputs.push(InputObject {
+            sections: vec![InputSection {
+                name: PROPERTY_SECTION.to_string(),
+                sh_type: SHT_NOTE,
+                flags: SHF_ALLOC,
+                data: note,
+                align: 4,
+                relocations: Vec::new(),
+                input_index: 1,
+                entsize: 0,
+                link: 0,
+                info: 0,
+            }],
+            symbols: Vec::new(),
+            filename: "<property>".to_string(),
+        }),
+    }
+}
+
+/// Offset and size, within the merged `.note` output section, of the
+/// property note [`merge_gnu_properties`] left in place (the only
+/// non-empty `.note.gnu.property` input section), for PT_GNU_PROPERTY.
+pub(super) fn property_note_extent(
+    inputs: &[InputObject],
+    section_map: &SectionMap,
+    note_out_idx: Option<usize>,
+) -> Option<(u32, u32)> {
+    let note_out_idx = note_out_idx?;
+    inputs.iter().enumerate().find_map(|(oi, o)| {
+        let sec = o
+            .sections
+            .iter()
+            .find(|s| s.name == PROPERTY_SECTION && s.sh_type == SHT_NOTE && !s.data.is_empty())?;
+        let &(out_idx, off) = section_map.get(&(oi, sec.input_index))?;
+        (out_idx == note_out_idx).then_some((off, sec.data.len() as u32))
+    })
+}
 
 pub(super) fn merge_sections(
     inputs: &mut [InputObject],

@@ -6,7 +6,7 @@
 use crate::common::fx_hash::FxHashMap;
 
 use super::elf::*;
-use super::types::GlobalSymbol;
+use super::types::{GlobalSymbol, LocalSlots};
 
 /// Local (`STB_LOCAL`) IFUNC symbols, as `(object index, symbol index)`.
 ///
@@ -164,8 +164,9 @@ pub(super) fn abs64_value_is_local(g: &GlobalSymbol, sh_flags: u64, is_pie: bool
     // synthetic `__lccc.strmerge.N` pool symbols that string merging
     // substitutes for references into merged string sections (those carry the
     // per-string offset in the *addend* and look undefined -- `shndx == 0` --
-    // but are entirely local).
-    g.defined_in.is_some()
+    // but are entirely local).  An absolute definition's value is the same
+    // at every load address.
+    g.defined_in.is_some() && !g.absolute
 }
 
 /// Whether a PIE `R_X86_64_64` through `sym`, stored in a section with flags
@@ -188,7 +189,7 @@ pub(super) fn pie_needs_relative(
             return false; // undefined weak resolves to 0; nothing to slide
         }
     }
-    !sym.is_undefined()
+    !sym.is_undefined() && sym.shndx != SHN_ABS
 }
 
 /// Whether a PIE GOT slot for `g` holds an address inside this output (and so
@@ -205,24 +206,42 @@ pub(super) fn got_slot_holds_local_address(g: &GlobalSymbol) -> bool {
     if g.copy_reloc {
         return true;
     }
-    !g.is_dynamic && g.defined_in.is_some()
+    !g.is_dynamic && g.defined_in.is_some() && !g.absolute
 }
 
-/// Whether an executable's GOT-indirect reference to `g` may address it
-/// directly instead (see `elf::gotpcrelx_relaxation` for the instruction
-/// side).  The symbol must be defined in the executable itself -- nothing
-/// can preempt it -- and must not be an IFUNC (its canonical address is the
-/// IPLT stub the IFUNC GOT serves), an absolute symbol (a RIP-relative `lea`
-/// of an absolute value moves when a PIE slides) or a copy-relocated DSO
-/// object.  `create_plt_got` and the relocation pass both ask this exact
-/// question of the same symbol table, so a reference whose slot was elided
-/// is always one that gets rewritten.
-pub(super) fn exec_got_relax_target(g: &GlobalSymbol) -> bool {
-    g.defined_in.is_some()
-        && !g.is_dynamic
-        && !g.copy_reloc
-        && (g.info & 0xf) != STT_GNU_IFUNC
-        && g.section_idx != SHN_ABS
+/// How an executable's GOT-indirect reference to `g` may address it
+/// directly instead, or `None` if it must keep its slot (see
+/// `elf::gotpcrelx_relaxation` for the instruction side).  The symbol must be
+/// defined in the executable itself -- nothing can preempt it -- and must not
+/// be an IFUNC (its canonical address is the IPLT stub the IFUNC GOT serves)
+/// or a copy-relocated DSO object.  An absolute definition is a
+/// [`GotTarget::Absolute`], which PIE may still encode as an immediate.
+///
+/// `create_plt_got` and the relocation pass both ask this exact question of
+/// the same symbol table, so a reference whose slot was elided is always one
+/// that gets rewritten.  That is why a linker-created absolute symbol (a
+/// `--defsym` constant or expression) keeps its slot: an expression's value
+/// is only computed after layout, so the planner would decide on a
+/// placeholder and the applier on the real value.
+pub(super) fn exec_got_target(g: &GlobalSymbol) -> Option<GotTarget> {
+    if g.defined_in.is_none() || g.is_dynamic || g.copy_reloc || (g.info & 0xf) == STT_GNU_IFUNC {
+        return None;
+    }
+    if !g.absolute {
+        return Some(GotTarget::Image);
+    }
+    (g.defined_in != Some(usize::MAX)).then_some(GotTarget::Absolute(g.value))
+}
+
+/// The relaxation target of a GOT-indirect reference through a LOCAL
+/// symbol (never preemptible; a local IFUNC resolves to its IPLT stub).
+/// Shared by the executable and shared-object planners and appliers.
+pub(super) fn local_got_target(sym: &crate::backend::linker_common::Elf64Symbol) -> GotTarget {
+    if sym.shndx == SHN_ABS {
+        GotTarget::Absolute(sym.value)
+    } else {
+        GotTarget::Image
+    }
 }
 
 /// Whether the relocated field at `offset` is the rel32 operand of a direct
@@ -232,7 +251,7 @@ pub(super) fn exec_got_relax_target(g: &GlobalSymbol) -> bool {
 /// In code the byte before a RIP-relative disp32 is otherwise always a ModRM
 /// byte of the form `00 reg 101` (0x05..0x3d), which can never be mistaken
 /// for the `e8`/`e9` opcodes; a `0f 8x` pair is a two-byte `jcc`.
-fn is_branch_rel32(sh_flags: u64, data: &[u8], offset: u64) -> bool {
+pub(super) fn is_branch_rel32(sh_flags: u64, data: &[u8], offset: u64) -> bool {
     if sh_flags & SHF_EXECINSTR == 0 {
         return false;
     }
@@ -253,6 +272,7 @@ pub(super) fn create_plt_got(
     Vec<(String, bool)>,
     Vec<AbsDynReloc>,
     Vec<PieRelative>,
+    LocalSlots,
 ) {
     // Ordered vectors preserve deterministic layout; the shadow HashSets make
     // membership tests O(1). With tens of thousands of GOT symbols (e.g. a
@@ -268,6 +288,12 @@ pub(super) fn create_plt_got(
     let mut abs_dyn_relocs: Vec<AbsDynReloc> = Vec::new();
     let mut pie_relative: Vec<PieRelative> = Vec::new();
     let mut canonical_plt_set: FxHashSet<String> = FxHashSet::default();
+    // GOT slots of LOCAL symbols (section symbols included): a GOT-indirect
+    // reference to one that cannot be rewritten -- a `call *` behind a REX
+    // prefix, an addend other than -4, a plain GOTPCREL, a large-model
+    // `@GOT` -- still loads the slot's contents, so the slot must exist and
+    // hold the symbol's address.
+    let mut local_got = LocalSlots::default();
 
     for (obj_i, obj) in objects.iter().enumerate() {
         for sec_idx in 0..obj.sections.len() {
@@ -299,7 +325,25 @@ pub(super) fn create_plt_got(
                         sym_idx: si,
                     });
                 }
-                if sym.name.is_empty() || sym.is_local() {
+                if sym.is_local() {
+                    let t = rela.rela_type;
+                    let needs_slot = is_got64_family(t)
+                        || (is_gotpcrel_family(t)
+                            && gotpcrelx_relaxation(
+                                t,
+                                rela.addend,
+                                obj.section_data[sec_idx].as_slice(),
+                                rela.offset as usize,
+                                is_pie,
+                                local_got_target(sym),
+                            )
+                            .is_none());
+                    if needs_slot {
+                        local_got.insert((obj_i, si));
+                    }
+                    continue;
+                }
+                if sym.name.is_empty() {
                     continue;
                 }
                 let gsym_info = globals
@@ -347,14 +391,17 @@ pub(super) fn create_plt_got(
                         // on every execution of the instruction.
                         let relaxed = globals
                             .get(sym.name.as_str())
-                            .is_some_and(exec_got_relax_target)
-                            && gotpcrelx_relaxation(
-                                rela.rela_type,
-                                rela.addend,
-                                obj.section_data[sec_idx].as_slice(),
-                                rela.offset as usize,
-                                is_pie,
-                            )
+                            .and_then(exec_got_target)
+                            .and_then(|target| {
+                                gotpcrelx_relaxation(
+                                    rela.rela_type,
+                                    rela.addend,
+                                    obj.section_data[sec_idx].as_slice(),
+                                    rela.offset as usize,
+                                    is_pie,
+                                    target,
+                                )
+                            })
                             .is_some();
                         // Otherwise GOTPCREL needs a dedicated GOT entry, even if the
                         // symbol also has a PLT entry. The PLT's GOT.PLT slot uses
@@ -364,6 +411,20 @@ pub(super) fn create_plt_got(
                         // for other dynamic symbols, GLOB_DAT is used.
                         if !relaxed && got_only_set.insert(sym.name.to_string()) {
                             got_only_names.push(sym.name.to_string());
+                        }
+                    }
+                    // Large code model: `movabs $sym@GOT` can never be
+                    // relaxed, so the symbol needs a slot; `$f@PLTOFF` of a
+                    // library function needs its PLT entry (a call target,
+                    // never an address-of, so not canonical).
+                    t if is_got64_family(t) => {
+                        if got_only_set.insert(sym.name.to_string()) {
+                            got_only_names.push(sym.name.to_string());
+                        }
+                    }
+                    R_X86_64_PLTOFF64 if gsym_info.map(|g| g.0).unwrap_or(false) => {
+                        if plt_set.insert(sym.name.to_string()) {
+                            plt_names.push(sym.name.to_string());
                         }
                     }
                     R_X86_64_GOTTPOFF | R_X86_64_CODE_4_GOTTPOFF | R_X86_64_CODE_6_GOTTPOFF => {
@@ -407,6 +468,20 @@ pub(super) fn create_plt_got(
                                     offset: rela.offset,
                                     addend: rela.addend,
                                 });
+                            } else if sh_flags & (SHF_ALLOC | SHF_WRITE) == SHF_ALLOC {
+                                // The same reference from storage the loader
+                                // may not write after mapping (`movabs $var`
+                                // in -mcmodel=large -fno-pic text, a non-PIC
+                                // `.rodata` pointer): a dynamic relocation
+                                // there is a text relocation, which this
+                                // linker does not emit (and the image has no
+                                // DT_TEXTREL, so ld.so faulted writing it).
+                                // Like a PC32 reference, it takes the address
+                                // of the variable's copy-relocated home,
+                                // which is a link-time constant.
+                                if copy_reloc_set.insert(sym.name.to_string()) {
+                                    copy_reloc_names.push(sym.name.to_string());
+                                }
                             } else {
                                 // Absolute 64-bit reference to a dynamic DATA
                                 // symbol, e.g. the `_ZTVN10__cxxabiv1*` vtable
@@ -544,7 +619,13 @@ pub(super) fn create_plt_got(
     if is_pie && std::env::var("LCCC_DEBUG_GOT").is_ok() {
         eprintln!("[GOT] pie_relative={} entries", pie_relative.len());
     }
-    (plt_names, got_entries, abs_dyn_relocs, pie_relative)
+    (
+        plt_names,
+        got_entries,
+        abs_dyn_relocs,
+        pie_relative,
+        local_got,
+    )
 }
 
 #[cfg(test)]
@@ -567,6 +648,7 @@ mod tests {
             visibility: 0,
             lib_sym_value: 0x1000,
             version: None,
+            absolute: false,
         }
     }
 

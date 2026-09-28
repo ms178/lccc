@@ -683,13 +683,20 @@ if [ -x target/fastbuild/lccc-ld ]; then
     gate "linker-elf-grammar-fuzz" fast \
         python3 tests/linker/fuzz_elf_grammar.py \
             --lccc "$PWD/target/fastbuild/lccc-ld" --iters 64 --seed 20260906
-    # ELF32/i386 userspace links through lccc-ld (mirrors the ci.yml step):
-    # LCCC_REQUIRE_I386=1 makes a missing -m32 toolchain a FAIL, not a SKIP.
-    gate "i386-userspace-link" fast env LCCC_REQUIRE_I386=1 \
-        python3 tests/linker/run_linker_tests.py --lccc target/fastbuild/lccc --filter i386_
+    # The whole linker suite, x86-64 + i386 (mirrors the ci.yml step;
+    # ci-gate-parity requires --strict, LCCC_REQUIRE_I386=1 and the relocs
+    # tool on both sides, and no --filter/--tag).  --strict fails on SKIP.
+    # Fixtures assemble with the pinned GNU as 2.47 (installed above).
+    gate "kernel-relocs-tool" fast \
+        bash tests/linker/setup_kernel_tools.sh --prefix "$HOME/.cache/lccc-kernel-tools"
+    gate "linker-suite" fast env \
+        PATH="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin:$PATH" \
+        LCCC_REQUIRE_I386=1 \
+        LCCC_RELOCS_TOOL="$HOME/.cache/lccc-kernel-tools/bin/relocs" \
+        python3 tests/linker/run_linker_tests.py --lccc target/fastbuild/lccc --strict
 else
-    echo "SKIP  linker fuzz + i386 userspace link (target/fastbuild/lccc-ld not built)"
-    SKIPPED=$((SKIPPED + 3))
+    echo "SKIP  linker fuzz + linker suite (target/fastbuild/lccc-ld not built)"
+    SKIPPED=$((SKIPPED + 4))
 fi
 
 # Torture-corpus provisioning contract: stamp trust, integrity manifest,

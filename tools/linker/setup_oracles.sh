@@ -40,8 +40,10 @@
 #     release build of the same 23.1 branch is used instead.
 #
 # Storage layout (harness snapshot caps: ~128 MB / ~10k files):
-#   * installed oracle binaries -> $ARTIFACTS (= /home/user/artifacts/oracles):
-#     persisted, so a restore is just re-pointing wrappers;
+#   * installed oracle binaries -> $ARTIFACTS (= /home/user/artifacts/oracles),
+#     plus one .tar.xz per prefix in $ARTIFACTS/cache (restores drop
+#     executables but keep plain files), so a restore is an extraction and
+#     re-pointing wrappers, never a rebuild;
 #   * tarballs + build trees     -> $SRC (= /home/user/.cache/lccc-oracle-src):
 #     snapshot-EXCLUDED and deleted after a successful install — a binutils
 #     build tree alone is several hundred MB and would push the whole
@@ -70,6 +72,44 @@ mkdir -p "$PREFIX" "$SRC" "$LINKDIR"
 
 note() { printf '%s\n' "$*"; }
 
+# Fail in seconds, not after a 15-minute binutils build, when a tool a later
+# step needs is missing (a fresh container has no cmake, so mold used to die
+# with exit 127 only after bfd had been built).
+need() {
+    local t missing=()
+    for t in "$@"; do command -v "$t" >/dev/null 2>&1 || missing+=("$t"); done
+    [ ${#missing[@]} -eq 0 ] && return 0
+    note "setup_oracles: missing required tool(s): ${missing[*]}"
+    note "  e.g. sudo apt-get install -y build-essential cmake xz-utils curl git"
+    exit 1
+}
+
+# Wipe-resilient install cache.  Harness restores keep an installed prefix's
+# headers but drop its executables, so every wipe used to cost a full
+# rebuild (bfd ~15 min, mold ~40 min at -j2).  Each freshly installed prefix
+# is also archived as a plain, non-executable tarball under $CACHE, and a
+# missing executable is re-extracted from it before anything is rebuilt.
+CACHE="$ARTIFACTS/cache"
+restore_cached() {  # <prefix dir> <executable path inside it>
+    [ -x "$PREFIX/$1/$2" ] && return 0
+    [ -f "$CACHE/$1.tar.xz" ] || return 1
+    tar -xJf "$CACHE/$1.tar.xz" -C "$PREFIX" && [ -x "$PREFIX/$1/$2" ]
+}
+cache_prefix() {    # <prefix dir>
+    mkdir -p "$CACHE"
+    tar -cJf "$CACHE/$1.tar.xz.tmp" -C "$PREFIX" "$1"
+    mv -f "$CACHE/$1.tar.xz.tmp" "$CACHE/$1.tar.xz"
+}
+
+need curl tar xz
+restore_cached "bfd-$BINUTILS_VER" bin/ld || need make gcc g++
+restore_cached "mold-$MOLD_VER" bin/mold || need cmake make g++
+if [ "$WITH_WILD" = 1 ]; then
+    # rustup installs cargo outside the default PATH.
+    [ -d "$HOME/.cargo/bin" ] && PATH="$HOME/.cargo/bin:$PATH"
+    restore_cached wild-git bin/wild || need git cargo
+fi
+
 # ── GNU ld 2.47 (primary oracle) ────────────────────────────────────────────
 if [ -x "$PREFIX/bfd-$BINUTILS_VER/bin/ld" ]; then
     note "ld    : $("$PREFIX/bfd-$BINUTILS_VER/bin/ld" --version | head -1) (restored from $ARTIFACTS)"
@@ -86,6 +126,7 @@ else
           CFLAGS='-O2 -g0' CXXFLAGS='-O2 -g0'
       make -j"$JOBS" all-ld && make install-strip-ld )
     rm -rf "$BT"
+    cache_prefix "bfd-$BINUTILS_VER"
     note "ld    : $("$PREFIX/bfd-$BINUTILS_VER/bin/ld" --version | head -1) (built)"
 fi
 
@@ -107,6 +148,7 @@ else
       cmake --build build -j "$JOBS" && cmake --install build
       strip "$PREFIX/mold-$MOLD_VER/bin/mold" 2>/dev/null || true )
     rm -rf "$MT"
+    cache_prefix "mold-$MOLD_VER"
     note "mold  : $("$PREFIX/mold-$MOLD_VER/bin/mold" --version) (built, targets $MOLD_TARGETS)"
 fi
 
@@ -146,6 +188,7 @@ else
       mkdir -p "$PREFIX/wild-git/bin" && install -s target/release/wild "$PREFIX/wild-git/bin/wild"
       echo "$REV" > "$PREFIX/wild-git/REVISION" )
     rm -rf "$WT"
+    cache_prefix wild-git
     note "wild  : $("$PREFIX/wild-git/bin/wild" --version 2>&1 | head -1) (built)"
 fi
 

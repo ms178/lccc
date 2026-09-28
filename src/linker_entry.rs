@@ -5,9 +5,6 @@ use crate::backend::linker_common::Elf64Object;
 /// GNU property note flags, shared by every link path (built-in, shared
 /// object and linker-script links).
 pub use crate::backend::linker_common::cet::{PropertyLinkFlags, merge_property_into_objects};
-/// Small open-addressing hash sets, shared with the driver for the
-/// linker-synthesized-object tracking.
-pub use crate::common::fx_hash::FxHashSet;
 
 /// Version banner shared by the compiler driver's built-in linker query and
 /// the standalone `lccc-ld` binary.
@@ -121,7 +118,7 @@ pub fn link_with_script_x86(
     emit_relocs: bool,
     gc_sections: bool,
     soname: Option<&str>,
-    bsymbolic: bool,
+    dt_symbolic: bool,
     max_page_size: u64,
     defsym_defs: &[(String, String)],
 ) -> Result<(), String> {
@@ -134,7 +131,7 @@ pub fn link_with_script_x86(
         emit_relocs,
         gc_sections,
         soname,
-        bsymbolic,
+        dt_symbolic,
         max_page_size,
         defsym_defs,
     )
@@ -150,7 +147,7 @@ pub fn link_with_script_i386(
     emit_relocs: bool,
     gc_sections: bool,
     soname: Option<&str>,
-    bsymbolic: bool,
+    dt_symbolic: bool,
     max_page_size: u64,
     defsym_defs: &[(String, String)],
 ) -> Result<(), String> {
@@ -163,7 +160,7 @@ pub fn link_with_script_i386(
         emit_relocs,
         gc_sections,
         soname,
-        bsymbolic,
+        dt_symbolic,
         max_page_size,
         defsym_defs,
     )

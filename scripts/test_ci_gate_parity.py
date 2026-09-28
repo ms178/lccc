@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mutation tests: distinct asm-diff mode/corpus gates must stay hosted."""
+"""Mutation tests: CI/local gate parity (asm-diff modes, hosted mirror, linker suite)."""
 from __future__ import annotations
 
 from contextlib import redirect_stderr
@@ -179,6 +179,67 @@ class HostedStepsMirroredTest(unittest.TestCase):
         hosted = "\n".join(parity.run_script_bodies(p) for p in sorted(parity.WORKFLOWS.glob("*.yml")))
         parity.HOSTED_ONLY = self.saved
         self.assertEqual(self.check(local, hosted), (0, ""))
+
+
+class LinkerSuiteParityTest(unittest.TestCase):
+    """The whole linker suite, strictly, on both sides (review of PR #661)."""
+
+    LOCAL = (
+        'gate "kernel-relocs-tool" fast \\\n'
+        '    bash tests/linker/setup_kernel_tools.sh --prefix "$HOME/.cache/k"\n'
+        'gate "linker-suite" fast env \\\n'
+        '    PATH="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin:$PATH" \\\n'
+        "    LCCC_REQUIRE_I386=1 \\\n"
+        '    LCCC_RELOCS_TOOL="$HOME/.cache/k/bin/relocs" \\\n'
+        "    python3 tests/linker/run_linker_tests.py --lccc target/fastbuild/lccc --strict\n"
+    )
+    HOSTED = (
+        'bash tests/linker/setup_kernel_tools.sh --prefix "$HOME/.cache/k"\n'
+        'PATH="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin:$PATH" \\\n'
+        "LCCC_REQUIRE_I386=1 \\\n"
+        'LCCC_RELOCS_TOOL="$HOME/.cache/k/bin/relocs" \\\n'
+        "  python3 tests/linker/run_linker_tests.py \\\n"
+        "    --lccc target/fastbuild/lccc --strict -v\n"
+    )
+
+    def check(self, local: str, hosted: str) -> int:
+        with redirect_stderr(StringIO()):
+            return parity.check_linker_suite_parity(local, hosted)
+
+    def test_full_strict_suite_passes(self) -> None:
+        self.assertEqual(self.check(self.LOCAL, self.HOSTED), 0)
+
+    def test_repository_runs_the_full_suite(self) -> None:
+        hosted = "\n".join(parity.run_script_bodies(p) for p in sorted(parity.WORKFLOWS.glob("*.yml")))
+        self.assertEqual(self.check(parity.LOCAL.read_text(), hosted), 0)
+
+    def test_every_weakening_fails_on_either_side(self) -> None:
+        mutations = (
+            ("--strict", ""),                                   # SKIPs would pass
+            ("--strict", "--strict --filter i386_"),            # the old CI subset
+            ("--strict", "--strict --tag dynamic"),
+            ("--strict", "--strict --list"),                    # runs nothing
+            ("LCCC_REQUIRE_I386=1", "LCCC_REQUIRE_I386=0"),
+            ("LCCC_RELOCS_TOOL=", "LCCC_RELOCS_TOOX="),
+            ("gas-2.47-x86_64-linux-gnu/bin:", "gas-2.42/bin:"),  # unpinned assembler
+            ("python3 tests/linker/run_linker_tests.py", "echo python3 tests/linker/run_linker_tests.py"),
+            ("bash tests/linker/setup_kernel_tools.sh", "echo tests/linker/setup_kernel_tools.sh"),
+        )
+        for old, new in mutations:
+            for side in ("local", "hosted"):
+                with self.subTest(side=side, old=old, new=new):
+                    local = self.LOCAL.replace(old, new) if side == "local" else self.LOCAL
+                    hosted = self.HOSTED.replace(old, new) if side == "hosted" else self.HOSTED
+                    self.assertNotEqual((local, hosted), (self.LOCAL, self.HOSTED))
+                    self.assertEqual(self.check(local, hosted), 1)
+
+    def test_comment_is_not_an_invocation(self) -> None:
+        hosted = "\n".join("# " + line for line in self.HOSTED.splitlines())
+        self.assertEqual(self.check(self.LOCAL, hosted), 1)
+
+    def test_linker_scripts_are_path_tracked(self) -> None:
+        self.assertEqual(parity.COMMAND.findall("python3 tests/linker/fuzz_ld.py"),
+                         ["tests/linker/fuzz_ld.py"])
 
 
 if __name__ == "__main__":

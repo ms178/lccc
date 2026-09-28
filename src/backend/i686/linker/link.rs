@@ -11,7 +11,7 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use super::emit::emit_executable;
 use super::input::*;
 use super::options::{LinkOptions, check_capabilities};
-use super::sections::merge_sections;
+use super::sections::{merge_gnu_properties, merge_sections};
 use super::shared::emit_shared_library_32;
 use super::symbols::*;
 use super::types::*;
@@ -162,6 +162,10 @@ pub fn link_builtin(
         resolved.dso_visible_names()
     };
     let mut inputs = std::mem::take(&mut resolved.objects);
+
+    // Phase 4b: one merged GNU property note (CET / ISA level) in place of
+    // the per-input copies; every object here is a real input.
+    merge_gnu_properties(&mut inputs, &opts.properties);
 
     // Phase 5: Merge sections
     let (mut output_sections, mut section_name_to_idx, section_map) = merge_sections(&mut inputs);
@@ -435,6 +439,9 @@ pub fn link_shared(
         wrap: &opts.wrap,
     })?;
     let mut inputs = std::mem::take(&mut resolved.objects);
+
+    // One merged GNU property note, as in executables.
+    merge_gnu_properties(&mut inputs, &opts.properties);
 
     // Merge sections
     let (mut output_sections, mut section_name_to_idx, section_map) = merge_sections(&mut inputs);

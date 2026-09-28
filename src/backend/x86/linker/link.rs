@@ -61,7 +61,9 @@ fn apply_defsyms(
             globals.get(n).is_some_and(|g| g.defined_in.is_some()) || defsym::is_linker_defined(n)
         })
         .map_err(|e| e.gnu_message(index))?;
-        let value = match classified {
+        // Whether the definition is an address (slides with a PIE/.so load
+        // base) or a constant; see `GlobalSymbol::absolute`.
+        let (value, absolute) = match classified {
             // Alias: copy the target's whole definition, PLT/GOT slots included,
             // exactly as the old loop did. A target only the linker defines
             // (a magic symbol) has no address until layout, so it is deferred
@@ -86,16 +88,25 @@ fn apply_defsyms(
                         // `evaluate_pending_defsyms` overwrites the value
                         // after layout.
                         pending.push((name.clone(), target, index));
-                        0
+                        (0, false)
                     }
                 }
             }
-            Defsym::Constant(v) => v,
+            Defsym::Constant(v) => (v, true),
             // Validated now (a typo must fail the link even though the value
             // cannot be computed until layout), evaluated later.
+            // Its kind needs only WHICH operands are addresses, known now:
+            // an object symbol is one unless absolute, and the layout
+            // symbols `evaluate_pending_defsyms` will see are all addresses.
+            // (Any other name fails that evaluation as undefined.)
             Defsym::Expression(e) => {
+                let is_addr = defsym::is_address_expression(&e, |n| match globals.get(n) {
+                    Some(g) if g.defined_in.is_some() => !g.absolute,
+                    _ => defsym::is_linker_defined(n),
+                })
+                .map_err(|e| e.gnu_message(index))?;
                 pending.push((name.clone(), e, index));
-                0
+                (0, !is_addr)
             }
         };
         globals.insert(
@@ -122,6 +133,7 @@ fn apply_defsyms(
                 visibility: 0,
                 lib_sym_value: 0,
                 version: None,
+                absolute,
             },
         );
     }
@@ -221,6 +233,8 @@ pub fn link_builtin(
     phase!("load-inputs");
     // Parse user args using shared infrastructure
     let parsed_args = linker_common::parse_linker_args(user_args);
+    // Before the field moves below partially move `parsed_args`.
+    let requested_dyn_flags = parsed_args.requested_dyn_flags();
     // `-z ibt=func` & co: accepted, ignored, and warned about — verbatim
     // GNU ld wording.
     for kw in &parsed_args.z_ignored_keywords {
@@ -484,10 +498,12 @@ pub fn link_builtin(
         }
     }
 
-    // Linker-synthesized objects.  They must be excluded from the property
-    // note merge (a synthetic object without the note would veto every
-    // AND-class type) and from other "real input" decisions.
-    let mut synthetic_objects: FxHashSet<usize> = FxHashSet::default();
+    // Input loading is complete: `objects[..real_inputs]` are the objects
+    // read from files, and every object the linker synthesizes from here on
+    // (build-id note, string-merge pool, property carrier) is appended after
+    // them.  The property note merge counts only the real inputs — a
+    // synthetic object carries no note and would veto every AND-class type.
+    let real_inputs = objects.len();
 
     // --build-id: contribute a placeholder .note.gnu.build-id so the section
     // takes part in layout like any other input section.  The digest itself is
@@ -496,7 +512,6 @@ pub fn link_builtin(
     // `patch_output_build_id`).  Debian's gcc passes --build-id on every link.
     if parsed_args.build_id {
         objects.push(linker_common::build_id::synthetic_note_object());
-        synthetic_objects.insert(objects.len() - 1);
     }
 
     // Resolve remaining undefined symbols from default system libraries
@@ -560,6 +575,28 @@ pub fn link_builtin(
     // `--export-dynamic` roots must not include hidden symbols.
     linker_common::merge_object_visibility(&objects, &mut globals);
 
+    // COMDAT (SHT_GROUP/GRP_COMDAT) deduplication.
+    //
+    // C++ emits one definition of every inline function, template
+    // instantiation and vtable in EVERY translation unit that uses it, and
+    // declares the copies interchangeable via a group signature. Symbol
+    // resolution already picked a single winner, so the program behaved
+    // correctly -- but the losing section BODIES were still laid out, as dead
+    // bytes nothing could reach. This runs before ICF because it is cheaper
+    // and needs no content comparison: the compiler already told us these are
+    // the same entity.  It also runs before the --gc-sections sweep, which
+    // must know the losers: a reference to a COMDAT symbol reaches the
+    // surviving copy, not the referencing object's own.
+    let comdat_plan = linker_common::comdat::plan_comdat(&objects);
+    if std::env::var("LCCC_DEBUG_COMDAT").is_ok() {
+        eprintln!(
+            "[comdat] groups_discarded={} sections={} bytes_saved={}",
+            comdat_plan.groups_discarded,
+            comdat_plan.dead.len(),
+            comdat_plan.bytes_saved
+        );
+    }
+
     // Garbage-collect unreferenced sections when --gc-sections is active.
     // This removes sections not reachable from entry points, which may also
     // eliminate undefined symbol references from dead code.
@@ -577,13 +614,20 @@ pub fn link_builtin(
         // uses for the very same set.
         //
         // A version script narrows the set identically in both places.
-        if export_dynamic {
+        // The same holds for a definition a shared library of the link
+        // names (it calls back into it, or the program interposes it):
+        // `emit_executable` exports it, so it is a root.
+        let dso_names = objects.dso_names();
+        if export_dynamic || !dso_names.is_empty() {
             let version_script = parsed_args
                 .version_script
                 .as_deref()
                 .and_then(linker_common::VersionScript::parse);
             gc_roots.extend(globals.iter().filter_map(|(name, g)| {
                 if !linker_common::is_exported_dynamic_symbol(g) {
+                    return None;
+                }
+                if !export_dynamic && !dso_names.contains(name.split('@').next().unwrap_or(name)) {
                     return None;
                 }
                 if let Some(ref vs) = version_script
@@ -595,7 +639,12 @@ pub fn link_builtin(
                 Some(name.clone())
             }));
         }
-        linker_common::gc_collect_sections_elf64_roots(&objects, &gc_roots)
+        linker_common::gc_collect_sections_elf64_full(
+            &objects,
+            &gc_roots,
+            &FxHashSet::default(),
+            &comdat_plan.dead,
+        )
     } else {
         FxHashSet::default()
     };
@@ -607,7 +656,11 @@ pub fn link_builtin(
         let mut referenced_from_live: FxHashSet<String> = FxHashSet::default();
         for (obj_idx, obj) in objects.iter().enumerate() {
             for (sec_idx, relas) in obj.relocations.iter().enumerate() {
-                if dead_sections.contains(&(obj_idx, sec_idx)) {
+                // COMDAT losers are not emitted either; the sweep never saw
+                // them, so they are not in `dead_sections`.
+                if dead_sections.contains(&(obj_idx, sec_idx))
+                    || comdat_plan.dead.contains(&(obj_idx, sec_idx))
+                {
                     continue;
                 }
                 for rela in relas {
@@ -634,26 +687,6 @@ pub fn link_builtin(
     linker_common::check_undefined_symbols_elf64_verbose(&globals, 20, &objects)?;
 
     phase!("resolve+gc");
-    // COMDAT (SHT_GROUP/GRP_COMDAT) deduplication.
-    //
-    // C++ emits one definition of every inline function, template
-    // instantiation and vtable in EVERY translation unit that uses it, and
-    // declares the copies interchangeable via a group signature. Symbol
-    // resolution already picked a single winner, so the program behaved
-    // correctly -- but the losing section BODIES were still laid out, as dead
-    // bytes nothing could reach. This runs before ICF because it is cheaper
-    // and needs no content comparison: the compiler already told us these are
-    // the same entity.
-    let comdat_plan = linker_common::comdat::plan_comdat(&objects);
-    if std::env::var("LCCC_DEBUG_COMDAT").is_ok() {
-        eprintln!(
-            "[comdat] groups_discarded={} sections={} bytes_saved={}",
-            comdat_plan.groups_discarded,
-            comdat_plan.dead.len(),
-            comdat_plan.bytes_saved
-        );
-    }
-
     // SHF_MERGE string/constant deduplication (.rodata.str1.1, .rodata.cst8):
     // build pools across all objects, rewrite relocations to pool symbols,
     // and retire the input sections. Disabled with LCCC_NO_STRING_MERGE=1.
@@ -739,13 +772,17 @@ pub fn link_builtin(
     // front, next to the argument parsing.)
     if let Some(carrier) = linker_common::cet::merge_property_into_objects(
         &mut objects,
-        &synthetic_objects,
+        real_inputs,
         &cet_flags,
         false, // 64-bit link: 16-byte property entries
     )? {
-        synthetic_objects.insert(objects.len());
         objects.push(carrier);
     }
+
+    // One copy of each distinct CIE and no zero gaps between .eh_frame
+    // inputs (after the FDE prunes above, which may leave a CIE unused but
+    // never change one).
+    let eh_packing = linker_common::pack_eh_frame_sections(&mut objects, &dead_sections);
 
     // Merge sections (skip dead sections when gc-sections is active)
     let mut output_sections: Vec<OutputSection> = Vec::new();
@@ -756,6 +793,7 @@ pub fn link_builtin(
         &mut section_map,
         &dead_sections,
     );
+    linker_common::apply_cie_redirects(&mut objects, &section_map, &eh_packing)?;
 
     // Point folded sections at the representative's placement. This must run
     // after the merge, when the survivor has a real (output, offset) pair, and
@@ -788,7 +826,7 @@ pub fn link_builtin(
     phase!("common");
     // Create PLT/GOT
     let is_pie = parsed_args.is_pie;
-    let (plt_names, got_entries, abs_dyn_relocs, pie_relative) =
+    let (plt_names, got_entries, abs_dyn_relocs, pie_relative, local_got) =
         create_plt_got(&objects, &mut globals, is_pie);
 
     phase!("plt-got");
@@ -825,11 +863,13 @@ pub fn link_builtin(
         &icf_plan.redirect,
         &plt_names,
         &got_entries,
+        &local_got,
         &abs_dyn_relocs,
         &pie_relative,
         &needed_sonames,
         output_path,
         export_dynamic,
+        objects.dso_names(),
         &rpath_entries,
         use_runpath,
         is_static,
@@ -837,6 +877,7 @@ pub fn link_builtin(
         entry_symbol.as_deref(),
         parsed_args.z_now,
         parsed_args.z_relro,
+        requested_dyn_flags,
         parsed_args.map_path.as_deref(),
         parsed_args.version_script.as_deref(),
         is_pie,
@@ -907,7 +948,8 @@ pub fn link_shared(
     let sort_common = parsed.sort_common;
     let version_script: Option<String> = parsed.version_script.clone();
     let no_undefined = parsed.no_undefined;
-    let bsymbolic = parsed.bsymbolic;
+    let symbolic = parsed.symbolic;
+    let requested_dyn_flags = parsed.requested_dyn_flags();
     let exclude_libs: Vec<String> = parsed.exclude_libs.clone();
 
     // (path_or_lib, is_lib, whole_archive, as_needed, static_search), in
@@ -1074,20 +1116,25 @@ pub fn link_shared(
     // GNU property note merge, as on the executable path (input level,
     // before the section merge — see the comment in `link_builtin`;
     // `cet_flags` was computed up front, next to the argument parsing).
-    let synthetic_objects: FxHashSet<usize> = FxHashSet::default();
+    // Nothing is synthesized before this point on the shared-library path,
+    // so every object is a real input.
+    let real_inputs = objects.len();
     if let Some(carrier) = linker_common::cet::merge_property_into_objects(
         &mut objects,
-        &synthetic_objects,
+        real_inputs,
         &cet_flags,
         false, // 64-bit link: 16-byte property entries
     )? {
         objects.push(carrier);
     }
 
-    // Merge sections (no gc-sections for shared libraries)
+    // Merge sections (no gc-sections for shared libraries), packing
+    // .eh_frame as on the executable path.
+    let eh_packing = linker_common::pack_eh_frame_sections(&mut objects, &FxHashSet::default());
     let mut output_sections: Vec<OutputSection> = Vec::new();
     let mut section_map: FxHashMap<(usize, usize), (usize, u64)> = FxHashMap::default();
     linker_common::merge_sections_elf64(&objects, &mut output_sections, &mut section_map);
+    linker_common::apply_cie_redirects(&mut objects, &section_map, &eh_packing)?;
 
     // Allocate COMMON symbols
     linker_common::allocate_common_symbols_elf64(&mut globals, &mut output_sections, sort_common);
@@ -1105,7 +1152,10 @@ pub fn link_shared(
         &rpath_entries,
         use_runpath,
         version_script.as_deref(),
-        bsymbolic,
+        symbolic,
+        requested_dyn_flags,
+        parsed.z_relro,
+        parsed.z_now,
         &exclude_libs,
         parsed.map_path.as_deref(),
         &pending_defsyms,
