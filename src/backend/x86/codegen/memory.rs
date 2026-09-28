@@ -2813,6 +2813,13 @@ impl X86Codegen {
 
     pub(super) fn emit_acc_to_secondary_impl(&mut self) {
         self.state.emit("    movq %rax, %rcx");
+        // S20 SEC contract: this hook overwrites %rcx — reached on x86-64 via
+        // over-aligned-alloca GEP bases (traits.rs default emit_gep) and the
+        // generic memcpy staging path — so any parked SEC residency is stale
+        // from here on. Invalidate per the conservative emit_reg_to_secondary
+        // precedent (mirroring the ACC entry would also be sound, but must
+        // never cascade a stale ACC park).
+        self.state.reg_cache.invalidate_sec();
     }
 
     pub(super) fn emit_memcpy_store_dest_from_acc_impl(&mut self) {

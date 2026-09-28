@@ -71,6 +71,18 @@ pub struct RegCache {
     /// unclassified line. Release builds compile the field away.
     #[cfg(debug_assertions)]
     pub(crate) acc_park_epoch: u64,
+    /// DEBUG-ONLY: the `AsmOutput` %rcx shadow epoch at the moment `sec`
+    /// was last (re)written. The %rcx mirror of `acc_park_epoch`: every
+    /// park on an epoch-enabled target (x86-64, i686) goes through
+    /// `CodegenState::park_sec` (which syncs this) and every consume goes
+    /// through `CodegenState::sec_has_verified` (which asserts it). An
+    /// emitter that writes %rcx without `invalidate_sec` leaves the epochs
+    /// unequal at the next consume — the dead-%rcx-read miscompile class
+    /// (CC-O0CALL-1: the SIGSEGV-via-garbage-address family) becomes a
+    /// loud debug assertion naming the value and the clobbering line.
+    /// Release builds compile the field away.
+    #[cfg(debug_assertions)]
+    pub(crate) sec_park_epoch: u64,
 }
 
 impl RegCache {
@@ -1317,6 +1329,25 @@ impl CodegenState {
         }
     }
 
+    /// Record that the secondary register now holds `value_id`, syncing
+    /// the debug %rcx shadow epoch (see [`RegCache::sec_park_epoch`]).
+    /// The %rcx mirror of [`park_acc`](Self::park_acc): every park on an
+    /// epoch-enabled target (x86-64, i686) MUST go through this — a raw
+    /// `set_sec` leaves the epoch stale and the next `sec_has_verified`
+    /// would (correctly, but spuriously) report a discipline violation.
+    /// i686 and RISC-V keep raw `set_sec` for now: their secondary-cache
+    /// traffic is producer-only (i686: no `sec_has` consumer exists) or
+    /// unwired to the epoch (RISC-V: foreign ISA, the scan is inert), so
+    /// migrating them would add epoch bookkeeping no assertion can observe.
+    #[inline]
+    pub fn park_sec(&mut self, value_id: u32, is_alloca: bool) {
+        self.reg_cache.set_sec(value_id, is_alloca);
+        #[cfg(debug_assertions)]
+        {
+            self.reg_cache.sec_park_epoch = self.out.debug_rcx_epoch();
+        }
+    }
+
     /// The authoritative accumulator query for every site about to SOURCE a
     /// value FROM %rax. Returns `reg_cache.acc_has(...)`, and in debug builds
     /// asserts the shadow epoch is unchanged since the park — i.e. that no
@@ -1347,13 +1378,65 @@ impl CodegenState {
                     "x86 codegen: acc cache claims value {} is resident in %rax, but the \
                      %rax shadow epoch moved since the park ({} -> {}): some emitter wrote \
                      %rax without invalidate_acc, and sourcing the value from %rax now \
-                     reads a dead register. Last unclassified emitted line: {:?} \
-                     (unclassified vocabulary so far: {:?} — extend the analyzer tables \
-                     in backend/common.rs if that line is benign — otherwise fix the \
-                     missing invalidate_acc).",
+                     reads a dead register. Last classified %rax write: {:?}. Last \
+                     unclassified emitted line: {:?} (unclassified vocabulary so far: \
+                     {:?} — extend the analyzer tables in backend/common.rs if that \
+                     line is benign — otherwise fix the missing invalidate_acc).",
                     value_id,
                     park,
                     now,
+                    self.out.debug_last_rax_write(),
+                    self.out.debug_last_unclassified(),
+                    self.out.debug_unclassified_mnemonics()
+                );
+            }
+        }
+        has
+    }
+
+    /// The authoritative secondary-cache query for every site about to
+    /// SOURCE a value FROM %rcx. Returns `reg_cache.sec_has(...)`, and in
+    /// debug builds asserts the shadow epoch is unchanged since the park —
+    /// i.e. that no instruction wrote any part of %rcx without an
+    /// `invalidate_sec` since the cache claimed residency. The %rcx mirror
+    /// of [`acc_has_verified`](Self::acc_has_verified), and the mechanical
+    /// enforcement behind the `movq %rcx,%rax` SEC fast path in
+    /// `operand_to_rax`: without a slot there is no slow-but-correct
+    /// fallback, only a dead-register read (the CC-O0CALL-1 SIGSEGV
+    /// family) or, after an over-invalidation, the loud no-location panic.
+    /// The epoch check catches the under-invalidation direction.
+    ///
+    /// Sites that merely test residency to decide whether to skip a RELOAD
+    /// (reading %rcx to move it elsewhere is still a consume — they must
+    /// use this too). Only genuinely non-consuming probes may call
+    /// `reg_cache.sec_has` directly (today: none on x86-64; the i686 and
+    /// RISC-V call sites stay raw — see `park_sec` — because no epoch
+    /// assertion can observe them).
+    #[inline]
+    pub fn sec_has_verified(&self, value_id: u32, is_alloca: bool) -> bool {
+        let has = self.reg_cache.sec_has(value_id, is_alloca);
+        #[cfg(debug_assertions)]
+        {
+            // The assert is meaningful only on epoch-enabled targets; on a
+            // foreign ISA the epoch cannot move (the scan is gated off), so
+            // a stale park epoch would compare against a frozen 0.
+            if has && self.out.rax_epoch_active {
+                let park = self.reg_cache.sec_park_epoch;
+                let now = self.out.debug_rcx_epoch();
+                debug_assert!(
+                    park == now,
+                    "x86 codegen: secondary cache claims value {} is resident in %rcx, but the \
+                     %rcx shadow epoch moved since the park ({} -> {}): some emitter wrote \
+                     %rcx without invalidate_sec, and sourcing the value from %rcx now \
+                     reads a dead register (CC-O0CALL-1 class). Last classified %rcx \
+                     write: {:?}. Last unclassified emitted line: {:?} (unclassified \
+                     vocabulary so far: {:?} — extend the analyzer tables in \
+                     backend/common.rs if that line is benign — otherwise fix the \
+                     missing invalidate_sec).",
+                    value_id,
+                    park,
+                    now,
+                    self.out.debug_last_rcx_write(),
                     self.out.debug_last_unclassified(),
                     self.out.debug_unclassified_mnemonics()
                 );
@@ -1575,6 +1658,104 @@ mod acc_epoch_validator_tests {
         assert!(
             refused.is_err(),
             "on an opted-in target the stale park must be refused"
+        );
+    }
+}
+
+/// The %rcx mirror of `acc_epoch_validator_tests`: the mechanical
+/// enforcement contract of the secondary cache. The bug class is the
+/// CC-O0CALL-1 family (an emitter writes %rcx without `invalidate_sec`,
+/// the next SEC consume sources a dead register — a SIGSEGV via a garbage
+/// address in the call-staging shape, silent corruption elsewhere).
+#[cfg(all(test, debug_assertions))]
+mod sec_epoch_validator_tests {
+    use super::*;
+
+    /// An emitter that writes %rcx through the output sink without
+    /// `invalidate_sec` desyncs the shadow epoch, and the next verified
+    /// consume must refuse (debug panic) instead of sourcing a dead
+    /// register. The release predicate itself is unchanged — the assert is
+    /// the enforcement.
+    #[test]
+    fn unstaged_rcx_clobber_is_caught_between_park_and_consume() {
+        let mut state = CodegenState::new();
+        // This test speaks x86 vocabulary, so it opts into the discipline
+        // exactly as the x86-64/i686 constructors do (the flag gates both
+        // shadow epochs).
+        state.enable_rax_epoch_discipline();
+        // Park v7 (e.g. the tail of emit_to_rcx): the park syncs the epoch.
+        state.park_sec(7, false);
+        assert!(
+            state.sec_has_verified(7, false),
+            "a fresh park verifies and consumes"
+        );
+        // Benign traffic that does not write %rcx: still verifiable. (A
+        // %rax write is benign HERE — the epochs are independent.)
+        state.out.emit("    movq %rbx, %rax");
+        state.out.emit("    movl %ecx, -8(%rbp)");
+        state.out.emit("    divq %rcx");
+        assert!(state.sec_has_verified(7, false), "non-writing lines hold");
+        // An UNSTAGED clobber (the bug class: a future emitter forgets its
+        // invalidate_sec). The sink classifies the write and bumps the epoch.
+        state.out.emit("    movq $1, %rcx");
+        assert_ne!(
+            state.reg_cache.sec_park_epoch,
+            state.out.debug_rcx_epoch(),
+            "the sink must bump the epoch for the %rcx write"
+        );
+        // The verified consume refuses loudly; the raw predicate is what
+        // release would consult (the assert is the whole difference).
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            state.sec_has_verified(7, false);
+        }));
+        assert!(
+            refused.is_err(),
+            "stale sec residency must panic under debug_assertions"
+        );
+        assert!(
+            state.reg_cache.sec_has(7, false),
+            "the cache entry itself is unchanged (invalidation, not the query, fixes it)"
+        );
+        // A proper invalidate_sec clears the entry; the consume is simply
+        // false — the over-invalidation direction, safe by construction.
+        state.reg_cache.invalidate_sec();
+        assert!(!state.sec_has_verified(7, false));
+    }
+
+    /// Re-parking after an intervening clobber heals the cache: the epoch
+    /// syncs to the CURRENT sink state, so the next consume verifies again.
+    #[test]
+    fn sec_repark_after_clobber_resyncs_the_epoch() {
+        let mut state = CodegenState::new();
+        state.enable_rax_epoch_discipline();
+        state.park_sec(3, false);
+        state.out.emit("    addq %rax, %rcx");
+        assert_ne!(
+            state.reg_cache.sec_park_epoch,
+            state.out.debug_rcx_epoch(),
+            "addq %rcx is an explicit-destination write and must bump"
+        );
+        // The value is recomputed and re-parked:
+        state.park_sec(3, false);
+        assert!(
+            state.sec_has_verified(3, false),
+            "a re-park re-establishes residency with a fresh epoch"
+        );
+    }
+
+    /// The shared opt-in flag gates the SEC assertion too: without it the
+    /// scan is inert, the epoch cannot move, and a stale park stays
+    /// unverifiable-but-silent (the foreign-ISA posture).
+    #[test]
+    fn sec_assert_is_inert_without_target_opt_in() {
+        let mut state = CodegenState::new();
+        assert!(!state.out.rax_epoch_active);
+        state.park_sec(9, false);
+        state.out.emit("    movq $1, %rcx");
+        assert_eq!(state.out.debug_rcx_epoch(), 0, "inert scan never bumps");
+        assert!(
+            state.sec_has_verified(9, false),
+            "without the opt-in the query degrades to the raw predicate"
         );
     }
 }

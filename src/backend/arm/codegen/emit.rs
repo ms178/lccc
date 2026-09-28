@@ -1486,8 +1486,18 @@ impl ArmCodegen {
                         }
                     }
                     IrConst::D32(v) => {
-                        self.state
-                            .emit_fmt(format_args!("    mov x0, #{}", *v as i64));
+                        // BID bit pattern, zero-extended: values through
+                        // imm16 are one `mov` (the movz alias); anything
+                        // larger needs the movz/movk sequence (which also
+                        // finds the single-`movn` form where it applies) —
+                        // a bare `mov x0, #N` past 65535 is unencodable
+                        // and GAS rejects it. Garden-variety decimal
+                        // literals all exceed it (2.0DF = 0x32000014).
+                        if *v <= 65535 {
+                            self.state.emit_fmt(format_args!("    mov x0, #{}", v));
+                        } else {
+                            self.emit_load_imm64("x0", *v as i64);
+                        }
                     }
                     IrConst::D64(v) => {
                         self.emit_load_imm64("x0", *v as i64);
@@ -1731,8 +1741,11 @@ impl ArmCodegen {
         match ty {
             IrType::I8 | IrType::U8 => "strb",
             IrType::I16 | IrType::U16 => "strh",
-            IrType::I32 | IrType::U32 | IrType::F32 => "str", // 32-bit store with w register
-            _ => "str",                                       // 64-bit store with x register
+            // D32 rides the 32-bit arm: a 32-bit carrier is a 32-bit
+            // carrier — moves never interpret the bits (cf. `reg_for_type`
+            // and `load_instr_for_type_impl`, which classify D32 identically).
+            IrType::I32 | IrType::U32 | IrType::F32 | IrType::D32 => "str", // 32-bit store with w register
+            _ => "str", // 64-bit store with x register
         }
     }
 
@@ -1747,6 +1760,9 @@ impl ArmCodegen {
                 | IrType::I32
                 | IrType::U32
                 | IrType::F32
+                // D32 views through w registers exactly like U32: moves
+                // only, zero-extending (cf. `str_for_type`).
+                | IrType::D32
         );
         match base {
             "x0" => {
@@ -2729,21 +2745,21 @@ impl ArchCodegen for ArmCodegen {
         if info.disp != 0 || info.shift > 3 {
             return false;
         }
-        // Type mirror of the indexed emitters: the `ldr`/`str` general
-        // arms move 64-bit carriers, so D64 folds width-exactly, but D32
-        // would ride the same 64-bit arms (over-read on load, over-store
-        // on store — the AArch64 D32 width bug is global to every
-        // load/store path, indexed or not; refusing the fold keeps D32 on
-        // the non-indexed path with identical behavior, no regression).
-        // F128 and wide ints are map-excluded upstream
-        // (`is_foldable_mem_ty`) and refused here too, so the decider
-        // stays honest if that guarantee ever widens.
+        // Type mirror of the indexed emitters: every arm below moves its
+        // type width-exactly. D64 rides the 64-bit `ldr`/`str` arms; D32
+        // rides the w-view arms exactly like U32 (a 32-bit carrier is a
+        // 32-bit carrier — moves never interpret the bits; D32 is never
+        // FP-homed, so no FP arm can mis-claim it). F128 and wide ints
+        // are map-excluded upstream (`is_foldable_mem_ty`) and refused
+        // here too, so the decider stays honest if that guarantee ever
+        // widens.
         let types_ok = info.access_tys.iter().all(|t| {
             matches!(
                 t,
                 IrType::F64
                     | IrType::F32
                     | IrType::D64
+                    | IrType::D32
                     | IrType::I8
                     | IrType::U8
                     | IrType::I16
@@ -3603,10 +3619,18 @@ mod indexed_fold_contract_tests {
         let cg = gpr_homed_cg();
         // Sub-word types fold only unshifted (no shifted register-offset
         // form); the rest take shift 2 (scale 4).
-        for ty in [IrType::F64, IrType::F32, IrType::D64] {
+        for ty in [IrType::F64, IrType::D64] {
             assert!(
                 cg.indexed_fold_ok(&gep_info(vec![ty], 2)),
                 "{ty:?} must fold: the emitter's 64-bit arms move it width-exactly"
+            );
+        }
+        // D32 rides the w-view arms exactly like U32 (zero-extending);
+        // F32 rides the s-view arms.
+        for ty in [IrType::F32, IrType::D32] {
+            assert!(
+                cg.indexed_fold_ok(&gep_info(vec![ty], 2)),
+                "{ty:?} must fold: the emitter's 32-bit-view arms move it width-exactly"
             );
         }
         for ty in [IrType::I64, IrType::U64, IrType::Ptr] {
@@ -3631,12 +3655,13 @@ mod indexed_fold_contract_tests {
     }
 
     #[test]
-    fn decider_refuses_d32_and_map_excluded_types() {
+    fn decider_refuses_map_excluded_types() {
         let cg = gpr_homed_cg();
-        // D32 would ride the emitter's 64-bit `ldr`/`str` arms
-        // (over-read/over-store); F128 and wide ints are map-excluded
-        // upstream and refused here too.
-        for ty in [IrType::D32, IrType::F128, IrType::I128, IrType::U128] {
+        // F128 and wide ints are map-excluded upstream and refused here
+        // too. (D32 used to be refused as well, before the emitter grew
+        // width-exact w-view arms for it; it now folds — see the accept
+        // test above.)
+        for ty in [IrType::F128, IrType::I128, IrType::U128] {
             assert!(
                 !cg.indexed_fold_ok(&gep_info(vec![ty], 2)),
                 "{ty:?} must be refused before the fold is guaranteed"
@@ -3649,5 +3674,185 @@ mod indexed_fold_contract_tests {
         let cg = gpr_homed_cg();
         assert!(cg.indexed_fold_ok(&gep_info(vec![IrType::F32], 3)));
         assert!(!cg.indexed_fold_ok(&gep_info(vec![IrType::F32], 4)));
+    }
+
+    #[test]
+    fn d32_indexed_load_and_store_move_through_w_regs() {
+        // GP-homed dest: `ldr wN, [xB, xI, lsl #2]` — never the x view
+        // (a 64-bit load would over-read the packed array element).
+        let mut cg = gpr_homed_cg();
+        cg.reg_assignments.insert(100, PhysReg(2));
+        assert!(cg.emit_load_indexed_impl(&Value(100), &Value(1), &Value(2), 2, IrType::D32));
+        let buf = &cg.state.out.buf;
+        assert!(
+            buf.contains("ldr w") && buf.contains("lsl #2"),
+            "D32 indexed load must use the w view, got: {buf:?}"
+        );
+        assert!(
+            !buf.contains("ldr x"),
+            "no 64-bit load for D32, got: {buf:?}"
+        );
+
+        // GP-homed source: `str wN, [...]` — never the x view (a 64-bit
+        // store would clobber the neighboring element).
+        let mut cg = gpr_homed_cg();
+        cg.reg_assignments.insert(101, PhysReg(2));
+        assert!(cg.emit_store_indexed_impl(
+            &Operand::Value(Value(101)),
+            &Value(1),
+            &Value(2),
+            2,
+            IrType::D32
+        ));
+        let buf = &cg.state.out.buf;
+        assert!(
+            buf.contains("str w") && buf.contains("lsl #2"),
+            "D32 indexed store must use the w view, got: {buf:?}"
+        );
+        assert!(
+            !buf.contains("str x"),
+            "no 64-bit store for D32, got: {buf:?}"
+        );
+    }
+
+    #[test]
+    fn d32_indexed_const_store_uses_str_w0() {
+        // Unhomed constant: materialize into x0, then `str w0` (the low
+        // 32 bits carry the value; the store must not touch x0's view).
+        let mut cg = gpr_homed_cg();
+        assert!(cg.emit_store_indexed_impl(
+            &Operand::Const(IrConst::D32(5)),
+            &Value(1),
+            &Value(2),
+            2,
+            IrType::D32
+        ));
+        let buf = &cg.state.out.buf;
+        assert!(
+            buf.contains("str w0, ["),
+            "D32 indexed const store must use `str w0`, got: {buf:?}"
+        );
+        assert!(
+            !buf.contains("str x0"),
+            "no 64-bit store for D32, got: {buf:?}"
+        );
+    }
+
+    #[test]
+    fn decimal_zero_indexed_stores_use_zero_regs() {
+        // `D32(0)` carries the exact zero bits: `str wzr` is exact and
+        // skips the per-iteration materialization.
+        let mut cg = gpr_homed_cg();
+        assert!(cg.emit_store_indexed_impl(
+            &Operand::Const(IrConst::D32(0)),
+            &Value(1),
+            &Value(2),
+            2,
+            IrType::D32
+        ));
+        assert!(
+            cg.state.out.buf.contains("str wzr, ["),
+            "D32(0) indexed store must use `str wzr`, got: {:?}",
+            cg.state.out.buf
+        );
+
+        // `D64(0)` likewise through `str xzr` at the 8-byte scale.
+        let mut cg = gpr_homed_cg();
+        assert!(cg.emit_store_indexed_impl(
+            &Operand::Const(IrConst::D64(0)),
+            &Value(1),
+            &Value(2),
+            3,
+            IrType::D64
+        ));
+        assert!(
+            cg.state.out.buf.contains("str xzr, ["),
+            "D64(0) indexed store must use `str xzr`, got: {:?}",
+            cg.state.out.buf
+        );
+    }
+
+    #[test]
+    fn d32_indexed_large_const_store_stays_encodable() {
+        // A D32 constant past imm16 (garden-variety decimal literals all
+        // are: 2.0DF = 0x32000014) must materialize through movz/movk, not
+        // a bare `mov x0, #N` — GAS rejects the latter as unencodable.
+        let mut cg = gpr_homed_cg();
+        assert!(cg.emit_store_indexed_impl(
+            &Operand::Const(IrConst::D32(0xdead_beef)),
+            &Value(1),
+            &Value(2),
+            2,
+            IrType::D32
+        ));
+        let buf = &cg.state.out.buf;
+        assert!(
+            !buf.contains("mov x0, #3735928559"),
+            "unencodable mov for large D32 const, got: {buf:?}"
+        );
+        assert!(
+            buf.contains("movz x0, #48879") && buf.contains("movk x0, #57005, lsl #16"),
+            "large D32 const must materialize via movz/movk, got: {buf:?}"
+        );
+        assert!(
+            buf.contains("str w0, ["),
+            "D32 indexed const store must use `str w0`, got: {buf:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod operand_const_materialization_tests {
+    use super::*;
+
+    fn materialize(c: IrConst) -> String {
+        let mut cg = ArmCodegen::new();
+        cg.operand_to_x0(&Operand::Const(c));
+        cg.state.out.buf.clone()
+    }
+
+    #[test]
+    fn d32_small_const_is_one_mov() {
+        // Through imm16 the movz alias is a single encodable `mov`.
+        for (v, want) in [
+            (0u32, "mov x0, #0"),
+            (5, "mov x0, #5"),
+            (65535, "mov x0, #65535"),
+        ] {
+            let buf = materialize(IrConst::D32(v));
+            assert!(
+                buf.contains(want) && !buf.contains("movz") && !buf.contains("movk"),
+                "D32({v}) must be one `{want}`, got: {buf:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn d32_large_const_uses_movz_movk() {
+        // Past imm16 a bare `mov` is unencodable: movz/movk instead.
+        // 0xDEADBEEF = low half 48879, high half 57005.
+        let buf = materialize(IrConst::D32(0xdead_beef));
+        assert!(
+            !buf.contains("mov x0, #"),
+            "no bare mov for D32 past imm16, got: {buf:?}"
+        );
+        assert!(
+            buf.contains("movz x0, #48879") && buf.contains("movk x0, #57005, lsl #16"),
+            "D32(0xDEADBEEF) must be movz+movk, got: {buf:?}"
+        );
+    }
+
+    #[test]
+    fn d32_shifted_halfword_is_one_movz() {
+        // One nonzero halfword above the low 16 bits is a single
+        // shifted `movz` — optimal, and never a bare `mov` (which has
+        // no shift field and would be unencodable here).
+        let buf = materialize(IrConst::D32(0xffff_0000));
+        assert!(
+            buf.contains("movz x0, #65535, lsl #16")
+                && !buf.contains("movk")
+                && !buf.contains("movn"),
+            "D32(0xFFFF0000) must be one shifted movz, got: {buf:?}"
+        );
     }
 }
