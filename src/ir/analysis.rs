@@ -324,6 +324,70 @@ pub fn compute_dominators(num_blocks: usize, preds: &FlatAdj, succs: &FlatAdj) -
     idom
 }
 
+/// Cooper-Harvey-Kennedy iterative dominators: the former implementation,
+/// kept as an independent oracle for [`compute_dominators`].
+#[cfg(test)]
+fn compute_dominators_chk(num_blocks: usize, preds: &FlatAdj, succs: &FlatAdj) -> Vec<usize> {
+    fn intersect(
+        mut finger1: usize,
+        mut finger2: usize,
+        idom: &[usize],
+        rpo_number: &[usize],
+    ) -> usize {
+        while finger1 != finger2 {
+            while rpo_number[finger1] > rpo_number[finger2] {
+                finger1 = idom[finger1];
+            }
+            while rpo_number[finger2] > rpo_number[finger1] {
+                finger2 = idom[finger2];
+            }
+        }
+        finger1
+    }
+    const UNDEF: usize = usize::MAX;
+
+    let rpo = compute_reverse_postorder(num_blocks, succs);
+    let mut rpo_number = vec![UNDEF; num_blocks];
+    for (order, &block) in rpo.iter().enumerate() {
+        rpo_number[block] = order;
+    }
+
+    let mut idom = vec![UNDEF; num_blocks];
+    if rpo.is_empty() {
+        return idom;
+    }
+    idom[rpo[0]] = rpo[0]; // Entry dominates itself
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &b in rpo.iter().skip(1) {
+            let mut new_idom = UNDEF;
+            for &p in preds.row(b) {
+                let p = p as usize;
+                if idom[p] != UNDEF {
+                    new_idom = p;
+                    break;
+                }
+            }
+            if new_idom == UNDEF {
+                continue;
+            }
+            for &p in preds.row(b) {
+                let p = p as usize;
+                if p != new_idom && idom[p] != UNDEF {
+                    new_idom = intersect(new_idom, p, &idom, &rpo_number);
+                }
+            }
+            if idom[b] != new_idom {
+                idom[b] = new_idom;
+                changed = true;
+            }
+        }
+    }
+    idom
+}
+
 // ── Dominance frontiers ───────────────────────────────────────────────────────
 
 /// Compute dominance frontiers for each block.
@@ -402,70 +466,6 @@ impl CfgAnalysis {
             num_blocks,
         }
     }
-}
-
-/// Cooper-Harvey-Kennedy iterative dominators: the former implementation,
-/// kept as an independent oracle for [`compute_dominators`].
-#[cfg(test)]
-fn compute_dominators_chk(num_blocks: usize, preds: &FlatAdj, succs: &FlatAdj) -> Vec<usize> {
-    fn intersect(
-        mut finger1: usize,
-        mut finger2: usize,
-        idom: &[usize],
-        rpo_number: &[usize],
-    ) -> usize {
-        while finger1 != finger2 {
-            while rpo_number[finger1] > rpo_number[finger2] {
-                finger1 = idom[finger1];
-            }
-            while rpo_number[finger2] > rpo_number[finger1] {
-                finger2 = idom[finger2];
-            }
-        }
-        finger1
-    }
-    const UNDEF: usize = usize::MAX;
-
-    let rpo = compute_reverse_postorder(num_blocks, succs);
-    let mut rpo_number = vec![UNDEF; num_blocks];
-    for (order, &block) in rpo.iter().enumerate() {
-        rpo_number[block] = order;
-    }
-
-    let mut idom = vec![UNDEF; num_blocks];
-    if rpo.is_empty() {
-        return idom;
-    }
-    idom[rpo[0]] = rpo[0]; // Entry dominates itself
-
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for &b in rpo.iter().skip(1) {
-            let mut new_idom = UNDEF;
-            for &p in preds.row(b) {
-                let p = p as usize;
-                if idom[p] != UNDEF {
-                    new_idom = p;
-                    break;
-                }
-            }
-            if new_idom == UNDEF {
-                continue;
-            }
-            for &p in preds.row(b) {
-                let p = p as usize;
-                if p != new_idom && idom[p] != UNDEF {
-                    new_idom = intersect(new_idom, p, &idom, &rpo_number);
-                }
-            }
-            if idom[b] != new_idom {
-                idom[b] = new_idom;
-                changed = true;
-            }
-        }
-    }
-    idom
 }
 
 #[cfg(test)]

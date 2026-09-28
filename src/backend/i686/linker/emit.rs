@@ -79,14 +79,38 @@ pub(super) fn emit_executable(
     let mut dynsym_map: FxHashMap<String, usize> = FxHashMap::default();
     let mut dynsym_names: Vec<String> = Vec::new();
 
+    // An import's binding describes this executable's references, not the
+    // library's definition: glibc's `puts` is a weak alias of `_IO_puts`, and
+    // copying that STB_WEAK would turn an ordinary call into a weak reference
+    // that ld.so binds to 0 instead of reporting a missing symbol, while a
+    // `__attribute__((weak))` reference must stay weak although the library
+    // defines the symbol GLOBAL.  STB_WEAK iff every reference is weak.
+    let mut import_has_strong_ref: FxHashMap<&str, bool> = FxHashMap::default();
+    for obj in inputs {
+        for sym in &obj.symbols {
+            if sym.section_index == SHN_UNDEF && sym.binding != STB_LOCAL && !sym.name.is_empty() {
+                *import_has_strong_ref
+                    .entry(sym.name.as_str())
+                    .or_insert(false) |= sym.binding != STB_WEAK;
+            }
+        }
+    }
+    let import_binding = |name: &str| match import_has_strong_ref.get(name) {
+        Some(false) => STB_WEAK,
+        _ => STB_GLOBAL,
+    };
+    // A canonical-PLT import must be found by ld.so's symbol lookup (its
+    // value is what the other modules bind to), so it goes to the hashed
+    // part of .dynsym below instead of this unhashed prefix.
+    let is_canonical_plt = |name: &str| global_symbols.get(name).is_some_and(|s| s.canonical_plt);
+
     // PLT symbols (unhashed imports)
-    for name in plt_symbols {
+    for name in plt_symbols.iter().filter(|n| !is_canonical_plt(n)) {
         let idx = dynsym_entries.len();
         let name_off = dynstr.add(name);
-        // Preserve original binding (STB_WEAK vs STB_GLOBAL)
         let (bind, stype) = if let Some(sym) = global_symbols.get(name) {
             (
-                sym.binding,
+                import_binding(name),
                 if sym.sym_type != 0 {
                     sym.sym_type
                 } else {
@@ -110,7 +134,11 @@ pub(super) fn emit_executable(
 
     // GOT-only symbols: only dynamic (imported) symbols go in .dynsym
     // Local GOT symbols are resolved at link time and don't need dynamic entries
+    // (A function can be both a PLT and a GOT import; it gets one entry.)
     for name in got_dyn_symbols {
+        if dynsym_map.contains_key(name) || is_canonical_plt(name) {
+            continue;
+        }
         let idx = dynsym_entries.len();
         let name_off = dynstr.add(name);
         let sym = &global_symbols[name];
@@ -118,7 +146,7 @@ pub(super) fn emit_executable(
             name: name_off,
             value: 0,
             size: sym.size,
-            info: (sym.binding << 4) | sym.sym_type,
+            info: (import_binding(name) << 4) | sym.sym_type,
             other: 0,
             shndx: SHN_UNDEF,
         });
@@ -145,6 +173,29 @@ pub(super) fn emit_executable(
             value: 0,
             size: sym.size,
             info: (STB_GLOBAL << 4) | STT_OBJECT,
+            other: 0,
+            shndx: SHN_UNDEF,
+        });
+        dynsym_map.insert(name.clone(), idx);
+        dynsym_names.push(name.clone());
+    }
+
+    // Canonical-PLT imports (hashed: undefined, but valued -- see
+    // `LinkerSymbol::canonical_plt`; the value is patched after layout).
+    let mut canonical_syms_for_dynsym: Vec<String> = plt_symbols
+        .iter()
+        .filter(|n| is_canonical_plt(n))
+        .cloned()
+        .collect();
+    canonical_syms_for_dynsym.sort();
+    for name in &canonical_syms_for_dynsym {
+        let idx = dynsym_entries.len();
+        let name_off = dynstr.add(name);
+        dynsym_entries.push(Elf32Sym {
+            name: name_off,
+            value: 0,
+            size: 0,
+            info: (import_binding(name) << 4) | STT_FUNC,
             other: 0,
             shndx: SHN_UNDEF,
         });
@@ -213,6 +264,7 @@ pub(super) fn emit_executable(
     // All hashed symbols = copy + textrel + exported definitions
     let mut all_hashed_syms: Vec<String> = Vec::new();
     all_hashed_syms.extend(copy_syms_for_dynsym.iter().cloned());
+    all_hashed_syms.extend(canonical_syms_for_dynsym.iter().cloned());
     all_hashed_syms.extend(textrel_syms_for_dynsym.iter().cloned());
     all_hashed_syms.extend(export_syms_for_dynsym.iter().cloned());
 
@@ -1228,6 +1280,16 @@ pub(super) fn emit_executable(
         }
     }
 
+    // Canonical PLT: the undefined symbol's value is its PLT entry (the
+    // address `assign_symbol_addresses` gave it); `st_shndx` stays UND, which
+    // is what keeps PLT-class lookups -- the JUMP_SLOT of our own PLT --
+    // binding to the library rather than looping back to the entry.
+    for name in &canonical_syms_for_dynsym {
+        if let (Some(sym), Some(&idx)) = (global_symbols.get(name), dynsym_map.get(name)) {
+            dynsym_entries[idx].value = sym.address;
+        }
+    }
+
     // Patch dynsym for copy-reloc symbols
     for name in &copy_syms_for_dynsym {
         if let Some(sym) = global_symbols.get(name) {
@@ -1771,6 +1833,7 @@ fn assign_symbol_addresses(
             copy_addr: 0,
             version: None,
             uses_textrel: false,
+            canonical_plt: false,
         });
     if let Some(sym) = global_symbols.get_mut("_GLOBAL_OFFSET_TABLE_") {
         sym.address = got_base;
@@ -1829,6 +1892,7 @@ fn assign_symbol_addresses(
                 copy_addr: 0,
                 version: None,
                 uses_textrel: false,
+                canonical_plt: false,
             });
     }
 

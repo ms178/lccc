@@ -189,6 +189,10 @@ pub struct LinkerScript {
     /// if they reference section-defined symbols).
     pub top_assigns: Vec<Assignment>,
     pub top_asserts: Vec<(Expr, String)>,
+    /// `SEARCH_DIR(path)` entries in order, searched for `-l` after the
+    /// command line's `-L` directories.  A leading `=` (sysroot-relative) is
+    /// stripped: lccc-ld has no `--sysroot`, so the sysroot is `/`.
+    pub search_dirs: Vec<String>,
 }
 
 // ── Tokenizer ───────────────────────────────────────────────────────────
@@ -249,6 +253,28 @@ impl<'a> Lexer<'a> {
             b'/' => false,
             _ => false,
         }
+    }
+
+    /// A file-name operand (`SEARCH_DIR(/usr/lib)`, `SEARCH_DIR("=/lib")`):
+    /// a quoted string, or the raw bytes up to whitespace or `)` -- an
+    /// unquoted path is not an expression, and the normal lexer would split
+    /// it at every `/` (the division operator).
+    fn path_operand(&mut self) -> Option<String> {
+        self.skip_ws();
+        if self.src.get(self.pos) == Some(&b'"') {
+            return match self.next() {
+                Tok::Str(s) => Some(s),
+                _ => None,
+            };
+        }
+        let start = self.pos;
+        while self.pos < self.src.len()
+            && self.src[self.pos] != b')'
+            && !self.src[self.pos].is_ascii_whitespace()
+        {
+            self.pos += 1;
+        }
+        (self.pos > start).then(|| String::from_utf8_lossy(&self.src[start..self.pos]).into_owned())
     }
 
     /// Lex the next token in normal (expression/statement) context.
@@ -433,7 +459,20 @@ pub fn parse_linker_script(src: &str) -> Result<LinkerScript, String> {
                     }
                     expect(&mut lx, ")")?;
                 }
-                "OUTPUT_FORMAT" | "OUTPUT_ARCH" | "TARGET" | "SEARCH_DIR" | "OUTPUT" => {
+                "SEARCH_DIR" => {
+                    expect(&mut lx, "(")?;
+                    let dir = lx
+                        .path_operand()
+                        .ok_or_else(|| "SEARCH_DIR: expected a directory".to_string())?;
+                    expect(&mut lx, ")")?;
+                    let dir = match dir.strip_prefix('=') {
+                        Some("") => "/".to_string(),
+                        Some(rest) => rest.to_string(),
+                        None => dir,
+                    };
+                    script.search_dirs.push(dir);
+                }
+                "OUTPUT_FORMAT" | "OUTPUT_ARCH" | "TARGET" | "OUTPUT" => {
                     skip_parens(&mut lx)?;
                 }
                 "INCLUDE" => {
@@ -1629,6 +1668,20 @@ mod tests {
         assert!(!glob_match(".text.split.[0-9a-zA-Z_]*", ".text.split.-x"));
         assert!(glob_match("___ksymtab+*", "___ksymtab+foo"));
         assert!(glob_match(".data..hot.*", ".data..hot.x"));
+    }
+
+    #[test]
+    fn search_dir_operands() {
+        let s = parse_linker_script(
+            "SEARCH_DIR(\"=/usr/local/lib64\"); SEARCH_DIR(/opt/x-1.2/lib) SEARCH_DIR( \"rel dir\" )\n\
+             SEARCH_DIR(=)",
+        )
+        .unwrap();
+        assert_eq!(
+            s.search_dirs,
+            ["/usr/local/lib64", "/opt/x-1.2/lib", "rel dir", "/"]
+        );
+        assert!(parse_linker_script("SEARCH_DIR()").is_err());
     }
 
     #[test]

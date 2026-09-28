@@ -8,6 +8,7 @@ use crate::common::fx_hash::FxHashMap;
 use std::collections::BTreeSet;
 
 use super::elf::*;
+use super::plt_got::exec_got_relax_target;
 use super::reloc_field::{self, w8_checked, w16_checked, w32_checked};
 use super::types::{BASE_ADDR, GlobalSymbol, PAGE_SIZE};
 use crate::backend::elf::{elf64_sym_entry, push_strtab_name};
@@ -125,13 +126,18 @@ pub(super) fn emit_executable(
     let mut dyn_sym_names: Vec<String> = Vec::new();
     let mut dyn_sym_seen: crate::common::fx_hash::FxHashSet<String> =
         crate::common::fx_hash::FxHashSet::default();
+    // A canonical-PLT import is left out of this unhashed prefix: its
+    // `st_value` (the PLT entry) is how ld.so redirects every other object's
+    // references to it, so the loader must be able to *find* it, i.e. it has
+    // to be in `.gnu.hash`.  It is appended to the hashed part below.
+    let is_canonical_plt = |name: &str| globals.get(name).is_some_and(|g| g.canonical_plt);
     for name in plt_names {
-        if dyn_sym_seen.insert(name.clone()) {
+        if !is_canonical_plt(name) && dyn_sym_seen.insert(name.clone()) {
             dyn_sym_names.push(name.clone());
         }
     }
     for (name, is_plt) in got_entries {
-        if !name.is_empty() && !*is_plt && !dyn_sym_seen.contains(name) {
+        if !name.is_empty() && !*is_plt && !is_canonical_plt(name) && !dyn_sym_seen.contains(name) {
             if let Some(gsym) = globals.get(name) {
                 if gsym.is_dynamic && !gsym.copy_reloc {
                     dyn_sym_seen.insert(name.clone());
@@ -152,6 +158,11 @@ pub(super) fn emit_executable(
         .collect();
     for (name, _) in &copy_reloc_syms {
         if dyn_sym_seen.insert(name.clone()) {
+            dyn_sym_names.push(name.clone());
+        }
+    }
+    for name in plt_names {
+        if is_canonical_plt(name) && dyn_sym_seen.insert(name.clone()) {
             dyn_sym_names.push(name.clone());
         }
     }
@@ -295,7 +306,7 @@ pub(super) fn emit_executable(
                 && !*p
                 && globals
                     .get(n)
-                    .map(|g| g.is_dynamic && !g.copy_reloc && g.plt_idx.is_none())
+                    .map(|g| g.is_dynamic && !g.copy_reloc)
                     .unwrap_or(false)
         })
         .count();
@@ -342,7 +353,15 @@ pub(super) fn emit_executable(
     } else {
         pie_relative
             .iter()
-            .filter(|pr| section_map.contains_key(&(pr.obj_idx, pr.sec_idx)))
+            .filter(|pr| {
+                let obj = &objects[pr.obj_idx];
+                section_map.contains_key(&(pr.obj_idx, pr.sec_idx))
+                    && super::plt_got::pie_needs_relative(
+                        &obj.symbols[pr.sym_idx],
+                        globals,
+                        obj.sections[pr.sec_idx].flags,
+                    )
+            })
             .collect()
     };
     // A PIE also has to slide the GOT slots that hold the address of a symbol
@@ -361,15 +380,12 @@ pub(super) fn emit_executable(
             if name.is_empty() || *is_plt {
                 continue;
             }
-            // Same rule as the data relocations: the slot needs sliding when
-            // what we put in it is one of our own addresses.  That covers both
-            // a locally-defined symbol and a dynamic function's PLT entry (the
-            // GLOB_DAT writer below deliberately skips those, filling the slot
-            // statically instead).
+            // The slot needs sliding when what we put in it is one of our own
+            // addresses; a shared-library symbol's slot is the loader's
+            // (GLOB_DAT) and a TLS slot holds an offset.
             let needs_slide = globals
                 .get(name.as_str())
-                .map(super::plt_got::stored_value_is_local)
-                .unwrap_or(false);
+                .is_some_and(super::plt_got::got_slot_holds_local_address);
             if needs_slide {
                 v.push(ord);
             }
@@ -1215,6 +1231,8 @@ pub(super) fn emit_executable(
             section_idx: SHN_ABS,
             is_dynamic: false,
             copy_reloc: false,
+            canonical_plt: false,
+            visibility: 0,
             lib_sym_value: 0,
             version: None,
         });
@@ -1963,6 +1981,26 @@ pub(super) fn emit_executable(
             linker_common::write_sysv_hash(&mut out, sysv_hash_offset as usize, sh);
         }
 
+        // An import's binding describes *this* output's references, not the
+        // library's definition: glibc defines `puts` as a weak alias of
+        // `_IO_puts`, and copying that STB_WEAK into our `.dynsym` would turn
+        // an ordinary call into a weak reference -- one ld.so silently binds
+        // to 0 instead of failing with "symbol lookup error" when a library
+        // version lacks it.  Conversely a `__attribute__((weak))` reference
+        // must stay weak even though the library defines the symbol GLOBAL.
+        // STB_WEAK therefore iff every reference is weak, as in GNU ld.
+        let mut import_has_strong_ref: FxHashMap<&str, bool> = FxHashMap::default();
+        for obj in objects {
+            for sym in &obj.symbols {
+                if sym.is_undefined() && !sym.is_local() && !sym.name.is_empty() {
+                    let strong = import_has_strong_ref
+                        .entry(sym.name.as_str())
+                        .or_insert(false);
+                    *strong |= !sym.is_weak();
+                }
+            }
+        }
+
         // .dynsym
         let mut ds = dynsym_offset as usize + 24; // skip null entry
         for name in &dyn_sym_names {
@@ -1996,7 +2034,14 @@ pub(super) fn emit_executable(
                     w64(&mut out, ds + 8, sym_val);
                     w64(&mut out, ds + 16, gsym.size);
                 } else {
-                    let bind = gsym.info >> 4;
+                    let bind = if gsym.is_dynamic {
+                        match import_has_strong_ref.get(name.as_str()) {
+                            Some(false) => STB_WEAK,
+                            _ => STB_GLOBAL,
+                        }
+                    } else {
+                        gsym.info >> 4
+                    };
                     let stype = gsym.info & 0xf;
                     let st_info = (bind << 4) | if stype != 0 { stype } else { STT_FUNC };
                     if ds + 5 < out.len() {
@@ -2004,7 +2049,18 @@ pub(super) fn emit_executable(
                         out[ds + 5] = 0;
                     }
                     w16(&mut out, ds + 6, 0);
-                    w64(&mut out, ds + 8, 0);
+                    // Canonical PLT: an undefined symbol with a non-zero value
+                    // is the psABI's way of saying "this executable's PLT entry
+                    // is the function's address".  ld.so then resolves data
+                    // references to it (GLOB_DAT, R_X86_64_64 -- in the
+                    // libraries too) to that entry, while PLT-class lookups
+                    // (JUMP_SLOT, including our own) skip undefined symbols
+                    // and still bind to the library.
+                    let value = match gsym.plt_idx {
+                        Some(pi) if gsym.canonical_plt => plt_addr + 16 + pi as u64 * 16,
+                        _ => 0,
+                    };
+                    w64(&mut out, ds + 8, value);
                     w64(&mut out, ds + 16, 0);
                 }
             } else {
@@ -2074,19 +2130,7 @@ pub(super) fn emit_executable(
                 .nth(ord)
                 .map(|(n, _)| n.clone())
                 .unwrap_or_default();
-            let addend = globals
-                .get(name.as_str())
-                .map(|g| {
-                    if g.is_dynamic && !g.copy_reloc {
-                        // The slot was filled with our PLT entry, not g.value.
-                        g.plt_idx
-                            .map(|pi| plt_addr + 16 + pi as u64 * 16)
-                            .unwrap_or(g.value)
-                    } else {
-                        g.value
-                    }
-                })
-                .unwrap_or(0);
+            let addend = globals.get(name.as_str()).map(|g| g.value).unwrap_or(0);
             w64(&mut out, rd, got_addr + ord as u64 * 8);
             w64(&mut out, rd + 8, R_X86_64_RELATIVE as u64);
             w64(&mut out, rd + 16, addend);
@@ -2101,11 +2145,11 @@ pub(super) fn emit_executable(
             let is_dynamic = gsym_info
                 .map(|g| g.is_dynamic && !g.copy_reloc)
                 .unwrap_or(false);
-            let has_plt = gsym_info.map(|g| g.plt_idx.is_some()).unwrap_or(false);
-            // Skip GLOB_DAT for dynamic symbols that also have a PLT entry:
-            // their GOT entry is statically filled with the PLT address to match
-            // the canonical address used by R_X86_64_64 data relocations.
-            if is_dynamic && !has_plt {
+            // Every shared-library symbol's slot is resolved by ld.so, PLT or
+            // not: for a canonical-PLT function the loader's answer is our PLT
+            // entry (published as the `.dynsym` value), for any other it is
+            // the library's definition -- the address every other object sees.
+            if is_dynamic {
                 let si = dyn_sym_index.get(name.as_str()).copied().unwrap_or(0);
                 // TLS symbols get R_X86_64_TPOFF64 (ld.so stores the TP offset);
                 // everything else gets GLOB_DAT.
@@ -2389,15 +2433,9 @@ pub(super) fn emit_executable(
                     }
                 } else if gsym.copy_reloc && gsym.value != 0 {
                     w64(&mut out, go, gsym.value);
-                } else if gsym.is_dynamic {
-                    if let Some(plt_idx) = gsym.plt_idx {
-                        // Dynamic function with both PLT and GOTPCREL: fill GOT with
-                        // PLT entry address so address-of via GOTPCREL matches the
-                        // canonical PLT address used by R_X86_64_64 data relocations.
-                        let plt_entry_addr = plt_addr + 16 + plt_idx as u64 * 16;
-                        w64(&mut out, go, plt_entry_addr);
-                    }
                 }
+                // A shared-library symbol's slot stays zero: its GLOB_DAT (or
+                // TPOFF64) is the only writer.
             }
             go += 8;
         }
@@ -2597,21 +2635,32 @@ pub(super) fn emit_executable(
                         let t = if !sym.name.is_empty() && !sym.is_local() {
                             if let Some(g) = globals_snap.get(sym.name.as_str()) {
                                 if g.is_dynamic && !g.copy_reloc {
-                                    if let Some(pi) = g.plt_idx {
-                                        plt_addr + 16 + pi as u64 * 16
-                                    } else {
-                                        // Dynamic DATA symbol with no PLT: its
-                                        // address is unknown until ld.so maps
-                                        // the library, so a dynamic R_X86_64_64
-                                        // was emitted into .rela.dyn for this
-                                        // storage. Leave the bytes zero -- the
-                                        // loader adds `symbol + addend`, and
-                                        // pre-writing the addend here would make
-                                        // ld.so's RELA (not REL) semantics
-                                        // irrelevant while leaving a bogus
-                                        // pointer if the reloc is ever skipped.
+                                    if super::plt_got::abs64_defers_to_loader(
+                                        g,
+                                        in_sec.flags,
+                                        is_pie,
+                                    ) {
+                                        // The address is unknown until ld.so
+                                        // maps the library, so a dynamic
+                                        // R_X86_64_64 was emitted into
+                                        // .rela.dyn for this storage. Leave the
+                                        // bytes zero -- the loader adds
+                                        // `symbol + addend`, and pre-writing the
+                                        // addend would leave a bogus pointer if
+                                        // the reloc were ever skipped.
                                         deferred_to_loader = true;
                                         0
+                                    } else if let Some(pi) = g.plt_idx {
+                                        // Canonical PLT entry (see
+                                        // `GlobalSymbol::canonical_plt`).
+                                        plt_addr + 16 + pi as u64 * 16
+                                    } else {
+                                        return Err(format!(
+                                            "internal: R_X86_64_64 against shared-library \
+                                             function '{}' has neither a PLT entry nor a \
+                                             dynamic relocation",
+                                            sym.name
+                                        ));
                                     }
                                 } else {
                                     s
@@ -2771,8 +2820,44 @@ pub(super) fn emit_executable(
                     | R_X86_64_REX_GOTPCRELX
                     | R_X86_64_CODE_4_GOTPCRELX
                     | R_X86_64_CODE_6_GOTPCRELX => {
-                        if !sym.name.is_empty() && !sym.is_local() {
-                            if let Some(g) = globals_snap.get(sym.name.as_str()) {
+                        // Address the target directly whenever the instruction
+                        // and the target allow it -- also when the symbol has a
+                        // slot for some other, unrelaxable reference: the
+                        // rewritten instruction saves the dependent load.  The
+                        // decision reads the ORIGINAL section bytes, exactly as
+                        // `create_plt_got` did when it elided slots.  A LOCAL
+                        // symbol never has a slot (see `create_plt_got`) and is
+                        // never preemptible; a local IFUNC's `s` is already its
+                        // IPLT stub.
+                        let global = (!sym.name.is_empty() && !sym.is_local())
+                            .then(|| globals_snap.get(sym.name.as_str()))
+                            .flatten();
+                        let target_ok = match global {
+                            Some(g) => exec_got_relax_target(g),
+                            None => sym.is_local() && sym.shndx != SHN_ABS,
+                        };
+                        let relax = gotpcrelx_relaxation(
+                            rela.rela_type,
+                            a,
+                            objects[obj_idx].section_data[sec_idx].as_slice(),
+                            rela.offset as usize,
+                            is_pie,
+                        );
+                        if let Some(kind) = relax.filter(|_| target_ok) {
+                            let (pos, v) =
+                                rewrite_got_relax(&mut out, fp, kind, rela.rela_type, is_pie, s, p);
+                            w32_checked(
+                                &mut out,
+                                pos,
+                                v,
+                                rela.rela_type,
+                                &sym.name,
+                                &objects[obj_idx].source_name,
+                            )?;
+                            continue;
+                        }
+                        if let Some(g) = global {
+                            {
                                 if let Some(gi) = g.got_idx {
                                     let entry = &got_entries[gi];
                                     let gea = if entry.1 {

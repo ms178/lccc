@@ -763,6 +763,35 @@ case("tls_alignment",
      """},
     tags=("tls", "layout"))
 
+# PT_TLS p_vaddr must be a multiple of the segment's largest member
+# alignment: the loader computes the thread-pointer offset from p_vaddr
+# modulo p_align (glibc _dl_determine_tlsoffset), so an image whose TLS
+# segment starts misaligned -- here .tdata (align 4) whose RW-segment offset
+# is not 64-aligned, followed by an aligned(64) .tbss member -- hands out a
+# misaligned `b`.  `tls_alignment` above passed by layout luck while the
+# builtin linkers laid PT_TLS out at the .tdata start unaligned.
+# The RW data in front of the TLS segment is varied so that the natural
+# (unaligned) .tdata position lands at several different offsets mod 64.
+for (_suffix, _flags), _pad in ((_l, _n) for _l in (("", []), ("_static", ["-static"]))
+                                for _n in (1, 3, 6, 11)):
+    case(f"tls_segment_alignment_after_tdata{_suffix}_pad{_pad}",
+        {"a.c": """
+            #include <stdio.h>
+            #include <stdint.h>
+            __thread int a = 1;
+            __thread int a2 = 2;
+            __thread char b[3] __attribute__((aligned(64)));
+            int main(void){
+                b[0] = 9;
+                printf("%d %d %d %d\\n", a, a2, b[0], (int)((uintptr_t)b % 64));
+                return 0;
+            }
+         """,
+         "pad.c": f"int rw_pad[{_pad}] = {{1}};"},
+        ldflags=_flags,
+        expect_stdout="1 2 9 0\n",
+        tags=("tls", "layout"))
+
 case("tls_general_dynamic",
     {"a.c": """
         #include <stdio.h>
@@ -2138,6 +2167,90 @@ def _script_undefined_archive_test(args, oracles):
         shutil.rmtree(td, ignore_errors=True)
 
 
+def _file_mode_libs_test(args, oracles):
+    """`-l` in relocatable (`-r`) and script (`-T`) links, vs GNU ld.
+
+    Both modes once ignored `-lNAME` outright (they read only positional
+    files), so `ld -r a.o -L. -lfoo` produced an object still undefined in
+    foo and `-T` links lost every `-l`.  Checked: the defined-symbol set of
+    the output equals GNU ld's for plain, --whole-archive and script
+    SEARCH_DIR resolution; a library that exists only as a shared object and
+    a library that does not exist are errors in both linkers.
+    """
+    name = "file_mode_libs_r_and_T"
+    td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
+    srcs = {
+        "head.c": "int lib_a(void); int lib_b(void);\n"
+                  "int startup(void){ return lib_a() + lib_b(); }\n",
+        "a.c": "int lib_a(void){ return 1; }\n",
+        "unused.c": "int lib_unused(void){ return 3; }\n",
+        "b.c": "int lib_b(void){ return 2; }\n",
+        "so.c": "int lib_so(void){ return 4; }\n",
+        "useso.c": "int lib_so(void); int user(void){ return lib_so(); }\n",
+    }
+    try:
+        for fn, body in srcs.items():
+            with open(os.path.join(td, fn), "w") as f:
+                f.write(body)
+        for d in ("sub", "soonly"):
+            os.mkdir(os.path.join(td, d))
+        with open(os.path.join(td, "t.lds"), "w") as f:
+            f.write('SEARCH_DIR("sub")\nENTRY(startup)\nSECTIONS {\n  . = 0x400000;\n'
+                    "  .text : { *(.text*) }\n  .data : { *(.data*) *(.rodata*) *(.bss*) }\n"
+                    "  /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) }\n}\n")
+        cflags = ["-c", "-O1", "-ffreestanding", "-fno-pic", "-fno-asynchronous-unwind-tables",
+                  "-fno-stack-protector"]
+        steps = [[CC] + cflags + ["head.c", "a.c", "unused.c", "b.c", "useso.c"],
+                 ["ar", "rcs", "liba.a", "a.o", "unused.o"],
+                 ["ar", "rcs", "sub/libb.a", "b.o"],
+                 [CC, "-shared", "-fPIC", "so.c", "-o", "soonly/libso.so"]]
+        for cmd in steps:
+            r = sh(cmd, cwd=td)
+            if r.returncode != 0:
+                return Result(name, "FAIL", f"fixture: {' '.join(cmd)}: {r.stderr.decode()[:200]}")
+        lccc_ld = os.path.join(os.path.dirname(os.path.abspath(args.lccc)), "lccc-ld")
+
+        def defined(path):
+            out = sh(["nm", path], cwd=td).stdout.decode()
+            return sorted(m.group(1) for m in re.finditer(r"^\S*\s+[TDBR] (\S+)$", out, re.M))
+
+        cases = [
+            ("-r", ["-r", "head.o", "-Lsub", "-L.", "-la", "-lb"]),
+            ("-r --whole-archive", ["-r", "head.o", "-L.", "--whole-archive", "-la",
+                                    "--no-whole-archive", "sub/libb.a"]),
+            ("-T SEARCH_DIR", ["-T", "t.lds", "head.o", "-L.", "-la", "-lb"]),
+        ]
+        for i, (what, argv) in enumerate(cases):
+            got = {}
+            for tag, ld in (("lccc", lccc_ld), ("gnu", "ld")):
+                out = f"o{i}.{tag}"
+                r = sh([ld] + argv + ["-o", out], cwd=td)
+                if r.returncode != 0:
+                    return Result(name, "FAIL", f"{what}: {tag} failed: {r.stderr.decode()[:300]}")
+                got[tag] = defined(out)
+            if got["lccc"] != got["gnu"]:
+                return Result(name, "FAIL", f"{what}: defined {got['lccc']} != GNU ld {got['gnu']}")
+            if "lib_b" not in got["lccc"]:
+                return Result(name, "FAIL", f"{what}: -lb not linked ({got['lccc']})")
+
+        for what, argv, needle in (
+            ("shared-only -r", ["-r", "useso.o", "-Lsoonly", "-lso"], "libso.so"),
+            ("missing -r", ["-r", "head.o", "-lnope"], "-lnope"),
+        ):
+            if sh(["ld"] + argv + ["-o", "bad.gnu"], cwd=td).returncode == 0:
+                return Result(name, "FAIL", f"fixture: GNU ld accepted {what}")
+            r = sh([lccc_ld] + argv + ["-o", "bad.lccc"], cwd=td)
+            if r.returncode == 0:
+                return Result(name, "FAIL", f"lccc-ld accepted {what}")
+            if needle.encode() not in r.stderr:
+                return Result(name, "FAIL", f"{what}: diagnostic lacks {needle}: {r.stderr.decode()[:200]}")
+        return Result(name, "PASS")
+    except Exception as e:
+        return Result(name, "FAIL", f"harness exception: {e!r}")
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
 def _script_undefined_archive_test_i386(args, oracles):
     """ELF32 `-T` links must honour `-u SYM` against archives.
 
@@ -2255,6 +2368,85 @@ VERSION {
  LCCC_VDSO_1 { global: vdso_answer; local: *; };
 }
 """
+
+
+def _bstatic_positional_test(args, oracles):
+    """-Bstatic / -Bdynamic are positional library-search modes (x86-64).
+
+    `-Wl,-Bstatic -lfoo -Wl,-Bdynamic` must take libfoo.a while the program
+    stays dynamically linked against libc -- lccc-ld once rewrote -Bstatic
+    to -static and produced a fully static executable.  Compared against GNU
+    ld: PT_INTERP presence, the DT_NEEDED set, the run output, and that a
+    -Bstatic search never falls back to a directory's libbar.so.
+    """
+    name = "bstatic_positional_search"
+    td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
+    try:
+        files = {
+            "foo_a.c": "int foo(void){ return 1; }\n",
+            "foo_so.c": "int foo(void){ return 2; }\n",
+            "bar.c": "int bar(void){ return 3; }\n",
+            "main.c": "#include <stdio.h>\nint foo(void);\n"
+                      "int main(void){ printf(\"%d\\n\", foo()); return 0; }\n",
+            "mbar.c": "int bar(void);\nint main(void){ return bar(); }\n",
+        }
+        for fn, body in files.items():
+            with open(os.path.join(td, fn), "w") as f:
+                f.write(body)
+        os.mkdir(os.path.join(td, "lib"))
+        os.mkdir(os.path.join(td, "solib"))
+        os.mkdir(os.path.join(td, "shim"))
+        os.symlink(os.path.join(os.path.dirname(os.path.abspath(args.lccc)), "lccc-ld"),
+                   os.path.join(td, "shim", "ld"))
+        steps = [
+            [CC, "-O1", "-c", "foo_a.c", "main.c", "mbar.c"],
+            ["ar", "rcs", "lib/libfoo.a", "foo_a.o"],
+            [CC, "-O1", "-fPIC", "-shared", "foo_so.c", "-o", "lib/libfoo.so"],
+            [CC, "-O1", "-fPIC", "-shared", "bar.c", "-o", "solib/libbar.so"],
+        ]
+        for cmd in steps:
+            r = sh(cmd, cwd=td)
+            if r.returncode != 0:
+                return Result(name, "FAIL", f"fixture: {' '.join(cmd)}: {r.stderr.decode()[:200]}")
+
+        def link(lccc, flags, out):
+            shim = ["-B" + os.path.join(td, "shim")] if lccc else []
+            return sh([CC, "-no-pie"] + shim + flags + ["-o", out], cwd=td)
+
+        def shape(out):
+            ph = sh(["readelf", "-lW", out], cwd=td).stdout.decode()
+            d = sh(["readelf", "-dW", out], cwd=td).stdout.decode()
+            return ("INTERP" in ph,
+                    sorted(re.findall(r"NEEDED\)\s+Shared library: \[([^\]]+)\]", d)))
+
+        flags = ["main.o", "-Llib", "-Wl,-Bstatic", "-lfoo", "-Wl,-Bdynamic"]
+        for lccc, out in ((False, "ref"), (True, "new")):
+            r = link(lccc, flags, out)
+            if r.returncode != 0:
+                who = "lccc-ld" if lccc else "GNU ld"
+                return Result(name, "FAIL", f"{who} link failed: {r.stderr.decode()[:300]}")
+        if shape("new") != shape("ref"):
+            return Result(name, "FAIL", f"(PT_INTERP, DT_NEEDED) {shape('new')} != GNU ld {shape('ref')}")
+        if not shape("new")[0]:
+            return Result(name, "FAIL", "-Bstatic produced a static executable")
+        run = sh([os.path.join(td, "new")], cwd=td)
+        if run.returncode != 0 or run.stdout != b"1\n":
+            return Result(name, "FAIL", f"run: rc={run.returncode} out={run.stdout!r} (libfoo.a gives 1)")
+
+        # A -Bstatic search skips a directory holding only libbar.so.
+        bad = ["mbar.o", "-Lsolib", "-Wl,-Bstatic", "-lbar", "-Wl,-Bdynamic"]
+        if link(False, bad, "bad_ref").returncode == 0:
+            return Result(name, "FAIL", "fixture: GNU ld resolved -Bstatic -lbar to a shared object")
+        r = link(True, bad, "bad_new")
+        if r.returncode == 0:
+            return Result(name, "FAIL", "lccc-ld resolved -Bstatic -lbar to libbar.so")
+        if b"-lbar" not in r.stderr:
+            return Result(name, "FAIL", f"diagnostic does not name -lbar: {r.stderr.decode()[:200]}")
+        return Result(name, "PASS")
+    except Exception as e:
+        return Result(name, "FAIL", f"harness exception: {e!r}")
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
 
 
 def _as_needed_positional_test(args, oracles):
@@ -3367,6 +3559,528 @@ def _shim_for(td, lccc_ld):
     if not os.path.exists(link):
         os.symlink(os.path.abspath(lccc_ld), link)
     return shim
+
+
+_PEQ_LIB = r"""
+#include <stdio.h>
+#include <stdlib.h>
+void *lib_puts(void){ return (void*)&puts; }
+void *lib_abs(void){ return (void*)&abs; }
+int lib_var = 5;
+int *lib_var_addr(void){ return &lib_var; }
+int lib_call(int (*f)(const char *)){ return f("via-lib") >= 0; }
+void lib_weakref(void){}
+"""
+
+_PEQ_MAIN = r"""
+#include <stdio.h>
+#include <stdlib.h>
+#include <dlfcn.h>
+void *lib_puts(void); void *lib_abs(void); int *lib_var_addr(void);
+int lib_call(int (*f)(const char *));
+extern void lib_weakref(void) __attribute__((weak));
+extern int lib_var;
+void *dtab[] = { (void*)puts, (void*)abs };
+void * const rtab[] = { (void*)puts, (void*)abs };
+int *pv = &lib_var;
+extern __thread int tv;
+int get_tv(void);
+void extra(void);
+__attribute__((noinline)) void *code_puts(void){ return (void*)&puts; }
+int main(void){
+  extra();
+  puts("x");
+  int r = abs(-3);
+  void *lp = lib_puts();
+  if (lib_weakref) lib_weakref();
+  printf("code %d data %d rodata %d abs %d %d dlsym %d var %d %d rd %d call %d tv %d %d\n",
+    code_puts()==lp, dtab[0]==lp, rtab[0]==lp, dtab[1]==lib_abs(), rtab[1]==lib_abs(),
+    dlsym(RTLD_DEFAULT,"puts")==lp, pv==lib_var_addr(), &lib_var==lib_var_addr(), lib_var + r,
+    lib_call((int (*)(const char *))dtab[0]), tv, get_tv());
+  return 0;
+}
+"""
+
+_PEQ_TLS = "__thread int tv = 77;\n"
+_PEQ_TLSUSE = ('extern __thread int tv __attribute__((tls_model("initial-exec")));\n'
+               "int get_tv(void){ return tv; }\n")
+_PEQ_EXTRA_C = r"""
+#include <stdio.h>
+void *asm_puts(void); extern int pcrel_puts; void *lib_puts(void);
+void extra(void){
+  printf("asm-lea %d pcrel %d\n", asm_puts()==lib_puts(),
+         (void*)((char*)&pcrel_puts + pcrel_puts)==lib_puts());
+}
+"""
+# A non-branch R_X86_64_PC32 in code and a PC-relative word in read-only
+# data, both against a shared-library function.
+_PEQ_EXTRA_S = """\t.text
+\t.globl asm_puts
+asm_puts:
+\tleaq puts(%rip), %rax
+\tret
+\t.section .rodata
+\t.globl pcrel_puts
+pcrel_puts:
+\t.long puts - .
+\t.section .note.GNU-stack,"",@progbits
+"""
+_PEQ_EXPECT = ("x\nvia-lib\ncode 1 data 1 rodata 1 abs 1 1 dlsym 1 var 1 1 rd 8 call 1 tv 77 77\n")
+
+
+def _dso_pointer_equality_test(args, oracles):
+    """`&f` of a shared-library function is ONE address in every module.
+
+    The executable used to hand out its own PLT entry as the address of a
+    DSO function (in code, in data, in its GOT slots) without telling ld.so,
+    whose other modules then saw the library's definition: `&puts` in the
+    program != `&puts` in a library.  The psABI's answer, implemented now, is
+    the canonical PLT: a non-PIC address-of makes the PLT entry the address
+    and publishes it as the undefined symbol's `.dynsym` value, and every GOT
+    slot of a DSO symbol is left to GLOB_DAT.  Covered for -fPIE, -fno-pic
+    and -fPIC objects: address-of in code, in `.data` and in read-only data,
+    `dlsym`, a callback through the pointer, a copy-relocated variable whose
+    address is also stored in data (its PIE slide must not depend on
+    relocation order), an exe-defined TLS variable reached via IE (its GOT
+    slot holds an offset, never slid), and a non-branch PC32 / `.long f - .`
+    (asm) -- which GNU ld refuses in a PIE, so that part is compared against
+    the expected output rather than an oracle.  The `.dynsym` bindings are
+    checked too: an import is WEAK iff every reference is (glibc's `puts` is
+    itself a weak definition, which must not leak into our references).
+    """
+    name = "dso_pointer_equality"
+    td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
+    files = {"lib.c": _PEQ_LIB, "main.c": _PEQ_MAIN, "tls.c": _PEQ_TLS,
+             "tlsuse.c": _PEQ_TLSUSE, "extra.c": _PEQ_EXTRA_C, "asm.s": _PEQ_EXTRA_S,
+             "noextra.c": "void extra(void){}\n"}
+    try:
+        for fn, body in files.items():
+            with open(os.path.join(td, fn), "w") as f:
+                f.write(body)
+        r = sh([CC, "-shared", "-fPIC", "-O1", "lib.c", "-o", "libpq.so"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL", f"fixture lib: {r.stderr.decode()[:200]}")
+        lccc_ld = os.path.join(os.path.dirname(os.path.abspath(args.lccc)), "lccc-ld")
+        shim = _shim_for(td, lccc_ld)
+        env = dict(os.environ, LD_LIBRARY_PATH=td)
+        for mode, cf, lf in (("pie", "-fPIE", "-pie"), ("nopie", "-fno-pic", "-no-pie"),
+                             ("pic", "-fPIC", "-pie")):
+            for extra, oracle in ((["extra.c", "asm.s"], False), (["noextra.c"], True)):
+                srcs = ["main.c", "tls.c", "tlsuse.c"] + extra
+                want = _PEQ_EXPECT if oracle else "asm-lea 1 pcrel 1\n" + _PEQ_EXPECT
+                linkers = [("lccc", ["-B" + shim])] + ([("gnu", [])] if oracle else [])
+                for tag, bflag in linkers:
+                    exe = f"t.{mode}.{int(oracle)}.{tag}"
+                    r = sh([CC] + bflag + ["-O1", cf, lf] + srcs +
+                           ["-L.", "-lpq", "-ldl", "-o", exe], cwd=td)
+                    if r.returncode != 0:
+                        return Result(name, "FAIL",
+                                      f"{mode}/{tag} link: {r.stderr.decode()[:300]}")
+                    run = sh([os.path.join(td, exe)], cwd=td, env=env)
+                    got = run.stdout.decode()
+                    if run.returncode != 0 or got != want:
+                        return Result(name, "FAIL",
+                                      f"{mode}/{tag}: rc={run.returncode} got {got!r} want {want!r}")
+                if not oracle:
+                    continue
+                syms = sh(["readelf", "-W", "--dyn-syms", f"t.{mode}.1.lccc"],
+                          cwd=td).stdout.decode()
+                bind = {m.group(2): (m.group(1), int(m.group(0).split()[1], 16))
+                        for m in re.finditer(r"^\s*\d+:\s+[0-9a-f]+\s+\d+\s+\w+\s+(\w+)\s+\w+\s+UND\s+([A-Za-z_]\w*)",
+                                             syms, re.M)}
+                if bind.get("puts", ("?",))[0] != "GLOBAL":
+                    return Result(name, "FAIL", f"{mode}: puts import binding {bind.get('puts')}")
+                if bind.get("lib_weakref", ("?",))[0] != "WEAK":
+                    return Result(name, "FAIL",
+                                  f"{mode}: weak reference imported as {bind.get('lib_weakref')}")
+                # -fno-pic takes `&puts` with an absolute relocation: canonical PLT.
+                if mode == "nopie" and not bind.get("puts", ("", 0))[1]:
+                    return Result(name, "FAIL", "nopie: puts has no canonical-PLT st_value")
+        return Result(name, "PASS")
+    finally:
+        if not args.keep:
+            shutil.rmtree(td, ignore_errors=True)
+
+
+_DSE_LIB = r"""
+int counter = 5;
+void inc(void){ counter++; }
+int get_counter(void){ return counter; }
+static __thread int tie_local __attribute__((tls_model("initial-exec"))) = 7;
+__thread int tie_glob __attribute__((tls_model("initial-exec"))) = 9;
+int tls_sum(void){ tie_local++; tie_glob++; return tie_local + tie_glob; }
+__attribute__((visibility("hidden"))) int hid_fn(void){ return 3; }
+__attribute__((visibility("hidden"))) int hid_var = 11;
+__attribute__((visibility("protected"))) int prot_fn(void){ return 4; }
+int call_hid(void){ return hid_fn() + hid_var + prot_fn(); }
+extern char __bss_start[], _end[];
+__attribute__((section("dse_sec"), used)) int dse_item[2] = {1, 2};
+extern int __start_dse_sec[], __stop_dse_sec[];
+long anchors(void){ return (_end >= __bss_start) * 100 + (__stop_dse_sec - __start_dse_sec); }
+int *dse_first(void){ return __start_dse_sec; }
+"""
+
+# Two translation units, each with its own `static __thread st`: their GOT
+# slots/pairs must not be shared (they were keyed by name).  `tv`/`tv2` live
+# in ANOTHER library, so their GD/TLSDESC accesses must name the symbol in
+# DTPMOD64 (resolving to the defining module), not "this module".
+_DSE_TLS1 = r"""
+extern __thread int tv, tv2;
+static __thread int st = 100;
+int b1(void){ st++; tv++; return tv + tv2 + st; }
+"""
+_DSE_TLS2 = r"""
+static __thread int st = 1000;
+extern __thread int tv;
+int b2(void){ st++; return st + tv; }
+"""
+_DSE_TLSDEF = "__thread int tv = 5;\n__thread int tv2 = 50;\n"
+
+_DSE_MAIN = r"""
+#include <stdio.h>
+#include <dlfcn.h>
+extern int counter; void inc(void); int get_counter(void); int tls_sum(void);
+int call_hid(void); int prot_fn(void); long anchors(void); int *dse_first(void);
+int b1(void), b2(void);
+int main(void){
+  inc();
+  printf("counter %d %d\n", counter, get_counter());
+  printf("tls %d\n", tls_sum());
+  printf("hid %d %d\n", call_hid(), prot_fn());
+  void *h = dlopen(NULL, RTLD_NOW);
+  printf("exported %d %d %d\n", dlsym(h, "hid_fn") != 0, dlsym(h, "hid_var") != 0,
+         dlsym(h, "__dso_handle") != 0);
+  printf("anchors %ld %d\n", anchors(), dse_first()[1]);
+  int x = b1(); int y = b2();
+  printf("gd %d %d\n", x, y);
+  return 0;
+}
+"""
+_DSE_EXPECT = ("counter 6 6\ntls 18\nhid 18 4\nexported 0 0 0\nanchors 102 2\n"
+               "gd 157 1007\n")
+
+_DSE_CXX_LIB = r"""
+#include <stdexcept>
+extern "C" int thrower(int x){ if (x) throw std::runtime_error("boom"); return 0; }
+"""
+_DSE_CXX_MAIN = r"""
+#include <stdexcept>
+#include <cstdio>
+extern "C" int thrower(int);
+int main(){ try { thrower(1); } catch (const std::exception &e) {
+  std::printf("caught %s\n", e.what()); return 0; } return 1; }
+"""
+
+
+def _dso_emit_semantics_test(args, oracles):
+    """A shared library linked by lccc-ld behaves like one linked by GNU ld.
+
+    Regression net for the x86-64 shared-object emitter, each line a bug it
+    had: exported data reached through a GOT slot was bound with
+    R_X86_64_RELATIVE, so an executable's COPY of it and the library's
+    original diverged (`counter 5 6`); Initial-Exec TLS of the library's own
+    variables was relaxed to Local-Exec offsets that only an executable has
+    (`tls` read another module's block); HIDDEN symbols (`hid_fn`,
+    `__dso_handle`, `DW.ref.__gxx_personality_v0`) were exported; every
+    definition claimed section index 1, so GNU ld put the executable's copy
+    of `counter` into write-protected `.data.rel.ro` (SIGSEGV on the first
+    store, seen on i386); GD pairs of another library's TLS used DTPMOD64
+    against symbol 0 ("this module") and static-TLS pairs of two TUs'
+    `static __thread st` shared one slot; linker-provided anchors
+    (`__start_SEC`, `_end`) were SHN_ABS and unrelocated; `.gnu.version_r`
+    chained only its first provider (GNU ld refused to link against a C++
+    library: "invalid needed version"); and no PT_GNU_EH_FRAME was emitted,
+    so an exception thrown through the library hit std::terminate.  Each
+    executable is linked by BOTH GNU ld and lccc-ld, in -fno-pic, PIE and
+    (TLS dialects) gnu/gnu2 variants, against a fixed expected output.
+    """
+    name = "dso_emit_semantics"
+    td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
+    files = {"lib.c": _DSE_LIB, "tls1.c": _DSE_TLS1, "tls2.c": _DSE_TLS2,
+             "tlsdef.c": _DSE_TLSDEF, "main.c": _DSE_MAIN,
+             "cxxlib.cc": _DSE_CXX_LIB, "cxxmain.cc": _DSE_CXX_MAIN,
+             "le.c": "__thread int le __attribute__((tls_model(\"local-exec\")));\n"
+                     "int get_le(void){ return ++le; }\n"}
+    try:
+        for fn, body in files.items():
+            with open(os.path.join(td, fn), "w") as f:
+                f.write(body)
+        lccc_ld = os.path.join(os.path.dirname(os.path.abspath(args.lccc)), "lccc-ld")
+        shim = _shim_for(td, lccc_ld)
+        env = dict(os.environ, LD_LIBRARY_PATH=td)
+        r = sh([CC, "-shared", "-fPIC", "-O1", "tlsdef.c", "-o", "libtv.so"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL", f"fixture libtv: {r.stderr.decode()[:200]}")
+        for dialect in ("gnu", "gnu2"):
+            for opt in ("-O0", "-O2"):
+                lib = "libdse.so"
+                r = sh([CC, "-B" + shim, "-shared", "-fPIC", opt, f"-mtls-dialect={dialect}",
+                        "lib.c", "tls1.c", "tls2.c", "-L.", "-ltv", "-o", lib], cwd=td)
+                if r.returncode != 0:
+                    return Result(name, "FAIL",
+                                  f"{dialect}{opt} lib link: {r.stderr.decode()[:300]}")
+                for mode, cf, lf in (("nopie", "-fno-pic", "-no-pie"), ("pie", "-fPIE", "-pie")):
+                    for tag, bflag in (("gnu", []), ("lccc", ["-B" + shim])):
+                        exe = f"m.{mode}.{tag}"
+                        r = sh([CC] + bflag + ["-O1", cf, lf, "main.c", "-L.", "-ldse",
+                                               "-ltv", "-ldl", "-o", exe], cwd=td)
+                        if r.returncode != 0:
+                            return Result(name, "FAIL", f"{dialect}{opt} {mode}/{tag} link: "
+                                          f"{r.stderr.decode()[:300]}")
+                        run = sh([os.path.join(td, exe)], cwd=td, env=env)
+                        got = run.stdout.decode()
+                        if run.returncode != 0 or got != _DSE_EXPECT:
+                            return Result(name, "FAIL", f"{dialect}{opt} {mode}/{tag}: "
+                                          f"rc={run.returncode} got {got!r}")
+        # Static checks on the last library.
+        syms = sh(["readelf", "-W", "--dyn-syms", "libdse.so"], cwd=td).stdout.decode()
+        defined = {}
+        for m in re.finditer(r"^\s*\d+:\s+[0-9a-f]+\s+\d+\s+\w+\s+\w+\s+(\w+)\s+(\w+)\s+(\S+)$",
+                             syms, re.M):
+            defined[m.group(3).split("@")[0]] = (m.group(1), m.group(2))
+        for leaked in ("hid_fn", "hid_var", "__dso_handle", "__TMC_END__",
+                       "_GLOBAL_OFFSET_TABLE_", "_DYNAMIC"):
+            if leaked in defined:
+                return Result(name, "FAIL", f"{leaked} exported from the library")
+        if defined.get("prot_fn", ("",))[0] != "PROTECTED":
+            return Result(name, "FAIL", f"prot_fn dynsym visibility {defined.get('prot_fn')}")
+        shdrs = sh(["readelf", "-W", "-S", "libdse.so"], cwd=td).stdout.decode()
+        flags = {int(m.group(1)): m.group(2) for m in re.finditer(
+            r"^\s*\[\s*(\d+)\]\s+\S+\s+\w+\s+[0-9a-f]+\s+[0-9a-f]+\s+[0-9a-f]+\s+[0-9a-f]+\s+(\w*)",
+            shdrs, re.M)}
+        ndx = defined.get("counter", ("", ""))[1]
+        if not ndx.isdigit() or "W" not in flags.get(int(ndx), ""):
+            return Result(name, "FAIL", f"counter's st_shndx {ndx} is not a writable section")
+        if "GNU_EH_FRAME" not in sh(["readelf", "-W", "-l", "libdse.so"], cwd=td).stdout.decode():
+            return Result(name, "FAIL", "no PT_GNU_EH_FRAME")
+        # Local-Exec TLS cannot be linked into a shared object.
+        r = sh([CC, "-B" + shim, "-shared", "-fPIC", "-O1", "le.c", "-o", "le.so"], cwd=td)
+        if r.returncode == 0 or b"R_X86_64_TPOFF32" not in r.stderr:
+            return Result(name, "FAIL", "local-exec TLS in a shared object was not refused")
+        # C++: exception through the library; GNU ld must accept its
+        # version tables when linking the executable.
+        cxx = shutil.which("g++")
+        if cxx:
+            r = sh([cxx, "-B" + shim, "-shared", "-fPIC", "-O1", "cxxlib.cc", "-o", "libcx.so"],
+                   cwd=td)
+            if r.returncode != 0:
+                return Result(name, "FAIL", f"c++ lib link: {r.stderr.decode()[:300]}")
+            ver = sh(["readelf", "-V", "libcx.so"], cwd=td)
+            if ver.stderr.strip():
+                return Result(name, "FAIL", f"readelf -V: {ver.stderr.decode()[:200]}")
+            r = sh([cxx, "-O1", "cxxmain.cc", "-L.", "-lcx", "-o", "cx"], cwd=td)
+            if r.returncode != 0:
+                return Result(name, "FAIL", f"GNU ld vs lccc C++ DSO: {r.stderr.decode()[:300]}")
+            run = sh([os.path.join(td, "cx")], cwd=td, env=env)
+            if run.returncode != 0 or run.stdout.decode() != "caught boom\n":
+                return Result(name, "FAIL", f"c++ exception through the DSO: rc={run.returncode} "
+                              f"{run.stdout.decode()!r} {run.stderr.decode()[:200]!r}")
+        return Result(name, "PASS", "" if cxx else "g++ missing: C++ part skipped")
+    finally:
+        if not args.keep:
+            shutil.rmtree(td, ignore_errors=True)
+
+
+_PEQ_EXTRA_S32 = """\t.text
+\t.globl asm_puts
+asm_puts:
+\tmovl $puts, %eax
+\tret
+\t.section .rodata
+\t.globl pcrel_puts
+pcrel_puts:
+\t.long puts - .
+\t.section .note.GNU-stack,"",@progbits
+"""
+
+
+def _dso_pointer_equality_i386_test(args, oracles):
+    """The i386 counterpart of `dso_pointer_equality` (ET_EXEC only).
+
+    Same program, from -fno-pic and -fPIC objects.  Besides the canonical
+    PLT (`movl $puts`, `R_386_32` in data, `.long puts - .`), this pins the
+    GOT side: a `-fPIC` `&puts` is a GOT32X load, and it used to read the
+    function's lazily-bound `.got.plt` slot -- `PLT+6` before the first call,
+    the library's address after it.  It now has its own GLOB_DAT slot.
+    """
+    name = "i386_dso_pointer_equality"
+    td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
+    files = {"lib.c": _PEQ_LIB, "main.c": _PEQ_MAIN, "tls.c": _PEQ_TLS,
+             "tlsuse.c": _PEQ_TLSUSE, "extra.c": _PEQ_EXTRA_C, "asm.s": _PEQ_EXTRA_S32}
+    try:
+        for fn, body in files.items():
+            with open(os.path.join(td, fn), "w") as f:
+                f.write(body)
+        r = sh([CC, "-m32", "-shared", "-fPIC", "-O1", "lib.c", "-o", "libpq.so"], cwd=td)
+        if r.returncode != 0:
+            # CI installs multilib and sets LCCC_REQUIRE_I386=1: there an
+            # unusable -m32 toolchain is a broken runner, not a reason to skip.
+            status = "FAIL" if os.environ.get("LCCC_REQUIRE_I386") == "1" else "SKIP"
+            return Result(name, status, f"no -m32 toolchain: {r.stderr.decode()[:150]}")
+        lccc_ld = os.path.join(os.path.dirname(os.path.abspath(args.lccc)), "lccc-ld")
+        shim = _shim_for(td, lccc_ld)
+        env = dict(os.environ, LD_LIBRARY_PATH=td)
+        want = "asm-lea 1 pcrel 1\n" + _PEQ_EXPECT
+        for cf in ("-fno-pic", "-fPIC"):
+            for tag, bflag in (("lccc", ["-B" + shim]), ("gnu", [])):
+                exe = f"t{cf}.{tag}"
+                r = sh([CC, "-m32"] + bflag + ["-O1", cf, "-no-pie", "main.c", "tls.c",
+                       "tlsuse.c", "extra.c", "asm.s", "-L.", "-lpq", "-ldl", "-o", exe], cwd=td)
+                if r.returncode != 0:
+                    return Result(name, "FAIL", f"{cf}/{tag} link: {r.stderr.decode()[:300]}")
+                run = sh([os.path.join(td, exe)], cwd=td, env=env)
+                got = run.stdout.decode()
+                if run.returncode != 0 or got != want:
+                    return Result(name, "FAIL",
+                                  f"{cf}/{tag}: rc={run.returncode} got {got!r} want {want!r}")
+            syms = sh(["readelf", "-W", "-D", "-s", f"t{cf}.lccc"], cwd=td).stdout.decode()
+            und = {m.group(3): (m.group(2), int(m.group(1), 16))
+                   for m in re.finditer(r"^\s*\d+:\s+([0-9a-f]+)\s+\d+\s+\w+\s+(\w+)\s+\w+\s+UND\s+([A-Za-z_]\w*)",
+                                        syms, re.M)}
+            if und.get("puts", ("?", 0)) [0] != "GLOBAL" or not und["puts"][1]:
+                return Result(name, "FAIL", f"{cf}: puts import {und.get('puts')} (want GLOBAL, canonical)")
+            if und.get("lib_weakref", ("?",))[0] != "WEAK":
+                return Result(name, "FAIL", f"{cf}: weak reference imported as {und.get('lib_weakref')}")
+        return Result(name, "PASS")
+    finally:
+        if not args.keep:
+            shutil.rmtree(td, ignore_errors=True)
+
+
+_GOTX_ASM = r"""	.text
+	.globl	target
+	.type	target, @function
+target:	movl	$42, %eax
+	ret
+	.globl	f_mov, f_mov32, f_movr9, f_call, f_jmp, f_high, f_dso, f_test, f_add, f_cmp
+f_mov:	movq	var@GOTPCREL(%rip), %rax
+	movq	(%rax), %rax
+	ret
+f_mov32: movl	var@GOTPCREL(%rip), %eax
+	leaq	var(%rip), %rcx
+	cmpl	%ecx, %eax
+	sete	%al
+	movzbl	%al, %eax
+	ret
+f_movr9: movq	var@GOTPCREL(%rip), %r9
+	movq	(%r9), %rax
+	ret
+f_call:	subq	$8, %rsp
+	call	*target@GOTPCREL(%rip)
+	addq	$8, %rsp
+	ret
+f_jmp:	jmp	*target@GOTPCREL(%rip)
+f_high:	movl	var@GOTPCREL+4(%rip), %eax
+	leaq	var(%rip), %rcx
+	shrq	$32, %rcx
+	cmpl	%ecx, %eax
+	sete	%al
+	movzbl	%al, %eax
+	ret
+f_dso:	movq	puts@GOTPCREL(%rip), %rax
+	testq	%rax, %rax
+	setne	%al
+	movzbl	%al, %eax
+	ret
+f_test:	movq	$-1, %rcx
+	xorl	%eax, %eax
+	testq	%rcx, var@GOTPCREL(%rip)
+	setne	%al
+	ret
+f_add:	xorl	%eax, %eax
+	addq	var@GOTPCREL(%rip), %rax
+	leaq	var(%rip), %rcx
+	cmpq	%rcx, %rax
+	sete	%al
+	movzbl	%al, %eax
+	ret
+f_cmp:	leaq	var(%rip), %rcx
+	xorl	%eax, %eax
+	cmpq	var@GOTPCREL(%rip), %rcx
+	sete	%al
+	ret
+	.data
+	.globl	var
+var:	.quad	7
+	.section .note.GNU-stack,"",@progbits
+"""
+_GOTX_MAIN = r"""#include <stdio.h>
+long f_mov(void), f_movr9(void);
+int f_mov32(void), f_call(void), f_jmp(void), f_high(void), f_dso(void), f_test(void),
+    f_add(void), f_cmp(void);
+int main(void){
+  printf("%ld %ld %d %d %d %d %d %d %d %d\n", f_mov(), f_movr9(), f_mov32(), f_call(), f_jmp(),
+         f_high(), f_dso(), f_test(), f_add(), f_cmp());
+  return 0;
+}
+"""
+
+
+def _gotpcrelx_relax_test(args, oracles):
+    """GOTPCRELX relaxation matches GNU ld instruction for instruction.
+
+    Every relaxable form (mov -> mov-imm without PIC / lea with it, a REX.R
+    destination, the 32-bit mov, call -> addr32 call, jmp -> jmp+nop,
+    test/add/cmp -> immediate forms without PIC) and every form that must
+    stay GOT-indirect (a high-half load with addend 0, a DSO symbol) is
+    linked by both linkers as PIE and non-PIE.  Checked: identical runtime
+    output, identical per-function instruction shapes (mnemonics and
+    operands with addresses masked), and no more GLOB_DAT relocations than
+    GNU ld.
+    """
+    name = "gotpcrelx_relax_vs_bfd"
+    td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
+    try:
+        with open(os.path.join(td, "f.s"), "w") as f:
+            f.write(_GOTX_ASM)
+        with open(os.path.join(td, "m.c"), "w") as f:
+            f.write(_GOTX_MAIN)
+        lccc_ld = os.path.join(os.path.dirname(os.path.abspath(args.lccc)), "lccc-ld")
+        shim = _shim_for(td, lccc_ld)
+        want = "7 7 1 42 42 1 1 1 1 1\n"
+
+        def shape(exe):
+            out = sh(["objdump", "-d", "--no-show-raw-insn", exe], cwd=td).stdout.decode()
+            lines, fn = [], None
+            for ln in out.splitlines():
+                m = re.match(r"^[0-9a-f]+ <(f_\w+)>:$", ln)
+                if m:
+                    fn = m.group(1)
+                    continue
+                if not ln.strip():
+                    fn = None
+                    continue
+                if fn and re.match(r"^\s+[0-9a-f]+:", ln):
+                    insn = re.sub(r"^\s+[0-9a-f]+:\s*", "", ln)
+                    insn = re.sub(r"0x[0-9a-f]+|\b[0-9a-f]{4,}\b|<[^>]*>|#.*", "X", insn)
+                    lines.append(f"{fn}: {' '.join(insn.split())}")
+            return lines
+
+        for mode in ("-pie", "-no-pie"):
+            shapes, glob = {}, {}
+            for tag, bflag in (("lccc", ["-B" + shim]), ("gnu", [])):
+                exe = f"t{mode}.{tag}"
+                r = sh([CC] + bflag + ["-O1", mode, "f.s", "m.c", "-o", exe], cwd=td)
+                if r.returncode != 0:
+                    return Result(name, "FAIL", f"{mode}/{tag} link: {r.stderr.decode()[:300]}")
+                run = sh([os.path.join(td, exe)], cwd=td)
+                if run.returncode != 0 or run.stdout.decode() != want:
+                    return Result(name, "FAIL",
+                                  f"{mode}/{tag}: got {run.stdout.decode()!r} want {want!r}")
+                shapes[tag] = shape(exe)
+                relocs = sh(["readelf", "-W", "-r", exe], cwd=td).stdout.decode()
+                glob[tag] = relocs.count("R_X86_64_GLOB_DAT")
+            if shapes["lccc"] != shapes["gnu"]:
+                diff = [f"{a} | {b}" for a, b in zip(shapes["lccc"], shapes["gnu"]) if a != b]
+                return Result(name, "FAIL", f"{mode}: instruction shapes differ: {diff[:4]}")
+            if not shapes["lccc"]:
+                return Result(name, "FAIL", f"{mode}: no f_* functions disassembled")
+            if glob["lccc"] > glob["gnu"]:
+                return Result(name, "FAIL", f"{mode}: GLOB_DAT {glob['lccc']} > GNU ld {glob['gnu']}")
+        return Result(name, "PASS")
+    finally:
+        if not args.keep:
+            shutil.rmtree(td, ignore_errors=True)
 
 
 def _build_id_note_test(args, oracles):
@@ -7161,6 +7875,16 @@ def main():
         results.append(_rel_test(name, sources, expect,
                                  compile_flags=cflags)(args, oracles))
     results.append(_whole_archive_r_test(args, oracles))
+    if (not args.filter or "file_mode" in args.filter) and (not args.tag or args.tag == "rel"):
+        results.append(_file_mode_libs_test(args, oracles))
+
+    if not args.tag or args.tag == "dynamic":
+        for tname, runner in (("dso_pointer_equality", _dso_pointer_equality_test),
+                              ("i386_dso_pointer_equality", _dso_pointer_equality_i386_test),
+                              ("gotpcrelx_relax_vs_bfd", _gotpcrelx_relax_test),
+                              ("dso_emit_semantics", _dso_emit_semantics_test)):
+            if not args.filter or args.filter in tname:
+                results.append(runner(args, oracles))
 
     if (not args.filter or "cxx" in args.filter) and (not args.tag or args.tag == "ehframe"):
         results.append(_cxx_eh_test(args, oracles))
@@ -7214,6 +7938,8 @@ def main():
         results.append(_script_overlay_test(args, oracles))
     if (not args.filter or "as_needed" in args.filter) and not args.tag:
         results.append(_as_needed_positional_test(args, oracles))
+    if (not args.filter or "bstatic" in args.filter) and not args.tag:
+        results.append(_bstatic_positional_test(args, oracles))
     if (not args.filter or "print_map" in args.filter) and not args.tag:
         results.append(_print_map_test(args, oracles))
     if (not args.filter or "version" in args.filter) and not args.tag:

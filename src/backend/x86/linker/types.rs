@@ -30,6 +30,21 @@ pub struct GlobalSymbol {
     pub section_idx: u16,
     pub is_dynamic: bool,
     pub copy_reloc: bool,
+    /// A shared-library function whose PLT entry serves as its address in
+    /// this executable (a non-PIC address-of: `mov $f`, `R_X86_64_64` in
+    /// read-only data, a non-branch `R_X86_64_PC32`).  Its `.dynsym` entry
+    /// then carries the PLT entry's address as `st_value` -- the "canonical
+    /// PLT" convention -- so ld.so resolves every other object's references
+    /// to that same address and `&f` compares equal everywhere.
+    pub canonical_plt: bool,
+    /// Merged ELF visibility (`STV_*`) of every relocatable-object symbol
+    /// table entry naming this symbol -- definition and references alike --
+    /// combined by the gABI "most constraining wins" rule
+    /// (`linker_common::merge_object_visibility`).  Shared-library entries
+    /// never contribute: a DSO's visibility is its own business.  Anything
+    /// other than `STV_DEFAULT` makes the symbol non-preemptible; `HIDDEN`
+    /// and `INTERNAL` additionally keep it out of `.dynsym`.
+    pub visibility: u8,
     pub lib_sym_value: u64,
     pub version: Option<String>,
 }
@@ -56,6 +71,12 @@ impl GlobalSymbolOps for GlobalSymbol {
     fn size(&self) -> u64 {
         self.size
     }
+    fn visibility(&self) -> u8 {
+        self.visibility
+    }
+    fn set_visibility(&mut self, visibility: u8) {
+        self.visibility = visibility;
+    }
     fn new_defined(obj_idx: usize, sym: &Elf64Symbol) -> Self {
         GlobalSymbol {
             value: sym.value,
@@ -68,6 +89,8 @@ impl GlobalSymbolOps for GlobalSymbol {
             section_idx: sym.shndx,
             is_dynamic: false,
             copy_reloc: false,
+            canonical_plt: false,
+            visibility: 0,
             lib_sym_value: 0,
             version: None,
         }
@@ -84,6 +107,8 @@ impl GlobalSymbolOps for GlobalSymbol {
             section_idx: SHN_COMMON,
             is_dynamic: false,
             copy_reloc: false,
+            canonical_plt: false,
+            visibility: 0,
             lib_sym_value: 0,
             version: None,
         }
@@ -100,6 +125,8 @@ impl GlobalSymbolOps for GlobalSymbol {
             section_idx: SHN_UNDEF,
             is_dynamic: false,
             copy_reloc: false,
+            canonical_plt: false,
+            visibility: 0,
             lib_sym_value: 0,
             version: None,
         }
@@ -120,6 +147,8 @@ impl GlobalSymbolOps for GlobalSymbol {
             section_idx: SHN_UNDEF,
             is_dynamic: true,
             copy_reloc: false,
+            canonical_plt: false,
+            visibility: 0,
             lib_sym_value: dsym.value,
             version: dsym.version.clone(),
         }
