@@ -1491,6 +1491,12 @@ impl X86Codegen {
         self.state.pic_mode = pic;
     }
 
+    /// Record shared-object output. Distinct from PIC: a PIE executable may
+    /// use Local-Exec TLS, a shared object may not.
+    pub fn set_shared_lib(&mut self, shared: bool) {
+        self.state.shared_lib = shared;
+    }
+
     /// Enable function return thunk (-mfunction-return=thunk-extern).
     pub fn set_function_return_thunk(&mut self, enabled: bool) {
         self.state.function_return_thunk = enabled;
@@ -1546,6 +1552,7 @@ impl X86Codegen {
     /// Apply all relevant options from a `CodegenOptions` struct.
     pub fn apply_options(&mut self, opts: &crate::backend::CodegenOptions) {
         self.state.disable_regalloc = opts.disable_regalloc;
+        self.state.shared_lib = opts.shared_lib;
         self.set_pic(opts.pic || opts.pie);
         self.state.pie_mode = opts.pie;
         self.set_function_return_thunk(opts.function_return_thunk);
@@ -7522,6 +7529,21 @@ impl ArchCodegen for X86Codegen {
                 return false;
             }
         }
+        // PF-TLS-1: a Load/Store the text path folds into ONE Local-Exec
+        // instruction (`%fs:sym@TPOFF+N`) must not be claimed here — the
+        // MachInst lowering would emit the two-instruction base
+        // materialization plus an indirect access. The gate is the same
+        // resolution the fold itself uses, so the two can never disagree.
+        if let crate::ir::reexports::Instruction::Load { ptr, ty, .. } = inst {
+            if Self::tls_direct_type_ok(*ty) && self.tls_local_exec_access(ptr.0, 0).is_some() {
+                return false;
+            }
+        }
+        if let crate::ir::reexports::Instruction::Store { ptr, ty, .. } = inst {
+            if Self::tls_direct_type_ok(*ty) && self.tls_local_exec_access(ptr.0, 0).is_some() {
+                return false;
+            }
+        }
         // PF-15 hazard closure: a Cast admitted to the MachInst queue never
         // runs the mature cast emitter, so it neither records a pending
         // widening move nor honours try_record_pending_widen's refusal
@@ -9333,6 +9355,10 @@ impl ArchCodegen for X86Codegen {
         fn load_instr_for_type(&self, ty: IrType) -> &'static str => load_instr_for_type_impl;
         // memory
         fn emit_store(&mut self, val: &Operand, ptr: &Value, ty: IrType) => emit_store_impl;
+        // PF-TLS-1 Local-Exec direct TLS access (`%fs:sym@TPOFF+N`). Default
+        // false on every other backend, so non-x86 ladders are unchanged.
+        fn try_emit_tls_direct_load(&mut self, dest: &Value, base: &Value, offset: i64, ty: IrType) -> bool => try_emit_tls_direct_load_impl;
+        fn try_emit_tls_direct_store(&mut self, val: &Operand, base: &Value, offset: i64, ty: IrType) -> bool => try_emit_tls_direct_store_impl;
         fn emit_load(&mut self, dest: &Value, ptr: &Value, ty: IrType) => emit_load_impl;
         fn emit_store_with_const_offset(&mut self, val: &Operand, base: &Value, offset: i64, ty: IrType) => emit_store_with_const_offset_impl;
         fn emit_load_with_const_offset(&mut self, dest: &Value, base: &Value, offset: i64, ty: IrType) => emit_load_with_const_offset_impl;

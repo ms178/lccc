@@ -560,6 +560,42 @@ pub trait ArchCodegen {
         panic!("global RIP-relative store only supported on x86");
     }
 
+    /// Emit a Local-Exec TLS load/store directly against the thread pointer
+    /// (`%fs:symbol@TPOFF+N`), when the access may legally use the
+    /// link-time-constant form.
+    ///
+    /// This is the PF-TLS-1 fold: it replaces the two-instruction Local-Exec
+    /// base materialization (`movq %fs:0,%r` + `leaq sym@TPOFF(%r)`) plus the
+    /// access with ONE instruction. The TPOFF offset is a link-time constant,
+    /// so it is legal in every executable (PIE included) but NOT in a shared
+    /// object, and only for a symbol this module owns. The default answer is
+    /// `false` — every backend without an x86 segment override keeps its
+    /// current sequence, and the caller's ladder is untouched.
+    ///
+    /// `base` is the pointer value and `offset` the folded constant offset
+    /// (0 for a direct `GlobalAddr` access). Returns false when the access is
+    /// not a legal direct form, leaving the caller's ladder unchanged.
+    fn try_emit_tls_direct_load(
+        &mut self,
+        _dest: &Value,
+        _base: &Value,
+        _offset: i64,
+        _ty: IrType,
+    ) -> bool {
+        false
+    }
+
+    /// Store counterpart of [`CodegenBackend::try_emit_tls_direct_load`].
+    fn try_emit_tls_direct_store(
+        &mut self,
+        _val: &Operand,
+        _base: &Value,
+        _offset: i64,
+        _ty: IrType,
+    ) -> bool {
+        false
+    }
+
     /// Emit a load with a folded GEP constant offset: load from (base + const_offset).
     ///
     /// This is an optimization for the common pattern:

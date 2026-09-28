@@ -323,6 +323,10 @@ pub struct CodegenState {
     /// Position-independent executable mode. x86-64 may address ordinary
     /// executable data directly; full PIC and weak extern data still use GOT.
     pub pie_mode: bool,
+    /// Shared-object output (`-shared`). Gates the Local-Exec TLS direct
+    /// form: legal in executables (PIE included), rejected by the linker for
+    /// `ET_DYN` shared objects.
+    pub shared_lib: bool,
     /// Set of symbol names that are locally defined (not extern) and have internal
     /// linkage (static) — these can use direct addressing even in PIC mode.
     pub local_symbols: FxHashSet<String>,
@@ -697,6 +701,7 @@ impl CodegenState {
             trampoline_data_blocks: Vec::new(),
             label_counter: 0,
             pic_mode: false,
+            shared_lib: false,
             pie_mode: false,
             local_symbols: FxHashSet::default(),
             extern_function_symbols: FxHashSet::default(),

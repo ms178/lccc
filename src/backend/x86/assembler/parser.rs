@@ -370,6 +370,15 @@ pub enum Displacement {
     SymbolAddend(String, i64),
     /// Symbol with relocation modifier: symbol@GOT, symbol@GOTPCREL, symbol@TPOFF, etc.
     SymbolMod(String, String),
+    /// Symbol with relocation modifier **and** a constant addend:
+    /// `symbol@TPOFF+8`, `symbol@GOTTPOFF-4`.
+    ///
+    /// GNU as folds the addend into the relocation's addend field; treating
+    /// this shape as a plain `symbol+offset` would keep the modifier text in
+    /// the symbol name and degrade the access to an absolute `R_X86_64_32S`
+    /// relocation — a silently wrong address for every TLS/GOT form, which is
+    /// why the shape is a distinct variant instead of a normalization.
+    SymbolModAddend(String, String, i64),
     /// Symbol plus integer offset: symbol+N or symbol-N
     SymbolPlusOffset(String, i64),
     /// Symbol difference: `rva(gdt)(%ebp)` in the compressed-boot head_64.S
@@ -1978,7 +1987,7 @@ fn parse_immediate_operand(s: &str) -> Result<Operand, String> {
 /// Known relocation modifiers (GNU as). `sym@VER@GOTPCREL` must split at the
 /// LAST '@' (the modifier), keeping `sym@VER` as the versioned symbol name;
 /// a bare `sym@VER` (suffix not in this list) stays a plain symbol.
-fn is_known_reloc_modifier(m: &str) -> bool {
+pub(crate) fn is_known_reloc_modifier(m: &str) -> bool {
     matches!(
         m.to_ascii_uppercase().as_str(),
         "GOT"
@@ -2023,6 +2032,37 @@ fn split_sym_modifier(s: &str) -> Option<(String, String)> {
         return None;
     }
     Some((s[..i].to_string(), modifier.to_string()))
+}
+
+/// Split `sym@MOD` with a trailing constant addend (`sym@TPOFF+8`,
+/// `sym@GOTTPOFF-4`) into `(symbol, modifier, addend)`.
+///
+/// The split happens at the LAST `@` (so a versioned `sym@VER@MOD+N` keeps its
+/// version in the symbol, exactly like [`split_sym_modifier`]) and the addend
+/// is the signed integer after the first `+`/`-` inside the modifier tail.
+/// Returns `None` unless the tail before the sign is a known relocation
+/// modifier and the remainder parses as an integer — every other spelling is
+/// left to the plain-symbol / symbol-difference paths below.
+fn split_sym_modifier_addend(s: &str) -> Option<(String, String, i64)> {
+    let at = s.rfind('@')?;
+    let sym = &s[..at];
+    let tail = &s[at + 1..];
+    if sym.is_empty() || tail.is_empty() {
+        return None;
+    }
+    // Position 0 is skipped: a leading sign is part of the addend, not a
+    // separator (the modifier itself never starts with '+'/'-').
+    let cut = tail
+        .char_indices()
+        .skip(1)
+        .find(|(_, c)| *c == '+' || *c == '-')?
+        .0;
+    let modifier = tail[..cut].to_string();
+    if !is_known_reloc_modifier(&modifier) {
+        return None;
+    }
+    let addend = crate::backend::asm_expr::parse_integer_expr(&tail[cut..]).ok()?;
+    Some((sym.to_string(), modifier, addend))
 }
 
 /// Try to parse a symbol difference expression in an immediate value.
@@ -2298,6 +2338,13 @@ fn parse_displacement(s: &str) -> Result<Displacement, String> {
     // Symbol with modifier: symbol@GOTPCREL, sym@VER@GOTPCREL, etc.
     if let Some((sym, modifier)) = split_sym_modifier(s) {
         return Ok(Displacement::SymbolMod(sym, modifier));
+    }
+
+    // Symbol with modifier AND addend: `sym@TPOFF+8`, `sym@GOTTPOFF-4`.
+    // Must be tried before the plain `symbol+offset` split: that split would
+    // name the symbol `sym@TPOFF` and emit a plain absolute relocation.
+    if let Some((sym, modifier, addend)) = split_sym_modifier_addend(s) {
+        return Ok(Displacement::SymbolModAddend(sym, modifier, addend));
     }
 
     // Check for symbol+offset or symbol-offset (e.g., `.Lstr0+1`, `foo-4`)
@@ -4597,6 +4644,63 @@ fn collect_conditional_branches(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `sym@MOD+N` must keep the relocation modifier AND carry N as an
+    /// addend.  Parsing it as a plain `symbol+offset` names the symbol
+    /// `sym@MOD` and degrades the access to an absolute `R_X86_64_32S`
+    /// relocation — a silently wrong TLS/GOT address, not a loud error.
+    #[test]
+    fn test_symbol_modifier_with_addend_keeps_the_relocation() {
+        for (text, sym, modifier, addend) in [
+            ("a@TPOFF+8", "a", "TPOFF", 8),
+            ("a@tpoff+8", "a", "tpoff", 8),
+            ("a@TPOFF-8", "a", "TPOFF", -8),
+            ("g_tls@GOTTPOFF+16", "g_tls", "GOTTPOFF", 16),
+            ("g@GOTPCREL+4", "g", "GOTPCREL", 4),
+            ("v@VER@TPOFF+24", "v@VER", "TPOFF", 24),
+        ] {
+            let disp = parse_displacement(text).unwrap_or_else(|e| panic!("{text}: {e}"));
+            match disp {
+                Displacement::SymbolModAddend(s, m, a) => {
+                    assert_eq!(s, sym, "{text}: symbol");
+                    assert_eq!(m, modifier, "{text}: modifier");
+                    assert_eq!(a, addend, "{text}: addend");
+                }
+                other => panic!("{text}: parsed as {other:?}, expected SymbolModAddend"),
+            }
+        }
+        // The bare form stays a plain SymbolMod (no addend variant invented).
+        assert!(matches!(
+            parse_displacement("a@TPOFF"),
+            Ok(Displacement::SymbolMod(_, _))
+        ));
+        // A NON-relocation suffix is not a modifier: the string stays one
+        // opaque symbol name (GAS behaviour for a versioned/unknown `@tail`),
+        // so no addend is split off and no relocation is invented.
+        assert!(matches!(
+            parse_displacement("my@label+8"),
+            Ok(Displacement::Symbol(_))
+        ));
+    }
+
+    /// The same shape in a full memory operand: `%fs:a@TPOFF+8` is the
+    /// Local-Exec TLS form this parser has to support for direct accesses.
+    #[test]
+    fn test_segment_symbol_modifier_addend_memory_operand() {
+        let op = parse_memory_operand("%fs:a@TPOFF+8").expect("parse %fs:a@TPOFF+8");
+        match op {
+            Operand::Memory(mem) => {
+                assert_eq!(mem.segment.as_deref(), Some("fs"));
+                match mem.displacement {
+                    Displacement::SymbolModAddend(s, m, a) => {
+                        assert_eq!((s.as_str(), m.as_str(), a), ("a", "TPOFF", 8));
+                    }
+                    other => panic!("displacement parsed as {other:?}"),
+                }
+            }
+            other => panic!("operand parsed as {other:?}"),
+        }
+    }
 
     /// `disp(base)+k` must be rejected like GAS ("junk after expression"),
     /// never silently truncated to `disp(base)`: the truncation previously

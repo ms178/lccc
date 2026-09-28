@@ -87,6 +87,12 @@ pub(crate) struct CodegenOptions {
     /// `-fpie`). Unlike full PIC, ordinary data definitions in the executable
     /// are non-preemptible and may use direct RIP-relative references.
     pub(crate) pie: bool,
+    /// Whether the output is a SHARED OBJECT (`-shared`). Kept separate from
+    /// `pic` on purpose: Local-Exec TLS (`%fs:sym@TPOFF`) is a link-time
+    /// constant in every executable, PIE included, but the linker rejects
+    /// `R_X86_64_TPOFF32` when producing a shared object. Codegen needs to
+    /// tell those two apart; `pic` alone cannot.
+    pub(crate) shared_lib: bool,
     /// Whether to replace `ret` with `jmp __x86_return_thunk` (-mfunction-return=thunk-extern)
     pub(crate) function_return_thunk: bool,
     /// Whether to replace indirect calls/jumps with retpoline thunks (-mindirect-branch=thunk-extern)

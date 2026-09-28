@@ -104,13 +104,24 @@ GHASH/mulpack for the multi-source shape rule).
 
 ## Tier 1 — measured, largest first
 
-### RA-PRESSURE-3 · Phi-copy cycle resolution — sha256 round loop (1.73–1.80×)
-218 insns vs clang 126 (83 loads/25 stores/**64 spills**, 15 branches).
-Sub-problems (kill-switch separately): (1) express the cyclic rotation
-web as register permutation — check `ui: alu/phi` admission, see
-`span_recurrence`; (2) 2×/4× unroll so the rotation runs once per body.
-Negative space: the valve count-coupled supply is falsified (W2 09-11);
-RA-06 intra-block splitting-measurement is recorded dead (W1 09-05).
+### RA-PRESSURE-3 · **RE-SCOPED 2026-09-28** — sha256 round loop
+The historical framing ("land a generic phi-copy cycle resolver") is
+obsolete: a general resolver already ships (Kahn decomposition in
+`plan_edge_copies`, exhaustive semantic-equivalence test over EVERY
+parallel-copy graph for n=2..5, default-on policy, and
+`check_phi_acyclic_order.sh` pinning rotation < legacy statically).
+Re-measured at `-O2` on `6f8ace9c`: `sha256_transform` is **148 insns /
+14 rrmov / 10 stkref** (GCC 142/19/8, Clang 129/24/26) — not the
+historical 218 insns / 64 spills, and lccc now has FEWER stack
+references than Clang. The residual gap is instruction selection and
+*physical* rotation, not copy resolution.
+New sub-problems: (1) express the rotation as a register permutation
+(rotate-by-immediate / `rorx`-class) rather than copies — check
+`ui: alu/phi` admission, see `span_recurrence`; (2) 2×/4× unroll so the
+rotation runs once per body; (3) close the 19-insn gap to Clang.
+Negative space unchanged: the valve count-coupled supply is falsified
+(W2 09-11); RA-06 intra-block splitting-measurement is recorded dead
+(W1 09-05).
 
 ### RA-PRESSURE-4 · Aggregate/struct register pressure — `struct_copy` (1.15–1.45×)
 156 insns vs clang 76 (**77 spills**). `CCC_NO_AGGREGATE_SPLIT` escape.
@@ -133,15 +144,47 @@ loads at constrained offsets + sliding-window SLP (`vec_arx` /
 `arx_vectorize` first-light: `s10/next/solve/split` → v-slp flags).
 Done = schedule vectorized at -O2, kernel ≤1.15×.
 
-### PF-TLS-1 · TLS segment access — remaining dups
-2.19× → 1.06× landed. Remaining: two of three `&tls_slots` computations
-not CSE'd; prologue may stage the thread pointer. Next step: direct
-`%fs:symbol@TPOFF` lowering. Done = ≤1.05×, every dynamic-offset TLS
-read one `%fs:` operand.
+### PF-TLS-1 · TLS segment access — **DIRECT LOCAL-EXEC FORM LANDED (2026-09-28)**
+Legal Local-Exec accesses now lower to ONE instruction,
+`%fs:symbol@TPOFF(+N)`, instead of base materialization + access.
+Measured at `-O2` on `6f8ace9c` → this tree (`ra_quality_census`):
+`set_all` 54 → **36** insns, `sum_all` 41 → **28**, a 3-store `set`
+12 → **6** (byte-identical to GCC), benchmark `tls_pass` 34 → **30**
+(GCC 37, Clang 31), whole focused TU 123 → 91.
+Legality rule (measured against GCC, not guessed): Local-Exec is a
+link-time constant, so it is used for every executable — PIE included —
+but **never** for `-shared`, and only for a symbol this module owns
+(extern TLS keeps Initial-Exec, as GCC does). The backend therefore
+carries a new `shared_lib` flag: `pic_mode` alone cannot tell `-fPIC`
+from `-shared`, and the two have opposite legality here.
+Two prerequisites were repaired first, both reproducible on the review
+baseline: (1) the assembler dropped the relocation modifier for
+`sym@MOD+N` (`R_X86_64_32S` against a symbol literally named
+`sym@TPOFF` — a silent wrong address; lccc's relocations now match GNU
+as 2.47 exactly); (2) `lccc -fPIC -shared` could not link ANY
+`static __thread` ("R_X86_64_TPOFF32 ... can not be used when making a
+shared object") because shared output used Local-Exec — it now uses
+Initial-Exec, verified by a `dlopen` round-trip.
+Runtime: **not established** — the scaled `tls_seg_access` screen
+(`-DPASSES=20000000U`, 7 interleaved rounds, output identical to GCC)
+has a per-binary spread of 0.67–0.94 s, so the before/after medians are
+inside the noise. UNVERIFIED ON TARGET.
+Evidence: [`engineering/evidence/PF-TLS-1/README.md`](engineering/evidence/PF-TLS-1/README.md);
+gates `tests/regression/check_tls_model_selection.sh` +
+`tests/regression/tls_local_exec_direct.c`.
+Remaining: two of three `&tls_slots` computations still not CSE'd; a
+variable-index TLS read still pays the base (unavoidable); `%gs:` and
+i686 coverage not attempted.
 
 ### PF-CLS-1 · Byte-classifier chains (expat_xml_scan 1.31–1.37×)
-79 vs gcc 78 insns — branch-prediction/scheduling-bound, not insn
-count. Structural block: `a||b||c` last-member critical edge + shared
+**Re-measured 2026-09-28 at `-O2`: `expat_utf8_name_length` is 70 insns
+vs gcc 79** — lccc is now statically AHEAD, so the 1.31–1.37× runtime
+gap is pure branch/layout behaviour and instruction-count work here is
+wasted effort. Use `scripts/callgrind_ab.py` (deterministic `Ir`,
+I1/LL misses, branch mispredictions) or a target-CPU PMU run; this
+host's wall-clock noise floor is ~15 %.
+Historically: 79 vs gcc 78 insns — branch-prediction/scheduling-bound,
+not insn count. Structural block: `a||b||c` last-member critical edge + shared
 increment block starve if-conversion (two attempts reverted W1 09-01g).
 **Split the critical edge on the last member first**; the counting
 spelling `pred && n++` needs the same `Select`s as the boolean one.
@@ -238,19 +281,31 @@ shape (k_i ≤ 53 / k_s ≤ 3); the beat-gcc and beat-legacy-by-10 contract
 unchanged. Do-not-reopen: the predicate gates profitability only —
 correctness always stays with the RA's disjoint-interval coalescing rule.
 
-### CC-O0CALL-1 · -O0 call-argument materialization clobbers a register home (OPEN, P0)
-Csmith 20260945 (differential vs GCC 14.2 at -O0): deterministic
-SIGSEGV, `-O1`/`-O2` and GCC clean. At -O0 (`disable_regalloc`),
-a call argument's pointer base stayed in `%rax` across the previous
-argument's evaluation; the next argument loaded through the stale
-`%rax` (`mov (%rax),%r8`) and dereferenced garbage. Independent of
-GLA (crashes with `CCC_RA_GLOBAL_LOCATION=0` too) and of FE-RELRO-1
-(fixed binary still crashes). Reproducer:
-`artifacts/repros/miscompile_csmith_20260945_-O0.c`; reduction in
-progress. Debug leads: `CCC_DEBUG_NOHOME` home-freshness reporting,
-the -O0 slot-assignment path in `stack_layout/`, and the Call lowering
-argument-order walk. Done = minimized repro + root cause + regression
-test + full CI green.
+### CC-O0CALL-1 · **CLOSED 2026-09-28** — secondary-cache (`%rcx`) clobber by GP argument 4
+The previously proposed cause (`-O0` accumulator-address loads trusting a
+non-SSA cache hit) is **falsified**: applying that guard leaves Csmith
+20260945 SIGSEGVing, and its regression test passes on the broken
+baseline, so it does not discriminate.
+Actual cause: `%rcx` is both the secondary value cache and SysV's fourth
+GP argument register. Argument 4 staged a scalar into `%rcx` without
+invalidating the cached pointer identity, so the next (aggregate)
+argument rematerialized the "pointer" from `%rcx` and dereferenced the
+scalar that had just been written — `movq %rcx,%rax; movq (%rax),%r8`
+with a NULL base. Independent of the peephole and of GLA (also fails
+with `CCC_NO_PEEPHOLE=1` and `CCC_RA_GLOBAL_LOCATION=0`).
+Fix: invalidate the secondary cache after a GP argument writes ABI slot
+3 and before the next argument is staged, for every classification that
+can write it (scalar, i128/i64 register pairs, by-value aggregates, both
+mixed struct classes); the next-iteration placement also covers the
+early-`continue` staging paths.
+Evidence: reduced reproducer
+`tests/regression/call_secondary_cache_clobber.c` (8 ABI shapes), gate
+`tests/regression/check_call_secondary_cache.sh` (20 output-checked
+arms: `-O0..-O3/-Os` × {default, no-peephole, no-GLA, both}), the full
+Csmith seed 20260945 now prints `checksum = 39DEBCF9` / exit 0 like GCC,
+and GCC `-fsanitize=address,undefined` is clean on the reduced case.
+Historical reproducer kept:
+`artifacts/repros/miscompile_csmith_20260945_-O0.c`.
 
 ### INF-HARNESS-1 · Subtract startup / scale short benchmarks
 lz4's 1.94× hid a 10× work gap (~2 ms fixed cost in a 7 ms measure).

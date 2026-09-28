@@ -624,6 +624,10 @@ fn i686_memory_displacement(
         Displacement::SymbolMod(symbol, modifier) => {
             (symbol.as_str(), 0, None, Some(modifier.as_str()))
         }
+
+        Displacement::SymbolModAddend(symbol, modifier, addend) => {
+            (symbol.as_str(), *addend, None, Some(modifier.as_str()))
+        }
     };
 
     (
