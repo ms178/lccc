@@ -3,14 +3,15 @@
 //! Emits an ELF64 shared library (ET_DYN) with PIC relocations, PLT stubs,
 //! `.dynamic` section, and GNU hash tables.
 
-use crate::backend::elf::{STV_DEFAULT, STV_PROTECTED, push_strtab_name};
+use crate::backend::elf::{STT_NOTYPE, STV_DEFAULT, STV_PROTECTED, push_strtab_name};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use std::collections::BTreeSet;
 
 use super::elf::*;
 use super::emit_exec::resolve_sym;
+use super::plt_got::local_got_target;
 use super::reloc_field::{self, w8_checked, w16_checked, w32_checked};
-use super::types::{GlobalSymbol, PAGE_SIZE};
+use super::types::{GlobalSymbol, LocalSlots, PAGE_SIZE};
 use crate::backend::linker_common::VersionScript;
 use crate::backend::linker_common::{self, DynStrTab, OutputSection};
 
@@ -116,36 +117,48 @@ fn push_verneed_entry(
     }
 }
 
-/// GOT slots (or slot pairs) of LOCAL symbols, keyed by (object index,
-/// symbol index) and numbered in first-reference order, so the layout is
-/// deterministic.
-#[derive(Default)]
-struct LocalSlots {
-    order: Vec<(usize, usize)>,
-    index: FxHashMap<(usize, usize), usize>,
-}
-
-impl LocalSlots {
-    fn insert(&mut self, key: (usize, usize)) {
-        if let std::collections::hash_map::Entry::Vacant(e) = self.index.entry(key) {
-            e.insert(self.order.len());
-            self.order.push(key);
-        }
-    }
-    fn len(&self) -> usize {
-        self.order.len()
-    }
-    fn is_empty(&self) -> bool {
-        self.order.is_empty()
-    }
-    fn get(&self, key: (usize, usize)) -> Option<usize> {
-        self.index.get(&key).copied()
-    }
-}
-
 /// Linkage symbols GNU ld defines with hidden visibility: they name this
 /// image's own GOT and dynamic section and are never published in `.dynsym`
 /// (a reference from another module would bind to the wrong image's table).
+/// GNU ld's diagnostic for a non-PIC relocation in a shared object.
+fn non_pic_reloc_error(obj_name: &str, rela_type: u32, sym_name: &str) -> String {
+    format!(
+        "{obj_name}: relocation {} against '{sym_name}' can not be used when making a shared \
+         object; recompile with -fPIC",
+        reloc_field::name(rela_type).unwrap_or("of this type")
+    )
+}
+
+/// Hand a PC-relative field whose value depends on the load address to
+/// ld.so, as GNU ld does: in writable storage it becomes a dynamic
+/// R_X86_64_PC32/PC64 -- against the symbol when ld.so may bind it
+/// elsewhere, else against symbol 0 with the absolute target folded into
+/// the addend.  In read-only storage that would be a text relocation, which
+/// this linker does not produce (nor does GNU ld for x86-64 PC32 in a shared
+/// object): the object was compiled without -fPIC.
+#[allow(clippy::too_many_arguments)]
+fn pc_rel_to_loader(
+    entries: &mut Vec<(u64, u32, String, i64)>,
+    sec_flags: u64,
+    rela_type: u32,
+    p: u64,
+    sym: &Symbol,
+    symbolic: bool,
+    s: u64,
+    a: i64,
+    obj_name: &str,
+) -> Result<(), String> {
+    if sec_flags & SHF_WRITE == 0 {
+        return Err(non_pic_reloc_error(obj_name, rela_type, &sym.name));
+    }
+    if symbolic {
+        entries.push((p, rela_type, sym.name.to_string(), a));
+    } else {
+        entries.push((p, rela_type, String::new(), s as i64 + a));
+    }
+    Ok(())
+}
+
 fn is_hidden_linkage_symbol(name: &str) -> bool {
     matches!(name, "_GLOBAL_OFFSET_TABLE_" | "_DYNAMIC")
 }
@@ -175,7 +188,14 @@ pub(super) fn emit_shared_library(
     rpath_entries: &[String],
     use_runpath: bool,
     version_script_path: Option<&str>,
-    bsymbolic: bool,
+    symbolic: crate::backend::linker_common::Symbolic,
+    // `(DT_FLAGS, DT_FLAGS_1)` bits the options request
+    // (`LinkerArgs::requested_dyn_flags`); DF_SYMBOLIC is added here.
+    requested_dyn_flags: (u64, u64),
+    // `-z relro` (the default) / `-z norelro`.
+    z_relro: bool,
+    // `-z now`: the lazy-binding `.got.plt` joins the RELRO window.
+    z_now: bool,
     // `--exclude-libs`: archives whose symbols must not be re-exported.
     exclude_libs: &[String],
     // `-Map=FILE`: write a GNU-ld-compatible link map. Previously reachable
@@ -188,6 +208,17 @@ pub(super) fn emit_shared_library(
     pending_defsyms: &[(String, String, usize)],
 ) -> Result<(), String> {
     let base_addr: u64 = 0;
+    // Option-derived dynamic flags, fixed up front: the `.dynamic` sizing
+    // and the writer below read these same three values, so the entry count
+    // and the bytes cannot disagree.
+    let dt_symbolic = symbolic == crate::backend::linker_common::Symbolic::All;
+    let (dt_flags, dt_flags_1) = {
+        let (mut f, f1) = requested_dyn_flags;
+        if dt_symbolic {
+            f |= crate::backend::linker_common::dyn_flags::DF_SYMBOLIC;
+        }
+        (f, f1)
+    };
 
     // Congruent segment packing — see the extended rationale in
     // emit_exec.rs. File offsets stay dense; virtual addresses advance one
@@ -325,13 +356,8 @@ pub(super) fn emit_shared_library(
     let preemptible_def = |name: &str, g: &GlobalSymbol| -> bool {
         exports_def(name, g)
             && g.visibility == STV_DEFAULT
-            && !bsymbolic
+            && !symbolic.binds_locally(g.info & 0xf)
             && !linker_provided.contains(name)
-    };
-    // A genuinely absolute definition (SHN_ABS input symbol, `--defsym`
-    // constant): its value must not move with the load address.
-    let is_abs = |name: &str, g: &GlobalSymbol| -> bool {
-        g.section_idx == SHN_ABS && !linker_provided.contains(name)
     };
     // An undefined, non-DSO symbol is imported through `.dynsym` unless its
     // merged visibility is HIDDEN/INTERNAL: a hidden undefined weak symbol
@@ -373,7 +399,7 @@ pub(super) fn emit_shared_library(
                     continue;
                 }
                 match rela.rela_type {
-                    R_X86_64_PLT32 | R_X86_64_PC32 => {
+                    R_X86_64_PLT32 | R_X86_64_PC32 | R_X86_64_PLTOFF64 => {
                         if let Some(gsym) = globals.get(sym.name.as_str()) {
                             let locally_defined = gsym.defined_in.is_some() && !gsym.is_dynamic;
                             // External references always need a stub.
@@ -389,7 +415,7 @@ pub(super) fn emit_shared_library(
                             // script locals, --exclude-libs, -Bsymbolic.
                             let is_func = (gsym.info & 0xf) == STT_FUNC
                                 || sym.sym_type() == STT_FUNC
-                                || rela.rela_type == R_X86_64_PLT32;
+                                || matches!(rela.rela_type, R_X86_64_PLT32 | R_X86_64_PLTOFF64);
                             let interposable = locally_defined
                                 && is_func
                                 && preemptible_def(sym.name.as_str(), gsym);
@@ -428,6 +454,7 @@ pub(super) fn emit_shared_library(
                     version: None,
                     plt_idx: None,
                     got_idx: None,
+                    absolute: false,
                 },
             );
         }
@@ -440,21 +467,91 @@ pub(super) fn emit_shared_library(
         }
     }
 
-    // A GOT-indirect reference to a non-preemptible, non-IFUNC, non-absolute
-    // definition can address it directly (`elf::gotpcrelx_relaxation` decides
-    // for the instruction).  PIC rules: only the `lea`, `addr32 call` and
-    // `jmp` forms -- the immediate forms would embed a load-time address.
-    // The scan below and the relocation pass ask the same question of the
-    // same original bytes, so every reference left unrelaxed has a slot.
-    let relax_target = |name: &str, g: &GlobalSymbol| -> bool {
-        g.defined_in.is_some()
+    // IFUNCs bound inside this library: STB_LOCAL ones, and global ones
+    // ld.so cannot rebind (hidden/protected, version-script local,
+    // -Bsymbolic).  A preemptible IFUNC needs nothing special -- its
+    // symbolic JUMP_SLOT/GLOB_DAT/R_X86_64_64 makes ld.so run the resolver.
+    // A bound one has no link-time address at all: its symbol value is the
+    // RESOLVER.  Each referenced one gets an IPLT entry, `jmp *slot(%rip)`
+    // through a `.got.plt` slot that an R_X86_64_IRELATIVE (appended to
+    // `.rela.plt`, after the JUMP_SLOTs, where GNU ld puts them, so the
+    // resolver runs once the rest of the library is relocated) fills with
+    // the resolver's answer.  That entry then IS the function's address for
+    // every reference in the library -- calls, `lea`, GOT slots, pointers in
+    // data -- so function-pointer equality holds, and GOT-indirect
+    // references relax to it like to any local function.  This emitter
+    // used to refuse such references outright.
+    let bound_ifunc_global = |name: &str, g: &GlobalSymbol| -> bool {
+        (g.info & 0xf) == STT_GNU_IFUNC
+            && g.defined_in.is_some()
             && !g.is_dynamic
             && g.section_idx != SHN_UNDEF
-            && !is_abs(name, g)
-            && (g.info & 0xf) != STT_GNU_IFUNC
             && !preemptible_def(name, g)
     };
-    let local_relax_target = |sym: &Symbol| sym.shndx != SHN_ABS && sym.sym_type() != STT_GNU_IFUNC;
+    let mut iplt_globals: Vec<String> = Vec::new();
+    let mut iplt_locals: Vec<(usize, usize)> = Vec::new();
+    {
+        let mut seen_globals: FxHashSet<&str> = FxHashSet::default();
+        let mut seen_locals: FxHashSet<(usize, usize)> = FxHashSet::default();
+        for (obj_idx, obj) in objects.iter().enumerate() {
+            for (sec_idx, sec_relas) in obj.relocations.iter().enumerate() {
+                // References from unloaded storage (DWARF) need no entry.
+                if obj.sections[sec_idx].flags & SHF_ALLOC == 0 {
+                    continue;
+                }
+                for rela in sec_relas {
+                    let si = rela.sym_idx as usize;
+                    let Some(sym) = obj.symbols.get(si) else {
+                        continue;
+                    };
+                    if rela.rela_type == R_X86_64_NONE {
+                        continue;
+                    }
+                    if sym.is_local() {
+                        if sym.sym_type() == STT_GNU_IFUNC
+                            && sym.shndx != SHN_UNDEF
+                            && seen_locals.insert((obj_idx, si))
+                        {
+                            iplt_locals.push((obj_idx, si));
+                        }
+                    } else if !sym.name.is_empty()
+                        && globals
+                            .get(sym.name.as_str())
+                            .is_some_and(|g| bound_ifunc_global(&sym.name, g))
+                        && seen_globals.insert(sym.name.as_str())
+                    {
+                        iplt_globals.push(sym.name.to_string());
+                    }
+                }
+            }
+        }
+    }
+    let n_iplt = iplt_globals.len() + iplt_locals.len();
+
+    // A GOT-indirect reference to a non-preemptible definition can address
+    // it directly (`elf::gotpcrelx_relaxation` decides for the instruction)
+    // -- a bound IFUNC included, whose address is its IPLT entry (every one
+    // referenced from loaded storage has one, see above).  PIC rules: an
+    // address in this object only through `lea`, `addr32 call` and `jmp`;
+    // an absolute value (`GlobalSymbol::absolute`) only through the
+    // immediate forms.  A linker-created absolute (`--defsym`) keeps its
+    // slot: an expression's value is computed after layout, and planner and
+    // applier must decide on the same value (see `exec_got_target`).  The
+    // scan below and the relocation pass ask the same question of the same
+    // original bytes, so every reference left unrelaxed has a slot.
+    let got_target = |name: &str, g: &GlobalSymbol| -> Option<GotTarget> {
+        if g.defined_in.is_none()
+            || g.is_dynamic
+            || g.section_idx == SHN_UNDEF
+            || preemptible_def(name, g)
+        {
+            return None;
+        }
+        if !g.absolute {
+            return Some(GotTarget::Image);
+        }
+        (g.defined_in != Some(usize::MAX)).then_some(GotTarget::Absolute(g.value))
+    };
 
     // GOT slots.  Global symbols are keyed by name (one slot per symbol, and
     // their dynamic relocations name the `.dynsym` entry); LOCAL symbols by
@@ -494,19 +591,19 @@ pub(super) fn emit_shared_library(
                     needs_tlsld_slot = true;
                     continue;
                 }
-                if sym.name.is_empty() {
-                    continue;
-                }
-                let relaxable = || {
+                let relaxable = |target: GotTarget| {
                     gotpcrelx_relaxation(
                         rela.rela_type,
                         rela.addend,
                         obj.section_data[sec_idx].as_slice(),
                         rela.offset as usize,
                         true,
+                        target,
                     )
                     .is_some()
                 };
+                // Locals first: a section symbol has an empty name and is
+                // exactly what `mov .Lc@GOTPCREL(%rip)` references.
                 if sym.is_local() {
                     // Never preemptible and never in `.dynsym`; its slots are
                     // filled with module-relative values (RELATIVE, or TLS
@@ -518,21 +615,30 @@ pub(super) fn emit_shared_library(
                         t if is_tlsdesc_gotpc(t) => local_desc.insert(key),
                         t if is_gottpoff_family(t) => local_ie.insert(key),
                         t if is_gotpcrel_family(t) => {
-                            if !(local_relax_target(sym) && relaxable()) {
+                            if !relaxable(local_got_target(sym)) {
                                 local_got.insert(key);
                             }
                         }
+                        t if is_got64_family(t) => local_got.insert(key),
                         _ => {}
                     }
                     continue;
                 }
+                if sym.name.is_empty() {
+                    continue;
+                }
                 match rela.rela_type {
+                    t if is_got64_family(t) => {
+                        if got_needed_seen.insert(sym.name.to_string()) {
+                            got_needed_names.push(sym.name.to_string());
+                        }
+                    }
                     t if is_gotpcrel_family(t) || is_gottpoff_family(t) => {
                         let relaxed = is_gotpcrel_family(t)
                             && globals
                                 .get(sym.name.as_str())
-                                .is_some_and(|g| relax_target(&sym.name, g))
-                            && relaxable();
+                                .and_then(|g| got_target(&sym.name, g))
+                                .is_some_and(relaxable);
                         if !relaxed && got_needed_seen.insert(sym.name.to_string()) {
                             got_needed_names.push(sym.name.to_string());
                         }
@@ -590,6 +696,7 @@ pub(super) fn emit_shared_library(
                     version: None,
                     plt_idx: None,
                     got_idx: None,
+                    absolute: false,
                 },
             );
         }
@@ -598,11 +705,17 @@ pub(super) fn emit_shared_library(
     // Pre-scan: collect named global symbols referenced by R_X86_64_64 relocations.
     // These must appear in the dynamic symbol table so the dynamic linker can
     // resolve them (supporting symbol interposition at runtime).
+    // A PC32/PC64 in writable storage against such a symbol becomes a
+    // dynamic PC-relative relocation that names it just the same.
     let mut abs64_sym_names: BTreeSet<String> = BTreeSet::new();
     for obj in objects.iter() {
-        for sec_relas in &obj.relocations {
+        for (sec_idx, sec_relas) in obj.relocations.iter().enumerate() {
+            let writable =
+                obj.sections[sec_idx].flags & (SHF_ALLOC | SHF_WRITE) == SHF_ALLOC | SHF_WRITE;
             for rela in sec_relas {
-                if rela.rela_type == R_X86_64_64 {
+                if rela.rela_type == R_X86_64_64
+                    || (writable && matches!(rela.rela_type, R_X86_64_PC32 | R_X86_64_PC64))
+                {
                     let si = rela.sym_idx as usize;
                     if si >= obj.symbols.len() {
                         continue;
@@ -1137,18 +1250,18 @@ pub(super) fn emit_shared_library(
             + (num_hashed as u64 * 4)
     };
 
-    let plt_size = if plt_names.is_empty() {
+    // PLT entries: PLT0, one per imported/preemptible function, then one
+    // per bound IFUNC (IPLT); `.got.plt` and `.rela.plt` follow the same
+    // index order.
+    let n_plt_total = plt_names.len() + n_iplt;
+    let plt_size = if n_plt_total == 0 {
         0u64
     } else {
-        16 + 16 * plt_names.len() as u64
+        16 + 16 * n_plt_total as u64
     };
-    let got_plt_count = if plt_names.is_empty() {
-        0
-    } else {
-        3 + plt_names.len()
-    };
+    let got_plt_count = if n_plt_total == 0 { 0 } else { 3 + n_plt_total };
     let got_plt_size = got_plt_count as u64 * 8;
-    let rela_plt_size = plt_names.len() as u64 * 24;
+    let rela_plt_size = n_plt_total as u64 * 24;
 
     // Count R_X86_64_RELATIVE relocations needed (for internal absolute addresses)
     // We'll collect them during relocation processing
@@ -1192,15 +1305,13 @@ pub(super) fn emit_shared_library(
     if has_fini {
         dyn_count += 1;
     }
-    if !plt_names.is_empty() {
+    if rela_plt_size > 0 {
         dyn_count += 4;
     } // DT_PLTGOT, DT_PLTRELSZ, DT_PLTREL, DT_JMPREL
     if rpath_string.is_some() {
         dyn_count += 1;
     } // DT_RUNPATH or DT_RPATH
-    if bsymbolic {
-        dyn_count += 2;
-    } // DT_SYMBOLIC + DT_FLAGS(DF_SYMBOLIC)
+    dyn_count += u64::from(dt_symbolic) + u64::from(dt_flags != 0) + u64::from(dt_flags_1 != 0);
     if verdef_count > 0 || verneed_count > 0 {
         dyn_count += 1; // DT_VERSYM
     }
@@ -1258,7 +1369,14 @@ pub(super) fn emit_shared_library(
 
     // phdrs: PHDR, LOAD(ro), LOAD(text), LOAD(rodata), LOAD(rw), DYNAMIC,
     // NOTE* + GNU_PROPERTY, GNU_STACK, [GNU_RELRO], [TLS]
-    let has_relro = !sections_with_abs_relocs.is_empty();
+    // RELRO follows `-z relro` (the default), as in `emit_exec`.  It used to
+    // exist only when some read-only section carried absolute relocations,
+    // so a typical -fPIC library -- whose relocated constants the compiler
+    // already puts in `.data.rel.ro` -- had NO PT_GNU_RELRO: `.dynamic`,
+    // `.init_array`, `.data.rel.ro` and every GOT slot stayed writable for
+    // the life of the process.  The window is now what GNU ld protects:
+    // those plus the whole `.got`, and `.got.plt` too under `-z now`.
+    let has_relro = z_relro;
     // .eh_frame_hdr + PT_GNU_EH_FRAME.  Not optional for a shared library:
     // modern crtbeginS.o no longer registers `.eh_frame` with
     // `__register_frame_info`, so libgcc's unwinder finds a DSO's FDEs ONLY
@@ -1295,15 +1413,7 @@ pub(super) fn emit_shared_library(
     // sections, TLS, .bss.  Same contract as `emit_exec`: the RELRO window
     // gets its own PT_LOAD and the page pad becomes NOBITS instead of a run
     // of file zeros.  MUST match the layout pass exactly.
-    let has_post_relro_content = got_plt_size > 0
-        || !got_needed_names.is_empty()
-        || !tlsgd_names.is_empty()
-        || !tlsdesc_names.is_empty()
-        || !local_gd.is_empty()
-        || !local_desc.is_empty()
-        || !local_ie.is_empty()
-        || !local_got.is_empty()
-        || needs_tlsld_slot
+    let has_post_relro_content = (got_plt_size > 0 && !z_now)
         || output_sections.iter().any(|s| {
             s.flags & SHF_ALLOC != 0
                 && s.flags & SHF_WRITE != 0
@@ -1475,11 +1585,17 @@ pub(super) fn emit_shared_library(
     let rela_dyn_offset = offset;
     let rela_dyn_addr = vaddr!(offset);
     // Each R_X86_64_64 reloc in input becomes one R_X86_64_RELATIVE entry.
+    // A PC32/PC64 in writable storage may become a dynamic PC-relative
+    // relocation (see the relocation pass), so it is counted too.
     let mut max_rela_count: usize = 0;
     for obj in objects.iter() {
-        for sec_relas in &obj.relocations {
+        for (sec_idx, sec_relas) in obj.relocations.iter().enumerate() {
+            let writable =
+                obj.sections[sec_idx].flags & (SHF_ALLOC | SHF_WRITE) == SHF_ALLOC | SHF_WRITE;
             for rela in sec_relas {
-                if rela.rela_type == R_X86_64_64 {
+                if rela.rela_type == R_X86_64_64
+                    || (writable && matches!(rela.rela_type, R_X86_64_PC32 | R_X86_64_PC64))
+                {
                     max_rela_count += 1;
                 }
             }
@@ -1541,6 +1657,38 @@ pub(super) fn emit_shared_library(
     // `relro_file_end` / `rw2_addr` are the two halves of the split-LOAD
     // interface: file offset where RELRO content ends, and the address the
     // writable tail's PT_LOAD starts at (post-bias-update).
+    // .got layout (offsets within the section):
+    //   [got_needed slots][GD pairs][local GD pairs][TLSDESC pairs]
+    //   [local TLSDESC pairs][LD pair][local IE slots][local GOT slots]
+    // Pairs come first so every 16-byte pair stays 8-aligned (all entries
+    // are 8 bytes; nothing needs more).  Every slot is written by ld.so
+    // during relocation only (TLS descriptors too: they are resolved
+    // eagerly from .rela.dyn), so the section belongs to the RELRO window.
+    offset = (offset + 7) & !7;
+    let got_offset = offset;
+    let got_addr = vaddr!(offset);
+    let tlsgd_got_base = got_needed.len() as u64 * 8; // offset of first GD pair within .got
+    let local_gd_base = tlsgd_got_base + tlsgd_names.len() as u64 * 16;
+    let tlsdesc_base = local_gd_base + local_gd.len() as u64 * 16;
+    let local_desc_base = tlsdesc_base + tlsdesc_names.len() as u64 * 16;
+    let tlsld_got_off = local_desc_base + local_desc.len() as u64 * 16;
+    let local_ie_base = tlsld_got_off + if needs_tlsld_slot { 16 } else { 0 };
+    let local_got_base = local_ie_base + local_ie.len() as u64 * 8;
+    let got_size = local_got_base + local_got.len() as u64 * 8;
+    offset += got_size;
+
+    // Under `-z now` nothing writes `.got.plt` after startup either (Full
+    // RELRO); under lazy binding ld.so's resolver patches it on every
+    // first call, so it goes after the boundary.
+    let got_plt_in_relro = has_relro && z_now;
+    let (mut got_plt_offset, mut got_plt_addr) = (0u64, 0u64);
+    if got_plt_in_relro {
+        offset = (offset + 7) & !7;
+        got_plt_offset = offset;
+        got_plt_addr = vaddr!(offset);
+        offset += got_plt_size;
+    }
+
     let mut relro_file_end = offset;
     let mut relro_mem_size = 0u64;
     let mut rw2_addr = vaddr!(offset);
@@ -1554,29 +1702,13 @@ pub(super) fn emit_shared_library(
         rw2_addr = vaddr!(offset);
     }
 
-    // .got.plt entries - MUST be after RELRO boundary since dynamic linker
-    // needs to write to them during lazy PLT resolution
-    offset = (offset + 7) & !7;
-    let got_plt_offset = offset;
-    let got_plt_addr = vaddr!(offset);
-    offset += got_plt_size;
-
-    // .got layout (offsets within the section):
-    //   [got_needed slots][GD pairs][local GD pairs][TLSDESC pairs]
-    //   [local TLSDESC pairs][LD pair][local IE slots][local GOT slots]
-    // Pairs come first so every 16-byte pair stays 8-aligned (all entries
-    // are 8 bytes; nothing needs more).
-    let got_offset = offset;
-    let got_addr = vaddr!(offset);
-    let tlsgd_got_base = got_needed.len() as u64 * 8; // offset of first GD pair within .got
-    let local_gd_base = tlsgd_got_base + tlsgd_names.len() as u64 * 16;
-    let tlsdesc_base = local_gd_base + local_gd.len() as u64 * 16;
-    let local_desc_base = tlsdesc_base + tlsdesc_names.len() as u64 * 16;
-    let tlsld_got_off = local_desc_base + local_desc.len() as u64 * 16;
-    let local_ie_base = tlsld_got_off + if needs_tlsld_slot { 16 } else { 0 };
-    let local_got_base = local_ie_base + local_ie.len() as u64 * 8;
-    let got_size = local_got_base + local_got.len() as u64 * 8;
-    offset += got_size;
+    // Lazy `.got.plt`: after the RELRO boundary (see above).
+    if !got_plt_in_relro {
+        offset = (offset + 7) & !7;
+        got_plt_offset = offset;
+        got_plt_addr = vaddr!(offset);
+        offset += got_plt_size;
+    }
 
     for sec in output_sections.iter_mut() {
         if sec.flags & SHF_ALLOC != 0
@@ -1729,6 +1861,7 @@ pub(super) fn emit_shared_library(
             visibility: 0,
             lib_sym_value: 0,
             version: None,
+            absolute: false,
         });
         if entry.defined_in.is_none() && !entry.is_dynamic {
             entry.value = sym.value;
@@ -2048,6 +2181,55 @@ pub(super) fn emit_shared_library(
         }
     }
 
+    // An import's binding is STB_WEAK iff every reference to it is weak,
+    // exactly as in GNU ld: glibc defines `puts` as a weak alias, and
+    // copying that STB_WEAK would let ld.so silently bind an ordinary call
+    // to 0 on a library lacking it; conversely `__cxa_finalize`, referenced
+    // only weakly by crtbeginS.o, must stay weak although libc defines it
+    // GLOBAL.  The type is STT_TLS iff some reference says so.
+    let mut import_has_strong_ref: FxHashMap<&str, bool> = FxHashMap::default();
+    let mut import_ref_type: FxHashMap<&str, u8> = FxHashMap::default();
+    for obj in objects.iter() {
+        for sym in &obj.symbols {
+            if sym.is_undefined() && !sym.is_local() && !sym.name.is_empty() {
+                *import_has_strong_ref
+                    .entry(sym.name.as_str())
+                    .or_insert(false) |= !sym.is_weak();
+                if sym.sym_type() == STT_TLS {
+                    import_ref_type.insert(sym.name.as_str(), STT_TLS);
+                }
+            }
+        }
+    }
+
+    // Bound IFUNCs take their IPLT entry as address (see the scan above);
+    // the resolver's address goes to the IRELATIVE.  A global one's
+    // `.dynsym` entry (-Bsymbolic, protected) then exports that canonical
+    // address as a plain function, as GNU ld does for pointer equality.
+    let n_plt = plt_names.len();
+    let iplt_entry = |j: usize| plt_addr + 16 + (n_plt + j) as u64 * 16;
+    let mut iplt_resolvers: Vec<u64> = Vec::with_capacity(n_iplt);
+    for (j, name) in iplt_globals.iter().enumerate() {
+        let g = globals
+            .get_mut(name)
+            .ok_or_else(|| format!("internal error: IFUNC '{name}' vanished"))?;
+        iplt_resolvers.push(g.value);
+        g.value = iplt_entry(j);
+        g.info = (g.info & 0xf0) | STT_FUNC;
+    }
+    let mut local_ifunc_addr: FxHashMap<(usize, usize), u64> = FxHashMap::default();
+    for (k, &(obj_idx, si)) in iplt_locals.iter().enumerate() {
+        iplt_resolvers.push(resolve_sym(
+            obj_idx,
+            &objects[obj_idx].symbols[si],
+            globals,
+            section_map,
+            output_sections,
+            plt_addr,
+        ));
+        local_ifunc_addr.insert((obj_idx, si), iplt_entry(iplt_globals.len() + k));
+    }
+
     // .dynsym
     let mut ds = dynsym_offset as usize + 24; // skip null entry
     for name in &dyn_sym_names {
@@ -2076,11 +2258,28 @@ pub(super) fn emit_shared_library(
                 w64(&mut out, ds + 8, sym_val);
                 w64(&mut out, ds + 16, gsym.size);
             } else {
-                // Undefined symbol (from -l dependencies or weak refs)
-                // Preserve original binding (STB_WEAK vs STB_GLOBAL) and type
-                let bind = gsym.info >> 4;
-                let stype = gsym.info & 0xf;
-                let st_info = (bind << 4) | if stype != 0 { stype } else { STT_FUNC };
+                // Import.  Its binding describes this output's references,
+                // not the providing library's definition (see
+                // `import_has_strong_ref`); its type is the one the
+                // references carry -- NOTYPE unless they said STT_TLS,
+                // which ld.so does need, as GNU ld does.  A FUNC/OBJECT
+                // copied from the provider would claim knowledge the
+                // referencing objects never had (and for an unresolved
+                // weak reference such as `_ITM_registerTMCloneTable` there
+                // is no provider to copy from at all).
+                let bind = if gsym.is_dynamic {
+                    match import_has_strong_ref.get(name.as_str()) {
+                        Some(false) => STB_WEAK,
+                        _ => STB_GLOBAL,
+                    }
+                } else {
+                    gsym.info >> 4
+                };
+                let stype = import_ref_type
+                    .get(name.as_str())
+                    .copied()
+                    .unwrap_or(STT_NOTYPE);
+                let st_info = (bind << 4) | stype;
                 if ds + 5 < out.len() {
                     out[ds + 4] = st_info;
                     out[ds + 5] = 0;
@@ -2091,7 +2290,11 @@ pub(super) fn emit_shared_library(
             }
         } else {
             if ds + 5 < out.len() {
-                out[ds + 4] = (STB_GLOBAL << 4) | STT_FUNC;
+                out[ds + 4] = (STB_GLOBAL << 4)
+                    | import_ref_type
+                        .get(name.as_str())
+                        .copied()
+                        .unwrap_or(STT_NOTYPE);
                 out[ds + 5] = 0;
             }
             w16(&mut out, ds + 6, 0);
@@ -2160,6 +2363,18 @@ pub(super) fn emit_shared_library(
                 (plt_addr as i64 - (pea + 16) as i64) as u32,
             );
         }
+        // IPLT entries: the slot is filled eagerly by IRELATIVE, so there
+        // is no lazy path to fall back to -- trap instead of the push/jmp.
+        for j in 0..n_iplt {
+            let i = n_plt + j;
+            let ep = po + 16 + i * 16;
+            let pea = plt_addr + 16 + i as u64 * 16;
+            let gea = got_plt_addr + 24 + i as u64 * 8;
+            out[ep] = 0xff;
+            out[ep + 1] = 0x25; // jmp [GOT.PLT slot]
+            w32(&mut out, ep + 2, (gea as i64 - (pea + 6) as i64) as u32);
+            out[ep + 6..ep + 16].fill(0xcc);
+        }
     }
 
     // .got.plt
@@ -2171,6 +2386,10 @@ pub(super) fn emit_shared_library(
         for (i, _) in plt_names.iter().enumerate() {
             // GOT[3+i] = address of "push <index>" in PLT stub (lazy binding)
             w64(&mut out, gp + 24 + i * 8, plt_addr + 16 + i as u64 * 16 + 6);
+        }
+        // IPLT slots: the resolver until ld.so applies the IRELATIVE.
+        for (j, &resolver) in iplt_resolvers.iter().enumerate() {
+            w64(&mut out, gp + 24 + (n_plt + j) * 8, resolver);
         }
     }
 
@@ -2187,6 +2406,12 @@ pub(super) fn emit_shared_library(
             w64(&mut out, rp, gea); // r_offset = GOT.PLT slot address
             w64(&mut out, rp + 8, (si << 32) | R_X86_64_JUMP_SLOT as u64);
             w64(&mut out, rp + 16, 0); // r_addend = 0
+            rp += 24;
+        }
+        for (j, &resolver) in iplt_resolvers.iter().enumerate() {
+            w64(&mut out, rp, gpb + (n_plt + j) as u64 * 8);
+            w64(&mut out, rp + 8, R_X86_64_IRELATIVE as u64);
+            w64(&mut out, rp + 16, resolver); // ld.so adds the load bias
             rp += 24;
         }
     }
@@ -2208,6 +2433,9 @@ pub(super) fn emit_shared_library(
     // offset of a shared library's block is only known to ld.so.
     let mut tpoff64_entries: Vec<(u64, String, u64)> = Vec::new();
     let mut abs64_entries: Vec<(u64, String, i64)> = Vec::new(); // (offset, sym_name, addend) for R_X86_64_64 relocs
+    // (offset, type, sym_name or "" for symbol 0, addend): R_X86_64_PC32 /
+    // R_X86_64_PC64 left to ld.so -- see `pc_rel_to_loader` below.
+    let mut pcrel_entries: Vec<(u64, u32, String, i64)> = Vec::new();
     // TLS module-id relocations: (got_slot_vaddr, sym_name_or_empty).
     // DTPMOD64 always needed (module id known only at load time); symbol 0
     // means "this module".  DTPOFF64 only for preemptible/imported symbols.
@@ -2227,6 +2455,9 @@ pub(super) fn emit_shared_library(
         .then(|| g.value.wrapping_sub(tls_addr))
     };
     let local_sym_addr = |(obj_idx, si): (usize, usize)| -> u64 {
+        if let Some(&iplt) = local_ifunc_addr.get(&(obj_idx, si)) {
+            return iplt;
+        }
         resolve_sym(
             obj_idx,
             &objects[obj_idx].symbols[si],
@@ -2261,7 +2492,7 @@ pub(super) fn emit_shared_library(
             }
         }
     }
-    for (i, &key) in local_gd.order.iter().enumerate() {
+    for (i, &key) in local_gd.keys().iter().enumerate() {
         let off = local_gd_base + i as u64 * 16;
         dtpmod64_entries.push((got_addr + off, String::new()));
         let dtpoff = local_sym_addr(key).wrapping_sub(tls_addr);
@@ -2279,7 +2510,7 @@ pub(super) fn emit_shared_library(
             None => tlsdesc_entries.push((slot, name.clone(), 0)),
         }
     }
-    for (i, &key) in local_desc.order.iter().enumerate() {
+    for (i, &key) in local_desc.keys().iter().enumerate() {
         let slot = got_addr + local_desc_base + i as u64 * 16;
         let off = local_sym_addr(key).wrapping_sub(tls_addr);
         tlsdesc_entries.push((slot, String::new(), off));
@@ -2293,13 +2524,13 @@ pub(super) fn emit_shared_library(
         None
     };
     // Local IE slots: TPOFF64 against symbol 0, addend = block offset.
-    for (i, &key) in local_ie.order.iter().enumerate() {
+    for (i, &key) in local_ie.keys().iter().enumerate() {
         let off = local_sym_addr(key).wrapping_sub(tls_addr);
         tpoff64_entries.push((got_addr + local_ie_base + i as u64 * 8, String::new(), off));
     }
     // Local GOT slots: the symbol's address.  An absolute symbol's value is
     // stored as-is; RELATIVE would add the load bias to it.
-    for (i, &(obj_idx, si)) in local_got.order.iter().enumerate() {
+    for (i, &(obj_idx, si)) in local_got.keys().iter().enumerate() {
         let off = local_got_base + i as u64 * 8;
         let v = local_sym_addr((obj_idx, si));
         if objects[obj_idx].symbols[si].shndx == SHN_ABS {
@@ -2329,7 +2560,7 @@ pub(super) fn emit_shared_library(
         }
         match local_def {
             Some(g) if preemptible_def(name, g) => glob_dat_entries.push((gea, name.clone())),
-            Some(g) if is_abs(name, g) => w64(&mut out, slot_off, g.value),
+            Some(g) if g.absolute => w64(&mut out, slot_off, g.value),
             Some(g) => {
                 w64(&mut out, slot_off, g.value);
                 rela_dyn_entries.push((gea, g.value));
@@ -2341,6 +2572,25 @@ pub(super) fn emit_shared_library(
         }
     }
 
+    // Whether ld.so may bind `sym` outside this library: an import, or a
+    // preemptible definition.  The same predicate that makes an
+    // R_X86_64_64 symbolic.
+    let binds_outside = |sym: &Symbol, global: Option<&GlobalSymbol>| -> bool {
+        sym.sym_type() != STT_SECTION
+            && match global {
+                Some(g) if g.defined_in.is_some() && !g.is_dynamic => preemptible_def(&sym.name, g),
+                Some(g) => imports_undef(g),
+                None => !sym.name.is_empty() && !sym.is_local(),
+            }
+    };
+    // A truly absolute target (`--defsym X=0x1000`, an SHN_ABS input
+    // symbol; never a linker-provided anchor, which is section-relative).
+    let abs_target = |sym: &Symbol, global: Option<&GlobalSymbol>| -> bool {
+        match global {
+            Some(g) => g.absolute,
+            None => sym.shndx == SHN_ABS && sym.sym_type() != STT_SECTION,
+        }
+    };
     for obj_idx in 0..objects.len() {
         for sec_idx in 0..objects[obj_idx].sections.len() {
             let relas = &objects[obj_idx].relocations[sec_idx];
@@ -2393,36 +2643,15 @@ pub(super) fn emit_shared_library(
                     output_sections,
                     plt_addr,
                 );
+                // A bound local IFUNC's address is its IPLT entry.
+                let s = if sym.is_local() {
+                    local_ifunc_addr.get(&(obj_idx, si)).copied().unwrap_or(s)
+                } else {
+                    s
+                };
                 let global = (!sym.name.is_empty() && !sym.is_local())
                     .then(|| globals_snap.get(sym.name.as_str()))
                     .flatten();
-                // A reference that ld.so cannot see (the target is bound
-                // inside this library) to an IFUNC would need
-                // R_X86_64_IRELATIVE plus an IPLT stub, which this emitter
-                // does not build; resolving it like a plain function jumps
-                // into the RESOLVER.  Refuse instead of emitting that.  (A
-                // preemptible IFUNC is fine: its symbolic JUMP_SLOT/GLOB_DAT/
-                // R_X86_64_64 makes ld.so run the resolver.)
-                let bound_ifunc = if sym.is_local() {
-                    sym.sym_type() == STT_GNU_IFUNC && sym.shndx != SHN_UNDEF
-                } else {
-                    global.is_some_and(|g| {
-                        (g.info & 0xf) == STT_GNU_IFUNC
-                            && g.defined_in.is_some()
-                            && !g.is_dynamic
-                            && !preemptible_def(&sym.name, g)
-                    })
-                };
-                if bound_ifunc && rela.rela_type != R_X86_64_NONE {
-                    return Err(format!(
-                        "{obj_name}: {} against non-preemptible IFUNC symbol '{}' in a shared \
-                         library is not supported (it needs R_X86_64_IRELATIVE and an IPLT \
-                         entry); give the symbol default visibility or drop -Bsymbolic",
-                        reloc_field::name(rela.rela_type).unwrap_or("relocation"),
-                        sym.name
-                    ));
-                }
-
                 match rela.rela_type {
                     R_X86_64_64 => {
                         let val = (s as i64 + a) as u64;
@@ -2435,17 +2664,10 @@ pub(super) fn emit_shared_library(
                         // this library: an import, or a preemptible
                         // definition.  Everything else is RELATIVE (or
                         // nothing, for a hidden undefined weak symbol, 0).
-                        let symbolic = sym.sym_type() != STT_SECTION
-                            && match global {
-                                Some(g) if g.defined_in.is_some() && !g.is_dynamic => {
-                                    preemptible_def(&sym.name, g)
-                                }
-                                Some(g) => imports_undef(g),
-                                None => !sym.name.is_empty() && !sym.is_local(),
-                            };
+                        let symbolic = binds_outside(sym, global);
                         let absolute = !symbolic
                             && match global {
-                                Some(g) => is_abs(&sym.name, g),
+                                Some(g) => g.absolute,
                                 None => sym.shndx == SHN_ABS,
                             };
                         if symbolic {
@@ -2455,6 +2677,40 @@ pub(super) fn emit_shared_library(
                         }
                     }
                     R_X86_64_PC32 | R_X86_64_PLT32 => {
+                        // A PC-relative field has no link-time value when
+                        // its target is not fixed relative to this image:
+                        // an absolute symbol (the image moves, the target
+                        // does not), or -- for anything but a branch that
+                        // goes through the PLT -- a symbol ld.so may bind
+                        // elsewhere.  A non-branch PC32 takes the symbol's
+                        // ADDRESS (`lea x(%rip)`, `.long x - .`): the PLT
+                        // entry is not that address, and a preemptible
+                        // definition's own copy is not the one an
+                        // executable's COPY relocation made canonical.
+                        let via_plt = global.is_some_and(|g| g.plt_idx.is_some())
+                            && (rela.rela_type == R_X86_64_PLT32
+                                || super::plt_got::is_branch_rel32(
+                                    in_sec.flags,
+                                    objects[obj_idx].section_data[sec_idx].as_slice(),
+                                    rela.offset,
+                                ));
+                        if in_sec.flags & SHF_ALLOC != 0
+                            && !via_plt
+                            && (abs_target(sym, global) || binds_outside(sym, global))
+                        {
+                            pc_rel_to_loader(
+                                &mut pcrel_entries,
+                                in_sec.flags,
+                                rela.rela_type,
+                                p,
+                                sym,
+                                binds_outside(sym, global),
+                                s,
+                                a,
+                                obj_name,
+                            )?;
+                            continue;
+                        }
                         // For dynamic symbols, redirect through PLT
                         let t = if !sym.name.is_empty() && !sym.is_local() {
                             if let Some(g) = globals_snap.get(sym.name.as_str()) {
@@ -2478,10 +2734,24 @@ pub(super) fn emit_shared_library(
                             &objects[obj_idx].source_name,
                         )?;
                     }
-                    // TODO: R_X86_64_32/32S are not position-independent and should
-                    // ideally emit a diagnostic when used in shared libraries. For now
-                    // we apply them statically which works for simple cases but may fail
-                    // if the library is loaded at a high address.
+                    // Absolute fields narrower than a pointer cannot hold a
+                    // load-time address, so in loaded storage they are only
+                    // valid against an absolute symbol that ld.so cannot
+                    // rebind (GNU ld: "recompile with -fPIC"; it never
+                    // turns them into dynamic relocations either).  Writing
+                    // the link-time value -- this emitter's old behaviour
+                    // -- produced a library that was wrong at every load
+                    // address but 0.  A non-preemptible absolute value is
+                    // load-independent and stays a link-time constant (as
+                    // in lld; GNU ld refuses even that, a conservatism with
+                    // no correctness basis).  Non-alloc sections (DWARF)
+                    // are never loaded and keep link-time values.
+                    R_X86_64_32 | R_X86_64_32S | R_X86_64_16 | R_X86_64_8
+                        if in_sec.flags & SHF_ALLOC != 0
+                            && (!abs_target(sym, global) || binds_outside(sym, global)) =>
+                    {
+                        return Err(non_pic_reloc_error(obj_name, rela.rela_type, &sym.name));
+                    }
                     R_X86_64_32 => {
                         w32_checked(
                             &mut out,
@@ -2527,20 +2797,24 @@ pub(super) fn emit_shared_library(
                         // scan: a reference is either rewritten to address
                         // its target directly or has a slot.  The PIC forms
                         // only (`lea`, `addr32 call`, `jmp`).
-                        let target_ok = match global {
-                            Some(g) => relax_target(&sym.name, g),
-                            None => sym.is_local() && local_relax_target(sym),
+                        let target = match global {
+                            Some(g) => got_target(&sym.name, g),
+                            None if sym.is_local() => Some(local_got_target(sym)),
+                            None => None,
                         };
-                        let relax = gotpcrelx_relaxation(
-                            rela.rela_type,
-                            a,
-                            objects[obj_idx].section_data[sec_idx].as_slice(),
-                            rela.offset as usize,
-                            true,
-                        );
-                        if let Some(kind) = relax.filter(|_| target_ok) {
+                        let relax = target.and_then(|target| {
+                            gotpcrelx_relaxation(
+                                rela.rela_type,
+                                a,
+                                objects[obj_idx].section_data[sec_idx].as_slice(),
+                                rela.offset as usize,
+                                true,
+                                target,
+                            )
+                        });
+                        if let Some(kind) = relax {
                             let (pos, v) =
-                                rewrite_got_relax(&mut out, fp, kind, rela.rela_type, true, s, p);
+                                rewrite_got_relax(&mut out, fp, kind, rela.rela_type, s, p);
                             w32_checked(&mut out, pos, v, rela.rela_type, &sym.name, obj_name)?;
                             continue;
                         }
@@ -2568,7 +2842,82 @@ pub(super) fn emit_shared_library(
                         )?;
                     }
                     R_X86_64_PC64 => {
+                        if in_sec.flags & SHF_ALLOC != 0
+                            && (abs_target(sym, global) || binds_outside(sym, global))
+                        {
+                            pc_rel_to_loader(
+                                &mut pcrel_entries,
+                                in_sec.flags,
+                                rela.rela_type,
+                                p,
+                                sym,
+                                binds_outside(sym, global),
+                                s,
+                                a,
+                                obj_name,
+                            )?;
+                            continue;
+                        }
                         w64(&mut out, fp, (s as i64 + a - p as i64) as u64);
+                    }
+                    // ── Medium/large code model: offsets from the GOT origin
+                    // (`_GLOBAL_OFFSET_TABLE_` = `got_addr` in this emitter).
+                    R_X86_64_GOTPC32 => {
+                        w32_checked(
+                            &mut out,
+                            fp,
+                            got_addr as i64 + a - p as i64,
+                            rela.rela_type,
+                            &sym.name,
+                            obj_name,
+                        )?;
+                    }
+                    R_X86_64_GOTPC64 => {
+                        w64(&mut out, fp, (got_addr as i64 + a - p as i64) as u64);
+                    }
+                    R_X86_64_GOTOFF64 => {
+                        // S + A - GOT only means something when S is bound
+                        // in this module; GNU ld refuses it for an undefined
+                        // symbol for the same reason.
+                        if global.is_some_and(|g| imports_undef(g) && g.defined_in.is_none()) {
+                            return Err(format!(
+                                "{obj_name}: relocation R_X86_64_GOTOFF64 against undefined \
+                                 symbol '{}' can not be used when making a shared object",
+                                sym.name
+                            ));
+                        }
+                        w64(&mut out, fp, (s as i64 + a - got_addr as i64) as u64);
+                    }
+                    R_X86_64_PLTOFF64 => {
+                        // L + A - GOT: the PLT entry when the call must go
+                        // through ld.so (import / preemptible definition),
+                        // the definition itself otherwise.
+                        let l = global
+                            .and_then(|g| g.plt_idx)
+                            .map_or(s, |pi| plt_addr + 16 + pi as u64 * 16);
+                        w64(&mut out, fp, (l as i64 + a - got_addr as i64) as u64);
+                    }
+                    t if is_got64_family(t) => {
+                        let gea = if sym.is_local() {
+                            local_got
+                                .get((obj_idx, si))
+                                .map(|i| got_addr + local_got_base + i as u64 * 8)
+                        } else {
+                            got_sym_addrs.get(sym.name.as_str()).copied()
+                        };
+                        let Some(gea) = gea else {
+                            return Err(format!(
+                                "{obj_name}: internal error: no GOT slot for {} against '{}'",
+                                reloc_field::name(rela.rela_type).unwrap_or("relocation"),
+                                sym.name
+                            ));
+                        };
+                        let v = if t == R_X86_64_GOTPCREL64 {
+                            gea as i64 + a - p as i64
+                        } else {
+                            gea as i64 - got_addr as i64 + a
+                        };
+                        w64(&mut out, fp, v as u64);
                     }
                     t if is_gottpoff_family(t) => {
                         // Initial-Exec: the instruction reads the symbol's
@@ -2760,6 +3109,7 @@ pub(super) fn emit_shared_library(
         + tpoff64_entries.len()
         + tlsdesc_entries.len()
         + abs64_entries.len()
+        + pcrel_entries.len()
         + dtpmod64_entries.len()
         + dtpoff64_entries.len();
     let rela_dyn_size = total_rela_count as u64 * 24;
@@ -2837,6 +3187,17 @@ pub(super) fn emit_shared_library(
             rd += 24;
         }
     }
+    // PC-relative fields ld.so computes (`S + A - P`, overflow-checked by
+    // glibc for PC32).
+    for (rel_offset, rtype, sym_name, addend) in &pcrel_entries {
+        let si = dyn_sym_ref(sym_name)?;
+        if rd + 24 <= out.len() {
+            w64(&mut out, rd, *rel_offset);
+            w64(&mut out, rd + 8, (si << 32) | *rtype as u64);
+            w64(&mut out, rd + 16, *addend as u64);
+            rd += 24;
+        }
+    }
 
     // .dynamic
     let mut dd = dynamic_offset as usize;
@@ -2907,15 +3268,24 @@ pub(super) fn emit_shared_library(
         w64(&mut out, dd + 8, sysv_hash_addr);
         dd += 16;
     }
-    if bsymbolic {
+    if dt_symbolic {
         // DT_SYMBOLIC (legacy) + DT_FLAGS:DF_SYMBOLIC (modern): search the
-        // library itself before the global scope at run time.
+        // library itself before the global scope at run time.  Only for
+        // `-Bsymbolic`: under `-Bsymbolic-functions` data must still be
+        // looked up globally.
         w64(&mut out, dd, 16u64);
         w64(&mut out, dd + 8, 0);
         dd += 16; // DT_SYMBOLIC
+    }
+    if dt_flags != 0 {
         w64(&mut out, dd, DT_FLAGS as u64);
-        w64(&mut out, dd + 8, 0x2);
-        dd += 16; // DF_SYMBOLIC
+        w64(&mut out, dd + 8, dt_flags);
+        dd += 16;
+    }
+    if dt_flags_1 != 0 {
+        w64(&mut out, dd, 0x6fff_fffb); // DT_FLAGS_1
+        w64(&mut out, dd + 8, dt_flags_1);
+        dd += 16;
     }
     if verdef_count > 0 || verneed_count > 0 {
         w64(&mut out, dd, DT_VERSYM as u64);
@@ -2954,7 +3324,7 @@ pub(super) fn emit_shared_library(
         w64(&mut out, dd + 8, fini_array_size);
         dd += 16;
     }
-    if !plt_names.is_empty() {
+    if rela_plt_size > 0 {
         w64(&mut out, dd, DT_PLTGOT as u64);
         w64(&mut out, dd + 8, got_plt_addr);
         dd += 16;
@@ -3130,7 +3500,7 @@ pub(super) fn emit_shared_library(
     // address range holds it.
     let bss_out = output_sections.iter().position(|s| s.name == ".bss");
     let def_shndx = |name: &str, g: &GlobalSymbol| -> u16 {
-        if is_abs(name, g) {
+        if g.absolute {
             return SHN_ABS;
         }
         let mapped = if g.section_idx == 0xffff {
@@ -3142,6 +3512,20 @@ pub(super) fn emit_shared_library(
         };
         if let Some(h) = mapped.and_then(|oi| out_sec_to_hdr.get(&oi)) {
             return *h;
+        }
+        // `__stop_SEC` is one past SEC's end, which is usually also the
+        // start of the next section; it belongs to SEC (as in GNU ld), so
+        // name-match the encapsulation anchors before falling back to
+        // address containment.
+        if linker_provided.contains(name)
+            && let Some(sec_name) = name
+                .strip_prefix("__start_")
+                .or_else(|| name.strip_prefix("__stop_"))
+            && let Some((_, &h)) = out_sec_to_hdr
+                .iter()
+                .find(|&(&oi, _)| output_sections[oi].name == sec_name)
+        {
+            return h;
         }
         out_sec_to_hdr
             .iter()

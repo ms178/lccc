@@ -96,7 +96,7 @@ pub use parse_object::{parse_elf64_object, parse_elf64_object_at};
 pub use section_map::map_section_name;
 
 // parse_shared.rs
-pub use parse_shared::{parse_shared_library_symbols, parse_soname};
+pub use parse_shared::{parse_shared_library_symbols, parse_soname, shared_library_dynsym_names};
 
 // dynstr.rs
 pub use dynstr::DynStrTab;
@@ -150,19 +150,21 @@ pub use resolve_lib::{expand_file_mode_libs, resolve_lib, resolve_lib_positional
 pub use write::{align_up_64, pad_to, write_elf64_phdr, write_elf64_phdr_at, write_elf64_shdr};
 
 // args.rs
-pub use args::{HashStyle, InputItem, LinkerArgs, exclude_libs_matches, parse_linker_args};
+pub use args::{
+    HashStyle, InputItem, LinkerArgs, Symbolic, dyn_flags, exclude_libs_matches, parse_linker_args,
+};
 
 // check.rs
 pub use check::{check_undefined_symbols_elf64, check_undefined_symbols_elf64_verbose};
 
 // eh_frame.rs
 pub use eh_frame::{
-    build_eh_frame_hdr, compact_eh_frame, count_eh_frame_fdes, prune_dead_fdes,
-    scan_eh_frame_records,
+    EhFramePacking, apply_cie_redirects, build_eh_frame_hdr, compact_eh_frame, count_eh_frame_fdes,
+    pack_eh_frame_sections, prune_dead_fdes, scan_eh_frame_records,
 };
 
 // gc_sections.rs
 pub use gc_sections::{
-    gc_collect_sections_elf64, gc_collect_sections_elf64_roots,
+    gc_collect_sections_elf64, gc_collect_sections_elf64_full, gc_collect_sections_elf64_roots,
     gc_collect_sections_elf64_roots_and_sections,
 };

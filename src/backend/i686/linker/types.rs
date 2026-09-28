@@ -40,7 +40,6 @@ pub(super) const SHF_EXECINSTR: u32 = 0x4;
 pub(super) const SHF_MERGE: u32 = 0x10;
 #[expect(dead_code)] // ELF standard section flag, defined for reference
 pub(super) const SHF_STRINGS: u32 = 0x20;
-#[expect(dead_code)] // ELF standard section flag, defined for reference
 pub(super) const SHF_INFO_LINK: u32 = 0x40;
 pub(super) const SHF_GROUP: u32 = 0x200;
 pub(super) const SHF_TLS: u32 = 0x400;

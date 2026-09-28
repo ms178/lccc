@@ -151,6 +151,7 @@ pub(super) fn load_file_as_needed(
     if data.len() >= 18 {
         let e_type = u16::from_le_bytes([data[16], data[17]]);
         if e_type == ET_DYN {
+            objects.note_dso_names(linker_common::shared_library_dynsym_names(data));
             return linker_common::load_shared_library_elf64_as_needed(
                 path,
                 globals,

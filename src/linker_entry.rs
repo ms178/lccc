@@ -121,7 +121,7 @@ pub fn link_with_script_x86(
     emit_relocs: bool,
     gc_sections: bool,
     soname: Option<&str>,
-    bsymbolic: bool,
+    dt_symbolic: bool,
     max_page_size: u64,
     defsym_defs: &[(String, String)],
 ) -> Result<(), String> {
@@ -134,7 +134,7 @@ pub fn link_with_script_x86(
         emit_relocs,
         gc_sections,
         soname,
-        bsymbolic,
+        dt_symbolic,
         max_page_size,
         defsym_defs,
     )
@@ -150,7 +150,7 @@ pub fn link_with_script_i386(
     emit_relocs: bool,
     gc_sections: bool,
     soname: Option<&str>,
-    bsymbolic: bool,
+    dt_symbolic: bool,
     max_page_size: u64,
     defsym_defs: &[(String, String)],
 ) -> Result<(), String> {
@@ -163,7 +163,7 @@ pub fn link_with_script_i386(
         emit_relocs,
         gc_sections,
         soname,
-        bsymbolic,
+        dt_symbolic,
         max_page_size,
         defsym_defs,
     )

@@ -325,6 +325,47 @@ pub fn eval_with_symbols(
     Ok(v)
 }
 
+/// Whether a (syntactically valid) expression denotes an ADDRESS in the
+/// output rather than an absolute value, with `is_address` saying which
+/// symbol names are addresses.
+///
+/// This is GNU ld's section-relative vs absolute distinction (ld/ldexp.c),
+/// and it decides what the defined symbol is in a position-independent
+/// output: an address slides with the load base (a PIE/`.so` needs
+/// `R_X86_64_RELATIVE` for a pointer to it and exports it against its
+/// section) while an absolute value does not (no RELATIVE, `SHN_ABS`).
+/// Getting it wrong is a silent miscompile either way: `--defsym x=_start+4`
+/// read through a GOT slot without RELATIVE points into unmapped memory, and
+/// `--defsym size=_end-_start` with RELATIVE comes out off by the load bias.
+///
+/// The rule, which matches ld's for every expression it gives a meaning to:
+/// count the address operands, adding across `+`, subtracting across `-`
+/// (so `sym + 4` has one, `_end - _start` none), and let every other
+/// operator (`*`, `/`, `%`, unary `-`, `~`) turn its operands into plain
+/// numbers, as ld's `make_abs` does.  Exactly one address means the result
+/// is an address.  (ld makes the sum of two addresses in different sections
+/// absolute too; the sum of two in one section is meaningless in a PIE
+/// either way.)  The answer depends only on WHICH names are addresses, not
+/// on their values, so it can be decided before layout.
+pub fn is_address_expression(
+    expr: &str,
+    is_address: impl Fn(&str) -> bool,
+) -> Result<bool, DefsymError> {
+    let mut ctx = Ctx {
+        s: expr.as_bytes(),
+        i: 0,
+    };
+    let degree = ctx.degree_expr(&is_address)?;
+    ctx.skip_ws();
+    if ctx.i != ctx.s.len() {
+        return Err(DefsymError::Syntax(format!(
+            "trailing '{}' at offset {}",
+            ctx.s[ctx.i] as char, ctx.i
+        )));
+    }
+    Ok(degree == 1)
+}
+
 /// A recursive-descent parser over the expression grammar GNU ld accepts:
 /// `+ - * / %` with the usual precedence, parentheses, unary minus, numbers and
 /// symbols. No allocation per token, no intermediate string.
@@ -419,6 +460,71 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    /// The address degree of an expression (see [`is_address_expression`]):
+    /// the same grammar as `eval_expr`, counting address operands instead of
+    /// computing values.  Every atom is parsed by `eval_atom` itself, so the
+    /// two walks cannot disagree about where a token ends.
+    fn degree_expr(&mut self, is_address: &dyn Fn(&str) -> bool) -> Result<i64, DefsymError> {
+        let mut lhs = self.degree_term(is_address)?;
+        while let Some(op) = self.peek() {
+            if op != b'+' && op != b'-' {
+                break;
+            }
+            self.i += 1;
+            let rhs = self.degree_term(is_address)?;
+            lhs = if op == b'+' {
+                lhs.saturating_add(rhs)
+            } else {
+                lhs.saturating_sub(rhs)
+            };
+        }
+        Ok(lhs)
+    }
+
+    fn degree_term(&mut self, is_address: &dyn Fn(&str) -> bool) -> Result<i64, DefsymError> {
+        let mut lhs = self.degree_unary(is_address)?;
+        while let Some(op) = self.peek() {
+            if op != b'*' && op != b'/' && op != b'%' {
+                break;
+            }
+            self.i += 1;
+            self.degree_unary(is_address)?;
+            lhs = 0;
+        }
+        Ok(lhs)
+    }
+
+    fn degree_unary(&mut self, is_address: &dyn Fn(&str) -> bool) -> Result<i64, DefsymError> {
+        match self.peek() {
+            Some(b'-') | Some(b'~') => {
+                self.i += 1;
+                self.degree_unary(is_address)?;
+                Ok(0)
+            }
+            Some(b'+') => {
+                self.i += 1;
+                self.degree_unary(is_address)
+            }
+            Some(b'(') => {
+                self.i += 1;
+                let d = self.degree_expr(is_address)?;
+                match self.peek() {
+                    Some(b')') => self.i += 1,
+                    _ => return Err(DefsymError::Syntax("missing ')'".to_string())),
+                }
+                Ok(d)
+            }
+            _ => {
+                let start = self.i;
+                self.eval_atom(&|_| Some(0))?;
+                let tok = std::str::from_utf8(&self.s[start..self.i])
+                    .unwrap_or("")
+                    .trim();
+                Ok(i64::from(parse_number(tok).is_none() && is_address(tok)))
+            }
+        }
+    }
+
     fn eval_atom(&mut self, lookup: &dyn Fn(&str) -> Option<u64>) -> Result<u64, DefsymError> {
         match self.peek() {
             Some(b'(') => {
@@ -474,6 +580,33 @@ mod tests {
 
     fn defined(name: &str) -> bool {
         matches!(name, "real" | "_start" | "_end" | "a" | "b")
+    }
+
+    #[test]
+    fn address_vs_absolute_follows_gnu_ld() {
+        let addr = |n: &str| matches!(n, "_start" | "_end" | "a" | "b");
+        for (e, want) in [
+            ("_start", true),
+            ("_start+4", true),
+            ("4 + _start", true),
+            ("(_start - 8) + 0x10", true),
+            ("_end - _start + a", true),
+            ("0x1000", false),
+            ("0x1000 + 0x10", false),
+            ("_end - _start", false),
+            ("(_end - _start) / 2", false),
+            ("_start * 1", false),
+            ("-_start", false),
+            ("~_start", false),
+            ("4 - _start", false),
+            ("a + b", false),
+            ("absval + 1", false),
+            ("absval + _start", true),
+        ] {
+            assert_eq!(is_address_expression(e, addr), Ok(want), "{e}");
+        }
+        assert!(is_address_expression("(_start", addr).is_err());
+        assert!(is_address_expression("_start )", addr).is_err());
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! Defines the `GlobalSymbol` type used by all linker phases, plus
 //! architecture-specific constants (base address, page size, interpreter path).
 
-use super::elf::{SHN_COMMON, SHN_UNDEF};
+use super::elf::{SHN_ABS, SHN_COMMON, SHN_UNDEF};
 use crate::backend::linker_common::{self, Elf64Symbol, GlobalSymbolOps};
 
 /// Base virtual address for the executable (standard non-PIE x86-64 address)
@@ -47,6 +47,50 @@ pub struct GlobalSymbol {
     pub visibility: u8,
     pub lib_sym_value: u64,
     pub version: Option<String>,
+    /// The value is a link-time constant rather than an address in this
+    /// output: an `SHN_ABS` definition in an object, or a `--defsym` whose
+    /// expression GNU ld evaluates to an absolute value (a number, a
+    /// difference of two addresses, ...).  It never moves with the load base,
+    /// so a PIE or shared object must not add `R_X86_64_RELATIVE` for it,
+    /// exports it as `SHN_ABS`, and may encode it as an immediate.
+    ///
+    /// Not derivable from `section_idx`: every symbol the linker creates --
+    /// `__ehdr_start`, `_end`, `__start_SEC`, `--defsym x=_start+4` -- is
+    /// stored with `section_idx == SHN_ABS` (it belongs to no input section)
+    /// yet is an ADDRESS, which slides with the load base like any other.
+    pub absolute: bool,
+}
+
+/// GOT slots (or slot pairs) of LOCAL symbols, keyed by (object index,
+/// symbol index) and numbered in first-reference order, so the layout is
+/// deterministic.  Section symbols (empty names) are keyed like any other
+/// local: `mov .Lfoo@GOTPCREL(%rip)` usually reaches the linker as one.
+#[derive(Default)]
+pub struct LocalSlots {
+    order: Vec<(usize, usize)>,
+    index: crate::common::fx_hash::FxHashMap<(usize, usize), usize>,
+}
+
+impl LocalSlots {
+    pub fn insert(&mut self, key: (usize, usize)) {
+        if let std::collections::hash_map::Entry::Vacant(e) = self.index.entry(key) {
+            e.insert(self.order.len());
+            self.order.push(key);
+        }
+    }
+    pub fn len(&self) -> usize {
+        self.order.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+    pub fn get(&self, key: (usize, usize)) -> Option<usize> {
+        self.index.get(&key).copied()
+    }
+    /// Keys in slot order.
+    pub fn keys(&self) -> &[(usize, usize)] {
+        &self.order
+    }
 }
 
 impl GlobalSymbolOps for GlobalSymbol {
@@ -93,6 +137,7 @@ impl GlobalSymbolOps for GlobalSymbol {
             visibility: 0,
             lib_sym_value: 0,
             version: None,
+            absolute: sym.shndx == SHN_ABS,
         }
     }
     fn new_common(obj_idx: usize, sym: &Elf64Symbol) -> Self {
@@ -111,6 +156,7 @@ impl GlobalSymbolOps for GlobalSymbol {
             visibility: 0,
             lib_sym_value: 0,
             version: None,
+            absolute: false,
         }
     }
     fn new_undefined(sym: &Elf64Symbol) -> Self {
@@ -129,6 +175,7 @@ impl GlobalSymbolOps for GlobalSymbol {
             visibility: 0,
             lib_sym_value: 0,
             version: None,
+            absolute: false,
         }
     }
     fn set_common_bss(&mut self, bss_offset: u64) {
@@ -151,6 +198,7 @@ impl GlobalSymbolOps for GlobalSymbol {
             visibility: 0,
             lib_sym_value: dsym.value,
             version: dsym.version.clone(),
+            absolute: false,
         }
     }
 }
