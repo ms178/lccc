@@ -733,6 +733,156 @@ def case_property_notes(e):
                        f"{r.stderr[:200]!r}")
 
 
+TEXTREL_ASM = """\
+    .text
+    .globl get41
+    .type get41,@function
+get41:
+    movl $v41, %eax
+    movl (%eax), %eax
+    ret
+    .size get41, .-get41
+    .section .rodata,"a"
+    .p2align 2
+    .globl ptr42
+    .type ptr42,@object
+    .size ptr42,4
+ptr42: .long v42
+    .data
+v41: .long 41
+v42: .long 42
+    .section .note.GNU-stack,"",@progbits
+"""
+
+
+def case_text_relocations(e):
+    """Text relocations in an i386 shared object follow GNU ld's policy.
+
+    Absolute `R_386_32` fields in `.text` and `.rodata` of a non-PIC shared
+    object become dynamic relocations in read-only storage.  Differential
+    against GNU ld: by default both warn about the first site and that
+    DT_TEXTREL is created, and emit DT_TEXTREL + DF_TEXTREL; `-z text` is
+    refused with GNU's message; `-z notext` is silent.  lccc-ld used to
+    emit the tags silently and reject `-z text` with a message of its own;
+    the library must still run.
+    """
+    _w(e.td, "tr.s", TEXTREL_ASM)
+    _w(e.td, "trm.c", "#include <stdio.h>\nint get41(void); extern int *const ptr42;\n"
+                      "int main(void){ printf(\"%d %d\\n\", get41(), *ptr42); return 0; }\n")
+    _ok(e.gcc("-c", "tr.s", "-o", "tr.o", lccc=False), "assemble tr.s")
+    _ok(e.gcc("-O1", "-fno-pic", "-c", "trm.c", "-o", "trm.o", lccc=False), "compile trm.c")
+    for lccc in (False, True):
+        who = "lccc" if lccc else "GNU"
+        r = e.gcc("-shared", "tr.o", "-o", "libtr.so", lccc=lccc)
+        _ok(r, f"{who}: default link")
+        if (b"creating DT_TEXTREL in a shared object" not in r.stderr
+                or b"tr.o: warning: relocation in read-only section `." not in r.stderr):
+            raise Fail(f"{who}: default link must warn like GNU ld: {r.stderr[:300]!r}")
+        img = Elf32(e.path("libtr.so"))
+        if not img.has("TEXTREL") or not img.flags() & DF_TEXTREL:
+            raise Fail(f"{who}: DT_TEXTREL/DF_TEXTREL missing")
+        r = e.gcc("-shared", "tr.o", "-Wl,-z,text", "-o", "libtr_zt.so", lccc=lccc)
+        if r.returncode == 0 or b"read-only segment has dynamic relocations" not in r.stderr:
+            raise Fail(f"{who} -z text: rc={r.returncode} {r.stderr[:300]!r}")
+        r = _ok(e.gcc("-shared", "tr.o", "-Wl,-z,notext", "-o", "libtr_nt.so", lccc=lccc),
+                f"{who}: -z notext")
+        if b"TEXTREL" in r.stderr or b"read-only" in r.stderr:
+            raise Fail(f"{who} -z notext must be silent: {r.stderr[:300]!r}")
+        _ok(e.gcc("-no-pie", "trm.o", "-o", "trm", e.path("libtr.so"), lccc=lccc),
+            f"{who}: main link")
+        r = e.run(e.path("trm"), False, libdir=e.td)
+        if r.returncode != 0 or r.stdout != b"41 42\n":
+            raise Fail(f"{who}: run rc={r.returncode} out={r.stdout!r}")
+
+
+COPY_ALIAS_LIB = """\
+int real_obj = 5;
+extern int weak_obj __attribute__((weak, alias("real_obj")));
+int lib_get(void) { return real_obj; }
+void lib_set(int v) { real_obj = v; }
+"""
+
+COPY_ALIAS_MAIN = """\
+#include <stdio.h>
+#include <stdlib.h>
+extern int weak_obj __attribute__((weak));
+extern char **environ;
+int lib_get(void);
+void lib_set(int);
+static char *my_env[] = { "LCCC_ALIAS=yes", 0 };
+int main(void)
+{
+    weak_obj = 11;
+    int a = lib_get();
+    lib_set(22);
+    environ = my_env;
+    const char *v = getenv("LCCC_ALIAS");
+    printf("%d %d %s\\n", a, weak_obj, v ? v : "(null)");
+    return 0;
+}
+"""
+
+
+def _dyn_relocs_and_syms(e, exe):
+    """(R_386_COPY target names, {dynsym name: (value, binding)}) via readelf."""
+    rel = _ok(e.cmd(["readelf", "-rW", "-D", exe]), "readelf -r").stdout.decode()
+    copies = [ln.split()[-1].split("@")[0] for ln in rel.splitlines() if "R_386_COPY" in ln]
+    out = _ok(e.cmd(["readelf", "-sW", "-D", exe]), "readelf -s").stdout.decode()
+    syms = {}
+    for ln in out.splitlines():
+        f = ln.split()
+        if len(f) >= 8 and f[0][:-1].isdigit() and f[0].endswith(":") and f[6] != "UND":
+            syms[f[7].split("@")[0]] = (int(f[1], 16), f[4])
+    return copies, syms
+
+
+def case_copy_relocation_aliases(e):
+    """A copy relocation moves an object together with all its names.
+
+    A non-PIC executable referencing a shared library's WEAK data symbol
+    whose object also has a strong name (glibc's `environ` / `__environ`,
+    here `weak_obj` / `real_obj`) must define every name at the one copy,
+    or the library keeps working on its original while the program sees
+    the copy.  lccc-ld used to dodge the copy for WEAK data and patch every
+    reference in `.text` instead: a DT_TEXTREL executable (now warned
+    about) for every non-PIC program naming `environ`.  Differential
+    against GNU ld: one R_386_COPY per object, every alias exported at the
+    copy with the library's binding, no DT_TEXTREL, same output.
+    """
+    _w(e.td, "ca.c", COPY_ALIAS_LIB)
+    _w(e.td, "cam.c", COPY_ALIAS_MAIN)
+    _ok(e.gcc("-O1", "-fPIC", "-shared", "ca.c", "-o", "libca.so", lccc=False), "build libca.so")
+    _ok(e.gcc("-O1", "-fno-pic", "-c", "cam.c", "-o", "cam.o", lccc=False), "compile cam.c")
+    views = {}
+    for lccc in (False, True):
+        who = "lccc" if lccc else "GNU"
+        exe = f"cam_{who}"
+        r = _ok(e.gcc("-no-pie", "cam.o", "-o", exe, e.path("libca.so"), "-Wl,-z,text",
+                      lccc=lccc), f"{who}: link")
+        if r.stderr:
+            raise Fail(f"{who}: unexpected diagnostics {r.stderr[:300]!r}")
+        img = Elf32(e.path(exe))
+        if img.has("TEXTREL") or img.flags() & DF_TEXTREL:
+            raise Fail(f"{who}: DT_TEXTREL in a copy-relocating executable")
+        for bind_now in (False, True):
+            r = e.run(e.path(exe), bind_now, libdir=e.td)
+            if r.returncode != 0 or r.stdout != b"11 22 yes\n":
+                raise Fail(f"{who}: run rc={r.returncode} out={r.stdout!r}")
+        copies, syms = _dyn_relocs_and_syms(e, e.path(exe))
+        groups = (("weak_obj", "real_obj"), ("environ", "__environ"))
+        for group in groups:
+            if not all(n in syms for n in group):
+                raise Fail(f"{who}: {group} not all exported: {sorted(syms)}")
+            if len({syms[n][0] for n in group}) != 1:
+                raise Fail(f"{who}: aliases {group} at different addresses: "
+                           f"{[hex(syms[n][0]) for n in group]}")
+            if sum(1 for c in copies if syms.get(c, (None,))[0] == syms[group[0]][0]) != 1:
+                raise Fail(f"{who}: want exactly one R_386_COPY for {group}, got {copies}")
+        views[who] = {n: syms[n][1] for g in groups for n in g}
+    if views["lccc"] != views["GNU"]:
+        raise Fail(f"alias bindings {views['lccc']} != GNU ld's {views['GNU']}")
+
+
 CASES = [
     ("i386_tls_matrix", case_tls_matrix),
     ("i386_exe_tls_transitions", case_exe_tls_transitions),
@@ -740,6 +890,8 @@ CASES = [
     ("i386_archive_semantics", case_archive_semantics),
     ("i386_options_and_tags", case_options_and_tags),
     ("i386_property_notes", case_property_notes),
+    ("i386_text_relocations", case_text_relocations),
+    ("i386_copy_relocation_aliases", case_copy_relocation_aliases),
 ]
 
 

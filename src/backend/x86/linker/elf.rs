@@ -49,6 +49,13 @@ pub const R_X86_64_REX_GOTPCRELX: u32 = 42;
 pub const R_X86_64_CODE_4_GOTPCRELX: u32 = 43;
 pub const R_X86_64_CODE_4_GOTTPOFF: u32 = 44;
 pub const R_X86_64_CODE_4_GOTPC32_TLSDESC: u32 = 45;
+/// MOVRS with a REX prefix (`REX 0f 38 8b`): the field is 5 bytes into
+/// the instruction.  GNU ld 2.47 defines CODE_5_GOTPC32_TLSDESC for
+/// completeness only (no instruction uses it) and refuses it, as does this
+/// linker.
+pub const R_X86_64_CODE_5_GOTPCRELX: u32 = 46;
+pub const R_X86_64_CODE_5_GOTTPOFF: u32 = 47;
+pub const R_X86_64_CODE_5_GOTPC32_TLSDESC: u32 = 48;
 pub const R_X86_64_CODE_6_GOTPCRELX: u32 = 49;
 pub const R_X86_64_CODE_6_GOTTPOFF: u32 = 50;
 pub const R_X86_64_CODE_6_GOTPC32_TLSDESC: u32 = 51;
@@ -79,6 +86,7 @@ pub fn is_gotpcrel_family(t: u32) -> bool {
             | R_X86_64_GOTPCRELX
             | R_X86_64_REX_GOTPCRELX
             | R_X86_64_CODE_4_GOTPCRELX
+            | R_X86_64_CODE_5_GOTPCRELX
             | R_X86_64_CODE_6_GOTPCRELX
     )
 }
@@ -91,6 +99,7 @@ pub fn is_gotpcrelx_relaxable(t: u32) -> bool {
         R_X86_64_GOTPCRELX
             | R_X86_64_REX_GOTPCRELX
             | R_X86_64_CODE_4_GOTPCRELX
+            | R_X86_64_CODE_5_GOTPCRELX
             | R_X86_64_CODE_6_GOTPCRELX
     )
 }
@@ -145,6 +154,12 @@ pub enum GotRelax {
     /// `add/or/adc/sbb/and/sub/xor/cmp foo@GOTPCREL(%rip), %reg` ->
     /// `<op> $foo, %reg`.
     Binop,
+    /// `movrs foo@GOTPCREL(%rip), %reg` (`REX 0f 38 8b`) -> `cs cs REX lea
+    /// foo(%rip), %reg` or `cs cs REX' mov $foo, %reg`: the `0f 38` escape
+    /// becomes two ignored segment overrides and the REX byte moves up, so
+    /// the length is unchanged (GNU ld 2.47's rewrite).  The read-shared
+    /// hint of a load that no longer happens has nothing left to apply to.
+    MovrsLoad { imm: bool },
 }
 
 /// The relaxation available for a GOT-indirect relocation whose 32-bit
@@ -167,6 +182,8 @@ pub enum GotRelax {
 /// * `CODE_4_GOTPCRELX`: a REX2 prefix (`d5 xx`) at `off - 4` -- the
 ///   opcode-preserving `lea` only; the REX2 payload of the immediate forms
 ///   is laid out differently, and `call`/`jmp` cannot carry it.
+/// * `CODE_5_GOTPCRELX`: a REX-prefixed MOVRS (`REX 0f 38 8b` from `off -
+///   5`) -- [`GotRelax::MovrsLoad`].
 ///
 /// A type whose prefix is absent (a misdescribed or truncated instruction,
 /// e.g. `REX_GOTPCRELX` two bytes into its section) is never relaxed: its
@@ -225,6 +242,15 @@ pub fn gotpcrelx_relaxation(
                 return None;
             }
             Some(GotRelax::Load { imm: false })
+        }
+        R_X86_64_CODE_5_GOTPCRELX => {
+            if off < 5
+                || code[off - 5] & 0xf0 != 0x40
+                || code[off - 4..off - 1] != [0x0f, 0x38, 0x8b]
+            {
+                return None;
+            }
+            (rip_ok || imm_ok).then_some(GotRelax::MovrsLoad { imm: imm_ok })
         }
         _ => None,
     }
@@ -307,55 +333,199 @@ pub fn rewrite_got_relax(
             buf[fp - 3] = rex_r_to_b(buf[fp - 3]);
             (fp, s as i64)
         }
+        GotRelax::MovrsLoad { imm } => {
+            let rex = buf[fp - 5];
+            buf[fp - 5] = 0x2e;
+            buf[fp - 4] = 0x2e;
+            if imm && fits_imm32(s) {
+                let modrm = buf[fp - 1];
+                buf[fp - 1] = 0xc0 | ((modrm & 0x38) >> 3);
+                buf[fp - 2] = 0xc7;
+                buf[fp - 3] = rex_r_to_b(rex);
+                (fp, s as i64)
+            } else {
+                buf[fp - 2] = 0x8d;
+                buf[fp - 3] = rex;
+                (fp, pcrel)
+            }
+        }
     }
 }
 
-/// Initial-Exec -> Local-Exec: the instruction an `R_X86_64_GOTTPOFF` at
-/// section offset `off` of `code` belongs to, if it is one of the two the
-/// psABI defines (`movq foo@gottpoff(%rip), %reg` / `addq ..., %reg`, REX.W
-/// at `off - 3`, RIP-relative ModRM).  Verified inside the section, as for
-/// [`gotpcrelx_relaxation`]; REX2/APX forms are not rewritten.
+/// Initial-Exec -> Local-Exec: the instruction a GOTTPOFF-family
+/// relocation at section offset `off` of `code` belongs to, if a
+/// same-length rewrite to an immediate covers it.  Verified inside the
+/// section, as for [`gotpcrelx_relaxation`]; every form needs a
+/// RIP-relative ModRM (`00 reg 101`).  The set is GNU ld 2.47's, minus the
+/// inputs it rewrites without checking:
+///
+/// * `R_X86_64_GOTTPOFF`: the two forms the psABI defines, `movq
+///   foo@gottpoff(%rip), %reg` / `addq ..., %reg` -- REX.W at `off - 3`,
+///   opcode `8b`/`03`.  The REX.W byte is what makes the rewrite safe: it is
+///   part of the instruction and carries the REX.R bit that moves to REX.B.
+///   A form without it (`movl foo@gottpoff(%rip), %eax`, which GNU as
+///   refuses to assemble) has no prefix byte we may touch -- whatever
+///   precedes the opcode belongs to the previous instruction -- so it keeps
+///   its GOT slot, where GNU ld refuses the link.
+/// * `R_X86_64_CODE_4_GOTTPOFF`: the same two with a REX2 prefix (`d5 P`
+///   at `off - 4`, `%r16`..`%r31` destinations) in opcode map 0 (`P.M0`
+///   clear: with it set the opcode byte would be a map-1 `0f 8b`, a `jnp`,
+///   which GNU ld would rewrite regardless).
+/// * `R_X86_64_CODE_5_GOTTPOFF`: `movrs foo@gottpoff(%rip), %reg` with
+///   REX.W (`REX 0f 38 8b` from `off - 5`), which becomes `cs cs REX' mov
+///   $imm, %reg`: the `0f 38` escape turns into ignored segment overrides.
+/// * `R_X86_64_CODE_6_GOTTPOFF`: APX EVEX (`62 P0 P1 P2` at `off - 6`) in
+///   map 4 with no operand-size prefix (`pp` = 0; a 16-bit form would take
+///   an imm16 and change the length): `add` with a new data destination
+///   (`add foo@gottpoff(%rip), %reg1, %reg2`, opcode `03`, or `01` -- the
+///   same sum -- which without ND would instead STORE into the slot), and
+///   `movrs foo@gottpoff(%rip), %reg` (`8b`, no ND), which becomes a REX2
+///   `mov $imm` behind two ignored `cs` prefixes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IeToLe {
+    /// `REX.W 8b|03 /r` -> `REX.W c7|81 /0`.
+    Rex(IeOp),
+    /// `d5 P 8b|03 /r` -> `d5 P' c7|81 /0`.
+    Rex2(IeOp),
+    /// `REX.W 0f 38 8b /r` (MOVRS) -> `2e 2e REX.W' c7 /0`.
+    RexMovrs,
+    /// EVEX `add` -> EVEX `81 /0` (same P1/P2: NDD, NF, W kept).
+    EvexAdd,
+    /// EVEX `movrs` -> `2e 2e d5 P c7 /0`.
+    EvexMovrs,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IeOp {
     Mov,
     Add,
 }
 
 pub fn gottpoff_ie_to_le(rela_type: u32, code: &[u8], off: usize) -> Option<IeToLe> {
-    if rela_type != R_X86_64_GOTTPOFF || off < 3 || off.checked_add(4)? > code.len() {
+    let prefix_len = match rela_type {
+        R_X86_64_GOTTPOFF => 3,
+        R_X86_64_CODE_4_GOTTPOFF => 4,
+        R_X86_64_CODE_5_GOTTPOFF => 5,
+        R_X86_64_CODE_6_GOTTPOFF => 6,
+        _ => return None,
+    };
+    if off < prefix_len || off.checked_add(4)? > code.len() {
         return None;
     }
-    let (rex, op, modrm) = (code[off - 3], code[off - 2], code[off - 1]);
-    if rex & 0xf8 != 0x48 || modrm & 0xc7 != 0x05 {
+    let (op, modrm) = (code[off - 2], code[off - 1]);
+    if modrm & 0xc7 != 0x05 {
         return None;
     }
-    match op {
-        0x8b => Some(IeToLe::Mov),
-        0x03 => Some(IeToLe::Add),
+    let legacy_op = match op {
+        0x8b => Some(IeOp::Mov),
+        0x03 => Some(IeOp::Add),
         _ => None,
+    };
+    match rela_type {
+        R_X86_64_GOTTPOFF => legacy_op
+            .filter(|_| code[off - 3] & 0xf8 == 0x48)
+            .map(IeToLe::Rex),
+        R_X86_64_CODE_4_GOTTPOFF => legacy_op
+            .filter(|_| code[off - 4] == 0xd5 && code[off - 3] & 0x80 == 0)
+            .map(IeToLe::Rex2),
+        R_X86_64_CODE_5_GOTTPOFF => (code[off - 5] & 0xf8 == 0x48
+            && code[off - 4..off - 1] == [0x0f, 0x38, 0x8b])
+        .then_some(IeToLe::RexMovrs),
+        _ => {
+            let (p0, p1, p2) = (code[off - 5], code[off - 4], code[off - 3]);
+            if code[off - 6] != 0x62 || p0 & 0x07 != 4 || p1 & 0x03 != 0 {
+                return None;
+            }
+            let nd = p2 & 0x10 != 0;
+            match op {
+                0x03 => Some(IeToLe::EvexAdd),
+                0x01 if nd => Some(IeToLe::EvexAdd),
+                0x8b if !nd => Some(IeToLe::EvexMovrs),
+                _ => None,
+            }
+        }
     }
 }
 
-/// Apply an [`IeToLe`] rewrite at field position `fp`: `REX' c7 /0` or
-/// `REX' 81 /0` with the destination moved into ModRM.rm (REX.R -> REX.B,
-/// see [`rex_r_to_b`]; without it `%r12` silently became `%rsp`).  The
-/// caller stores the TP offset into the imm32 at `fp`.
+/// REX2 payload `M0 R4 X4 B4 W R3 X3 B3`: move both R bits to the B bits
+/// (clearing any stray B, meaningless under RIP-relative addressing but
+/// not once the ModRM names a register).
+fn rex2_r_to_b(payload: u8) -> u8 {
+    (payload & !0x55) | ((payload & 0x44) >> 2)
+}
+
+/// EVEX P0 `~R3 ~X3 ~B3 ~R4 B4 m m m`: move R3 -> B3 and R4 -> B4 (whose
+/// sense is not inverted), then clear both R bits (set, inverted) -- GNU
+/// ld's `evex_move_r_to_b`.
+fn evex_r_to_b(p0: u8) -> u8 {
+    let p0 = (p0 & !0x20) | ((p0 & 0x80) >> 2);
+    let p0 = (p0 & !0x08) | ((!p0 & 0x10) >> 1);
+    p0 | 0x90
+}
+
+/// Apply an [`IeToLe`] rewrite at field position `fp`: an `op $imm32`
+/// form with the destination moved from ModRM.reg into ModRM.rm (REX.R ->
+/// REX.B, see [`rex_r_to_b`], and likewise for REX2/EVEX; without it `%r12`
+/// silently became `%rsp`).  The caller stores the TP offset into the imm32
+/// at `fp`.
 pub fn rewrite_ie_to_le(buf: &mut [u8], fp: usize, kind: IeToLe) {
     let modrm = buf[fp - 1];
-    buf[fp - 1] = 0xc0 | ((modrm & 0x38) >> 3);
-    buf[fp - 2] = match kind {
-        IeToLe::Mov => 0xc7,
-        IeToLe::Add => 0x81,
+    let reg = (modrm & 0x38) >> 3;
+    buf[fp - 1] = 0xc0 | reg;
+    let imm_op = |op| match op {
+        IeOp::Mov => 0xc7,
+        IeOp::Add => 0x81,
     };
-    buf[fp - 3] = rex_r_to_b(buf[fp - 3]);
+    match kind {
+        IeToLe::Rex(op) => {
+            buf[fp - 2] = imm_op(op);
+            buf[fp - 3] = rex_r_to_b(buf[fp - 3]);
+        }
+        IeToLe::Rex2(op) => {
+            buf[fp - 2] = imm_op(op);
+            buf[fp - 3] = rex2_r_to_b(buf[fp - 3]);
+        }
+        IeToLe::RexMovrs => {
+            let rex = buf[fp - 5];
+            buf[fp - 5] = 0x2e;
+            buf[fp - 4] = 0x2e;
+            buf[fp - 3] = rex_r_to_b(rex);
+            buf[fp - 2] = 0xc7;
+        }
+        IeToLe::EvexAdd => {
+            buf[fp - 2] = 0x81;
+            buf[fp - 5] = evex_r_to_b(buf[fp - 5]);
+        }
+        IeToLe::EvexMovrs => {
+            let (p0, p1) = (buf[fp - 5], buf[fp - 4]);
+            let mut payload = 0u8;
+            if p0 & 0x80 == 0 {
+                payload |= 0x01; // ~R3 -> B3
+            }
+            if p0 & 0x10 == 0 {
+                payload |= 0x10; // ~R4 -> B4
+            }
+            if p1 & 0x80 != 0 {
+                payload |= 0x08; // W
+            }
+            buf[fp - 6] = 0x2e;
+            buf[fp - 5] = 0x2e;
+            buf[fp - 4] = 0xd5;
+            buf[fp - 3] = payload;
+            buf[fp - 2] = 0xc7;
+        }
+    }
 }
 
-/// TLS Initial-Exec through a GOT slot (classic / REX2 / APX EVEX).
+/// TLS Initial-Exec through a GOT slot (classic / REX2 / MOVRS / APX EVEX).
 #[inline]
 pub fn is_gottpoff_family(t: u32) -> bool {
     matches!(
         t,
-        R_X86_64_GOTTPOFF | R_X86_64_CODE_4_GOTTPOFF | R_X86_64_CODE_6_GOTTPOFF
+        R_X86_64_GOTTPOFF
+            | R_X86_64_CODE_4_GOTTPOFF
+            | R_X86_64_CODE_5_GOTTPOFF
+            | R_X86_64_CODE_6_GOTTPOFF
     )
 }
 pub const R_X86_64_16: u32 = 12;
@@ -393,8 +563,8 @@ pub fn is_got64_family(t: u32) -> bool {
 // DT_* constants now in shared module - re-export them
 pub use crate::backend::elf::{
     DT_DEBUG, DT_FINI_ARRAY, DT_FINI_ARRAYSZ, DT_FLAGS, DT_FLAGS_1, DT_INIT_ARRAY, DT_INIT_ARRAYSZ,
-    DT_PREINIT_ARRAY, DT_PREINIT_ARRAYSZ, DT_RELACOUNT, DT_RPATH, DT_RUNPATH, DT_SONAME, DT_VERDEF,
-    DT_VERDEFNUM, DT_VERNEED, DT_VERNEEDNUM, DT_VERSYM,
+    DT_PREINIT_ARRAY, DT_PREINIT_ARRAYSZ, DT_RELACOUNT, DT_RPATH, DT_RUNPATH, DT_SONAME,
+    DT_TEXTREL, DT_VERDEF, DT_VERDEFNUM, DT_VERNEED, DT_VERNEEDNUM, DT_VERSYM,
 };
 
 // ── Type aliases ─────────────────────────────────────────────────────────
@@ -791,21 +961,17 @@ mod tests {
 
     #[test]
     fn ie_to_le_validates_and_moves_rex_r_to_b() {
+        const MOV: IeToLe = IeToLe::Rex(IeOp::Mov);
+        const ADD: IeToLe = IeToLe::Rex(IeOp::Add);
         // movq foo@gottpoff(%rip), %r12  ->  movq $tpoff, %r12
         let mut b = vec![0xc3, 0x4c, 0x8b, 0x25, 0, 0, 0, 0];
-        assert_eq!(
-            gottpoff_ie_to_le(R_X86_64_GOTTPOFF, &b, 4),
-            Some(IeToLe::Mov)
-        );
-        rewrite_ie_to_le(&mut b, 4, IeToLe::Mov);
+        assert_eq!(gottpoff_ie_to_le(R_X86_64_GOTTPOFF, &b, 4), Some(MOV));
+        rewrite_ie_to_le(&mut b, 4, MOV);
         assert_eq!(&b[..4], &[0xc3, 0x49, 0xc7, 0xc4]);
         // addq foo@gottpoff(%rip), %rax with a stray REX.B
         let mut b = vec![0x49, 0x03, 0x05, 0, 0, 0, 0];
-        assert_eq!(
-            gottpoff_ie_to_le(R_X86_64_GOTTPOFF, &b, 3),
-            Some(IeToLe::Add)
-        );
-        rewrite_ie_to_le(&mut b, 3, IeToLe::Add);
+        assert_eq!(gottpoff_ie_to_le(R_X86_64_GOTTPOFF, &b, 3), Some(ADD));
+        rewrite_ie_to_le(&mut b, 3, ADD);
         assert_eq!(&b[..3], &[0x48, 0x81, 0xc0]);
         // At the section start, without REX.W, not RIP-relative, other op.
         assert_eq!(
@@ -824,13 +990,146 @@ mod tests {
             gottpoff_ie_to_le(R_X86_64_GOTTPOFF, &[0x48, 0x2b, 0x05, 0, 0, 0, 0], 3),
             None
         );
-        assert_eq!(
-            gottpoff_ie_to_le(
-                R_X86_64_CODE_4_GOTTPOFF,
-                &[0xd5, 0x48, 0x8b, 0x05, 0, 0, 0, 0],
-                4
+    }
+
+    #[test]
+    fn ie_to_le_evex_forms_match_gnu_ld() {
+        // (input, output) pairs from GNU as / GNU ld 2.47 (field zeroed).
+        let cases: [(&[u8], &[u8], IeToLe); 4] = [
+            // add foo@gottpoff(%rip), %rax, %r17
+            (
+                &[0x62, 0xf4, 0xf4, 0x10, 0x03, 0x05],
+                &[0x62, 0xf4, 0xf4, 0x10, 0x81, 0xc0],
+                IeToLe::EvexAdd,
             ),
+            // add %r20, foo@gottpoff(%rip), %r9 (opcode 01 with ND)
+            (
+                &[0x62, 0xe4, 0xb4, 0x18, 0x01, 0x25],
+                &[0x62, 0xfc, 0xb4, 0x18, 0x81, 0xc4],
+                IeToLe::EvexAdd,
+            ),
+            // {nf} add foo@gottpoff(%rip), %r18
+            (
+                &[0x62, 0xe4, 0xfc, 0x0c, 0x03, 0x15],
+                &[0x62, 0xfc, 0xfc, 0x0c, 0x81, 0xc2],
+                IeToLe::EvexAdd,
+            ),
+            // movrs foo@gottpoff(%rip), %r19 -> cs cs mov $imm, %r19
+            (
+                &[0x62, 0xe4, 0xfc, 0x08, 0x8b, 0x1d],
+                &[0x2e, 0x2e, 0xd5, 0x18, 0xc7, 0xc3],
+                IeToLe::EvexMovrs,
+            ),
+        ];
+        for (input, output, kind) in cases {
+            let mut b = [input, &[0u8; 4][..]].concat();
+            assert_eq!(
+                gottpoff_ie_to_le(R_X86_64_CODE_6_GOTTPOFF, &b, 6),
+                Some(kind),
+                "{input:02x?}"
+            );
+            rewrite_ie_to_le(&mut b, 6, kind);
+            assert_eq!(&b[..6], output, "{input:02x?}");
+        }
+        // Refused: opcode 01 without ND stores INTO the slot; a 66 (pp=1)
+        // operand-size form would need an imm16; map 1; movrs with ND;
+        // not EVEX; not RIP-relative.
+        for code in [
+            [0x62, 0xe4, 0xfc, 0x08, 0x01, 0x05],
+            [0x62, 0xf4, 0xf5, 0x10, 0x03, 0x05],
+            [0x62, 0xf1, 0xf4, 0x10, 0x03, 0x05],
+            [0x62, 0xe4, 0xfc, 0x18, 0x8b, 0x1d],
+            [0x63, 0xf4, 0xf4, 0x10, 0x03, 0x05],
+            [0x62, 0xf4, 0xf4, 0x10, 0x03, 0x04],
+        ] {
+            let b = [&code[..], &[0u8; 4][..]].concat();
+            assert_eq!(
+                gottpoff_ie_to_le(R_X86_64_CODE_6_GOTTPOFF, &b, 6),
+                None,
+                "{code:02x?}"
+            );
+        }
+    }
+
+    #[test]
+    fn movrs_rewrites_match_gnu_ld() {
+        // movrs gx@gottpoff(%rip), %r12 -> cs cs mov $tpoff, %r12
+        let mut b = vec![0x4c, 0x0f, 0x38, 0x8b, 0x25, 0, 0, 0, 0];
+        let kind = gottpoff_ie_to_le(R_X86_64_CODE_5_GOTTPOFF, &b, 5);
+        assert_eq!(kind, Some(IeToLe::RexMovrs));
+        rewrite_ie_to_le(&mut b, 5, IeToLe::RexMovrs);
+        assert_eq!(&b[..5], &[0x2e, 0x2e, 0x49, 0xc7, 0xc4]);
+        // Without REX.W (a 32-bit load of the slot), or not MOVRS: refused.
+        for code in [
+            [0x44, 0x0f, 0x38, 0x8b, 0x05],
+            [0x48, 0x0f, 0x38, 0x03, 0x05],
+            [0x48, 0x0f, 0x39, 0x8b, 0x05],
+        ] {
+            let b = [&code[..], &[0u8; 4][..]].concat();
+            assert_eq!(gottpoff_ie_to_le(R_X86_64_CODE_5_GOTTPOFF, &b, 5), None);
+        }
+        // movrs dat@GOTPCREL(%rip), %r13: immediate without PIC, lea with.
+        let code = [0x4c, 0x0f, 0x38, 0x8b, 0x2d, 0, 0, 0, 0];
+        let t = R_X86_64_CODE_5_GOTPCRELX;
+        let k = gotpcrelx_relaxation(t, -4, &code, 5, false, GotTarget::Image).unwrap();
+        assert_eq!(k, GotRelax::MovrsLoad { imm: true });
+        let mut b = code.to_vec();
+        assert_eq!(
+            rewrite_got_relax(&mut b, 5, k, t, 0x404010, 0),
+            (5, 0x404010)
+        );
+        assert_eq!(&b[..5], &[0x2e, 0x2e, 0x49, 0xc7, 0xc5]);
+        let k = gotpcrelx_relaxation(t, -4, &code, 5, true, GotTarget::Image).unwrap();
+        let mut b = code.to_vec();
+        assert_eq!(
+            rewrite_got_relax(&mut b, 5, k, t, 0x3000, 0x1000),
+            (5, 0x1ffc)
+        );
+        assert_eq!(&b[..5], &[0x2e, 0x2e, 0x4c, 0x8d, 0x2d]);
+        // No REX in front of the escape: not this relocation's form.
+        let code = [0x90, 0x0f, 0x38, 0x8b, 0x05, 0, 0, 0, 0];
+        assert_eq!(
+            gotpcrelx_relaxation(t, -4, &code, 5, false, GotTarget::Image),
             None
         );
+    }
+
+    #[test]
+    fn ie_to_le_rex2_moves_both_r_bits() {
+        let mov = IeToLe::Rex2(IeOp::Mov);
+        // movq foo@gottpoff(%rip), %r31: d5 4c 8b 3d (R4=1 R3=1, reg=7)
+        //   -> movq $tpoff, %r31: d5 19 c7 c7 (B4=1 B3=1, W kept)
+        let mut b = vec![0xd5, 0x4c, 0x8b, 0x3d, 0, 0, 0, 0];
+        assert_eq!(
+            gottpoff_ie_to_le(R_X86_64_CODE_4_GOTTPOFF, &b, 4),
+            Some(mov)
+        );
+        rewrite_ie_to_le(&mut b, 4, mov);
+        assert_eq!(&b[..4], &[0xd5, 0x19, 0xc7, 0xc7]);
+        // addq foo@gottpoff(%rip), %r16: d5 48 03 05 -> d5 18 81 c0 (R4 -> B4)
+        let add = IeToLe::Rex2(IeOp::Add);
+        let mut b = vec![0xd5, 0x48, 0x03, 0x05, 0, 0, 0, 0];
+        assert_eq!(
+            gottpoff_ie_to_le(R_X86_64_CODE_4_GOTTPOFF, &b, 4),
+            Some(add)
+        );
+        rewrite_ie_to_le(&mut b, 4, add);
+        assert_eq!(&b[..4], &[0xd5, 0x18, 0x81, 0xc0]);
+        // addl foo@gottpoff(%rip), %r20d (no W): d5 40 03 25 -> d5 10 81 c4
+        let mut b = vec![0xd5, 0x40, 0x03, 0x25, 0, 0, 0, 0];
+        assert_eq!(
+            gottpoff_ie_to_le(R_X86_64_CODE_4_GOTTPOFF, &b, 4),
+            Some(add)
+        );
+        rewrite_ie_to_le(&mut b, 4, add);
+        assert_eq!(&b[..4], &[0xd5, 0x10, 0x81, 0xc4]);
+        // Map 1 (M0 set), no d5, prefix outside the section: refused.
+        for (code, off) in [
+            (&[0xd5, 0xc8, 0x8b, 0x05, 0, 0, 0, 0][..], 4),
+            (&[0x90, 0x48, 0x8b, 0x05, 0, 0, 0, 0][..], 4),
+            (&[0x48, 0x8b, 0x05, 0, 0, 0, 0][..], 3),
+        ] {
+            assert_eq!(gottpoff_ie_to_le(R_X86_64_CODE_4_GOTTPOFF, code, off), None);
+        }
     }
 }

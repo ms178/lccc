@@ -13,7 +13,7 @@ pub(super) fn resolve_symbols(
     inputs: &[InputObject],
     _output_sections: &[OutputSection],
     section_map: &SectionMap,
-    dynlib_syms: &FxHashMap<String, (String, u8, u32, Option<String>, bool, u8)>,
+    dynlib_syms: &super::input::DynlibSyms,
 ) -> (
     FxHashMap<String, LinkerSymbol>,
     FxHashMap<(usize, usize), String>,
@@ -72,7 +72,7 @@ pub(super) fn resolve_symbols(
                 needs_copy: false,
                 copy_addr: 0,
                 version: None,
-                uses_textrel: false,
+                lib_value: 0,
                 canonical_plt: false,
             };
 
@@ -119,40 +119,8 @@ pub(super) fn resolve_symbols(
                     continue;
                 }
 
-                if let Some((lib, dyn_sym_type, dyn_size, dyn_ver, _is_default, dyn_binding)) =
-                    dynlib_syms.get(sym.name.as_str())
-                {
-                    let is_func = *dyn_sym_type == STT_FUNC || *dyn_sym_type == STT_GNU_IFUNC;
-                    global_symbols.insert(
-                        sym.name.to_string(),
-                        LinkerSymbol {
-                            address: 0,
-                            size: *dyn_size,
-                            sym_type: *dyn_sym_type,
-                            binding: *dyn_binding,
-                            visibility: STV_DEFAULT,
-                            is_defined: false,
-                            // Decided per reference by `mark_plt_got_needs`:
-                            // a PLT only for calls and address-of, a GOT slot
-                            // only for GOT-relative references.
-                            needs_plt: false,
-                            needs_got: false,
-                            output_section: usize::MAX,
-                            section_offset: 0,
-                            plt_index: 0,
-                            got_index: 0,
-                            is_dynamic: true,
-                            dynlib: lib.clone(),
-                            // A DSO TLS variable lives in its module's TLS
-                            // block: it is reached through TLS_TPOFF GOT
-                            // slots, never copied into the executable.
-                            needs_copy: !is_func && *dyn_sym_type != STT_TLS,
-                            copy_addr: 0,
-                            version: dyn_ver.clone(),
-                            uses_textrel: false,
-                            canonical_plt: false,
-                        },
-                    );
+                if let Some(d) = dynlib_syms.get(sym.name.as_str()) {
+                    global_symbols.insert(sym.name.to_string(), LinkerSymbol::dynamic_import(d));
                 } else {
                     global_symbols
                         .entry(sym.name.clone())
@@ -174,7 +142,7 @@ pub(super) fn resolve_symbols(
                             needs_copy: false,
                             copy_addr: 0,
                             version: None,
-                            uses_textrel: false,
+                            lib_value: 0,
                             canonical_plt: false,
                         });
                 }

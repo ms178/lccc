@@ -206,25 +206,13 @@ pub fn link_builtin(
     let (plt_symbols, got_dyn_symbols, got_local_symbols, num_plt, num_got_total) =
         build_plt_got_lists(&mut global_symbols);
 
-    // Phase 8b: Mark WEAK dynamic data symbols for text relocations instead of COPY
+    // Phase 8b: a copy relocation moves an object, not a name.  Every other
+    // data export of the same library at the same address -- glibc's strong
+    // `__environ` behind the weak `environ` a program names -- must be
+    // defined at the copy too, or the library keeps using the original
+    // while the program sees the copy.
     if !is_static {
-        let weak_data_syms: Vec<String> = global_symbols
-            .iter()
-            .filter(|(_, s)| {
-                s.is_dynamic
-                    && s.needs_copy
-                    && s.binding == STB_WEAK
-                    && s.sym_type != STT_FUNC
-                    && s.sym_type != STT_GNU_IFUNC
-            })
-            .map(|(n, _)| n.clone())
-            .collect();
-        for name in &weak_data_syms {
-            if let Some(sym) = global_symbols.get_mut(name) {
-                sym.needs_copy = false;
-                sym.uses_textrel = true;
-            }
-        }
+        register_copy_aliases(&mut global_symbols, &resolved.dynlib_syms);
     }
 
     // Phase 9: Collect IFUNC symbols for static linking
@@ -360,7 +348,7 @@ fn apply_defsyms(
                 needs_copy: false,
                 copy_addr: 0,
                 version: None,
-                uses_textrel: false,
+                lib_value: 0,
                 canonical_plt: false,
             },
         );
@@ -483,7 +471,7 @@ pub fn link_shared(
         }
         match resolved.dynlib_syms.get(sym.name.as_str()) {
             Some(entry) => {
-                referenced.insert(entry.0.clone());
+                referenced.insert(entry.lib.clone());
             }
             None if sym.binding != STB_WEAK
                 && !super::shared::is_emitter_defined(&sym.name, &section_name_to_idx) =>
@@ -515,4 +503,52 @@ pub fn link_shared(
         &opts,
         &pending_defsyms,
     )
+}
+
+/// Define every alias of a copy-relocated shared-library object at the
+/// copy (GNU ld's weakdef handling, `_bfd_elf_adjust_dynamic_symbol`).
+///
+/// Two default-version `STT_OBJECT` exports of one library with the same
+/// `st_value` name one object.  When the executable copy-relocates either,
+/// the others join the copy: `emit` gives the group one `.bss` slot and one
+/// `R_386_COPY`, and exports every member there, so ld.so binds the
+/// library's own references (through whichever name) to the copy.
+///
+/// This replaces a text-relocation scheme: a WEAK data import used to skip
+/// the copy (because its strong alias would have stayed behind) and patch
+/// every reference in the code instead -- a `DT_TEXTREL` executable for
+/// every non-PIC program that names `environ`, where GNU ld emits a copy.
+pub(super) fn register_copy_aliases(
+    global_symbols: &mut FxHashMap<String, LinkerSymbol>,
+    dynlib_syms: &DynlibSyms,
+) {
+    let copied: FxHashSet<(String, u32)> = global_symbols
+        .values()
+        .filter(|s| s.is_dynamic && s.needs_copy && s.sym_type == STT_OBJECT && s.lib_value != 0)
+        .map(|s| (s.dynlib.clone(), s.lib_value))
+        .collect();
+    if copied.is_empty() {
+        return;
+    }
+    for (name, d) in dynlib_syms {
+        if d.sym_type != STT_OBJECT
+            || !d.is_default_ver
+            || !copied.contains(&(d.lib.clone(), d.value))
+        {
+            continue;
+        }
+        match global_symbols.get_mut(name) {
+            // Not referenced by the executable: it still has to be defined
+            // at the copy for the library's sake.
+            None => {
+                global_symbols.insert(name.clone(), LinkerSymbol::dynamic_import(d));
+            }
+            // Referenced only through the GOT, or not at all yet: join the
+            // copy so its GLOB_DAT resolves there too.
+            Some(g) if g.is_dynamic && g.dynlib == d.lib => g.needs_copy = true,
+            // Defined by the executable itself (it interposes), or bound to
+            // another library: not an alias of this copy.
+            Some(_) => {}
+        }
+    }
 }

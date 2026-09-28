@@ -437,7 +437,9 @@ pub(super) fn emit_shared_library_32(
     let mut needs_ldm = false;
     let mut num_relative = 0usize;
     let mut num_symbolic = 0usize;
-    let mut textrel = false;
+    // First dynamic relocation into a read-only section (GNU's warning
+    // names it); `Some` means the image needs DT_TEXTREL.
+    let mut textrel_site: Option<String> = None;
     let mut static_tls = false;
     let mut imports: Vec<String> = Vec::new();
     let mut import_set: FxHashSet<String> = FxHashSet::default();
@@ -477,7 +479,16 @@ pub(super) fn emit_shared_library_32(
                     } else {
                         num_symbolic += 1;
                     }
-                    textrel |= !writable;
+                    if !writable && textrel_site.is_none() {
+                        textrel_site = Some(linker_common::TextrelPolicy::site(
+                            &obj.filename,
+                            match &t.key {
+                                SymKey::Global(n) => Some(n.as_str()),
+                                _ => None,
+                            },
+                            &sec.name,
+                        ));
+                    }
                 };
                 if !t.local
                     && !t.defined
@@ -638,12 +649,13 @@ pub(super) fn emit_shared_library_32(
     });
     let want_gnu_hash = opts.hash_style.wants_gnu();
 
-    if textrel && opts.z_text {
-        return Err(
-            "read-only segment has dynamic relocations (text relocations) and -z text was given; recompile with -fPIC"
-                .to_string(),
-        );
-    }
+    let textrel = match &textrel_site {
+        Some(site) => {
+            opts.textrel.apply(site, "shared object")?;
+            true
+        }
+        None => false,
+    };
 
     // ── Layout ────────────────────────────────────────────────────────────
     let base_addr: u32 = 0;
@@ -1018,7 +1030,7 @@ pub(super) fn emit_shared_library_32(
         needs_copy: false,
         copy_addr: 0,
         version: None,
-        uses_textrel: false,
+        lib_value: 0,
         canonical_plt: false,
     };
     let gs = global_symbols
@@ -2039,7 +2051,7 @@ mod tests {
             needs_copy: false,
             copy_addr: 0,
             version: None,
-            uses_textrel: false,
+            lib_value: 0,
             canonical_plt: false,
         };
         assert!(!binds_locally(&gs, Symbolic::None));

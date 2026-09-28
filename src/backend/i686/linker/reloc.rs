@@ -43,12 +43,10 @@ pub(super) struct RelocContext<'a> {
 }
 
 /// Apply all relocations from input objects to the output sections.
-/// Returns a list of text relocations (address, dynsym_index) for symbols using textrel.
 pub(super) fn apply_relocations(
     inputs: &[InputObject],
     ctx: &mut RelocContext,
-) -> Result<Vec<(u32, String)>, String> {
-    let mut text_relocs: Vec<(u32, String)> = Vec::new();
+) -> Result<(), String> {
     for (obj_idx, obj) in inputs.iter().enumerate() {
         for sec in &obj.sections {
             if sec.relocations.is_empty() {
@@ -73,7 +71,7 @@ pub(super) fn apply_relocations(
                 ctx.tls_relaxed_call_slots.insert(sec_addr + field);
             }
             for &(rel_offset, rel_type, sym_idx, addend) in &sec.relocations {
-                let tr = apply_one_reloc(
+                apply_one_reloc(
                     obj_idx,
                     obj,
                     sec,
@@ -85,17 +83,13 @@ pub(super) fn apply_relocations(
                     addend,
                     ctx,
                 )?;
-                if let Some(t) = tr {
-                    text_relocs.push(t);
-                }
             }
         }
     }
-    Ok(text_relocs)
+    Ok(())
 }
 
 /// Apply a single relocation.
-/// Returns Some((patch_addr, sym_name)) if a text relocation entry is needed.
 fn apply_one_reloc(
     obj_idx: usize,
     obj: &InputObject,
@@ -107,7 +101,7 @@ fn apply_one_reloc(
     sym_idx: u32,
     addend: i32,
     ctx: &mut RelocContext,
-) -> Result<Option<(u32, String)>, String> {
+) -> Result<(), String> {
     let patch_offset = sec_base_offset + rel_offset;
     let patch_addr = ctx.output_sections[out_sec_idx].addr + patch_offset;
 
@@ -128,33 +122,15 @@ fn apply_one_reloc(
             .unwrap_or(false);
 
     let mut relax_got32x = false;
-    let mut text_reloc: Option<(u32, String)> = None;
 
     let value: u32 = match rel_type {
-        R_386_NONE => return Ok(None),
-        R_386_32 => {
-            // Check if this symbol uses text relocations (WEAK dynamic data)
-            if !sym.name.is_empty() {
-                if let Some(gs) = ctx.global_symbols.get(sym.name.as_str()) {
-                    if gs.uses_textrel {
-                        // Record a text relocation; write 0 for now (dynamic linker fills it)
-                        text_reloc = Some((patch_addr, sym.name.clone()));
-                        addend as u32
-                    } else {
-                        (sym_addr as i32 + addend) as u32
-                    }
-                } else {
-                    (sym_addr as i32 + addend) as u32
-                }
-            } else {
-                (sym_addr as i32 + addend) as u32
-            }
-        }
+        R_386_NONE => return Ok(()),
+        R_386_32 => (sym_addr as i32 + addend) as u32,
         R_386_PC32 | R_386_PLT32 => {
             if ctx.tls_relaxed_call_slots.contains(&patch_addr) {
                 // The `call ___tls_get_addr` of a transitioned GD/LDM
                 // sequence (see `apply_tls_transition`) is gone.
-                return Ok(None);
+                return Ok(());
             }
             let s = if is_dyn {
                 ctx.global_symbols
@@ -172,7 +148,7 @@ fn apply_one_reloc(
             if ctx.tls_relaxed_call_slots.contains(&patch_addr) {
                 // `call *___tls_get_addr@GOT(%reg)` of a transitioned
                 // GD/LDM sequence: the call no longer exists.
-                return Ok(None);
+                return Ok(());
             }
             resolve_got_reloc(sym, sym_addr, addend, rel_type, ctx, &mut relax_got32x)
         }
@@ -199,7 +175,7 @@ fn apply_one_reloc(
                 patch_offset,
                 ctx,
             )?;
-            return Ok(None);
+            return Ok(());
         }
         R_386_TLS_DTPMOD32 => 1u32,
         R_386_TLS_DTPOFF32 => {
@@ -228,7 +204,7 @@ fn apply_one_reloc(
         out_sec.data[off..off + 4].copy_from_slice(&value.to_le_bytes());
     }
 
-    Ok(text_reloc)
+    Ok(())
 }
 
 /// Link one dynamic-model TLS relocation of an executable by transitioning

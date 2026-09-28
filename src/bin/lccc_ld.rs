@@ -288,6 +288,9 @@ fn is_benign_ignorable(a: &str) -> bool {
         | "--no-warn-search-mismatch"
         | "--no-warn-execstack"
         | "--warn-execstack"
+        // GNU's `--warn-textrel` turns the text-relocation check to "warn",
+        // which is already lccc-ld's default (`TextrelPolicy::Warn`).
+        | "--warn-textrel"
         | "--fatal-warnings"
         | "--no-fatal-warnings"
         | "--disable-linker-version"

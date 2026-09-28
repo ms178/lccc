@@ -5198,6 +5198,530 @@ def _ie_to_le_local_test(args, oracles):
             shutil.rmtree(td, ignore_errors=True)
 
 
+_IEF_ASM = r"""	.text
+	.globl	ie_movl, ie_gadd, apx
+# movl ly@gottpoff(%rip), %ecx -- no REX.W, so no prefix byte the IE->LE
+# rewrite may touch (GNU as refuses to assemble it; hand-encoded).
+ie_movl:	.byte	0x8b, 0x0d
+	.reloc	., R_X86_64_GOTTPOFF, ly-4
+	.long	0
+	movslq	%ecx, %rcx
+	movl	%fs:(%rcx), %eax
+	ret
+# addq of the executable's own GLOBAL TLS symbol.
+ie_gadd:	movq	%fs:0, %rax
+	addq	gx@gottpoff(%rip), %rax
+	movl	(%rax), %eax
+	ret
+# APX forms (encoded, never executed).
+apx:	addq	ly@gottpoff(%rip), %rax, %r17
+	addq	%r20, ly@gottpoff(%rip), %r9
+	addq	gx@gottpoff(%rip), %r21, %r22
+	{nf} addq	ly@gottpoff(%rip), %r18
+	{nf} addq	ly@gottpoff(%rip), %r18, %r11
+	movrs	ly@gottpoff(%rip), %r19
+	movq	gx@gottpoff(%rip), %r25
+	movq	ly@gottpoff(%rip), %r31
+	addq	gx@gottpoff(%rip), %r16
+	addq	ly@gottpoff(%rip), %r8
+	ret
+	.section .tdata,"awT",@progbits
+	.p2align 2
+ly:	.long	44
+	.globl	gx
+	.type	gx,@object
+	.size	gx,4
+gx:	.long	55
+	.section .note.GNU-stack,"",@progbits
+"""
+
+# `apx` after the IE -> LE rewrite, one (bytes before the imm32, symbol)
+# pair per instruction: GNU ld 2.47's output for the same object, except
+# the last -- GNU writes `lea disp32(%r8), %r8` (4d 8d 80) where lccc-ld
+# keeps `add $imm32, %r8`: same length and result (flags aside), and one
+# form for every register (GNU itself must use `add` for %rsp).
+_IEF_APX_WANT = (
+    ("62f4f41081c0", "ly"),    # add $tpoff, %rax, %r17   (EVEX: 03 -> 81)
+    ("62fcb41881c4", "ly"),    # add $tpoff, %r20, %r9    (01 + ND: same sum)
+    ("62fccc1081c5", "gx"),    # add $tpoff, %r21, %r22
+    ("62fcfc0c81c2", "ly"),    # {nf} add $tpoff, %r18
+    ("62fca41c81c2", "ly"),    # {nf} add $tpoff, %r18, %r11
+    ("2e2ed518c7c3", "ly"),    # movrs -> cs cs mov $tpoff, %r19 (REX2)
+    ("d519c7c1", "gx"),        # mov $tpoff, %r25          (REX2 R -> B)
+    ("d519c7c7", "ly"),        # mov $tpoff, %r31
+    ("d51881c0", "gx"),        # add $tpoff, %r16
+    ("4981c0", "ly"),          # add $tpoff, %r8
+)
+
+
+def _ie_to_le_forms_test(args, oracles):
+    """Initial-Exec in an executable: every form rewritten or slotted.
+
+    The planner and the relocation pass now share one per-reference
+    decision (`exec_ie_target_local` + `elf::gottpoff_ie_to_le`).  Before,
+    an executable's own GLOBAL TLS symbol always took a GOT slot and a load
+    (no IE -> LE at all), while a LOCAL one never got a slot, so a
+    reference the rewrite does not cover failed the link: APX EVEX forms
+    (`R_X86_64_CODE_6_GOTTPOFF`, which GNU ld rewrites) and a non-REX.W
+    `movl`, whose preceding byte belongs to another instruction.  Checked:
+    runtime values; the exact rewritten bytes of the REX.W, REX2 and EVEX
+    forms (GNU ld 2.47's encodings: `81 /0` with R moved to B, `movrs` to a
+    REX2 `mov` behind `cs` prefixes); the non-REX.W reference reading a
+    link-time slot that holds the TP offset and carries no dynamic
+    relocation -- in PDE, PIE and static executables.
+    """
+    name = "ie_to_le_forms"
+    td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
+    try:
+        with open(os.path.join(td, "ief.s"), "w") as f:
+            f.write(_IEF_ASM)
+        with open(os.path.join(td, "m.c"), "w") as f:
+            f.write("#include <stdio.h>\nint ie_movl(void), ie_gadd(void);\n"
+                    "int main(void) { printf(\"%d %d\\n\", ie_movl(), ie_gadd()); return 0; }\n")
+        r = sh([CC, "-c", "ief.s"], cwd=td)
+        if r.returncode != 0:
+            err = r.stderr.decode()[:300]
+            if "movrs" in err or "no such instruction" in err:
+                return Result(name, "SKIP", f"assembler without APX/MOVRS: {err}")
+            return Result(name, "FAIL", f"assemble: {err}")
+        r = sh([CC, "-O1", "-c", "m.c"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL", f"compile: {r.stderr.decode()[:300]}")
+        lccc_ld = os.path.join(os.path.dirname(os.path.abspath(args.lccc)), "lccc-ld")
+        shim = _shim_for(td, lccc_ld)
+        for mode in (["-no-pie"], ["-pie"], ["-static"]):
+            exe = "t" + "".join(mode)
+            r = sh([CC, "-B" + shim] + mode + ["m.o", "ief.o", "-o", exe], cwd=td)
+            if r.returncode != 0:
+                return Result(name, "FAIL", f"{mode} link: {r.stderr.decode()[:300]}")
+            run = sh([os.path.join(td, exe)], cwd=td)
+            if run.returncode != 0 or run.stdout.decode() != "44 55\n":
+                return Result(name, "FAIL", f"{mode}: got {run.stdout.decode()!r} "
+                              f"rc {run.returncode}")
+            path = os.path.join(td, exe)
+            with open(path, "rb") as f:
+                d = f.read()
+            tls = [p for p in _elf_bytes_phdrs(d) if p[0] == 7]  # PT_TLS
+            if len(tls) != 1:
+                return Result(name, "FAIL", f"{mode}: {len(tls)} PT_TLS headers")
+            _t, _fl, _off, tva, _fsz, tmsz, tal = tls[0]
+            block = (tmsz + tal - 1) // tal * tal
+            syms = _nm_addrs(path, td)
+
+            def tpoff(sym):
+                return syms[sym] - tva - block
+
+            def imm(sym):
+                return (tpoff(sym) & 0xFFFFFFFF).to_bytes(4, "little")
+
+            # addq gx@gottpoff(%rip), %rax  ->  addq $tpoff, %rax
+            got = _elf_vread(d, syms["ie_gadd"] + 9, 7)
+            if got != bytes.fromhex("4881c0") + imm("gx"):
+                return Result(name, "FAIL", f"{mode} ie_gadd: {got.hex()}: the executable's "
+                              "own TLS must be rewritten to an immediate, not loaded")
+            want = b"".join(bytes.fromhex(pre) + imm(sym) for pre, sym in _IEF_APX_WANT)
+            got = _elf_vread(d, syms["apx"], len(want) + 1)
+            if got != want + b"\xc3":
+                return Result(name, "FAIL", f"{mode} apx:\n  got  {got.hex()}\n"
+                              f"  want {want.hex()}c3")
+            # movl: unchanged instruction reading a slot that holds tpoff(ly).
+            ins = _elf_vread(d, syms["ie_movl"], 6)
+            if ins[:2] != b"\x8b\x0d":
+                return Result(name, "FAIL", f"{mode} ie_movl rewritten: {ins.hex()}")
+            slot = syms["ie_movl"] + 6 + struct.unpack("<i", ins[2:])[0]
+            val = _elf_vread(d, slot, 8)
+            if val is None or struct.unpack("<q", val)[0] != tpoff("ly"):
+                return Result(name, "FAIL", f"{mode} slot 0x{slot:x} holds "
+                              f"{val.hex() if val else None}, want tpoff {tpoff('ly')}")
+            rel = sh(["readelf", "-rW", path], cwd=td).stdout.decode()
+            if any(ln.split()[0].lstrip("0") == f"{slot:x}" for ln in rel.splitlines()
+                   if ln[:1] in "0123456789abcdef" and ln.split()):
+                return Result(name, "FAIL", f"{mode}: dynamic relocation against the TP-offset "
+                              f"slot 0x{slot:x}:\n{rel[-600:]}")
+        # A -T link has no GOT: the same rewrites (it used to patch only the
+        # opcode -- `%r12` became `%rsp`, `addq` and REX2/EVEX forms failed or
+        # were garbled), and a clear error for the unconvertible `movl`.
+        # Its synthesised PT_TLS used to be overwritten by the PT_NOTE after
+        # it whenever the input carried a note (GNU as 2.47's property note).
+        with open(os.path.join(td, "s.ld"), "w") as f:
+            f.write("ENTRY(apx)\nSECTIONS {\n  . = 0x400000;\n  .text : { *(.text) }\n"
+                    "  . = ALIGN(0x1000);\n  .tdata : { *(.tdata) }\n  .tbss : { *(.tbss) }\n}\n")
+        a = _IEF_ASM
+        nomovl = a[:a.index("# movl ly")] + a[a.index("# addq of"):]
+        with open(os.path.join(td, "ief2.s"), "w") as f:
+            f.write(nomovl.replace("ie_movl, ", ""))
+        note = "\t.section .note.x,\"a\",@note\n\t.p2align 2\n\t.long 4, 4, 1\n\t.ascii \"LCCC\"\n\t.long 0\n"
+        with open(os.path.join(td, "note.s"), "w") as f:
+            f.write(note)
+        r = sh([CC, "-c", "ief2.s", "note.s"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL", f"assemble ief2.s: {r.stderr.decode()[:300]}")
+        r = sh([lccc_ld, "-T", "s.ld", "ief.o", "-o", "full.img"], cwd=td)
+        if r.returncode == 0 or b"a -T link has no GOT" not in r.stderr:
+            return Result(name, "FAIL", f"-T with an unconvertible GOTTPOFF: rc {r.returncode} "
+                          f"{r.stderr[:300]!r}")
+        r = sh([lccc_ld, "-T", "s.ld", "ief2.o", "note.o", "-o", "s.img"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL", f"-T link: {r.stderr.decode()[:300]}")
+        path = os.path.join(td, "s.img")
+        with open(path, "rb") as f:
+            d = f.read()
+        phdrs = _elf_bytes_phdrs(d)
+        types = [p[0] for p in phdrs]
+        if types.count(7) != 1 or 0 in types or 4 not in types:
+            return Result(name, "FAIL", f"-T: program header types {types}: want one PT_TLS, "
+                          "the PT_NOTE, no PT_NULL")
+        _t, _fl, _off, tva, _fsz, tmsz, tal = next(p for p in phdrs if p[0] == 7)
+        block = (tmsz + tal - 1) // tal * tal
+        syms = _nm_addrs(path, td)
+        imm = {s_: ((syms[s_] - tva - block) & 0xFFFFFFFF).to_bytes(4, "little")
+               for s_ in ("ly", "gx")}
+        want = b"".join(bytes.fromhex(pre) + imm[sym] for pre, sym in _IEF_APX_WANT)
+        got = _elf_vread(d, syms["apx"], len(want) + 1)
+        if got != want + b"\xc3":
+            return Result(name, "FAIL", f"-T apx:\n  got  {got.hex() if got else None}\n"
+                          f"  want {want.hex()}c3")
+        got = _elf_vread(d, syms["ie_gadd"] + 9, 7)
+        if got != bytes.fromhex("4881c0") + imm["gx"]:
+            return Result(name, "FAIL", f"-T ie_gadd: {got.hex() if got else None}")
+        return Result(name, "PASS")
+    finally:
+        if not args.keep:
+            shutil.rmtree(td, ignore_errors=True)
+
+
+_MOVRS_ASM = r"""	.text
+	.globl	mvr, mvd, mvf
+# Executed: both become plain moves when the target is this executable's.
+mvr:	movrs	ly@gottpoff(%rip), %rax
+	movl	%fs:(%rax), %eax
+	ret
+mvd:	movrs	dat@GOTPCREL(%rip), %rax
+	movq	(%rax), %rax
+	ret
+# Encoded only (a library's symbol keeps its MOVRS load).
+mvf:	movrs	gx@gottpoff(%rip), %r12
+	movrs	dat@GOTPCREL(%rip), %r13
+	movrs	ext@GOTPCREL(%rip), %rcx
+	addq	dat@GOTPCREL(%rip), %r12
+	ret
+	.data
+	.globl	dat
+	.type	dat,@object
+	.size	dat,8
+dat:	.quad	1
+	.section .tdata,"awT",@progbits
+	.p2align 2
+ly:	.long	44
+	.globl	gx
+	.type	gx,@object
+	.size	gx,4
+gx:	.long	55
+	.section .note.GNU-stack,"",@progbits
+"""
+
+
+def _movrs_relocations_test(args, oracles):
+    """MOVRS relocations (`R_X86_64_CODE_5_*`, GNU as / ld 2.47).
+
+    `movrs sym@gottpoff(%rip)` / `movrs sym@GOTPCREL(%rip)` with a REX
+    prefix (`REX 0f 38 8b`) carry R_X86_64_CODE_5_GOTTPOFF /
+    CODE_5_GOTPCRELX, which lccc-ld refused as unknown relocation types.
+    Now: IE -> LE and GOTPCRELX relaxation with GNU ld 2.47's encodings
+    (`cs cs REX' mov $imm, %reg` / `cs cs REX lea sym(%rip), %reg`, the
+    `0f 38` escape turned into ignored prefixes), the slot otherwise -- a
+    shared library's symbol, or any TLS reference in a shared object.
+    Exact bytes in PDE / PIE / static executables, runtime values of the
+    rewritten forms, the shared-object slots and their dynamic
+    relocations.  Also the -T path's GOTPCRELX rewrite, which moved
+    ModRM.reg without REX.R (`addq dat@GOTPCREL(%rip), %r12` became
+    `add $dat, %rsp`).
+    """
+    name = "movrs_relocations"
+    td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
+    try:
+        with open(os.path.join(td, "mv.s"), "w") as f:
+            f.write(_MOVRS_ASM)
+        with open(os.path.join(td, "m.c"), "w") as f:
+            f.write("#include <stdio.h>\nint mvr(void); long mvd(void);\n"
+                    "int main(void) { printf(\"%d %ld\\n\", mvr(), mvd()); return 0; }\n")
+        with open(os.path.join(td, "ext.c"), "w") as f:
+            f.write("int ext = 3;\n")
+        r = sh([CC, "-c", "mv.s"], cwd=td)
+        if r.returncode != 0:
+            err = r.stderr.decode()[:300]
+            if "movrs" in err:
+                return Result(name, "SKIP", f"assembler without MOVRS: {err}")
+            return Result(name, "FAIL", f"assemble: {err}")
+        for argv in (["-O1", "-c", "m.c"], ["-O1", "-c", "ext.c"],
+                     ["-fPIC", "-shared", "ext.c", "-o", "libext.so"]):
+            r = sh([CC] + argv, cwd=td)
+            if r.returncode != 0:
+                return Result(name, "FAIL", f"{argv}: {r.stderr.decode()[:300]}")
+        lccc_ld = os.path.join(os.path.dirname(os.path.abspath(args.lccc)), "lccc-ld")
+        shim = _shim_for(td, lccc_ld)
+        for mode in (["-no-pie"], ["-pie"], ["-static"]):
+            exe = "t" + "".join(mode)
+            lib = ["ext.o"] if mode == ["-static"] else ["./libext.so"]
+            r = sh([CC, "-B" + shim] + mode + ["m.o", "mv.o"] + lib + ["-o", exe], cwd=td)
+            if r.returncode != 0:
+                return Result(name, "FAIL", f"{mode} link: {r.stderr.decode()[:300]}")
+            env = dict(os.environ, LD_LIBRARY_PATH=td)
+            run = subprocess.run([os.path.join(td, exe)], cwd=td, env=env,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+            if run.returncode != 0 or run.stdout.decode() != "44 1\n":
+                return Result(name, "FAIL", f"{mode}: got {run.stdout.decode()!r} "
+                              f"rc {run.returncode}")
+            path = os.path.join(td, exe)
+            with open(path, "rb") as f:
+                d = f.read()
+            tls = [p for p in _elf_bytes_phdrs(d) if p[0] == 7]
+            _t, _fl, _off, tva, _fsz, tmsz, tal = tls[0]
+            block = (tmsz + tal - 1) // tal * tal
+            syms = _nm_addrs(path, td)
+
+            def le32(v):
+                return (v & 0xFFFFFFFF).to_bytes(4, "little")
+
+            def tp(sym):
+                return le32(syms[sym] - tva - block)
+
+            pie = mode == ["-pie"]
+            mvf = syms["mvf"]
+
+            def dat_load(pre_imm, pre_lea, at):
+                # at: address of the instruction; the field ends 9 bytes in.
+                if pie:
+                    return bytes.fromhex(pre_lea) + le32(syms["dat"] - (at + 9))
+                return bytes.fromhex(pre_imm) + le32(syms["dat"])
+
+            checks = [
+                ("mvr", syms["mvr"], bytes.fromhex("2e2e48c7c0") + tp("ly")),
+                ("mvd", syms["mvd"], dat_load("2e2e48c7c0", "2e2e488d05", syms["mvd"])),
+                ("mvf/gx", mvf, bytes.fromhex("2e2e49c7c4") + tp("gx")),
+                ("mvf/dat", mvf + 9, dat_load("2e2e49c7c5", "2e2e4c8d2d", mvf + 9)),
+            ]
+            if mode == ["-static"]:
+                checks.append(("mvf/ext", mvf + 18, bytes.fromhex("2e2e48c7c1") + le32(syms["ext"])))
+                checks.append(("mvf/add", mvf + 27, bytes.fromhex("4981c4") + le32(syms["dat"])))
+            else:
+                # A library's symbol: the MOVRS load through its slot stays.
+                checks.append(("mvf/ext", mvf + 18, None))
+                if not pie:
+                    checks.append(("mvf/add", mvf + 27, bytes.fromhex("4981c4") + le32(syms["dat"])))
+            for label, at, want in checks:
+                got = _elf_vread(d, at, 9 if want is None else len(want))
+                if want is None:
+                    if got[:5] != bytes.fromhex("480f388b0d"):
+                        return Result(name, "FAIL", f"{mode} {label}: {got.hex()}: a dynamic "
+                                      "symbol's MOVRS must keep loading its slot")
+                    continue
+                if got != want:
+                    return Result(name, "FAIL", f"{mode} {label}: {got.hex()} want {want.hex()}")
+        # Shared object: every TLS reference keeps its slot (TPOFF64); a
+        # preemptible symbol keeps its GOTPCREL slot (GLOB_DAT).
+        r = sh([CC, "-B" + shim, "-shared", "mv.o", "-o", "libmv.so"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL", f"-shared link: {r.stderr.decode()[:300]}")
+        rel = sh(["readelf", "-rW", "libmv.so"], cwd=td).stdout.decode()
+        for want in ("R_X86_64_TPOFF64", "R_X86_64_GLOB_DAT"):
+            if want not in rel:
+                return Result(name, "FAIL", f"-shared: no {want}:\n{rel[-800:]}")
+        with open(os.path.join(td, "libmv.so"), "rb") as f:
+            d = f.read()
+        syms = _nm_addrs(os.path.join(td, "libmv.so"), td)
+        got = _elf_vread(d, syms["mvr"], 5)
+        if got != bytes.fromhex("480f388b05"):
+            return Result(name, "FAIL", f"-shared mvr rewritten: {got.hex()}")
+        # -T: GOTPCRELX rewrites with the prefix handled.
+        with open(os.path.join(td, "s.ld"), "w") as f:
+            f.write("ENTRY(mvf)\nSECTIONS {\n  . = 0x400000;\n  .text : { *(.text) }\n"
+                    "  .data : { *(.data) }\n  . = ALIGN(0x1000);\n  .tdata : { *(.tdata) }\n}\n")
+        r = sh([lccc_ld, "-T", "s.ld", "mv.o", "ext.o", "-o", "s.img"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL", f"-T link: {r.stderr.decode()[:300]}")
+        with open(os.path.join(td, "s.img"), "rb") as f:
+            d = f.read()
+        syms = _nm_addrs(os.path.join(td, "s.img"), td)
+        dat = (syms["dat"] & 0xFFFFFFFF).to_bytes(4, "little")
+        for label, at, want in (("mvf/dat", syms["mvf"] + 9, bytes.fromhex("2e2e49c7c5") + dat),
+                                ("mvf/add", syms["mvf"] + 27, bytes.fromhex("4981c4") + dat)):
+            got = _elf_vread(d, at, len(want))
+            if got != want:
+                return Result(name, "FAIL", f"-T {label}: {got.hex() if got else None} "
+                              f"want {want.hex()}")
+        return Result(name, "PASS")
+    finally:
+        if not args.keep:
+            shutil.rmtree(td, ignore_errors=True)
+
+
+_TEXTREL_RO_ASM = """\
+    .section .rodata,"a"
+    .p2align 3
+    .globl tbl
+    .type tbl,@object
+    .size tbl,8
+tbl: .quad val
+    .data
+val: .long 5
+    .section .note.GNU-stack,"",@progbits
+"""
+
+_TEXTREL_TEXT_ASM = """\
+    .text
+    .globl getval
+    .type getval,@function
+getval:
+    movabs $val2, %rax
+    movl (%rax), %eax
+    ret
+    .size getval, .-getval
+    .data
+val2: .long 7
+    .section .note.GNU-stack,"",@progbits
+"""
+
+
+def _elf64_dynamic(d):
+    """(tag, value) pairs of an ELF64 image's PT_DYNAMIC, up to DT_NULL."""
+    out = []
+    for typ, _fl, off, _va, fsz, _msz, _al in _elf_bytes_phdrs(d) or []:
+        if typ == 2:  # PT_DYNAMIC
+            for p in range(off, off + fsz, 16):
+                tag, val = struct.unpack_from("<qQ", d, p)
+                if tag == 0:
+                    break
+                out.append((tag, val))
+    return out
+
+
+def _text_relocations_test(args, oracles):
+    """Dynamic relocations into read-only storage (text relocations).
+
+    A PIE whose `.rodata` holds an absolute pointer (`.quad sym` from
+    hand-written assembly or non-PIC objects) used to keep that section in
+    the read-only segment with no DT_TEXTREL: ld.so faulted writing the
+    RELATIVE before `main`.  lccc-ld now places such a section at the head
+    of PT_GNU_RELRO (as its shared-object emitter already did): written
+    while still writable, then protected -- no text relocation, so `-z
+    text` links it.  Code cannot move (`movabs $sym` in `.text`, in a PIE or
+    a shared object): that is a real text relocation, which used to be
+    written into a read-only mapping just the same, and now follows GNU
+    ld's policy on both linkers -- the default warns about the first site
+    and that DT_TEXTREL is created and emits DT_TEXTREL + DF_TEXTREL,
+    `-z text` refuses the link with GNU's message, `-z notext` is silent.
+    """
+    name = "text_relocations"
+    td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
+    try:
+        for fn, body in (("ro.s", _TEXTREL_RO_ASM), ("txt.s", _TEXTREL_TEXT_ASM),
+                         ("m_ro.c", "#include <stdio.h>\nextern int *const tbl;\n"
+                                    "int main(void){ printf(\"%d\\n\", *tbl); return 0; }\n"),
+                         ("m_all.c", "#include <stdio.h>\nextern int *const tbl;\n"
+                                     "int getval(void);\nint main(void){ printf(\"%d %d\\n\","
+                                     " *tbl, getval()); return 0; }\n"),
+                         ("s.c", "int getval(void);\nint call(void){ return getval(); }\n")):
+            with open(os.path.join(td, fn), "w") as f:
+                f.write(body)
+        r = sh([CC, "-c", "ro.s", "txt.s"], cwd=td)
+        r2 = sh([CC, "-O1", "-fPIE", "-c", "m_ro.c", "m_all.c"], cwd=td)
+        r3 = sh([CC, "-O1", "-fPIC", "-c", "s.c"], cwd=td)
+        for rr in (r, r2, r3):
+            if rr.returncode != 0:
+                return Result(name, "FAIL", f"compile: {rr.stderr.decode()[:300]}")
+        lccc_ld = os.path.join(os.path.dirname(os.path.abspath(args.lccc)), "lccc-ld")
+        shim = _shim_for(td, lccc_ld)
+        linkers = (("lccc", ["-B" + shim]), ("gnu", []))
+
+        def link(tag, argv, out):
+            bflag = dict(linkers)[tag]
+            return sh([CC] + bflag + argv + ["-o", out], cwd=td)
+
+        def image(out):
+            with open(os.path.join(td, out), "rb") as f:
+                return f.read()
+
+        def textrel_tags(d):
+            dyn = _elf64_dynamic(d)
+            has_tag = any(t == 22 for t, _ in dyn)  # DT_TEXTREL
+            flags = next((v for t, v in dyn if t == 30), 0)  # DT_FLAGS
+            return has_tag, bool(flags & 4)  # DF_TEXTREL
+
+        def run(exe, want, libdir=None):
+            env = dict(os.environ)
+            if libdir:
+                env["LD_LIBRARY_PATH"] = libdir
+            rr = subprocess.run([os.path.join(td, exe)], cwd=td, env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+            if rr.returncode != 0 or rr.stdout.decode() != want:
+                return f"{exe}: rc {rr.returncode} out {rr.stdout.decode()!r} want {want!r}"
+            return None
+
+        # 1. PIE, read-only data only: relro-moved, no text relocation.
+        r = link("lccc", ["-pie", "m_ro.o", "ro.o", "-Wl,-z,text"], "ro.pie")
+        if r.returncode != 0 or r.stderr:
+            return Result(name, "FAIL", f"ro PIE -z text: rc {r.returncode} "
+                          f"stderr {r.stderr.decode()[:300]!r}")
+        d = image("ro.pie")
+        if textrel_tags(d) != (False, False):
+            return Result(name, "FAIL", "ro PIE: DT_TEXTREL/DF_TEXTREL without code relocations")
+        tbl = _nm_addrs(os.path.join(td, "ro.pie"), td)["tbl"]
+        relro = [p for p in _elf_bytes_phdrs(d) if p[0] == 0x6474E552]
+        if len(relro) != 1 or not relro[0][3] <= tbl < relro[0][3] + relro[0][5]:
+            return Result(name, "FAIL", f"ro PIE: tbl 0x{tbl:x} not inside PT_GNU_RELRO {relro}")
+        err = run("ro.pie", "5\n")
+        if err:
+            return Result(name, "FAIL", err)
+        # 2. Code relocations in a PIE and in a shared object: GNU's policy on
+        #    both linkers.
+        variants = (("PIE", ["-pie", "m_all.o", "ro.o", "txt.o"], "all.pie"),
+                    ("shared object", ["-shared", "txt.o", "s.o"], "libtr.so"))
+        for kind, argv, out in variants:
+            for tag, _b in linkers:
+                label = f"{kind}/{tag}"
+                r = link(tag, argv, out + "." + tag)
+                msg = r.stderr.decode(errors="replace")
+                if r.returncode != 0:
+                    return Result(name, "FAIL", f"{label}: rc {r.returncode}: {msg[:300]}")
+                site = ("txt.o: warning: relocation in read-only section `.text'" if tag == "lccc"
+                        else "warning: relocation in read-only section")
+                if f"creating DT_TEXTREL in a {kind}" not in msg or site not in msg:
+                    return Result(name, "FAIL", f"{label}: default link must warn like GNU ld: "
+                                  f"{msg[:300]!r}")
+                if textrel_tags(image(out + "." + tag)) != (True, True):
+                    return Result(name, "FAIL", f"{label}: DT_TEXTREL + DF_TEXTREL missing")
+                r = link(tag, argv + ["-Wl,-z,text"], out + ".ztext")
+                if r.returncode == 0 or b"read-only segment has dynamic relocations" not in r.stderr:
+                    return Result(name, "FAIL", f"{label} -z text: rc {r.returncode} "
+                                  f"{r.stderr[:300]!r}")
+                r = link(tag, argv + ["-Wl,-z,notext"], out + ".notext")
+                if r.returncode != 0 or b"TEXTREL" in r.stderr or b"read-only" in r.stderr:
+                    return Result(name, "FAIL", f"{label} -z notext: rc {r.returncode} "
+                                  f"{r.stderr[:300]!r}")
+                if textrel_tags(image(out + ".notext")) != (True, True):
+                    return Result(name, "FAIL", f"{label} -z notext: tags missing")
+        err = run("all.pie.lccc", "5 7\n")
+        if err:
+            return Result(name, "FAIL", err)
+        # The library, used by an executable (and the read-only data one:
+        # relro-moved, so `-z text` accepts it).
+        os.replace(os.path.join(td, "libtr.so.lccc"), os.path.join(td, "libtr.so"))
+        r = link("lccc", ["-shared", "ro.o", "-Wl,-z,text"], "libro.so")
+        if r.returncode != 0 or textrel_tags(image("libro.so")) != (False, False):
+            return Result(name, "FAIL", f"ro .so -z text: rc {r.returncode} {r.stderr[:300]!r}")
+        r = link("lccc", ["-pie", "m_all.o", "./libtr.so", "./libro.so"], "use.pie")
+        if r.returncode != 0:
+            return Result(name, "FAIL", f"link against the libraries: {r.stderr[:300]!r}")
+        err = run("use.pie", "5 7\n", libdir=td)
+        if err:
+            return Result(name, "FAIL", err)
+        return Result(name, "PASS")
+    finally:
+        if not args.keep:
+            shutil.rmtree(td, ignore_errors=True)
+
+
 def _build_id_note_test(args, oracles):
     """--build-id must emit a content-derived .note.gnu.build-id.
 
@@ -9156,7 +9680,10 @@ def _registry(args, oracles):
                           ("eh_frame_packing", _eh_frame_packing_test),
                           ("gotpcrel_edges", _gotpcrel_edges_test),
                           ("absolute_symbols_pic", _absolute_symbols_pic_test),
-                          ("ie_to_le_local", _ie_to_le_local_test)):
+                          ("ie_to_le_local", _ie_to_le_local_test),
+                          ("ie_to_le_forms", _ie_to_le_forms_test),
+                          ("movrs_relocations", _movrs_relocations_test),
+                          ("text_relocations", _text_relocations_test)):
         reg.append(one(tname, runner, "dynamic"))
     reg += [
         one("cxx_exceptions_unwind", _cxx_eh_test, "ehframe"),

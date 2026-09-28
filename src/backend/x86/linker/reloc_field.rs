@@ -111,6 +111,9 @@ pub fn name(rtype: u32) -> Option<&'static str> {
         R_X86_64_CODE_4_GOTPCRELX => "R_X86_64_CODE_4_GOTPCRELX",
         R_X86_64_CODE_4_GOTTPOFF => "R_X86_64_CODE_4_GOTTPOFF",
         R_X86_64_CODE_4_GOTPC32_TLSDESC => "R_X86_64_CODE_4_GOTPC32_TLSDESC",
+        R_X86_64_CODE_5_GOTPCRELX => "R_X86_64_CODE_5_GOTPCRELX",
+        R_X86_64_CODE_5_GOTTPOFF => "R_X86_64_CODE_5_GOTTPOFF",
+        R_X86_64_CODE_5_GOTPC32_TLSDESC => "R_X86_64_CODE_5_GOTPC32_TLSDESC",
         R_X86_64_CODE_6_GOTPCRELX => "R_X86_64_CODE_6_GOTPCRELX",
         R_X86_64_CODE_6_GOTTPOFF => "R_X86_64_CODE_6_GOTTPOFF",
         R_X86_64_CODE_6_GOTPC32_TLSDESC => "R_X86_64_CODE_6_GOTPC32_TLSDESC",
@@ -150,6 +153,7 @@ pub fn field(rtype: u32) -> Option<RelocField> {
         | R_X86_64_GOTPCRELX
         | R_X86_64_REX_GOTPCRELX
         | R_X86_64_CODE_4_GOTPCRELX
+        | R_X86_64_CODE_5_GOTPCRELX
         | R_X86_64_CODE_6_GOTPCRELX
         | R_X86_64_GOTPC32_TLSDESC
         | R_X86_64_CODE_4_GOTPC32_TLSDESC
@@ -158,6 +162,7 @@ pub fn field(rtype: u32) -> Option<RelocField> {
         | R_X86_64_TLSLD
         | R_X86_64_GOTTPOFF
         | R_X86_64_CODE_4_GOTTPOFF
+        | R_X86_64_CODE_5_GOTTPOFF
         | R_X86_64_CODE_6_GOTTPOFF
         | R_X86_64_TPOFF32
         | R_X86_64_DTPOFF32 => S32,
@@ -472,6 +477,7 @@ mod tests {
             R_X86_64_GOTPCRELX,
             R_X86_64_REX_GOTPCRELX,
             R_X86_64_CODE_4_GOTPCRELX,
+            R_X86_64_CODE_5_GOTPCRELX,
             R_X86_64_CODE_6_GOTPCRELX,
         ] {
             assert_eq!(field(t), Some(S32), "type {t} lost its field");
