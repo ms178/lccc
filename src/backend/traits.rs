@@ -65,7 +65,7 @@ macro_rules! delegate_to_impl {
 
 use super::cast::{FloatOp, classify_float_binop};
 use super::common::PtrDirective;
-use super::generation::{is_i128_type, is_wide_int_type};
+use super::generation::is_i128_type;
 use super::regalloc::PhysReg;
 use super::state::{CodegenState, SlotAddr, StackSlot};
 use crate::common::types::{AddressSpace, IrType};
@@ -420,8 +420,24 @@ pub trait ArchCodegen {
     /// never is).  `feeds_store` matters because stores may stage the
     /// stored value through a scratch register at the access site, which
     /// narrows acceptance further.
+    ///
+    /// The default REFUSES every fold, loudly: no backend may inherit a
+    /// fold capability its emitter does not implement (a decider-yes the
+    /// emitter later refuses skips the offset chain and rematerialises
+    /// from never-written homes — the i686 `20080122-1` anecdote above).
+    /// Every backend with indexed emission overrides this to mirror its
+    /// emitter exactly (x86-64, i686, AArch64); RISC-V has no indexed
+    /// addressing and inherits this refusal. RISC-V's generate path never
+    /// consults the indexed map, so the assert below never fires there —
+    /// if it ever does, RISC-V grew indexed emission and needs its own
+    /// override. (An empty access profile — alias-only traffic — refuses
+    /// quietly: there is no fold candidate to be loud about.)
     fn indexed_fold_ok(&self, info: &super::generation::IndexedGepInfo) -> bool {
-        info.access_tys.iter().all(|t| !is_wide_int_type(*t))
+        debug_assert!(
+            info.access_tys.is_empty(),
+            "indexed_fold_ok must be overridden by backends with indexed emission"
+        );
+        false
     }
 
     /// Whether `emit_fused_cmp_branch_blocks` handles floating-point compares
@@ -3111,4 +3127,43 @@ pub fn emit_return_default(
 /// instructions only when the target supports them.
 fn unimplemented_target(what: &str) -> ! {
     unimplemented!("target does not support {}", what)
+}
+
+#[cfg(test)]
+mod indexed_fold_default_tests {
+    use super::*;
+    use crate::backend::generation::IndexedGepInfo;
+    use crate::backend::riscv::codegen::emit::RiscvCodegen;
+
+    fn gep_info(access_tys: Vec<IrType>) -> IndexedGepInfo {
+        IndexedGepInfo {
+            base: Value(1),
+            index: Value(2),
+            shift: 2,
+            disp: 0,
+            orig_offset: Value(3),
+            access_tys,
+            feeds_store: false,
+        }
+    }
+
+    #[test]
+    fn default_refuses_alias_only_traffic_quietly() {
+        // RISC-V is the no-override witness: it never consults the indexed
+        // map, so an empty (alias-only) profile must refuse WITHOUT firing
+        // the assert — in debug and release alike.
+        let cg = RiscvCodegen::new();
+        assert!(!cg.indexed_fold_ok(&gep_info(vec![])));
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "indexed_fold_ok must be overridden")]
+    fn default_is_loud_about_real_fold_candidates() {
+        // A real candidate reaching the default means a backend with
+        // indexed emission forgot its override: fail loud in debug builds
+        // (release keeps the refusal, silently sound).
+        let cg = RiscvCodegen::new();
+        let _ = cg.indexed_fold_ok(&gep_info(vec![IrType::I32]));
+    }
 }

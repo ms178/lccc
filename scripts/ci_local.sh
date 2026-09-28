@@ -669,6 +669,13 @@ gate "cross-backend-atomics" fast \
 gate "indexed-fold-scratch-index" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_indexed_fold_scratch_index.sh
 
+# _Decimal64 indexed fold (S15): the x86-64 indexed path must accept D64 on
+# the load half, the store half, and the decider. Structural SIB-movsd
+# assertions plus an integer-checksum gcc differential (mirrors the ci.yml
+# step of the same script; ci-gate-parity fails if the two drift apart).
+gate "decimal64-indexed-fold" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_decimal64_indexed_fold.sh
+
 if [ -x target/fastbuild/lccc-ld ]; then
     gate "linker-fuzz" fast env \
         LCCC_LD="$PWD/target/fastbuild/lccc-ld" FUZZ_N=128 FUZZ_SEED=20260906 \

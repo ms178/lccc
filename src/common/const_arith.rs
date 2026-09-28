@@ -538,6 +538,14 @@ pub fn negate_const(val: IrConst) -> Option<IrConst> {
 pub fn const_to_bid(val: &IrConst, src_ct: &CType, width: u8) -> Option<IrConst> {
     use crate::common::decimal::*;
     let enc = |neg: bool, digits: &[u8], exp: i32| -> Option<IrConst> {
+        // Funnel-normalize to `round_to_prec`'s entry contract (normalized
+        // or empty): producers spell zero differently (`&[0]` for
+        // `IrConst::Zero`/binary zero, `"0"` from decoded BID coefficients),
+        // and one canonicalization here beats trusting every producer.
+        let digits: &[u8] = match digits.iter().position(|&d| d != 0) {
+            Some(p) => &digits[p..],
+            None => &[],
+        };
         match width {
             32 => Some(IrConst::D32(encode_bid32(neg, digits, exp))),
             64 => Some(IrConst::D64(encode_bid64(neg, digits, exp))),

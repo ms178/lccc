@@ -4195,4 +4195,34 @@ mod indexed_fold_contract_tests {
         let cg = X86Codegen::new();
         assert!(cg.indexed_fold_ok(&gep_info(vec![IrType::I32], true, 2)));
     }
+
+    #[test]
+    fn store_fed_folds_accept_all_emitter_arms() {
+        // Store-side companion of the load-side accepted[] pin above:
+        // staging narrows nothing on x86-64 (the write-confinement proof
+        // on the override), so every emitter-armed type folds store-fed
+        // too — in particular D64/D32, whose SIB stores the
+        // check_decimal64_indexed_fold.sh gate pins end to end.
+        let cg = X86Codegen::new();
+        for ty in [
+            IrType::F64,
+            IrType::F32,
+            IrType::D64,
+            IrType::D32,
+            IrType::I8,
+            IrType::U8,
+            IrType::I16,
+            IrType::U16,
+            IrType::I32,
+            IrType::U32,
+            IrType::I64,
+            IrType::U64,
+            IrType::Ptr,
+        ] {
+            assert!(
+                cg.indexed_fold_ok(&gep_info(vec![ty], true, 2)),
+                "{ty:?} store-fed folds must be guaranteed"
+            );
+        }
+    }
 }

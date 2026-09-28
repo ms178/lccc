@@ -200,6 +200,17 @@ fn cmp_suffix_to_half(suffix: &[u8]) -> Ordering {
 /// O(n^2) (a compile-time DoS on mega-literals).
 fn round_to_prec(digits: &[u8], exponent: i32, prec: usize) -> (Vec<u8>, i32) {
     debug_assert!(prec > 0, "round_to_prec: precision must be nonzero");
+    // Entry contract: digits are normalized (no leading zeros) or empty
+    // (the canonical zero). Rounding decides by POSITION (`d[prec..]` is
+    // the dropped suffix), so unnormalized input mis-rounds: `0.00000001`
+    // as [0x7,1] (8 digits, prec 7) truncates to all-zeros and returns
+    // exact zero instead of 1e-8. All producers normalize (the parser
+    // strips, `int_digits(0)` is empty, `const_to_bid` funnel-strips);
+    // a firing names a producer bug, never weaken it.
+    debug_assert!(
+        digits.is_empty() || digits[0] != 0,
+        "round_to_prec: digits must be normalized (leading zeros stripped)"
+    );
     let mut d = digits.to_vec();
     let mut e = exponent;
     if d.len() > prec {
@@ -245,14 +256,28 @@ struct WidthParams {
     emax: i32,
 }
 
-/// Core encoder: returns the finite encoding fields (exp_field, coefficient
-/// as u128) or None for zero. `sign_bit` handled by caller.
-fn encode_fields(p: &WidthParams, digits: &[u8], exponent: i32) -> (Option<(i32, u128)>, i32) {
+/// Outcome of [`encode_fields`]. The old `(Option<(exp_field, coef)>,
+/// exp_field)` tuple let callers confuse the signal value (`-1` = infinity)
+/// with a real exponent field; the enum makes the three paths unmixable, so
+/// the tuple-pairing bug class can no longer typecheck. `sign_bit` is still
+/// handled by the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EncodeOutcome {
+    /// Finite nonzero value: biased exponent field + coefficient.
+    Finite { exp_field: i32, coef: u128 },
+    /// Zero: clamped written exponent (coefficient is 0).
+    Zero { exp_field: i32 },
+    /// Overflow: the exponent exceeded emax with no rescue headroom.
+    Infinite,
+}
+
+/// Core encoder: classifies the rounded value into its [`EncodeOutcome`].
+fn encode_fields(p: &WidthParams, digits: &[u8], exponent: i32) -> EncodeOutcome {
     let (d, mut e) = round_to_prec(digits, exponent, p.prec);
     if d.is_empty() {
         // zero: keep clamped written exponent
         let ef = (exponent + p.bias).clamp(0, p.emax + p.bias);
-        return (None, ef);
+        return EncodeOutcome::Zero { exp_field: ef };
     }
     // `round_to_prec` guarantees at most `prec` digits (a rounding carry
     // is shifted into the exponent there, exactly); assert the contract
@@ -268,7 +293,7 @@ fn encode_fields(p: &WidthParams, digits: &[u8], exponent: i32) -> (Option<(i32,
     }
     // Overflow?
     if e > p.emax {
-        return (None, -1); // -1 signals infinity
+        return EncodeOutcome::Infinite;
     }
     // Underflow to subnormal range: coef = round-half-even(D / 10^shift)
     // at biased exponent 0, where `shift = emin - e > 0`. Like
@@ -287,16 +312,19 @@ fn encode_fields(p: &WidthParams, digits: &[u8], exponent: i32) -> (Option<(i32,
         // certainly subnormal zero (|D| / 10^shift < 0.1 rounds down):
         // return it in O(1) with bit-identical results.
         if shift as usize > n {
-            return (None, 0);
+            return EncodeOutcome::Zero { exp_field: 0 };
         }
         if shift as usize == n {
             // Rounds to 0 or the minimum subnormal: the kept prefix is
             // empty (even), so an exact half rounds down to zero.
             let up = cmp_suffix_to_half(&d) == Ordering::Greater;
             if !up {
-                return (None, 0);
+                return EncodeOutcome::Zero { exp_field: 0 };
             }
-            return (Some((0, 1)), 0);
+            return EncodeOutcome::Finite {
+                exp_field: 0,
+                coef: 1,
+            };
         }
         // shift < n: keep the leading `n - shift` digits, round once by
         // the `shift`-digit suffix.
@@ -316,7 +344,7 @@ fn encode_fields(p: &WidthParams, digits: &[u8], exponent: i32) -> (Option<(i32,
         // digits... except a rounding carry (999 -> 1000) adds one; the
         // value stays exact either way.
         let coef = digits_val(&k);
-        return (Some((0, coef)), 0);
+        return EncodeOutcome::Finite { exp_field: 0, coef };
     }
     let ef = e + p.bias;
     let coef = {
@@ -326,7 +354,10 @@ fn encode_fields(p: &WidthParams, digits: &[u8], exponent: i32) -> (Option<(i32,
         }
         v
     };
-    (Some((ef, coef)), ef)
+    EncodeOutcome::Finite {
+        exp_field: ef,
+        coef,
+    }
 }
 
 /// Encode a decimal value into a BID32 bit pattern.
@@ -342,16 +373,15 @@ pub fn encode_bid32(neg: bool, digits: &[u8], exponent: i32) -> u32 {
         emin: -101,
         emax: 90,
     };
-    let (r, ef) = encode_fields(&p, digits, exponent);
-    match r {
-        None => {
-            if ef < 0 {
-                sign | 0x7800_0000 // infinity
-            } else {
-                sign | ((ef as u32) << 23) // zero (coefficient 0)
-            }
+    match encode_fields(&p, digits, exponent) {
+        EncodeOutcome::Infinite => sign | 0x7800_0000,
+        EncodeOutcome::Zero { exp_field: ef } => {
+            sign | ((ef as u32) << 23) // zero (coefficient 0)
         }
-        Some((efld, coef)) => {
+        EncodeOutcome::Finite {
+            exp_field: efld,
+            coef,
+        } => {
             let c = coef as u32;
             if c < (1 << 23) {
                 sign | ((efld as u32) << 23) | c
@@ -374,16 +404,13 @@ pub fn encode_bid64(neg: bool, digits: &[u8], exponent: i32) -> u64 {
         emin: -398,
         emax: 369,
     };
-    let (r, ef) = encode_fields(&p, digits, exponent);
-    match r {
-        None => {
-            if ef < 0 {
-                sign | 0x7800_0000_0000_0000
-            } else {
-                sign | ((ef as u64) << 53)
-            }
-        }
-        Some((efld, coef)) => {
+    match encode_fields(&p, digits, exponent) {
+        EncodeOutcome::Infinite => sign | 0x7800_0000_0000_0000,
+        EncodeOutcome::Zero { exp_field: ef } => sign | ((ef as u64) << 53),
+        EncodeOutcome::Finite {
+            exp_field: efld,
+            coef,
+        } => {
             let c = coef as u64;
             if c < (1u64 << 53) {
                 sign | ((efld as u64) << 53) | c
@@ -406,16 +433,13 @@ pub fn encode_bid128(neg: bool, digits: &[u8], exponent: i32) -> (u64, u64) {
         emin: -6176,
         emax: 6111,
     };
-    let (r, ef) = encode_fields(&p, digits, exponent);
-    match r {
-        None => {
-            if ef < 0 {
-                (sign | 0x7800_0000_0000_0000, 0)
-            } else {
-                (sign | ((ef as u64) << 49), 0)
-            }
-        }
-        Some((efld, coef)) => {
+    match encode_fields(&p, digits, exponent) {
+        EncodeOutcome::Infinite => (sign | 0x7800_0000_0000_0000, 0),
+        EncodeOutcome::Zero { exp_field: ef } => (sign | ((ef as u64) << 49), 0),
+        EncodeOutcome::Finite {
+            exp_field: efld,
+            coef,
+        } => {
             debug_assert!(coef < (1u128 << 113), "D128 coefficients never reach 2^113");
             let hi = sign | ((efld as u64) << 49) | ((coef >> 64) as u64);
             let lo = coef as u64;
@@ -531,9 +555,12 @@ pub fn bid64_is_zero(v: u64) -> bool {
 
 /// A u128 magnitude as most-significant-first decimal digits (`[0]` for
 /// zero), matching the encoder's digit-vector convention.
+/// Most-significant-first decimal digits of `mag`. Zero is the EMPTY vector:
+/// the single canonical zero spelling shared with the literal parser (which
+/// clears all-zero digits) and required by `round_to_prec`'s entry contract.
 fn int_digits(mag: u128) -> Vec<u8> {
     if mag == 0 {
-        return vec![0];
+        return Vec::new();
     }
     let mut m = mag;
     let mut rev = Vec::new();
@@ -829,7 +856,9 @@ mod tests {
     /// Split a u64 magnitude into most-significant-first decimal digits.
     fn digs(mut v: u64) -> Vec<u8> {
         if v == 0 {
-            return vec![0];
+            // Parser-faithful: zero is the empty vector (the single
+            // canonical zero spelling `round_to_prec` requires).
+            return Vec::new();
         }
         let mut rev = Vec::new();
         while v > 0 {
@@ -1325,5 +1354,50 @@ mod tests {
             )),
             Some((false, 9900000000000000, 115))
         );
+    }
+
+    #[test]
+    fn int_digits_zero_is_empty_canonical() {
+        // Canonical zero spelling: empty, matching the parser
+        // (`parse_decimal_literal` clears all-zero digits).
+        assert!(int_digits(0).is_empty());
+        assert_eq!(int_digits(42), vec![4, 2]);
+    }
+
+    #[test]
+    fn empty_zero_encodes_gcc_zero_bits() {
+        // Canonicalization preserves the GCC zero bit patterns (the old
+        // `&[0]` spelling encoded the same values).
+        assert_eq!(encode_bid32(false, &[], 0), 0x3280_0000);
+        assert_eq!(encode_bid64(false, &[], 0), 0x31C0_0000_0000_0000);
+        assert_eq!(encode_bid128(false, &[], 0), (0x3040_0000_0000_0000, 0));
+    }
+
+    #[test]
+    fn tiny_literal_stays_nonzero() {
+        // `0.00000001` normalizes to [1]e-8 and encodes nonzero: ef = 93,
+        // small form 93<<23|1. (The unnormalized [0x7,1] would mis-round
+        // to exact zero — see `unnormalized_entry_fires_contract`.)
+        let lit = parse_decimal_literal("0.00000001").unwrap();
+        assert_eq!(lit.digits, vec![1]);
+        assert_eq!(lit.exponent, -8);
+        assert_eq!(encode_bid32(false, &lit.digits, lit.exponent), 0x2E80_0001);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "must be normalized")]
+    fn unnormalized_entry_fires_contract() {
+        // The buggy-producer witness: 8 digits against prec 7 truncates
+        // to all-zeros and returns exact zero instead of 1e-8, so the
+        // `round_to_prec` entry assert fires (debug builds only).
+        let _ = encode_bid32(false, &[0, 0, 0, 0, 0, 0, 0, 1], -8);
+    }
+
+    #[test]
+    fn computed_subnormal_rounds_half_even() {
+        // S6 (`shift < n`): [1,5]e-102 keeps [1], drops exact-half [5],
+        // rounds up (kept digit odd) to coef 2 at biased exponent 0.
+        assert_eq!(encode_bid32(false, &[1, 5], -102), 0x0000_0002);
     }
 }
