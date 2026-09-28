@@ -41,7 +41,11 @@ impl X86Arch for I686Arch {
                 if let Operand::Label(_) = &instr.operands[0] {
                     let is_short_only = matches!(mnem, "jecxz" | "jcxz" | "loop");
                     let is_conditional = mnem != "jmp";
-                    if is_short_only && instr_len == 2 {
+                    // A leading 0x67 (the `addr16` word splice or a 16-bit
+                    // counter spelling) puts the displacement at +2 instead
+                    // of +1; the short-only form is still exactly 3 bytes.
+                    let has_67_head = instr_len == 3 && encoder.bytes[0] == 0x67;
+                    if is_short_only && (instr_len == 2 || (instr_len == 3 && has_67_head)) {
                         // Short-only jumps have no long form; register as already relaxed
                         Some(JumpDetection {
                             is_conditional: true,

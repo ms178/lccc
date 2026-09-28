@@ -1,0 +1,43 @@
+# i686 GAS prefix words: addr16/data16 as standalone override spellings.
+# GAS 2.47.20260726-probed; addr32/data32/rex do not exist in 32-bit mode
+# (redundant or unsupported) and are covered by the reject cases.
+;;; addr16_forced
+.text
+addr16 nop
+addr16 mov %eax, 0x0898
+addr16 mov %ax, 0x0898
+addr16 mov %al, 0x0898
+addr16 mov 0x0898, %eax
+addr16 add %ax, (%bx,%si)
+addr16 mov %ax, (%bx,%si)
+addr16 mov %es:8(%bx), %ax
+addr16 rep movsb
+addr16 lea 1, %eax
+addr16 lea -1, %eax
+addr16 lea sym, %eax
+addr16 jecxz 1f
+addr16 loop 1f
+1:
+;;; data16_forced
+.text
+data16 nop
+data16 mov %eax, (%eax)
+data16 mov %eax, %ebx
+data16 jmp foo
+data16 je foo
+data16 call foo
+;;; branch_size_forms
+.text
+call *%ax
+jmp *%si
+cmpsb (%di),(%si)
+movsb (%esi), %es:(%edi)
+;;; addr16_data16_rejects reject
+.text
+addr16 addr16 add %ax, (%bx,%si)
+data16 mov %ax, (%eax)
+data16 addr16 mov %eax, (%eax)
+addr32 add %eax, (%eax)
+data32 add %eax, %ebx
+rex mov %eax, %ebx
+rex.x mov %eax, %ebx

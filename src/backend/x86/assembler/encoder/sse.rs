@@ -20,16 +20,29 @@ impl super::InstructionEncoder {
             {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                // `.s` on an SSE move selects the store-direction opcode
+                // with the roles kept in place (GAS 2.47: `movaps.s
+                // %xmm6,%xmm2' = 0f 29 e6, `movdqa.s %xmm6,%xmm2' =
+                // 66 0f 7f e6) — the store half of the load/store pair.
+                // `.s` picks the store row with the ROLES UNCHANGED:
+                // reg = data source, r/m = destination (GAS 2.47:
+                // `movaps.s %xmm4,%xmm6' = 0f 29 e6, `movsd.s %xmm4,%xmm6'
+                // = f2 0f 11 e6).  The load row keeps reg=dst, r/m=src.
+                let (opcode, reg_name, rm_name, reg_num_v, rm_num_v) = if self.s_flip {
+                    (store_opcode, &src.name, &dst.name, src_num, dst_num)
+                } else {
+                    (load_opcode, &dst.name, &src.name, dst_num, src_num)
+                };
                 // Emit mandatory prefix bytes (e.g. 0x66, 0xF2, 0xF3) before REX.
                 // The prefix ends where the 0x0F escape byte begins.
-                let prefix_len = load_opcode.iter().position(|&b| b == 0x0F).unwrap_or(0);
-                for &b in &load_opcode[..prefix_len] {
+                let prefix_len = opcode.iter().position(|&b| b == 0x0F).unwrap_or(0);
+                for &b in &opcode[..prefix_len] {
                     self.bytes.push(b);
                 }
-                self.emit_rex_rr(0, &dst.name, &src.name);
+                self.emit_rex_rr(0, reg_name, rm_name);
                 // Emit remaining opcode bytes (0x0F + opcode byte)
-                self.bytes.extend_from_slice(&load_opcode[prefix_len..]);
-                self.bytes.push(self.modrm(3, dst_num, src_num));
+                self.bytes.extend_from_slice(&opcode[prefix_len..]);
+                self.bytes.push(self.modrm(3, reg_num_v, rm_num_v));
                 Ok(())
             }
             (Operand::Memory(mem), Operand::Register(dst)) if is_xmm(&dst.name) => {
@@ -856,16 +869,25 @@ impl super::InstructionEncoder {
                 self.bytes.push(self.modrm(3, src_num, dst_num));
                 Ok(())
             }
-            // movq %xmm, %xmm -> F3 0F 7E /r
+            // movq %xmm, %xmm -> F3 0F 7E /r (load) — `.s` selects the
+            // store form 66 0F D6 /r (GAS 2.47: `movq.s %xmm4,%xmm6' =
+            // 66 0f d6 e6; plain movq keeps the F3 load form).
             (Operand::Register(src), Operand::Register(dst))
                 if is_xmm(&src.name) && is_xmm(&dst.name) =>
             {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                self.bytes.push(0xF3);
-                self.emit_rex_rr(0, &dst.name, &src.name);
-                self.bytes.extend_from_slice(&[0x0F, 0x7E]);
-                self.bytes.push(self.modrm(3, dst_num, src_num));
+                if self.s_flip {
+                    self.bytes.push(0x66);
+                    self.emit_rex_rr(0, &src.name, &dst.name);
+                    self.bytes.extend_from_slice(&[0x0F, 0xD6]);
+                    self.bytes.push(self.modrm(3, src_num, dst_num));
+                } else {
+                    self.bytes.push(0xF3);
+                    self.emit_rex_rr(0, &dst.name, &src.name);
+                    self.bytes.extend_from_slice(&[0x0F, 0x7E]);
+                    self.bytes.push(self.modrm(3, dst_num, src_num));
+                }
                 Ok(())
             }
             // movq mem, %xmm -> F3 0F 7E /r (load)

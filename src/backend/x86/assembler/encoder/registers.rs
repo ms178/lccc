@@ -822,7 +822,14 @@ fn check_movdq_shape(mnemonic: &str, ops: &[Operand]) -> Result<(), String> {
             matches!(op, Operand::Register(r)
                 if matches!(reg_class(&r.name), RegClass::Mmx | RegClass::Xmm))
         });
-        if both_vec {
+        // The one exception (GAS 2.47 byte-probed): `vmovd %xmm4,%xmm6'
+        // (VEX/EVEX, both XMM, same width) is accepted and encoded through
+        // the EVEX-promoted row (62 f1 7e 08 7e f4; `.s' flips to D6).
+        // The non-VEX `movd` pair and every `mm`-involved pair stay
+        // rejected (`movd %xmm4,%xmm6' and `movd %mm1,%mm2' are
+        // "operand type mismatch").
+        let vex_xmm_pair = vex && !has_mm && both_vec;
+        if both_vec && !vex_xmm_pair {
             return Err(type_err());
         }
     }

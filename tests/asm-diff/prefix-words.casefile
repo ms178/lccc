@@ -1,0 +1,52 @@
+# x86-64 GAS prefix words: addr32/data16/rex/rex.x as standalone spellings.
+# GAS 2.47.20260726-probed (`as --64`). addr32 COALESCES with the body's
+# address-size override (67 89 00 for `addr32 mov %eax,(%eax)`), redirects
+# accumulator-absolute movs to the 32-bit moffs rows, and rejects 64-bit-only
+# bases; rex/rex.x OR-merge with the body's REX byte. addr16/data32 and the
+# .y/.xy/.z rex spellings do not exist in 64-bit mode.
+;;; addr32_forms
+.text
+addr32 nop
+addr32 mov %eax, %ebx
+addr32 mov $0x89abcdef, %eax
+addr32 mov %eax, (%eax)
+addr32 mov (%eax), %eax
+addr32 mov %rax, (%ebx)
+addr32 push (%eax)
+addr32 monitor
+addr32 mov %eax, 0x600898
+addr32 mov %rax, 0x600898
+addr32 mov %ax, 0x600898
+addr32 mov %al, 0x600898
+addr32 mov 0x600898, %rax
+addr32 mov 0x600898, %eax
+addr32 rep movsb
+addr32 repz cmpsb
+addr32 fs mov %eax, (%ebx)
+;;; data16_forms
+.text
+data16 nop
+data16 mov %eax, (%eax)
+data16 mov %eax, %ebx
+;;; rex_forms
+.text
+rex mov %ebx, %edi
+rex.x mov %ebx, %edi
+rex mov %r8d, %r9d
+rex mov %eax, %ebx
+rex.x mov %r8d, %ebx
+rex mov %rax, %rbx
+rex.x mov %r8d, %r9d
+;;; prefix_rejects reject
+.text
+addr32 addr32 add %eax, (%eax)
+addr32 jecxz 1f
+addr16 add %rax, (%rax)
+data32 mov %eax, %ebx
+rex.y mov %ebx, %edi
+rex.xy mov %ebx, %edi
+rex.z mov %ebx, %edi
+rex lock mov %ebx, %edi
+data16 mov %ax, (%eax)
+addr32 mov %eax, (%rax)
+1:

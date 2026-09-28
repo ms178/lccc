@@ -1,0 +1,44 @@
+# i686 no-operand system instructions and the MONITOR family.
+# Every expected byte pair was GAS 2.47.20260726-probed (`as --32`) while
+# wiring the encoders; asmdiff re-derives both sides per run.
+;;; smap_uao_sev_pkru
+.text
+clac
+stac
+serialize
+rdpkru
+wrpkru
+enclu
+encls
+enclv
+wbnoinvd
+;;; monitor_family
+.text
+monitor
+monitor %eax,%ecx,%edx
+monitor %ax,%ecx,%edx
+monitorx
+monitorx %eax,%ecx,%edx
+monitorx %ax,%ecx,%edx
+mwait
+mwait %eax,%ecx
+mwaitx
+mwaitx %eax,%ecx,%ebx
+;;; uao_wait
+.text
+umonitor %eax
+umonitor %ebx
+umonitor %ax
+umonitor %bx
+tpause %eax
+tpause %ebx
+umwait %eax
+umwait %ebx
+;;; monitor_hint_rejects reject
+.text
+monitor %ebx,%ecx,%edx
+monitor %al,%ecx,%edx
+mwait %ax,%ecx
+mwaitx %ax,%ecx,%ebx
+tpause %ax
+umonitor %al

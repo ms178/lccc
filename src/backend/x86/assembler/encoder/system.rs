@@ -813,14 +813,29 @@ impl super::InstructionEncoder {
                     return Err(format!("operand size mismatch for `{mnemonic}'"));
                 };
                 let pp_f2 = mnemonic == "urdmsr"; // F2 for read, F3 for write
+                // Field law (GAS 2.47, tc-i386.c build_apx_evex_prefix +
+                // print_register, cross-checked on the full register
+                // matrix): the modrm REG field carries the FIRST urdmsr
+                // operand and the SECOND uwrmsr operand; the RM field
+                // carries the other one.  Extension bits follow their
+                // FIELD OWNER, never a fixed operand position:
+                //   reg  +8 -> REX.R / P0 bit7 (inverted), +16 -> REX2.R /
+                //              P0 bit4 (inverted)
+                //   rm   +8 -> REX.B / P0 bit5 (inverted), +16 -> REX2.B /
+                //              P0 bit3 (SET, non-inverted)
+                // EVEX iff any operand is an EGPR (r16+); r8-r15 use the
+                // legacy REX form; a REX extending nothing is elided
+                // (GAS: `urdmsr %rdx,%rax' = f2 0f 38 f8 d0, no 0x40).
+                let (s, d) = (gp_id(src).unwrap(), gp_id(dst).unwrap());
+                let (reg_id, rm_id) = if pp_f2 { (s, d) } else { (d, s) };
                 if Self::msr_is_egpr(src) || Self::msr_is_egpr(dst) {
-                    // EVEX m4, pp 3(read)/2(write), opcode F8, P2 = 08.
-                    let (s, d) = (gp_id(src).unwrap(), gp_id(dst).unwrap());
+                    // EVEX m4, pp 3(read)/2(write), opcode F8, W=0,
+                    // vvvv unused (P2 = 08: V' set, ND clear, aaa 0).
                     self.emit_evex(
-                        s & 8 != 0,
+                        reg_id & 8 != 0,
                         false,
-                        d & 8 != 0,
-                        s & 16 != 0,
+                        rm_id & 8 != 0,
+                        reg_id & 16 != 0,
                         4,
                         0,
                         0,
@@ -830,33 +845,25 @@ impl super::InstructionEncoder {
                         false,
                         0,
                         false,
-                        d & 16 != 0,
+                        rm_id & 16 != 0,
                         false,
                     );
                     self.bytes.push(0xF8);
-                    // urdmsr: reg=src rm=dst; uwrmsr SWAPS (GAS:
-                    // `uwrmsr %r12,%r14' = f3 45 0f 38 f8 f4 — reg=r14).
-                    if pp_f2 {
-                        self.bytes.push(self.modrm(3, (s & 7) as u8, (d & 7) as u8));
-                    } else {
-                        self.bytes.push(self.modrm(3, (d & 7) as u8, (s & 7) as u8));
-                    }
+                    self.bytes
+                        .push(self.modrm(3, (reg_id & 7) as u8, (rm_id & 7) as u8));
                 } else {
-                    // Legacy F2/F3.0F38.F8 with REX.R (src) REX.B (dst).
                     if pp_f2 {
                         self.bytes.push(0xF2);
                     } else {
                         self.bytes.push(0xF3);
                     }
-                    let (s, d) = (gp_id(src).unwrap(), gp_id(dst).unwrap());
-                    let rex = 0x40 | (u8::from(s & 8 != 0) << 2) | u8::from(d & 8 != 0);
-                    self.bytes.push(rex);
-                    self.bytes.extend_from_slice(&[0x0F, 0x38, 0xF8]);
-                    if pp_f2 {
-                        self.bytes.push(self.modrm(3, (s & 7) as u8, (d & 7) as u8));
-                    } else {
-                        self.bytes.push(self.modrm(3, (d & 7) as u8, (s & 7) as u8));
+                    let rex = 0x40 | (u8::from(reg_id & 8 != 0) << 2) | u8::from(rm_id & 8 != 0);
+                    if rex != 0x40 {
+                        self.bytes.push(rex);
                     }
+                    self.bytes.extend_from_slice(&[0x0F, 0x38, 0xF8]);
+                    self.bytes
+                        .push(self.modrm(3, (reg_id & 7) as u8, (rm_id & 7) as u8));
                 }
                 Ok(())
             }

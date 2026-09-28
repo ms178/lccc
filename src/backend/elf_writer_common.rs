@@ -4105,6 +4105,15 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 }),
                 jump.target_addend,
             );
+            // A leading 0x67 address-size override (the i686 `addr16`
+            // word or a 16-bit counter spelling) sits between the jump
+            // opcode and its displacement byte.
+            let disp_at = jump.offset as usize
+                + if self.sections[sec_idx].data.get(jump.offset as usize) == Some(&0x67) {
+                    2
+                } else {
+                    1
+                };
             let Some(target_off) = target else {
                 // Unresolvable target (undefined/external). A short-only
                 // branch (jecxz/loop: never relaxed BY the engine, hence
@@ -4118,11 +4127,20 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 // already-pushed guard. Letting the jump fall through
                 // instead would leave disp 0 with no reloc: a silent jump
                 // into the next instruction.
+                // A leading 0x67 address-size override (the i686 `addr16`
+                // word or a 16-bit counter spelling) sits between the jump
+                // opcode and its displacement byte.
+                let disp_at = jump.offset as usize
+                    + if self.sections[sec_idx].data.get(jump.offset as usize) == Some(&0x67) {
+                        2
+                    } else {
+                        1
+                    };
                 if !jump.can_grow
                     && !self.sections[sec_idx]
                         .relocations
                         .iter()
-                        .any(|r| r.offset == jump.offset as u64 + 1)
+                        .any(|r| r.offset == disp_at as u64)
                 {
                     let Some(pc8) = A::reloc_pc8() else {
                         return Err(format!(
@@ -4131,7 +4149,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         ));
                     };
                     push_pc8.push(ElfRelocation {
-                        offset: jump.offset as u64 + 1,
+                        offset: disp_at as u64,
                         symbol: jump.target.clone(),
                         reloc_type: pc8,
                         // Wrapping: a source addend of i64::MIN is not a
@@ -4146,16 +4164,18 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 }
                 continue;
             };
-            let end_of_instr = jump.offset + 2;
+            // The 67-prefixed short form is 3 bytes: the displacement
+            // ends at disp_at + 1, not offset + 2.
+            let end_of_instr = disp_at as i64 + 1;
             let disp = target_off as i64 - end_of_instr as i64;
             // A surviving short jump must be representable exactly. Out
             // of range, a short-only branch is unencodable and GAS errors
             // (`value of N too large for field of 1 byte`); panicking
             // the assembler instead is never acceptable.
             if !(-128..=127).contains(&disp) {
-                return Err(Self::pc8_range_error(disp, jump.offset as u64 + 1));
+                return Err(Self::pc8_range_error(disp, disp_at as u64));
             }
-            patches.push((jump.offset + 1, disp as u8));
+            patches.push((disp_at, disp as u8));
         }
         for (off, byte) in patches {
             self.sections[sec_idx].data[off] = byte;
