@@ -31,6 +31,22 @@ pub fn load_inputs_x86(
     crate::backend::x86::linker::load_inputs_for_ld(inputs, objects, undefined)
 }
 
+/// Input list of a `-r` or `-T` link with every `-lNAME` expanded in place;
+/// see [`crate::backend::linker_common::expand_file_mode_libs`].
+pub fn expand_file_mode_libs(
+    ordered_args: &[String],
+    files: &[(String, bool)],
+    extra_dirs: &[String],
+    mode: &str,
+) -> Result<Vec<(String, bool)>, String> {
+    crate::backend::linker_common::expand_file_mode_libs(ordered_args, files, extra_dirs, mode)
+}
+
+/// The `SEARCH_DIR` directories a linker script declares, in order.
+pub fn script_search_dirs(script_src: &str) -> Result<Vec<String>, String> {
+    Ok(crate::backend::linker_common::linker_script::parse_linker_script(script_src)?.search_dirs)
+}
+
 /// Load ELF32/i386 objects and archives for a script-driven link.
 /// `undefined` are `-u`/`--undefined` symbols that must pull archive members.
 pub fn load_inputs_i386_script(

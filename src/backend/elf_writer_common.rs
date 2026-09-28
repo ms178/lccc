@@ -289,6 +289,27 @@ impl PadQueue {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only switch: apply every jump transition and every padding
+    /// rewrite on its own, through an in-place splice and `shift_after`, as
+    /// the assembler did before the edits were batched.  The sequential
+    /// algorithm is the specification the batched `apply_jump_transitions`
+    /// and `flush_padding_edits` must reproduce byte for byte; the
+    /// differential tests (`batched_edit_differential_tests`) assemble the
+    /// same source both ways and compare the objects.
+    static SEQUENTIAL_EDITS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test-only count of `PadQueue` flush fallbacks (an edit whose anchor
+    /// the queue could not accept), so the tests can prove they exercise it.
+    static PAD_QUEUE_FALLBACKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Test-only fault injection: treat every edit after the first of a
+    /// sweep as unacceptable, so the flush-and-requeue fallback runs on
+    /// every rewrite.  No known source reaches that fallback naturally
+    /// (markers are visited in offset order and their runs are disjoint,
+    /// so anchors arrive sorted), which is exactly why it needs forcing.
+    static PAD_QUEUE_FORCE_FALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// One relaxation-pass transition of a jump (see `relax_jumps`).
 enum JumpAction {
     /// Long form -> 2-byte short form (first, optimistic pass only).
@@ -3661,6 +3682,11 @@ impl<A: X86Arch> ElfWriterCore<A> {
     /// relocations appended (still in descending offset order) are exactly
     /// the sequential ones, so the object file is byte-identical.
     fn apply_jump_transitions(&mut self, sec_idx: usize, actions: &[(usize, JumpAction)]) {
+        #[cfg(test)]
+        if SEQUENTIAL_EDITS.get() {
+            self.apply_jump_transitions_sequential(sec_idx, actions);
+            return;
+        }
         let reloc_pos = |offset: usize, is_conditional: bool| {
             (if is_conditional {
                 offset + 2
@@ -3768,6 +3794,82 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 patch_size: if rel16 { 2 } else { 4 },
             };
             sec.relocations.push(reloc);
+        }
+    }
+
+    /// Test-only reference for `apply_jump_transitions`: the pre-batching
+    /// algorithm, one transition at a time from the back of the section
+    /// (so every transition sees original coordinates for everything in
+    /// front of it), each an in-place splice plus a full `shift_after`.
+    #[cfg(test)]
+    fn apply_jump_transitions_sequential(
+        &mut self,
+        sec_idx: usize,
+        actions: &[(usize, JumpAction)],
+    ) {
+        let mut order: Vec<(usize, bool)> = actions
+            .iter()
+            .map(|(j, a)| (*j, matches!(a, JumpAction::Shrink)))
+            .collect();
+        order.sort_unstable_by_key(|&(j, _)| {
+            std::cmp::Reverse(self.sections[sec_idx].jumps[j].offset)
+        });
+        for (j, shrink) in order {
+            let jump = &self.sections[sec_idx].jumps[j];
+            let (offset, old_len, long_len, is_conditional) =
+                (jump.offset, jump.len, jump.long_len, jump.is_conditional);
+            let (target, target_addend) = (jump.target.clone(), jump.target_addend);
+            let reloc_pos = (if is_conditional {
+                offset + 2
+            } else {
+                offset + 1
+            }) as u64;
+            let data = &mut self.sections[sec_idx].data;
+            if shrink {
+                if is_conditional {
+                    data[offset] = 0x70 + (data[offset + 1] - 0x80);
+                } else {
+                    data[offset] = 0xEB;
+                }
+                data[offset + 1] = 0;
+                data.drain(offset + 2..offset + old_len);
+                self.sections[sec_idx]
+                    .relocations
+                    .retain(|r| r.offset != reloc_pos);
+                self.shift_after(sec_idx, offset + 1, 2 - old_len as i64, None);
+                let jump = &mut self.sections[sec_idx].jumps[j];
+                jump.relaxed = true;
+                jump.can_grow = true;
+                jump.len = 2;
+            } else {
+                let grow = long_len - old_len;
+                if is_conditional {
+                    let cc = data[offset] - 0x70;
+                    data.splice(offset + 2..offset + 2, std::iter::repeat_n(0u8, grow));
+                    data[offset] = 0x0f;
+                    data[offset + 1] = 0x80 + cc;
+                } else {
+                    data.splice(offset + 2..offset + 2, std::iter::repeat_n(0u8, grow));
+                    data[offset] = 0xE9;
+                }
+                self.shift_after(sec_idx, offset + 1, grow as i64, None);
+                let rel16 = long_len == if is_conditional { 4 } else { 3 };
+                self.sections[sec_idx].relocations.push(ElfRelocation {
+                    offset: reloc_pos,
+                    symbol: target,
+                    reloc_type: if rel16 {
+                        A::reloc_pc16().expect("rel16 branch without architecture relocation")
+                    } else {
+                        A::reloc_pc32()
+                    },
+                    addend: if rel16 { -2 } else { -4 } + target_addend,
+                    diff_symbol: None,
+                    patch_size: if rel16 { 2 } else { 4 },
+                });
+                let jump = &mut self.sections[sec_idx].jumps[j];
+                jump.relaxed = false;
+                jump.len = long_len;
+            }
         }
     }
 
@@ -4323,21 +4425,28 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         at: (orig_offset + existing_padding) as u64,
                         seq: marker_seq,
                     };
-                    if !queue.accepts(&edit) {
-                        self.flush_padding_edits(sec_idx, &mut queue);
-                        // The flush remapped this marker like every other
-                        // record, so its offset is now `current_offset`,
-                        // which the empty queue maps to itself.
-                        let m = &self.sections[sec_idx].align_markers[marker_idx];
-                        let edit = PadEdit {
-                            start: m.offset,
-                            at: (m.offset + existing_padding) as u64,
-                            ..edit
-                        };
-                        queue.push(edit);
+                    // Reference mode (tests): the queue stays empty, so its
+                    // map is the identity, and every rewrite lands at once.
+                    #[cfg(test)]
+                    if SEQUENTIAL_EDITS.get() {
+                        self.apply_padding_edit_sequential(sec_idx, edit);
                     } else {
-                        queue.push(edit);
+                        self.enqueue_padding_edit(
+                            sec_idx,
+                            marker_idx,
+                            existing_padding,
+                            &mut queue,
+                            edit,
+                        );
                     }
+                    #[cfg(not(test))]
+                    self.enqueue_padding_edit(
+                        sec_idx,
+                        marker_idx,
+                        existing_padding,
+                        &mut queue,
+                        edit,
+                    );
                 }
             }
             // Persist the adjusted size so repeated fixup passes are idempotent.
@@ -4350,6 +4459,51 @@ impl<A: X86Arch> ElfWriterCore<A> {
             marker_idx += 1;
         }
         self.flush_padding_edits(sec_idx, &mut queue);
+    }
+
+    /// Queue one padding rewrite of `fixup_alignment_markers`, flushing
+    /// first when its anchor would break the queue's sort order.
+    fn enqueue_padding_edit(
+        &mut self,
+        sec_idx: usize,
+        marker_idx: usize,
+        existing_padding: usize,
+        queue: &mut PadQueue,
+        edit: PadEdit,
+    ) {
+        #[cfg(test)]
+        let forced = PAD_QUEUE_FORCE_FALLBACK.get() && !queue.edits.is_empty();
+        #[cfg(not(test))]
+        let forced = false;
+        if !forced && queue.accepts(&edit) {
+            queue.push(edit);
+            return;
+        }
+        #[cfg(test)]
+        PAD_QUEUE_FALLBACKS.set(PAD_QUEUE_FALLBACKS.get() + 1);
+        self.flush_padding_edits(sec_idx, queue);
+        // The flush remapped this marker like every other record, so its
+        // offset is now the one `fixup_alignment_markers` computed through
+        // the queue, which the empty queue maps to itself.
+        let m = &self.sections[sec_idx].align_markers[marker_idx];
+        let edit = PadEdit {
+            start: m.offset,
+            at: (m.offset + existing_padding) as u64,
+            ..edit
+        };
+        queue.push(edit);
+    }
+
+    /// Test-only reference for the queued padding rewrite: splice the run
+    /// in place and `shift_after` its END with the marker's source position
+    /// as the tie, exactly the pre-batching edit.
+    #[cfg(test)]
+    fn apply_padding_edit_sequential(&mut self, sec_idx: usize, edit: PadEdit) {
+        let delta = edit.bytes.len() as i64 - edit.old_len as i64;
+        self.sections[sec_idx]
+            .data
+            .splice(edit.start..edit.start + edit.old_len, edit.bytes);
+        self.shift_after(sec_idx, edit.at as usize, delta, Some(edit.seq));
     }
 
     /// Apply the queued padding rewrites of `fixup_alignment_markers` in one
@@ -5776,6 +5930,372 @@ ret
         assert_eq!(
             assemble_err(".text\nt1: nop\n.data\n.quad t1 - .\n", true),
             "cannot represent relocation type BFD_RELOC_64_PCREL"
+        );
+    }
+}
+
+/// Differential tests of the batched section edits (`apply_jump_transitions`,
+/// `PadQueue` + `flush_padding_edits`) against the sequential reference
+/// (`SEQUENTIAL_EDITS`): the same source is assembled both ways and the
+/// complete objects — section bytes, relocations, symbol values — must be
+/// identical, or both runs must fail with the same diagnostic.
+#[cfg(test)]
+mod batched_edit_differential_tests {
+    use super::{PAD_QUEUE_FALLBACKS, PAD_QUEUE_FORCE_FALLBACK, SEQUENTIAL_EDITS};
+    use crate::backend::i686::assembler::assemble as assemble32;
+    use crate::backend::x86::assembler::assemble as assemble64;
+    use std::fmt::Write as _;
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Mode {
+        Batched,
+        /// Batched, with the queue's flush-and-requeue fallback forced on
+        /// every rewrite after a sweep's first.
+        BatchedForcedFallback,
+        Sequential,
+    }
+
+    fn object(asm: &str, arch32: bool, mode: Mode) -> Result<Vec<u8>, String> {
+        let dir = std::env::temp_dir().join(format!(
+            "lccc_batch_{}_{}_{}_{}",
+            std::process::id(),
+            if arch32 { 32 } else { 64 },
+            mode as u8,
+            std::thread::current()
+                .name()
+                .unwrap_or("t")
+                .replace("::", "_")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("t.o");
+        SEQUENTIAL_EDITS.set(mode == Mode::Sequential);
+        PAD_QUEUE_FORCE_FALLBACK.set(mode == Mode::BatchedForcedFallback);
+        let res = if arch32 {
+            assemble32(asm, out.to_str().unwrap())
+        } else {
+            assemble64(asm, out.to_str().unwrap())
+        };
+        SEQUENTIAL_EDITS.set(false);
+        PAD_QUEUE_FORCE_FALLBACK.set(false);
+        let res = res.map(|()| std::fs::read(&out).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+        res
+    }
+
+    /// Assemble `asm` sequentially and in both batched modes; panic on any
+    /// difference.  Returns the (common) result.
+    fn same(asm: &str, arch32: bool, what: &str) -> Result<Vec<u8>, String> {
+        let sequential = object(asm, arch32, Mode::Sequential);
+        for mode in [Mode::Batched, Mode::BatchedForcedFallback] {
+            check_same(
+                &object(asm, arch32, mode),
+                &sequential,
+                asm,
+                arch32,
+                what,
+                mode,
+            );
+        }
+        sequential
+    }
+
+    fn check_same(
+        batched: &Result<Vec<u8>, String>,
+        sequential: &Result<Vec<u8>, String>,
+        asm: &str,
+        arch32: bool,
+        what: &str,
+        mode: Mode,
+    ) {
+        if batched != sequential {
+            let detail = match (batched, sequential) {
+                (Ok(b), Ok(s)) => {
+                    let at = b
+                        .iter()
+                        .zip(s)
+                        .position(|(x, y)| x != y)
+                        .unwrap_or(b.len().min(s.len()));
+                    format!(
+                        "objects differ at byte {at} (sizes {} vs {})",
+                        b.len(),
+                        s.len()
+                    )
+                }
+                (b, s) => format!(
+                    "results differ: batched {:?} vs sequential {:?}",
+                    b.as_ref().err(),
+                    s.as_ref().err()
+                ),
+            };
+            let forced = if mode == Mode::BatchedForcedFallback {
+                ", forced fallback"
+            } else {
+                ""
+            };
+            panic!("{what} (arch32={arch32}{forced}): {detail}\n--- source ---\n{asm}");
+        }
+    }
+
+    /// Both architectures, both algorithms, and the source must assemble.
+    fn same_ok(asm: &str, what: &str) -> Vec<u8> {
+        let mut text64 = Vec::new();
+        for arch32 in [false, true] {
+            match same(asm, arch32, what) {
+                Ok(obj) if !arch32 => text64 = obj,
+                Ok(_) => {}
+                Err(e) => panic!("{what} (arch32={arch32}) must assemble: {e}\n{asm}"),
+            }
+        }
+        text64
+    }
+
+    fn nops(n: usize) -> String {
+        "nop\n".repeat(n)
+    }
+
+    #[test]
+    fn padding_runs_at_the_same_offset() {
+        // An empty run, a max-skip run and a plain run stacked at one
+        // offset, re-sized when the leading jump shrinks and grows back.
+        let asm = format!(
+            ".text\nf:\njmp .Lfar\n{}.p2align 3\n.p2align 4,,5\n.balign 2\n.La:\n{}jne .La\n{}.Lfar:\nret\n",
+            nops(9),
+            nops(40),
+            nops(140)
+        );
+        same_ok(&asm, "stacked padding");
+    }
+
+    #[test]
+    fn padding_shrinks_to_zero_then_grows() {
+        // 5-byte jmp + 14 nops = 19 -> pad 13; the optimistic shrink to 2
+        // bytes gives 16 -> pad 0; the far target forces rel32 again -> 13.
+        let asm = format!(
+            ".text\nf:\njmp .Lfar\n{}.p2align 4\n.Lh:\n{}.Lfar:\nret\n",
+            nops(14),
+            nops(140)
+        );
+        same_ok(&asm, "shrink to zero then grow");
+    }
+
+    #[test]
+    fn labels_on_both_sides_of_padding() {
+        let asm = format!(
+            ".text\nf:\njmp .Lfar\n{}.Lbefore:\n.p2align 4\n.Lafter:\n{}jne .Lbefore\njne .Lafter\n\
+             .long .Lafter-.Lbefore\n.uleb128 .Lafter-.Lbefore\n{}.Lfar:\nret\n",
+            nops(3),
+            nops(100),
+            nops(150)
+        );
+        same_ok(&asm, "labels on both sides");
+    }
+
+    #[test]
+    fn org_between_growing_jump_and_back_edge() {
+        let asm = format!(
+            ".text\nf:\n.Lbase:\njmp .Lfar\n.Lb:\nnop\n.org .Lbase+20\n{}jne .Lb\n{}.Lfar:\nret\n",
+            nops(110),
+            nops(130)
+        );
+        same_ok(&asm, "org");
+    }
+
+    #[test]
+    fn max_skip_alignment_flips() {
+        let asm = format!(
+            ".text\nf:\njmp .Lfar\n.Lb:\n{}.p2align 4,,10\n{}jne .Lb\n{}.p2align 5,,3\n.Lc:\n{}jmp .Lc\n.Lfar:\nret\n",
+            nops(4),
+            nops(114),
+            nops(7),
+            nops(120)
+        );
+        same_ok(&asm, "max-skip");
+    }
+
+    #[test]
+    fn branches_with_addends_rel8_and_rel32() {
+        let asm = format!(
+            ".text\nf:\n.Lt:\nnop\nnop\nnop\njmp .Lt+2\njne .Lt+1\njmp .Lfar+1\njne .Lfar+3\n{}\
+             jmp .Lnear+1\n.Lnear:\nnop\nnop\njmp ext+4\njne ext\n{}.Lfar:\nret\nnop\nnop\nnop\njmp .Lt+2\n",
+            nops(60),
+            nops(130)
+        );
+        same_ok(&asm, "addends");
+    }
+
+    #[test]
+    fn numeric_labels() {
+        let asm = format!(
+            ".text\nf:\n1:\n{}jne 1b\njmp 1f\n{}1:\n.p2align 4\n2:\n{}jne 2b\njmp 2f\n{}2:\nret\n",
+            nops(20),
+            nops(126),
+            nops(100),
+            nops(3)
+        );
+        same_ok(&asm, "numeric labels");
+    }
+
+    // ---- randomized programs -------------------------------------------
+
+    struct Rng(u64);
+
+    impl Rng {
+        /// xorshift64*: deterministic, so a failing seed reproduces.
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+        fn pick<'a>(&mut self, xs: &[&'a str]) -> &'a str {
+            xs[self.below(xs.len() as u64) as usize]
+        }
+    }
+
+    /// A random program over the constructs whose sizes the batched edits
+    /// move: relaxable branches (conditional/unconditional, forward/back,
+    /// named/numeric, with addends), alignment in every form (stacked,
+    /// max-skip, fill, labels on either side), `.org`, deferred `.skip`,
+    /// label differences in data, and external branches.
+    fn program(rng: &mut Rng) -> String {
+        const JCC: &[&str] = &["jmp", "jne", "je", "jl", "jg", "jb", "jae"];
+        let labels = 4 + rng.below(12);
+        let mut defined = vec![false; labels as usize];
+        let mut asm = String::from(".text\nf:\n");
+        let mut aux = 0u32;
+        for _ in 0..10 + rng.below(50) {
+            match rng.below(16) {
+                0..=2 => {
+                    let n = match rng.below(4) {
+                        0 => rng.below(8),
+                        1 => 100 + rng.below(40),
+                        _ => rng.below(64),
+                    };
+                    asm.push_str(&nops(n as usize));
+                }
+                3 | 4 => {
+                    let l = rng.below(labels) as usize;
+                    if !defined[l] {
+                        defined[l] = true;
+                        let _ = writeln!(asm, ".L{l}:");
+                    }
+                }
+                5..=7 => {
+                    let l = rng.below(labels);
+                    let add = if rng.below(6) == 0 {
+                        format!("+{}", 1 + rng.below(3))
+                    } else {
+                        String::new()
+                    };
+                    let _ = writeln!(asm, "{} .L{l}{add}", rng.pick(JCC));
+                }
+                8 => {
+                    let _ = match rng.below(5) {
+                        0 => writeln!(asm, ".p2align {}", 1 + rng.below(5)),
+                        1 => writeln!(asm, ".p2align {},,{}", 2 + rng.below(4), rng.below(16)),
+                        2 => writeln!(asm, ".balign {}", 1u32 << (1 + rng.below(5))),
+                        3 => writeln!(asm, ".p2align {},0xcc", 1 + rng.below(4)),
+                        _ => writeln!(asm, ".p2align 3\n.p2align 4,,{}\n.balign 2", rng.below(12)),
+                    };
+                }
+                9 => {
+                    let _ = writeln!(
+                        asm,
+                        ".LA{aux}:\n.p2align {}\n.LB{aux}:\n.long .LB{aux}-.LA{aux}",
+                        2 + rng.below(4)
+                    );
+                    aux += 1;
+                }
+                10 => {
+                    let d = 1 + rng.below(3);
+                    let _ = match rng.below(3) {
+                        0 => writeln!(asm, "{d}:"),
+                        1 => writeln!(asm, "{} {d}b", rng.pick(JCC)),
+                        _ => writeln!(asm, "{} {d}f", rng.pick(JCC)),
+                    };
+                }
+                11 => {
+                    // A deferred `.skip` whose size follows relaxation (it
+                    // can shrink to zero and grow again).
+                    let _ = writeln!(
+                        asm,
+                        ".LS{aux}:\n{}{} .L{}\n.LE{aux}:\n.skip .LE{aux}-.LS{aux}",
+                        nops(rng.below(4) as usize),
+                        rng.pick(JCC),
+                        rng.below(labels)
+                    );
+                    aux += 1;
+                }
+                12 => {
+                    let _ = writeln!(
+                        asm,
+                        ".LO{aux}:\n{} .L{}\n.org .LO{aux}+{}",
+                        rng.pick(JCC),
+                        rng.below(labels),
+                        6 + rng.below(20)
+                    );
+                    aux += 1;
+                }
+                13 => {
+                    let (a, b) = (rng.below(labels), rng.below(labels));
+                    let _ = if rng.below(2) == 0 {
+                        writeln!(asm, ".long .L{a}-.L{b}")
+                    } else {
+                        writeln!(asm, ".uleb128 .L{a}-.L{b}")
+                    };
+                }
+                14 => {
+                    let _ = writeln!(
+                        asm,
+                        "{} ext{}{}",
+                        rng.pick(&["call", "jmp", "jne"]),
+                        rng.below(3),
+                        rng.pick(&["", "+4"])
+                    );
+                }
+                _ => {
+                    let _ = writeln!(asm, ".skip {}", rng.below(40));
+                }
+            }
+        }
+        // Every referenced label exists: an undefined named label would
+        // become an external symbol and stop being a relaxation target.
+        for (l, d) in defined.iter().enumerate() {
+            if !d {
+                let _ = writeln!(asm, "{}.L{l}:", nops(rng.below(3) as usize));
+            }
+        }
+        asm.push_str("1:\n2:\n3:\nret\n");
+        asm
+    }
+
+    #[test]
+    fn random_programs_match_sequential_edits() {
+        let (mut ok, mut total) = (0usize, 0usize);
+        let fallbacks_before = PAD_QUEUE_FALLBACKS.get();
+        for seed in 1..=300u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+            let asm = program(&mut rng);
+            for arch32 in [false, true] {
+                total += 1;
+                if same(&asm, arch32, &format!("random program seed {seed}")).is_ok() {
+                    ok += 1;
+                }
+            }
+        }
+        // The comparison must mostly be between objects, not diagnostics,
+        // and the forced mode must actually have driven the fallback.
+        assert!(
+            ok * 10 >= total * 8,
+            "only {ok}/{total} random programs assembled"
+        );
+        let fallbacks = PAD_QUEUE_FALLBACKS.get() - fallbacks_before;
+        assert!(
+            fallbacks >= total,
+            "only {fallbacks} queue fallbacks over {total} programs"
         );
     }
 }

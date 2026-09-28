@@ -113,55 +113,135 @@ pub(super) struct PieRelative {
     pub sym_idx: usize,
 }
 
-/// Decide whether an `R_X86_64_64` relocation in a PIE becomes `RELATIVE`.
+/// Whether an `R_X86_64_64` against global `g`, stored in a section with
+/// flags `sh_flags`, is left for ld.so to fill through a symbolic dynamic
+/// `R_X86_64_64` (an `AbsDynReloc`) rather than resolved by this link.
 ///
-/// Address-independent by construction, so it can be called during the scan
-/// that runs before layout.  Mirrors the `deferred_to_loader` predicate in
-/// `emit_exec`'s relocation applier: a reference to a *dynamic* symbol is
-/// resolved by the loader through `GLOB_DAT`/`JUMP_SLOT`/`AbsDynReloc`, not by
-/// a slide, so it must not also get a `RELATIVE`.  Everything that resolves to
-/// an address inside this output does need one -- including references through
-/// section symbols, which is how the compiler points an array of `const char *`
-/// at merged string literals.  Those are the easy ones to miss, and missing one
-/// leaves a pointer holding its link-time offset, which faults on first use
-/// under ASLR.
-/// True when the value the relocation applier will store is an address inside
-/// *this* output, and therefore has to be slid by the load base.
+/// * A shared-library DATA object that was not copy-relocated: its address
+///   exists only once the library is mapped.
+/// * A shared-library FUNCTION, in writable storage of a PIE: the loader has
+///   to write the slot anyway (a PIE is relocated as a whole), so it may as
+///   well write the function's real address -- which is what GNU ld and lld
+///   do.  An indirect call through the pointer then goes straight to the
+///   function instead of through our PLT, and no canonical PLT entry is
+///   needed.  Read-only storage, or a non-PIE (whose image is not relocated
+///   at all), instead gets the canonical PLT entry, see
+///   [`GlobalSymbol::canonical_plt`].
 ///
-/// Mirrors `emit_exec`'s applier arm for `R_X86_64_64` case for case, because a
-/// disagreement is a wrong image either way: a pointer that is never slid, or a
-/// slide applied on top of an address the loader is about to overwrite.
-pub(super) fn stored_value_is_local(g: &GlobalSymbol) -> bool {
-    if g.is_dynamic && !g.copy_reloc {
-        // The applier stores our own PLT entry when the symbol has one -- a
-        // local address, so it needs sliding.  This is how an `.eh_frame` FDE
-        // points at `__gxx_personality_v0`; missing it means the unwinder jumps
-        // to the unslid PLT address and the first C++ throw segfaults.
-        // With no PLT the applier defers to ld.so via `abs_dyn_relocs`, and a
-        // slide there would double-apply.
-        return g.plt_idx.is_some();
+/// Every input to the decision is final once `create_plt_got` has run
+/// (`copy_reloc` is only ever set on `STT_OBJECT`s, and it is only consulted
+/// for those), so the planner, the `RELATIVE` filter and the relocation
+/// applier all agree by calling this one function.
+pub(super) fn abs64_defers_to_loader(g: &GlobalSymbol, sh_flags: u64, is_pie: bool) -> bool {
+    g.is_dynamic
+        && !g.copy_reloc
+        && ((g.info & 0xf) == STT_OBJECT || (is_pie && sh_flags & SHF_WRITE != 0))
+}
+
+/// True when the value the relocation applier stores for an `R_X86_64_64`
+/// against `g` is an address inside *this* output, and therefore has to be
+/// slid by the load base in a PIE (an `R_X86_64_RELATIVE`).
+///
+/// Mirrors `emit_exec`'s applier arm for `R_X86_64_64` case for case, because
+/// a disagreement is a wrong image either way: a pointer that is never slid,
+/// or a slide applied on top of an address the loader is about to overwrite.
+///
+/// Must be asked after `create_plt_got` has finished: a copy-relocated
+/// symbol's storage is our own `.bss` copy, and that is only known once every
+/// relocation has been seen.  (Asking during the scan, as this used to be,
+/// made the answer depend on relocation order: `int *p = &lib_var;` lost its
+/// slide whenever a later PC32 turned `lib_var` into a copy relocation.)
+pub(super) fn abs64_value_is_local(g: &GlobalSymbol, sh_flags: u64, is_pie: bool) -> bool {
+    if g.copy_reloc {
+        return true;
     }
-    // A definition we own: a normal local/global definition, a copy-relocated
-    // symbol's .bss copy, or one of the synthetic `__lccc.strmerge.N` pool
-    // symbols that string merging substitutes for references into merged string
-    // sections (those carry the per-string offset in the *addend* and look
-    // undefined -- `shndx == 0` -- but are entirely local).
+    if g.is_dynamic {
+        // Either the loader writes the whole value, or we store our own
+        // canonical PLT entry (a local address).
+        return !abs64_defers_to_loader(g, sh_flags, is_pie);
+    }
+    // A definition we own: a normal local/global definition, or one of the
+    // synthetic `__lccc.strmerge.N` pool symbols that string merging
+    // substitutes for references into merged string sections (those carry the
+    // per-string offset in the *addend* and look undefined -- `shndx == 0` --
+    // but are entirely local).
     g.defined_in.is_some()
 }
 
-fn pie_needs_relative(
+/// Whether a PIE `R_X86_64_64` through `sym`, stored in a section with flags
+/// `sh_flags`, becomes an `R_X86_64_RELATIVE`.  Everything that resolves to an
+/// address inside this output needs one -- including references through
+/// section symbols, which is how the compiler points an array of
+/// `const char *` at merged string literals.  Those are the easy ones to
+/// miss, and missing one leaves a pointer holding its link-time offset, which
+/// faults on first use under ASLR.
+pub(super) fn pie_needs_relative(
     sym: &crate::backend::linker_common::Elf64Symbol,
     globals: &FxHashMap<String, GlobalSymbol>,
+    sh_flags: u64,
 ) -> bool {
     if !sym.name.is_empty() && !sym.is_local() {
         if let Some(g) = globals.get(sym.name.as_str()) {
-            return stored_value_is_local(g);
+            return abs64_value_is_local(g, sh_flags, true);
         }
         if sym.is_weak() {
             return false; // undefined weak resolves to 0; nothing to slide
         }
     }
     !sym.is_undefined()
+}
+
+/// Whether a PIE GOT slot for `g` holds an address inside this output (and so
+/// needs an `R_X86_64_RELATIVE`).  A shared-library symbol's slot is always
+/// filled by the loader (`GLOB_DAT`, or `TPOFF64` for TLS) -- never with our
+/// PLT entry, because ld.so resolves every *other* object's references to the
+/// library's definition unless `.dynsym` says otherwise, and a PLT address in
+/// the slot would then compare unequal to the library's own `&f`.  A TLS slot
+/// holds a thread-pointer offset, which must not be slid either.
+pub(super) fn got_slot_holds_local_address(g: &GlobalSymbol) -> bool {
+    if (g.info & 0xf) == STT_TLS {
+        return false;
+    }
+    if g.copy_reloc {
+        return true;
+    }
+    !g.is_dynamic && g.defined_in.is_some()
+}
+
+/// Whether an executable's GOT-indirect reference to `g` may address it
+/// directly instead (see `elf::gotpcrelx_relaxation` for the instruction
+/// side).  The symbol must be defined in the executable itself -- nothing
+/// can preempt it -- and must not be an IFUNC (its canonical address is the
+/// IPLT stub the IFUNC GOT serves), an absolute symbol (a RIP-relative `lea`
+/// of an absolute value moves when a PIE slides) or a copy-relocated DSO
+/// object.  `create_plt_got` and the relocation pass both ask this exact
+/// question of the same symbol table, so a reference whose slot was elided
+/// is always one that gets rewritten.
+pub(super) fn exec_got_relax_target(g: &GlobalSymbol) -> bool {
+    g.defined_in.is_some()
+        && !g.is_dynamic
+        && !g.copy_reloc
+        && (g.info & 0xf) != STT_GNU_IFUNC
+        && g.section_idx != SHN_ABS
+}
+
+/// Whether the relocated field at `offset` is the rel32 operand of a direct
+/// branch (`call`/`jmp`/`jcc rel32`), i.e. a use that does not take the
+/// target's address.  Only code can hold a branch; in any other section a
+/// PC-relative field (`.long f - .`) is data that *does* take the address.
+/// In code the byte before a RIP-relative disp32 is otherwise always a ModRM
+/// byte of the form `00 reg 101` (0x05..0x3d), which can never be mistaken
+/// for the `e8`/`e9` opcodes; a `0f 8x` pair is a two-byte `jcc`.
+fn is_branch_rel32(sh_flags: u64, data: &[u8], offset: u64) -> bool {
+    if sh_flags & SHF_EXECINSTR == 0 {
+        return false;
+    }
+    let off = offset as usize;
+    if off == 0 || off > data.len() {
+        return false;
+    }
+    let op = data[off - 1];
+    op == 0xe8 || op == 0xe9 || (off >= 2 && data[off - 2] == 0x0f && (0x80..=0x8f).contains(&op))
 }
 
 pub(super) fn create_plt_got(
@@ -187,23 +267,30 @@ pub(super) fn create_plt_got(
     let mut copy_reloc_set: FxHashSet<String> = FxHashSet::default();
     let mut abs_dyn_relocs: Vec<AbsDynReloc> = Vec::new();
     let mut pie_relative: Vec<PieRelative> = Vec::new();
+    let mut canonical_plt_set: FxHashSet<String> = FxHashSet::default();
 
     for (obj_i, obj) in objects.iter().enumerate() {
         for sec_idx in 0..obj.sections.len() {
+            let sh_flags = obj.sections[sec_idx].flags;
             for rela in &obj.relocations[sec_idx] {
                 let si = rela.sym_idx as usize;
                 if si >= obj.symbols.len() {
                     continue;
                 }
                 let sym = &obj.symbols[si];
-                // PIE slide entries must be collected *before* the local-symbol
-                // skip below.  Locally-defined absolute references are exactly
-                // the ones a slide applies to, and the ones most often written
-                // through a section symbol -- `const char *msgs[] = {...}`
-                // relocates against the merged `.rodata.str1.1` section symbol,
-                // not against a named symbol.  Everything after this point only
+                // PIE slide candidates must be collected *before* the
+                // local-symbol skip below.  Locally-defined absolute references
+                // are exactly the ones a slide applies to, and the ones most
+                // often written through a section symbol -- `const char
+                // *msgs[] = {...}` relocates against the merged
+                // `.rodata.str1.1` section symbol, not against a named symbol.
+                // Which candidates really become RELATIVE depends on the final
+                // copy-relocation set, so `emit_exec` filters them with
+                // `pie_needs_relative` once this scan is complete.  Non-alloc
+                // storage (DWARF's DW_AT_low_pc and friends) is never loaded
+                // and needs no slide.  Everything after this point only
                 // concerns references that cross the dynamic boundary.
-                if is_pie && rela.rela_type == R_X86_64_64 && pie_needs_relative(sym, globals) {
+                if is_pie && rela.rela_type == R_X86_64_64 && sh_flags & SHF_ALLOC != 0 {
                     pie_relative.push(PieRelative {
                         obj_idx: obj_i,
                         sec_idx,
@@ -228,9 +315,20 @@ pub(super) fn create_plt_got(
                                 copy_reloc_names.push(sym.name.to_string());
                             }
                         } else {
-                            // Dynamic function symbol - needs PLT
+                            // Dynamic function symbol - needs PLT.  Unless the
+                            // field is the rel32 of a branch, the reference
+                            // takes the function's address (`lea f(%rip)`, or a
+                            // `.long f - .` in data), and that address is the
+                            // PLT entry -- so it has to be made canonical.
                             if plt_set.insert(sym.name.to_string()) {
                                 plt_names.push(sym.name.to_string());
+                            }
+                            if !is_branch_rel32(
+                                sh_flags,
+                                obj.section_data[sec_idx].as_slice(),
+                                rela.offset,
+                            ) {
+                                canonical_plt_set.insert(sym.name.to_string());
                             }
                         }
                     }
@@ -239,13 +337,32 @@ pub(super) fn create_plt_got(
                     | R_X86_64_REX_GOTPCRELX
                     | R_X86_64_CODE_4_GOTPCRELX
                     | R_X86_64_CODE_6_GOTPCRELX => {
-                        // GOTPCREL always needs a dedicated GOT entry, even if the
+                        // A reference the relocation pass rewrites to address
+                        // the symbol directly (`mov` -> `lea`, `call *` ->
+                        // `addr32 call`, ...) needs no slot; the symbol gets
+                        // one only if some OTHER reference to it cannot be
+                        // relaxed.  GNU ld and lld elide these slots too --
+                        // each one kept costs 8 bytes of .got, a 24-byte
+                        // R_X86_64_RELATIVE in a PIE, and a dependent load
+                        // on every execution of the instruction.
+                        let relaxed = globals
+                            .get(sym.name.as_str())
+                            .is_some_and(exec_got_relax_target)
+                            && gotpcrelx_relaxation(
+                                rela.rela_type,
+                                rela.addend,
+                                obj.section_data[sec_idx].as_slice(),
+                                rela.offset as usize,
+                                is_pie,
+                            )
+                            .is_some();
+                        // Otherwise GOTPCREL needs a dedicated GOT entry, even if the
                         // symbol also has a PLT entry. The PLT's GOT.PLT slot uses
                         // JUMP_SLOT (lazy binding, initially PLT+6) which is wrong
                         // for address-of. For symbols with PLT, the GOT entry is
                         // statically filled with the PLT address (no GLOB_DAT);
                         // for other dynamic symbols, GLOB_DAT is used.
-                        if got_only_set.insert(sym.name.to_string()) {
+                        if !relaxed && got_only_set.insert(sym.name.to_string()) {
                             got_only_names.push(sym.name.to_string());
                         }
                     }
@@ -271,12 +388,25 @@ pub(super) fn create_plt_got(
                     _ if gsym_info.map(|g| g.0).unwrap_or(false) => {
                         let sym_type = gsym_info.map(|g| g.1).unwrap_or(0);
                         if rela.rela_type == R_X86_64_64 {
-                            if sym_type != STT_OBJECT {
-                                // Function pointer initialised from a dynamic
-                                // function: the canonical address is its PLT entry.
+                            if sym_type != STT_OBJECT && !(is_pie && sh_flags & SHF_WRITE != 0) {
+                                // Function pointer in storage the loader does
+                                // not otherwise touch (a non-PIE, or read-only
+                                // data): the address we store is our PLT entry,
+                                // which is then the function's canonical address.
                                 if plt_set.insert(sym.name.to_string()) {
                                     plt_names.push(sym.name.to_string());
                                 }
+                                canonical_plt_set.insert(sym.name.to_string());
+                            } else if sym_type != STT_OBJECT {
+                                // PIE, writable storage: let ld.so store the
+                                // real address (see `abs64_defers_to_loader`).
+                                abs_dyn_relocs.push(AbsDynReloc {
+                                    name: sym.name.to_string(),
+                                    obj_idx: obj_i,
+                                    sec_idx,
+                                    offset: rela.offset,
+                                    addend: rela.addend,
+                                });
                             } else {
                                 // Absolute 64-bit reference to a dynamic DATA
                                 // symbol, e.g. the `_ZTVN10__cxxabiv1*` vtable
@@ -299,6 +429,36 @@ pub(super) fn create_plt_got(
                                     offset: rela.offset,
                                     addend: rela.addend,
                                 });
+                            }
+                        } else if matches!(
+                            rela.rela_type,
+                            R_X86_64_32
+                                | R_X86_64_32S
+                                | R_X86_64_16
+                                | R_X86_64_8
+                                | R_X86_64_PC64
+                                | R_X86_64_PC16
+                                | R_X86_64_PC8
+                        ) {
+                            // Non-PIC address-of (`mov $f, %edi`, `.quad f - .`)
+                            // resolved at link time: nothing in the image is
+                            // left for the loader, so the address has to be
+                            // one this link knows.  A function's is its
+                            // canonical PLT entry; a data object's is its
+                            // copy-relocated `.bss` home -- exactly what a
+                            // PC32 reference to it gets.  (These used to fall
+                            // into the GOT-only arm below, which gave the
+                            // symbol a slot nothing read and resolved the field
+                            // itself to 0.)
+                            if sym_type == STT_OBJECT {
+                                if copy_reloc_set.insert(sym.name.to_string()) {
+                                    copy_reloc_names.push(sym.name.to_string());
+                                }
+                            } else {
+                                if plt_set.insert(sym.name.to_string()) {
+                                    plt_names.push(sym.name.to_string());
+                                }
+                                canonical_plt_set.insert(sym.name.to_string());
                             }
                         } else if !plt_set.contains(sym.name.as_str())
                             && got_only_set.insert(sym.name.to_string())
@@ -364,6 +524,7 @@ pub(super) fn create_plt_got(
         if let Some(gsym) = globals.get_mut(name) {
             gsym.plt_idx = Some(plt_idx);
             gsym.got_idx = Some(got_idx);
+            gsym.canonical_plt = canonical_plt_set.contains(name);
         }
     }
 
@@ -384,4 +545,81 @@ pub(super) fn create_plt_got(
         eprintln!("[GOT] pie_relative={} entries", pie_relative.len());
     }
     (plt_names, got_entries, abs_dyn_relocs, pie_relative)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dso_sym(stt: u8) -> GlobalSymbol {
+        GlobalSymbol {
+            value: 0,
+            size: 0,
+            info: (STB_GLOBAL << 4) | stt,
+            defined_in: None,
+            from_lib: Some("libc.so.6".into()),
+            plt_idx: None,
+            got_idx: None,
+            section_idx: SHN_UNDEF,
+            is_dynamic: true,
+            copy_reloc: false,
+            canonical_plt: false,
+            visibility: 0,
+            lib_sym_value: 0x1000,
+            version: None,
+        }
+    }
+
+    #[test]
+    fn branch_rel32_detection() {
+        let x = SHF_ALLOC | SHF_EXECINSTR;
+        // call / jmp / jcc rel32
+        assert!(is_branch_rel32(x, &[0xe8, 0, 0, 0, 0], 1));
+        assert!(is_branch_rel32(x, &[0xe9, 0, 0, 0, 0], 1));
+        assert!(is_branch_rel32(x, &[0x0f, 0x84, 0, 0, 0, 0], 2));
+        // lea f(%rip), %rax: ModRM 0x05 precedes the field.
+        assert!(!is_branch_rel32(x, &[0x48, 0x8d, 0x05, 0, 0, 0, 0], 3));
+        // `.long f - .` after a data byte that happens to be 0xe8.
+        assert!(!is_branch_rel32(SHF_ALLOC, &[0xe8, 0, 0, 0, 0], 1));
+        // Field at the start of the section / beyond it.
+        assert!(!is_branch_rel32(x, &[0, 0, 0, 0], 0));
+        assert!(!is_branch_rel32(x, &[0xe8], 9));
+    }
+
+    #[test]
+    fn abs64_placement() {
+        let func = dso_sym(STT_FUNC);
+        let data = dso_sym(STT_OBJECT);
+        let (ro, rw) = (SHF_ALLOC, SHF_ALLOC | SHF_WRITE);
+        // Data: always the loader's (unless copy-relocated).
+        assert!(abs64_defers_to_loader(&data, ro, false));
+        assert!(abs64_defers_to_loader(&data, rw, true));
+        let mut copied = data.clone();
+        copied.copy_reloc = true;
+        assert!(!abs64_defers_to_loader(&copied, rw, true));
+        assert!(abs64_value_is_local(&copied, rw, true));
+        // Functions: the loader's only in writable PIE storage; otherwise our
+        // canonical PLT entry, which a PIE must slide.
+        assert!(abs64_defers_to_loader(&func, rw, true));
+        assert!(!abs64_value_is_local(&func, rw, true));
+        assert!(!abs64_defers_to_loader(&func, ro, true));
+        assert!(abs64_value_is_local(&func, ro, true));
+        assert!(!abs64_defers_to_loader(&func, rw, false));
+    }
+
+    #[test]
+    fn got_slots_of_dso_and_tls_symbols_are_never_slid() {
+        let mut func = dso_sym(STT_FUNC);
+        func.plt_idx = Some(0);
+        func.canonical_plt = true;
+        assert!(!got_slot_holds_local_address(&func));
+        let mut tls = dso_sym(STT_TLS);
+        tls.is_dynamic = false;
+        tls.defined_in = Some(0);
+        assert!(!got_slot_holds_local_address(&tls));
+        let mut local = dso_sym(STT_OBJECT);
+        local.is_dynamic = false;
+        local.defined_in = Some(0);
+        assert!(got_slot_holds_local_address(&local));
+    }
 }

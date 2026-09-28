@@ -73,6 +73,7 @@ pub(super) fn resolve_symbols(
                 copy_addr: 0,
                 version: None,
                 uses_textrel: false,
+                canonical_plt: false,
             };
 
             match global_symbols.get(sym.name.as_str()) {
@@ -131,8 +132,11 @@ pub(super) fn resolve_symbols(
                             binding: *dyn_binding,
                             visibility: STV_DEFAULT,
                             is_defined: false,
-                            needs_plt: is_func,
-                            needs_got: is_func,
+                            // Decided per reference by `mark_plt_got_needs`:
+                            // a PLT only for calls and address-of, a GOT slot
+                            // only for GOT-relative references.
+                            needs_plt: false,
+                            needs_got: false,
                             output_section: usize::MAX,
                             section_offset: 0,
                             plt_index: 0,
@@ -146,6 +150,7 @@ pub(super) fn resolve_symbols(
                             copy_addr: 0,
                             version: dyn_ver.clone(),
                             uses_textrel: false,
+                            canonical_plt: false,
                         },
                     );
                 } else {
@@ -170,6 +175,7 @@ pub(super) fn resolve_symbols(
                             copy_addr: 0,
                             version: None,
                             uses_textrel: false,
+                            canonical_plt: false,
                         });
                 }
             }
@@ -322,11 +328,27 @@ pub(super) fn mark_plt_got_needs(
                 }
 
                 match rel_type {
+                    // A call reaches a shared-library function through its
+                    // PLT entry, and so does a non-PIC address-of (`R_386_32`,
+                    // a non-branch `R_386_PC32`), which makes the entry the
+                    // function's canonical address.  A DSO data object
+                    // referenced like that is copy-relocated instead
+                    // (`needs_copy`, decided when it was resolved).
                     R_386_PLT32 => {
                         if let Some(gs) = global_symbols.get_mut(sym.name.as_str()) {
                             if gs.is_dynamic {
                                 gs.needs_plt = true;
-                                gs.needs_got = true;
+                            }
+                        }
+                    }
+                    R_386_PC32 | R_386_32 => {
+                        if let Some(gs) = global_symbols.get_mut(sym.name.as_str()) {
+                            if gs.is_dynamic
+                                && (gs.sym_type == STT_FUNC || gs.sym_type == STT_GNU_IFUNC)
+                            {
+                                gs.needs_plt = true;
+                                gs.canonical_plt |=
+                                    rel_type == R_386_32 || !is_branch_rel32(sec, rel_offset);
                             }
                         }
                     }
@@ -350,6 +372,26 @@ pub(super) fn mark_plt_got_needs(
             }
         }
     }
+}
+
+/// Whether the relocated field at `offset` of `sec` is the rel32 of a direct
+/// branch (`call`/`jmp`/`jcc rel32`) -- a use that does not take the
+/// target's address.  Only code holds branches: in data, `.long f - .` does
+/// take the address.  In code the byte before any other PC-relative disp32
+/// is part of a ModRM/SIB/opcode sequence that cannot be `e8`/`e9` (i386 has
+/// no RIP-relative addressing, so a non-branch PC32 in code is rare anyway).
+fn is_branch_rel32(sec: &InputSection, offset: u32) -> bool {
+    if sec.flags & SHF_EXECINSTR == 0 {
+        return false;
+    }
+    let off = offset as usize;
+    if off == 0 || off > sec.data.len() {
+        return false;
+    }
+    let op = sec.data[off - 1];
+    op == 0xe8
+        || op == 0xe9
+        || (off >= 2 && sec.data[off - 2] == 0x0f && (0x80..=0x8f).contains(&op))
 }
 
 pub(super) fn check_undefined_symbols(
@@ -390,10 +432,15 @@ pub(super) fn build_plt_got_lists(
     let mut got_dyn_symbols: Vec<String> = Vec::new();
     let mut got_local_symbols: Vec<String> = Vec::new();
 
+    // A shared-library function can need both: a PLT entry for its calls
+    // (with a lazily-bound `.got.plt` slot) and an ordinary GOT slot for a
+    // GOT-relative address-of, which must hold the resolved address from the
+    // start -- a lazy `.got.plt` slot holds `PLT+6` until the first call.
     for (name, sym) in global_symbols.iter() {
         if sym.needs_plt {
             plt_symbols.push(name.clone());
-        } else if sym.needs_got && !sym.needs_plt {
+        }
+        if sym.needs_got {
             if sym.is_dynamic {
                 got_dyn_symbols.push(name.clone());
             } else {

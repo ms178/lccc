@@ -53,6 +53,70 @@ pub trait GlobalSymbolOps: Clone {
     fn has_copy_reloc(&self) -> bool {
         false
     }
+
+    /// Merged `STV_*` visibility (see [`merge_object_visibility`]).  Backends
+    /// that do not track visibility report `STV_DEFAULT`, which preserves
+    /// their historical behaviour exactly.
+    fn visibility(&self) -> u8 {
+        crate::backend::elf::STV_DEFAULT
+    }
+
+    /// Store the merged visibility.  A no-op for backends without the field.
+    fn set_visibility(&mut self, _visibility: u8) {}
+}
+
+/// Rank of an `STV_*` value on the gABI constraint order
+/// `DEFAULT < PROTECTED < HIDDEN < INTERNAL`.  The numeric `STV_*` values do
+/// not follow that order (INTERNAL is 1, PROTECTED is 3), so comparing them
+/// directly would let PROTECTED override HIDDEN.
+fn visibility_rank(v: u8) -> u8 {
+    use crate::backend::elf::{STV_HIDDEN, STV_INTERNAL, STV_PROTECTED};
+    match v & 0x3 {
+        STV_PROTECTED => 1,
+        STV_HIDDEN => 2,
+        STV_INTERNAL => 3,
+        _ => 0,
+    }
+}
+
+/// Combine two `STV_*` values: the more constraining one wins.
+pub fn most_constraining_visibility(a: u8, b: u8) -> u8 {
+    if visibility_rank(b & 0x3) > visibility_rank(a & 0x3) {
+        b & 0x3
+    } else {
+        a & 0x3
+    }
+}
+
+/// Fold the visibility of every non-local symbol-table entry of every
+/// relocatable input into the matching global symbol.
+///
+/// gABI (Symbol Visibility): "the most constraining visibility attribute" of
+/// all references *and* the definition applies to the symbol in the output.
+/// That is why this is a post-resolution pass over the object symbol tables
+/// rather than a copy of the winning definition's `st_other`: the common
+/// case it gets right is a TU that declares `extern int f(void)
+/// __attribute__((visibility("hidden")))` and calls it, with the defining TU
+/// compiled without the attribute -- the reference alone makes `f` hidden.
+/// Running after resolution also makes the result independent of the order
+/// in which definitions replaced references.  Shared-library symbols never
+/// contribute: those are resolved against, not linked in.
+pub fn merge_object_visibility<G: GlobalSymbolOps>(
+    objects: &[super::types::Elf64Object],
+    globals: &mut crate::common::fx_hash::FxHashMap<String, G>,
+) {
+    for obj in objects {
+        for sym in &obj.symbols {
+            let vis = sym.visibility();
+            if vis == crate::backend::elf::STV_DEFAULT || sym.is_local() || sym.name.is_empty() {
+                continue;
+            }
+            if let Some(g) = globals.get_mut(sym.name.as_str()) {
+                let merged = most_constraining_visibility(g.visibility(), vis);
+                g.set_visibility(merged);
+            }
+        }
+    }
 }
 
 // ── Linker-defined symbols ──────────────────────────────────────────────
@@ -244,4 +308,18 @@ pub fn is_exported_dynamic_symbol<G: GlobalSymbolOps>(g: &G) -> bool {
         && !g.is_dynamic()
         && !g.has_copy_reloc()
         && (g.info() >> 4) != 0 // not STB_LOCAL
+        && is_dynamic_visibility(g.visibility())
+}
+
+/// Whether a symbol of merged visibility `vis` may appear in `.dynsym` as a
+/// definition.  HIDDEN and INTERNAL symbols are, by definition, not visible
+/// outside the component; exporting them (as the x86-64 emitters once did
+/// for `__dso_handle`, `__TMC_END__` and `DW.ref.__gxx_personality_v0`) lets
+/// another module bind to a private object.  PROTECTED symbols are exported
+/// but not preemptible.
+pub fn is_dynamic_visibility(vis: u8) -> bool {
+    !matches!(
+        vis & 0x3,
+        crate::backend::elf::STV_HIDDEN | crate::backend::elf::STV_INTERNAL
+    )
 }

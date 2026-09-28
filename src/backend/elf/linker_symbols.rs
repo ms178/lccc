@@ -17,6 +17,7 @@ use super::constants::*;
 ///
 /// Each backend computes these from its own layout, then passes them to
 /// `get_standard_linker_symbols()` to get the canonical symbol list.
+#[derive(Default)]
 pub struct LinkerSymbolAddresses {
     /// Base address of the ELF executable (e.g., 0x400000 for x86-64).
     pub base_addr: u64,

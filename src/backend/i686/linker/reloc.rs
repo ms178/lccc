@@ -433,16 +433,19 @@ pub(super) fn resolve_got_reloc(
     relax_got32x: &mut bool,
 ) -> u32 {
     if let Some(gs) = ctx.global_symbols.get(sym.name.as_str()) {
-        if gs.is_dynamic {
-            let got_entry_addr = if gs.needs_plt {
-                ctx.gotplt_vaddr + (ctx.gotplt_reserved + gs.plt_index as u32) * 4
-            } else {
-                ctx.got_vaddr + (ctx.got_reserved as u32 + (gs.got_index - ctx.num_plt) as u32) * 4
-            };
-            (got_entry_addr as i32 + addend - ctx.got_base as i32) as u32
-        } else if gs.needs_got {
+        if gs.needs_got {
+            // Every GOT-relative reference to a named symbol gave it a slot
+            // of its own (`mark_plt_got_needs`); for a shared-library symbol
+            // that slot is filled by GLOB_DAT -- never the lazy `.got.plt`
+            // slot of its PLT entry, which holds `PLT+6` until the first
+            // call, so an address loaded from it would change over time.
             let got_entry_addr =
                 ctx.got_vaddr + (ctx.got_reserved as u32 + (gs.got_index - ctx.num_plt) as u32) * 4;
+            (got_entry_addr as i32 + addend - ctx.got_base as i32) as u32
+        } else if gs.is_dynamic {
+            // Unreachable while the invariant above holds; the PLT's slot is
+            // the only one such a symbol could have.
+            let got_entry_addr = ctx.gotplt_vaddr + (ctx.gotplt_reserved + gs.plt_index as u32) * 4;
             (got_entry_addr as i32 + addend - ctx.got_base as i32) as u32
         } else if rel_type == R_386_GOT32X {
             *relax_got32x = true;

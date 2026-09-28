@@ -1003,6 +1003,7 @@ pub(super) fn emit_shared_library_32(
         copy_addr: 0,
         version: None,
         uses_textrel: false,
+        canonical_plt: false,
     };
     let gs = global_symbols
         .entry("_GLOBAL_OFFSET_TABLE_".to_string())
@@ -1831,6 +1832,7 @@ mod tests {
             copy_addr: 0,
             version: None,
             uses_textrel: false,
+            canonical_plt: false,
         };
         assert!(!binds_locally(&gs, Symbolic::None));
         assert!(!binds_locally(&gs, Symbolic::Functions));

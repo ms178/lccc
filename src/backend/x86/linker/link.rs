@@ -118,6 +118,8 @@ fn apply_defsyms(
                 section_idx: SHN_ABS,
                 is_dynamic: false,
                 copy_reloc: false,
+                canonical_plt: false,
+                visibility: 0,
                 lib_sym_value: 0,
                 version: None,
             },
@@ -240,6 +242,16 @@ pub fn link_builtin(
     let cet_flags = parsed_args.property_link_flags()?;
     let extra_lib_paths = parsed_args.extra_lib_paths;
     let libs_to_load = parsed_args.libs_to_load;
+    // Whether each `-l` in `libs_to_load` was written under `-Bstatic` (or
+    // `-static`): its search then accepts only `libNAME.a`.  args.rs records
+    // every `-l` in both lists at once, so the two stay index-aligned.
+    let lib_static_search: Vec<bool> = parsed_args
+        .inputs
+        .iter()
+        .filter(|it| it.is_lib)
+        .map(|it| it.static_search)
+        .collect();
+    debug_assert_eq!(lib_static_search.len(), libs_to_load.len());
     let extra_object_files = parsed_args.extra_object_files;
     let export_dynamic = parsed_args.export_dynamic;
     let rpath_entries = parsed_args.rpath_entries;
@@ -415,7 +427,14 @@ pub fn link_builtin(
         }
         let needed_lib_count = needed_libs.len();
         for (idx, lib_name) in all_lib_names.iter().enumerate() {
-            if let Some(lib_path) = linker_common::resolve_lib(lib_name, &all_lib_paths, is_static)
+            // Driver-supplied libraries follow the link mode; a user `-l`
+            // follows the `-Bstatic`/`-Bdynamic` state at its position.
+            let static_only = is_static
+                || idx
+                    .checked_sub(needed_lib_count)
+                    .is_some_and(|k| lib_static_search.get(k).copied().unwrap_or(false));
+            if let Some(lib_path) =
+                linker_common::resolve_lib_positional(lib_name, &all_lib_paths, static_only)
             {
                 if !lib_paths_resolved.contains(&lib_path) {
                     lib_paths_resolved.push(lib_path);
@@ -535,6 +554,11 @@ pub fn link_builtin(
         // The wrapper may be undefined if the user forgot to provide it.
         // Leave that to the normal undefined-symbol check below.
     }
+
+    // gABI visibility merge over definitions AND references.  After --wrap
+    // (which renames references) and before the GC root set, whose
+    // `--export-dynamic` roots must not include hidden symbols.
+    linker_common::merge_object_visibility(&objects, &mut globals);
 
     // Garbage-collect unreferenced sections when --gc-sections is active.
     // This removes sections not reachable from entry points, which may also
@@ -886,13 +910,22 @@ pub fn link_shared(
     let bsymbolic = parsed.bsymbolic;
     let exclude_libs: Vec<String> = parsed.exclude_libs.clone();
 
-    // (path_or_lib, is_lib, whole_archive, as_needed), in command-line order.
-    // Both archive and as-needed state are POSITIONAL, so they have to travel
-    // with the input rather than being read as global flags.
-    let ordered_items: Vec<(String, bool, bool, bool)> = parsed
+    // (path_or_lib, is_lib, whole_archive, as_needed, static_search), in
+    // command-line order.  Archive, as-needed and -Bstatic state are all
+    // POSITIONAL, so they have to travel with the input rather than being
+    // read as global flags.
+    let ordered_items: Vec<(String, bool, bool, bool, bool)> = parsed
         .inputs
         .iter()
-        .map(|it| (it.name.clone(), it.is_lib, it.whole_archive, it.as_needed))
+        .map(|it| {
+            (
+                it.name.clone(),
+                it.is_lib,
+                it.whole_archive,
+                it.as_needed,
+                it.static_search,
+            )
+        })
         .collect();
 
     // Load user object files (from the compiler driver, before user_args)
@@ -911,10 +944,10 @@ pub fn link_shared(
     all_lib_paths.extend(lib_path_strings.iter().cloned());
 
     // Load ordered items (bare files and -l libraries) preserving --whole-archive state
-    let mut libs_to_load_later: Vec<(String, bool, bool)> = Vec::new();
-    for (item, is_lib, wa, an) in &ordered_items {
+    let mut libs_to_load_later: Vec<(String, bool, bool, bool)> = Vec::new();
+    for (item, is_lib, wa, an, static_search) in &ordered_items {
         if *is_lib {
-            libs_to_load_later.push((item.clone(), *wa, *an));
+            libs_to_load_later.push((item.clone(), *wa, *an, *static_search));
         } else {
             load_file_as_needed(
                 item,
@@ -931,8 +964,10 @@ pub fn link_shared(
     // Resolve -l libraries
     if !libs_to_load_later.is_empty() {
         let mut lib_paths_resolved: Vec<(String, bool, bool)> = Vec::new();
-        for (lib_name, wa, an) in &libs_to_load_later {
-            if let Some(lib_path) = linker_common::resolve_lib(lib_name, &all_lib_paths, false) {
+        for (lib_name, wa, an, static_search) in &libs_to_load_later {
+            if let Some(lib_path) =
+                linker_common::resolve_lib_positional(lib_name, &all_lib_paths, *static_search)
+            {
                 if !lib_paths_resolved.iter().any(|(p, _, _)| p == &lib_path) {
                     lib_paths_resolved.push((lib_path, *wa, *an));
                 }
@@ -1031,6 +1066,10 @@ pub fn link_shared(
     // Expressions come back pending; the emitter evaluates them once addresses
     // are final.
     let pending_defsyms = apply_defsyms(&mut globals, &parsed.defsym_defs)?;
+
+    // gABI visibility merge (definitions and references); the export filter
+    // and every preemptibility decision in `emit_shared_library` read it.
+    linker_common::merge_object_visibility(&objects, &mut globals);
 
     // GNU property note merge, as on the executable path (input level,
     // before the section merge — see the comment in `link_builtin`;

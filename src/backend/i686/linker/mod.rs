@@ -1,18 +1,28 @@
 //! Native i686 (32-bit x86) ELF linker.
 //!
-//! Links ELF32 relocatable objects (.o) and archives (.a) into a dynamically-
-//! linked or static ELF32 executable. Supports PLT/GOT for dynamic symbols,
-//! TLS (all i386 models), GNU hash tables, GLIBC version tables, copy
-//! relocations, COMDAT group deduplication, and IFUNC (IRELATIVE) for static.
+//! Links ELF32 relocatable objects (.o), archives (.a, including thin
+//! archives) and shared objects into a dynamically-linked or static ELF32
+//! executable or an ELF32 shared object. Inputs are processed in command-line
+//! order with GNU ld's positional state (`--whole-archive`, `-Bstatic`,
+//! `--as-needed`, `--push-state`). Supports PLT/GOT for dynamic symbols, TLS
+//! (every i386 access model, with GNU-equivalent transitions in executables),
+//! GNU/SysV hash tables, GLIBC version tables, copy relocations, COMDAT group
+//! deduplication, and IFUNC (IRELATIVE) for static links.
 //!
 //! ## Module structure
 //!
+//! - `options` - Link options, and the capability check that rejects every
+//!   semantic option this backend does not implement before any input is read
 //! - `types` - ELF32 constants, structures, and linker state types
 //! - `parse` - ELF32 object file parsing
 //! - `dynsym` - Dynamic symbol reading from shared libraries
 //! - `reloc` - i386 relocation application
+//! - `tls` - TLS sequence recognisers and access-model rewrites (GD/LD/IE/
+//!   GOTIE/TLSDESC to LE or IE)
+//! - `dynamic` - The `.dynamic` table shared by both emitters
 //! - `gnu_hash` - GNU hash table building
-//! - `input` - Phases 1-4: argument parsing, file loading, archive resolution
+//! - `input` - Phases 1-4: ordered input loading, `-l` search (shared before
+//!   static unless `-Bstatic`), archive member extraction
 //! - `sections` - Phase 5: section merging and COMDAT deduplication
 //! - `symbols` - Phases 6-9: symbol resolution, PLT/GOT marking, IFUNC collection
 //! - `shared` - Shared library (.so) emission

@@ -222,6 +222,12 @@ pub(super) struct LinkerSymbol {
     pub version: Option<String>,
     /// Whether this dynamic data symbol uses text relocations instead of COPY.
     pub uses_textrel: bool,
+    /// A shared-library function whose PLT entry is its address in this
+    /// executable (an `R_386_32`, or an `R_386_PC32` that is not a branch):
+    /// `.dynsym` then publishes the PLT entry as the undefined symbol's
+    /// value, so ld.so resolves every other module's references to the same
+    /// address and `&f` compares equal everywhere (the psABI "canonical PLT").
+    pub canonical_plt: bool,
 }
 
 /// A merged output section.

@@ -357,6 +357,7 @@ fn apply_defsyms(
                 copy_addr: 0,
                 version: None,
                 uses_textrel: false,
+                canonical_plt: false,
             },
         );
     }

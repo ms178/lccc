@@ -302,22 +302,17 @@ fn is_benign_ignorable(a: &str) -> bool {
     ) || a.starts_with("-plugin-opt=")
 }
 
-/// The elf_i386 argument list: `passthrough` with the position-sensitive
-/// tokens re-inserted where they appeared (see `i386_positional` in `run`).
-fn i386_ordered_args(
-    passthrough: &[String],
-    positional: &[(usize, String)],
-    bstatic_alias_at: &[usize],
-) -> Vec<String> {
+/// `passthrough` with the positional input files re-inserted where they
+/// appeared (see `positional_files` in `run`): the elf_i386 userspace argument
+/// list, and the order `-r`/`-T` links expand `-l` in.
+fn ordered_args(passthrough: &[String], positional: &[(usize, String)]) -> Vec<String> {
     let mut out = Vec::with_capacity(passthrough.len() + positional.len());
     let mut pending = positional.iter().peekable();
     for (idx, tok) in passthrough.iter().enumerate() {
         while let Some((_, t)) = pending.next_if(|(at, _)| *at == idx) {
             out.push(t.clone());
         }
-        if !bstatic_alias_at.contains(&idx) {
-            out.push(tok.clone());
-        }
+        out.push(tok.clone());
     }
     out.extend(pending.map(|(_, t)| t.clone()));
     out
@@ -354,17 +349,14 @@ fn run(args: &[String]) -> Result<(), String> {
     let mut undefined_symbols: Vec<String> = Vec::new();
     // Set when gcc handed us the LTO plugin; see the -plugin arm below.
     let mut saw_lto_plugin = false;
-    // elf_i386 only: tokens that must keep their command-line position
-    // relative to `passthrough` (positional files, `-Bstatic`/`-Bdynamic`),
-    // tagged with the `passthrough` length at the time they appeared.  The
-    // i386 pipeline resolves one ordered input list (archive extraction and
-    // library search depend on position); the x86-64 path keeps consuming
-    // `inputs` + `passthrough` separately.  See `i386_ordered_args`.
-    let mut i386_positional: Vec<(usize, String)> = Vec::new();
-    // `passthrough` indices of the `-static` that `-Bstatic` is translated
-    // to for x86-64 (which has no positional static search); the i386 list
-    // carries the raw `-Bstatic` instead.
-    let mut bstatic_alias_at: Vec<usize> = Vec::new();
+    // Positional input files, tagged with the `passthrough` length at the
+    // time they appeared, so they keep their command-line position relative
+    // to the `-l`, `-Bstatic` and `--whole-archive` tokens there.  The i386
+    // userspace pipeline and the `-r`/`-T` modes resolve one ordered input
+    // list (archive extraction and library search depend on position); the
+    // x86-64 userspace path keeps consuming `inputs` + `passthrough`
+    // separately.  See `ordered_args`.
+    let mut positional_files: Vec<(usize, String)> = Vec::new();
 
     let mut i = 0;
     while i < args.len() {
@@ -527,17 +519,13 @@ fn run(args: &[String]) -> Result<(), String> {
                 passthrough.push("-static".to_string());
             }
             // GNU ld: `-Bstatic` is positional — it restricts the `-l`
-            // searches that follow to `libNAME.a` until `-Bdynamic`.  The
-            // i386 pipeline implements exactly that; x86-64 still treats it
-            // as `-static`.
-            "-Bstatic" | "-dn" | "-non_shared" => {
-                is_static = true;
-                i386_positional.push((passthrough.len(), a.to_string()));
-                bstatic_alias_at.push(passthrough.len());
-                passthrough.push("-static".to_string());
-            }
-            "-Bdynamic" | "-dy" | "-call_shared" => {
-                i386_positional.push((passthrough.len(), a.to_string()));
+            // searches that follow to `libNAME.a` until `-Bdynamic`, and
+            // does not by itself make the output a static executable
+            // (`-Wl,-Bstatic -lfoo -Wl,-Bdynamic` links libfoo.a into an
+            // otherwise dynamic program).  Both pipelines read the token
+            // from its position in `passthrough`.
+            "-Bstatic" | "-dn" | "-non_shared" | "-Bdynamic" | "-dy" | "-call_shared" => {
+                passthrough.push(a.to_string());
             }
             // gcc's specs save/restore the positional state around groups
             // (`--push-state --as-needed -lgcc_s --pop-state`); dropping the
@@ -844,7 +832,7 @@ fn run(args: &[String]) -> Result<(), String> {
                     // The userspace mode re-derives its passthrough sandwich
                     // from this flag below.
                     inputs.push((a.to_string(), whole_archive));
-                    i386_positional.push((passthrough.len(), a.to_string()));
+                    positional_files.push((passthrough.len(), a.to_string()));
                 }
             }
         }
@@ -871,6 +859,8 @@ fn run(args: &[String]) -> Result<(), String> {
         if script_path.is_some() {
             eprintln!("lccc-ld: warning: -r with a linker script: script ignored");
         }
+        let ordered = ordered_args(&passthrough, &positional_files);
+        let inputs = lccc::linker_entry::expand_file_mode_libs(&ordered, &inputs, &[], "-r")?;
         let mut objects = Vec::new();
         lccc::linker_entry::load_inputs_x86(&inputs, &mut objects, &undefined_symbols)?;
         return lccc::linker_entry::link_relocatable_x86(&objects, &output);
@@ -899,6 +889,13 @@ fn run(args: &[String]) -> Result<(), String> {
     // Mode 2: script-driven link (kernel-style -T).
     // ------------------------------------------------------------------
     if let Some(script_path) = script_path {
+        let mut script_src = std::fs::read_to_string(&script_path)
+            .map_err(|e| format!("cannot read script '{}': {}", script_path, e))?;
+        // `-l` resolves against `-L`, then the script's SEARCH_DIRs.
+        let ordered = ordered_args(&passthrough, &positional_files);
+        let search_dirs = lccc::linker_entry::script_search_dirs(&script_src)?;
+        let inputs =
+            lccc::linker_entry::expand_file_mode_libs(&ordered, &inputs, &search_dirs, "-T")?;
         let mut objects = if elf_i386 {
             lccc::linker_entry::load_inputs_i386_script(&inputs, &undefined_symbols)?
         } else {
@@ -933,8 +930,6 @@ fn run(args: &[String]) -> Result<(), String> {
             synthetic.insert(objects.len());
             objects.push(carrier);
         }
-        let mut script_src = std::fs::read_to_string(&script_path)
-            .map_err(|e| format!("cannot read script '{}': {}", script_path, e))?;
         if let Some(e) = entry_override {
             // command-line -e overrides ENTRY() in the script
             script_src = format!("ENTRY({})\n{}", e, script_src);
@@ -987,7 +982,7 @@ fn run(args: &[String]) -> Result<(), String> {
     // the SAME i686 pipeline the `lccc-i686` compiler driver links with,
     // with every file and library arriving positionally, in order.
     if elf_i386 {
-        let i386_args = i386_ordered_args(&passthrough, &i386_positional, &bstatic_alias_at);
+        let i386_args = ordered_args(&passthrough, &positional_files);
         if shared {
             return lccc::linker_entry::link_shared_i386(&output, &i386_args);
         }

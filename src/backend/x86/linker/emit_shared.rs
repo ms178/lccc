@@ -3,7 +3,7 @@
 //! Emits an ELF64 shared library (ET_DYN) with PIC relocations, PLT stubs,
 //! `.dynamic` section, and GNU hash tables.
 
-use crate::backend::elf::push_strtab_name;
+use crate::backend::elf::{STV_DEFAULT, STV_PROTECTED, push_strtab_name};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use std::collections::BTreeSet;
 
@@ -78,14 +78,29 @@ fn push_verdef_entry_with_parent(
 /// provider-side `.gnu.version_d`. Omitting this table makes glibc's internal
 /// `*_rtld_global*@GLIBC_PRIVATE` references look unversioned at load time and
 /// fails before `main` with a misleading undefined-symbol diagnostic.
-fn push_verneed_entry(buf: &mut Vec<u8>, soname_off: usize, versions: &[(String, u16, usize)]) {
+///
+/// `last` terminates the Verneed chain. Every other node's `vn_next` is the
+/// byte distance to the following node, which (Vernaux records being laid out
+/// directly behind their Verneed) is `16 + 16 * versions.len()`. Writing 0 for
+/// every node -- as this emitter once did -- truncates the chain after the
+/// first provider: `readelf -V` warns "Invalid vn_next field of 0", ld.so
+/// never sees the later providers' versions, and GNU ld refuses to link
+/// against the library (`_Unwind_Resume: invalid needed version 3` for a C++
+/// DSO that needs libc.so.6, libgcc_s.so.1 and libstdc++.so.6).
+fn push_verneed_entry(
+    buf: &mut Vec<u8>,
+    soname_off: usize,
+    versions: &[(String, u16, usize)],
+    last: bool,
+) {
     let start = buf.len();
     buf.resize(start + 16, 0);
     w16(buf, start, 1); // vn_version
     w16(buf, start + 2, versions.len() as u16);
     w32(buf, start + 4, soname_off as u32);
     w32(buf, start + 8, 16); // vn_aux: first Vernaux
-    w32(buf, start + 12, 0); // one provider per node in this emitter
+    let next = if last { 0 } else { 16 + 16 * versions.len() };
+    w32(buf, start + 12, next as u32);
     for (idx, (version, other, name_off)) in versions.iter().enumerate() {
         let aux = buf.len();
         buf.resize(aux + 16, 0);
@@ -99,6 +114,40 @@ fn push_verneed_entry(buf: &mut Vec<u8>, soname_off: usize, versions: &[(String,
             if idx + 1 == versions.len() { 0 } else { 16 },
         );
     }
+}
+
+/// GOT slots (or slot pairs) of LOCAL symbols, keyed by (object index,
+/// symbol index) and numbered in first-reference order, so the layout is
+/// deterministic.
+#[derive(Default)]
+struct LocalSlots {
+    order: Vec<(usize, usize)>,
+    index: FxHashMap<(usize, usize), usize>,
+}
+
+impl LocalSlots {
+    fn insert(&mut self, key: (usize, usize)) {
+        if let std::collections::hash_map::Entry::Vacant(e) = self.index.entry(key) {
+            e.insert(self.order.len());
+            self.order.push(key);
+        }
+    }
+    fn len(&self) -> usize {
+        self.order.len()
+    }
+    fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+    fn get(&self, key: (usize, usize)) -> Option<usize> {
+        self.index.get(&key).copied()
+    }
+}
+
+/// Linkage symbols GNU ld defines with hidden visibility: they name this
+/// image's own GOT and dynamic section and are never published in `.dynsym`
+/// (a reference from another module would bind to the wrong image's table).
+fn is_hidden_linkage_symbol(name: &str) -> bool {
+    matches!(name, "_GLOBAL_OFFSET_TABLE_" | "_DYNAMIC")
 }
 
 fn elf_hash_name(name: &str) -> u32 {
@@ -214,6 +263,84 @@ pub(super) fn emit_shared_library(
             .collect()
     };
 
+    // One definition of "exported" and "preemptible" serves every decision
+    // below: `.dynsym` membership, PLT routing, the relocation a GOT slot
+    // gets, and the flavour of an `R_X86_64_64`.  They used to be re-derived
+    // at each site from different inputs -- the PLT scan read the
+    // *referencing* object's `st_other`, the export filter read no
+    // visibility at all, and the GOT pass treated every local definition as
+    // non-preemptible -- so hidden symbols were exported while exported data
+    // was bound with `R_X86_64_RELATIVE`, which splits a copy-relocated
+    // variable in two (the executable reads its copy, this library writes
+    // the original).
+    //
+    // exported:    a definition in this output that `.dynsym` publishes --
+    //              not HIDDEN/INTERNAL (merged gABI visibility), not
+    //              version-script local, not from an `--exclude-libs`
+    //              archive, and not one of the linkage symbols GNU ld
+    //              defines hidden (`_GLOBAL_OFFSET_TABLE_`, `_DYNAMIC`).
+    // preemptible: exported with DEFAULT visibility and no `-Bsymbolic`:
+    //              ld.so may bind it to another module's definition, so
+    //              every reference from this library must go through a
+    //              symbolic dynamic relocation (or the PLT).
+    let is_version_local = |name: &str| {
+        version_script
+            .as_ref()
+            .is_some_and(|vs| vs.any_local_star() && !vs.matches_global(&sym_base(name)))
+    };
+    let exports_def = |name: &str, g: &GlobalSymbol| -> bool {
+        g.defined_in.is_some()
+            && !g.is_dynamic
+            && (g.info >> 4) != STB_LOCAL
+            && g.section_idx != SHN_UNDEF
+            && linker_common::is_dynamic_visibility(g.visibility)
+            && !is_hidden_linkage_symbol(name)
+            && !is_version_local(name)
+            && !excluded_syms.contains(name)
+    };
+    // Symbols this emitter defines itself once the layout is known
+    // (`_end`, `__bss_start`, `__start_SEC`, ...; see "Define
+    // linker-provided symbols" below).  They are ADDRESSES in this image even
+    // though they are recorded with SHN_ABS and no defining object: GOT
+    // slots and R_X86_64_64 fields holding them need R_X86_64_RELATIVE, and
+    // their `.dynsym` entries need a real section index -- an SHN_ABS entry
+    // is not relocated by ld.so.  They bind locally (GNU ld gives
+    // `__start_`/`__stop_` protected visibility), so they are never
+    // preemptible.  Only names still undefined here are provided.
+    let linker_provided: FxHashSet<String> =
+        get_standard_linker_symbols(&LinkerSymbolAddresses::default())
+            .iter()
+            .map(|s| s.name.to_string())
+            .chain(
+                linker_common::resolve_start_stop_symbols(output_sections)
+                    .into_iter()
+                    .map(|(n, _)| n),
+            )
+            .filter(|n| {
+                globals
+                    .get(n)
+                    .is_none_or(|g| g.defined_in.is_none() && !g.is_dynamic)
+            })
+            .collect();
+    let preemptible_def = |name: &str, g: &GlobalSymbol| -> bool {
+        exports_def(name, g)
+            && g.visibility == STV_DEFAULT
+            && !bsymbolic
+            && !linker_provided.contains(name)
+    };
+    // A genuinely absolute definition (SHN_ABS input symbol, `--defsym`
+    // constant): its value must not move with the load address.
+    let is_abs = |name: &str, g: &GlobalSymbol| -> bool {
+        g.section_idx == SHN_ABS && !linker_provided.contains(name)
+    };
+    // An undefined, non-DSO symbol is imported through `.dynsym` unless its
+    // merged visibility is HIDDEN/INTERNAL: a hidden undefined weak symbol
+    // resolves to 0 inside this component and must never become a dynamic
+    // reference (it could be satisfied by some other module's definition).
+    let imports_undef = |g: &GlobalSymbol| -> bool {
+        g.is_dynamic || linker_common::is_dynamic_visibility(g.visibility)
+    };
+
     // Identify symbols that need PLT entries: any symbol referenced via
     // R_X86_64_PLT32 or R_X86_64_PC32 that is not defined locally.
     // In shared libraries, undefined symbols are resolved at runtime by the
@@ -251,24 +378,21 @@ pub(super) fn emit_shared_library(
                             let locally_defined = gsym.defined_in.is_some() && !gsym.is_dynamic;
                             // External references always need a stub.
                             let external = gsym.is_dynamic
-                                || (gsym.defined_in.is_none() && gsym.section_idx == SHN_UNDEF);
+                                || (gsym.defined_in.is_none()
+                                    && gsym.section_idx == SHN_UNDEF
+                                    && imports_undef(gsym));
                             // GNU semantics: calls to our own EXPORTED functions
                             // also route through the PLT so LD_PRELOAD /
                             // earlier-DSO interposition works. Direct binding
-                            // only for hidden/protected visibility (not
-                            // exported), version-script-locals, or -Bsymbolic.
-                            let hidden = sym.visibility() != 0; // STV_HIDDEN/PROTECTED/INTERNAL
-                            let version_local = version_script.as_ref().is_some_and(|vs| {
-                                vs.any_local_star() && !vs.matches_global(&sym_base(&sym.name))
-                            }) || excluded_syms.contains(sym.name.as_str());
+                            // for everything `preemptible_def` rejects: merged
+                            // HIDDEN/PROTECTED/INTERNAL visibility, version-
+                            // script locals, --exclude-libs, -Bsymbolic.
                             let is_func = (gsym.info & 0xf) == STT_FUNC
                                 || sym.sym_type() == STT_FUNC
                                 || rela.rela_type == R_X86_64_PLT32;
                             let interposable = locally_defined
                                 && is_func
-                                && !hidden
-                                && !version_local
-                                && !bsymbolic;
+                                && preemptible_def(sym.name.as_str(), gsym);
                             if (external || interposable) && plt_seen.insert(sym.name.to_string()) {
                                 plt_names.push(sym.name.to_string());
                             }
@@ -298,6 +422,8 @@ pub(super) fn emit_shared_library(
                     section_idx: SHN_UNDEF,
                     is_dynamic: true,
                     copy_reloc: false,
+                    canonical_plt: false,
+                    visibility: 0,
                     lib_sym_value: 0,
                     version: None,
                     plt_idx: None,
@@ -314,9 +440,31 @@ pub(super) fn emit_shared_library(
         }
     }
 
-    // Collect symbols that need GOT entries (GOTPCREL references).
-    // For undefined symbols, these need R_X86_64_GLOB_DAT relocations
-    // (or R_X86_64_TPOFF64 for TLS symbols referenced via GOTTPOFF).
+    // A GOT-indirect reference to a non-preemptible, non-IFUNC, non-absolute
+    // definition can address it directly (`elf::gotpcrelx_relaxation` decides
+    // for the instruction).  PIC rules: only the `lea`, `addr32 call` and
+    // `jmp` forms -- the immediate forms would embed a load-time address.
+    // The scan below and the relocation pass ask the same question of the
+    // same original bytes, so every reference left unrelaxed has a slot.
+    let relax_target = |name: &str, g: &GlobalSymbol| -> bool {
+        g.defined_in.is_some()
+            && !g.is_dynamic
+            && g.section_idx != SHN_UNDEF
+            && !is_abs(name, g)
+            && (g.info & 0xf) != STT_GNU_IFUNC
+            && !preemptible_def(name, g)
+    };
+    let local_relax_target = |sym: &Symbol| sym.shndx != SHN_ABS && sym.sym_type() != STT_GNU_IFUNC;
+
+    // GOT slots.  Global symbols are keyed by name (one slot per symbol, and
+    // their dynamic relocations name the `.dynsym` entry); LOCAL symbols by
+    // (object, symbol index): two translation units may each have a
+    // `static __thread int x`, and keying those by name -- as this emitter
+    // once did for TLSGD -- hands both the same slot.
+    //   got_needed_names  GOTPCREL* (non-relaxed) and GOTTPOFF of globals
+    //   tlsgd_names       TLSGD pairs of globals
+    //   tlsdesc_names     TLSDESC pairs of globals
+    //   local_gd / local_desc / local_ie / local_got: the same for locals
     let mut got_needed_names: Vec<String> = Vec::new();
     let mut got_needed_seen: FxHashSet<String> = FxHashSet::default();
     let mut tlsgd_seen: FxHashSet<String> = FxHashSet::default();
@@ -324,10 +472,18 @@ pub(super) fn emit_shared_library(
     // TLS General-Dynamic symbols: each needs a GOT slot PAIR
     // (DTPMOD64 at slot, DTPOFF64 at slot+8).
     let mut tlsgd_names: Vec<String> = Vec::new();
+    // TLS descriptors: a 16-byte pair each, filled by ld.so from one
+    // R_X86_64_TLSDESC.
+    let mut tlsdesc_names: Vec<String> = Vec::new();
+    let mut tlsdesc_seen: FxHashSet<String> = FxHashSet::default();
+    let mut local_gd = LocalSlots::default();
+    let mut local_desc = LocalSlots::default();
+    let mut local_ie = LocalSlots::default();
+    let mut local_got = LocalSlots::default();
     // TLS Local-Dynamic: one shared GOT pair (DTPMOD64, 0) per module.
     let mut needs_tlsld_slot = false;
-    for obj in objects.iter() {
-        for sec_relas in &obj.relocations {
+    for (obj_idx, obj) in objects.iter().enumerate() {
+        for (sec_idx, sec_relas) in obj.relocations.iter().enumerate() {
             for rela in sec_relas {
                 let si = rela.sym_idx as usize;
                 if si >= obj.symbols.len() {
@@ -341,26 +497,43 @@ pub(super) fn emit_shared_library(
                 if sym.name.is_empty() {
                     continue;
                 }
-                // Skip local symbols - they don't need GOT entries in dynsym
-                // (e.g. static _Thread_local variables referenced via GOTTPOFF)
+                let relaxable = || {
+                    gotpcrelx_relaxation(
+                        rela.rela_type,
+                        rela.addend,
+                        obj.section_data[sec_idx].as_slice(),
+                        rela.offset as usize,
+                        true,
+                    )
+                    .is_some()
+                };
                 if sym.is_local() {
-                    // ...but a local symbol referenced via TLSGD still needs a
-                    // GOT pair; use the symbol's mangled per-object identity.
-                    if rela.rela_type == R_X86_64_TLSGD && tlsgd_seen.insert(sym.name.to_string()) {
-                        tlsgd_names.push(sym.name.to_string());
+                    // Never preemptible and never in `.dynsym`; its slots are
+                    // filled with module-relative values (RELATIVE, or TLS
+                    // relocations against symbol 0 with the TLS-block offset
+                    // as addend).
+                    let key = (obj_idx, si);
+                    match rela.rela_type {
+                        R_X86_64_TLSGD => local_gd.insert(key),
+                        t if is_tlsdesc_gotpc(t) => local_desc.insert(key),
+                        t if is_gottpoff_family(t) => local_ie.insert(key),
+                        t if is_gotpcrel_family(t) => {
+                            if !(local_relax_target(sym) && relaxable()) {
+                                local_got.insert(key);
+                            }
+                        }
+                        _ => {}
                     }
                     continue;
                 }
                 match rela.rela_type {
-                    R_X86_64_GOTPCREL
-                    | R_X86_64_GOTPCRELX
-                    | R_X86_64_REX_GOTPCRELX
-                    | R_X86_64_CODE_4_GOTPCRELX
-                    | R_X86_64_CODE_6_GOTPCRELX
-                    | R_X86_64_GOTTPOFF
-                    | R_X86_64_CODE_4_GOTTPOFF
-                    | R_X86_64_CODE_6_GOTTPOFF => {
-                        if got_needed_seen.insert(sym.name.to_string()) {
+                    t if is_gotpcrel_family(t) || is_gottpoff_family(t) => {
+                        let relaxed = is_gotpcrel_family(t)
+                            && globals
+                                .get(sym.name.as_str())
+                                .is_some_and(|g| relax_target(&sym.name, g))
+                            && relaxable();
+                        if !relaxed && got_needed_seen.insert(sym.name.to_string()) {
                             got_needed_names.push(sym.name.to_string());
                         }
                         // Track TLS symbols for proper dynamic relocation emission
@@ -373,17 +546,29 @@ pub(super) fn emit_shared_library(
                             tlsgd_names.push(sym.name.to_string());
                         }
                     }
+                    t if is_tlsdesc_gotpc(t) => {
+                        if tlsdesc_seen.insert(sym.name.to_string()) {
+                            tlsdesc_names.push(sym.name.to_string());
+                        }
+                    }
                     _ => {}
                 }
             }
         }
     }
     // Ensure GOT-referenced undefined symbols are in globals for dynsym
-    for name in &got_needed_names {
+    for name in got_needed_names
+        .iter()
+        .chain(tlsgd_names.iter())
+        .chain(tlsdesc_names.iter())
+    {
         if !globals.contains_key(name) {
             // Use STT_TLS for TLS symbols so the dynamic symbol table has the
             // correct type, allowing the dynamic linker to resolve them properly.
-            let stype = if tls_got_names.contains(name) {
+            let stype = if tls_got_names.contains(name)
+                || tlsgd_seen.contains(name)
+                || tlsdesc_seen.contains(name)
+            {
                 STT_TLS
             } else {
                 STT_FUNC
@@ -399,6 +584,8 @@ pub(super) fn emit_shared_library(
                     section_idx: SHN_UNDEF,
                     is_dynamic: true,
                     copy_reloc: false,
+                    canonical_plt: false,
+                    visibility: 0,
                     lib_sym_value: 0,
                     version: None,
                     plt_idx: None,
@@ -434,41 +621,17 @@ pub(super) fn emit_shared_library(
     let mut dyn_sym_seen: FxHashSet<String> = FxHashSet::default();
     let mut exported: Vec<String> = globals
         .iter()
-        .filter(|(name, g)| {
-            if !(g.defined_in.is_some() && !g.is_dynamic
-                && (g.info >> 4) != 0 // not STB_LOCAL
-                && g.section_idx != SHN_UNDEF)
-            {
-                return false;
-            }
-            // GNU version scripts commonly use `local: *;` to hide all symbols
-            // except listed API patterns.  Honor that for shared libraries so
-            // FFmpeg-style DSOs expose the intended ABI and produce versioned
-            // dynamic symbols for consumers like mpv.
-            if let Some(ref vs) = version_script {
-                // .symver-derived globals are keyed "base@@VER"/"base@VER";
-                // the script's patterns name the BASE. Matching the composed
-                // string dropped every explicitly-versioned export: glibc's
-                // libc.so lost fdopen/fopen/... (defined as
-                // _IO_new_fdopen + `.symver fdopen@@GLIBC_2.2.5`) and
-                // sotruss-lib.so failed with `undefined reference to fdopen`
-                // even though the DSO was right there on the command line.
-                if vs.any_local_star() && !vs.matches_global(&sym_base(name)) {
-                    return false;
-                }
-            }
-            // --exclude-libs: symbols pulled in from the named static
-            // archives are linked in but NOT re-exported. This is how a
-            // shared library statically absorbs a helper archive (OpenSSL's
-            // libcrypto.a inside a plugin .so is the canonical case) without
-            // leaking that archive's entire symbol table into its ABI, where
-            // it would collide with a different version loaded elsewhere in
-            // the process.
-            if excluded_syms.contains(name.as_str()) {
-                return false;
-            }
-            true
-        })
+        // `exports_def` above.  Two of its clauses deserve their history:
+        // * version scripts: `.symver`-derived globals are keyed
+        //   "base@@VER"/"base@VER" while the script's patterns name the BASE;
+        //   matching the composed string dropped every explicitly-versioned
+        //   export (glibc's libc.so lost fdopen/fopen/..., defined as
+        //   _IO_new_fdopen + `.symver fdopen@@GLIBC_2.2.5`).
+        // * --exclude-libs: symbols pulled in from the named static archives
+        //   are linked in but NOT re-exported -- how a shared library absorbs
+        //   a helper archive (OpenSSL's libcrypto.a inside a plugin .so)
+        //   without leaking it into its ABI.
+        .filter(|(name, g)| exports_def(name, g))
         .map(|(n, _)| n.clone())
         .collect();
     exported.sort();
@@ -480,7 +643,11 @@ pub(super) fn emit_shared_library(
 
     // Also add undefined/dynamic symbols (from -l libs and PLT imports)
     for (name, gsym) in globals.iter() {
-        if (gsym.is_dynamic || (gsym.defined_in.is_none() && gsym.section_idx == SHN_UNDEF))
+        if (gsym.is_dynamic
+            || (gsym.defined_in.is_none()
+                && gsym.section_idx == SHN_UNDEF
+                && imports_undef(gsym)
+                && !is_hidden_linkage_symbol(name)))
             && !dyn_sym_seen.contains(name)
         {
             dyn_sym_seen.insert(name.clone());
@@ -492,10 +659,15 @@ pub(super) fn emit_shared_library(
     // relocations are in dynsym.  Version-script-local definitions are resolved
     // with RELATIVE relocations below and must not be re-exported here.
     for name in &abs64_sym_names {
-        let is_version_local = version_script
-            .as_ref()
-            .is_some_and(|vs| vs.any_local_star() && !vs.matches_global(&sym_base(name)));
-        if !is_version_local && dyn_sym_seen.insert(name.clone()) {
+        // A local definition is published only if `exports_def` says so (a
+        // hidden or version-local one is bound with R_X86_64_RELATIVE); an
+        // undefined one only if it is really imported.
+        let publish = match globals.get(name) {
+            Some(g) if g.defined_in.is_some() && !g.is_dynamic => exports_def(name, g),
+            Some(g) => imports_undef(g),
+            None => true,
+        } && !is_hidden_linkage_symbol(name);
+        if publish && dyn_sym_seen.insert(name.clone()) {
             dyn_sym_names.push(name.clone());
         }
     }
@@ -922,7 +1094,7 @@ pub(super) fn emit_shared_library(
     let verdef_size = verdef_data.len() as u64;
 
     let mut verneed_data = Vec::new();
-    for lib in &sorted_needed_libs {
+    for (lib_i, lib) in sorted_needed_libs.iter().enumerate() {
         let mut versions: Vec<(String, u16, usize)> = needed_versions[lib]
             .iter()
             .filter_map(|version| {
@@ -934,7 +1106,8 @@ pub(super) fn emit_shared_library(
             .collect();
         versions.sort_by(|a, b| a.1.cmp(&b.1));
         let soname_off = dynstr.get_offset(lib);
-        push_verneed_entry(&mut verneed_data, soname_off, &versions);
+        let last = lib_i + 1 == sorted_needed_libs.len();
+        push_verneed_entry(&mut verneed_data, soname_off, &versions, last);
     }
     let verneed_size = verneed_data.len() as u64;
     let verneed_count = sorted_needed_libs.len() as u64;
@@ -1086,7 +1259,31 @@ pub(super) fn emit_shared_library(
     // phdrs: PHDR, LOAD(ro), LOAD(text), LOAD(rodata), LOAD(rw), DYNAMIC,
     // NOTE* + GNU_PROPERTY, GNU_STACK, [GNU_RELRO], [TLS]
     let has_relro = !sections_with_abs_relocs.is_empty();
+    // .eh_frame_hdr + PT_GNU_EH_FRAME.  Not optional for a shared library:
+    // modern crtbeginS.o no longer registers `.eh_frame` with
+    // `__register_frame_info`, so libgcc's unwinder finds a DSO's FDEs ONLY
+    // through `dl_iterate_phdr` -> PT_GNU_EH_FRAME.  Without it a C++
+    // exception thrown through this library reaches std::terminate and
+    // backtrace() stops at its first frame.  Same sizing as `emit_exec`.
+    let eh_frame_fde_count: usize = output_sections
+        .iter()
+        .filter(|s| s.name == ".eh_frame" && s.mem_size > 0)
+        .flat_map(|s| s.inputs.iter())
+        .map(|input| {
+            linker_common::count_eh_frame_fdes(
+                &objects[input.object_idx].section_data[input.section_idx],
+            )
+        })
+        .sum();
+    let eh_frame_hdr_size: u64 = if eh_frame_fde_count > 0 {
+        (12 + 8 * eh_frame_fde_count) as u64
+    } else {
+        0
+    };
     let mut phdr_count: u64 = 7; // base count
+    if eh_frame_hdr_size > 0 {
+        phdr_count += 1; // PT_GNU_EH_FRAME
+    }
     if has_tls_sections {
         phdr_count += 1;
     }
@@ -1101,6 +1298,11 @@ pub(super) fn emit_shared_library(
     let has_post_relro_content = got_plt_size > 0
         || !got_needed_names.is_empty()
         || !tlsgd_names.is_empty()
+        || !tlsdesc_names.is_empty()
+        || !local_gd.is_empty()
+        || !local_desc.is_empty()
+        || !local_ie.is_empty()
+        || !local_got.is_empty()
         || needs_tlsld_slot
         || output_sections.iter().any(|s| {
             s.flags & SHF_ALLOC != 0
@@ -1197,6 +1399,15 @@ pub(super) fn emit_shared_library(
     new_segment!();
     let rodata_page_offset = offset;
     let rodata_page_addr = vaddr!(offset);
+    // .eh_frame_hdr leads the rodata segment (filled after relocation).
+    let (eh_frame_hdr_offset, eh_frame_hdr_vaddr) = if eh_frame_hdr_size > 0 {
+        let o = offset;
+        let v = vaddr!(offset);
+        offset += eh_frame_hdr_size;
+        (o, v)
+    } else {
+        (0u64, 0u64)
+    };
     for (idx, sec) in output_sections.iter_mut().enumerate() {
         if is_pure_rodata(idx, sec) {
             let a = sec.alignment.max(1);
@@ -1284,6 +1495,11 @@ pub(super) fn emit_shared_library(
     max_rela_count += got_needed.len();
     // Each TLSGD pair may emit DTPMOD64 + DTPOFF64; the TLSLD slot emits DTPMOD64.
     max_rela_count += tlsgd_names.len() * 2 + if needs_tlsld_slot { 1 } else { 0 };
+    // One relocation per TLS descriptor, local GD pair (DTPMOD64 only: the
+    // offset is static), local IE slot (TPOFF64) and local GOT slot
+    // (RELATIVE, none for an absolute symbol).
+    max_rela_count +=
+        tlsdesc_names.len() + local_desc.len() + local_gd.len() + local_ie.len() + local_got.len();
     let rela_dyn_max_size = max_rela_count as u64 * 24;
     offset += rela_dyn_max_size;
 
@@ -1345,14 +1561,21 @@ pub(super) fn emit_shared_library(
     let got_plt_addr = vaddr!(offset);
     offset += got_plt_size;
 
-    // GOT for locally-resolved symbols, followed by TLS GD pairs and the
-    // optional LD pair. Layout:
-    //   [got_needed slots][GD pair 0][GD pair 1]...[LD pair]
+    // .got layout (offsets within the section):
+    //   [got_needed slots][GD pairs][local GD pairs][TLSDESC pairs]
+    //   [local TLSDESC pairs][LD pair][local IE slots][local GOT slots]
+    // Pairs come first so every 16-byte pair stays 8-aligned (all entries
+    // are 8 bytes; nothing needs more).
     let got_offset = offset;
     let got_addr = vaddr!(offset);
     let tlsgd_got_base = got_needed.len() as u64 * 8; // offset of first GD pair within .got
-    let tlsld_got_off = tlsgd_got_base + tlsgd_names.len() as u64 * 16;
-    let got_size = tlsld_got_off + if needs_tlsld_slot { 16 } else { 0 };
+    let local_gd_base = tlsgd_got_base + tlsgd_names.len() as u64 * 16;
+    let tlsdesc_base = local_gd_base + local_gd.len() as u64 * 16;
+    let local_desc_base = tlsdesc_base + tlsdesc_names.len() as u64 * 16;
+    let tlsld_got_off = local_desc_base + local_desc.len() as u64 * 16;
+    let local_ie_base = tlsld_got_off + if needs_tlsld_slot { 16 } else { 0 };
+    let local_got_base = local_ie_base + local_ie.len() as u64 * 8;
+    let got_size = local_got_base + local_got.len() as u64 * 8;
     offset += got_size;
 
     for sec in output_sections.iter_mut() {
@@ -1502,6 +1725,8 @@ pub(super) fn emit_shared_library(
             section_idx: SHN_ABS,
             is_dynamic: false,
             copy_reloc: false,
+            canonical_plt: false,
+            visibility: 0,
             lib_sym_value: 0,
             version: None,
         });
@@ -1750,6 +1975,20 @@ pub(super) fn emit_shared_library(
             ph += 56;
         }
     }
+    if eh_frame_hdr_size > 0 {
+        wphdr(
+            &mut out,
+            ph,
+            PT_GNU_EH_FRAME,
+            PF_R,
+            eh_frame_hdr_offset,
+            eh_frame_hdr_vaddr,
+            eh_frame_hdr_size,
+            eh_frame_hdr_size,
+            4,
+        );
+        ph += 56;
+    }
     wphdr(&mut out, ph, PT_GNU_STACK, PF_R | PF_W, 0, 0, 0, 0, 0x10);
     ph += 56;
     if has_relro {
@@ -1816,13 +2055,15 @@ pub(super) fn emit_shared_library(
         w32(&mut out, ds, no);
         if let Some(gsym) = globals.get(name) {
             if gsym.defined_in.is_some() && !gsym.is_dynamic && gsym.section_idx != SHN_UNDEF {
-                // Exported defined symbol: preserve original st_info (type + binding)
+                // Exported defined symbol: preserve original st_info (type
+                // + binding); st_other carries PROTECTED (the only
+                // non-default visibility an exported symbol can have).
                 if ds + 5 < out.len() {
                     out[ds + 4] = gsym.info;
-                    out[ds + 5] = 0;
+                    out[ds + 5] = gsym.visibility;
                 }
-                // shndx=1: marks symbol as defined (non-UNDEF). The dynamic linker
-                // only checks UNDEF vs defined, not the actual section index.
+                // Placeholder; the real section index is patched in once
+                // section-header numbering is fixed (`def_shndx` below).
                 w16(&mut out, ds + 6, 1);
                 // For TLS symbols, the value must be the offset within the TLS segment,
                 // not the virtual address. The dynamic linker uses this offset to
@@ -1940,7 +2181,9 @@ pub(super) fn emit_shared_library(
         for (i, name) in plt_names.iter().enumerate() {
             let gea = gpb + i as u64 * 8;
             // Find symbol index in dynsym
-            let si = dyn_sym_index.get(name.as_str()).copied().unwrap_or(0);
+            let si = dyn_sym_index.get(name.as_str()).copied().ok_or_else(|| {
+                format!("internal error: PLT entry for '{name}', which is not in .dynsym")
+            })?;
             w64(&mut out, rp, gea); // r_offset = GOT.PLT slot address
             w64(&mut out, rp + 8, (si << 32) | R_X86_64_JUMP_SLOT as u64);
             w64(&mut out, rp + 16, 0); // r_addend = 0
@@ -1948,72 +2191,98 @@ pub(super) fn emit_shared_library(
         }
     }
 
-    // Build GOT entries map
+    // Build GOT entries map.  Slot CONTENTS and their dynamic relocations
+    // are decided once, per slot, in the pass below the TLS setup.
     let mut got_sym_addrs: FxHashMap<String, u64> = FxHashMap::default();
     for (i, name) in got_needed.iter().enumerate() {
-        let gea = got_addr + i as u64 * 8;
-        got_sym_addrs.insert(name.clone(), gea);
-        // Fill GOT with resolved symbol value (skip TLS - handled in reloc loop below)
-        if !tls_got_names.contains(name) {
-            if let Some(gsym) = globals.get(name) {
-                if gsym.defined_in.is_some() && !gsym.is_dynamic {
-                    w64(&mut out, (got_offset + i as u64 * 8) as usize, gsym.value);
-                }
-            }
-        }
+        got_sym_addrs.insert(name.clone(), got_addr + i as u64 * 8);
     }
 
     // Apply relocations and collect dynamic relocation entries
     let globals_snap: FxHashMap<String, GlobalSymbol> = globals.clone();
     let mut rela_dyn_entries: Vec<(u64, u64)> = Vec::new(); // (offset, value) for RELATIVE relocs
     let mut glob_dat_entries: Vec<(u64, String)> = Vec::new(); // (offset, sym_name) for GLOB_DAT relocs
-    let mut tpoff64_entries: Vec<(u64, String)> = Vec::new(); // (offset, sym_name) for R_X86_64_TPOFF64 relocs
+    // (offset, sym_name or "" for symbol 0, addend) for R_X86_64_TPOFF64:
+    // symbolic for a preemptible/imported TLS symbol, symbol 0 plus the
+    // offset inside this module's TLS block otherwise -- the thread-pointer
+    // offset of a shared library's block is only known to ld.so.
+    let mut tpoff64_entries: Vec<(u64, String, u64)> = Vec::new();
     let mut abs64_entries: Vec<(u64, String, i64)> = Vec::new(); // (offset, sym_name, addend) for R_X86_64_64 relocs
     // TLS module-id relocations: (got_slot_vaddr, sym_name_or_empty).
-    // DTPMOD64 always needed (module id known only at load time). DTPOFF64
-    // needed only for symbols that may be interposed (named globals).
+    // DTPMOD64 always needed (module id known only at load time); symbol 0
+    // means "this module".  DTPOFF64 only for preemptible/imported symbols.
     let mut dtpmod64_entries: Vec<(u64, String)> = Vec::new();
     let mut dtpoff64_entries: Vec<(u64, String)> = Vec::new();
+    // (descriptor vaddr, sym_name or "", addend) for R_X86_64_TLSDESC.
+    let mut tlsdesc_entries: Vec<(u64, String, u64)> = Vec::new();
 
-    // TLS GD/LD GOT pair setup
+    // A TLS symbol whose offset in THIS module's TLS block is a link-time
+    // constant: defined here and not preemptible.
+    let static_tls_offset = |name: &str| -> Option<u64> {
+        let g = globals_snap.get(name)?;
+        (g.defined_in.is_some()
+            && !g.is_dynamic
+            && g.section_idx != SHN_UNDEF
+            && !preemptible_def(name, g))
+        .then(|| g.value.wrapping_sub(tls_addr))
+    };
+    let local_sym_addr = |(obj_idx, si): (usize, usize)| -> u64 {
+        resolve_sym(
+            obj_idx,
+            &objects[obj_idx].symbols[si],
+            &globals_snap,
+            section_map,
+            output_sections,
+            plt_addr,
+        )
+    };
+
+    // TLS GD pairs (DTPMOD64 at slot, DTPOFF64 at slot+8).  A symbol defined
+    // here and not preemptible has a static DTPOFF and needs only the module
+    // id; anything else is resolved by ld.so against the DEFINING module --
+    // DTPMOD64 must then name the symbol, not symbol 0 ("this module"), or
+    // the access lands in this library's block at the other module's offset.
     let mut tlsgd_slot_addr: FxHashMap<String, u64> = FxHashMap::default();
     for (i, name) in tlsgd_names.iter().enumerate() {
         let slot = got_addr + tlsgd_got_base + i as u64 * 16;
         tlsgd_slot_addr.insert(name.clone(), slot);
-        dtpmod64_entries.push((slot, String::new())); // module id of THIS module
-        // DTPOFF: statically known when the symbol is defined here; store it.
-        let mut static_off: Option<u64> = None;
-        if let Some(g) = globals_snap.get(name) {
-            if g.defined_in.is_some() && !g.is_dynamic && g.section_idx != SHN_UNDEF {
-                static_off = Some(g.value.wrapping_sub(tls_addr));
-            }
-        }
-        // Local TLS symbols (not in globals): resolve from object symtabs.
-        if static_off.is_none() && !globals_snap.contains_key(name) {
-            'outer: for (oi, obj) in objects.iter().enumerate() {
-                for sym in &obj.symbols {
-                    if sym.name == *name && sym.shndx != 0 {
-                        if let Some(&(out_i, so)) = section_map.get(&(oi, sym.shndx as usize)) {
-                            static_off = Some(
-                                (output_sections[out_i].addr + so + sym.value)
-                                    .wrapping_sub(tls_addr),
-                            );
-                            break 'outer;
-                        }
-                    }
-                }
-            }
-        }
-        match static_off {
+        match static_tls_offset(name) {
             Some(off) => {
+                dtpmod64_entries.push((slot, String::new()));
                 w64(
                     &mut out,
                     (got_offset + tlsgd_got_base + i as u64 * 16 + 8) as usize,
                     off,
                 );
             }
-            None => dtpoff64_entries.push((slot + 8, name.clone())),
+            None => {
+                dtpmod64_entries.push((slot, name.clone()));
+                dtpoff64_entries.push((slot + 8, name.clone()));
+            }
         }
+    }
+    for (i, &key) in local_gd.order.iter().enumerate() {
+        let off = local_gd_base + i as u64 * 16;
+        dtpmod64_entries.push((got_addr + off, String::new()));
+        let dtpoff = local_sym_addr(key).wrapping_sub(tls_addr);
+        w64(&mut out, (got_offset + off + 8) as usize, dtpoff);
+    }
+    // TLS descriptors: one R_X86_64_TLSDESC per 16-byte pair, resolved
+    // eagerly from .rela.dyn (glibc handles it there; no DT_TLSDESC_* lazy
+    // trampoline is needed).
+    let mut tlsdesc_slot_addr: FxHashMap<String, u64> = FxHashMap::default();
+    for (i, name) in tlsdesc_names.iter().enumerate() {
+        let slot = got_addr + tlsdesc_base + i as u64 * 16;
+        tlsdesc_slot_addr.insert(name.clone(), slot);
+        match static_tls_offset(name) {
+            Some(off) => tlsdesc_entries.push((slot, String::new(), off)),
+            None => tlsdesc_entries.push((slot, name.clone(), 0)),
+        }
+    }
+    for (i, &key) in local_desc.order.iter().enumerate() {
+        let slot = got_addr + local_desc_base + i as u64 * 16;
+        let off = local_sym_addr(key).wrapping_sub(tls_addr);
+        tlsdesc_entries.push((slot, String::new(), off));
     }
     let tlsld_slot = if needs_tlsld_slot {
         let slot = got_addr + tlsld_got_off;
@@ -2023,36 +2292,52 @@ pub(super) fn emit_shared_library(
     } else {
         None
     };
+    // Local IE slots: TPOFF64 against symbol 0, addend = block offset.
+    for (i, &key) in local_ie.order.iter().enumerate() {
+        let off = local_sym_addr(key).wrapping_sub(tls_addr);
+        tpoff64_entries.push((got_addr + local_ie_base + i as u64 * 8, String::new(), off));
+    }
+    // Local GOT slots: the symbol's address.  An absolute symbol's value is
+    // stored as-is; RELATIVE would add the load bias to it.
+    for (i, &(obj_idx, si)) in local_got.order.iter().enumerate() {
+        let off = local_got_base + i as u64 * 8;
+        let v = local_sym_addr((obj_idx, si));
+        if objects[obj_idx].symbols[si].shndx == SHN_ABS {
+            w64(&mut out, (got_offset + off) as usize, v);
+        } else {
+            rela_dyn_entries.push((got_addr + off, v));
+        }
+    }
 
-    // Add RELATIVE entries for GOT entries that point to local symbols,
-    // GLOB_DAT entries for GOT entries that point to external non-TLS symbols,
-    // and TPOFF64 entries for GOT entries that point to external TLS symbols.
+    // Global GOT slots.  Preemptible definitions get GLOB_DAT so that ld.so
+    // can bind them elsewhere -- above all to an executable's COPY of a data
+    // object, which RELATIVE would split in two -- non-preemptible ones a
+    // RELATIVE (or their value, if absolute); IE slots get TPOFF64.
     for (i, name) in got_needed.iter().enumerate() {
         let gea = got_addr + i as u64 * 8;
+        let slot_off = (got_offset + i as u64 * 8) as usize;
         let is_tls = tls_got_names.contains(name);
-        if let Some(gsym) = globals_snap.get(name) {
-            if gsym.defined_in.is_some() && !gsym.is_dynamic && gsym.section_idx != SHN_UNDEF {
-                if is_tls {
-                    // Locally-defined TLS symbol: compute TPOFF and store in GOT
-                    let tpoff = (gsym.value as i64 - tls_addr as i64) - tls_mem_size as i64;
-                    w64(&mut out, (got_offset + i as u64 * 8) as usize, tpoff as u64);
-                    // No dynamic relocation needed - statically resolved
-                } else {
-                    rela_dyn_entries.push((gea, gsym.value));
-                }
-            } else if is_tls {
-                // External TLS symbol - needs R_X86_64_TPOFF64 dynamic relocation
-                tpoff64_entries.push((gea, name.clone()));
-            } else {
-                // External non-TLS symbol - needs GLOB_DAT
-                glob_dat_entries.push((gea, name.clone()));
+        let g = globals_snap.get(name);
+        let local_def =
+            g.filter(|g| g.defined_in.is_some() && !g.is_dynamic && g.section_idx != SHN_UNDEF);
+        if is_tls {
+            match static_tls_offset(name) {
+                Some(off) => tpoff64_entries.push((gea, String::new(), off)),
+                None => tpoff64_entries.push((gea, name.clone(), 0)),
             }
-        } else if is_tls {
-            // Unknown TLS symbol - needs R_X86_64_TPOFF64
-            tpoff64_entries.push((gea, name.clone()));
-        } else {
-            // Unknown symbol - needs GLOB_DAT
-            glob_dat_entries.push((gea, name.clone()));
+            continue;
+        }
+        match local_def {
+            Some(g) if preemptible_def(name, g) => glob_dat_entries.push((gea, name.clone())),
+            Some(g) if is_abs(name, g) => w64(&mut out, slot_off, g.value),
+            Some(g) => {
+                w64(&mut out, slot_off, g.value);
+                rela_dyn_entries.push((gea, g.value));
+            }
+            // A hidden undefined (weak) symbol is 0 in this component: the
+            // slot keeps its zero and has no relocation.
+            None if g.is_some_and(|g| !imports_undef(g)) => {}
+            None => glob_dat_entries.push((gea, name.clone())),
         }
     }
 
@@ -2108,6 +2393,35 @@ pub(super) fn emit_shared_library(
                     output_sections,
                     plt_addr,
                 );
+                let global = (!sym.name.is_empty() && !sym.is_local())
+                    .then(|| globals_snap.get(sym.name.as_str()))
+                    .flatten();
+                // A reference that ld.so cannot see (the target is bound
+                // inside this library) to an IFUNC would need
+                // R_X86_64_IRELATIVE plus an IPLT stub, which this emitter
+                // does not build; resolving it like a plain function jumps
+                // into the RESOLVER.  Refuse instead of emitting that.  (A
+                // preemptible IFUNC is fine: its symbolic JUMP_SLOT/GLOB_DAT/
+                // R_X86_64_64 makes ld.so run the resolver.)
+                let bound_ifunc = if sym.is_local() {
+                    sym.sym_type() == STT_GNU_IFUNC && sym.shndx != SHN_UNDEF
+                } else {
+                    global.is_some_and(|g| {
+                        (g.info & 0xf) == STT_GNU_IFUNC
+                            && g.defined_in.is_some()
+                            && !g.is_dynamic
+                            && !preemptible_def(&sym.name, g)
+                    })
+                };
+                if bound_ifunc && rela.rela_type != R_X86_64_NONE {
+                    return Err(format!(
+                        "{obj_name}: {} against non-preemptible IFUNC symbol '{}' in a shared \
+                         library is not supported (it needs R_X86_64_IRELATIVE and an IPLT \
+                         entry); give the symbol default visibility or drop -Bsymbolic",
+                        reloc_field::name(rela.rela_type).unwrap_or("relocation"),
+                        sym.name
+                    ));
+                }
 
                 match rela.rela_type {
                     R_X86_64_64 => {
@@ -2117,21 +2431,26 @@ pub(super) fn emit_shared_library(
                         // Named global/weak symbols need R_X86_64_64 dynamic relocs
                         // (with symbol index) to support symbol interposition.
                         // Section symbols and local symbols use R_X86_64_RELATIVE.
-                        let is_version_local = version_script
-                            .as_ref()
-                            .is_some_and(|vs| vs.any_local_star() && !vs.matches_global(&sym.name));
-                        let locally_defined = globals_snap
-                            .get(sym.name.as_str())
-                            .map(|g| g.defined_in.is_some() && !g.is_dynamic)
-                            .unwrap_or(false);
-                        let is_named_global = !sym.name.is_empty()
-                            && !sym.is_local()
-                            && sym.sym_type() != STT_SECTION
-                            && !is_version_local
-                            && !(bsymbolic && locally_defined);
-                        if is_named_global {
+                        // Symbolic iff ld.so may bind the symbol outside
+                        // this library: an import, or a preemptible
+                        // definition.  Everything else is RELATIVE (or
+                        // nothing, for a hidden undefined weak symbol, 0).
+                        let symbolic = sym.sym_type() != STT_SECTION
+                            && match global {
+                                Some(g) if g.defined_in.is_some() && !g.is_dynamic => {
+                                    preemptible_def(&sym.name, g)
+                                }
+                                Some(g) => imports_undef(g),
+                                None => !sym.name.is_empty() && !sym.is_local(),
+                            };
+                        let absolute = !symbolic
+                            && match global {
+                                Some(g) => is_abs(&sym.name, g),
+                                None => sym.shndx == SHN_ABS,
+                            };
+                        if symbolic {
                             abs64_entries.push((p, sym.name.to_string(), a));
-                        } else if s != 0 {
+                        } else if s != 0 && !absolute {
                             rela_dyn_entries.push((p, val));
                         }
                     }
@@ -2203,146 +2522,144 @@ pub(super) fn emit_shared_library(
                             &objects[obj_idx].source_name,
                         )?;
                     }
-                    R_X86_64_GOTPCREL
-                    | R_X86_64_GOTPCRELX
-                    | R_X86_64_REX_GOTPCRELX
-                    | R_X86_64_CODE_4_GOTPCRELX
-                    | R_X86_64_CODE_6_GOTPCRELX => {
-                        if let Some(&gea) = got_sym_addrs.get(sym.name.as_str()) {
-                            w32_checked(
-                                &mut out,
-                                fp,
-                                gea as i64 + a - p as i64,
-                                rela.rela_type,
-                                &sym.name,
-                                &objects[obj_idx].source_name,
-                            )?;
-                        } else if is_gotpcrelx_relaxable(rela.rela_type) && !sym.name.is_empty() {
-                            // GOT relaxation: convert to LEA
-                            if let Some(g) = globals_snap.get(sym.name.as_str()) {
-                                if g.defined_in.is_some() {
-                                    if fp >= 2 && fp < out.len() && out[fp - 2] == 0x8b {
-                                        out[fp - 2] = 0x8d;
-                                    }
-                                    w32_checked(
-                                        &mut out,
-                                        fp,
-                                        s as i64 + a - p as i64,
-                                        rela.rela_type,
-                                        &sym.name,
-                                        &objects[obj_idx].source_name,
-                                    )?;
-                                    continue;
-                                }
-                            }
-                            w32_checked(
-                                &mut out,
-                                fp,
-                                s as i64 + a - p as i64,
-                                rela.rela_type,
-                                &sym.name,
-                                &objects[obj_idx].source_name,
-                            )?;
-                        } else {
-                            w32_checked(
-                                &mut out,
-                                fp,
-                                s as i64 + a - p as i64,
-                                rela.rela_type,
-                                &sym.name,
-                                &objects[obj_idx].source_name,
-                            )?;
+                    t if is_gotpcrel_family(t) => {
+                        // Same predicates, same ORIGINAL bytes as the slot
+                        // scan: a reference is either rewritten to address
+                        // its target directly or has a slot.  The PIC forms
+                        // only (`lea`, `addr32 call`, `jmp`).
+                        let target_ok = match global {
+                            Some(g) => relax_target(&sym.name, g),
+                            None => sym.is_local() && local_relax_target(sym),
+                        };
+                        let relax = gotpcrelx_relaxation(
+                            rela.rela_type,
+                            a,
+                            objects[obj_idx].section_data[sec_idx].as_slice(),
+                            rela.offset as usize,
+                            true,
+                        );
+                        if let Some(kind) = relax.filter(|_| target_ok) {
+                            let (pos, v) =
+                                rewrite_got_relax(&mut out, fp, kind, rela.rela_type, true, s, p);
+                            w32_checked(&mut out, pos, v, rela.rela_type, &sym.name, obj_name)?;
+                            continue;
                         }
+                        let gea = if sym.is_local() {
+                            local_got
+                                .get((obj_idx, si))
+                                .map(|i| got_addr + local_got_base + i as u64 * 8)
+                        } else {
+                            got_sym_addrs.get(sym.name.as_str()).copied()
+                        };
+                        let Some(gea) = gea else {
+                            return Err(format!(
+                                "{obj_name}: internal error: no GOT slot for {} against '{}'",
+                                reloc_field::name(rela.rela_type).unwrap_or("relocation"),
+                                sym.name
+                            ));
+                        };
+                        w32_checked(
+                            &mut out,
+                            fp,
+                            gea as i64 + a - p as i64,
+                            rela.rela_type,
+                            &sym.name,
+                            obj_name,
+                        )?;
                     }
                     R_X86_64_PC64 => {
                         w64(&mut out, fp, (s as i64 + a - p as i64) as u64);
                     }
-                    R_X86_64_GOTTPOFF | R_X86_64_CODE_4_GOTTPOFF | R_X86_64_CODE_6_GOTTPOFF => {
-                        // TLS Initial-Exec: point the instruction at the GOT entry.
-                        // For locally-defined TLS symbols, the GOT entry was already
-                        // filled with the static TPOFF value above. For external TLS
-                        // symbols, the dynamic linker fills the GOT slot at load time
-                        // via R_X86_64_TPOFF64.
-                        if let Some(&gea) = got_sym_addrs.get(sym.name.as_str()) {
-                            // Only fill the GOT entry statically for locally-defined symbols
-                            let is_local_tls = if let Some(g) = globals_snap.get(sym.name.as_str())
-                            {
-                                g.defined_in.is_some()
-                                    && !g.is_dynamic
-                                    && g.section_idx != SHN_UNDEF
-                            } else {
-                                false
-                            };
-                            if is_local_tls {
-                                let tpoff = (s as i64 - tls_addr as i64) - tls_mem_size as i64;
-                                w64(
-                                    &mut out,
-                                    (got_offset + (gea - got_addr)) as usize,
-                                    tpoff as u64,
-                                );
-                            }
-                            // Patch the instruction to reference the GOT entry
-                            w32_checked(
-                                &mut out,
-                                fp,
-                                gea as i64 + a - p as i64,
-                                rela.rela_type,
-                                &sym.name,
-                                &objects[obj_idx].source_name,
-                            )?;
+                    t if is_gottpoff_family(t) => {
+                        // Initial-Exec: the instruction reads the symbol's
+                        // thread-pointer offset from its GOT slot, which
+                        // ld.so fills (R_X86_64_TPOFF64).  Never relaxed to
+                        // Local-Exec here: a shared library's TLS block
+                        // offset is unknown until load time.
+                        let gea = if sym.is_local() {
+                            local_ie
+                                .get((obj_idx, si))
+                                .map(|i| got_addr + local_ie_base + i as u64 * 8)
                         } else {
-                            // No GOT entry: IE-to-LE relaxation for locally-resolved symbols.
-                            // Handles mov (8b) and add (03); transplants REX.R
-                            // into REX.B since the register moves from ModRM.reg
-                            // to ModRM.rm (see emit_exec.rs for details).
-                            let tpoff = (s as i64 - tls_addr as i64) - tls_mem_size as i64;
-                            let opc = if fp >= 2 { out[fp - 2] } else { 0 };
-                            if fp >= 3 && fp + 4 <= out.len() && (opc == 0x8b || opc == 0x03) {
-                                let modrm = out[fp - 1];
-                                let reg = (modrm >> 3) & 7;
-                                out[fp - 2] = if opc == 0x8b { 0xc7 } else { 0x81 };
-                                out[fp - 1] = 0xc0 | reg;
-                                let rex = out[fp - 3];
-                                if (rex & 0xf0) == 0x40 {
-                                    out[fp - 3] = (rex & 0b1111_1010) | ((rex >> 2) & 1);
-                                }
-                                w32_checked(
-                                    &mut out,
-                                    fp,
-                                    tpoff + a,
-                                    rela.rela_type,
-                                    &sym.name,
-                                    &objects[obj_idx].source_name,
-                                )?;
-                            }
-                        }
-                    }
-                    R_X86_64_TPOFF32 => {
-                        let tpoff = (s as i64 - tls_addr as i64) - tls_mem_size as i64;
+                            got_sym_addrs.get(sym.name.as_str()).copied()
+                        };
+                        let Some(gea) = gea else {
+                            return Err(format!(
+                                "{obj_name}: internal error: no GOT slot for {} against '{}'",
+                                reloc_field::name(rela.rela_type).unwrap_or("relocation"),
+                                sym.name
+                            ));
+                        };
                         w32_checked(
                             &mut out,
                             fp,
-                            tpoff + a,
+                            gea as i64 + a - p as i64,
                             rela.rela_type,
                             &sym.name,
-                            &objects[obj_idx].source_name,
+                            obj_name,
                         )?;
+                    }
+                    R_X86_64_TPOFF32 => {
+                        // Local-Exec addresses the variable at a fixed
+                        // offset from the thread pointer, which only the
+                        // executable's own TLS block has.  GNU ld rejects
+                        // this too.
+                        return Err(format!(
+                            "{obj_name}: relocation R_X86_64_TPOFF32 against '{}' can not be \
+                             used when making a shared object; recompile with -fPIC",
+                            sym.name
+                        ));
                     }
                     R_X86_64_TLSGD => {
                         // Point the lea at the (DTPMOD64, DTPOFF64) GOT pair.
-                        if let Some(&slot) = tlsgd_slot_addr.get(sym.name.as_str()) {
-                            w32_checked(
-                                &mut out,
-                                fp,
-                                slot as i64 + a - p as i64,
-                                rela.rela_type,
-                                &sym.name,
-                                &objects[obj_idx].source_name,
-                            )?;
+                        let slot = if sym.is_local() {
+                            local_gd
+                                .get((obj_idx, si))
+                                .map(|i| got_addr + local_gd_base + i as u64 * 16)
                         } else {
-                            eprintln!("warning: TLSGD without GOT pair for '{}'", sym.name);
-                        }
+                            tlsgd_slot_addr.get(sym.name.as_str()).copied()
+                        };
+                        let Some(slot) = slot else {
+                            return Err(format!(
+                                "{obj_name}: internal error: no TLSGD GOT pair for '{}'",
+                                sym.name
+                            ));
+                        };
+                        w32_checked(
+                            &mut out,
+                            fp,
+                            slot as i64 + a - p as i64,
+                            rela.rela_type,
+                            &sym.name,
+                            obj_name,
+                        )?;
                     }
+                    t if is_tlsdesc_gotpc(t) => {
+                        // `lea sym@tlsdesc(%rip), %rax` -> the descriptor.
+                        let slot = if sym.is_local() {
+                            local_desc
+                                .get((obj_idx, si))
+                                .map(|i| got_addr + local_desc_base + i as u64 * 16)
+                        } else {
+                            tlsdesc_slot_addr.get(sym.name.as_str()).copied()
+                        };
+                        let Some(slot) = slot else {
+                            return Err(format!(
+                                "{obj_name}: internal error: no TLS descriptor for '{}'",
+                                sym.name
+                            ));
+                        };
+                        w32_checked(
+                            &mut out,
+                            fp,
+                            slot as i64 + a - p as i64,
+                            rela.rela_type,
+                            &sym.name,
+                            obj_name,
+                        )?;
+                    }
+                    // `call *(%rax)` through the descriptor stays as is.
+                    R_X86_64_TLSDESC_CALL => {}
                     R_X86_64_TLSLD => {
                         if let Some(slot) = tlsld_slot {
                             w32_checked(
@@ -2371,23 +2688,77 @@ pub(super) fn emit_shared_library(
                         let dtpoff = s as i64 - tls_addr as i64;
                         w64(&mut out, fp, (dtpoff + a) as u64);
                     }
-                    R_X86_64_NONE => {}
+                    R_X86_64_SIZE32 => {
+                        let size = global.map_or(sym.size, |g| g.size);
+                        w32_checked(
+                            &mut out,
+                            fp,
+                            size as i64 + a,
+                            rela.rela_type,
+                            &sym.name,
+                            obj_name,
+                        )?;
+                    }
+                    R_X86_64_SIZE64 => {
+                        let size = global.map_or(sym.size, |g| g.size);
+                        w64(&mut out, fp, (size as i64 + a) as u64);
+                    }
+                    R_X86_64_NONE | R_X86_64_GNU_VTINHERIT | R_X86_64_GNU_VTENTRY => {}
                     other => {
-                        eprintln!(
-                            "warning: unsupported relocation type {} for '{}' in shared library",
-                            other, sym.name
-                        );
+                        // Leaving the field unrelocated produced a library
+                        // that loads and then misbehaves; refuse instead.
+                        return Err(format!(
+                            "{obj_name}: unsupported relocation {} ({other}) against '{}' in \
+                             a shared library",
+                            reloc_field::name(other).unwrap_or("type"),
+                            sym.name
+                        ));
                     }
                 }
             }
         }
     }
 
+    // Build .eh_frame_hdr from the RELOCATED .eh_frame (initial_location
+    // fields are only meaningful after the PC32 relocations were applied).
+    if eh_frame_hdr_size > 0
+        && let Some(ef) = output_sections
+            .iter()
+            .find(|s| s.name == ".eh_frame" && s.mem_size > 0)
+    {
+        let ef_start = ef.file_offset as usize;
+        let ef_end = ef_start + ef.mem_size as usize;
+        if ef_end <= out.len() {
+            let hdr = linker_common::build_eh_frame_hdr(
+                &out[ef_start..ef_end],
+                ef.addr,
+                eh_frame_hdr_vaddr,
+                true,
+            );
+            if !hdr.is_empty() && eh_frame_hdr_offset as usize + hdr.len() <= out.len() {
+                write_bytes(&mut out, eh_frame_hdr_offset as usize, &hdr);
+            }
+        }
+    }
+
     // Write .rela.dyn entries
+    // Symbol index of a dynamic relocation: "" is symbol 0; any other name
+    // must be in `.dynsym`.  A lookup miss used to fall back to index 0 --
+    // the null symbol -- silently turning an import into a module-relative
+    // value; it is an internal inconsistency and is reported as one.
+    let dyn_sym_ref = |name: &str| -> Result<u64, String> {
+        if name.is_empty() {
+            return Ok(0);
+        }
+        dyn_sym_index.get(name).copied().ok_or_else(|| {
+            format!("internal error: dynamic relocation against '{name}', which is not in .dynsym")
+        })
+    };
     let relative_count = rela_dyn_entries.len();
     let total_rela_count = relative_count
         + glob_dat_entries.len()
         + tpoff64_entries.len()
+        + tlsdesc_entries.len()
         + abs64_entries.len()
         + dtpmod64_entries.len()
         + dtpoff64_entries.len();
@@ -2404,7 +2775,7 @@ pub(super) fn emit_shared_library(
     }
     // Then: R_X86_64_GLOB_DAT entries (type 6, with symbol index)
     for (rel_offset, sym_name) in &glob_dat_entries {
-        let si = dyn_sym_index.get(sym_name.as_str()).copied().unwrap_or(0);
+        let si = dyn_sym_ref(sym_name)?;
         if rd + 24 <= out.len() {
             w64(&mut out, rd, *rel_offset); // r_offset = GOT entry address
             w64(&mut out, rd + 8, (si << 32) | R_X86_64_GLOB_DAT as u64);
@@ -2415,23 +2786,30 @@ pub(super) fn emit_shared_library(
     // Then: R_X86_64_TPOFF64 entries (type 18, with symbol index) for TLS GOT entries.
     // The dynamic linker fills these GOT slots with the thread-pointer offset of the
     // TLS symbol, so that `%fs:0 + GOT[n]` gives the correct address.
-    for (rel_offset, sym_name) in &tpoff64_entries {
-        let si = dyn_sym_index.get(sym_name.as_str()).copied().unwrap_or(0);
+    // Symbol 0 + addend for a TLS symbol bound inside this library.
+    for (rel_offset, sym_name, addend) in &tpoff64_entries {
+        let si = dyn_sym_ref(sym_name)?;
         if rd + 24 <= out.len() {
             w64(&mut out, rd, *rel_offset); // r_offset = GOT entry address
             w64(&mut out, rd + 8, (si << 32) | R_X86_64_TPOFF64 as u64);
-            w64(&mut out, rd + 16, 0); // r_addend = 0
+            w64(&mut out, rd + 16, *addend);
+            rd += 24;
+        }
+    }
+    // TLS descriptors, same symbol-0 convention.
+    for (rel_offset, sym_name, addend) in &tlsdesc_entries {
+        let si = dyn_sym_ref(sym_name)?;
+        if rd + 24 <= out.len() {
+            w64(&mut out, rd, *rel_offset);
+            w64(&mut out, rd + 8, (si << 32) | R_X86_64_TLSDESC as u64);
+            w64(&mut out, rd + 16, *addend);
             rd += 24;
         }
     }
     // TLS module/offset relocations for General/Local-Dynamic GOT pairs.
     // DTPMOD64 with sym 0 = "this module"; ld.so writes the module id.
     for (rel_offset, sym_name) in &dtpmod64_entries {
-        let si = if sym_name.is_empty() {
-            0
-        } else {
-            dyn_sym_index.get(sym_name.as_str()).copied().unwrap_or(0)
-        };
+        let si = dyn_sym_ref(sym_name)?;
         if rd + 24 <= out.len() {
             w64(&mut out, rd, *rel_offset);
             w64(&mut out, rd + 8, (si << 32) | R_X86_64_DTPMOD64 as u64);
@@ -2440,7 +2818,7 @@ pub(super) fn emit_shared_library(
         }
     }
     for (rel_offset, sym_name) in &dtpoff64_entries {
-        let si = dyn_sym_index.get(sym_name.as_str()).copied().unwrap_or(0);
+        let si = dyn_sym_ref(sym_name)?;
         if rd + 24 <= out.len() {
             w64(&mut out, rd, *rel_offset);
             w64(&mut out, rd + 8, (si << 32) | R_X86_64_DTPOFF64 as u64);
@@ -2451,7 +2829,7 @@ pub(super) fn emit_shared_library(
     // Then: R_X86_64_64 entries (type 1, with symbol index) for named symbol
     // references in data sections (function pointer tables, vtables, etc.)
     for (rel_offset, sym_name, addend) in &abs64_entries {
-        let si = dyn_sym_index.get(sym_name.as_str()).copied().unwrap_or(0);
+        let si = dyn_sym_ref(sym_name)?;
         if rd + 24 <= out.len() {
             w64(&mut out, rd, *rel_offset); // r_offset
             w64(&mut out, rd + 8, (si << 32) | R_X86_64_64 as u64);
@@ -2619,6 +2997,7 @@ pub(super) fn emit_shared_library(
         ".rela.dyn",
         ".rela.plt",
         ".plt",
+        ".eh_frame_hdr",
         ".dynamic",
         ".got",
         ".got.plt",
@@ -2687,6 +3066,9 @@ pub(super) fn emit_shared_library(
     if plt_size > 0 {
         next_hdr += 1;
     }
+    if eh_frame_hdr_size > 0 {
+        next_hdr += 1;
+    }
     for (i, sec) in output_sections.iter().enumerate() {
         if sec.flags & SHF_ALLOC != 0
             && sec.sh_type != SHT_NOBITS
@@ -2736,6 +3118,58 @@ pub(super) fn emit_shared_library(
     let symtab_shidx = next_hdr as u16;
     let strtab_shidx = symtab_shidx + 1;
 
+    // Section-header index of a global definition, for `.dynsym` and
+    // `.symtab`.  Consumers DO read it: GNU ld decides where an executable's
+    // COPY of a data object goes from the flags of the section the DSO says
+    // it lives in -- a read-only one sends it to `.data.rel.ro`, which is
+    // write-protected after relocation, so the first store to the variable
+    // faults.  (Every definition used to claim index 1, `.gnu.hash`.)
+    // COMMON symbols (section_idx 0xffff after allocation) live in `.bss`;
+    // a definition whose input section has no header of its own (a
+    // `--defsym` alias, a linker-provided symbol) takes the section whose
+    // address range holds it.
+    let bss_out = output_sections.iter().position(|s| s.name == ".bss");
+    let def_shndx = |name: &str, g: &GlobalSymbol| -> u16 {
+        if is_abs(name, g) {
+            return SHN_ABS;
+        }
+        let mapped = if g.section_idx == 0xffff {
+            bss_out
+        } else {
+            g.defined_in
+                .and_then(|o| section_map.get(&(o, g.section_idx as usize)))
+                .map(|&(oi, _)| oi)
+        };
+        if let Some(h) = mapped.and_then(|oi| out_sec_to_hdr.get(&oi)) {
+            return *h;
+        }
+        out_sec_to_hdr
+            .iter()
+            .filter(|&(&oi, _)| {
+                let sec = &output_sections[oi];
+                sec.addr <= g.value && g.value <= sec.addr + sec.mem_size
+            })
+            .max_by_key(|&(&oi, _)| output_sections[oi].addr)
+            .map(|(_, &h)| h)
+            .unwrap_or(dynsym_shidx as u16)
+    };
+    {
+        let mut ds = dynsym_offset as usize + 24;
+        for name in &dyn_sym_names {
+            if let Some(g) = globals.get(name)
+                && g.defined_in.is_some()
+                && !g.is_dynamic
+                && g.section_idx != SHN_UNDEF
+            {
+                w16(&mut out, ds + 6, def_shndx(name, g));
+                if linker_provided.contains(name.as_str()) {
+                    out[ds + 5] = STV_PROTECTED;
+                }
+            }
+            ds += 24;
+        }
+    }
+
     // Full static symbol table for GDB, perf, and Callgrind. ELF requires local
     // entries before globals and sh_info to name the first global index.
     let mut symtab_entries: Vec<[u8; 24]> = vec![[0u8; 24]];
@@ -2774,7 +3208,10 @@ pub(super) fn emit_shared_library(
         entry[4] = sym.info;
         entry[5] = sym.other;
         entry[6..8].copy_from_slice(&shndx.to_le_bytes());
-        let value = output_sections[oi].addr + sec_off + sym.value;
+        let mut value = output_sections[oi].addr + sec_off + sym.value;
+        if sym.sym_type() == STT_TLS {
+            value = value.wrapping_sub(tls_addr);
+        }
         entry[8..16].copy_from_slice(&value.to_le_bytes());
         entry[16..24].copy_from_slice(&sym.size.to_le_bytes());
         symtab_entries.push(entry);
@@ -2801,24 +3238,28 @@ pub(super) fn emit_shared_library(
     global_names.sort_by(|a, b| a.0.cmp(b.0));
     for (name, sym) in global_names {
         let name_off = push_strtab_name(&mut symtab_names, name.as_bytes());
-        let shndx = if sym.section_idx == SHN_ABS {
-            SHN_ABS
-        } else if sym.section_idx == SHN_COMMON {
-            SHN_COMMON
-        } else if let Some(obj_idx) = sym.defined_in {
-            section_map
-                .get(&(obj_idx, sym.section_idx as usize))
-                .and_then(|(oi, _)| out_sec_to_hdr.get(oi))
-                .copied()
-                .unwrap_or(SHN_ABS)
+        let shndx = def_shndx(name, sym);
+        // GNU ld demotes HIDDEN/INTERNAL definitions to STB_LOCAL in the
+        // output's `.symtab` (keeping st_other); the stable partition sort
+        // below moves them in front of the globals.
+        let info = if linker_common::is_dynamic_visibility(sym.visibility) {
+            sym.info
         } else {
-            SHN_ABS
+            (STB_LOCAL << 4) | (sym.info & 0xf)
         };
         let mut entry = [0u8; 24];
         entry[0..4].copy_from_slice(&name_off.to_le_bytes());
-        entry[4] = sym.info;
+        entry[4] = info;
+        entry[5] = sym.visibility;
         entry[6..8].copy_from_slice(&shndx.to_le_bytes());
-        entry[8..16].copy_from_slice(&sym.value.to_le_bytes());
+        // gABI: a TLS symbol's st_value in an executable or shared object
+        // is its offset in the TLS template, not a virtual address.
+        let value = if (sym.info & 0xf) == STT_TLS {
+            sym.value.wrapping_sub(tls_addr)
+        } else {
+            sym.value
+        };
+        entry[8..16].copy_from_slice(&value.to_le_bytes());
         entry[16..24].copy_from_slice(&sym.size.to_le_bytes());
         symtab_entries.push(entry);
     }
@@ -2856,6 +3297,9 @@ pub(super) fn emit_shared_library(
         sh_count += 1;
     }
     if plt_size > 0 {
+        sh_count += 1;
+    }
+    if eh_frame_hdr_size > 0 {
         sh_count += 1;
     }
     // Merged output sections (non-BSS, non-TLS, non-init/fini)
@@ -3091,6 +3535,21 @@ pub(super) fn emit_shared_library(
             0,
             16,
             16,
+        );
+    }
+    if eh_frame_hdr_size > 0 {
+        write_shdr_so(
+            &mut out,
+            get_shname(".eh_frame_hdr"),
+            SHT_PROGBITS,
+            SHF_ALLOC,
+            eh_frame_hdr_vaddr,
+            eh_frame_hdr_offset,
+            eh_frame_hdr_size,
+            0,
+            0,
+            4,
+            0,
         );
     }
     // Merged output sections (text/rodata/data, excluding BSS/TLS/init_array/fini_array)

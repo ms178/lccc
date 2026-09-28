@@ -119,8 +119,9 @@ pub use mapfile::{LinkMap, MapArchiveMember, MapSectionContribution, build_link_
 
 // symbols.rs
 pub use symbols::{
-    GlobalSymbolOps, InputSection, OutputSection, is_exported_dynamic_symbol,
-    is_layout_anchor_symbol, is_linker_defined_symbol, is_valid_c_identifier_for_section,
+    GlobalSymbolOps, InputSection, OutputSection, is_dynamic_visibility,
+    is_exported_dynamic_symbol, is_layout_anchor_symbol, is_linker_defined_symbol,
+    is_valid_c_identifier_for_section, merge_object_visibility, most_constraining_visibility,
     resolve_start_stop_symbols,
 };
 
@@ -143,7 +144,7 @@ pub use archive::{
 };
 
 // resolve_lib.rs
-pub use resolve_lib::resolve_lib;
+pub use resolve_lib::{expand_file_mode_libs, resolve_lib, resolve_lib_positional};
 
 // write.rs
 pub use write::{align_up_64, pad_to, write_elf64_phdr, write_elf64_phdr_at, write_elf64_shdr};
