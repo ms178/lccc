@@ -1,9 +1,58 @@
 # Follow-up: VEX/EVEX encoding audit and semantic oracle hardening
 
 **Date:** 2026-09-29
-**Repository base:** `32299e7ff6522979d72f1476157a0ecb6b9eabf5`
-**Upstream:** fetched `origin/main`; it still resolves to the same base.
-**Scope:** i686 unsigned scalar conversions, x86-64/i686 assembler regressions, and the semantic trust boundary in `encdiff.py`/`insndiff.py`.
+**Repository base:** `02d4c9067651eb987881c41f907f639b28420db6`
+**Upstream:** `origin/main` at `02d4c9067651eb987881c41f907f639b28420db6` after rebasing to the latest fetched main.
+**Upstream changes:** PR #680 added `LCCC_SYSROOT` discovery (`324e270c8ed04e0906d81b730bf326864ba40dc5`); PR #679 merged the original encoder audit as `128bd082b74462f268670ffa37486c5f816ad887`. Those original fixes/tests are on current `origin/main`. This continuation is not doc-only: at its start local `main` was four commits ahead of the freshly fetched upstream, and the working tree added the substantive pinned-width VCVT implementation, VFPCLASS validation, i686 regressions, and restore-script multilib preflight described below.
+**Scope:** the earlier i686 unsigned-scalar conversion and VEX/EVEX audit, plus the current pinned-width packed-convert aliases, their x86-64/i686 acceptance/byte regressions, VFPCLASS validation, and current ISA-manual reconciliation.
+
+## Continuation addendum: pinned-width converts and current ISA sources
+
+This addendum supersedes the earlier statement below that only the follow-up document remained local. The current worktree adds an explicit GAS-alias parser and end-to-end encoder routing for packed-convert x/y/z width pins, along with x86-64 and i686 casefiles. The existing VFPCLASS implementation and VBMI2/i686 work are retained and validated; no unrelated encoder family was duplicated.
+
+### Repository and shared-work check
+
+The harness had removed `.git`. `scripts/arena_session_restore.sh` restored Git metadata by cloning `/home/user/artifacts/lccc.bundle`; it reported 190 preserved worktree modifications and did not reset or replace the worktree. A fresh fetch from `https://github.com/ms178/lccc.git` located `origin/main` at `02d4c9067651eb987881c41f907f639b28420db6`; the current branch's merge base is that exact commit. The rebase check is performed again before the final snapshot. The only open upstream PR observed during this pass was #682 (integer reductions, loop LICM, and oracle validation), unrelated to the x86 assembler changes.
+
+### Architectural authority versus assembler syntax oracle
+
+The implementation keeps these evidence roles separate:
+
+- **Instruction semantics and architectural encoding forms:** Intel's current *Intel 64 and IA-32 Architectures Software Developer's Manual*, version 093, Volume 2C, together with the current Intel AVX10.2 Architecture Specification Rev. 4.0 where applicable; and AMD's latest available *AMD64 Architecture Programmer's Manual*, Volume 4, Rev. 3.27 (July 2026).
+- **GAS mnemonic acceptance, x/y/z suffix spelling, forced `{vex}` selection, and emitted bytes:** GNU `as` **2.47.20260726** only. The suffixes are GAS-specific width selectors; they are not Intel/AMD architectural mnemonic suffixes. The implementation deliberately uses an explicit allowlist rather than inferring that every trailing x/y/z is a legal convert alias.
+- **Independent assembler/compiler byte cross-checks:** GCC 16.2 (`cg162`), Clang 23.1 (`cclang2310`), ICX (`cicxlatest`, the moving alias at run time), and ICC 2021.10 (`cicc2021100`) through `encdiff.py`. These comparisons use the canonical architectural mnemonic, not the GAS-only pinned alias spelling.
+
+Primary references consulted and retained under `/home/user/artifacts/`:
+
+1. Intel, *Intel 64 and IA-32 Architectures Software Developer's Manual*, Vol. 2C, **v093**, official catalog updated 2026-09-21; current PDF: <https://cdrdv2-public.intel.com/929355/326018-093-sdm-vol-2c.pdf>. Relevant printed pages: VCVTDQ2PH 5-30–5-31; VCVTNEPS2BF16 5-38–5-39; VCVTPD2PH 5-40–5-41; VCVTQQ2PH 5-83–5-84; VFPCLASSPH 5-348–5-350 and VFPCLASSPS 5-351–5-352. The exact downloaded PDF is `/home/user/artifacts/intel-sdm-v093-vol2c.pdf` (SHA-256 `86651d693340a6fedb9851e459945eafba83a877d4bbe2e4575fcfdb531bb68`).
+2. Intel, *Intel AVX10.2 Architecture Specification*, **Rev. 4.0**, May 2025, document 361050-004US: <https://cdrdv2-public.intel.com/828965/361050-intel-avx10.2-spec.pdf>. Section 7.6, pp. 105–107, specifies VFPCLASSBF16's EVEX map/pp/opcode, packed widths, immediate classification and operation. It is the primary source for the AVX10.2 BF16 row; the current SDM Vol. 2C covers the FP16 VFPCLASS rows.
+3. AMD, *AMD64 Architecture Programmer's Manual*, Vol. 4, **Rev. 3.27**, July 2026, publication 26568: <https://docs.amd.com/v/u/en-US/26568_3.27_APM_Vol4_PUB>. Relevant pages: VCVTDQ2PH 860–861; VCVTNEPS2BF16 874–875; VCVTPD2PH 876–877; VCVTQQ2PH 915–916; VFPCLASSPH 1143–1144; VFPCLASSPS 1146–1147; VFPCLASSSH 1145. The extracted current manual is `/home/user/artifacts/amd-26568-rev3.27-2026.txt` (SHA-256 `9040a362cabb0de5d90be52ad2222415a1221de97304f4bea9353b1b2c697769`).
+4. A compact extraction of the cited Intel SDM/AVX10.2 pages and AMD instruction entries is `/home/user/artifacts/assembler-current-doc-excerpts-2026-09-29.txt` (SHA-256 `92e8963f5278bbc53c88ac9ae09cabf7770fcc1c9417c3c81dfc02daa9b174f1`).
+
+### Implemented pinned-convert behavior
+
+`vcvt_params()` now resolves exact native instruction names before attempting any suffix parse (important for native names such as `vcvtps2phx` and `vcvtph2psx`). Its suffix grammar is a GAS 2.47-probed allowlist. The pin is carried through shape validation, VEX.L or EVEX.L'L, memory broadcast-count validation, EVEX tuple displacement scaling and mode routing. Width-mismatched registers, ambiguous unsuffixed narrow-memory forms, mismatched broadcasts, unsupported z spellings, and spurious extra suffixes remain rejects.
+
+The covered aliases are:
+
+- VEX families: `vcvtpd2ps{x,y}`, `vcvtpd2dq{x,y}`, `vcvttpd2dq{x,y}`.
+- EVEX AVX512-DQ/F forms: `vcvtpd2udq{x,y}`, `vcvttpd2udq{x,y}`, `vcvtqq2ps{x,y}`, `vcvtuqq2ps{x,y}`.
+- EVEX 2:1 conversions: `vcvtdq2ph{x,y}`, `vcvtudq2ph{x,y}`, `vcvtneps2bf16{x,y}`, and the aliases `vcvtps2phxx` / `vcvtps2phxy` whose native base mnemonic is `vcvtps2phx`.
+- EVEX 4:1 conversions: `vcvtpd2ph{x,y,z}`, `vcvtqq2ph{x,y,z}`, and `vcvtuqq2ph{x,y,z}`.
+
+`vcvtneps2bf16` is a real architectural dual-encoding case: Intel SDM v093 lists VEX.128/VEX.256 as well as EVEX.128/.256/.512. GAS 2.47 defaults the unsuffixed form to EVEX and accepts `{vex}` to select map 2 / 0F38; the x/y pins select their source widths in either row. The implementation preserves that default preference while supporting explicit VEX selection. Its full-vector memory tuple scaling is regression-tested at the signed disp8 boundary: x/16-byte and y/32-byte rows with displacements 2032/4064 both encode disp8 `7f` in x86-64 and i686.
+
+### Validation results for this continuation
+
+- `scripts/build_lccc_fast.sh` rebuilt the final code at `-O1`, using the required two build jobs; the focused Rust test `vcvt_pinned_x_y_z_aliases_and_vex_dual_form` passes (**1 passed, 0 failed**, 3880 filtered).
+- GAS 2.47.20260726 whole-object differentials: pinned VCVT casefile **12/12** in x86-64 and **12/12** in i686; existing VFPCLASS casefile **19/19** in x86-64 and **13/13** in i686. `asmdiff` counts case groups, including the independent reject groups.
+- `encdiff.py` canonical-convert corpus: **10/10 `ok`** in each mode, comparing LCCC, GAS 2.47, GCC 16.2, Clang 23.1, ICX and ICC. Every row is byte-identical across all five assemblers in x86-64 and i686; there are no `BEATS`/performance claims.
+- `encdiff.py` VFPCLASS corpus: 4 canonical forms per mode. GAS, GCC and Clang accept the FP16/FP32/FP64 and AVX10.2 BF16 rows and match LCCC bytes. ICC and ICX accept the three FP16/FP32/FP64 rows but do not accept the newer `vfpclassbf16` AVX10.2 row; this is recorded as compiler-oracle coverage, not treated as evidence against the current Intel specification. No accepted-row byte mismatches were found.
+- After the successful fastbuild, the canonical-oracle sweep was rerun from the current `target/fastbuild/lccc`: 10 pinned VCVT rows in each mode and 4 VFPCLASS rows in each mode. All VCVT bytes matched GAS/GCC/Clang/ICC/ICX; all VFPCLASS rows matched every accepting oracle, while ICC and ICX continue to reject only the AVX10.2 `vfpclassbf16` form. The archived rows were byte/value-compared to the rerun scoreboards. Reproduction log: `/home/user/artifacts/encdiff-current-vcvt-vfpclass-2026-09-29.log` (SHA-256 `a3918f39bfa8cfcb764909aa9c99c54e0ef4032ca7b2e095ce684655f35ad65d`). The four current scoreboards are retained at `/home/user/artifacts/pinned-vcvt-multioracle-{x86_64,i686}-2026-09-29.json` and `/home/user/artifacts/vfpclass-multioracle-{x86_64,i686}-2026-09-29.json`; their hashes are listed below.
+- The first full `ci_local.sh --fast` preflight reached **102 passed, 1 failed, 5 skipped**. The sole failure was the i386 linker-suite C++ DSO fixture: the image had gcc/libc i386 multilib but lacked `g++-multilib`, producing `/usr/include/c++/14/exception:35:10: fatal error: bits/c++config.h: No such file or directory`. No gate was weakened. Installed Debian `g++-multilib` / `lib32stdc++-14-dev`; a direct `g++ -m32` `<stdexcept>` compile now passes, and the linker suite rerun reports **301 pass, 0 fail, 0 warn, 0 skip**. `scripts/arena_session_restore.sh` now preflights and provisions this C++ multilib dependency so a future harness restore does not repeat the failure.
+- After provisioning, `ci_local.sh --fast` passed **103 passed, 0 failed, 5 skipped** on tree `1f5f1d50b3d176a82c06ce465b66ac4d41c91b47`: x86-64 GAS 2.47 differential **1350/1350**, i686 **636/636**, linker suite **301/0/0/0**, rustfmt and clippy passed. Log: `/home/user/artifacts/ci_local-fast-pinned-vcvt-2026-09-29.log` (SHA-256 `80327e7eea74227e5315e4769ccb2ea02952ca76d0d634f9ddd5bd9685f1e8d7`). This is an explicitly intermediate fast-only stamp, not delivery-grade: the result paragraph changed the tracked document after that run. Final delivery runs `--fast` and `--slow` only after this addendum is finalized; the exact-tree `mode=full` stamp is authoritative and is recorded with the snapshot ledger. Preserve the corresponding logs as `/home/user/artifacts/ci_local-fast-final-2026-09-29.log` and `/home/user/artifacts/ci_local-slow-final-2026-09-29.log`.
+
+This work validates encodings and syntax/shape correctness. It does not claim generated-code speedups; no hardware PMU is available in this environment, and no runtime performance measurement was made.
 
 ## Landed changes
 
@@ -76,7 +125,7 @@ A separate `insndiff.py` probe set now reports `BETTER=3`: the two `vpdpbusds` r
 `vec_opt.py` extracted 53,882 vector lines from 934 Binutils testsuite files, deduplicated them into 25,983 shape keys, and retained **25,586 GAS-64-accepted representatives** spanning 1,178 mnemonics. The offline LCCC/GAS 2.47 screen reported:
 
 - 21,949 accepted by both LCCC and GAS: **21,857 `ok` + 92 round-trip-verified `BEATS`** versus GAS.
-- 3,637 GAS-accepted forms rejected by LCCC (`REJECTS-VALID`); these are primarily in the already documented deferred ISA families (pinned convert spellings, newer FP16/BF16/AVX10 rows, VBMI2, GFNI/SM4, XOP, and related families). They remain gaps, not fixes, and were not silently counted as supported.
+- 3,637 GAS-accepted forms rejected by LCCC (`REJECTS-VALID`) in that **pre-continuation** screen. This is not a current-tree count: the screen predates the pinned-width VCVT and VFPCLASS work documented above. It included deferred FP16/BF16/AVX10, VBMI2, GFNI/SM4, XOP and related forms; the exact remaining set must be re-screened before assigning a current gap count.
 - No `WRONG-BYTES` or `UNVERIFIED-*` rows among accepted encodings after semantic validation.
 
 The 92 GAS-shorter candidates were then sent to all five compiler oracles. Every row was `ok-best`: Clang and ICX matched LCCC's shorter lengths, while GAS/GCC/ICC used encodings one byte longer. Thus none is a strict win over the best compiler oracle. This is a size/encoding comparison only; no runtime or hardware-performance conclusion follows.
@@ -96,6 +145,30 @@ The generated corpora and full JSON scoreboards are preserved under `/home/user/
 
 The corpus generator and invocation are documented in `scripts/vec_opt.py`; the curated run can be replayed directly with `scripts/encdiff.py --casefiles ...` and the six casefiles above.
 
+### Current continuation scoreboards and source files
+
+The per-instruction compiler-oracle byte records and current-manual extracts are durable under `/home/user/artifacts/`. Hashes:
+
+| Artifact | SHA-256 |
+|---|---|
+| `pinned-vcvt-multioracle-x86_64-2026-09-29.json` | `4f3909f771c231e1d941f944dd327a9bff855315fb009e2636814a5e9cce0eb1` |
+| `pinned-vcvt-multioracle-i686-2026-09-29.json` | `2bbf56d02f08d523e76c26ba606c1ac81bb9448f050f34216a463f389c2597f9` |
+| `vfpclass-multioracle-x86_64-2026-09-29.json` | `6a9fbee63c267295d4dbbd99f7a17c17f906d91318e59c11654a73d31e55d480` |
+| `vfpclass-multioracle-i686-2026-09-29.json` | `9e31f403e7d1a3ddc63495e852f0f44337bf7e68cfda71deb32d8ccbc1b332a7` |
+| `pinned-bf16-disp-probes-x86_64.json` | `92c810a01f393c47d6f86638295f06b0ed545b7f94818b5739fc5196d9b62fdf` |
+| `pinned-bf16-disp-probes-i686.json` | `7ddacf4ebde443fb52277a7a859bdaf14eb04792d4e337cb1a94084d1d02f978` |
+| `intel-sdm-v093-vol2c.pdf` | `86651d693340a6fedb9851e459945eafba83a877d4bbe2e4575fcfdb531bb68` |
+| `intel-avx10.2-2025-rev4.pdf` | `25fe4fd43d5e5a2661e02666c06cc14e0b08efb812d48d7fb29abe9566e21910` |
+| `amd-26568-rev3.27-2026.txt` | `9040a362cabb0de5d90be52ad2222415a1221de97304f4bea9353b1b2c697769` |
+| `assembler-current-doc-excerpts-2026-09-29.txt` | `92e8963f5278bbc53c88ac9ae09cabf7770fcc1c9417c3c81dfc02daa9b174f1` |
+| `ci_local-fast-pinned-vcvt-preflight-2026-09-29.log` | `3db56e9eac2cb746f66c28b78c78787f92d49dfcf2cdacd338590008d49178ae` |
+| `ci_local-fast-pinned-vcvt-2026-09-29.log` | `80327e7eea74227e5315e4769ccb2ea02952ca76d0d634f9ddd5bd9685f1e8d7` |
+| `encdiff-current-vcvt-vfpclass-2026-09-29.log` | `a3918f39bfa8cfcb764909aa9c99c54e0ef4032ca7b2e095ce684655f35ad65d` |
+| `pinned-vcvt-oracle-input-x86_64-2026-09-29.txt` | `fe2d0bc1f1ebfe16bd69fc15e9229645f74039394eb4eebe10fcd7549b6fd41b` |
+| `vfpclass-oracle-input-x86_64-2026-09-29.txt` | `1f417c4ba435790a4eb7c7a289c5ac363c549f2b287a678634fafe76e7da3a71` |
+
+The multi-oracle scoreboards are regenerated with `scripts/encdiff.py --lccc target/fastbuild/lccc --file <input.txt> --json <scoreboard.json>`; add `--32` for i686. Canonical instruction inputs are saved as `/home/user/artifacts/pinned-vcvt-oracle-input-{x86_64,i686}-2026-09-29.txt` and `/home/user/artifacts/vfpclass-oracle-input-{x86_64,i686}-2026-09-29.txt`. `--32` selects LCCC/GAS 32-bit mode plus remote compiler `-m32`. The x/y/z spellings themselves are compared directly to GAS in the committed casefiles, because those spellings are GAS syntax rather than architectural names.
+
 ## Validation environment note
 
 The first `scripts/ci_local.sh --fast` attempt on the S04 tree reported **96 passed, 7 failed, 5 skipped**. All seven failures shared one host prerequisite: the container lacked the i386 multilib C headers/runtime (`bits/libc-header-start.h`, `crti.o`, and `-lgcc` were unavailable under `-m32`). This affected the nocfi parity, reassociation, copy-alias, notype routing, i686 integer ISA, two-lane i64, and linker-suite gates; the linker suite reported 19 i386 fixture failures, not linker-oracle mismatches.
@@ -106,17 +179,14 @@ The initial fast-run log is preserved at `/home/user/artifacts/ci_local-fast-202
 
 ## Snapshot and final-gate policy
 
-This branch has three validated checkpoint commits, all based on the current upstream main:
+Historical baseline: the original encoder audit, regression tests and CI wiring landed in PR #679 (`128bd082b74462f268670ffa37486c5f816ad887`) at `02d4c9067651eb987881c41f907f639b28420db6`; rebase found those changes already present and dropped the duplicates. This continuation is **not** the old doc-only delta: at its start the local branch had four commits above the freshly fetched `origin/main` (`bd89fe1d`, `ec036f09`, `e8d46582`, `158cea53`) plus the new VCVT/VFPCLASS work described in the addendum. Its merge base was the current `origin/main` commit `02d4c906`. The S09 full-CI stamp applies only to its old tree; S10 VBMI2 was explicitly an UNGATED interim snapshot. Neither historical stamp substitutes for full validation of the exact tree in this continuation.
 
-- `e1618a809079504849a6f58e0fe067a5b8ddadf1` — i686 `vcvtusi` rows.
-- `8cffc3babd4f4d52783c865a0a869e0d5c4c8e10` — encdiff semantic validation and reject-group filtering.
-- `45dee377353c46bd6aa46b070b84871ceae3a45c` — insndiff fail-closed decoding.
-
-Snapshots S01–S03 were deliberately marked **UNGATED** because the full-tree CI mirror had not run yet; they are intermediate recovery points, not delivery snapshots. Before delivery, run `scripts/ci_local.sh --fast` followed by `scripts/ci_local.sh --slow` on the unchanged final tree, then publish the matching `mode=full` snapshot. The tree-matched pass stamp and `/home/user/artifacts/SNAPSHOT_LEDGER.md` are the authoritative CI/snapshot record. Do not edit the tree after that pass without rerunning the gate.
+Snapshots S01–S07 in the existing ledger are historical **UNGATED** checkpoints: S01–S06 were built against `32299e7...`, and S07 was based on `17479e69...`; neither base is current. They are recovery/history points, not delivery patches. Any checkpoint made before a matching full-tree CI pass on the exact final tree is likewise intermediate. Run the full fast and slow gates on one unchanged tree before publishing the matching `mode=full` snapshot. The tree-matched pass stamp and `/home/user/artifacts/SNAPSHOT_LEDGER.md` are authoritative; do not edit the tree after that pass without rerunning the gate.
 
 ## Remaining work
 
-1. Complete the exact-tree fast and slow CI passes, rustfmt, and clippy; record any failures and their causes before considering this deliverable final.
-2. Triage the 3,637 shape-corpus `REJECTS-VALID` rows against the ranked deferred-family list in `FOLLOWUP-2026-09-27-evex-fp16-maps56.md`. Prioritize by emitted-code relevance and testability, not raw count. Each selected family still needs GAS 2.47 probes, compiler-oracle comparison where applicable, and positive/negative regressions.
-3. The current encdiff/insndiff wrappers compare x86-64. Keep i686 coverage byte-exact through `asmdiff.py --32`; if multi-oracle i686 sweeps become a priority, add an explicit mode-aware wrapper rather than feeding 32-bit instructions through the x86-64 probe.
-4. Do not claim runtime gains from these encoding-length results. The VM exposes two vCPUs and no usable PMU; no Raptor Lake performance measurement was obtained.
+1. **Snapshot gate policy:** the delivery candidate must have an exact-tree `mode=full` `ci_local` stamp (both `--fast` and `--slow` on the same unchanged tree). The final logs are retained at `/home/user/artifacts/ci_local-fast-final-2026-09-29.log` and `/home/user/artifacts/ci_local-slow-final-2026-09-29.log`; the matching tree hash and `ci_gate` are recorded in `/home/user/artifacts/SNAPSHOT_LEDGER.md`. The successful fast-only log earlier in this document is an intermediate preflight, not the final stamp. Any tracked source/document change invalidates the stamp and requires both gates again.
+2. The **3,637** shape-corpus `REJECTS-VALID` count above is a historical pre-continuation screen, not a current remaining-gap count: the corpus has not yet been rerun after pinned-convert and VFPCLASS additions. Re-screen the saved 25,586-representative corpus before quoting a new number, then triage remaining families by emitted-code relevance and testability rather than raw count.
+3. `encdiff.py --32` already provides mode-aware LCCC/GAS `--32` and remote compiler `-m32` comparisons; this continuation used it on canonical VCVT and VFPCLASS forms. The full multi-oracle VEX/EVEX corpus recorded earlier was x86-64; there is no claim that the entire 1,860-instruction corpus was re-run in i686 mode. Keep GAS 2.47 x86-64/i686 casefiles as the syntax/byte-acceptance gate.
+4. Compiler-version coverage for the AVX10.2-only `vfpclassbf16` row is intentionally partial: GCC 16.2 and Clang 23.1 accept it; ICC 2021.10 and the `cicxlatest` alias did not. Preserve that limitation in future evidence rather than treating unsupported compiler parsers as architectural counter-evidence.
+5. Do not claim runtime gains from encoding-length results. The VM exposes two vCPUs and no usable PMU; no Raptor Lake performance measurement was obtained.

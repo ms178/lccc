@@ -43,6 +43,10 @@ Examples
 
     # Whole casefile corpus, local oracle only (no network)
     scripts/encdiff.py --casefiles tests/asm-diff/*.casefile --offline
+
+    # i686: local lccc-i686 and GAS --32, remote compilers with -m32
+    scripts/encdiff.py --32 --lccc target/fastbuild/lccc-i686 \
+        --casefiles tests/asm-diff/i686/*.casefile
 """
 from __future__ import annotations
 
@@ -103,7 +107,7 @@ def _run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
 
 
 def encode_local(tool: str, insn: str, tmp: Path, objcopy: str,
-                 prologue: str = ".text") -> Encoding:
+                 prologue: str = ".text", bits32: bool = False) -> Encoding:
     """Assemble `insn` with a local assembler (LCCC or GNU as)."""
     before, after = local_label_scaffold(insn)
     parts = [prologue]
@@ -119,9 +123,11 @@ def encode_local(tool: str, insn: str, tmp: Path, objcopy: str,
         obj.unlink()
 
     if tool.endswith("lccc") or "lccc" in Path(tool).name:
-        cmd = [tool, "-c", str(src), "-o", str(obj)]
+        cmd = [tool] + (["-m32"] if bits32 else []) + [
+            "-c", str(src), "-o", str(obj)]
     else:
-        cmd = [tool, "--64", "-o", str(obj), str(src)]
+        cmd = [tool, "--32" if bits32 else "--64",
+               "-o", str(obj), str(src)]
     r = _run(cmd)
     if r.returncode != 0 or not obj.exists():
         msg = (r.stderr or r.stdout).strip().splitlines()
@@ -539,7 +545,8 @@ def _canon_insn(insn: str) -> str:
     return insn
 
 
-def decodes_same(objdump: str, a: bytes, b: bytes) -> bool | None:
+def decodes_same(objdump: str, a: bytes, b: bytes,
+                 bits32: bool = False) -> bool | None:
     """Compare disassembly, returning None when it cannot be verified.
 
     False means both byte strings decoded successfully but to different
@@ -554,7 +561,8 @@ def decodes_same(objdump: str, a: bytes, b: bytes) -> bool | None:
             raw = Path(td) / "d.bin"
             raw.write_bytes(data)
             r = subprocess.run(
-                [objdump, "-D", "-b", "binary", "-m", "i386:x86-64",
+                [objdump, "-D", "-b", "binary", "-m",
+                 "i386" if bits32 else "i386:x86-64",
                  "-M", "att", str(raw)],
                 capture_output=True, text=True, timeout=120)
         if r.returncode != 0:
@@ -581,7 +589,8 @@ def decodes_same(objdump: str, a: bytes, b: bytes) -> bool | None:
     return da == db
 
 
-def _roundtrip_same_as(row: Row, references: list[bytes]) -> bool | None:
+def _roundtrip_same_as(row: Row, references: list[bytes],
+                       bits32: bool = False) -> bool | None:
     """Require the candidate to decode like every distinct reference form.
 
     `None` is fail-closed: without a usable disassembly there is no semantic
@@ -589,7 +598,7 @@ def _roundtrip_same_as(row: Row, references: list[bytes]) -> bool | None:
     """
     if not row.lccc.ok or row.lccc.data is None or not references:
         return None
-    results = [decodes_same(_OBJDUMP, row.lccc.data, ref)
+    results = [decodes_same(_OBJDUMP, row.lccc.data, ref, bits32=bits32)
                for ref in sorted(set(references))]
     if any(result is False for result in results):
         return False
@@ -598,9 +607,10 @@ def _roundtrip_same_as(row: Row, references: list[bytes]) -> bool | None:
     return None
 
 
-def _classify_roundtrip(row: Row, references: list[bytes], success: str) -> None:
+def _classify_roundtrip(row: Row, references: list[bytes], success: str,
+                        bits32: bool = False) -> None:
     """Assign a byte-different verdict only after semantic round-trip proof."""
-    same = _roundtrip_same_as(row, references)
+    same = _roundtrip_same_as(row, references, bits32=bits32)
     if same is True:
         row.verdict = success
         row.note = (row.note + " | " if row.note else "") + \
@@ -615,7 +625,7 @@ def _classify_roundtrip(row: Row, references: list[bytes], success: str) -> None
                    "objdump could not verify semantic equivalence"
 
 
-def classify(row: Row) -> None:
+def classify(row: Row, bits32: bool = False) -> None:
     ok_oracles = {k: v for k, v in row.oracles.items() if v.ok and v.data is not None}
 
     if not ok_oracles:
@@ -639,9 +649,9 @@ def classify(row: Row) -> None:
         row.note = "oracles differ: " + ", ".join(
             f"{k}={len(v.data)}B" for k, v in sorted(ok_oracles.items()))
         if n < best:
-            _classify_roundtrip(row, best_bytes, "BEATS")
+            _classify_roundtrip(row, best_bytes, "BEATS", bits32=bits32)
         elif n == best:
-            _classify_roundtrip(row, best_bytes, "ok-best")
+            _classify_roundtrip(row, best_bytes, "ok-best", bits32=bits32)
         elif is_wrong_shorter(row.insn):
             row.verdict = "DECLINED-WRONG"
             row.note += (f" | {best}B form from {','.join(best_who)} is not"
@@ -653,7 +663,7 @@ def classify(row: Row) -> None:
                          " NaN payload")
         else:
             row.note += f" | shortest is {best}B from {','.join(best_who)}"
-            _classify_roundtrip(row, best_bytes, "LONGER")
+            _classify_roundtrip(row, best_bytes, "LONGER", bits32=bits32)
         return
 
     ref = next(iter(bytesets))
@@ -662,14 +672,14 @@ def classify(row: Row) -> None:
     elif n < len(ref):
         row.note = (f"oracles agree on {len(ref)}B"
                     f" ({','.join(sorted(ok_oracles))})")
-        _classify_roundtrip(row, [ref], "BEATS")
+        _classify_roundtrip(row, [ref], "BEATS", bits32=bits32)
     elif n > len(ref):
         row.note = (f"oracles agree on {len(ref)}B"
                     f" ({','.join(sorted(ok_oracles))})")
-        _classify_roundtrip(row, [ref], "LONGER")
+        _classify_roundtrip(row, [ref], "LONGER", bits32=bits32)
     else:
         row.note = f"same length, different bytes (oracle {ref.hex()})"
-        _classify_roundtrip(row, [ref], "ok")
+        _classify_roundtrip(row, [ref], "ok", bits32=bits32)
 
 
 # Cases where a shorter encoding EXISTS but is deliberately not taken.
@@ -769,6 +779,8 @@ def main() -> int:
                     help="extra Compiler Explorer id to use as an oracle")
     ap.add_argument("--offline", action="store_true",
                     help="local GNU as only; no network")
+    ap.add_argument("--32", dest="bits32", action="store_true",
+                    help="compare i686 code: LCCC/GAS --32, remote compilers -m32")
     ap.add_argument("--only", action="append", default=[],
                     help="report only these verdicts")
     ap.add_argument("--batch", type=int, default=60,
@@ -787,6 +799,10 @@ def main() -> int:
         insns += read_casefiles(args.casefiles)
     if not insns:
         ap.error("no instructions: use --insn, --file or --casefiles")
+    if not args.bits32 and any(Path(p).parent.name == "i686"
+                                for p in args.casefiles):
+        ap.error("i686 casefiles require --32 (otherwise LCCC/GAS and remote "
+                 "oracles use x86-64 mode)")
 
     seen: set[str] = set()
     uniq = [i for i in insns if not (i in seen or seen.add(i))]
@@ -799,8 +815,10 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="encdiff-") as td:
         tmp = Path(td)
         # Local assemblers are cheap; run them straight through.
-        locals_lccc = [encode_local(args.lccc, i, tmp, args.objcopy) for i in uniq]
-        locals_gas = [encode_local(args.gas, i, tmp, args.objcopy) for i in uniq]
+        locals_lccc = [encode_local(args.lccc, i, tmp, args.objcopy,
+                                    bits32=args.bits32) for i in uniq]
+        locals_gas = [encode_local(args.gas, i, tmp, args.objcopy,
+                                   bits32=args.bits32) for i in uniq]
 
         remote: dict[str, list[Encoding]] = {}
         if not args.offline:
@@ -809,7 +827,8 @@ def main() -> int:
             with concurrent.futures.ThreadPoolExecutor(
                     max_workers=max(1, len(oracle_ids))) as ex:
                 futs = {
-                    ex.submit(encode_remote_many, cid, uniq, "-O0 -c",
+                    ex.submit(encode_remote_many, cid, uniq,
+                              "-O0 -m32 -c" if args.bits32 else "-O0 -c",
                               args.batch): name
                     for name, cid in oracle_ids.items()
                 }
@@ -827,7 +846,7 @@ def main() -> int:
             for name, encs in remote.items():
                 if k < len(encs):
                     row.oracles[name] = encs[k]
-            classify(row)
+            classify(row, bits32=args.bits32)
             rows.append(row)
 
     rows.sort(key=lambda r: (SEVERITY.get(r.verdict, 9), r.insn))
@@ -895,7 +914,8 @@ def main() -> int:
 
     if args.json:
         payload = {
-            "schema": 3,
+            "schema": 4,
+            "target": "i686" if args.bits32 else "x86_64",
             "n": len(rows),
             "verdicts": counts,
             "oracles_reached": reachable,

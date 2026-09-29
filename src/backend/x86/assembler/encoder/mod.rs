@@ -330,6 +330,19 @@ fn label_to_disp(s: &str) -> Displacement {
 /// Mnemonics with NO VEX encoding (EVEX is the only form). Shared by
 /// the EVEX routing and the {vex} rejection gate.
 fn evex_only_mnemonic(mnemonic: &str) -> bool {
+    // VFPCLASS has no VEX encoding, including the AVX10.2 BF16 form and
+    // X/Y/Z-pinned packed aliases; route even low-register XMM forms here.
+    if avx::vfpclass_params(mnemonic).is_some() {
+        return true;
+    }
+    // EVEX-only convert aliases need low-register routing too. Do not
+    // classify the AVX VEX aliases or VCVTNEPS2BF16's explicit {vex} form as
+    // EVEX-only; its ordinary/default route is handled by prefer_evex.
+    if avx::vcvt_params(mnemonic)
+        .is_some_and(|params| params.pinned_ll.is_some() && params.vex.is_none())
+    {
+        return true;
+    }
     // AVX512-FP16 is EVEX-only (GAS 2.47.20260726: every ph/sh row encodes
     // through map5/map6 or map3 — no VEX spelling exists). Listed via the
     // shared suffix rule instead of 80 literal arms.
@@ -353,7 +366,6 @@ fn evex_only_mnemonic(mnemonic: &str) -> bool {
             | "vcvtdq2ph"
             | "vcvtudq2ph"
             | "vcvtps2phx"
-            | "vcvtneps2bf16"
             | "vcvtqq2ph"
             | "vcvtuqq2ph"
             | "vcvtpd2ph"
@@ -412,8 +424,12 @@ fn evex_only_mnemonic(mnemonic: &str) -> bool {
             | "vpmullq"
             | "vpsraq"
             | "vpsravq"
+            | "vpcompressb"
+            | "vpcompressw"
             | "vpcompressd"
             | "vpcompressq"
+            | "vpexpandb"
+            | "vpexpandw"
             | "vpexpandd"
             | "vpexpandq"
             | "vpshldw"
@@ -422,6 +438,12 @@ fn evex_only_mnemonic(mnemonic: &str) -> bool {
             | "vpshrdd"
             | "vpshldq"
             | "vpshrdq"
+            | "vpshldvw"
+            | "vpshrdvw"
+            | "vpshldvd"
+            | "vpshrdvd"
+            | "vpshldvq"
+            | "vpshrdvq"
             // AVX512DQ/F scalar-control family (EVEX-only per SDM).
             | "valignd"
             | "valignq"
@@ -1617,6 +1639,16 @@ impl InstructionEncoder {
                 }
             }))
         };
+        // Packed/scalar VFPCLASS (including the AVX10.2 BF16 row and
+        // x/y/z-pinned packed memory aliases) is EVEX-only and writes K.
+        if let Some(params) = avx::vfpclass_params(mnemonic) {
+            return r(self.encode_evex_vfpclass(ops, mnemonic, params));
+        }
+        // Packed-convert base names and their explicitly supported pinned
+        // x/y/z aliases share the shape, EVEX length, tuple and SAE rules.
+        if avx::vcvt_params(mnemonic).is_some() {
+            return r(self.encode_evex_vcvt(ops, mnemonic));
+        }
         // ---- AVX/AVX512 compare pseudo-ops (vcmpeqpd, vcmpneq_uqsd, ...) ----
         // Every k-dest compare alias routes here first: the predicate is
         // distilled from the mnemonic (GAS's alias table incl. the 12
@@ -2143,6 +2175,15 @@ impl InstructionEncoder {
             "vpshrdd" => r(self.encode_evex_3src_imm(ops, 3, 1, 0, 0x73, false)),
             "vpshldq" => r(self.encode_evex_3src_imm(ops, 3, 1, 1, 0x71, false)),
             "vpshrdq" => r(self.encode_evex_3src_imm(ops, 3, 1, 1, 0x73, false)),
+            // AVX512VBMI2 variable funnel shifts (0F38, pp=66):
+            // AT&T (r/m source, vvvv source, destination), with D/Q
+            // broadcasts permitted and the word forms full-vector only.
+            "vpshldvw" => r(self.encode_evex_binary(ops, 2, 1, 1, 0x70)),
+            "vpshrdvw" => r(self.encode_evex_binary(ops, 2, 1, 1, 0x72)),
+            "vpshldvd" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x71)),
+            "vpshrdvd" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x73)),
+            "vpshldvq" => r(self.encode_evex_binary(ops, 2, 1, 1, 0x71)),
+            "vpshrdvq" => r(self.encode_evex_binary(ops, 2, 1, 1, 0x73)),
             // extract with imm8 (GAS: ModRM.reg=src, r/m=dst)
             "vextracti32x4" => r(self.encode_evex_extract_imm(ops, 3, 1, 0, 0x39)),
             "vextracti64x2" => r(self.encode_evex_extract_imm(ops, 3, 1, 1, 0x39)),
@@ -2899,6 +2940,18 @@ impl InstructionEncoder {
                 }
                 r(self.encode_evex_broadcast_mem(ops, 0x1B, 1))
             }
+            "vpcompressb" => {
+                if let Err(e) = Self::evex_forbid_broadcast("vpcompressb", ops) {
+                    return Some(Err(e));
+                }
+                r(self.encode_evex_compress_expand(ops, "vpcompressb", 0x63, 0, 1, true))
+            }
+            "vpcompressw" => {
+                if let Err(e) = Self::evex_forbid_broadcast("vpcompressw", ops) {
+                    return Some(Err(e));
+                }
+                r(self.encode_evex_compress_expand(ops, "vpcompressw", 0x63, 1, 2, true))
+            }
             "vpcompressd" => {
                 if let Err(e) = Self::evex_forbid_broadcast("vpcompressd", ops) {
                     return Some(Err(e));
@@ -2910,6 +2963,18 @@ impl InstructionEncoder {
                     return Some(Err(e));
                 }
                 r(self.encode_evex_compress_expand(ops, "vpcompressq", 0x8B, 1, 8, true))
+            }
+            "vpexpandb" => {
+                if let Err(e) = Self::evex_forbid_broadcast("vpexpandb", ops) {
+                    return Some(Err(e));
+                }
+                r(self.encode_evex_compress_expand(ops, "vpexpandb", 0x62, 0, 1, false))
+            }
+            "vpexpandw" => {
+                if let Err(e) = Self::evex_forbid_broadcast("vpexpandw", ops) {
+                    return Some(Err(e));
+                }
+                r(self.encode_evex_compress_expand(ops, "vpexpandw", 0x62, 1, 2, false))
             }
             "vpexpandd" => {
                 if let Err(e) = Self::evex_forbid_broadcast("vpexpandd", ops) {
@@ -3294,7 +3359,7 @@ impl InstructionEncoder {
         let prefer_evex = matches!(
             mnemonic,
             "vpdpbusd" | "vpdpwssd" | "vpmadd52luq" | "vpmadd52huq"
-        );
+        ) || avx::vcvt_params(mnemonic).is_some_and(|params| params.prefer_evex);
         // {vex}/{vex2}/{vex3} (GAS 2.47): the EVEX encoding is forbidden.
         // Anything only EVEX can express is rejected, in GAS's order:
         //   zmm / EGPR memory / xmm-ymm 16-31  -> `unsupported instruction'
@@ -3406,6 +3471,15 @@ impl InstructionEncoder {
                 "{}: no AVX-512/EVEX form for these operands (zmm/k/masked)",
                 mnemonic
             ));
+        }
+
+        // Pinned VEX aliases need the source-width LL even for a memory
+        // source and XMM destination. VCVTNEPS2BF16 also reaches its VEX row
+        // only under an explicit {vex} selector; its default remains EVEX.
+        if avx::vcvt_params(mnemonic).is_some_and(|params| {
+            params.vex.is_some() && (params.pinned_ll.is_some() || params.prefer_evex)
+        }) {
+            return self.encode_vcvt(ops, mnemonic);
         }
 
         match mnemonic {
@@ -7068,6 +7142,101 @@ mod encoding_opt_tests {
     }
 
     #[test]
+    fn evex_vfpclass_packed_scalar_and_bf16() {
+        // GAS 2.47 byte probes: packed opcode 66, scalar opcode 67,
+        // map=3; W/pp select PS/PD/PH/BF16 or SS/SD/SH. VFPCLASS has no
+        // vvvv source (encoded 1111b) and writes a K destination.
+        assert_eq!(hex("vfpclassps $123, %xmm1, %k2"), "62 f3 7d 08 66 d1 7b");
+        assert_eq!(hex("vfpclasspsy $123, %ymm1, %k2"), "62 f3 7d 28 66 d1 7b");
+        assert_eq!(hex("vfpclasspsz $123, %zmm1, %k2"), "62 f3 7d 48 66 d1 7b");
+        assert_eq!(hex("vfpclasspsx $123, (%rax), %k2"), "62 f3 7d 08 66 10 7b");
+        assert_eq!(hex("vfpclasspdy $123, (%rax), %k2"), "62 f3 fd 28 66 10 7b");
+        assert_eq!(hex("vfpclassphz $123, (%rax), %k2"), "62 f3 7c 48 66 10 7b");
+        assert_eq!(
+            hex("vfpclassbf16x $123, (%rax), %k2"),
+            "62 f3 7f 08 66 10 7b"
+        );
+        assert_eq!(
+            hex("vfpclassps $123, (%rax){1to16}, %k2{%k4}"),
+            "62 f3 7d 5c 66 10 7b"
+        );
+        assert_eq!(
+            hex("vfpclasspd $123, (%rax){1to8}, %k2"),
+            "62 f3 fd 58 66 10 7b"
+        );
+        assert_eq!(
+            hex("vfpclassph $123, (%rax){1to32}, %k2"),
+            "62 f3 7c 58 66 10 7b"
+        );
+        assert_eq!(
+            hex("vfpclassbf16 $123, (%rax){1to32}, %k2"),
+            "62 f3 7f 58 66 10 7b"
+        );
+        assert_eq!(hex("vfpclassss $123, %xmm1, %k2"), "62 f3 7d 08 67 d1 7b");
+        assert_eq!(hex("vfpclasssd $123, (%rax), %k2"), "62 f3 fd 08 67 10 7b");
+        assert_eq!(hex("vfpclasssh $123, %xmm1, %k2"), "62 f3 7c 08 67 d1 7b");
+        assert_eq!(hex("vfpclasssh $123, (%rax), %k2"), "62 f3 7c 08 67 10 7b");
+        // Imm8 is signed -128..=255; the K-destination mask is merge-only.
+        assert_eq!(
+            hex("vfpclassps $-1, %xmm1, %k2{%k4}"),
+            "62 f3 7d 0c 66 d1 ff"
+        );
+        assert_eq!(hex("vfpclassps $255, %xmm1, %k2"), "62 f3 7d 08 66 d1 ff");
+
+        assert!(fails("vfpclassps $123, (%rax), %k2")); // unpinned, non-broadcast mem is ambiguous
+        assert!(fails("vfpclasspsx $123, %ymm1, %k2"));
+        assert!(fails("vfpclasspsz $123, %xmm1, %k2"));
+        assert!(fails("vfpclassss $123, %ymm1, %k2"));
+        assert!(fails("vfpclassss $123, (%rax){1to4}, %k2"));
+        assert!(fails("vfpclasssh $123, (%rax){1to2}, %k2"));
+        assert!(fails("vfpclassps $123, %xmm1{%k3}, %k2"));
+        assert!(fails("vfpclassps $123, %xmm1, %xmm2"));
+        assert!(fails("vfpclassps $256, %xmm1, %k2"));
+        assert!(fails("vfpclassps $-129, %xmm1, %k2"));
+        assert!(fails("vfpclasspsx $123, (%rax){1to8}, %k2"));
+        assert!(fails("vfpclassps $123, %xmm1, %k2{%k4}{z}"));
+    }
+
+    #[test]
+    fn vcvt_pinned_x_y_z_aliases_and_vex_dual_form() {
+        // GAS 2.47 x/y aliases pin the source width even when a VEX memory
+        // source has only an XMM destination. EVEX narrow memory tuples use
+        // that pinned source VL for disp8 scaling.
+        assert_eq!(hex("vcvtpd2psx (%rax), %xmm2"), "c5 f9 5a 10");
+        assert_eq!(hex("vcvtpd2psy (%rax), %xmm2"), "c5 fd 5a 10");
+        assert_eq!(hex("vcvtpd2psx %xmm1, %xmm2"), "c5 f9 5a d1");
+        assert_eq!(hex("vcvtpd2psy %ymm1, %xmm2"), "c5 fd 5a d1");
+        assert_eq!(hex("vcvtdq2phx (%rax), %xmm2"), "62 f5 7c 08 5b 10");
+        assert_eq!(hex("vcvtdq2phy (%rax), %xmm2"), "62 f5 7c 28 5b 10");
+        assert_eq!(hex("vcvtpd2phx 2032(%rax), %xmm2"), "62 f5 fd 08 5a 50 7f");
+        assert_eq!(hex("vcvtpd2phy 4064(%rax), %xmm2"), "62 f5 fd 28 5a 50 7f");
+        assert_eq!(hex("vcvtpd2phz 8128(%rax), %xmm2"), "62 f5 fd 48 5a 50 7f");
+        assert_eq!(hex("vcvtpd2phx (%rax){1to2}, %xmm2"), "62 f5 fd 18 5a 10");
+        assert_eq!(hex("vcvtpd2phy (%rax){1to4}, %xmm2"), "62 f5 fd 38 5a 10");
+        assert_eq!(hex("vcvtpd2phz (%rax){1to8}, %xmm2"), "62 f5 fd 58 5a 10");
+        // Exact native names ending in x are not stripped as aliases; the
+        // doubled x/y spellings append a separate pin to VCVTPS2PHX.
+        assert_eq!(hex("vcvtps2phx %xmm1, %xmm2"), "62 f5 7d 08 1d d1");
+        assert_eq!(hex("vcvtps2phxy %ymm1, %xmm2"), "62 f5 7d 28 1d d1");
+        assert_eq!(hex("vcvtph2psx %xmm1, %xmm2"), "62 f6 7d 08 13 d1");
+
+        // GAS defaults BF16 to EVEX, while {vex} selects its VEX.0F38 row.
+        assert_eq!(hex("vcvtneps2bf16 %ymm1, %xmm2"), "62 f2 7e 28 72 d1");
+        assert_eq!(hex("vcvtneps2bf16x (%rax), %xmm2"), "62 f2 7e 08 72 10");
+        assert_eq!(hex("vcvtneps2bf16y (%rax), %xmm2"), "62 f2 7e 28 72 10");
+        assert_eq!(hex("{vex} vcvtneps2bf16x %xmm1, %xmm2"), "c4 e2 7a 72 d1");
+        assert_eq!(hex("{vex} vcvtneps2bf16y (%rax), %xmm2"), "c4 e2 7e 72 10");
+
+        assert!(fails("vcvtpd2ps (%rax), %xmm2"));
+        assert!(fails("vcvtpd2psx %ymm1, %xmm2"));
+        assert!(fails("vcvtpd2psy %xmm1, %xmm2"));
+        assert!(fails("vcvtpd2phz (%rax), %ymm2"));
+        assert!(fails("vcvtpd2phx (%rax){1to4}, %xmm2"));
+        assert!(fails("vcvtneps2bf16z (%rax), %ymm2"));
+        assert!(fails("vcvtph2psxx %xmm1, %xmm2"));
+    }
+
+    #[test]
     fn evex_sae_broadcast_and_cmp_cvt() {
         assert_eq!(
             hex("vaddps {rn-sae}, %zmm1, %zmm2, %zmm3"),
@@ -7170,6 +7339,10 @@ mod encoding_opt_tests {
         assert_eq!(n(3, 1, 0, 0x27), Some(4));
         assert_eq!(n(3, 1, 1, 0x27), Some(8));
         assert_eq!(n(3, 1, 0, 0x51), Some(4));
+        assert_eq!(n(3, 1, 0, 0x67), Some(4)); // vfpclassss
+        assert_eq!(n(3, 1, 1, 0x67), Some(8)); // vfpclasssd
+        assert_eq!(n(3, 0, 0, 0x67), Some(2)); // vfpclasssh
+        assert_eq!(n(3, 0, 1, 0x67), None); // undefined W=1 neighbor
         assert_eq!(n(3, 1, 0, 0x26), None); // packed vgetmantpd
     }
 
