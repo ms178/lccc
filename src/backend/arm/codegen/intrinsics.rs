@@ -1100,6 +1100,7 @@ impl ArmCodegen {
             | IntrinsicOp::VecFmaF64x4
             | IntrinsicOp::VecHorizontalAddF32x8
             | IntrinsicOp::VecHorizontalMaxI32x8
+            | IntrinsicOp::VecHorizontalMinI32x8
             | IntrinsicOp::VecLoadF32x8
             | IntrinsicOp::VecMaddF32x8
             | IntrinsicOp::VecMaddF32x8Signed(..)

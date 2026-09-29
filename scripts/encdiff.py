@@ -63,7 +63,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 API = "https://godbolt.org/api"
-CACHE = Path(os.environ.get("GODBOLT_CACHE", ".godbolt-cache"))
+
+# The cache used to default to the RELATIVE path ".godbolt-cache", so the
+# directory this tool wrote to depended on the working directory it was
+# invoked from: run it from anywhere but the repository root and it silently
+# built a second, private cache in that directory, re-issuing every request
+# and scattering .godbolt-cache/ over the filesystem. It now uses the one
+# absolute, tree-wide location shared with scripts/godbolt.py,
+# scripts/codegen_oracle.py and tools/oracle/godbolt_oracle.py.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import godbolt_cache  # noqa: E402
+CACHE = godbolt_cache.CACHE
 _OBJDUMP = os.environ.get("LCCC_OBJDUMP", "objdump")
 TIMEOUT = int(os.environ.get("GODBOLT_TIMEOUT", "120"))
 
@@ -154,19 +164,15 @@ def local_label_scaffold(insn: str) -> tuple[str, str]:
 
 # ─── Remote oracles (Compiler Explorer) ───────────────────────────────────
 
-def _cache_path(key: str) -> Path:
-    return CACHE / (hashlib.sha256(key.encode()).hexdigest()[:32] + ".json")
-
-
 def _post(cid: str, source: str, args: str) -> dict:
     """Compile `source` remotely, returning the API's JSON response."""
-    key = f"{cid}\x00{args}\x00{source}"
-    cp = _cache_path(key)
-    if cp.exists():
-        try:
-            return json.loads(cp.read_text())
-        except json.JSONDecodeError:
-            cp.unlink(missing_ok=True)
+    # Through the cache shared tree-wide, under its own namespace: this stores
+    # the raw API reply (including `opcodes`), which is a different shape from
+    # the assembly held in `att-v2` and the execution records in `oracle-v1`.
+    # A corrupt record is treated as a miss and overwritten, never fatal.
+    hit = godbolt_cache.load_json(godbolt_cache.NS_ENCDIFF, cid, args, source)
+    if hit is not None:
+        return hit
 
     body = json.dumps({
         "source": source,
@@ -183,8 +189,7 @@ def _post(cid: str, source: str, args: str) -> dict:
                  "Accept": "application/json"})
     with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
         out = json.load(r)
-    CACHE.mkdir(parents=True, exist_ok=True)
-    cp.write_text(json.dumps(out))
+    godbolt_cache.store_json(godbolt_cache.NS_ENCDIFF, out, cid, args, source)
     return out
 
 

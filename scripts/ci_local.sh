@@ -314,6 +314,13 @@ gate "call-secondary-cache" fast \
 
 gate "vec-dead-remainder" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_vec_dead_remainder.sh
+
+gate "minmax-reduction" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_minmax_reduction.sh
+
+gate "hot-loop-metric" fast \
+    python3 scripts/test_hot_loop_metric.py
+
 gate "copy-alias-sizes" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_copy_alias_sizes.sh
 
@@ -704,6 +711,15 @@ gate "decimal64-indexed-fold" fast \
 gate "decimal32-arm-width" fast \
     env CCC_ARM=target/fastbuild/lccc-arm bash tests/regression/check_decimal32_indexed_fold_arm.sh
 
+# Pure-logic gate: it exercises the oracle-verdict / oracle-agreement
+# classifier directly, so it needs neither a built linker nor a single
+# installed oracle linker.  That is the point -- the paths it pins (two
+# oracles going `inapplicable`, one crashing, the reference having no
+# opinion) are exactly the ones a host with only bfd installed never
+# executes end-to-end.
+gate "linker-oracle-verdict" fast \
+    python3 tests/linker/test_reloc_oracle_verdict.py
+
 if [ -x target/fastbuild/lccc-ld ]; then
     gate "linker-fuzz" fast env \
         LCCC_LD="$PWD/target/fastbuild/lccc-ld" FUZZ_N=128 FUZZ_SEED=20260906 \
@@ -742,6 +758,13 @@ gate "ensure-gcc-torture-contract" fast \
 # have shipped wrong answers before, which is why they are asserted.
 gate "godbolt-oracle-selftest" fast \
     python3 tools/oracle/godbolt_oracle_selftest.py
+
+# One CE cache now backs four tools, and every way it can be wrong is silent:
+# a forgeable key serves one program's result for another's, a truncated
+# record reads as a hit instead of a miss, and a cached rate-limit blip
+# strands an oracle out of every future sweep. Pinned offline, no network.
+gate "godbolt-cache-selftest" fast \
+    python3 scripts/test_godbolt_cache.py
 
 # --------------------------------------------------------------- job:bench --
 # The bench workflow carries the CODEGEN-QUALITY gate, which the test job does
