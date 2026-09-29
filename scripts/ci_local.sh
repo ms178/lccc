@@ -729,6 +729,17 @@ fi
 gate "ensure-gcc-torture-contract" fast \
     bash tests/regression/check_ensure_gcc_torture.sh
 
+# Cross-vendor oracle (docs/GODBOLT_ORACLE.md).  Only the OFFLINE half runs
+# here: the live sweep needs godbolt.org, and a network dependency inside
+# ci_local turns an outage into a red local gate -- the exact failure shape
+# this branch already spent time on.  What is offline is the part that
+# silently used to be wrong: Compiler Explorer's stream framing, and the
+# program-level traps (file-scope storage, rotations by the full width) that
+# make an oracle report a divergence that is really a broken test.  Both
+# have shipped wrong answers before, which is why they are asserted.
+gate "godbolt-oracle-selftest" fast \
+    python3 tools/oracle/godbolt_oracle_selftest.py
+
 # --------------------------------------------------------------- job:bench --
 # The bench workflow carries the CODEGEN-QUALITY gate, which the test job does
 # not.  Leaving it out of this mirror is exactly how a +24% instruction-count
