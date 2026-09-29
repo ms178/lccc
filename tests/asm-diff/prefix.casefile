@@ -180,6 +180,48 @@ repne scasl
 repne scasq
 repne cmpsb
 repne cmpsw
+;;; string_explicit_operands
+.text
+# The explicit-operand string forms (slot law, 2.47-probed): the ES-slot
+# is picked by operand position and must be %es-or-none, the ESI side
+# keeps any non-%ds override, accumulator spellings exist for STOS/LODS
+# only in the canonical order with the size-matched register, and the
+# INS/OUTS port is (%dx) or %dx.
+movsb (%rsi),%es:(%rdi)
+movsb %fs:(%rsi),%es:(%rdi)
+cmpsb (%rsi),%es:(%rdi)
+cmpsb %es:(%rdi),(%rsi)
+movsw (%rsi),%es:(%rdi)
+movsq (%rsi),(%rdi)
+stosb %al,(%rdi)
+stosb %al,%es:(%rdi)
+stosq %rax,(%rdi)
+lodsb (%rsi)
+lodsq (%rsi),%rax
+lodsw %fs:(%rsi),%ax
+scasb (%rdi)
+insb (%dx),%es:(%rdi)
+insb %dx,(%rdi)
+outsb (%rsi),%dx
+outsb %es:(%rsi),%dx
+movsb (%rsi,%rax),%es:(%rdi)
+;;; string_explicit_rejects reject
+.text
+movsb (%rsi),%fs:(%rdi)
+movsb %es:(%rdi),%fs:(%rsi)
+movsb %gs:(%rsi),%fs:(%rcx)
+stosb %cl,%es:(%rdi)
+stosb %rax,(%rdi)
+stosb (%rdi),%al
+lodsb %al,(%rsi)
+lodsb %rax,(%rsi)
+scasb %eax,(%rdi)
+insb (%eax),%es:(%rdi)
+insb (%edx),%es:(%rdi)
+insb (%dx)
+outsb (%rsi)
+outsb %dx,(%rsi)
+outsb (%rsi),%eax
 ;;; seg_ss
 .text
 mov %ss:8(%rax), %rbx

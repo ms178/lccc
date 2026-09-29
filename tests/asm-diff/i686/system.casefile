@@ -38,6 +38,10 @@ umwait %ebx
 .text
 monitor %ebx,%ecx,%edx
 monitor %al,%ecx,%edx
+monitor %eax,%ecx,%ebx
+monitor %eax,%ebx,%ecx
+monitor %eax,%cx,%edx
+monitorx %eax,%ecx,%ebx
 mwait %ax,%ecx
 mwaitx %ax,%ecx,%ebx
 tpause %ax

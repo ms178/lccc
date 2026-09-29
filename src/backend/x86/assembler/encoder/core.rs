@@ -1058,16 +1058,20 @@ impl super::InstructionEncoder {
 
         // Strip @PLT suffix from symbol names - the suffix only affects relocation type,
         // not the symbol name in the ELF symbol table. Use PLT32 reloc when @PLT is present.
-        let (sym, rtype) = if let Some(base) = symbol.strip_suffix("@PLT") {
-            let plt_type = if reloc_type == R_X86_64_PC32 {
-                R_X86_64_PLT32
+        // Case-insensitive like GAS's suffix matching (`call foo@plt`
+        // promotes exactly like `foo@PLT`).
+        let (sym, rtype) =
+            if symbol.len() >= 4 && symbol[symbol.len() - 4..].eq_ignore_ascii_case("@plt") {
+                let base = &symbol[..symbol.len() - 4];
+                let plt_type = if reloc_type == R_X86_64_PC32 {
+                    R_X86_64_PLT32
+                } else {
+                    reloc_type
+                };
+                (base, plt_type)
             } else {
-                reloc_type
+                (symbol, reloc_type)
             };
-            (base, plt_type)
-        } else {
-            (symbol, reloc_type)
-        };
         self.relocations.push(Relocation {
             offset: self.bytes.len() as u64,
             symbol: sym.to_string(),

@@ -28,6 +28,32 @@ addr32 fs mov %eax, (%ebx)
 data16 nop
 data16 mov %eax, (%eax)
 data16 mov %eax, %ebx
+;;; data16_branches
+.text
+# the 16-bit branch law: 66 + near form + rel16 + R_X86_64_PC16 (GAS
+# 2.47 objdump-verified); with @PLT GAS rejects the 4-byte reloc on a
+# 2-byte field, and so does the encoder.
+data16 jmp foo
+data16 je foo
+data16 call foo
+;;; data16_branch_rejects reject
+.text
+data16 jmp foo@PLT
+data16 call foo@PLT
+;;; data16_branch_local
+.text
+# Same-section local targets: GAS resolves the rel16 in place (no
+# relocation; lccc's PC16 fold now does the same). Only the FAR-local
+# form is pinned byte-exact — for NEAR targets GAS relaxes down to
+# `66 eb rel8`, which lccc deliberately does not replicate: the explicit
+# data16 requests a 16-bit displacement (the same fixed-rel16 policy as
+# the .code16 branches).
+data16 jmp 1f
+.space 200
+1: nop
+data16 je 2f
+.space 200
+2: nop
 ;;; rex_forms
 .text
 rex mov %ebx, %edi

@@ -4745,6 +4745,29 @@ impl<A: X86Arch> ElfWriterCore<A> {
         }
     }
 
+    /// The rel16 sibling of `pc8_range_error`: a folded 16-bit branch
+    /// displacement that does not fit in ±32 KiB (GAS: "value of ... too
+    /// large for field of 2 bytes"). Same printing conventions as the
+    /// 8-bit version — negative values as hex of the target cell, the
+    /// offset in the architecture's address width.
+    fn pc16_range_error(rel: i64, offset: u64) -> String {
+        if A::elf_class() == ELFCLASS32 {
+            let val = if rel < 0 {
+                format!("{:08x}", rel as u32)
+            } else {
+                format!("{rel}")
+            };
+            format!("value of {val} too large for field of 2 bytes at {offset:08x}")
+        } else {
+            let val = if rel < 0 {
+                format!("{:016x}", rel as u64)
+            } else {
+                format!("{rel}")
+            };
+            format!("value of {val} too large for field of 2 bytes at {offset:016x}")
+        }
+    }
+
     /// A surviving 8-byte relocation the target cannot represent. ELF32
     /// has neither a 64-bit PC-relative nor a 64-bit absolute type
     /// (both trait fallbacks alias the 32-bit ones); GAS rejects every
@@ -4891,12 +4914,18 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 if let Some((target_sec, target_off)) = label_pos {
                     let is_local = self.is_local_symbol(&reloc.symbol);
 
-                    // Same-section rel16 branches (.code16): patch the
-                    // 2-byte field directly — GAS never emits a reloc for
-                    // a local 16-bit branch.
+                    // Same-section rel16 branches (.code16, and x86-64
+                    // `data16 jmp/jcc/call`): patch the 2-byte field
+                    // directly — GAS never emits a reloc for a local
+                    // 16-bit branch. Out of ±32 KiB range the branch is
+                    // unencodable: error like the 8-bit fold does instead
+                    // of silently truncating the displacement.
                     if let Some(pc16) = A::reloc_pc16() {
                         if reloc.reloc_type == pc16 && target_sec == sec_idx && is_local {
                             let rel = (target_off as i64) + reloc.addend - (reloc.offset as i64);
+                            if !(-(1i64 << 15)..=(1i64 << 15) - 1).contains(&rel) {
+                                return Err(Self::pc16_range_error(rel, reloc.offset));
+                            }
                             resolved.push((reloc.offset as usize, rel, 2));
                             continue;
                         }

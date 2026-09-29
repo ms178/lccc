@@ -38,6 +38,23 @@ test.s %edx,%ecx
 test.s %dl,%cl
 test.s %r9d,%r8d
 test %edx,%ecx
+;;; xchg_s
+.text
+# The .s suffix swaps the ModR/M roles — and the REX.R/REX.B assignment
+# with them (48 87 d1 -> 48 87 ca; xchg.s %r8,%rcx = 49 87 c8) — but the
+# accumulator short form is unaffected (xchg.s %rax,%rcx = 48 91), and
+# the memory operand rides r/m in both spellings.
+xchg.s %edx,%ecx
+xchg %edx,%ecx
+xchg.s %rdx,%rcx
+xchg.s %dl,%cl
+xchg.s %eax,%ecx
+xchg.s %rax,%rcx
+xchg.s %r8,%rcx
+xchg.s %rcx,%r8
+xchg (%rbx),%rax
+xchg %rax,(%rbx)
+xchg.s (%rbx),%rax
 testb.s %dl,%cl
 ;;; sse_s_reg_reg
 .text
@@ -91,14 +108,43 @@ vmovdqu64.s %zmm29,%zmm30
 vmovq.s %xmm29,%xmm30
 vmovd.s %xmm29,%xmm30
 vmovsd.s %xmm29,%xmm30,%xmm28
+;;; vmovd_vmovq_xmm_xmm
+.text
+vmovd %xmm4,%xmm6
+vmovq %xmm1,%xmm2
+vmovd %xmm29,%xmm30
+vmovq %xmm29,%xmm30
 ;;; monitor_family
 .text
 monitor %rax,%ecx,%edx
 monitor %eax,%ecx,%edx
 monitor %eax,%rcx,%rdx
+monitor %rax,%rcx,%rdx
 monitorx %rax,%ecx,%edx
 monitorx %eax,%ecx,%edx
+monitorx %eax,%rcx,%rdx
+monitorx %rax,%rcx,%rdx
+mwait
+mwait %eax,%ecx
+mwait %rax,%rcx
+mwaitx
 mwaitx %eax,%ecx,%ebx
+mwaitx %rax,%rcx,%rbx
+;;; monitor_family_rejects reject
+.text
+monitor %ax,%rcx,%rdx
+monitor %al,%rcx,%rdx
+monitor %rax,%rcx,%rbx
+monitor %rax,%r8,%r9
+monitor %rax,%ecx,%rdx
+monitor %eax,%rcx,%edx
+monitorx %rax,%rbx,%rcx
+monitorx %eax,%ecx,%ebx
+mwait %eax,%rcx
+mwait %ax,%ecx
+mwaitx %ax,%cx,%bx
+mwaitx %eax,%ecx,%edx
+mwaitx %r8d,%ecx,%ebx
 ;;; user_msr
 .text
 urdmsr %rdx,%rax
