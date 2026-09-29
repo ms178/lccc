@@ -860,6 +860,19 @@ fn build_loop_alias_info(func: &IrFunction, natural_loop: &NaturalLoop) -> LoopA
     }
 }
 
+/// Emit a LICM diagnostic when `CCC_DEBUG_LICM` is set.
+///
+/// Without this, "why was this invariant load left in the loop?" costs an
+/// instrumented rebuild per hypothesis: the rejection has six independent
+/// causes (volatility, must-execute, preheader shape, aliasing, calls,
+/// address-taken allocas) and the emitted assembly shows only the result.
+#[inline]
+fn licm_debug(f: impl FnOnce()) {
+    if std::env::var("CCC_DEBUG_LICM").is_ok() {
+        f();
+    }
+}
+
 /// Check if a Load instruction is safe to hoist from a loop.
 ///
 /// A load is safe to hoist if:
@@ -925,6 +938,7 @@ fn is_load_hoistable(
     // like any other derived pointer.
     if global_addr_values.contains(&ptr_id) {
         if !preheader_is_dedicated && !root_global_addr_values.contains(&ptr_id) {
+            licm_debug(|| eprintln!("[LICM] global load: preheader not dedicated"));
             return false;
         }
         if loop_mem.has_calls {
@@ -956,13 +970,29 @@ fn is_load_hoistable(
     // Such loads may only move into a *dedicated* preheader, whose sole
     // successor is the loop header (see hoist_loop_invariants).
     if !preheader_is_dedicated {
+        licm_debug(|| {
+            eprintln!(
+                "[LICM] derived-pointer load v{}: preheader is not dedicated \
+                 (LOOP-PREHEADER-1 inserts one)",
+                ptr_id
+            )
+        });
         return false;
     }
-    if std::env::var_os("CCC_NO_LICM_ALIAS").is_some() || !alias_info.complete || loop_mem.has_calls
-    {
+    if std::env::var_os("CCC_NO_LICM_ALIAS").is_some() {
+        licm_debug(|| eprintln!("[LICM] load v{}: alias engine off", ptr_id));
+        return false;
+    }
+    if loop_mem.has_calls {
+        licm_debug(|| eprintln!("[LICM] load v{}: loop has calls", ptr_id));
+        return false;
+    }
+    if !alias_info.complete {
+        licm_debug(|| eprintln!("[LICM] load v{}: alias info incomplete", ptr_id));
         return false;
     }
     let Some(load_form) = alias_info.forms.get(&ptr_id) else {
+        licm_debug(|| eprintln!("[LICM] load v{}: pointer has no linear form", ptr_id));
         return false;
     };
     alias_info.stores.iter().all(|(store_form, store_size)| {
@@ -1235,12 +1265,31 @@ fn hoist_loop_invariants(
                     // before the guard (gcc.c-torture/execute/20051215-1.c).
                     // Require the load's original block to dominate every
                     // loop block, i.e. it is must-execute for any iteration.
-                    !*volatile
-                        && natural_loop
-                            .body
-                            .iter()
-                            .all(|&b| dominates_block(idom, block_idx, b))
-                        && is_load_hoistable(
+                    if *volatile {
+                        licm_debug(|| {
+                            eprintln!(
+                                "[LICM] load v{} in block {} not hoisted: volatile \
+                                 access must execute exactly as written (C11 5.1.2.3)",
+                                dest.0, block_idx
+                            )
+                        });
+                        false
+                    } else if !(natural_loop
+                        .body
+                        .iter()
+                        .all(|&b| dominates_block(idom, block_idx, b)))
+                    {
+                        licm_debug(|| {
+                            eprintln!(
+                                "[LICM] load v{} in block {} not hoisted: its block does \
+                                 not dominate every loop block (block is not the header, \
+                                 so the load is not must-execute)",
+                                dest.0, block_idx
+                            )
+                        });
+                        false
+                    } else {
+                        is_load_hoistable(
                             ptr,
                             alloca_info,
                             &loop_mem,
@@ -1253,6 +1302,7 @@ fn hoist_loop_invariants(
                             ty.size() as i64,
                             preheader_is_dedicated,
                         )
+                    }
                 } else {
                     false
                 };

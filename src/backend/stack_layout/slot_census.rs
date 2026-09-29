@@ -88,11 +88,21 @@ pub struct SlotCensusEntry {
 /// [`crate::backend::regalloc::RegAllocResult::eligible`]); `reg_assigned` is
 /// the final value → register map handed to the emitter.  `value_locations` is
 /// authoritative for who lives in memory.
+///
+/// `is_32bit` is the pointer width of the target being code-generated.  It is
+/// a parameter rather than a `crate::common::types::target_is_32bit()` read
+/// for two reasons: the `NonGpr`/`Temp` split below is decided by
+/// `is_non_gpr_type`, which takes the width explicitly, so taking it here too
+/// keeps the one place that classifies types on one width; and the caller can
+/// assert it against the process-wide target, which turns a silent drift into
+/// a debug abort instead of a census that disagrees with the allocator that
+/// produced the slots it is explaining.
 pub fn build_slot_census(
     func: &IrFunction,
     state: &CodegenState,
     eligible: &FxHashSet<u32>,
     reg_assigned: &FxHashMap<u32, crate::backend::regalloc::PhysReg>,
+    is_32bit: bool,
 ) -> Vec<SlotCensusEntry> {
     use crate::ir::reexports::Instruction;
     // Result type of every value with a typed definition, so a non-eligible
@@ -124,7 +134,6 @@ pub fn build_slot_census(
             }
         }
     }
-    let is_32bit = crate::common::types::target_is_32bit();
     let mut by_offset: FxHashMap<i64, SlotCensusEntry> = FxHashMap::default();
     for (&value_id, slot) in &state.value_locations {
         let offset = slot.0;

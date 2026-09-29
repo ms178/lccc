@@ -314,6 +314,74 @@ gate "call-secondary-cache" fast \
 
 gate "vec-dead-remainder" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_vec_dead_remainder.sh
+
+gate "minmax-reduction" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_minmax_reduction.sh
+
+# Observable-access gates.  Three instruments, because each catches a
+# different way the `volatile` contract gets broken and each was proved to do
+# so by mutation (reintroducing the guard deletion in licm.rs):
+#
+#   volatile-spin-loop        BEHAVIOURAL.  Asserts a volatile access is
+#                             positioned between the loop header and the
+#                             backward branch.  The only one of the three
+#                             that catches a HOIST (a hoist keeps the access
+#                             count at one, which is why the subscript gate
+#                             below stays green on a miscompiled spin loop --
+#                             measured, not assumed).
+#   volatile-pointer-subscript BEHAVIOURAL.  Asserts the qualifier survives
+#                             subscript/pointer arithmetic, i.e. no CSE, no
+#                             dead-store elimination, no forward.
+#   volatile-destructuring    STATIC.  Fails when a `volatile` destructured
+#                             from an IR access is bound and never used, which
+#                             is exactly how a guard disappears in a refactor.
+#                             Costs no build, so it runs first in a review.
+#
+# All three are fast: they need only $CCC (or, for the static one, nothing but
+# the source tree) and no oracle linkers.
+gate "volatile-spin-loop" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_volatile_spin_loop.sh
+
+gate "volatile-pointer-subscript" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_volatile_pointer_subscript.sh
+
+gate "volatile-destructuring" fast \
+    python3 scripts/check_volatile_destructuring.py --self-test \
+    && python3 scripts/check_volatile_destructuring.py
+
+# End-to-end contract for the loop-preheader pass.  Its unit tests can only
+# reach the pure terminator helpers, so they cannot observe whether a
+# preheader was actually inserted -- a Rust-side suite passes identically
+# whether the pass fires once or never.  This gate asserts the emitted
+# assembly in both directions: the shape it must improve (hoisted) and the
+# shapes it must decline (byte-identical, load still in the loop).
+gate "loop-preheader" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_loop_preheader.sh
+
+# LICM must not hoist a volatile load out of its loop (C11 5.1.2.3): N
+# observable accesses must not become 1.  The runtime cannot see this -- a
+# hoisted volatile load computes the same answer -- so the gate asserts it
+# structurally, with a non-volatile load in the same shape as the negative
+# control (that one MUST be hoisted, or the test proves nothing).
+# Complements the three observable-access gates above: those cover spin
+# loops, subscripts and the destructuring refactor; this one covers the
+# do-while shape, where a hoist is legal-looking and easy to miss.
+gate "volatile-licm" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_volatile_licm.sh
+
+gate "hot-loop-metric" fast \
+    python3 scripts/test_hot_loop_metric.py
+
+# The full corpus gate is SLOW, so a source file that cannot even link used to
+# reach upstream on a green local run: tests/regression/*.c is globbed
+# non-recursively and compiled standalone, so a multi-file driver dropped in
+# that directory fails to link.  --compile-only is the cheap half of that gate
+# (no execution, no GCC reference build) and catches exactly this, in seconds.
+# Failure detail names the non-self-contained file instead of printing a wall
+# of `undefined reference` lines.
+gate "regression-corpus-link" fast \
+    python3 tests/regression/run_regression.py --lccc "$LCCC" -j 2 --compile-only
+
 gate "copy-alias-sizes" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_copy_alias_sizes.sh
 
@@ -704,6 +772,15 @@ gate "decimal64-indexed-fold" fast \
 gate "decimal32-arm-width" fast \
     env CCC_ARM=target/fastbuild/lccc-arm bash tests/regression/check_decimal32_indexed_fold_arm.sh
 
+# Pure-logic gate: it exercises the oracle-verdict / oracle-agreement
+# classifier directly, so it needs neither a built linker nor a single
+# installed oracle linker.  That is the point -- the paths it pins (two
+# oracles going `inapplicable`, one crashing, the reference having no
+# opinion) are exactly the ones a host with only bfd installed never
+# executes end-to-end.
+gate "linker-oracle-verdict" fast \
+    python3 tests/linker/test_reloc_oracle_verdict.py
+
 if [ -x target/fastbuild/lccc-ld ]; then
     gate "linker-fuzz" fast env \
         LCCC_LD="$PWD/target/fastbuild/lccc-ld" FUZZ_N=128 FUZZ_SEED=20260906 \
@@ -742,6 +819,13 @@ gate "ensure-gcc-torture-contract" fast \
 # have shipped wrong answers before, which is why they are asserted.
 gate "godbolt-oracle-selftest" fast \
     python3 tools/oracle/godbolt_oracle_selftest.py
+
+# One CE cache now backs four tools, and every way it can be wrong is silent:
+# a forgeable key serves one program's result for another's, a truncated
+# record reads as a hit instead of a miss, and a cached rate-limit blip
+# strands an oracle out of every future sweep. Pinned offline, no network.
+gate "godbolt-cache-selftest" fast \
+    python3 scripts/test_godbolt_cache.py
 
 # --------------------------------------------------------------- job:bench --
 # The bench workflow carries the CODEGEN-QUALITY gate, which the test job does

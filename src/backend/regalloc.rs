@@ -7427,6 +7427,7 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecMaxI32x8
                     | O::VecMinI32x8
                     | O::VecHorizontalMaxI32x8
+                    | O::VecHorizontalMinI32x8
                     | O::VecMaskedAddI32x8
                     // BB-SLP 256-bit dword shifts consume the I32x8 home
                     // directly (three-operand VEX immediate form).
@@ -7646,6 +7647,7 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                                 | O::VecMaxI32x8
                                 | O::VecMinI32x8
                                 | O::VecHorizontalMaxI32x8
+                                | O::VecHorizontalMinI32x8
                                 | O::VecHorizontalMaxI32x4
                                 | O::VecSmaxI32x4
                                 | O::VecSminI32x4

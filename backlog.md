@@ -110,6 +110,150 @@ GHASH/mulpack for the multi-source shape rule).
 
 ## Tier 1 — measured, largest first
 
+### MINMAX-1 · **LANDED 2026-09-29** — integer min/max reductions on x86-64
+`min`/`max` over `int[]` stayed scalar on x86-64 although the packed
+machinery was finished: the reduction only becomes a `Select` after
+`if_convert`, which runs AFTER the main vectorizer, and the late rerun that
+catches it was gated on `matches!(target, Aarch64)` while its own comment
+promised the x86-64 rerun. Fixed (shared early/late dispatch table, opened
+to x86-64), plus `ReductionKind::Min` (`vpminsd`, new
+`VecHorizontalMinI32x8`) and admission of the ordinary IV-indexed-GEP shape
+at `iv_init == 0`.
+Measured `-O3 -march=x86-64-v3`, steady-state density: `min_i32`/`max_i32`
+**1.5 -> 0.1250 insn/byte** (12x; level with gcc 16.2 and icx, behind clang
+23.1's 4x-unrolled 0.0547 only). Pinned oracles: clang 23.1 0.0547, gcc 16.2
+0.1250, icx 0.1250, icc 0.5625.
+Second defect found and fixed on the way (MINMAX-1b): a dynamic loop bound
+was divided by the vector width with a `UDiv` inserted into the loop HEADER,
+so the min/max steady state carried a real 64-bit `divq` — 6 of its 10
+instructions. Now emitted once in the preheader as `LShr` (power-of-two
+width): 10 -> 4 insns per trip. Both the AVX2 and the SSE2 transform, corpus
+A/B shows no regression. See
+[`engineering/evidence/MINMAX-1/README.md`](engineering/evidence/MINMAX-1/README.md).
+
+* **MINMAX-5 · extract the duplicated dynamic-limit hoist (LOW-3).** The
+  ~110-line hoist is cloned verbatim between `transform_reduction_avx2` and
+  `transform_reduction_sse2`. Mechanical, and the right call eventually, but
+  it must be its OWN commit with its own re-measurement: it touches the single
+  largest behavioural change in MINMAX-1, and spending a correctness session's
+  validation budget on a maintainability wart with no defect behind it is the
+  wrong order. Deferred deliberately, with the reasoning recorded, rather than
+  skipped silently.
+
+**Gate/observability follow-ups from the PR #681 audit** (detail and
+measurements in
+[`engineering/evidence/PR681-AUDIT-RESPONSE/README.md`](engineering/evidence/PR681-AUDIT-RESPONSE/README.md)):
+
+* **OBS-1 · `src/lib.rs` carries `#![allow(unused_variables)]` crate-wide.**
+  This, not any rustc limitation, is why a deleted `!*volatile` guard in
+  `licm.rs` reached a green Clippy job: rustc *does* lint refutable-pattern
+  bindings (verified: `rustc -D warnings` errors on the exact shape), and this
+  crate has the lint switched off. Until it is addressed, a dropped
+  observable-access guard in any pass is invisible to the build.
+  `scripts/check_volatile_destructuring.py` covers the one field where silence
+  is a miscompile. The right follow-up is a **counted ratchet** over
+  `unused_variables` sites — measure today, never raise it — in the style of
+  `check_env_test_hygiene.sh`, migrating the safety-relevant sites first.
+* **OBS-2 · widen the ratchet to the other observable-access fields.**
+  `Instruction` carries a second flag, `semantic_volatile`, which has the same
+  silent-drop exposure and currently **no instrument at all**. `AtomicLoad` /
+  `AtomicRmw` / `AtomicStore` are excluded on the *argument* that `_Atomic`
+  accesses are already unremovable; that is an argument, not a measurement.
+* **OBS-3 · `check_volatile_spin_loop.sh` asserts on the INNERMOST loop.**
+  A volatile access hoisted from an inner loop into an outer one would pass.
+  Not reachable today (no pass sinks outward), but the helper should support
+  "inside any enclosing loop" and the gate should say which it means.
+* **OBS-4 · `loop_preheader` is 528 lines of CFG surgery, default-on at -O2,
+  and fires ~0 times at default settings.** Measured: byte-identical output
+  with and without it on every guard-at-top shape, including the SQLite
+  `if (p == 0) return 0;` case its own docstring cites; it fires under
+  `CCC_LOOP_ROTATE=1` (18x, per the W3 journal) and on a plain `-O2` `do`-while
+  shape. Either find the shape family it is actually good for and measure the
+  insertion rate over the golden workloads, or gate it off by default. Today
+  it is paid for on every `-O2` compile and its value is invisible.
+  `tests/regression/check_loop_preheader.sh` now pins both directions.
+* **OBS-5 · an access COUNT cannot see a HOIST.**
+  `check_volatile_pointer_subscript.sh` passed green on a compiler that hoists
+  a volatile MMIO load out of its spin loop, because hoisting preserves the
+  count. Measured, not assumed. Any future gate asserting on emitted code
+  should ask about POSITION; `tests/regression/lib_loop_bounds.sh` is the
+  shared primitive.
+
+* **OBS-6 · `reloc_pc32_out_of_range_diagnosed_on_script_path` cannot pass on
+  a host whose non-reference linkers cannot parse the fixture's script.**
+  Measured on this box: 300 pass / 1 fail, with
+  `only 1 of 2 oracles could express an opinion, need 2` -- bfd refuses, and
+  mold 2.37 answers `unknown linker script token` for the fixture's
+  `ENTRY(probe)`, so it is `inapplicable` and the applicability floor of 2 is
+  never met. This is the fail-closed rule working **as designed** (see the
+  "two inapplicable out of three is NOT a cross-check" known-answer case), and
+  it is not a regression: on a host with bfd + lld + wild it passes. The
+  defect is in the *fixture*, not the rule: a fixture whose linker script
+  needs a token some oracles lack makes the test host-dependent in a way that
+  reads as "lccc is unconformant". Fix by giving the fixture a script every
+  configured oracle can parse, or by reporting an incapable oracle as an
+  explicit `SKIP` for the case with the reason attached, rather than folding
+  it into a FAIL that reads like a conformance verdict. Do NOT lower the
+  floor.
+
+**Named follow-ups, in value order** (all measured, all refused today so
+they stay CORRECT rather than fast):
+
+* **MINMAX-4 · the rest of the late rerun (measured, deliberately off).**
+  The unrestricted rerun also fires the Adler-32 epic and the guarded-sum
+  transforms on `zlib_ng_adler32`. Measured on the benchmark program itself
+  (`-O3 -march=x86-64-v3`, `valgrind --tool=callgrind`, whole program):
+  **396,349,832 -> 400,499,785 retired instructions (+1.05 %)**, static
+  instructions 335 -> 370 (+10.4 %), stack references 32 -> 44 (+37.5 %) —
+  even though the steady-state loop it produces is denser (14 -> 12 insns per
+  32 bytes). The prologue, the extra accumulator traffic and the spills cost
+  more than the packed body saves *on this workload*. The rerun is therefore
+  scoped to min/max (`LateMinmaxOnlyScope`), which keeps the 12x min/max win
+  and leaves every other kernel byte-identical (adler32 is now 332 static
+  instructions and 0.3750 insn/byte — better than the 335 / 0.4375 baseline,
+  from the preheader-division fix alone). Re-open with a PROFITABILITY guard
+  (prologue + epilogue cost vs trip count), not by deleting the transform.
+
+* **MINMAX-2 · multi-accumulator min/max.** `for (...) { if (a[i]<mn) ...;
+  if (a[i]>mx) ...; }`, and the same loop with a sum. Two of the corpus's
+  worst kernels are this shape (`moving_stats`: lccc 149 insns/trip vs icc
+  0.625 insn/byte; `fir_filter`, `conv_u8_3x3` are nearby). The pattern
+  models ONE accumulator, so it refuses; the follow-up is to populate
+  `SecondaryAccumulator` with a `kind` and wire the min/max epilogue per
+  accumulator. The refusal exists because NOT doing this produced
+  `sum == 0` for every n below the vector width.
+* **MINMAX-3 · 16-bit and unsigned lanes.** `vpminsw`/`vpmaxsw` are SSE2
+  baseline (`vpmin*`/`vpmax*` for 8-bit need SSE4.1, `vpminud`/`vpmaxud`
+  too). `moving_stats` is `short` data: lccc 3.0 insn/byte vs gcc 0.125.
+* **LOOP-PREHEADER-2 · fix `loop_rotate`'s condition lowering, then enable
+  rotation (measured blocker).** `loop_rotate` makes the loop body the header,
+  which is what turns LICM's derived-pointer load hoisting from dead to live —
+  with rotation plus the dedicated preheaders from LOOP-PREHEADER-1 the
+  `fir_filter` FIR hot loop goes **56 -> 38 instructions (-32 %)**. Rotation is
+  OFF by default because it is **+209 static instructions (+2.6 %)** across the
+  51 benchmark programs at `-O3 -march=x86-64-v3`, and the entire cost is one
+  lowering defect: the rotated latch materialises the loop condition as an `i1`
+  value instead of keeping a comparison, so the backend emits `setl %bl;
+  movzbl %bl,%ebx; testb %bl,%bl; jne` where a single `jl` belongs. Three
+  instructions per iteration, in every rotated loop. Fix the condition
+  lowering, re-measure, then re-evaluate enabling rotation at `-O2+` — which
+  **Blocking defect, already known:** `loop_rotate` leaves invalid SSA on 2 of
+  the 51 benchmark programs (`fir_filter.c`, `moving_stats.c`): under
+  `CCC_VALIDATE_SSA=1` both abort with `SSA PHI-ARITY VIOLATION after phase
+  'after iter=0 loop_rotate'` — phi incoming-label sets that do not match the
+  rewritten CFG. Verified NOT caused by LOOP-PREHEADER-1 (reproduces with
+  `CCC_DISABLE_PASSES=loop_preheader`, and fires before that pass runs). Fix the phi
+  rewriting before touching the condition lowering.
+  would simultaneously make LOOP-PREHEADER-1 pay corpus-wide. Evidence:
+  [`engineering/evidence/LOOP-PREHEADER-1/`](engineering/evidence/LOOP-PREHEADER-1/README.md).
+
+* **RED-WIDEN-1 · widening reductions.** `int s; for (i) s += a[i];` with
+  `a` of `short`/`unsigned char`: lccc stays scalar (3.0 / 5.0 insn/byte)
+  where gcc does 0.28 / 0.53. Needs the detector to accept
+  `accumulator_type != element_type` and a widen-then-fold body
+  (`vpmovsxwd`/`vpmovzxbd` + `vpaddd`).
+
+
 ### ZERO-REM-1 · **LANDED 2026-09-28** — dead vectorizer remainder loops
 The map vectorizer emitted its scalar mirror (the `N % W` tail loop, which
 doubles as the runtime dependence guard's fallback) even when a constant trip

@@ -9469,6 +9469,130 @@ def _reloc_range_fixture(td, directive, sym):
     return obj
 
 
+def reloc_oracle_verdict(oerr: bytes, orc: int, kind: str, label: str) -> str:
+    """How one oracle linker's answer counts for an out-of-range relocation.
+
+    This is the cross-check's whole vocabulary, so it lives at module scope
+    (and is unit-tested by `test_reloc_oracle_verdict.py`) instead of being
+    buried as a closure inside the test body: a classification that decides
+    PASS/FAIL must be checkable without building a fixture and running three
+    linkers.
+
+    * ``accepted``     -- it linked the input.  A real disagreement: lccc
+                          refuses what the ecosystem accepts.
+    * ``refused``      -- it refused AND named a range failure for this
+                          relocation type.  Agreement.
+    * ``silent``       -- it refused without naming the type or a range.
+                          Counted as a disagreement, so an unrecognised
+                          refusal can never be mistaken for conformity.
+    * ``inapplicable`` -- it never REACHED the relocation (mold 2.37 cannot
+                          parse this minimal `-T` script at all: "unknown
+                          linker script token").  It has no opinion to agree
+                          or disagree with, so it is excluded -- and the
+                          result says so.
+    * ``errored``      -- it DIED rather than answered: an exit status
+                          outside {0, 1}, i.e. a crash, an abort, or the OOM
+                          killer.  Never excluded, and always a
+                          DISAGREEMENT.  A crashed oracle is a MISSING
+                          result, not a neutral one -- and `inapplicable` is
+                          inferred from the absence of a substring in
+                          stderr, so without this class a segfaulting mold is
+                          indistinguishable from a mold that legitimately
+                          skipped the relocation, and a red test turns
+                          green.
+
+    `errored` is classified FIRST, before the `shared` shortcut: that
+    shortcut accepts any refusal on the shared path (GNU ld words its
+    R_X86_64_32 refusal its own way), and a segfault is not a refusal.
+
+    The WORDING is deliberately not part of the contract: bfd says
+    "relocation truncated to fit", mold and lld say "out of range", and the
+    psABI mandates neither.  Demanding bfd's spelling from every oracle
+    meant that merely installing mold turned a conforming lccc into "lccc is
+    inventing a restriction", with no diagnostics printed.
+    """
+    if orc not in (0, 1):
+        return "errored"
+    if orc == 0:
+        return "accepted"
+    if label == "shared":
+        # GNU ld refuses every R_X86_64_32 in a shared object with wording
+        # of its own, so any refusal counts on this path.
+        return "refused"
+    if f"R_X86_64_{kind}".encode() not in oerr:
+        return "inapplicable"
+    if b"truncated" in oerr or b"out of range" in oerr:
+        return "refused"
+    return "silent"
+
+
+def reloc_oracle_agreement(agree, notes, oracles):
+    """Fold per-oracle verdicts into a single `(status, detail)` for the test.
+
+    Lives at module scope and is unit-tested (`test_reloc_oracle_verdict.py`)
+    because this is where the cross-check can silently weaken: excluding an
+    oracle from the agreement set is a decision about how much evidence a
+    PASS rests on, and a rule that only ever runs against three real linkers
+    on a well-stocked host is a rule nobody ever sees fail.
+
+    Four ways to fail, all fail-closed:
+
+    * **No oracles at all.** An empty oracle set makes the floor zero and the
+      agreement check vacuously true, so the fold would report PASS having
+      consulted nobody.  Rejected outright.
+    * **Applicability floor.** `inapplicable` shrinks the agreement set, so
+      it needs a floor.  With the normal three-oracle set, two oracles that
+      fail to reach the relocation would otherwise leave ONE linker deciding
+      the whole test -- and a "cross-check" resting on a single opinion is
+      not a cross-check.  The floor is `min(2, len(oracles))`, not a flat 2,
+      so a host with a single linker installed still gets the (weaker, but
+      real) conformance check instead of a spurious failure.
+    * **The reference must have an opinion.** `oracles[0]` is always bfd,
+      the psABI reference.  If the reference never reached the relocation the
+      fixture did not exercise what the test claims, and no amount of
+      agreement from the others repairs that.
+    * **Any disagreement fails.** `errored` is never excluded, so a crashed
+      oracle lands here rather than being dropped as "no opinion".
+
+    A PASS that rested on fewer oracles than were configured says so in the
+    detail: a cross-check that quietly narrowed is exactly how a gate rots.
+    """
+    if not oracles:
+        # Fail-closed, and the reason is the applicability floor below: with an
+        # empty oracle set `floor` collapses to 0, so `all(agree)` over an empty
+        # agreement list is vacuously True and the test reports PASS having
+        # gathered no evidence at all.  That is the one shape in which this
+        # function's "cross-check" degrades into a no-op that still prints
+        # PASS, so it gets its own explicit verdict rather than being
+        # papered over by the floor.
+        return ("FAIL",
+                "no oracles configured to cross-check against: an empty "
+                "agreement set is vacuously true, so this would report PASS "
+                "without a single opinion")
+    applicable = [n for n, (v, _, _) in notes.items() if v != "inapplicable"]
+    floor = min(2, len(oracles))
+    reference = oracles[0][0] if oracles else None
+    if len(applicable) < floor:
+        return ("FAIL",
+                "only %d of %d oracles could express an opinion, need %d: %s"
+                % (len(applicable), len(oracles), floor, notes))
+    if reference is not None and reference not in applicable:
+        return ("FAIL",
+                "the reference oracle %r never reached the relocation, so the "
+                "fixture was not exercised: %s" % (reference, notes))
+    if not all(ok for _, ok in agree):
+        return ("FAIL",
+                "oracles disagree with the refusal: %s; diagnostics: %s"
+                % (agree, notes))
+    detail = ""
+    if len(applicable) < len(oracles):
+        detail = ("agreed by %d of %d oracles; inapplicable: %s"
+                  % (len(applicable), len(oracles),
+                     ", ".join("%s(%s)" % (n, notes[n][0])
+                               for n in sorted(set(notes) - set(applicable)))))
+    return ("PASS", detail)
+
+
 def _kinds_in(obj):
     out = sh(["readelf", "-rW", obj]).stdout.decode()
     return {m for m in re.findall(r"R_X86_64_\w+", out)}
@@ -9560,51 +9684,13 @@ def _reloc_field_range_tests(args, oracles):
                 # rejects `--defsym`, which once made every oracle "agree"
                 # vacuously.)  The oracle must also name the truncation.
                 agree = []
-                # How an oracle's answer counts:
-                #
-                # * "accepted"     -- it linked the input. A real
-                #                     disagreement: lccc refuses what the
-                #                     ecosystem accepts.
-                # * "refused"      -- it refused AND named a range failure
-                #                     for this relocation type. Agreement.
-                # * "silent"       -- it refused without naming the type or
-                #                     a range: counted as disagreement, so
-                #                     an unrecognised refusal can never be
-                #                     mistaken for conformity.
-                # * "inapplicable" -- it never REACHED the relocation
-                #                     (mold 2.37 cannot parse this minimal
-                #                     `-T` script at all: "unknown linker
-                #                     script token"). It has no opinion to
-                #                     agree or disagree with, so it is
-                #                     excluded -- and the result says so.
-                #                     An oracle that cannot run the fixture
-                #                     is not evidence about lccc either way,
-                #                     which is the opposite failure mode
-                #                     from the one the comment above warns
-                #                     about (an oracle that never linked
-                #                     because the DRIVER rejected the flag,
-                #                     which made every oracle "agree").
-                #
-                # The WORDING is deliberately not part of the contract: bfd
-                # says "relocation truncated to fit", mold and lld say
-                # "out of range", and the psABI mandates neither.  This file
-                # already accepts both spellings for lccc's OWN message in
-                # the field-width cases below; demanding bfd's spelling from
-                # the ORACLE half meant that installing mold turned a
-                # conforming lccc into "lccc is inventing a restriction".
-                # The shared path keeps its own weaker rule: GNU ld refuses
-                # every R_X86_64_32 in a shared object with wording of its
-                # own, so any refusal counts there.
+                # Oracle answers are classified by `reloc_oracle_verdict`
+                # (module scope, unit-tested by
+                # `test_reloc_oracle_verdict.py`): the classification
+                # decides PASS/FAIL, so it is a named function rather
+                # than a closure buried in this loop.
                 def _oracle_verdict(oerr: bytes, orc: int, kind: str) -> str:
-                    if orc == 0:
-                        return "accepted"
-                    if label == "shared":
-                        return "refused"
-                    if f"R_X86_64_{kind}".encode() not in oerr:
-                        return "inapplicable"
-                    if b"truncated" in oerr or b"out of range" in oerr:
-                        return "refused"
-                    return "silent"
+                    return reloc_oracle_verdict(oerr, orc, kind, label)
 
                 notes = {}
                 defsym = f"-Wl,--defsym,farpc={far}"
@@ -9622,18 +9708,8 @@ def _reloc_field_range_tests(args, oracles):
                     notes[oname] = (verdict, o.returncode, o.stderr.decode()[:120])
                     if verdict != "inapplicable":
                         agree.append((oname, verdict == "refused"))
-                if not agree:
-                    results.append(Result(
-                        name, "FAIL",
-                        f"no oracle could express an opinion about the fixture: "
-                        f"{notes}"))
-                elif not all(ok for _, ok in agree):
-                    results.append(Result(
-                        name, "FAIL",
-                        f"oracles disagree with the refusal: {agree}; "
-                        f"diagnostics: {notes}"))
-                else:
-                    results.append(Result(name, "PASS"))
+                status, detail = reloc_oracle_agreement(agree, notes, oracles)
+                results.append(Result(name, status, detail))
             # An R_X86_64_32 against an EXPORTED absolute symbol is refused
             # whatever its value: ld.so may bind the name elsewhere.
             name = "reloc_32_preemptible_abs_in_shared_refused"

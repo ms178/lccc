@@ -7165,6 +7165,28 @@ impl X86Codegen {
                     self.store_rax_to(d);
                 }
             }
+            IntrinsicOp::VecHorizontalMinI32x8 => {
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                // %scalar = horizontal_min(%vec) - AVX2 8xI32 -> I32.
+                // Same three-fold structure as the horizontal MAX, with
+                // vpminsd; see that arm for why vpshufd (lane permute) and
+                // not vpsrldq (zero-filling byte shift) is mandatory.
+                self.avx_load_arg(&args[0]);
+                // Halve 8->4: min of low 128 and high 128.
+                self.state.emit("    vextracti128 $1, %ymm0, %xmm1");
+                self.state.emit("    vpminsd %xmm1, %xmm0, %xmm0");
+                // Reduce 4->2: permute lanes {2,3,0,1}, min-merge.
+                self.state.emit("    vpshufd $0x4e, %xmm0, %xmm1");
+                self.state.emit("    vpminsd %xmm1, %xmm0, %xmm0");
+                // Reduce 2->1: permute lanes {1,0,3,2}, min-merge.
+                self.state.emit("    vpshufd $0xb1, %xmm0, %xmm1");
+                self.state.emit("    vpminsd %xmm1, %xmm0, %xmm0");
+                self.state.emit("    vmovd %xmm0, %eax");
+                if let Some(d) = dest {
+                    self.store_rax_to(d);
+                }
+            }
             IntrinsicOp::VecHorizontalMaxI32x8 => {
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
