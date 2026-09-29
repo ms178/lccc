@@ -313,43 +313,61 @@ multilib and did not deliver it is broken.
 
 ## 5. Remaining defects, filed
 
-### 5.1 GOTTPOFF against a preemptible global
+### 5.1 GOTTPOFF against a preemptible global — **CLOSED: not reachable**
 
-**Status:** open, divergence-only, unreachable from a compiler. Low impact.
+**Status was:** open, divergence-only, unreachable from a compiler. Low impact.
 
-GNU allows IE→LE only for a non-preemptible symbol; otherwise the GOTTPOFF
-stays a dynamic `R_X86_64_TPOFF64` and ld.so computes it. lccc-ld has no
-preemptibility test on this path.
+**Measured, then closed.** The proposal below was to add a preemptibility
+gate to the executable IE→LE relaxation. Building the probe showed the gate
+would be **dead code**: the predicate it would guard is already there, under
+a different name.
 
-**Proposal.** Gate the executable IE→LE relaxation on
-`non-preemptible ∧ output is not a shared object`, and refuse otherwise with
-GNU's wording:
+`exec_ie_target_local` returns `!is_dynamic && defined_in.is_some()`. In an
+executable a symbol that is *imported* from a shared object is exactly the
+preemptible case, and it is `is_dynamic` — so the relaxation is already
+declined for precisely the symbols the gate was proposed to catch. Built and
+run, `-no-pie` and `-pie` executables plus a PIE against a `.so` that exports
+its `__thread` variables with default visibility:
 
-```
-TLS transition from R_X86_64_GOTTPOFF to R_X86_64_TPOFF32 against `tv2'
-at 0x2 in section `.text' failed
-```
+| link | lccc | GNU ld | relocations lccc emitted |
+|---|---:|---:|---|
+| exe `-no-pie`, defined `tv1`/`tv2` | `ie 33` | `ie 33` | IE→LE, correct |
+| exe `-pie`, defined | `ie 33` | `ie 33` | IE→LE, correct |
+| PIE vs `.so`, exported TLS | `so-ie 33` | `so-ie 33` | **`R_X86_64_TPOFF64`**, not relaxed |
+| the `.so` itself | — | — | `R_X86_64_DTPOFF64` |
 
-The predicate already exists and is correct (`exports_def`/`preemptible_def` in
-`emit_shared.rs`); it should be lifted into `linker_common` rather than written
-a third time.
+The preemptible case keeps the **dynamic** `TPOFF64` and the loader computes
+it, byte-for-byte what GNU produces. Adding the gate would have added a
+branch that can never take, plus an error message no user can reach — the
+"comprehensive-looking" fix that is really a liability.
 
-**Scope honestly:** the dynamic-`TPOFF64` half is not a gate, it is a feature.
-Refusing is strictly better than silently miscompiling, but it is not
-"supporting IE for preemptible TLS". Two items, the gate first.
+### 5.2 `R_X86_64_64` against a preemptible global in read-only storage — **CLOSED: not reachable**
 
-### 5.2 `R_X86_64_64` against a preemptible global in read-only storage
+**Status was:** open, unreachable from a compiler (compilers emit
+`.data.rel.ro`).
 
-**Status:** open, unreachable from a compiler (compilers emit `.data.rel.ro`).
+**Measured, then closed.** The hazard was real in principle — a write into a
+read-only page is a segfault in `ld.so`, not in the program — but lccc-ld
+already promotes such a section. Forcing the case: an `R_X86_64_64` against
+symbols defined in the same link, in a section stripped to `A` (read-only,
+alloc) with `objcopy --set-section-flags`, linked `-pie -fPIE`:
 
-lccc-ld's output writability depends on a *planner* decision made much earlier
-than the relocation pass, and read-only-ness is not an error the way
-`PC32`/`32`/`16`/`8` are. If a future change widens the RELRO boundary without
-recomputing that predicate, this becomes a write into a read-only page at load
-— a segfault in `ld.so`, not in the program.
+| linker | result | relocations |
+|---|---:|---|
+| GNU ld | `ro 106` | — |
+| lccc-ld | `ro 106` | `R_X86_64_RELATIVE` against the merged definitions |
 
-**Proposal.** Make read-only-ness a checked precondition at the point of
-emission, so the invariant is local to the code that can break it.
+`exec_*` decides at emission time and the section ends up in RELRO with
+dynamic relocations that `ld.so` applies before the pages go read-only. Both
+the premise ("unreachable from a compiler") and the mitigation ("promote to
+RELRO") hold, so the "checked precondition" proposal would likewise be a
+branch that cannot fail.
+
+**What survives from both:** the *reason* they are unreachable is worth
+keeping, and it is now written down in the code and here rather than as a
+proposal — a future change that widens the RELRO boundary has to recompute
+the writability predicate, and the tests that would catch it are the ones in
+`tests/linker/run_linker_tests.py`, not a new error path.
 
 ### 5.3 `R_X86_64_GOT64` with a non-zero addend on a **global**
 
@@ -418,16 +436,35 @@ in `create_plt_got`.
    re-investigation. Prefer `SKIP (no i386 toolchain)` after a positive probe
    of the *reference* compiler, as `ie_to_le_forms` and `movrs_relocations`
    already do for `as`.
-2. **GOTTPOFF preemptibility gate** (5.1). Refuse first; do not attempt the
-   dynamic `TPOFF64` support in the same change.
-3. **Localise the read-only precondition** (5.2). Prevents a class rather than
-   an instance.
+2. ~~**GOTTPOFF preemptibility gate**~~ **CLOSED, not reachable** — §5.1. The
+   predicate already exists as `exec_ie_target_local`; the probe shows the
+   preemptible case keeps the dynamic `TPOFF64` and matches GNU.
+3. ~~**Localise the read-only precondition**~~ **CLOSED, not reachable** —
+   §5.2. A read-only section holding `R_X86_64_64` is already promoted to
+   RELRO with `R_X86_64_RELATIVE`, and both linkers agree.
 4. **`DsoNames` newtype** (§6). Makes the `--as-needed` contract a type.
 5. **Unify the "real inputs" iteration** (§6). Cheap, and it is the exact shape
    that caused the original six failures.
 6. **Reference-toolchain probes for the corpus gates** (§6). CI already has the
    toolchain, so this cannot hide a real failure there.
-7. **Property-merge oracle breadth.** The property fixtures are hand-written
+7. **The one measured codegen gap: constant-trip loops.** `int_alu` in
+   `tests/oracle/programs/` is the only program where lccc is far behind:
+   92 instructions against Clang 23's 23. Clang unrolls the fixed-trip-count
+   loops and constant-folds the result, so it emits **no loop at all**;
+   lccc strength-reduces the division by 10 and by 7 into multiply/shift
+   sequences and keeps everything in registers — a good loop body that still
+   runs 64 times at runtime. This is the highest-value optimisation the
+   three-vendor oracle points at, and it is named here rather than half
+   built: a partial unroller that mishandles one guard is worse than none.
+   Start with loops whose trip count is a literal and whose body is
+   straight-line with no calls, stores or `volatile`, and verify with
+   `tools/oracle/godbolt_oracle.py --filter int_alu`.
+8. **Widen the oracle's program set.** Eight programs cover the main passes;
+   they do not cover vectorisation widths, atomics, or `-march`/feature
+   variation. `docs/GODBOLT_ORACLE.md` states exactly what the current
+   table does and does not measure, so the next person extends rather than
+   re-derives.
+ The property fixtures are hand-written
    notes; a C/C++ fixture compiled by the real toolchain would catch decoder
    bugs they cannot, and would have failed on the author's host — which is the
    actual lesson of this PR.
