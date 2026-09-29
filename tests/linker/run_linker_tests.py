@@ -5556,6 +5556,211 @@ def _movrs_relocations_test(args, oracles):
             shutil.rmtree(td, ignore_errors=True)
 
 
+# Plain R_X86_64_GOTPCREL (assembled with -mrelax-relocations=no): every
+# relaxable shape, a library symbol, an absolute symbol and a MOVRS load.
+_PLAIN_GOTPCREL_ASM = """\
+	.text
+	.globl	pgd, pgr, pgc, pgx, pga, pgm
+	.type	pgd, @function
+pgd:	mov	dat@GOTPCREL(%rip), %rax
+	mov	(%rax), %eax
+	ret
+	.size	pgd, .-pgd
+	.type	pgr, @function
+pgr:	mov	dat@GOTPCREL(%rip), %r11
+	mov	(%r11), %eax
+	ret
+	.size	pgr, .-pgr
+	.type	pgc, @function
+pgc:	push	%rbx
+	call	*fn@GOTPCREL(%rip)
+	pop	%rbx
+	jmp	*fn@GOTPCREL(%rip)
+	.size	pgc, .-pgc
+	.type	pgx, @function
+pgx:	mov	ext@GOTPCREL(%rip), %rax
+	mov	(%rax), %eax
+	ret
+	.size	pgx, .-pgx
+	.type	pga, @function
+pga:	mov	absv@GOTPCREL(%rip), %rax
+	ret
+	.size	pga, .-pga
+	.type	pgm, @function
+pgm:	movrs	dat@GOTPCREL(%rip), %eax
+	ret
+	.size	pgm, .-pgm
+	.type	fn, @function
+fn:	mov	$5, %eax
+	ret
+	.size	fn, .-fn
+	.globl	absv
+	.set	absv, 0x1234
+	.data
+	.type	dat, @object
+dat:	.long	44
+	.size	dat, 4
+"""
+
+_PLAIN_GOTPCREL_SCRIPT_ASM = """\
+	.text
+	.globl	_start
+_start:	mov	dat@GOTPCREL(%rip), %rax
+	call	*fn@GOTPCREL(%rip)
+	ret
+fn:	ret
+	.data
+dat:	.long	1
+"""
+
+
+def _plain_gotpcrel_test(args, oracles):
+    """Plain R_X86_64_GOTPCREL (old assemblers, `-mrelax-relocations=no`,
+    NASM's `wrt ..gotpcrel`) is relaxed where no prefix byte has to change,
+    for a recognizable legacy opcode only.
+
+    lccc-ld used to give every such reference a GOT slot in executables and
+    shared objects (a load per access for a locally bound symbol); now `mov`
+    -> `lea`, `call *` -> `addr32 call`, `jmp *` -> `jmp; nop`, exact bytes
+    and runtime values in PDE / PIE / static / shared links.  A library
+    symbol, an absolute symbol (whose immediate `mov` would need the REX
+    byte edited) and `movrs` (`0f 38 8b`: GNU ld 2.47 turns it into the
+    undefined `0f 38 8d`) keep their slot, whose contents are checked.  The
+    -T path decided these as GOTPCRELX, corrupting `movrs` the same way: it
+    is refused now (a -T link has no GOT).
+    """
+    name = "plain_gotpcrel_relaxation"
+    td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
+    try:
+        for fname, text in (("pg.s", _PLAIN_GOTPCREL_ASM),
+                            ("sc.s", _PLAIN_GOTPCREL_SCRIPT_ASM),
+                            ("m.c", "#include <stdio.h>\n"
+                                    "int pgd(void), pgr(void), pgc(void), pgx(void);\n"
+                                    "long pga(void);\nint main(void) {\n"
+                                    "  printf(\"%d %d %d %d %#lx\\n\", pgd(), pgr(), pgc(),"
+                                    " pgx(), pga());\n  return 0;\n}\n"),
+                            ("ext.c", "int ext = 3;\n")):
+            with open(os.path.join(td, fname), "w") as f:
+                f.write(text)
+        r = sh([CC, "-Wa,-mrelax-relocations=no", "-c", "pg.s"], cwd=td)
+        if r.returncode != 0:
+            err = r.stderr.decode()[:300]
+            if "movrs" in err:
+                return Result(name, "SKIP", f"assembler without MOVRS: {err}")
+            return Result(name, "FAIL", f"assemble: {err}")
+        rel = sh(["readelf", "-rW", "pg.o"], cwd=td).stdout.decode()
+        if rel.count("R_X86_64_GOTPCREL ") != 7:
+            return Result(name, "FAIL", f"assembler did not emit plain GOTPCREL:\n{rel[-600:]}")
+        for argv in (["-Wa,-mrelax-relocations=no", "-c", "sc.s"], ["-O1", "-c", "m.c"],
+                     ["-O1", "-c", "ext.c"], ["-fPIC", "-shared", "ext.c", "-o", "libext.so"]):
+            r = sh([CC] + argv, cwd=td)
+            if r.returncode != 0:
+                return Result(name, "FAIL", f"{argv}: {r.stderr.decode()[:300]}")
+        lccc_ld = os.path.join(os.path.dirname(os.path.abspath(args.lccc)), "lccc-ld")
+        shim = _shim_for(td, lccc_ld)
+        env = dict(os.environ, LD_LIBRARY_PATH=td)
+
+        def le32(v):
+            return (v & 0xFFFFFFFF).to_bytes(4, "little")
+
+        for mode in ("-no-pie", "-pie", "-static", "-shared"):
+            if mode == "-shared":
+                r = sh([CC, "-B" + shim, "-shared", "pg.o", "./libext.so", "-o", "libpg.so"],
+                       cwd=td)
+                img = "libpg.so"
+                if r.returncode == 0:
+                    r = sh([CC, "-B" + shim, "m.o", "./libpg.so", "-o", "t-shared"], cwd=td)
+            else:
+                lib = ["ext.o"] if mode == "-static" else ["./libext.so"]
+                img = "t" + mode
+                r = sh([CC, "-B" + shim, mode, "m.o", "pg.o"] + lib + ["-o", img], cwd=td)
+            if r.returncode != 0:
+                return Result(name, "FAIL", f"{mode} link: {r.stderr.decode()[:300]}")
+            run = subprocess.run([os.path.join(td, "t" + mode)], cwd=td, env=env,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+            if run.returncode != 0 or run.stdout.decode() != "44 44 5 3 0x1234\n":
+                return Result(name, "FAIL", f"{mode}: got {run.stdout.decode()!r} "
+                              f"rc {run.returncode} {run.stderr.decode()[:200]!r}")
+            path = os.path.join(td, img)
+            with open(path, "rb") as f:
+                d = f.read()
+            syms = _nm_addrs(path, td)
+            dat, fn = syms["dat"], syms["fn"]
+            pgc = syms["pgc"]
+            want = [
+                ("pgd", syms["pgd"], bytes.fromhex("488d05") + le32(dat - (syms["pgd"] + 7))),
+                ("pgr", syms["pgr"], bytes.fromhex("4c8d1d") + le32(dat - (syms["pgr"] + 7))),
+                ("pgc/call", pgc + 1, bytes.fromhex("67e8") + le32(fn - (pgc + 7))),
+                ("pgc/jmp", pgc + 8, bytes.fromhex("e9") + le32(fn - (pgc + 13)) + b"\x90"),
+            ]
+            if mode == "-static":
+                want.append(("pgx", syms["pgx"],
+                             bytes.fromhex("488d05") + le32(syms["ext"] - (syms["pgx"] + 7))))
+            dynrel = sh(["readelf", "-rW", img], cwd=td).stdout.decode()
+
+            def slot_of(label, at, head, fill):
+                # The load must stay, through a slot that yields `fill`.
+                got = _elf_vread(d, at, len(head) + 4)
+                if got is None or got[:len(head)] != head:
+                    return f"{label}: {got.hex() if got else None}, want the {head.hex()} load kept"
+                slot = at + len(head) + 4 + int.from_bytes(got[len(head):], "little", signed=True)
+                rows = [ln.split() for ln in dynrel.splitlines()
+                        if ln.split() and ln.split()[0].lstrip("0") == f"{slot:x}"]
+                if fill is None:
+                    return None if rows else f"{label}: slot {slot:#x} has no dynamic relocation"
+                if mode in ("-pie", "-shared") and fill != 0x1234:
+                    ok = any(rw[2] == "R_X86_64_RELATIVE" and int(rw[3], 16) == fill
+                             for rw in rows)
+                    return None if ok else f"{label}: slot {slot:#x} rows {rows}, want RELATIVE"
+                val = _elf_vread(d, slot, 8)
+                if rows or val is None or int.from_bytes(val, "little") != fill:
+                    return f"{label}: slot {slot:#x} = {val.hex() if val else None} rows {rows}"
+                return None
+
+            problems = [f"{label}: {(_elf_vread(d, at, len(w)) or b'').hex()} want {w.hex()}"
+                        for label, at, w in want if _elf_vread(d, at, len(w)) != w]
+            if mode != "-static":
+                problems.append(slot_of("pgx", syms["pgx"], bytes.fromhex("488b05"), None))
+            problems.append(slot_of("pga", syms["pga"], bytes.fromhex("488b05"),
+                                    None if mode == "-shared" else 0x1234))
+            problems.append(slot_of("pgm", syms["pgm"], bytes.fromhex("0f388b05"), dat))
+            problems = [p for p in problems if p]
+            if problems:
+                return Result(name, "FAIL", f"{mode}: " + "; ".join(problems)[:600])
+        # -T: no GOT, so the relaxable forms are rewritten and MOVRS refused.
+        with open(os.path.join(td, "s.ld"), "w") as f:
+            f.write("SECTIONS {\n  . = 0x400000;\n  .text : { *(.text) }\n"
+                    "  .data : { *(.data) }\n}\n")
+        r = sh([lccc_ld, "-T", "s.ld", "sc.o", "-o", "s.img"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL", f"-T link: {r.stderr.decode()[:300]}")
+        with open(os.path.join(td, "s.img"), "rb") as f:
+            d = f.read()
+        syms = _nm_addrs(os.path.join(td, "s.img"), td)
+        st = syms["_start"]
+        want = (bytes.fromhex("488d05") + le32(syms["dat"] - (st + 7))
+                + bytes.fromhex("67e8") + le32(syms["fn"] - (st + 13)))
+        got = _elf_vread(d, st, len(want))
+        if got != want:
+            return Result(name, "FAIL", f"-T: {got.hex() if got else None} want {want.hex()}")
+        r = sh([lccc_ld, "-T", "s.ld", "pg.o", "ext.o", "-o", "m.img"], cwd=td)
+        err = r.stderr.decode()
+        field = _nm_addrs(os.path.join(td, "pg.o"), td)["pgm"] + 4
+        refusal = (f"R_X86_64_GOTPCREL against 'dat' in pg.o at offset {field:#x} uses an "
+                   "instruction form this linker cannot relax")
+        if r.returncode == 0 or refusal not in err:
+            with open(os.path.join(td, "m.img"), "rb") as f:
+                d = f.read()
+            pgm = _nm_addrs(os.path.join(td, "m.img"), td).get("pgm", 0)
+            got = _elf_vread(d, pgm, 4)
+            return Result(name, "FAIL", f"-T movrs: rc={r.returncode} bytes "
+                          f"{got.hex() if got else None} {err[:300]!r}; want the refusal")
+        return Result(name, "PASS")
+    finally:
+        if not args.keep:
+            shutil.rmtree(td, ignore_errors=True)
+
+
 _TEXTREL_RO_ASM = """\
     .section .rodata,"a"
     .p2align 3
@@ -9621,6 +9826,463 @@ def _defsym_layout_test(args, oracles):
     return results
 
 
+_DEFSYM_ORDER_MAIN = r"""
+#include <stdio.h>
+extern char anchor[], a[], b[], c[], selfy[], selfy_orig[];
+int main(void)
+{
+    printf("%ld %ld %lu %ld\n", (long)(a - anchor), (long)(b - anchor),
+           (unsigned long)c, (long)(selfy - selfy_orig));
+    return 0;
+}
+"""
+
+_DEFSYM_ORDER_ASM = """\
+        .text
+        .globl anchor
+        .type anchor, @function
+anchor: nop
+        nop
+        nop
+        nop
+        nop
+        nop
+        nop
+        nop
+        .size anchor, 8
+        .data
+        .globl selfy, selfy_orig
+        .type selfy, @object
+selfy_orig:
+selfy:  .quad 0
+        .size selfy, 8
+"""
+
+
+def _write(td, name, text):
+    with open(os.path.join(td, name), "w") as f:
+        f.write(text)
+
+
+def _defsym_order_test(args, oracles):
+    """`--defsym` order semantics: forward references, redefinitions, self
+    references and cycles, on every lccc-ld path, against GNU ld.
+
+    lccc-ld applied `--defsym`s strictly left to right against the input
+    symbols: `a=b b=anchor+4` failed with "undefined symbol `b'" (GNU ld
+    accepts it and gives a = b = anchor+4), the reversed spelling left `a`
+    at 0, and `selfy=selfy+1` over an input `selfy` yielded 1 instead of
+    the input's address plus one.  The shared `DefsymPlan` binds each
+    reference as GNU ld's multi-pass assignment evaluation does.
+
+    Checked exactly:
+      * symbol values relative to `anchor` in both orders, equal to GNU
+        ld's, for x86-64 -pie (the builtin path), -shared and -T (the
+        script path, which used to refuse any expression over a placed
+        symbol);
+      * i386, by running a -no-pie program linked by each: identical
+        output, `4 4 4 1`;
+      * an x86-64 PIE run (main built -fPIC, so it reads the symbols
+        through the GOT): `a` and `b` are ADDRESSES and slide with the load
+        base (R_X86_64_RELATIVE), `c = b - anchor` is the absolute 4.  GNU
+        ld makes every --defsym SHN_ABS and its PIE leaves the pointers
+        unslid (documented divergence; lld agrees with lccc);
+      * -fPIE code reaches `c` with R_X86_64_PC32, which no PIE can
+        satisfy for an absolute symbol (the image moves, 4 does not): an
+        error naming the symbol.  GNU ld links it and the program reads
+        base+4 (documented divergence; lld also refuses);
+      * `a=b b=a` is an error naming the cycle (GNU ld silently defines
+        both as 0 -- documented divergence).
+    """
+    names = ("defsym_forward_reference_pie", "defsym_forward_reference_shared",
+             "defsym_forward_reference_script", "defsym_forward_reference_i386",
+             "defsym_address_slides_in_pie", "defsym_pc32_absolute_pie_refused",
+             "defsym_cycle_diagnosed")
+    lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+    if not os.path.exists(lccc_ld):
+        return [Result(n, "SKIP", "lccc-ld not built") for n in names]
+    orders = (
+        ["a=b", "b=anchor+4", "c=b-anchor", "selfy=selfy+1"],
+        ["c=b-anchor", "selfy=selfy+1", "b=anchor+4", "a=b"],
+    )
+    want = {"a": 4, "b": 4, "c": 4, "selfy": 1}
+    results = []
+    td = tempfile.mkdtemp(prefix="lnk.defsym_order.")
+    try:
+        _write(td, "d.s", _DEFSYM_ORDER_ASM)
+        _write(td, "d32.s", _DEFSYM_ORDER_ASM.replace(".quad", ".long").replace(
+            ".size selfy, 8", ".size selfy, 4"))
+        _write(td, "m.c", _DEFSYM_ORDER_MAIN)
+        _write(td, "t.ld", "SECTIONS { . = 0x400000; .text : { *(.text) } "
+                           ". = 0x600000; .data : { *(.data) } }\n")
+        for cmd in ([CC, "-c", "d.s", "-o", "d.o"], [CC, "-m32", "-c", "d32.s", "-o", "d32.o"],
+                    [CC, "-O1", "-fPIC", "-c", "m.c", "-o", "m.o"],
+                    [CC, "-O1", "-fPIE", "-c", "m.c", "-o", "mpie.o"],
+                    [CC, "-m32", "-O1", "-fno-pic", "-c", "m.c", "-o", "m32.o"]):
+            r = sh(cmd, cwd=td)
+            if r.returncode != 0:
+                return [Result(n, "FAIL", f"fixture: {' '.join(cmd)}: {r.stderr.decode()[:200]}")
+                        for n in names]
+
+        def values(path):
+            syms = {}
+            out = sh(["readelf", "-sW", path]).stdout.decode()
+            for line in out.splitlines():
+                f = line.split()
+                if len(f) >= 8 and f[0][:-1].isdigit() and f[0].endswith(":"):
+                    syms.setdefault(f[7], int(f[1], 16))
+            return syms
+
+        def rel(path):
+            """{a, b, c, selfy} relative to anchor/selfy_orig, as `want`."""
+            v = values(path)
+            if not all(k in v for k in ("anchor", "a", "b", "c", "selfy", "selfy_orig")):
+                return None
+            return {"a": v["a"] - v["anchor"], "b": v["b"] - v["anchor"], "c": v["c"],
+                    "selfy": v["selfy"] - v["selfy_orig"]}
+
+        variants = (
+            ("defsym_forward_reference_pie", ["-pie", "-e", "anchor"]),
+            ("defsym_forward_reference_shared", ["-shared"]),
+            ("defsym_forward_reference_script", ["-T", "t.ld", "-e", "anchor"]),
+        )
+        for name, mode in variants:
+            problems = []
+            for order in orders:
+                defs = [x for d in order for x in ("--defsym", d)]
+                got = {}
+                for who, ld in (("lccc", lccc_ld), ("GNU", "ld")):
+                    out = f"{name}.{who}.{orders.index(order)}"
+                    r = sh([ld] + mode + defs + ["d.o", "-o", out], cwd=td)
+                    if r.returncode != 0:
+                        problems.append(f"{who} [{' '.join(order)}]: rc={r.returncode} "
+                                        f"{r.stderr.decode()[:160]}")
+                        continue
+                    got[who] = rel(os.path.join(td, out))
+                if "lccc" in got and "GNU" in got:
+                    if got["GNU"] != want:
+                        problems.append(f"oracle drift: GNU gives {got['GNU']}, expected {want}")
+                    elif got["lccc"] != got["GNU"]:
+                        problems.append(f"[{' '.join(order)}] lccc {got['lccc']} != GNU {got['GNU']}")
+            results.append(Result(name, "FAIL" if problems else "PASS",
+                                  "; ".join(problems)[:600]))
+
+        shim = _shim_for(td, lccc_ld)
+
+        def run(name, link, want_out):
+            """Link with each command in `link` (label -> argv) per order,
+            run, and require `want_out`."""
+            problems = []
+            for i, order in enumerate(orders):
+                wl = ",".join(f"--defsym={d}" for d in order)
+                for who, argv in link.items():
+                    exe = f"{name}.{who}.{i}"
+                    r = sh(argv + [f"-Wl,{wl}", "-o", exe], cwd=td)
+                    if r.returncode != 0:
+                        problems.append(f"{who} link [{' '.join(order)}]: "
+                                        f"{r.stderr.decode()[:200]}")
+                        continue
+                    rr = sh([os.path.join(td, exe)], cwd=td)
+                    if rr.returncode != 0 or rr.stdout != want_out:
+                        problems.append(f"{who} run [{' '.join(order)}]: rc={rr.returncode} "
+                                        f"out={rr.stdout!r}, want {want_out!r}")
+            results.append(Result(name, "FAIL" if problems else "PASS",
+                                  "; ".join(problems)[:600]))
+
+        run("defsym_forward_reference_i386",
+            {"lccc": [CC, "-m32", f"-B{shim}", "-no-pie", "m32.o", "d32.o"],
+             "GNU": [CC, "-m32", "-no-pie", "m32.o", "d32.o"]},
+            b"4 4 4 1\n")
+        # The addresses slide, the absolute does not (lccc only; see above).
+        run("defsym_address_slides_in_pie",
+            {"lccc": [CC, f"-B{shim}", "-pie", "m.o", "d.o"]}, b"4 4 4 1\n")
+
+        # PC32 against an absolute symbol in a PIE is refused, naming it.
+        name = "defsym_pc32_absolute_pie_refused"
+        r = sh([CC, f"-B{shim}", "-pie", "mpie.o", "d.o",
+                "-Wl,--defsym=b=anchor+4,--defsym=a=b,--defsym=c=b-anchor,"
+                "--defsym=selfy=selfy+1", "-o", "pc32"], cwd=td)
+        msg = "relocation R_X86_64_PC32 against absolute symbol `c'"
+        if r.returncode == 0 or msg not in r.stderr.decode():
+            results.append(Result(name, "FAIL",
+                                  f"rc={r.returncode} stderr={r.stderr.decode()[:200]!r}, "
+                                  f"want an error containing {msg!r}"))
+        else:
+            results.append(Result(name, "PASS"))
+
+        # A cycle is diagnosed, naming it.
+        name = "defsym_cycle_diagnosed"
+        r = sh([lccc_ld, "-pie", "-e", "anchor", "--defsym", "a=b", "--defsym", "b=a",
+                "d.o", "-o", "cyc"], cwd=td)
+        msg = "--defsym:1: circular reference: a -> b -> a"
+        if r.returncode == 0 or msg not in r.stderr.decode():
+            results.append(Result(name, "FAIL",
+                                  f"rc={r.returncode} stderr={r.stderr.decode()[:200]!r}, "
+                                  f"want an error containing {msg!r}"))
+        else:
+            results.append(Result(name, "PASS"))
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+    return results
+
+
+_PLTOFF_LIB = "int dvar = 42;\nint fn(void) { return 7; }\n"
+
+_PLTOFF_ASM = """\
+        .text
+        .globl get_pltoff, get_pc32, call_fnoff
+get_pltoff:
+        leaq _GLOBAL_OFFSET_TABLE_(%rip), %rcx
+        movabsq $dvar@PLTOFF, %rax
+        addq %rcx, %rax
+        ret
+get_pc32:
+        leaq dvar(%rip), %rax
+        ret
+call_fnoff:
+        leaq _GLOBAL_OFFSET_TABLE_(%rip), %rcx
+        movabsq $fn@PLTOFF, %rax
+        addq %rcx, %rax
+        jmp *%rax
+        .section .note.GNU-stack,"",@progbits
+"""
+
+_PLTOFF_MAIN = r"""
+#include <stdio.h>
+extern int dvar;
+void *get_pltoff(void), *get_pc32(void);
+int call_fnoff(void);
+int main(void)
+{
+    printf("%d %d %d %d\n", get_pc32() == (void *)&dvar,
+           get_pltoff() == (void *)&dvar, dvar, call_fnoff());
+    return 0;
+}
+"""
+
+_DSO_HANDLE_MAIN = r"""
+#include <stdio.h>
+extern void *__dso_handle;
+int main(void) { printf("%d\n", __dso_handle == (void *)&__dso_handle); return 0; }
+"""
+
+
+def _reference_kind_test(args, oracles):
+    """References whose meaning depends on what the target is.
+
+    * `pltoff_library_variable_exec`: `v@PLTOFF` (large-model GOT-relative)
+      of a shared-library VARIABLE used to give the variable a PLT entry
+      and a JUMP_SLOT; that entry also captured every direct (PC32)
+      reference, so the program read the stub's code bytes.  GNU ld 2.44
+      and 2.47 do the same (measured: `1 1 <garbage> 7`).  Now the variable
+      is copy-relocated like any direct reference: `1 1 42 7`, for -no-pie
+      and for -pie (main built -fPIE); no JUMP_SLOT names it.
+    * `pltoff_library_variable_shared`: in a shared object there is no copy
+      and no link-time address: refused, naming the variable.
+    * `pie_absolute32_refused`: non-PIC code (`R_X86_64_32S` to a variable,
+      `R_X86_64_32` to a string section) in a PIE was written with
+      link-time addresses and crashed; now GNU ld's exact error.  An
+      absolute symbol in the same field still links and runs.
+    * `driver_pie_startfiles`: `lccc -pie` linked crt1.o/crtbegin.o (non-PIC,
+      the latter now refused above); gcc's spec takes Scrt1.o/crtbeginS.o/
+      crtendS.o.  crtbeginS.o's `__dso_handle` points at itself (crtbegin.o's
+      is 0), so the program prints 1.
+    * `as_needed_dropped_library_exports_nothing`: an `--as-needed` library
+      nothing needed is not in the link, so its undefined references must
+      not export the executable's definitions to `.dynsym` (GNU ld unloads
+      it); a library that is linked still does.
+    """
+    names = ("pltoff_library_variable_exec", "pltoff_library_variable_shared",
+             "pie_absolute32_refused", "driver_pie_startfiles",
+             "as_needed_dropped_library_exports_nothing")
+    lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+    if not os.path.exists(lccc_ld):
+        return [Result(n, "SKIP", "lccc-ld not built") for n in names]
+    results = []
+    td = tempfile.mkdtemp(prefix="lnk.refkind.")
+    try:
+        _write(td, "lib.c", _PLTOFF_LIB)
+        _write(td, "h.s", _PLTOFF_ASM)
+        _write(td, "m.c", _PLTOFF_MAIN)
+        _write(td, "abs.s", "\t.text\n\t.globl get_abs\nget_abs:\tmovl $kabs, %eax\n\tret\n"
+                            "\t.globl kabs\n\t.set kabs, 0x1234\n"
+                            "\t.section .note.GNU-stack,\"\",@progbits\n")
+        _write(td, "am.c", '#include <stdio.h>\nint get_abs(void);\n'
+                           'int main(void){printf("%x\\n", get_abs());return 0;}\n')
+        _write(td, "x.c", "extern int foo(void);\nint libx_use(void){return foo();}\n")
+        _write(td, "fm.c", "int foo(void){return 3;}\nint main(void){return foo()-3;}\n")
+        _write(td, "dh.c", _DSO_HANDLE_MAIN)
+        for cmd in ([CC, "-shared", "-fPIC", "lib.c", "-o", "libd.so"],
+                    [CC, "-c", "h.s", "-o", "h.o"],
+                    [CC, "-O1", "-fno-pic", "-c", "m.c", "-o", "m.o"],
+                    [CC, "-O1", "-fPIE", "-c", "m.c", "-o", "mpie.o"],
+                    [CC, "-c", "abs.s", "-o", "abs.o"],
+                    [CC, "-O1", "-fPIE", "-c", "am.c", "-o", "am.o"],
+                    [CC, "-shared", "-fPIC", "x.c", "-o", "libx.so"],
+                    [CC, "-O1", "-fPIE", "-c", "fm.c", "-o", "fm.o"]):
+            r = sh(cmd, cwd=td)
+            if r.returncode != 0:
+                return [Result(n, "FAIL", f"fixture: {' '.join(cmd)}: {r.stderr.decode()[:200]}")
+                        for n in names]
+        shim = _shim_for(td, lccc_ld)
+        rpath = f"-Wl,-rpath,{td}"
+
+        # ── PLTOFF64 of a library variable, executable ──
+        problems = []
+        for mode, main in (("-no-pie", "m.o"), ("-pie", "mpie.o")):
+            exe = f"pltoff{mode}"
+            r = sh([CC, f"-B{shim}", mode, main, "h.o", "-L.", "-ld", rpath, "-o", exe], cwd=td)
+            if r.returncode != 0:
+                problems.append(f"{mode} link: {r.stderr.decode()[:200]}")
+                continue
+            rr = sh([os.path.join(td, exe)], cwd=td)
+            if rr.returncode != 0 or rr.stdout != b"1 1 42 7\n":
+                problems.append(f"{mode}: rc={rr.returncode} out={rr.stdout!r}, want b'1 1 42 7\\n'")
+            rel = sh(["readelf", "-rW", exe], cwd=td).stdout.decode()
+            slots = [l for l in rel.splitlines() if "JUMP_SLOT" in l and " dvar" in l]
+            if slots:
+                problems.append(f"{mode}: JUMP_SLOT for the variable: {slots[0].strip()}")
+            if not any("R_X86_64_COPY" in l and " dvar" in l for l in rel.splitlines()):
+                problems.append(f"{mode}: no R_X86_64_COPY for dvar")
+        results.append(Result("pltoff_library_variable_exec", "FAIL" if problems else "PASS",
+                              "; ".join(problems)[:600]))
+
+        # ── ... and in a shared object ──
+        _write(td, "q.s", "\t.text\n\t.globl g2\ng2:\tmovabsq $dvar@PLTOFF, %rax\n\tret\n")
+        sh([CC, "-c", "q.s", "-o", "q.o"], cwd=td)
+        r = sh([lccc_ld, "-shared", "q.o", "-L.", "-ld", "-o", "q.so"], cwd=td)
+        msg = "relocation R_X86_64_PLTOFF64 against shared-library variable 'dvar'"
+        ok = r.returncode != 0 and msg in r.stderr.decode()
+        results.append(Result("pltoff_library_variable_shared", "PASS" if ok else "FAIL",
+                              "" if ok else f"rc={r.returncode} stderr={r.stderr.decode()[:200]!r}, "
+                                            f"want an error containing {msg!r}"))
+
+        # ── Narrow absolute fields in a PIE ──
+        problems = []
+        want = ("relocation R_X86_64_32S against symbol `dvar' can not be used when making "
+                "a PIE object; recompile with -fPIE")
+        r = sh([CC, f"-B{shim}", "-pie", "m.o", "h.o", "-L.", "-ld", "-o", "bad"], cwd=td)
+        if r.returncode == 0 or want not in r.stderr.decode():
+            problems.append(f"variable: rc={r.returncode} stderr={r.stderr.decode()[:200]!r}")
+        gnu = sh([CC, "-pie", "m.o", "h.o", "-L.", "-ld", "-o", "bad.gnu"], cwd=td)
+        if want not in gnu.stderr.decode():
+            problems.append(f"oracle drift: GNU ld said {gnu.stderr.decode()[:200]!r}")
+        _write(td, "s.s", "\t.text\n\t.globl get_str\nget_str:\tmovl $.LC0, %eax\n\tret\n"
+                          "\t.section .rodata.str1.1,\"aMS\",@progbits,1\n.LC0:\t.string \"x\"\n")
+        sh([CC, "-c", "s.s", "-o", "s.o"], cwd=td)
+        want_s = ("relocation R_X86_64_32 against `.rodata.str1.1' can not be used when "
+                  "making a PIE object; recompile with -fPIE")
+        r = sh([lccc_ld, "-pie", "-e", "get_str", "s.o", "-o", "bad2"], cwd=td)
+        if r.returncode == 0 or want_s not in r.stderr.decode():
+            problems.append(f"section: rc={r.returncode} stderr={r.stderr.decode()[:200]!r}")
+        gnu = sh(["ld", "-pie", "-e", "get_str", "s.o", "-o", "bad2.gnu"], cwd=td)
+        if want_s not in gnu.stderr.decode():
+            problems.append(f"oracle drift: GNU ld said {gnu.stderr.decode()[:200]!r}")
+        r = sh([CC, f"-B{shim}", "-pie", "am.o", "abs.o", "-o", "absok"], cwd=td)
+        rr = sh([os.path.join(td, "absok")], cwd=td) if r.returncode == 0 else None
+        if rr is None or rr.stdout != b"1234\n":
+            problems.append(f"absolute: link rc={r.returncode} {r.stderr.decode()[:160]!r} "
+                            f"out={rr and rr.stdout!r}")
+        results.append(Result("pie_absolute32_refused", "FAIL" if problems else "PASS",
+                              "; ".join(problems)[:600]))
+
+        # ── The driver's PIE startfiles ──
+        r = sh([args.lccc, "-O1", "-pie", "dh.c", "-o", "dh"], cwd=td)
+        rr = sh([os.path.join(td, "dh")], cwd=td) if r.returncode == 0 else None
+        hdr = sh(["readelf", "-hW", "dh"], cwd=td).stdout.decode() if rr else ""
+        if rr is None or rr.stdout != b"1\n" or "DYN" not in hdr:
+            results.append(Result("driver_pie_startfiles", "FAIL",
+                                  f"link rc={r.returncode} {r.stderr.decode()[:200]!r} "
+                                  f"out={rr and rr.stdout!r} (want b'1\\n', ET_DYN)"))
+        else:
+            results.append(Result("driver_pie_startfiles", "PASS"))
+
+        # ── A dropped --as-needed library exports nothing ──
+        problems = []
+        for label, flags, want_needed in (("as-needed", ["-Wl,--as-needed", "-lx",
+                                                         "-Wl,--no-as-needed"], 0),
+                                          ("linked", ["-Wl,--no-as-needed", "-lx"], 1)):
+            for who, b in (("lccc", [f"-B{shim}"]), ("GNU", [])):
+                exe = f"an.{label}.{who}"
+                r = sh([CC] + b + ["-pie", "fm.o", "-L."] + flags + [rpath, "-o", exe], cwd=td)
+                if r.returncode != 0:
+                    problems.append(f"{who} {label}: {r.stderr.decode()[:160]}")
+                    continue
+                dyn = sh(["readelf", "-dW", exe], cwd=td).stdout.decode()
+                syms = sh(["readelf", "--dyn-syms", "-W", exe], cwd=td).stdout.decode()
+                needed = int("libx.so" in dyn)
+                exported = sum(1 for l in syms.splitlines() if l.split()[-1:] == ["foo"])
+                if (needed, exported) != (want_needed, want_needed):
+                    problems.append(f"{who} {label}: DT_NEEDED libx={needed} foo exported="
+                                    f"{exported}, want {want_needed}/{want_needed}")
+        results.append(Result("as_needed_dropped_library_exports_nothing",
+                              "FAIL" if problems else "PASS", "; ".join(problems)[:600]))
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+    return results
+
+
+def _standalone_ld_flags_test(args, oracles):
+    """Behaviour of `lccc-ld` invoked as `ld` (by gcc, or by hand), for
+    x86-64 and i386, against GNU ld:
+
+    * `-lc` finds libc on GNU ld's built-in search path (lccc-ld had none:
+      "cannot find -lc" unless a driver passed -L), and `-nostdlib` drops
+      that path, as GNU ld's does;
+    * bare `--disable-new-dtags` / `--enable-new-dtags` pick DT_RPATH /
+      DT_RUNPATH for `-rpath` (only the `-Wl,` spelling used to reach the
+      parser: both were dropped as unknown options, so a GCC-driven link
+      always got DT_RUNPATH).
+    """
+    names = ("lccc_ld_default_search_path_x86_64", "lccc_ld_default_search_path_i386",
+             "lccc_ld_new_dtags_x86_64", "lccc_ld_new_dtags_i386")
+    lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+    if not os.path.exists(lccc_ld):
+        return [Result(n, "SKIP", "lccc-ld not built") for n in names]
+    results = []
+    td = tempfile.mkdtemp(prefix="lnk.searchdir.")
+    try:
+        _write(td, "x.c", "#include <stdio.h>\nint hello(void){return puts(\"hi\");}\n")
+        for name, cflags, mflags in ((names[0], [], []),
+                                     (names[1], ["-m32"], ["-m", "elf_i386"])):
+            r = sh([CC] + cflags + ["-fPIC", "-c", "x.c", "-o", "x.o"], cwd=td)
+            if r.returncode != 0:
+                results.append(Result(name, "FAIL", f"fixture: {r.stderr.decode()[:200]}"))
+                continue
+            problems = []
+            for who, ld in (("lccc", lccc_ld), ("GNU", "ld")):
+                r = sh([ld] + mflags + ["-shared", "x.o", "-lc", "-o", f"x.{who}.so"], cwd=td)
+                dyn = sh(["readelf", "-dW", f"x.{who}.so"], cwd=td).stdout.decode()
+                if r.returncode != 0 or "[libc.so.6]" not in dyn:
+                    problems.append(f"{who}: rc={r.returncode} {r.stderr.decode()[:160]!r}, "
+                                    "want DT_NEEDED libc.so.6")
+                r = sh([ld] + mflags + ["-nostdlib", "-shared", "x.o", "-lc", "-o", "n.so"],
+                       cwd=td)
+                if r.returncode == 0 or "cannot find -lc" not in r.stderr.decode():
+                    problems.append(f"{who} -nostdlib: rc={r.returncode} "
+                                    f"{r.stderr.decode()[:160]!r}, want \"cannot find -lc\"")
+            results.append(Result(name, "FAIL" if problems else "PASS",
+                                  "; ".join(problems)[:600]))
+            dname = name.replace("default_search_path", "new_dtags")
+            problems = []
+            for flag, tag in (("--disable-new-dtags", "(RPATH)"),
+                              ("--enable-new-dtags", "(RUNPATH)")):
+                for who, ld in (("lccc", lccc_ld), ("GNU", "ld")):
+                    out = f"d.{who}.so"
+                    r = sh([ld] + mflags + ["-shared", "x.o", "-rpath", "/opt/lccc-x", flag,
+                                            "-o", out], cwd=td)
+                    dyn = sh(["readelf", "-dW", out], cwd=td).stdout.decode()
+                    got = [l.split()[1] for l in dyn.splitlines() if "/opt/lccc-x" in l]
+                    if r.returncode != 0 or got != [tag]:
+                        problems.append(f"{who} {flag}: rc={r.returncode} tags={got}, want "
+                                        f"[{tag!r}] {r.stderr.decode()[:120]!r}")
+            results.append(Result(dname, "FAIL" if problems else "PASS",
+                                  "; ".join(problems)[:600]))
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+    return results
+
+
 class _Entry:
     """One registered test (or group of tests sharing a fixture).
 
@@ -9683,6 +10345,7 @@ def _registry(args, oracles):
                           ("ie_to_le_local", _ie_to_le_local_test),
                           ("ie_to_le_forms", _ie_to_le_forms_test),
                           ("movrs_relocations", _movrs_relocations_test),
+                          ("plain_gotpcrel_relaxation", _plain_gotpcrel_test),
                           ("text_relocations", _text_relocations_test)):
         reg.append(one(tname, runner, "dynamic"))
     reg += [
@@ -9773,6 +10436,18 @@ def _registry(args, oracles):
         group(("defsym_layout_plus", "defsym_layout_arith", "defsym_layout_end_final",
                "defsym_layout_reloc_reference", "defsym_layout_shared"),
               _defsym_layout_test, "defsym", aux=("defsym_layout_expr",)),
+        group(("lccc_ld_default_search_path_x86_64", "lccc_ld_default_search_path_i386",
+               "lccc_ld_new_dtags_x86_64", "lccc_ld_new_dtags_i386"),
+              _standalone_ld_flags_test, "dynamic", "i386"),
+        group(("pltoff_library_variable_exec", "pltoff_library_variable_shared",
+               "pie_absolute32_refused", "driver_pie_startfiles",
+               "as_needed_dropped_library_exports_nothing"),
+              _reference_kind_test, "dynamic"),
+        group(("defsym_forward_reference_pie", "defsym_forward_reference_shared",
+               "defsym_forward_reference_script", "defsym_forward_reference_i386",
+               "defsym_address_slides_in_pie", "defsym_pc32_absolute_pie_refused",
+               "defsym_cycle_diagnosed"),
+              _defsym_order_test, "defsym"),
     ]
     return reg
 

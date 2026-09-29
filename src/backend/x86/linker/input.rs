@@ -151,14 +151,30 @@ pub(super) fn load_file_as_needed(
     if data.len() >= 18 {
         let e_type = u16::from_le_bytes([data[16], data[17]]);
         if e_type == ET_DYN {
-            objects.note_dso_names(linker_common::shared_library_dynsym_names(data));
-            return linker_common::load_shared_library_elf64_as_needed(
+            linker_common::load_shared_library_elf64_as_needed(
                 path,
                 globals,
                 needed_sonames,
                 lib_paths,
                 as_needed,
-            );
+            )?;
+            // A library's `.dynsym` names export the executable's definitions
+            // it references -- if it is part of the link.  An `--as-needed`
+            // library that nothing needed gets no DT_NEEDED and is never
+            // loaded, so its references must not export anything: GNU ld
+            // unloads such a library, its symbols included.  (It is in the
+            // link iff its soname is in the DT_NEEDED list, also when an
+            // earlier input put it there.)
+            let soname = linker_common::parse_soname(data).unwrap_or_else(|| {
+                Path::new(path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.to_string())
+            });
+            if needed_sonames.contains(&soname) {
+                objects.note_dso_names(linker_common::shared_library_dynsym_names(data));
+            }
+            return Ok(());
         }
     }
 

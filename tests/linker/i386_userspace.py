@@ -883,6 +883,79 @@ def case_copy_relocation_aliases(e):
         raise Fail(f"alias bindings {views['lccc']} != GNU ld's {views['GNU']}")
 
 
+COPY_NEED_LIB = """\
+int got_only = 7;
+int direct = 8;
+int dbg_only = 9;
+void lib_bump(void) { got_only += 10; direct += 10; }
+"""
+
+COPY_NEED_PIC = """\
+extern int got_only;
+int read_got_only(void) { return got_only; }
+"""
+
+COPY_NEED_MAIN = """\
+#include <stdio.h>
+extern int direct;
+int read_got_only(void);
+void lib_bump(void);
+int main(void)
+{
+    lib_bump();
+    printf("%d %d\\n", read_got_only(), direct);
+    return 0;
+}
+"""
+
+COPY_NEED_DBG = """\
+\t.section .debug_lccc_note,"",@progbits
+\t.long dbg_only
+"""
+
+
+def case_copy_only_when_addressed(e):
+    """Only a DSO object the executable addresses directly is copied.
+
+    `got_only` is reached from PIC code through its GOT slot alone,
+    `dbg_only` is named only by a non-allocated (DWARF-like) section, and
+    `direct` is addressed by non-PIC code (R_386_32).  GNU ld copies just
+    `direct`; lccc-ld used to copy every DSO data object it resolved,
+    whatever the reference: a COPY relocation and .bss for nothing, which
+    ld.so also refuses for protected-visibility objects.  Exact COPY set,
+    GLOB_DAT for the GOT-only object, and the same output as GNU ld's
+    link, lazily and with immediate binding.
+    """
+    _w(e.td, "cn.c", COPY_NEED_LIB)
+    _w(e.td, "cnp.c", COPY_NEED_PIC)
+    _w(e.td, "cnm.c", COPY_NEED_MAIN)
+    _w(e.td, "cnd.s", COPY_NEED_DBG)
+    _ok(e.gcc("-O1", "-fPIC", "-shared", "cn.c", "-o", "libcn.so", lccc=False), "build libcn.so")
+    _ok(e.gcc("-O1", "-fPIC", "-c", "cnp.c", "-o", "cnp.o", lccc=False), "compile cnp.c")
+    _ok(e.gcc("-O1", "-fno-pic", "-c", "cnm.c", "-o", "cnm.o", lccc=False), "compile cnm.c")
+    _ok(e.gcc("-c", "cnd.s", "-o", "cnd.o", lccc=False), "assemble cnd.s")
+    for lccc in (False, True):
+        who = "lccc" if lccc else "GNU"
+        exe = f"cn_{who}"
+        _ok(e.gcc("-no-pie", "cnm.o", "cnp.o", "cnd.o", "-o", exe, e.path("libcn.so"),
+                  "-Wl,-z,text", lccc=lccc), f"{who}: link")
+        for bind_now in (False, True):
+            r = e.run(e.path(exe), bind_now, libdir=e.td)
+            if r.returncode != 0 or r.stdout != b"17 18\n":
+                raise Fail(f"{who}: run rc={r.returncode} out={r.stdout!r}")
+        rel = _ok(e.cmd(["readelf", "-rW", "-D", e.path(exe)]), "readelf -r").stdout.decode()
+        by_type = {}
+        for ln in rel.splitlines():
+            f = ln.split()
+            if len(f) >= 5 and f[2].startswith("R_386_"):
+                by_type.setdefault(f[2], set()).add(f[4].split("@")[0])
+        copies = by_type.get("R_386_COPY", set())
+        if copies != {"direct"}:
+            raise Fail(f"{who}: R_386_COPY for {sorted(copies)}, want ['direct']")
+        if "got_only" not in by_type.get("R_386_GLOB_DAT", set()):
+            raise Fail(f"{who}: got_only has no R_386_GLOB_DAT: {by_type}")
+
+
 CASES = [
     ("i386_tls_matrix", case_tls_matrix),
     ("i386_exe_tls_transitions", case_exe_tls_transitions),
@@ -892,6 +965,7 @@ CASES = [
     ("i386_property_notes", case_property_notes),
     ("i386_text_relocations", case_text_relocations),
     ("i386_copy_relocation_aliases", case_copy_relocation_aliases),
+    ("i386_copy_only_when_addressed", case_copy_only_when_addressed),
 ]
 
 

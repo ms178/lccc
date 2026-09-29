@@ -237,7 +237,6 @@ impl LinkerSymbol {
     /// not TLS) starts out copy-relocated; `mark_plt_got_needs` and the
     /// canonical-PLT logic refine the rest per reference.
     pub fn dynamic_import(d: &super::input::DynlibSym) -> Self {
-        let is_func = d.sym_type == STT_FUNC || d.sym_type == STT_GNU_IFUNC;
         LinkerSymbol {
             address: 0,
             size: d.size,
@@ -247,7 +246,8 @@ impl LinkerSymbol {
             is_defined: false,
             // Decided per reference by `mark_plt_got_needs`: a PLT only for
             // calls and address-of, a GOT slot only for GOT-relative
-            // references.
+            // references, a copy only for a data object the executable
+            // addresses directly.
             needs_plt: false,
             needs_got: false,
             output_section: usize::MAX,
@@ -256,10 +256,7 @@ impl LinkerSymbol {
             got_index: 0,
             is_dynamic: true,
             dynlib: d.lib.clone(),
-            // A DSO TLS variable lives in its module's TLS block: it is
-            // reached through TLS_TPOFF GOT slots, never copied into the
-            // executable.
-            needs_copy: !is_func && d.sym_type != STT_TLS,
+            needs_copy: false,
             copy_addr: 0,
             version: d.version.clone(),
             lib_value: d.value,

@@ -299,9 +299,7 @@ pub(super) fn mark_plt_got_needs(
                     // A call reaches a shared-library function through its
                     // PLT entry, and so does a non-PIC address-of (`R_386_32`,
                     // a non-branch `R_386_PC32`), which makes the entry the
-                    // function's canonical address.  A DSO data object
-                    // referenced like that is copy-relocated instead
-                    // (`needs_copy`, decided when it was resolved).
+                    // function's canonical address.
                     R_386_PLT32 => {
                         if let Some(gs) = global_symbols.get_mut(sym.name.as_str()) {
                             if gs.is_dynamic {
@@ -309,14 +307,34 @@ pub(super) fn mark_plt_got_needs(
                             }
                         }
                     }
-                    R_386_PC32 | R_386_32 => {
+                    // A DSO data object the executable addresses directly
+                    // -- an absolute or PC-relative field of any width, or
+                    // a GOT-relative offset -- must live at a link-time
+                    // address: it is copy-relocated into the executable.
+                    // Only such a reference: an object reached through its
+                    // GOT slot alone (PIC code linked into the executable)
+                    // stays in its library, as with GNU ld -- a copy would
+                    // cost .bss and a relocation for nothing, and is
+                    // refused by ld.so for a protected-visibility object.
+                    // A DSO TLS variable is never copied: it lives in its
+                    // module's TLS block (TLS_TPOFF slots).  References
+                    // from non-allocated sections (DWARF) are never loaded
+                    // and create nothing -- GNU ld ignores them too.
+                    R_386_PC32 | R_386_32 | R_386_16 | R_386_PC16 | R_386_8 | R_386_PC8
+                    | R_386_GOTOFF
+                        if sec.flags & SHF_ALLOC != 0 =>
+                    {
                         if let Some(gs) = global_symbols.get_mut(sym.name.as_str()) {
-                            if gs.is_dynamic
-                                && (gs.sym_type == STT_FUNC || gs.sym_type == STT_GNU_IFUNC)
-                            {
+                            if !gs.is_dynamic {
+                                continue;
+                            }
+                            let is_func = gs.sym_type == STT_FUNC || gs.sym_type == STT_GNU_IFUNC;
+                            if is_func && matches!(rel_type, R_386_PC32 | R_386_32) {
                                 gs.needs_plt = true;
                                 gs.canonical_plt |=
                                     rel_type == R_386_32 || !is_branch_rel32(sec, rel_offset);
+                            } else if !is_func && gs.sym_type != STT_TLS {
+                                gs.needs_copy = true;
                             }
                         }
                     }

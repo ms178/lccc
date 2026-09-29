@@ -185,6 +185,15 @@ pub enum GotRelax {
 /// * `CODE_5_GOTPCRELX`: a REX-prefixed MOVRS (`REX 0f 38 8b` from `off -
 ///   5`) -- [`GotRelax::MovrsLoad`].
 ///
+/// * plain `GOTPCREL` (old assemblers, `-mrelax-relocations=no`, NASM's
+///   `wrt ..gotpcrel`): the relocation promises nothing, so only the
+///   rewrites that touch no byte before the opcode are applied -- `mov` ->
+///   `lea` (a REX or REX2 prefix, if any, stays valid for `lea`) and the
+///   `call`/`jmp` forms -- and only when the opcode is recognizably a legacy
+///   map-0 opcode ([`plain_map0_opcode`]).  GNU ld 2.47 also converts `mov`
+///   here but tests the opcode byte alone, so a `movrs
+///   foo@GOTPCREL(%rip)` (`0f 38 8b`) becomes the undefined `0f 38 8d`.
+///
 /// A type whose prefix is absent (a misdescribed or truncated instruction,
 /// e.g. `REX_GOTPCRELX` two bytes into its section) is never relaxed: its
 /// GOT slot is always correct, and rewriting would touch bytes outside the
@@ -216,6 +225,12 @@ pub fn gotpcrelx_relaxation(
     // absolute value is known now and fits, or the load is not relaxed.
     let load = || (rip_ok || imm_ok).then_some(GotRelax::Load { imm: imm_ok });
     match rela_type {
+        R_X86_64_GOTPCREL if plain_map0_opcode(code, off) => match op {
+            0x8b if rip_ok => Some(GotRelax::Load { imm: false }),
+            0xff if modrm == 0x15 && rip_ok => Some(GotRelax::Call),
+            0xff if modrm == 0x25 && rip_ok => Some(GotRelax::Jmp),
+            _ => None,
+        },
         R_X86_64_GOTPCRELX => match op {
             0x8b => load(),
             0xff if modrm == 0x15 && rip_ok => Some(GotRelax::Call),
@@ -254,6 +269,27 @@ pub fn gotpcrelx_relaxation(
         }
         _ => None,
     }
+}
+
+/// Whether the opcode byte at `off - 2` of a plain `R_X86_64_GOTPCREL`
+/// reference (field at `off`) can be taken as a legacy map-0 opcode.
+///
+/// Nothing is known about the bytes before it, so this rejects every
+/// layout in which the same byte would be an opcode of another map: the
+/// `0f` escape (`0f 38 8b` is MOVRS, `0f 8b` has no ModRM), a REX2 prefix
+/// selecting map 1, and the VEX (`c5`/`c4`), XOP (`8f`) and EVEX (`62`)
+/// prefixes at the distance their payload puts them.  In 64-bit mode those
+/// bytes are always such prefixes when they sit in prefix position.  A
+/// preceding instruction that merely ENDS in one of them is rejected too:
+/// the reference then keeps its GOT slot, which is always correct.
+fn plain_map0_opcode(code: &[u8], off: usize) -> bool {
+    let at = |back: usize| off.checked_sub(back).map(|i| code[i]);
+    !(at(3) == Some(0x0f)
+        || (at(4) == Some(0x0f) && matches!(at(3), Some(0x38 | 0x3a)))
+        || (at(4) == Some(0xd5) && at(3).is_some_and(|p| p & 0x80 != 0))
+        || at(4) == Some(0xc5)
+        || matches!(at(5), Some(0xc4 | 0x8f))
+        || at(6) == Some(0x62))
 }
 
 /// REX byte after moving ModRM.reg into ModRM.rm: REX.R becomes REX.B.  The
@@ -754,14 +790,60 @@ mod tests {
     }
 
     #[test]
+    fn plain_gotpcrel_touches_no_prefix() {
+        let plain = |bytes: &[u8], is_pic, target| {
+            let buf = [bytes, &Z[..]].concat();
+            gotpcrelx_relaxation(R_X86_64_GOTPCREL, -4, &buf, bytes.len(), is_pic, target)
+        };
+        let lea = Some(GotRelax::Load { imm: false });
+        // `mov` -> `lea` whatever precedes it (REX, REX2 map 0, nothing),
+        // never the immediate form, which would have to edit the REX byte.
+        assert_eq!(
+            plain(&[0xc3, 0x48, 0x8b, 0x05], false, GotTarget::Image),
+            lea
+        );
+        assert_eq!(plain(&[0x8b, 0x05], true, GotTarget::Image), lea);
+        assert_eq!(
+            plain(&[0xd5, 0x48, 0x8b, 0x05], false, GotTarget::Image),
+            lea
+        );
+        assert_eq!(
+            plain(&[0x90, 0xff, 0x15], true, GotTarget::Image),
+            Some(GotRelax::Call)
+        );
+        assert_eq!(
+            plain(&[0x90, 0xff, 0x25], false, GotTarget::Image),
+            Some(GotRelax::Jmp)
+        );
+        // An absolute value needs the immediate `mov`: unavailable.
+        assert_eq!(
+            plain(&[0x48, 0x8b, 0x05], true, GotTarget::Absolute(8)),
+            None
+        );
+        // Immediate `test`/binop forms need REX.W, which nothing promises.
+        assert_eq!(plain(&[0x48, 0x85, 0x05], false, GotTarget::Image), None);
+        assert_eq!(plain(&[0x48, 0x03, 0x05], false, GotTarget::Image), None);
+        // `8b` as the opcode of another map: MOVRS with and without REX,
+        // REX2 map 1, VEX2/VEX3/XOP/EVEX (e.g. EVEX 0f38 8b vpcompressd).
+        for other in [
+            &[0x0f, 0x38, 0x8b, 0x05][..],
+            &[0x48, 0x0f, 0x38, 0x8b, 0x05],
+            &[0x0f, 0x3a, 0x8b, 0x05],
+            &[0x90, 0x0f, 0x8b, 0x05],
+            &[0xd5, 0xc8, 0x8b, 0x05],
+            &[0xc5, 0xf9, 0x8b, 0x05],
+            &[0xc4, 0xe2, 0x79, 0x8b, 0x05],
+            &[0x8f, 0xe9, 0x78, 0x8b, 0x05],
+            &[0x62, 0xf2, 0x7d, 0x08, 0x8b, 0x05],
+        ] {
+            assert_eq!(plain(other, false, GotTarget::Image), None, "{other:02x?}");
+        }
+    }
+
+    #[test]
     fn unrelaxable_references() {
         let mov = [0x48, 0x8b, 0x05, 0, 0, 0, 0];
         let buf = [&[0xc3][..], &mov[..]].concat();
-        // Plain GOTPCREL promises nothing about the instruction.
-        assert_eq!(
-            gotpcrelx_relaxation(R_X86_64_GOTPCREL, -4, &buf, 4, false, GotTarget::Image),
-            None
-        );
         // A non -4 addend reads part of the slot (e.g. its high half).
         assert_eq!(
             gotpcrelx_relaxation(R_X86_64_REX_GOTPCRELX, 0, &buf, 4, false, GotTarget::Image),

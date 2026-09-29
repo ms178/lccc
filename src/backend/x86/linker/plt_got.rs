@@ -460,8 +460,20 @@ pub(super) fn create_plt_got(
                             got_only_names.push(sym.name.to_string());
                         }
                     }
+                    // `L` of `f@PLTOFF` is a function's PLT entry.  A library
+                    // VARIABLE has none to name: a stub would make `v@PLTOFF`
+                    // point at code, give the variable a JUMP_SLOT, and -- the
+                    // PC32 arm below redirects to any PLT entry -- send every
+                    // direct reference to it there too (measured: all of them
+                    // read the stub's bytes; GNU ld 2.44 does exactly that).
+                    // Its link-time address is its copy, so it is resolved as
+                    // any direct reference to it is.
                     R_X86_64_PLTOFF64 if gsym_info.map(|g| g.0).unwrap_or(false) => {
-                        if plt_set.insert(sym.name.to_string()) {
+                        if gsym_info.map(|g| g.1) == Some(STT_OBJECT) {
+                            if copy_reloc_set.insert(sym.name.to_string()) {
+                                copy_reloc_names.push(sym.name.to_string());
+                            }
+                        } else if plt_set.insert(sym.name.to_string()) {
                             plt_names.push(sym.name.to_string());
                         }
                     }

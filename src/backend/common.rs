@@ -908,6 +908,33 @@ impl BuiltinLinkSetup {
     }
 }
 
+/// The position-independent variant of a CRT object list, as gcc's startfile
+/// spec picks it for `-shared` and `-pie`: `crtbeginS.o`/`crtendS.o` for
+/// `crtbegin.o`/`crtend.o`, and `start` (`Scrt1.o` for a PIE) in place of
+/// `crt1.o` -- dropped when `None` (a shared object has no entry code).
+/// The plain objects are non-PIC (`crtbegin.o` addresses `__TMC_END__` with
+/// R_X86_64_32, `crt1.o` may address `main` absolutely), so a PIE linked
+/// from them holds link-time addresses the loader never relocates.
+#[cfg(not(feature = "gcc_linker"))]
+fn pic_crt_objects(objs: &[String], start: Option<&str>) -> Vec<String> {
+    objs.iter()
+        .filter_map(|p| {
+            if let Some(d) = p.strip_suffix("/crt1.o") {
+                return start.map(|s| format!("{d}/{s}"));
+            }
+            Some(
+                p.strip_suffix("/crtbegin.o")
+                    .map(|d| format!("{d}/crtbeginS.o"))
+                    .or_else(|| {
+                        p.strip_suffix("/crtend.o")
+                            .map(|d| format!("{d}/crtendS.o"))
+                    })
+                    .unwrap_or_else(|| p.clone()),
+            )
+        })
+        .collect()
+}
+
 /// Link using the built-in native ELF linker for any supported architecture.
 ///
 /// This is the fully native path: no external ld binary is needed. The linker
@@ -962,22 +989,8 @@ fn link_builtin_native(
                 let no_start_files = is_nostdlib || has("-nostartfiles");
                 let no_default_libs = is_nostdlib || has("-nodefaultlibs");
                 let crt = resolve_builtin_link_setup(arch, user_args, no_start_files, false);
-                let pic_crt = |objs: &[String]| -> Vec<String> {
-                    objs.iter()
-                        .filter(|p| !p.ends_with("/crt1.o"))
-                        .map(|p| {
-                            p.strip_suffix("/crtbegin.o")
-                                .map(|d| format!("{d}/crtbeginS.o"))
-                                .or_else(|| {
-                                    p.strip_suffix("/crtend.o")
-                                        .map(|d| format!("{d}/crtendS.o"))
-                                })
-                                .unwrap_or_else(|| p.clone())
-                        })
-                        .collect()
-                };
-                let before = pic_crt(&crt.crt_before);
-                let after = pic_crt(&crt.crt_after);
+                let before = pic_crt_objects(&crt.crt_before, None);
+                let after = pic_crt_objects(&crt.crt_after, None);
                 let before: Vec<&str> = before.iter().map(String::as_str).collect();
                 let after: Vec<&str> = after.iter().map(String::as_str).collect();
                 let libs: &[&str] = if no_default_libs {
@@ -1004,6 +1017,22 @@ fn link_builtin_native(
 
     let mut setup = resolve_builtin_link_setup(arch, user_args, is_nostdlib, is_static);
     add_arch_extra_libs(&mut setup, arch.elf_machine, is_static);
+    // `-pie` (the last of `-pie`/`-no-pie` wins, as for the linker) takes
+    // gcc's PIE startfiles.  x86-64 only here: the i686 linker does not
+    // produce PIEs yet, and other backends own their own policy.
+    let is_pie = user_args
+        .iter()
+        .rev()
+        .find_map(|a| match a.as_str() {
+            "-pie" | "--pie" | "--pic-executable" => Some(true),
+            "-no-pie" | "--no-pie" | "--no-pic-executable" => Some(false),
+            _ => None,
+        })
+        .unwrap_or(false);
+    if arch.elf_machine == EM_X86_64 && is_pie && !is_static {
+        setup.crt_before = pic_crt_objects(&setup.crt_before, Some("Scrt1.o"));
+        setup.crt_after = pic_crt_objects(&setup.crt_after, None);
+    }
     let refs = setup.as_refs();
 
     match arch.elf_machine {
