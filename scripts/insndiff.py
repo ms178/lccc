@@ -278,22 +278,33 @@ def _canon_mov_imm(insn: str) -> str:
     return f"mov ${val:#x},%{reg}"
 
 
-def _decode(objdump: str, data: bytes, tmp: Path) -> str:
-    """Disassemble raw bytes and normalise away pure encoding choices."""
+def _decode(objdump: str, data: bytes, tmp: Path) -> str | None:
+    """Disassemble raw bytes and normalise away pure encoding choices.
+
+    `None` means the bytes could not be reliably decoded; it is never evidence
+    that two encodings are equivalent.
+    """
     if not data:
-        return ""
+        return None
     raw = tmp / "d.bin"
     raw.write_bytes(data)
     r = subprocess.run(
         [objdump, "-D", "-b", "binary", "-m", "i386:x86-64",
          "-M", "att", str(raw)],
         capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:
+        return None
     out = []
     for line in r.stdout.splitlines():
         m = re.match(r"^\s+[0-9a-f]+:\s+((?:[0-9a-f]{2} )+)\s*\t(.*)$", line)
         if not m:
             continue
-        insn = m.group(2).split("#")[0].strip()
+        insn = m.group(2).split("#")[0].strip().lower()
+        if not insn or insn == "(bad)" or insn.startswith(".byte"):
+            return None
+        # Objdump's `{vex}` marker names a legal VEX encoding of an
+        # EVEX-only mnemonic; it is a GNU pseudo-prefix, not an operand.
+        insn = re.sub(r"^\{vex(?:2|3)?\}\s+", "", insn)
         # A redundant scale-1 index and an explicit zero displacement are the
         # two spellings that differ only by encoding, not by meaning.
         insn = _SCALE1.sub(r"(%\1)", insn)
@@ -302,13 +313,14 @@ def _decode(objdump: str, data: bytes, tmp: Path) -> str:
         insn = _canon_commutative(insn)
         insn = _canon_mov_imm(insn)
         out.append(insn)
-    return "\n".join(out)
+    return "\n".join(out) if out else None
 
 
 def verify_shorter(objdump: str, l: Encoding, g: Encoding, tmp: Path) -> bool:
-    """True when LCCC's shorter encoding decodes to the same instruction."""
+    """True only when both streams decode and canonicalize identically."""
     try:
-        return _decode(objdump, l.data, tmp) == _decode(objdump, g.data, tmp)
+        left, right = _decode(objdump, l.data, tmp), _decode(objdump, g.data, tmp)
+        return left is not None and right is not None and left == right
     except (OSError, subprocess.SubprocessError):
         return False
 

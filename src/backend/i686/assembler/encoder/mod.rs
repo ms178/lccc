@@ -3117,6 +3117,21 @@ impl InstructionEncoder {
         ) {
             return Some(self.encode_via_x64(instr));
         }
+        // EVEX-only unsigned GP->scalar conversions have no local i686
+        // encoder arm. Their 32-bit rows use only GP ids 0..7, so the shared
+        // EVEX encoder is byte-identical for both register and memory sources.
+        // Keep the explicit *q spellings mode-gated here: GAS rejects them
+        // before operand validation in .code32, while the shared x86-64
+        // encoder would otherwise be willing to select the W=1 row.
+        if matches!(stem, "vcvtusi2ssq" | "vcvtusi2sdq") {
+            return Some(Err(format!("`{stem}' is only supported in 64-bit mode")));
+        }
+        if matches!(
+            stem,
+            "vcvtusi2ss" | "vcvtusi2ssl" | "vcvtusi2sd" | "vcvtusi2sdl"
+        ) {
+            return Some(self.encode_via_x64(instr));
+        }
         // Suffixed GP-touching spellings (vcvtsi2ssl, vcvtsd2siq, …): the
         // stem before the size suffix decides.  EXCEPTION: an explicit
         // `{evex}` hint forces the EVEX-promoted rows, which only the
@@ -3519,6 +3534,59 @@ mod merged_pr629_followup_tests {
             "no VEX/XOP encoding for `vmcall'"
         );
         assert_eq!(assemble("vmcall").unwrap(), "0f 01 c1");
+    }
+
+    #[test]
+    fn unsigned_scalar_evex_conversions_delegate_for_i686_gprs() {
+        // GAS 2.47 --32: these default/W0 and explicit-L spellings all use
+        // the same EVEX row.  The legacy i686 dispatcher previously rejected
+        // every one because it blocked all GP-data operands before its local
+        // mnemonic match (which has no EVEX unsigned-conversion arms).
+        for (source, bytes) in [
+            ("vcvtusi2ss %eax,%xmm1,%xmm2", "62 f1 76 08 7b d0"),
+            ("vcvtusi2ss (%eax),%xmm1,%xmm2", "62 f1 76 08 7b 10"),
+            ("vcvtusi2ssl %eax,%xmm1,%xmm2", "62 f1 76 08 7b d0"),
+            ("vcvtusi2ssl (%eax),%xmm1,%xmm2", "62 f1 76 08 7b 10"),
+            ("vcvtusi2sd %eax,%xmm1,%xmm2", "62 f1 77 08 7b d0"),
+            ("vcvtusi2sd (%eax),%xmm1,%xmm2", "62 f1 77 08 7b 10"),
+            ("vcvtusi2sdl %eax,%xmm1,%xmm2", "62 f1 77 08 7b d0"),
+            ("vcvtusi2sdl (%eax),%xmm1,%xmm2", "62 f1 77 08 7b 10"),
+            ("{evex} vcvtusi2ss %eax,%xmm1,%xmm2", "62 f1 76 08 7b d0"),
+            ("VCVTUSI2SDL (%eax),%xmm1,%xmm2", "62 f1 77 08 7b 10"),
+        ] {
+            assert_eq!(assemble(source).unwrap(), bytes, "{source}");
+        }
+    }
+
+    #[test]
+    fn unsigned_qword_evex_conversions_keep_the_64_bit_mode_error() {
+        for source in [
+            "vcvtusi2ssq %eax,%xmm1,%xmm2",
+            "vcvtusi2ssq (%eax),%xmm1,%xmm2",
+            "vcvtusi2sdq %eax,%xmm1,%xmm2",
+            "vcvtusi2sdq (%eax),%xmm1,%xmm2",
+        ] {
+            assert_eq!(
+                assemble(source).unwrap_err(),
+                format!(
+                    "`{}' is only supported in 64-bit mode",
+                    source.split_whitespace().next().unwrap()
+                ),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn evex_only_unsigned_conversions_reject_forced_vex() {
+        for prefix in ["{vex}", "{vex3}"] {
+            let source = format!("{prefix} vcvtusi2ssl %eax,%xmm1,%xmm2");
+            assert_eq!(
+                assemble(&source).unwrap_err(),
+                "no VEX/XOP encoding for `vcvtusi2ss'",
+                "{source}"
+            );
+        }
     }
 
     #[test]
