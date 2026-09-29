@@ -634,6 +634,16 @@ jobs:
           bash tests/regression/check_linker_notype_code.sh
           bash tests/regression/check_got64_old_spelling.sh
           bash tests/regression/check_tls_pie_preemptible.sh
+          # MINMAX-1: integer min/max reductions lower to packed vpmin/vpmax
+          # on AVX2, and every shape the transform does not model (unsigned,
+          # 16-bit, float, guarded, multi-accumulator) stays scalar AND stays
+          # correct.
+          bash tests/regression/check_minmax_reduction.sh
+          # The loop-density metric decides which compiler wins on a kernel,
+          # so its loop identification is tested like a pass: dominator-based
+          # backedges, composite loops never measured, step recovery through
+          # index addressing.
+          python3 scripts/test_hot_loop_metric.py
           bash tests/regression/check_tls_model_selection.sh
           bash tests/regression/check_phi_acyclic_order.sh
           python3 scripts/check_doc_links.py
@@ -685,6 +695,14 @@ jobs:
       # product; a linker-only rebuild should retain expensive object files.
       - name: Verify kernel tool-identity invalidation
         run: bash tests/regression/check_kernel_tool_identity.sh
+
+      # The relocation cross-check's decision logic, tested directly.  It
+      # needs no built linker and no oracle linker, so it runs on every host:
+      # the paths it pins (two oracles going `inapplicable`, one crashing,
+      # the reference having no opinion) are exactly the ones a host with
+      # only bfd installed never exercises end-to-end.
+      - name: Relocation oracle-verdict logic
+        run: python3 tests/linker/test_reloc_oracle_verdict.py
 
       # Deterministic bounded fuzzing catches parser/linker panics without
       # making ordinary PRs depend on an unbounded corpus or external fuzzer.
