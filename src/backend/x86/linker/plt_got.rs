@@ -376,7 +376,7 @@ pub(super) fn create_plt_got(
                             )
                             .is_none());
                     if needs_slot {
-                        local_got.insert((obj_i, si));
+                        local_got.insert((obj_i, si, got_slot_addr_addend(t, rela.addend)));
                     }
                     continue;
                 }

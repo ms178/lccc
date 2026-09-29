@@ -596,6 +596,22 @@ pub fn is_got64_family(t: u32) -> bool {
     matches!(t, R_X86_64_GOT64 | R_X86_64_GOTPCREL64 | R_X86_64_GOTPLT64)
 }
 
+/// The part of a GOT relocation's addend that is an ADDRESS offset the slot
+/// itself must CONTAIN, rather than a displacement bias in the field.
+///
+/// `R_X86_64_GOT64` is the only absolute 64-bit GOT form: its slot holds
+/// `S + A` and its field holds the slot's plain offset from
+/// `_GLOBAL_OFFSET_TABLE_`.  The other two are PC-relative (`GOTPCREL64`) or
+/// PLT-relative (`GOTPLT64`); their addend displaces the field and the slot
+/// holds plain `S`, like every other GOT form.
+///
+/// Returning 0 for those keeps two things that used to be entangled
+/// independent: what the slot HOLDS, and what the FIELD says.  Folding the
+/// GOT64 addend into the field makes the program read `slot + A` -- see
+/// `LocalSlots` for the measured consequence.
+pub fn got_slot_addr_addend(t: u32, addend: i64) -> i64 {
+    if t == R_X86_64_GOT64 { addend } else { 0 }
+}
 // DT_* constants now in shared module - re-export them
 pub use crate::backend::elf::{
     DT_DEBUG, DT_FINI_ARRAY, DT_FINI_ARRAYSZ, DT_FLAGS, DT_FLAGS_1, DT_INIT_ARRAY, DT_INIT_ARRAYSZ,

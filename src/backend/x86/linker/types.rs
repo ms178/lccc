@@ -62,17 +62,36 @@ pub struct GlobalSymbol {
 }
 
 /// GOT slots (or slot pairs) of LOCAL symbols, keyed by (object index,
-/// symbol index) and numbered in first-reference order, so the layout is
-/// deterministic.  Section symbols (empty names) are keyed like any other
-/// local: `mov .Lfoo@GOTPCREL(%rip)` usually reaches the linker as one.
+/// symbol index, ADDRESS ADDEND) and numbered in first-reference order, so
+/// the layout is deterministic.  Section symbols (empty names) are keyed like
+/// any other local: `mov .Lfoo@GOTPCREL(%rip)` usually reaches the linker as
+/// one.
+///
+/// WHY THE KEY CARRIES AN ADDEND.  `R_X86_64_GOT64` is an ABSOLUTE 64-bit
+/// reference: its slot holds `S + A` and the field holds that slot's plain
+/// offset from `_GLOBAL_OFFSET_TABLE_`.  Every other GOT form's addend is a
+/// displacement bias and its slot holds plain `S`.  The two spellings of a
+/// local address differ between assemblers -- `$lvar@GOT` is
+/// `R_X86_64_GOT64 lvar + 0` on binutils >= 2.44 but
+/// `R_X86_64_GOT64 .data + 8` on <= 2.43, one address written two ways -- and
+/// a section symbol is shared by every local in its section, so `.data + 0`,
+/// `.data + 8` and `.data + 16` are three addresses behind ONE symbol.  Keyed
+/// by symbol alone they collapse to one slot, and the field then points at
+/// (slot + A): a second local reads eight bytes past a slot, and the first
+/// reads the section base.  Measured against GNU ld 2.42 on a `.data` with
+/// three locals at offsets 0, 16 and 32: lccc-ld and GNU ld BOTH answer
+/// `1 0 0` instead of `1 1 1`.  The addend belongs to the slot's VALUE, not
+/// to the field; [`super::elf::got_slot_addr_addend`] returns it for
+/// `R_X86_64_GOT64` and 0 for every other GOT type, which keeps the slot
+/// value and the field formula independent of each other.
 #[derive(Default)]
 pub struct LocalSlots {
-    order: Vec<(usize, usize)>,
-    index: crate::common::fx_hash::FxHashMap<(usize, usize), usize>,
+    order: Vec<(usize, usize, i64)>,
+    index: crate::common::fx_hash::FxHashMap<(usize, usize, i64), usize>,
 }
 
 impl LocalSlots {
-    pub fn insert(&mut self, key: (usize, usize)) {
+    pub fn insert(&mut self, key: (usize, usize, i64)) {
         if let std::collections::hash_map::Entry::Vacant(e) = self.index.entry(key) {
             e.insert(self.order.len());
             self.order.push(key);
@@ -84,11 +103,11 @@ impl LocalSlots {
     pub fn is_empty(&self) -> bool {
         self.order.is_empty()
     }
-    pub fn get(&self, key: (usize, usize)) -> Option<usize> {
+    pub fn get(&self, key: (usize, usize, i64)) -> Option<usize> {
         self.index.get(&key).copied()
     }
     /// Keys in slot order.
-    pub fn keys(&self) -> &[(usize, usize)] {
+    pub fn keys(&self) -> &[(usize, usize, i64)] {
         &self.order
     }
 }
