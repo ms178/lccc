@@ -619,17 +619,27 @@ pub(super) fn emit_shared_library(
                     // filled with module-relative values (RELATIVE, or TLS
                     // relocations against symbol 0 with the TLS-block offset
                     // as addend).
-                    let key = (obj_idx, si);
+                    // The TLS sets are keyed by (object, symbol) alone -- a
+                    // TLS reference carries no address addend.  The GOT set
+                    // additionally carries the addend the slot must HOLD
+                    // (`got_slot_addr_addend`), which is non-zero only for
+                    // R_X86_64_GOT64 and is an ADDRESS, not a bias.
+                    let key = (obj_idx, si, 0);
+                    let got_key = (
+                        obj_idx,
+                        si,
+                        got_slot_addr_addend(rela.rela_type, rela.addend),
+                    );
                     match rela.rela_type {
                         R_X86_64_TLSGD => local_gd.insert(key),
                         t if is_tlsdesc_gotpc(t) => local_desc.insert(key),
                         t if is_gottpoff_family(t) => local_ie.insert(key),
                         t if is_gotpcrel_family(t) => {
                             if !relaxable(local_got_target(sym)) {
-                                local_got.insert(key);
+                                local_got.insert(got_key);
                             }
                         }
-                        t if is_got64_family(t) => local_got.insert(key),
+                        t if is_got64_family(t) => local_got.insert(got_key),
                         _ => {}
                     }
                     continue;
@@ -2514,10 +2524,10 @@ pub(super) fn emit_shared_library(
             }
         }
     }
-    for (i, &key) in local_gd.keys().iter().enumerate() {
+    for (i, &(oi, si, _a)) in local_gd.keys().iter().enumerate() {
         let off = local_gd_base + i as u64 * 16;
         dtpmod64_entries.push((got_addr + off, String::new()));
-        let dtpoff = local_sym_addr(key).wrapping_sub(tls_addr);
+        let dtpoff = local_sym_addr((oi, si)).wrapping_sub(tls_addr);
         w64(&mut out, (got_offset + off + 8) as usize, dtpoff);
     }
     // TLS descriptors: one R_X86_64_TLSDESC per 16-byte pair, resolved
@@ -2532,9 +2542,9 @@ pub(super) fn emit_shared_library(
             None => tlsdesc_entries.push((slot, name.clone(), 0)),
         }
     }
-    for (i, &key) in local_desc.keys().iter().enumerate() {
+    for (i, &(oi, si, _a)) in local_desc.keys().iter().enumerate() {
         let slot = got_addr + local_desc_base + i as u64 * 16;
-        let off = local_sym_addr(key).wrapping_sub(tls_addr);
+        let off = local_sym_addr((oi, si)).wrapping_sub(tls_addr);
         tlsdesc_entries.push((slot, String::new(), off));
     }
     let tlsld_slot = if needs_tlsld_slot {
@@ -2546,15 +2556,19 @@ pub(super) fn emit_shared_library(
         None
     };
     // Local IE slots: TPOFF64 against symbol 0, addend = block offset.
-    for (i, &key) in local_ie.keys().iter().enumerate() {
-        let off = local_sym_addr(key).wrapping_sub(tls_addr);
+    for (i, &(oi, si, _a)) in local_ie.keys().iter().enumerate() {
+        let off = local_sym_addr((oi, si)).wrapping_sub(tls_addr);
         tpoff64_entries.push((got_addr + local_ie_base + i as u64 * 8, String::new(), off));
     }
     // Local GOT slots: the symbol's address.  An absolute symbol's value is
     // stored as-is; RELATIVE would add the load bias to it.
-    for (i, &(obj_idx, si)) in local_got.keys().iter().enumerate() {
+    for (i, &(obj_idx, si, addr_addend)) in local_got.keys().iter().enumerate() {
         let off = local_got_base + i as u64 * 8;
-        let v = local_sym_addr((obj_idx, si));
+        // A GOT64 slot holds `S + A`; `.data + 8` and `lvar + 0` are one
+        // address written two ways (binutils <= 2.43 versus >= 2.44), and a
+        // section symbol is shared by every local in its section, so the
+        // addend is what keeps those addresses in separate slots.
+        let v = local_sym_addr((obj_idx, si)).wrapping_add(addr_addend as u64);
         if objects[obj_idx].symbols[si].shndx == SHN_ABS {
             w64(&mut out, (got_offset + off) as usize, v);
         } else {
@@ -2849,9 +2863,10 @@ pub(super) fn emit_shared_library(
                             w32_checked(&mut out, pos, v, rela.rela_type, &sym.name, obj_name)?;
                             continue;
                         }
+                        let slot_addend = got_slot_addr_addend(t, a);
                         let gea = if sym.is_local() {
                             local_got
-                                .get((obj_idx, si))
+                                .get((obj_idx, si, slot_addend))
                                 .map(|i| got_addr + local_got_base + i as u64 * 8)
                         } else {
                             got_sym_addrs.get(sym.name.as_str()).copied()
@@ -2942,9 +2957,10 @@ pub(super) fn emit_shared_library(
                         w64(&mut out, fp, (l as i64 + a - got_addr as i64) as u64);
                     }
                     t if is_got64_family(t) => {
+                        let slot_addend = got_slot_addr_addend(t, a);
                         let gea = if sym.is_local() {
                             local_got
-                                .get((obj_idx, si))
+                                .get((obj_idx, si, slot_addend))
                                 .map(|i| got_addr + local_got_base + i as u64 * 8)
                         } else {
                             got_sym_addrs.get(sym.name.as_str()).copied()
@@ -2956,8 +2972,18 @@ pub(super) fn emit_shared_library(
                                 sym.name
                             ));
                         };
+                        // A local GOT64 slot already contains `S + A`, so the
+                        // field is its plain offset; a global slot is keyed by
+                        // name and holds plain `S`, so its addend stays here.
+                        // See `LocalSlots` and the same note in `emit_exec`.
                         let v = if t == R_X86_64_GOTPCREL64 {
                             gea as i64 + a - p as i64
+                        } else if sym.is_local() {
+                            // `a - slot_addend` is 0 for GOT64, whose
+                            // local slot already contains `S + A`, and `a`
+                            // for GOTPLT64, whose local slot holds
+                            // plain `S` and keeps the addend as a bias.
+                            gea as i64 - got_addr as i64 + (a - slot_addend)
                         } else {
                             gea as i64 - got_addr as i64 + a
                         };
@@ -2971,7 +2997,7 @@ pub(super) fn emit_shared_library(
                         // offset is unknown until load time.
                         let gea = if sym.is_local() {
                             local_ie
-                                .get((obj_idx, si))
+                                .get((obj_idx, si, 0))
                                 .map(|i| got_addr + local_ie_base + i as u64 * 8)
                         } else {
                             got_sym_addrs.get(sym.name.as_str()).copied()
@@ -3007,7 +3033,7 @@ pub(super) fn emit_shared_library(
                         // Point the lea at the (DTPMOD64, DTPOFF64) GOT pair.
                         let slot = if sym.is_local() {
                             local_gd
-                                .get((obj_idx, si))
+                                .get((obj_idx, si, 0))
                                 .map(|i| got_addr + local_gd_base + i as u64 * 16)
                         } else {
                             tlsgd_slot_addr.get(sym.name.as_str()).copied()
@@ -3031,7 +3057,7 @@ pub(super) fn emit_shared_library(
                         // `lea sym@tlsdesc(%rip), %rax` -> the descriptor.
                         let slot = if sym.is_local() {
                             local_desc
-                                .get((obj_idx, si))
+                                .get((obj_idx, si, 0))
                                 .map(|i| got_addr + local_desc_base + i as u64 * 16)
                         } else {
                             tlsdesc_slot_addr.get(sym.name.as_str()).copied()

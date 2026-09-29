@@ -4792,6 +4792,61 @@ int main(int argc, char **argv){
 """
 
 
+def _got64_spelling_asm():
+    """One `checkN` per pad size, so a single object carries all three.
+
+    `checkN` reads `lvarN@GOT` through `_GLOBAL_OFFSET_TABLE_` and answers
+    whether the loaded value equals `lvarN`'s own address.  The pad BEFORE
+    each `lvarN` is what makes its section offset non-zero -- and a non-zero
+    offset is exactly what makes the assembler's spelling choice observable
+    (`R_X86_64_GOT64 .data + 8` on binutils <= 2.43 versus
+    `R_X86_64_GOT64 lvar + 0` on >= 2.44).
+
+    The result is a COMPARISON rather than an inspection because
+    `R_X86_64_GOT64` stores the relocated address in the slot and the slot's
+    plain offset in the field: folding the addend into the field reads eight
+    bytes past the slot, which is a value that can look plausible until it is
+    compared against the thing it was supposed to be.
+    """
+    parts = ["\t.text"]
+    for n in (0, 1, 2):
+        parts += [
+            f"\t.globl\tcheck{n}",
+            f"\t.type\tcheck{n}, @function",
+            f"check{n}:",
+            "\tleaq\t_GLOBAL_OFFSET_TABLE_(%rip), %rcx",
+            f"\tmovabsq\t$lvar{n}@GOT, %rax",
+            "\tmovq\t(%rcx,%rax), %rax",
+            f"\tleaq\tlvar{n}(%rip), %rcx",
+            "\tcmpq\t%rcx, %rax",
+            "\tsete\t%al",
+            "\tmovzbl\t%al, %eax",
+            "\tret",
+            f"\t.size\tcheck{n}, .-check{n}",
+        ]
+    parts += ["\t.data", "\t.p2align 3"]
+    for n in (0, 1, 2):
+        parts += [f"lvar{n}:", f"\t.quad\t{0x1111 + n * 0x111}", "\t.p2align 3"]
+        if n < 2:
+            parts += ["\t.zero\t8"]
+    parts += ['\t.section .note.GNU-stack,"",@progbits', ""]
+    return "\n".join(parts)
+
+
+# Every check must answer 1: the GOT slot holds the address it names.
+GOT64_WANT = "1 1 1\n"
+
+_GOT64_SPELLING_MAIN = r"""#include <stdio.h>
+/* extern, NOT static: the definitions are GLOBAL symbols in the fixture.  A
+   `static` declaration here declares a different, local, undefined function,
+   so every call binds to 0 and every check answers 0 -- which makes the whole
+   test pass while testing nothing.  The expected value is asserted, so that
+   cannot go unnoticed. */
+int check0(void), check1(void), check2(void);
+int main(void){ printf("%d %d %d\n", check0(), check1(), check2()); return 0; }
+"""
+
+
 def _elf_vread(d, va, n):
     """`n` bytes at virtual address `va` of an ELF64 image (via PT_LOAD)."""
     for typ, _fl, off, pva, fsz, _msz, _al in _elf_bytes_phdrs(d) or []:
@@ -4978,6 +5033,164 @@ def _gotpcrel_edges_test(args, oracles):
     finally:
         if not args.keep:
             shutil.rmtree(td, ignore_errors=True)
+
+
+def _assembler_variants():
+    """Every assembler this run should cross-check, as `(label, argv)`.
+
+    A relocation's SPELLING is a property of the ASSEMBLER, not of the linker.
+    The measured example: for a LOCAL `$lvar@GOT` with no symbol-table entry
+    of its own, binutils <= 2.43 emits `R_X86_64_GOT64 .data + 8` (the section
+    symbol with the offset folded into the addend) while >= 2.44 emits
+    `R_X86_64_GOT64 lvar + 0`.  Both name one address, but a linker that
+    handles only one of them is silently wrong on exactly the toolchain that
+    produced the other -- and a suite that assembles every fixture with a
+    single pinned `as` cannot see the difference at all.  The GOT64 defect
+    this branch repaired was invisible in CI for precisely that reason.
+
+    So the same fixture is assembled by every assembler on this list and each
+    one is required to agree with GNU ld.  `LCCC_ASSEMBLERS` is a
+    colon-separated list of extra assembler binaries (typically one older
+    build); the default `as` from PATH is always included.  A variant that
+    cannot assemble a given fixture is SKIPPED for it, never failed: an old
+    `as` has no REX2/APX, and that is a property of the tool, not of the
+    linker.
+    """
+    out = [("as", ["as"])]
+    for spec in (os.environ.get("LCCC_ASSEMBLERS") or "").split(":"):
+        spec = spec.strip()
+        if not spec:
+            continue
+        if not (os.path.isabs(spec) and os.access(spec, os.X_OK)):
+            # A configured assembler that is not there is a broken runner.
+            out.append((spec, [spec]))
+            continue
+        out.append((os.path.basename(os.path.dirname(spec)) + "/" +
+                    os.path.basename(spec), [spec]))
+    return out
+
+
+def _as_version(argv):
+    """`GNU assembler (GNU Binutils) 2.42` -> `2.42`; '' when unknown."""
+    r = sh(argv + ["--version"])
+    if r.returncode != 0:
+        return ""
+    m = re.search(r"(\d+\.\d+(?:\.\d+)?)\s*$", r.stdout.decode(errors="replace").splitlines()[0])
+    return m.group(1) if m else ""
+
+
+def _got64_spelling_matrix_test(args, oracles):
+    """One fixture, every assembler, each required to agree with GNU ld.
+
+    The fixture is the shape whose spelling is version-sensitive: a local
+    `$lvar@GOT` read through `_GLOBAL_OFFSET_TABLE_`, where the answer is
+    compared against `lvar`'s own address at runtime.  `R_X86_64_GOT64` stores
+    the relocated ADDRESS in the slot and the slot's plain offset in the
+    relocation field, so an implementation that folds the addend into the
+    field reads eight bytes past the slot -- a value that can look plausible
+    until it is compared, which is why the check is a comparison and not an
+    inspection.
+
+    Three offsets are covered, because the offset is what selects the
+    spelling: 0 (the address IS the section base, so `+ 0` either way) and
+    two non-zero offsets (where <= 2.43 and >= 2.44 genuinely differ).  Each
+    assembler is reported with the relocations it actually emitted, so a
+    future binutils that changes the spelling again shows up in the output
+    instead of silently narrowing what is covered.
+    """
+    name = "got64_spelling_matrix"
+    td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
+    try:
+        for pad in (0, 1, 2):
+            with open(os.path.join(td, f"t{pad}.s"), "w") as f:
+                f.write(_got64_spelling_asm())
+        with open(os.path.join(td, "m.c"), "w") as f:
+            f.write(_GOT64_SPELLING_MAIN)
+        lccc_ld = os.path.join(os.path.dirname(os.path.abspath(args.lccc)), "lccc-ld")
+        shim = _shim_for(td, lccc_ld)
+        variants = _assembler_variants()
+        ran, spells, skipped, oracles_differ = 0, [], [], []
+        for label, argv in variants:
+            for pad in (0, 1, 2):
+                obj = f"t{pad}.{label}.o"
+                r = sh(argv + [f"t{pad}.s", "-o", obj], cwd=td)
+                if r.returncode != 0:
+                    skipped.append(f"{label}@{pad}:assemble")
+                    continue
+                spells.append("%s/%s: %s" % (label, pad, _got64_spellings(obj, td)))
+                for mode in ("-no-pie", "-pie"):
+                    outs = {}
+                    for tag, bflag in (("lccc", ["-B" + shim]), ("gnu", [])):
+                        exe = f"a{pad}{mode}.{label}.{tag}"
+                        lr = sh([CC] + bflag + [mode, obj, "m.c", "-o", exe], cwd=td)
+                        if lr.returncode != 0:
+                            return Result(name, "FAIL",
+                                          f"{label}@{pad} {mode}/{tag} link: "
+                                          f"{lr.stderr.decode()[:300]}")
+                        run = sh([os.path.join(td, exe)], cwd=td)
+                        outs[tag] = (run.returncode, run.stdout.decode())
+                    # THE SPECIFICATION IS THE ASSERTION, NOT THE ORACLE.
+                    #
+                    # Each `checkN` must answer 1: the GOT slot holds the
+                    # address it names.  That is checkable without a reference,
+                    # and it is asserted directly, because two linkers that are
+                    # wrong in the same way agree perfectly -- and a fixture
+                    # that fails to bind (a `static` declaration against global
+                    # asm symbols) makes every check answer 0, so "lccc == GNU"
+                    # is not evidence and neither is "lccc == GNU == 0 0 0".
+                    if outs["lccc"] != (0, GOT64_WANT):
+                        return Result(name, "FAIL",
+                                      f"{label}@{pad} {mode}: lccc-ld gives "
+                                      f"{outs['lccc']}, want {GOT64_WANT} "
+                                      f"(spelling: {spells[-1]})")
+                    # GNU ld is reported, not required.  On binutils <= 2.43
+                    # it answers `1 0 0` here: it keys the local GOT slot on
+                    # the SECTION symbol, so three locals at .data+0, +0x10 and
+                    # +0x20 collapse onto one slot and the field then points
+                    # past it.  lccc-ld is deliberately more correct than the
+                    # reference on this shape; see `LocalSlots` in
+                    # src/backend/x86/linker/types.rs.
+                    if outs["gnu"] != outs["lccc"]:
+                        oracles_differ.append(
+                            f"{label}@{pad} {mode}: GNU ld {outs['gnu']!r}, "
+                            f"lccc-ld {outs['lccc']!r}")
+                ran += 1
+        if ran == 0:
+            return Result(name, "SKIP",
+                          "no assembler could build the fixture: %s" % ", ".join(skipped))
+        detail = ("%d fixture(s) x %d assembler(s); relocations seen: %s"
+                  % (ran, len(variants), "; ".join(spells[:3])))
+        if oracles_differ:
+            detail += " | ORACLE DISAGREES (lccc-ld follows the psABI): " + \
+                      "; ".join(oracles_differ[:3])
+        return Result(name, "PASS", detail)
+    except Exception as e:
+        return Result(name, "FAIL", f"harness exception: {e!r}")
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
+def _got64_spellings(obj, td):
+    """The GOT-family relocations `obj` actually carries, compactly.
+
+    `readelf -rW` prints `Offset Info Type Value Name+Addend`; only the last
+    two columns are interesting here, and only for the GOT family -- the
+    `R_X86_64_64` rows for `_GLOBAL_OFFSET_TABLE_` are an artefact of reading
+    the GOT base, not of the relocation under test.
+    """
+    d = sh(["readelf", "-rW", obj], cwd=td).stdout.decode(errors="replace")
+    out = []
+    for line in d.splitlines():
+        if "R_X86_64_" not in line:
+            continue
+        rtype = re.search(r"(R_X86_64_\w+)", line).group(1)
+        if not rtype.startswith("R_X86_64_GOT"):
+            continue
+        tail = line.split(rtype, 1)[1].split(None, 1)
+        out.append(rtype.replace("R_X86_64_", "") + ":" +
+                   (tail[1].strip() if len(tail) > 1 else ""))
+    return ",".join(out) or "(none)"
+
 
 
 # `objabs` lives in its own object: GAS refuses `@GOTPCREL` on a symbol it
@@ -6374,6 +6587,7 @@ def _crossarch_gnu_hash_relro_test(args, oracles):
         ("lccc-riscv", 64, 0x1000, True),
     ]
     seen = 0
+    m32_why = ""
     with tempfile.TemporaryDirectory() as td:
         N = 48
         src = os.path.join(td, "f.c")
@@ -6384,6 +6598,22 @@ def _crossarch_gnu_hash_relro_test(args, oracles):
             path = os.path.join(bindir, drv)
             if not os.path.exists(path):
                 continue
+            if bits == 32:
+                # Same rule as the C++ probe, for the same reason: ask the
+                # REFERENCE toolchain before blaming the driver.  `lccc-i686
+                # -shared` on a host without 32-bit libgcc fails inside
+                # libgcc discovery, which says nothing about `.gnu.hash`
+                # sizing or RELRO — the two things this test is about.
+                #
+                # Skip THIS driver, not the whole test: arm and riscv do not
+                # need the multilib, and a host that has those two but not the
+                # i386 toolchain should still get the coverage it can get.
+                # The `seen` tally below decides whether anything survived.
+                pr = sh([CC, "-m32", "-shared", "-fPIC", "-O1", src,
+                         "-o", os.path.join(td, ".m32probe.so")], timeout=120)
+                if pr.returncode != 0:
+                    m32_why = pr.stderr.decode(errors="replace")[-200:]
+                    continue
             so = os.path.join(td, drv + ".so")
             r = sh([path, "-O1", "-shared", "-fPIC", src, "-o", so],
                    timeout=120)
@@ -6502,6 +6732,16 @@ def _crossarch_gnu_hash_relro_test(args, oracles):
                                   % (drv, va, len_))
             seen += 1
     if seen < 2:
+        # A skipped i386 driver is the informative case: the reference
+        # toolchain cannot build for i386 here, so the driver was never
+        # asked.  `LCCC_REQUIRE_I386=1` (ci.yml and ci_local.sh both set it)
+        # means a runner that promised the multilib and did not deliver it is
+        # broken, not untested.
+        if m32_why:
+            status = "FAIL" if os.environ.get("LCCC_REQUIRE_I386") == "1" else "SKIP"
+            return Result(name, status,
+                          "no -m32 toolchain (%d other drivers verified): %s"
+                          % (seen, m32_why))
         return Result(name, "SKIP", "arch drivers missing (built %d)" % seen)
     return Result(name, "PASS", "%d arch drivers verified (@48 exports each)"
                   % seen)
@@ -10341,6 +10581,7 @@ def _registry(args, oracles):
                           ("so_bound_ifunc", _so_bound_ifunc_test),
                           ("eh_frame_packing", _eh_frame_packing_test),
                           ("gotpcrel_edges", _gotpcrel_edges_test),
+                          ("got64_spelling_matrix", _got64_spelling_matrix_test),
                           ("absolute_symbols_pic", _absolute_symbols_pic_test),
                           ("ie_to_le_local", _ie_to_le_local_test),
                           ("ie_to_le_forms", _ie_to_le_forms_test),

@@ -486,7 +486,7 @@ pub(super) fn emit_executable(
         // Local slots follow the named ones and hold an address in this
         // output unless the symbol is absolute or thread-local (a TP
         // offset, the same in every thread and at every load address).
-        for (i, &(obj_idx, si)) in local_got.keys().iter().enumerate() {
+        for (i, &(obj_idx, si, _a)) in local_got.keys().iter().enumerate() {
             let sym = &objects[obj_idx].symbols[si];
             if sym.shndx != SHN_ABS && !local_is_tls(&objects[obj_idx], sym) {
                 v.push(ord + i);
@@ -1413,7 +1413,7 @@ pub(super) fn emit_executable(
     let local_got_values: Vec<u64> = local_got
         .keys()
         .iter()
-        .map(|&(obj_idx, si)| {
+        .map(|&(obj_idx, si, addr_addend)| {
             let sym = &objects[obj_idx].symbols[si];
             if let Some(&stub) = local_ifunc_slots.get(&(obj_idx, si)) {
                 return stub;
@@ -1429,7 +1429,10 @@ pub(super) fn emit_executable(
             if local_is_tls(&objects[obj_idx], sym) {
                 addr.wrapping_sub(tls_addr).wrapping_sub(tls_mem_size)
             } else {
-                addr
+                // A GOT64 slot CONTAINS `S + A` (the addend is an address, not
+                // a bias -- see `LocalSlots`); every other GOT form holds
+                // plain `S`, and for those the helper returns 0.
+                addr.wrapping_add(addr_addend as u64)
             }
         })
         .collect();
@@ -3060,7 +3063,7 @@ pub(super) fn emit_executable(
                                     }
                                 }),
                                 None if sym.is_local() => local_got
-                                    .get((obj_idx, si))
+                                    .get((obj_idx, si, 0))
                                     .map(|i| got_addr + (got_globdat_count + i) as u64 * 8),
                                 None => None,
                             };
@@ -3132,7 +3135,7 @@ pub(super) fn emit_executable(
                                 }
                             }),
                             None if sym.is_local() => local_got
-                                .get((obj_idx, si))
+                                .get((obj_idx, si, 0))
                                 .map(|i| got_addr + (got_globdat_count + i) as u64 * 8),
                             None => None,
                         };
@@ -3201,9 +3204,10 @@ pub(super) fn emit_executable(
                         // of a slot offset is never relaxed, so
                         // `create_plt_got` gives every GOT64 reference a
                         // slot, a LOCAL one included.
+                        let slot_addend = got_slot_addr_addend(t, a);
                         let gea = if sym.is_local() {
                             local_got
-                                .get((obj_idx, si))
+                                .get((obj_idx, si, slot_addend))
                                 .map(|i| got_addr + (got_globdat_count + i) as u64 * 8)
                         } else {
                             (!sym.name.is_empty())
@@ -3225,8 +3229,31 @@ pub(super) fn emit_executable(
                                 sym.name
                             ));
                         };
+                        // A LOCAL GOT64 slot already CONTAINS `S + A`
+                        // (`local_got_values`), so its field is the slot's
+                        // PLAIN offset and the addend must not be added again.
+                        // A GLOBAL slot is keyed by name and holds plain `S`,
+                        // so there the addend stays in the field.
+                        //
+                        // A non-zero GOT64 addend on a GLOBAL is not
+                        // encodable this way and is not merely unsupported
+                        // here: the slot is name-keyed, so the only way to
+                        // hold `S + A` would be a per-addend entry.  GNU ld
+                        // does not build one either -- measured on ld 2.42,
+                        // `$gv+8@GOT` against a defined global yields
+                        // `movabs $0x0,%rax`, a faulting image from the
+                        // reference linker.  Every form a compiler emits is
+                        // addend 0, and the offset-carrying spelling arrives
+                        // as a LOCAL reference.  Keep the divergence recorded
+                        // rather than "fixing" it into one.
                         let v = if t == R_X86_64_GOTPCREL64 {
                             gea as i64 + a - p as i64
+                        } else if sym.is_local() {
+                            // `a - slot_addend` is 0 for GOT64, whose
+                            // local slot already contains `S + A`, and `a`
+                            // for GOTPLT64, whose local slot holds
+                            // plain `S` and keeps the addend as a bias.
+                            gea as i64 - got_plt_addr as i64 + (a - slot_addend)
                         } else {
                             gea as i64 - got_plt_addr as i64 + a
                         };
