@@ -49,6 +49,9 @@ pub(super) struct DynlibSym {
     pub binding: u8,
     /// `st_value` inside the library (see `DynSymInfo::value`).
     pub value: u32,
+    /// True when `value` falls inside a `PF_X` LOAD segment of the defining
+    /// library (see `DynSymInfo::in_exec_segment`).
+    pub in_exec: bool,
 }
 
 impl DynlibSym {
@@ -61,6 +64,7 @@ impl DynlibSym {
             is_default_ver: sym.is_default_ver,
             binding: sym.binding,
             value: sym.value,
+            in_exec: sym.in_exec_segment,
         }
     }
 }

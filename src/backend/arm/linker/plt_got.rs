@@ -9,6 +9,15 @@ use crate::common::fx_hash::FxHashMap;
 use super::elf::*;
 use super::types::GlobalSymbol;
 
+/// True when a dynamic symbol of ELF type `sym_type`, defined at a library
+/// address inside (`lib_in_exec`) or outside an executable LOAD segment, is
+/// COPY-relocated by a data reference. Mirrors the x86-64 classifier:
+/// `STT_OBJECT` always qualifies, `STT_NOTYPE` only in data (an untyped
+/// function keeps its PLT).
+fn copy_data_type(sym_type: u8, lib_in_exec: bool) -> bool {
+    sym_type == STT_OBJECT || (sym_type == STT_NOTYPE && !lib_in_exec)
+}
+
 pub(super) fn create_plt_got(
     objects: &[ElfObject],
     globals: &mut FxHashMap<String, GlobalSymbol>,
@@ -30,14 +39,15 @@ pub(super) fn create_plt_got(
                 }
                 let gsym_info = globals
                     .get(sym.name.as_str())
-                    .map(|g| (g.is_dynamic, g.info & 0xf));
+                    .map(|g| (g.is_dynamic, g.info & 0xf, g.lib_in_exec));
 
                 match rela.rela_type {
                     R_AARCH64_CALL26 | R_AARCH64_JUMP26
                         if gsym_info.map(|g| g.0).unwrap_or(false) =>
                     {
                         let sym_type = gsym_info.map(|g| g.1).unwrap_or(0);
-                        if sym_type == STT_OBJECT {
+                        let lib_in_exec = gsym_info.map(|g| g.2).unwrap_or(false);
+                        if copy_data_type(sym_type, lib_in_exec) {
                             if !copy_reloc_names.contains(&sym.name.to_string()) {
                                 copy_reloc_names.push(sym.name.to_string());
                             }
@@ -55,7 +65,8 @@ pub(super) fn create_plt_got(
                         if gsym_info.map(|g| g.0).unwrap_or(false) =>
                     {
                         let sym_type = gsym_info.map(|g| g.1).unwrap_or(0);
-                        if sym_type == STT_OBJECT {
+                        let lib_in_exec = gsym_info.map(|g| g.2).unwrap_or(false);
+                        if copy_data_type(sym_type, lib_in_exec) {
                             if !copy_reloc_names.contains(&sym.name.to_string()) {
                                 copy_reloc_names.push(sym.name.to_string());
                             }
@@ -68,7 +79,8 @@ pub(super) fn create_plt_got(
                     }
                     R_AARCH64_ABS64 if gsym_info.map(|g| g.0).unwrap_or(false) => {
                         let sym_type = gsym_info.map(|g| g.1).unwrap_or(0);
-                        if sym_type != STT_OBJECT {
+                        let lib_in_exec = gsym_info.map(|g| g.2).unwrap_or(false);
+                        if !copy_data_type(sym_type, lib_in_exec) {
                             if !plt_names.contains(&sym.name.to_string()) {
                                 plt_names.push(sym.name.to_string());
                             }
@@ -95,7 +107,7 @@ pub(super) fn create_plt_got(
         if let Some(gsym) = globals.get_mut(name) {
             gsym.copy_reloc = true;
             if let Some(ref lib) = gsym.from_lib {
-                if (gsym.info & 0xf) == STT_OBJECT && gsym.lib_sym_value != 0 {
+                if copy_data_type(gsym.info & 0xf, gsym.lib_in_exec) && gsym.lib_sym_value != 0 {
                     let key = (lib.clone(), gsym.lib_sym_value);
                     if !copy_reloc_lib_addrs.contains(&key) {
                         copy_reloc_lib_addrs.push(key);
@@ -111,7 +123,7 @@ pub(super) fn create_plt_got(
             .filter(|(name, g)| {
                 g.is_dynamic
                     && !g.copy_reloc
-                    && (g.info & 0xf) == STT_OBJECT
+                    && copy_data_type(g.info & 0xf, g.lib_in_exec)
                     && !copy_reloc_names.contains(name)
                     && g.from_lib.is_some()
                     && g.lib_sym_value != 0

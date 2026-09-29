@@ -630,6 +630,10 @@ jobs:
           # it is not -- including the alias-guard fallback, where the mirror
           # is live.
           bash tests/regression/check_vec_dead_remainder.sh
+          bash tests/regression/check_copy_alias_sizes.sh
+          bash tests/regression/check_linker_notype_code.sh
+          bash tests/regression/check_got64_old_spelling.sh
+          bash tests/regression/check_tls_pie_preemptible.sh
           bash tests/regression/check_tls_model_selection.sh
           bash tests/regression/check_phi_acyclic_order.sh
           python3 scripts/check_doc_links.py

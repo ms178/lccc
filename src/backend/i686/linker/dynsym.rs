@@ -10,6 +10,52 @@
 
 use super::types::*;
 
+/// ELF32 LOAD segments: `(p_vaddr, p_vaddr + p_memsz, is_exec)`.
+fn load_segments(
+    data: &[u8],
+    e_phoff: usize,
+    e_phentsize: usize,
+    e_phnum: usize,
+) -> Vec<(u32, u32, bool)> {
+    const PT_LOAD: u32 = 1;
+    const PF_X: u32 = 1;
+    let mut segs = Vec::new();
+    for i in 0..e_phnum {
+        // Checked table walk: corrupt `e_phnum`/`e_phentsize`/`e_phoff`
+        // end the scan instead of wrapping the index (32-bit-host
+        // safety; the 64-bit reader's `table_entry` gives the same
+        // guarantee, as does the checked walk below).
+        let Some(mul) = i.checked_mul(e_phentsize) else {
+            break;
+        };
+        let Some(off) = e_phoff.checked_add(mul) else {
+            break;
+        };
+        let Some(end) = off.checked_add(32) else {
+            break;
+        };
+        if e_phentsize < 32 || end > data.len() {
+            break;
+        }
+        if read_u32(data, off) != PT_LOAD {
+            continue;
+        }
+        let vaddr = read_u32(data, off + 8);
+        let memsz = read_u32(data, off + 20);
+        let flags = read_u32(data, off + 24);
+        segs.push((vaddr, vaddr.saturating_add(memsz), flags & PF_X != 0));
+    }
+    segs
+}
+
+/// True when `vaddr` falls inside an executable LOAD segment. An address in
+/// no segment reports false: data is the safe default for the COPY-alias
+/// sweep (see the 64-bit `addr_in_exec_segment`).
+fn addr_in_exec_segment(segs: &[(u32, u32, bool)], vaddr: u32) -> bool {
+    segs.iter()
+        .any(|&(lo, hi, exec)| exec && vaddr >= lo && vaddr < hi)
+}
+
 /// Read dynamic symbol info, with library search paths for resolving linker script entries.
 ///
 /// Every symbol carries the SONAME of the ELF object that actually defines
@@ -172,6 +218,10 @@ fn read_dynsyms_file_ext(
     }
     let strtab = &data[str_sh_offset..str_sh_offset + str_sh_size];
 
+    let e_phoff = read_u32(&data, 28) as usize;
+    let e_phentsize = read_u16(&data, 42) as usize;
+    let e_phnum = read_u16(&data, 44) as usize;
+    let segs = load_segments(&data, e_phoff, e_phentsize, e_phnum);
     let count = sh_size / sh_entsize;
     let mut syms = Vec::new();
     for j in 0..count {
@@ -222,6 +272,7 @@ fn read_dynsyms_file_ext(
                     is_default_ver,
                     value: st_value,
                     soname: None,
+                    in_exec_segment: addr_in_exec_segment(&segs, st_value),
                 });
             }
         }
@@ -257,10 +308,21 @@ fn read_dynsyms_from_dynamic(
     }
 
     let mut loads: Vec<(u32, u32, u32)> = Vec::new(); // (p_vaddr, p_offset, p_filesz)
+    let segs = load_segments(data, e_phoff, e_phentsize, e_phnum);
     let mut dynamic_off: Option<usize> = None;
     for i in 0..e_phnum {
-        let off = e_phoff + i * e_phentsize;
-        if off + 32 > data.len() {
+        // Checked table walk (see `load_segments`): corrupt headers end
+        // the scan instead of wrapping the index.
+        let Some(mul) = i.checked_mul(e_phentsize) else {
+            break;
+        };
+        let Some(off) = e_phoff.checked_add(mul) else {
+            break;
+        };
+        let Some(end) = off.checked_add(32) else {
+            break;
+        };
+        if end > data.len() {
             break;
         }
         let p_type = read_u32(data, off);
@@ -368,6 +430,7 @@ fn read_dynsyms_from_dynamic(
             is_default_ver: false,
             value: st_value,
             soname: None,
+            in_exec_segment: addr_in_exec_segment(&segs, st_value),
         });
     }
     // parse_soname_elf32 needs section headers; this image has none, so
@@ -613,7 +676,12 @@ fn soname_from_dynamic(path: &str) -> Option<String> {
     let mut dynamic: Option<(usize, usize)> = None;
     for i in 0..e_phnum {
         let off = e_phoff.checked_add(i.checked_mul(e_phentsize)?)?;
-        if off + 32 > data.len() {
+        // The entry must end in-bounds too (32-bit-host safety: `off + 32`
+        // itself can wrap on a corrupt `e_phoff`).
+        let Some(end) = off.checked_add(32) else {
+            return None;
+        };
+        if end > data.len() {
             return None;
         }
         match read_u32(&data, off) {

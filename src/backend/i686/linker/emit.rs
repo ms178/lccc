@@ -177,7 +177,9 @@ pub(super) fn emit_executable(
             name: name_off,
             value: 0,
             size: sym.size,
-            info: (sym.binding << 4) | STT_OBJECT,
+            // Preserve the library's type: GNU ld publishes a copy of an
+            // untyped (STT_NOTYPE) export as NOTYPE, not OBJECT.
+            info: (sym.binding << 4) | (sym.sym_type & 0xf),
             other: 0,
             shndx: SHN_UNDEF,
         });
@@ -1819,6 +1821,7 @@ fn assign_symbol_addresses(
             copy_addr: 0,
             version: None,
             lib_value: 0,
+            lib_in_exec: false,
             canonical_plt: false,
         });
     if let Some(sym) = global_symbols.get_mut("_GLOBAL_OFFSET_TABLE_") {
@@ -1878,6 +1881,7 @@ fn assign_symbol_addresses(
                 copy_addr: 0,
                 version: None,
                 lib_value: 0,
+                lib_in_exec: false,
                 canonical_plt: false,
             });
     }
@@ -2062,7 +2066,15 @@ fn copy_groups(
             reps.push(name.clone());
             reps.len() - 1
         };
-        if global_symbols[&reps[g]].binding == STB_WEAK && sym.binding != STB_WEAK {
+        // The group shares one R_386_COPY, sized by the representative's
+        // dynsym entry: the rep must be the largest member, or the copy
+        // under-fills the group-max slot and the tail stays zero (same
+        // address, different st_size — e.g. a first-seen 4-byte alias would
+        // truncate an 8-byte read). Weak-vs-strong still upgrades on ties.
+        let rep = &global_symbols[&reps[g]];
+        if sym.size > rep.size
+            || (sym.size == rep.size && rep.binding == STB_WEAK && sym.binding != STB_WEAK)
+        {
             reps[g] = name.clone();
         }
         group.insert(name.clone(), g);
@@ -2073,6 +2085,62 @@ fn copy_groups(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn copy_alias(name: &str, size: u32, binding: u8) -> (String, LinkerSymbol) {
+        (
+            name.to_string(),
+            LinkerSymbol {
+                address: 0,
+                size,
+                sym_type: STT_OBJECT,
+                binding,
+                visibility: STV_DEFAULT,
+                is_defined: false,
+                needs_plt: false,
+                needs_got: false,
+                output_section: usize::MAX,
+                section_offset: 0,
+                plt_index: 0,
+                got_index: 0,
+                is_dynamic: true,
+                dynlib: "libaliased.so".to_string(),
+                needs_copy: true,
+                copy_addr: 0,
+                version: None,
+                lib_value: 0x4008,
+                lib_in_exec: false,
+                canonical_plt: false,
+            },
+        )
+    }
+
+    #[test]
+    fn copy_group_rep_is_the_largest_member() {
+        // Same-address aliases with different sizes share one R_386_COPY,
+        // sized by the representative's dynsym entry: the rep must be the
+        // largest member even when the sort puts the small alias first.
+        let mut syms = FxHashMap::default();
+        let (n4, s4) = copy_alias("alias4", 4, STB_GLOBAL);
+        let (n8, s8) = copy_alias("alias8", 8, STB_GLOBAL);
+        syms.insert(n4, s4);
+        syms.insert(n8, s8);
+        let names = vec!["alias4".to_string(), "alias8".to_string()];
+        let (reps, group) = copy_groups(&syms, &names);
+        assert_eq!(reps.len(), 1);
+        assert_eq!(reps[0], "alias8");
+        assert_eq!(group["alias4"], 0);
+        assert_eq!(group["alias8"], 0);
+        // Equal sizes keep the weak-vs-strong upgrade.
+        let mut syms = FxHashMap::default();
+        let (nw, sw) = copy_alias("weak8", 8, STB_WEAK);
+        let (ns, ss) = copy_alias("strong8", 8, STB_GLOBAL);
+        syms.insert(nw, sw);
+        syms.insert(ns, ss);
+        let names = vec!["strong8".to_string(), "weak8".to_string()];
+        let (reps, _) = copy_groups(&syms, &names);
+        assert_eq!(reps.len(), 1);
+        assert_eq!(reps[0], "strong8");
+    }
 
     fn disp32(bytes: &[u8], at: usize) -> u32 {
         u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())

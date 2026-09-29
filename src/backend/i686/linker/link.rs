@@ -338,6 +338,7 @@ fn apply_defsyms(
                 copy_addr: 0,
                 version: None,
                 lib_value: 0,
+                lib_in_exec: false,
                 canonical_plt: false,
             },
         );
@@ -507,7 +508,7 @@ pub fn link_shared(
 /// Define every alias of a copy-relocated shared-library object at the
 /// copy (GNU ld's weakdef handling, `_bfd_elf_adjust_dynamic_symbol`).
 ///
-/// Two default-version `STT_OBJECT` exports of one library with the same
+/// Two default-version data exports of one library with the same
 /// `st_value` name one object.  When the executable copy-relocates either,
 /// the others join the copy: `emit` gives the group one `.bss` slot and one
 /// `R_386_COPY`, and exports every member there, so ld.so binds the
@@ -523,14 +524,19 @@ pub(super) fn register_copy_aliases(
 ) {
     let copied: FxHashSet<(String, u32)> = global_symbols
         .values()
-        .filter(|s| s.is_dynamic && s.needs_copy && s.sym_type == STT_OBJECT && s.lib_value != 0)
+        .filter(|s| {
+            s.is_dynamic
+                && s.needs_copy
+                && copy_data_type(s.sym_type, s.lib_in_exec)
+                && s.lib_value != 0
+        })
         .map(|s| (s.dynlib.clone(), s.lib_value))
         .collect();
     if copied.is_empty() {
         return;
     }
     for (name, d) in dynlib_syms {
-        if d.sym_type != STT_OBJECT
+        if !copy_data_type(d.sym_type, d.in_exec)
             || !d.is_default_ver
             || !copied.contains(&(d.lib.clone(), d.value))
         {

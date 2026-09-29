@@ -73,6 +73,7 @@ pub(super) fn resolve_symbols(
                 copy_addr: 0,
                 version: None,
                 lib_value: 0,
+                lib_in_exec: false,
                 canonical_plt: false,
             };
 
@@ -143,6 +144,7 @@ pub(super) fn resolve_symbols(
                             copy_addr: 0,
                             version: None,
                             lib_value: 0,
+                            lib_in_exec: false,
                             canonical_plt: false,
                         });
                 }
@@ -304,6 +306,12 @@ pub(super) fn mark_plt_got_needs(
                         if let Some(gs) = global_symbols.get_mut(sym.name.as_str()) {
                             if gs.is_dynamic {
                                 gs.needs_plt = true;
+                                // Calls never need a copy: code isn't copied.
+                                // (Data reached through a call is UB; the
+                                // crash merely moves, so it keeps its copy.)
+                                if is_plt_code_type(gs.sym_type, gs.lib_in_exec) {
+                                    gs.needs_copy = false;
+                                }
                             }
                         }
                     }
@@ -328,12 +336,20 @@ pub(super) fn mark_plt_got_needs(
                             if !gs.is_dynamic {
                                 continue;
                             }
-                            let is_func = gs.sym_type == STT_FUNC || gs.sym_type == STT_GNU_IFUNC;
-                            if is_func && matches!(rel_type, R_386_PC32 | R_386_32) {
+                            // Code (functions, plus untyped exports in
+                            // executable segments) takes the PLT on a 32-bit
+                            // reference exactly like a function: a `call
+                            // notypefn` (PC32) or address-taking of it must
+                            // reach real code, never a copy of code bytes
+                            // (BSS is NX). Narrower code references take
+                            // nothing, as functions always have.
+                            let is_code = is_plt_code_type(gs.sym_type, gs.lib_in_exec);
+                            if is_code && matches!(rel_type, R_386_PC32 | R_386_32) {
                                 gs.needs_plt = true;
+                                gs.needs_copy = false;
                                 gs.canonical_plt |=
                                     rel_type == R_386_32 || !is_branch_rel32(sec, rel_offset);
-                            } else if !is_func && gs.sym_type != STT_TLS {
+                            } else if !is_code && gs.sym_type != STT_TLS {
                                 gs.needs_copy = true;
                             }
                         }

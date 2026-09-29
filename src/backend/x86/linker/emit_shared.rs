@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 
 use super::elf::*;
 use super::emit_exec::resolve_sym;
-use super::plt_got::local_got_target;
+use super::plt_got::{copy_data_type, local_got_target};
 use super::reloc_field::{self, w8_checked, w16_checked, w32_checked};
 use super::types::{GlobalSymbol, LocalSlots, PAGE_SIZE};
 use crate::backend::linker_common::VersionScript;
@@ -425,7 +425,7 @@ pub(super) fn emit_shared_library(
                             // to name; the relocation pass refuses it.
                             let pltoff_of_data = rela.rela_type == R_X86_64_PLTOFF64
                                 && gsym.is_dynamic
-                                && (gsym.info & 0xf) == STT_OBJECT;
+                                && copy_data_type(gsym.info & 0xf, gsym.lib_in_exec);
                             if (external || interposable)
                                 && !pltoff_of_data
                                 && plt_seen.insert(sym.name.to_string())
@@ -461,6 +461,7 @@ pub(super) fn emit_shared_library(
                     canonical_plt: false,
                     visibility: 0,
                     lib_sym_value: 0,
+                    lib_in_exec: false,
                     version: None,
                     plt_idx: None,
                     got_idx: None,
@@ -713,6 +714,7 @@ pub(super) fn emit_shared_library(
                     canonical_plt: false,
                     visibility: 0,
                     lib_sym_value: 0,
+                    lib_in_exec: false,
                     version: None,
                     plt_idx: None,
                     got_idx: None,
@@ -1890,6 +1892,7 @@ pub(super) fn emit_shared_library(
             canonical_plt: false,
             visibility: 0,
             lib_sym_value: 0,
+            lib_in_exec: false,
             version: None,
             absolute: false,
         });
@@ -2940,7 +2943,9 @@ pub(super) fn emit_shared_library(
                         // has no value (GNU ld points it at a PLT stub made
                         // for the variable -- code -- and binds the variable
                         // with a JUMP_SLOT).
-                        if global.is_some_and(|g| g.is_dynamic && (g.info & 0xf) == STT_OBJECT) {
+                        if global.is_some_and(|g| {
+                            g.is_dynamic && copy_data_type(g.info & 0xf, g.lib_in_exec)
+                        }) {
                             return Err(format!(
                                 "{obj_name}: relocation R_X86_64_PLTOFF64 against shared-library \
                                  variable '{}' can not be used when making a shared object: a \

@@ -114,6 +114,7 @@ fn apply_defsyms(
                 canonical_plt: false,
                 visibility: 0,
                 lib_sym_value: 0,
+                lib_in_exec: false,
                 version: None,
                 // Whether the definition slides with a PIE/.so load base;
                 // see `GlobalSymbol::absolute`.
@@ -829,8 +830,19 @@ pub fn link_builtin(
     phase!("common");
     // Create PLT/GOT
     let is_pie = parsed_args.is_pie;
+    // Global TLS definitions this PIE exports (see
+    // `emit_exec::preemptible_tls_names`): computed once so the planner
+    // and the emitter cannot disagree about the dynamic TLS model.
+    let preemptible_tls = super::emit_exec::preemptible_tls_names(
+        &globals,
+        is_pie,
+        is_static,
+        export_dynamic,
+        objects.dso_names(),
+        parsed_args.version_script.as_deref(),
+    );
     let (plt_names, got_entries, abs_dyn_relocs, pie_relative, local_got) =
-        create_plt_got(&objects, &mut globals, is_pie);
+        create_plt_got(&objects, &mut globals, is_pie, &preemptible_tls);
 
     phase!("plt-got");
     // Collect IFUNC symbols for static linking
@@ -889,6 +901,7 @@ pub fn link_builtin(
         &local_ifuncs,
         parsed_args.hash_style,
         &pending_defsyms,
+        &preemptible_tls,
     );
     phase!("emit-exec");
     if ld_time {

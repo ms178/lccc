@@ -36,6 +36,11 @@ pub struct GlobalSymbol {
     pub copy_reloc: bool,
     /// Symbol's value in the source shared library (for alias detection)
     pub lib_sym_value: u64,
+    /// True when `lib_sym_value` falls inside a `PF_X` LOAD segment of the
+    /// defining library (see `DynSymbol::in_exec_segment`). Only meaningful
+    /// for dynamic symbols; lets the COPY-vs-PLT classifier tell untyped
+    /// data (copy) from untyped code (PLT) when `info` is `STT_NOTYPE`.
+    pub lib_in_exec: bool,
 }
 
 impl GlobalSymbolOps for GlobalSymbol {
@@ -70,6 +75,7 @@ impl GlobalSymbolOps for GlobalSymbol {
             is_dynamic: false,
             copy_reloc: false,
             lib_sym_value: 0,
+            lib_in_exec: false,
         }
     }
     fn new_common(obj_idx: usize, sym: &Elf64Symbol) -> Self {
@@ -85,6 +91,7 @@ impl GlobalSymbolOps for GlobalSymbol {
             is_dynamic: false,
             copy_reloc: false,
             lib_sym_value: 0,
+            lib_in_exec: false,
         }
     }
     fn new_undefined(sym: &Elf64Symbol) -> Self {
@@ -100,6 +107,7 @@ impl GlobalSymbolOps for GlobalSymbol {
             is_dynamic: false,
             copy_reloc: false,
             lib_sym_value: 0,
+            lib_in_exec: false,
         }
     }
     fn set_common_bss(&mut self, bss_offset: u64) {
@@ -119,6 +127,7 @@ impl GlobalSymbolOps for GlobalSymbol {
             is_dynamic: true,
             copy_reloc: false,
             lib_sym_value: dsym.value,
+            lib_in_exec: dsym.in_exec_segment,
         }
     }
 }

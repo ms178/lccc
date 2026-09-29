@@ -1031,6 +1031,7 @@ pub(super) fn emit_shared_library_32(
         copy_addr: 0,
         version: None,
         lib_value: 0,
+        lib_in_exec: false,
         canonical_plt: false,
     };
     let gs = global_symbols
@@ -2059,6 +2060,7 @@ mod tests {
             copy_addr: 0,
             version: None,
             lib_value: 0,
+            lib_in_exec: false,
             canonical_plt: false,
         };
         assert!(!binds_locally(&gs, Symbolic::None));

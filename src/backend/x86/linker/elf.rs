@@ -15,8 +15,8 @@ pub use crate::backend::elf::{
     SHT_DYNAMIC, SHT_DYNSYM, SHT_FINI_ARRAY, SHT_GNU_HASH, SHT_GNU_VERDEF, SHT_GNU_VERNEED,
     SHT_GNU_VERSYM, SHT_HASH, SHT_INIT_ARRAY, SHT_NOBITS, SHT_NOTE, SHT_PREINIT_ARRAY,
     SHT_PROGBITS, SHT_RELA, SHT_STRTAB, SHT_SYMTAB, STB_GLOBAL, STB_LOCAL, STB_WEAK, STT_FUNC,
-    STT_GNU_IFUNC, STT_OBJECT, STT_SECTION, STT_TLS, get_standard_linker_symbols, is_thin_archive,
-    parse_linker_script_entries, w16, w32, w64, wphdr, write_bytes,
+    STT_GNU_IFUNC, STT_NOTYPE, STT_OBJECT, STT_SECTION, STT_TLS, get_standard_linker_symbols,
+    is_thin_archive, parse_linker_script_entries, w16, w32, w64, wphdr, write_bytes,
 };
 
 use crate::backend::linker_common;

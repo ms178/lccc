@@ -2813,12 +2813,19 @@ impl X86Codegen {
 
     pub(super) fn emit_acc_to_secondary_impl(&mut self) {
         self.state.emit("    movq %rax, %rcx");
-        // S20 SEC contract: this hook overwrites %rcx — reached on x86-64 via
-        // over-aligned-alloca GEP bases (traits.rs default emit_gep) and the
-        // generic memcpy staging path — so any parked SEC residency is stale
-        // from here on. Invalidate per the conservative emit_reg_to_secondary
-        // precedent (mirroring the ACC entry would also be sound, but must
-        // never cascade a stale ACC park).
+        // S22 SEC contract: this hook overwrites %rcx — on x86-64 it is
+        // reached only through the OverAligned arm of the default emit_gep
+        // (traits.rs): emit_reg_to_secondary, emit_leaq_base_index,
+        // emit_gep_add_const_to_acc and emit_memcpy are all overridden here
+        // without the accumulator round-trip, and the float-binop default
+        // that also calls it is dead (every backend overrides it). Any
+        // parked SEC residency is stale from here on: invalidate per the
+        // conservative emit_reg_to_secondary precedent. (A precise park of
+        // the GEP base would be sound but is deliberately NOT done: the
+        // hook carries no value id, the base is an overaligned alloca (too
+        // rare to measure a hit-rate effect), and a traits-level park would
+        // activate riscv's dormant SEC consumer whose writers were never
+        // audited. Soundness here, performance elsewhere.)
         self.state.reg_cache.invalidate_sec();
     }
 
