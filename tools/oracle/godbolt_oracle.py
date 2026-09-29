@@ -84,8 +84,31 @@ VENDOR = {"cg162": "GNU", "cclang2310": "LLVM", "cicxlatest": "Intel"}
 # An x86 mnemonic at the start of a line in `as -S` output.  Deliberately
 # narrow: labels, directives, comments and .cfi_* lines must not count.
 INSN = re.compile(r"^\s+[a-z][a-z0-9.]*\b")
-# (compiler, flags, source-hash, execute) -> record, for one process.
-_CACHE: dict = {}
+
+# A full sweep issues two requests per compiler per program (asm, then
+# execute) and Compiler Explorer rate-limits hard, so results are persisted
+# through the cache shared with scripts/codegen_oracle.py, scripts/encdiff.py
+# and scripts/oracle_asm.py -- one .godbolt-cache/ for the whole tree, hit
+# once per (compiler, flags, source, execute) tuple across runs, not once per
+# process. Without this a sweep could not be resumed after a 429 and could
+# not be re-run offline to reproduce a table it had already published.
+sys.path.insert(0, os.path.join(REPO, "scripts"))
+import godbolt_cache  # noqa: E402
+
+# Failures are not all alike, and caching them all is how an oracle disappears
+# from every future sweep with no way back. A transport failure -- rate limit,
+# dropped connection, malformed reply -- is retried next run. A deterministic
+# one -- this oracle rejects this program, or CE declines to execute it -- is
+# cached, because the answer will be identical and re-asking only spends the
+# rate limit we are trying to conserve.
+_TRANSPORT = (urllib.error.URLError, urllib.error.HTTPError, OSError,
+              TimeoutError, json.JSONDecodeError)
+
+# Cleared by --no-cache. Module-level rather than threaded through every
+# signature because `remote()` is invoked from a thread-pool lambda and a
+# fifth positional argument would obscure it for no gain: this is written
+# once, before any sweep starts, and only read afterwards.
+USE_CACHE = True
 # `<number>:` local labels and `.size`/`.type`/`.globl` directives.
 DIRECTIVE = re.compile(r"^\s*\.|^\s*[0-9]+:|^\s*\.[A-Za-z_]+")
 
@@ -182,57 +205,63 @@ def _join(stream, sep: str = "") -> str:
 def remote(cid: str, source: str, flags: str, execute: bool, timeout: int) -> dict:
     """Compile on one oracle.  Never raises: every failure is a SKIP record.
 
-    Results are memoised in a process-wide cache keyed by
-    (compiler, flags, source hash, execute) so a program that asks for both
-    an asm pass and an execute pass -- or a second sweep with different
-    --filter -- does not re-spend the rate limit on identical work.
+    Results are memoised in the tree-wide persistent cache (see the comment on
+    the `godbolt_cache` import) keyed by (compiler, flags, source, execute),
+    so a program that asks for both an asm pass and an execute pass -- or a
+    second sweep with a different --filter, or a re-run next week to reproduce
+    a published table -- does not re-spend the rate limit on identical work.
+
+    Not every result is cached. See `_TRANSPORT`: a rate-limit or network
+    failure is retried next run, because caching it would make a transient
+    blip indistinguishable from an oracle that genuinely cannot run the
+    program, and would strand it out of every future sweep.
     """
     rec = {"id": cid, "vendor": VENDOR.get(cid, "?"), "ok": False,
            "asm_insns": None, "stdout": None, "exit": None, "reason": None}
     ck = (cid, flags, hashlib.sha256(source.encode()).hexdigest(), execute)
-    if ck in _CACHE:
-        return dict(_CACHE[ck])
+    if USE_CACHE:
+        hit = godbolt_cache.load_json(godbolt_cache.NS_ORACLE, *ck)
+        if hit is not None:
+            return hit
 
     def safe(execute_it):
+        """Return ``(response, error, was_transport_failure)``."""
         try:
-            return _ce_call(cid, source, flags, execute_it, timeout), None
-        except (urllib.error.URLError, urllib.error.HTTPError, OSError,
-                TimeoutError) as e:
-            return None, f"{type(e).__name__}: {e}"
-        except json.JSONDecodeError as e:
-            return None, f"bad JSON from CE: {e}"
+            return _ce_call(cid, source, flags, execute_it, timeout), None, False
+        except _TRANSPORT as e:
+            return None, f"{type(e).__name__}: {e}", True
 
-    r, err = safe(False)                       # asm pass (no execution)
+    def finish(cacheable: bool) -> dict:
+        if cacheable and USE_CACHE:
+            godbolt_cache.store_json(godbolt_cache.NS_ORACLE, rec, *ck)
+        return dict(rec)
+
+    r, err, transport = safe(False)            # asm pass (no execution)
     if r is None:
         rec["reason"] = err
-        _CACHE[ck] = rec
-        return rec
+        return finish(not transport)
     asm = _join(r.get("asm"), "\n")
     if r.get("code") not in (0, None) and not asm:
         rec["reason"] = (r.get("stderr") or "compile failed").strip().splitlines()[0][:160]
-        _CACHE[ck] = rec
-        return rec
+        return finish(True)     # the oracle rejected the program: same next time
     rec["ok"] = True
     rec["asm_insns"] = sum(1 for l in asm.splitlines() if INSN.match(l)) if asm else 0
 
     if execute:
-        x, err = safe(True)                    # execute pass
+        x, err, transport = safe(True)         # execute pass
         if x is None:
             rec["reason"] = err
             rec["ok"] = False
-            _CACHE[ck] = rec
-            return rec
+            return finish(not transport)
         if not x.get("didExecute"):
             rec["reason"] = "CE compiled but did not execute"
             rec["ok"] = False
-            _CACHE[ck] = rec
-            return rec
+            return finish(True)     # CE's refusal is a property of the program
         br = x.get("buildResult") or {}
         rec["stdout"] = _join(x.get("stdout") or br.get("stdout"), "\n")
         er = x.get("execResult") or {}
         rec["exit"] = er.get("code") if "code" in er else br.get("code")
-    _CACHE[ck] = rec
-    return dict(rec)
+    return finish(True)
 
 
 def local(binary: str, source: str, flags: str, execute: bool, tmp: str) -> dict:
@@ -433,7 +462,25 @@ def main(argv=None) -> int:
                          "locally for some programs -- a local reference "
                          "compiler makes the speed column always available.")
     ap.add_argument("--jobs", type=int, default=2)
+    ap.add_argument("--no-cache", action="store_true",
+                    help="ignore and do not write the persistent CE cache "
+                         "(every request hits the network)")
+    ap.add_argument("--cache-stats", action="store_true",
+                    help="print the persistent cache's record counts and exit")
     a = ap.parse_args(argv)
+
+    global USE_CACHE
+    USE_CACHE = not a.no_cache
+
+    if a.cache_stats:
+        st = godbolt_cache.stats()
+        if not st:
+            print(f"cache empty ({godbolt_cache.CACHE})")
+        else:
+            print(f"cache at {godbolt_cache.CACHE}")
+            for ns, n in sorted(st.items()):
+                print(f"  {ns:12s} {n:6d} records")
+        return 0
 
     if a.list:
         for name, ids in sorted(ORACLE_SET.items()):

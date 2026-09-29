@@ -245,6 +245,12 @@ pub(crate) fn x86_simd_available_pub() -> bool {
     x86_simd_available()
 }
 
+// Late-rerun scope (see [`set_late_minmax_only`]). False for the early pass
+// and for every pass that is not the post-if-conversion rerun.
+thread_local! {
+    static LATE_MINMAX_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// AVX2 (256-bit ymm) availability for passes that emit YMM-shaped
 /// intrinsics directly (the BB-SLP vectorizer's width selection).
 pub(crate) fn x86_avx2_available_pub() -> bool {
@@ -263,6 +269,76 @@ pub(crate) fn set_x86_fma_enabled(enabled: bool) {
 
 fn x86_fma_enabled() -> bool {
     X86_FMA_AVAILABLE.with(|f| f.get())
+}
+
+/// Restrict this thread's vectorizer run to the reductions the LATE rerun
+/// exists for: Select-shaped integer min/max.
+///
+/// Why the late run is narrowed at all: the unrestricted rerun also picks up
+/// the guarded-sum reduction in `zlib_ng_adler32`. That transform is not free
+/// and it is not a win — measured with `valgrind --tool=callgrind` on the
+/// benchmark program itself (`-O3 -march=x86-64-v3`), whole-program retired
+/// instructions went **396,349,832 -> 400,499,785 (+1.05 %)**, static
+/// instructions 335 -> 370 (+10.4 %) and stack references 32 -> 44 (+37.5 %),
+/// even though the steady-state loop it produced is denser (14 -> 12
+/// instructions per 32 bytes). The prologue, the extra accumulator traffic
+/// and the spills cost more than the packed body saves. Admitting only the
+/// min/max reductions keeps the measured 12x min/max win and leaves every
+/// other kernel byte-identical to before the late pass existed.
+///
+/// Re-opening the rest is a real follow-up (see `backlog.md` MINMAX-4): the
+/// steady-state gain is genuine, so the work is the accumulator/traffic side,
+/// not the transform's legality.
+pub(crate) fn set_late_minmax_only(enabled: bool) {
+    LATE_MINMAX_ONLY.with(|f| f.set(enabled));
+}
+
+fn late_minmax_only() -> bool {
+    LATE_MINMAX_ONLY.with(|f| f.get())
+}
+
+/// RAII scope for the late-rerun restriction.
+///
+/// The set/reset pair this replaces is correct only while nothing between the
+/// two calls can panic or return early, and neither can be ruled out: the
+/// scoped call is a whole-module `for_each_function` over arbitrary IR. A
+/// panic with the flag still set leaves it set for every later function on
+/// this worker thread -- and because the flag is thread-local, it survives
+/// into the next translation unit that thread compiles, silently restricting
+/// vectorization there. `Drop` makes that impossible.
+///
+/// Restoring the *previous* value rather than hard-coding `false` also makes
+/// nesting well-defined; the `debug_assert!` records that the current
+/// pipeline does not nest, so a future second scope fails loudly in debug
+/// builds instead of quietly clearing the outer scope's flag.
+///
+/// Usage:
+///
+/// ```ignore
+/// let _scope = LateMinMaxOnlyScope::enter();
+/// module.for_each_function(late_fn);
+/// ```
+pub(crate) struct LateMinMaxOnlyScope {
+    previous: bool,
+}
+
+impl LateMinMaxOnlyScope {
+    pub(crate) fn enter() -> Self {
+        let previous = late_minmax_only();
+        debug_assert!(
+            !previous,
+            "nested LateMinMaxOnlyScope: the inner scope would restore the flag \
+             while the outer one is still live"
+        );
+        set_late_minmax_only(true);
+        Self { previous }
+    }
+}
+
+impl Drop for LateMinMaxOnlyScope {
+    fn drop(&mut self) {
+        set_late_minmax_only(self.previous);
+    }
 }
 
 /// Read-only access for sibling passes (BB-SLP's packed FMA contraction
@@ -420,9 +496,17 @@ fn vectorize_with_analysis_mode(
             continue;
         }
 
-        // Try to vectorize this loop - first try matmul, then try reduction patterns.
+        // Try to vectorize this loop - first try matmul, then try reduction
+        // patterns. The late rerun skips the matmul analysis entirely (see
+        // `set_late_minmax_only`): it is here for the Select-shaped min/max
+        // reductions and nothing else.
         take_reject();
-        if let Some(pattern) = analyze_loop_pattern(func, loop_info, cfg) {
+        let matmul_pattern = if late_minmax_only() {
+            None
+        } else {
+            analyze_loop_pattern(func, loop_info, cfg)
+        };
+        if let Some(pattern) = matmul_pattern {
             // Select vector width: default to AVX2 (4-wide) unless explicitly disabled
             let use_sse2 =
                 force_two_wide || std::env::var("LCCC_FORCE_SSE2").is_ok() || !x86_avx2_available();
@@ -469,6 +553,7 @@ fn vectorize_with_analysis_mode(
             }
         } else if !neon
             && !force_two_wide
+            && !late_minmax_only()
             && std::env::var("LCCC_FORCE_SSE2").is_err()
             && x86_strict_recip_avx2_enabled()
             && let Some(strict_pattern) =
@@ -483,6 +568,7 @@ fn vectorize_with_analysis_mode(
             continue;
         } else if !neon
             && !force_two_wide
+            && !late_minmax_only()
             && std::env::var("LCCC_FORCE_SSE2").is_err()
             && x86_avx2_available()
             && let Some(count_pattern) = analyze_byte_count_loop(func, loop_info, cfg)
@@ -505,6 +591,7 @@ fn vectorize_with_analysis_mode(
             }
         } else if !neon
             && !force_two_wide
+            && !late_minmax_only()
             && std::env::var("LCCC_FORCE_SSE2").is_err()
             && x86_avx2_available()
             && let Some(adler_pattern) = analyze_adler_loop(func, loop_info, cfg)
@@ -532,6 +619,23 @@ fn vectorize_with_analysis_mode(
             force_two_wide || (!neon && !force_two_wide),
             neon,
         ) {
+            // LATE RERUN SCOPE: only the min/max reductions this pass exists
+            // for. Anything else (sums, dot products, guarded/widening sums)
+            // is left exactly as the early pass produced it - measured, not
+            // assumed: admitting them cost +1.05 % retired instructions on
+            // `zlib_ng_adler32` and +37.5 % stack references.
+            if late_minmax_only()
+                && !matches!(red_pattern.kind, ReductionKind::Min | ReductionKind::Max)
+            {
+                if debug {
+                    eprintln!(
+                        "[VEC] Late rerun: only min/max reductions are admitted (this one is {:?})",
+                        red_pattern.kind
+                    );
+                }
+                continue;
+            }
+
             // Packed FP reductions reassociate additions across SIMD lanes.
             // That is observably different for IEEE-754 values (for example
             // [1e100, 1, -1e100, 1] sums to 1 in source order but 2 after a
@@ -650,7 +754,8 @@ fn vectorize_with_analysis_mode(
                 // byte-offset and element-index schemes have no such
                 // discipline and stay zero-init-only.
                 if !const_zero_init
-                    && !(red_pattern.kind == ReductionKind::Max && const_nonzero_init)
+                    && !(matches!(red_pattern.kind, ReductionKind::Max | ReductionKind::Min)
+                        && const_nonzero_init)
                 {
                     if debug {
                         eprintln!(
@@ -693,6 +798,13 @@ fn vectorize_with_analysis_mode(
                 total_changes += transform_reduction_avx2(func, &red_pattern, fp_contract);
             }
         } else if !no_map_vec() {
+            // AUD-4: the late scope deliberately does NOT gate the map
+            // vectorizer. It exists to keep late REDUCTION admission narrow
+            // (see the `ReductionKind::Min | Max` gate below), which is what
+            // the zlib_ng_adler32 measurement justifies. Gating map-shaped
+            // loops as well was collateral: it silently un-vectorized the
+            // late map loops, and `check_vec_dead_remainder.sh` catches one
+            // of them (`shape_u16_tail`) falling back to scalar.
             // Conditional-store statement forms (`if (c1 && c2) s[i] = f(s[i]);`)
             // are not map-shaped until the guarded store becomes a select
             // against the dominating same-address load.  Rewrite first
@@ -727,6 +839,8 @@ fn vectorize_with_analysis_mode(
                 }
                 total_changes += transform_map_vector(func, &map_pattern, avx2, neon, fp_contract);
             } else if std::env::var("CCC_NO_STENCIL_VEC").is_err() {
+                // AUD-4: same reasoning as the map vectorizer above -- the
+                // late scope restricts reduction admission, not stencils.
                 // OP-05a: generalized non-reduction FP loops (stencils and
                 // multi-load maps with constant tap offsets). AArch64's NEON
                 // intrinsics are not wired for the displacement form yet.
@@ -824,6 +938,14 @@ enum ReductionKind {
     /// required (the scalar init broadcasts into the vector accumulator).
     /// NEON-only (levkropp 8b139820, audited port).
     Max,
+    /// Minimum: mn = min(mn, arr[i]) - Select-shaped after if-conversion.
+    /// The exact mirror of `Max`: signed integer min is associative,
+    /// commutative and idempotent, so a lane-wise reduction is bit-identical
+    /// to the scalar loop and no zero init is required (the scalar init is
+    /// broadcast into the vector accumulator). AVX2 `vpminsd` +
+    /// `VecHorizontalMinI32x8`; the SSE2/NEON path stays Max-only (no
+    /// horizontal min there yet), so a Min on a non-AVX2 target stays scalar.
+    Min,
 }
 
 /// Pattern matching result for a vectorizable reduction loop.
@@ -1939,6 +2061,7 @@ fn analyze_reduction_pattern(
     // polarities are accepted; SIGNED compares only — smax is a signed max,
     // an unsigned compare (Ugt/Ult) must NOT match (that would need umax).
     let mut is_max_reduction = false;
+    let mut is_min_reduction = false;
     let mut max_select_val = None;
     let mut max_accumulator_phi = None;
     // v13 (2026-09-18): the gate is LIFTED on x86. The AVX2 transform
@@ -2034,6 +2157,14 @@ fn analyze_reduction_pattern(
                     use crate::ir::reexports::IrCmpOp as C;
                     let x_on = |o: &Operand| matches!(o, Operand::Value(v) if v.0 == x_val.0);
                     let phi_on = |o: &Operand| matches!(o, Operand::Value(v) if v.0 == dest.0);
+                    // `is_max_form` and `is_min_form` are exact duals: the
+                    // only difference is which arm of the Select carries the
+                    // freshly loaded element.  `>=`/`<=` (Sge/Sle) are legal
+                    // for BOTH because on equality the two arms hold the same
+                    // value, so keeping the phi is indistinguishable from
+                    // taking x.  Unsigned compares stay rejected: `vpmaxsd`
+                    // and `vpminsd` are signed-only (`vpmaxud`/`vpminud` are
+                    // SSE4.1 and have no AVX2 baseline guarantee here).
                     let is_max_form = match (op, take_x_when_true) {
                         (C::Sgt | C::Sge, true) if x_on(lhs) && phi_on(rhs) => true,
                         (C::Slt | C::Sle, false) if x_on(lhs) && phi_on(rhs) => true,
@@ -2041,9 +2172,17 @@ fn analyze_reduction_pattern(
                         (C::Sgt | C::Sge, false) if phi_on(lhs) && x_on(rhs) => true,
                         _ => false,
                     };
-                    if is_max_form {
+                    let is_min_form = match (op, take_x_when_true) {
+                        (C::Slt | C::Sle, true) if x_on(lhs) && phi_on(rhs) => true,
+                        (C::Sgt | C::Sge, false) if x_on(lhs) && phi_on(rhs) => true,
+                        (C::Sgt | C::Sge, true) if phi_on(lhs) && x_on(rhs) => true,
+                        (C::Slt | C::Sle, false) if phi_on(lhs) && x_on(rhs) => true,
+                        _ => false,
+                    };
+                    if is_max_form || is_min_form {
                         max_accumulator_phi = Some(*dest);
-                        is_max_reduction = true;
+                        is_max_reduction = is_max_form;
+                        is_min_reduction = is_min_form;
                         max_select_val = Some(sel_val);
                         break 'max_search;
                     }
@@ -2178,8 +2317,8 @@ fn analyze_reduction_pattern(
             }
         }
         for (idx, inst) in block.instructions.iter().enumerate() {
-            // Max reduction: the accumulator update IS the Select.
-            if is_max_reduction {
+            // Min/Max reduction: the accumulator update IS the Select.
+            if is_max_reduction || is_min_reduction {
                 if let Instruction::Select { dest, .. } = inst {
                     if Some(*dest) == max_select_val {
                         body_idx = Some(block_idx);
@@ -2283,13 +2422,13 @@ fn analyze_reduction_pattern(
     let body = &func.blocks[body_idx];
     let add_inst = &body.instructions[accumulator_add_idx];
 
-    // Max-reduction early return: the update is the Select; the non-phi arm
-    // must be an I32 load whose GEP marches with the IV, and the marching
+    // Min/Max-reduction early return: the update is the Select; the non-phi
+    // arm must be an I32 load whose GEP marches with the IV, and the marching
     // pointer's preheader init must start exactly at element iv_init
     // (coverage legality: the vector loop covers [c, c+4*iters), and the
     // remainder resumes from the marching pointer's position; a pointer
     // starting anywhere else would silently skip or re-read elements).
-    if is_max_reduction {
+    if is_max_reduction || is_min_reduction {
         let Instruction::Select {
             true_val,
             false_val,
@@ -2361,11 +2500,10 @@ fn analyze_reduction_pattern(
             }
             false
         };
-        if !gep_uses_iv(func, &loop_info.body, array_gep, iv, &iv_derived, 4)
-            && !marches_one_element()
-        {
+        let gep_is_iv_indexed = gep_uses_iv(func, &loop_info.body, array_gep, iv, &iv_derived, 4);
+        if !gep_is_iv_indexed && !marches_one_element() {
             if debug {
-                eprintln!("[VEC-RED]   Max-reduction array GEP doesn't use IV");
+                eprintln!("[VEC-RED]   Min/Max-reduction array GEP doesn't use IV");
             }
             return None;
         }
@@ -2390,16 +2528,25 @@ fn analyze_reduction_pattern(
             }
             return None;
         };
-        // STRICT shape requirement (levkropp's original check, kept strict
-        // on purpose): the array access must be a marching-pointer phi whose
-        // preheader incoming is a constant-offset GEP at exactly iv_init*4
-        // bytes (element c). Coverage legality depends on it: the vector
-        // loop covers elements [c, c + 4*iters) via the marching pointer,
-        // and the remainder resumes at (iv_final - c)*4 relative to the
-        // SAME element-c base. A direct IV-indexed GEP would be re-scaled
-        // by vec_width in the transform and start reading at element c*4
-        // instead of c — silently wrong for any c != 0 — so that shape is
-        // rejected outright rather than special-cased.
+        // COVERAGE LEGALITY — two admitted shapes.
+        //
+        // (a) The strict marching-pointer form (levkropp's original check):
+        //     the access is a phi whose preheader incoming is a
+        //     constant-offset GEP at exactly iv_init*4 bytes, i.e. element c.
+        //     The vector loop covers [c, c + 4*iters) through the marching
+        //     pointer and the remainder resumes at (iv_final - c)*4 relative
+        //     to the SAME element-c base.
+        //
+        // (b) A direct IV-indexed GEP with iv_init == 0 (c == 0). The old
+        //     code rejected every IV-indexed GEP because the transform
+        //     rescales the offset chain by vec_width, which would start the
+        //     vector loop at element c*w instead of c — wrong for c != 0.
+        //     With c == 0 both admitted schemes are exact: the byte-IV
+        //     strength reduction starts its counter at 0 and steps
+        //     elem_sz*vec_width, and the scaled-GEP fallback starts at
+        //     offset 0 as well, so the vector loop covers [0, w*iters) and
+        //     the remainder (max_shift == 0) resumes at w*iters. No head
+        //     element is skipped or re-read. c != 0 keeps requirement (a).
         let mut ptr_init_ok = false;
         for inst in &header.instructions {
             if let Instruction::Phi { dest, incoming, .. } = inst {
@@ -2434,17 +2581,90 @@ fn analyze_reduction_pattern(
                 }
             }
         }
-        if !ptr_init_ok {
+        // `gep_is_iv_indexed && iv_init == 0` is shape (b); it needs no
+        // pointer check because there is no separate pointer to match.
+        let iv_indexed_zero_start = gep_is_iv_indexed && iv_init == 0;
+        if !ptr_init_ok && !iv_indexed_zero_start {
             if debug {
-                eprintln!("[VEC-RED]   Max-reduction pointer/IV init mismatch");
+                eprintln!(
+                    "[VEC-RED]   Min/Max-reduction pointer/IV init mismatch \
+                     (iv_init={}, marching-pointer form={})",
+                    iv_init, ptr_init_ok
+                );
             }
             return None;
         }
+        // SOUNDNESS: the Min/Max pattern models exactly ONE accumulator
+        // (`seconds` stays empty, and the secondary-accumulator emitter
+        // rejects Min/Max with `unreachable!`). A loop that also carries an
+        // independent sum (`s += a[i]` beside `mx = max(mx, a[i])`) would
+        // therefore be rewritten with its sum accumulator unmodelled: the
+        // vector body keeps only the min/max fold and the sum collapses to
+        // its initial value. Measured, not theorised - `mnmax_kernel`
+        // returned sum == 0 for every n below the vector width. Refuse the
+        // shape instead of guessing: any header phi other than the IV, the
+        // marching array pointer and the min/max accumulator, whose latch
+        // incoming is computed inside the loop, is treated as an unmodelled
+        // second accumulator. Multi-accumulator min/max is a real capability
+        // gap (moving_stats sums while it extremes); wiring it through
+        // `seconds` is the follow-up, and it must not be attempted by
+        // silently dropping accumulators.
+        {
+            let mut body_defs: FxHashSet<u32> = FxHashSet::default();
+            for &bi in &loop_info.body {
+                for inst in &func.blocks[bi].instructions {
+                    if let Some(d) = inst.dest() {
+                        body_defs.insert(d.0);
+                    }
+                }
+            }
+            let mut stray_accumulator = false;
+            for hinst in &header.instructions {
+                let Instruction::Phi { dest, incoming, .. } = hinst else {
+                    continue;
+                };
+                if *dest == iv || *dest == array_gep || Some(*dest) == max_accumulator_phi {
+                    continue;
+                }
+                // The LATCH (backedge) incoming is the candidate's next
+                // value; an accumulator's next value is computed inside the
+                // loop (`s + a[i]`, `max(mx, a[i])`), so that is the edge
+                // that identifies one. The preheader incoming is the seed
+                // (a constant or a pre-loop load) and identifies nothing.
+                for (op, lbl) in incoming {
+                    if *lbl != latch_label {
+                        continue;
+                    }
+                    if let Operand::Value(v) = op {
+                        if body_defs.contains(&v.0) {
+                            stray_accumulator = true;
+                        }
+                    }
+                }
+            }
+            if stray_accumulator {
+                if debug {
+                    eprintln!(
+                        "[VEC-RED]   Min/Max reduction shares the loop with another \
+                         accumulator (unmodelled): staying scalar"
+                    );
+                }
+                return None;
+            }
+        }
         if debug {
-            eprintln!("[VEC-RED]   Max reduction detected: mx = max(mx, load(arr[iv]))");
+            if is_min_reduction {
+                eprintln!("[VEC-RED]   Min reduction detected: mn = min(mn, load(arr[iv]))");
+            } else {
+                eprintln!("[VEC-RED]   Max reduction detected: mx = max(mx, load(arr[iv]))");
+            }
         }
         return Some(ReductionPattern {
-            kind: ReductionKind::Max,
+            kind: if is_min_reduction {
+                ReductionKind::Min
+            } else {
+                ReductionKind::Max
+            },
             seconds: Vec::new(),
             guard_cond: None,
             guard_rhs: None,
@@ -3584,10 +3804,10 @@ fn rewrite_reduction_body(
 
     let body_block = &mut func.blocks[body_idx];
     match kind {
-        // Max never reaches the secondary-accumulator emitter: the Max
+        // Max/Min never reach the secondary-accumulator emitter: the
         // detector never records extra accumulators (seconds is empty).
-        ReductionKind::Max => {
-            unreachable!("max reductions never carry a secondary accumulator")
+        ReductionKind::Max | ReductionKind::Min => {
+            unreachable!("min/max reductions never carry a secondary accumulator")
         }
         ReductionKind::Sum => {
             let load_inst = Instruction::Intrinsic {
@@ -17784,11 +18004,35 @@ fn rewire_escaping_iv_uses(
 ) -> usize {
     let Some(rem_iv) = rem_iv else {
         // No remainder loop was built, so there is no element-counting value
-        // to point at.  ZERO-REM-1 reaches here legitimately with `None`
-        // only via the map path's dead-mirror case, which supplies the
-        // constant trip count instead (see `transform_map_vector`), so a
-        // caller that has neither is a bug -- and a wrong answer is not an
-        // acceptable failure mode for a "cannot happen".
+        // to point at -- and the packed body has ALREADY been committed, so
+        // the loop now drops its tail elements.  That is a miscompile, not a
+        // missed optimisation, which is why this is `debug_assert!(false)`
+        // and not a quiet `return 0`.
+        //
+        // Every current call site passes `Some`:
+        //
+        //   stencil / map-with-mirror  `Some(rem_iv_phi)`   -- the mirror's IV.
+        //   map, dead mirror           `Some(trip_val)`     -- ZERO-REM-1:
+        //       (`transform_map_vector`) the constant trip count is
+        //       materialised in the preheader and passed here, gated on
+        //       `escaping_iv_uses(..) > 0`.  It does NOT arrive with `None`.
+        //   reduction (AVX2 / SSE2)    `rem_iv`             -- `None` only if
+        //       `insert_reduction_remainder_loop` declined, and every one of
+        //       its decline conditions is checked BEFORE any IR is touched by
+        //       `reduction_remainder_references_sound` (see the DOMINANCE
+        //       PRECONDITION at the top of `transform_reduction_avx2`), so on
+        //       a transform that reached this point it cannot decline.
+        //
+        // So `None` here means a future caller vectorized a loop whose tail
+        // it cannot cover.  Two things NOT to do about it:
+        //
+        //   * Do not relax the assert.  It is the tripwire that caught the
+        //     original "escaping counter reads the vector counter" bug.
+        //   * Do not move it below the `escaping_iv_uses == 0` early return
+        //     to "avoid false positives".  When nothing escapes, the assert
+        //     is the ONLY thing that reports the incomplete transform -- the
+        //     missing tail is a wrong answer whether or not the counter is
+        //     observed afterwards.
         debug_assert!(
             false,
             "vectorized a loop without a remainder loop; an escaping \
@@ -17986,7 +18230,7 @@ fn reduction_array_a_base(func: &IrFunction, pattern: &ReductionPattern) -> Valu
             }
         }
     }
-    if base.is_none() && pattern.kind == ReductionKind::Max {
+    if base.is_none() && matches!(pattern.kind, ReductionKind::Max | ReductionKind::Min) {
         let latch_label = func.blocks[pattern.latch_idx].label;
         for inst in &func.blocks[pattern.header_idx].instructions {
             if let Instruction::Phi { dest, incoming, .. } = inst {
@@ -18435,7 +18679,7 @@ fn insert_reduction_remainder_loop(
     // [c, c + w*(lim - c)) through the marching pointer, and the remainder
     // addresses RELATIVE to element c (the pointer's preheader value). Its
     // start index is w*(iv_final - c) and its limit is n - c.
-    let max_shift: i64 = if pattern.kind == ReductionKind::Max {
+    let max_shift: i64 = if matches!(pattern.kind, ReductionKind::Max | ReductionKind::Min) {
         let latch_label = func.blocks[pattern.latch_idx].label;
         let mut c = 0i64;
         for inst in &func.blocks[pattern.header_idx].instructions {
@@ -18810,14 +19054,19 @@ fn insert_reduction_remainder_loop(
                 });
             }
         }
-        ReductionKind::Max => {
-            // mx = max(mx, x) as a scalar Select: take x when x > mx.
-            // Signed compare matches the detector's signed-only gate.
+        ReductionKind::Max | ReductionKind::Min => {
+            // mx = max(mx, x) / mn = min(mn, x) as a scalar Select: take x
+            // when it beats the running extreme. Signed compare matches the
+            // detector's signed-only gate.
             let cmp_rem = Value(*next_val_id);
             *next_val_id += 1;
             remainder_body_instructions.push(Instruction::Cmp {
                 dest: cmp_rem,
-                op: IrCmpOp::Sgt,
+                op: if pattern.kind == ReductionKind::Max {
+                    IrCmpOp::Sgt
+                } else {
+                    IrCmpOp::Slt
+                },
                 lhs: Operand::Value(scalar_a),
                 rhs: Operand::Value(sum_rem_phi),
                 ty: pattern.accumulator_type,
@@ -18919,8 +19168,8 @@ fn insert_reduction_remainder_loop(
             },
         ]);
         match pattern.kind {
-            ReductionKind::Max => {
-                unreachable!("max reductions never carry a secondary accumulator")
+            ReductionKind::Max | ReductionKind::Min => {
+                unreachable!("min/max reductions never carry a secondary accumulator")
             }
             ReductionKind::Sum => {
                 remainder_body_instructions.push(Instruction::BinOp {
@@ -19036,6 +19285,43 @@ fn insert_reduction_remainder_loop(
     4 // 4 new blocks added
 }
 
+/// The block a loop is entered from, when the loop has exactly one entry.
+///
+/// Returns `None` when the header has several predecessors outside the loop
+/// (or none the terminators name), so callers can fall back instead of
+/// assuming a preheader exists. Used to keep the vectorizer's own
+/// loop-invariant arithmetic OUT of the loop it just created: LICM runs
+/// before this pass, so nothing downstream would hoist it again.
+fn find_loop_preheader(
+    func: &IrFunction,
+    header_idx: usize,
+    loop_blocks: &FxHashSet<usize>,
+) -> Option<usize> {
+    let header_label = func.blocks[header_idx].label;
+    let mut found: Option<usize> = None;
+    for (bi, block) in func.blocks.iter().enumerate() {
+        if loop_blocks.contains(&bi) {
+            continue;
+        }
+        let enters = match &block.terminator {
+            Terminator::Branch(label) => *label == header_label,
+            Terminator::CondBranch {
+                true_label,
+                false_label,
+                ..
+            } => *true_label == header_label || *false_label == header_label,
+            _ => false,
+        };
+        if enters {
+            if found.is_some() {
+                return None; // several entries: not a single preheader
+            }
+            found = Some(bi);
+        }
+    }
+    found
+}
+
 /// Transform reduction loop to use AVX2 256-bit vectorization (4×F64, 8×I32, etc.).
 fn transform_reduction_avx2(
     func: &mut IrFunction,
@@ -19137,6 +19423,16 @@ fn transform_reduction_avx2(
                 IntrinsicOp::VecMaxI32x8,
                 None,
                 IntrinsicOp::VecHorizontalMaxI32x8,
+            ),
+            // Min reduction: the mirror of the Max row above - 8 lanes,
+            // lane-wise vpminsd against the accumulator, horizontal min to
+            // land the scalar. Same marching-pointer step scaling (4 -> 32).
+            IrType::I32 if pattern.kind == ReductionKind::Min => (
+                8u64,
+                IntrinsicOp::VecLoadI32x8,
+                IntrinsicOp::VecMinI32x8,
+                None,
+                IntrinsicOp::VecHorizontalMinI32x8,
             ),
             IrType::I32 => (
                 8u64,
@@ -19274,59 +19570,130 @@ fn transform_reduction_avx2(
             }
         }
         Operand::Value(limit_val) => {
-            // Dynamic limit: insert division
-            let div_dest = Value(next_val_id);
-            next_val_id += 1;
-
+            // Dynamic limit: divide ONCE, OUTSIDE the loop, with a shift.
+            //
+            // This used to insert the division into the HEADER - i.e. inside
+            // the loop - so every iteration re-divided a value that never
+            // changes. LICM runs before the vectorizer (and the late rerun
+            // runs after it), so nothing hoisted it again. The min/max
+            // reductions reach this path with an I64 limit, and a 64-bit
+            // `divq` in the steady-state body cost 6 of the loop's 10
+            // instructions: 0.3125 insn/byte against GCC's 0.125. Hoisting
+            // into the preheader and using LShr (exact for the UNSIGNED
+            // division UDiv denotes, and every vector width is a power of
+            // two) turns the whole bound computation into one instruction
+            // that runs once.  Falls back to the header when the loop has no
+            // single preheader: correct either way, only slower.
             let limit_ty =
                 match &func.blocks[pattern.header_idx].instructions[pattern.exit_cmp_inst_idx] {
                     Instruction::Cmp { ty, .. } => *ty,
                     _ => IrType::I64,
                 };
+            // AUD-3: the hoisted bound computation USES the limit, so it may
+            // only go into the preheader if the limit's definition is already
+            // available there. Without this a limit defined inside the loop
+            // (the header being the reachable case) is referenced before its
+            // def -- an SSA violation a plain compile does not surface but
+            // CCC_VALIDATE_SSA does. The CFG is built lazily, inside the
+            // filter, so a loop with no preheader pays nothing and the common
+            // path is unchanged; when the check fails we fall back to the
+            // header, which is correct either way and only slower.
+            let preheader_idx = find_loop_preheader(func, pattern.header_idx, &pattern.loop_blocks)
+                .filter(|&pre_idx| {
+                    let cfg = CfgAnalysis::build(func);
+                    strict_external_value_available(
+                        func,
+                        &cfg,
+                        &pattern.loop_blocks,
+                        pre_idx,
+                        *limit_val,
+                    )
+                });
+            let width_pow2 = vec_width.is_power_of_two();
+            let stride_pow2 = byte_stride.is_power_of_two();
+            let const_of = |v: u64| match limit_ty {
+                IrType::I32 => IrConst::I32(v as i32),
+                IrType::I64 => IrConst::I64(v as i64),
+                _ => IrConst::I64(v as i64),
+            };
 
+            let div_dest = Value(next_val_id);
+            next_val_id += 1;
             let div_inst = Instruction::BinOp {
                 dest: div_dest,
-                op: IrBinOp::UDiv,
+                op: if width_pow2 {
+                    IrBinOp::LShr
+                } else {
+                    IrBinOp::UDiv
+                },
                 lhs: Operand::Value(*limit_val),
-                rhs: Operand::Const(match limit_ty {
-                    IrType::I32 => IrConst::I32(vec_width as i32),
-                    IrType::I64 => IrConst::I64(vec_width as i64),
-                    _ => IrConst::I64(vec_width as i64),
-                }),
+                rhs: Operand::Const(const_of(if width_pow2 {
+                    vec_width.trailing_zeros() as u64
+                } else {
+                    vec_width
+                })),
                 ty: limit_ty,
             };
 
-            // Insert before comparison
-            func.blocks[pattern.header_idx]
-                .instructions
-                .insert(pattern.exit_cmp_inst_idx, div_inst);
-            changes += 1;
+            // The byte-stride scaling (only under the byte-offset IV scheme)
+            // is part of the SAME invariant computation, so it lives beside
+            // the division rather than in the loop.
+            let mul_dest = Value(next_val_id);
+            let byte_limit_inst = if use_byte_iv {
+                next_val_id += 1;
+                Some(Instruction::BinOp {
+                    dest: mul_dest,
+                    op: if stride_pow2 {
+                        IrBinOp::Shl
+                    } else {
+                        IrBinOp::Mul
+                    },
+                    lhs: Operand::Value(div_dest),
+                    rhs: Operand::Const(const_of(if stride_pow2 {
+                        byte_stride.trailing_zeros() as u64
+                    } else {
+                        byte_stride
+                    })),
+                    ty: limit_ty,
+                })
+            } else {
+                None
+            };
+
+            let has_byte_limit = byte_limit_inst.is_some();
+            match preheader_idx {
+                Some(pre_idx) => {
+                    func.blocks[pre_idx].instructions.push(div_inst);
+                    if let Some(mul_inst) = byte_limit_inst {
+                        func.blocks[pre_idx].instructions.push(mul_inst);
+                    }
+                }
+                None => {
+                    func.blocks[pattern.header_idx]
+                        .instructions
+                        .insert(pattern.exit_cmp_inst_idx, div_inst);
+                    if let Some(mul_inst) = byte_limit_inst {
+                        func.blocks[pattern.header_idx]
+                            .instructions
+                            .insert(pattern.exit_cmp_inst_idx + 1, mul_inst);
+                    }
+                }
+            }
+            changes += 1 + has_byte_limit as usize;
 
             if debug {
                 eprintln!(
-                    "[VEC-RED]   Inserted division for dynamic limit: Value({})",
+                    "[VEC-RED]   Divided dynamic limit in {}: Value({})",
+                    if preheader_idx.is_some() {
+                        "the preheader"
+                    } else {
+                        "the header (no single preheader)"
+                    },
                     div_dest.0
                 );
             }
 
-            if use_byte_iv {
-                let mul_dest = Value(next_val_id);
-                next_val_id += 1;
-                let mul_inst = Instruction::BinOp {
-                    dest: mul_dest,
-                    op: IrBinOp::Mul,
-                    lhs: Operand::Value(div_dest),
-                    rhs: Operand::Const(match limit_ty {
-                        IrType::I32 => IrConst::I32(byte_stride as i32),
-                        IrType::I64 => IrConst::I64(byte_stride as i64),
-                        _ => IrConst::I64(byte_stride as i64),
-                    }),
-                    ty: limit_ty,
-                };
-                func.blocks[pattern.header_idx]
-                    .instructions
-                    .insert(pattern.exit_cmp_inst_idx + 1, mul_inst);
-                changes += 1;
+            if has_byte_limit {
                 Operand::Value(mul_dest)
             } else {
                 Operand::Value(div_dest)
@@ -19483,7 +19850,7 @@ fn transform_reduction_avx2(
             // bytes (vec_width × elem_size). The dedicated base-matching
             // scaler (not the shared dest-matching one) is what makes the
             // marching-pointer PHI form vectorize correctly.
-            ReductionKind::Max => {
+            ReductionKind::Max | ReductionKind::Min => {
                 let init_bcast = Value(next_val_id);
                 next_val_id += 1;
                 let vec_load = Value(next_val_id);
@@ -19581,7 +19948,11 @@ fn transform_reduction_avx2(
                         pattern.accumulator_add_idx + 1,
                         Instruction::Intrinsic {
                             dest: Some(vec_sum_value),
-                            op: IntrinsicOp::VecMaxI32x8,
+                            op: if pattern.kind == ReductionKind::Max {
+                                IntrinsicOp::VecMaxI32x8
+                            } else {
+                                IntrinsicOp::VecMinI32x8
+                            },
                             dest_ptr: None,
                             args: vec![
                                 Operand::Value(pattern.accumulator_phi),
@@ -19635,9 +20006,27 @@ fn transform_reduction_avx2(
                             }
                         }
                     }
+                    // The marching-pointer stride lives in a step GEP ONLY
+                    // under the element-index scheme. Under the byte-offset
+                    // IV (`use_byte_iv`) the stride is the LATCH INCREMENT,
+                    // already scaled to `byte_stride` above, and the load
+                    // takes the marching PHI directly as its pointer -- there
+                    // is no GEP to find, so `scaled` is legitimately false
+                    // and the transform is still correct.
+                    //
+                    // Asserting it unconditionally was a real bug, not just a
+                    // noisy debug check: it aborted
+                    // `regression-corpus-debug-assertions` on
+                    // `vec_no_remainder` and `vectorize_max_reduction_neon`,
+                    // both of which use the byte-IV form with a constant
+                    // (I64) trip count. Release never saw it -- the assertion
+                    // is compiled out -- and release was genuinely correct,
+                    // which is why the corpus stayed green for months.
                     debug_assert!(
-                        scaled,
-                        "max transform requires the marching-pointer step GEP"
+                        scaled || use_byte_iv,
+                        "max transform requires the marching-pointer step GEP \
+                         (or the byte-offset IV, which carries the stride in the \
+                         latch increment)"
                     );
                     if scaled {
                         changes += 1;
@@ -19645,7 +20034,11 @@ fn transform_reduction_avx2(
                 }
 
                 if debug {
-                    eprintln!("[VEC-RED]   Transformed max body: load + vpmaxsd (AVX2 8-wide)");
+                    if pattern.kind == ReductionKind::Max {
+                        eprintln!("[VEC-RED]   Transformed max body: load + vpmaxsd (AVX2 8-wide)");
+                    } else {
+                        eprintln!("[VEC-RED]   Transformed min body: load + vpminsd (AVX2 8-wide)");
+                    }
                 }
             }
             ReductionKind::Sum => {
@@ -20378,6 +20771,15 @@ fn transform_reduction_sse2(
                 Some(IntrinsicOp::MulF64x2),
                 IntrinsicOp::HorizontalAddF64x2,
             ),
+            // Min reduction: no packed-min epilogue outside AVX2 (the SSE2
+            // path and NEON have no horizontal min intrinsic), so refuse the
+            // shape instead of reaching an unreachable!() below.
+            IrType::I32 if pattern.kind == ReductionKind::Min => {
+                if debug {
+                    eprintln!("[VEC-RED] Min reduction requires AVX2");
+                }
+                return 0;
+            }
             // NEON 4-wide i32 max reduction: lane-wise smax + smaxv reduce.
             IrType::I32 if pattern.kind == ReductionKind::Max => {
                 if !neon {
@@ -20404,7 +20806,9 @@ fn transform_reduction_sse2(
                 match pattern.kind {
                     ReductionKind::Sum => IntrinsicOp::VecSadalpI32x4,
                     ReductionKind::DotProduct => IntrinsicOp::VecSmlalLoI32x4,
-                    ReductionKind::Max => unreachable!("max has an I32 accumulator"),
+                    ReductionKind::Max | ReductionKind::Min => {
+                        unreachable!("min/max have an I32 accumulator")
+                    }
                 },
                 None,
                 IntrinsicOp::VecHorizontalAddI64x2,
@@ -20540,59 +20944,130 @@ fn transform_reduction_sse2(
             }
         }
         Operand::Value(limit_val) => {
-            // Dynamic limit: insert division
-            let div_dest = Value(next_val_id);
-            next_val_id += 1;
-
+            // Dynamic limit: divide ONCE, OUTSIDE the loop, with a shift.
+            //
+            // This used to insert the division into the HEADER - i.e. inside
+            // the loop - so every iteration re-divided a value that never
+            // changes. LICM runs before the vectorizer (and the late rerun
+            // runs after it), so nothing hoisted it again. The min/max
+            // reductions reach this path with an I64 limit, and a 64-bit
+            // `divq` in the steady-state body cost 6 of the loop's 10
+            // instructions: 0.3125 insn/byte against GCC's 0.125. Hoisting
+            // into the preheader and using LShr (exact for the UNSIGNED
+            // division UDiv denotes, and every vector width is a power of
+            // two) turns the whole bound computation into one instruction
+            // that runs once.  Falls back to the header when the loop has no
+            // single preheader: correct either way, only slower.
             let limit_ty =
                 match &func.blocks[pattern.header_idx].instructions[pattern.exit_cmp_inst_idx] {
                     Instruction::Cmp { ty, .. } => *ty,
                     _ => IrType::I64,
                 };
+            // AUD-3: the hoisted bound computation USES the limit, so it may
+            // only go into the preheader if the limit's definition is already
+            // available there. Without this a limit defined inside the loop
+            // (the header being the reachable case) is referenced before its
+            // def -- an SSA violation a plain compile does not surface but
+            // CCC_VALIDATE_SSA does. The CFG is built lazily, inside the
+            // filter, so a loop with no preheader pays nothing and the common
+            // path is unchanged; when the check fails we fall back to the
+            // header, which is correct either way and only slower.
+            let preheader_idx = find_loop_preheader(func, pattern.header_idx, &pattern.loop_blocks)
+                .filter(|&pre_idx| {
+                    let cfg = CfgAnalysis::build(func);
+                    strict_external_value_available(
+                        func,
+                        &cfg,
+                        &pattern.loop_blocks,
+                        pre_idx,
+                        *limit_val,
+                    )
+                });
+            let width_pow2 = vec_width.is_power_of_two();
+            let stride_pow2 = byte_stride.is_power_of_two();
+            let const_of = |v: u64| match limit_ty {
+                IrType::I32 => IrConst::I32(v as i32),
+                IrType::I64 => IrConst::I64(v as i64),
+                _ => IrConst::I64(v as i64),
+            };
 
+            let div_dest = Value(next_val_id);
+            next_val_id += 1;
             let div_inst = Instruction::BinOp {
                 dest: div_dest,
-                op: IrBinOp::UDiv,
+                op: if width_pow2 {
+                    IrBinOp::LShr
+                } else {
+                    IrBinOp::UDiv
+                },
                 lhs: Operand::Value(*limit_val),
-                rhs: Operand::Const(match limit_ty {
-                    IrType::I32 => IrConst::I32(vec_width as i32),
-                    IrType::I64 => IrConst::I64(vec_width as i64),
-                    _ => IrConst::I64(vec_width as i64),
-                }),
+                rhs: Operand::Const(const_of(if width_pow2 {
+                    vec_width.trailing_zeros() as u64
+                } else {
+                    vec_width
+                })),
                 ty: limit_ty,
             };
 
-            // Insert before comparison
-            func.blocks[pattern.header_idx]
-                .instructions
-                .insert(pattern.exit_cmp_inst_idx, div_inst);
-            changes += 1;
+            // The byte-stride scaling (only under the byte-offset IV scheme)
+            // is part of the SAME invariant computation, so it lives beside
+            // the division rather than in the loop.
+            let mul_dest = Value(next_val_id);
+            let byte_limit_inst = if use_byte_iv {
+                next_val_id += 1;
+                Some(Instruction::BinOp {
+                    dest: mul_dest,
+                    op: if stride_pow2 {
+                        IrBinOp::Shl
+                    } else {
+                        IrBinOp::Mul
+                    },
+                    lhs: Operand::Value(div_dest),
+                    rhs: Operand::Const(const_of(if stride_pow2 {
+                        byte_stride.trailing_zeros() as u64
+                    } else {
+                        byte_stride
+                    })),
+                    ty: limit_ty,
+                })
+            } else {
+                None
+            };
+
+            let has_byte_limit = byte_limit_inst.is_some();
+            match preheader_idx {
+                Some(pre_idx) => {
+                    func.blocks[pre_idx].instructions.push(div_inst);
+                    if let Some(mul_inst) = byte_limit_inst {
+                        func.blocks[pre_idx].instructions.push(mul_inst);
+                    }
+                }
+                None => {
+                    func.blocks[pattern.header_idx]
+                        .instructions
+                        .insert(pattern.exit_cmp_inst_idx, div_inst);
+                    if let Some(mul_inst) = byte_limit_inst {
+                        func.blocks[pattern.header_idx]
+                            .instructions
+                            .insert(pattern.exit_cmp_inst_idx + 1, mul_inst);
+                    }
+                }
+            }
+            changes += 1 + has_byte_limit as usize;
 
             if debug {
                 eprintln!(
-                    "[VEC-RED]   Inserted division for dynamic limit: Value({})",
+                    "[VEC-RED]   Divided dynamic limit in {}: Value({})",
+                    if preheader_idx.is_some() {
+                        "the preheader"
+                    } else {
+                        "the header (no single preheader)"
+                    },
                     div_dest.0
                 );
             }
 
-            if use_byte_iv {
-                let mul_dest = Value(next_val_id);
-                next_val_id += 1;
-                let mul_inst = Instruction::BinOp {
-                    dest: mul_dest,
-                    op: IrBinOp::Mul,
-                    lhs: Operand::Value(div_dest),
-                    rhs: Operand::Const(match limit_ty {
-                        IrType::I32 => IrConst::I32(byte_stride as i32),
-                        IrType::I64 => IrConst::I64(byte_stride as i64),
-                        _ => IrConst::I64(byte_stride as i64),
-                    }),
-                    ty: limit_ty,
-                };
-                func.blocks[pattern.header_idx]
-                    .instructions
-                    .insert(pattern.exit_cmp_inst_idx + 1, mul_inst);
-                changes += 1;
+            if has_byte_limit {
                 Operand::Value(mul_dest)
             } else {
                 Operand::Value(div_dest)
@@ -20745,6 +21220,18 @@ fn transform_reduction_sse2(
             // (the phi's preheader incoming) is broadcast into the vector
             // accumulator, so zero vector iterations still reduce to the scalar
             // init (smaxv of 4 equal lanes = the init).
+            //
+            // Min shares the arm only for exhaustiveness: there is no
+            // horizontal-min epilogue at 128 bits (VecHorizontalMinI32x4 does
+            // not exist), so the intrinsic table above already refused Min
+            // before control can get here. The guard keeps that refusal
+            // fail-closed if the table ever changes.
+            ReductionKind::Min => {
+                if debug {
+                    eprintln!("[VEC-RED]   Min reduction requires the AVX2 path");
+                }
+                return 0;
+            }
             ReductionKind::Max => {
                 let init_bcast = Value(next_val_id);
                 next_val_id += 1;
@@ -20899,9 +21386,27 @@ fn transform_reduction_sse2(
                             }
                         }
                     }
+                    // The marching-pointer stride lives in a step GEP ONLY
+                    // under the element-index scheme. Under the byte-offset
+                    // IV (`use_byte_iv`) the stride is the LATCH INCREMENT,
+                    // already scaled to `byte_stride` above, and the load
+                    // takes the marching PHI directly as its pointer -- there
+                    // is no GEP to find, so `scaled` is legitimately false
+                    // and the transform is still correct.
+                    //
+                    // Asserting it unconditionally was a real bug, not just a
+                    // noisy debug check: it aborted
+                    // `regression-corpus-debug-assertions` on
+                    // `vec_no_remainder` and `vectorize_max_reduction_neon`,
+                    // both of which use the byte-IV form with a constant
+                    // (I64) trip count. Release never saw it -- the assertion
+                    // is compiled out -- and release was genuinely correct,
+                    // which is why the corpus stayed green for months.
                     debug_assert!(
-                        scaled,
-                        "max transform requires the marching-pointer step GEP"
+                        scaled || use_byte_iv,
+                        "max transform requires the marching-pointer step GEP \
+                         (or the byte-offset IV, which carries the stride in the \
+                         latch increment)"
                     );
                     if scaled {
                         changes += 1;
@@ -24436,19 +24941,6 @@ fn func_has_volatile_loop_access(func: &IrFunction) -> bool {
 /// Passes neon=true so AArch64-only widening forms (sadalp, smlal/smlal2)
 /// may be emitted; other backends reject those intrinsics.
 pub(crate) fn vectorize_function_two_wide(func: &mut IrFunction) -> usize {
-    let cfg = CfgAnalysis::build(func);
-    vectorize_with_analysis_mode(func, &cfg, true, true, false, FpContract::default())
-}
-
-/// Late AArch64 vectorization (levkropp 8ef1978f concept): reduction loops
-/// whose accumulator update only becomes Select-shaped after the main loop's
-/// if_convert phase (max reductions, conditional sums). The early vectorizer
-/// runs before if-conversion and rejects those loops as "conditional"; this
-/// second pass catches the converted form. Runs the SAME analysis — patterns
-/// already vectorized early contain Vec* intrinsics, which the analyzers
-/// reject structurally (no scalar Load/BinOp/Select shape), so re-running is
-/// idempotent and cannot double-transform.
-pub(crate) fn vectorize_function_two_wide_late(func: &mut IrFunction) -> usize {
     let cfg = CfgAnalysis::build(func);
     vectorize_with_analysis_mode(func, &cfg, true, true, false, FpContract::default())
 }

@@ -975,6 +975,13 @@ pub enum IntrinsicOp {
     /// with vextracti128 + vpmaxsd + vpshufd + vpmaxsd pairs, ending in vmovd
     /// to the dest GPR. args[0] = source vector value; dest = scalar I32.
     VecHorizontalMaxI32x8,
+    /// AVX2 horizontal signed min: %scalar = min over all 8 I32 lanes of the
+    /// source vector. The mirror of `VecHorizontalMaxI32x8`: three `vpminsd`
+    /// folds (vextracti128 + two vpshufd lane permutes) ending in `vmovd`.
+    /// The lane PERMUTE is load-bearing here too - a zero-filling `vpsrldq`
+    /// would fold in a synthetic lane 0 and turn the min of all-positive
+    /// data into 0, exactly as it turns an all-negative max into 0.
+    VecHorizontalMinI32x8,
     /// Horizontal reduction: %scalar = horizontal_add(%vec) - SSE2 4×I32 → I32
     /// args[0] = source vector value; dest = scalar I32 result
     VecHorizontalAddI32x4,
@@ -1914,6 +1921,7 @@ impl IntrinsicOp {
             | IntrinsicOp::VecMinI16x8
             | IntrinsicOp::VecMaxI16x8
             | IntrinsicOp::VecHorizontalMaxI32x8
+            | IntrinsicOp::VecHorizontalMinI32x8
         ) ||
         // The modern vectorizer's value-producing families (splats, zeros,
         // non-volatile vector loads, packed arithmetic) are pure: they read
@@ -2468,6 +2476,7 @@ mod vector_result_width_tests {
             "VecHorizontalAddI64x4" => IntrinsicOp::VecHorizontalAddI64x4,
             "VecHorizontalMaxI32x4" => IntrinsicOp::VecHorizontalMaxI32x4,
             "VecHorizontalMaxI32x8" => IntrinsicOp::VecHorizontalMaxI32x8,
+            "VecHorizontalMinI32x8" => IntrinsicOp::VecHorizontalMinI32x8,
             "VecLoadF32x4" => IntrinsicOp::VecLoadF32x4,
             "VecLoadF32x8" => IntrinsicOp::VecLoadF32x8,
             "VecLoadF64x2" => IntrinsicOp::VecLoadF64x2,
