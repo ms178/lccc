@@ -617,6 +617,7 @@ jobs:
           set -euo pipefail
           python3 scripts/check_ci_gate_parity.py
           python3 scripts/test_ci_gate_parity.py
+          python3 scripts/test_encdiff.py
           bash tests/regression/check_loop_memset.sh
           bash tests/regression/check_bool_pair_tail_jmp.sh
           bash tests/regression/check_bool_pair_prune.sh

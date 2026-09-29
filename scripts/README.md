@@ -15,7 +15,7 @@ Developer and research tooling. None of these are needed to build LCCC.
 | `realmode_corpus.sh` | Compare LCCC/GCC executable (`SHF_EXECINSTR`) bytes per `arch/x86/boot` C file under the real `-m16 -Os` flags. |
 | `asmdiff.py` | Whole-object differential against GNU as: section bytes, relocations, and symbols. See `tests/asm-diff/README.md`. |
 | `insndiff.py` | Per-instruction encoding differential against GNU as. Reduces an encoding bug to a single mnemonic in one step; supports `--sweep` over register/immediate matrices. A shorter-than-GAS encoding is reported as `BETTER` only after the tool disassembles both forms and confirms they decode identically. |
-| `encdiff.py` | Multi-assembler encoding differential: LCCC against GNU as **and** the Clang, GCC, ICC and ICX integrated assemblers over the Compiler Explorer API. Judges LCCC against the *shortest legal encoding any oracle produced*, not against GAS alone. |
+| `encdiff.py` | Multi-assembler encoding differential: LCCC against GNU as **and** the Clang, GCC, ICC and ICX integrated assemblers over the Compiler Explorer API. A shorter result is a `BEATS` only after objdump round-trips it against every distinct shortest oracle encoding; missing/undecodable disassembly is reported as unverified and fails the gate. Casefile harvesting skips `reject` groups. |
 | `gen_encoding_sweep.py` | Generate instructions that have MORE THAN ONE legal encoding (accumulator short forms, imm8 sign-extension, redundant REX, VEX2-vs-VEX3, scale-1 index folds, ...). These are the only places an encoding can be improved, and most are invisible to a structural-coverage corpus. |
 | `gen_asmdiff_corpus.py` | Generate the `tests/asm-diff/*.casefile` corpora. Every case is validated against GNU as before being written. |
 | `gen_apx_asmdiff.py` | Generate `tests/asm-diff/apx.casefile`: REX2/EGPR/NDD/`{nf}`/`{evex}` plus the unsigned-imm32-into-EGPR size win (tagged `betterok`). |
@@ -85,13 +85,21 @@ SIB byte. Comparing only against GAS would have shown a clean pass forever.
 oracles concurrently, so a 1,900-instruction sweep against five assemblers
 takes ~30 s rather than ~2 h.
 
-A shorter encoding is never accepted on size alone. Both `encdiff.py` and
-`insndiff.py` disassemble the two candidates and require them to decode to the
-same instruction; `asmdiff.py` does the same for a whole object when a case is
-marked `betterok`. This is not ceremony -- the first version of the fold was
-4 bytes shorter *and wrong* for `%r12`/`%r13`, because those register numbers
-mean something different in the base slot than in the index slot, and only the
-round-trip check caught it.
+A shorter encoding is never accepted on size alone. `encdiff.py` disassembles
+LCCC's candidate against every distinct shortest oracle encoding and reports
+`BEATS` only if all decode to the same canonical instruction. If objdump is
+missing, returns an error, or cannot decode either stream, the result is
+`UNVERIFIED-BEATS`/`UNVERIFIED-BYTES` and the command exits nonzero; it never
+counts as a win. Byte-different equal-length and longer candidates are also
+round-trip checked before being called correct or merely longer. `insndiff.py`
+does the same for per-instruction comparisons, and `asmdiff.py` checks whole
+objects when a case is marked `betterok`. The classifier, fail-closed
+behavior, VEX disassembly marker normalization, and reject-group filtering are
+pinned by `python3 scripts/test_encdiff.py` in both local and hosted CI. This
+is not ceremony -- the first version of the scale-1 fold was 4 bytes shorter
+*and wrong* for `%r12`/`%r13`, because those register numbers mean something
+different in the base slot than in the index slot, and only the round-trip
+check caught it.
 
 Two verdicts record deliberate refusals, so they are not mistaken for work
 left undone:

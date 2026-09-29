@@ -15,17 +15,19 @@ assemblers over the Compiler Explorer API — and reports:
                genuine encoding choice to make. LCCC is judged against the
                SHORTEST legal encoding any oracle produced, not against GAS.
   * LONGER     every oracle agrees and LCCC is longer: wasted I-cache.
-  * BEATS      LCCC is shorter than every oracle. Not automatically good —
-               it must be verified to decode back to the same instruction,
-               which this tool does by round-tripping through the oracle's
-               disassembler.
+  * BEATS      LCCC is shorter than every oracle and its bytes round-trip to
+               the same instruction as every shortest oracle encoding.
   * WRONG      LCCC's bytes decode to a different instruction, or it rejects
                input every oracle accepts.
+  * UNVERIFIED-BEATS / UNVERIFIED-BYTES
+               the disassembler could not establish semantic equivalence;
+               these are never reported as a win or a pass.
 
-The round-trip check is what makes a SHORTER result trustworthy. A shorter
-encoding that decodes to something else is a miscompile, not an optimisation,
-so `--verify-roundtrip` (on by default) disassembles LCCC's bytes with the
-oracle and requires the mnemonic and operands to match.
+The round-trip check is always on. A shorter encoding that decodes to
+something else is a miscompile, not an optimisation: LCCC's bytes are
+compared with every shortest oracle encoding, and `BEATS` is emitted only when
+all comparisons succeed. Missing/unsupported disassembly fails closed as an
+`UNVERIFIED-*` verdict rather than being counted as a win.
 
 Remote results are cached under `.godbolt-cache/` keyed by (compiler, source),
 so a tuning loop does not re-hit the network. `--offline` restricts the run to
@@ -511,8 +513,12 @@ _MOV_IMM = re.compile(r"^(movabs|mov)\s+\$(0x[0-9a-f]+|\d+),%(\w+)$")
 
 
 def _canon_insn(insn: str) -> str:
-    """Canonicalise the spellings that differ only by encoding choice."""
+    """Canonicalise disassembly spellings that differ only by encoding choice."""
     insn = insn.split("#")[0].strip().lower()
+    # Objdump marks an EVEX-only mnemonic's legal VEX row with a GNU pseudo
+    # prefix (`{vex} vpdpbusds`). It describes the selected encoding, not a
+    # different architectural instruction, so remove it for semantic compare.
+    insn = re.sub(r"^\{vex(?:2|3)?\}\s+", "", insn)
     insn = _SCALE1.sub(r"(%\1)", insn)
     insn = _ZERODISP.sub("(", insn)
     insn = re.sub(r"\s+", " ", insn)
@@ -533,11 +539,17 @@ def _canon_insn(insn: str) -> str:
     return insn
 
 
-def decodes_same(objdump: str, a: bytes, b: bytes) -> bool:
-    """True when two byte strings disassemble to the same instruction."""
-    def dis(data: bytes) -> str:
+def decodes_same(objdump: str, a: bytes, b: bytes) -> bool | None:
+    """Compare disassembly, returning None when it cannot be verified.
+
+    False means both byte strings decoded successfully but to different
+    instruction text. None is deliberately distinct: a missing/old objdump,
+    a failed invocation, empty bytes, or undecodable data must not be treated
+    as proof that a shorter encoding is correct (or as proof that it is wrong).
+    """
+    def dis(data: bytes) -> str | None:
         if not data:
-            return ""
+            return None
         with tempfile.TemporaryDirectory(prefix="encdiff-dis-") as td:
             raw = Path(td) / "d.bin"
             raw.write_bytes(data)
@@ -545,16 +557,62 @@ def decodes_same(objdump: str, a: bytes, b: bytes) -> bool:
                 [objdump, "-D", "-b", "binary", "-m", "i386:x86-64",
                  "-M", "att", str(raw)],
                 capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            return None
         out = []
         for line in r.stdout.splitlines():
             m = re.match(r"^\s+[0-9a-f]+:\s+((?:[0-9a-f]{2} )+)\s*\t(.*)$", line)
-            if m:
-                out.append(_canon_insn(m.group(2)))
-        return "\n".join(out)
+            if not m:
+                continue
+            insn = _canon_insn(m.group(2))
+            # Objdump renders undecodable bytes as `.byte` (and some versions
+            # use `(bad)`). Two undecodable streams are not equivalent code.
+            if not insn or insn == "(bad)" or insn.startswith(".byte"):
+                return None
+            out.append(insn)
+        return "\n".join(out) if out else None
+
     try:
-        return dis(a) == dis(b)
+        da, db = dis(a), dis(b)
     except (OSError, subprocess.SubprocessError):
+        return None
+    if da is None or db is None:
+        return None
+    return da == db
+
+
+def _roundtrip_same_as(row: Row, references: list[bytes]) -> bool | None:
+    """Require the candidate to decode like every distinct reference form.
+
+    `None` is fail-closed: without a usable disassembly there is no semantic
+    evidence for a size win (or for a pass when the bytes differ).
+    """
+    if not row.lccc.ok or row.lccc.data is None or not references:
+        return None
+    results = [decodes_same(_OBJDUMP, row.lccc.data, ref)
+               for ref in sorted(set(references))]
+    if any(result is False for result in results):
         return False
+    if results and all(result is True for result in results):
+        return True
+    return None
+
+
+def _classify_roundtrip(row: Row, references: list[bytes], success: str) -> None:
+    """Assign a byte-different verdict only after semantic round-trip proof."""
+    same = _roundtrip_same_as(row, references)
+    if same is True:
+        row.verdict = success
+        row.note = (row.note + " | " if row.note else "") + \
+                   "round-trip verified against shortest oracle encoding(s)"
+    elif same is False:
+        row.verdict = "WRONG-BYTES"
+        row.note = (row.note + " | " if row.note else "") + \
+                   "LCCC disassembly differs from a shortest oracle encoding"
+    else:
+        row.verdict = "UNVERIFIED-BEATS" if success == "BEATS" else "UNVERIFIED-BYTES"
+        row.note = (row.note + " | " if row.note else "") + \
+                   "objdump could not verify semantic equivalence"
 
 
 def classify(row: Row) -> None:
@@ -567,10 +625,11 @@ def classify(row: Row) -> None:
     lengths = {k: len(v.data) for k, v in ok_oracles.items()}
     best = min(lengths.values())
     best_who = sorted(k for k, n in lengths.items() if n == best)
+    best_bytes = sorted({v.data for v in ok_oracles.values() if len(v.data) == best})
     bytesets = {v.data for v in ok_oracles.values()}
     disagree = len(bytesets) > 1
 
-    if not row.lccc.ok:
+    if not row.lccc.ok or row.lccc.data is None:
         row.verdict = "REJECTS-VALID"
         row.note = f"oracles accept ({','.join(sorted(ok_oracles))})"
         return
@@ -580,10 +639,9 @@ def classify(row: Row) -> None:
         row.note = "oracles differ: " + ", ".join(
             f"{k}={len(v.data)}B" for k, v in sorted(ok_oracles.items()))
         if n < best:
-            row.verdict = "BEATS"
+            _classify_roundtrip(row, best_bytes, "BEATS")
         elif n == best:
-            row.verdict = "ok-best"
-            row.note += f" | matches shortest ({','.join(best_who)})"
+            _classify_roundtrip(row, best_bytes, "ok-best")
         elif is_wrong_shorter(row.insn):
             row.verdict = "DECLINED-WRONG"
             row.note += (f" | {best}B form from {','.join(best_who)} is not"
@@ -594,28 +652,24 @@ def classify(row: Row) -> None:
                          " source swap; refused, FP add/mul propagate SRC1's"
                          " NaN payload")
         else:
-            row.verdict = "LONGER"
             row.note += f" | shortest is {best}B from {','.join(best_who)}"
+            _classify_roundtrip(row, best_bytes, "LONGER")
         return
 
     ref = next(iter(bytesets))
     if row.lccc.data == ref:
         row.verdict = "ok"
     elif n < len(ref):
-        row.verdict = "BEATS"
         row.note = (f"oracles agree on {len(ref)}B"
                     f" ({','.join(sorted(ok_oracles))})")
+        _classify_roundtrip(row, [ref], "BEATS")
     elif n > len(ref):
-        row.verdict = "LONGER"
         row.note = (f"oracles agree on {len(ref)}B"
                     f" ({','.join(sorted(ok_oracles))})")
-    elif decodes_same(_OBJDUMP, row.lccc.data, ref):
-        # Same length, different bytes, but the two decode identically -- a
-        # different spelling of the same instruction, not a defect.
-        row.verdict = "ok"
+        _classify_roundtrip(row, [ref], "LONGER")
     else:
-        row.verdict = "WRONG-BYTES"
         row.note = f"same length, different bytes (oracle {ref.hex()})"
+        _classify_roundtrip(row, [ref], "ok")
 
 
 # Cases where a shorter encoding EXISTS but is deliberately not taken.
@@ -658,28 +712,41 @@ def is_wrong_shorter(insn: str) -> bool:
 
 SEVERITY = {
     "WRONG-BYTES": 0,
-    "DECLINED-FP": 6,   # shorter form exists but changes NaN payload
-    "DECLINED-WRONG": 6, # shorter form exists but is not equivalent
-    "REJECTS-VALID": 1,
-    "LONGER": 2,
-    "BEATS": 3,      # investigate: must round-trip
-    "DISAGREE": 4,
-    "ok-best": 5,
-    "ok": 6,
-    "both-reject": 7,
-    "NO-ORACLE": 8,
+    "UNVERIFIED-BEATS": 1,
+    "UNVERIFIED-BYTES": 1,
+    "REJECTS-VALID": 2,
+    "LONGER": 3,
+    "BEATS": 4,      # semantic round-trip verified
+    "DISAGREE": 5,
+    "ok-best": 6,
+    "ok": 7,
+    "DECLINED-FP": 7,   # shorter form exists but changes NaN payload
+    "DECLINED-WRONG": 7, # shorter form exists but is not equivalent
+    "both-reject": 8,
+    "NO-ORACLE": 9,
 }
 
 
 def read_casefiles(paths: list[str]) -> list[str]:
+    """Harvest positive instruction rows from asm-diff casefiles.
+
+    `reject` groups are intentionally omitted: feeding expected failures to a
+    batched remote assembler makes every containing batch fail and be split
+    recursively, without adding useful encoding data.
+    """
     out: list[str] = []
     seen: set[str] = set()
     for p in paths:
+        in_reject_group = False
         for line in Path(p).read_text().splitlines():
             t = line.strip()
+            if t.startswith(";;;"):
+                fields = t[3:].split()
+                in_reject_group = "reject" in fields[1:]
+                continue
             if not t or t.startswith((";", "#", "//")):
                 continue
-            if t.startswith(".") or t.endswith(":"):
+            if in_reject_group or t.startswith(".") or t.endswith(":"):
                 continue
             if t not in seen:
                 seen.add(t)
@@ -697,7 +764,7 @@ def main() -> int:
                     help="one instruction (repeatable)")
     ap.add_argument("--file", help="file with one instruction per line")
     ap.add_argument("--casefiles", nargs="*", default=[],
-                    help="asm-diff casefiles to harvest instructions from")
+                    help="asm-diff casefiles to harvest positive instructions from (reject groups skipped)")
     ap.add_argument("--compiler", action="append", default=[],
                     help="extra Compiler Explorer id to use as an oracle")
     ap.add_argument("--offline", action="store_true",
@@ -796,14 +863,14 @@ def main() -> int:
     reachable = sorted({n for r in rows for n, e in r.oracles.items() if e.ok})
     print(f"oracles reached: {', '.join(reachable) if reachable else 'none'}")
 
-    # Head-to-head: how often is LCCC strictly shorter / tied / longer than
-    # each named oracle, counting only instructions that oracle assembled.
-    print("\n=== LCCC vs each oracle (payload bytes; lower is better) ===")
-    print(f"{'oracle':<8} {'beat':>6} {'tie':>6} {'lose':>6} {'n':>6}  "
+    # Raw byte-length counts are useful for a size inventory, but are not the
+    # semantic verdict: only a round-trip-verified row is a confirmed win.
+    print("\n=== LCCC vs each oracle (raw payload lengths; not semantic verdicts) ===")
+    print(f"{'oracle':<8} {'shorter':>7} {'tie':>6} {'longer':>7} {'n':>6}  "
           f"{'lccc B':>8} {'them B':>8}  delta")
     vs_rows = []
     for name in reachable:
-        beat = tie = lose = 0
+        shorter = tie = longer = 0
         lccc_b = them_b = 0
         n = 0
         for r in rows:
@@ -816,26 +883,26 @@ def main() -> int:
             lccc_b += a
             them_b += b
             if a < b:
-                beat += 1
+                shorter += 1
             elif a == b:
                 tie += 1
             else:
-                lose += 1
+                longer += 1
         delta = lccc_b - them_b
-        vs_rows.append((name, beat, tie, lose, n, lccc_b, them_b, delta))
-        print(f"{name:<8} {beat:>6} {tie:>6} {lose:>6} {n:>6}  "
+        vs_rows.append((name, shorter, tie, longer, n, lccc_b, them_b, delta))
+        print(f"{name:<8} {shorter:>7} {tie:>6} {longer:>7} {n:>6}  "
               f"{lccc_b:>8} {them_b:>8}  {delta:+d}")
 
     if args.json:
         payload = {
-            "schema": 2,
+            "schema": 3,
             "n": len(rows),
             "verdicts": counts,
             "oracles_reached": reachable,
             "vs": [
-                {"oracle": n, "beat": b, "tie": t, "lose": l, "n": nn,
+                {"oracle": n, "shorter": s, "tie": t, "longer": l, "n": nn,
                  "lccc_bytes": lb, "oracle_bytes": ob, "delta": d}
-                for (n, b, t, l, nn, lb, ob, d) in vs_rows
+                for (n, s, t, l, nn, lb, ob, d) in vs_rows
             ],
             "rows": [
                 {
@@ -860,7 +927,9 @@ def main() -> int:
         args.json.write_text(json.dumps(payload, indent=2) + "\n")
         print(f"wrote {args.json}")
 
-    bad = sum(counts.get(k, 0) for k in ("WRONG-BYTES", "REJECTS-VALID", "LONGER"))
+    bad = sum(counts.get(k, 0) for k in (
+        "WRONG-BYTES", "UNVERIFIED-BEATS", "UNVERIFIED-BYTES",
+        "REJECTS-VALID", "LONGER"))
     return 1 if bad else 0
 
 

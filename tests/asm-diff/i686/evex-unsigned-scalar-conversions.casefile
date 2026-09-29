@@ -1,0 +1,33 @@
+;;; cvtusi_default_l_register_and_memory
+.text
+vcvtusi2ss %eax, %xmm1, %xmm2
+vcvtusi2ss (%eax), %xmm1, %xmm2
+vcvtusi2sd %eax, %xmm1, %xmm2
+vcvtusi2sd (%eax), %xmm1, %xmm2
+
+;;; cvtusi_explicit_l_register_and_memory
+.text
+vcvtusi2ssl %eax, %xmm1, %xmm2
+vcvtusi2ssl (%eax), %xmm1, %xmm2
+vcvtusi2sdl %eax, %xmm1, %xmm2
+vcvtusi2sdl (%eax), %xmm1, %xmm2
+
+;;; cvtusi_case_and_force_evex
+.text
+{evex} vcvtusi2ss %eax, %xmm1, %xmm2
+VCVTUSI2SDL (%eax), %xmm1, %xmm2
+
+;;; cvtusi_qword_is_64_bit_only reject
+.text
+vcvtusi2ssq %eax, %xmm1, %xmm2
+vcvtusi2sdq (%eax), %xmm1, %xmm2
+
+;;; cvtusi_forced_vex_is_unavailable reject
+.text
+{vex} vcvtusi2ssl %eax, %xmm1, %xmm2
+{vex3} vcvtusi2sdl %eax, %xmm1, %xmm2
+
+;;; cvtusi_invalid_decorators_and_width reject
+.text
+vcvtusi2ss %eax, %xmm1, %xmm2{%k1}
+vcvtusi2ss %eax, %ymm1, %xmm2

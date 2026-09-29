@@ -337,6 +337,9 @@ gate "ci-gate-parity" fast \
 gate "ci-asm-diff-parity-self-test" fast \
     python3 scripts/test_ci_gate_parity.py
 
+gate "encdiff-semantic-validation" fast \
+    python3 scripts/test_encdiff.py
+
 gate "ra-web-inloop-use" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_ra_web_inloop_use.sh
 

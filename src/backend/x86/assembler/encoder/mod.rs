@@ -600,6 +600,19 @@ fn decor_stem(mnemonic: &str) -> &str {
     m.strip_suffix(['b', 'w', 'l', 'q']).unwrap_or(m)
 }
 
+/// Stem printed by the `{vex*}` EVEX-only rejection. Most EVEX mnemonics
+/// carry no AT&T width suffix (`vpabsq` is the full name, not `vpabs`), but
+/// the unsigned GPR-to-scalar conversions use `l`/`q` to select source width
+/// and GAS prints their unsuffixed mnemonic in the diagnostic.
+fn vex_error_stem(mnemonic: &str) -> &str {
+    match mnemonic {
+        "vcvtusi2ssl" | "vcvtusi2ssq" => "vcvtusi2ss",
+        "vcvtusi2sdl" | "vcvtusi2sdq" => "vcvtusi2sd",
+        _ if evex_only_mnemonic(mnemonic) => mnemonic,
+        _ => decor_stem(mnemonic),
+    }
+}
+
 /// `vblendvb` rejection echo: register operands join with commas and
 /// no spaces, exactly as GAS normalizes them (`` `vblendvb
 /// %xmm14,%xmm6,%xmm2,%xmm3' ``). Anything else reports the mnemonic
@@ -3292,15 +3305,10 @@ impl InstructionEncoder {
         // Dual-encoded and plain VEX mnemonics fall through to their VEX
         // rows (`{vex} vpdpbusd %ymm3,%ymm1,%ymm2` = `c4 e2 75 50 d3`).
         if self.vex_hint.is_some() {
-            // EVEX-only vector mnemonics have no AT&T size suffix: the
-            // final `q/w/b` is part of their actual name (GAS says
-            // `vpabsq`, not `vpabs`). Legacy `movq`/`addl` do need their
-            // size suffix stripped for these diagnostics.
-            let stem = if evex_only_mnemonic(mnemonic) {
-                mnemonic
-            } else {
-                decor_stem(mnemonic)
-            };
+            // Keep genuine mnemonic endings (`vpabsq`, not `vpabs`) while
+            // dropping the scalar unsigned-conversion source-width suffixes
+            // that GAS omits from this diagnostic.
+            let stem = vex_error_stem(mnemonic);
             let egpr_mem = ops.iter().any(|op| {
                 matches!(op, Operand::Memory(m) if
                     m.base.as_ref().is_some_and(|b| gp_id(&b.name).is_some_and(|id| id >= 16))
@@ -7442,6 +7450,25 @@ mod merged_pr629_followup_tests {
             "rex2 pseudo prefix cannot be used for `vaddps'"
         );
         assert!(fails("{vex} vpbroadcastb %eax,%xmm1")); // EVEX-only GPR row.
+    }
+
+    #[test]
+    fn vex_rejection_stems_normalize_unsigned_conversion_source_widths() {
+        for (mnemonic, source, expected_stem) in [
+            ("vcvtusi2ss", "%eax", "vcvtusi2ss"),
+            ("vcvtusi2ssl", "%eax", "vcvtusi2ss"),
+            ("vcvtusi2ssq", "%rax", "vcvtusi2ss"),
+            ("vcvtusi2sd", "%eax", "vcvtusi2sd"),
+            ("vcvtusi2sdl", "%eax", "vcvtusi2sd"),
+            ("vcvtusi2sdq", "%rax", "vcvtusi2sd"),
+        ] {
+            let source = format!("{{vex}} {mnemonic} {source},%xmm1,%xmm2");
+            assert_eq!(
+                fail_msg(&source),
+                format!("no VEX/XOP encoding for `{expected_stem}'"),
+                "{source}"
+            );
+        }
     }
 
     #[test]
