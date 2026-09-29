@@ -721,6 +721,7 @@ pub(super) fn emit_shared_library(
             is_dynamic: false,
             copy_reloc: false,
             lib_sym_value: 0,
+            lib_in_exec: false,
         });
         if entry.defined_in.is_none() && !entry.is_dynamic {
             entry.value = sym.value;

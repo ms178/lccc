@@ -11,7 +11,7 @@ use super::elf::*;
 use super::plt_got::{exec_got_target, exec_ie_target_local, local_got_target, local_is_tls};
 use super::reloc_field::{self, w8_checked, w16_checked, w32_checked};
 use super::types::{BASE_ADDR, GlobalSymbol, LocalSlots, PAGE_SIZE};
-use crate::backend::elf::{STV_PROTECTED, elf64_sym_entry, push_strtab_name};
+use crate::backend::elf::{STV_DEFAULT, STV_PROTECTED, elf64_sym_entry, push_strtab_name};
 use crate::backend::linker_common::{self, DynStrTab, OutputSection};
 
 /// The dynsym NAME for a dynamic symbol reference. Versioned references are
@@ -37,6 +37,47 @@ fn dynsym_emit_name(name: &str) -> &str {
 /// as it does for a shared object (`{ global: a; b; local: *; };` keeps a
 /// plugin ABI small).
 ///
+/// Global TLS definitions of this executable another module may interpose:
+/// a PIE (never `-static`: a static image binds its own TLS) that exports
+/// them with default visibility.  Their TP offset is ld.so's to compute,
+/// so they keep the dynamic TLS model -- GD relaxes to IE, GOTTPOFF loads
+/// from a slot with an `R_X86_64_TPOFF64` dynamic relocation -- exactly
+/// like a shared library's TLS; relaxing them to LE would hardcode a TP
+/// offset the loader may legitimately change.  Hidden, protected and
+/// unexported definitions are never interposable and still relax to LE, as
+/// does every TLS reference in a non-PIE.  Built once per link so the
+/// planner and the emitter provably agree.  (Filed as §5.1 in
+/// `docs/PR663_CI_REPAIR_AND_FOLLOWUP.md`, whose proposed refuse-to-link
+/// gate this supersedes: refusing is strictly worse than linking
+/// correctly.)
+pub(super) fn preemptible_tls_names(
+    globals: &FxHashMap<String, GlobalSymbol>,
+    is_pie: bool,
+    is_static: bool,
+    export_dynamic: bool,
+    dso_names: &crate::common::fx_hash::FxHashSet<String>,
+    version_script_path: Option<&str>,
+) -> crate::common::fx_hash::FxHashSet<String> {
+    if !is_pie || is_static {
+        return crate::common::fx_hash::FxHashSet::default();
+    }
+    ExecExports::new(export_dynamic, dso_names, version_script_path)
+        .map(|exports| {
+            globals
+                .iter()
+                .filter(|(name, g)| {
+                    g.defined_in.is_some()
+                        && !g.is_dynamic
+                        && (g.info & 0xf) == STT_TLS
+                        && g.visibility == STV_DEFAULT
+                        && exports.exports(name, g)
+                })
+                .map(|(name, _)| name.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The one predicate for the emitter and for `--gc-sections`, whose roots
 /// must include every export: an exported definition is reachable from
 /// outside the image, so a reachability sweep that missed one would
@@ -147,6 +188,9 @@ pub(super) fn emit_executable(
     // addresses and the linker-provided symbols exist.  See
     // `link::evaluate_pending_defsyms` for the full rationale.
     pending_defsyms: &super::link::PendingDefsyms,
+    // Global TLS definitions this PIE exports (see
+    // `preemptible_tls_names`): they keep the dynamic TLS model.
+    preemptible_tls: &crate::common::fx_hash::FxHashSet<String>,
 ) -> Result<(), String> {
     let ld_time = std::env::var("LCCC_LD_TIME").is_ok();
     // Without DF_1_PIE an ET_DYN is treated as a shared object: ld.so would
@@ -349,12 +393,16 @@ pub(super) fn emit_executable(
     let rela_dyn_glob_count = got_entries
         .iter()
         .filter(|(n, p)| {
+            // Must match the `.rela.dyn` scan below entry for entry: an
+            // uncounted write lands past the section end (into whatever the
+            // layout placed next) and silently vanishes -- or corrupts it.
             !n.is_empty()
                 && !*p
-                && globals
+                && (globals
                     .get(n)
                     .map(|g| g.is_dynamic && !g.copy_reloc)
                     .unwrap_or(false)
+                    || preemptible_tls.contains(n))
         })
         .count();
     // Dynamic executables carry IFUNC IRELATIVE relocations at the END of
@@ -1244,6 +1292,13 @@ pub(super) fn emit_executable(
 
     // Allocate BSS space for copy-relocated symbols.
     // Symbols that are aliases (same from_lib + lib_sym_value) share the same BSS slot.
+    let copy_group_max = copy_group_max_sizes(copy_reloc_syms.iter().filter_map(|(name, size)| {
+        globals.get(name).and_then(|g| {
+            g.from_lib
+                .as_ref()
+                .map(|lib| ((lib.clone(), g.lib_sym_value), *size))
+        })
+    }));
     let mut copy_reloc_addr_map: FxHashMap<(String, u64), u64> = FxHashMap::default(); // (lib, lib_value) -> bss_addr
     for (name, size) in &copy_reloc_syms {
         let gsym = globals.get(name).cloned();
@@ -1256,8 +1311,11 @@ pub(super) fn emit_executable(
             if let Some(&existing_addr) = copy_reloc_addr_map.get(k) {
                 existing_addr // reuse existing BSS slot for alias
             } else {
+                // Size the shared slot for the group's largest member, not
+                // for whoever sorts first (see copy_group_max_sizes).
+                let group_size = copy_group_max.get(k).copied().unwrap_or(*size);
                 let aligned = (bss_addr + bss_size + 7) & !7;
-                bss_size = aligned - bss_addr + size;
+                bss_size = aligned - bss_addr + group_size;
                 copy_reloc_addr_map.insert(k.clone(), aligned);
                 aligned
             }
@@ -1338,6 +1396,7 @@ pub(super) fn emit_executable(
             canonical_plt: false,
             visibility: 0,
             lib_sym_value: 0,
+            lib_in_exec: false,
             version: None,
             absolute: false,
         });
@@ -2181,7 +2240,10 @@ pub(super) fn emit_executable(
             if let Some(gsym) = globals.get(name) {
                 if gsym.copy_reloc {
                     if ds + 5 < out.len() {
-                        out[ds + 4] = (STB_GLOBAL << 4) | STT_OBJECT;
+                        // Preserve the library's type: GNU ld publishes a
+                        // copy of an untyped (STT_NOTYPE) export as NOTYPE,
+                        // not OBJECT.
+                        out[ds + 4] = (STB_GLOBAL << 4) | (gsym.info & 0xf);
                         out[ds + 5] = 0;
                     }
                     w16(&mut out, ds + 6, dyn_def_shndx(gsym));
@@ -2323,7 +2385,12 @@ pub(super) fn emit_executable(
             let gsym_info = globals.get(name);
             let is_dynamic = gsym_info
                 .map(|g| g.is_dynamic && !g.copy_reloc)
-                .unwrap_or(false);
+                .unwrap_or(false)
+                // A preemptible TLS definition's slot is equally
+                // loader-resolved (`R_X86_64_TPOFF64` below; the `STT_TLS`
+                // test there is what selects it, so no other member of
+                // the set can take the `GLOB_DAT` path).
+                || preemptible_tls.contains(name);
             // Every shared-library symbol's slot is resolved by ld.so, PLT or
             // not: for a canonical-PLT function the loader's answer is our PLT
             // entry (published as the `.dynsym` value), for any other it is
@@ -3027,7 +3094,10 @@ pub(super) fn emit_executable(
                             .then(|| globals_snap.get(sym.name.as_str()))
                             .flatten();
                         let target_local = match global {
-                            Some(g) => exec_ie_target_local(g),
+                            Some(g) => {
+                                exec_ie_target_local(g)
+                                    && !preemptible_tls.contains(sym.name.as_str())
+                            }
                             None => sym.is_local(),
                         };
                         let rewrite = if target_local {
@@ -3297,8 +3367,8 @@ pub(super) fn emit_executable(
                         };
                         let is_dyn_tls = globals_snap
                             .get(sym.name.as_str())
-                            .map(|g| g.is_dynamic)
-                            .unwrap_or(false);
+                            .is_some_and(|g| g.is_dynamic)
+                            || preemptible_tls.contains(sym.name.as_str());
                         if !is_dyn_tls {
                             // GD -> LE:  mov %fs:0,%rax ; lea tpoff(%rax),%rax
                             let tpoff = (s as i64 - tls_addr as i64) - tls_mem_size as i64;
@@ -4233,4 +4303,41 @@ pub(super) fn reloc_truncated(
          recompile with -mcmodel=large or -fpic if the image exceeds 2 GiB",
         rtype, target, objects[obj_idx].source_name, value
     )
+}
+
+/// Largest `st_size` per COPY-alias group, keyed by (defining library,
+/// address in that library).
+///
+/// Same-address DSO data exports share one BSS slot but keep one
+/// `R_X86_64_COPY` each with its own `st_size`, so sizing the slot by the
+/// first-seen member under-allocates whenever a later-larger alias shares
+/// the group: the 8-byte copy then overflows a 4-byte slot into its
+/// neighbor. Pre-sizing every group for its largest member keeps the layout
+/// correct regardless of member order.
+fn copy_group_max_sizes(
+    pairs: impl Iterator<Item = ((String, u64), u64)>,
+) -> FxHashMap<(String, u64), u64> {
+    let mut max: FxHashMap<(String, u64), u64> = FxHashMap::default();
+    for (k, s) in pairs {
+        max.entry(k).and_modify(|m| *m = (*m).max(s)).or_insert(s);
+    }
+    max
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copy_group_max_sizes_takes_the_largest_member() {
+        let lib = "libaliased.so".to_string();
+        let pairs = vec![
+            ((lib.clone(), 0x4008), 4u64),
+            ((lib.clone(), 0x4008), 8u64),
+            ((lib.clone(), 0x4010), 2u64),
+        ];
+        let max = copy_group_max_sizes(pairs.into_iter());
+        assert_eq!(max[&(lib.clone(), 0x4008)], 8);
+        assert_eq!(max[&(lib.clone(), 0x4010)], 2);
+    }
 }

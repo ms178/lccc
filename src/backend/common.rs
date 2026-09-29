@@ -1473,6 +1473,12 @@ fn mnemonic_base(token: &str) -> &str {
 /// (trailing `:`), assembler directives (leading `.`) and empty lines are
 /// ignored.
 ///
+/// AT&T-only: every scanned line is AT&T by construction (the emitters
+/// speak AT&T natively, and GCC dialect alternatives in inline asm resolve
+/// to the first — AT&T — branch), so dest-last reading is total. There is
+/// no `.intel_syntax` mode anywhere in the pipeline; an Intel-shaped line
+/// would misclassify, and must never be produced.
+///
 /// The `(writes_rax, unclassified_mnemonic)` pair is what the caller —
 /// `AsmOutput::debug_scan_tail`, the only production caller — records INTO
 /// THE OUTPUT STREAM it is scanning. Stream-scoped, not thread-scoped:
@@ -1596,13 +1602,43 @@ pub(crate) fn asm_line_writes_rax(line: &str) -> bool {
     classify_rax_line(line).0
 }
 
+/// True when a short-`movs` mnemonic with explicit operands is MOVSX rather
+/// than a string op: exactly two operands with a PURE register destination
+/// (`movsl %eax,%ebx`, `movsl (%rax),%ebx` — the CPU ignores any `rep`
+/// prefix there). Memory-memory (`movsl (%esi),(%edi)`, GAS-accepted with
+/// or without `rep`, encoding A5) IS the string op — `rep` counts %rcx
+/// there — as is anything that is not two operands with a register dst
+/// (conservative: every real MOVSX has one, ISA fact). Only the four
+/// ambiguous spellings qualify — `movslq` never reaches the rep rule (its
+/// base is `movsl`, not `movs`), and the other string bases (`stos`,
+/// `cmps`, ...) have no MOVSX reading.
+fn movs_is_movsx(token: &str, operands_part: &str) -> bool {
+    if !matches!(token, "movsb" | "movsw" | "movsl" | "movsq") {
+        return false;
+    }
+    let ops = split_operands_top_level(operands_part);
+    if ops.len() != 2 {
+        return false;
+    }
+    // A pure register destination: exactly `%reg` — no memory parens, no
+    // segment `:` (`%ds:(%esi)` is memory despite the leading `%`); the
+    // same shape test as `pure_rax_reg`, minus the family membership.
+    let dst = ops[1].trim();
+    dst.starts_with('%') && dst.len() >= 2 && !dst[1..].contains(|c: char| !is_mnemonic_byte(c))
+}
+
 /// Does this AT&T-syntax assembly line write any part of %rcx?
 ///
 /// The %rcx mirror of [`classify_rax_line`] (same purity, same fail-loud
 /// contract: an UNKNOWN mnemonic carrying operands is treated as a write;
 /// labels, directives and empty lines are ignored). Shares the helpers
 /// (`split_operands_top_level`, `mnemonic_base`, the both-operand and
-/// last-two tables); differs where the ISA differs:
+/// last-two tables); differs where the ISA differs.
+///
+/// AT&T-only, like the %rax side: Intel-syntax lines never occur (GCC
+/// dialect alternatives in inline asm resolve to the first — AT&T —
+/// branch, and the emitters speak AT&T natively), so dest-last reading is
+/// total here, exactly as there.
 ///
 /// * The implicit table is NOT a copy: one-operand div/idiv/mul, lods,
 ///   cmpxchg, rdtsc, xgetbv, rdmsr, the cwtl family, cmpxchg8b/16b and
@@ -1613,7 +1649,11 @@ pub(crate) fn asm_line_writes_rax(line: &str) -> bool {
 /// * `rep*`-prefixed string ops write the %rcx counter — but the prefix is
 ///   only a counter-user on string-op bases. `rep ret` / `rep nop`
 ///   (`pause`) carry an ignored hint prefix and fall through to normal
-///   classification instead of reporting a write.
+///   classification instead of reporting a write, and so do short-`movs`
+///   spellings with a register destination (`rep movsl %eax,%ebx` is
+///   MOVSX with an ignored prefix — no counter traffic — not a string
+///   op; memory-memory `rep movsl (%esi),(%edi)` IS the string op and
+///   reports the counter).
 /// * One-operand `mul`/`div`/`idiv` and one-operand `imul` multiply INTO
 ///   the implicit rax:rdx pair: their explicit operand is the SOURCE, so a
 ///   `%rcx`-looking operand there must NOT report a write (the dest-last
@@ -1659,7 +1699,14 @@ fn classify_rcx_line(line: &str) -> (bool, Option<String>) {
 
     // A `rep*` prefix on a string-op base consumes the %rcx counter. Any
     // other base (`rep ret`, `rep nop`) ignores the prefix: fall through.
-    if saw_rep && (REP_STRING_BASES.contains(&token) || REP_STRING_BASES.contains(&base)) {
+    // Short-`movs` spellings with a register destination are MOVSX, not
+    // string ops — the CPU ignores `rep` there, so only the explicit
+    // destination can be a %rcx write (`rep movsl %eax,%ebx` touches no
+    // part of %rcx); memory-memory is the string op (`rep` counts).
+    if saw_rep
+        && (REP_STRING_BASES.contains(&token) || REP_STRING_BASES.contains(&base))
+        && !movs_is_movsx(token, operands_part)
+    {
         return (true, None);
     }
     if IMPLICIT_RCX_WRITES.contains(&token) || IMPLICIT_RCX_WRITES.contains(&base) {
@@ -4136,6 +4183,23 @@ mod rax_epoch_analyzer_tests {
     }
 
     #[test]
+    fn att_syntax_contract_intel_shaped_lines() {
+        // The classifier reads dest-LAST (AT&T). An Intel reader would flip
+        // every verdict below — but Intel-syntax lines never occur (GCC
+        // dialect alternatives resolve to the AT&T branch, and the emitters
+        // speak AT&T natively), so these pin the contract, not a dialect.
+        for line in [
+            "    movq %rax, %rbx",
+            "    movl %eax, %ebx",
+            "    addq %rax, %rbx",
+            "    leaq (%rax), %rbx",
+        ] {
+            assert!(!asm_line_writes_rax(line), "AT&T dest-last: {line:?}");
+        }
+        assert!(asm_line_writes_rax("    movq %rbx, %rax"));
+    }
+
+    #[test]
     fn unknown_mnemonics_fail_loud() {
         // An unclassified mnemonic whose DESTINATION is rax-shaped still
         // reports a write (dest-last is universal in AT&T) and is recorded
@@ -4323,6 +4387,10 @@ mod rcx_epoch_analyzer_tests {
             "    btrq %rax, %rcx",
             "    mulxq %rbx, %rax, %rcx",
             "    rdrand %ecx",
+            // Short-`movs` with operands is MOVSX (the `rep` is ignored):
+            // a write here comes from the explicit %rcx destination alone.
+            "    rep movsl %eax, %ecx",
+            "    rep movsb %al, %cl",
         ] {
             assert!(asm_line_writes_rcx(line), "must WRITE rcx: {line:?}");
         }
@@ -4347,9 +4415,16 @@ mod rcx_epoch_analyzer_tests {
             // `rep*` on a string-op base consumes the %rcx counter.
             "    rep stosq",
             "    rep movsb",
+            "    rep movsl",
+            "    rep movsq",
             "    repz cmpsb",
             "    repne scasb",
             "    rep lodsl",
+            // Memory-memory short-`movs` IS the string op (GAS-accepted,
+            // encoding A4/A5): `rep` counts %rcx despite the operands.
+            "    rep movsl (%esi),(%edi)",
+            "    rep movsl %ds:(%esi),%es:(%edi)",
+            "    rep movsb (%esi),(%edi)",
             // Both-operand class with a %rcx operand.
             "    lock xaddl %ecx, (%rsp)",
             "    xchgq %rax, %rcx",
@@ -4377,6 +4452,14 @@ mod rcx_epoch_analyzer_tests {
             // The `rep` prefix on a non-string base is an ignored hint.
             "    rep ret",
             "    rep nop",
+            // Short-`movs` with a register destination is MOVSX, not a
+            // string op: the `rep` is ignored and a non-%rcx destination
+            // writes nothing (memory sources included).
+            "    rep movsl %eax, %ebx",
+            "    rep movsw %ax, %dx",
+            "    rep movsq %rax, %rbx",
+            "    rep movsl (%rax), %ebx",
+            "    rep movsb %al, %bl",
             // One-operand mul/div/idiv/imul write the implicit rax:rdx
             // pair; the explicit %rcx-looking operand is the SOURCE.
             "    divq %rcx",
@@ -4408,6 +4491,22 @@ mod rcx_epoch_analyzer_tests {
         ] {
             assert!(!asm_line_writes_rcx(line), "must NOT write rcx: {line:?}");
         }
+    }
+
+    #[test]
+    fn rcx_att_syntax_contract_intel_shaped_lines() {
+        // Dest-LAST (AT&T) reading, like the %rax side: an Intel reader
+        // would flip every verdict. Intel-syntax lines never occur (see
+        // `classify_rcx_line`), so these pin the contract, not a dialect.
+        for line in [
+            "    movq %rcx, %rbx",
+            "    movl %ecx, %ebx",
+            "    addq %rcx, %rbx",
+            "    leaq (%rcx), %rbx",
+        ] {
+            assert!(!asm_line_writes_rcx(line), "AT&T dest-last: {line:?}");
+        }
+        assert!(asm_line_writes_rcx("    movq %rbx, %rcx"));
     }
 }
 

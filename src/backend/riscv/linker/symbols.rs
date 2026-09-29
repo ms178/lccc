@@ -179,7 +179,11 @@ pub fn mark_plt_and_copy_symbols(
     for (name, sym) in global_syms.iter_mut() {
         if !sym.defined {
             if let Some(shlib_sym) = shared_lib_syms.get(name) {
-                if shlib_sym.sym_type() == STT_OBJECT {
+                // Untyped (STT_NOTYPE) exports: data copies (bfd-compatible),
+                // code keeps its PLT (see DynSymbol::in_exec_segment).
+                if shlib_sym.sym_type() == STT_OBJECT
+                    || (shlib_sym.sym_type() == STT_NOTYPE && !shlib_sym.in_exec_segment)
+                {
                     copy_symbols.push((name.clone(), shlib_sym.size));
                 } else {
                     sym.needs_plt = true;

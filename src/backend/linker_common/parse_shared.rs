@@ -7,10 +7,44 @@
 use super::types::DynSymbol;
 use crate::backend::elf::{
     DT_GNU_HASH, DT_NULL, DT_SONAME, DT_STRSZ, DT_STRTAB, DT_SYMTAB, DT_VERSYM, ELF_MAGIC,
-    ELFCLASS64, ELFDATA2LSB, ET_DYN, PT_DYNAMIC, SHN_UNDEF, SHT_DYNAMIC, SHT_DYNSYM,
+    ELFCLASS64, ELFDATA2LSB, ET_DYN, PF_X, PT_DYNAMIC, PT_LOAD, SHN_UNDEF, SHT_DYNAMIC, SHT_DYNSYM,
     SHT_GNU_VERDEF, SHT_GNU_VERSYM, read_cstr, read_i64, read_u16, read_u32, read_u64, slice_at,
     table_entry,
 };
+
+/// LOAD segments of a 64-bit library: `(p_vaddr, p_vaddr + p_memsz, is_exec)`.
+/// Used to place each export in code vs data without section headers.
+fn load_segments(
+    data: &[u8],
+    e_phoff: usize,
+    e_phentsize: usize,
+    e_phnum: usize,
+) -> Vec<(u64, u64, bool)> {
+    let mut segs = Vec::new();
+    for i in 0..e_phnum {
+        if e_phentsize < 56 || table_entry(data, e_phoff, i, e_phentsize).is_none() {
+            break;
+        }
+        let ph = e_phoff + i * e_phentsize;
+        if read_u32(data, ph) != PT_LOAD {
+            continue;
+        }
+        let vaddr = read_u64(data, ph + 16);
+        let memsz = read_u64(data, ph + 40);
+        let flags = read_u32(data, ph + 4);
+        segs.push((vaddr, vaddr.saturating_add(memsz), flags & PF_X != 0));
+    }
+    segs
+}
+
+/// True when `vaddr` falls inside an executable LOAD segment. An address in
+/// no segment (a degenerate library) reports false: data is the safe
+/// default (a stray COPY of unknown bytes reads zeros, while a stray PLT
+/// on data hands out a code address for a data read).
+fn addr_in_exec_segment(segs: &[(u64, u64, bool)], vaddr: u64) -> bool {
+    segs.iter()
+        .any(|&(lo, hi, exec)| exec && vaddr >= lo && vaddr < hi)
+}
 
 /// Extract dynamic symbols from a shared library (.so) file.
 ///
@@ -137,6 +171,10 @@ pub fn parse_shared_library_symbols(data: &[u8], lib_name: &str) -> Result<Vec<D
                 };
                 let sym_count = sym_data.len() / 24;
 
+                let e_phoff = read_u64(data, 32) as usize;
+                let e_phentsize = read_u16(data, 54) as usize;
+                let e_phnum = read_u16(data, 56) as usize;
+                let segs = load_segments(data, e_phoff, e_phentsize, e_phnum);
                 let mut symbols = Vec::new();
                 for j in 1..sym_count {
                     let off = j * 24;
@@ -190,6 +228,7 @@ pub fn parse_shared_library_symbols(data: &[u8], lib_name: &str) -> Result<Vec<D
                         size,
                         version,
                         is_default_ver,
+                        in_exec_segment: addr_in_exec_segment(&segs, value),
                     });
                 }
                 return Ok(symbols);
@@ -317,6 +356,7 @@ fn parse_shared_library_symbols_from_phdrs(
         0
     };
 
+    let segs = load_segments(data, e_phoff, e_phentsize, e_phnum);
     let mut symbols = Vec::new();
     for j in 1..sym_count {
         let off = symtab_file_offset + j * 24;
@@ -360,6 +400,7 @@ fn parse_shared_library_symbols_from_phdrs(
             size,
             version: None,
             is_default_ver,
+            in_exec_segment: addr_in_exec_segment(&segs, value),
         });
     }
 

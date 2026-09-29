@@ -314,6 +314,17 @@ gate "call-secondary-cache" fast \
 
 gate "vec-dead-remainder" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_vec_dead_remainder.sh
+gate "copy-alias-sizes" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_copy_alias_sizes.sh
+
+gate "notype-code-routing" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_linker_notype_code.sh
+
+gate "got64-old-spelling" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_got64_old_spelling.sh
+
+gate "tls-pie-preemptible" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_tls_pie_preemptible.sh
 
 gate "phi-acyclic-copy-order" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_phi_acyclic_order.sh

@@ -507,6 +507,7 @@ pub(super) fn emit_dynamic_executable(
             is_dynamic: false,
             copy_reloc: false,
             lib_sym_value: 0,
+            lib_in_exec: false,
         });
         if entry.defined_in.is_none() && !entry.is_dynamic {
             entry.value = sym.value;
@@ -734,7 +735,9 @@ pub(super) fn emit_dynamic_executable(
         if let Some(gsym) = globals.get(name) {
             if gsym.copy_reloc {
                 if ds + 5 < out.len() {
-                    out[ds + 4] = (STB_GLOBAL << 4) | STT_OBJECT;
+                    // Preserve the library's type: GNU ld publishes a
+                    // copy of an untyped (STT_NOTYPE) export as NOTYPE.
+                    out[ds + 4] = (STB_GLOBAL << 4) | (gsym.info & 0xf);
                     out[ds + 5] = 0;
                 }
                 w16(&mut out, ds + 6, 1);

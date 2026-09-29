@@ -46,6 +46,11 @@ pub struct GlobalSymbol {
     /// and `INTERNAL` additionally keep it out of `.dynsym`.
     pub visibility: u8,
     pub lib_sym_value: u64,
+    /// True when `lib_sym_value` falls inside a `PF_X` LOAD segment of the
+    /// defining library (see `DynSymbol::in_exec_segment`). Only meaningful
+    /// for dynamic symbols; lets the COPY-vs-PLT classifier tell untyped
+    /// data (copy) from untyped code (PLT) when `info` is `STT_NOTYPE`.
+    pub lib_in_exec: bool,
     pub version: Option<String>,
     /// The value is a link-time constant rather than an address in this
     /// output: an `SHN_ABS` definition in an object, or a `--defsym` whose
@@ -155,6 +160,7 @@ impl GlobalSymbolOps for GlobalSymbol {
             canonical_plt: false,
             visibility: 0,
             lib_sym_value: 0,
+            lib_in_exec: false,
             version: None,
             absolute: sym.shndx == SHN_ABS,
         }
@@ -174,6 +180,7 @@ impl GlobalSymbolOps for GlobalSymbol {
             canonical_plt: false,
             visibility: 0,
             lib_sym_value: 0,
+            lib_in_exec: false,
             version: None,
             absolute: false,
         }
@@ -193,6 +200,7 @@ impl GlobalSymbolOps for GlobalSymbol {
             canonical_plt: false,
             visibility: 0,
             lib_sym_value: 0,
+            lib_in_exec: false,
             version: None,
             absolute: false,
         }
@@ -216,6 +224,7 @@ impl GlobalSymbolOps for GlobalSymbol {
             canonical_plt: false,
             visibility: 0,
             lib_sym_value: dsym.value,
+            lib_in_exec: dsym.in_exec_segment,
             version: dsym.version.clone(),
             absolute: false,
         }

@@ -113,6 +113,22 @@ pub(super) struct PieRelative {
     pub sym_idx: usize,
 }
 
+/// True when a dynamic symbol of ELF type `sym_type`, defined at a library
+/// address inside (`lib_in_exec`) or outside an executable LOAD segment, is
+/// COPY-relocated by a *data* reference (a `PC32` load/store/LEA, an
+/// absolute address-taking). `STT_OBJECT` always qualifies; `STT_NOTYPE`
+/// (hand-written asm without `.type`) qualifies only in data: bfd copies
+/// those too, while an untyped *function* keeps its PLT so that
+/// `lea f(%rip)` still calls real code (bfd refuses that shape outright
+/// with a TEXTREL error in a PIE; we keep linking and stay correct).
+/// Calls (`R_X86_64_PLT32`) use this too: a call to known data is UB whose
+/// crash merely moves from the library's bytes to the copy. The same
+/// data-ness test serves the shared link, where no COPY exists but data
+/// still takes no PLT entry of its own (`@PLTOFF`).
+pub(super) fn copy_data_type(sym_type: u8, lib_in_exec: bool) -> bool {
+    sym_type == STT_OBJECT || (sym_type == STT_NOTYPE && !lib_in_exec)
+}
+
 /// Whether an `R_X86_64_64` against global `g`, stored in a section with
 /// flags `sh_flags`, is left for ld.so to fill through a symbolic dynamic
 /// `R_X86_64_64` (an `AbsDynReloc`) rather than resolved by this link.
@@ -129,13 +145,13 @@ pub(super) struct PieRelative {
 ///   [`GlobalSymbol::canonical_plt`].
 ///
 /// Every input to the decision is final once `create_plt_got` has run
-/// (`copy_reloc` is only ever set on `STT_OBJECT`s, and it is only consulted
-/// for those), so the planner, the `RELATIVE` filter and the relocation
-/// applier all agree by calling this one function.
+/// (`copy_reloc` is only ever set on data types ([`copy_data_type`]), and it
+/// is only consulted for those), so the planner, the `RELATIVE` filter and
+/// the relocation applier all agree by calling this one function.
 pub(super) fn abs64_defers_to_loader(g: &GlobalSymbol, sh_flags: u64, is_pie: bool) -> bool {
     g.is_dynamic
         && !g.copy_reloc
-        && ((g.info & 0xf) == STT_OBJECT || (is_pie && sh_flags & SHF_WRITE != 0))
+        && (copy_data_type(g.info & 0xf, g.lib_in_exec) || (is_pie && sh_flags & SHF_WRITE != 0))
 }
 
 /// True when the value the relocation applier stores for an `R_X86_64_64`
@@ -293,6 +309,7 @@ pub(super) fn create_plt_got(
     objects: &[ElfObject],
     globals: &mut FxHashMap<String, GlobalSymbol>,
     is_pie: bool,
+    preemptible_tls: &crate::common::fx_hash::FxHashSet<String>,
 ) -> (
     Vec<String>,
     Vec<(String, bool)>,
@@ -385,12 +402,13 @@ pub(super) fn create_plt_got(
                 }
                 let gsym_info = globals
                     .get(sym.name.as_str())
-                    .map(|g| (g.is_dynamic, g.info & 0xf));
+                    .map(|g| (g.is_dynamic, g.info & 0xf, g.lib_in_exec));
 
                 match rela.rela_type {
                     R_X86_64_PLT32 | R_X86_64_PC32 if gsym_info.map(|g| g.0).unwrap_or(false) => {
                         let sym_type = gsym_info.map(|g| g.1).unwrap_or(0);
-                        if sym_type == STT_OBJECT {
+                        let lib_in_exec = gsym_info.map(|g| g.2).unwrap_or(false);
+                        if copy_data_type(sym_type, lib_in_exec) {
                             // Dynamic data symbol - needs copy relocation
                             if copy_reloc_set.insert(sym.name.to_string()) {
                                 copy_reloc_names.push(sym.name.to_string());
@@ -469,7 +487,11 @@ pub(super) fn create_plt_got(
                     // Its link-time address is its copy, so it is resolved as
                     // any direct reference to it is.
                     R_X86_64_PLTOFF64 if gsym_info.map(|g| g.0).unwrap_or(false) => {
-                        if gsym_info.map(|g| g.1) == Some(STT_OBJECT) {
+                        let sym_type = gsym_info.map(|g| g.1).unwrap_or(0);
+                        let lib_in_exec = gsym_info.map(|g| g.2).unwrap_or(false);
+                        // Untyped data copies like OBJECT; untyped code keeps
+                        // its PLT (its link-time address is the stub).
+                        if copy_data_type(sym_type, lib_in_exec) {
                             if copy_reloc_set.insert(sym.name.to_string()) {
                                 copy_reloc_names.push(sym.name.to_string());
                             }
@@ -481,15 +503,14 @@ pub(super) fn create_plt_got(
                         // Rewritten to `mov/add $tpoff` when the target is
                         // this executable's own TLS and the instruction is
                         // one the rewrite covers; only the rest need a slot.
-                        let relaxed = globals
-                            .get(sym.name.as_str())
-                            .is_some_and(exec_ie_target_local)
-                            && gottpoff_ie_to_le(
-                                t,
-                                obj.section_data[sec_idx].as_slice(),
-                                rela.offset as usize,
-                            )
-                            .is_some();
+                        let relaxed = globals.get(sym.name.as_str()).is_some_and(|g| {
+                            exec_ie_target_local(g) && !preemptible_tls.contains(sym.name.as_str())
+                        }) && gottpoff_ie_to_le(
+                            t,
+                            obj.section_data[sec_idx].as_slice(),
+                            rela.offset as usize,
+                        )
+                        .is_some();
                         if !relaxed
                             && !plt_set.contains(sym.name.as_str())
                             && got_only_set.insert(sym.name.to_string())
@@ -502,7 +523,8 @@ pub(super) fn create_plt_got(
                         // needs a GOT slot carrying an R_X86_64_TPOFF64 dynamic
                         // relocation. GD against local symbols relaxes to LE
                         // (no GOT entry needed).
-                        if gsym_info.map(|g| g.0).unwrap_or(false)
+                        if (gsym_info.map(|g| g.0).unwrap_or(false)
+                            || preemptible_tls.contains(sym.name.as_str()))
                             && !plt_set.contains(sym.name.as_str())
                             && got_only_set.insert(sym.name.to_string())
                         {
@@ -511,8 +533,10 @@ pub(super) fn create_plt_got(
                     }
                     _ if gsym_info.map(|g| g.0).unwrap_or(false) => {
                         let sym_type = gsym_info.map(|g| g.1).unwrap_or(0);
+                        let lib_in_exec = gsym_info.map(|g| g.2).unwrap_or(false);
+                        let is_data = copy_data_type(sym_type, lib_in_exec);
                         if rela.rela_type == R_X86_64_64 {
-                            if sym_type != STT_OBJECT && !(is_pie && sh_flags & SHF_WRITE != 0) {
+                            if !is_data && !(is_pie && sh_flags & SHF_WRITE != 0) {
                                 // Function pointer in storage the loader does
                                 // not otherwise touch (a non-PIE, or read-only
                                 // data): the address we store is our PLT entry,
@@ -521,7 +545,7 @@ pub(super) fn create_plt_got(
                                     plt_names.push(sym.name.to_string());
                                 }
                                 canonical_plt_set.insert(sym.name.to_string());
-                            } else if sym_type != STT_OBJECT {
+                            } else if !is_data {
                                 // PIE, writable storage: let ld.so store the
                                 // real address (see `abs64_defers_to_loader`).
                                 abs_dyn_relocs.push(AbsDynReloc {
@@ -588,7 +612,7 @@ pub(super) fn create_plt_got(
                             // into the GOT-only arm below, which gave the
                             // symbol a slot nothing read and resolved the field
                             // itself to 0.)
-                            if sym_type == STT_OBJECT {
+                            if is_data {
                                 if copy_reloc_set.insert(sym.name.to_string()) {
                                     copy_reloc_names.push(sym.name.to_string());
                                 }
@@ -619,7 +643,7 @@ pub(super) fn create_plt_got(
         if let Some(gsym) = globals.get_mut(name) {
             gsym.copy_reloc = true;
             if let Some(ref lib) = gsym.from_lib {
-                if (gsym.info & 0xf) == STT_OBJECT && gsym.lib_sym_value != 0 {
+                if copy_data_type(gsym.info & 0xf, gsym.lib_in_exec) && gsym.lib_sym_value != 0 {
                     let key = (lib.clone(), gsym.lib_sym_value);
                     if !copy_reloc_lib_addrs.contains(&key) {
                         copy_reloc_lib_addrs.push(key);
@@ -635,7 +659,7 @@ pub(super) fn create_plt_got(
             .filter(|(name, g)| {
                 g.is_dynamic
                     && !g.copy_reloc
-                    && (g.info & 0xf) == STT_OBJECT
+                    && copy_data_type(g.info & 0xf, g.lib_in_exec)
                     && !copy_reloc_set.contains(*name)
                     && g.from_lib.is_some()
                     && g.lib_sym_value != 0
@@ -710,6 +734,7 @@ mod tests {
             canonical_plt: false,
             visibility: 0,
             lib_sym_value: 0x1000,
+            lib_in_exec: false,
             version: None,
             absolute: false,
         }
@@ -750,6 +775,39 @@ mod tests {
         assert!(!abs64_defers_to_loader(&func, ro, true));
         assert!(abs64_value_is_local(&func, ro, true));
         assert!(!abs64_defers_to_loader(&func, rw, false));
+    }
+
+    #[test]
+    fn copy_data_type_admits_untyped_data_only() {
+        assert!(copy_data_type(STT_OBJECT, false));
+        assert!(copy_data_type(STT_OBJECT, true));
+        // Untyped asm without `.type`: data copies (bfd-compatible), code
+        // keeps its PLT.
+        assert!(copy_data_type(STT_NOTYPE, false));
+        assert!(!copy_data_type(STT_NOTYPE, true));
+        assert!(!copy_data_type(STT_FUNC, false));
+        assert!(!copy_data_type(STT_FUNC, true));
+        assert!(!copy_data_type(STT_GNU_IFUNC, false));
+        assert!(!copy_data_type(STT_TLS, false));
+    }
+
+    #[test]
+    fn abs64_untyped_data_defers_like_object() {
+        let mut untyped_data = dso_sym(STT_NOTYPE);
+        untyped_data.lib_in_exec = false;
+        let mut untyped_code = dso_sym(STT_NOTYPE);
+        untyped_code.lib_in_exec = true;
+        let (ro, rw) = (SHF_ALLOC, SHF_ALLOC | SHF_WRITE);
+        // Data in read-only storage: the linker's (copy-relocated home).
+        assert!(abs64_defers_to_loader(&untyped_data, ro, false));
+        assert!(abs64_defers_to_loader(&untyped_data, rw, true));
+        // Code behaves like a function: the loader's only in writable PIE
+        // storage, otherwise our canonical PLT entry.
+        assert!(abs64_defers_to_loader(&untyped_code, rw, true));
+        assert!(!abs64_value_is_local(&untyped_code, rw, true));
+        assert!(!abs64_defers_to_loader(&untyped_code, ro, true));
+        assert!(abs64_value_is_local(&untyped_code, ro, true));
+        assert!(!abs64_defers_to_loader(&untyped_code, rw, false));
     }
 
     #[test]

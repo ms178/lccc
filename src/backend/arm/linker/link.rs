@@ -611,6 +611,7 @@ fn apply_defsyms(
                 is_dynamic: false,
                 copy_reloc: false,
                 lib_sym_value: 0,
+                lib_in_exec: false,
             },
         );
     }

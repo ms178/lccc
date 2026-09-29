@@ -90,6 +90,14 @@ pub struct DynSymbol {
     pub info: u8,
     pub value: u64,
     pub size: u64,
+    /// True when `value` falls inside a `PF_X` LOAD segment of the defining
+    /// library. Untyped (`STT_NOTYPE`) exports — hand-written asm without
+    /// `.type` — cannot be classified by `info` alone: the COPY-vs-PLT
+    /// decision routes NOTYPE-in-data to a copy relocation (bfd-compatible)
+    /// while NOTYPE-in-text keeps its PLT (a `lea f(%rip)` of an untyped
+    /// function must still call real code). Computed from program headers
+    /// (always present) rather than section headers (often stripped).
+    pub in_exec_segment: bool,
     /// GLIBC version string for this symbol (e.g. "GLIBC_2.3"), if any.
     pub version: Option<String>,
     /// Whether this is the default version (@@GLIBC_x.y vs @GLIBC_x.y).

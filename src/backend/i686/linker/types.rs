@@ -224,12 +224,35 @@ pub(super) struct LinkerSymbol {
     /// same library are one object and share one copy (see
     /// `link::register_copy_aliases`).
     pub lib_value: u32,
+    /// True when `lib_value` falls inside a `PF_X` LOAD segment of the
+    /// defining library. Only meaningful for dynamic symbols; lets the
+    /// COPY-alias sweep tell untyped data (join the copy) from untyped
+    /// code (stay out) when `sym_type` is `STT_NOTYPE`.
+    pub lib_in_exec: bool,
     /// A shared-library function whose PLT entry is its address in this
     /// executable (an `R_386_32`, or an `R_386_PC32` that is not a branch):
     /// `.dynsym` then publishes the PLT entry as the undefined symbol's
     /// value, so ld.so resolves every other module's references to the same
     /// address and `&f` compares equal everywhere (the psABI "canonical PLT").
     pub canonical_plt: bool,
+}
+
+/// True when a shared-library export of ELF type `sym_type`, defined at a
+/// library address inside (`in_exec`) or outside an executable LOAD
+/// segment, joins a copy relocation. Mirrors the x86-64 classifier:
+/// `STT_OBJECT` always qualifies, `STT_NOTYPE` (asm without `.type`) only
+/// in data — an untyped function stays out, so its callers keep real code.
+pub(super) fn copy_data_type(sym_type: u8, in_exec: bool) -> bool {
+    sym_type == STT_OBJECT || (sym_type == STT_NOTYPE && !in_exec)
+}
+
+/// True when a shared-library export takes the PLT on a code reference
+/// (call or address-of): functions, plus untyped exports in executable
+/// segments. The deliberate mirror of [`copy_data_type`], not its negation:
+/// TLS, COMMON and other types take NEITHER path (their old routing),
+/// so only NOTYPE-code changes behavior here.
+pub(super) fn is_plt_code_type(sym_type: u8, in_exec: bool) -> bool {
+    sym_type == STT_FUNC || sym_type == STT_GNU_IFUNC || (sym_type == STT_NOTYPE && in_exec)
 }
 
 impl LinkerSymbol {
@@ -260,6 +283,7 @@ impl LinkerSymbol {
             copy_addr: 0,
             version: d.version.clone(),
             lib_value: d.value,
+            lib_in_exec: d.in_exec,
             canonical_plt: false,
         }
     }
@@ -292,6 +316,10 @@ pub(super) struct DynSymInfo {
     /// `environ` and strong `__environ`), which a copy relocation must move
     /// together.
     pub value: u32,
+    /// True when `value` falls inside a `PF_X` LOAD segment of the defining
+    /// library. Lets the COPY-alias sweep tell untyped data (join the copy)
+    /// from untyped code (stay out) when `sym_type` is `STT_NOTYPE`.
+    pub in_exec_segment: bool,
     /// DT_SONAME of the shared object defining the symbol (None when it has
     /// none; the caller then falls back to the name the library was found by).
     pub soname: Option<String>,
