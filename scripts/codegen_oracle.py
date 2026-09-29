@@ -80,6 +80,7 @@ from typing import Any, Iterable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import godbolt  # noqa: E402
+import godbolt_cache  # noqa: E402
 
 DEFAULT_FLAGS = "-O3 -march=x86-64-v3"
 # Rank mode keeps the scoreboard's historical survey default so old
@@ -308,23 +309,22 @@ def _local_compile(executable: str, source: Path, flags: str) -> list[str]:
 
 def _compile_remote(name: str, source: str, flags: str) -> list[str]:
     cid = godbolt.resolve_compiler(name)
-    # att-v2 cache absorbed from codegen_scoreboard.py so batch compare and
-    # --rank share one remote-compile path.  The digest pins syntax/parser
-    # ABI (a pre-v2 cache stored Intel syntax, which made AT&T load/store
-    # metrics silently read as zero) and the network is hit once per
-    # (compiler, flags, source) tuple instead of once per report mode.
-    key = hashlib.sha256(f"att-v2\0{cid}\0{flags}\0{source}".encode()).hexdigest()[:32]
-    hit = godbolt.CACHE / f"{key}.s"
-    if hit.exists():
-        return hit.read_text(errors="replace").splitlines()
+    # One remote-compile path for every report mode, through the cache shared
+    # with tools/oracle/godbolt_oracle.py and scripts/encdiff.py
+    # (scripts/godbolt_cache.py). The `att-v2` namespace pins the syntax
+    # contract -- a pre-v2 cache stored Intel syntax, which made AT&T
+    # load/store metrics silently read as zero in a table that then looked
+    # like a triumph -- and bumping it is how a format change invalidates old
+    # records instead of poisoning new ones. The network is hit once per
+    # (compiler, flags, source) tuple: once per report mode, and once ever.
+    hit = godbolt_cache.load_lines(godbolt_cache.NS_ASM, cid, flags, source)
+    if hit is not None:
+        return hit
     data = godbolt.compile_on_godbolt(cid, source, flags, intel=False)
     if data is None:
         raise godbolt.GodboltError(f"remote compile failed: {name} ({cid})")
     lines = godbolt.assembly_lines(data)
-    godbolt.CACHE.mkdir(parents=True, exist_ok=True)
-    tmp = hit.with_suffix(f".tmp.{os.getpid()}.{threading.get_ident()}")
-    tmp.write_text("\n".join(lines))
-    tmp.replace(hit)
+    godbolt_cache.store_lines(godbolt_cache.NS_ASM, lines, cid, flags, source)
     return lines
 
 

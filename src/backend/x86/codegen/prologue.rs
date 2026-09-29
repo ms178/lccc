@@ -2303,11 +2303,28 @@ impl X86Codegen {
         // layout (`self.state.value_locations`, `space`).  Purely
         // observational — it never mutates codegen state.
         if crate::backend::stack_layout::slot_census_enabled() {
+            // `src/backend/x86` IS the x86-64 backend: `Target::I686` has its
+            // own backend (`src/backend/i686`).  The width is therefore a
+            // property of this file rather than of whatever target the driver
+            // last selected, and saying so explicitly is the point -- the
+            // census classifies types with the allocator's own
+            // `is_non_gpr_type(ty, is_32bit)`, so a census computed from a
+            // different width than the allocator used would attribute causes
+            // that are simply wrong.  The assert makes that unrepresentable
+            // instead of merely unlikely.
+            let census_is_32bit = false;
+            debug_assert_eq!(
+                census_is_32bit,
+                crate::common::types::target_is_32bit(),
+                "x86-64 backend census running under a 32-bit target: the \
+                 census would classify types at the wrong width"
+            );
             let entries = crate::backend::stack_layout::build_slot_census(
                 func,
                 &self.state,
                 &ra_eligible,
                 &reg_assigned,
+                census_is_32bit,
             );
             crate::backend::stack_layout::emit_slot_census(
                 func,

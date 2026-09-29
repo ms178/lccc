@@ -39,10 +39,15 @@ from typing import Any
 
 API = os.environ.get("GODBOLT_API", "https://godbolt.org/api").rstrip("/")
 USER_AGENT = "lccc-codegen-research/2 (+https://github.com/ms178/lccc)"
-CACHE = Path(os.environ.get(
-    "GODBOLT_CACHE",
-    str(Path(__file__).resolve().parent.parent / ".godbolt-cache"),
-))
+
+# Where records live, and how they are written, is now one module's job:
+# scripts/godbolt_cache.py is shared with tools/oracle/godbolt_oracle.py,
+# scripts/encdiff.py and scripts/codegen_oracle.py so that all four tools hit
+# the network once per tuple instead of once per tool. `CACHE` stays a module
+# attribute because existing callers address it as `godbolt.CACHE`.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import godbolt_cache  # noqa: E402
+CACHE = godbolt_cache.CACHE
 
 # Required competition set. Keep these ids reviewable and deterministic.
 # ICC Classic ended at 2021.10.0; ICX remains a moving channel and is therefore
