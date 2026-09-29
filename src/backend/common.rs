@@ -652,24 +652,34 @@ pub(crate) fn with_sysroot_prefix(path: &str) -> String {
     }
 }
 
-/// Existence probe honouring LCCC_SYSROOT (prefixed path first, host fallback).
-// See the with_sysroot_prefix note: used by the unconditional i686 shared
-// linker path, so this must exist under `gcc_linker` too.
-pub(crate) fn exists_with_sysroot(path: &str) -> bool {
-    std::path::Path::new(&with_sysroot_prefix(path)).exists() || std::path::Path::new(path).exists()
-}
-
-/// Resolve a discovery candidate to an existing directory.
-/// Prefers the LCCC_SYSROOT-prefixed variant when populated, then the host
-/// path, otherwise reports absence via `None`.
+/// Resolve the directory that actually contains `file`: the
+/// LCCC_SYSROOT-prefixed candidate first, then the host path; `None` when
+/// neither root carries the file.
+///
+/// Probing the file and resolving the directory MUST be one atomic step.
+/// The previous shape — an `exists()` on the file followed by an independent
+/// dir-level preference for the sysroot — answered the existence question
+/// from one root and the *path* question from another. A partial sysroot
+/// tree (for example a 32-bit-only multilib unpack that carries
+/// `$SYSROOT/usr/lib/gcc/x86_64-linux-gnu/14/` as a directory but no 64-bit
+/// `crtbegin.o`/`libgcc.a` inside it) then satisfied the dir-existence
+/// test, every x86-64 link resolved its GCC lib dir under the sysroot,
+/// never saw the host's 64-bit `libgcc.a`, silently fell back to the
+/// host `libgcc_s.so.1` in the generic search dirs, and died with
+/// undefined `__bid_*` decimal-FP symbols — while a complete sysroot and
+/// a sysroot-less host both linked fine. The fused probe returns the same
+/// root that carried the evidence, so a sysroot can only ever ADD
+/// resolution capability, never remove the host's.
 #[cfg(not(feature = "gcc_linker"))]
-fn resolve_sysroot_dir(path: &str) -> Option<String> {
-    let prefixed = with_sysroot_prefix(path);
-    if std::path::Path::new(&prefixed).exists() {
+fn resolve_sysroot_file_dir(dir: &str, file: &str) -> Option<String> {
+    let prefixed = with_sysroot_prefix(dir);
+    if prefixed != dir
+        && std::path::Path::new(&format!("{}/{}", prefixed.trim_end_matches('/'), file)).exists()
+    {
         return Some(prefixed);
     }
-    if std::path::Path::new(path).exists() {
-        return Some(path.to_string());
+    if std::path::Path::new(&format!("{}/{}", dir.trim_end_matches('/'), file)).exists() {
+        return Some(dir.to_string());
     }
     None
 }
@@ -685,14 +695,13 @@ fn find_gcc_lib_dir(arch: &DirectLdArchConfig) -> Option<String> {
     for base in arch.gcc_lib_base_paths {
         for ver in arch.gcc_versions {
             let dir = format!("{}/{}", base, ver);
-            let mut candidates = vec![dir];
+            let mut candidates = vec![dir.clone()];
             for sub in arch.gcc_multilib_subdirs {
-                candidates.push(format!("{}/{}", candidates[0], sub));
+                candidates.push(format!("{}/{}", dir, sub));
             }
-            for dir in candidates {
-                let crtbegin = format!("{}/crtbegin.o", dir);
-                if exists_with_sysroot(&crtbegin) {
-                    return resolve_sysroot_dir(&dir);
+            for cand in candidates {
+                if let Some(resolved) = resolve_sysroot_file_dir(&cand, "crtbegin.o") {
+                    return Some(resolved);
                 }
             }
         }
@@ -704,9 +713,8 @@ fn find_gcc_lib_dir(arch: &DirectLdArchConfig) -> Option<String> {
         for ver in arch.gcc_versions {
             for sub in arch.gcc_multilib_subdirs {
                 let dir = format!("{}/{}/{}", base, ver, sub);
-                let crtbegin = format!("{}/crtbegin.o", dir);
-                if exists_with_sysroot(&crtbegin) {
-                    return resolve_sysroot_dir(&dir);
+                if let Some(resolved) = resolve_sysroot_file_dir(&dir, "crtbegin.o") {
+                    return Some(resolved);
                 }
             }
         }
@@ -719,9 +727,8 @@ fn find_gcc_lib_dir(arch: &DirectLdArchConfig) -> Option<String> {
 #[cfg(not(feature = "gcc_linker"))]
 fn find_crt_dir(arch: &DirectLdArchConfig) -> Option<String> {
     for dir in arch.crt_dir_candidates {
-        let crt1 = format!("{}/crt1.o", dir);
-        if exists_with_sysroot(&crt1) {
-            return resolve_sysroot_dir(dir);
+        if let Some(resolved) = resolve_sysroot_file_dir(dir, "crt1.o") {
+            return Some(resolved);
         }
     }
     None
@@ -763,8 +770,18 @@ fn resolve_builtin_link_setup(
         system_lib_paths.push(crt.clone());
     }
     for dir in arch.system_lib_dirs {
-        if let Some(resolved) = resolve_sysroot_dir(dir) {
-            system_lib_paths.push(resolved);
+        // Additive, never substitutive: when a sysroot carries this search
+        // directory, the host twin stays searchable right behind it. A
+        // partial sysroot (e.g. a 32-bit-only multilib unpack) must not
+        // shadow host libraries it does not carry; a complete one wins by
+        // search order — exactly the additive intent of the
+        // "un-prefixed host path remains a fallback" policy above.
+        let prefixed = with_sysroot_prefix(dir);
+        if prefixed != *dir && std::path::Path::new(&prefixed).exists() {
+            system_lib_paths.push(prefixed);
+        }
+        if std::path::Path::new(dir).exists() {
+            system_lib_paths.push(dir.to_string());
         }
     }
 
