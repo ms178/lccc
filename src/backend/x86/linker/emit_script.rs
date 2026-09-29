@@ -15,7 +15,7 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 use super::elf::*;
 use super::reloc_field::{self, w8_checked, w16_checked, w32_checked};
-use crate::backend::linker_common::defsym::{self, Defsym};
+use crate::backend::linker_common::defsym;
 use crate::backend::linker_common::{
     self,
     linker_script::{
@@ -774,82 +774,174 @@ struct OutSec {
     data_commands: Vec<(u64, u8, linker_script::Expr)>,
 }
 
+/// A script-path definition row: `(object index, shndx, value, size, info)`.
+type DefRow = (usize, u16, u64, u64, u8);
+
+/// `--defsym`s whose values need final addresses, left for after layout.
+#[derive(Debug)]
+struct ScriptDefsyms {
+    plan: defsym::DefsymPlan,
+    /// Input definitions a `--defsym` overrides but also reads (`a=a+1`),
+    /// as they were before the override.
+    shadow: FxHashMap<String, DefRow>,
+    /// Names still to evaluate, with the position of the defining
+    /// statement.  Each has a placeholder row (`SHN_UNDEF` under object
+    /// `usize::MAX`) so the name counts as defined -- a script
+    /// `PROVIDE(name = ...)` must not define it -- while `lookup_sym` and
+    /// relocation resolution still find no value for it.  The third field
+    /// is the name that last had no value, for the final diagnostic.
+    deferred: Vec<(String, usize, String)>,
+}
+
+/// The placeholder row of a deferred `--defsym` (see [`ScriptDefsyms`]).
+const DEFERRED_DEFSYM: DefRow = (usize::MAX, SHN_UNDEF, 0, 0, (STB_GLOBAL << 4) | STT_NOTYPE);
+
+/// The row of a computed `--defsym`: absolute, as GNU ld reports it.  `usize::MAX`
+/// rather than 0 keeps the object index visibly unused: `lookup_sym`
+/// returns `value` verbatim for `SHN_ABS`, and a stray 0 would name the
+/// first input object if that test were ever reordered.
+fn defsym_row(value: u64) -> DefRow {
+    (
+        usize::MAX,
+        SHN_ABS,
+        value,
+        0,
+        (STB_GLOBAL << 4) | STT_NOTYPE,
+    )
+}
+
 /// Apply `--defsym` to the script path's definition table.
 ///
-/// The table maps a name to `(object index, shndx, value, size, info)`, and
-/// `lookup_sym` already returns `value` verbatim when `shndx == SHN_ABS` -- so an
-/// absolute definition is `(usize::MAX, SHN_ABS, value, 0, GLOBAL|NOTYPE)`, with
-/// the object index never read. `usize::MAX` rather than 0 keeps that visible: a
-/// stray 0 would name the first input object if the SHN_ABS test were reordered.
+/// Binding and classification come from `linker_common::defsym::DefsymPlan`,
+/// as on the executable and shared paths, so all three agree on what a
+/// right-hand side means (forward references, redefinitions, self
+/// references) and a mistake is reported identically everywhere.
 ///
-/// Classification comes from `linker_common::defsym`, the same module the
-/// executable and shared paths use, so all three agree on what a right-hand side
-/// means and a typo is reported identically everywhere.
-///
-/// Expressions are the one form this path cannot always honour: a name defined
-/// inside an output section has no address until layout, and this runs before it.
-/// Rather than guess, that case says so and names the alternative that works.
+/// This runs before layout.  An alias of an input symbol is a copy of its
+/// definition row.  A value that needs no address (a constant, an
+/// expression over absolutes) is computed now, so the script's own
+/// expressions can use it during layout.  A value that reads an address --
+/// a section-resident input symbol, or a symbol the script assigns -- is
+/// deferred: [`ScriptDefsyms::resolve`] computes it once layout has placed
+/// what it reads.  (This path used to refuse those outright, so
+/// `--defsym b=_start+4` worked without `-T` and failed with it.)
 fn apply_script_defsyms(
-    def_syms: &mut FxHashMap<String, (usize, u16, u64, u64, u8)>,
+    def_syms: &mut FxHashMap<String, DefRow>,
     defs: &[(String, String)],
-) -> Result<(), String> {
-    for (pos, (name, expr)) in defs.iter().enumerate() {
-        // GNU's `--defsym:N` counter (1-based position in the link's defsym
-        // list), so a script-link failure reads exactly like a builtin-link
-        // one — and like GNU ld's.  See `DefsymError::gnu_message`.
-        let index = pos + 1;
-        let classified = defsym::classify(expr, |n| {
-            def_syms
-                .get(n)
-                .is_some_and(|&(_, shndx, _, _, _)| shndx != SHN_UNDEF)
-        })
-        .map_err(|e| e.gnu_message(index))?;
-        let value = match classified {
-            Defsym::Alias(target) => {
-                // `classify` returns `Alias` only for names this same
-                // predicate found in `def_syms`, and nothing mutates the
-                // map between the two — so the lookup cannot miss.  (The
-                // builtin paths CAN miss here: their predicate additionally
-                // accepts layout-derived magic names via
-                // `is_linker_defined`, which is why they defer instead.)
-                let target_def = *def_syms
-                    .get(&target)
-                    .expect("defsym Alias target vanished between classify and lookup");
-                def_syms.insert(name.clone(), target_def);
-                continue;
+    script_assigned: &FxHashSet<String>,
+) -> Result<ScriptDefsyms, String> {
+    use defsym::{DefsymError, DefsymPlan, LinkSym};
+    let plan = DefsymPlan::new(defs, |n| match def_syms.get(n) {
+        Some(&(_, SHN_ABS, _, _, _)) => LinkSym::Absolute,
+        Some(&(_, shndx, _, _, _)) if shndx != SHN_UNDEF => LinkSym::Address,
+        _ if script_assigned.contains(n) => LinkSym::Address,
+        _ => LinkSym::Undefined,
+    })?;
+    let shadow: FxHashMap<String, DefRow> = plan
+        .shadowed_names()
+        .into_iter()
+        .filter_map(|n| def_syms.get(n).map(|&d| (n.to_string(), d)))
+        .collect();
+    let mut computed: Vec<(String, usize)> = Vec::new();
+    for st in plan.finals() {
+        let copied = plan.aliased_link_symbol(st).and_then(|t| {
+            shadow
+                .get(t)
+                .or_else(|| def_syms.get(t))
+                .copied()
+                .filter(|&(_, shndx, _, _, _)| shndx != SHN_UNDEF)
+        });
+        match copied {
+            Some(row) => {
+                def_syms.insert(st.name.clone(), row);
             }
-            Defsym::Constant(v) => v,
-            Defsym::Expression(e) => {
-                let absolute_only = |n: &str| {
-                    def_syms
-                        .get(n)
-                        .and_then(|&(_, shndx, value, _, _)| (shndx == SHN_ABS).then_some(value))
-                };
-                match defsym::eval_with_symbols(&e, &absolute_only) {
-                    Ok(v) => v,
-                    // The name exists but lives in a section that is not placed
-                    // yet. That is neither an undefined symbol nor a syntax
-                    // error, and claiming either would send the user after the
-                    // wrong thing.
-                    Err(defsym::DefsymError::UndefinedSymbol(n)) if def_syms.contains_key(&n) => {
-                        return Err(defsym::DefsymError::NeedsLayout(e).gnu_message(index));
-                    }
-                    Err(err) => return Err(err.gnu_message(index)),
-                }
-            }
-        };
-        def_syms.insert(
-            name.clone(),
-            (
-                usize::MAX,
-                SHN_ABS,
-                value,
-                0,
-                (STB_GLOBAL << 4) | STT_NOTYPE,
-            ),
-        );
+            None => computed.push((st.name.clone(), st.index - 1)),
+        }
     }
-    Ok(())
+    // Before layout only absolute values exist; everything else is "not
+    // yet", which defers the statement rather than failing it.  The rows
+    // read here are input definitions (a `Link` binding never names a
+    // `--defsym`, except its own shadowed target).
+    let before_layout = |n: &str| match shadow.get(n).or_else(|| def_syms.get(n)) {
+        Some(&(_, SHN_ABS, value, _, _)) if !script_assigned.contains(n) => Ok(value),
+        _ => Err(DefsymError::NeedsLayout(n.to_string())),
+    };
+    let mut rows: Vec<(String, DefRow)> = Vec::with_capacity(computed.len());
+    let mut deferred = Vec::new();
+    for (name, pos) in computed {
+        match plan.evaluate_needed(&[pos], before_layout) {
+            Ok(values) => {
+                let value = values[pos]
+                    .ok_or_else(|| format!("internal error: --defsym {name} was not evaluated"))?;
+                rows.push((name, defsym_row(value)));
+            }
+            Err((_, DefsymError::NeedsLayout(missing))) => {
+                rows.push((name.clone(), DEFERRED_DEFSYM));
+                deferred.push((name, pos, missing));
+            }
+            Err((i, e)) => return Err(e.gnu_message(plan.statements[i].index)),
+        }
+    }
+    def_syms.extend(rows);
+    Ok(ScriptDefsyms {
+        plan,
+        shadow,
+        deferred,
+    })
+}
+
+impl ScriptDefsyms {
+    /// Compute every deferred value whose inputs now have values, replacing
+    /// the placeholder rows.  A name reads as `lookup_sym` and relocation
+    /// resolution read it -- a script assignment first (`script_value`),
+    /// then the definition table through `row_value` -- except a shadowed
+    /// input definition, which is read from its saved row.  Returns whether
+    /// anything was computed, so the caller can iterate this with the
+    /// script's own deferred assignments to a common fixed point.  An
+    /// error other than "not yet" is final.
+    fn resolve(
+        &mut self,
+        def_syms: &mut FxHashMap<String, DefRow>,
+        script_value: impl Fn(&str) -> Option<u64>,
+        row_value: impl Fn(DefRow) -> Option<u64>,
+    ) -> Result<bool, String> {
+        use defsym::DefsymError;
+        let mut progress = false;
+        let mut still = Vec::new();
+        for (name, pos, _) in std::mem::take(&mut self.deferred) {
+            let r = self.plan.evaluate_needed(&[pos], |n| {
+                match self.shadow.get(n) {
+                    Some(&row) => row_value(row),
+                    None => {
+                        script_value(n).or_else(|| def_syms.get(n).copied().and_then(&row_value))
+                    }
+                }
+                .ok_or_else(|| DefsymError::NeedsLayout(n.to_string()))
+            });
+            match r {
+                Ok(values) => {
+                    let value = values[pos].ok_or_else(|| {
+                        format!("internal error: --defsym {name} was not evaluated")
+                    })?;
+                    def_syms.insert(name, defsym_row(value));
+                    progress = true;
+                }
+                Err((_, DefsymError::NeedsLayout(missing))) => still.push((name, pos, missing)),
+                Err((i, e)) => return Err(e.gnu_message(self.plan.statements[i].index)),
+            }
+        }
+        self.deferred = still;
+        Ok(progress)
+    }
+
+    /// The error for a value that layout never made computable (it reads a
+    /// symbol of a discarded section, or a script symbol that did not
+    /// resolve): GNU ld's undefined-symbol diagnostic, naming it.
+    fn unresolved_error(&self) -> Option<String> {
+        let (_, pos, missing) = self.deferred.first()?;
+        let index = self.plan.statements[*pos].index;
+        Some(defsym::DefsymError::UndefinedSymbol(missing.clone()).gnu_message(index))
+    }
 }
 
 pub fn link_with_script(
@@ -1012,7 +1104,30 @@ fn link_with_script_machine(
     // ignore --defsym entirely: the name never entered def_syms, and the link
     // failed later with "undefined symbols: <name>", blaming the reference for a
     // definition the user had given on the command line.
-    apply_script_defsyms(&mut def_syms, defsym_defs)?;
+    // A right-hand side may also read a symbol the script assigns (`_end`,
+    // a PROVIDE'd marker): those have addresses only after layout.
+    let script_assigned: FxHashSet<String> = script
+        .sections
+        .iter()
+        .flat_map(|item| -> Vec<&Assignment> {
+            match item {
+                SectionsItem::Assign(a) => vec![a],
+                SectionsItem::Output(def) => def
+                    .items
+                    .iter()
+                    .filter_map(|i| match i {
+                        SecItem::Assign(a) => Some(a),
+                        _ => None,
+                    })
+                    .collect(),
+                SectionsItem::Assert(..) => Vec::new(),
+            }
+        })
+        .chain(script.top_assigns.iter())
+        .filter(|a| a.symbol != "." && a.symbol != "__assert__")
+        .map(|a| a.symbol.clone())
+        .collect();
+    let mut script_defsyms = apply_script_defsyms(&mut def_syms, defsym_defs, &script_assigned)?;
 
     // Symbols the *inputs* declared STV_HIDDEN/STV_INTERNAL. Visibility is an
     // ABI property decided by the compiler; the linker must honour it before
@@ -1839,10 +1954,22 @@ fn link_with_script_machine(
     }
 
     // ── Re-run deferred assignments to fixed point ──
+    // `--defsym` values that read addresses join the same fixed point: a
+    // script assignment may read a `--defsym` and vice versa.
     let mut made_progress = true;
     let mut pending = deferred;
-    while made_progress && !pending.is_empty() {
-        made_progress = false;
+    while made_progress && !(pending.is_empty() && script_defsyms.deferred.is_empty()) {
+        made_progress = script_defsyms.resolve(
+            &mut def_syms,
+            |n| symbols.get(n).copied(),
+            |(oi, shndx, value, _, _)| {
+                if shndx == SHN_ABS {
+                    Some(value)
+                } else {
+                    placed_map.get(&(oi, shndx as usize)).map(|b| b + value)
+                }
+            },
+        )?;
         let mut still: Vec<(Assignment, u64, Option<String>, bool)> = Vec::new();
         for (a, adot, adot_home, in_output_body) in pending.into_iter() {
             match eval_full(
@@ -1914,6 +2041,9 @@ fn link_with_script_machine(
             }
         }
         pending = still;
+    }
+    if let Some(e) = script_defsyms.unresolved_error() {
+        return Err(e);
     }
     // Evaluate top-level assigns/asserts (PROVIDE etc.) the same way.
     for a in &script.top_assigns {
@@ -2682,11 +2812,13 @@ fn link_with_script_machine(
                         // absolute symbol is an ordinary target then (its
                         // RIP-relative form is exact); in a PIE it must stay
                         // an immediate.  A plain R_X86_64_GOTPCREL promises
-                        // nothing about the instruction (GNU ld gives it a
-                        // GOT slot): only the rewrites that touch no prefix
-                        // byte are applied -- `mov` -> `lea` and the branch
-                        // forms -- by deciding it as a prefix-free
-                        // GOTPCRELX and never taking the immediate `mov`.
+                        // nothing about the instruction: only the rewrites
+                        // that touch no prefix byte (`mov` -> `lea`, the
+                        // branch forms) and only for a recognizable map-0
+                        // opcode -- deciding it as a GOTPCRELX, as this path
+                        // once did, turned `movrs` (`0f 38 8b`) into the
+                        // undefined `0f 38 8d`, and put an absolute symbol of
+                        // a PIE behind a sliding `lea`.
                         let absolute = if sym.is_local() {
                             sym.shndx == SHN_ABS
                         } else {
@@ -2699,25 +2831,14 @@ fn link_with_script_machine(
                         } else {
                             GotTarget::Image
                         };
-                        let as_type = if t == R_X86_64_GOTPCREL {
-                            R_X86_64_GOTPCRELX
-                        } else {
-                            t
-                        };
                         let kind = gotpcrelx_relaxation(
-                            as_type,
+                            t,
                             a,
                             obj.section_data[si].as_slice(),
                             rela.offset as usize,
                             is_pie,
                             target,
-                        )
-                        .map(|k| match k {
-                            GotRelax::Load { .. } if t == R_X86_64_GOTPCREL => {
-                                GotRelax::Load { imm: false }
-                            }
-                            k => k,
-                        });
+                        );
                         let Some(kind) = kind else {
                             let lo = (rela.offset as usize).saturating_sub(2);
                             let hi = (rela.offset as usize).min(obj.section_data[si].len());
@@ -2733,7 +2854,7 @@ fn link_with_script_machine(
                                 &obj.section_data[si][lo..hi]
                             ));
                         };
-                        let (at, v) = rewrite_got_relax(&mut out, fp, kind, as_type, s, p);
+                        let (at, v) = rewrite_got_relax(&mut out, fp, kind, t, s, p);
                         w32_checked(&mut out, at, v, t, &sym.name, &obj.source_name)?;
                     }
                     // GOTPC32: distance from the reference to the GOT origin.
@@ -4160,9 +4281,13 @@ const R_386_SIZE32: u32 = 38;
 
 #[cfg(test)]
 mod tests {
-    use super::apply_script_defsyms;
+    use super::{DEFERRED_DEFSYM, apply_script_defsyms};
     use crate::backend::elf::{SHN_ABS, STB_GLOBAL, STT_NOTYPE};
-    use crate::common::fx_hash::FxHashMap;
+    use crate::common::fx_hash::{FxHashMap, FxHashSet};
+
+    fn none() -> FxHashSet<String> {
+        FxHashSet::default()
+    }
 
     /// One `def_syms` row: (object index, section index, value, size, info).
     type DefSym = (usize, u16, u64, u64, u8);
@@ -4195,13 +4320,14 @@ mod tests {
         apply_script_defsyms(
             &mut syms,
             &defs(&[("k", "100"), ("bar", "foo"), ("off", "base+4")]),
+            &none(),
         )
         .unwrap();
         assert_eq!(syms.get("k").copied(), Some(abs(100)));
         assert_eq!(syms.get("bar").copied(), Some((3, 5, 0x401000, 0x20, 0x12)));
         assert_eq!(syms.get("off").copied(), Some(abs(104)));
         // A later defsym can build on an earlier one (command-line order).
-        apply_script_defsyms(&mut syms, &defs(&[("off2", "off+1")])).unwrap();
+        apply_script_defsyms(&mut syms, &defs(&[("off2", "off+1")]), &none()).unwrap();
         assert_eq!(syms.get("off2").copied(), Some(abs(105)));
     }
 
@@ -4211,31 +4337,67 @@ mod tests {
     #[test]
     fn failures_carry_gnu_counter_and_wording() {
         let mut syms: FxHashMap<String, DefSym> = FxHashMap::default();
-        let err =
-            apply_script_defsyms(&mut syms, &defs(&[("ok", "1"), ("x", "nosuch")])).unwrap_err();
+        let err = apply_script_defsyms(&mut syms, &defs(&[("ok", "1"), ("x", "nosuch")]), &none())
+            .unwrap_err();
         assert_eq!(
             err,
             "--defsym:2: undefined symbol `nosuch' referenced in expression"
         );
-        let err = apply_script_defsyms(&mut syms, &defs(&[("x", "1/0")])).unwrap_err();
+        let err = apply_script_defsyms(&mut syms, &defs(&[("x", "1/0")]), &none()).unwrap_err();
         assert_eq!(err, "--defsym:1 / by zero");
-        let err = apply_script_defsyms(&mut syms, &defs(&[("x", "(1+")])).unwrap_err();
+        let err = apply_script_defsyms(&mut syms, &defs(&[("x", "(1+")]), &none()).unwrap_err();
         assert_eq!(err, "--defsym:0: syntax error");
     }
 
-    /// An expression over a section-resident symbol (known, but with no
-    /// final address until layout) is `NeedsLayout` — neither "undefined
-    /// symbol" nor "syntax error", both of which would send the user
-    /// after the wrong thing.
+    /// An expression over a section-resident or script-assigned symbol
+    /// has no value before layout: it is deferred behind a placeholder
+    /// that keeps the name defined, and `resolve` computes it -- in GNU
+    /// ld's order semantics, forward references included -- from final
+    /// addresses.  A self reference reads the saved input row.
     #[test]
-    fn section_resident_expression_needs_layout() {
+    fn address_expressions_resolve_after_layout() {
         let mut syms: FxHashMap<String, DefSym> = FxHashMap::default();
-        syms.insert("placed_later".to_string(), (2, 1, 0, 0, 0x10));
-        let err = apply_script_defsyms(&mut syms, &defs(&[("x", "placed_later+4")])).unwrap_err();
+        syms.insert("anchor".to_string(), (2, 1, 0x10, 8, 0x12));
+        syms.insert("selfy".to_string(), (2, 3, 0, 8, 0x11));
+        let script: FxHashSet<String> = ["_end".to_string()].into_iter().collect();
+        let mut pending = apply_script_defsyms(
+            &mut syms,
+            &defs(&[
+                ("a", "b"),
+                ("b", "anchor+4"),
+                ("c", "b-anchor"),
+                ("selfy", "selfy+1"),
+                ("e", "_end"),
+                ("k", "c*0+7"),
+            ]),
+            &script,
+        )
+        .unwrap();
+        for n in ["a", "b", "c", "selfy", "e", "k"] {
+            assert_eq!(syms.get(n).copied(), Some(DEFERRED_DEFSYM), "{n}");
+        }
+        // Input section (2, 1) placed at 0x401000, (2, 3) at 0x600000.
+        let placed = |(oi, shndx, value, _, _): DefSym| match (oi, shndx) {
+            (_, SHN_ABS) => Some(value),
+            (2, 1) => Some(0x401000 + value),
+            (2, 3) => Some(0x600000 + value),
+            _ => None,
+        };
+        // `_end` not assigned yet: nothing that reads it resolves.
+        assert!(pending.resolve(&mut syms, |_| None, placed).unwrap());
+        assert_eq!(syms.get("e").copied(), Some(DEFERRED_DEFSYM));
         assert_eq!(
-            err,
-            "--defsym:1: expression 'placed_later+4' needs final symbol addresses, \
-             which this link path does not have; use a constant or a symbol alias"
+            pending.unresolved_error().as_deref(),
+            Some("--defsym:5: undefined symbol `_end' referenced in expression")
         );
+        let end = |n: &str| (n == "_end").then_some(0x700000);
+        assert!(pending.resolve(&mut syms, end, placed).unwrap());
+        assert!(pending.unresolved_error().is_none());
+        assert_eq!(syms.get("a").copied(), Some(abs(0x401014)));
+        assert_eq!(syms.get("b").copied(), Some(abs(0x401014)));
+        assert_eq!(syms.get("c").copied(), Some(abs(4)));
+        assert_eq!(syms.get("selfy").copied(), Some(abs(0x600001)));
+        assert_eq!(syms.get("e").copied(), Some(abs(0x700000)));
+        assert_eq!(syms.get("k").copied(), Some(abs(7)));
     }
 }

@@ -6,7 +6,7 @@
 
 use crate::backend::elf::{SHN_ABS, STB_GLOBAL, STT_NOTYPE};
 use crate::backend::linker_common::SymStr;
-use crate::backend::linker_common::defsym::{self, Defsym, DefsymError};
+use crate::backend::linker_common::defsym;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use std::path::Path;
 
@@ -19,109 +19,91 @@ use super::plt_got::{collect_ifunc_symbols, collect_local_ifuncs, create_plt_got
 use super::types::{GlobalSymbol, INTERP};
 use crate::backend::linker_common::{self, OutputSection};
 
+/// `--defsym` definitions planned before layout and finished after it.
+///
+/// The plan (`linker_common::defsym::DefsymPlan`) binds every reference and
+/// fixes each definition's kind -- address or absolute -- once, before
+/// layout, which is when the PLT/GOT need scan and the RELATIVE decisions
+/// must see them.  Values that need final addresses are computed by
+/// [`evaluate_pending_defsyms`] from the same plan, so the two phases cannot
+/// disagree about what a right-hand side refers to.
+pub(crate) struct PendingDefsyms {
+    plan: defsym::DefsymPlan,
+    /// Input definitions a `--defsym` overrides but also reads (`a=a+1`),
+    /// as they were before the override; their final addresses come from
+    /// the emitter's own placement rule.
+    shadow: FxHashMap<String, GlobalSymbol>,
+    /// Finally-defined names whose value is computed, with the position of
+    /// the defining statement.  (Aliases of input symbols are complete
+    /// copies made before layout and need nothing more.)
+    computed: Vec<(String, usize)>,
+}
+
 /// Apply `--defsym SYMBOL=EXPRESSION` to the global symbol table.
 ///
-/// Both link paths used to contain an alias-only loop: look the right-hand side
-/// up in `globals`, and if found copy its definition to the left-hand side. A
-/// constant (`--defsym far=0x1000`) and an arithmetic expression
-/// (`--defsym half=(_end-_start)/2`) both miss that lookup, and because the loop
-/// was `if let Some(..)` the miss was silent -- the symbol stayed undefined and
-/// the link failed later with "undefined symbols: far", blaming the reference
-/// for a definition the user had just given.
+/// Binding and classification live in `linker_common::defsym` so the ELF
+/// backends cannot disagree about what a right-hand side means; its
+/// [`defsym::DefsymPlan`] documents GNU ld's order semantics (earlier
+/// definitions, forward references, self references) that it reproduces.
 ///
-/// Classification lives in `linker_common::defsym` so the four ELF backends
-/// cannot disagree about what a right-hand side means. Definitions are applied in
-/// command-line order, which lets a later `--defsym` refer to an earlier one.
-///
-/// Aliases and constants resolve here, before layout. Expressions are only
-/// *validated* here and returned for deferred evaluation: their value depends
-/// on final symbol addresses, which exist only once the emitter has assigned
-/// section addresses. Evaluating them against the pre-layout (section-relative)
-/// values produced silently wrong addresses -- `--defsym x=_start+4` with
-/// `_start` at the beginning of `.text` yielded 4 instead of the final address,
-/// while GNU ld yields the layout address. The emitter calls
-/// [`evaluate_pending_defsyms`] after address finalisation, which is also after
-/// the linker-provided symbols (`_end`, `_etext`, …) exist, so expressions over
-/// them work exactly as in GNU ld.
+/// An alias of an input symbol (`--defsym a=real`, or a chain of `--defsym`
+/// aliases ending there) copies the whole definition, PLT/GOT slots and
+/// section included, so it IS that symbol.  Every other definition becomes
+/// a linker-created symbol (`defined_in == Some(usize::MAX)`): an absolute
+/// one (`SHN_ABS`, no relocation) or an address, as the plan classified it
+/// -- which PIE/`.so` emission needs before layout.  Its value is computed
+/// after layout ([`evaluate_pending_defsyms`]); constants need no layout
+/// but go through the same path, so there is exactly one.
 fn apply_defsyms(
     globals: &mut FxHashMap<String, GlobalSymbol>,
     defs: &[(String, String)],
-) -> Result<Vec<(String, String, usize)>, String> {
-    let mut pending: Vec<(String, String, usize)> = Vec::new();
-    for (pos, (name, expr)) in defs.iter().enumerate() {
-        let index = pos + 1;
-        // "Defined" means the same thing it means to `resolve_sym` and to the
-        // undefined-symbol check: the symbol belongs to some object, or is one
-        // this linker created (defined_in == Some(usize::MAX)).
-        // Layout-derived magic symbols (`_etext`, `end`, …) count as defined
-        // even though they only exist after layout — GNU ld resolves them
-        // during expression evaluation, and so do we (see
-        // `defsym::is_linker_defined`).
-        let classified = defsym::classify(expr, |n| {
-            globals.get(n).is_some_and(|g| g.defined_in.is_some()) || defsym::is_linker_defined(n)
-        })
-        .map_err(|e| e.gnu_message(index))?;
-        // Whether the definition is an address (slides with a PIE/.so load
-        // base) or a constant; see `GlobalSymbol::absolute`.
-        let (value, absolute) = match classified {
-            // Alias: copy the target's whole definition, PLT/GOT slots included,
-            // exactly as the old loop did. A target only the linker defines
-            // (a magic symbol) has no address until layout, so it is deferred
-            // to evaluation like an expression.
-            Defsym::Alias(target) => {
-                match globals.get(&target) {
-                    Some(sym) if sym.defined_in.is_some() => {
-                        if sym.is_dynamic {
-                            // GNU ld: a symbol visible only through a shared
-                            // library is not "defined in this link", so
-                            // aliasing it is an undefined-symbol error.
-                            return Err(DefsymError::UndefinedSymbol(target).gnu_message(index));
-                        }
-                        globals.insert(name.clone(), sym.clone());
-                        continue;
-                    }
-                    _ => {
-                        // Linker language symbol (`_etext`, `end`, …): the
-                        // arm's 0 becomes the usual placeholder (defined,
-                        // ABS) below, so the undefined-symbol check and the
-                        // PLT/GOT need scan see it;
-                        // `evaluate_pending_defsyms` overwrites the value
-                        // after layout.
-                        pending.push((name.clone(), target, index));
-                        (0, false)
-                    }
-                }
+) -> Result<PendingDefsyms, String> {
+    // "Defined" means what it means to `resolve_sym` and to the undefined-
+    // symbol check.  A symbol only a shared library defines is not defined
+    // in this link (GNU ld: undefined symbol referenced in expression).
+    let plan = defsym::DefsymPlan::new(defs, |n| match globals.get(n) {
+        Some(g) if g.defined_in.is_some() && !g.is_dynamic => {
+            if g.absolute {
+                defsym::LinkSym::Absolute
+            } else {
+                defsym::LinkSym::Address
             }
-            Defsym::Constant(v) => (v, true),
-            // Validated now (a typo must fail the link even though the value
-            // cannot be computed until layout), evaluated later.
-            // Its kind needs only WHICH operands are addresses, known now:
-            // an object symbol is one unless absolute, and the layout
-            // symbols `evaluate_pending_defsyms` will see are all addresses.
-            // (Any other name fails that evaluation as undefined.)
-            Defsym::Expression(e) => {
-                let is_addr = defsym::is_address_expression(&e, |n| match globals.get(n) {
-                    Some(g) if g.defined_in.is_some() => !g.absolute,
-                    _ => defsym::is_linker_defined(n),
-                })
-                .map_err(|e| e.gnu_message(index))?;
-                pending.push((name.clone(), e, index));
-                (0, !is_addr)
-            }
-        };
+        }
+        _ => defsym::LinkSym::Undefined,
+    })?;
+    let shadow: FxHashMap<String, GlobalSymbol> = plan
+        .shadowed_names()
+        .into_iter()
+        .filter_map(|n| globals.get(n).map(|g| (n.to_string(), g.clone())))
+        .collect();
+    let mut computed = Vec::new();
+    for st in plan.finals() {
+        // An alias's target is either not a `--defsym` name at all or the
+        // statement's own (shadowed) target, so this reads an input
+        // definition, never one inserted by this loop.
+        let copied = plan.aliased_link_symbol(st).and_then(|t| {
+            shadow
+                .get(t)
+                .or_else(|| globals.get(t))
+                .filter(|g| g.defined_in.is_some_and(|d| d != usize::MAX) && !g.is_dynamic)
+                .cloned()
+        });
+        if let Some(sym) = copied {
+            globals.insert(st.name.clone(), sym);
+            continue;
+        }
+        computed.push((st.name.clone(), st.index - 1));
         globals.insert(
-            name.clone(),
+            st.name.clone(),
             GlobalSymbol {
-                value,
+                // Overwritten by `evaluate_pending_defsyms` before any
+                // consumer (relocation applier, dynsym, symtab) reads it.
+                value: 0,
                 size: 0,
                 info: (STB_GLOBAL << 4) | STT_NOTYPE,
-                // `Some(usize::MAX)` is this linker's marker for a symbol it
-                // created itself: `resolve_sym` returns `value` verbatim for it
-                // and the symtab writer emits it as SHN_ABS, so the constant
-                // lands in no section and needs no relocation. For a pending
-                // expression the value is a placeholder overwritten by
-                // `evaluate_pending_defsyms` before any consumer (relocation
-                // applier, dynsym, symtab) reads it.
+                // `Some(usize::MAX)`: a symbol this linker created;
+                // `resolve_sym` returns `value` verbatim and the symtab
+                // writer emits it as SHN_ABS.
                 defined_in: Some(usize::MAX),
                 from_lib: None,
                 plt_idx: None,
@@ -133,41 +115,82 @@ fn apply_defsyms(
                 visibility: 0,
                 lib_sym_value: 0,
                 version: None,
-                absolute,
+                // Whether the definition slides with a PIE/.so load base;
+                // see `GlobalSymbol::absolute`.
+                absolute: !st.is_address,
             },
         );
     }
-    Ok(pending)
+    Ok(PendingDefsyms {
+        plan,
+        shadow,
+        computed,
+    })
 }
 
-/// Evaluate `--defsym` expressions against the finalised global symbol table.
+/// A global symbol's final value from its pre-layout definition: an
+/// input-section offset becomes an address, a COMMON symbol lands in
+/// `.bss`, and everything else (absolute, linker-created, undefined) keeps
+/// its value.  The one placement rule of both emitters, also applied to the
+/// input definitions a `--defsym` overrides but reads.
+pub(crate) fn placed_value(
+    gsym: &GlobalSymbol,
+    section_map: &FxHashMap<(usize, usize), (usize, u64)>,
+    output_sections: &[OutputSection],
+    bss_addr: Option<u64>,
+) -> u64 {
+    let Some(obj_idx) = gsym.defined_in else {
+        return gsym.value;
+    };
+    if gsym.section_idx == SHN_COMMON || gsym.section_idx == 0xffff {
+        gsym.value + bss_addr.unwrap_or(0)
+    } else if gsym.section_idx != SHN_UNDEF && gsym.section_idx != SHN_ABS {
+        match section_map.get(&(obj_idx, gsym.section_idx as usize)) {
+            Some(&(oi, so)) => gsym.value + output_sections[oi].addr + so,
+            None => gsym.value,
+        }
+    } else {
+        gsym.value
+    }
+}
+
+/// Compute the `--defsym` values against the finalised global symbol table.
 ///
 /// Must run inside the emitter, after (1) section addresses are assigned to
-/// every global symbol and (2) the linker-provided symbols (`_end`, `_etext`,
-/// `__bss_start`, …) are inserted, so the expression sees exactly the values
-/// GNU ld's language-symbol machinery would see. Running it at the same point
-/// in `emit_executable` and `emit_shared_library` keeps the two paths from
-/// drifting.
+/// every global symbol and (2) the linker-provided symbols (`_end`,
+/// `_etext`, `__bss_start`, the `__start_`/`__stop_` symbols) are inserted,
+/// so an expression sees exactly the values GNU ld's language-symbol
+/// machinery would see.  Running it at the same point in `emit_executable`
+/// and `emit_shared_library` keeps the two paths from drifting.
 ///
-/// Lookup mirrors the classification predicate: only defined symbols
-/// participate, an expression over an undefined name is an error rather than
-/// a silent zero, and arithmetic wraps as unsigned 64-bit (a linker address
-/// expression means the two's-complement difference, never a complaint).
+/// `place` is the emitter's rule giving an input symbol's final value from
+/// its pre-layout definition; it finishes the shadowed definitions exactly
+/// as the emitter finished every other symbol.  Arithmetic wraps as
+/// unsigned 64-bit (a linker address expression means the two's-complement
+/// difference, never a complaint).
 pub(crate) fn evaluate_pending_defsyms(
     globals: &mut FxHashMap<String, GlobalSymbol>,
-    pending: &[(String, String, usize)],
+    pending: &PendingDefsyms,
+    place: &dyn Fn(&GlobalSymbol) -> u64,
 ) -> Result<(), String> {
-    for (name, expr, index) in pending {
-        let value = defsym::eval_with_symbols(expr, &|n| {
-            globals
+    if pending.computed.is_empty() {
+        return Ok(());
+    }
+    let needed: Vec<usize> = pending.computed.iter().map(|&(_, pos)| pos).collect();
+    let values = pending
+        .plan
+        .evaluate(&needed, |n| match pending.shadow.get(n) {
+            Some(g) => g.defined_in.is_some().then(|| place(g)),
+            None => globals
                 .get(n)
-                .and_then(|g| g.defined_in.is_some().then_some(g.value))
-        })
-        .map_err(|err| err.gnu_message(*index))?;
+                .and_then(|g| g.defined_in.is_some().then_some(g.value)),
+        })?;
+    for (name, pos) in &pending.computed {
         let entry = globals
             .get_mut(name)
             .ok_or_else(|| format!("--defsym {name}: symbol vanished before evaluation"))?;
-        entry.value = value;
+        entry.value = values[*pos]
+            .ok_or_else(|| format!("internal error: --defsym {name} was not evaluated"))?;
         entry.defined_in = Some(usize::MAX);
         entry.section_idx = SHN_ABS;
     }
@@ -605,39 +628,19 @@ pub fn link_builtin(
         if let Some(ref e) = entry_symbol {
             gc_roots.push(e.clone());
         }
-        // `--export-dynamic` makes every exported global reachable from
-        // *outside* the image (dlsym, a dlopen'd plugin, another DSO), so
-        // nothing inside the link references it and a pure reachability sweep
-        // collects it.  The link succeeds and the binary runs -- it just
-        // fails at the first dlsym.  GNU ld, lld and mold all root the
-        // exported set; see `is_exported_dynamic_symbol`, which the emitter
-        // uses for the very same set.
-        //
-        // A version script narrows the set identically in both places.
-        // The same holds for a definition a shared library of the link
-        // names (it calls back into it, or the program interposes it):
-        // `emit_executable` exports it, so it is a root.
-        let dso_names = objects.dso_names();
-        if export_dynamic || !dso_names.is_empty() {
-            let version_script = parsed_args
-                .version_script
-                .as_deref()
-                .and_then(linker_common::VersionScript::parse);
-            gc_roots.extend(globals.iter().filter_map(|(name, g)| {
-                if !linker_common::is_exported_dynamic_symbol(g) {
-                    return None;
-                }
-                if !export_dynamic && !dso_names.contains(name.split('@').next().unwrap_or(name)) {
-                    return None;
-                }
-                if let Some(ref vs) = version_script
-                    && vs.any_local_star()
-                    && !vs.matches_global(name)
-                {
-                    return None;
-                }
-                Some(name.clone())
-            }));
+        // Every definition the executable exports is reachable from
+        // outside the image; the emitter's own predicate names them.
+        if let Some(exports) = super::emit_exec::ExecExports::new(
+            export_dynamic,
+            objects.dso_names(),
+            parsed_args.version_script.as_deref(),
+        ) {
+            gc_roots.extend(
+                globals
+                    .iter()
+                    .filter(|(name, g)| exports.exports(name, g))
+                    .map(|(name, _)| name.clone()),
+            );
         }
         linker_common::gc_collect_sections_elf64_full(
             &objects,

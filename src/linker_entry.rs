@@ -174,19 +174,53 @@ pub fn link_with_script_i386(
 /// inputs (the gcc-style ld invocation lists crt1/crti/crtn explicitly), so
 /// no CRT injection happens here; the crt slots stay empty and `user_args`
 /// carries -L/-l/-z/... in GNU spelling for `parse_linker_args`.
+/// GNU ld's built-in library search path (its default script's
+/// `SEARCH_DIR`s, searched after every `-L`), for the standalone linker.
+/// The union of the multiarch (Debian/Ubuntu) and lib64/lib (Fedora, Arch)
+/// layouts, in GNU's order; a directory a system lacks costs one failed
+/// lookup.  `-nostdlib` and `-T` (whose script replaces the default one)
+/// drop it, as in GNU ld.
+pub const DEFAULT_SEARCH_DIRS_X86_64: &[&str] = &[
+    "/usr/local/lib/x86_64-linux-gnu",
+    "/lib/x86_64-linux-gnu",
+    "/usr/lib/x86_64-linux-gnu",
+    "/usr/local/lib64",
+    "/lib64",
+    "/usr/lib64",
+    "/usr/local/lib",
+    "/lib",
+    "/usr/lib",
+];
+
+/// [`DEFAULT_SEARCH_DIRS_X86_64`] for `-m elf_i386`.  `/usr/lib` and `/lib`
+/// hold 64-bit libraries on a multilib host; the i386 search skips files of
+/// the wrong class ("skipping incompatible"), as GNU ld does.
+pub const DEFAULT_SEARCH_DIRS_I386: &[&str] = &[
+    "/usr/local/lib/i386-linux-gnu",
+    "/lib/i386-linux-gnu",
+    "/usr/lib/i386-linux-gnu",
+    "/usr/local/lib32",
+    "/lib32",
+    "/usr/lib32",
+    "/usr/local/lib",
+    "/lib",
+    "/usr/lib",
+];
+
 pub fn link_builtin_x86(
     object_files: &[&str],
     output: &str,
     user_args: &[String],
+    search_dirs: &[&str],
 ) -> Result<(), String> {
     crate::backend::x86::linker::link_builtin(
         object_files,
         output,
         user_args,
-        &[], // lib paths come from -L in user_args
-        &[], // no implicit libs: the caller lists -lc etc. explicitly
-        &[], // CRT before: positional
-        &[], // CRT after: positional
+        search_dirs, // after the -L paths in user_args
+        &[],         // no implicit libs: the caller lists -lc etc. explicitly
+        &[],         // CRT before: positional
+        &[],         // CRT after: positional
     )
 }
 
@@ -195,8 +229,9 @@ pub fn link_shared_x86(
     object_files: &[&str],
     output: &str,
     user_args: &[String],
+    search_dirs: &[&str],
 ) -> Result<(), String> {
-    crate::backend::x86::linker::link_shared(object_files, output, user_args, &[], &[])
+    crate::backend::x86::linker::link_shared(object_files, output, user_args, search_dirs, &[])
 }
 
 /// Standard ELF32/i386 userspace executable link for `lccc-ld -m elf_i386`.
@@ -206,21 +241,29 @@ pub fn link_shared_x86(
 /// `-l` libraries, positional flags) is in `user_args` in command-line
 /// order, so no CRT, library path or implicit library injection happens
 /// here and link order is preserved exactly.
-pub fn link_builtin_i386(output: &str, user_args: &[String]) -> Result<(), String> {
+pub fn link_builtin_i386(
+    output: &str,
+    user_args: &[String],
+    search_dirs: &[&str],
+) -> Result<(), String> {
     crate::backend::i686::linker::link_builtin(
         &[], // every operand is positional in user_args
         output,
         user_args,
-        &[], // lib paths come from -L in user_args
-        &[], // no implicit libs: the caller lists -lc etc. explicitly
-        &[], // CRT before: positional
-        &[], // CRT after: positional
+        search_dirs, // after the -L paths in user_args
+        &[],         // no implicit libs: the caller lists -lc etc. explicitly
+        &[],         // CRT before: positional
+        &[],         // CRT after: positional
     )
 }
 
 /// ELF32/i386 shared-library link for `lccc-ld -m elf_i386 -shared`.
-pub fn link_shared_i386(output: &str, user_args: &[String]) -> Result<(), String> {
-    crate::backend::i686::linker::link_shared(&[], output, user_args, &[], &[], &[], &[])
+pub fn link_shared_i386(
+    output: &str,
+    user_args: &[String],
+    search_dirs: &[&str],
+) -> Result<(), String> {
+    crate::backend::i686::linker::link_shared(&[], output, user_args, search_dirs, &[], &[], &[])
 }
 
 #[cfg(test)]

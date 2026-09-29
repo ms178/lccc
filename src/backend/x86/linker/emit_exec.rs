@@ -28,6 +28,49 @@ fn dynsym_emit_name(name: &str) -> &str {
     }
 }
 
+/// Which of an executable's definitions it exports to `.dynsym`: with
+/// `--export-dynamic` every defined global (so a dlopen'd plugin can bind
+/// to the program), and always those whose name a linked shared library
+/// defines or references -- the library's callback into the program, or
+/// its interposable call to a function the program replaces (`malloc`);
+/// GNU ld and lld do the same.  A version script narrows the set exactly
+/// as it does for a shared object (`{ global: a; b; local: *; };` keeps a
+/// plugin ABI small).
+///
+/// The one predicate for the emitter and for `--gc-sections`, whose roots
+/// must include every export: an exported definition is reachable from
+/// outside the image, so a reachability sweep that missed one would
+/// collect it and the program would fail at the first `dlsym`.
+pub(super) struct ExecExports<'a> {
+    export_dynamic: bool,
+    dso_names: &'a crate::common::fx_hash::FxHashSet<String>,
+    version_script: Option<linker_common::VersionScript>,
+}
+
+impl<'a> ExecExports<'a> {
+    /// `None` when the executable exports nothing.
+    pub(super) fn new(
+        export_dynamic: bool,
+        dso_names: &'a crate::common::fx_hash::FxHashSet<String>,
+        version_script_path: Option<&str>,
+    ) -> Option<Self> {
+        (export_dynamic || !dso_names.is_empty()).then(|| Self {
+            export_dynamic,
+            dso_names,
+            version_script: version_script_path.and_then(linker_common::VersionScript::parse),
+        })
+    }
+
+    pub(super) fn exports(&self, name: &str, g: &GlobalSymbol) -> bool {
+        linker_common::is_exported_dynamic_symbol(g)
+            && (self.export_dynamic || self.dso_names.contains(dynsym_emit_name(name)))
+            && !self
+                .version_script
+                .as_ref()
+                .is_some_and(|vs| vs.any_local_star() && !vs.matches_global(name))
+    }
+}
+
 pub(super) fn emit_executable(
     objects: &[ElfObject],
     interp: &[u8],
@@ -103,7 +146,7 @@ pub(super) fn emit_executable(
     // depends on final addresses, so they are evaluated here, after section
     // addresses and the linker-provided symbols exist.  See
     // `link::evaluate_pending_defsyms` for the full rationale.
-    pending_defsyms: &[(String, String, usize)],
+    pending_defsyms: &super::link::PendingDefsyms,
 ) -> Result<(), String> {
     let ld_time = std::env::var("LCCC_LD_TIME").is_ok();
     // Without DF_1_PIE an ET_DYN is treated as a shared object: ld.so would
@@ -200,35 +243,11 @@ pub(super) fn emit_executable(
         }
     }
 
-    // Exported definitions: with --export-dynamic every defined global (so a
-    // dlopen'd plugin can bind to the program), and always those whose name
-    // a linked shared library defines or references -- the library's
-    // callback into the program, or its interposable call to a function the
-    // program replaces (`malloc`).  GNU ld and lld do the same.
-    if export_dynamic || !dso_names.is_empty() {
-        // A version script narrows the exported set exactly as it does
-        // for shared objects; `{ global: a; b; local: *; }` is the common
-        // spelling used to keep an executable's plugin ABI small.
-        let version_script = version_script_path.and_then(linker_common::VersionScript::parse);
+    // Exported definitions (see `ExecExports`).
+    if let Some(exports) = ExecExports::new(export_dynamic, dso_names, version_script_path) {
         let mut exported: Vec<String> = globals
             .iter()
-            .filter(|(name, g)| {
-                // Export defined, non-dynamic (local to this executable) global
-                // symbols.  The predicate is shared with `--gc-sections`'s root
-                // set so the two can never drift apart.
-                if !linker_common::is_exported_dynamic_symbol(*g) {
-                    return false;
-                }
-                if !export_dynamic && !dso_names.contains(dynsym_emit_name(name)) {
-                    return false;
-                }
-                if let Some(ref vs) = version_script {
-                    if vs.any_local_star() && !vs.matches_global(name) {
-                        return false;
-                    }
-                }
-                true
-            })
+            .filter(|(name, g)| exports.exports(name, g))
             .map(|(n, _)| n.clone())
             .collect();
         exported.sort(); // deterministic output
@@ -1270,20 +1289,17 @@ pub(super) fn emit_executable(
         sec.data = data;
     }
 
-    // Update global symbol addresses
-    for (_, gsym) in globals.iter_mut() {
-        if let Some(obj_idx) = gsym.defined_in {
-            if gsym.section_idx == SHN_COMMON || gsym.section_idx == 0xffff {
-                if let Some(bss_sec) = output_sections.iter().find(|s| s.name == ".bss") {
-                    gsym.value += bss_sec.addr;
-                }
-            } else if gsym.section_idx != SHN_UNDEF && gsym.section_idx != SHN_ABS {
-                let si = gsym.section_idx as usize;
-                if let Some(&(oi, so)) = section_map.get(&(obj_idx, si)) {
-                    gsym.value += output_sections[oi].addr + so;
-                }
-            }
-        }
+    // Update global symbol addresses (`link::placed_value`; the same rule
+    // finishes the input definitions a `--defsym` overrides but reads).
+    let bss_addr_for_common = output_sections
+        .iter()
+        .find(|s| s.name == ".bss")
+        .map(|s| s.addr);
+    let place = |gsym: &GlobalSymbol| {
+        super::link::placed_value(gsym, section_map, output_sections, bss_addr_for_common)
+    };
+    for gsym in globals.values_mut() {
+        gsym.value = place(gsym);
     }
 
     // Define linker-provided symbols using shared infrastructure (consistent
@@ -1351,7 +1367,7 @@ pub(super) fn emit_executable(
     // symbols exist.  Running it here (not in `link_builtin`, where the values
     // are still section-relative) is what makes `--defsym x=_start+4` agree
     // with GNU ld.
-    super::link::evaluate_pending_defsyms(globals, pending_defsyms)?;
+    super::link::evaluate_pending_defsyms(globals, pending_defsyms, &place)?;
 
     // Override IFUNC symbol addresses to point to IPLT entries.
     // Save the original (resolver) addresses for IFUNC GOT initialization.
@@ -2787,6 +2803,102 @@ pub(super) fn emit_executable(
                     Some(&slot) => slot,
                     None => s,
                 };
+
+                // A PC-relative field holds the distance from the image to
+                // its target.  In a PIE the image moves at load time and an
+                // absolute target (`--defsym k=0x1000`, an SHN_ABS input
+                // symbol) does not, so every value written here is wrong by
+                // the load base once the program runs -- `lea k(%rip)` from
+                // -fPIE code yields base+0x1000 -- and no dynamic relocation
+                // can repair a code field.  GNU ld writes it anyway (a
+                // silent miscompile, measured on 2.44/2.47); refuse it, as
+                // lld does, and say what works.  (A GOT reference -- -fPIC
+                // code -- reads the value from a slot and is correct.)
+                if is_pie
+                    && matches!(
+                        rela.rela_type,
+                        R_X86_64_PC32 | R_X86_64_PLT32 | R_X86_64_PC64
+                    )
+                {
+                    let absolute_target = if sym.name.is_empty() || sym.is_local() {
+                        sym.shndx == SHN_ABS
+                    } else {
+                        globals_snap
+                            .get(sym.name.as_str())
+                            .is_some_and(|g| g.absolute && !g.is_dynamic && g.plt_idx.is_none())
+                    };
+                    if absolute_target {
+                        return Err(format!(
+                            "{}: relocation {} against absolute symbol `{}' in section {} \
+                             cannot be used in a PIE: a PC-relative reference cannot reach \
+                             an address that does not move with the image; reference it \
+                             through the GOT (recompile with -fPIC) or link without -pie",
+                            obj_name,
+                            reloc_field::name(rela.rela_type).unwrap_or("PC-relative"),
+                            if sym.name.is_empty() {
+                                "<local>"
+                            } else {
+                                sym.name.as_str()
+                            },
+                            sec_name,
+                        ));
+                    }
+                }
+
+                // The mirror image: a narrow ABSOLUTE field (`mov $x, %eax`,
+                // `movl x, %eax` -- non-PIC code) holds an address that must
+                // move with a PIE, and no 32/16/8-bit dynamic relocation
+                // exists to move it.  Writing the link-time address produced
+                // a program that crashed on its first such access.  GNU ld
+                // refuses it with this text; only values that do not move
+                // (absolute symbols, an undefined weak's 0) fit.
+                if is_pie
+                    && matches!(
+                        rela.rela_type,
+                        R_X86_64_32 | R_X86_64_32S | R_X86_64_16 | R_X86_64_8
+                    )
+                {
+                    let fixed = if sym.name.is_empty() || sym.is_local() {
+                        sym.shndx == SHN_ABS && sym.sym_type() != STT_SECTION
+                    } else {
+                        globals_snap
+                            .get(sym.name.as_str())
+                            .map_or(sym.is_weak(), |g| {
+                                g.absolute
+                                    || (g.defined_in.is_none() && !g.is_dynamic && sym.is_weak())
+                            })
+                    };
+                    if !fixed {
+                        // Name what the source named: a section symbol's
+                        // section, and for a string-merge pool (which
+                        // replaced a `.rodata.str*` section reference) the
+                        // pool's section, never its internal symbol.
+                        let pool = globals_snap
+                            .get(sym.name.as_str())
+                            .filter(|_| !sym.name.is_empty() && !sym.is_local())
+                            .and_then(|g| Some((objects.get(g.defined_in?)?, g.section_idx)))
+                            .filter(|(o, _)| o.source_name == "<string-merge>")
+                            .and_then(|(o, si)| o.sections.get(si as usize));
+                        let what = if let Some(sec) = pool {
+                            format!("`{}'", sec.name)
+                        } else if sym.sym_type() == STT_SECTION {
+                            format!(
+                                "`{}'",
+                                objects[obj_idx]
+                                    .sections
+                                    .get(sym.shndx as usize)
+                                    .map_or("<section>", |sec| sec.name.as_str())
+                            )
+                        } else {
+                            format!("symbol `{}'", sym.name)
+                        };
+                        return Err(format!(
+                            "{obj_name}: relocation {} against {what} can not be used when \
+                             making a PIE object; recompile with -fPIE",
+                            reloc_field::name(rela.rela_type).unwrap_or("absolute"),
+                        ));
+                    }
+                }
 
                 match rela.rela_type {
                     R_X86_64_64 => {

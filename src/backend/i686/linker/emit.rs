@@ -32,7 +32,7 @@ pub(super) fn emit_executable(
     opts: &LinkOptions,
     dso_refs: &FxHashSet<String>,
     output_path: &str,
-    pending_defsyms: &[(String, String, usize)],
+    pending_defsyms: &super::link::PendingDefsyms,
     interp: &[u8],
 ) -> Result<(), String> {
     let num_ifunc = ifunc_symbols.len();
@@ -1796,7 +1796,7 @@ fn assign_symbol_addresses(
     fini_array_size: u32,
     rel_iplt_vaddr: u32,
     rel_iplt_size: u32,
-    pending_defsyms: &[(String, String, usize)],
+    pending_defsyms: &super::link::PendingDefsyms,
 ) -> Result<(), String> {
     global_symbols
         .entry("_GLOBAL_OFFSET_TABLE_".to_string())
@@ -1928,7 +1928,14 @@ fn assign_symbol_addresses(
     // Last: finalise --defsym constants/expressions, so they see the section
     // addresses and the standard linker symbols, and so a user definition of
     // a standard name (e.g. `--defsym _end=...`) wins over the auto value.
-    super::link::evaluate_pending_defsyms(global_symbols, pending_defsyms)
+    let place = |g: &LinkerSymbol| {
+        if g.output_section < output_sections.len() {
+            output_sections[g.output_section].addr + g.section_offset
+        } else {
+            g.address
+        }
+    };
+    super::link::evaluate_pending_defsyms(global_symbols, pending_defsyms, &place)
 }
 
 /// How PLT entries address their `.got.plt` slots.

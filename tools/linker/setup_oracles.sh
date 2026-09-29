@@ -39,25 +39,28 @@
 #   * lld: a source build of LLVM is hours on this host; the apt.llvm.org
 #     release build of the same 23.1 branch is used instead.
 #
-# Storage layout (harness snapshot caps: ~128 MB / ~10k files):
-#   * installed oracle binaries -> $ARTIFACTS (= /home/user/artifacts/oracles),
-#     plus one .tar.xz per prefix in $ARTIFACTS/cache (restores drop
-#     executables but keep plain files), so a restore is an extraction and
-#     re-pointing wrappers, never a rebuild;
-#   * tarballs + build trees     -> $SRC (= /home/user/.cache/lccc-oracle-src):
-#     snapshot-EXCLUDED and deleted after a successful install — a binutils
-#     build tree alone is several hundred MB and would push the whole
-#     workspace snapshot over its cap;
+# Storage layout:
+#   * installed oracle binaries -> $ARTIFACTS (default $HOME/artifacts/oracles);
+#   * tarballs + build trees     -> $SRC (default $HOME/.cache/lccc-oracle-src),
+#     deleted after a successful install — a binutils build tree alone is
+#     several hundred MB;
+#   * optional install cache     -> $ORACLE_CACHE (unset: disabled).  For
+#     hosts whose persistence keeps plain files but drops executables (some
+#     sandboxed workspaces): each fresh install is also archived there as a
+#     .tar.xz, and a missing executable is re-extracted before anything is
+#     rebuilt (bfd ~15 min, mold ~40 min at -j2).  Off by default because
+#     on an ordinary machine it only doubles the disk use;
 #   * lld lives in /usr (apt) and is re-installed after a wipe (~30 s).
 #
 # Idempotent: re-running verifies and skips whatever already checks out.
 set -euo pipefail
 
 JOBS="${JOBS:-2}"                      # research policy: -j2
-ARTIFACTS="${ARTIFACTS:-/home/user/artifacts/oracles}"
+ARTIFACTS="${ARTIFACTS:-$HOME/artifacts/oracles}"
 PREFIX="${PREFIX:-$ARTIFACTS}"         # install root == persistent root
-SRC="${SRC:-/home/user/.cache/lccc-oracle-src}"
-LINKDIR="${LINKDIR:-/home/user/artifacts/bin}"
+SRC="${SRC:-$HOME/.cache/lccc-oracle-src}"
+LINKDIR="${LINKDIR:-$HOME/artifacts/bin}"
+CACHE="${ORACLE_CACHE:-}"              # optional install cache (see above)
 
 BINUTILS_VER=2.47
 MOLD_VER=2.42.1
@@ -84,18 +87,15 @@ need() {
     exit 1
 }
 
-# Wipe-resilient install cache.  Harness restores keep an installed prefix's
-# headers but drop its executables, so every wipe used to cost a full
-# rebuild (bfd ~15 min, mold ~40 min at -j2).  Each freshly installed prefix
-# is also archived as a plain, non-executable tarball under $CACHE, and a
-# missing executable is re-extracted from it before anything is rebuilt.
-CACHE="$ARTIFACTS/cache"
+# Optional install cache ($ORACLE_CACHE; see "Storage layout").  Both
+# helpers are no-ops without it.
 restore_cached() {  # <prefix dir> <executable path inside it>
     [ -x "$PREFIX/$1/$2" ] && return 0
-    [ -f "$CACHE/$1.tar.xz" ] || return 1
+    [ -n "$CACHE" ] && [ -f "$CACHE/$1.tar.xz" ] || return 1
     tar -xJf "$CACHE/$1.tar.xz" -C "$PREFIX" && [ -x "$PREFIX/$1/$2" ]
 }
 cache_prefix() {    # <prefix dir>
+    [ -n "$CACHE" ] || return 0
     mkdir -p "$CACHE"
     tar -cJf "$CACHE/$1.tar.xz.tmp" -C "$PREFIX" "$1"
     mv -f "$CACHE/$1.tar.xz.tmp" "$CACHE/$1.tar.xz"

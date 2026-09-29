@@ -420,7 +420,7 @@ pub(super) fn emit_shared_library_32(
     needed_sonames: &[String],
     output_path: &str,
     opts: &LinkOptions,
-    pending_defsyms: &[(String, String, usize)],
+    pending_defsyms: &super::link::PendingDefsyms,
 ) -> Result<(), String> {
     if section_name_to_idx.contains_key(".preinit_array") {
         // The loader runs DT_PREINIT_ARRAY of the executable only (gABI).
@@ -1099,7 +1099,14 @@ pub(super) fn emit_shared_library_32(
             *e = new_sym(sym.value as u32, binding);
         }
     }
-    super::link::evaluate_pending_defsyms(global_symbols, pending_defsyms)?;
+    let place = |g: &LinkerSymbol| {
+        if g.output_section < output_sections.len() {
+            output_sections[g.output_section].addr + g.section_offset
+        } else {
+            g.address
+        }
+    };
+    super::link::evaluate_pending_defsyms(global_symbols, pending_defsyms, &place)?;
     let global_symbols: &FxHashMap<String, LinkerSymbol> = global_symbols;
     let plt_addr = |name: &str| -> u32 {
         let i = global_symbols.get(name).map_or(0, |g| g.plt_index) as u32;

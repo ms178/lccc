@@ -88,9 +88,10 @@ pub enum DefsymError {
     DivByZero,
     /// An expression named a symbol the link does not define.
     UndefinedSymbol(String),
-    /// The expression is well formed but this backend has no point at which it
-    /// can evaluate it (expressions need final addresses; a backend that applies
-    /// `--defsym` before layout can only handle aliases and constants).
+    /// The expression reads the named symbol, which has no value yet at this
+    /// point of the link (a placed symbol before layout).  A caller that
+    /// evaluates in phases uses it as "not yet": the `-T` path defers such a
+    /// statement until layout has placed the name.
     NeedsLayout(String),
 }
 
@@ -116,8 +117,8 @@ impl DefsymError {
     /// and a syntax error accepts none), while undefined-symbol and
     /// division-by-zero failures report the defsym's own index.
     ///
-    /// [`NeedsLayout`] is a link-path capability message with no GNU
-    /// counterpart; it keeps the descriptive form.
+    /// [`NeedsLayout`] has no GNU counterpart (GNU ld evaluates after
+    /// layout); it names the symbol that had no value.
     pub fn gnu_message(&self, index: usize) -> String {
         match self {
             DefsymError::Syntax(_) => "--defsym:0: syntax error".to_string(),
@@ -125,10 +126,9 @@ impl DefsymError {
             DefsymError::UndefinedSymbol(name) => {
                 format!("--defsym:{index}: undefined symbol `{name}' referenced in expression")
             }
-            DefsymError::NeedsLayout(expr) => {
+            DefsymError::NeedsLayout(name) => {
                 format!(
-                    "--defsym:{index}: expression '{expr}' needs final symbol addresses, \
-                         which this link path does not have; use a constant or a symbol alias"
+                    "--defsym:{index}: symbol `{name}' has no address yet at this point of the link"
                 )
             }
         }
@@ -366,6 +366,366 @@ pub fn is_address_expression(
     Ok(degree == 1)
 }
 
+/// Every distinct symbol name an expression mentions, in first-use order.
+///
+/// Walks the degree grammar (which never divides, so `1/(a-a)` still yields
+/// `a`), i.e. exactly the tokens the evaluator will look up.
+fn referenced_names(expr: &str) -> Result<Vec<String>, DefsymError> {
+    let names = std::cell::RefCell::new(Vec::<String>::new());
+    is_address_expression(expr, |n| {
+        let mut v = names.borrow_mut();
+        if !v.iter().any(|x| x == n) {
+            v.push(n.to_string());
+        }
+        false
+    })?;
+    Ok(names.into_inner())
+}
+
+/// What the link, apart from `--defsym`, knows about a name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkSym {
+    /// Not defined in this link (a shared-library symbol counts: GNU ld
+    /// reports it as undefined in an expression).
+    Undefined,
+    /// Defined by an input object at an address in the output.
+    Address,
+    /// Defined with an absolute value (`SHN_ABS`).
+    Absolute,
+}
+
+/// Where one symbol reference inside a `--defsym` right-hand side binds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Binding {
+    /// The value the `--defsym` statement with this position (0-based) gives.
+    Defsym(usize),
+    /// The definition the link has independently of `--defsym`: an input
+    /// object's symbol or one of the layout symbols (`_end`, …).
+    Link(String),
+}
+
+/// A `--defsym` right-hand side with its references bound.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Rhs {
+    Constant(u64),
+    Alias(Binding),
+    /// The expression text and the binding of every name it mentions.
+    Expression(String, Vec<(String, Binding)>),
+}
+
+/// One `--defsym NAME=EXPR`, planned.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Statement {
+    pub name: String,
+    /// 1-based position: the `N` of GNU ld's `--defsym:N` diagnostics.
+    pub index: usize,
+    pub rhs: Rhs,
+    /// Whether the value is an address in the output (slides with a PIE /
+    /// `.so` load base) rather than an absolute value; see
+    /// [`is_address_expression`].
+    pub is_address: bool,
+}
+
+/// All `--defsym` options of a link, bound and ordered once so that every
+/// backend -- and both phases of one link (classification before layout,
+/// evaluation after it) -- agrees on what each right-hand side means.
+///
+/// Binding follows GNU ld, which runs `--defsym`s as linker-script
+/// assignments, in order, over several passes (measured with ld 2.47):
+///
+/// 1. A name defined by an EARLIER `--defsym` means that definition's value
+///    at that point: `a=1 b=a a=2` gives `b = 1`, `a = 2`.
+/// 2. A statement's reference to its own target, with no earlier
+///    `--defsym` of it, means the input's definition: `a=a+1` over an
+///    object's `a` is that address plus one, and an error without one.
+/// 3. A name defined only by LATER `--defsym`s means the last of them
+///    (ld's final pass sees the values of the previous one): `a=b
+///    b=_start+4` gives `a = b = _start+4`, in either order.
+/// 4. Anything else is the link's own definition, or an error.
+///
+/// One deliberate divergence: a cycle through rule 3 (`a=b b=a`) is an
+/// error naming the cycle.  ld silently defines both as 0 -- a value no one
+/// wrote, which then flows into relocations.
+#[derive(Clone, Debug, Default)]
+pub struct DefsymPlan {
+    pub statements: Vec<Statement>,
+    /// Statement positions, dependencies before dependents.
+    order: Vec<usize>,
+}
+
+impl DefsymPlan {
+    /// Bind and classify `defs` (`(name, expression)` in command-line
+    /// order).  `link` describes names defined outside `--defsym`; it is
+    /// asked before any `--defsym` is applied.  Errors carry GNU ld's text.
+    pub fn new(defs: &[(String, String)], link: impl Fn(&str) -> LinkSym) -> Result<Self, String> {
+        let mut defined_at: std::collections::HashMap<&str, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (i, (name, _)) in defs.iter().enumerate() {
+            defined_at.entry(name.as_str()).or_default().push(i);
+        }
+        let known = |n: &str| link(n) != LinkSym::Undefined || is_linker_defined(n);
+        let bind = |n: &str, at: usize| -> Result<Binding, String> {
+            let err = || DefsymError::UndefinedSymbol(n.to_string()).gnu_message(at + 1);
+            if let Some(ds) = defined_at.get(n) {
+                if let Some(&j) = ds.iter().rev().find(|&&j| j < at) {
+                    return Ok(Binding::Defsym(j));
+                }
+                if n != defs[at].0 {
+                    return Ok(Binding::Defsym(*ds.last().unwrap_or(&at)));
+                }
+            }
+            if known(n) {
+                Ok(Binding::Link(n.to_string()))
+            } else {
+                Err(err())
+            }
+        };
+        let mut statements = Vec::with_capacity(defs.len());
+        for (i, (name, expr)) in defs.iter().enumerate() {
+            // Syntax only: which names exist is `bind`'s question.
+            let rhs = match classify(expr, |_| true).map_err(|e| e.gnu_message(i + 1))? {
+                Defsym::Constant(v) => Rhs::Constant(v),
+                Defsym::Alias(t) => Rhs::Alias(bind(&t, i)?),
+                Defsym::Expression(e) => {
+                    let names = referenced_names(&e).map_err(|x| x.gnu_message(i + 1))?;
+                    let refs = names
+                        .into_iter()
+                        .map(|n| bind(&n, i).map(|b| (n, b)))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Rhs::Expression(e, refs)
+                }
+            };
+            statements.push(Statement {
+                name: name.clone(),
+                index: i + 1,
+                rhs,
+                is_address: false,
+            });
+        }
+        let order = Self::topological_order(&statements)?;
+        // Classify in dependency order: a reference to another `--defsym`
+        // is an address exactly when that definition is one.
+        for &i in &order {
+            let is_addr_of = |b: &Binding, st: &[Statement]| match b {
+                Binding::Defsym(j) => st[*j].is_address,
+                Binding::Link(n) => link(n) == LinkSym::Address || is_linker_defined(n),
+            };
+            let is_address = match &statements[i].rhs {
+                Rhs::Constant(_) => false,
+                Rhs::Alias(b) => is_addr_of(b, &statements),
+                Rhs::Expression(e, refs) => is_address_expression(e, |n| {
+                    refs.iter()
+                        .find(|(r, _)| r == n)
+                        .is_some_and(|(_, b)| is_addr_of(b, &statements))
+                })
+                .map_err(|x| x.gnu_message(i + 1))?,
+            };
+            statements[i].is_address = is_address;
+        }
+        Ok(DefsymPlan { statements, order })
+    }
+
+    /// Dependencies before dependents; a cycle is an error naming it.
+    fn topological_order(st: &[Statement]) -> Result<Vec<usize>, String> {
+        // 0 = unvisited, 1 = on the DFS stack, 2 = done.  Iterative, so a
+        // long alias chain from a generated command line cannot overflow
+        // the stack.
+        let mut state = vec![0u8; st.len()];
+        let mut order = Vec::with_capacity(st.len());
+        for root in 0..st.len() {
+            if state[root] != 0 {
+                continue;
+            }
+            let mut stack: Vec<(usize, Vec<usize>)> = vec![(root, st[root].defsym_deps())];
+            state[root] = 1;
+            while let Some((node, pending)) = stack.last_mut() {
+                let node = *node;
+                match pending.pop() {
+                    Some(d) if state[d] == 1 => {
+                        let from = stack.iter().position(|(n, _)| *n == d).unwrap_or(0);
+                        let mut path: Vec<&str> = stack[from..]
+                            .iter()
+                            .map(|(n, _)| st[*n].name.as_str())
+                            .collect();
+                        path.push(st[d].name.as_str());
+                        return Err(format!(
+                            "--defsym:{}: circular reference: {}",
+                            st[d].index,
+                            path.join(" -> ")
+                        ));
+                    }
+                    Some(d) if state[d] == 0 => {
+                        state[d] = 1;
+                        stack.push((d, st[d].defsym_deps()));
+                    }
+                    Some(_) => {}
+                    None => {
+                        state[node] = 2;
+                        order.push(node);
+                        stack.pop();
+                    }
+                }
+            }
+        }
+        Ok(order)
+    }
+
+    /// The statement that finally defines each name (the last one naming
+    /// it), in command-line order.
+    pub fn finals(&self) -> Vec<&Statement> {
+        let mut seen = std::collections::HashSet::new();
+        let mut v: Vec<&Statement> = self
+            .statements
+            .iter()
+            .rev()
+            .filter(|s| seen.insert(s.name.as_str()))
+            .collect();
+        v.reverse();
+        v
+    }
+
+    /// Follow alias-to-`--defsym` links from `st` to the statement whose
+    /// right-hand side is not such an alias.
+    pub fn root<'a>(&'a self, mut st: &'a Statement) -> &'a Statement {
+        while let Rhs::Alias(Binding::Defsym(j)) = &st.rhs {
+            st = &self.statements[*j];
+        }
+        st
+    }
+
+    /// The input symbol `st` is ultimately an alias of, if any: such a
+    /// definition is a copy of that symbol (section, PLT/GOT and all)
+    /// rather than a computed value.
+    pub fn aliased_link_symbol<'a>(&'a self, st: &'a Statement) -> Option<&'a str> {
+        match &self.root(st).rhs {
+            Rhs::Alias(Binding::Link(n)) => Some(n.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Names a statement binds to the link's own definition of ITS OWN
+    /// target (rule 2): that definition is overridden by the `--defsym`
+    /// itself, so the backend must keep a copy of it to evaluate against.
+    pub fn shadowed_names(&self) -> Vec<&str> {
+        let mut v: Vec<&str> = Vec::new();
+        for s in &self.statements {
+            let mentions_self = match &s.rhs {
+                Rhs::Alias(Binding::Link(n)) => n == &s.name,
+                Rhs::Expression(_, refs) => refs
+                    .iter()
+                    .any(|(n, b)| n == &s.name && *b == Binding::Link(n.clone())),
+                _ => false,
+            };
+            if mentions_self && !v.contains(&s.name.as_str()) {
+                v.push(s.name.as_str());
+            }
+        }
+        v
+    }
+
+    /// The values of the statements at positions `needed` and of everything
+    /// they depend on, indexed by position (`None`: not computed).
+    ///
+    /// `link` gives the final value of a name's non-`--defsym` definition.
+    /// Only what is needed is computed: an alias that became a copy of an
+    /// input symbol has no value to compute unless another definition reads
+    /// it, and a link path without final addresses (a `-T` link before
+    /// layout) must not fail on a value nobody uses.  An error names the
+    /// failing statement's position.
+    pub fn evaluate_needed(
+        &self,
+        needed: &[usize],
+        link: impl Fn(&str) -> Result<u64, DefsymError>,
+    ) -> Result<Vec<Option<u64>>, (usize, DefsymError)> {
+        let n = self.statements.len();
+        let mut want = vec![false; n];
+        let mut work: Vec<usize> = needed.to_vec();
+        while let Some(i) = work.pop() {
+            if !std::mem::replace(&mut want[i], true) {
+                work.extend(self.statements[i].defsym_deps());
+            }
+        }
+        let mut values: Vec<Option<u64>> = vec![None; n];
+        for &i in self.order.iter().filter(|&&i| want[i]) {
+            let st = &self.statements[i];
+            let value_of = |b: &Binding, name: &str| -> Result<u64, DefsymError> {
+                match b {
+                    // Dependencies come first in `order` and are wanted.
+                    Binding::Defsym(j) => values[*j].ok_or(DefsymError::UndefinedSymbol(
+                        self.statements[*j].name.clone(),
+                    )),
+                    Binding::Link(l) => link(l).map_err(|e| match e {
+                        DefsymError::UndefinedSymbol(_) => {
+                            DefsymError::UndefinedSymbol(name.to_string())
+                        }
+                        other => other,
+                    }),
+                }
+            };
+            let v = match &st.rhs {
+                Rhs::Constant(v) => Ok(*v),
+                Rhs::Alias(b) => value_of(b, b_name(b, &st.name)),
+                Rhs::Expression(e, refs) => {
+                    let failed = std::cell::RefCell::new(None);
+                    let r = eval_with_symbols(e, &|name| {
+                        let (_, b) = refs.iter().find(|(r, _)| r == name)?;
+                        value_of(b, name)
+                            .map_err(|x| *failed.borrow_mut() = Some(x))
+                            .ok()
+                    });
+                    match failed.into_inner() {
+                        Some(x) => Err(x),
+                        None => r,
+                    }
+                }
+            }
+            .map_err(|x| (i, x))?;
+            values[i] = Some(v);
+        }
+        Ok(values)
+    }
+}
+
+impl DefsymPlan {
+    /// [`Self::evaluate_needed`] for a link with final addresses: `link`
+    /// returns `None` for a name it does not define, and errors come back
+    /// as GNU ld's text.
+    pub fn evaluate(
+        &self,
+        needed: &[usize],
+        link: impl Fn(&str) -> Option<u64>,
+    ) -> Result<Vec<Option<u64>>, String> {
+        self.evaluate_needed(needed, |n| {
+            link(n).ok_or_else(|| DefsymError::UndefinedSymbol(n.to_string()))
+        })
+        .map_err(|(i, e)| e.gnu_message(self.statements[i].index))
+    }
+}
+
+impl Statement {
+    /// Positions of the `--defsym` statements this one reads.
+    fn defsym_deps(&self) -> Vec<usize> {
+        match &self.rhs {
+            Rhs::Alias(Binding::Defsym(j)) => vec![*j],
+            Rhs::Expression(_, refs) => refs
+                .iter()
+                .filter_map(|(_, b)| match b {
+                    Binding::Defsym(j) => Some(*j),
+                    Binding::Link(_) => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+fn b_name<'a>(b: &'a Binding, fallback: &'a str) -> &'a str {
+    match b {
+        Binding::Link(n) => n.as_str(),
+        Binding::Defsym(_) => fallback,
+    }
+}
+
 /// A recursive-descent parser over the expression grammar GNU ld accepts:
 /// `+ - * / %` with the usual precedence, parentheses, unary minus, numbers and
 /// symbols. No allocation per token, no intermediate string.
@@ -580,6 +940,153 @@ mod tests {
 
     fn defined(name: &str) -> bool {
         matches!(name, "real" | "_start" | "_end" | "a" | "b")
+    }
+
+    fn pairs(v: &[(&str, &str)]) -> Vec<(String, String)> {
+        v.iter()
+            .map(|(n, e)| (n.to_string(), e.to_string()))
+            .collect()
+    }
+
+    /// The link of the planner tests: `_start` at 0x1000 in an object
+    /// (like GNU ld's `-pie` test link) and, where asked, an object `a`
+    /// at 0x402000.
+    fn plan_and_eval(defs: &[(&str, &str)], object_a: bool) -> Result<Vec<(String, u64)>, String> {
+        let link = |n: &str| match n {
+            "_start" => LinkSym::Address,
+            "a" if object_a => LinkSym::Address,
+            _ => LinkSym::Undefined,
+        };
+        let value = |n: &str| match n {
+            "_start" => Some(0x1000),
+            "a" if object_a => Some(0x402000),
+            _ => None,
+        };
+        let plan = DefsymPlan::new(&pairs(defs), link)?;
+        let finals: Vec<usize> = plan.finals().iter().map(|s| s.index - 1).collect();
+        let values = plan.evaluate(&finals, value)?;
+        Ok(finals
+            .iter()
+            .map(|&i| (plan.statements[i].name.clone(), values[i].unwrap()))
+            .collect())
+    }
+
+    /// Order semantics measured on GNU ld 2.47 (`ld -pie`, `_start` at
+    /// 0x1000): earlier definitions are read as they were, forward
+    /// references see the last definition, a self reference sees the
+    /// input's definition.
+    #[test]
+    fn plan_matches_gnu_ld_order_semantics() {
+        let v = |d: &[(&str, &str)], obj| plan_and_eval(d, obj).unwrap();
+        let s = |v: &[(&str, u64)]| -> Vec<(String, u64)> {
+            v.iter().map(|(n, x)| (n.to_string(), *x)).collect()
+        };
+        assert_eq!(
+            v(&[("a", "b"), ("b", "_start+4")], false),
+            s(&[("a", 0x1004), ("b", 0x1004)])
+        );
+        assert_eq!(
+            v(&[("b", "_start+4"), ("a", "b")], false),
+            s(&[("b", 0x1004), ("a", 0x1004)])
+        );
+        assert_eq!(
+            v(&[("a", "b"), ("b", "0x10")], false),
+            s(&[("a", 0x10), ("b", 0x10)])
+        );
+        assert_eq!(
+            v(&[("a", "b+1"), ("b", "0x10")], false),
+            s(&[("a", 0x11), ("b", 0x10)])
+        );
+        assert_eq!(
+            v(&[("a", "1"), ("b", "a"), ("a", "2")], false),
+            s(&[("b", 1), ("a", 2)])
+        );
+        assert_eq!(v(&[("a", "a+1")], true), s(&[("a", 0x402001)]));
+        // A later redefinition is what a forward reference sees.
+        assert_eq!(
+            v(&[("x", "b"), ("b", "1"), ("b", "2")], false),
+            s(&[("x", 2), ("b", 2)])
+        );
+        assert_eq!(
+            plan_and_eval(&[("a", "a+1")], false).unwrap_err(),
+            "--defsym:1: undefined symbol `a' referenced in expression"
+        );
+    }
+
+    /// A cycle is reported with its path.  (GNU ld silently defines every
+    /// member as 0 -- a value nobody wrote.)
+    #[test]
+    fn plan_reports_cycles_with_their_path() {
+        assert_eq!(
+            plan_and_eval(&[("a", "b"), ("b", "a")], false).unwrap_err(),
+            "--defsym:1: circular reference: a -> b -> a"
+        );
+        assert_eq!(
+            plan_and_eval(&[("p", "q+1"), ("q", "r*2"), ("r", "p-_start")], false).unwrap_err(),
+            "--defsym:1: circular reference: p -> q -> r -> p"
+        );
+        // Redefinitions are not cycles: `b` reads the first `a`.
+        assert!(plan_and_eval(&[("a", "1"), ("b", "a+1"), ("a", "b")], false).is_ok());
+    }
+
+    /// Address or absolute follows the bound definitions, whatever their
+    /// order on the command line.
+    #[test]
+    fn plan_classifies_through_forward_references() {
+        let link = |n: &str| {
+            if n == "_start" {
+                LinkSym::Address
+            } else {
+                LinkSym::Undefined
+            }
+        };
+        for defs in [
+            pairs(&[
+                ("a", "b"),
+                ("b", "_start+4"),
+                ("c", "b-_start"),
+                ("d", "c+b"),
+            ]),
+            pairs(&[
+                ("d", "c+b"),
+                ("c", "b-_start"),
+                ("b", "_start+4"),
+                ("a", "b"),
+            ]),
+        ] {
+            let plan = DefsymPlan::new(&defs, link).unwrap();
+            let kind = |n: &str| {
+                plan.finals()
+                    .iter()
+                    .find(|s| s.name == n)
+                    .unwrap()
+                    .is_address
+            };
+            assert!(kind("a") && kind("b") && kind("d"));
+            assert!(!kind("c"));
+        }
+    }
+
+    /// Only what is needed is evaluated: an alias whose value nobody reads
+    /// does not fail a link that cannot compute it.
+    #[test]
+    fn plan_evaluates_only_what_is_needed() {
+        let plan = DefsymPlan::new(&pairs(&[("a", "_start"), ("k", "7")]), |n| {
+            if n == "_start" {
+                LinkSym::Address
+            } else {
+                LinkSym::Undefined
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            plan.aliased_link_symbol(&plan.statements[0]),
+            Some("_start")
+        );
+        let v = plan
+            .evaluate_needed(&[1], |_| Err(DefsymError::NeedsLayout(String::new())))
+            .unwrap();
+        assert_eq!(v, vec![None, Some(7)]);
     }
 
     #[test]
@@ -801,14 +1308,13 @@ mod tests {
     }
 
     #[test]
-    fn the_needs_layout_error_says_what_to_use_instead() {
-        // No GNU counterpart (a link-path capability message); keep the
-        // descriptive form, with the defsym counter for uniformity.
-        let m = DefsymError::NeedsLayout("_start+4".into()).gnu_message(3);
-        assert!(m.contains("_start+4"), "{m}");
-        assert!(m.contains("constant"), "{m}");
-        assert!(m.contains("alias"), "{m}");
-        assert!(m.starts_with("--defsym:3:"), "{m}");
+    fn the_needs_layout_error_names_the_symbol() {
+        // No GNU counterpart; the defsym counter is kept for uniformity.
+        let m = DefsymError::NeedsLayout("_start".into()).gnu_message(3);
+        assert_eq!(
+            m,
+            "--defsym:3: symbol `_start' has no address yet at this point of the link"
+        );
     }
 
     #[test]

@@ -207,7 +207,7 @@ pub(super) fn emit_shared_library(
     // `--defsym` expressions deferred from `apply_defsyms`; evaluated here
     // once section addresses and the linker-provided symbols are final, so the
     // shared path and the executable path agree (see `link::evaluate_pending_defsyms`).
-    pending_defsyms: &[(String, String, usize)],
+    pending_defsyms: &super::link::PendingDefsyms,
 ) -> Result<(), String> {
     let base_addr: u64 = 0;
     // Option-derived dynamic flags, fixed up front: the `.dynamic` sizing
@@ -421,7 +421,15 @@ pub(super) fn emit_shared_library(
                             let interposable = locally_defined
                                 && is_func
                                 && preemptible_def(sym.name.as_str(), gsym);
-                            if (external || interposable) && plt_seen.insert(sym.name.to_string()) {
+                            // `v@PLTOFF` of a library variable has no PLT entry
+                            // to name; the relocation pass refuses it.
+                            let pltoff_of_data = rela.rela_type == R_X86_64_PLTOFF64
+                                && gsym.is_dynamic
+                                && (gsym.info & 0xf) == STT_OBJECT;
+                            if (external || interposable)
+                                && !pltoff_of_data
+                                && plt_seen.insert(sym.name.to_string())
+                            {
                                 plt_names.push(sym.name.to_string());
                             }
                         }
@@ -1826,20 +1834,17 @@ pub(super) fn emit_shared_library(
         sec.data = data;
     }
 
-    // Update global symbol addresses
-    for (_, gsym) in globals.iter_mut() {
-        if let Some(obj_idx) = gsym.defined_in {
-            if gsym.section_idx == SHN_COMMON || gsym.section_idx == 0xffff {
-                if let Some(bss_sec) = output_sections.iter().find(|s| s.name == ".bss") {
-                    gsym.value += bss_sec.addr;
-                }
-            } else if gsym.section_idx != SHN_UNDEF && gsym.section_idx != SHN_ABS {
-                let si = gsym.section_idx as usize;
-                if let Some(&(oi, so)) = section_map.get(&(obj_idx, si)) {
-                    gsym.value += output_sections[oi].addr + so;
-                }
-            }
-        }
+    // Update global symbol addresses (`link::placed_value`; the same rule
+    // finishes the input definitions a `--defsym` overrides but reads).
+    let bss_addr_for_common = output_sections
+        .iter()
+        .find(|s| s.name == ".bss")
+        .map(|s| s.addr);
+    let place = |gsym: &GlobalSymbol| {
+        super::link::placed_value(gsym, section_map, output_sections, bss_addr_for_common)
+    };
+    for gsym in globals.values_mut() {
+        gsym.value = place(gsym);
     }
 
     // Define linker-provided symbols
@@ -1898,7 +1903,7 @@ pub(super) fn emit_shared_library(
 
     // Finalise deferred `--defsym` expressions now that every address they may
     // reference is final (section addresses + linker-provided symbols).
-    super::link::evaluate_pending_defsyms(globals, pending_defsyms)?;
+    super::link::evaluate_pending_defsyms(globals, pending_defsyms, &place)?;
 
     // === Build output buffer ===
     let file_size = offset as usize;
@@ -2915,6 +2920,19 @@ pub(super) fn emit_shared_library(
                         w64(&mut out, fp, (s as i64 + a - got_addr as i64) as u64);
                     }
                     R_X86_64_PLTOFF64 => {
+                        // A shared object cannot copy-relocate, so a library
+                        // variable has no link-time address at all: `v@PLTOFF`
+                        // has no value (GNU ld points it at a PLT stub made
+                        // for the variable -- code -- and binds the variable
+                        // with a JUMP_SLOT).
+                        if global.is_some_and(|g| g.is_dynamic && (g.info & 0xf) == STT_OBJECT) {
+                            return Err(format!(
+                                "{obj_name}: relocation R_X86_64_PLTOFF64 against shared-library \
+                                 variable '{}' can not be used when making a shared object: a \
+                                 variable has no PLT entry; address it through the GOT (@GOT)",
+                                sym.name
+                            ));
+                        }
                         // L + A - GOT: the PLT entry when the call must go
                         // through ld.so (import / preemptible definition),
                         // the definition itself otherwise.

@@ -297,9 +297,10 @@ fn is_benign_ignorable(a: &str) -> bool {
         | "--no-relax"
         // Driver-level flags that reach a standalone linker when a build system
         // hands the same list to both. A linker never adds default libraries on
-        // its own -- that is the driver's job -- so -nostdlib has no effect here,
-        // and warning about it on every kernel-style link is noise that hides the
-        // warnings that matter.
+        // its own -- that is the driver's job; for ld, -nostdlib only drops the
+        // built-in library search path (read where that path is chosen), and
+        // warning about any of these on every kernel-style link is noise that
+        // hides the warnings that matter.
         | "-nostdlib" | "-nostartfiles" | "-nodefaultlibs"
         | "-O0" | "-O1" | "-O2" | "-O3" // ld's own -O is a size/speed hint
     ) || a.starts_with("-plugin-opt=")
@@ -425,6 +426,13 @@ fn run(args: &[String]) -> Result<(), String> {
             "-no-pie" => {
                 is_pie = false;
                 passthrough.push("--no-pic-executable".to_string());
+            }
+            // DT_RPATH vs DT_RUNPATH for -rpath.  Only the `-Wl,` spelling
+            // reaches the shared parser, so a driver calling this as `ld`
+            // (gcc passes them bare) used to lose both to the unknown-option
+            // warning, and a plain -rpath always became DT_RUNPATH.
+            "--disable-new-dtags" | "--enable-new-dtags" => {
+                passthrough.push(format!("-Wl,{a}"));
             }
             "-shared" | "-Bshareable" => shared = true,
             "--no-dynamic-linker" | "--no-ld-generated-unwind-info" => {}
@@ -985,10 +993,19 @@ fn run(args: &[String]) -> Result<(), String> {
     // elf_i386 … crt1.o crti.o crtbegin.o … -lc … crtend.o crtn.o`) drive
     // the SAME i686 pipeline the `lccc-i686` compiler driver links with,
     // with every file and library arriving positionally, in order.
+    // GNU ld's built-in search path follows the `-L`s, except under
+    // -nostdlib ("only search library directories explicitly specified").
+    let default_dirs: &[&str] = if args.iter().any(|a| a == "-nostdlib") {
+        &[]
+    } else if elf_i386 {
+        lccc::linker_entry::DEFAULT_SEARCH_DIRS_I386
+    } else {
+        lccc::linker_entry::DEFAULT_SEARCH_DIRS_X86_64
+    };
     if elf_i386 {
         let i386_args = ordered_args(&passthrough, &positional_files);
         if shared {
-            return lccc::linker_entry::link_shared_i386(&output, &i386_args);
+            return lccc::linker_entry::link_shared_i386(&output, &i386_args, default_dirs);
         }
         // The i686 executable emitter produces ET_EXEC at the ABI base
         // address only.  A PIE needs a load-address-independent image plus
@@ -1001,7 +1018,7 @@ fn run(args: &[String]) -> Result<(), String> {
                  ET_EXEC for i386 (link with -no-pie)"
                 .to_string());
         }
-        return lccc::linker_entry::link_builtin_i386(&output, &i386_args);
+        return lccc::linker_entry::link_builtin_i386(&output, &i386_args, default_dirs);
     }
     let mut object_files: Vec<String> = Vec::new();
     for (path, wa) in &inputs {
@@ -1016,7 +1033,12 @@ fn run(args: &[String]) -> Result<(), String> {
     let object_refs: Vec<&str> = object_files.iter().map(|s| s.as_str()).collect();
 
     if shared {
-        return lccc::linker_entry::link_shared_x86(&object_refs, &output, &passthrough);
+        return lccc::linker_entry::link_shared_x86(
+            &object_refs,
+            &output,
+            &passthrough,
+            default_dirs,
+        );
     }
     // A plain -pie is honoured by the built-in emitter: ET_DYN based at 0,
     // DF_1_PIE, and an R_X86_64_RELATIVE for every internal absolute address,
@@ -1032,7 +1054,7 @@ fn run(args: &[String]) -> Result<(), String> {
              producing an image that faults in the CRT self-relocation)"
             .to_string());
     }
-    lccc::linker_entry::link_builtin_x86(&object_refs, &output, &passthrough)
+    lccc::linker_entry::link_builtin_x86(&object_refs, &output, &passthrough, default_dirs)
 }
 
 #[cfg(test)]
