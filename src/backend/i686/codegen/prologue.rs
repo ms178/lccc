@@ -402,31 +402,36 @@ impl I686Codegen {
             }
         }
 
-        let (reg_assigned, cached_liveness, _caller_save_spans, accumulator_assignments) =
-            crate::backend::stack_layout::run_regalloc_and_merge_clobbers_ex(
-                func,
-                available_regs,
-                caller_saved_regs,
-                &asm_clobbered_regs,
-                &mut self.reg_assignments,
-                &mut self.used_callee_saved,
-                false,
-                never_materialized,
-                Vec::new(),
-                Vec::new(),
-                // i686 emits SIB indexed addressing directly at the Load/Store
-                // (session 27) AND folds constant-offset GEPs with register
-                // bases (const_offset_fold_reg_base_ok): BOTH forms consume
-                // address registers RA-invisibly at the access position.
-                // collect_folded_gep_links_all extends the base intervals of
-                // const-offset folds plus base AND index intervals of indexed
-                // folds to their consumers, so the address registers survive
-                // intervening calls and accumulator staging.
-                crate::backend::generation::collect_folded_gep_links_all(func),
-                &self.state.ra_config,
-                // Not alias-aware yet: ignored scratch map keeps the pre-alias freshness behavior.
-                &mut crate::common::fx_hash::FxHashMap::default(),
-            );
+        let (
+            reg_assigned,
+            cached_liveness,
+            _caller_save_spans,
+            accumulator_assignments,
+            _ra_eligible,
+        ) = crate::backend::stack_layout::run_regalloc_and_merge_clobbers_ex(
+            func,
+            available_regs,
+            caller_saved_regs,
+            &asm_clobbered_regs,
+            &mut self.reg_assignments,
+            &mut self.used_callee_saved,
+            false,
+            never_materialized,
+            Vec::new(),
+            Vec::new(),
+            // i686 emits SIB indexed addressing directly at the Load/Store
+            // (session 27) AND folds constant-offset GEPs with register
+            // bases (const_offset_fold_reg_base_ok): BOTH forms consume
+            // address registers RA-invisibly at the access position.
+            // collect_folded_gep_links_all extends the base intervals of
+            // const-offset folds plus base AND index intervals of indexed
+            // folds to their consumers, so the address registers survive
+            // intervening calls and accumulator staging.
+            crate::backend::generation::collect_folded_gep_links_all(func),
+            &self.state.ra_config,
+            // Not alias-aware yet: ignored scratch map keeps the pre-alias freshness behavior.
+            &mut crate::common::fx_hash::FxHashMap::default(),
+        );
 
         // %ebx must be saved/restored only when it really holds the GOT base.
         if needs_got && !self.used_callee_saved.contains(&PhysReg(0)) {

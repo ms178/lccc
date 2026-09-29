@@ -624,6 +624,12 @@ jobs:
           bash tests/regression/check_gvn_xsign_load_cse.sh
           bash tests/regression/check_gvn_cross_block_mul_dot.sh
           bash tests/regression/check_call_secondary_cache.sh
+          # ZERO-REM-1: the map vectorizer's scalar remainder mirror must be
+          # omitted (not merely unreachable) when a constant trip count makes
+          # it dead, on every shape where that is provable and on none where
+          # it is not -- including the alias-guard fallback, where the mirror
+          # is live.
+          bash tests/regression/check_vec_dead_remainder.sh
           bash tests/regression/check_tls_model_selection.sh
           bash tests/regression/check_phi_acyclic_order.sh
           python3 scripts/check_doc_links.py

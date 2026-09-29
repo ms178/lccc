@@ -321,26 +321,31 @@ impl ArmCodegen {
             crate::backend::regalloc::PhysReg(7),
             crate::backend::regalloc::PhysReg(8),
         ];
-        let (mut reg_assigned, cached_liveness, _caller_save_spans, accumulator_assignments) =
-            crate::backend::generation::run_regalloc_and_merge_clobbers_ex(
-                func,
-                available_regs,
-                caller_saved_regs,
-                &asm_clobbered_regs,
-                &mut self.reg_assignments,
-                &mut self.used_callee_saved,
-                false,
-                None,
-                call_arg_regs,
-                Vec::new(),
-                // ARM emits indexed addressing [base, index, lsl #N] directly at
-                // the Load/Store with no IR-visible use of the index there; the
-                // allocator must keep the index live to the consumer's end.
-                crate::backend::generation::collect_folded_index_links(func),
-                &self.state.ra_config,
-                // Not alias-aware yet: ignored scratch map keeps the pre-alias freshness behavior.
-                &mut crate::common::fx_hash::FxHashMap::default(),
-            );
+        let (
+            mut reg_assigned,
+            cached_liveness,
+            _caller_save_spans,
+            accumulator_assignments,
+            _ra_eligible,
+        ) = crate::backend::generation::run_regalloc_and_merge_clobbers_ex(
+            func,
+            available_regs,
+            caller_saved_regs,
+            &asm_clobbered_regs,
+            &mut self.reg_assignments,
+            &mut self.used_callee_saved,
+            false,
+            None,
+            call_arg_regs,
+            Vec::new(),
+            // ARM emits indexed addressing [base, index, lsl #N] directly at
+            // the Load/Store with no IR-visible use of the index there; the
+            // allocator must keep the index live to the consumer's end.
+            crate::backend::generation::collect_folded_index_links(func),
+            &self.state.ra_config,
+            // Not alias-aware yet: ignored scratch map keeps the pre-alias freshness behavior.
+            &mut crate::common::fx_hash::FxHashMap::default(),
+        );
 
         if std::env::var_os("CCC_NO_CSINC_FOLD").is_none() {
             if let Some((plan, condition_is_32)) = conditional_increment_leaf_plan(func) {

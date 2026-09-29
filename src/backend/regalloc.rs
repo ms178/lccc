@@ -612,6 +612,15 @@ pub struct RegAllocResult {
     /// targets whose emitters are not alias-aware (ARM/RISC-V/i686 keep the
     /// pre-alias behavior).
     pub phi_chain: FxHashMap<u32, u32>,
+    /// Values the allocator considered for a register home — the causal
+    /// denominator of a spill.  A slot holding an *eligible* value that ended
+    /// up with no register is register-pressure traffic; a slot holding a value
+    /// that was never a candidate (alloca, address-taken, i128/vector/aggregate)
+    /// is structurally required memory.  Only the allocator knows which is
+    /// which, so it publishes the set for the census
+    /// (`CCC_SLOT_CENSUS=1`, `scripts/stack_census.py`) instead of every
+    /// consumer re-deriving eligibility and drifting from it.
+    pub eligible: FxHashSet<u32>,
 }
 
 /// Whether x86 can preserve incoming parameters directly in caller-saved homes.
@@ -2340,7 +2349,9 @@ fn loop_weight(depth: u32) -> u64 {
     }
 }
 
-fn is_non_gpr_type(ty: &IrType, is_32bit: bool) -> bool {
+/// Shared with the slot census so the "why is this in memory" taxonomy uses
+/// the allocator's own predicate instead of a lookalike copy.
+pub(crate) fn is_non_gpr_type(ty: &IrType, is_32bit: bool) -> bool {
     ty.is_float()
         || ty.is_long_double()
         || matches!(ty, IrType::I128 | IrType::U128)
@@ -3124,6 +3135,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         || (config.available_regs.is_empty() && config.caller_saved_regs.is_empty())
     {
         return RegAllocResult {
+            eligible: FxHashSet::default(),
             assignments: FxHashMap::default(),
             accumulator_assignments: if has_builtin_setjmp {
                 Vec::new()
@@ -5751,6 +5763,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     }
 
     RegAllocResult {
+        eligible,
         assignments,
         accumulator_assignments,
         used_regs,

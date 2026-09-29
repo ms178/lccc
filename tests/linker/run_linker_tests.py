@@ -9320,6 +9320,53 @@ def _reloc_field_range_tests(args, oracles):
                 # rejects `--defsym`, which once made every oracle "agree"
                 # vacuously.)  The oracle must also name the truncation.
                 agree = []
+                # How an oracle's answer counts:
+                #
+                # * "accepted"     -- it linked the input. A real
+                #                     disagreement: lccc refuses what the
+                #                     ecosystem accepts.
+                # * "refused"      -- it refused AND named a range failure
+                #                     for this relocation type. Agreement.
+                # * "silent"       -- it refused without naming the type or
+                #                     a range: counted as disagreement, so
+                #                     an unrecognised refusal can never be
+                #                     mistaken for conformity.
+                # * "inapplicable" -- it never REACHED the relocation
+                #                     (mold 2.37 cannot parse this minimal
+                #                     `-T` script at all: "unknown linker
+                #                     script token"). It has no opinion to
+                #                     agree or disagree with, so it is
+                #                     excluded -- and the result says so.
+                #                     An oracle that cannot run the fixture
+                #                     is not evidence about lccc either way,
+                #                     which is the opposite failure mode
+                #                     from the one the comment above warns
+                #                     about (an oracle that never linked
+                #                     because the DRIVER rejected the flag,
+                #                     which made every oracle "agree").
+                #
+                # The WORDING is deliberately not part of the contract: bfd
+                # says "relocation truncated to fit", mold and lld say
+                # "out of range", and the psABI mandates neither.  This file
+                # already accepts both spellings for lccc's OWN message in
+                # the field-width cases below; demanding bfd's spelling from
+                # the ORACLE half meant that installing mold turned a
+                # conforming lccc into "lccc is inventing a restriction".
+                # The shared path keeps its own weaker rule: GNU ld refuses
+                # every R_X86_64_32 in a shared object with wording of its
+                # own, so any refusal counts there.
+                def _oracle_verdict(oerr: bytes, orc: int, kind: str) -> str:
+                    if orc == 0:
+                        return "accepted"
+                    if label == "shared":
+                        return "refused"
+                    if f"R_X86_64_{kind}".encode() not in oerr:
+                        return "inapplicable"
+                    if b"truncated" in oerr or b"out of range" in oerr:
+                        return "refused"
+                    return "silent"
+
+                notes = {}
                 defsym = f"-Wl,--defsym,farpc={far}"
                 for oname, ocmd in oracles:
                     if label == "script":
@@ -9331,12 +9378,20 @@ def _reloc_field_range_tests(args, oracles):
                     else:
                         o = sh(ocmd + ["-nostdlib", "-static", defsym, "-Wl,-e,probe", "p.o",
                                        "-o", f"o.{oname}"], cwd=td)
-                    agree.append((oname, o.returncode != 0
-                                  and (label == "shared" or b"truncated" in o.stderr)))
-                if agree and not all(ok for _, ok in agree):
+                    verdict = _oracle_verdict(o.stderr, o.returncode, kind)
+                    notes[oname] = (verdict, o.returncode, o.stderr.decode()[:120])
+                    if verdict != "inapplicable":
+                        agree.append((oname, verdict == "refused"))
+                if not agree:
                     results.append(Result(
                         name, "FAIL",
-                        f"oracles disagree with the refusal: {agree}"))
+                        f"no oracle could express an opinion about the fixture: "
+                        f"{notes}"))
+                elif not all(ok for _, ok in agree):
+                    results.append(Result(
+                        name, "FAIL",
+                        f"oracles disagree with the refusal: {agree}; "
+                        f"diagnostics: {notes}"))
                 else:
                     results.append(Result(name, "PASS"))
             # An R_X86_64_32 against an EXPORTED absolute symbol is refused

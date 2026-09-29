@@ -96,6 +96,12 @@ candidate/main `.text` is identical and its runtime ratio's interval spans
 1.0. **No allocator speedup or regression is established.** Require
 post-allocation slot-traffic feedback and a small, verified general change
 before reconsidering full register-source-spanning remat.
+**2026-09-28: the slot-traffic feedback prerequisite now exists** —
+`scripts/stack_census.py --per-slot N` reports per-slot load/store/addr
+traffic, and the census shows `sha256_transform` has **0 spill** and 12
+`csave` references, so the Phase-2 remat experiment cannot pay for itself on
+this function in its current shape. Re-open only for a function the census
+shows as genuinely spill-dominated.
 Oracle targets: `sha256_transform ≤ 1.5×`, epilogue ref-count −50 %.
 Design refs: [`engineering/DECISIONS.md`](engineering/DECISIONS.md)
 RA-GLA-01/02/03. Aligns with **R3** (RA span supply + phi/ORI lowering —
@@ -103,6 +109,54 @@ skip the 1.93× sha256 without tripling the web count; compare
 GHASH/mulpack for the multi-source shape rule).
 
 ## Tier 1 — measured, largest first
+
+### ZERO-REM-1 · **LANDED 2026-09-28** — dead vectorizer remainder loops
+The map vectorizer emitted its scalar mirror (the `N % W` tail loop, which
+doubles as the runtime dependence guard's fallback) even when a constant trip
+count made it unreachable: 17 instructions of guard, resume-index arithmetic,
+materialised stream pointers and a dead scalar body **per vectorized loop**.
+`transform_map_vector` now omits it when `N % packed_width == 0`,
+`pattern.guarded_streams` is empty and the escaping counter can be re-pointed
+at the trip count (materialised in the preheader with the mirror's own
+`Cast`-to-`iv_ty` form, so it works in bare-`Value` use positions too).
+Measured at `-O2` on upstream `main` `93f2a43b` (A/B against the kill
+switch): `sha256_transform` **151 → 135** insns / 20 → 19 rrmov / 1 → 0
+stkref, a 16-element `unsigned` copy 61 → 28, `shape_u32_exact` 39 → 18.
+Pinned-oracle targets for the same function: GCC 16.2 = 142, Clang 23.1 =
+129. Kill switch `CCC_NO_MAP_ZERO_REM=1`.
+Evidence: [`engineering/evidence/ZERO-REM-1/README.md`](engineering/evidence/ZERO-REM-1/README.md);
+gates `tests/regression/check_vec_dead_remainder.sh` +
+`tests/regression/check_vec_remainder_shapes.py` +
+`tests/regression/vec_dead_remainder.c` and the assembly-shape fixture
+`tests/regression/vec_shapes/vec_dead_remainder_shapes.c` (a subdirectory, so
+`run_regression.py`'s program corpus does not try to link it).
+Not done: the reduction and stencil vectorizers build their own tails; the same
+constant-trip-count reasoning applies there.
+
+### SPILL-01 · **TOOL LANDED 2026-09-28** — causal stack-reference census
+`ra_quality_census` counted stack references; nothing said *why* they exist.
+`RegAllocResult` now publishes the allocator's own `eligible` set and
+`src/backend/stack_layout/slot_census.rs` turns it into a per-slot cause
+(`alloca`/`address`/`wide`/`spill`/`nongpr`/`temp`, opt-in `CCC_SLOT_CENSUS=1`);
+`scripts/stack_census.py` joins it with the POST-PEEPHOLE assembly and
+attributes every emitted stack reference (plus `csave`/`argout`/`incoming`).
+Corpus gate met: **98.74 %** coverage (1251/1267) vs the 95 % criterion.
+Finding that re-orders the queue: **44.4 % of stack references are
+callee-save save/restore**, 23.8 % structural (alloca/address/wide/nongpr) and
+only **10.7 % are spills** — and `sha256_transform`, the RA-PRESSURE-3 target,
+has **zero** spill references.
+Evidence: [`engineering/evidence/SPILL-01/README.md`](engineering/evidence/SPILL-01/README.md).
+
+### RA-CSAVE-1 · **NEW 2026-09-28** — callee-save save/restore traffic
+Opened from the SPILL-01 census: 562 of 1267 stack references (44.4 %) are
+callee-saved registers being saved on entry and restored on exit, more than
+spills and allocas combined. Every register taken from the callee-saved pool
+costs two stack references per call. Before touching eviction policy: measure
+how many of those registers are *used* after allocation (`[RA-STATS]
+callee-homes=`) versus saved defensively, and whether the corpus's hot
+functions would rather spill a caller-saved value. Done = a census-driven,
+output-checked change that reduces `csave` references on the corpus without an
+instruction-count regression, or a documented bound.
 
 ### RA-PRESSURE-3 · **RE-SCOPED 2026-09-28** — sha256 round loop
 The historical framing ("land a generic phi-copy cycle resolver") is
