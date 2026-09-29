@@ -698,7 +698,11 @@ fn i686_make_relocation(
     diff_symbol: Option<&str>,
 ) -> Relocation {
     let (symbol, reloc_type) = if diff_symbol.is_none() {
-        if let Some(base) = symbol.strip_suffix("@PLT") {
+        if symbol.len() >= 4 && symbol[symbol.len() - 4..].eq_ignore_ascii_case("@plt") {
+            // Case-insensitive like GAS's suffix matching (`call foo@plt`
+            // promotes exactly like `foo@PLT`); a lowercase spelling used
+            // to leak the suffix into the symbol table as R_386_PC32.
+            let base = &symbol[..symbol.len() - 4];
             (
                 base,
                 if reloc_type == R_386_PC32 {

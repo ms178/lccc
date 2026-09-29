@@ -27,13 +27,26 @@ impl X86Arch for X86_64Arch {
 
         // Detect jump instructions for relaxation
         let jump = {
+            // An explicit `data16` prefix is a 16-bit displacement request,
+            // not a rel32 jump: the encoded form is `66 e9 rel16` (5 bytes),
+            // which the length check below would read as a 5-byte E9 rel32
+            // jump and the relaxer would then "shrink" by overwriting the
+            // first opcode byte with EB — dropping the 66/segment prefixes
+            // and leaving the displacement reloc dangling. GAS relaxes such
+            // branches to `66 eb rel8` for near local targets; lccc keeps
+            // the requested rel16 (the same fixed-rel16 policy the .code16
+            // branches document) and the PC16 in-place fold resolves it.
+            let data16 = instr
+                .prefixes
+                .iter()
+                .any(|p| p.eq_ignore_ascii_case("data16"));
             // Match the encoder's normalization: GAS accepts `.s` on any
             // mnemonic (`jmp.s` relaxes exactly like `jmp`) and is
             // case-insensitive. Without this, `jmp.s` misclassifies as
             // conditional (length 5 != 6) and is never relaxed.
             let mnem_lower = instr.mnemonic.to_ascii_lowercase();
             let mnem: &str = mnem_lower.strip_suffix(".s").unwrap_or(&mnem_lower);
-            let is_jump = mnem.starts_with('j') && mnem.len() >= 2;
+            let is_jump = !data16 && mnem.starts_with('j') && mnem.len() >= 2;
             if is_jump && instr.operands.len() == 1 {
                 if let Operand::Label(_) = &instr.operands[0] {
                     let is_conditional = mnem != "jmp";
@@ -85,7 +98,8 @@ impl X86Arch for X86_64Arch {
         _section_data_len: u64,
     ) -> Result<EncodeResult, String> {
         use crate::backend::i686::assembler::encoder::{
-            InstructionEncoder as I686Encoder, R_386_32, R_386_PC32, R_386_PLT32,
+            InstructionEncoder as I686Encoder, R_386_8, R_386_16, R_386_32, R_386_PC8, R_386_PC16,
+            R_386_PC32, R_386_PLT32,
         };
         let mut encoder = I686Encoder::new();
         encoder.offset = 0;
@@ -144,6 +158,15 @@ impl X86Arch for X86_64Arch {
                 R_386_32 => R_X86_64_32,
                 R_386_PC32 => R_X86_64_PC32,
                 R_386_PLT32 => R_X86_64_PLT32,
+                // Width-and-semantics-matched 16/8-bit pairs: the linker
+                // computes S+A, S+A-P identically, only the field width
+                // differs. `data16 jmp ext` inside a .code32 section of a
+                // 64-bit object emits R_386_PC16 (GAS: R_X86_64_PC16),
+                // `movw $ext,%ax` the R_386_16 pair.
+                R_386_16 => R_X86_64_16,
+                R_386_PC16 => R_X86_64_PC16,
+                R_386_8 => R_X86_64_8,
+                R_386_PC8 => R_X86_64_PC8,
                 other => {
                     return Err(format!(
                         ".code32 in 64-bit object: relocation type {} for '{}' has no \
@@ -256,8 +279,27 @@ impl X86Arch for X86_64Arch {
         Some(R_X86_64_PC8_INTERNAL)
     }
     fn reloc_pc8() -> Option<u32> {
-        Some(15)
-    } // R_X86_64_PC8
+        Some(R_X86_64_PC8)
+    }
+    /// Rel16 branch fields (`data16 jmp/call/jcc`) own the real
+    /// R_X86_64_PC16: same-section local targets are folded in place by
+    /// the shared writer (GAS emits no relocation for them), external and
+    /// cross-section targets keep the reloc for the linker.
+    fn reloc_pc16() -> Option<u32> {
+        Some(R_X86_64_PC16)
+    }
+    /// Patch width per relocation type. The trait default (4) is right for
+    /// the word32/word64 classes this writer emits most; the 8/16-bit
+    /// classes own narrower fields and a 4-byte patch would clobber the
+    /// neighbouring instruction bytes.
+    fn reloc_patch_size(reloc_type: u32) -> u8 {
+        match reloc_type {
+            R_X86_64_8 | R_X86_64_PC8 => 1,
+            R_X86_64_16 | R_X86_64_PC16 => 2,
+            R_X86_64_64 | R_X86_64_PC64 => 8,
+            _ => 4,
+        }
+    }
     fn reloc_abs32_for_internal() -> Option<u32> {
         Some(R_X86_64_32)
     }

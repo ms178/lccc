@@ -269,11 +269,14 @@ impl super::InstructionEncoder {
                     self.bytes.push(0xB8 + dst_num);
                     if sym == "_GLOBAL_OFFSET_TABLE_" {
                         // GOT-base immediate (PIC prologue idiom): R_386_GOTPC.
-                        // The addend is finalized centrally in `encode()` as
-                        // the field's instruction-relative offset (GAS 2.47:
-                        // `mov $_GLOBAL_OFFSET_TABLE_,%eax' = b8 01000000,
-                        // i.e. linked value GOT - insn_start).
-                        self.add_relocation(sym, R_386_GOTPC, 0);
+                        // The field-offset addend is finalized centrally in
+                        // `encode()` (GAS 2.47: `mov
+                        // $_GLOBAL_OFFSET_TABLE_,%eax' = b8 01000000, i.e.
+                        // linked value GOT - insn_start) ON TOP of the
+                        // user addend (`movl $_GLOBAL_OFFSET_TABLE_+2,%eax'
+                        // = b8 03000000 — +2 +1); dropping it here would
+                        // silence every `_GLOBAL_OFFSET_TABLE_+N' spelling.
+                        self.add_relocation(sym, R_386_GOTPC, addend);
                     } else {
                         self.add_relocation(sym, R_386_32, addend);
                     }
@@ -982,14 +985,17 @@ impl super::InstructionEncoder {
                 // The implicit addend = opcode length so the PC correction works:
                 // ebx (= return addr of thunk call) + (GOT + addend - P) = GOT
                 if sym == "_GLOBAL_OFFSET_TABLE_" {
-                    // R_386_GOTPC; the field addend is finalized centrally
-                    // in `encode()` as the field's instruction-relative
-                    // offset (== opcode_len here). The field bytes are
-                    // written as zeros because the object writer applies
-                    // the metadata addend ADDITIVELY — pre-writing the
-                    // addend here would double-count (the old 04-vs-02
-                    // field bug against GAS).
-                    self.add_relocation(sym, R_386_GOTPC, 0);
+                    // R_386_GOTPC; the field-offset addend is finalized
+                    // centrally in `encode()` (== opcode_len here) ON TOP
+                    // of the user addend (GAS 2.47: `addl
+                    // $_GLOBAL_OFFSET_TABLE_,%ebx' = 81 c3 02000000,
+                    // `addl $_GLOBAL_OFFSET_TABLE_+2,%ebx' = 81 c3
+                    // 04000000). The field bytes are written as zeros
+                    // because the object writer applies the metadata
+                    // addend ADDITIVELY — pre-writing the addend here
+                    // would double-count (the old 04-vs-02 field bug
+                    // against GAS).
+                    self.add_relocation(sym, R_386_GOTPC, addend);
                     self.bytes.extend_from_slice(&[0, 0, 0, 0]);
                 } else {
                     let reloc = match imm_len {
@@ -998,7 +1004,8 @@ impl super::InstructionEncoder {
                         _ => R_386_32,
                     };
                     self.add_relocation(sym, reloc, addend);
-                    self.bytes.extend_from_slice(&vec![0u8; imm_len as usize]);
+                    let zeros = [0u8; 8];
+                    self.bytes.extend_from_slice(&zeros[..imm_len as usize]);
                 }
                 Ok(())
             }
@@ -1258,7 +1265,17 @@ impl super::InstructionEncoder {
                     self.bytes.push(0x66);
                 }
                 self.bytes.push(if size == 1 { 0x84 } else { 0x85 });
-                self.bytes.push(self.modrm(3, src_num, dst_num));
+                // `.s` flips the ModR/M roles even though TEST is
+                // commutative and both orders decode identically (GAS
+                // 2.47: `test %edx,%ecx` = 85 d1, `test.s %edx,%ecx` =
+                // 85 ca) — the store-direction convention is about the
+                // ENCODING, not the semantics.
+                let (reg_field, rm_field) = if self.s_flip {
+                    (dst_num, src_num)
+                } else {
+                    (src_num, dst_num)
+                };
+                self.bytes.push(self.modrm(3, reg_field, rm_field));
                 Ok(())
             }
             (Operand::Immediate(ImmediateValue::Integer(val)), Operand::Register(dst)) => {
@@ -1349,9 +1366,12 @@ impl super::InstructionEncoder {
         // 16-bit forms take 0x66 and an imm16 immediate (GAS 2.47:
         // `imul $0x9090,(%eax),%dx` = 66 69 10 90 90; `imul $0x90,%edx,%ecx`
         // = 69 ca 90 00 00 00 — $0x90 does not fit the SIGNED imm8, so the
-        // full-width row wins).
+        // full-width row wins). The 1-operand form MUST NOT take the 0x66
+        // here: it routes through encode_unary_rm, which pushes its own
+        // single 0x66 (GAS 2.47: `imul %ax` = 66 f7 e8 — one 0x66; the
+        // unguarded push produced 66 66 f7 e8).
         let word = size == 2;
-        if word {
+        if word && ops.len() >= 2 {
             self.bytes.push(0x66);
         }
         match ops.len() {
@@ -1948,7 +1968,14 @@ impl super::InstructionEncoder {
 
         match &ops[0] {
             Operand::Label(label) => {
-                let sym = label.strip_suffix("@PLT").unwrap_or(label.as_str());
+                let sym = strip_plt_suffix(label);
+                if self.explicit_data16 && sym.len() != label.len() {
+                    // GAS 2.47 rejects `data16 jmp foo@PLT` (either case):
+                    // a 16-bit displacement field cannot carry a PLT32.
+                    // Checked before any byte is pushed so a rejected form
+                    // leaves no partial state in `self.bytes`.
+                    return Err("4-byte relocation cannot be applied to 2-byte field".to_string());
+                }
                 if self.code16 {
                     // .code16 near jmp: E9 rel16 + R_386_PC16 (GAS emits
                     // `e9 00 00` + PC16 for forward targets; short local
@@ -1966,7 +1993,7 @@ impl super::InstructionEncoder {
                     // inserted by the forced-data16 fixup, not here.
                     self.sized_op = true;
                     self.bytes.push(0xE9);
-                    self.add_relocation(label, R_386_PC16, -2);
+                    self.add_relocation(sym, R_386_PC16, -2);
                     self.bytes.extend_from_slice(&[0, 0]);
                     return Ok(());
                 }
@@ -2190,7 +2217,14 @@ impl super::InstructionEncoder {
 
         match &ops[0] {
             Operand::Label(label) => {
-                let sym = label.strip_suffix("@PLT").unwrap_or(label.as_str());
+                let sym = strip_plt_suffix(label);
+                if self.explicit_data16 && sym.len() != label.len() {
+                    // GAS 2.47 rejects `data16 je foo@PLT` (either case):
+                    // a 16-bit displacement field cannot carry a PLT32.
+                    // Checked before any byte is pushed so a rejected form
+                    // leaves no partial state in `self.bytes`.
+                    return Err("4-byte relocation cannot be applied to 2-byte field".to_string());
+                }
                 if self.code16 {
                     // .code16 Jcc: 0F 8x rel16 + R_386_PC16. GAS relaxes
                     // same-section short targets to 7x rel8; lccc emits the
@@ -2207,7 +2241,7 @@ impl super::InstructionEncoder {
                     // is inserted by the forced-data16 fixup, not here.
                     self.sized_op = true;
                     self.bytes.extend_from_slice(&[0x0F, 0x80 + cc]);
-                    self.add_relocation(label, R_386_PC16, -2);
+                    self.add_relocation(sym, R_386_PC16, -2);
                     self.bytes.extend_from_slice(&[0, 0]);
                     return Ok(());
                 }
@@ -2233,7 +2267,14 @@ impl super::InstructionEncoder {
 
         match &ops[0] {
             Operand::Label(label) => {
-                let sym = label.strip_suffix("@PLT").unwrap_or(label.as_str());
+                let sym = strip_plt_suffix(label);
+                if self.explicit_data16 && sym.len() != label.len() {
+                    // GAS 2.47 rejects `data16 call foo@PLT` (either case):
+                    // a 16-bit displacement field cannot carry a PLT32.
+                    // Checked before any byte is pushed so a rejected form
+                    // leaves no partial state in `self.bytes`.
+                    return Err("4-byte relocation cannot be applied to 2-byte field".to_string());
+                }
                 if self.code16 {
                     // .code16 near call: E8 rel16 + R_386_PC16 (GAS:
                     // `e8 00 00` + PC16 ext_fn-0x2). The explicit 32-bit
@@ -2355,7 +2396,10 @@ impl super::InstructionEncoder {
         }
 
         match (&ops[0], &ops[1]) {
-            (Operand::Register(src), Operand::Memory(mem)) => {
+            // xchg is symmetric, so AT&T's memory-first spelling encodes
+            // identically (GAS 2.47: `xchg (%ebx),%eax` = 87 03).
+            (Operand::Register(src), Operand::Memory(mem))
+            | (Operand::Memory(mem), Operand::Register(src)) => {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 if size == 2 || size == 4 {
                     self.sized_op = true;
@@ -2375,8 +2419,17 @@ impl super::InstructionEncoder {
                 if size == 2 {
                     self.bytes.push(0x66);
                 }
+                // `.s` swaps the ModR/M roles (GAS 2.47: `xchg.s %edx,%ecx`
+                // = 87 ca vs plain `xchg %edx,%ecx` = 87 d1); the
+                // accumulator short form above is unaffected (`xchg.s
+                // %eax,%ecx` = 91, probed).
+                let (reg_field, rm_field) = if self.s_flip {
+                    (dst_num, src_num)
+                } else {
+                    (src_num, dst_num)
+                };
                 self.bytes.push(if size == 1 { 0x86 } else { 0x87 });
-                self.bytes.push(self.modrm(3, src_num, dst_num));
+                self.bytes.push(self.modrm(3, reg_field, rm_field));
                 Ok(())
             }
             _ => Err("unsupported xchg operands".to_string()),

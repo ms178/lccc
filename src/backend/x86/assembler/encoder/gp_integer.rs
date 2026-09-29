@@ -2714,10 +2714,26 @@ impl super::InstructionEncoder {
                 // Near jump with 32-bit displacement (will be resolved by linker/relocator)
                 // Always use R_X86_64_PLT32 for branch targets, matching modern GCC/binutils.
                 // R_X86_64_PC32 is rejected by ld for PIE executables calling shared lib functions.
+                let sym = strip_plt_suffix(label);
+                if self.explicit_data16 && sym.len() != label.len() {
+                    // GAS 2.47: `data16 jmp foo@PLT` — "4-byte relocation
+                    // cannot be applied to 2-byte field": the 16-bit
+                    // displacement field cannot carry a PLT32. Checked
+                    // before the opcode bytes so a rejected form leaves no
+                    // partial state in `self.bytes`.
+                    return Err("4-byte relocation cannot be applied to 2-byte field".to_string());
+                }
                 self.bytes.push(0xE9);
-                let sym = label.strip_suffix("@PLT").unwrap_or(label.as_str());
-                let reloc_type = R_X86_64_PLT32;
-                self.add_relocation(sym, reloc_type, -4);
+                if self.explicit_data16 {
+                    // `data16 jmp foo` shrinks the displacement to rel16
+                    // with the 16-bit PC-relative class (GAS 2.47: 66 e9
+                    // 0000 + R_X86_64_PC16 -2). The 0x66 is inserted by
+                    // the central forced-data16 splice, not here.
+                    self.add_relocation(sym, R_X86_64_PC16, -2);
+                    self.bytes.extend_from_slice(&[0, 0]);
+                    return Ok(());
+                }
+                self.add_relocation(sym, R_X86_64_PLT32, -4);
                 self.bytes.extend_from_slice(&[0, 0, 0, 0]);
                 Ok(())
             }
@@ -2757,10 +2773,22 @@ impl super::InstructionEncoder {
             Operand::Label(label) => {
                 // Near jcc with 32-bit displacement
                 // Strip @PLT suffix and use PLT32 relocation (matches GCC behavior)
+                let sym = strip_plt_suffix(label);
+                if self.explicit_data16 && sym.len() != label.len() {
+                    // GAS 2.47: a 16-bit jcc field cannot carry a PLT32.
+                    // Checked before the opcode bytes so a rejected form
+                    // leaves no partial state in `self.bytes`.
+                    return Err("4-byte relocation cannot be applied to 2-byte field".to_string());
+                }
                 self.bytes.extend_from_slice(&[0x0F, 0x80 + cc]);
-                let reloc_type = R_X86_64_PLT32;
-                let sym = label.strip_suffix("@PLT").unwrap_or(label);
-                self.add_relocation(sym, reloc_type, -4);
+                if self.explicit_data16 {
+                    // `data16 je foo` = 66 0f 84 0000 + R_X86_64_PC16 -2;
+                    // the 0x66 comes from the central data16 splice.
+                    self.add_relocation(sym, R_X86_64_PC16, -2);
+                    self.bytes.extend_from_slice(&[0, 0]);
+                    return Ok(());
+                }
+                self.add_relocation(sym, R_X86_64_PLT32, -4);
                 self.bytes.extend_from_slice(&[0, 0, 0, 0]);
                 Ok(())
             }
@@ -2775,11 +2803,23 @@ impl super::InstructionEncoder {
 
         match &ops[0] {
             Operand::Label(label) => {
-                self.bytes.push(0xE8);
                 // Use PLT32 for external function calls (linker will resolve)
-                let reloc_type = R_X86_64_PLT32;
-                let sym = label.strip_suffix("@PLT").unwrap_or(label.as_str());
-                self.add_relocation(sym, reloc_type, -4);
+                let sym = strip_plt_suffix(label);
+                if self.explicit_data16 && sym.len() != label.len() {
+                    // GAS 2.47: a 16-bit call field cannot carry a PLT32.
+                    // Checked before the opcode byte so a rejected form
+                    // leaves no partial state in `self.bytes`.
+                    return Err("4-byte relocation cannot be applied to 2-byte field".to_string());
+                }
+                self.bytes.push(0xE8);
+                if self.explicit_data16 {
+                    // `data16 call foo` = 66 e8 0000 + R_X86_64_PC16 -2;
+                    // the 0x66 comes from the central data16 splice.
+                    self.add_relocation(sym, R_X86_64_PC16, -2);
+                    self.bytes.extend_from_slice(&[0, 0]);
+                    return Ok(());
+                }
+                self.add_relocation(sym, R_X86_64_PLT32, -4);
                 self.bytes.extend_from_slice(&[0, 0, 0, 0]);
                 Ok(())
             }
@@ -2920,9 +2960,24 @@ impl super::InstructionEncoder {
                 if size == 2 {
                     self.bytes.push(0x66);
                 }
-                self.emit_rex_rr(size, &src.name, &dst.name);
+                // `.s` swaps the ModR/M roles — and therefore the REX.R/
+                // REX.B assignments with them (GAS 2.47: `xchg.s %rdx,%rcx`
+                // = 48 87 ca vs plain `xchg %rdx,%rcx` = 48 87 d1). The
+                // accumulator short form above is unaffected (`xchg.s
+                // %rax,%rcx` = 48 91, probed).
+                let (reg_field, rm_field) = if self.s_flip {
+                    (dst_num, src_num)
+                } else {
+                    (src_num, dst_num)
+                };
+                let (reg_name, rm_name) = if self.s_flip {
+                    (&dst.name, &src.name)
+                } else {
+                    (&src.name, &dst.name)
+                };
+                self.emit_rex_rr(size, reg_name, rm_name);
                 self.bytes.push(if size == 1 { 0x86 } else { 0x87 });
-                self.bytes.push(self.modrm(3, src_num, dst_num));
+                self.bytes.push(self.modrm(3, reg_field, rm_field));
                 Ok(())
             }
             _ => Err("unsupported xchg operands".to_string()),
@@ -3137,6 +3192,21 @@ impl super::InstructionEncoder {
     ///    in `encode` detects the 32-bit base registers of both memory
     ///    operands and inserts the byte in canonical position.)
     ///
+    /// Operand-shape laws (byte-probed against 2.47):
+    ///  * accumulator-carrying spellings exist for STOS and LODS only, with
+    ///    the accumulator in its canonical slot and the size-matched name
+    ///    (`stosb %al,(%rdi)` = aa, `stosq %rax,(%rdi)` = 48 ab,
+    ///    `lodsq (%rsi),%rax` = 48 ad); a wrong register or a reversed
+    ///    order is "operand type mismatch" (`stosb (%rdi),%al`,
+    ///    `lodsb %rax,(%rsi)`);
+    ///  * SCAS takes no register spelling (`scasb %eax,(%rdi)` rejected);
+    ///  * INS/OUTS require both operands — the single-memory spelling is
+    ///    "number of operands mismatch" (`insb (%dx)` rejected) — and the
+    ///    port operand must be exactly `(%dx)` (`insb (%eax),…` rejected,
+    ///    "`(%eax)' is not valid here (expected `(%dx)')");
+    ///  * the ES-slot segment check names the operand by its 1-BASED
+    ///    source position (`movsb (%rsi),%fs:(%rdi)` → "operand 2").
+    ///
     /// `esi_idx`/`edi_idx` name the operand INDEX playing each role
     /// (`None` when the family has no such operand). The central
     /// operand-segment choke point in `encode` skips string ops (see
@@ -3152,6 +3222,68 @@ impl super::InstructionEncoder {
         stem: &str,
     ) -> Result<(), String> {
         if ops.is_empty() {
+            if size == 2 {
+                self.bytes.push(0x66);
+            } else if size == 8 {
+                self.bytes.push(0x48); // REX.W
+            }
+            self.bytes.push(if size == 1 { opcode } else { opcode + 1 });
+            return Ok(());
+        }
+        // INS/OUTS carry their port operand explicitly in GAS's templates:
+        // the one-operand spellings are rejected outright (2.47:
+        // `insb (%dx)' / `outsb (%rsi)' → "number of operands mismatch for
+        // `ins'/`outs'"), unlike the accumulator-implicit stos/scas/lods.
+        if ops.len() == 1 && matches!(stem, "ins" | "outs") {
+            return Err(format!("number of operands mismatch for `{stem}'"));
+        }
+        // Two-operand INS/OUTS: the port is `(%dx)` or the `%dx` register
+        // (2.47 accepts `insb (%dx),%es:(%edi)` AND `insb %dx,(%rdi)` =
+        // 6c; `outsb (%rsi),%dx` = 6e), the address operand follows the
+        // family's slot law — INS addresses EDI (reject non-%es, 2.47:
+        // "`ins' operand 2 must use `%es' segment"), OUTS addresses ESI
+        // (keep every non-%ds override, 2.47: `outsb %es:(%rsi),%dx` =
+        // 26 6e) — and the order is fixed (`outsb %dx,(%esi)` is
+        // "operand type mismatch for `outs'").
+        if ops.len() == 2 && matches!(stem, "ins" | "outs") {
+            let port_is_dx = |op: &Operand| match op {
+                Operand::Register(r) => r.name.eq_ignore_ascii_case("dx"),
+                Operand::Memory(m) => {
+                    m.base
+                        .as_ref()
+                        .is_some_and(|b| b.name.eq_ignore_ascii_case("dx"))
+                        && m.index.is_none()
+                }
+                _ => false,
+            };
+            let addr_idx = if stem == "ins" { 1 } else { 0 };
+            if !port_is_dx(&ops[1 - addr_idx]) {
+                return Err(format!("operand type mismatch for `{stem}'"));
+            }
+            let mem =
+                mem_of(&ops[addr_idx]).ok_or(format!("operand type mismatch for `{stem}'"))?;
+            match (stem, mem.segment.as_deref()) {
+                ("ins", None | Some("es")) => {}
+                ("ins", Some(_)) => {
+                    return Err(format!(
+                        "`{stem}' operand {} must use `%es' segment",
+                        addr_idx + 1
+                    ));
+                }
+                ("outs", None | Some("ds")) => {}
+                ("outs", Some(other)) => {
+                    let byte = match other {
+                        "es" => 0x26,
+                        "cs" => 0x2E,
+                        "ss" => 0x36,
+                        "fs" => 0x64,
+                        "gs" => 0x65,
+                        _ => return Err(format!("unsupported segment override: %{other}")),
+                    };
+                    self.bytes.push(byte);
+                }
+                _ => unreachable!("stem is ins or outs"),
+            }
             if size == 2 {
                 self.bytes.push(0x66);
             } else if size == 8 {
@@ -3212,9 +3344,86 @@ impl super::InstructionEncoder {
                 _ => None,
             }
         }
+        // Accumulator-carrying spellings (2.47-probed): STOS leads with the
+        // accumulator (`stosb %al,(%rdi)` = aa, `stosq %rax,(%rdi)` = 48 ab)
+        // and LODS trails with it (`lodsq (%rsi),%rax` = 48 ad). The register
+        // must be the size-matched accumulator and the order is fixed; SCAS
+        // has no register spelling (2.47: `scasb %eax,(%rdi)` is "operand
+        // type mismatch"), and both fall through to the memory-only path,
+        // whose `mem_of` rejects a register operand exactly like GAS.
+        if edi_idx.is_some() && esi_idx.is_none() && stem == "stos" {
+            if !is_size_matched_accumulator(&ops[0], size) {
+                return Err(format!("operand type mismatch for `{stem}'"));
+            }
+            let mem = mem_of(&ops[1]).ok_or(format!("operand type mismatch for `{stem}'"))?;
+            match mem.segment.as_deref() {
+                None | Some("es") => {}
+                Some(_) => {
+                    return Err(format!("`{stem}' operand 2 must use `%es' segment"));
+                }
+            }
+            if size == 2 {
+                self.bytes.push(0x66);
+            } else if size == 8 {
+                self.bytes.push(0x48); // REX.W
+            }
+            self.bytes.push(if size == 1 { opcode } else { opcode + 1 });
+            return Ok(());
+        }
+        if esi_idx.is_some() && edi_idx.is_none() && stem == "lods" {
+            let mem = mem_of(&ops[0]).ok_or(format!("operand type mismatch for `{stem}'"))?;
+            if !is_size_matched_accumulator(&ops[1], size) {
+                return Err(format!("operand type mismatch for `{stem}'"));
+            }
+            let seg_byte = match mem.segment.as_deref() {
+                None | Some("ds") => None,
+                Some("es") => Some(0x26),
+                Some("cs") => Some(0x2E),
+                Some("ss") => Some(0x36),
+                Some("fs") => Some(0x64),
+                Some("gs") => Some(0x65),
+                Some(other) => {
+                    return Err(format!("unsupported segment override: %{other}"));
+                }
+            };
+            if let Some(b) = seg_byte {
+                self.bytes.push(b);
+            }
+            if size == 2 {
+                self.bytes.push(0x66);
+            } else if size == 8 {
+                self.bytes.push(0x48); // REX.W
+            }
+            self.bytes.push(if size == 1 { opcode } else { opcode + 1 });
+            return Ok(());
+        }
         let m0 = mem_of(&ops[0]).ok_or(format!("operand type mismatch for `{stem}'"))?;
         let m1 = mem_of(&ops[1]).ok_or(format!("operand type mismatch for `{stem}'"))?;
         let mems = [m0, m1];
+
+        // The port operand of INS/OUTS must be spelled `(%dx)` (2.47:
+        // `insb (%eax),%es:(%edi)' → "`(%eax)' is not valid here (expected
+        // `(%dx)')"). The ESI side of OUTS and the EDI side of INS stay
+        // unvalidated — a bare base register is trusted like everywhere
+        // else in this family.
+        if stem == "ins" {
+            let port_ok = mems[0]
+                .base
+                .as_ref()
+                .is_some_and(|b| b.name.eq_ignore_ascii_case("dx"));
+            if !port_ok {
+                return Err(format!("operand type mismatch for `{stem}'"));
+            }
+        }
+        if stem == "outs" {
+            let port_ok = mems[1]
+                .base
+                .as_ref()
+                .is_some_and(|b| b.name.eq_ignore_ascii_case("dx"));
+            if !port_ok {
+                return Err(format!("operand type mismatch for `{stem}'"));
+            }
+        }
 
         // EDI side: %es or nothing.
         if let Some(i) = edi_idx {
@@ -3251,6 +3460,26 @@ impl super::InstructionEncoder {
     }
 }
 
+/// True when `op` is the size-matched accumulator register operand of a
+/// string op: `%al`/`%ax`/`%eax`/`%rax` for element sizes 1/2/4/8 (GAS 2.47
+/// accepts `stosb %al,(%rdi)` and `stosq %rax,(%rdi)` but rejects
+/// `stosb %rax,(%rdi)` — "`%rax' not allowed with `stosb'" — and
+/// `stosb %cl,(%rdi)` — "operand type mismatch").
+pub(crate) fn is_size_matched_accumulator(op: &Operand, size: u8) -> bool {
+    let Operand::Register(reg) = op else {
+        return false;
+    };
+    let name = reg.name.to_ascii_lowercase();
+    let wanted = match size {
+        1 => "al",
+        2 => "ax",
+        4 => "eax",
+        8 => "rax",
+        _ => return false,
+    };
+    name == wanted
+}
+
 /// Element size (1/2/4/8) of a sized string-op mnemonic suffix.
 pub(crate) fn string_op_size(mnemonic: &str) -> Result<u8, String> {
     Ok(match mnemonic.as_bytes().last() {
@@ -3276,68 +3505,79 @@ pub(crate) fn addr_hint_is32(ops: &[Operand]) -> bool {
     })
 }
 
-/// GAS 2.47 MONITOR/MONITORX law: the FIRST operand alone is the
-/// address-size hint, and only the canonical 8 GPR spellings are accepted
-/// (EGPR hints are rejected with "operand type mismatch").
-fn monitor_hint_ok(ops: &[Operand]) -> bool {
-    match ops.first() {
-        Some(Operand::Register(r)) => matches!(
-            r.name.to_ascii_lowercase().as_str(),
-            "rax"
-                | "eax"
-                | "ax"
-                | "al"
-                | "rbx"
-                | "ebx"
-                | "bx"
-                | "bl"
-                | "rcx"
-                | "ecx"
-                | "cx"
-                | "cl"
-                | "rdx"
-                | "edx"
-                | "dx"
-                | "dl"
-                | "rsi"
-                | "esi"
-                | "si"
-                | "rdi"
-                | "edi"
-                | "di"
-                | "rbp"
-                | "ebp"
-                | "bp"
-                | "rsp"
-                | "esp"
-                | "sp"
-        ),
-        _ => false,
+/// One MONITOR-family implicit slot: the register NUMBER (0=A, 1=C, 2=D,
+/// 3=B) and the width class (4 or 8) of a 32/64-bit spelling. 16/8-bit
+/// spellings and every other name return `None` — the caller splits them
+/// into GAS's "operand size mismatch" (16/8-bit) vs "operand type
+/// mismatch" (EGPRs, memory, anything else) diagnostics.
+fn monitor_slot(name: &str) -> Option<(u8, u8)> {
+    match name {
+        "rax" => Some((0, 8)),
+        "eax" => Some((0, 4)),
+        "rcx" => Some((1, 8)),
+        "ecx" => Some((1, 4)),
+        "rdx" => Some((2, 8)),
+        "edx" => Some((2, 4)),
+        "rbx" => Some((3, 8)),
+        "ebx" => Some((3, 4)),
+        _ => None,
     }
 }
 
-/// Validate the MONITOR/MONITORX hint spelling (GAS: EGPR hints are
-/// `operand type mismatch`).
-pub(crate) fn check_monitor_hint(ops: &[Operand], mnemonic: &str) -> Result<(), String> {
-    if monitor_hint_ok(ops) {
-        Ok(())
-    } else {
-        Err(format!("operand type mismatch for `{mnemonic}'"))
-    }
-}
-
-/// 0x67 is emitted iff the hint register's width is BELOW the mode default
-/// (64-bit code: `monitor %eax,...' = 67 ..., `monitor %rax,...` = no 67).
-pub(crate) fn monitor_hint_needs_addr32(ops: &[Operand]) -> bool {
-    match ops.first() {
-        Some(Operand::Register(r)) => {
-            let n = r.name.to_ascii_lowercase();
-            matches!(
-                n.as_str(),
-                "eax" | "ebx" | "ecx" | "edx" | "esi" | "edi" | "ebp" | "esp"
-            )
+/// The GAS 2.47 monitor-family law, matrix-probed on 2.47.20260726 over
+/// all width/register combinations of both modes. The implicit register
+/// NUMBERS are fixed per template — monitor/monitorx (0,1,2) = A,C,D;
+/// mwait (0,1) = A,C; mwaitx (0,1,3) = A,C,B — and every operand is a
+/// 32/64-bit spelling of its slot register: a 16/8-bit spelling is
+/// "operand size mismatch", an EGPR or any other register is "operand
+/// type mismatch".
+///
+/// Width classes (the subtle part, all probe-verified):
+///   * monitor/monitorx pin slots 1+2 to ONE width class and leave the
+///     hint free: `monitor %rax,%ecx,%edx` = 0f 01 c8 (no 67!),
+///     `monitor %eax,%rcx,%rdx` = 67 0f 01 c8, `monitor %rax,%ecx,%rdx`
+///     is REJECTED (slots 1+2 mixed widths), `monitor %eax,%ecx,%ebx` is
+///     REJECTED (slot 2 register number).
+///   * mwait/mwaitx pin ALL slots to one width class:
+///     `mwait %eax,%rcx` is "register type mismatch".
+///   * only monitor/monitorx carry the 0x67 address-size law, and it is
+///     driven by the hint spelling alone (`mwaitx %eax,%ecx,%ebx` =
+///     0f 01 fb, never 67).
+///
+/// Returns `Ok(needs_67)`.
+pub(crate) fn check_monitor_family(mnemonic: &str, ops: &[Operand]) -> Result<bool, String> {
+    let type_err = || format!("operand type mismatch for `{mnemonic}'");
+    let size_err = || format!("operand size mismatch for `{mnemonic}'");
+    let regs: Vec<(u8, u8)> = ops
+        .iter()
+        .map(|op| match op {
+            Operand::Register(r) => {
+                let n = r.name.to_ascii_lowercase();
+                match monitor_slot(&n) {
+                    Some(slot) => Ok(slot),
+                    None if matches!(
+                        n.as_str(),
+                        "ax" | "al" | "cx" | "cl" | "dx" | "dl" | "bx" | "bl"
+                    ) =>
+                    {
+                        Err(size_err())
+                    }
+                    None => Err(type_err()),
+                }
+            }
+            _ => Err(type_err()),
+        })
+        .collect::<Result<_, _>>()?;
+    match (mnemonic, regs.as_slice()) {
+        ("monitor" | "monitorx", [(0, w0), (1, w1), (2, w2)]) => {
+            if w1 != w2 {
+                return Err(type_err());
+            }
+            Ok(*w0 == 4)
         }
-        _ => false,
+        ("mwait", [(0, w0), (1, w1)]) if w0 == w1 => Ok(false),
+        ("mwaitx", [(0, w0), (1, w1), (3, w2)]) if w0 == w1 && w1 == w2 => Ok(false),
+        _ => Err(type_err()),
     }
 }
 
@@ -3354,7 +3594,7 @@ pub(crate) fn has_reg_operand(ops: &[Operand]) -> bool {
 /// itself, and an explicit `%es`/`%ds` is DROPPED as the architectural
 /// default).
 pub(crate) fn is_explicit_string_op(mnemonic: &str, ops: &[Operand]) -> bool {
-    if ops.is_empty() || !ops.iter().all(|op| matches!(op, Operand::Memory(_))) {
+    if ops.is_empty() {
         return false;
     }
     if ops.len() > 2 {
@@ -3366,8 +3606,36 @@ pub(crate) fn is_explicit_string_op(mnemonic: &str, ops: &[Operand]) -> bool {
         Some(b'b' | b'w' | b'l' | b'd' | b'q') => &m[..m.len() - 1],
         _ => return false,
     };
-    matches!(
-        stem,
-        "movs" | "stos" | "lods" | "scas" | "cmps" | "ins" | "outs"
-    )
+    // All-memory shapes: every family's register-free spelling, including
+    // the SSE-collision spellings (`movsd (%esi),(%edi)` is the string op
+    // while `movsd %xmm0,(%edi)` stays SSE — the XMM register operand
+    // disqualifies the shape here).
+    if ops.iter().all(|op| matches!(op, Operand::Memory(_))) {
+        return matches!(
+            stem,
+            "movs" | "stos" | "lods" | "scas" | "cmps" | "ins" | "outs"
+        );
+    }
+    // Register-carrying STOS/LODS spellings (`stosb %al,%es:(%rdi)`,
+    // `lodsq %fs:(%rsi),%rax`) and INS/OUTS with the `%dx` register port
+    // (`outsb %fs:(%rsi),%dx`): encode_string_op owns their segment law
+    // too, so the central choke point must skip them or it would splice a
+    // second override around the arm's decision (`stosb %al,%es:(%rdi)`
+    // would come out as `26 aa` instead of `aa`, `outsb %fs:(%rsi),%dx`
+    // as `64 64 6e` instead of `64 6e`). MOVS/SCAS with a register
+    // operand are MOVSX/segment-error shapes and keep the generic law.
+    if ops.len() == 2 && matches!(stem, "stos" | "lods" | "ins" | "outs") {
+        let mems = ops
+            .iter()
+            .filter(|op| matches!(op, Operand::Memory(_)))
+            .count();
+        let regs = ops
+            .iter()
+            .filter(|op| matches!(op, Operand::Register(_)))
+            .count();
+        if mems == 1 && regs == 1 {
+            return true;
+        }
+    }
+    false
 }

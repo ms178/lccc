@@ -14,11 +14,63 @@ mod x87;
 
 pub(crate) use registers::*;
 
+pub(crate) use crate::backend::x86::assembler::encoder::strip_plt_suffix;
+
 use crate::backend::x86::assembler::encoder::{
-    InstructionEncoder as X86InstructionEncoder, gp_id, is_reg64, is_vex_xop_encoding,
-    normalize_bare_label, op_decorated, vec_reg_id,
+    InstructionEncoder as X86InstructionEncoder, gp_id, is_reg64, is_size_matched_accumulator,
+    is_vex_xop_encoding, normalize_bare_label, op_decorated, string_op_size, vec_reg_id,
 };
 use crate::backend::x86::assembler::parser::*;
+
+/// The memory operand of an explicit-operand string op, or `None` when the
+/// operand is not memory (the register side of an accumulator spelling).
+fn string_mem_of(op: &Operand) -> Option<&MemoryOperand> {
+    match op {
+        Operand::Memory(m) => Some(m),
+        _ => None,
+    }
+}
+
+/// Address-size class of a string-op memory operand: `Ok(Some(true))` is
+/// the 16-bit class (bx/bp/si/di), `Ok(Some(false))` the 32-bit class,
+/// `Ok(None)` a displacement-only operand with no addressing registers.
+/// `Err(())` marks what GAS rejects outright: a 16-bit-class operand with
+/// an index component (`movsb (%bx,%si),%es:(%di)` — "expected `(%edi)'")
+/// and any operand mixing the two classes (`movsb (%si,%edi),…`).
+/// A 32-bit-class index component is tolerated and ignored (2.47:
+/// `movsb (%esi,%eax),%es:(%edi)` = a4).
+fn i686_string_address_class(mem: &MemoryOperand) -> Result<Option<bool>, ()> {
+    let slots = [&mem.base, &mem.index].into_iter().flatten();
+    let mut class: Option<bool> = None;
+    for slot in slots {
+        let n = slot.name.to_ascii_lowercase();
+        let is16 = matches!(n.as_str(), "bx" | "bp" | "si" | "di");
+        let is32 = matches!(
+            n.as_str(),
+            "eax" | "ebx" | "ecx" | "edx" | "esi" | "edi" | "ebp" | "esp"
+        );
+        match (is16, is32) {
+            (true, false) if class == Some(false) => return Err(()),
+            (true, false) => class = Some(true),
+            (false, true) if class == Some(true) => return Err(()),
+            (false, true) => class = Some(false),
+            _ => return Err(()),
+        }
+    }
+    if class == Some(true) && mem.index.is_some() {
+        return Err(());
+    }
+    Ok(class)
+}
+
+/// Validate one string-op ADDRESS operand's spelling (16-bit index /
+/// mixed-class rejection). Port operands (`(%dx)`) are exempt — their
+/// base register is checked separately.
+fn i686_check_string_address_class(mem: &MemoryOperand) -> Result<(), String> {
+    i686_string_address_class(mem)
+        .map(|_| ())
+        .map_err(|()| "operand type mismatch".to_string())
+}
 
 /// True for the FMA3 mnemonics that use the VEX 3-operand `0F38` encoding.
 /// (Ported from the x86-64 encoder's registers.rs.)
@@ -337,10 +389,13 @@ impl InstructionEncoder {
             }
         }
         // String ops carry their ESI/EDI addressing in the OPERANDS but
-        // emit no ModR/M, so `encode_modrm_mem`'s 16-bit detection never
-        // runs for them: `cmpsb (%di),(%si)` in .code32 needs the 0x67
-        // override exactly like any 16-bit-addressing form (GAS 2.47:
-        // 67 a6). Flag it here so the post-encode splice fires.
+        // emit no ModR/M, so `encode_modrm_mem`'s detection never runs for
+        // them: flag any NON-DEFAULT address size exactly like the ModR/M
+        // path would. In .code32 that is 16-bit addressing (`cmpsb
+        // (%di),(%si)` = 67 a6); in .code16 it is INVERTED — the 32-bit
+        // spellings are the override (`movsb (%esi),%es:(%edi)` = 67 a4)
+        // while the 16-bit ones are the mode default (`movsb
+        // (%bx),%es:(%di)` = a4, no prefix).
         {
             let stem = instr
                 .mnemonic
@@ -355,10 +410,13 @@ impl InstructionEncoder {
                 for op in &instr.operands {
                     if let Operand::Memory(mem) = op {
                         for slot in [&mem.base, &mem.index].into_iter().flatten() {
-                            if matches!(
-                                slot.name.to_ascii_lowercase().as_str(),
-                                "bx" | "bp" | "si" | "di"
-                            ) {
+                            let n = slot.name.to_ascii_lowercase();
+                            let is16 = matches!(n.as_str(), "bx" | "bp" | "si" | "di");
+                            let is32 = matches!(
+                                n.as_str(),
+                                "eax" | "ebx" | "ecx" | "edx" | "esi" | "edi" | "ebp" | "esp"
+                            );
+                            if (is16 && !self.code16) || (is32 && self.code16) {
                                 self.pending_addr32 = true;
                             }
                         }
@@ -452,10 +510,60 @@ impl InstructionEncoder {
             let stem = stem_raw
                 .strip_suffix(['b', 'w', 'l', 'd', 'q'])
                 .unwrap_or(stem_raw);
-            let is_string_op = matches!(
-                stem,
-                "movs" | "cmps" | "lods" | "scas" | "stos" | "ins" | "outs"
-            );
+            // Stem alone is a TRAP twice over, so classify by operand SHAPE
+            // (the same rule the x86-64 encoder's is_explicit_string_op
+            // uses):
+            //  * the SSE moves/compares `movsd`, `cmpsd`, `movsq`, `cmpsq`
+            //    stem-strip to `movs`/`cmps` but take XMM operands and
+            //    follow the GENERIC segment law (GAS 2.47:
+            //    `movsd %es:(%edi),%xmm0` = 26 f2 0f 10 07 — ES KEPT;
+            //    `movsd %fs:(%edi),%xmm0` = 64 f2 0f 10 07 — accepted);
+            //  * the GP `movsb`/`movsw` spellings with a register operand
+            //    are the MOVSX aliases (`movsb %es:(%edi),%eax` = movsbl,
+            //    dispatched to encode_movsx_infer_dst) — the string law
+            //    would silently DROP the `%es` (DS is the architectural
+            //    default of a data access, not ES) or falsely reject a
+            //    non-default segment. `movs`/`cmps` are string ops only
+            //    when EVERY operand is memory; the families without an SSE
+            //    or MOVSX collision (lods/stos/scas/ins/outs) are string
+            //    ops whenever no vector register appears, including the
+            //    accumulator spellings (`stosb %al,%es:(%edi)`), whose
+            //    segment law is decided by encode_string_op.
+            let has_vector_reg = instr.operands.iter().any(|op| {
+                matches!(op, Operand::Register(r) if {
+                    let n = r.name.to_ascii_lowercase();
+                    n.starts_with("xmm") || n.starts_with("ymm")
+                        || n.starts_with("zmm") || n.starts_with("mm")
+                })
+            });
+            let all_memory = !instr.operands.is_empty()
+                && instr
+                    .operands
+                    .iter()
+                    .all(|op| matches!(op, Operand::Memory(_)));
+            let acc_shape = instr.operands.len() == 2
+                && instr
+                    .operands
+                    .iter()
+                    .any(|op| matches!(op, Operand::Memory(_)))
+                && instr
+                    .operands
+                    .iter()
+                    .any(|op| matches!(op, Operand::Register(_)));
+            let is_string_op = match stem {
+                "movs" | "cmps" => all_memory,
+                "lods" | "scas" | "stos" | "ins" | "outs" => {
+                    !has_vector_reg && (all_memory || acc_shape)
+                }
+                _ => false,
+            };
+            // How many memory operands carry an explicit segment: the
+            // non-string dual-override reject below keys on it.
+            let seg_mem_count = instr
+                .operands
+                .iter()
+                .filter(|op| matches!(op, Operand::Memory(m) if m.segment.is_some()))
+                .count();
             for op in &instr.operands {
                 let Operand::Memory(mem) = op else { continue };
                 let Some(seg) = &mem.segment else { continue };
@@ -480,19 +588,33 @@ impl InstructionEncoder {
                         if prefix != 0x26 {
                             return Err(format!("`{}' operand 1 must use `%es' segment", stem));
                         }
-                        break; // ES on the EDI side: default, dropped.
+                        // ES on the EDI side: default, dropped — but KEEP
+                        // scanning: a second operand can still carry its
+                        // own override (GAS 2.47: `cmpsb
+                        // %es:(%edi),%fs:(%esi)` = 64 a6; a `break` here
+                        // dropped the FS byte).
+                        continue;
                     }
                     if base_is_esi && prefix == 0x3E {
-                        break; // DS on the ESI side: default, dropped.
+                        continue; // DS on the ESI side: default, dropped.
                     }
+                } else if seg_mem_count > 1 {
+                    // A NON-string instruction with overrides on two
+                    // memory operands is rejected by GAS outright — even
+                    // when one of them is the redundant default (2.47:
+                    // `movl %fs:(%eax),%gs:(%ebx)` and
+                    // `movl %ds:(%eax),%fs:(%ebx)` both error; only one
+                    // segment override can exist per instruction).
+                    return Err("operand type mismatch".to_string());
                 }
                 let default = self::core::i686_default_segment(
                     mem.base.as_ref().map(|reg| reg.name.as_str()),
                     mem.index.as_ref().map(|reg| reg.name.as_str()),
                 );
                 if prefix == default {
-                    // Redundant override: GAS drops it.
-                    break;
+                    // Redundant override: GAS drops it. Keep scanning:
+                    // a later operand may still need its byte.
+                    continue;
                 }
                 // Insertion point: past the FWAIT byte (GAS keeps 0x9B ahead
                 // of every prefix: `9b 26 67 d9 7f 08`), then IN FRONT of
@@ -509,7 +631,7 @@ impl InstructionEncoder {
                 // override in place: idempotence guard (defensive; all
                 // per-arm calls were removed).
                 if self.bytes.get(at) == Some(&prefix) {
-                    break;
+                    continue;
                 }
                 self.bytes.insert(at, prefix);
                 for relocation in self.relocations.iter_mut() {
@@ -517,7 +639,7 @@ impl InstructionEncoder {
                         relocation.offset += 1;
                     }
                 }
-                break;
+                continue;
             }
         }
 
@@ -544,7 +666,7 @@ impl InstructionEncoder {
                 // address-size override in after the group-1/segment prefix
                 // run (GAS: `mov %es:8(%bx), %ax` assembles to
                 // `26 67 66 8b 47 08`).
-                self.fixup_code32_addr16_prefix(start_len);
+                result = self.fixup_code32_addr16_prefix(start_len);
             } else if self.explicit_addr16 {
                 // The `addr16` prefix word on a body that encoded 32-bit
                 // addressing (redundant-but-accepted spellings: GAS
@@ -552,8 +674,12 @@ impl InstructionEncoder {
                 // 67 a3 98 08 via the moffs16 path). A body that already
                 // produced its own 0x67 through pending_addr32 took the
                 // branch above, so exactly one override is ever emitted
-                // (`addr16 mov %ax,(%bx,%si)' = 67 66 89 00).
-                self.fixup_code32_addr16_prefix(start_len);
+                // (`addr16 mov %ax,(%bx,%si)' = 67 66 89 00). A body whose
+                // 0x67 is TEMPLATE-FORCED (the monitor/umonitor 16-bit
+                // hint spellings push their own byte) makes the splice a
+                // duplicate: GAS rejects the whole form with "same type of
+                // prefix used twice" (`addr16 monitor %ax,%ecx,%edx`).
+                result = self.fixup_code32_addr16_prefix(start_len);
             }
             if self.explicit_data16 {
                 result = self.fixup_forced_data16(start_len);
@@ -564,16 +690,22 @@ impl InstructionEncoder {
         self.sized_op = false;
 
         // R_386_GOTPC addend finalization (GAS 2.47, byte-probed): the
-        // addend equals the relocation field's instruction-relative offset,
-        // so the linked value is GOT-base minus the INSTRUCTION start —
-        // exactly what the `call 1f; 1: pop %reg' PIC prologue idiom
-        // needs. `mov $_GLOBAL_OFFSET_TABLE_,%eax' = b8 01000000 (+1),
+        // field addend is USER_ADDEND + FIELD_OFFSET, so the linked value
+        // is GOT + USER_ADDEND minus the INSTRUCTION start — exactly what
+        // the `call 1f; 1: pop %reg' PIC prologue idiom needs. Bare uses:
+        // `mov $_GLOBAL_OFFSET_TABLE_,%eax' = b8 01000000 (+1),
         // `lea _GLOBAL_OFFSET_TABLE_(%eax),%eax' = 8d 80 02000000 (+2),
         // moffs form = +1, `mov %fs:_GLOBAL_OFFSET_TABLE_(%eax),%eax` =
-        // 64 8b 80 03000000 (+3). Recomputing here (after every prefix
-        // splice has shifted the offsets) covers all forms uniformly;
-        // reloc offsets are stream-absolute and start_len is this
-        // instruction's stream position.
+        // 64 8b 80 03000000 (+3). User addends ride on top (all
+        // byte-probed field contents): `leal
+        // _GLOBAL_OFFSET_TABLE_+4(%eax),%eax' = 8d 80 06000000 (+4 +2),
+        // `leal _GLOBAL_OFFSET_TABLE_-2(%eax),%eax' = 8d 80 00000000
+        // (-2 +2), `addl $_GLOBAL_OFFSET_TABLE_+2,%ebx' = 81 c3 04000000
+        // (+2 +2), `movl $_GLOBAL_OFFSET_TABLE_+2,%eax' = b8 03000000
+        // (+2 +1). Recomputing here (after every prefix splice has
+        // shifted the offsets) covers all forms uniformly; reloc offsets
+        // are stream-absolute and start_len is this instruction's stream
+        // position.
         if result.is_ok() {
             for relocation in &mut self.relocations[reloc_base..] {
                 // The `_GLOBAL_OFFSET_TABLE_` name is special in GAS: any
@@ -585,7 +717,7 @@ impl InstructionEncoder {
                         && relocation.diff_symbol.is_none())
                 {
                     relocation.reloc_type = R_386_GOTPC;
-                    relocation.addend = (relocation.offset - start_len as u64) as i64;
+                    relocation.addend += (relocation.offset - start_len as u64) as i64;
                 }
             }
         }
@@ -597,11 +729,282 @@ impl InstructionEncoder {
         result
     }
 
+    /// String operations (MOVS/STOS/LODS/SCAS/CMPS/INS/OUTS), all spellings.
+    ///
+    /// Slot-based port of the x86-64 encoder's `encode_string_op` (which is
+    /// the byte-probed reference for the segment law: ES is the default of
+    /// the EDI-side operand and an explicit `%es` is DROPPED there, a
+    /// non-ES segment on that operand is REJECTED as
+    /// "`{stem}' operand N must use `%es' segment" with N the 1-based
+    /// source position, `%ds` is dropped on the ESI side and any other
+    /// segment is kept; reversed operand orders route the `%es` through the
+    /// kept side exactly like GAS). The i686 adds what 16-bit addressing
+    /// makes possible:
+    ///
+    ///  * `sized_op` is recorded for every operand-size choice so the
+    ///    `.code16` inverter adds/strips 0x66 (`movsl (%esi),%es:(%edi)` in
+    ///    .code16 = `67 66 a5`, not the 16-bit `a5`);
+    ///  * address-size splicing stays with the pre-scan + central fixup
+    ///    (0x67 is NOT pushed here), and this method validates what the
+    ///    pre-scan cannot: GAS rejects explicit string operands whose
+    ///    address-size classes DISAGREE (`movsb (%si),%es:(%edi)`) and
+    ///    16-bit-class operands with an index component
+    ///    (`movsb (%bx,%si),%es:(%di)`), while 32-bit-class index
+    ///    components are tolerated and ignored
+    ///    (`movsb (%esi,%eax),%es:(%edi)` = a4);
+    ///  * INS/OUTS require both operands and an exact `(%dx)` port
+    ///    (`insb (%eax),…` rejected); accumulator spellings exist for
+    ///    STOS/LODS only, in the canonical order with the size-matched
+    ///    register (`stosl %eax,%es:(%edi)` = 67 66 ab in .code16).
+    ///
+    /// `esi_idx`/`edi_idx` name the operand INDEX playing each role
+    /// (`None` when the family has no such operand). All error returns
+    /// happen BEFORE any byte is pushed, so a rejected form leaves
+    /// `self.bytes` untouched.
+    fn encode_string_op(
+        &mut self,
+        ops: &[Operand],
+        opcode: u8,
+        size: u8,
+        esi_idx: Option<usize>,
+        edi_idx: Option<usize>,
+        stem: &str,
+    ) -> Result<(), String> {
+        // Every 2/4-byte form made an operand-size choice: the .code16
+        // inverter keys on this to emit (`movsl`) or strip (`movsw`) 0x66.
+        self.sized_op = size != 1;
+        let size_prefix = size == 2;
+        let push_op = |enc: &mut Self| {
+            enc.bytes.push(if size == 1 { opcode } else { opcode + 1 });
+        };
+        if ops.is_empty() {
+            if size_prefix {
+                self.bytes.push(0x66);
+            }
+            push_op(self);
+            return Ok(());
+        }
+        // INS/OUTS carry their port operand explicitly in GAS's templates:
+        // the one-operand spellings are rejected outright (2.47:
+        // `insb (%dx)' / `outsb (%rsi)' → "number of operands mismatch for
+        // `ins'/`outs'"), unlike the accumulator-implicit stos/scas/lods.
+        if ops.len() == 1 && matches!(stem, "ins" | "outs") {
+            return Err(format!("number of operands mismatch for `{stem}'"));
+        }
+        // Single explicit operand: the stos/scas EDI side, the lods ESI
+        // side (`scasb %es:(%edi)` = ae, `lodsb %fs:(%esi)` = 64 ac).
+        if ops.len() == 1 && edi_idx.is_some() && esi_idx.is_none() {
+            let mem =
+                string_mem_of(&ops[0]).ok_or(format!("operand type mismatch for `{stem}'"))?;
+            i686_check_string_address_class(mem)?;
+            match mem.segment.as_deref() {
+                None | Some("es") => {}
+                Some(_) => {
+                    return Err(format!("`{stem}' operand 1 must use `%es' segment"));
+                }
+            }
+            if size_prefix {
+                self.bytes.push(0x66);
+            }
+            push_op(self);
+            return Ok(());
+        }
+        if ops.len() == 1 && esi_idx.is_some() && edi_idx.is_none() {
+            let mem =
+                string_mem_of(&ops[0]).ok_or(format!("operand type mismatch for `{stem}'"))?;
+            i686_check_string_address_class(mem)?;
+            let seg_byte = match mem.segment.as_deref() {
+                None | Some("ds") => None,
+                Some("es") => Some(0x26),
+                Some("cs") => Some(0x2E),
+                Some("ss") => Some(0x36),
+                Some("fs") => Some(0x64),
+                Some("gs") => Some(0x65),
+                Some(other) => {
+                    return Err(format!("unsupported segment override: %{other}"));
+                }
+            };
+            if let Some(b) = seg_byte {
+                self.bytes.push(b);
+            }
+            if size_prefix {
+                self.bytes.push(0x66);
+            }
+            push_op(self);
+            return Ok(());
+        }
+        if ops.len() != 2 {
+            return Err(format!("number of operands mismatch for `{stem}'"));
+        }
+        // Accumulator-carrying spellings: STOS leads with the accumulator
+        // (`stosb %al,(%edi)` = aa, `stosq %rax,(%rdi)` on x86-64 = 48 ab)
+        // and LODS trails with it (`lodsw (%si),%ax` = 66 ad). The register
+        // must be the size-matched accumulator and the order is fixed;
+        // SCAS/CMPS/MOVS have no register spelling and fall through to the
+        // memory-only path, whose slot extraction rejects a register
+        // operand exactly like GAS.
+        if edi_idx.is_some() && esi_idx.is_none() && stem == "stos" {
+            if !is_size_matched_accumulator(&ops[0], size) {
+                return Err(format!("operand type mismatch for `{stem}'"));
+            }
+            let mem =
+                string_mem_of(&ops[1]).ok_or(format!("operand type mismatch for `{stem}'"))?;
+            i686_check_string_address_class(mem)?;
+            match mem.segment.as_deref() {
+                None | Some("es") => {}
+                Some(_) => {
+                    return Err(format!("`{stem}' operand 2 must use `%es' segment"));
+                }
+            }
+            if size_prefix {
+                self.bytes.push(0x66);
+            }
+            push_op(self);
+            return Ok(());
+        }
+        if esi_idx.is_some() && edi_idx.is_none() && stem == "lods" {
+            let mem =
+                string_mem_of(&ops[0]).ok_or(format!("operand type mismatch for `{stem}'"))?;
+            if !is_size_matched_accumulator(&ops[1], size) {
+                return Err(format!("operand type mismatch for `{stem}'"));
+            }
+            i686_check_string_address_class(mem)?;
+            let seg_byte = match mem.segment.as_deref() {
+                None | Some("ds") => None,
+                Some("es") => Some(0x26),
+                Some("cs") => Some(0x2E),
+                Some("ss") => Some(0x36),
+                Some("fs") => Some(0x64),
+                Some("gs") => Some(0x65),
+                Some(other) => {
+                    return Err(format!("unsupported segment override: %{other}"));
+                }
+            };
+            if let Some(b) = seg_byte {
+                self.bytes.push(b);
+            }
+            if size_prefix {
+                self.bytes.push(0x66);
+            }
+            push_op(self);
+            return Ok(());
+        }
+        // Two-operand INS/OUTS (decided here because the port may be the
+        // `%dx` REGISTER, which the memory-only extraction would reject):
+        // the port is `(%dx)` or `%dx`, the address operand follows the
+        // family's slot law — INS addresses EDI (reject non-%es), OUTS
+        // addresses ESI (keep every non-%ds override, 2.47:
+        // `outsb %es:(%rsi),%dx` = 26 6e) — and the order is fixed
+        // (`outsb %dx,(%esi)` is "operand type mismatch for `outs'").
+        if matches!(stem, "ins" | "outs") {
+            let port_idx = if stem == "ins" { 0 } else { 1 };
+            let addr_idx = 1 - port_idx;
+            let port_ok = match &ops[port_idx] {
+                Operand::Register(r) => r.name.eq_ignore_ascii_case("dx"),
+                Operand::Memory(m) => {
+                    m.base
+                        .as_ref()
+                        .is_some_and(|b| b.name.eq_ignore_ascii_case("dx"))
+                        && m.index.is_none()
+                }
+                _ => false,
+            };
+            if !port_ok {
+                return Err(format!("operand type mismatch for `{stem}'"));
+            }
+            let mem = string_mem_of(&ops[addr_idx])
+                .ok_or(format!("operand type mismatch for `{stem}'"))?;
+            i686_check_string_address_class(mem)?;
+            match (stem, mem.segment.as_deref()) {
+                ("ins", None | Some("es")) => {}
+                ("ins", Some(_)) => {
+                    return Err(format!(
+                        "`{stem}' operand {} must use `%es' segment",
+                        addr_idx + 1
+                    ));
+                }
+                ("outs", None | Some("ds")) => {}
+                ("outs", Some(other)) => {
+                    let byte = match other {
+                        "es" => 0x26,
+                        "cs" => 0x2E,
+                        "ss" => 0x36,
+                        "fs" => 0x64,
+                        "gs" => 0x65,
+                        _ => return Err(format!("unsupported segment override: %{other}")),
+                    };
+                    self.bytes.push(byte);
+                }
+                _ => unreachable!("stem is ins or outs"),
+            }
+            if size_prefix {
+                self.bytes.push(0x66);
+            }
+            push_op(self);
+            return Ok(());
+        }
+        let m0 = string_mem_of(&ops[0]).ok_or(format!("operand type mismatch for `{stem}'"))?;
+        let m1 = string_mem_of(&ops[1]).ok_or(format!("operand type mismatch for `{stem}'"))?;
+        let mems = [m0, m1];
+
+        // Address-spelling agreement + 16-bit index rejection (doc comment
+        // above), on the two ADDRESS operands. Both checks run before any
+        // byte is emitted.
+        let mut addr_class: Option<bool> = None;
+        for mem in mems.iter() {
+            let class = i686_string_address_class(mem)
+                .map_err(|()| format!("operand type mismatch for `{stem}'"))?;
+            if let Some(c) = class {
+                if let Some(prev) = addr_class {
+                    if prev != c {
+                        return Err(format!("operand type mismatch for `{stem}'"));
+                    }
+                }
+                addr_class = Some(c);
+            }
+        }
+
+        // EDI side: %es or nothing.
+        if let Some(i) = edi_idx {
+            match mems[i].segment.as_deref() {
+                None | Some("es") => {}
+                Some(_) => {
+                    return Err(format!("`{stem}' operand {} must use `%es' segment", i + 1));
+                }
+            }
+        }
+        // ESI side: any segment; %ds is the default and dropped.
+        let seg_byte = match esi_idx.and_then(|i| mems[i].segment.as_deref()) {
+            None | Some("ds") => None,
+            Some("es") => Some(0x26),
+            Some("cs") => Some(0x2E),
+            Some("ss") => Some(0x36),
+            Some("fs") => Some(0x64),
+            Some("gs") => Some(0x65),
+            Some(other) => {
+                return Err(format!("unsupported segment override: %{other}"));
+            }
+        };
+
+        if let Some(b) = seg_byte {
+            self.bytes.push(b);
+        }
+        if size_prefix {
+            self.bytes.push(0x66);
+        }
+        push_op(self);
+        Ok(())
+    }
+
     /// Splice the 0x67 address-size override for a 16-bit addressing form in
     /// 32-bit mode. The byte goes after the group-1 (lock/rep) and segment
     /// overrides and before any operand-size prefix and the opcode. Every
     /// relocation recorded at or after the splice point shifts by one.
-    fn fixup_code32_addr16_prefix(&mut self, start: usize) {
+    /// A body that ALREADY carries its own 0x67 in prefix position makes
+    /// the splice a duplicate-prefix form, which GAS rejects ("same type
+    /// of prefix used twice", 2.47: `addr16 monitor %ax,%ecx,%edx`,
+    /// `addr16 umonitor %ax`).
+    fn fixup_code32_addr16_prefix(&mut self, start: usize) -> Result<(), String> {
         // The FWAIT byte of the x87 waiting forms stays ahead of the
         // override (GAS: `9b 26 67 d9 7f 08` for `fstcw %es:8(%bx)` in
         // .code32).
@@ -619,12 +1022,16 @@ impl InstructionEncoder {
         {
             i += 1;
         }
+        if self.bytes.get(i) == Some(&0x67) {
+            return Err("same type of prefix used twice".to_string());
+        }
         self.bytes.insert(i, 0x67);
         for relocation in self.relocations.iter_mut() {
             if relocation.offset >= i as u64 {
                 relocation.offset += 1;
             }
         }
+        Ok(())
     }
 
     /// Splice the `data16` prefix word's 0x66 operand-size override. The
@@ -649,9 +1056,12 @@ impl InstructionEncoder {
             i += 1;
         }
         match self.bytes.get(i) {
-            Some(0x66) | Some(0x62) | Some(0xC4) | Some(0xC5) | Some(0xD5) => {
-                Err("same type of prefix used twice".to_string())
-            }
+            Some(0x66) => Err("same type of prefix used twice".to_string()),
+            // 0x62/0xC4/0xC5/0xD5 at the splice point are BOUND/LES/LDS/
+            // AAD OPCODES in 32-bit mode, not prefixes: GAS splices the
+            // 0x66 in front of them like any opcode (`data16 bound
+            // %eax,(%ebx)` = 66 62 03, `data16 aad` = 66 d5 0a — 2.47
+            // probed). Only a body-carried 0x66 is a duplicate.
             _ => {
                 self.bytes.insert(i, 0x66);
                 for relocation in self.relocations.iter_mut() {
@@ -679,9 +1089,16 @@ impl InstructionEncoder {
 
         // Locate the legacy-prefix run: group-1 (lock/rep), segment overrides,
         // and the size overrides may appear in any order before the opcode.
+        // GROUP-1 is collected SEPARATELY from the segment overrides: GAS
+        // re-emits the run in ITS canonical order regardless of the source
+        // spelling — FWAIT, segments, 0x67, 0x66, group-1 (2.47-probed:
+        // `lock addl %eax,%gs:(%ebx)' in .code16 = 65 67 66 f0 01 03,
+        // `rep movsb (%esi),%es:(%edi)' = 67 f3 a4, `umonitor %eax' =
+        // 67 f3 0f ae f0 — the lock/rep byte always comes last).
         let mut had_66 = false;
         let mut had_67 = false;
-        let mut keep: Vec<u8> = Vec::new();
+        let mut segments: Vec<u8> = Vec::new();
+        let mut group1: Vec<u8> = Vec::new();
         while i < self.bytes.len() {
             match self.bytes[i] {
                 0x66 => {
@@ -692,8 +1109,12 @@ impl InstructionEncoder {
                     had_67 = true;
                     i += 1;
                 }
-                b @ (0xF0 | 0xF2 | 0xF3 | 0x2E | 0x36 | 0x3E | 0x26 | 0x64 | 0x65) => {
-                    keep.push(b);
+                b @ (0xF0 | 0xF2 | 0xF3) => {
+                    group1.push(b);
+                    i += 1;
+                }
+                b @ (0x2E | 0x36 | 0x3E | 0x26 | 0x64 | 0x65) => {
+                    segments.push(b);
                     i += 1;
                 }
                 _ => break,
@@ -719,18 +1140,20 @@ impl InstructionEncoder {
 
         let mut out = Vec::with_capacity(self.bytes.len() - start + 3);
         // GAS byte order: FWAIT, segment overrides, then address-size,
-        // then operand-size (verified: `mov %ss:8(%eax), %ebx` in .code16
-        // assembles to `36 67 66 8b 58 08`).
+        // then operand-size, then group-1 (verified: `mov %ss:8(%eax),
+        // %ebx' in .code16 assembles to `36 67 66 8b 58 08`; `lock addl
+        // %eax,%gs:(%ebx)' to `65 67 66 f0 01 03`).
         if fwait {
             out.push(0x9B);
         }
-        out.extend_from_slice(&keep);
+        out.extend_from_slice(&segments);
         if want_67 {
             out.push(0x67);
         }
         if want_66 {
             out.push(0x66);
         }
+        out.extend_from_slice(&group1);
         out.extend_from_slice(&body);
 
         // Adding or removing a prefix MOVES every byte after it, so any
@@ -844,17 +1267,98 @@ impl InstructionEncoder {
             "movzbw" => self.encode_movzx(ops, 1, 2),
             "movzb" => self.encode_movzx_infer_dst(ops, 1),
             "movzw" => self.encode_movzx_infer_dst(ops, 2),
-            // `movsb (mem),(mem)`: two memory operands can only be the
-            // STRING form (movsx never takes mem,mem) — GAS 2.47:
-            // `movsb (%esi),%es:(%edi)` = a4.
-            "movsb" if ops.len() == 2 && ops.iter().all(|o| matches!(o, Operand::Memory(_))) => {
-                self.bytes.push(0xA4);
+            // String operations, bare and explicit-operand (GAS 2.47 slot
+            // law — see `encode_string_op`): `movsb (%esi),%es:(%edi)` = a4,
+            // `cmpsb %es:(%edi),%fs:(%esi)` = 64 a6, `stosl
+            // %eax,%es:(%edi)` in .code16 = 67 66 ab. A GP REGISTER operand
+            // selects a different instruction entirely — the MOVSX aliases
+            // (`movsb %es:(%edi),%eax` = movsbl) fall through to the arms
+            // below, and the SSE moves/compares (`movsd %xmm0,(%edi)`) fall
+            // through to their SSE arms; only all-memory or operand-less
+            // shapes are string ops here.
+            // `movsd`/`cmpsd` are string ops ONLY bare (a5/a7): GAS rejects
+            // every operand-carrying movsd/cmpsd spelling (one memory
+            // operand via the string count check, two via the SSE shape
+            // check), so operand-carrying forms fall through to the SSE
+            // arms. `movsw`/`movsl`/`cmpsw`/`cmpsl` keep their explicit
+            // forms (2.47: `movsw (%esi),%es:(%edi)` = 66 a5).
+            "movsb" | "movsw" | "movsl"
+                if ops.is_empty() || ops.iter().all(|o| matches!(o, Operand::Memory(_))) =>
+            {
+                self.encode_string_op(
+                    ops,
+                    0xA4,
+                    string_op_size(mnemonic)?,
+                    Some(0),
+                    Some(1),
+                    "movs",
+                )
+            }
+            "cmpsb" | "cmpsw" | "cmpsl"
+                if ops.is_empty() || ops.iter().all(|o| matches!(o, Operand::Memory(_))) =>
+            {
+                self.encode_string_op(
+                    ops,
+                    0xA6,
+                    string_op_size(mnemonic)?,
+                    Some(1),
+                    Some(0),
+                    "cmps",
+                )
+            }
+            "movsd" if ops.is_empty() => {
+                self.sized_op = true;
+                self.bytes.push(0xA5);
                 Ok(())
             }
-            "movsw" if ops.len() == 2 && ops.iter().all(|o| matches!(o, Operand::Memory(_))) => {
+            "cmpsd" if ops.is_empty() => {
                 self.sized_op = true;
-                self.bytes.extend_from_slice(&[0x66, 0xA5]);
+                self.bytes.push(0xA7);
                 Ok(())
+            }
+            // STOS/LODS also own the accumulator spellings — one memory
+            // operand plus one register (`stosb %al,%es:(%edi)`,
+            // `lodsw (%si),%ax`); the register must be the size-matched
+            // accumulator in the canonical slot, validated in the arm.
+            "stosb" | "stosw" | "stosl"
+                if ops.is_empty()
+                    || ops.iter().all(|o| matches!(o, Operand::Memory(_)))
+                    || (ops.len() == 2
+                        && ops.iter().any(|o| matches!(o, Operand::Memory(_)))
+                        && ops.iter().any(|o| matches!(o, Operand::Register(_)))) =>
+            {
+                self.encode_string_op(ops, 0xAA, string_op_size(mnemonic)?, None, Some(0), "stos")
+            }
+            "lodsb" | "lodsw" | "lodsl"
+                if ops.is_empty()
+                    || ops.iter().all(|o| matches!(o, Operand::Memory(_)))
+                    || (ops.len() == 2
+                        && ops.iter().any(|o| matches!(o, Operand::Memory(_)))
+                        && ops.iter().any(|o| matches!(o, Operand::Register(_)))) =>
+            {
+                self.encode_string_op(ops, 0xAC, string_op_size(mnemonic)?, Some(0), None, "lods")
+            }
+            "scasb" | "scasw" | "scasl"
+                if ops.is_empty() || ops.iter().all(|o| matches!(o, Operand::Memory(_))) =>
+            {
+                self.encode_string_op(ops, 0xAE, string_op_size(mnemonic)?, None, Some(0), "scas")
+            }
+            // INS/OUTS also route the `%dx` register spelling of the port
+            // (2.47: `insb %dx,(%edi)` = 6c, `outsb (%esi),%dx` = 6e);
+            // the arm validates the exact port shape and order.
+            "insb" | "insw" | "insl"
+                if ops.is_empty()
+                    || ops.iter().all(|o| matches!(o, Operand::Memory(_)))
+                    || (ops.len() == 2 && ops.iter().any(|o| matches!(o, Operand::Memory(_)))) =>
+            {
+                self.encode_string_op(ops, 0x6C, string_op_size(mnemonic)?, None, Some(1), "ins")
+            }
+            "outsb" | "outsw" | "outsl"
+                if ops.is_empty()
+                    || ops.iter().all(|o| matches!(o, Operand::Memory(_)))
+                    || (ops.len() == 2 && ops.iter().any(|o| matches!(o, Operand::Memory(_)))) =>
+            {
+                self.encode_string_op(ops, 0x6E, string_op_size(mnemonic)?, Some(0), None, "outs")
             }
             "movsb" if !ops.is_empty() => self.encode_movsx_infer_dst(ops, 1),
             "movsw" if !ops.is_empty() => self.encode_movsx_infer_dst(ops, 2),
@@ -1442,21 +1946,35 @@ impl InstructionEncoder {
                                 _ => None,
                             })
                             .collect();
+                        // The implicit register NUMBERS are exact per
+                        // template (GAS 2.47 matrix probes): slots are
+                        // (eax|ax, ecx, edx) — `monitor %eax,%ecx,%ebx`
+                        // and `monitor %eax,%ebx,%ecx` are "operand type
+                        // mismatch" (slot 2 must be register 2), and the
+                        // trailing slots have no 16-bit spellings in
+                        // 32-bit mode (`monitor %eax,%cx,%edx` rejected).
                         if names.len() != 3
                             || !matches!(names[0].as_str(), "eax" | "ax")
-                            || !matches!(
-                                names[1].as_str(),
-                                "eax" | "ebx" | "ecx" | "edx" | "esi" | "edi" | "ebp" | "esp"
-                            )
-                            || !matches!(
-                                names[2].as_str(),
-                                "eax" | "ebx" | "ecx" | "edx" | "esi" | "edi" | "ebp" | "esp"
-                            )
+                            || names[1] != "ecx"
+                            || names[2] != "edx"
                         {
                             return Err(format!("operand type mismatch for `{mnemonic}'"));
                         }
-                        if names[0] == "ax" {
+                        // The 0x67 encodes the 16-bit hint register's
+                        // address size, which is only NON-default in
+                        // 32-bit mode: `monitor %ax,%ecx,%edx` = 67 0f 01
+                        // c8 in .code32 but 0f 01 c8 in .code16, while the
+                        // 32-bit spelling needs the byte in .code16 (67 0f
+                        // 01 c8, probed) and none in .code32. The .code16
+                        // byte rides pending_addr32 so the central fixup
+                        // emits it in canonical position; the .code32 byte
+                        // is template-forced and pushed here (an explicit
+                        // `addr16` on top of it then rejects above).
+                        if names[0] == "ax" && !self.code16 {
                             self.bytes.push(0x67);
+                        }
+                        if names[0] == "eax" && self.code16 {
+                            self.pending_addr32 = true;
                         }
                         self.bytes.extend_from_slice(&[0x0F, 0x01, ext]);
                         Ok(())
@@ -1523,8 +2041,14 @@ impl InstructionEncoder {
                 if !is_16 && !is_32 {
                     return Err(format!("operand type mismatch for `umonitor'"));
                 }
-                if is_16 {
+                // Address-size law mirrors the monitor family above: the
+                // 16-bit spelling's 0x67 is non-default only in .code32
+                // (67 f3 0f ae f0), the 32-bit spelling's only in .code16.
+                if is_16 && !self.code16 {
                     self.bytes.push(0x67);
+                }
+                if is_32 && self.code16 {
+                    self.pending_addr32 = true;
                 }
                 self.bytes.extend_from_slice(&[0xF3, 0x0F, 0xAE]);
                 self.bytes.push(self.modrm(3, 6, num));
@@ -1587,83 +2111,6 @@ impl InstructionEncoder {
             }
             "repnz" | "repne" if ops.is_empty() => {
                 self.bytes.push(0xF2);
-                Ok(())
-            }
-
-            // String ops
-            "movsb" if ops.is_empty() => {
-                self.bytes.push(0xA4);
-                Ok(())
-            }
-            "movsl" if ops.is_empty() => {
-                self.sized_op = true;
-                self.bytes.push(0xA5);
-                Ok(())
-            }
-            "stosb" => {
-                self.bytes.push(0xAA);
-                Ok(())
-            }
-            "stosl" => {
-                self.sized_op = true;
-                self.bytes.push(0xAB);
-                Ok(())
-            }
-            "cmpsb" => {
-                self.bytes.push(0xA6);
-                Ok(())
-            }
-            "cmpsl" => {
-                self.sized_op = true;
-                self.bytes.push(0xA7);
-                Ok(())
-            }
-            "scasb" => {
-                self.bytes.push(0xAE);
-                Ok(())
-            }
-            "scasl" => {
-                self.sized_op = true;
-                self.bytes.push(0xAF);
-                Ok(())
-            }
-            "lodsb" => {
-                self.bytes.push(0xAC);
-                Ok(())
-            }
-            "lodsl" => {
-                self.sized_op = true;
-                self.bytes.push(0xAD);
-                Ok(())
-            }
-
-            // I/O string ops
-            "insb" => {
-                self.bytes.push(0x6C);
-                Ok(())
-            }
-            "insw" => {
-                self.sized_op = true;
-                self.bytes.extend_from_slice(&[0x66, 0x6D]);
-                Ok(())
-            }
-            "insl" => {
-                self.sized_op = true;
-                self.bytes.push(0x6D);
-                Ok(())
-            }
-            "outsb" => {
-                self.bytes.push(0x6E);
-                Ok(())
-            }
-            "outsw" => {
-                self.sized_op = true;
-                self.bytes.extend_from_slice(&[0x66, 0x6F]);
-                Ok(())
-            }
-            "outsl" => {
-                self.sized_op = true;
-                self.bytes.push(0x6F);
                 Ok(())
             }
 
@@ -2312,33 +2759,6 @@ impl InstructionEncoder {
             "rclb" | "rclw" | "rcll" | "rcl" => self.encode_shift(ops, mnemonic, 2),
             "rcrb" | "rcrw" | "rcrl" | "rcr" => self.encode_shift(ops, mnemonic, 3),
 
-            // 16-bit string operations
-            "movsw" if ops.is_empty() => {
-                self.sized_op = true;
-                self.bytes.extend_from_slice(&[0x66, 0xA5]);
-                Ok(())
-            }
-            "stosw" => {
-                self.sized_op = true;
-                self.bytes.extend_from_slice(&[0x66, 0xAB]);
-                Ok(())
-            }
-            "lodsw" => {
-                self.sized_op = true;
-                self.bytes.extend_from_slice(&[0x66, 0xAD]);
-                Ok(())
-            }
-            "scasw" => {
-                self.sized_op = true;
-                self.bytes.extend_from_slice(&[0x66, 0xAF]);
-                Ok(())
-            }
-            "cmpsw" => {
-                self.sized_op = true;
-                self.bytes.extend_from_slice(&[0x66, 0xA7]);
-                Ok(())
-            }
-
             // Additional multiply/divide sizes
             "mulb" => self.encode_unary_rm(ops, 4, 1),
             "mulw" => self.encode_unary_rm(ops, 4, 2),
@@ -2634,11 +3054,15 @@ impl InstructionEncoder {
     /// Vector-only mnemonics that READ or WRITE a GP register. Their i686
     /// spellings use the 32-bit register file with no REX, so they keep the
     /// local REX-free encoders; everything else `v*` delegates to the
-    /// shared x86-64 VEX/EVEX/XOP core. (vmovd/vmovq/vmovw are NOT here:
-    /// their vector-only spellings delegate like everything else, and
-    /// their GP spellings are caught by the operand check below — the
-    /// x86-64 GP forms are r64-based and invalid in .code32 anyway.)
-    const GP_VECTOR_MNEMONICS: [&str; 20] = [
+    /// shared x86-64 VEX/EVEX/XOP core. (vmovd/vmovq are NOT here, despite
+    /// an earlier revision listing them: keeping them blocked the
+    /// delegation of their VECTOR-only spellings (`vmovd %xmm4,%xmm6` =
+    /// 62 f1 7e 08 7e f4, `vmovq %xmm1,%xmm2` = c5 fa 7e d1 — both legal
+    /// in 32-bit mode and rejected as "unsupported/unhandled" while the
+    /// list held them). Their GP spellings are caught by the operand check
+    /// below, and the shared core emits byte-identical encodings for the
+    /// vector forms since every i686 register id is < 8.)
+    const GP_VECTOR_MNEMONICS: [&str; 18] = [
         "vpinsrb",
         "vpinsrw",
         "vpinsrd",
@@ -2657,8 +3081,6 @@ impl InstructionEncoder {
         "vcvttsd2si",
         "vcvtss2si",
         "vcvtsd2si",
-        "vmovd",
-        "vmovq",
     ];
 
     /// Delegate a vector-only instruction to the shared x86-64 VEX/EVEX/

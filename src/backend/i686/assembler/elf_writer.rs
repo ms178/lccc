@@ -262,10 +262,10 @@ impl X86Arch for I686Arch {
         // an ELF32 object only an explicit `sym@PLT` means R_386_PLT32
         // (GAS 2.47 `--32`, `.code64`: `call ext` -> R_386_PC32,
         // `call ext@PLT` -> R_386_PLT32).
-        let explicit_plt = matches!(
-            instr.operands.as_slice(),
-            [Operand::Label(label)] if label.ends_with("@PLT")
-        );
+        // Case-insensitive like GAS's suffix matching (`call foo@plt`
+        // promotes exactly like `foo@PLT`).
+        let explicit_plt = matches!(instr.operands.as_slice(), [Operand::Label(label)]
+            if label.len() >= 4 && label[label.len() - 4..].eq_ignore_ascii_case("@plt"));
         let relocations = encoder
             .relocations
             .into_iter()
