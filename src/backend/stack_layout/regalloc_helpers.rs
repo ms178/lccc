@@ -34,6 +34,7 @@ pub fn run_regalloc_and_merge_clobbers(
     Option<super::super::liveness::LivenessResult>,
     FxHashMap<u8, Vec<(u32, u32)>>,
     Vec<super::super::regalloc::AccumulatorAssignment>,
+    FxHashSet<u32>,
 ) {
     run_regalloc_and_merge_clobbers_ex(
         func,
@@ -165,6 +166,7 @@ pub fn run_regalloc_and_merge_clobbers_ex(
     Option<super::super::liveness::LivenessResult>,
     FxHashMap<u8, Vec<(u32, u32)>>,
     Vec<super::super::regalloc::AccumulatorAssignment>,
+    FxHashSet<u32>,
 ) {
     // `phi_chain_out` receives the allocator's blessed same-value classes
     // (see RegAllocResult::phi_chain); targets whose emitters are not
@@ -469,6 +471,7 @@ pub fn run_regalloc_and_merge_clobbers_ex(
             caller_save_spans: Default::default(),
             liveness: None,
             phi_chain: FxHashMap::default(),
+            eligible: FxHashSet::default(),
         }
     } else {
         super::super::regalloc::allocate_registers(func, &config)
@@ -478,6 +481,7 @@ pub fn run_regalloc_and_merge_clobbers_ex(
     let accumulator_assignments = alloc_result.accumulator_assignments;
     let caller_save_spans = alloc_result.caller_save_spans;
     let cached_liveness = alloc_result.liveness;
+    let eligible = alloc_result.eligible;
     *phi_chain_out = alloc_result.phi_chain;
 
     // Merge inline-asm clobbered callee-saved registers into the save/restore
@@ -496,6 +500,7 @@ pub fn run_regalloc_and_merge_clobbers_ex(
         cached_liveness,
         caller_save_spans,
         accumulator_assignments,
+        eligible,
     )
 }
 

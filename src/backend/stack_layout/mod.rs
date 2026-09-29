@@ -40,6 +40,7 @@ mod graph_coloring;
 mod inline_asm;
 mod regalloc_helpers;
 mod slot_assignment;
+pub mod slot_census;
 
 // Re-export submodule public APIs at the stack_layout:: level
 pub use inline_asm::{
@@ -50,6 +51,7 @@ pub use regalloc_helpers::{
     filter_available_regs, find_param_alloca, run_regalloc_and_merge_clobbers,
     run_regalloc_and_merge_clobbers_ex,
 };
+pub use slot_census::{build_slot_census, emit_slot_census, slot_census_enabled};
 
 use super::regalloc::PhysReg;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};

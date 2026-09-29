@@ -150,6 +150,13 @@ thread_local! {
     // policy bit.  Keeping it beside the map switch avoids an environment
     // lookup in every candidate loop and makes the early/main entries agree.
     static NO_MAP_I64_UNROLL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // ZERO-REM-1 kill switch: restored to "always emit the mirror" by
+    // `CCC_NO_MAP_ZERO_REM=1`.  It exists so the dead-remainder win can be
+    // re-measured at any time without rebuilding a historical tree -- the
+    // same contract as `CCC_NO_MAP_VEC`.  Resolved once per translation unit
+    // like the other policy bits, so the hot pattern scan reads a Cell and
+    // not the process environment.
+    static NO_MAP_ZERO_REM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub(crate) fn set_x86_map_i64_available(available: bool) {
@@ -174,6 +181,14 @@ fn no_map_vec() -> bool {
 
 fn no_map_i64_unroll() -> bool {
     NO_MAP_I64_UNROLL.with(|cell| cell.get())
+}
+
+pub(crate) fn set_no_map_zero_rem(disabled: bool) {
+    NO_MAP_ZERO_REM.with(|cell| cell.set(disabled));
+}
+
+fn no_map_zero_rem() -> bool {
+    NO_MAP_ZERO_REM.with(|cell| cell.get())
 }
 
 /// Record the x86 SIMD ISA profile for the current translation unit.
@@ -17734,6 +17749,31 @@ fn set_cloned_dest(inst: &mut Instruction, dest: Value) {
 /// the legitimate byte-to-element conversion and must not be touched.
 ///
 /// Shared by the reduction, map, and stencil paths.
+/// Count the uses of `iv` in blocks OUTSIDE the loop: the exact predicate
+/// `rewire_escaping_iv_uses` rewrites on (instructions and terminators),
+/// factored out so a caller can decide whether it needs a replacement value
+/// at all.  ZERO-REM-1 uses it to materialise the constant trip count only
+/// when something actually reads the counter after the loop.
+fn escaping_iv_uses(func: &IrFunction, iv: Value, outside_labels: &[BlockId]) -> usize {
+    let mut uses = 0usize;
+    for label in outside_labels {
+        let Some(bi) = func.blocks.iter().position(|b| b.label == *label) else {
+            continue;
+        };
+        for inst in func.blocks[bi].instructions.iter() {
+            let mut hit = false;
+            inst.for_each_used_value(|v| {
+                if v == iv.0 {
+                    hit = true;
+                }
+            });
+            uses += usize::from(hit);
+        }
+        uses += usize::from(terminator_uses_value(&func.blocks[bi].terminator, iv));
+    }
+    uses
+}
+
 fn rewire_escaping_iv_uses(
     func: &mut IrFunction,
     iv: Value,
@@ -17744,9 +17784,10 @@ fn rewire_escaping_iv_uses(
 ) -> usize {
     let Some(rem_iv) = rem_iv else {
         // No remainder loop was built, so there is no element-counting value
-        // to point at.  This cannot happen on any path that reaches here
-        // (every caller builds its remainder before the packed loop is
-        // touched and bails otherwise), but a wrong answer is not an
+        // to point at.  ZERO-REM-1 reaches here legitimately with `None`
+        // only via the map path's dead-mirror case, which supplies the
+        // constant trip count instead (see `transform_map_vector`), so a
+        // caller that has neither is a bug -- and a wrong answer is not an
         // acceptable failure mode for a "cannot happen".
         debug_assert!(
             false,
@@ -17755,6 +17796,11 @@ fn rewire_escaping_iv_uses(
         );
         return 0;
     };
+    // One predicate for "does the counter escape", shared with the caller
+    // that must decide whether to build a replacement value at all.
+    if escaping_iv_uses(func, iv, outside_labels) == 0 {
+        return 0;
+    }
 
     let mut rewrites = 0usize;
     for label in outside_labels {
@@ -21848,6 +21894,26 @@ fn transform_map_vector(
         .checked_mul(vector_unroll)
         .expect("map packed width must fit in u64");
 
+    // ZERO-REM-1: the trip count, when it is a compile-time constant, and the
+    // derived verdict "the packed body covers it exactly, so the scalar mirror
+    // cannot run even once".  Computed here because `packed_width` is only
+    // known after the unroll decision.  `next_val_id`/`next_label` are still
+    // reserved below, so skipping the mirror does not disturb any numbering.
+    let constant_trip: Option<i64> = match &pattern.limit {
+        Operand::Const(c) => c.to_i64().filter(|n| *n > 0),
+        _ => None,
+    };
+    // ZERO-REM-1: omit the mirror only where it is provably unreachable.
+    //   * a constant trip count that `packed_width` divides exactly -- a
+    //     dynamic `N` still needs the `N % W` tail;
+    //   * NO guarded streams: the mirror is the runtime dependence guard's
+    //     fallback target, so with guards it is live code.
+    // `CCC_NO_MAP_ZERO_REM=1` restores the previous always-emit behaviour so
+    // the win stays re-measurable without rebuilding a historical tree.
+    let remainder_dead = !no_map_zero_rem()
+        && pattern.guarded_streams.is_empty()
+        && constant_trip.is_some_and(|n| packed_width > 0 && n % packed_width as i64 == 0);
+
     // A zero-iteration vector loop plus scalar remainder only adds overhead.
     if matches!(&pattern.limit, Operand::Const(c)
         if c.to_i64().is_some_and(|n| n <= packed_width as i64))
@@ -22268,20 +22334,30 @@ fn transform_map_vector(
     next_val_id += 1;
     let byte_iv_next = Value(next_val_id);
     next_val_id += 1;
-    let Some(remainder) = build_map_remainder_loop(
-        func,
-        pattern,
-        &expr,
-        packed_width,
-        byte_iv,
-        elem_size,
-        &mut next_val_id,
-        &mut next_label,
-    ) else {
-        if debug {
-            eprintln!("[VEC-MAP]   Scalar remainder mirror unavailable; bailing");
-        }
-        return 0;
+    // ZERO-REM-1: with a constant trip count the packed body covers, the
+    // mirror is dead code -- a guard, the resume-index arithmetic, two
+    // materialised stream pointers and a whole scalar body (17 instructions
+    // on `sha256_transform`).  Skip building it entirely; the transform below
+    // then has to supply the post-loop counter value itself.
+    let remainder: Option<RemainderLoop> = if remainder_dead {
+        None
+    } else {
+        let Some(remainder) = build_map_remainder_loop(
+            func,
+            pattern,
+            &expr,
+            packed_width,
+            byte_iv,
+            elem_size,
+            &mut next_val_id,
+            &mut next_label,
+        ) else {
+            if debug {
+                eprintln!("[VEC-MAP]   Scalar remainder mirror unavailable; bailing");
+            }
+            return 0;
+        };
+        Some(remainder)
     };
 
     // Build IV-derived values for comparison rewriting.
@@ -22760,122 +22836,173 @@ fn transform_map_vector(
         .map(|(_, b)| b.label)
         .collect();
 
-    let rem_header_label = remainder.header_label;
-    let rem_iv_phi = remainder.iv_phi;
-    let rem_vec_exit_label = remainder.vec_exit_label;
-    changes += remainder.commit(func, pattern.header_idx);
+    // ZERO-REM-1: everything below consumes the mirror, so it is conditional
+    // on having built one.  `None` is the provably-dead case (constant trip
+    // count the packed body covers exactly): the loop then needs a different
+    // answer for "what does the counter read after the loop".
+    let rem: Option<(BlockId, Value)> = if let Some(remainder) = remainder {
+        let rem_header_label = remainder.header_label;
+        let rem_iv_phi = remainder.iv_phi;
+        let rem_vec_exit_label = remainder.vec_exit_label;
+        changes += remainder.commit(func, pattern.header_idx);
 
-    // Repair uses of the scalar IV that ESCAPE the loop: the packed loop
-    // redefines the counter once per vector iteration, so only the
-    // remainder IV holds the true post-loop value on the exit edge.
-    changes += rewire_escaping_iv_uses(
-        func,
-        pattern.iv,
-        Some(rem_iv_phi),
-        &outside_labels,
-        debug,
-        "[VEC-MAP]",
-    );
-    // Exit-block phis still name the loop-exit edge the remainder
-    // replaced: retarget loop-side incoming labels at the remainder
-    // header (values were rewired above; invariants keep their value).
-    {
-        let loop_labels: FxHashSet<BlockId> = pattern
-            .loop_blocks
-            .iter()
-            .map(|&bi| func.blocks[bi].label)
-            .collect();
-        for inst in func.blocks[pattern.exit_idx].instructions.iter_mut() {
-            if let Instruction::Phi { incoming, .. } = inst {
-                for (_, label) in incoming.iter_mut() {
-                    if loop_labels.contains(label) {
-                        *label = rem_header_label;
+        // Repair uses of the scalar IV that ESCAPE the loop: the packed loop
+        // redefines the counter once per vector iteration, so only the
+        // remainder IV holds the true post-loop value on the exit edge.
+        changes += rewire_escaping_iv_uses(
+            func,
+            pattern.iv,
+            Some(rem_iv_phi),
+            &outside_labels,
+            debug,
+            "[VEC-MAP]",
+        );
+        // Exit-block phis still name the loop-exit edge the remainder
+        // replaced: retarget loop-side incoming labels at the remainder
+        // header (values were rewired above; invariants keep their value).
+        {
+            let loop_labels: FxHashSet<BlockId> = pattern
+                .loop_blocks
+                .iter()
+                .map(|&bi| func.blocks[bi].label)
+                .collect();
+            for inst in func.blocks[pattern.exit_idx].instructions.iter_mut() {
+                if let Instruction::Phi { incoming, .. } = inst {
+                    for (_, label) in incoming.iter_mut() {
+                        if loop_labels.contains(label) {
+                            *label = rem_header_label;
+                        }
                     }
                 }
             }
         }
-    }
 
-    // Single-IV loop control: the remainder resumes from the BYTE IV
-    // (element index = byte_iv >> log2(elem_size)), not the element phi —
-    // otherwise the phi's last non-self use keeps the second induction
-    // variable alive through the packed loop.  The vec-exit block's
-    // `iv * vec_width` resume computation is rewritten in place; when the
-    // byte-guard rewrite above did not fire, this rewrite is still exact
-    // (byte_iv at the vector exit = 32 * vector iterations = the element
-    // phi's value there * elem_size, element-wise identical resume point).
-    {
-        let elem_shift = elem_size.trailing_zeros() as i64;
-        let vec_exit_idx = func
-            .blocks
-            .iter()
-            .position(|b| b.label == rem_vec_exit_label)
-            .expect("vec-exit block present after remainder commit");
-        let mul_pos = func.blocks[vec_exit_idx]
-            .instructions
-            .iter()
-            .position(|inst| {
-                matches!(
-                    inst,
-                    Instruction::BinOp {
-                        op: IrBinOp::Mul,
-                        lhs: Operand::Value(v),
-                        ..
-                    } if *v == pattern.iv
-                )
-            });
-        if let Some(pos) = mul_pos {
-            let i_rem_start = match &func.blocks[vec_exit_idx].instructions[pos] {
-                Instruction::BinOp { dest, .. } => *dest,
-                _ => unreachable!("position() matched a BinOp"),
-            };
-            let shr_val = if elem_shift > 0 {
-                let v = Value(next_val_id);
-                next_val_id += 1;
-                Some((
-                    v,
-                    Instruction::BinOp {
-                        dest: v,
-                        op: IrBinOp::LShr,
-                        lhs: Operand::Value(byte_iv),
-                        rhs: Operand::Const(IrConst::I64(elem_shift)),
-                        ty: IrType::I64,
+        // Single-IV loop control: the remainder resumes from the BYTE IV
+        // (element index = byte_iv >> log2(elem_size)), not the element phi —
+        // otherwise the phi's last non-self use keeps the second induction
+        // variable alive through the packed loop.  The vec-exit block's
+        // `iv * vec_width` resume computation is rewritten in place; when the
+        // byte-guard rewrite above did not fire, this rewrite is still exact
+        // (byte_iv at the vector exit = 32 * vector iterations = the element
+        // phi's value there * elem_size, element-wise identical resume point).
+        {
+            let elem_shift = elem_size.trailing_zeros() as i64;
+            let vec_exit_idx = func
+                .blocks
+                .iter()
+                .position(|b| b.label == rem_vec_exit_label)
+                .expect("vec-exit block present after remainder commit");
+            let mul_pos = func.blocks[vec_exit_idx]
+                .instructions
+                .iter()
+                .position(|inst| {
+                    matches!(
+                        inst,
+                        Instruction::BinOp {
+                            op: IrBinOp::Mul,
+                            lhs: Operand::Value(v),
+                            ..
+                        } if *v == pattern.iv
+                    )
+                });
+            if let Some(pos) = mul_pos {
+                let i_rem_start = match &func.blocks[vec_exit_idx].instructions[pos] {
+                    Instruction::BinOp { dest, .. } => *dest,
+                    _ => unreachable!("position() matched a BinOp"),
+                };
+                let shr_val = if elem_shift > 0 {
+                    let v = Value(next_val_id);
+                    next_val_id += 1;
+                    Some((
+                        v,
+                        Instruction::BinOp {
+                            dest: v,
+                            op: IrBinOp::LShr,
+                            lhs: Operand::Value(byte_iv),
+                            rhs: Operand::Const(IrConst::I64(elem_shift)),
+                            ty: IrType::I64,
+                        },
+                    ))
+                } else {
+                    None
+                };
+                let resume_src = shr_val
+                    .as_ref()
+                    .map(|(v, _)| Operand::Value(*v))
+                    .unwrap_or(Operand::Value(byte_iv));
+                let resume = match pattern.iv_ty {
+                    IrType::I32 | IrType::U32 => Instruction::Cast {
+                        dest: i_rem_start,
+                        src: resume_src,
+                        from_ty: IrType::I64,
+                        to_ty: pattern.iv_ty,
                     },
-                ))
-            } else {
-                None
-            };
-            let resume_src = shr_val
-                .as_ref()
-                .map(|(v, _)| Operand::Value(*v))
-                .unwrap_or(Operand::Value(byte_iv));
-            let resume = match pattern.iv_ty {
-                IrType::I32 | IrType::U32 => Instruction::Cast {
-                    dest: i_rem_start,
-                    src: resume_src,
+                    _ => Instruction::Copy {
+                        dest: i_rem_start,
+                        src: resume_src,
+                    },
+                };
+                let mut replacement: Vec<Instruction> = Vec::new();
+                if let Some((_, inst)) = shr_val {
+                    replacement.push(inst);
+                }
+                replacement.push(resume);
+                let n_new = replacement.len();
+                func.blocks[vec_exit_idx]
+                    .instructions
+                    .splice(pos..pos + 1, replacement);
+                changes += n_new;
+            }
+        }
+        Some((rem_header_label, rem_iv_phi))
+    } else {
+        // ZERO-REM-1: no mirror was built, so there is no element-counting IV
+        // for escaping uses to read -- the packed loop's counter counts
+        // VECTOR iterations (`N / W`), not elements.  The trip count is a
+        // compile-time constant here (that is exactly what made the mirror
+        // dead), so materialise it in the preheader using the mirror's own
+        // resume-index form: a `Cast` to the IV type, which gives the value a
+        // type in every use position, including the bare-`Value` slots
+        // (Store/GEP pointers) that an `Operand::Const` could not occupy.
+        //
+        // Demand-driven: most loops keep the counter to themselves, and an
+        // unused materialisation would report a change for a transform that
+        // changed nothing (and would rely on DCE to clean up).
+        if escaping_iv_uses(func, pattern.iv, &outside_labels) > 0 {
+            let trip = constant_trip.expect("remainder_dead implies a constant trip count");
+            let trip_val = Value(next_val_id);
+            next_val_id += 1;
+            func.blocks[preheader_idx]
+                .instructions
+                .push(Instruction::Cast {
+                    dest: trip_val,
+                    src: Operand::Const(IrConst::I64(trip)),
                     from_ty: IrType::I64,
                     to_ty: pattern.iv_ty,
-                },
-                _ => Instruction::Copy {
-                    dest: i_rem_start,
-                    src: resume_src,
-                },
-            };
-            let mut replacement: Vec<Instruction> = Vec::new();
-            if let Some((_, inst)) = shr_val {
-                replacement.push(inst);
-            }
-            replacement.push(resume);
-            let n_new = replacement.len();
-            func.blocks[vec_exit_idx]
-                .instructions
-                .splice(pos..pos + 1, replacement);
-            changes += n_new;
+                });
+            changes += 1;
+            changes += rewire_escaping_iv_uses(
+                func,
+                pattern.iv,
+                Some(trip_val),
+                &outside_labels,
+                debug,
+                "[VEC-MAP]",
+            );
         }
-    }
+        // No block was committed, so the exit edge and every exit-block phi
+        // already name the packed loop: there is nothing to retarget and
+        // there is no vec-exit resume computation to rewrite.
+        None
+    };
 
     // Loop versioning for streams that may alias the destination.
     if !pattern.guarded_streams.is_empty() {
+        // A guarded stream's fallback target IS the mirror, so a live guard
+        // implies a live mirror (`remainder_dead` requires an empty
+        // `guarded_streams`): the pair is present whenever this branch runs.
+        let (rem_header_label, rem_iv_phi) =
+            rem.expect("guarded streams imply a scalar mirror to fall back to");
         // Materialize the preheader references planned above. The
         // rematerialized chains are appended to the preheader BEFORE the
         // guard chain `emit_alias_guards` appends to the same block, so the

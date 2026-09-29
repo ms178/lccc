@@ -312,6 +312,9 @@ gate "tls-model-selection" fast \
 gate "call-secondary-cache" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_call_secondary_cache.sh
 
+gate "vec-dead-remainder" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_vec_dead_remainder.sh
+
 gate "phi-acyclic-copy-order" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_phi_acyclic_order.sh
 

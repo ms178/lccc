@@ -1136,8 +1136,14 @@ pub(crate) fn run_passes(
     // function or candidate loop.
     let no_map_vec = std::env::var("CCC_NO_MAP_VEC").is_ok();
     let no_map_i64_unroll = std::env::var_os("CCC_NO_MAP_I64_UNROLL").is_some();
+    // ZERO-REM-1: restorable kill switch for "omit the provably-dead vectorizer
+    // remainder loop". Off by default; `CCC_NO_MAP_ZERO_REM=1` restores the
+    // previous always-emit-the-mirror behaviour so the win stays re-measurable
+    // without rebuilding a historical tree.
+    let no_map_zero_rem = std::env::var_os("CCC_NO_MAP_ZERO_REM").is_some();
     vectorize::set_no_map_vec(no_map_vec);
     vectorize::set_no_map_i64_unroll(no_map_i64_unroll);
+    vectorize::set_no_map_zero_rem(no_map_zero_rem);
     // Linux's `.code16gcc` setup image has a hard 32 KiB code+data+BSS limit
     // and only six generally usable GPRs.  On the real linux-cachymod setup
     // corpus these four transformations increase final machine-code size by

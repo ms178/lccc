@@ -1533,56 +1533,61 @@ impl X86Codegen {
         // named "r11" and PhysReg(11) is named "r10". The indirect target is
         // the literal "%r10", i.e. PhysReg(11).
         let indirect_target_regs = vec![crate::backend::regalloc::PhysReg(11)];
-        let (reg_assigned, cached_liveness, caller_save_spans, accumulator_assignments) =
-            crate::backend::stack_layout::run_regalloc_and_merge_clobbers_ex(
-                func,
-                available_regs,
-                caller_saved_regs,
-                &asm_clobbered_regs,
-                &mut self.reg_assignments,
-                &mut self.used_callee_saved,
-                false,
-                Some(never_materialized),
-                call_arg_regs,
-                indirect_target_regs,
-                // Session 28: x86-64 emits SIB indexed addressing directly at
-                // the Load/Store (emit_load_indexed/emit_store_indexed) AND
-                // folds constant-offset GEPs with register bases
-                // (const_offset_fold_reg_base_ok): BOTH forms consume address
-                // registers RA-invisibly at the access position.
-                // collect_folded_gep_links_all extends const-fold base intervals
-                // plus indexed-fold base AND index intervals to their consumers,
-                // so every address register survives intervening calls and value
-                // staging (zlib-ng gz_reset NULL-store crash class).
-                {
-                    // CMP-REPLAY operand reads (IS-09): the consumer re-emits
-                    // the comparison at the SELECT/CondBranch position, so a
-                    // REGISTER-homed operand's interval must extend to the
-                    // consumer — otherwise the allocator frees the register
-                    // at the original Cmp position and a later-defined value
-                    // reuses it (sqlite3 yy_shift compared state+415 instead
-                    // of state). The links map each operand to its Cmp dest,
-                    // whose single use marks the replay position; the
-                    // extension then treats the replayed read exactly like
-                    // the folded-GEP address reads this map already covers.
-                    // Links are a SUPERSET of what the emitter finally
-                    // accepts (built with an empty fused set is not needed:
-                    // the scan skipped fused dests, and those operands keep
-                    // their normal adjacency-synchronized ranges) — a
-                    // retained link for a pruned entry only over-constrains
-                    // the allocator, never under-constrains.
-                    let mut links = crate::backend::generation::collect_folded_gep_links_all(func);
-                    for (operand, dests) in &self.cmp_replay_operand_links {
-                        links
-                            .entry(*operand)
-                            .or_default()
-                            .extend(dests.iter().copied());
-                    }
+        let (
+            reg_assigned,
+            cached_liveness,
+            caller_save_spans,
+            accumulator_assignments,
+            ra_eligible,
+        ) = crate::backend::stack_layout::run_regalloc_and_merge_clobbers_ex(
+            func,
+            available_regs,
+            caller_saved_regs,
+            &asm_clobbered_regs,
+            &mut self.reg_assignments,
+            &mut self.used_callee_saved,
+            false,
+            Some(never_materialized),
+            call_arg_regs,
+            indirect_target_regs,
+            // Session 28: x86-64 emits SIB indexed addressing directly at
+            // the Load/Store (emit_load_indexed/emit_store_indexed) AND
+            // folds constant-offset GEPs with register bases
+            // (const_offset_fold_reg_base_ok): BOTH forms consume address
+            // registers RA-invisibly at the access position.
+            // collect_folded_gep_links_all extends const-fold base intervals
+            // plus indexed-fold base AND index intervals to their consumers,
+            // so every address register survives intervening calls and value
+            // staging (zlib-ng gz_reset NULL-store crash class).
+            {
+                // CMP-REPLAY operand reads (IS-09): the consumer re-emits
+                // the comparison at the SELECT/CondBranch position, so a
+                // REGISTER-homed operand's interval must extend to the
+                // consumer — otherwise the allocator frees the register
+                // at the original Cmp position and a later-defined value
+                // reuses it (sqlite3 yy_shift compared state+415 instead
+                // of state). The links map each operand to its Cmp dest,
+                // whose single use marks the replay position; the
+                // extension then treats the replayed read exactly like
+                // the folded-GEP address reads this map already covers.
+                // Links are a SUPERSET of what the emitter finally
+                // accepts (built with an empty fused set is not needed:
+                // the scan skipped fused dests, and those operands keep
+                // their normal adjacency-synchronized ranges) — a
+                // retained link for a pruned entry only over-constrains
+                // the allocator, never under-constrains.
+                let mut links = crate::backend::generation::collect_folded_gep_links_all(func);
+                for (operand, dests) in &self.cmp_replay_operand_links {
                     links
-                },
-                &self.state.ra_config,
-                &mut self.phi_chain,
-            );
+                        .entry(*operand)
+                        .or_default()
+                        .extend(dests.iter().copied());
+                }
+                links
+            },
+            &self.state.ra_config,
+            &mut self.phi_chain,
+        );
 
         // Home-freshness bookkeeping (SOUNDNESS): reg_assignments is now THIS
         // function's final map. Build its inverse so note_dest_defined can
@@ -2290,6 +2295,28 @@ impl X86Codegen {
             },
             cached_liveness,
         );
+
+        // ── Causal stack-slot census (SPILL-01) ─────────────────────────
+        // Runs here because this is the first point where all three inputs are
+        // final and mutually consistent: the allocator's candidate set
+        // (`ra_eligible`) and assignment map (`reg_assigned`), and the frame
+        // layout (`self.state.value_locations`, `space`).  Purely
+        // observational — it never mutates codegen state.
+        if crate::backend::stack_layout::slot_census_enabled() {
+            let entries = crate::backend::stack_layout::build_slot_census(
+                func,
+                &self.state,
+                &ra_eligible,
+                &reg_assigned,
+            );
+            crate::backend::stack_layout::emit_slot_census(
+                func,
+                space,
+                if fpo { "rsp" } else { "rbp" },
+                self.used_callee_saved.len(),
+                &entries,
+            );
+        }
 
         // ── REPLAY home-collision veto (pr27285) ─────────────────
         // Post-slot companion to the readability prunes above: a definition

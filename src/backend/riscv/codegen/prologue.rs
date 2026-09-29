@@ -210,23 +210,28 @@ impl RiscvCodegen {
             Vec::new()
         };
         let call_arg_regs = caller_saved_regs.clone();
-        let (reg_assigned, cached_liveness, _caller_save_spans, accumulator_assignments) =
-            crate::backend::generation::run_regalloc_and_merge_clobbers_ex(
-                func,
-                available_regs,
-                caller_saved_regs,
-                &asm_clobbered_regs,
-                &mut self.reg_assignments,
-                &mut self.used_callee_saved,
-                true, // RISC-V asm emitter checks reg_assignments for inline asm operands
-                None,
-                call_arg_regs,
-                Vec::new(),
-                crate::common::fx_hash::FxHashMap::default(),
-                &self.state.ra_config,
-                // Not alias-aware yet: ignored scratch map keeps the pre-alias freshness behavior.
-                &mut crate::common::fx_hash::FxHashMap::default(),
-            );
+        let (
+            reg_assigned,
+            cached_liveness,
+            _caller_save_spans,
+            accumulator_assignments,
+            _ra_eligible,
+        ) = crate::backend::generation::run_regalloc_and_merge_clobbers_ex(
+            func,
+            available_regs,
+            caller_saved_regs,
+            &asm_clobbered_regs,
+            &mut self.reg_assignments,
+            &mut self.used_callee_saved,
+            true, // RISC-V asm emitter checks reg_assignments for inline asm operands
+            None,
+            call_arg_regs,
+            Vec::new(),
+            crate::common::fx_hash::FxHashMap::default(),
+            &self.state.ra_config,
+            // Not alias-aware yet: ignored scratch map keeps the pre-alias freshness behavior.
+            &mut crate::common::fx_hash::FxHashMap::default(),
+        );
 
         self.state.ra_accumulator_values =
             accumulator_assignments.iter().map(|a| a.value_id).collect();
