@@ -427,6 +427,18 @@ gate "multi-entry-loop" fast \
 gate "redundant-flags-compare" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_redundant_flags_compare.sh
 
+# `subl $1, %R; testl %R, %R; jne` -- the downward counter loop -- is one
+# instruction of pure overhead, because the subtraction already set ZF.  The
+# arithmetic producer only agrees with `test` on ZF, so the fold is licensed by
+# a consumer walk instead of by flag equality, and this gate pins both halves:
+# the pair must be gone for ZF-only consumers and must SURVIVE for the
+# sign-carrying `while ((n -= 3) > 0)` control in the same binary.  It also
+# self-tests its own matcher and the runtime result against GCC at four
+# optimisation levels -- an optimisation gate whose pattern matcher quietly
+# stopped matching would otherwise pass forever.
+gate "self-test-after-arith" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_self_test_after_arith.sh
+
 # A gate must not report a FAILURE that did not happen.  Under `set -o
 # pipefail` a consumer that stops reading early (`head`, `grep -q`) kills its
 # producer with SIGPIPE and the pipeline then reports 141, so `if ... | grep -q`

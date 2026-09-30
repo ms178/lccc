@@ -1368,7 +1368,60 @@ pub(super) fn fold_copy_and_mask_into_test(store: &mut LineStore, infos: &mut [L
     changed
 }
 
-// ── 5. redundant self-test after a logical op ────────────────────────────────
+// ── 5. redundant self-test after a logical or arithmetic op ──────────────────
+
+/// How a flag producer's EFLAGS compare with a `test` of its own result.
+///
+/// The distinction is the whole legality argument of the fold below, so it is
+/// named rather than spelled as a pair of booleans at the use site.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TestFlagAgreement {
+    /// CF and OF too: `and`/`or`/`xor` clear both, exactly like `test`.
+    Exact,
+    /// ZF alone (`sub`, `add`, `inc`, `dec`, `neg`): the arithmetic forms take
+    /// CF from the carry/borrow and OF from the overflow, where `test` clears
+    /// both, and they define AF from the borrow where `test` leaves it. SF and
+    /// PF agree at equal widths only, which the width rule below covers.
+    ZeroOnly,
+}
+
+/// Classify a producer line for [`eliminate_redundant_self_test`]: its operand
+/// width, and how closely its flags match a `test` of its own result. `None`
+/// for anything that is not a producer this fold may use — including a byte
+/// form (`addb`, `negb`), which writes only the low byte.
+///
+/// The list is deliberately exhaustive over the forms whose flag semantics are
+/// flag-for-flag known; an unrecognised producer falls back to "no fold", the
+/// same default-deny the rest of this module uses.
+fn test_flag_agreement(text: &str) -> Option<(bool, TestFlagAgreement)> {
+    const LOGICAL: &[(&str, bool)] = &[
+        ("andq ", true),
+        ("orq ", true),
+        ("xorq ", true),
+        ("andl ", false),
+        ("orl ", false),
+        ("xorl ", false),
+    ];
+    const ARITHMETIC: &[(&str, bool)] = &[
+        ("addq ", true),
+        ("subq ", true),
+        ("incq ", true),
+        ("decq ", true),
+        ("negq ", true),
+        ("addl ", false),
+        ("subl ", false),
+        ("incl ", false),
+        ("decl ", false),
+        ("negl ", false),
+    ];
+    if let Some((_, wide)) = LOGICAL.iter().find(|(p, _)| text.starts_with(p)) {
+        return Some((*wide, TestFlagAgreement::Exact));
+    }
+    ARITHMETIC
+        .iter()
+        .find(|(p, _)| text.starts_with(p))
+        .map(|(_, wide)| (*wide, TestFlagAgreement::ZeroOnly))
+}
 
 /// `andl $1, %esi; testq %rsi, %rsi; je` → `andl $1, %esi; je`.
 ///
@@ -1381,6 +1434,14 @@ pub(super) fn fold_copy_and_mask_into_test(store: &mut LineStore, infos: &mut [L
 /// Width rule: a 32-bit logical op zero-extends, so ZF is identical for the
 /// 64-bit test, but SF is not (bit 31 vs bit 63). When the widths differ the
 /// fold is therefore only applied if every consumer of the flags tests ZF.
+///
+/// Arithmetic producer: `subl $1, %esi; testl %esi, %esi; je` is the same one
+/// instruction of pure overhead — the decrement already set ZF — and it is the
+/// shape every downward counter loop compiles to (`while (--n)`,
+/// `for (; n--;)`, `while (n -= step)`), so it is worth the stricter proof. The
+/// producer agrees with the test on ZF/SF/PF only, so the fold is taken
+/// exclusively when [`flag_consumers_are_zf_only`] proves that every consumer
+/// of the flags reads ZF; see [`TestFlagAgreement::ZeroOnly`].
 #[expect(clippy::needless_range_loop)]
 pub(super) fn eliminate_redundant_self_test(store: &LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
@@ -1439,21 +1500,11 @@ pub(super) fn eliminate_redundant_self_test(store: &LineStore, infos: &mut [Line
             j += 1;
             continue;
         };
-        // Only logical ops reproduce a `test`'s flag state exactly.
-        let (prod_wide, is_logical) = if ptext.starts_with("andq ")
-            || ptext.starts_with("orq ")
-            || ptext.starts_with("xorq ")
-        {
-            (true, true)
-        } else if ptext.starts_with("andl ")
-            || ptext.starts_with("orl ")
-            || ptext.starts_with("xorl ")
-        {
-            (false, true)
-        } else {
-            (false, false)
+        let Some((prod_wide, agreement)) = test_flag_agreement(ptext) else {
+            j += 1;
+            continue;
         };
-        if !is_logical || get_dest_reg(&infos[pidx]) != fam {
+        if get_dest_reg(&infos[pidx]) != fam {
             j += 1;
             continue;
         }
@@ -1464,7 +1515,9 @@ pub(super) fn eliminate_redundant_self_test(store: &LineStore, infos: &mut [Line
             continue;
         }
         // Anything between the producer and the test must leave both the flags
-        // and the register alone.
+        // and the register alone. (Labels are barriers, so the scan above
+        // already guarantees this run is a straight-line window with no other
+        // entry point onto the test.)
         for n in pidx + 1..j {
             if infos[n].is_nop() || infos[n].kind == LineKind::Directive {
                 continue;
@@ -1479,17 +1532,41 @@ pub(super) fn eliminate_redundant_self_test(store: &LineStore, infos: &mut [Line
             j += 1;
             continue;
         }
-        // With mismatched widths only ZF survives unchanged.
-        if prod_wide != test_wide {
-            let Some((fstart, fend)) = function_range(store, infos, j) else {
+        // What separates the two producer classes is which flags the test may
+        // be replaced in: `and`/`or`/`xor` clear CF and OF exactly as the test
+        // does, while an arithmetic producer takes both from the operation, so
+        // it needs the flags to be read as ZF alone -- the same proof a width
+        // change needs, because a 32-bit producer zero-extends (ZF survives
+        // into the wide test) while SF does not (bit 31 vs bit 63).
+        //
+        // `flag_consumers_are_zf_only` is the whole proof, including the
+        // whole-EFLAGS readers: `lahf`, `pushf`, inline asm and unknown
+        // mnemonics have no condition code, so the walk charges them with
+        // `saw_non_zf` before either caller looks. That matters here because
+        // they are exactly the readers that can observe AF, which an
+        // arithmetic producer defines from the borrow and the test does not
+        // touch at all. The walk follows the TAKEN edge of every conditional
+        // jump, so a consumer in a block the fall-through never reaches still
+        // counts, and it reports `proved = false` rather than guessing when a
+        // target cannot be resolved.
+        if agreement == TestFlagAgreement::ZeroOnly || prod_wide != test_wide {
+            if !flag_consumers_are_zf_only(store, infos, j + 1) {
                 j += 1;
                 continue;
-            };
-            if !flags_are_block_local(store, infos, fstart, fend)
-                || !flag_consumers_are_zf_only(store, infos, j + 1)
-            {
-                j += 1;
-                continue;
+            }
+            if prod_wide != test_wide {
+                // Losing SF is a whole-function property, not a property of
+                // this straight-line run: verify the convention that flags do
+                // not cross a block boundary before relying on the consumer
+                // walk's reachability.
+                let Some((fstart, fend)) = function_range(store, infos, j) else {
+                    j += 1;
+                    continue;
+                };
+                if !flags_are_block_local(store, infos, fstart, fend) {
+                    j += 1;
+                    continue;
+                }
             }
         }
         mark_nop(&mut infos[j]);
@@ -2268,12 +2345,145 @@ mod tests {
 
     #[test]
     fn self_test_after_add_is_kept() {
+        // The consumer is `jb`, a carry test: `addl` takes CF from the carry
+        // while `testl` clears it, so the pair is not redundant. The ZF-only
+        // twin of this shape IS folded -- see the counter tests below.
         let out = run(concat!(
             "foo:\n",
             ".cfi_startproc\n",
             "    addl %edx, %esi\n",
             "    testl %esi, %esi\n",
             "    jb .LBB4\n",
+            "    ret\n",
+            ".LBB4:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("testl %esi, %esi"), "{out}");
+    }
+
+    /// Run the self-test pass over a one-function snippet whose body branches
+    /// forward to the appended `.LBB4`.
+    fn self_test_case(body: &str) -> String {
+        run(&format!(
+            "foo:\n.cfi_startproc\n{body}.LBB4:\n    ret\n.cfi_endproc\n"
+        ))
+    }
+
+    #[test]
+    fn self_test_after_counter_sub_is_removed_for_zf_consumer() {
+        // `while (--chain != 0)`: the decrement already set ZF.
+        let out = self_test_case(concat!(
+            "    subl $1, %ebp\n",
+            "    testl %ebp, %ebp\n",
+            "    je .LBB4\n",
+            "    ret\n",
+        ));
+        assert!(out.contains("subl $1, %ebp"), "{out}");
+        assert!(!out.contains("testl %ebp, %ebp"), "{out}");
+    }
+
+    #[test]
+    fn self_test_after_add_dec_neg_is_removed_for_zf_consumer() {
+        for (prod, tst) in [
+            ("addl %edx, %esi", "testl %esi, %esi"),
+            ("decl %esi", "testl %esi, %esi"),
+            ("negl %esi", "testl %esi, %esi"),
+            ("subq $8, %rsi", "testq %rsi, %rsi"),
+            // 32-bit producer zero-extends: ZF of the wide test is identical.
+            ("subl $1, %esi", "testq %rsi, %rsi"),
+        ] {
+            let out = self_test_case(&format!("    {prod}\n    {tst}\n    jne .LBB4\n    ret\n"));
+            assert!(!out.contains(tst), "`{tst}` after `{prod}` must go:\n{out}");
+        }
+    }
+
+    #[test]
+    fn self_test_after_sub_is_kept_for_carry_overflow_or_sign_consumers() {
+        // `sub` sets CF/OF from the subtraction, and SF (at equal widths) is
+        // the register's sign bit, which agrees with the test -- but the proof
+        // this fold carries is "ZF alone", so every non-ZF predicate refuses.
+        for jcc in [
+            "jb", "ja", "jl", "jg", "jle", "jge", "js", "jo", "jbe", "jp",
+        ] {
+            let out = self_test_case(&format!(
+                "    subl $1, %esi\n    testl %esi, %esi\n    {jcc} .LBB4\n    ret\n"
+            ));
+            assert!(out.contains("testl %esi, %esi"), "{jcc}:\n{out}");
+        }
+    }
+
+    #[test]
+    fn self_test_after_sub_is_kept_when_a_later_edge_reads_carry() {
+        // The taken edge of the first branch delivers the flags to `jb`.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    subl $1, %esi\n",
+            "    testl %esi, %esi\n",
+            "    je .LBB5\n",
+            "    ret\n",
+            ".LBB5:\n",
+            "    jb .LBB4\n",
+            "    ret\n",
+            ".LBB4:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("testl %esi, %esi"), "{out}");
+    }
+
+    #[test]
+    fn self_test_after_wide_sub_is_kept_under_a_narrow_test() {
+        // `subq` can leave a non-zero upper half that `testl` ignores, so the
+        // wide subtraction never licenses dropping the narrow test.
+        let out = self_test_case(concat!(
+            "    subq $1, %rsi\n",
+            "    testl %esi, %esi\n",
+            "    je .LBB4\n",
+            "    ret\n",
+        ));
+        assert!(out.contains("testl %esi, %esi"), "{out}");
+    }
+
+    #[test]
+    fn self_test_after_sub_is_kept_for_a_whole_flags_reader() {
+        let out = self_test_case(concat!(
+            "    subl $1, %esi\n",
+            "    testl %esi, %esi\n",
+            "    lahf\n",
+            "    je .LBB4\n",
+            "    ret\n",
+        ));
+        assert!(out.contains("testl %esi, %esi"), "{out}");
+    }
+
+    #[test]
+    fn self_test_after_sub_is_kept_when_the_register_is_touched_between() {
+        let out = self_test_case(concat!(
+            "    subl $1, %esi\n",
+            "    leal 1(%esi), %esi\n",
+            "    testl %esi, %esi\n",
+            "    je .LBB4\n",
+            "    ret\n",
+        ));
+        assert!(out.contains("testl %esi, %esi"), "{out}");
+    }
+
+    #[test]
+    fn self_test_after_sub_is_kept_when_a_branch_enters_at_the_test() {
+        // A label between the producer and the test is a barrier, so the fold
+        // never claims a straight-line window it does not have: the `jmp`
+        // delivers flags that the decrement did not produce, and the test is
+        // the only thing defining ZF for them.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    jmp .LBB5\n",
+            "    subl $1, %esi\n",
+            ".LBB5:\n",
+            "    testl %esi, %esi\n",
+            "    je .LBB4\n",
             "    ret\n",
             ".LBB4:\n",
             "    ret\n",
