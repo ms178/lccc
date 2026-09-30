@@ -165,6 +165,15 @@ elif [[ ! -f "$GEN/bench.json" ]]; then
     | atomic_write "$GEN/bench.json"
 fi
 
+# 5d. Runtime-readable mirror for the Next.js delivery portal (src/app/page.tsx
+#     + src/app/api/patch/[name]/route.ts read $PUB at request time; `next
+#     start` does NOT serve files added to public/ after the build, so the
+#     portal streams them through the route handler instead).
+atomic_write "$PUB/ledger.json" < "$LEDGER"
+for d in $docs ${LCCC_SNAPSHOT_DOCS:-}; do
+  [[ -f "$d" ]] && cp -f "$d" "$PUB/$(echo "$d" | tr '/' '_')"
+done
+
 rm -f "$patch_tmp"
 
 # 6. Rebuild the single-file web bundle so dist/index.html carries this

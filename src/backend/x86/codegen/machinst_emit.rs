@@ -881,7 +881,30 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
             let mnem = if *signed { "idiv" } else { "div" };
             let suffix = size.suffix();
             let div_str = fmt_operand(divisor, *size, out);
-            out.emit_fmt(format_args!("    {}{} {}", mnem, suffix, div_str));
+            if *size == OpSize::S64 && crate::backend::x86::cpu_model::active().bypass_div64() {
+                // 64-bit divide width bypass (see `X86Tune::bypass_div64` and
+                // `alu.rs::emit_div64`).  The preceding `XorRdx`/`Cqto` set up
+                // %rdx for the full-width divide; the fast path may clobber it
+                // (the slow path redoes it), so the guard needs no free
+                // register beyond %rdx, which the divide defines anyway:
+                //     movq %rax,%rdx; orq <div>,%rdx; shrq $32,%rdx
+                //     jnz 1f ; divl <div32> ; jmp 2f
+                //  1: xorl %edx,%edx | cqto ; [i]divq <div>
+                //  2:
+                let div32 = fmt_operand(divisor, OpSize::S32, out);
+                out.emit("    movq %rax, %rdx");
+                out.emit_fmt(format_args!("    orq {}, %rdx", div_str));
+                out.emit("    shrq $32, %rdx");
+                out.emit("    jnz 1f");
+                out.emit_fmt(format_args!("    divl {}", div32));
+                out.emit("    jmp 2f");
+                out.emit("1:");
+                out.emit(if *signed { "    cqto" } else { "    xorl %edx, %edx" });
+                out.emit_fmt(format_args!("    {}{} {}", mnem, suffix, div_str));
+                out.emit("2:");
+            } else {
+                out.emit_fmt(format_args!("    {}{} {}", mnem, suffix, div_str));
+            }
         }
 
         MachInst::Cmp { lhs, rhs, size } => {
@@ -1257,6 +1280,19 @@ pub fn emit_machinsts(insts: &[MachInst], out: &mut AsmOutput) {
             && try_emit_ndd_pair(&insts[i], &insts[i + 1], &insts[i + 2..], out)
         {
             i += 2;
+            continue;
+        }
+        // `xorl %edx,%edx` / `cqto` immediately before a width-bypassed 64-bit
+        // divide is dead: the guard overwrites %rdx and the slow path redoes
+        // the set-up itself (see the `MachInst::Div` arm).
+        if matches!(insts[i], MachInst::XorRdx | MachInst::Cqto { size: OpSize::S64 })
+            && matches!(
+                insts.get(i + 1),
+                Some(MachInst::Div { size: OpSize::S64, .. })
+            )
+            && crate::backend::x86::cpu_model::active().bypass_div64()
+        {
+            i += 1;
             continue;
         }
         emit_machinst(&insts[i], out);

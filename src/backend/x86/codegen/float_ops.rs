@@ -1077,7 +1077,8 @@ impl X86Codegen {
         // it for tzcnt on Skylake, where uops.info measures no dependency.
         let needs_break = match mnem {
             "popcnt" => self.tune.break_popcnt_dep(),
-            _ => self.tune.break_lzcnt_tzcnt_dep(),
+            "lzcnt" => self.tune.break_lzcnt_dep(),
+            _ => self.tune.break_tzcnt_dep(),
         };
         if needs_break && src_name != dst_name && src_name != dst32 {
             self.state
