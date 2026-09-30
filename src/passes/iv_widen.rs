@@ -126,7 +126,9 @@ use crate::common::types::IrType;
 use crate::ir::analysis::{CfgAnalysis, FlatAdj};
 use crate::ir::constants::IrConst;
 use crate::ir::instruction::{BasicBlock, Instruction, Operand, Terminator, Value};
-use crate::ir::reexports::{BlockId, IrBinOp, IrCmpOp, IrFunction};
+use crate::ir::reexports::{
+    BlockId, IrBinOp, IrCmpOp, IrFunction, replace_operand_value, replace_terminator_value,
+};
 use crate::passes::loop_analysis::{
     DominanceChecker, NaturalLoop, find_natural_loops, merge_loops_by_header,
 };
@@ -2146,10 +2148,10 @@ fn apply_widen(func: &mut IrFunction, plan: &WidenPlan, preheader_idx: usize, de
         // 64-bit slot.
         for inst in func.blocks[bi].instructions.iter_mut() {
             if escape_read_needs_narrow(inst, member, wide_ty) {
-                rewrite_operand_value(inst, member, Operand::Value(narrow));
+                replace_operand_value(inst, member, Operand::Value(narrow));
             }
         }
-        rewrite_terminator_value(
+        replace_terminator_value(
             &mut func.blocks[bi].terminator,
             member,
             Operand::Value(narrow),
@@ -2370,9 +2372,9 @@ fn value_still_used(func: &IrFunction, val: Value) -> bool {
 fn replace_all_uses_of_value(func: &mut IrFunction, old_val: Value, new_op: Operand) {
     for b in &mut func.blocks {
         for inst in &mut b.instructions {
-            rewrite_operand_value(inst, old_val, new_op);
+            replace_operand_value(inst, old_val, new_op);
         }
-        rewrite_terminator_value(&mut b.terminator, old_val, new_op);
+        replace_terminator_value(&mut b.terminator, old_val, new_op);
     }
 }
 
@@ -2440,36 +2442,6 @@ fn escape_read_needs_narrow(inst: &Instruction, member: Value, wide_ty: IrType) 
         // and everything else are narrow consumers.
         _ => true,
     }
-}
-
-fn rewrite_operand_value(inst: &mut Instruction, old_val: Value, new_op: Operand) {
-    // The canonical visitors make this complete for every instruction shape
-    // (Select data operands, atomics, calls, intrinsics, ...), unlike the
-    // hand-rolled match arms of earlier revisions.
-    let new_val = match new_op {
-        Operand::Value(v) => Some(v),
-        Operand::Const(_) => None,
-    };
-    inst.for_each_operand_mut(|op| {
-        if matches!(op, Operand::Value(v) if v.0 == old_val.0) {
-            *op = new_op;
-        }
-    });
-    if let Some(nv) = new_val {
-        inst.for_each_value_use_mut(|field| {
-            if field.0 == old_val.0 {
-                *field = nv;
-            }
-        });
-    }
-}
-
-fn rewrite_terminator_value(term: &mut Terminator, old_val: Value, new_op: Operand) {
-    term.for_each_operand_mut(|op| {
-        if matches!(op, Operand::Value(v) if *v == old_val) {
-            *op = new_op;
-        }
-    });
 }
 
 // ---------------------------------------------------------------------------

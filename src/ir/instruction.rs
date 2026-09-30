@@ -1114,6 +1114,51 @@ impl Instruction {
     }
 }
 
+/// Replace every read of `old` in `inst` with `new_op`.
+///
+/// Both visitor kinds are required and neither is redundant:
+/// [`Instruction::for_each_operand_mut`] covers the `Operand` slots (binary and
+/// unary operands, GEP offsets, store values, call and intrinsic arguments),
+/// while [`Instruction::for_each_value_use_mut`] covers the bare `Value` slots
+/// (`GetElementPtr.base`, `Load.ptr`, `dest_ptr`, ...) that a pass substituting
+/// a *value* must redirect as well.  Hand-rolled `match` arms over the
+/// instruction enum are how the two get out of sync: a shape nobody remembered
+/// to list keeps reading the replaced value, and the resulting IR still
+/// validates because the stale read is a value that is still defined.
+///
+/// This is the single canonical implementation; the passes that rewrite
+/// induction-variable uses share it rather than keeping private copies.
+pub fn replace_operand_value(inst: &mut Instruction, old: Value, new_op: Operand) {
+    let new_val = match new_op {
+        Operand::Value(v) => Some(v),
+        Operand::Const(_) => None,
+    };
+    inst.for_each_operand_mut(|op| {
+        if matches!(op, Operand::Value(v) if *v == old) {
+            *op = new_op;
+        }
+    });
+    // A constant cannot stand in a bare `Value` slot, so those slots are left
+    // alone: replacing `base` with a constant would need a materialization this
+    // helper has nowhere to put.
+    if let Some(nv) = new_val {
+        inst.for_each_value_use_mut(|field| {
+            if *field == old {
+                *field = nv;
+            }
+        });
+    }
+}
+
+/// Replace every read of `old` in a terminator with `new_op`.
+pub fn replace_terminator_value(term: &mut Terminator, old: Value, new_op: Operand) {
+    term.for_each_operand_mut(|op| {
+        if matches!(op, Operand::Value(v) if *v == old) {
+            *op = new_op;
+        }
+    });
+}
+
 impl Terminator {
     /// Mutably visit every Operand stored in this terminator.
     #[inline]
@@ -1157,6 +1202,79 @@ impl Terminator {
         let mut used = Vec::new();
         self.for_each_used_value(|id| used.push(id));
         used
+    }
+}
+
+#[cfg(test)]
+mod value_replacement_tests {
+    use super::*;
+
+    fn gep(dest: u32, base: u32, offset: u32) -> Instruction {
+        Instruction::GetElementPtr {
+            dest: Value(dest),
+            base: Value(base),
+            offset: Operand::Value(Value(offset)),
+            ty: IrType::I8,
+        }
+    }
+
+    #[test]
+    fn replaces_operand_and_bare_value_slots_together() {
+        // The GEP reads the old value in BOTH shapes: `offset` is an Operand
+        // slot, `base` is a bare Value field.  A replacement that handles only
+        // one of them leaves the instruction reading the old value.
+        let mut inst = gep(1, 7, 7);
+        replace_operand_value(&mut inst, Value(7), Operand::Value(Value(42)));
+        match inst {
+            Instruction::GetElementPtr { base, offset, .. } => {
+                assert_eq!(base, Value(42), "bare Value slot must be redirected");
+                assert_eq!(
+                    offset,
+                    Operand::Value(Value(42)),
+                    "Operand slot must be redirected"
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn leaves_unrelated_values_alone() {
+        let mut inst = gep(1, 7, 8);
+        replace_operand_value(&mut inst, Value(9), Operand::Value(Value(42)));
+        match inst {
+            Instruction::GetElementPtr { base, offset, .. } => {
+                assert_eq!(base, Value(7));
+                assert_eq!(offset, Operand::Value(Value(8)));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn constant_replacement_leaves_bare_value_slots_untouched() {
+        // `Operand::Const` has no `Value` form, so the bare slots must survive
+        // unchanged -- rewriting them to a placeholder would invert the pass's
+        // intent (and would not be a value at all).
+        let mut inst = gep(1, 7, 7);
+        replace_operand_value(&mut inst, Value(7), Operand::Const(IrConst::I64(3)));
+        match inst {
+            Instruction::GetElementPtr { base, offset, .. } => {
+                assert_eq!(base, Value(7));
+                assert_eq!(offset, Operand::Const(IrConst::I64(3)));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn terminator_operands_are_replaced() {
+        let mut term = Terminator::Return(Some(Operand::Value(Value(5))));
+        replace_terminator_value(&mut term, Value(5), Operand::Value(Value(6)));
+        match term {
+            Terminator::Return(Some(Operand::Value(v))) => assert_eq!(v, Value(6)),
+            _ => panic!("return operand must be redirected"),
+        }
     }
 }
 
