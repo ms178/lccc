@@ -309,22 +309,29 @@ def _local_compile(executable: str, source: Path, flags: str) -> list[str]:
 
 def _compile_remote(name: str, source: str, flags: str) -> list[str]:
     cid = godbolt.resolve_compiler(name)
+    # Pin the record to the *build* behind this id, not merely to the id: a
+    # Compiler Explorer id is a label, and when `g162` is rebuilt against a
+    # newer GCC the label survives while the emitted code does not. See
+    # godbolt.compiler_fingerprint. Costs nothing on a warm compiler-list
+    # cache -- godbolt.list_compilers holds the metadata for 24h.
+    fp = godbolt.compiler_fingerprint(cid)
     # One remote-compile path for every report mode, through the cache shared
     # with tools/oracle/godbolt_oracle.py and scripts/encdiff.py
-    # (scripts/godbolt_cache.py). The `att-v2` namespace pins the syntax
+    # (scripts/godbolt_cache.py). The `att-v3` namespace pins the syntax
     # contract -- a pre-v2 cache stored Intel syntax, which made AT&T
     # load/store metrics silently read as zero in a table that then looked
-    # like a triumph -- and bumping it is how a format change invalidates old
-    # records instead of poisoning new ones. The network is hit once per
-    # (compiler, flags, source) tuple: once per report mode, and once ever.
-    hit = godbolt_cache.load_lines(godbolt_cache.NS_ASM, cid, flags, source)
+    # like a triumph -- and bumping it is how a change to what a key *means*
+    # invalidates old records instead of poisoning new ones. The network is
+    # hit once per (compiler, version, flags, source) tuple: once per report
+    # mode, and once ever until that compiler's version moves.
+    hit = godbolt_cache.load_lines(godbolt_cache.NS_ASM, cid, fp, flags, source)
     if hit is not None:
         return hit
     data = godbolt.compile_on_godbolt(cid, source, flags, intel=False)
     if data is None:
         raise godbolt.GodboltError(f"remote compile failed: {name} ({cid})")
     lines = godbolt.assembly_lines(data)
-    godbolt_cache.store_lines(godbolt_cache.NS_ASM, lines, cid, flags, source)
+    godbolt_cache.store_lines(godbolt_cache.NS_ASM, lines, cid, fp, flags, source)
     return lines
 
 

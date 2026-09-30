@@ -77,6 +77,7 @@ API = "https://godbolt.org/api"
 # scripts/codegen_oracle.py and tools/oracle/godbolt_oracle.py.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import godbolt_cache  # noqa: E402
+import godbolt  # noqa: E402  -- for compiler_fingerprint (drift-safe cache keys)
 CACHE = godbolt_cache.CACHE
 _OBJDUMP = os.environ.get("LCCC_OBJDUMP", "objdump")
 TIMEOUT = int(os.environ.get("GODBOLT_TIMEOUT", "120"))
@@ -176,7 +177,8 @@ def _post(cid: str, source: str, args: str) -> dict:
     # the raw API reply (including `opcodes`), which is a different shape from
     # the assembly held in `att-v2` and the execution records in `oracle-v1`.
     # A corrupt record is treated as a miss and overwritten, never fatal.
-    hit = godbolt_cache.load_json(godbolt_cache.NS_ENCDIFF, cid, args, source)
+    fp = godbolt.compiler_fingerprint(cid)
+    hit = godbolt_cache.load_json(godbolt_cache.NS_ENCDIFF, cid, fp, args, source)
     if hit is not None:
         return hit
 
@@ -195,7 +197,7 @@ def _post(cid: str, source: str, args: str) -> dict:
                  "Accept": "application/json"})
     with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
         out = json.load(r)
-    godbolt_cache.store_json(godbolt_cache.NS_ENCDIFF, out, cid, args, source)
+    godbolt_cache.store_json(godbolt_cache.NS_ENCDIFF, out, cid, fp, args, source)
     return out
 
 

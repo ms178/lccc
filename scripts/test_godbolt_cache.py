@@ -184,6 +184,96 @@ def test_stats() -> None:
           f"{st}")
 
 
+def test_compiler_fingerprint_drives_the_key() -> None:
+    """A rebuild behind an unchanged id must invalidate every record.
+
+    This is the whole reason the fingerprint exists: a Compiler Explorer id
+    is a label, not a binary. If `g162` starts emitting a newer GCC's code
+    while keeping its id, a key built from the id alone would keep handing
+    back the old build's assembly under the new build's name -- a stale
+    comparison table wearing the costume of a current one.
+    """
+    src = "int f(void){return 1;}"
+    old = gc.key(gc.NS_ASM, "g162", "x86-64 gcc 16.2|16.2.0", "-O2", src)
+    moved = gc.key(gc.NS_ASM, "g162", "x86-64 gcc 16.2|16.2.1", "-O2", src)
+    check("a compiler rebuild changes the key", old != moved,
+          f"{old} vs {moved}")
+    check("the same build reproduces the same key",
+          old == gc.key(gc.NS_ASM, "g162", "x86-64 gcc 16.2|16.2.0", "-O2", src))
+    # The fingerprint is a distinct key component, not something a source
+    # text can forge by containing a similar-looking string.
+    forged = gc.key(gc.NS_ASM, "g162", "x86-64 gcc 16.2|16.2.0", "-O2",
+                    "|16.2.1")
+    check("fingerprint cannot be forged from the source text",
+          forged != gc.key(gc.NS_ASM, "g162", "16.2.1", "-O2", ""))
+
+
+def test_moving_channels_expire_pinned_ones_do_not() -> None:
+    """A placeholder version must not be treated as a pin.
+
+    `cgsnapshot` reports semver "(trunk)" and `cicxlatest` reports "(latest)":
+    both are rebuilt continuously while that string stays put. Folding it into
+    a key the way a real version is folded in would advertise a pin that does
+    not exist -- the exact drift MED-2 is about, wearing a disguise.
+    """
+    import godbolt  # sibling script; import-safe (no network at import)
+
+    T = godbolt.MOVING_CHANNEL_TTL
+    real = godbolt.compiler_metadata
+    try:
+        godbolt.compiler_metadata = lambda cid: {
+            "name": "x86-64 gcc 16.2", "semver": "16.2"}
+        a = godbolt.compiler_fingerprint("cg162", now=0.0)
+        b = godbolt.compiler_fingerprint("cg162", now=T * 99)
+        check("a release channel is pinned, never time-bucketed",
+              a == b == "x86-64 gcc 16.2|16.2", f"{a!r} vs {b!r}")
+
+        godbolt.compiler_metadata = lambda cid: {
+            "name": "x86-64 gcc (trunk)", "semver": "(trunk)"}
+        w0 = godbolt.compiler_fingerprint("cgsnapshot", now=0.0)
+        check("a moving channel is bucketed, not pinned",
+              w0.startswith("moving|"), w0)
+        check("a moving channel is stable inside one window",
+              godbolt.compiler_fingerprint("cgsnapshot", now=T - 1) == w0)
+        check("a moving channel rolls into a new window after the TTL",
+              godbolt.compiler_fingerprint("cgsnapshot", now=T + 1) != w0)
+
+        # The bucket must change the key, or expiry is decorative.
+        kw = lambda fp: gc.key(gc.NS_ASM, "cgsnapshot", fp, "-O2", "int f(void){return 2;}")
+        check("crossing the TTL changes the cache key",
+              kw(w0) != kw(godbolt.compiler_fingerprint("cgsnapshot", now=T + 1)))
+    finally:
+        godbolt.compiler_metadata = real
+
+
+def test_compiler_fingerprint_fails_soft() -> None:
+    """Never raise: an offline run keeps its cache, minus drift detection."""
+    import godbolt  # sibling script; import-safe (no network at import)
+
+    real = godbolt.compiler_metadata
+
+    def raising(_cid):
+        raise RuntimeError("network unreachable")
+
+    try:
+        godbolt.compiler_metadata = lambda cid: {
+            "id": cid, "name": "x86-64 gcc 16.2", "semver": "16.2.0"}
+        check("a resolved compiler yields name|semver",
+              godbolt.compiler_fingerprint("g162") == "x86-64 gcc 16.2|16.2.0",
+              godbolt.compiler_fingerprint("g162"))
+
+        godbolt.compiler_metadata = lambda cid: {
+            "id": cid, "name": "unknown", "semver": "unknown"}
+        check("an unrecognised id collapses to one sentinel",
+              godbolt.compiler_fingerprint("nope") == godbolt.FINGERPRINT_UNKNOWN)
+
+        godbolt.compiler_metadata = raising
+        check("a metadata failure degrades, never propagates",
+              godbolt.compiler_fingerprint("g162") == godbolt.FINGERPRINT_UNKNOWN)
+    finally:
+        godbolt.compiler_metadata = real
+
+
 def test_path_is_namespaced() -> None:
     p = gc.path_for(gc.NS_ORACLE, "a", "b")
     check("record path names its namespace", p.parent.name == gc.NS_ORACLE,

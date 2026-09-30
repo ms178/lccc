@@ -9554,6 +9554,17 @@ def reloc_oracle_agreement(agree, notes, oracles):
     A PASS that rested on fewer oracles than were configured says so in the
     detail: a cross-check that quietly narrowed is exactly how a gate rots.
     """
+    # An empty oracle set must FAIL, never PASS. With `oracles == []` the
+    # floor below degenerates to `min(2, 0) == 0`, `reference` is `None`, and
+    # `all([])` is `True` -- every guard is satisfied and the function returns
+    # PASS having consulted nobody. A gate whose entire purpose is to refuse
+    # verdicts that rest on too little evidence must not be able to certify
+    # a verdict resting on none. Unreachable from today's only call site
+    # (which always seeds bfd), but this is module scope, it is unit-tested,
+    # and a future caller that filters the oracle list would inherit a
+    # silent fail-open.
+    if not oracles:
+        return ("FAIL", "no oracles configured to cross-check against")
     applicable = [n for n, (v, _, _) in notes.items() if v != "inapplicable"]
     floor = min(2, len(oracles))
     reference = oracles[0][0] if oracles else None

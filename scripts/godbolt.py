@@ -159,6 +159,74 @@ def compiler_metadata(compiler_id: str, *, compilers: list[dict[str, Any]] | Non
     }
 
 
+# Returned by compiler_fingerprint() when the version cannot be established
+# (offline, retired id, reshaped API). A constant keeps the cache usable -- it
+# just loses drift detection -- rather than turning every hit into a failure.
+FINGERPRINT_UNKNOWN = "v-unknown"
+
+
+# A moving channel -- gcc (trunk), icx (latest) and friends -- is rebuilt
+# continuously while its reported version stays a placeholder ("(trunk)",
+# "(latest)"). Keying on that string would assert a pin that does not exist,
+# so its records instead roll into a fresh key slot once per window. One
+# week: long enough that a corpus sweep still hits cache between runs, short
+# enough that a trunk result quoted in a report is never more than a week
+# stale. Release channels are unaffected -- they carry a real version and
+# never expire.
+MOVING_CHANNEL_TTL = 7 * 24 * 3600.0
+
+# A real version string opens with a digit ("16.2", "23.1.0 (assertions)").
+# Anything else -- "(trunk)", "(latest)", "" -- is a placeholder.
+_PINNED_SEMVER = re.compile(r"^\s*\d")
+
+
+def compiler_fingerprint(compiler_id: str, *, now: float | None = None) -> str:
+    """Drift-sensitive identity of what ``compiler_id`` denotes *today*.
+
+    A Compiler Explorer id is a label, not a binary. When Godbolt rebuilds
+    ``cg162`` against a newer GCC -- or retires an id and repoints the alias --
+    the id is unchanged while the code it emits is not. Any cache keyed on the
+    id alone then keeps serving assembly produced by the *previous* build,
+    which is precisely how a stale comparison table comes to claim a win that
+    nobody ever measured against the compiler named in its header.
+
+    Folding this value into the key turns that silent lie into an ordinary
+    cache miss. Two shapes come back:
+
+    ``"<name>|<semver>"``
+        A release channel. The version identifies the build, so the record is
+        pinned and never expires; if the id is ever repointed, the version
+        moves and the old records leave the key space.
+
+    ``"moving|<name>|<window>"``
+        A moving channel, whose version string is a placeholder that never
+        changes however often the build does. Pinning on it would be a lie,
+        so the window counter rolls over every MOVING_CHANNEL_TTL seconds and
+        the record is quietly re-fetched instead.
+
+    Never raises. An offline run or an unrecognised id degrades to
+    FINGERPRINT_UNKNOWN, so the cache keeps working and simply loses its
+    drift detection for that run.
+    """
+    try:
+        meta = compiler_metadata(compiler_id)
+    except Exception:  # network down, id retired, API reshaped -- all non-fatal
+        return FINGERPRINT_UNKNOWN
+    name = str(meta.get("name") or "").strip()
+    semver = str(meta.get("semver") or "").strip()
+    # compiler_metadata() substitutes the literal string "unknown" for both
+    # fields when the id is absent; normalise that to the sentinel so that
+    # "we could not tell" is one value, not several.
+    parts = [x for x in (name, semver) if x and x != "unknown"]
+    if not parts:
+        return FINGERPRINT_UNKNOWN
+    if not semver or not _PINNED_SEMVER.match(semver):
+        stamp = time.time() if now is None else now
+        window = int(stamp // MOVING_CHANNEL_TTL)
+        return f"moving|{name}|{window}"
+    return "|".join(parts)
+
+
 def compile_on_godbolt(compiler_id: str, source: str, flags: str,
                         *, intel: bool = False, timeout: int = 120,
                         keep_directives: bool = False) -> dict[str, Any] | None:

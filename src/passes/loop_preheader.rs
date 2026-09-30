@@ -453,22 +453,12 @@ pub fn enabled(disabled: impl AsRef<str>) -> bool {
 mod tests {
     //! Unit tests for the pieces that are pure functions of a terminator.
     //!
-    //! COVERAGE GAP, STATED PLAINLY: the *transformation* has no dedicated
-    //! end-to-end gate yet. What exists is indirect and worth knowing about,
-    //! because it is what would catch a mis-spliced edge today:
-    //!
-    //!   * `tests/regression/licm_no_speculative_load_nondedicated_preheader.c`
-    //!     drives the SQLite NULL-guard shape this pass rewrites, and
-    //!     segfaults deterministically if the inserted block ever lands on
-    //!     the wrong edge.
-    //!   * `verify::verify_after_pass(module, "loop_preheader")` runs on
-    //!     every insertion, so a broken phi or a dangling label fails loudly.
-    //!
-    //! Neither asserts the pass *fires*, so a silent regression to "inserts
-    //! nothing" would pass both. A real gate must assert on emitted assembly
-    //! (a structurally correct preheader that hoists nothing is invisible to
-    //! a Rust-side test) and must use `CCC_DISABLE_PASSES=loop_preheader` as
-    //! its negative control, or it proves nothing. Tracked in `backlog.md`.
+    //! The *transformation* is covered end-to-end by
+    //! `tests/regression/check_loop_preheader.sh` and
+    //! `tests/regression/loop_preheader_shapes.c`, which assert on the
+    //! emitted assembly: a preheader insertion that is structurally right but
+    //! hoists nothing is invisible to a Rust-side test, and the property that
+    //! matters is the code LCCC finally emits.
     use super::*;
     use crate::common::types::IrType;
     use crate::ir::reexports::{IrConst, Operand};
