@@ -129,6 +129,72 @@ fn debug(f: impl FnOnce()) {
     }
 }
 
+/// Why a natural loop did not get a dedicated preheader, and how many did.
+///
+/// OBS-4: this pass is 500+ lines of default-on CFG surgery whose only
+/// observable was one line per INSERTION.  "inserted nothing" and "inserted
+/// nothing because the profitability gate rejected every loop" are entirely
+/// different findings, and only the second says the gate is mis-tuned.  A pass
+/// that never fires is either useless or blind and you cannot tell which
+/// without a census, so the counters live here and are reported per function
+/// under `CCC_DEBUG_LOOP_PREHEADER`.
+///
+/// Thread-local because the pass runs under `--rank`'s worker threads, exactly
+/// like the surrounding pipeline; a plain `static` would race and a
+/// `RefCell` would panic there.
+#[derive(Default, Clone, Copy)]
+struct Census {
+    loops: usize,
+    no_profit: usize,
+    no_single_pred: usize,
+    already_dedicated: usize,
+    indirect_pred: usize,
+    inserted: usize,
+}
+
+thread_local! {
+    static CENSUS: std::cell::Cell<Census> = const { std::cell::Cell::new(Census {
+        loops: 0, no_profit: 0, no_single_pred: 0,
+        already_dedicated: 0, indirect_pred: 0, inserted: 0,
+    }) };
+}
+
+#[inline]
+fn bump(f: impl FnOnce(&mut Census)) {
+    // read-modify-WRITE-back.  `&mut c.get()` alone would mutate a temporary
+    // copy of the Cell's value and discard it, so every counter would read
+    // zero -- which is exactly the kind of silently-wrong instrumentation
+    // that makes an observability feature worse than none.
+    CENSUS.with(|c| {
+        let mut v = c.get();
+        f(&mut v);
+        c.set(v);
+    });
+}
+
+fn census_snapshot() -> Census {
+    CENSUS.with(|c| c.get())
+}
+
+fn report_census(func_name: &str, c: Census) {
+    // Reuse the existing `debug` gate rather than reading the environment
+    // again: every extra `env::var` in the pass pipeline is budgeted by
+    // check_env_test_hygiene.sh, and the census must not spend that budget to
+    // print diagnostics nobody asked for.
+    debug(|| {
+        eprintln!(
+            "[LOOP-PREHEADER-CENSUS] {func_name}: loops={loops} inserted={inserted}          rejected: profitability={no_profit} no_single_outside_pred={no_single_pred}          already_dedicated={already_dedicated} indirect_pred={indirect_pred}",
+            func_name = func_name,
+            loops = c.loops,
+            inserted = c.inserted,
+            no_profit = c.no_profit,
+            no_single_pred = c.no_single_pred,
+            already_dedicated = c.already_dedicated,
+            indirect_pred = c.indirect_pred,
+        );
+    });
+}
+
 /// One planned preheader insertion, in labels so it survives other insertions.
 struct Plan {
     header_label: BlockId,
@@ -165,7 +231,21 @@ fn preheader_would_unlock_a_hoist(
     alloca_values: &FxHashSet<u32>,
     global_derived: &FxHashSet<u32>,
 ) -> bool {
-    for &block_idx in &natural_loop.body {
+    // Only the HEADER can ever satisfy LICM's must-execute rule, so scanning
+    // the whole body is quadratic work with a provably constant answer.
+    //
+    // Proof.  LICM hoists out of a block B only when B dominates every block
+    // of the loop, so in particular B dominates `header`.  But B is in the
+    // loop body, and a natural loop's header dominates every block of its
+    // body, so `header` dominates B.  Dominance is antisymmetric, hence
+    // B == header.  No other block can pass, at any body size.
+    //
+    // Before: |body| blocks x |body| dominance walks, each walking up the
+    // idom chain -- O(|body|^2 * depth), ~25M walks on a 5000-block loop, to
+    // recompute a single yes/no.  After: one walk.  The `dominates_block`
+    // call is kept rather than assumed away, so a malformed idom still
+    // degrades to "do not insert" instead of "insert anyway".
+    for &block_idx in std::slice::from_ref(&natural_loop.header) {
         if block_idx >= func.blocks.len() {
             continue;
         }
@@ -272,12 +352,14 @@ fn plan_insertions(
     );
     for natural_loop in loops {
         let header = natural_loop.header;
+        bump(|c| c.loops += 1);
         if header >= func.blocks.len() {
             continue;
         }
         let header_label = func.blocks[header].label;
         let Some(pred) = loop_analysis::find_preheader(header, &natural_loop.body, &cfg.preds)
         else {
+            bump(|c| c.no_single_pred += 1);
             continue; // zero or several outside predecessors: LICM skips it too
         };
         if pred >= func.blocks.len() {
@@ -292,6 +374,7 @@ fn plan_insertions(
                     header_label.0, pred_block.label.0
                 )
             });
+            bump(|c| c.already_dedicated += 1);
             continue; // already dedicated
         }
         if matches!(pred_block.terminator, Terminator::IndirectBranch { .. }) {
@@ -302,6 +385,7 @@ fn plan_insertions(
                     header_label.0, pred_block.label.0
                 )
             });
+            bump(|c| c.indirect_pred += 1);
             continue; // a computed goto into the header cannot be rerouted
         }
         debug(|| {
@@ -377,6 +461,18 @@ fn apply_insertions(func: &mut IrFunction, plans: &[Plan]) -> usize {
         }
         // 3. Splice the empty block in immediately before the header, so the
         //    backend can fall through from it instead of emitting a jump.
+        //
+        //    Inserting AT the entry block would silently replace the function
+        //    prologue target.  That is unreachable today -- an entry block
+        //    has no outside predecessor, so `find_preheader` returns None
+        //    first -- but "unreachable" is exactly the kind of invariant that
+        //    stops holding when someone widens the admission test.  Assert it
+        //    at the point of the dangerous operation.
+        debug_assert!(
+            header_idx != 0,
+            "loop header is the entry block: splicing a preheader would replace \
+             the function's entry"
+        );
         func.blocks.insert(
             header_idx,
             BasicBlock {
@@ -404,6 +500,7 @@ pub fn run_function(func: &mut IrFunction) -> usize {
     if func.is_declaration || func.blocks.len() < 2 {
         return 0;
     }
+    let fname = func.name.clone();
     let allocas = alloca_values(func);
     let globals = global_derived_values(func);
     let mut total = 0usize;
@@ -422,7 +519,13 @@ pub fn run_function(func: &mut IrFunction) -> usize {
         // Profitability gate: only loops that could actually unlock a hoist.
         let paying: Vec<&NaturalLoop> = loops
             .iter()
-            .filter(|l| preheader_would_unlock_a_hoist(func, l, &cfg.idom, &allocas, &globals))
+            .filter(|l| {
+                let ok = preheader_would_unlock_a_hoist(func, l, &cfg.idom, &allocas, &globals);
+                if !ok {
+                    bump(|c| c.no_profit += 1);
+                }
+                ok
+            })
             .collect();
         let plans = plan_insertions(func, &paying, &cfg);
         if plans.is_empty() {
@@ -433,7 +536,9 @@ pub fn run_function(func: &mut IrFunction) -> usize {
             break;
         }
         total += n;
+        bump(|c| c.inserted += n);
     }
+    report_census(&fname, census_snapshot());
     total
 }
 
@@ -458,7 +563,10 @@ mod tests {
     //! `tests/regression/loop_preheader_shapes.c`, which assert on the
     //! emitted assembly: a preheader insertion that is structurally right but
     //! hoists nothing is invisible to a Rust-side test, and the property that
-    //! matters is the code LCCC finally emits.
+    //! matters is the code LCCC finally emits.  The gate asserts both
+    //! directions -- the guarded shape whose derived-pointer load must be
+    //! hoisted, and the shapes that must come out byte-identical with the
+    //! pass disabled.
     use super::*;
     use crate::common::types::IrType;
     use crate::ir::reexports::{IrConst, Operand};

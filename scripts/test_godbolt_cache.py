@@ -136,6 +136,30 @@ def test_corruption_is_a_miss() -> None:
           gc.load_json(gc.NS_ORACLE, *parts) is None)
 
 
+def test_undecodable_text_is_a_miss() -> None:
+    """A text record that is not valid UTF-8 is a MISS, not a hit full of U+FFFD.
+
+    `load_text` used to decode with `errors="replace"`.  Atomic rename makes
+    truncation impossible for our own writes, so a decode failure means the
+    file was corrupted by something else -- a hand edit, bit rot, a half-synced
+    network mount -- and returning replacement characters would let a caller
+    diff or count mush as if it were real assembly.  The strict path is what
+    makes the "corruption is a miss" contract in the module docstring true for
+    the text half of the cache as well as the JSON half.
+    """
+    parts = ("undecodable", "t")
+    gc.store_text(gc.NS_ASM, "\tmovl\t%eax, %eax\n", *parts)
+    check("well-formed text round-trips through the strict decoder",
+          gc.load_text(gc.NS_ASM, *parts) == "\tmovl\t%eax, %eax\n")
+
+    path = gc.path_for(gc.NS_ASM, *parts)
+    path.write_bytes(b"\xff\xfe\x00asm garbage")
+    check("undecodable text is a miss, not a replacement-character hit",
+          gc.load_text(gc.NS_ASM, *parts) is None)
+    check("undecodable text lines are None, not ['']",
+          gc.load_lines(gc.NS_ASM, *parts) is None)
+
+
 def test_empty_text_is_not_a_miss() -> None:
     """An empty assembly body is a legitimate HIT, not a miss.
 

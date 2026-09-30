@@ -31,6 +31,20 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends gcc-multilib g++-multilib libc6-dev-i386
 
+      # The differential oracle set must be EXPLICIT, not whatever the runner
+      # image happens to ship: a gate whose evidence depends on the image is a
+      # gate that silently changes strength between runs.  `lld` is required
+      # in addition to `bfd` because it is the oracle that implements linker
+      # scripts -- mold accepts -T but its parser rejects even a minimal
+      # SECTIONS, so with mold alone every script-path relocation cross-check
+      # had a single opinion, which is not a cross-check.  The suite probes
+      # script capability structurally per oracle, so this stays honest even
+      # on a host where one of them is missing.
+      - name: Install differential linker oracles
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mold lld
+
       - name: Cache cargo registry
         uses: actions/cache@v6
         with:
@@ -48,6 +62,13 @@ jobs:
       # sources, making the regression gate test the wrong binary. Registry
       # and git dependency caches above retain the useful network speed-up;
       # the compiler executable is deliberately rebuilt from this checkout.
+
+      # Before anything that executes a script. A merge conflict committed
+      # into a shell script is a syntax error only when the shell REACHES the
+      # line, so every gate above the damage still reports PASS for a suite
+      # that never ran -- a green run that tested nothing.
+      - name: No merge conflict markers
+        run: python3 scripts/check_no_conflict_markers.py
 
       - name: Verify manifest Rust-toolchain selection
         run: bash tests/regression/check_rust_toolchain_selector.sh
@@ -190,6 +211,49 @@ jobs:
       # advertised engine must be a real implementation.  This exists because
       # the csmith/yarpgen engines once regressed to silent no-op stubs that
       # reported TOTAL: 0 with exit status 0 — a validation vacuum.
+      # ── observable-access (volatile) contract ────────────────────────────
+      # A `volatile` access is an observable side effect (C11 5.1.2.3): it
+      # must execute exactly as written, once per written occurrence.  These
+      # three steps are the instruments for that contract, and each was
+      # mutation-verified by reintroducing a deleted guard in
+      # src/passes/licm.rs:
+      #
+      #   * volatile-destructuring is STATIC and costs no build.  It fails when
+      #     a `volatile` destructured from an IR access is bound and never
+      #     used.  This is the failure mode the build cannot catch: src/lib.rs
+      #     allows `unused_variables` crate-wide, so a guard dropped in a
+      #     refactor leaves no diagnostic and `cargo clippy -- -D warnings`
+      #     stays green.  Its --self-test runs the detector over the known-bad
+      #     shape first, because a detector nobody has seen fire is not a
+      #     detector.
+      - name: Volatile destructuring ratchet
+        run: |
+          python3 scripts/check_volatile_destructuring.py --self-test
+          python3 scripts/check_volatile_destructuring.py
+
+      #   * The two behavioural gates read the emitted assembly.  The
+      #     spin-loop one is the only instrument here that catches a HOIST:
+      #     hoisting leaves the access count at one, so the subscript gate
+      #     stays green on a miscompiled MMIO poll loop (measured, not
+      #     assumed).  Both pair every volatile probe with a non-volatile
+      #     control that MUST be hoisted, so a green run means the two cases
+      #     were actually distinguished.
+      - name: Volatile spin-loop position gate
+        run: bash tests/regression/check_volatile_spin_loop.sh
+
+      - name: Volatile pointer subscript gate
+        run: bash tests/regression/check_volatile_pointer_subscript.sh
+
+      # End-to-end contract for the loop-preheader pass.  A 500-line CFG pass
+      # default-on at -O2 whose unit tests can only reach its pure terminator
+      # helpers needs an assembly-level gate: the Rust suite passes
+      # identically whether the pass fires once or never.  Asserted in both
+      # directions — the shape it must improve, and the two it must decline
+      # byte-for-byte.  Setting CCC_DISABLE_PASSES=loop_preheader makes the
+      # "pass on" half fail, so the gate can be seen to fail.
+      - name: Loop preheader end-to-end gate
+        run: bash tests/regression/check_loop_preheader.sh
+
       - name: Fuzz harness verdict tests
         run: python3 -m unittest discover -s tests/fuzz -p 'test_*.py'
 
@@ -640,7 +704,8 @@ jobs:
           # accesses must not become 1 (C11 5.1.2.3). The runtime cannot see
           # this -- a hoisted volatile load computes the same answer -- so the
           # gate asserts it structurally, with a non-volatile load in the same
-          # shape as the negative control.
+          # shape as the negative control. Complements the spin-loop and
+          # subscript gates above: this one covers the do-while shape.
           bash tests/regression/check_volatile_licm.sh
           # Dedicated-preheader transform, asserted on emitted assembly.
           bash tests/regression/check_loop_preheader.sh
@@ -648,6 +713,11 @@ jobs:
           # access semantics that no runtime comparison can observe.
           bash tests/regression/check_volatile_pointer_subscript.sh
           bash tests/regression/check_volatile_access_semantics.sh
+          # One comparison, one set of flags: cmov reads EFLAGS without
+          # writing it, so a cmov chain sharing a condition needs one cmp.
+          # Carries its own CCC_PEEPHOLE_SKIP negative control.
+          - name: Redundant flags compare
+            run: bash tests/regression/check_redundant_flags_compare.sh
           # The loop-density metric decides which compiler wins on a kernel,
           # so its loop identification is tested like a pass: dominator-based
           # backedges, composite loops never measured, step recovery through

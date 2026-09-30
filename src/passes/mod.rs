@@ -2619,13 +2619,16 @@ pub(crate) fn run_passes(
         // for a denser but more spill- and prologue-heavy loop. Admitting
         // only what the rerun exists for keeps the min/max win and leaves
         // every other kernel byte-identical. See `set_late_minmax_only`.
-        // RAII, not set/reset: a panic between the two calls used to leave
-        // the restriction set for the rest of this worker thread's life, and
-        // because the flag is thread-local it leaked into the next
-        // translation unit compiled on that thread.
-        let _late_scope = vectorize::LateMinMaxOnlyScope::enter();
-        let n = module.for_each_function(late_fn);
-        drop(_late_scope);
+        // RAII via block scope, not set/reset and not a bare named binding
+        // with a hand-written `drop()`: a panic between the two calls used to
+        // leave the restriction set for the rest of this worker thread's life,
+        // and because the flag is thread-local it leaked into the next
+        // translation unit compiled on that thread. The block also scopes the
+        // guard to exactly the calls it is meant to cover.
+        let n = {
+            let _scope = vectorize::LateMinMaxOnlyScope::enter();
+            module.for_each_function(late_fn)
+        };
         if n > 0 {
             // The vectorizer's block surgery does not maintain source_spans;
             // drop any that no longer align with their block's instructions
@@ -2713,9 +2716,10 @@ pub(crate) fn run_passes(
         && !pass_disabled(&disabled, "latevec")
         && !pass_disabled(&disabled, "vectorize")
     {
-        let _late_scope = vectorize::LateMinMaxOnlyScope::enter();
-        let n = module.for_each_function(vectorize::vectorize_function_late);
-        drop(_late_scope);
+        let n = {
+            let _scope = vectorize::LateMinMaxOnlyScope::enter();
+            module.for_each_function(vectorize::vectorize_function_late)
+        };
         if n > 0 {
             for func in &mut module.functions {
                 for block in &mut func.blocks {

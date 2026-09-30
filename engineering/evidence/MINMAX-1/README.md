@@ -184,7 +184,7 @@ than min/max. `zlib_ng_adler32`, `-O3 -march=x86-64-v3`,
 …while the *steady-state* loop of that same kernel is denser with the extra
 transform (14 -> 12 insns per 32 bytes). Denser hot loop, slower program: the
 prologue, the accumulator traffic and the spills are not paid back on this
-workload. `set_late_minmax_only` therefore admits only
+workload. `LateMinmaxOnlyScope` therefore admits only
 `ReductionKind::{Min, Max}` in the rerun (matmul, strict-recip, byte-count,
 Adler epic, map and stencil arms are all skipped), which keeps the min/max win
 and leaves every other kernel byte-identical — and adler32 ends up *better*

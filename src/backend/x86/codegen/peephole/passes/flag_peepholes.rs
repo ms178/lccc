@@ -24,7 +24,7 @@
 //! conditional branch elsewhere may consume flags that were set before a label.
 
 use super::super::types::*;
-use super::helpers::{get_dest_reg, writes_family_full};
+use super::helpers::{get_dest_reg, writes_family, writes_family_full};
 use super::liveness::FileLiveness;
 use super::relay_and_lea::{
     dead_in_block_after, family_private_to, function_range, line_refs_family, plain_gp_operand,
@@ -1947,6 +1947,156 @@ pub(super) fn narrow_dead_sign_extension(store: &mut LineStore, infos: &mut [Lin
         i += 1;
     }
     changed
+}
+
+// ── 7. redundant compare feeding a chain of cmovs ──────────────────────────
+
+/// `cmp A,B …(flag-preserving)… cmp A,B` → drop the **second** `cmp`.
+///
+/// # Why the second one is dead
+///
+/// `CMOVcc` READS EFLAGS but does not WRITE it. That is the whole reason this
+/// transform exists: a comparison computed for one conditional move is still
+/// intact for the next one, because nothing in between has disturbed it.
+///
+/// The backend emits one `cmp` per `cmov`. When if-conversion turns a chain of
+/// branches that share a condition into a chain of `cmov`s, every `cmov` after
+/// the first gets its own re-computation of a comparison the flags already
+/// hold. SQLite's varint decoder is the canonical case: the two tail arms test
+/// the same byte, and the emitted loop carried
+///
+/// ```text
+///     cmpb $-128, %r10b
+///     movl %r11d, %edx
+///     cmovbl %r12d, %edx
+///     cmpb $-128, %r10b        <-- recomputes flags nobody changed
+///     movl $3, %ecx
+///     movl $4, %ebx
+///     cmovbl %ecx, %ebx
+/// ```
+///
+/// which is one dead instruction on the slowest arm of the loop, in the one
+/// shape the kernel spends most of its time in.
+///
+/// # What makes it sound
+///
+/// The two instructions must be *textually* identical — same mnemonic, same
+/// width suffix, same operand text — so they compute identical flags, and
+/// every line between them must be one of:
+///
+///   * a no-op, a directive, or a label-free run of flag-`Neutral` code;
+///   * a flag reader that does not also write (`cmov`, `setcc`) — reading the
+///     flags cannot change them, and `adc`/`sbb`/`rcl`/`rcr`, which do, are
+///     excluded by [`reader_also_writes_flags`];
+///   * and, crucially, none of them may WRITE a register named by either
+///     operand.
+///
+/// That last clause is not decoration. Deleting the operand-write guards was
+/// tried, and it miscompiles two corpus tests — `bb_slp_i64_to_i32_select`
+/// (`gt_big[2]: got 6 want 100000`) and `array_string_init_matrix_O0`. Note
+/// that a hand-written C fixture does *not* reproduce this: the register
+/// allocator normally gives the two compares different registers, so the
+/// texts differ and the fold declines anyway. The hazard only opens where
+/// allocation reuses one register across the redefinition, and the corpus is
+/// where those shapes live.
+///
+/// Control flow, calls and inline asm are barriers, so a label or a branch
+/// target between the two ends the search. That also means the fold can never
+/// reach across a basic block, where the flags' liveness this reasoning
+/// depends on would have to be re-established.
+///
+/// # Memory operands are refused outright
+///
+/// If either operand names memory, two textually identical compares are *not*
+/// necessarily equal: a store between them can change what the load reads,
+/// and nothing in the `LineInfo` model lets us prove it did not. Rather than
+/// guess, the fold declines. The real-world case this targets is a compare
+/// against a register or an immediate, so nothing is lost, and a wrong fold
+/// here would be a miscompile rather than a missed optimisation.
+pub(super) fn fold_redundant_flags_compare(store: &LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut j = 0;
+    while j < len {
+        if infos[j].is_nop() || infos[j].pinned {
+            j += 1;
+            continue;
+        }
+        let t = infos[j].trimmed(store.get(j));
+
+        // Accept only `cmp`/`test` with an explicit width suffix; the bare
+        // forms are assembler defaults and are not what the backend emits.
+        let Some(args) = strip_width_suffix(t, "cmp").or_else(|| strip_width_suffix(t, "test"))
+        else {
+            j += 1;
+            continue;
+        };
+        let Some((a, b)) = split_two_operands(args) else {
+            j += 1;
+            continue;
+        };
+        // Refuse memory operands: see the module note above.
+        if a.contains('(') || b.contains('(') || a.contains('[') || b.contains('[') {
+            j += 1;
+            continue;
+        }
+        // Aliasing operands (`test %rax,%rax`) collapse to one family, and the
+        // single write check below then covers both, so no extra case is needed.
+        let fam_a = register_family_fast(a);
+        let fam_b = register_family_fast(b);
+
+        // Walk forward over flag-preserving lines looking for the same compare.
+        let mut k = j + 1;
+        while k < len {
+            if infos[k].is_nop() || infos[k].kind == LineKind::Directive {
+                k += 1;
+                continue;
+            }
+            if infos[k].pinned || infos[k].is_barrier() {
+                break;
+            }
+            let tk = infos[k].trimmed(store.get(k));
+            // Identity is tested FIRST, before the flag classification below.
+            // A `cmp` is itself a flag writer, so classifying first would break
+            // out of the walk on the very line this pass exists to delete.
+            if tk == t {
+                mark_nop(&mut infos[k]);
+                changed = true;
+                break;
+            }
+            match flags_effect(tk) {
+                // Someone recomputed the flags: the compare we walked from no
+                // longer describes them.
+                FlagsEffect::Writes => break,
+                // Reads the flags *and* writes them (adc/sbb/rcl/rcr/int).
+                FlagsEffect::Reads if reader_also_writes_flags(tk) => break,
+                FlagsEffect::Reads | FlagsEffect::Neutral => {}
+            }
+            // A redefinition of either operand register makes the second
+            // compare see a different value, even though the text matches.
+            if fam_a != REG_NONE && writes_family(&infos[k], tk, fam_a) {
+                break;
+            }
+            if fam_b != REG_NONE && fam_b != fam_a && writes_family(&infos[k], tk, fam_b) {
+                break;
+            }
+            k += 1;
+        }
+        j += 1;
+    }
+    changed
+}
+
+/// `"cmpq 1, %rax"` → `Some("1, %rax")`; `"cmpl $0, 8(%rbx)"` → `Some("$0, 8(%rbx)")`.
+/// Returns `None` unless the mnemonic is exactly `base` plus one of the four
+/// width suffixes, so `cmpps`/`cmpxchg` can never be mistaken for `cmp`.
+fn strip_width_suffix<'a>(t: &'a str, base: &str) -> Option<&'a str> {
+    let rest = t.strip_prefix(base)?;
+    let rest = rest.strip_prefix(['b', 'w', 'l', 'q'])?;
+    if !rest.starts_with(' ') {
+        return None;
+    }
+    Some(rest.trim_start())
 }
 
 #[cfg(test)]

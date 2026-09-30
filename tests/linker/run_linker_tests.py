@@ -9469,6 +9469,28 @@ def _reloc_range_fixture(td, directive, sym):
     return obj
 
 
+_SCRIPT_TOKEN_RE = re.compile(rb"linker script|\bt\.ld\b", re.I)
+
+
+def _oracle_rejected_the_script(oerr: bytes) -> bool:
+    """Did this oracle fail on the FIXTURE rather than on the relocation?
+
+    The minimal `-T` script this suite hands the oracles is deliberately
+    tiny, and a linker that cannot parse it never reaches the relocation at
+    all: the question was never put to it, so it has no opinion.  That is a
+    missing FEATURE, not a missing opinion, and the two must not share a
+    class -- see `reloc_oracle_agreement`, whose quorum is taken over the
+    oracles that could have answered.
+
+    Without this split, merely *installing* a linker without this script
+    syntax turns a conformance test red while proving nothing about lccc,
+    and the fix ("just accept the narrower quorum") is to delete the test.
+    Scoped to `label == "script"` deliberately: on the other paths there is
+    no script, so a mention of one would be a red herring.
+    """
+    return bool(_SCRIPT_TOKEN_RE.search(oerr))
+
+
 def reloc_oracle_verdict(oerr: bytes, orc: int, kind: str, label: str) -> str:
     """How one oracle linker's answer counts for an out-of-range relocation.
 
@@ -9485,11 +9507,16 @@ def reloc_oracle_verdict(oerr: bytes, orc: int, kind: str, label: str) -> str:
     * ``silent``       -- it refused without naming the type or a range.
                           Counted as a disagreement, so an unrecognised
                           refusal can never be mistaken for conformity.
-    * ``inapplicable`` -- it never REACHED the relocation (mold 2.37 cannot
-                          parse this minimal `-T` script at all: "unknown
-                          linker script token").  It has no opinion to agree
-                          or disagree with, so it is excluded -- and the
-                          result says so.
+    * ``incapable``  -- it could not process the INPUT SHAPE: a linker
+                          without this script syntax rejects the fixture
+                          before reaching any relocation.  A missing
+                          FEATURE, so it is excluded from the quorum --
+                          which is then taken over the oracles that could
+                          have answered -- and the result says so.
+    * ``inapplicable`` -- it REACHED the relocation and its answer is that
+                          this relocation type does not apply here.  It
+                          could have disagreed, so it still counts against
+                          the quorum.
     * ``errored``      -- it DIED rather than answered: an exit status
                           outside {0, 1}, i.e. a crash, an abort, or the OOM
                           killer.  Never excluded, and always a
@@ -9520,6 +9547,8 @@ def reloc_oracle_verdict(oerr: bytes, orc: int, kind: str, label: str) -> str:
         # of its own, so any refusal counts on this path.
         return "refused"
     if f"R_X86_64_{kind}".encode() not in oerr:
+        if label == "script" and _oracle_rejected_the_script(oerr):
+            return "incapable"
         return "inapplicable"
     if b"truncated" in oerr or b"out of range" in oerr:
         return "refused"
@@ -9565,13 +9594,27 @@ def reloc_oracle_agreement(agree, notes, oracles):
     # silent fail-open.
     if not oracles:
         return ("FAIL", "no oracles configured to cross-check against")
-    applicable = [n for n, (v, _, _) in notes.items() if v != "inapplicable"]
-    floor = min(2, len(oracles))
+    # `incapable` is a missing FEATURE, proved by a structural probe, not a
+    # missing opinion: such an oracle could never have reached the relocation
+    # on this input shape whatever the fixture said, so it is excluded from
+    # the opinion set -- and the floor is taken over the oracles that COULD
+    # have an opinion.  That keeps the cross-check meaningful instead of
+    # failing a test because one installed linker lacks a script feature,
+    # while still refusing to let the set collapse to a single opinion.
+    # `inapplicable` is deliberately NOT treated the same way: that oracle
+    # ran and reached the relocation, it simply had nothing to say here, so
+    # it still counts against the quorum.
+    incapable = [n for n, (v, _, _) in notes.items() if v == "incapable"]
+    inapplicable = [n for n, (v, _, _) in notes.items() if v == "inapplicable"]
+    applicable = [n for n, (v, _, _) in notes.items()
+                  if v not in ("inapplicable", "incapable")]
+    n_capable = len(oracles) - len(incapable)
+    floor = min(2, n_capable)
     reference = oracles[0][0] if oracles else None
     if len(applicable) < floor:
         return ("FAIL",
                 "only %d of %d oracles could express an opinion, need %d: %s"
-                % (len(applicable), len(oracles), floor, notes))
+                % (len(applicable), n_capable, floor, notes))
     if reference is not None and reference not in applicable:
         return ("FAIL",
                 "the reference oracle %r never reached the relocation, so the "
@@ -9582,10 +9625,15 @@ def reloc_oracle_agreement(agree, notes, oracles):
                 % (agree, notes))
     detail = ""
     if len(applicable) < len(oracles):
-        detail = ("agreed by %d of %d oracles; inapplicable: %s"
-                  % (len(applicable), len(oracles),
-                     ", ".join("%s(%s)" % (n, notes[n][0])
-                               for n in sorted(set(notes) - set(applicable)))))
+        parts = []
+        for label, names in (("inapplicable", inapplicable),
+                             ("not counted (incapable)", incapable)):
+            if names:
+                parts.append("%s: %s" % (
+                    label, ", ".join("%s(%s)" % (n, notes[n][0])
+                                     for n in sorted(names))))
+        detail = ("agreed by %d of %d oracles; %s"
+                  % (len(applicable), len(oracles), "; ".join(parts)))
     return ("PASS", detail)
 
 
@@ -9702,7 +9750,15 @@ def _reloc_field_range_tests(args, oracles):
                                        "-o", f"o.{oname}"], cwd=td)
                     verdict = _oracle_verdict(o.stderr, o.returncode, kind)
                     notes[oname] = (verdict, o.returncode, o.stderr.decode()[:120])
-                    if verdict != "inapplicable":
+                    # `inapplicable` AND `incapable` are both "no opinion":
+                    # the first ran and had nothing to say about this
+                    # relocation, the second never reached one.  Either way
+                    # there is nothing to agree or disagree WITH, so neither
+                    # may enter `agree`.  Letting `incapable` through here
+                    # appended `(name, False)` and turned "this linker
+                    # cannot parse the fixture" into a DISAGREEMENT --
+                    # the precise inversion the class exists to prevent.
+                    if verdict not in ("inapplicable", "incapable"):
                         agree.append((oname, verdict == "refused"))
                 status, detail = reloc_oracle_agreement(agree, notes, oracles)
                 results.append(Result(name, status, detail))
