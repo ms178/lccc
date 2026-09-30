@@ -328,6 +328,26 @@ gate "hot-loop-metric" fast \
 # control (that one MUST be hoisted, or the test proves nothing).
 gate "volatile-licm" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_volatile_licm.sh
+gate "loop-preheader" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_loop_preheader.sh
+
+# These two existed in the tree for a long time and were wired to NOTHING --
+# not ci.yml, not any of this script's gates, and unreachable from the corpus
+# runner (they assert on emitted assembly, not on runtime output, and the
+# spin-wait probe would simply hang and report TIMEOUT if it regressed).
+# That is how a deleted `!*volatile` in LICM's Load arm survived review: the
+# test that exists precisely to catch it never ran. Wired now.
+#
+# `check_volatile_pointer_subscript.sh` is the direct counterpart to the LICM
+# guard: `while (!regs[STATUS]) ;` -- the archetypal MMIO spin wait -- must
+# keep its load inside the loop, and the same qualifier must also defeat
+# dead-store elimination and load CSE on subscripted/pointer-arithmetic
+# forms. `check_volatile_access_semantics.sh` guards the wider pipeline
+# (forwarding, CSE, DCE, mem2reg promotion) rather than one pass.
+gate "volatile-pointer-subscript" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_volatile_pointer_subscript.sh
+gate "volatile-access-semantics" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_volatile_access_semantics.sh
 
 # Pure-logic gate: it exercises the oracle-verdict / oracle-agreement
 # classifier directly, so it needs neither a built linker nor a single

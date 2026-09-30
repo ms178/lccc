@@ -642,6 +642,12 @@ jobs:
           # gate asserts it structurally, with a non-volatile load in the same
           # shape as the negative control.
           bash tests/regression/check_volatile_licm.sh
+          # Dedicated-preheader transform, asserted on emitted assembly.
+          bash tests/regression/check_loop_preheader.sh
+          # Same unwired-gate fix as in ci_local.sh: these assert volatile
+          # access semantics that no runtime comparison can observe.
+          bash tests/regression/check_volatile_pointer_subscript.sh
+          bash tests/regression/check_volatile_access_semantics.sh
           # The loop-density metric decides which compiler wins on a kernel,
           # so its loop identification is tested like a pass: dominator-based
           # backedges, composite loops never measured, step recovery through

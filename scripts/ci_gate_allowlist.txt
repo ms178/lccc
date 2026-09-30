@@ -82,8 +82,6 @@ tests/regression/check_vec_interleave_codegen.sh  # passes locally; not yet wire
 tests/regression/check_vecreg_new_ops_codegen.sh  # codegen contract (XMM home) — needs triage
 tests/regression/check_vector_dot_fma_codegen.sh  # passes locally; not yet wired into ci_local.sh / a workflow
 tests/regression/check_vector_remainder_codegen.sh  # passes locally; not yet wired into ci_local.sh / a workflow
-tests/regression/check_volatile_access_semantics.sh  # exits 1 after partial pass — needs triage
-tests/regression/check_volatile_pointer_subscript.sh  # passes locally; not yet wired into ci_local.sh / a workflow
 tests/regression/check_wide_cond_zero_test.sh  # passes locally; not yet wired into ci_local.sh / a workflow
 tests/regression/check_wide_const_imm_stores.sh  # passes locally; not yet wired into ci_local.sh / a workflow
 tests/regression/check_widened_byte_chain.sh  # passes locally; not yet wired into ci_local.sh / a workflow

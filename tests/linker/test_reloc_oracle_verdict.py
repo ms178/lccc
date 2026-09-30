@@ -185,6 +185,19 @@ AGREEMENT_CASES = [
     _case("one inapplicable out of three passes but says so",
           _notes(bfd=_n("refused"), mold=_n("inapplicable"), wild=_n("refused")),
           THREE, "PASS", "agreed by 2 of 3"),
+    # ── an empty oracle set must FAIL, never PASS ────────────────────────
+    # Before the fix this returned PASS with zero evidence: floor = min(2, 0)
+    # = 0 so `len(applicable) < floor` was `0 < 0` = False, `reference` was
+    # None so the reference check was skipped, and `all([])` is True. Every
+    # guard was satisfied by the absence of any oracle at all. A gate that
+    # exists to refuse verdicts resting on too little evidence must not
+    # certify one resting on none.
+    _case("no oracles configured fails instead of passing vacuously",
+          _notes(), [], "FAIL", "no oracles"),
+    # Same trap, reached with notes present but no oracle to vouch for them:
+    # the notes must not be mistaken for evidence.
+    _case("notes without any configured oracle still fails",
+          _notes(bfd=_n("refused"), mold=_n("refused")), [], "FAIL", "no oracles"),
 ]
 
 

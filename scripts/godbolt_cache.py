@@ -72,9 +72,16 @@ CACHE = Path(os.environ.get(
 
 # Namespaces currently in use. Adding one is the sanctioned way to invalidate
 # a generation of records after a format change.
-NS_ASM = "att-v2"        # AT&T-syntax assembly, text, one file per tuple
-NS_ORACLE = "oracle-v1"  # execution-oracle records, JSON
-NS_ENCDIFF = "encdiff-v1"  # raw CE /compile replies incl. binary opcodes, JSON
+# v3/v2: the compiler's reported version (godbolt.compiler_fingerprint) is now
+# part of every remote key. A CE id is a label, not a binary -- when `g162` is
+# rebuilt against a newer GCC the id is unchanged but the code it emits is not,
+# and a v2 record would then keep serving the old build's output under the new
+# build's name. Bumping moves every pre-fingerprint record out of the reachable
+# key space in one explicit step instead of leaving it to be mistaken for a
+# current result. Bump these again on any future change to a key's meaning.
+NS_ASM = "att-v3"          # AT&T-syntax assembly, text, one file per tuple
+NS_ORACLE = "oracle-v1"    # execution-oracle records, JSON
+NS_ENCDIFF = "encdiff-v2"  # raw CE /compile replies incl. binary opcodes, JSON
 
 
 def key(namespace: str, *parts: Any) -> str:
@@ -136,13 +143,21 @@ def store_json(namespace: str, value: Any, *parts: Any) -> None:
 # --------------------------------------------------------------------------
 
 def load_text(namespace: str, *parts: Any) -> str | None:
-    """Return the cached text, or ``None`` on miss or corruption."""
+    """Return the cached text, or ``None`` on miss or corruption.
+
+    Decoding is STRICT, exactly like :func:`load_json`. ``errors="replace"`
+    would turn a record corrupted by anything other than truncation into
+    U+FFFD mush and report it as a *hit* -- a silent wrong answer from a
+    cache whose whole contract is that corruption is a miss. Atomic rename
+    makes truncation impossible, but hand-edits, disk rot and partial
+    network-sync are neither truncation nor impossible.
+    """
     path = path_for(namespace, *parts)
     try:
-        return path.read_text(encoding="utf-8", errors="replace")
+        return path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return None
 
 
@@ -172,6 +187,9 @@ def stats() -> dict[str, int]:
     if not CACHE.is_dir():
         return out
     for ns in sorted(p.name for p in CACHE.iterdir() if p.is_dir()):
+        # `_atomic_write` temps are "<stem>.tmp.<pid>.<tid><suffix>": they
+        # carry the real suffix, so `endswith(".tmp")` matched nothing and
+        # an aborted writer's leavings were counted as records.
         out[ns] = sum(1 for f in (CACHE / ns).iterdir()
-                      if f.is_file() and not f.name.endswith(".tmp"))
+                      if f.is_file() and ".tmp." not in f.name)
     return out

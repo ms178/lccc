@@ -182,23 +182,34 @@ they stay CORRECT rather than fast):
   `CCC_DISABLE_PASSES=loop_preheader`, and fires before that pass runs). Fix the phi
   rewriting before touching the condition lowering.
 
-* **LOOP-PREHEADER-3 · the pass has no dedicated gate (coverage debt).**
-  `src/passes/loop_preheader.rs` is a CFG-mutating pass enabled by default at
-  `-O2`, and nothing in `tests/` or `scripts/ci_local.sh` asserts it fires.
-  What covers it today is indirect:
-  `licm_no_speculative_load_nondedicated_preheader.c` segfaults if the
-  inserted block lands on the wrong edge, and `verify_after_pass` catches a
-  broken phi — but a silent regression to "inserts nothing" passes both.
-  The gate to write (model it on `check_volatile_licm.sh`, which gets this
-  right): assert on emitted assembly that
-  `int f(const int *c, int n){int t=0;for(int i=0;i<n;i++)t+=c[0];return t;}`
-  loads `(%rdi)` **once outside** the steady-state loop, and **inside** it
-  under `CCC_DISABLE_PASSES=loop_preheader` — that delta is the negative
-  control, and without it the gate passes vacuously on a compiler that hoists
-  nothing. Add the SQLite NULL-guard shape (runtime, no segfault), a
-  `switch`-entered and a computed-`goto` loop (the shapes where a preheader
-  must NOT be claimed), and an already-dedicated loop asserting idempotence
-  via `CCC_DEBUG_LOOP_PREHEADER`.
+* **LOOP-PREHEADER-3 · ~~the pass has no dedicated gate~~ CLOSED.**
+  Landed: `tests/regression/check_loop_preheader.sh` +
+  `tests/regression/loop_preheader_shapes.c`, wired into `ci_local.sh` and
+  `ci.yml`, and the shapes below are asserted on **emitted assembly**
+  (a preheader that is structurally valid but hoists nothing is invisible to
+  every runtime comparison and every Rust-side unit test).
+    1. *Effect.* `guarded_sum` (the SQLite NULL-guard shape) loads `p->nUsed`
+       once, outside the loop.
+    2. *Soundness.* That load sits **after** the `p == 0` early return; hoisted
+       into the guard block instead it would dereference NULL.
+    3. *Negative control.* Under `CCC_DISABLE_PASSES=loop_preheader` the same
+       loop reloads `p->nUsed` every iteration. Without this delta a pass that
+       never fired would also show one load outside the loop and pass
+       vacuously -- verified by disabling `enabled()`: three contracts fail.
+    4. *Refusal.* Four shapes stay byte-identical between the two arms:
+       `invariant_ptr` (nothing to unlock), `switch_entered` and
+       `computed_goto` (the miscompile shapes -- counting only Branch edges
+       would claim one of two entering blocks as *the* preheader, leaving the
+       hoisted bound's def not dominating its use on the other path), and
+       `already_dedicated`.
+    5. *Idempotence.* With `CCC_DEBUG_LOOP_PREHEADER=1` the fixpoint inserts
+       once and then reports "already has a dedicated preheader".
+  Note on the spec's original first shape,
+  `int f(const int *c,int n){int t=0;for(i<n;i++)t+=c[0];}`: it is **not** a
+  preheader shape in this pipeline. Measured, it is byte-identical with the
+  pass on and off -- LICM already hoists the unguarded load, so the pass has
+  nothing left to unlock. The gate therefore asserts refusal for it rather
+  than effect, which is the true behaviour.
 
 * **RED-WIDEN-1 · widening reductions.** `int s; for (i) s += a[i];` with
   `a` of `short`/`unsigned char`: lccc stays scalar (3.0 / 5.0 insn/byte)

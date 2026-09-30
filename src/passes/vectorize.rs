@@ -289,7 +289,18 @@ fn x86_fma_enabled() -> bool {
 /// Re-opening the rest is a real follow-up (see `backlog.md` MINMAX-4): the
 /// steady-state gain is genuine, so the work is the accumulator/traffic side,
 /// not the transform's legality.
-pub(crate) fn set_late_minmax_only(enabled: bool) {
+///
+/// Deliberately **not** `pub(crate)`, even though its siblings in this file
+/// are. The other flags are set once by `run_passes` before any pass runs and
+/// are simply read thereafter; this one is scoped to a single call, so it
+/// must be paired with a matching restore. Exposing the setter would invite
+/// an unpaired `set(true)` -- and because the flag is thread-local, a leaked
+/// `true` survives the current translation unit and silently restricts
+/// vectorization in the next one this worker thread compiles. Keeping the
+/// setter private makes [`LateMinMaxOnlyScope`] the only way to raise the
+/// flag, so the invariant is enforced by the type system rather than by
+/// whoever edits this file next.
+fn set_late_minmax_only(enabled: bool) {
     LATE_MINMAX_ONLY.with(|f| f.set(enabled));
 }
 
@@ -19605,31 +19616,45 @@ fn transform_reduction_avx2(
                     Instruction::Cmp { ty, .. } => *ty,
                     _ => IrType::I64,
                 };
-            // AUD-3: the hoisted bound computation USES the limit, so it may
-            // only go into the preheader if the limit's definition is already
-            // available there. Without this a limit defined inside the loop
-            // (the header being the reachable case) is referenced before its
-            // def -- an SSA violation a plain compile does not surface but
-            // CCC_VALIDATE_SSA does. The CFG is built lazily, inside the
-            // filter, so a loop with no preheader pays nothing and the common
-            // path is unchanged; when the check fails we fall back to the
-            // header, which is correct either way and only slower.
+            // AUD-3, CORRECTED: this filter is a REDUNDANT fail-closed
+            // guard, not a bug fix. It was added on the belief that the
+            // limit's definition might not be available at the preheader.
+            // That belief was wrong, and here is the proof, so nobody
+            // "fixes" this again or cites it as a correctness patch:
+            //
+            //   1. `reduction_remainder_references_sound` runs before any
+            //      transform and requires `invariant(&pattern.limit)`.
+            //   2. `invariant` requires `plan_remainder_reference` to yield
+            //      `RemainderRefPlan::UseOriginal`, which is returned iff
+            //      the definition's block is NOT in `loop_blocks`.
+            //   3. The original body used the limit, so SSA legality makes
+            //      the definition dominate the body block.
+            //   4. `find_loop_preheader` returns `Some` only for a UNIQUE
+            //      outside predecessor (it returns `None` on "several
+            //      entries"), so every entry to the loop passes it.
+            //   5. Therefore the definition is reachable on every path
+            //      into the preheader and cannot lie after it (it is
+            //      outside the loop), so it is available at the point we
+            //      append to.
+            //
+            // Kept anyway because it is nearly free -- the CFG is built
+            // lazily inside the filter, so a loop with no preheader pays
+            // nothing -- and a redundant refusal costs one missed
+            // optimization while a missing refusal costs a miscompile.
+            // It should never fire; if it ever does, the proof above is
+            // wrong and the bug is upstream of this filter.
+            //
+            // The `strict_cfg_dominates` conjunct is the RUNTIME FORM of
+            // step 4: it re-checks, against the built CFG, exactly the
+            // property uniqueness already guarantees. It is therefore also
+            // redundant -- but unlike step 4 it stays true if
+            // `find_loop_preheader` is ever weakened to admit several
+            // entries, which is precisely when the proof stops holding.
+            // Defence in depth for an invariant that lives in another
+            // function.
             let preheader_idx = find_loop_preheader(func, pattern.header_idx, &pattern.loop_blocks)
                 .filter(|&pre_idx| {
                     let cfg = CfgAnalysis::build(func);
-                    // TWO independent preconditions, both required.
-                    //
-                    // (1) The limit's def must already be available in the
-                    //     preheader, or the hoisted bound reads it before it
-                    //     is defined.
-                    // (2) The preheader must DOMINATE the header, or the
-                    //     bound's own def does not dominate its use inside
-                    //     the loop.
-                    //
-                    // (1) does not imply (2): it constrains where the limit
-                    // comes from, never where `pre_idx` sits relative to the
-                    // loop. Failing either one falls back to the header,
-                    // which is correct and only slower.
                     strict_external_value_available(
                         func,
                         &cfg,
@@ -20992,31 +21017,45 @@ fn transform_reduction_sse2(
                     Instruction::Cmp { ty, .. } => *ty,
                     _ => IrType::I64,
                 };
-            // AUD-3: the hoisted bound computation USES the limit, so it may
-            // only go into the preheader if the limit's definition is already
-            // available there. Without this a limit defined inside the loop
-            // (the header being the reachable case) is referenced before its
-            // def -- an SSA violation a plain compile does not surface but
-            // CCC_VALIDATE_SSA does. The CFG is built lazily, inside the
-            // filter, so a loop with no preheader pays nothing and the common
-            // path is unchanged; when the check fails we fall back to the
-            // header, which is correct either way and only slower.
+            // AUD-3, CORRECTED: this filter is a REDUNDANT fail-closed
+            // guard, not a bug fix. It was added on the belief that the
+            // limit's definition might not be available at the preheader.
+            // That belief was wrong, and here is the proof, so nobody
+            // "fixes" this again or cites it as a correctness patch:
+            //
+            //   1. `reduction_remainder_references_sound` runs before any
+            //      transform and requires `invariant(&pattern.limit)`.
+            //   2. `invariant` requires `plan_remainder_reference` to yield
+            //      `RemainderRefPlan::UseOriginal`, which is returned iff
+            //      the definition's block is NOT in `loop_blocks`.
+            //   3. The original body used the limit, so SSA legality makes
+            //      the definition dominate the body block.
+            //   4. `find_loop_preheader` returns `Some` only for a UNIQUE
+            //      outside predecessor (it returns `None` on "several
+            //      entries"), so every entry to the loop passes it.
+            //   5. Therefore the definition is reachable on every path
+            //      into the preheader and cannot lie after it (it is
+            //      outside the loop), so it is available at the point we
+            //      append to.
+            //
+            // Kept anyway because it is nearly free -- the CFG is built
+            // lazily inside the filter, so a loop with no preheader pays
+            // nothing -- and a redundant refusal costs one missed
+            // optimization while a missing refusal costs a miscompile.
+            // It should never fire; if it ever does, the proof above is
+            // wrong and the bug is upstream of this filter.
+            //
+            // The `strict_cfg_dominates` conjunct is the RUNTIME FORM of
+            // step 4: it re-checks, against the built CFG, exactly the
+            // property uniqueness already guarantees. It is therefore also
+            // redundant -- but unlike step 4 it stays true if
+            // `find_loop_preheader` is ever weakened to admit several
+            // entries, which is precisely when the proof stops holding.
+            // Defence in depth for an invariant that lives in another
+            // function.
             let preheader_idx = find_loop_preheader(func, pattern.header_idx, &pattern.loop_blocks)
                 .filter(|&pre_idx| {
                     let cfg = CfgAnalysis::build(func);
-                    // TWO independent preconditions, both required.
-                    //
-                    // (1) The limit's def must already be available in the
-                    //     preheader, or the hoisted bound reads it before it
-                    //     is defined.
-                    // (2) The preheader must DOMINATE the header, or the
-                    //     bound's own def does not dominate its use inside
-                    //     the loop.
-                    //
-                    // (1) does not imply (2): it constrains where the limit
-                    // comes from, never where `pre_idx` sits relative to the
-                    // loop. Failing either one falls back to the header,
-                    // which is correct and only slower.
                     strict_external_value_available(
                         func,
                         &cfg,

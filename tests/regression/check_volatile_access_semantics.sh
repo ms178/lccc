@@ -49,9 +49,37 @@ for lvl in O0 O1 O2 Os; do
     body=$(awk '/^read_after_store:/,/^\.size/' "$td/vol.s")
     loads=$(echo "$body" | grep -Ec "$load_pat")
     if [ "$loads" -ge 1 ]; then echo "ok: store-then-load reloads memory"; else echo "FAIL: volatile load forwarded/eliminated"; rc=1; fi
-    # 2. the loop body must contain a load
-    body=$(awk '/^reads_in_loop:/,/^\.size/' "$td/vol.s" | awk '/\.LBB[0-9]*:/{blk=blk+1} {print}' )
-    check reads_in_loop "$load_pat" "loop keeps volatile load in body"
+    # 2. the volatile read must happen INSIDE the loop, once per iteration.
+    #
+    # The property is position, not mnemonic. lccc folds the read into
+    # `addl counter(%rip), %esi`, which is ONE instruction instead of a
+    # `movl` plus an `addl` -- better code that a regex demanding a separate
+    # load reports as a failure. So slice out the loop (from the backward
+    # branch's target label to the branch itself) and require the volatile
+    # object to be referenced in it. Hoisting it out would leave the loop
+    # with no reference at all.
+    fn_body=$(awk '/^reads_in_loop:/,/^\.size/' "$td/vol.s")
+    tail_ln=$(echo "$fn_body" | grep -nE '^[[:space:]]*j[a-z]+ +\.[A-Za-z]' | tail -1 | cut -d: -f1)
+    if [ -z "$tail_ln" ]; then
+        echo "FAIL: reads_in_loop has no backward branch (loop unrolled?)"; rc=1
+    else
+        tail_lbl=$(echo "$fn_body" | sed -n "${tail_ln}p" | grep -oE '\.[A-Za-z][A-Za-z0-9_]*' | tail -1)
+        head_ln=$(echo "$fn_body" | grep -n "^${tail_lbl}:" | head -1 | cut -d: -f1)
+        loop=$(echo "$fn_body" | sed -n "${head_ln},${tail_ln}p")
+        if echo "$loop" | grep -q 'counter'; then
+            echo "ok: loop keeps the volatile read in the body"
+        else
+            echo "FAIL: volatile read hoisted out of the loop body"
+            echo "      loop was: $loop"
+            rc=1
+        fi
+        # NEGATIVE CONTROL: the loop must still be a loop. If the read
+        # vanished because the whole loop was optimised away, the check
+        # above would pass for the wrong reason.
+        if ! echo "$loop" | grep -qE '^[[:space:]]*j[a-z]+ +\.[A-Za-z]'; then
+            echo "FAIL: no back edge in the extracted loop region"; rc=1
+        fi
+    fi
     # 3. dead read survives
     check dead_read "$load_pat" "dead-result volatile load survives DCE"
     # 4. deref through pointer param loads
