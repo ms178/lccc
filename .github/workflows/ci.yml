@@ -755,6 +755,10 @@ jobs:
           # index addressing.
           python3 scripts/test_hot_loop_metric.py
           python3 scripts/test_godbolt_cache.py
+          python3 scripts/test_glibc_check_triage.py
+          python3 scripts/test_oracle_delta_gate.py
+          python3 scripts/oracle_delta_gate.py --self-test
+          python3 scripts/glibc_check_triage.py --self-test
           bash tests/regression/check_copy_alias_sizes.sh
           bash tests/regression/check_linker_notype_code.sh
           bash tests/regression/check_got64_old_spelling.sh
@@ -955,3 +959,38 @@ jobs:
         env:
           CARGO_BUILD_JOBS: "2"
         run: cargo clippy --all-targets --profile fastbuild --locked -j 2 -- -D warnings
+
+  # MS-01 (competitive half): compare LCCC against GCC / Clang / ICX on
+  # Compiler Explorer and fail on regression against the committed baseline.
+  # Networked, so a Compiler Explorer outage is a recorded skip (exit 0), never
+  # a red build; the self-tests in the `test` job pin the gate logic itself.
+  oracle-delta:
+    name: Compiler Explorer oracle delta
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build LCCC (fastbuild)
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: cargo build --profile fastbuild --locked -j 2 --bin lccc
+
+      - name: Oracle delta gate (LCCC vs GCC 16.2 / Clang / ICX)
+        run: |
+          python3 scripts/oracle_delta_gate.py \
+            --local target/fastbuild/lccc \
+            --report results/oracle-delta/report.json
+
+      - name: Upload oracle report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: oracle-delta
+          path: results/oracle-delta/
+          if-no-files-found: ignore

@@ -898,6 +898,20 @@ gate "godbolt-oracle-selftest" fast \
 gate "godbolt-cache-selftest" fast \
     python3 scripts/test_godbolt_cache.py
 
+# MS-11: glibc `make check` triage classifier (miscompile / unsupported /
+# environment). Fixture-driven, offline.
+gate "glibc-triage-selftest" fast \
+    python3 scripts/test_glibc_check_triage.py
+gate "glibc-triage-cli-selftest" fast \
+    python3 scripts/glibc_check_triage.py --self-test
+
+# MS-01: Compiler Explorer oracle delta gate logic (metrics, tolerance,
+# baseline handling). The networked run itself is hosted-only.
+gate "oracle-delta-selftest" fast \
+    python3 scripts/test_oracle_delta_gate.py
+gate "oracle-delta-cli-selftest" fast \
+    python3 scripts/oracle_delta_gate.py --self-test
+
 # --------------------------------------------------------------- job:bench --
 # The bench workflow carries the CODEGEN-QUALITY gate, which the test job does
 # not.  Leaving it out of this mirror is exactly how a +24% instruction-count
