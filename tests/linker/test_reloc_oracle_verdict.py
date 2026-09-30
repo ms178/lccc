@@ -59,6 +59,7 @@ THREE = [("bfd", ["gcc", "-fuse-ld=bfd"]),
          ("mold", ["gcc", "-fuse-ld=mold"]),
          ("wild", ["gcc", "-B/shim"])]
 ONE = [("bfd", ["gcc", "-fuse-ld=bfd"])]
+ZERO: list = []
 
 BFD_TRUNC = b"p.o: relocation R_X86_64_PC32 against symbol `farpc' can not be" \
             b" used; recompile with -fPIC: relocation truncated to fit"

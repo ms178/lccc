@@ -271,6 +271,13 @@ impl X86Codegen {
     /// - scale is 1, 2, 4, or 8
     ///
     /// Emits: `mov %src, (%base_reg,%index_reg,scale)`
+    #[allow(unused_variables)]
+    // Phase 9 is DISABLED: the body below the early `return false` is kept as
+    // executable documentation of the SIB-addressing decomposition we intend to
+    // restore, so its parameter bindings read as unused to `unused_variables`.
+    // The lint is enabled crate-wide (see `src/lib.rs`) precisely because a
+    // silently dead safety binding is how PR #681's volatile miscompile hid, so
+    // this is annotated per-item rather than suppressed globally.
     fn try_emit_phase9_indexed_store(&mut self, val: &Operand, ptr: &Value, ty: IrType) -> bool {
         // Phase 9 decomposes a variable-offset GEP into SIB addressing:
         //   Store val, (GEP base, Mul(idx, scale))  →  movl %eax, (%base, %idx, scale)
@@ -508,6 +515,13 @@ impl X86Codegen {
     /// - scale is 1, 2, 4, or 8
     ///
     /// Emits: `mov (%base_reg,%index_reg,scale), %dest`
+    #[allow(unused_variables)]
+    // Phase 9 is DISABLED: the body below the early `return false` is kept as
+    // executable documentation of the SIB-addressing decomposition we intend to
+    // restore, so its parameter bindings read as unused to `unused_variables`.
+    // The lint is enabled crate-wide (see `src/lib.rs`) precisely because a
+    // silently dead safety binding is how PR #681's volatile miscompile hid, so
+    // this is annotated per-item rather than suppressed globally.
     fn try_emit_phase9_indexed_load(&mut self, dest: &Value, ptr: &Value, ty: IrType) -> bool {
         // Disabled: same issue as try_emit_phase9_indexed_store — variable-offset
         // GEPs are already emitted, so base/index registers may be stale.

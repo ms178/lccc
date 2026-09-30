@@ -337,7 +337,7 @@ impl super::InstructionEncoder {
         &mut self,
         ops: &[Operand],
         pp: u8,
-        sd: bool,
+        _sd: bool,
         suffix_w: Option<u8>,
         mnemonic: &str,
     ) -> Result<(), String> {

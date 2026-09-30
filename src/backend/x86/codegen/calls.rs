@@ -205,7 +205,7 @@ impl X86Codegen {
     pub(super) fn emit_call_compute_stack_space_impl(
         &self,
         arg_classes: &[CallArgClass],
-        arg_types: &[IrType],
+        _arg_types: &[IrType],
         struct_arg_aligns: &[Option<usize>],
         _struct_arg_is_f128_sse: &[bool],
     ) -> usize {
@@ -220,7 +220,7 @@ impl X86Codegen {
         &mut self,
         args: &[Operand],
         arg_classes: &[CallArgClass],
-        arg_types: &[IrType],
+        _arg_types: &[IrType],
         stack_arg_space: usize,
         _fptr_spill: usize,
         _f128_temp_space: usize,

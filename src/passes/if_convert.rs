@@ -248,7 +248,7 @@ fn rewrite_covered_arm_loads(
             }
         }
     }
-    let resolve = |v: &Value| -> Value {
+    let _resolve = |v: &Value| -> Value {
         let mut cur = *v;
         for _ in 0..64 {
             match copy_of.get(&cur) {

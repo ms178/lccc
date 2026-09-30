@@ -492,7 +492,7 @@ impl Lowerer {
         bit_offset: u32,
         bit_width: u32,
         val: Operand,
-        volatile: bool,
+        _volatile: bool,
         sso: SsoMode,
     ) {
         let low_bits = storage_bits - bit_offset;

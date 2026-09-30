@@ -60,7 +60,10 @@ fi
 # ── 2-3. structural ─────────────────────────────────────────────────────
 "$ccc" -O2 $march -S "$src" -o "$td/v.s"
 
-python3 - "$td/v.s" <<'PY'
+rc=0
+# `cmd || rc=$?` is immune to `set -e`; a bare `python3 ... <<PY` that
+# exits non-zero would abort the script here and strand rc=$? below.
+python3 - "$td/v.s" <<'PY' || rc=$?
 import re, sys
 
 asm = open(sys.argv[1], errors="replace").read().splitlines()
@@ -158,7 +161,6 @@ else:
 
 sys.exit(fail)
 PY
-rc=$?
 if [ "$rc" -ne 0 ]; then
     echo "FAIL: volatile LICM structural contracts" >&2
     exit 1

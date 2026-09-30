@@ -4039,7 +4039,7 @@ mod tests {
     /// grows the code by 2 bytes at every zero site in the other arms.
     #[test]
     fn the_fold_predicate_is_the_encoding_arithmetic() {
-        for (name, c, imm, _) in arms() {
+        for (name, _c, imm, _) in arms() {
             let materialize = if imm == 0 { XOR_EAX } else { MOV_IMM_TO_EAX };
             let historical_disp8 = materialize + STORE_EAX_DISP8;
             let historical_disp32 = materialize + STORE_EAX_DISP32;
@@ -4108,7 +4108,7 @@ mod tests {
 
     #[test]
     fn every_nonzero_immediate_folds_in_every_arm() {
-        for (name, c, imm, _) in arms() {
+        for (name, _c, imm, _) in arms() {
             if imm != 0 {
                 assert!(const_stack_arg_fold_wins(imm), "{name}");
             }

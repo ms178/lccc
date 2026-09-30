@@ -33,6 +33,74 @@ COMMAND = re.compile(
 REGRESSION_DIR = ROOT / "tests" / "regression"
 ALLOWLIST = ROOT / "scripts" / "ci_gate_allowlist.txt"
 
+# `. path` / `source path` — how one shell gate pulls in a shared library.
+SOURCE_RE = re.compile(r"^\s*(?:\.|source)\s+(?:\"([^\"]+)\"|'([^']+)'|(\S+))")
+# `# shellcheck source=<repo-relative path>` — the repo-relative spelling of
+# the same file, which the `$here/...` form cannot give us.
+SHELLCHECK_SOURCE_RE = re.compile(
+    r"^\s*#\s*shellcheck\s+source=(\S+)"
+)
+
+
+def sourced_libraries() -> set[str]:
+    """Repo-relative paths that some gate script `source`s.
+
+    A sourced file is a library, not a gate: nothing can execute it on its own,
+    so requiring a hosted workflow to invoke it directly would be requiring a
+    no-op.  It is covered transitively -- the gate that sources it runs in
+    hosted CI, and cannot pass without the library.
+
+    Derived by scanning, not by a naming convention.  A `lib_` prefix would
+    work today and silently stop working the first time someone sources a
+    helper that is not called `lib_*`, which is exactly the kind of gap this
+    script exists to close.
+    """
+    found: set[str] = set()
+    candidates: list[Path] = [LOCAL]
+    candidates.extend(sorted(WORKFLOWS.glob("*.yml")))
+    for directory in (REGRESSION_DIR, ROOT / "scripts", ROOT / ".github" / "scripts"):
+        if directory.is_dir():
+            candidates.extend(sorted(directory.glob("*.sh")))
+            candidates.extend(sorted(directory.glob("*.py")))
+    for path in candidates:
+        try:
+            text = path.read_text()
+        except OSError:
+            continue
+        pending_directive: str | None = None
+        for line in text.splitlines():
+            d = SHELLCHECK_SOURCE_RE.match(line)
+            if d:
+                pending_directive = d.group(1)
+                continue
+            m = SOURCE_RE.match(line)
+            if not m:
+                # A directive applies only to the source statement it
+                # immediately precedes; anything else (including a blank line)
+                # breaks the pairing, so a stale directive can never be
+                # attached to an unrelated file.
+                if line.strip():
+                    pending_directive = None
+                continue
+            raw = next((g for g in m.groups() if g), "")
+            # `$here/...` and `$root/...` do not tell us where the library
+            # lives, so the path cannot be recovered from the source line
+            # alone.  The `# shellcheck source=<repo-relative path>` directive
+            # that shellcheck already requires states it exactly, so pair the
+            # two: remember the path from the nearest preceding directive and
+            # attach it to the source statement that follows.
+            if pending_directive:
+                found.add(pending_directive)
+                pending_directive = None
+                continue
+            tail = re.sub(r"^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?/", "", raw)
+            if "/" in tail:
+                found.add(tail)
+            elif raw.startswith(("tests/", "scripts/", ".github/")):
+                found.add(raw)
+    return found
+
+
 
 def run_script_bodies(path: Path) -> str:
     """All `run:` script text of one workflow, comment-stripped.
@@ -399,7 +467,7 @@ def check_fuzz_test_gate_parity(local_text: str, hosted: str) -> int:
 
 def main() -> int:
     local_text = LOCAL.read_text()
-    local_paths = set(COMMAND.findall(local_text))
+    local_paths = set(COMMAND.findall(local_text)) - sourced_libraries()
     bodies = []
     for path in sorted(WORKFLOWS.glob("*.yml")):
         bodies.append(run_script_bodies(path))

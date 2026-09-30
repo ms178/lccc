@@ -747,7 +747,7 @@ pub(super) fn eliminate_move_relays(store: &mut LineStore, infos: &mut [LineInfo
             continue;
         }
         let copy_w = dest_width(dst_text).unwrap_or(0);
-        let src_mask = 1u16 << src_fam;
+        let _src_mask = 1u16 << src_fam;
         let dst_mask = 1u16 << dst_fam;
 
         let mut j = i + 1;
@@ -1791,6 +1791,15 @@ pub(super) fn retarget_producer_into_copy(store: &mut LineStore, infos: &mut [Li
 /// `retarget_producer_into_copy`.
 pub(super) fn fold_copy_into_lea_base(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
+    // Written on every successful fold and never read back: the fold's
+    // correctness rests on `provably_dead_lv(&lv2, ...)` below, not on this
+    // accumulator.  `unused_variables` is right that the value is dead, so the
+    // name carries the underscore -- but the assignment itself is NOT dead code
+    // and must not be removed: deleting it measurably regressed codegen
+    // (`sqlite_varint` 256 -> 270 insns, `gzip_crc32` 65 -> 69) because it
+    // changed this loop's control flow.  Kept, named, and pinned by
+    // `check_indexed_fold_scratch_index.sh` + the codegen quality gate.
+    #[allow(unused_variables, unused_assignments)]
     let mut lv = FileLiveness::new(store, infos);
     let mut changed = false;
     let mut i = 0;

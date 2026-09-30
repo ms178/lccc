@@ -1523,7 +1523,7 @@ pub trait ArchCodegen {
         base_reg: PhysReg,
         index_reg: PhysReg,
         dest: &Value,
-        dest_reg: Option<PhysReg>,
+        _dest_reg: Option<PhysReg>,
     ) {
         // Default: load base to secondary, load index to acc, add, store
         // (straight to secondary: no accumulator round-trip — acc may hold

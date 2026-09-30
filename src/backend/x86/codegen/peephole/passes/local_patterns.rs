@@ -3434,7 +3434,7 @@ pub(super) fn fuse_copy_and_operation(store: &mut LineStore, infos: &mut [LineIn
 
                 // Sub-pattern: leaq disp(%<dst>), %<dst> → leaq disp(%<src>), %<dst>
                 let lea_prefix = format!("leaq ");
-                let lea_base = format!("(%{}), %{}", dst_reg_str, dst_reg_str);
+                let _lea_base = format!("(%{}), %{}", dst_reg_str, dst_reg_str);
                 if line_j.starts_with(&lea_prefix)
                     && line_j.ends_with(&format!("), %{}", dst_reg_str))
                     && line_j.contains(&format!("(%{})", dst_reg_str))
@@ -8089,7 +8089,7 @@ pub(super) fn fuse_mov_scalar_fp_into_vex_op(
             let n = r.strip_prefix("xmm").and_then(|d| d.parse::<u8>().ok());
             n.filter(|&n| n <= 15)
         };
-        let (Some(a_num), Some(d_num)) = (reg_num(src_a), reg_num(dst_d)) else {
+        let (Some(_a_num), Some(_d_num)) = (reg_num(src_a), reg_num(dst_d)) else {
             i += 1;
             continue;
         };

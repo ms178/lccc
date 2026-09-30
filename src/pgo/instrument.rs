@@ -910,7 +910,7 @@ fn dump_helper(
     let mut next = 6000;
     let file = Value(next);
     next += 1;
-    let pp = Value(next);
+    let _pp = Value(next);
     next += 1;
     let mm = Value(next);
     next += 1;

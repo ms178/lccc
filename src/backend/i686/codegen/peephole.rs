@@ -8753,7 +8753,7 @@ fn fold_logical_zero_test(store: &mut LineStore, infos: &mut [LineInfo]) -> bool
         }
         let t = trimmed(store, &infos[i], i);
         // (logical width, destination family, destination text)
-        let Some((width, dst_fam, dst_text)) = (|| {
+        let Some((width, _dst_fam, dst_text)) = (|| {
             for (m, w) in [
                 ("andl ", MoveSize::L),
                 ("orl ", MoveSize::L),
@@ -11504,7 +11504,6 @@ fn eliminate_never_read_stores_range(
     let mut sp_base: Option<i64> = None; // sp_down after first explicit allocation
     let mut esp_walk_ok = true;
     let mut has_call = false;
-    let mut any_esp_read = false;
     let mut norm: Vec<i32> = vec![0; end - start]; // per-line ESP normalization (subtract from biased offset)
 
     for i in start..end {
@@ -11519,7 +11518,6 @@ fn eliminate_never_read_stores_range(
                 sp_down += 4;
             }
             LineKind::Pop { .. } => {
-                any_esp_read = true;
                 sp_down -= 4;
                 norm[i - start] = sp_down as i32;
             }
@@ -11596,9 +11594,6 @@ fn eliminate_never_read_stores_range(
         };
         match infos[i].kind {
             LineKind::LoadEbp { offset, size, .. } => {
-                if is_esp_biased(offset) {
-                    any_esp_read = true;
-                }
                 read_ranges.push((normalize(offset), size.byte_size()));
             }
             _ => {
@@ -11651,9 +11646,6 @@ fn eliminate_never_read_stores_range(
                 // (e.g. folded memory operands like "cmpl -44(%ebp), %eax")
                 let ebp_off = infos[i].ebp_offset;
                 if ebp_off != EBP_OFFSET_NONE {
-                    if is_esp_biased(ebp_off) {
-                        any_esp_read = true;
-                    }
                     // Conservatively treat as a 16-byte read. 4 bytes (the
                     // GP-store maximum) is NOT enough: x87 folded operands
                     // read past the first dword — `fldl 16(%esp)` reads
@@ -12452,7 +12444,7 @@ fn eliminate_push_pop_pairs(store: &LineStore, infos: &mut [LineInfo]) -> bool {
                 LineKind::Push { .. } => {
                     depth += 1;
                 }
-                LineKind::Pop { reg } if depth > 0 => {
+                LineKind::Pop { reg: _ } if depth > 0 => {
                     depth -= 1;
                 }
                 LineKind::Pop { reg } if reg == push_reg && depth == 0 => {
@@ -12646,7 +12638,7 @@ fn else_hoist_diamonds(asm: String) -> String {
         // stores next to it, the SAME condition must jump to the join
         // (skipping the then body).  The inverted mnemonic would swap the
         // arms' values — a real miscompile (caught auditing cpucheck).
-        let Some((jcc, else_target)) = invert_jcc(lines[i].trim()).map(|(neg, t)| {
+        let Some((jcc, else_target)) = invert_jcc(lines[i].trim()).map(|(_neg, t)| {
             let orig = lines[i].trim().split(' ').next().unwrap_or("");
             (orig, t)
         }) else {

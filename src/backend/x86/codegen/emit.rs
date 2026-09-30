@@ -2773,7 +2773,7 @@ impl X86Codegen {
                     self.state
                         .out
                         .emit_instr_reg_reg("    movq", "rax", target_name);
-                } else if let Some(slot) = self.state.get_slot(v.0) {
+                } else if let Some(_slot) = self.state.get_slot(v.0) {
                     // Delegate to value_to_reg: it handles allocas (leaq with
                     // over-alignment), vector values, and — critically — loads
                     // small (4-byte) slots with `movl` instead of `movq`.
@@ -7917,7 +7917,7 @@ impl ArchCodegen for X86Codegen {
         let ra = &self.reg_assignments;
         let state = &self.state;
         let mut reject = false;
-        let is_load_store = matches!(
+        let _is_load_store = matches!(
             inst,
             crate::ir::reexports::Instruction::Load { .. }
                 | crate::ir::reexports::Instruction::Store { .. }

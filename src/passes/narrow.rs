@@ -307,7 +307,7 @@ fn narrow_through_stores(
                         }
                     }
                 }
-                Instruction::Load { dest, ty, .. } => {
+                Instruction::Load { dest, ty: _ty, .. } => {
                     let id = dest.0 as usize;
                     if id <= max_id {
                         if let Some(t) = load_type_map[id] {

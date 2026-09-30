@@ -622,7 +622,7 @@ impl X86Codegen {
     /// operand; the one deviation is freshness: a clobbered XMM home
     /// declines here (the staged path's exact behavior is preserved by the
     /// caller's fallback rather than risking a stale-register read).
-    fn fp_src_mem_operand(&mut self, op: &Operand, ty: IrType) -> Option<String> {
+    fn fp_src_mem_operand(&mut self, op: &Operand, _ty: IrType) -> Option<String> {
         match op {
             Operand::Value(v) => {
                 if let Some(reg) = self.fresh_home_of(v.0).filter(|r| is_xmm_reg(*r)) {
@@ -2133,7 +2133,7 @@ impl X86Codegen {
         // first so re-materialized operands are always reloaded from their
         // canonical locations.
         let replay_op = self.take_replay_cmp(cond);
-        if let Some((op, lhs, rhs, ty)) = &replay_op {
+        if let Some((_op, lhs, rhs, ty)) = &replay_op {
             self.state.reg_cache.invalidate_acc();
             self.emit_int_cmp_replay_insn(lhs, rhs, *ty);
         }

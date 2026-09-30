@@ -5450,7 +5450,7 @@ mod tests {
             rhs: Operand::Value(Value(3)),
             ty: IrType::I32,
         });
-        let inst = Instruction::BinOp {
+        let _inst = Instruction::BinOp {
             dest: Value(4),
             op: IrBinOp::And,
             lhs: Operand::Value(Value(2)),

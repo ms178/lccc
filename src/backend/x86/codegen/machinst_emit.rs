@@ -368,7 +368,7 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
             // Skip self-moves (same register or same stack slot)
             // AllocaAddr → Reg: emit leaq instead of mov
             if let MachOperand::AllocaAddr(id) = src {
-                if let MachOperand::Reg(r) = dst {
+                if let MachOperand::Reg(_r) = dst {
                     // This should have been resolved to a StackSlot-based leaq.
                     // If we reach here, the alloca wasn't resolved — emit placeholder.
                     out.emit_fmt(format_args!("    # ERROR: unresolved AllocaAddr({})", id));

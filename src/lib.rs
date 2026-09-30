@@ -1,7 +1,6 @@
 #![recursion_limit = "512"]
 #![allow(
     dead_code,
-    unused_variables,
     unused_mut,
     unused_assignments,
     unused_imports,
