@@ -2872,7 +2872,7 @@ fn analyze_reduction_pattern(
         }
     }
 
-    let mut primary_loads: Vec<Value> = Vec::new();
+    let primary_loads: Vec<Value>;
     let mut pattern = match added_inst {
         // Simple sum pattern: sum += arr[i]
         Instruction::Load { ptr, ty, .. } => {
@@ -3265,7 +3265,7 @@ fn analyze_reduction_pattern(
 fn analyze_secondary_accumulator(
     func: &IrFunction,
     loop_info: &loop_analysis::NaturalLoop,
-    cfg: &CfgAnalysis,
+    _cfg: &CfgAnalysis,
     primary: &ReductionPattern,
     primary_derived: &FxHashSet<Value>,
     secondary_phi: Value,
@@ -3908,7 +3908,7 @@ fn rewrite_value_uses_outside(
     replacement: Value,
 ) -> usize {
     let mut updates = 0usize;
-    let mut replace_in_operand = |op: &mut Operand| -> bool {
+    let replace_in_operand = |op: &mut Operand| -> bool {
         if let Operand::Value(v) = op {
             if v.0 == id {
                 *v = replacement;
@@ -4027,7 +4027,7 @@ fn rewrite_accumulator_uses_outside_loop(
     replacement: Value,
 ) -> usize {
     let mut updates = 0usize;
-    let mut replace_in_operand = |op: &mut Operand| -> bool {
+    let replace_in_operand = |op: &mut Operand| -> bool {
         if let Operand::Value(v) = op {
             if v.0 == acc_id {
                 *v = replacement;
@@ -7190,11 +7190,11 @@ fn parse_map_expr(
             // An invariant operand (including a Neg hoisted OUT of the
             // loop, or one with other readers) parses as a broadcast of
             // the negated value — no folding, the value is what it is.
-            let mut parse_fma_arg = |operand: &Operand,
-                                     product_pos: bool,
-                                     np: &mut bool,
-                                     na: &mut bool,
-                                     depth: usize|
+            let parse_fma_arg = |operand: &Operand,
+                                 product_pos: bool,
+                                 np: &mut bool,
+                                 na: &mut bool,
+                                 depth: usize|
              -> Option<MapExpr> {
                 let mut current = operand.clone();
                 let mut guard = 0usize;
@@ -9143,11 +9143,6 @@ fn emit_scalar_count_tree(
     insts: &mut Vec<Instruction>,
     next_val_id: &mut u32,
 ) -> Option<Operand> {
-    let fresh = |nid: &mut u32| {
-        let v = Value(*nid);
-        *nid += 1;
-        v
-    };
     match expr {
         // Boolean count trees never contain a fused FMA; failing closed
         // keeps a grammar extension from silently mis-mirroring.
@@ -9922,8 +9917,7 @@ fn analyze_adler_loop(
             p_ty_found = Some(*t);
             break;
         }
-        let (Some(p_phi), Some(p_init), Some(p_back), Some(p_ty)) =
-            (p_phi, p_init, p_back, p_ty_found)
+        let (Some(p_phi), Some(p_init), Some(_), Some(p_ty)) = (p_phi, p_init, p_back, p_ty_found)
         else {
             if debug {
                 eprintln!("[VEC-ADLER] cursor phi/backedge not recognized; declining");
@@ -14540,7 +14534,7 @@ fn scaled_operand_is_iv(
     func: &IrFunction,
     v: Value,
     iv: Value,
-    iv_derived: &FxHashSet<Value>,
+    _iv_derived: &FxHashSet<Value>,
 ) -> bool {
     let mut cur = v;
     for _ in 0..8 {
@@ -16267,8 +16261,6 @@ fn insert_remainder_loop(
 fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) -> usize {
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
     let mut changes = 0;
-    let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
-    let mut changes = 0;
 
     // DOMINANCE PRECONDITION -- before any IR is touched: the scalar
     // remainder must be able to reference every base with a dominating
@@ -16513,7 +16505,7 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
 
             for inst in &mut block.instructions {
                 if let Instruction::Cmp {
-                    dest,
+                    dest: _,
                     op: _,
                     lhs,
                     rhs,
@@ -16567,7 +16559,6 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
     // Step 2: Modify GEP offset calculation from IV*8 to IV*32.
     // Handle both explicit multiplies and strength-reduced pointer increments
     {
-        let mut found_any_mul = false;
         let mut modified_any_increment = false;
 
         // First, try to find and modify explicit IV * 8 multiplies
@@ -16582,7 +16573,6 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
                     ty: _,
                 } = inst
                 {
-                    found_any_mul = true;
                     // Check if this multiply involves IV-derived values and scale factor 8
                     let lhs_is_iv_derived = if let Operand::Value(v) = lhs {
                         iv_derived.contains(v)
@@ -16762,7 +16752,7 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
 
             // Now modify the GEPs by inserting mul instructions and updating offsets
             // Process in reverse order to avoid index shifting issues
-            for (block_idx, inst_idx, offset_val, gep_ty) in geps_to_modify.into_iter().rev() {
+            for (block_idx, inst_idx, offset_val, _gep_ty) in geps_to_modify.into_iter().rev() {
                 let mul_dest = Value(next_val_id);
                 next_val_id += 1;
 
@@ -16899,8 +16889,6 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
 /// Transform loop to use AVX2 FmaF64x4 intrinsic (4-wide, 256-bit).
 /// Same pattern as SSE2 but processes 4 elements per iteration instead of 2.
 fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) -> usize {
-    let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
-    let mut changes = 0;
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
     let mut changes = 0;
 
@@ -17178,7 +17166,7 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
 
             for inst in &mut block.instructions {
                 if let Instruction::Cmp {
-                    dest,
+                    dest: _,
                     op: _,
                     lhs,
                     rhs,
@@ -17239,7 +17227,7 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
                     op: IrBinOp::Mul,
                     lhs,
                     rhs,
-                    ty,
+                    ty: _,
                 } = inst
                 {
                     let lhs_is_iv = if let Operand::Value(v) = lhs {
@@ -18213,7 +18201,7 @@ fn terminator_uses_value(term: &Terminator, v: Value) -> bool {
 }
 
 fn rewrite_terminator_use(term: &mut Terminator, old: Value, new: Value) {
-    let mut fix = |op: &mut Operand| {
+    let fix = |op: &mut Operand| {
         if matches!(op, Operand::Value(x) if *x == old) {
             *op = Operand::Value(new);
         }
@@ -18390,7 +18378,6 @@ fn insert_reduction_remainder_loop(
     pattern: &ReductionPattern,
     vec_width: u64,
     horizontal_intrinsic: IntrinsicOp,
-    vec_sum_value: Value, // Accumulated vector SSA value
     byte_offset_iv: bool,
     second_acc: Option<Value>, // Second vector accumulator phi (NEON smlal2 half)
     seconds: &[SecondaryAccumulator], // Extra independent accumulators (multi-reduction)
@@ -19261,7 +19248,6 @@ fn insert_reduction_remainder_loop(
     };
 
     // Step 6: Add all new blocks to the function
-    let original_block_count = func.blocks.len();
     func.blocks.push(vec_exit_block);
     func.blocks.push(remainder_header_block);
     func.blocks.push(remainder_body_block);
@@ -19419,6 +19405,33 @@ fn emit_invariant_vector_bound(
             // comes from, never where `pre_idx` sits relative to the
             // loop. Failing either one falls back to the header,
             // which is correct and only slower.
+            //
+            // This filter is a REDUNDANT fail-closed guard, not a bug
+            // fix, and the proof is recorded so nobody "fixes" it away
+            // or cites it as a correctness patch:
+            //   1. `reduction_remainder_references_sound` runs before any
+            //      transform and requires `invariant(&pattern.limit)`.
+            //   2. `invariant` requires `plan_remainder_reference` to yield
+            //      `RemainderRefPlan::UseOriginal`, returned iff the
+            //      definition's block is NOT in `loop_blocks`.
+            //   3. The original body used the limit, so SSA legality makes
+            //      the definition dominate the body block.
+            //   4. `find_loop_preheader` returns `Some` only for a UNIQUE
+            //      outside predecessor (`None` on "several entries"), so
+            //      every entry to the loop passes it.
+            //   5. Therefore the definition is reachable on every path into
+            //      the preheader and cannot lie after it, so it is available
+            //      at the point we append to.
+            //
+            // Kept anyway, for two reasons that outlive the proof. It is
+            // nearly free: the CFG is built lazily inside the filter, so a
+            // loop with no preheader pays nothing, and a redundant refusal
+            // costs one missed optimisation where a missing refusal costs a
+            // miscompile. And `strict_cfg_dominates` is the RUNTIME FORM of
+            // step 4 -- it re-checks, against the built CFG, exactly the
+            // property uniqueness guarantees, so unlike step 4 it stays true
+            // if `find_loop_preheader` is ever weakened to admit several
+            // entries, which is precisely when the proof stops holding.
             strict_external_value_available(func, &cfg, &pattern.loop_blocks, pre_idx, limit_val)
                 && strict_cfg_dominates(&cfg, pre_idx, pattern.header_idx)
         });
@@ -20729,7 +20742,6 @@ fn transform_reduction_avx2(
             primary_sum.0 != u32::MAX,
             "primary accumulator not rewritten"
         );
-        vec_sum_value = primary_sum;
     }
 
     // Merge duplicate vector loads (a shared array is loaded once per
@@ -20751,13 +20763,11 @@ fn transform_reduction_avx2(
         .collect();
 
     let mut rem_iv: Option<Value> = None;
-    let mut rem_iv_unused: Option<Value> = None;
     let remainder_changes = insert_reduction_remainder_loop(
         func,
         pattern,
         vec_width,
         horizontal_intrinsic,
-        vec_sum_value, // Pass the vector accumulator SSA value
         use_byte_iv,
         None,             // AVX2 path uses a single NEON accumulator
         &pattern.seconds, // Extra independent accumulators, if any
@@ -20837,7 +20847,7 @@ fn transform_reduction_sse2(
     next_label = std::cmp::max(next_label, max_present_label + 1);
 
     // Determine vector width and intrinsics based on element type (SSE2 = half of AVX2)
-    let (vec_width, load_intrinsic, add_intrinsic, mul_intrinsic, horizontal_intrinsic) =
+    let (vec_width, load_intrinsic, _add_intrinsic, _mul_intrinsic, horizontal_intrinsic) =
         match pattern.element_type {
             IrType::F64 => (
                 2u64,
@@ -21567,7 +21577,6 @@ fn transform_reduction_sse2(
                 next_val_id += 1;
                 let acc1_phi = Value(next_val_id);
                 next_val_id += 1;
-                vec_sum_value = acc0_next;
                 second_acc = Some(acc1_phi);
 
                 // Zero both vector accumulators in the entry block.
@@ -22011,7 +22020,6 @@ fn transform_reduction_sse2(
             primary_sum.0 != u32::MAX,
             "primary accumulator not rewritten"
         );
-        vec_sum_value = primary_sum;
     }
 
     // Merge duplicate vector loads (a shared array is loaded once per
@@ -22039,7 +22047,6 @@ fn transform_reduction_sse2(
         pattern,
         vec_width,
         horizontal_intrinsic,
-        vec_sum_value, // Pass the vector accumulator SSA value
         use_byte_iv,
         second_acc,       // Second NEON accumulator phi (smlal2 half), if any
         &pattern.seconds, // Extra independent accumulators, if any
@@ -22810,7 +22817,6 @@ fn transform_map_vector(
             func,
             pattern,
             &expr,
-            packed_width,
             byte_iv,
             elem_size,
             &mut next_val_id,
@@ -23796,7 +23802,6 @@ fn build_map_remainder_loop(
     func: &IrFunction,
     pattern: &MapPattern,
     expr: &MapExpr,
-    vec_width: u64,
     byte_iv: Value,
     elem_size: u32,
     next_val_id: &mut u32,
@@ -23860,10 +23865,6 @@ fn build_map_remainder_loop(
     let offset_v = fresh();
     let gep_dst = fresh();
 
-    let iv_width_const = match pattern.iv_ty {
-        IrType::I32 | IrType::U32 => IrConst::I32(vec_width as i32),
-        _ => IrConst::I64(vec_width as i64),
-    };
     let one = match pattern.iv_ty {
         IrType::I32 | IrType::U32 => IrConst::I32(1),
         _ => IrConst::I64(1),

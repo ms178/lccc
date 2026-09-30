@@ -210,16 +210,11 @@ pub fn link_builtin(
     let is_static = user_args.iter().any(|a| a == "-static");
     let t_all = std::time::Instant::now();
     let ld_time = std::env::var("LCCC_LD_TIME").is_ok();
-    let mut t_phase = std::time::Instant::now();
+    let mut t_phase = crate::backend::linker_common::lap_timer::LapTimer::new();
     macro_rules! phase {
         ($name:expr_2021) => {
             if ld_time {
-                eprintln!(
-                    "[ldtime] {:<24} {:>7.1} ms",
-                    $name,
-                    t_phase.elapsed().as_secs_f64() * 1e3
-                );
-                t_phase = std::time::Instant::now();
+                eprintln!("[ldtime] {:<24} {:>7.1} ms", $name, t_phase.lap_ms());
             }
         };
     }

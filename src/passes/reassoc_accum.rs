@@ -316,7 +316,7 @@ fn rewrite_sum2_chain(
     if next_id == 0 {
         next_id = func.max_value_id() + 1;
     }
-    let mut fresh = |next_id: &mut u32| -> Value {
+    let fresh = |next_id: &mut u32| -> Value {
         let v = Value(*next_id);
         *next_id += 1;
         v

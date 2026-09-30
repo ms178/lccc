@@ -217,7 +217,7 @@ fn vcvt_base_params(mnemonic: &str) -> Option<VcvtParams> {
             sae_class: EvexSae::Er,
         }
     };
-    let mut params = match mnemonic {
+    let params = match mnemonic {
         // Widening: VEX xmm->xmm/xmm->ymm; EVEX + xmm->ymm/ymm->zmm.
         "vcvtps2pd" => Some(p(Some((0x5A, 0)), 1, 0, 0, 0x5A, VcvtKind::Wide, 4)),
         "vcvtdq2pd" => Some(p(Some((0xE6, 2)), 1, 2, 0, 0xE6, VcvtKind::Wide, 4)),

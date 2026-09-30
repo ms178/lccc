@@ -361,7 +361,7 @@ fn is_barrier_kind(kind: LineKind) -> bool {
 }
 
 /// Does the instruction at index `idx` write the GP register family `reg`?
-fn writes_reg(store: &LineStore, infos: &[LineInfo], idx: usize, reg: u8) -> bool {
+fn writes_reg(_store: &LineStore, infos: &[LineInfo], idx: usize, reg: u8) -> bool {
     match infos[idx].kind {
         // FP slot moves write no GP register (the XMM domain is invisible
         // to the GP spill machinery).
@@ -390,7 +390,7 @@ fn writes_reg(store: &LineStore, infos: &[LineInfo], idx: usize, reg: u8) -> boo
 }
 
 /// Does the instruction at index `idx` read or write stack slot `offset`?
-fn accesses_slot(store: &LineStore, infos: &[LineInfo], idx: usize, offset: i32) -> bool {
+fn accesses_slot(_store: &LineStore, infos: &[LineInfo], idx: usize, offset: i32) -> bool {
     match infos[idx].kind {
         LineKind::StoreRbp { offset: o, .. }
         | LineKind::LoadRbp { offset: o, .. }
@@ -863,7 +863,6 @@ pub(super) fn fold_save_reload_roundtrip(store: &mut LineStore, infos: &mut [Lin
             // exact re-write) up to the function end; an rsp shift invalidates
             // offsets entirely.
             let mut post = l2 + 1;
-            let mut redefined = false;
             let mut slot_dead = true;
             while post < fend.min(len) {
                 if infos[post].is_nop() {
@@ -899,7 +898,6 @@ pub(super) fn fold_save_reload_roundtrip(store: &mut LineStore, infos: &mut [Lin
                     }
                     if m == n {
                         if let Some((_mn, _sr, _mem)) = parse_2op_store(&t) {
-                            redefined = true;
                         } else {
                             slot_dead = false; // read of the deleted value
                             break;

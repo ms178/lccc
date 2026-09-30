@@ -658,10 +658,10 @@ pub(crate) enum WindowWriteKind {
 /// and as the base classifier inside `allocate_window`.
 pub(crate) fn window_last_writes_core(insts: &[MachInst]) -> FxHashMap<u8, WindowWriteKind> {
     let mut last: FxHashMap<u8, (usize, WindowWriteKind)> = FxHashMap::default();
-    let mut record = |r: u8,
-                      idx: usize,
-                      kind: WindowWriteKind,
-                      last: &mut FxHashMap<u8, (usize, WindowWriteKind)>| {
+    let record = |r: u8,
+                  idx: usize,
+                  kind: WindowWriteKind,
+                  last: &mut FxHashMap<u8, (usize, WindowWriteKind)>| {
         last.entry(r)
             .and_modify(|(i, k)| {
                 if idx > *i || (idx == *i && kind == WindowWriteKind::Precolor) {
@@ -1771,7 +1771,6 @@ mod tests {
     #[test]
     fn admission_refusals() {
         let (mut slots, mut types, mut uses, busy) = base_maps();
-        let empty: FxHashSet<u32> = FxHashSet::default();
         slots.insert(70, StackSlot(-8)); // 70: fine
         slots.insert(71, StackSlot(-16)); // 71: XMM domain via FAlu
         slots.insert(72, StackSlot(-24)); // 72: float type

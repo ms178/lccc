@@ -266,3 +266,52 @@ class LinkerSuiteParityTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GateNameUniquenessTest(unittest.TestCase):
+    """A gate registered twice re-runs, inflates PASSED, and can silently drift.
+
+    Four such duplicates shipped before this check existed: the rest of the
+    module reduced gate commands to a `set`, which erases exactly the
+    multiplicity a duplicate is made of.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.local = parity.LOCAL.read_text()
+
+    def test_real_tree_has_no_duplicate_gate_names(self) -> None:
+        self.assertEqual(parity.check_gate_name_uniqueness(self.local), 0)
+
+    def test_a_repeated_registration_is_rejected(self) -> None:
+        line = next(
+            line
+            for line in self.local.splitlines()
+            if line.startswith('gate "') and line.endswith("\\")
+        )
+        name = line.split('"')[1]
+        mutated = self.local + f'\n{line}\n    true\n'
+        with redirect_stderr(StringIO()) as err:
+            self.assertEqual(parity.check_gate_name_uniqueness(mutated), 1)
+        self.assertIn(name, err.getvalue())
+        self.assertIn("registered 2x", err.getvalue())
+
+    def test_the_same_script_under_different_arguments_is_not_a_duplicate(self) -> None:
+        # Pins the design decision, because the obvious alternative is wrong.
+        # Comparing command-path multiplicity (a Counter over COMMAND.findall)
+        # fails the CLEAN tree: asmdiff.py and fuzz_diff.py legitimately run
+        # once per mode, check_volatile_destructuring.py runs as --self-test and
+        # then for real, and COMMAND.findall also matches paths named in prose.
+        # Uniqueness is therefore asserted on gate names only.
+        text = (
+            'gate "asmdiff-x64" fast \\\n'
+            "    python3 scripts/asmdiff.py --corpus a\n"
+            'gate "asmdiff-i686" fast \\\n'
+            "    python3 scripts/asmdiff.py --32 --corpus a\n"
+            'gate "destructuring-selftest" fast \\\n'
+            "    python3 scripts/check_volatile_destructuring.py --self-test\n"
+            'gate "destructuring" fast \\\n'
+            "    python3 scripts/check_volatile_destructuring.py\n"
+        )
+        with redirect_stderr(StringIO()):
+            self.assertEqual(parity.check_gate_name_uniqueness(text), 0)

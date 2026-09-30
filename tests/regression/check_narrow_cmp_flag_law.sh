@@ -47,9 +47,9 @@ EOF
 "$LCCC" -m32 -Os -mregparm=3 -fno-pic -S -o "$workdir/out.s" "$workdir/src.c" \
     || fail "lccc failed to compile the probe"
 
-sgt_body=$(awk '/^sgt:/,/^$/' "$workdir/out.s" | head -40)
-ult_body=$(awk '/^ult:/,/^$/' "$workdir/out.s" | head -40)
-seq_body=$(awk '/^seq:/,/^$/' "$workdir/out.s" | head -40)
+sgt_body=$(awk '/^sgt:/,/^$/' "$workdir/out.s" | sed -n '1,40p')
+ult_body=$(awk '/^ult:/,/^$/' "$workdir/out.s" | sed -n '1,40p')
+seq_body=$(awk '/^seq:/,/^$/' "$workdir/out.s" | sed -n '1,40p')
 
 [[ -n "$sgt_body" ]] || fail "no sgt body in the asm"
 [[ -n "$ult_body" ]] || fail "no ult body in the asm"
@@ -82,7 +82,7 @@ pass "ZF-safe reader still folds (cmpb present in seq)"
 CCC_NO_NARROW_CMP_FOLD=1 "$LCCC" -m32 -Os -mregparm=3 -fno-pic -S \
     -o "$workdir/out_killed.s" "$workdir/src.c" \
     || fail "lccc (kill switch) failed to compile the probe"
-ult_killed=$(awk '/^ult:/,/^$/' "$workdir/out_killed.s" | head -40)
+ult_killed=$(awk '/^ult:/,/^$/' "$workdir/out_killed.s" | sed -n '1,40p')
 grep -q "cmpb \$50" <<<"$ult_killed" \
     || fail "kill switch did not revert the fold:
 $ult_killed"

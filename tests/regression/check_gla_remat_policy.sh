@@ -81,7 +81,7 @@ must_grep() { # must_grep PAT FILE [description]
 must_not_grep() { # must_not_grep PAT FILE [description]
   if grep -Eq "$1" "$2"; then
     >&2 echo "FAIL: ${3:-forbidden pattern present: $1 in $2}"
-    grep -E "$1" "$2" | head -3 | sed 's/^/      /' >&2
+    grep -E "$1" "$2" | sed -n '1,3p' | sed 's/^/      /' >&2
     exit 1
   fi
 }

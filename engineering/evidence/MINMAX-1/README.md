@@ -228,6 +228,16 @@ as **MINMAX-2** in `backlog.md`: `moving_stats` (sum + min + max over a
   * **contract 4** — i686 (no AVX2 min/max) agrees with the oracle.
 * `scripts/test_hot_loop_metric.py` — nine known-answer cases for the
   measurement instrument used above (see §6).
+* `tests/regression/minmax_reduction.c` and
+  `tests/regression/minmax_refused.c` — the same two programs as complete
+  single-TU entries in the ordinary regression corpus, so both the randomized
+  differential and the refused-shape checksum also run at the corpus default
+  `-O2` on every `run_regression.py` invocation, with no oracle and no extra
+  script. Their support files stay in `minmax_shapes/`: the corpus glob is
+  `tests/regression/*.c` (non-recursive) and every root-level `.c` must be a
+  self-contained program, so a driver that needs a sibling object cannot live
+  there. `minmax_harness.c` carries `LCCC_MINMAX_KERNELS_INLINE` to switch
+  between the two shapes from one source.
 
 ## 6. The instrument had to be fixed first (and it flattered LCCC)
 

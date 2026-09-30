@@ -50,7 +50,7 @@ fi
 ! grep -q 'popcnt' "$tmp/veto2.s"
 
 # 4. Macro contract mirrors codegen exactly (GCC defines the same set).
-"$CCC" -O2 -m32 -mlzcnt -mpopcnt -E "$tmp/t.c" 2>/dev/null | head -1 >/dev/null
+"$CCC" -O2 -m32 -mlzcnt -mpopcnt -E "$tmp/t.c" 2>/dev/null | sed -n '1,1p' >/dev/null
 "$CCC" -O2 -m32 -mlzcnt -mpopcnt -S -o "$tmp/m1.s" /dev/null 2>/dev/null || true
 printf '#ifdef __LZCNT__\nint lz_m;\n#endif\n#ifdef __POPCNT__\nint pc_m;\n#endif\nint main(void){return 0;}\n' > "$tmp/m.c"
 "$CCC" -O2 -m32 -mlzcnt -mpopcnt -S "$tmp/m.c" -o "$tmp/m1.s"

@@ -2153,7 +2153,7 @@ pub(crate) fn compute_i686_mulacc_chains_with_config(
         // single-use widening casts (zext OR sext) become feeder candidates.
         // `op` is ALREADY canonicalized by the tail-loop caller.
         let resolve_addend =
-            |op: &Operand, use_point: u32, after_head: bool| -> Option<(Operand, Option<u32>)> {
+            |op: &Operand, use_point: u32, _after_head: bool| -> Option<(Operand, Option<u32>)> {
                 match op {
                     Operand::Const(c) if c.to_i64().is_some() => Some((op.clone(), None)),
                     Operand::Value(v) => {
@@ -3192,7 +3192,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // register instead (Phase 2/2d/2h filters; see
     // collect_i686_scratch_denials for the full denial policy: indexed-GEP
     // dests, their GlobalAddr bases and load dests, and div quotients).
-    let mut scratch_denied = if is_32bit {
+    let scratch_denied = if is_32bit {
         crate::backend::generation::collect_i686_scratch_denials(func)
     } else {
         FxHashSet::default()
@@ -3202,7 +3202,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // one of those registers (rdi/rsi/rdx/r8/r9 on x86-64) is clobbered by an
     // earlier argument before this value is read. Exclude arg registers from
     // the Phase-2 pool for exactly these values (see RegAllocConfig::call_arg_regs).
-    let (mut later_arg_values, mut indirect_arg_values) = collect_call_arg_values(func);
+    let (later_arg_values, indirect_arg_values) = collect_call_arg_values(func);
 
     let block_loop_weight: Vec<u64> = liveness
         .block_loop_depth

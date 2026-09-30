@@ -398,12 +398,47 @@ gate "loop-preheader" fast \
 gate "volatile-licm" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_volatile_licm.sh
 
+# A volatile BITFIELD is a read-modify-write, sometimes straddling two storage
+# units, so the gates above cannot see it: they inspect straight-line accesses.
+# Every access of every one of those RMWs used to be emitted non-volatile, which
+# at -O2 collapsed a loop of N volatile stores into a single store -- a wrong
+# answer, not a lost optimisation.  Non-volatile twins in the same fixture are
+# the control: they must still merge.
+gate "volatile-bitfield" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_volatile_bitfield_split.sh
+
+# A function DEFINITION's own `aligned(N)`: GCC honours the definition channel as
+# well as the prototype channel, and the attribute REPLACES `-falign-functions`
+# rather than merging with it (`aligned(1)` suppresses the directive; the
+# default only applies when there is no attribute).  Both halves are asserted,
+# with the parameterized spellings and two unannotated controls.
+gate "function-alignment-definition" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_function_alignment_definition.sh
+
+# One entry, one preheader.  A loop with several entries must not get a
+# speculative load hoisted into a preheader that only one of its entries passes.
+gate "multi-entry-loop" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_multi_entry_loop.sh
+
 # One comparison, one set of flags. `cmov` reads EFLAGS without writing it, so
 # a `cmov` chain that shares a condition needs ONE `cmp`, not one per `cmov`.
 # The gate carries its own negative control (CCC_PEEPHOLE_SKIP) so a build
 # where the pass silently stopped running cannot pass it.
 gate "redundant-flags-compare" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_redundant_flags_compare.sh
+
+# A gate must not report a FAILURE that did not happen.  Under `set -o
+# pipefail` a consumer that stops reading early (`head`, `grep -q`) kills its
+# producer with SIGPIPE and the pipeline then reports 141, so `if ... | grep -q`
+# takes the else branch although the pattern matched -- measured at 27-153 false
+# failures per 20000 checks, and reproduced end to end on a gate that failed
+# about one run in three against byte-identical compiler output.  The detector
+# is strict over every script CI runs; --self-test first, because a detector
+# that matches nothing passes vacuously.
+gate "pipefail-sigpipe-selftest" fast \
+    python3 scripts/check_pipefail_sigpipe.py --self-test
+gate "pipefail-sigpipe" fast \
+    python3 scripts/check_pipefail_sigpipe.py
 
 gate "hot-loop-metric" fast \
     python3 scripts/test_hot_loop_metric.py

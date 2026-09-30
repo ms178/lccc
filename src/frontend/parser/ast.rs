@@ -277,6 +277,17 @@ pub struct FunctionDef {
     pub body: CompoundStmt,
     /// Function attributes (storage class, inline hints, GCC __attribute__).
     pub attrs: FunctionAttributes,
+    /// Alignment requested on this definition -- `__attribute__((aligned(N)))`
+    /// or `_Alignas(N)` written on the DEFINITION rather than on a prototype.
+    ///
+    /// GCC honours both channels and takes the maximum; this field is the
+    /// definition channel, which previously had no path to codegen: alignment
+    /// reaches the backend through `IrModule::function_alignments`, keyed by the
+    /// emitted function name, and only `lower_global_decl` (prototypes) ever
+    /// wrote to it.  A nested function's emitted name is mangled
+    /// (`parent.inner`), which is why the key at the definition end has to be
+    /// taken from the built `IrFunction` rather than from the C name.
+    pub alignment: Option<usize>,
     pub is_kr: bool,
     pub span: Span,
 }

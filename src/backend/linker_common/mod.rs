@@ -66,6 +66,7 @@ mod eh_frame;
 pub mod filemap;
 mod gc_sections;
 mod hash;
+pub mod lap_timer;
 pub mod linker_script;
 mod mapfile;
 mod merge;

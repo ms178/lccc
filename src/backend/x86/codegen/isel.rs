@@ -2627,7 +2627,8 @@ fn lower_instruction_typed_inner(
             });
             if let Some(ty) = float_ty {
                 if matches!(ty, IrType::F32 | IrType::F64 | IrType::D32 | IrType::D64) {
-                    let (Some(src_v), Some(&src_reg)) = (src_vid, src_vid.and_then(|s| ra.get(&s)))
+                    let (Some(_src_v), Some(&src_reg)) =
+                        (src_vid, src_vid.and_then(|s| ra.get(&s)))
                     else {
                         return false;
                     };

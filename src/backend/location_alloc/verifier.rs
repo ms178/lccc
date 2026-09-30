@@ -142,7 +142,7 @@ pub(crate) fn verify_rewrite(
         if !block_labels.insert(b.label.0) {
             return Err(format!("duplicate block label {}", b.label.0));
         }
-        let mut check_target = |t: BlockId| -> Result<(), String> {
+        let check_target = |t: BlockId| -> Result<(), String> {
             if label_map.get(&t).is_none() {
                 return Err(format!(
                     "block {} terminator targets missing block {}",

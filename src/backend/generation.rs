@@ -1863,7 +1863,7 @@ fn build_foldable_global_addr_set(
 
     loop {
         let mut bad: FxHashSet<u32> = FxHashSet::default();
-        let mut mark = |id: u32, bad: &mut FxHashSet<u32>| {
+        let mark = |id: u32, bad: &mut FxHashSet<u32>| {
             if live.contains(&id) {
                 bad.insert(id);
             }
@@ -2529,7 +2529,6 @@ pub(crate) fn build_folded_value_set(
     let use_counts = count_value_uses(func);
     let stab = analyze_base_stability(func);
     let gep_fold_map = build_gep_fold_map(func, &use_counts, &stab);
-    let indexed_gep_map = build_indexed_gep_map(func, &use_counts, &stab);
     let global_addr_map = build_global_addr_map(func, tls_symbols, Some(absolute_symbols));
     let mut set = FxHashSet::default();
     for block in &func.blocks {
@@ -3703,12 +3702,47 @@ fn emit_functions_and_sections(
         if !func.is_declaration {
             let sect = function_text_section(func, function_sections);
             emit_switch_to_section(cg, &sect);
-            if let Some(&alignment) = module.function_alignments.get(&func.name) {
-                if alignment > 1 && alignment.is_power_of_two() {
-                    cg.state()
-                        .emit_fmt(format_args!(".p2align {}", alignment.trailing_zeros()));
-                }
-            }
+            // This function's own `aligned(N)`, in the three states GCC
+            // distinguishes, handed to `generate_function` as its placement:
+            //
+            //   * None          -- no attribute; the backend's
+            //                      `-falign-functions` default applies.
+            //   * Some(Some(l)) -- the attribute fixes the entry at 2^l and
+            //                      REPLACES that default rather than merging
+            //                      with it. Measured, GCC 14 `-O2`: with
+            //                      `-falign-functions=32`, `aligned(2)` still
+            //                      emits `.align 2` while an unannotated
+            //                      neighbour gets `.p2align 5`.
+            //   * Some(None)    -- `aligned(1)`: natural alignment, which GCC
+            //                      expresses by emitting NO directive, i.e. it
+            //                      suppresses the default instead of falling
+            //                      back to it.
+            //
+            // The nesting is the point: a plain `Option<u32>` cannot tell
+            // "no attribute" from "an attribute that requires no padding", and
+            // conflating them is exactly the bug -- the default directive
+            // would come back and force 16-byte alignment on a request for 1.
+            //
+            // Emitting the attribute directive here (and letting the default
+            // follow it) used to mean max(attribute, default), because
+            // `.p2align` only ever ADVANCES the location counter: `aligned(2)`
+            // came out 16-byte aligned. It also put two directives in front of
+            // one label, which reads as if the second overrode the attribute.
+            let attr_align = module
+                .function_alignments
+                .get(&func.name)
+                .copied()
+                .map(|a| {
+                    if a > 1 && a.is_power_of_two() {
+                        Some(a.trailing_zeros())
+                    } else {
+                        // aligned(1) => natural alignment. Any other non-power-of-
+                        // two value is rejected by GCC's front end; the
+                        // conservative reading of an unusable request is "no
+                        // padding", not "some other alignment".
+                        None
+                    }
+                });
             // Dual-layout emission: when the static chain pass reordered this
             // function's blocks, emit it with BOTH the chain order and the
             // pre-chain order, and keep whichever compiles smaller. The
@@ -3737,7 +3771,7 @@ fn emit_functions_and_sections(
                 let mark = cg.state().out.buf.len();
                 crate::backend::state::EXPLORATORY_EMISSION
                     .store(true, std::sync::atomic::Ordering::Relaxed);
-                generate_function(cg, func, source_mgr, file_table);
+                generate_function(cg, attr_align, func, source_mgr, file_table);
                 let chain_peep = cg.peephole_for_metric(cg.state_ref().out.buf[mark..].to_string());
                 let chain_count = crate::passes::block_layout::count_instruction_lines(&chain_peep);
                 cg.state().out.buf.truncate(mark);
@@ -3757,7 +3791,7 @@ fn emit_functions_and_sections(
                         .into_iter()
                         .map(|b| b.expect("permutation covers every block"))
                         .collect();
-                    generate_function(cg, &alt, source_mgr, file_table);
+                    generate_function(cg, attr_align, &alt, source_mgr, file_table);
                     let orig_peep =
                         cg.peephole_for_metric(cg.state_ref().out.buf[mark..].to_string());
                     let orig_count =
@@ -3770,19 +3804,19 @@ fn emit_functions_and_sections(
                     // and the shipped text comes from a non-exploratory
                     // emission in both arms.
                     if chain_count < orig_count {
-                        generate_function(cg, func, source_mgr, file_table);
+                        generate_function(cg, attr_align, func, source_mgr, file_table);
                     } else {
-                        generate_function(cg, &alt, source_mgr, file_table);
+                        generate_function(cg, attr_align, &alt, source_mgr, file_table);
                     }
                 } else {
                     // Malformed record (block count changed after the layout
                     // pass — defensive): emit once with the live order.
                     crate::backend::state::EXPLORATORY_EMISSION
                         .store(false, std::sync::atomic::Ordering::Relaxed);
-                    generate_function(cg, func, source_mgr, file_table);
+                    generate_function(cg, attr_align, func, source_mgr, file_table);
                 }
             } else {
-                generate_function(cg, func, source_mgr, file_table);
+                generate_function(cg, attr_align, func, source_mgr, file_table);
             }
         }
     }
@@ -3984,8 +4018,24 @@ pub(crate) fn x86_inline_memset_len(
     }
 }
 
+/// The entry alignment of the function currently being emitted: its own
+/// `aligned(N)` when it has one, otherwise the backend's `-falign-functions`
+/// default (2^log2, or None for "emit no directive").
+///
+/// Kept as one function so the attribute cannot be honoured on one path and
+/// forgotten on another: every placement site in `generate_function` -- plain,
+/// `-fpatchable-function-entry` with and without a leading pad, and the
+/// non-function-section path -- goes through here.
+fn fn_entry_align_log2(cg: &dyn ArchCodegen, attr: Option<Option<u32>>) -> Option<u32> {
+    match attr {
+        Some(fixed) => fixed,
+        None => cg.function_alignment_log2(),
+    }
+}
+
 fn generate_function(
     cg: &mut dyn ArchCodegen,
+    attr_align: Option<Option<u32>>,
     func: &IrFunction,
     source_mgr: Option<&SourceManager>,
     file_table: &FxHashMap<String, u32>,
@@ -4058,7 +4108,7 @@ fn generate_function(
                 // and leave the body in the PFE section.
                 emit_switch_to_section(cg, &func_sect);
 
-                if let Some(log2) = cg.function_alignment_log2() {
+                if let Some(log2) = fn_entry_align_log2(cg, attr_align) {
                     cg.state().emit_fmt(format_args!(".p2align {}", log2));
                 }
 
@@ -4066,13 +4116,13 @@ fn generate_function(
                 for _ in 0..before {
                     cg.state().emit("nop");
                 }
-            } else if let Some(log2) = cg.function_alignment_log2() {
+            } else if let Some(log2) = fn_entry_align_log2(cg, attr_align) {
                 cg.state().emit_fmt(format_args!(".p2align {}", log2));
             }
-        } else if let Some(log2) = cg.function_alignment_log2() {
+        } else if let Some(log2) = fn_entry_align_log2(cg, attr_align) {
             cg.state().emit_fmt(format_args!(".p2align {}", log2));
         }
-    } else if let Some(log2) = cg.function_alignment_log2() {
+    } else if let Some(log2) = fn_entry_align_log2(cg, attr_align) {
         cg.state().emit_fmt(format_args!(".p2align {}", log2));
     }
 

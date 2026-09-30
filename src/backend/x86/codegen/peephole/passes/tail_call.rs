@@ -269,8 +269,6 @@ fn is_tail_call_candidate(
     let mut found_pop_rbp = false;
     // Index and immediate of a frameless `addq $N, %rsp`, when that is the
     // teardown form. The caller must keep it BEFORE the jump.
-    let mut frame_release: Option<(usize, String)> = None;
-    let _ = &frame_release;
     let mut j = call_idx + 1;
 
     while j < limit {
@@ -317,7 +315,6 @@ fn is_tail_call_candidate(
                         if reg == "%rsp" && imm.bytes().all(|b| b.is_ascii_digit()) {
                             found_frame_teardown = true;
                             found_pop_rbp = true; // no %rbp was pushed
-                            frame_release = Some((j, imm.to_string()));
                             j += 1;
                             continue;
                         }

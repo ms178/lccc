@@ -53,10 +53,15 @@ pub(super) fn apply_relocations(
                 continue;
             }
 
-            let _out_name = match output_section_name(&sec.name, sec.flags, sec.sh_type) {
-                Some(n) => n,
-                None => continue,
-            };
+            // A section with no output-section mapping is skipped.  This was
+            // written as `let _out_name = match .. { Some(n) => n, None =>
+            // continue }`, which is a control-flow guard wearing a binding: the
+            // binding was never read, so the only thing it expressed was the
+            // `continue`.
+            if output_section_name(&sec.name, sec.flags, sec.sh_type).is_none() {
+                continue;
+            }
+
             let (out_sec_idx, sec_base_offset) =
                 match ctx.section_map.get(&(obj_idx, sec.input_index)) {
                     Some(&v) => v,

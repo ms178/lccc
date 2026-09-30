@@ -722,6 +722,48 @@ fn plain_reg_family(op: &str) -> Option<RegId> {
 ///    and zero in the fold (or vice versa), so the shape is declined.
 /// 6. Never `%rsp`/`%rbp`, and `xchg`-class or implicit-destination
 ///    producers are excluded by the parser (only `mov`/`lea` are read).
+/// Compute the rewritten form of every use of `%T` in a copy-back window, or
+/// `None` if **any** one of them cannot be expressed.
+///
+/// The `None` is the whole point: the caller must abandon the fold outright,
+/// because the commit that follows deletes the copy and retargets the producer,
+/// leaving `%T` undefined.  A partially rewritten use list is not a degraded
+/// result, it is a miscompile.
+///
+/// Two distinct refusals, both fatal:
+///
+///   * `rw == line` — the use mentions `%T` according to the family classifier
+///     (`scan_register_refs`) but no spelling in `t_names` matches, so there is
+///     nothing to rewrite.  **Reachable**: `register_family_at` maps the
+///     high-byte aliases `%ah`/`%bh`/`%ch`/`%dh` to the same families as the
+///     `%al`-class names, but they appear in no [`REG_NAMES`] slot at any width
+///     and have no counterpart at all once the family moves to
+///     `%rsi`/`%rdi`/`%r8`+ (see [`HIGH_BYTE`]).  Reproduced by
+///     `a_non_rewritable_use_aborts_the_whole_copyback_fold`, where leaving this
+///     path open leaves a later `%rax` read pointing at a register nothing
+///     defines.
+///   * `%T` still present after replacement — the rewrite would be incomplete.
+fn plan_copyback_rewrites(
+    store: &LineStore,
+    infos: &[LineInfo],
+    all_uses: &[usize],
+    t_names: &[(String, String)],
+) -> Option<Vec<(usize, String)>> {
+    let mut rewritten = Vec::with_capacity(all_uses.len());
+    for &j in all_uses {
+        let line = infos[j].trimmed(store.get(j)).to_string();
+        let mut rw = line.clone();
+        for (from, to) in t_names {
+            rw = replace_reg(&rw, from, to);
+        }
+        if rw == line || t_names.iter().any(|(from, _)| contains_reg(&rw, from)) {
+            return None;
+        }
+        rewritten.push((j, rw));
+    }
+    Some(rewritten)
+}
+
 pub(super) fn fold_induction_copyback(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     if len < 3 {
@@ -877,7 +919,6 @@ pub(super) fn fold_induction_copyback(store: &mut LineStore, infos: &mut [LineIn
         // Uses of `%D` in this window need no rewrite — `%D` already holds
         // the producer's value under the fold.
         let mut uses: Vec<usize> = Vec::new();
-        let mut last = c;
         let mut ok = true;
         for j in (c + 1)..len {
             if infos[j].is_nop() {
@@ -903,7 +944,6 @@ pub(super) fn fold_induction_copyback(store: &mut LineStore, infos: &mut [LineIn
                     break;
                 }
                 uses.push(j);
-                last = j;
             } else {
                 if writes_d || writes_t {
                     break;
@@ -966,20 +1006,24 @@ pub(super) fn fold_induction_copyback(store: &mut LineStore, infos: &mut [LineIn
                 )
             })
             .collect();
-        let mut rewritten_uses: Vec<(usize, String)> = Vec::with_capacity(all_uses.len());
-        let mut all_rewritable = true;
-        for &j in &all_uses {
-            let line = infos[j].trimmed(store.get(j)).to_string();
-            let mut rw = line.clone();
-            for (from, to) in &t_names {
-                rw = replace_reg(&rw, from, to);
-            }
-            if rw == line || t_names.iter().any(|(from, _)| contains_reg(&rw, from)) {
-                all_rewritable = false;
-                break;
-            }
-            rewritten_uses.push((j, rw));
-        }
+        // PRECOMPUTE-THEN-COMMIT, with the refusal carried by the TYPE.
+        //
+        // The commit below is not reversible use-by-use: it retargets the
+        // producer from `%T` to `%D` and NOPs the copy, so from that moment `%T`
+        // has no definition at all and any use we failed to rewrite reads an
+        // undefined register.  The whole plan therefore has to be computed and
+        // validated before the first mutation, and a refusal has to abandon
+        // every already-validated use, not just the rest of the scan.
+        //
+        // `Option` rather than a `bool` deliberately.  The earlier version
+        // computed `all_rewritable = false` and then never read it -- a
+        // fail-open in a function whose own comment promised the fold "aborts".
+        // A bool is state the programmer must remember to consume; an `Option`
+        // is state the compiler *forces* the caller to consume.  The bug class
+        // is removed rather than the instance fixed.
+        let Some(rewritten_uses) = plan_copyback_rewrites(store, infos, &all_uses, &t_names) else {
+            continue;
+        };
         replace_line(store, &mut infos[i], i, new_producer);
         mark_nop(&mut infos[c]);
         for (j, rw) in rewritten_uses {

@@ -193,7 +193,7 @@ fn analyze_function_purity(
         });
     }
 
-    let mut is_pure = true;
+    let is_pure = true;
     let mut is_const = true;
 
     for block in &func.blocks {

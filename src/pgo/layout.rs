@@ -303,7 +303,6 @@ fn layout_function(
 ) {
     use crate::ir::reexports::Terminator;
     let promoted: FxHashSet<u32> = crate::pgo::promoted_hot_labels(u, &f.name);
-    let entry = f.blocks[0].label;
 
     // Per-block hotness: derived counts; promoted blocks get entry hotness.
     let mut counts = FxHashMap::<BlockId, u64>::default();

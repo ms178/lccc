@@ -20,16 +20,32 @@ keeps every identifier in scope: `volatile` is still bound, still compiles,
 and the guard it fed is simply gone.  The optimizer then hoists a volatile
 MMIO load out of its spin loop, and the program hangs on real hardware.
 
-WHY THE COMPILER DOES NOT CATCH IT
-----------------------------------
-`src/lib.rs` carries a crate-wide `#![allow(unused_variables)]` (alongside
-`dead_code`, `unused_mut`, ...), so the dead binding produces no diagnostic and
-CI's `cargo clippy -- -D warnings` stays green.  rustc itself *would* warn --
-`unused_variables` fires on refutable-pattern bindings exactly like any other
--- but this tree has deliberately switched that lint off, so the safety net
-for a safety-critical field does not exist.  This ratchet is the replacement,
-and it is narrower than the lint: it covers one field, at the one place that
-field can be silently dropped.
+WHY THE COMPILER DOES NOT FULLY CATCH IT
+----------------------------------------
+`src/lib.rs` no longer allows `unused_variables`, so rustc now fires on a dead
+binding and this ratchet is a second, narrower net under it.  The lint alone is
+still not sufficient for this field, for two reasons that are exactly the two
+rules below.
+
+  1. A dropped guard whose binding is still *mentioned* in the arm
+     (`Instruction::Store { volatile: false, .. }` re-emits the field) is not an
+     unused variable, so rustc is silent.
+  2. Volatility also travels as a FUNCTION PARAMETER, and no lint can know that
+     a parameter named `volatile` is load-bearing.  Renaming it to `_volatile`
+     silences the diagnostic while leaving the flag dropped in the body -- which
+     is what happened in `expr_assign.rs::store_bitfield_split`, where the rename
+     hid a wrong-code bug for volatile bitfields.
+
+THE PARAMETER RULE
+------------------
+A parameter whose NAME contains `volatile` is a volatility flag the function is
+trusted to honour.  If the body never reads it, the flag is dropped, and the
+compiler cannot tell "does not matter here" from "was forgotten": `_volatile` is
+a legal, warning-free way to write the latter.  So a `_`-prefixed `volatile`
+parameter is a violation, and any volatile parameter never read in its own body
+is a violation.  Discarding it explicitly in the body (`let _ = volatile;`) is
+allowed and is the reviewable way to record that the flag is irrelevant -- the
+same escape hatch as `volatile: _`.
 
 THE RULE
 --------
@@ -397,6 +413,121 @@ def _use_window(src: str, pattern_close: int, block_close: int) -> int:
     return min(stop, block_close)
 
 
+
+# ---------------------------------------------------------------------------
+# Rule 2: a volatility flag passed in as a parameter
+# ---------------------------------------------------------------------------
+# Deliberately not anchored to `pub`/`pub(super)`: visibility is irrelevant to
+# whether a body honours its own parameter.
+_FN_RE = re.compile(r"\bfn\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^<>]*>)?\s*\(")
+
+
+def _match_paren(text: str, open_idx: int) -> int:
+    """Index of the `)` closing the `(` at ``open_idx``, or -1."""
+    depth = 0
+    for k in range(open_idx, len(text)):
+        c = text[k]
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return k
+    return -1
+
+
+def _split_top_level(text: str, sep: str = ",") -> list[str]:
+    """Split on ``sep`` at bracket depth 0, so `FxHashMap<u8, u32>` survives."""
+    parts, cur, depth = [], "", 0
+    for ch in text:
+        if ch in "(<[":
+            depth += 1
+        elif ch in ")>]":
+            depth -= 1
+        if ch == sep and depth == 0:
+            parts.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        parts.append(cur)
+    return parts
+
+
+def _volatile_params(param_list: str) -> list[str]:
+    """Parameter names claiming to carry volatility, in order.
+
+    Matches `volatile: bool`, `_volatile: bool`, `mut volatile: bool`.  A
+    parameter whose TYPE mentions volatile (`p: *volatile u8`) is not a flag and
+    is not matched: the name is what the rule is about.
+    """
+    names = []
+    for raw in _split_top_level(param_list):
+        m = re.match(r"\s*(?:mut\s+|ref\s+)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*:",
+                     raw)
+        if not m:
+            continue
+        name = m.group("name")
+        if "volatile" in name:
+            names.append(name)
+    return names
+
+
+def check_volatile_params(text: str, origin: str) -> list[str]:
+    """One violation per volatility parameter its own body never reads."""
+    src = _strip_comments(text)
+    violations: list[str] = []
+    for m in _FN_RE.finditer(src):
+        open_idx = src.index("(", m.end() - 1)
+        close_idx = _match_paren(src, open_idx)
+        line = src.count("\n", 0, m.start()) + 1
+        if close_idx < 0:
+            violations.append(
+                f"{origin}:{line}: could not delimit the parameter list of "
+                f"`{m.group('name')}` (unbalanced parens)")
+            continue
+        params = _volatile_params(src[open_idx + 1:close_idx])
+        if not params:
+            continue
+        # A trait method declaration has no body: no site to honour the flag
+        # there, and each implementation is checked as a function in its own
+        # right.
+        brace = src.find("{", close_idx)
+        if brace < 0 or ";" in src[close_idx + 1:brace]:
+            continue
+        body_close = _match_brace(src, brace)
+        if body_close < 0:
+            violations.append(
+                f"{origin}:{line}: could not delimit the body of "
+                f"`{m.group('name')}`; refusing to claim its volatility "
+                f"parameter is honoured")
+            continue
+        body = src[brace:body_close + 1]
+        for name in params:
+            stripped = name.lstrip("_")
+            underscored = name.startswith("_") and stripped != ""
+            # A bare mention counts; `volatile: false` inside the body does NOT,
+            # for the same reason `_USE_RE` has the lookahead: there the word is
+            # the name of a field being written, which is exactly the shape of
+            # the bug (a dropped flag re-emitted as a literal).
+            used = re.search(
+                r"\b" + re.escape(stripped) + r"\b(?!\s*:)", body) is not None
+            if underscored:
+                why = (f"is named `_{stripped}`; the underscore asserts the flag "
+                       f"is unused")
+            elif not used:
+                why = "is never read in its own body"
+            else:
+                continue
+            violations.append(
+                f"{origin}:{line}: volatility parameter `{name}` of "
+                f"`{m.group('name')}` {why} -- a flag that reaches a function and "
+                f"is dropped there is a wrong-code bug, not a missed optimisation "
+                f"(if it is genuinely irrelevant, discard it explicitly: "
+                f"`let _ = {stripped};`)")
+    return violations
+
+
 def check_source(text: str, origin: str) -> list[str]:
     """Return one violation string per dead `volatile` binding in ``text``."""
     src = _strip_comments(text)
@@ -440,6 +571,7 @@ def check_source(text: str, origin: str) -> list[str]:
                 f"and never uses it -- an observable-access guard was dropped "
                 f"(write `volatile: _` if volatility genuinely does not "
                 f"matter here)")
+    violations += check_volatile_params(text, origin)
     return violations
 
 
@@ -598,6 +730,44 @@ _SELF_TEST_CASES = [
          }
      }
      """, True),
+    # Rule 2: volatility passed as a parameter.  The first case is the OLD
+    # `store_bitfield_split` signature verbatim -- the commit that hid the
+    # volatile-bitfield bug by renaming the parameter instead of using it.
+    ("the store_bitfield_split regression, verbatim shape",
+     """
+     fn store_bitfield_split(&mut self, addr: Value, storage_ty: IrType,
+                             bit_offset: u32, bit_width: u32, val: Operand,
+                             _volatile: bool, sso: SsoMode) {
+         let x = self.load(addr, storage_ty);
+     }
+     """, True),
+    ("a volatile parameter the body reads is fine",
+     """
+     fn store_bitfield_split(&mut self, addr: Value, volatile: bool, sso: SsoMode) {
+         self.emit(Store { volatile, ptr: addr });
+     }
+     """, False),
+    ("a volatile parameter never read is flagged",
+     """
+     fn lower(&mut self, volatile: bool, addr: Value) {
+         self.emit(Load { volatile: false, ptr: addr });
+     }
+     """, True),
+    ("explicit discard of a parameter is fine",
+     """
+     fn lower(&mut self, volatile: bool, addr: Value) {
+         let _ = volatile;
+         self.emit(Load { ptr: addr });
+     }
+     """, False),
+    ("a pointer type that mentions volatile is not a flag",
+     """
+     fn describe(ptr: *volatile u8, len: usize) -> usize { len }
+     """, False),
+    ("a trait method declaration has no body and is not judged",
+     """
+     trait T { fn lower(&self, volatile: bool, addr: Value) -> u8; }
+     """, False),
     ("unterminated body fails closed",
      """
      fn f(inst: &Instruction) -> bool {

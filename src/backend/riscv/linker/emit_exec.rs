@@ -1443,7 +1443,6 @@ pub fn emit_executable(
             section_count += 1;
         }
 
-        let _rela_plt_shidx = section_count;
         write_shdr(
             &mut elf,
             get_name(".rela.plt"),

@@ -2280,7 +2280,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
         sec_idx: usize,
     ) -> Result<Instruction, String> {
         let mut out = instr.clone();
-        let mut sub = |w: &mut Self, s: &mut String| -> Result<(), String> {
+        let sub = |w: &mut Self, s: &mut String| -> Result<(), String> {
             if s.contains('.') {
                 if let Some((_, rewritten)) = w.substitute_dot(s) {
                     *s = rewritten;
@@ -3574,7 +3574,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             // only growth is considered.
             let mut first_pass = true;
             loop {
-                let mut any_change = false;
+                let any_change;
                 let mut local_labels: FxHashMap<String, usize> = FxHashMap::default();
                 for (name, &(s_idx, offset)) in &self.label_positions {
                     if s_idx == sec_idx {
@@ -4333,7 +4333,6 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     // Start every sweep from None: an earlier sweep's
                     // acceptance must not survive a later rejection (the
                     // padding run is rebuilt the same way below).
-                    tight_resolved_align = None;
                     let (target, bucket): (Option<u64>, Option<u64>) = 'arm: {
                         let Some(&(h_sec, h_off)) = self.label_positions.get(header.as_str())
                         else {

@@ -77,7 +77,7 @@ impl ColorClasses {
             root
         }
         let mut parent: FxHashMap<u32, u32> = FxHashMap::default();
-        let mut union = |parent: &mut FxHashMap<u32, u32>, a: u32, b: u32| {
+        let union = |parent: &mut FxHashMap<u32, u32>, a: u32, b: u32| {
             parent.entry(a).or_insert(a);
             parent.entry(b).or_insert(b);
             let ra = find_up(parent, a);

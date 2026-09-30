@@ -7,11 +7,23 @@
 //!
 //! ```c
 //! int f(const int *c, int n) {          // `addl (%rdi), %edx` in the loop,
-//!     int t = 0;                        // every iteration, forever
-//!     for (int i = 0; i < n; i++) t += c[0];
+//!     if (n <= 0) return 0;             // every iteration, forever
+//!     int i = 0, t = 0;
+//!     do { t += c[0]; i++; } while (i < n);
 //!     return t;
 //! }
 //! ```
+//!
+//! The guard being *outside* the loop is load-bearing, not decoration: it puts
+//! the load in the loop header, which dominates every loop block, so LICM's
+//! must-execute rule is satisfied and only the dedicated-preheader rule is
+//! missing.  The guard-at-top spelling of the same body —
+//! `for (int i = 0; i < n; i++) t += c[0];` — lowers with the guard *as* the
+//! header, so the load sits in a block that does not dominate the loop and this
+//! pass correctly declines it.  The two spellings are therefore not
+//! interchangeable -- one is the target, the other is a refusal -- and both are
+//! pinned in `tests/regression/check_loop_preheader.sh` (contracts 1 and 2) so
+//! the distinction cannot rot.
 //!
 //! ## Why the shape matters, and why it is a *soundness* requirement
 //!
@@ -215,31 +227,49 @@ fn preheader_would_unlock_a_hoist(
     alloca_values: &FxHashSet<u32>,
     global_derived: &FxHashSet<u32>,
 ) -> bool {
-    // Only the HEADER can ever satisfy LICM's must-execute rule, so scanning
-    // the whole body is quadratic work with a provably constant answer.
+    // ONLY THE HEADER CAN QUALIFY -- proved, not assumed.
     //
-    // Proof.  LICM hoists out of a block B only when B dominates every block
-    // of the loop, so in particular B dominates `header`.  But B is in the
-    // loop body, and a natural loop's header dominates every block of its
-    // body, so `header` dominates B.  Dominance is antisymmetric, hence
-    // B == header.  No other block can pass, at any body size.
+    //   Let B be a loop block that dominates every loop block.  The header H is
+    //   a loop block, so B dom H.  B is in the natural loop, so by definition of
+    //   a natural loop H dom B.  Dominance is antisymmetric, therefore B = H.
     //
-    // Before: |body| blocks x |body| dominance walks, each walking up the
-    // idom chain -- O(|body|^2 * depth), ~25M walks on a 5000-block loop, to
-    // recompute a single yes/no.  After: one walk.  The `dominates_block`
-    // call is kept rather than assumed away, so a malformed idom still
-    // degrades to "do not insert" instead of "insert anyway".
-    for &block_idx in std::slice::from_ref(&natural_loop.header) {
-        if block_idx >= func.blocks.len() {
-            continue;
-        }
-        if !natural_loop
+    // This is what makes the scan below header-only.  The alternative -- asking
+    // of every loop block whether it dominates every other -- cannot be made
+    // cheap: `body` is an `FxHashSet`, so its iteration order is arbitrary and
+    // the "yes" case (the header itself) never short-circuits, so the expected
+    // cost is ~|body|^2/2 dominance walks of O(idom depth) each, ~12.5M walks on
+    // a 5 000-block loop.  The header-only form is O(|body| * depth) once.
+    //
+    // Measured effect on this repo today: none that is resolvable, because the
+    // pass fires on 0 of the 51 benchmark programs at default settings (it only
+    // fires on the preheader fixtures, 1 insertion each) -- `loop_rotate` is
+    // opt-in and the profitability gate rejects the rest.  This is a latent
+    // scalability fix for large real-world loops (kernel/glibc-scale CFGs),
+    // not a measured corpus win, and it is recorded that way rather than being
+    // sold as a speedup.
+    //
+    // The assertion below keeps the proof honest: if LICM's must-execute rule is
+    // ever relaxed from "is the header" to something weaker, the header-only
+    // shortcut silently stops being equivalent, and a debug build says so instead
+    // of quietly losing hoists.
+    //
+    // It costs one dominance walk per block, not one per (block, block) pair.
+    // "Some non-header block dominates every loop block" and "some non-header
+    // block dominates the header" are the same statement: dominating the header
+    // is necessary, and the header is itself a loop block.  The pair-scan form
+    // would pay the O(|body|^2 * depth) the shortcut above exists to avoid.
+    debug_assert!(
+        natural_loop
             .body
             .iter()
-            .all(|&b| dominates_block(idom, block_idx, b))
-        {
-            continue; // not must-execute: LICM refuses the hoist anyway
-        }
+            .filter(|&&b| b != natural_loop.header && b < func.blocks.len())
+            .all(|&b| !dominates_block(idom, b, natural_loop.header)),
+        "a non-header loop block dominates the header; the \
+         header-only shortcut in preheader_would_unlock_a_hoist is no longer \
+         equivalent -- revisit the must-execute rule it relies on"
+    );
+    let block_idx = natural_loop.header;
+    if block_idx < func.blocks.len() {
         for inst in &func.blocks[block_idx].instructions {
             if let Instruction::Load { ptr, volatile, .. } = inst {
                 if *volatile || alloca_values.contains(&ptr.0) {
@@ -414,14 +444,21 @@ fn apply_insertions(func: &mut IrFunction, plans: &[Plan]) -> usize {
         if pred_idx == header_idx {
             continue; // a self-loop header: not a shape LICM hoists from
         }
-        // Block 0 is the function entry. Inserting before it would make the
-        // new block the entry, silently reparenting every parameter and
-        // alloca in the function. It is unreachable today -- an entry-block
-        // header has no predecessor outside the loop, so `find_preheader`
-        // returns `None` and no plan is ever made for it -- but the failure
-        // mode is catastrophic and the guard is free, so it is a refusal
-        // rather than an assertion: a future analysis change must lose the
-        // optimisation here, not the function.
+        // Block 0 is the function entry.  Inserting before it would make the
+        // new block the entry, silently reparenting every parameter and alloca
+        // in the function.  It is unreachable today -- an entry-block header
+        // has no predecessor outside the loop, so `find_preheader` returns
+        // `None` and no plan is ever made for it -- but the failure mode is
+        // catastrophic and the guard is free, so it is a refusal rather than
+        // an assertion: a future analysis change must lose the optimisation
+        // here, not the function.
+        //
+        // A `debug_assert!` would be the wrong instrument for this invariant: it
+        // panics in debug builds and is compiled OUT of release, which inverts
+        // the intent for a guard whose entire purpose is to contain a
+        // catastrophic, otherwise-silent outcome.  Assertions document
+        // invariants you believe cannot be violated; refusals enforce the ones
+        // you are not willing to bet the function on.
         if header_idx == 0 {
             continue;
         }

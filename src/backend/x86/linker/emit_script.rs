@@ -3385,7 +3385,6 @@ fn link_with_script_machine(
                         os.size,
                         8,
                     )?;
-                    ph_off += machine.phdr_size() as usize;
                     break;
                 }
             }
@@ -3394,7 +3393,7 @@ fn link_with_script_machine(
 
     // ── Section headers (+ optional symtab) ──
     let mut shstrtab: Vec<u8> = vec![0];
-    let mut shname = |t: &mut Vec<u8>, n: &str| -> u32 {
+    let shname = |t: &mut Vec<u8>, n: &str| -> u32 {
         let off = t.len() as u32;
         t.extend_from_slice(n.as_bytes());
         t.push(0);

@@ -577,7 +577,6 @@ impl X86Codegen {
         if self.apx_enabled {
             caller_saved_regs.extend_from_slice(&X86_APX_EGPRS);
         }
-        let mut has_indirect_call = false;
         let mut has_calls = false;
         let mut has_i128_ops = false;
         // has_gep / has_select were historically consumed here to steer
@@ -585,7 +584,6 @@ impl X86Codegen {
         // dynamically (checking actual %rdx homes) and the Select emitter
         // never touched %rdx, so both flags are dead — kept out of the scan.
         let mut has_switch = false; // Switch → jump tables use rdx
-        let mut has_i32_widening = false; // Cast from I32/U32 to I64/pointer → needs sign-ext
         for block in &func.blocks {
             for inst in &block.instructions {
                 match inst {
@@ -614,7 +612,6 @@ impl X86Codegen {
                     }
                     Instruction::CallIndirect { .. } => {
                         has_calls = true;
-                        has_indirect_call = true;
                     }
                     Instruction::BinOp { ty, .. } => {
                         if matches!(ty, IrType::I128 | IrType::U128) {
@@ -636,7 +633,6 @@ impl X86Codegen {
                         if matches!(from_ty, IrType::I32 | IrType::U32)
                             && matches!(to_ty, IrType::I64 | IrType::U64 | IrType::Ptr)
                         {
-                            has_i32_widening = true;
                         }
                     }
                     Instruction::Cmp { ty, .. } | Instruction::Store { ty, .. } => {
@@ -728,7 +724,7 @@ impl X86Codegen {
         // copy_phi_srcs[dest] = list of value sources (from Copy/Phi) whose
         // 64-bit value flows into `dest`. Built in pass 1, used in pass 2.
         let mut copy_phi_srcs: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
-        let mut mark = |op: &Operand, set: &mut FxHashSet<u32>| {
+        let mark = |op: &Operand, set: &mut FxHashSet<u32>| {
             if let Operand::Value(v) = op {
                 set.insert(v.0);
             }
@@ -3820,7 +3816,7 @@ impl X86Codegen {
                 "r9" => Some(13),
                 _ => None,
             };
-            for (i, param) in func.params.iter().enumerate() {
+            for (i, _param) in func.params.iter().enumerate() {
                 let Some(dest) = paramref_dests[i] else {
                     continue;
                 };

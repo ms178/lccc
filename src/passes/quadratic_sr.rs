@@ -167,7 +167,7 @@ fn reduce_loop(func: &mut IrFunction, lp: &loop_analysis::NaturalLoop, cfg: &Cfg
                 continue;
             };
             // One of them must be Add(other, 1).
-            let (a_val, b_val) = {
+            let (a_val, _b_val) = {
                 let b_is_a_plus1 = is_plus_one_of(func, &lp.body, *bv, *av);
                 let a_is_b_plus1 = is_plus_one_of(func, &lp.body, *av, *bv);
                 if b_is_a_plus1 {
@@ -201,7 +201,7 @@ fn reduce_loop(func: &mut IrFunction, lp: &loop_analysis::NaturalLoop, cfg: &Cfg
             break;
         }
     }
-    let Some((_prod, a_val, a_inv, half)) = triangular else {
+    let Some((_prod, _a_val, a_inv, half)) = triangular else {
         return 0;
     };
 
@@ -435,7 +435,7 @@ fn reduce_loop(func: &mut IrFunction, lp: &loop_analysis::NaturalLoop, cfg: &Cfg
     // Replace uses of final_val with idx_phi within the loop.
     for &bi in &lp.body {
         for inst in &mut func.blocks[bi].instructions {
-            let mut replace = |op: &mut Operand| {
+            let replace = |op: &mut Operand| {
                 if let Operand::Value(v) = op {
                     if *v == final_val {
                         *v = idx_phi;

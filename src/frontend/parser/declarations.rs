@@ -133,7 +133,6 @@ impl Parser {
                 self.attrs.parsing_ext_vector_nelem.take(),
                 start,
             );
-            let _dbg_vs = d.vector_size_expr.is_some();
             d.set_vector_size_expr(self.attrs.parsing_vector_size_expr.take());
             d.set_static(self.attrs.parsing_static());
             d.set_extern(self.attrs.parsing_extern());
@@ -237,7 +236,14 @@ impl Parser {
         }
 
         if is_funcdef {
-            self.parse_function_def(type_spec, name, derived, start, decl_attrs)
+            self.parse_function_def(
+                type_spec,
+                name,
+                derived,
+                start,
+                decl_attrs,
+                merged_alignment,
+            )
         } else {
             let ctx = DeclContext {
                 attrs: decl_attrs,
@@ -258,6 +264,7 @@ impl Parser {
         derived: Vec<DerivedDeclarator>,
         start: crate::common::source::Span,
         decl_attrs: DeclAttributes,
+        alignment: Option<usize>,
     ) -> Option<ExternalDecl> {
         self.attrs.set_typedef(false); // function defs are never typedefs
         let (params, variadic) = if let Some(DerivedDeclarator::Function(p, v)) = derived.last() {
@@ -312,6 +319,7 @@ impl Parser {
         }
 
         Some(ExternalDecl::FunctionDef(FunctionDef {
+            alignment,
             return_type,
             name: name.unwrap_or_default(),
             params: final_params,

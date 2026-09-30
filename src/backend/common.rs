@@ -3465,7 +3465,7 @@ pub(crate) fn compute_value_type_map(
     // untyped; every consumer treats untyped as the conservative wide
     // default (emitter `movq`, 8-byte slot), exactly the pre-change
     // behavior.
-    let mut widen_to = |map: &mut FxHashMap<u32, IrType>, dest: u32, ty: IrType| -> bool {
+    let widen_to = |map: &mut FxHashMap<u32, IrType>, dest: u32, ty: IrType| -> bool {
         let old = map.get(&dest).copied();
         if old.is_none_or(|o| o.size() < ty.size()) {
             map.insert(dest, ty);

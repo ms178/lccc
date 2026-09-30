@@ -1,12 +1,14 @@
 #![recursion_limit = "512"]
-#![allow(
-    dead_code,
-    unused_variables,
-    unused_mut,
-    unused_assignments,
-    unused_imports,
-    unreachable_code
-)]
+// Crate policy: `unused_mut` and `unused_assignments` are deliberately NOT
+// allowed. An assignment whose value is never read is dead state, and dead
+// state has hidden live defects in this codebase twice -- `fold_induction_copyback`
+// computed a refusal flag it never read, and the nested-function parser computed
+// an alignment attribute nothing could consume. Both lints are enforced
+// crate-wide so that cannot recur quietly. The remaining allows are structural:
+// `dead_code` covers backend entry points reached only from the CLI and trait
+// impls; `unused_imports` covers cfg-gated re-exports; `unreachable_code` covers
+// faithful mirrors of C semantics that are provably unreachable.
+#![allow(dead_code, unused_imports, unreachable_code)]
 //! Clippy policy.
 //!
 //! This codebase deliberately does not conform to the default `clippy::all` /
@@ -25,7 +27,13 @@
 //! fix a category can delete its line here and get an immediate, complete list
 //! of the remaining sites from a fresh `cargo clippy` run. Generated code is
 //! byte-identical with and without this block; it only affects compiler-build
-//! diagnostics. CI runs clippy advisory (`continue-on-error: true`).
+//! diagnostics. CI runs clippy **strict** -- `cargo clippy --all-targets
+//! --profile fastbuild --locked -j 2 -- -D warnings`, with no
+//! `continue-on-error` anywhere in `.github/workflows/ci.yml` -- so this list is
+//! load-bearing rather than advisory: any category removed from it before its
+//! sites are fixed turns hosted CI red. That is the intended failure mode, and
+//! the reason the list is kept to the exact set the tree violates instead of a
+//! comfortable superset.
 #![allow(
     clippy::bind_instead_of_map,
     clippy::chunks_exact_to_as_chunks,

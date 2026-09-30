@@ -292,7 +292,7 @@ fn build_block_cfg(func: &IrFunction) -> (Vec<Vec<usize>>, Vec<Vec<usize>>) {
     }
 
     let mut succs: Vec<Vec<usize>> = vec![Vec::new(); nblocks];
-    let mut add_edge = |succs: &mut [Vec<usize>], from: usize, label: u32| {
+    let add_edge = |succs: &mut [Vec<usize>], from: usize, label: u32| {
         if let Some(&to) = label_to_idx.get(&label) {
             if !succs[from].contains(&to) {
                 succs[from].push(to);

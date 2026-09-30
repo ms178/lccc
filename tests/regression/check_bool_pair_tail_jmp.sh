@@ -74,7 +74,7 @@ fi
 "$work/chains.lccc" > "$work/out.lccc"
 if ! cmp -s "$work/out.gcc" "$work/out.lccc"; then
     echo "FAIL: differential output mismatch (lccc vs gcc)"
-    diff "$work/out.gcc" "$work/out.lccc" | head -5
+    diff "$work/out.gcc" "$work/out.lccc" | sed -n '1,5p'
     fail=1
 else
     echo "ok(differential): outputs identical"

@@ -1398,7 +1398,7 @@ fn synth_mul_uncached(
             if depth == 0 {
                 return;
             }
-            let mut step = |s: &mut Search, st: MulStep, next: u32| {
+            let step = |s: &mut Search, st: MulStep, next: u32| {
                 s.path.push(st);
                 s.go(Some(next), depth - 1);
                 s.path.pop();

@@ -667,7 +667,7 @@ pub fn instrument_module(
                         if b.label.0 != e.src {
                             continue;
                         }
-                        let mut rw = |l: &mut BlockId| {
+                        let rw = |l: &mut BlockId| {
                             if l.0 == e.dst {
                                 l.0 = s;
                             }
@@ -910,7 +910,6 @@ fn dump_helper(
     let mut next = 6000;
     let file = Value(next);
     next += 1;
-    let pp = Value(next);
     next += 1;
     let mm = Value(next);
     next += 1;
@@ -1648,14 +1647,14 @@ fn push_helper_fn(
         // Rewrite body references to the raw ParamRef values (Value(0..n))
         // to the alloca loads. The helpers use a small instruction set, so a
         // targeted match is sufficient and safe.
-        let mut remap_op = |op: &mut Operand| {
+        let remap_op = |op: &mut Operand| {
             if let Operand::Value(v) = op {
                 if let Some(&l) = param_loads.get(v.0 as usize) {
                     *op = Operand::Value(l);
                 }
             }
         };
-        let mut remap_dest = |d: &mut Value| {
+        let remap_dest = |d: &mut Value| {
             if let Some(&l) = param_loads.get(d.0 as usize) {
                 *d = l;
             }
@@ -2248,7 +2247,7 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
             },
             source_spans: vec![],
         };
-        let mut mk_inc = |slot: usize, label: BlockId, next: u32| -> (BasicBlock, u32) {
+        let mk_inc = |slot: usize, label: BlockId, next: u32| -> (BasicBlock, u32) {
             let mut b = VpBuilder::new(next);
             let cp = b.gep(site, (32 + slot * 8) as i64);
             let cv = b.load(cp);
@@ -2272,7 +2271,7 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
         let (blk_li1, n2) = mk_inc(1, li1, n1);
         let (blk_li2, n3) = mk_inc(2, li2, n2);
         let (blk_li3, n4) = mk_inc(3, li3, n3);
-        let mut mk_set = |slot: usize, label: BlockId, next: u32| -> (BasicBlock, u32) {
+        let mk_set = |slot: usize, label: BlockId, next: u32| -> (BasicBlock, u32) {
             let mut b = VpBuilder::new(next);
             let tmp = b.gep(site, (slot * 8) as i64);
             b.store(tmp, Operand::Value(fp));
@@ -2530,7 +2529,7 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
         // lret: return the multi-def retv (NO redefinition — a copy here
         // would override the value set by ldone/lfound; the backend treats
         // multi-def values like phi-eliminated copies).
-        let mut x = VpBuilder::new(w.next);
+        let x = VpBuilder::new(w.next);
         let blk_ret = BasicBlock {
             label: lret,
             instructions: x.is,

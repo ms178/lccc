@@ -241,6 +241,27 @@ jobs:
       - name: Volatile spin-loop position gate
         run: bash tests/regression/check_volatile_spin_loop.sh
 
+      # A volatile BITFIELD is a read-modify-write, sometimes straddling two
+      # storage units, so none of the gates above can see it: they inspect
+      # straight-line accesses.  Every access of every one of those RMWs used to
+      # be emitted non-volatile, which at -O2 collapsed a loop of N volatile
+      # stores into a single store -- a wrong answer, not a lost optimisation.
+      # Non-volatile twins in the same fixture are the control.
+      - name: Volatile bitfield lowering gate
+        run: bash tests/regression/check_volatile_bitfield_split.sh
+
+      # A gate must not report a FAILURE that did not happen.  Under `set -o
+      # pipefail` a consumer that stops reading early (`head`, `grep -q`) kills
+      # its producer with SIGPIPE and the pipeline reports 141, so the negative
+      # branch runs although the pattern matched -- measured at 27-153 false
+      # failures per 20000 checks, and reproduced on a gate that failed about
+      # one run in three while the compiler emitted byte-identical output 400
+      # consecutive times.  Strict over every script CI runs.
+      - name: Pipefail/SIGPIPE detector
+        run: |
+          python3 scripts/check_pipefail_sigpipe.py --self-test
+          python3 scripts/check_pipefail_sigpipe.py
+
       # `check_volatile_pointer_subscript.sh` and `check_loop_preheader.sh`
       # are NOT repeated here. Both used to exist as standalone steps AND
       # inside the "Verify remaining fast local contracts" block below, so
@@ -716,6 +737,14 @@ jobs:
           # access semantics that no runtime comparison can observe.
           bash tests/regression/check_volatile_pointer_subscript.sh
           bash tests/regression/check_volatile_access_semantics.sh
+          # One entry, one preheader: a loop with several entries must not get a
+          # speculative load hoisted into a preheader that only one entry passes.
+          bash tests/regression/check_multi_entry_loop.sh
+          # A function DEFINITION's own `aligned(N)`, and the rule that an
+          # attribute REPLACES `-falign-functions` instead of merging with it
+          # (`aligned(1)` suppresses the directive).  Parameterized spellings
+          # plus two unannotated controls.
+          bash tests/regression/check_function_alignment_definition.sh
           # One comparison, one set of flags: cmov reads EFLAGS without
           # writing it, so a cmov chain sharing a condition needs one cmp.
           # Carries its own CCC_PEEPHOLE_SKIP negative control.

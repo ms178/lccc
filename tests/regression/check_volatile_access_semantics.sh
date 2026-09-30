@@ -9,7 +9,7 @@
 #  3. a dead-result volatile load must survive DCE
 #  4. *p through a pointer-to-volatile parameter must load
 #  5. volatile locals keep their RMW shape (no mem2reg promotion)
-set -uo pipefail
+set -euo pipefail
 
 CCC=${CCC:-./target/fastbuild/lccc}
 td=$(mktemp -d)
@@ -30,12 +30,22 @@ rc=0
 # signed-widening form selected for an i32 value on x86-64. RA-01 deliberately
 # turns ordinary PIE globals into `symbol(%rip)` accesses.
 load_pat='mov(l|slq) +[^,]*\(%[re]?[a-z0-9]+'
+# A volatile READ is an observable access whatever instruction performs it, so
+# the loop check cannot be spelled "there is a mov": `t += counter` selects the
+# tighter fused read-modify-write `addl counter(%rip), %esi` (one instruction
+# where GCC emits `movl counter(%rip), %ecx` + `addl %ecx, %edx`), and a
+# mov-only pattern reported that correct code as "volatile load eliminated".
+# What must not happen is the access disappearing from the loop, so the pattern
+# accepts any ALU instruction with a trailing memory operand — the memory
+# operand is last in AT&T, which is what keeps a *store* (`movl %eax,
+# counter(%rip)`) out of the match.
+read_pat='(mov[lbwlq]?|movs(bl|bq|wl|wq|lq)|add[lbwlq]?|sub[lbwlq]?|and[lbwlq]?|or[lbwlq]?|xor[lbwlq]?|cmp[lbwlq]?) +[^,]*\(%[re]?[a-z0-9]+'
 check() { # check <fn> <grep-pattern> <description>
     local fn=$1 pat=$2 desc=$3
     local body
     body=$(awk -v f="$fn" '$0==f":"{ins=1} ins{print} /^\.size/{if(ins)exit}' "$td/vol.s")
     if [ -z "$body" ]; then echo "FAIL: $fn not found"; rc=1; return; fi
-    if echo "$body" | grep -Eq "$pat"; then
+    if echo "$body" | grep -Ec "$pat" >/dev/null; then
         echo "ok: $desc"
     else
         echo "FAIL: $desc (pattern '$pat' not in $fn)"; rc=1
@@ -47,7 +57,10 @@ for lvl in O0 O1 O2 Os; do
     "$CCC" -$lvl -S "$td/vol.c" -o "$td/vol.s" || { echo "FAIL: compile at -$lvl"; rc=1; continue; }
     # 1. a real load of counter between the store and the return
     body=$(awk '/^read_after_store:/,/^\.size/' "$td/vol.s")
-    loads=$(echo "$body" | grep -Ec "$load_pat")
+    # `grep -c` exits 1 on a zero count, which under `set -e` would abort the
+    # whole script instead of reporting the one failed check.
+    loads=$(echo "$body" | grep -Ec "$load_pat" || true)
+    case $loads in ''|*[!0-9]*) echo "FAIL: load count unreadable ('$loads')"; rc=1; loads=0 ;; esac
     if [ "$loads" -ge 1 ]; then echo "ok: store-then-load reloads memory"; else echo "FAIL: volatile load forwarded/eliminated"; rc=1; fi
     # 2. the volatile read must happen INSIDE the loop, once per iteration.
     #
@@ -64,9 +77,9 @@ for lvl in O0 O1 O2 Os; do
         echo "FAIL: reads_in_loop has no backward branch (loop unrolled?)"; rc=1
     else
         tail_lbl=$(echo "$fn_body" | sed -n "${tail_ln}p" | grep -oE '\.[A-Za-z][A-Za-z0-9_]*' | tail -1)
-        head_ln=$(echo "$fn_body" | grep -n "^${tail_lbl}:" | head -1 | cut -d: -f1)
+        head_ln=$(echo "$fn_body" | grep -n "^${tail_lbl}:" | sed -n '1,1p' | cut -d: -f1)
         loop=$(echo "$fn_body" | sed -n "${head_ln},${tail_ln}p")
-        if echo "$loop" | grep -q 'counter'; then
+        if echo "$loop" | grep -c 'counter' >/dev/null; then
             echo "ok: loop keeps the volatile read in the body"
         else
             echo "FAIL: volatile read hoisted out of the loop body"
@@ -76,7 +89,7 @@ for lvl in O0 O1 O2 Os; do
         # NEGATIVE CONTROL: the loop must still be a loop. If the read
         # vanished because the whole loop was optimised away, the check
         # above would pass for the wrong reason.
-        if ! echo "$loop" | grep -qE '^[[:space:]]*j[a-z]+ +\.[A-Za-z]'; then
+        if ! echo "$loop" | grep -cE '^[[:space:]]*j[a-z]+ +\.[A-Za-z]' >/dev/null; then
             echo "FAIL: no back edge in the extracted loop region"; rc=1
         fi
     fi
@@ -86,7 +99,8 @@ for lvl in O0 O1 O2 Os; do
     check deref_param "$load_pat" "*volatile-ptr param loads"
     # 5. volatile local: store;load;store sequence
     body=$(awk '/^volatile_local:/,/^\.size/' "$td/vol.s")
-    n=$(echo "$body" | grep -Ec 'mov[a-z]* +[^#]*\(%(rsp|rbp|esp|ebp)')
+    n=$(echo "$body" | grep -Ec 'mov[a-z]* +[^#]*\(%(rsp|rbp|esp|ebp)' || true)
+    case $n in ''|*[!0-9]*) echo "FAIL: mem access count unreadable ('$n')"; rc=1; n=0 ;; esac
     if [ "$n" -ge 3 ]; then echo "ok: volatile local keeps RMW"; else echo "FAIL: volatile local promoted (mem access count $n < 3)"; rc=1; fi
 done
 
