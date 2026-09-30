@@ -1,0 +1,53 @@
+;;; x86-64-avx-vnni-int16-vex-and-evex-forms
+.text
+;;; Documented VEX.128/256 forms.
+vpdpwsud %xmm4, %xmm5, %xmm6
+vpdpwsud %ymm4, %ymm5, %ymm6
+vpdpwsud %xmm7, %xmm5, %xmm6
+vpdpwsud (%rax), %xmm5, %xmm6
+vpdpwsud 2032(%rax), %xmm5, %xmm6
+vpdpwsud (%rax), %ymm5, %ymm6
+vpdpwsud 4064(%rax), %ymm5, %ymm6
+{vex} vpdpwsud %ymm4, %ymm5, %ymm6
+vpdpwsuds %xmm4, %xmm5, %xmm6
+vpdpwsuds %ymm4, %ymm5, %ymm6
+vpdpwsuds (%rax), %xmm5, %xmm6
+vpdpwsuds 2032(%rax), %xmm5, %xmm6
+vpdpwsuds (%rax), %ymm5, %ymm6
+vpdpwsuds 4064(%rax), %ymm5, %ymm6
+;;; AVX10.2/AVX10-VNNI-INT EVEX extensions.
+vpdpwsud %zmm4, %zmm5, %zmm6
+vpdpwsud (%rax){1to4}, %xmm5, %xmm6
+vpdpwsud 508(%rax){1to8}, %ymm5, %ymm6{%k7}{z}
+vpdpwsud 8128(%rax), %zmm5, %zmm6{%k7}
+vpdpwsuds %zmm4, %zmm5, %zmm6{%k7}{z}
+vpdpwsuds (%rax){1to16}, %zmm5, %zmm6{%k7}
+vpdpwsuds 4064(%rax), %ymm5, %ymm6{%k7}
+
+;;; x86-64-avx-vnni-int16-reject-width-mismatch reject
+.text
+vpdpwsud %xmm1, %ymm2, %ymm3
+
+;;; x86-64-avx-vnni-int16-reject-zmm-mismatch reject
+.text
+vpdpwsud %zmm1, %zmm2, %ymm3
+
+;;; x86-64-avx-vnni-int16-reject-source-mask reject
+.text
+vpdpwsuds %zmm1{%k1}, %zmm2, %zmm3
+
+;;; x86-64-avx-vnni-int16-reject-wrong-broadcast-count reject
+.text
+vpdpwsud (%rax){1to4}, %ymm2, %ymm3
+
+;;; x86-64-avx-vnni-int16-reject-forced-vex-zmm reject
+.text
+{vex} vpdpwsud %zmm1, %zmm2, %zmm3
+
+;;; x86-64-avx-vnni-int16-reject-forced-vex-broadcast reject
+.text
+{vex} vpdpwsud (%rax){1to8}, %ymm2, %ymm3
+
+;;; x86-64-avx-vnni-int16-reject-operand-count reject
+.text
+vpdpwsud %xmm1, %xmm2

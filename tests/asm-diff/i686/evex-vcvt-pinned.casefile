@@ -1,0 +1,91 @@
+;;; vcvt-pinned-vex-x-y
+.text
+vcvtpd2psx %xmm1, %xmm2
+vcvtpd2psy %ymm3, %xmm4
+vcvtpd2psx (%eax), %xmm5
+vcvtpd2psy 4064(%eax), %xmm6
+vcvtpd2dqx (%eax), %xmm1
+vcvtpd2dqy 1016(%eax), %xmm2
+vcvttpd2dqx (%eax), %xmm3
+vcvttpd2dqy 1016(%eax), %xmm4
+
+;;; vcvt-pinned-evex-dq-vl
+.text
+vcvtpd2udqx (%eax), %xmm1
+vcvtpd2udqy %ymm2, %xmm3
+vcvttpd2udqx 2032(%eax), %xmm4
+vcvttpd2udqy %ymm5, %xmm6
+vcvtqq2psx (%eax), %xmm1
+vcvtqq2psy %ymm2, %xmm3
+vcvtuqq2psx (%eax), %xmm4
+vcvtuqq2psy %ymm5, %xmm6
+
+;;; vcvt-pinned-fp16-register-and-memory
+.text
+vcvtdq2phx %xmm1, %xmm2
+vcvtdq2phy %ymm3, %xmm4
+vcvtudq2phx (%eax), %xmm5
+vcvtudq2phy 4064(%eax), %xmm6
+vcvtps2phx %xmm1, %xmm2
+vcvtps2phxx (%eax), %xmm3
+vcvtps2phxy %ymm4, %xmm5
+vcvtpd2phx 2032(%eax), %xmm1
+vcvtpd2phy 4064(%eax), %xmm2
+vcvtpd2phz 8128(%eax), %xmm3
+vcvtqq2phx 2032(%eax), %xmm4
+vcvtqq2phy 4064(%eax), %xmm5
+vcvtqq2phz 8128(%eax), %xmm6
+vcvtuqq2phx 2032(%eax), %xmm1
+vcvtuqq2phy 4064(%eax), %xmm2
+vcvtuqq2phz 8128(%eax), %xmm3
+vcvtph2psx %xmm1, %xmm4
+
+;;; vcvt-pinned-bf16-dual-encoding
+.text
+vcvtneps2bf16 %ymm1, %xmm2
+vcvtneps2bf16x (%eax), %xmm3
+vcvtneps2bf16x 2032(%eax), %xmm3
+vcvtneps2bf16y (%eax), %xmm4
+vcvtneps2bf16y 4064(%eax), %xmm4
+{vex} vcvtneps2bf16 %xmm5, %xmm6
+{vex} vcvtneps2bf16x %xmm1, %xmm2
+{vex} vcvtneps2bf16y (%eax), %xmm3
+
+;;; vcvt-pinned-broadcast-counts
+.text
+vcvtpd2psx (%eax){1to2}, %xmm1
+vcvtpd2psy (%eax){1to4}, %xmm2
+vcvtpd2phx (%eax){1to2}, %xmm3
+vcvtpd2phy (%eax){1to4}, %xmm4
+vcvtpd2phz (%eax){1to8}, %xmm5
+vcvtneps2bf16x (%eax){1to4}, %xmm6
+vcvtneps2bf16y (%eax){1to8}, %xmm7
+
+;;; vcvt-pinned-evex-forced-on-vex-alias
+.text
+{evex} vcvtpd2psx (%eax), %xmm1
+{evex} vcvtpd2psy (%eax), %xmm2
+
+;;; vcvt-reject-ambiguous-unpinned-narrow-memory reject
+.text
+vcvtpd2ps (%eax), %xmm2
+
+;;; vcvt-reject-pinned-register-width-mismatch reject
+.text
+vcvtpd2psx %ymm1, %xmm2
+
+;;; vcvt-reject-pinned-destination-width-mismatch reject
+.text
+vcvtpd2phz (%eax), %ymm2
+
+;;; vcvt-reject-pinned-broadcast-width-mismatch reject
+.text
+vcvtpd2phx (%eax){1to4}, %xmm2
+
+;;; vcvt-reject-unsupported-z-spelling reject
+.text
+vcvtneps2bf16z (%eax), %ymm2
+
+;;; vcvt-reject-false-extra-x-suffix reject
+.text
+vcvtph2psxx %xmm1, %xmm2

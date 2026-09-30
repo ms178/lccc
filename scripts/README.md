@@ -15,7 +15,7 @@ Developer and research tooling. None of these are needed to build LCCC.
 | `realmode_corpus.sh` | Compare LCCC/GCC executable (`SHF_EXECINSTR`) bytes per `arch/x86/boot` C file under the real `-m16 -Os` flags. |
 | `asmdiff.py` | Whole-object differential against GNU as: section bytes, relocations, and symbols. See `tests/asm-diff/README.md`. |
 | `insndiff.py` | Per-instruction encoding differential against GNU as. Reduces an encoding bug to a single mnemonic in one step; supports `--sweep` over register/immediate matrices. A shorter-than-GAS encoding is reported as `BETTER` only after the tool disassembles both forms and confirms they decode identically. |
-| `encdiff.py` | Multi-assembler encoding differential: LCCC against GNU as **and** the Clang, GCC, ICC and ICX integrated assemblers over the Compiler Explorer API. A shorter result is a `BEATS` only after objdump round-trips it against every distinct shortest oracle encoding; missing/undecodable disassembly is reported as unverified and fails the gate. Casefile harvesting skips `reject` groups. |
+| `encdiff.py` | Multi-assembler encoding differential: LCCC against GNU as **and** the Clang, GCC, ICC and ICX integrated assemblers over the Compiler Explorer API. Supports x86-64 and i686 (`--32`, local `lccc-i686`/GAS `--32`, remote compiler `-m32`). A shorter result is a `BEATS` only after objdump round-trips it against every distinct shortest oracle encoding in the selected mode; missing/undecodable disassembly is reported as unverified and fails the gate. Casefile harvesting skips `reject` groups. |
 | `gen_encoding_sweep.py` | Generate instructions that have MORE THAN ONE legal encoding (accumulator short forms, imm8 sign-extension, redundant REX, VEX2-vs-VEX3, scale-1 index folds, ...). These are the only places an encoding can be improved, and most are invisible to a structural-coverage corpus. |
 | `gen_asmdiff_corpus.py` | Generate the `tests/asm-diff/*.casefile` corpora. Every case is validated against GNU as before being written. |
 | `gen_apx_asmdiff.py` | Generate `tests/asm-diff/apx.casefile`: REX2/EGPR/NDD/`{nf}`/`{evex}` plus the unsigned-imm32-into-EGPR size win (tagged `betterok`). |
@@ -75,7 +75,11 @@ legal encoding exists.
 
 `encdiff.py` exists for that second question. It assembles the same
 instruction with every reachable oracle and scores LCCC against the best
-result any of them produced. That is how the scale-1 index fold was found:
+result any of them produced. Use `--32 --lccc target/fastbuild/lccc-i686
+--casefiles tests/asm-diff/i686/*.casefile` for like-for-like i686 coverage:
+local GAS uses `--32`, remote GCC/Clang/ICC/ICX receive `-m32`, and semantic
+round trips use objdump's `i386` decoder. The default remains x86-64. That is
+how the scale-1 index fold was found:
 for `mov -1(,%rdi,1),%rcx`, GAS, clang, gcc and icx all emit 8 bytes while ICC
 emits 4, because ICC folds a scale-1 index into the base slot and drops the
 SIB byte. Comparing only against GAS would have shown a clean pass forever.

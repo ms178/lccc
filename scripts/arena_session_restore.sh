@@ -88,19 +88,22 @@ log "cargo: $(cargo --version 2>/dev/null || echo MISSING)"
 
 # ---- 3. host packages (kernel tree + -m32 oracle) ----------------------------
 if ! gcc -m32 -x c -o /dev/null - <<< 'int main(){return 0;}' 2>/dev/null \
+    || ! printf '#include <stdexcept>\nint main(){return 0;}\n' | g++ -m32 -x c++ -o /dev/null - 2>/dev/null \
     || ! command -v zstd >/dev/null 2>&1 || ! command -v qemu-system-x86_64 >/dev/null 2>&1; then
-    log 'installing apt deps (gcc-multilib, kernel tooling)'
+    log 'installing apt deps (gcc/g++-multilib, kernel tooling)'
     sudo apt-get update -qq >/dev/null 2>&1
     # The list is what scripts/prepare_kernel_tree.sh preflights, plus the 32-bit
-    # oracle: installing only part of it lets --with-kernel fail after the
-    # tarball download, which is the expensive part (observed: zstd missing for
-    # CONFIG_KERNEL_ZSTD=y on a restored sandbox).
+    # C and C++ oracles used by compiler/linker suites: installing only gcc-multilib
+    # lets i386 C++ DSO tests fail later with a missing bits/c++config.h.
+    # Installing only part of the kernel tooling also lets --with-kernel fail
+    # after the tarball download (observed: zstd missing for CONFIG_KERNEL_ZSTD=y).
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-        flex bison bc libelf-dev libssl-dev cpio gcc-multilib libc6-dev-i386 \
+        flex bison bc libelf-dev libssl-dev cpio gcc-multilib g++-multilib libc6-dev-i386 \
         zstd xz-utils lz4 lzop bzip2 kmod dwarves rsync qemu-system-x86 \
         >/dev/null 2>&1
 fi
-log "m32 oracle: $(gcc -m32 -x c -o /dev/null - <<< 'int main(){return 0;}' 2>/dev/null && echo OK || echo FAIL)"
+log "m32 C oracle: $(gcc -m32 -x c -o /dev/null - <<< 'int main(){return 0;}' 2>/dev/null && echo OK || echo FAIL)"
+log "m32 C++ oracle: $(printf '#include <stdexcept>\nint main(){return 0;}\n' | g++ -m32 -x c++ -o /dev/null - 2>/dev/null && echo OK || echo FAIL)"
 
 # ---- 4. git: remote + identity + executable bits ------------------------------
 # The harness snapshot excludes sensitive credential paths, and in practice it can
