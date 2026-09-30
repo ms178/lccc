@@ -61,6 +61,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -203,25 +204,62 @@ def _get(url: str, timeout: int = 120) -> list:
     raise last
 
 
+_LISTING_LOCK = threading.Lock()
+_LISTING: list | None = None
+_LISTING_FETCHED = False
+PROBE_VERSION = True
+
+
+def _compiler_listing() -> list | None:
+    """The whole CE compiler catalog: ONE request per process, not per compiler.
+
+    `/api/compilers` is the entire Compiler Explorer catalog -- megabytes of
+    JSON for every language and vendor.  The previous version of this code
+    fetched it once per compiler id, and `_run_one` calls
+    `_compiler_version` while building the record, i.e. BEFORE the cache
+    check.  So a sweep over five reference compilers issued five full catalog
+    downloads, concurrently and unsynchronised, and a sweep that was 100%
+    cache hits and completely offline still paid for all of them -- each up to
+    `_VERSION_TIMEOUT` seconds, twice, because `_get` retries once.  The old
+    docstring claimed "a sweep run offline must behave exactly as it did
+    before this existed", which was simply false.
+
+    Now the listing is fetched at most once, under a lock, and the
+    "fetched" flag is set even on failure so a dead network is not retried
+    once per compiler.
+    """
+    global _LISTING, _LISTING_FETCHED
+    if _LISTING_FETCHED:
+        return _LISTING
+    with _LISTING_LOCK:
+        if not _LISTING_FETCHED:
+            try:
+                _LISTING = _get(f"{CE}/compilers", timeout=_VERSION_TIMEOUT)
+            except _TRANSPORT:
+                _LISTING = None
+            _LISTING_FETCHED = True
+    return _LISTING
+
+
 def _compiler_version(cid: str) -> str | None:
     """Compiler Explorer's current version string for `cid`, or None.
 
-    One request per compiler per process.  A transport failure returns None
-    rather than raising: version drift detection is an improvement over
-    trusting a stale record, never a reason to fail a sweep, and a sweep run
-    offline must behave exactly as it did before this existed.
+    Memoised per compiler, and served from the process-wide listing above, so
+    N compilers cost one request.  A transport failure returns None rather
+    than raising: version drift detection is an improvement over trusting a
+    stale record, never a reason to fail a sweep.  `PROBE_VERSION = False`
+    (the `--no-version-probe` flag) skips it entirely, which is what an
+    offline or cache-replay run wants -- the probe is the only network call
+    a fully cached sweep would otherwise make.
     """
     if cid in _VERSION_PROBE:
         return _VERSION_PROBE[cid]
     version = None
-    try:
-        listing = _get(f"{CE}/compilers", timeout=_VERSION_TIMEOUT)
-        for c in listing or ():
+    if PROBE_VERSION:
+        for c in _compiler_listing() or ():
             if c.get("id") == cid:
                 version = c.get("version") or c.get("fullVersion") or None
                 break
-    except _TRANSPORT:
-        version = None
     _VERSION_PROBE[cid] = version
     return version
 
@@ -524,6 +562,11 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--list", action="store_true", help="list oracle compiler ids and exit")
+    ap.add_argument("--no-version-probe", action="store_true",
+                    help="do not fetch CE's compiler catalog to record "
+                         "versions; the only network call a fully cached "
+                         "sweep makes, so use this when offline or "
+                         "replaying a published table")
     ap.add_argument("--oracles", help="comma-separated Compiler Explorer ids")
     ap.add_argument("--oracle-set", choices=sorted(ORACLE_SET), default="default")
     ap.add_argument("--filter", default="", help="substring filter on program name")
@@ -553,8 +596,9 @@ def main(argv=None) -> int:
                     help="print the persistent cache's record counts and exit")
     a = ap.parse_args(argv)
 
-    global USE_CACHE
+    global USE_CACHE, PROBE_VERSION
     USE_CACHE = not a.no_cache
+    PROBE_VERSION = not a.no_version_probe
 
     if a.cache_stats:
         st = godbolt_cache.stats()

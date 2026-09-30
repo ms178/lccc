@@ -10876,6 +10876,26 @@ def _registry(args, oracles):
     return reg
 
 
+
+def missing_required_oracles(oracles, required):
+    """Which of `required` are not present in `oracles` (list of (name, cmd)).
+
+    The script-path cross-check is a QUORUM: its whole value is that two
+    independent linkers agreed. If lld is absent, `incapable` correctly
+    excludes mold, `floor` drops to `min(2, 1)`, and the suite certifies a
+    SINGLE opinion -- still PASS. That is the right answer to "what can this
+    host prove", and the wrong answer to "is this CI job proving what its
+    own comment says it proves": the workflow installs lld precisely so the
+    quorum has two members, and nothing checked that it did.
+
+    This function is module scope and unit-tested for the same reason
+    `reloc_oracle_agreement` is: a fail-open that only ever runs on hosts
+    that are fully stocked is a fail-open nobody ever sees fail.
+    """
+    have = {name for name, _ in oracles}
+    return [r for r in required if r not in have]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--lccc", default=DEFAULT_LCCC)
@@ -10888,6 +10908,11 @@ def main():
     ap.add_argument("--json", metavar="FILE", help="also write the results as JSON")
     ap.add_argument("--strict", action="store_true",
                     help="fail on SKIP and WARN results too (CI mode)")
+    ap.add_argument("--require-oracles", metavar="NAMES", default="",
+                    help="comma-separated oracles that MUST be registered; "
+                         "the run fails before executing anything if any is "
+                         "missing, so CI cannot silently certify a narrower "
+                         "quorum than its comment claims")
     args = ap.parse_args()
     # Many cases execute the driver from a temporary working directory. Keep a
     # caller-supplied relative path anchored to the invocation directory.
@@ -10920,6 +10945,21 @@ def main():
     if have_wild:
         wildpath = shutil.which("wild")
         oracles.append(("wild", [CC, f"-B{os.path.dirname(_wild_shim(wildpath))}"]))
+
+    required = [n.strip() for n in args.require_oracles.split(",") if n.strip()]
+    missing = missing_required_oracles(oracles, required)
+    if missing:
+        print(
+            "FAIL: required differential oracles not registered: "
+            + ", ".join(missing)
+            + f"\n  registered: {', '.join(n for n, _ in oracles) or '(none)'}"
+            + "\n  This run would still pass, but on a narrower quorum than"
+              "\n  the job claims to check. Either install the missing"
+              " oracle(s) or drop\n  them from --require-oracles and say so in"
+              " the workflow comment.",
+            file=sys.stderr,
+        )
+        return 2
 
     registry = _registry(args, oracles)
     if args.list:

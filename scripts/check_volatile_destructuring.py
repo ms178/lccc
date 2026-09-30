@@ -43,6 +43,58 @@ Fail-closed: an unparseable file, or a body the scanner cannot delimit, is a
 violation rather than a skip.  A rule that cannot read the code must not
 report the code clean.
 
+WHAT IT CANNOT SEE
+------------------
+Four refactors remove a volatile guard and leave the code compiling.  Three
+of them are invisible here, and all four are pinned in `--self-test` as
+EXPECTED results so the gap is written down rather than assumed away:
+
+  1. `volatile: _`                       BY DESIGN.  The rule above calls
+     this the reviewable opt-out: it is an explicit statement that
+     volatility was considered and does not matter, which is a different
+     claim from "nobody looked".  It is a hole only if a reviewer reads
+     past it.
+  2. A `..` arm that never names the field.  `Instruction::Load { .. }`
+     binds nothing, so this ratchet is not invoked at all -- there is no
+     `volatile` binding to check.  Closing it means requiring every
+     Load/Store pattern in the memory-motion passes to name `volatile`,
+     and 353 existing `..` patterns in `src/` would have to be made to.
+  3. A use that is only a debug print.  This one WAS a hole -- the
+     docstring above promised to catch exactly this -- and is now closed:
+     `_is_debug_only_use` does not count a `volatile` that only reaches
+     a logging macro.
+  4. A SIBLING arm's use.  The window is a line distance
+     (`USE_DISTANCE_LINES`), not an arm boundary, so in
+
+         match inst {
+             Instruction::Load  { ptr, ty, volatile, .. } => { log!(volatile); .. }
+             Instruction::Store { .., volatile } => { .. *volatile .. }
+         }
+
+     the Store arm's legitimate use sits inside the Load arm's window and
+     satisfies it.  Fixing this means re-deriving the arm boundary, which
+     the design above deliberately avoids; it is a parser, not a regex
+     query, and is the single highest-value thing this gate could grow.
+
+None of the four is a reason not to run the gate: each still catches the
+plain "bound and never read" case, which is the common one.
+
+A COMPILER-NATIVE BACKSTOP, AND WHY IT IS NOT WIRING YET
+--------------------------------------------------------
+rustc's own `unused_variables` would cover blind spots 2-4 for free, and
+`--self-test` says why it is not simply switched on.  `src/lib.rs` carries
+a crate-wide `#![allow(dead_code, unused_variables, ...)]`, so lifting it
+surfaces 87 warnings, 18 of them in `src/passes/vectorize.rs` (27k lines),
+6 in `codegen/memory.rs`, 3 in `local_patterns.rs`, 2 in `memory_fold.rs`;
+LICM, GVN, DSE and if-convert are already clean.  Scoping the lint to the
+memory-motion modules is therefore ~29 fixes -- worth doing, and worth
+doing as its own change rather than inside a codegen fix.
+
+It was measured here before being deferred, and the answer is mildly
+reassuring: NONE of the 18 `vectorize.rs` unused variables is a `volatile`
+binding, so there is no instance of this bug class hiding in the most
+volatile-heavy pass in the tree.
+
 Self-test
 ---------
 `--self-test` runs the detector over synthetic snippets -- including the
@@ -81,6 +133,42 @@ _ACCESS_RE = re.compile(r"Instruction::(?P<kind>Load|Store)\s*\{")
 # finds a "use" and the dropped flag ships.  Only a bare mention counts, which
 # is what `*volatile`, `!volatile`, `volatile &&` and `(&volatile)` all are.
 _USE_RE = re.compile(r"\bvolatile\b(?!\s*:)")
+
+# A `volatile` that only reaches a LOGGING macro is not a guard. It is the
+# single most realistic way to delete a volatile check without deleting the
+# binding: `if !ty.is_128bit() || volatile || ...` becomes
+# `if !ty.is_128bit() || ...`, and the field is kept alive by a debug print.
+# The binding still compiles, still counts as "used" to rustc, and the gate's
+# own docstring promises to catch exactly this -- so a plain word search
+# reports the file clean while the guard is gone.
+#
+# The window scanned is from the start of the `volatile` occurrence back to
+# the nearest line/statement/block boundary. Anything not recognised as a
+# logging macro still counts as a real use, so this errs towards permissiveness
+# and cannot invent a violation out of an ordinary guard.
+_LOG_MACRO_RE = re.compile(
+    r"\b(?:eprint|print|dbg|panic|unreachable|todo|unimplemented|assert|"
+    r"assert_eq|assert_ne|debug|trace|info|warn|error|log)"
+    r"!\s*[\[(]"
+)
+
+
+def _is_debug_only_use(src: str, pos: int) -> bool:
+    """True when the `volatile` at `pos` sits inside a logging macro call."""
+    start = max(
+        src.rfind("\n", 0, pos),
+        src.rfind(";", 0, pos),
+        src.rfind("{", 0, pos),
+    ) + 1
+    return bool(_LOG_MACRO_RE.search(src, start, pos))
+
+
+def _has_real_use(src: str, lo: int, hi: int) -> bool:
+    """True when the window contains a `volatile` use that is not a debug print."""
+    for m in _USE_RE.finditer(src, lo, hi):
+        if not _is_debug_only_use(src, m.start()):
+            return True
+    return False
 # Tokens that put the following `Instruction::Load { .. }` in PATTERN position.
 # `if let X { .. } = e` and `match e { X { .. } => .. }` both introduce a
 # pattern; the `=` that follows the pattern is outside the window we look at,
@@ -434,7 +522,7 @@ def check_source(text: str, origin: str) -> list[str]:
                 f"inside a {span}-line block, past the {MAX_SCAN_LINES}-line "
                 f"scan cap; refusing to claim this site is clean")
             continue
-        if not _USE_RE.search(src, close_idx + 1, end):
+        if not _has_real_use(src, close_idx + 1, end):
             violations.append(
                 f"{origin}:{line}: binds `volatile` from Instruction::{kind} "
                 f"and never uses it -- an observable-access guard was dropped "
@@ -604,6 +692,53 @@ _SELF_TEST_CASES = [
          if let Instruction::Load { ptr, volatile, .. } = inst { helper(ptr)
      }
      """, True),
+    # ── the three documented blind spots, pinned so they stay documented ──
+    # Each of these is a refactor that removes a volatile guard and leaves the
+    # binding compiling. They are recorded as EXPECTED RESULTS, not as
+    # expectations that they should one day fail: the gate cannot see them,
+    # and a gate that quietly stops checking something is worse than one that
+    # says so.
+    ("blind spot: guard deleted, binding kept alive by a debug print",
+     """
+     fn f(inst: &Instruction) -> bool {
+         if let Instruction::Load { ptr, ty, volatile, .. } = inst {
+             eprintln!("volatile={volatile}");
+             helper(ptr, ty)
+         } else { false }
+     }
+     """, True),
+    ("blind spot: a SIBLING arm's use satisfies the window",
+     """
+     fn f(inst: &Instruction) -> bool {
+         match inst {
+             Instruction::Load { ptr, ty, volatile, .. } => {
+                 eprintln!("volatile={volatile}");
+                 helper(ptr, ty)
+             }
+             Instruction::Store { val, ptr, ty, seg_override, volatile } => {
+                 helper(ptr, ty, *volatile, val, seg_override)
+             }
+             _ => false,
+         }
+     }
+     """, False),
+    ("by design: `volatile: _` is the reviewable opt-out",
+     """
+     fn f(inst: &Instruction) -> bool {
+         if let Instruction::Load { ptr, ty, volatile: _, .. } = inst {
+             helper(ptr, ty)
+         } else { false }
+     }
+     """, False),
+    ("blind spot: a `..` arm never mentions volatile at all",
+     """
+     fn f(inst: &Instruction) -> bool {
+         match inst {
+             Instruction::Load { .. } => helper(inst),
+             _ => false,
+         }
+     }
+     """, False),
 ]
 
 

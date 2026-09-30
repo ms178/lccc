@@ -37,9 +37,19 @@ jobs:
       # in addition to `bfd` because it is the oracle that implements linker
       # scripts -- mold accepts -T but its parser rejects even a minimal
       # SECTIONS, so with mold alone every script-path relocation cross-check
-      # had a single opinion, which is not a cross-check.  The suite probes
-      # script capability structurally per oracle, so this stays honest even
-      # on a host where one of them is missing.
+      # would have a single opinion, which is not a cross-check.
+      #
+      # Two independent safeguards, because either alone is insufficient:
+      #   * The suite infers a per-oracle `incapable` verdict from the LINKER
+      #     DIAGNOSTIC (a regex for "linker script"/"t.ld" in stderr), which
+      #     excludes mold from the script-path quorum rather than counting its
+      #     silence as agreement.  That is a negative inference, not a probe:
+      #     it can be fooled by a diagnostic that quotes the script name.
+      #   * `--require-oracles bfd,lld` below makes the run FAIL if lld is not
+      #     actually registered, which is the failure this job is most exposed
+      #     to -- the `apt-get install` can succeed, or appear to, without the
+      #     oracle being usable, and without this flag the suite would still
+      #     return PASS on a one-member quorum.
       - name: Install differential linker oracles
         run: |
           sudo apt-get update
@@ -242,12 +252,12 @@ jobs:
         run: bash tests/regression/check_volatile_spin_loop.sh
 
       # `check_volatile_pointer_subscript.sh` and `check_loop_preheader.sh`
-      # are NOT repeated here. Both used to exist as standalone steps AND
-      # inside the "Verify remaining fast local contracts" block below, so
-      # each ran twice -- and the standalone copy ran with no `CCC` exported,
-      # i.e. against whatever the gate's own default resolves to, which is a
-      # strictly weaker check than the one that actually has a binary in
-      # hand. They now run exactly once, in the block that sets CCC.
+      # run here and NOT in the "Verify remaining fast local contracts" block
+      # below, so each runs exactly once. This copy is the one that has `CCC`
+      # set for it; a second copy inside that block would run the gate
+      # against its own default compiler resolution instead of the binary the
+      # job just built, which is a strictly weaker check. Keep the two lists
+      # in sync -- scripts/check_ci_gate_parity.py enforces the ci_local half.
 
       - name: Fuzz harness verdict tests
         run: python3 -m unittest discover -s tests/fuzz -p 'test_*.py'
@@ -833,6 +843,7 @@ jobs:
           LCCC_RELOCS_TOOL="$HOME/.cache/lccc-kernel-tools/bin/relocs" \
             python3 tests/linker/run_linker_tests.py \
               --lccc target/fastbuild/lccc --strict -v \
+              --require-oracles bfd,lld \
               --json "$RUNNER_TEMP/linker-results.json"
 
       # Passing cases delete their scratch directories, so what remains is

@@ -251,20 +251,20 @@ AGREEMENT_CASES += [
     #    that could answer, and never let the exclusion hide a disagreement.
     _case("an incapable oracle is excluded; quorum is over the capable ones",
           _notes(bfd=_n("refused"), lld=_n("refused"),
-                 mold=_n("incapable", 1, b"cannot parse a -T linker scriptb")),
+                 mold=_n("incapable", 1, b"cannot parse a -T linker script")),
           THREE_LLD, "PASS", "not counted"),
     _case("incapable does not rescue a disagreement",
           _notes(bfd=_n("refused"), lld=_n("accepted", 0),
-                 mold=_n("incapable", 1, b"cannot parse a -T linker scriptb")),
+                 mold=_n("incapable", 1, b"cannot parse a -T linker script")),
           THREE_LLD, "FAIL", "disagree"),
     _case("incapable does not rescue a silent refusal",
           _notes(bfd=_n("refused"), lld=_n("silent"),
-                 mold=_n("incapable", 1, b"cannot parse a -T linker scriptb")),
+                 mold=_n("incapable", 1, b"cannot parse a -T linker script")),
           THREE_LLD, "FAIL", "disagree"),
     _case("every oracle incapable is not a vacuous PASS",
-          _notes(bfd=_n("incapable", 1, b"cannot parse a -T linker scriptb"),
-                 lld=_n("incapable", 1, b"cannot parse a -T linker scriptb"),
-                 mold=_n("incapable", 1, b"cannot parse a -T linker scriptb")),
+          _notes(bfd=_n("incapable", 1, b"cannot parse a -T linker script"),
+                 lld=_n("incapable", 1, b"cannot parse a -T linker script"),
+                 mold=_n("incapable", 1, b"cannot parse a -T linker script")),
           THREE_LLD, "FAIL"),
     _case("incapable narrows the quorum honestly, and says so",
           _notes(bfd=_n("refused"), mold=_n("incapable", 1, b"no -T support")),
@@ -285,6 +285,33 @@ AGREEMENT_CASES += [
 
 
 
+REQUIRED_CASES = [
+    # (label, oracles, required, want_missing)
+    ("a fully stocked host satisfies bfd,lld",
+     [("bfd", []), ("lld", []), ("mold", [])], ["bfd", "lld"], []),
+    ("a host without lld is caught -- the silent-narrowing case",
+     [("bfd", []), ("mold", [])], ["bfd", "lld"], ["lld"]),
+    ("bfd alone cannot satisfy a two-oracle quorum",
+     [("bfd", [])], ["bfd", "lld"], ["lld"]),
+    ("mold present but lld absent is still missing",
+     [("bfd", []), ("mold", []), ("wild", [])], ["lld"], ["lld"]),
+    ("an empty requirement is always satisfied",
+     [("bfd", [])], [], []),
+    ("every missing name is reported, not just the first",
+     [("bfd", [])], ["bfd", "lld", "mold"], ["lld", "mold"]),
+]
+
+
+def _required_cases(RLT):
+    out = []
+    for label, oracles, required, want in REQUIRED_CASES:
+        got = RLT.missing_required_oracles(oracles, required)
+        ok = got == want
+        detail = "" if ok else "want %r, got %r" % (want, got)
+        out.append((label, ok, detail))
+    return out
+
+
 def main() -> int:
     failures = 0
     print("== reloc_oracle_verdict ==")
@@ -300,13 +327,20 @@ def main() -> int:
         print("  %-4s %s" % ("ok" if ok else "FAIL", name))
         if not ok:
             print("        %s" % detail)
+    print("== missing_required_oracles ==")
+    req = _required_cases(RLT)
+    for name, ok, detail in req:
+        failures += 0 if ok else 1
+        print("  %-4s %s" % ("ok" if ok else "FAIL", name))
+        if not ok:
+            print("        %s" % detail)
     print()
-    total = len(VERDICT_CASES) + len(AGREEMENT_CASES)
+    total = len(VERDICT_CASES) + len(AGREEMENT_CASES) + len(req)
     if failures:
         print("FAILED: %d of %d cases" % (failures, total))
         return 1
-    print("PASS: all %d cases (%d verdict, %d agreement)" % (
-        total, len(VERDICT_CASES), len(AGREEMENT_CASES)))
+    print("PASS: all %d cases (%d verdict, %d agreement, %d required)" % (
+        total, len(VERDICT_CASES), len(AGREEMENT_CASES), len(req)))
     return 0
 
 

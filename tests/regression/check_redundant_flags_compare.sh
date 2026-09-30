@@ -111,7 +111,7 @@ CCC_PEEPHOLE_SKIP=flags_compare \
 #     what it tests. Match any byte register instead.
 hot() { awk '/^\.LBB[0-9]+:/{blk=$0; buf=""} {buf=buf"\n"$0}
         /cmovb/{seen[blk]=buf} END{for(b in seen) print seen[b]}' "$1" \
-        | awk '/^[[:space:]]+cmpb \$-128, %[a-z0-9]+b$/ {n++} END{print n+0}'; }
+        | awk '/^[[:space:]]+cmpb \$-128, %([a-z0-9]+b|[abcd]l|sil|dil|bpl|spl)$/ {n++} END{print n+0}'; }
 
 on=$(hot "$work/on.s"); off=$(hot "$work/off.s")
 
@@ -122,7 +122,13 @@ else
     fail=1
 fi
 
-ncmov=$(grep -cE '^[[:space:]]+cmovb' "$work/on.s")
+# `grep -c` exits 1 when it matches nothing. Under the script's `set -euo
+# pipefail`, that aborts the whole gate, so the "only $ncmov cmovb in the
+# function" message below was unreachable and the negative control never
+# ran: a regression that removed both cmovs surfaced as a bare exit 1 with
+# no output at all. `|| true` keeps the count and lets each check own its
+# own diagnostic.
+ncmov=$(grep -cE '^[[:space:]]+cmovb' "$work/on.s" || true)
 if [ "$ncmov" -ge 2 ]; then
     note "shape: $ncmov cmovb present, so the fold removed a cmp and not a cmov"
 else

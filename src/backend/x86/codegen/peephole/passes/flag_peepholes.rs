@@ -2035,8 +2035,40 @@ pub(super) fn fold_redundant_flags_compare(store: &LineStore, infos: &mut [LineI
             j += 1;
             continue;
         };
-        // Refuse memory operands: see the module note above.
-        if a.contains('(') || b.contains('(') || a.contains('[') || b.contains('[') {
+        // Positive allowlist, NOT a "looks like memory" heuristic.
+        //
+        // The previous test was `a.contains('(') || b.contains('(') ||
+        // a.contains('[') || b.contains('[')`. It could not see two operand
+        // shapes the backend really emits:
+        //
+        //   * `%fs:sym@TPOFF` -- the TLS fast path (`try_emit_tls_direct_
+        //     load` / `..._store` in x86/codegen/emit.rs) addresses
+        //     thread-local storage segment-relatively, with no `(` and no
+        //     `[`;
+        //   * a bare symbol (`cmpl $0, counter`) -- likewise, an absolute
+        //     address with neither delimiter.
+        //
+        // Both slipped through, and both then read as *register* compares:
+        // `register_family_fast` returns `REG_NONE` for them, so the clobber
+        // checks below were skipped entirely, and a store to that address
+        // between two textually identical compares was folded away --
+        // deleting the second compare and leaving the `cmov` reading flags
+        // that described a value the intervening store had already replaced.
+        //
+        // This was the one memory-operand test in the whole peephole
+        // directory that rejected on neither `:` nor `!is_reg_or_imm`
+        // (cf. `load_op_fuse::accesses_memory`, `dead_writes.rs:218,552`,
+        // `local_patterns.rs:3420`, `memory_fold.rs:2742`,
+        // `assembler/parser.rs:1666`). Those all use the positive form, which
+        // is why this one is being replaced rather than merely widened.
+        //
+        // An operand is accepted only if it is an immediate or a plain GP
+        // register. Everything else -- memory, a symbol, a segment override,
+        // a high-byte register the family table does not name -- is refused.
+        // Refusing a foldable compare only costs one `cmp`; accepting an
+        // unfoldable one is a miscompile, so the asymmetry is deliberate.
+        let operand_ok = |op: &str| op.starts_with('$') || plain_gp_operand(op).is_some();
+        if !operand_ok(a) || !operand_ok(b) {
             j += 1;
             continue;
         }
@@ -3295,6 +3327,114 @@ mod tests {
         out.matches("cmpb $-128,").count()
     }
 
+    /// A compare whose operand is neither an immediate nor a plain register
+    /// must never be folded, however memory-free it *looks*. "No `(` and no
+    /// `[`" is not the same as "not memory": the TLS fast path emits
+    /// `%fs:sym@TPOFF`, and an absolute symbol is spelled with no delimiter
+    /// at all. Both used to read as register compares -- `register_family_fast`
+    /// answers `REG_NONE` for them, so the clobber checks were skipped and
+    /// the pass deleted the second compare across an intervening store.
+    #[test]
+    fn flags_compare_refuses_operands_that_are_not_immediate_or_register() {
+        for (label, op) in [
+            ("TLS segment-relative", "%fs:x@TPOFF"),
+            ("TLS, lowercase spelling", "%fs:x@tpoff"),
+            ("bare symbol", "counter"),
+        ] {
+            let asm = format!(
+                "main:\n    .cfi_startproc\n    cmpl $0, {op}\n    movl $1, {op}\n    \
+                 cmpl $0, {op}\n    cmovl %esi, %edi\n    .cfi_endproc\n    ret\n"
+            );
+            let out = run(&asm);
+            assert_eq!(
+                out.matches("cmpl $0,").count(),
+                2,
+                "{label} (`{op}`): the intervening store invalidates the second \
+                 compare, so both must survive:\n{out}"
+            );
+        }
+    }
+
+    /// The surviving compare must be the FIRST one, not merely *a* compare.
+    /// `n_cmp` reports the same answer whichever one the pass deleted, so the
+    /// count alone cannot see a pass that folds backwards. Order can: the
+    /// earlier compare is the one the intervening region is flag-compatible
+    /// with, so it has to be the survivor.
+    #[test]
+    fn flags_compare_keeps_the_first_of_the_pair() {
+        let out = run(&two_cmp_case("movq %rsi, %rdx"));
+        assert_eq!(
+            out.matches("cmpb $-128,").count(),
+            1,
+            "exactly one compare should fold:\n{out}"
+        );
+        let first_cmov = out.find("cmovb").expect("the cmov chain must survive");
+        let surviving_cmp = out.find("cmpb $-128,").expect("a compare must survive");
+        assert!(
+            surviving_cmp < first_cmov,
+            "the surviving compare must come FIRST, because the cmov that \
+             follows it reads its flags. A compare that survives *after* a \
+             cmov means the pass deleted the wrong one:\n{out}"
+        );
+    }
+
+    /// A `cmov` between the two compares BLOCKS the fold, and it must.
+    /// `cmovcc %rsi, %rcx` writes `%rcx`, which is the very register the
+    /// compare reads, so the second `cmp` is not redundant -- folding it
+    /// would leave the following `cmov` reading the flags of a comparison
+    /// against a value the `cmov` has already replaced. The pass catches
+    /// this on `reg_refs`, not on `preserves_eflags` (a `cmov` genuinely
+    /// leaves EFLAGS alone, and `preserves_eflags` says so).
+    ///
+    /// This is also the reason the emitted shape has its `cmov`s on the
+    /// TAIL -- `cmp; cmp; cmov; cmov`, "one comparison feeds the cmov
+    /// chain" -- rather than between the compares: there is nothing left
+    /// to fold once a `cmov` has clobbered the compared register.
+    #[test]
+    fn flags_compare_refuses_across_a_cmov_that_writes_the_compared_register() {
+        let out = run(&cmov_chain_case());
+        assert_eq!(
+            out.matches("cmpb $-128,").count(),
+            2,
+            "the intervening cmov writes %rcx, so both compares are live:\n{out}"
+        );
+    }
+
+    /// `cmp; cmov; mov; cmp; cmov` -- the shape a `cmov` in the window
+    /// produces when the compared register is NOT the one the `cmov` writes.
+    /// Here the fold is legal and must fire, and again the FIRST compare is
+    /// the survivor.
+    #[test]
+    fn flags_compare_folds_across_a_cmov_that_writes_a_different_register() {
+        let asm = "main:\n    .cfi_startproc\n    cmpb $-128, %rcx\n    \
+                   cmovb %rsi, %rdx\n    movq %rsi, %r8\n    \
+                   cmpb $-128, %rcx\n    cmovb %rsi, %rdx\n    \
+                   .cfi_endproc\n    ret\n";
+        let out = run(asm);
+        assert_eq!(
+            out.matches("cmpb $-128,").count(),
+            1,
+            "the cmov writes %rdx and the mov writes %r8, so %rcx is untouched \
+             and the second compare folds:\n{out}"
+        );
+        let surviving_cmp = out.find("cmpb $-128,").expect("a compare must survive");
+        let first_cmov = out.find("cmovb").expect("the cmov chain must survive");
+        assert!(
+            surviving_cmp < first_cmov,
+            "the first compare must survive:\n{out}"
+        );
+    }
+
+    /// The `cmp; cmov; mov; cmp; cmov` shape that a `cmov` writing the
+    /// compared register produces. See the test above for why it must not
+    /// fold.
+    fn cmov_chain_case() -> String {
+        "main:\n    .cfi_startproc\n    cmpb $-128, %rcx\n    cmovb %rsi, %rcx\n    \
+         movq %rsi, %rdx\n    cmpb $-128, %rcx\n    cmovb %rsi, %rcx\n    \
+         .cfi_endproc\n    ret\n"
+            .to_string()
+    }
+
     /// A flag-preserving, non-clobbering line between two identical compares:
     /// the exact redundancy this pass exists to remove. If this ever stops
     /// folding, the pass has become a pessimisation and every other test below
@@ -3330,7 +3470,7 @@ mod tests {
             "daa",                        // AF/CF
             "kortestw %ax, %bx",          // ZF/CF
             "fcomip %st(1)",              // ZF/PF/CF
-            "fcomip %st(1)",              // ZF/PF/CF
+            "fucomip %st(1)",             // ZF/PF/CF, the commuting variant
             "pcmpistri $0, (%rax), %rdx", // ZF/CF/SF/OF + EAX
         ] {
             let out = run(&two_cmp_case(mid));

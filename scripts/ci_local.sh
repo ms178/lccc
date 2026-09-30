@@ -834,7 +834,8 @@ if [ -x target/fastbuild/lccc-ld ]; then
         PATH="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin:$PATH" \
         LCCC_REQUIRE_I386=1 \
         LCCC_RELOCS_TOOL="$HOME/.cache/lccc-kernel-tools/bin/relocs" \
-        python3 tests/linker/run_linker_tests.py --lccc target/fastbuild/lccc --strict
+        python3 tests/linker/run_linker_tests.py --lccc target/fastbuild/lccc --strict \
+        --require-oracles bfd,lld
 else
     echo "SKIP  linker fuzz + linker suite (target/fastbuild/lccc-ld not built)"
     SKIPPED=$((SKIPPED + 4))

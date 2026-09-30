@@ -127,3 +127,68 @@ why it is a follow-up and not a regression.
 4. Re-measure with Callgrind across the corpus; only then consider flipping
    `CCC_LOOP_ROTATE` to default. Do not flip it on a wall-clock hunch — the
    `setcc` regression above is invisible in aggregate cycle counts.
+
+## Re-verified on the merged tree (2026-09-30, after PR #695)
+
+The numbers above were measured on the pre-merge branch. Re-measured on the
+merged main (`ec08e6a6`) plus the audit fixes, to confirm nothing in the
+merged state changed the picture. It did not.
+
+`unsigned long f(const unsigned char *v, int n) { for (i=0;i<n;i++) s+=v[0]; }`
+
+| build | loop body | insn/iter |
+| --- | --- | --- |
+| `-O2` (default) | `movzbl (%rdi),%r9d; addq %r9,%rdx; cmpl %esi,%r8d; jl .LBB2` | **4** |
+| `-O2 CCC_LOOP_ROTATE=1` | `movzbl (%rdi),%edx; addq %rdx,%r8; setl %dil; movzbl %dil,%edi; testb %dil,%dil; jne .LBB3` | **6** |
+
+`CCC_DEBUG_CMP_FUSE=1` still names the same refusal:
+
+```
+[CMPFUSE] refusing non-legacy fusion (setcc_fam=7 setcc_live_after=Some(true)
+                                      relay_live_after=Some(Some(true)))
+```
+
+So rotation is still a 2-instruction-per-iteration LOSS on this shape, which is
+why it stays opt-in and why the fusion is the prerequisite rather than a
+nice-to-have. Note `setcc_fam=7` (`%dil`): the earlier note's `%r8b` is the
+same defect at a different register allocation, so the reproduction is
+register-agnostic.
+
+### Sharper root cause: it is the `ret_live` seed, not the fixpoint
+
+The note above says the fixpoint "cannot prove liveness across a backward
+edge" and suggests the loop header's live-in is seeded wrong. Having read
+`passes/liveness.rs`, the mechanism is more specific and more fixable than
+that:
+
+The backward dataflow itself is correct — `inn = eff.reads | (out & !eff.writes)`
+iterated to a fixpoint over reverse line order, converging in the round bound.
+The pessimism enters through the **exit seed**, at
+
+```rust
+if succs[rel].is_empty() {
+    out |= ret_live; // fell off the end: be conservative
+}
+```
+
+`ret_live` is derived from return-value classification markers
+(`ret_rdx_marker`, `ret_rax_marker`) and, when the marker is absent or
+illegible, deliberately keeps the conservative bit. In the rotation shape the
+loop-exit edge falls off the end of the analysed window, so the guard block's
+live-out takes that conservative value, `r8`/`dil` is live-in at the `jne`,
+and the fusion refuses — even though the register is defined by `setcc` two
+instructions earlier and is dead on every path out of the block, the back edge
+included.
+
+So the fix is to make the exit seed **precise for a function that ends in a
+real `ret` with a known return classification**, not to change the dataflow.
+Two properties make that safe to do as its own change:
+
+* every consumer of this analysis gates **fail-closed**, so a precision
+  improvement can only turn refusals into transformations, never the reverse;
+* `ret_rax_marker` already demonstrates the shape of the change — it drops the
+  RAX bit when the signature says the function is pure-SSE/x87-returning.
+
+The measurement that must gate it: every consumer's own gate, plus a
+corpus-wide Callgrind comparison, because "more fusions" is not automatically
+"better" and a mis-fused compare-branch is a miscompile.
