@@ -12374,7 +12374,11 @@ fn demask_value_positions(expr: MapExpr) -> MapExpr {
                 // Already-canonical `mask & 1`: keep the mask in condition
                 // position instead of demasking it a second time.
                 if is_demasked_bool(op, &l, &r) {
-                    let (m, one) = if is_lane_mask(&l) { (*l, *r) } else { (*r, *l) };
+                    let (m, one) = if is_lane_mask(&l) {
+                        (*l, *r)
+                    } else {
+                        (*r, *l)
+                    };
                     return MapExpr::BinOp(
                         IrBinOp::And,
                         Box::new(go(m, false)),
@@ -27163,11 +27167,7 @@ mod map_expr_interpreter_tests {
         }
 
         fn cmp(op: IrCmpOp, stream: usize, value: i32) -> MapExpr {
-            MapExpr::Cmp(
-                op,
-                Box::new(MapExpr::Load(stream)),
-                Box::new(constant(value)),
-            )
+            MapExpr::Cmp(op, Box::new(MapExpr::Load(stream)), Box::new(constant(value)))
         }
 
         fn bin(op: IrBinOp, lhs: MapExpr, rhs: MapExpr) -> MapExpr {
@@ -27186,22 +27186,10 @@ mod map_expr_interpreter_tests {
         }
 
         let trees: Vec<(&str, MapExpr)> = vec![
-            (
-                "a + (b > k)",
-                bin(IrBinOp::Add, MapExpr::Load(0), cmp(IrCmpOp::Slt, 1, 5)),
-            ),
-            (
-                "a - (b > k)",
-                bin(IrBinOp::Sub, MapExpr::Load(0), cmp(IrCmpOp::Ult, 1, 5)),
-            ),
-            (
-                "a & (b > k)",
-                bin(IrBinOp::And, MapExpr::Load(0), cmp(IrCmpOp::Slt, 1, 5)),
-            ),
-            (
-                "a | (b > k)",
-                bin(IrBinOp::Or, MapExpr::Load(0), cmp(IrCmpOp::Eq, 1, 3)),
-            ),
+            ("a + (b > k)", bin(IrBinOp::Add, MapExpr::Load(0), cmp(IrCmpOp::Slt, 1, 5))),
+            ("a - (b > k)", bin(IrBinOp::Sub, MapExpr::Load(0), cmp(IrCmpOp::Ult, 1, 5))),
+            ("a & (b > k)", bin(IrBinOp::And, MapExpr::Load(0), cmp(IrCmpOp::Slt, 1, 5))),
+            ("a | (b > k)", bin(IrBinOp::Or, MapExpr::Load(0), cmp(IrCmpOp::Eq, 1, 3))),
             (
                 "(a > k) ^ (b < k)",
                 bin(
