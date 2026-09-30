@@ -21,6 +21,29 @@
  * This test drives the exact shape with a get_aux() that returns NULL, so
  * a regressing compiler segfaults deterministically. A second entry with a
  * non-NULL cache checks the loop still computes correct results.
+ *
+ * WHAT THIS TEST NOW PROVES (updated with the loop_preheader pass).
+ *
+ * The load IS hoisted here today, and that is correct -- do not "fix" it.
+ * `loop_preheader` splices an empty dedicated preheader onto the single
+ * edge from the `if(p==0)` block to the loop header, and LICM hoists into
+ * THAT block, not into the guard:
+ *
+ *     guard:  p = get_aux(); if (p == 0) goto ret0; else goto pre;
+ *     pre:    t = p->nUsed;          <-- reached only when p != 0
+ *     header: i < t ...
+ *
+ * `pre` has exactly one successor (the header), so reaching it means the
+ * loop is entered, which means p != 0. The NULL path branches to `ret0`
+ * without ever passing through `pre`. The dereference-before-NULL-test
+ * bug is therefore still impossible, by construction rather than by
+ * refusal.
+ *
+ * So the contract this file pins has shifted from "LICM must refuse this
+ * shape" to "the hoist must land in the guarded preheader and nowhere
+ * else". A compiler that hoists into the guard block still segfaults in
+ * phase 1 below, which is exactly the signal we want. Run with
+ * CCC_DISABLE_PASSES=loop_preheader to exercise the original refusal path.
  */
 #include <stdio.h>
 #include <string.h>

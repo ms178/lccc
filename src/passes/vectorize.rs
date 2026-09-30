@@ -19303,6 +19303,16 @@ fn find_loop_preheader(
         if loop_blocks.contains(&bi) {
             continue;
         }
+        // EVERY kind of entering edge must be counted, not just the two
+        // easy ones. Missing a `Switch` case or an `IndirectBranch` target
+        // does not make this function conservative -- it makes it WRONG in
+        // the dangerous direction: with one entry via a `Switch` and one via
+        // a `Branch` it would report the `Branch` block as *the* preheader,
+        // and the caller would place the hoisted loop bound in a block that
+        // does not dominate the header. The def would then not dominate its
+        // use on the switch path: an SSA violation, i.e. a miscompile, not a
+        // missed optimisation. Counting them makes that shape return `None`,
+        // and the caller falls back to the header -- correct, only slower.
         let enters = match &block.terminator {
             Terminator::Branch(label) => *label == header_label,
             Terminator::CondBranch {
@@ -19310,6 +19320,12 @@ fn find_loop_preheader(
                 false_label,
                 ..
             } => *true_label == header_label || *false_label == header_label,
+            Terminator::Switch { cases, default, .. } => {
+                *default == header_label || cases.iter().any(|(_, l)| *l == header_label)
+            }
+            Terminator::IndirectBranch {
+                possible_targets, ..
+            } => possible_targets.contains(&header_label),
             _ => false,
         };
         if enters {
@@ -19601,13 +19617,26 @@ fn transform_reduction_avx2(
             let preheader_idx = find_loop_preheader(func, pattern.header_idx, &pattern.loop_blocks)
                 .filter(|&pre_idx| {
                     let cfg = CfgAnalysis::build(func);
+                    // TWO independent preconditions, both required.
+                    //
+                    // (1) The limit's def must already be available in the
+                    //     preheader, or the hoisted bound reads it before it
+                    //     is defined.
+                    // (2) The preheader must DOMINATE the header, or the
+                    //     bound's own def does not dominate its use inside
+                    //     the loop.
+                    //
+                    // (1) does not imply (2): it constrains where the limit
+                    // comes from, never where `pre_idx` sits relative to the
+                    // loop. Failing either one falls back to the header,
+                    // which is correct and only slower.
                     strict_external_value_available(
                         func,
                         &cfg,
                         &pattern.loop_blocks,
                         pre_idx,
                         *limit_val,
-                    )
+                    ) && strict_cfg_dominates(&cfg, pre_idx, pattern.header_idx)
                 });
             let width_pow2 = vec_width.is_power_of_two();
             let stride_pow2 = byte_stride.is_power_of_two();
@@ -20975,13 +21004,26 @@ fn transform_reduction_sse2(
             let preheader_idx = find_loop_preheader(func, pattern.header_idx, &pattern.loop_blocks)
                 .filter(|&pre_idx| {
                     let cfg = CfgAnalysis::build(func);
+                    // TWO independent preconditions, both required.
+                    //
+                    // (1) The limit's def must already be available in the
+                    //     preheader, or the hoisted bound reads it before it
+                    //     is defined.
+                    // (2) The preheader must DOMINATE the header, or the
+                    //     bound's own def does not dominate its use inside
+                    //     the loop.
+                    //
+                    // (1) does not imply (2): it constrains where the limit
+                    // comes from, never where `pre_idx` sits relative to the
+                    // loop. Failing either one falls back to the header,
+                    // which is correct and only slower.
                     strict_external_value_available(
                         func,
                         &cfg,
                         &pattern.loop_blocks,
                         pre_idx,
                         *limit_val,
-                    )
+                    ) && strict_cfg_dominates(&cfg, pre_idx, pattern.header_idx)
                 });
             let width_pow2 = vec_width.is_power_of_two();
             let stride_pow2 = byte_stride.is_power_of_two();

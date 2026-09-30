@@ -263,6 +263,14 @@ def compile_one(lccc: Path, gcc: str, test: TestCase, workdir: Path,
                           f"lccc PGO-generate compile failed:\n{se[-2000:]}",
                           time.monotonic() - start, 0.0, phases + ["gen:fail"])
         phases.append("gen:ok")
+        if compile_only:
+            # `--compile-only` promises "compile+link, do not run it". The
+            # instrumented build has linked, which is the whole contract on
+            # this path; training and the -fprofile-use rebuild both EXECUTE
+            # the program, so honouring the flag here is what keeps the fast
+            # link gate fast -- and honest about what it did.
+            return Result(test.name, "pass", "",
+                          time.monotonic() - start, 0.0, phases + ["link:ok"])
         rc, so, se = run_checked([str(out)], env=env, cwd=workdir)
         if rc != 0:
             return Result(test.name, "fail",

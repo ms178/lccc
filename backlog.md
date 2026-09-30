@@ -172,6 +172,8 @@ they stay CORRECT rather than fast):
   movzbl %bl,%ebx; testb %bl,%bl; jne` where a single `jl` belongs. Three
   instructions per iteration, in every rotated loop. Fix the condition
   lowering, re-measure, then re-evaluate enabling rotation at `-O2+` — which
+  would simultaneously make LOOP-PREHEADER-1 pay corpus-wide. Evidence:
+  [`engineering/evidence/LOOP-PREHEADER-1/`](engineering/evidence/LOOP-PREHEADER-1/README.md).
   **Blocking defect, already known:** `loop_rotate` leaves invalid SSA on 2 of
   the 51 benchmark programs (`fir_filter.c`, `moving_stats.c`): under
   `CCC_VALIDATE_SSA=1` both abort with `SSA PHI-ARITY VIOLATION after phase
@@ -179,8 +181,24 @@ they stay CORRECT rather than fast):
   rewritten CFG. Verified NOT caused by LOOP-PREHEADER-1 (reproduces with
   `CCC_DISABLE_PASSES=loop_preheader`, and fires before that pass runs). Fix the phi
   rewriting before touching the condition lowering.
-  would simultaneously make LOOP-PREHEADER-1 pay corpus-wide. Evidence:
-  [`engineering/evidence/LOOP-PREHEADER-1/`](engineering/evidence/LOOP-PREHEADER-1/README.md).
+
+* **LOOP-PREHEADER-3 · the pass has no dedicated gate (coverage debt).**
+  `src/passes/loop_preheader.rs` is a CFG-mutating pass enabled by default at
+  `-O2`, and nothing in `tests/` or `scripts/ci_local.sh` asserts it fires.
+  What covers it today is indirect:
+  `licm_no_speculative_load_nondedicated_preheader.c` segfaults if the
+  inserted block lands on the wrong edge, and `verify_after_pass` catches a
+  broken phi — but a silent regression to "inserts nothing" passes both.
+  The gate to write (model it on `check_volatile_licm.sh`, which gets this
+  right): assert on emitted assembly that
+  `int f(const int *c, int n){int t=0;for(int i=0;i<n;i++)t+=c[0];return t;}`
+  loads `(%rdi)` **once outside** the steady-state loop, and **inside** it
+  under `CCC_DISABLE_PASSES=loop_preheader` — that delta is the negative
+  control, and without it the gate passes vacuously on a compiler that hoists
+  nothing. Add the SQLite NULL-guard shape (runtime, no segfault), a
+  `switch`-entered and a computed-`goto` loop (the shapes where a preheader
+  must NOT be claimed), and an already-dedicated loop asserting idempotence
+  via `CCC_DEBUG_LOOP_PREHEADER`.
 
 * **RED-WIDEN-1 · widening reductions.** `int s; for (i) s += a[i];` with
   `a` of `short`/`unsigned char`: lccc stays scalar (3.0 / 5.0 insn/byte)

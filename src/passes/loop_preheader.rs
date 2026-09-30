@@ -345,6 +345,17 @@ fn apply_insertions(func: &mut IrFunction, plans: &[Plan]) -> usize {
         if pred_idx == header_idx {
             continue; // a self-loop header: not a shape LICM hoists from
         }
+        // Block 0 is the function entry. Inserting before it would make the
+        // new block the entry, silently reparenting every parameter and
+        // alloca in the function. It is unreachable today -- an entry-block
+        // header has no predecessor outside the loop, so `find_preheader`
+        // returns `None` and no plan is ever made for it -- but the failure
+        // mode is catastrophic and the guard is free, so it is a refusal
+        // rather than an assertion: a future analysis change must lose the
+        // optimisation here, not the function.
+        if header_idx == 0 {
+            continue;
+        }
         // 1. Reroute the outside edge.  Only `pred`'s terminator is rewritten:
         //    backedges from inside the loop still target the header directly.
         if !retarget_edges(
@@ -442,12 +453,22 @@ pub fn enabled(disabled: impl AsRef<str>) -> bool {
 mod tests {
     //! Unit tests for the pieces that are pure functions of a terminator.
     //!
-    //! The *transformation* is covered end-to-end by
-    //! `tests/regression/check_loop_preheader.sh` and
-    //! `tests/regression/loop_preheader_shapes.c`, which assert on the
-    //! emitted assembly: a preheader insertion that is structurally right but
-    //! hoists nothing is invisible to a Rust-side test, and the property that
-    //! matters is the code LCCC finally emits.
+    //! COVERAGE GAP, STATED PLAINLY: the *transformation* has no dedicated
+    //! end-to-end gate yet. What exists is indirect and worth knowing about,
+    //! because it is what would catch a mis-spliced edge today:
+    //!
+    //!   * `tests/regression/licm_no_speculative_load_nondedicated_preheader.c`
+    //!     drives the SQLite NULL-guard shape this pass rewrites, and
+    //!     segfaults deterministically if the inserted block ever lands on
+    //!     the wrong edge.
+    //!   * `verify::verify_after_pass(module, "loop_preheader")` runs on
+    //!     every insertion, so a broken phi or a dangling label fails loudly.
+    //!
+    //! Neither asserts the pass *fires*, so a silent regression to "inserts
+    //! nothing" would pass both. A real gate must assert on emitted assembly
+    //! (a structurally correct preheader that hoists nothing is invisible to
+    //! a Rust-side test) and must use `CCC_DISABLE_PASSES=loop_preheader` as
+    //! its negative control, or it proves nothing. Tracked in `backlog.md`.
     use super::*;
     use crate::common::types::IrType;
     use crate::ir::reexports::{IrConst, Operand};
