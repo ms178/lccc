@@ -1,0 +1,123 @@
+;;; vfpclass-x86_64-registers
+.text
+vfpclassps $0xab, %xmm1, %k2
+vfpclassps $123, %ymm28, %k3{%k7}
+vfpclassps $255, %zmm31, %k7
+vfpclasspd $-1, %xmm7, %k1{%k2}
+vfpclasspd $1, %ymm17, %k4
+vfpclasspd $255, %zmm30, %k0
+vfpclassph $123, %xmm6, %k5
+vfpclassph $123, %ymm6, %k5
+vfpclassph $123, %zmm6, %k5{%k7}
+vfpclassbf16 $123, %xmm5, %k5
+vfpclassbf16 $123, %ymm5, %k5
+vfpclassbf16 $123, %zmm5, %k5{%k7}
+vfpclassss $123, %xmm6, %k5
+vfpclasssd $255, %xmm30, %k5{%k7}
+vfpclasssh $0xab, %xmm6, %k5
+
+;;; vfpclass-x-y-z-pinned-memory
+.text
+vfpclasspsx $123, (%rax), %k1
+vfpclasspsy $123, 4064(%rax), %k2{%k7}
+vfpclasspsz $123, 8128(%rax), %k3
+vfpclasspdx $123, 2032(%rax), %k4
+vfpclasspdy $123, 4064(%rax), %k5{%k7}
+vfpclasspdz $123, 8128(%rax), %k6
+vfpclassphx $123, 2032(%rax), %k1
+vfpclassphy $123, 4064(%rax), %k2
+vfpclassphz $123, 8128(%rax), %k3{%k7}
+vfpclassbf16x $123, 2032(%rax), %k4
+vfpclassbf16y $123, 4064(%rax), %k5{%k7}
+vfpclassbf16z $123, 8128(%rax), %k6
+vfpclasspsx $123, %xmm3, %k1
+vfpclasspdy $123, %ymm4, %k2
+vfpclassphz $123, %zmm5, %k3
+
+;;; vfpclass-packed-broadcast-inference-and-tuple-scale
+.text
+vfpclassps $123, (%rax){1to4}, %k2
+vfpclassps $123, 508(%rax){1to8}, %k3{%k7}
+vfpclassps $123, -512(%rax){1to16}, %k4
+vfpclasspd $123, (%rax){1to2}, %k2
+vfpclasspd $123, 1016(%rax){1to4}, %k3{%k7}
+vfpclasspd $123, -1024(%rax){1to8}, %k4
+vfpclassph $123, (%rax){1to8}, %k2
+vfpclassph $123, 254(%rax){1to16}, %k3{%k7}
+vfpclassph $123, -256(%rax){1to32}, %k4
+vfpclassbf16 $123, (%rax){1to8}, %k2
+vfpclassbf16 $123, 254(%rax){1to16}, %k3{%k7}
+vfpclassbf16 $123, -256(%rax){1to32}, %k4
+vfpclasspsz $123, (%r20), %k5
+
+;;; vfpclass-scalar-tuple1
+.text
+vfpclassss $123, %xmm6, %k5{%k7}
+vfpclassss $123, 508(%rdx), %k5
+vfpclassss $123, -512(%rdx), %k5{%k7}
+vfpclasssd $123, %xmm6, %k5
+vfpclasssd $123, 1016(%rdx), %k5{%k7}
+vfpclasssd $123, -1024(%rdx), %k5
+vfpclasssh $123, %xmm6, %k5{%k7}
+vfpclasssh $123, 254(%rdx), %k5
+vfpclasssh $123, -256(%rdx), %k5{%k7}
+
+;;; vfpclass-reject-ambiguous-unpinned-memory reject
+.text
+vfpclassps $123, (%rax), %k2
+
+;;; vfpclass-reject-pinned-x-width-mismatch reject
+.text
+vfpclasspsx $123, %ymm1, %k2
+
+;;; vfpclass-reject-pinned-z-width-mismatch reject
+.text
+vfpclasspsz $123, %xmm1, %k2
+
+;;; vfpclass-reject-broadcast-count-pinned-width reject
+.text
+vfpclasspsx $123, (%rax){1to8}, %k2
+
+;;; vfpclass-reject-broadcast-count-invalid-vector-length reject
+.text
+vfpclassps $123, (%rax){1to2}, %k2
+
+;;; vfpclass-reject-scalar-wide-vector reject
+.text
+vfpclassss $123, %ymm1, %k2
+
+;;; vfpclass-reject-scalar-broadcast-ss reject
+.text
+vfpclassss $123, (%rax){1to4}, %k2
+
+;;; vfpclass-reject-scalar-broadcast-sh reject
+.text
+vfpclasssh $123, (%rax){1to2}, %k2
+
+;;; vfpclass-reject-source-mask-placement reject
+.text
+vfpclassps $123, %xmm1{%k3}, %k2
+
+;;; vfpclass-reject-non-k-destination reject
+.text
+vfpclassps $123, %xmm1, %xmm2
+
+;;; vfpclass-reject-zeroing-k-destination reject
+.text
+vfpclassps $123, %xmm1, %k2{%k4}{z}
+
+;;; vfpclass-reject-imm-high reject
+.text
+vfpclassps $256, %xmm1, %k2
+
+;;; vfpclass-reject-imm-low reject
+.text
+vfpclassps $-129, %xmm1, %k2
+
+;;; vfpclass-reject-invalid-suffix reject
+.text
+vfpclasspsq $123, (%rax), %k2
+
+;;; vfpclass-reject-scalar-pinned-alias reject
+.text
+vfpclassssx $123, (%rax), %k2

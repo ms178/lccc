@@ -39,7 +39,7 @@ class EncDiffSemanticTests(unittest.TestCase):
         with mock.patch.object(encdiff, "decodes_same", return_value=True) as check:
             encdiff.classify(candidate)
         self.assertEqual(candidate.verdict, "BEATS")
-        check.assert_called_once_with(encdiff._OBJDUMP, b"L", b"GAS")
+        check.assert_called_once_with(encdiff._OBJDUMP, b"L", b"GAS", bits32=False)
 
     def test_disagreeing_shortest_forms_are_all_roundtrip_checked(self):
         candidate = row_with(b"L", gas=b"GA", icx=b"IC")
@@ -111,6 +111,26 @@ class EncDiffSemanticTests(unittest.TestCase):
             self.assertIs(encdiff.decodes_same("missing-objdump", b"\x90", b"\x90"), None)
 
         self.assertIs(encdiff.decodes_same("objdump", b"", b""), None)
+
+    def test_i686_roundtrip_classification_uses_32bit_disassembly(self):
+        candidate = row_with(b"L", gas=b"GAS", clang=b"GAS")
+        with mock.patch.object(encdiff, "decodes_same", return_value=True) as check:
+            encdiff.classify(candidate, bits32=True)
+        self.assertEqual(candidate.verdict, "BEATS")
+        self.assertTrue(check.call_args_list)
+        self.assertTrue(all(call.kwargs["bits32"]
+                            for call in check.call_args_list))
+
+    def test_i686_disassembler_uses_i386_machine_mode(self):
+        with mock.patch.object(encdiff.subprocess, "run", side_effect=[
+                objdump_result("90", "nop"),
+                objdump_result("90", "nop")]) as run:
+            self.assertIs(encdiff.decodes_same(
+                "objdump", b"\x90", b"\x90", bits32=True), True)
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(len(commands), 2)
+        self.assertTrue(all(cmd[cmd.index("-m") + 1] == "i386"
+                            for cmd in commands))
 
     def test_insndiff_roundtrip_verifies_vex_marker_and_rejects_undecodable_bytes(self):
         lccc = insndiff.Encoding(True, b"\xc4\xe2\x71\x51\x10", "")

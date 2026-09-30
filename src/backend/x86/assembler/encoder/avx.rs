@@ -55,16 +55,147 @@ pub(crate) const CMP_SIZE_MISMATCH: &str = "operand size mismatch";
 /// width kind, and source element size (for broadcast N).
 pub(crate) struct VcvtParams {
     pub vex: Option<(u8, u8)>,
+    /// VEX map: 1 = 0F, 2 = 0F38. Most packed converts use map 1;
+    /// VCVTNEPS2BF16 also has a GAS-selectable VEX.0F38 row.
+    pub vex_map: u8,
     pub map: u8,
     pub pp: u8,
     pub w: u8,
     pub opcode: u8,
     pub kind: VcvtKind,
     pub src_elem: u32,
+    /// Explicit x/y/z GAS alias, pinning EVEX.L'L (and VEX.L where present)
+    /// to the input vector width. None means the unsuffixed spelling.
+    pub pinned_ll: Option<u8>,
+    /// GAS defaults VCVTNEPS2BF16 to its EVEX row even though {vex} can
+    /// select the shorter VEX row.
+    pub prefer_evex: bool,
+    pub sae_class: EvexSae,
+}
+
+/// VFPCLASS encoding parameters. Packed forms use opcode 66, scalar forms
+/// opcode 67, and the source element size drives their EVEX memory tuple.
+/// GAS 2.47 accepts x/y/z spellings as pinned packed vector lengths; Intel
+/// AVX10.2 Rev. 4 additionally specifies the BF16 pp=3 row.
+#[derive(Clone, Copy)]
+pub(crate) struct VfpclassParams {
+    pub map: u8,
+    pub pp: u8,
+    pub w: u8,
+    pub opcode: u8,
+    pub element_bytes: u32,
+    pub scalar: bool,
+    pub pinned_ll: Option<u8>,
+}
+
+pub(crate) fn vfpclass_params(mnemonic: &str) -> Option<VfpclassParams> {
+    let lower = mnemonic.to_ascii_lowercase();
+    let (base, pinned_ll) = if let Some(base) = lower.strip_suffix('x') {
+        (base, Some(0))
+    } else if let Some(base) = lower.strip_suffix('y') {
+        (base, Some(1))
+    } else if let Some(base) = lower.strip_suffix('z') {
+        (base, Some(2))
+    } else {
+        (lower.as_str(), None)
+    };
+    let (pp, w, element_bytes, scalar) = match base {
+        "vfpclassps" => (1, 0, 4, false),
+        "vfpclasspd" => (1, 1, 8, false),
+        "vfpclassph" => (0, 0, 2, false),
+        "vfpclassbf16" => (3, 0, 2, false),
+        "vfpclassss" => (1, 0, 4, true),
+        "vfpclasssd" => (1, 1, 8, true),
+        "vfpclasssh" => (0, 0, 2, true),
+        _ => return None,
+    };
+    if scalar && pinned_ll.is_some() {
+        return None;
+    }
+    Some(VfpclassParams {
+        map: 3,
+        pp,
+        w,
+        opcode: if scalar { 0x67 } else { 0x66 },
+        element_bytes,
+        scalar,
+        pinned_ll,
+    })
 }
 
 /// Packed-convert parameters, opcodes verified against GAS 2.47 bytes.
+/// Exact instruction names win before suffix parsing: `vcvtps2phx` and
+/// `vcvtph2psx` have a real trailing `x`; only the explicitly enumerated
+/// x/y/z aliases below add a separate pinned-width suffix.
 pub(crate) fn vcvt_params(mnemonic: &str) -> Option<VcvtParams> {
+    if let Some(params) = vcvt_base_params(mnemonic) {
+        return Some(finish_vcvt_params(mnemonic, None, params));
+    }
+    if !mnemonic
+        .get(..4)
+        .is_some_and(|p| p.eq_ignore_ascii_case("vcvt"))
+    {
+        return None;
+    }
+    let lower = mnemonic.to_ascii_lowercase();
+    if let Some(params) = vcvt_base_params(&lower) {
+        return Some(finish_vcvt_params(&lower, None, params));
+    }
+    let (base, suffix) = match lower.as_bytes().last().copied()? {
+        b'x' => (&lower[..lower.len() - 1], 'x'),
+        b'y' => (&lower[..lower.len() - 1], 'y'),
+        b'z' => (&lower[..lower.len() - 1], 'z'),
+        _ => return None,
+    };
+    let pinned_ll = vcvt_pinned_alias_ll(base, suffix)?;
+    Some(finish_vcvt_params(
+        base,
+        Some(pinned_ll),
+        vcvt_base_params(base)?,
+    ))
+}
+
+/// GAS does not accept a blanket trailing x/y/z rule for conversions. Keep
+/// the alias grammar explicit, including the two native names that end in x.
+fn vcvt_pinned_alias_ll(base: &str, suffix: char) -> Option<u8> {
+    let ll = match suffix {
+        'x' => 0,
+        'y' => 1,
+        'z' => 2,
+        _ => return None,
+    };
+    let allowed = match base {
+        // AVX VEX aliases and their EVEX alternatives.
+        "vcvtpd2ps" | "vcvtpd2dq" | "vcvttpd2dq" => ll < 2,
+        // AVX512-DQ/F VL aliases (the zmm->ymm spelling is unsuffixed).
+        "vcvtpd2udq" | "vcvttpd2udq" | "vcvtqq2ps" | "vcvtuqq2ps" => ll < 2,
+        // AVX512-FP16/BF16 2:1 and 4:1 narrowing.
+        "vcvtdq2ph" | "vcvtudq2ph" | "vcvtneps2bf16" | "vcvtps2phx" => ll < 2,
+        "vcvtpd2ph" | "vcvtqq2ph" | "vcvtuqq2ph" => true,
+        _ => false,
+    };
+    allowed.then_some(ll)
+}
+
+fn finish_vcvt_params(base: &str, pinned_ll: Option<u8>, mut params: VcvtParams) -> VcvtParams {
+    params.pinned_ll = pinned_ll;
+    params.prefer_evex = base == "vcvtneps2bf16";
+    params.sae_class =
+        if base.starts_with("vcvtt") || matches!(base, "vcvtps2pd" | "vcvtph2pd" | "vcvtph2psx") {
+            EvexSae::Sae
+        } else if matches!(base, "vcvtdq2pd" | "vcvtudq2pd" | "vcvtneps2bf16") {
+            EvexSae::None
+        } else {
+            EvexSae::Er
+        };
+    if base == "vcvtneps2bf16" {
+        params.vex = Some((0x72, 2));
+        params.vex_map = 2;
+    }
+    params
+}
+
+fn vcvt_base_params(mnemonic: &str) -> Option<VcvtParams> {
     let p = |vex: Option<(u8, u8)>,
              map: u8,
              pp: u8,
@@ -74,15 +205,19 @@ pub(crate) fn vcvt_params(mnemonic: &str) -> Option<VcvtParams> {
              src_elem: u32| {
         VcvtParams {
             vex,
+            vex_map: 1,
             map,
             pp,
             w,
             opcode,
             kind,
             src_elem,
+            pinned_ll: None,
+            prefer_evex: false,
+            sae_class: EvexSae::Er,
         }
     };
-    match mnemonic {
+    let mut params = match mnemonic {
         // Widening: VEX xmm->xmm/xmm->ymm; EVEX + xmm->ymm/ymm->zmm.
         "vcvtps2pd" => Some(p(Some((0x5A, 0)), 1, 0, 0, 0x5A, VcvtKind::Wide, 4)),
         "vcvtdq2pd" => Some(p(Some((0xE6, 2)), 1, 2, 0, 0xE6, VcvtKind::Wide, 4)),
@@ -164,7 +299,8 @@ pub(crate) fn vcvt_params(mnemonic: &str) -> Option<VcvtParams> {
         // xmm->xmm/ymm, ymm->zmm; memory source tuple N=2 (the ph element).
         "vcvtph2ps" => Some(p(None, 2, 1, 0, 0x13, VcvtKind::Wide, 2)),
         _ => None,
-    }
+    }?;
+    Some(params)
 }
 
 /// Vector width class: 0 = xmm, 1 = ymm, 2 = zmm.
@@ -203,13 +339,14 @@ pub(crate) fn check_vcvt_shape(mnemonic: &str, ops: &[Operand]) -> Result<(), St
             let Some(src_w) = vec_width(&r.name) else {
                 return Err(format!("operand type mismatch for `{mnemonic}'"));
             };
-            let ok = match params.kind {
+            let width_ok = match params.kind {
                 VcvtKind::Same => src_w == dst_w,
                 VcvtKind::Narrow => matches!((src_w, dst_w), (0, 0) | (1, 0) | (2, 1)),
                 VcvtKind::Wide => matches!((src_w, dst_w), (0, 0) | (0, 1) | (1, 2)),
                 VcvtKind::Narrow4 => matches!((src_w, dst_w), (0, 0) | (1, 0) | (2, 0)),
                 VcvtKind::Wide4 => matches!((src_w, dst_w), (0, 0) | (0, 1) | (0, 2)),
             };
+            let ok = width_ok && params.pinned_ll.is_none_or(|pinned| pinned == src_w);
             if !ok {
                 if params.kind == VcvtKind::Same {
                     return Err(format!("register type mismatch for `{mnemonic}'"));
@@ -218,6 +355,22 @@ pub(crate) fn check_vcvt_shape(mnemonic: &str, ops: &[Operand]) -> Result<(), St
             }
         }
         Operand::Memory(_) => {
+            if let Some(pinned_ll) = params.pinned_ll {
+                // A pinned spelling gives the memory source an exact vector
+                // width. Narrow rows permit x/y -> xmm and z -> ymm; the 4:1
+                // rows always write xmm and use x/y/z to select the source.
+                let legal = match params.kind {
+                    VcvtKind::Narrow => {
+                        matches!((pinned_ll, dst_w), (0, 0) | (1, 0) | (2, 1))
+                    }
+                    VcvtKind::Narrow4 => dst_w == 0,
+                    _ => false,
+                };
+                if !legal {
+                    return Err(format!("operand size mismatch for `{mnemonic}'"));
+                }
+                return Ok(());
+            }
             match params.kind {
                 // mem->xmm is ambiguous (m128 vs m256 both fit an xmm
                 // result); only the m512->ymm spelling is unambiguous.
@@ -307,7 +460,8 @@ pub(crate) fn check_broadcast_shape(
         "vbroadcastss" => evex || dst_w <= 1,
         "vbroadcastsd" => dst_w >= 1,
         "vbroadcastf128" | "vbroadcasti128" => dst_w == 1,
-        "vbroadcastf32x4" | "vbroadcastf64x2" | "vbroadcasti32x4" | "vbroadcasti64x2" => dst_w >= 1,
+        "vbroadcastf32x2" | "vbroadcastf32x4" | "vbroadcastf64x2" | "vbroadcasti32x4"
+        | "vbroadcasti64x2" => dst_w >= 1,
         "vbroadcastf32x8" | "vbroadcastf64x4" | "vbroadcasti32x8" | "vbroadcasti64x4" => dst_w == 2,
         _ => evex || dst_w <= 1,
     };
@@ -317,8 +471,95 @@ pub(crate) fn check_broadcast_shape(
     Ok(())
 }
 
-/// Compress/expand shape validation: `vpcompressd/q` store (reg ->
-/// reg/mem), `vpexpandd/q` load (reg/mem -> reg). Same-width registers
+/// VEX VNNI rows require every vector register operand to use the same VL.
+/// The generic operand checker intentionally exempts the whole `vpdp*`
+/// family so its byte-probed EVEX/VEX encoders can issue family-specific
+/// diagnostics; apply this check before emitting a VEX row.
+pub(crate) fn check_vex_same_vector_width(mnemonic: &str, ops: &[Operand]) -> Result<(), String> {
+    if ops.len() != 3 {
+        return Err(format!("number of operands mismatch for `{mnemonic}'"));
+    }
+    let mut width = None;
+    for op in ops {
+        if let Operand::Register(reg) = op
+            && let Some(current) = vec_width(&reg.name)
+        {
+            if width.is_some_and(|previous| previous != current) {
+                return Err(format!("register type mismatch for `{mnemonic}'"));
+            }
+            width = Some(current);
+        }
+    }
+    Ok(())
+}
+
+/// Validate EVEX lane-insert shapes before the generic three-source encoder
+/// derives LL from the widest operand. The inserted lane is XMM for x4 and
+/// YMM for x8; the base and destination must have the same width, and the
+/// destination must be at least twice the inserted-lane width.
+pub(crate) fn check_evex_lane_insert_shape(
+    mnemonic: &str,
+    ops: &[Operand],
+    lane_width: u8,
+    vector_min_width: u8,
+) -> Result<(), String> {
+    if ops.len() != 4 {
+        return Err(format!("number of operands mismatch for `{mnemonic}'"));
+    }
+    let type_error = || format!("operand type mismatch for `{mnemonic}'");
+    let size_error = || format!("operand size mismatch for `{mnemonic}'");
+    let base_width = match &ops[2] {
+        Operand::Register(reg) => vec_width(&reg.name).ok_or_else(type_error)?,
+        _ => return Err(type_error()),
+    };
+    let dst_width = match &ops[3] {
+        Operand::Register(reg) => vec_width(&reg.name).ok_or_else(type_error)?,
+        _ => return Err(type_error()),
+    };
+    if base_width != dst_width {
+        return Err(format!("register type mismatch for `{mnemonic}'"));
+    }
+    if base_width < vector_min_width {
+        return Err(size_error());
+    }
+    match &ops[1] {
+        Operand::Register(reg) if vec_width(&reg.name) == Some(lane_width) => Ok(()),
+        Operand::Register(reg) if vec_width(&reg.name).is_some() => Err(size_error()),
+        Operand::Memory(_) => Ok(()),
+        _ => Err(type_error()),
+    }
+}
+
+/// Validate EVEX lane-extract source and destination widths. x4 extracts a
+/// 128-bit lane from a YMM/ZMM source; x8 extracts a 256-bit lane from ZMM.
+pub(crate) fn check_evex_lane_extract_shape(
+    mnemonic: &str,
+    ops: &[Operand],
+    lane_width: u8,
+    source_min_width: u8,
+) -> Result<(), String> {
+    if ops.len() != 3 {
+        return Err(format!("number of operands mismatch for `{mnemonic}'"));
+    }
+    let type_error = || format!("operand type mismatch for `{mnemonic}'");
+    let size_error = || format!("operand size mismatch for `{mnemonic}'");
+    let source_width = match &ops[1] {
+        Operand::Register(reg) => vec_width(&reg.name).ok_or_else(type_error)?,
+        _ => return Err(type_error()),
+    };
+    if source_width < source_min_width {
+        return Err(size_error());
+    }
+    match &ops[2] {
+        Operand::Register(reg) if vec_width(&reg.name) == Some(lane_width) => Ok(()),
+        Operand::Register(reg) if vec_width(&reg.name).is_some() => Err(size_error()),
+        Operand::Memory(_) => Ok(()),
+        _ => Err(type_error()),
+    }
+}
+
+/// Compress/expand shape validation: `vpcompressb/w/d/q` store (reg ->
+/// reg/mem), `vpexpandb/w/d/q` load (reg/mem -> reg). Same-width registers
 /// (`register type mismatch' on cross), vector-or-memory sides only
 /// (`operand type mismatch').
 pub(crate) fn check_compress_shape(
@@ -932,7 +1173,7 @@ impl super::InstructionEncoder {
         let Some((opcode, pp)) = params.vex else {
             return Err(format!("{mnemonic}: no VEX form"));
         };
-        self.encode_avx_2op_0f(ops, opcode, pp)
+        self.encode_avx_2op_vex_map(ops, params.vex_map, opcode, pp, params.pinned_ll)
     }
 
     /// EVEX packed convert (all widths, masked, broadcast). Disp8 N is
@@ -951,6 +1192,8 @@ impl super::InstructionEncoder {
         // (`vcvtps2pd {rz-sae},%ymm1,%xmm2` is `operand size mismatch`,
         // not a rounding error), so the shape gate runs first.
         check_vcvt_shape(mnemonic, &ops)?;
+        let params =
+            vcvt_params(mnemonic).ok_or_else(|| format!("{mnemonic} requires 2 operands"))?;
         // Convert SAE/ER classes — the complete oracle table, probed on
         // GAS 2.47 (and stable on 2.44) for EVERY packed-convert family
         // at 512-bit width ({sae} and {rn-sae} each):
@@ -968,22 +1211,13 @@ impl super::InstructionEncoder {
         // or zmm source on the narrowing kinds) — `vcvtps2qq {rn-sae},
         // %xmm1,%xmm2` and `vcvtqq2ps {rn-sae},%ymm1,%xmm2` are both
         // rejected while the zmm shapes accept.
-        let sae_class = if mnemonic.starts_with("vcvtt") {
-            EvexSae::Sae
-        } else if matches!(mnemonic, "vcvtps2pd" | "vcvtph2pd" | "vcvtph2psx") {
-            EvexSae::Sae
-        } else if matches!(mnemonic, "vcvtdq2pd" | "vcvtudq2pd" | "vcvtneps2bf16") {
-            EvexSae::None
-        } else {
-            EvexSae::Er
-        };
-        let (sae_bcst, sae_ll) = Self::apply_evex_sae(sae, sae_class, 0)?;
-        let params =
-            vcvt_params(mnemonic).ok_or_else(|| format!("{mnemonic} requires 2 operands"))?;
+        let (sae_bcst, sae_ll) = Self::apply_evex_sae(sae, params.sae_class, 0)?;
         let (aaa, z) = Self::evex_mask_info(&ops[1]);
         // Narrowing LL is the SOURCE width (ymm->xmm is LL=01,
         // zmm/m512->ymm is LL=10); same/wide use the dest width.
-        let width_ll = if matches!(params.kind, VcvtKind::Narrow | VcvtKind::Narrow4) {
+        let width_ll = if let Some(pinned_ll) = params.pinned_ll {
+            pinned_ll
+        } else if matches!(params.kind, VcvtKind::Narrow | VcvtKind::Narrow4) {
             match &ops[0] {
                 Operand::Register(r) if is_zmm(&r.name) => 0b10,
                 Operand::Register(r) if is_ymm(&r.name) => 0b01,
@@ -1066,12 +1300,19 @@ impl super::InstructionEncoder {
                             VcvtKind::Wide => src_bytes * 2 == vl,
                             VcvtKind::Wide4 => src_bytes * 4 == vl,
                             VcvtKind::Narrow => match vec_width(&dst.name) {
-                                Some(0) => src_bytes == 16 || src_bytes == 32,
+                                Some(0) => params
+                                    .pinned_ll
+                                    .map_or(src_bytes == 16 || src_bytes == 32, |pinned| {
+                                        src_bytes == Self::evex_vl_bytes(pinned)
+                                    }),
                                 _ => src_bytes == 64,
                             },
                             VcvtKind::Narrow4 => {
                                 matches!(src_bytes, 16 | 32 | 64)
                                     && matches!(vec_width(&dst.name), Some(0))
+                                    && params.pinned_ll.map_or(true, |pinned| {
+                                        src_bytes == Self::evex_vl_bytes(pinned)
+                                    })
                             }
                         };
                     if !legal {
@@ -1081,7 +1322,10 @@ impl super::InstructionEncoder {
                 } else {
                     match params.kind {
                         VcvtKind::Same => (false, vl),
-                        VcvtKind::Narrow | VcvtKind::Narrow4 => (false, 64),
+                        VcvtKind::Narrow | VcvtKind::Narrow4 => (
+                            false,
+                            params.pinned_ll.map(Self::evex_vl_bytes).unwrap_or(64),
+                        ),
                         VcvtKind::Wide => (false, (vl / 2).max(1)),
                         VcvtKind::Wide4 => (false, (vl / 4).max(1)),
                     }
@@ -1098,9 +1342,9 @@ impl super::InstructionEncoder {
 
     /// EVEX compress (reg -> reg/mem, store direction) / expand
     /// (reg/mem -> reg, load direction). Disp8 N is the element size
-    /// (dword 4 / qword 8): the transferred prefix is mask-defined, so
-    /// no VL multiple applies. No SAE (standalone `{sae}` fails here
-    /// with the GAS text); explicit `{1toN}` is forbidden by the caller.
+    /// (byte 1 / word 2 / dword 4 / qword 8): the transferred prefix is
+    /// mask-defined, so no VL multiple applies. No SAE (standalone `{sae}`
+    /// fails here with the GAS text); explicit `{1toN}` is forbidden by the caller.
     pub(crate) fn encode_evex_compress_expand(
         &mut self,
         ops: &[Operand],
@@ -1848,12 +2092,13 @@ impl super::InstructionEncoder {
                 Operand::Register(src1),
                 Operand::Register(dst),
             ) => {
-                // vinserti32x4/i64x2 (38) N=16; vinserti32x8/i64x4 (3A) N=32;
+                // vinsertf/i32x4/i64x2 (18/38) N=16; vinsertf/i32x8/i64x4
+                // (1A/3A) N=32. Scalar-control forms (27/51/55/57/0A/0B)
                 // scalar-control forms (27/51/55/57/0A/0B) are element-sized
                 // (ss N=4, sd N=8, read from W); everything else Full VL.
                 let tuple_n = match opcode {
-                    0x38 => 16u32,
-                    0x3A => 32,
+                    0x18 | 0x38 => 16u32,
+                    0x1A | 0x3A => 32,
                     0x27 | 0x51 | 0x55 | 0x57 | 0x0A | 0x0B => {
                         if w == 1 {
                             8
@@ -2153,7 +2398,11 @@ impl super::InstructionEncoder {
                 Operand::Memory(mem),
             ) => {
                 // Tuple: i32x4/i64x2 (39) N=16, i32x8/i64x4 (3B) N=32.
-                let tuple_n = if opcode == 0x3B { 32u32 } else { 16 };
+                let tuple_n = if matches!(opcode, 0x1B | 0x3B) {
+                    32u32
+                } else {
+                    16
+                };
                 let src_num =
                     self.emit_evex_memop(&src.name, mem, None, map, w, pp, ll, z, aaa, false)?;
                 self.bytes.push(opcode);
@@ -2283,7 +2532,7 @@ impl super::InstructionEncoder {
                     0x5A | 0x1A => 16u32,
                     0x5B | 0x1B => 32,
                     // vbroadcasti32x2/vbroadcastf32x2 load one 64-bit pair.
-                    0x59 => 8,
+                    0x19 | 0x59 => 8,
                     _ => [16u32, 32, 64][ll as usize],
                 };
                 self.encode_evex_mem(dst_num, mem, n)
@@ -3136,10 +3385,24 @@ impl super::InstructionEncoder {
         opcode: u8,
         pp: u8,
     ) -> Result<(), String> {
+        self.encode_avx_2op_vex_map(ops, 1, opcode, pp, None)
+    }
+
+    /// Two-operand unary VEX form with an explicit opcode map and optional
+    /// pinned L. The x/y convert aliases can name a memory-source width that
+    /// cannot be inferred from their XMM destination.
+    pub(crate) fn encode_avx_2op_vex_map(
+        &mut self,
+        ops: &[Operand],
+        map: u8,
+        opcode: u8,
+        pp: u8,
+        pinned_l: Option<u8>,
+    ) -> Result<(), String> {
         if ops.len() != 2 {
             return Err("AVX 2-op requires 2 operands".to_string());
         }
-        let l = self.vex_l_from_ops(ops);
+        let l = pinned_l.unwrap_or_else(|| self.vex_l_from_ops(ops));
 
         match (&ops[0], &ops[1]) {
             (Operand::Register(src), Operand::Register(dst))
@@ -3149,7 +3412,7 @@ impl super::InstructionEncoder {
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 let r = needs_vex_ext(&dst.name);
                 let b = needs_vex_ext(&src.name);
-                self.emit_vex(r, false, b, 1, 0, 0, l, pp); // mm=1 (0F), vvvv=0
+                self.emit_vex(r, false, b, map, 0, 0, l, pp);
                 self.bytes.push(opcode);
                 self.bytes.push(self.modrm(3, dst_num, src_num));
                 Ok(())
@@ -3159,7 +3422,7 @@ impl super::InstructionEncoder {
                 let r = needs_vex_ext(&dst.name);
                 let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
                 let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
-                self.emit_vex(r, x, b_ext, 1, 0, 0, l, pp);
+                self.emit_vex(r, x, b_ext, map, 0, 0, l, pp);
                 self.bytes.push(opcode);
                 self.encode_modrm_mem(dst_num, mem)
             }
@@ -3270,9 +3533,10 @@ impl super::InstructionEncoder {
                 _ => None,
             },
             // 0F3A pp=1: scalar-control (getmant/range/fixupimm/reduce/
-            // rndscale scalar rows; the 26/54/56/08/09 neighbors are packed).
+            // rndscale scalar rows; the 26/54/56/08/09 neighbors are packed)
+            // plus VFPCLASSSS/SD (opcode 67, Tuple1 N=4/8).
             (3, 1) => match opcode {
-                0x27 | 0x51 | 0x55 | 0x57 | 0x0A | 0x0B => Some(if w == 1 { 8 } else { 4 }),
+                0x27 | 0x51 | 0x55 | 0x57 | 0x0A | 0x0B | 0x67 => Some(if w == 1 { 8 } else { 4 }),
                 _ => None,
             },
             // AVX512-FP16 scalar rows (GAS 2.47.20260726, byte-probed):
@@ -3296,6 +3560,7 @@ impl super::InstructionEncoder {
             },
             (3, 0) => match opcode {
                 0x27 | 0x57 | 0x0A => Some(2), // vgetmantsh/vreducesh/vrndscalesh
+                0x67 if w == 0 => Some(2),     // vfpclasssh
                 _ => None,
             },
             _ => None,
@@ -3439,6 +3704,10 @@ impl super::InstructionEncoder {
             (2, 1, 0, 0x51) => Some(4), // vpdpbusds
             (2, 1, 0, 0x52) => Some(4), // vpdpwssd
             (2, 1, 0, 0x53) => Some(4), // vpdpwssds
+            (2, 1, 0, 0xD2) => Some(4), // vpdpwusd
+            (2, 1, 0, 0xD3) => Some(4), // vpdpwusds
+            (2, 2, 0, 0xD2) => Some(4), // vpdpwsud
+            (2, 2, 0, 0xD3) => Some(4), // vpdpwsuds
             (2, 1, 0, 0x55) => Some(4), // vpopcntd
             (2, 1, 0, 0x64) => Some(4), // vpblendmd
             (2, 1, 0, 0x65) => Some(4), // vblendmps
@@ -4402,6 +4671,111 @@ impl super::InstructionEncoder {
             }
             _ => Err("operand type mismatch".to_string()),
         }
+    }
+
+    /// EVEX VFPCLASS, AT&T `(imm8, src, dst-k)`. Packed sources select VL
+    /// from an XMM/YMM/ZMM register, an x/y/z-pinned mnemonic, or an
+    /// unpinned memory broadcast count; unpinned non-broadcast memory is
+    /// ambiguous and rejected like GAS. Scalar SS/SD/SH sources are XMM or
+    /// element-sized memory (Tuple1 N=4/8/2). The destination is a K register;
+    /// its optional `{%kN}` is an input mask, while `{z}` is never legal.
+    pub(crate) fn encode_evex_vfpclass(
+        &mut self,
+        ops: &[Operand],
+        mnemonic: &str,
+        params: VfpclassParams,
+    ) -> Result<(), String> {
+        let type_error = || format!("operand type mismatch for `{mnemonic}'");
+        let size_error = || format!("operand size mismatch for `{mnemonic}'");
+        if ops.len() != 3 {
+            return Err(format!("number of operands mismatch for `{mnemonic}'"));
+        }
+        let imm = match &ops[0] {
+            Operand::Immediate(ImmediateValue::Integer(value)) if (-128..=255).contains(value) => {
+                *value as u8
+            }
+            Operand::Immediate(ImmediateValue::Integer(_)) => return Err(type_error()),
+            _ => return Err(type_error()),
+        };
+        let dst = match &ops[2] {
+            Operand::Register(reg) if is_kreg(&reg.name) => reg,
+            _ => return Err(type_error()),
+        };
+        let (aaa, z) = Self::evex_mask_info(&ops[2]);
+        if z {
+            return Err(format!("unsupported masking for `{mnemonic}'"));
+        }
+
+        let ll = match &ops[1] {
+            Operand::Register(src) => {
+                let Some(width) = vec_width(&src.name) else {
+                    return Err(type_error());
+                };
+                if params.scalar {
+                    if width != 0 {
+                        return Err(size_error());
+                    }
+                    0
+                } else if let Some(pinned) = params.pinned_ll {
+                    if width != pinned {
+                        return Err(size_error());
+                    }
+                    pinned
+                } else {
+                    width
+                }
+            }
+            Operand::Memory(mem) => {
+                if params.scalar {
+                    0
+                } else if let Some(pinned) = params.pinned_ll {
+                    pinned
+                } else if let Some(count) = mem.broadcast {
+                    if count == 0 {
+                        return Err(format!("unsupported broadcast for `{mnemonic}'"));
+                    }
+                    match params.element_bytes * u32::from(count) {
+                        16 => 0,
+                        32 => 1,
+                        64 => 2,
+                        _ => return Err(format!("unsupported broadcast for `{mnemonic}'")),
+                    }
+                } else {
+                    return Err(size_error());
+                }
+            }
+            _ => return Err(type_error()),
+        };
+
+        match &ops[1] {
+            Operand::Register(src) => {
+                let (dst_num, src_num) = self.emit_evex_mod3(
+                    &dst.name, &src.name, None, params.map, params.w, params.pp, ll, false, aaa,
+                    false,
+                )?;
+                self.bytes.push(params.opcode);
+                self.bytes.push(self.modrm(3, dst_num, src_num));
+            }
+            Operand::Memory(mem) => {
+                // Packed broadcast tuples scale by VL/N (the central
+                // decorator validator checks N*element == VL); non-broadcast
+                // packed forms use Full VL, while scalar forms always use
+                // their element-sized Tuple1 even though broadcast is denied.
+                let (bcst, tuple_n) = if params.scalar {
+                    (mem.broadcast.is_some(), params.element_bytes)
+                } else {
+                    Self::evex_mem_scale(mem, ll, 1)
+                };
+                let dst_num = self.emit_evex_memop(
+                    &dst.name, mem, None, params.map, params.w, params.pp, ll, false, aaa, bcst,
+                )?;
+                self.bytes.push(params.opcode);
+                self.encode_evex_mem(dst_num, mem, tuple_n)?;
+            }
+            _ => unreachable!("VFPCLASS source kind was validated above"),
+        }
+        self.bytes.push(imm);
+        Ok(())
     }
 
     /// EVEX k-register compare/test (AVX512F/BW vptestm*). AT&T
