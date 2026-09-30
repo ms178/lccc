@@ -421,6 +421,11 @@ printf '<!-- base=%s patch_sha256=%s tar_sha256=%s bundle_sha256=%s bundle_clone
   "$BASE" "$patch_sha" "$tar_sha" "$bundle_sha" "${bundle_clone:-unknown}" "$verdict" "$ci_gate" "$tree_now" >> "$ledger_tmp"
 sync -f "$ledger_tmp" 2>/dev/null || true
 mv -f "$ledger_tmp" "$LEDGER"
+# Same rule as atomic_write: mktemp's 0600 must not leak onto published
+# artifacts (the ledger predates atomic_write's chmod and kept its own
+# write path; an owner-only ledger breaks downstream readers exactly the
+# same way an owner-only deliverable does).
+chmod 644 "$LEDGER"
 
 # Advance the sequence only once every independently recoverable artifact and
 # the ledger have been published successfully.

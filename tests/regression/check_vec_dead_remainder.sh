@@ -46,6 +46,10 @@ corpus=$here/vec_dead_remainder.c
 shapes=$here/vec_shapes/vec_dead_remainder_shapes.c
 work=$(mktemp -d "${TMPDIR:-/tmp}/lccc-zerorem.XXXXXX")
 trap 'rm -rf "$work"' EXIT
+# Shared host i386-execution probe: contract 3 compares RUNTIME OUTPUT of
+# the gcc oracle against lccc for -m32, so it needs the host to execute
+# i386, not merely link it (i386_exec.sh).
+source "$here/i386_exec.sh"
 fail=0
 note() { printf '  %s\n' "$*"; }
 bad() { printf '  FAIL: %s\n' "$*" >&2; fail=1; }
@@ -103,7 +107,9 @@ fi
 
 # ---------------------------------------------------------------- contract 3
 note "contract 3: i686 (no map-vectorizer lowering) still matches the oracle"
-if "$GCC" -O2 -m32 "$corpus" -o "$work/ref32" 2> /dev/null; then
+if ! i386_exec_ok "$GCC" "$work"; then
+    note "  SKIP: host cannot link+execute i386 (see i386_exec.sh)"
+elif "$GCC" -O2 -m32 "$corpus" -o "$work/ref32" 2> /dev/null; then
     timeout 60 "$work/ref32" > "$work/expected32" || bad "i686: gcc oracle exited non-zero"
     for opt in -O0 -O2; do
         if ! "$CCC" $opt -m32 "$corpus" -o "$work/run32" 2> "$work/err"; then

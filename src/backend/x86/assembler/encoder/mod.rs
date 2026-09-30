@@ -1570,9 +1570,19 @@ impl InstructionEncoder {
         // no table entry has no broadcast form at all. Before that
         // check, `vaddpd (%rcx){1to4}, %zmm30, %zmm31` silently encoded
         // as `{1to8}` — a false accept of an instruction GAS rejects.
+        // Byte 1 low nibble is B4 (APX EGPR base, NOT inverted) ++ mmm:
+        // the map is exactly the low 3 bits. A `& 0xF` here folds B4 into
+        // the map key, so every `{1toN}` broadcast whose memory base is
+        // r16-r31 missed the packed-broadcast element table and was
+        // rejected as `unsupported broadcast` even though the emitted
+        // encoding was correct (`vaddps 508(%r16){1to16}, %zmm5, %zmm6` =
+        // `62 f9 54 58 58 70 7f`). The scalar branch masked `& 7` at its
+        // call site; extracting the pure map here fixes both branches and
+        // keeps the EGPR index path (X4 lives in byte 2, outside the pp
+        // mask) untouched.
         let (b_map, b_pp, b_w, b_op, vl_bytes) = if bytes.len() >= pi + 5 {
             (
-                bytes[pi + 1] & 0xF,
+                bytes[pi + 1] & 0x7,
                 bytes[pi + 2] & 3,
                 (bytes[pi + 2] >> 7) & 1,
                 bytes[pi + 4],
@@ -1581,7 +1591,7 @@ impl InstructionEncoder {
         } else {
             (0u8, 0u8, 0u8, 0u8, 0u32)
         };
-        let scalar_class = Self::evex_scalar_bcst_class(b_map & 7, b_pp, b_w, b_op);
+        let scalar_class = Self::evex_scalar_bcst_class(b_map, b_pp, b_w, b_op);
         let packed_elem = Self::evex_packed_bcst_elem(b_map, b_pp, b_w, b_op);
         for op in ops {
             let (_, _, bcst, _) = op_decor(op);
@@ -1797,6 +1807,27 @@ impl InstructionEncoder {
             // VCVTNE2PS2BF16 uses F2/72 (different PP despite adjacent maps).
             "vdpbf16ps" => r(self.encode_evex_binary(ops, 2, 2, 0, 0x52)),
             "vcvtne2ps2bf16" => r(self.encode_evex_binary(ops, 2, 3, 0, 0x72)),
+            // AVX10.2 SM4 (EVEX.128/256/512.{F3,F2}.0F38.W0 DA): the EVEX
+            // rows are part of the AVX10.2 conformance set (the older
+            // "VEX.128/256 only" note in the SDM predates AVX10.2), and
+            // GAS 2.47 encodes them — zmm (`vsm4key4 %zmm1,%zmm2,%zmm3` =
+            // `62 f2 6e 48 da d9`), EGPR bases and xmm16+ spellings all
+            // need them. No decorator is defined for these rows; GAS
+            // rejects each with its own message (byte-probed):
+            //   `{k}`/`{z}`     -> `unsupported masking for `vsm4key4''
+            //   `{1toN}`        -> `unsupported broadcast for `vsm4key4''
+            //   `{sae}`/`{r*-sae}` -> `unsupported static rounding/sae for
+            //                          `vsm4rnds4'' (evex_sae_class has no
+            //                          DA row, so apply_evex_sae rejects).
+            // Width mismatches keep `register type mismatch` from the
+            // shared packed gate. Low-register xmm/ymm spellings never
+            // reach this arm: without zmm/EGPR/high-vector operands the
+            // dispatcher prefers the shorter VEX.128/256 rows in the main
+            // table (GAS emits VEX there too).
+            "vsm4key4" => r(Self::evex_forbid_mask_bcst(mnemonic, ops)
+                .and_then(|_| self.encode_evex_binary(ops, 2, 2, 0, 0xDA))),
+            "vsm4rnds4" => r(Self::evex_forbid_mask_bcst(mnemonic, ops)
+                .and_then(|_| self.encode_evex_binary(ops, 2, 3, 0, 0xDA))),
             // permutes (EVEX.NDS.66.0F38)
             "vpermd" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x36)),
             "vpermps" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x16)),
@@ -7229,6 +7260,48 @@ mod encoding_opt_tests {
         assert_eq!(hex("vprold $1, (%rdi), %zmm1"), "62 f1 75 48 72 0f 01");
         // xmm vpxord (EVEX-only mnemonic, dest != 0).
         assert_eq!(hex("vpxord %xmm2, %xmm1, %xmm3"), "62 f1 75 08 ef da");
+    }
+
+    #[test]
+    fn evex_egpr_base_broadcast_map_key() {
+        // S02 red-team regression: the central broadcast-count check read
+        // EVEX byte 1 with & 0xF, folding the APX B4 bit (EGPR base,
+        // NOT inverted) into the map key — every {1toN} load with an
+        // r16-r31 base was rejected as `unsupported broadcast' even
+        // though the emitted encoding was correct. Byte 1 low nibble is
+        // B4 ++ mmm; the map is exactly & 0x7. Byte-probed against
+        // GAS 2.47 (map 0F rows here; 0F38/0F3A rows in the casefile
+        // corpus — evex-redteam-s02.casefile).
+        assert_eq!(
+            hex("vaddps 508(%r16){1to16}, %zmm5, %zmm6"),
+            "62 f9 54 58 58 70 7f"
+        );
+        assert_eq!(
+            hex("vaddps (%r16){1to8}, %ymm5, %ymm6"),
+            "62 f9 54 38 58 30"
+        );
+        // EGPR INDEX (X4 in byte 2, outside the pp mask) worked before
+        // and must keep working.
+        assert_eq!(
+            hex("vaddps 508(%rax,%r16,4){1to16}, %zmm5, %zmm6"),
+            "62 f1 50 58 58 74 80"
+        );
+    }
+
+    #[test]
+    fn evex_sm4_avx10_conformance() {
+        // AVX10.2 adds EVEX.128/256/512 rows for VSM4KEY4/VSM4RNDS4
+        // (no masking, no broadcast; low-register xmm/ymm spellings keep
+        // the shorter VEX.128/256 rows). Byte-probed against GAS 2.47:
+        // zmm key = 62 f2 6e 48 da d9, EGPR base sets B4 (bit 3 of
+        // byte 1, not inverted), xmm20+ needs R'/V'.
+        assert_eq!(hex("vsm4key4 %zmm1, %zmm2, %zmm3"), "62 f2 6e 48 da d9");
+        assert_eq!(hex("vsm4rnds4 %zmm1, %zmm2, %zmm3"), "62 f2 6f 48 da d9");
+        assert_eq!(hex("vsm4key4 (%r16), %xmm5, %xmm6"), "62 fa 56 08 da 30");
+        assert_eq!(hex("vsm4rnds4 %xmm20, %xmm5, %xmm6"), "62 b2 57 08 da f4");
+        // VEX preference for low-register spellings (GAS emits VEX there).
+        assert_eq!(hex("vsm4key4 %xmm4, %xmm5, %xmm6"), "c4 e2 52 da f4");
+        assert_eq!(hex("vsm4rnds4 %ymm4, %ymm5, %ymm6"), "c4 e2 57 da f4");
     }
 
     #[test]

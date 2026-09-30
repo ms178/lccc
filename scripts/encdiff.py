@@ -520,9 +520,40 @@ def _vcmp_imm_symmetric(text: str) -> bool:
 _GP32_TO_64 = {
     "eax": "rax", "ebx": "rbx", "ecx": "rcx", "edx": "rdx",
     "esi": "rsi", "edi": "rdi", "ebp": "rbp", "esp": "rsp",
-    **{f"r{n}d": f"r{n}" for n in range(8, 16)},
+    **{f"r{n}d": f"r{n}" for n in range(8, 32)},
 }
-_MOV_IMM = re.compile(r"^(movabs|mov)\s+\$(0x[0-9a-f]+|\d+),%(\w+)$")
+# 64-bit GPR names including the APX EGPR range: `movabs $val,%rN` (the
+# imm64 form) canonicalises onto the same `mov $val,%rN` spelling as the
+# zero-extending imm32 form when the value fits unsigned 32 bits — they
+# write identical register contents (x86-64 zero-extends every 32-bit
+# write), so a length comparison between them is a pure encoding choice.
+_GP64_FULL = {
+    "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+    *(f"r{n}" for n in range(8, 32)),
+}
+_MOV_IMM = re.compile(r"^(movabs|mov)\s+\$(0x[0-9a-f]+|\d+),%([a-z0-9]+)$")
+# Direct branches whose objdump spelling differs by encoding choice:
+# objdump renders a 66-prefixed near branch as `jmpw`/`callw` and a
+# 66-prefixed SHORT branch as `data16 jmp`, while the un-prefixed short
+# form is plain `jmp`. All three names describe the same architectural
+# branch; the 66 prefix is a dead operand-size hint for branches in
+# 64-bit mode (Intel SDM Jcc/JMP: the default operand size applies).
+_BRANCH_W = re.compile(r"^(jmp|call)w\b")
+# Direct branch to an absolute target: canonicalised to the displacement
+# from the instruction end, so two encodings of one branch with different
+# instruction lengths (short vs near) compare by WHERE they jump, not by
+# the absolute address objdump happened to print.
+_BRANCH_TARGET = re.compile(
+    r"^((?:data16\s+)?(?:j[a-z]+|jmp|call|loop[a-z]*))\s+(0x[0-9a-f]+)$")
+
+
+def _canon_branch_target(insn: str, addr: int, nbytes: int) -> str:
+    """Rewrite a direct branch's absolute target as its end-relative disp."""
+    m = _BRANCH_TARGET.match(insn)
+    if not m:
+        return insn
+    target = int(m.group(2), 16)
+    return f"{m.group(1)} {target - (addr + nbytes):+#x}"
 
 
 def _canon_insn(insn: str) -> str:
@@ -532,6 +563,10 @@ def _canon_insn(insn: str) -> str:
     # prefix (`{vex} vpdpbusds`). It describes the selected encoding, not a
     # different architectural instruction, so remove it for semantic compare.
     insn = re.sub(r"^\{vex(?:2|3)?\}\s+", "", insn)
+    # `jmpw`/`callw` (66-prefixed near branch) and `data16 jmp` (66-prefixed
+    # short branch) are the same instruction text as their un-prefixed
+    # spellings; unify so only the target matters.
+    insn = _BRANCH_W.sub(r"\1", insn)
     insn = _SCALE1.sub(r"(%\1)", insn)
     insn = _ZERODISP.sub("(", insn)
     insn = re.sub(r"\s+", " ", insn)
@@ -547,8 +582,16 @@ def _canon_insn(insn: str) -> str:
     if m:
         val = int(m.group(2), 0)
         reg = m.group(3)
-        if reg in _GP32_TO_64 and 0 <= val <= 0xFFFFFFFF:
-            insn = f"mov ${val:#x},%{_GP32_TO_64[reg]}"
+        if 0 <= val <= 0xFFFFFFFF:
+            # Zero-extension equivalence: writing a 32-bit register (the
+            # imm32 opcode, incl. the REX2/EGPR rows objdump prints as
+            # %r16d) and movabs-ing the same zero-extended value into the
+            # 64-bit register produce identical register contents, so both
+            # canonicalise to `mov $val,%r64` (covers %r16d-%r31d too).
+            if reg in _GP32_TO_64:
+                insn = f"mov ${val:#x},%{_GP32_TO_64[reg]}"
+            elif reg in _GP64_FULL:
+                insn = f"mov ${val:#x},%{reg}"
     return insn
 
 
@@ -576,10 +619,16 @@ def decodes_same(objdump: str, a: bytes, b: bytes,
             return None
         out = []
         for line in r.stdout.splitlines():
-            m = re.match(r"^\s+[0-9a-f]+:\s+((?:[0-9a-f]{2} )+)\s*\t(.*)$", line)
+            m = re.match(
+                r"^\s+([0-9a-f]+):\s+((?:[0-9a-f]{2} )+)\s*\t(.*)$", line)
             if not m:
                 continue
-            insn = _canon_insn(m.group(2))
+            insn = _canon_insn(m.group(3))
+            # Branch targets: compare by displacement-from-end so a short
+            # and a near encoding of the same branch compare equal exactly
+            # when they transfer to the same place.
+            insn = _canon_branch_target(
+                insn, int(m.group(1), 16), len(m.group(2).split()))
             # Objdump renders undecodable bytes as `.byte` (and some versions
             # use `(bad)`). Two undecodable streams are not equivalent code.
             if not insn or insn == "(bad)" or insn.startswith(".byte"):
@@ -676,6 +725,12 @@ def classify(row: Row, bits32: bool = False) -> None:
     ref = next(iter(bytesets))
     if row.lccc.data == ref:
         row.verdict = "ok"
+    elif is_declined_data16_relax(row.insn) and n > len(ref):
+        row.verdict = "DECLINED-DATA16"
+        row.note = (row.note + " | " if row.note else "") + (
+            f"{len(ref)}B form from gas relaxes the explicit 16-bit"
+            " displacement to the short row; refused (fixed-rel16 policy,"
+            " see prefix-words.casefile)")
     elif n < len(ref):
         row.note = (f"oracles agree on {len(ref)}B"
                     f" ({','.join(sorted(ok_oracles))})")
@@ -710,6 +765,20 @@ def is_declined_fp_swap(insn: str) -> bool:
     return bool(parts) and parts[0] in _FP_NONCOMMUTATIVE
 
 
+# An EXPLICIT `data16` branch names the 16-bit displacement form itself:
+# lccc's fixed-rel16 policy keeps `data16 je 1f` on the rel16 near row even
+# for a target GAS would relax down to the 66-prefixed SHORT form (3B).
+# The far-local rows are pinned byte-exact in prefix-words.casefile; only
+# the near-target relaxation differs, and that difference is a documented
+# deliberate policy (the explicit prefix is a request for a 16-bit field),
+# not a lost encoding. Classified separately so LONGER keeps its signal.
+_DECLINED_DATA16_RELAX = re.compile(r"^data16\s+(?:j\w+|jmp|call)\b", re.I)
+
+
+def is_declined_data16_relax(insn: str) -> bool:
+    return _DECLINED_DATA16_RELAX.match(insn) is not None
+
+
 # Shorter encodings that are simply WRONG. Every one of these was produced by
 # an oracle and rejected here after checking what the bytes actually do.
 #
@@ -739,6 +808,7 @@ SEVERITY = {
     "ok": 7,
     "DECLINED-FP": 7,   # shorter form exists but changes NaN payload
     "DECLINED-WRONG": 7, # shorter form exists but is not equivalent
+    "DECLINED-DATA16": 7, # shorter form relaxes the requested 16-bit field
     "both-reject": 8,
     "NO-ORACLE": 9,
 }

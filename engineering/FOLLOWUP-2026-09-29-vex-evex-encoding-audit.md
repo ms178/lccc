@@ -208,3 +208,80 @@ Snapshots S01–S07 in the existing ledger are historical **UNGATED** checkpoint
 3. `encdiff.py --32` already provides mode-aware LCCC/GAS `--32` and remote compiler `-m32` comparisons; this continuation used it on canonical VCVT and VFPCLASS forms. The full multi-oracle VEX/EVEX corpus recorded earlier was x86-64; there is no claim that the entire 1,860-instruction corpus was re-run in i686 mode. Keep GAS 2.47 x86-64/i686 casefiles as the syntax/byte-acceptance gate.
 4. Compiler-version coverage for the AVX10.2-only `vfpclassbf16` row is intentionally partial: GCC 16.2 and Clang 23.1 accept it; ICC 2021.10 and the `cicxlatest` alias did not. Preserve that limitation in future evidence rather than treating unsupported compiler parsers as architectural counter-evidence.
 5. Do not claim runtime gains from encoding-length results. The VM exposes two vCPUs and no usable PMU; no Raptor Lake performance measurement was obtained.
+
+## S02 session addendum (2026-09-30, rebased on `ac003e4c`): red-team audit of merged PR #687
+
+The latest merged PR ("x86: extend VEX/EVEX coverage and make encoding oracles
+mode-aware", `493983c4`) shipped without local compilation or assembler runs.
+This session rebuilt the tree (fastbuild green, `-D warnings`), provisioned a
+non-root multilib-equivalent environment (dpkg-extracted 32-bit sysroot +
+gcc PATH shim + GAS 2.47 rebuild + kernel relocs tool from the v6.12 mirror
+with verified SHA-256 pins), and ran the full `ci_local.sh --fast` triage,
+an adversarial asm-diff sweep of the new families, and the whole-corpus
+`encdiff` differential. Findings and fixes (each committed and snapshot):
+
+1. **ci_local clippy gate OOM** (commit `b1e869f2`): the gate ran a bare
+   `cargo clippy` without the cargo-test memory mitigations, so on a <6 GB
+   host the OOM killer SIGKILLed rustc mid-gate and the gate reported a lint
+   failure that never happened (`CI_LOCAL_JOBS=1` alone is insufficient —
+   verified both ways). `clippy_gate()` now mirrors `cargo_test_repeated`'s
+   heuristic (debug=0/incremental=0/-j1 on small hosts, env overrides
+   honored); lint-identical by construction.
+2. **Six regression gates probed the -m32 LINK but gated i386 RUN legs on it**
+   (commit `3899cdba`): nocfi-peephole-parity's probe compiled a trivial -m32
+   program and never ran it; copy-alias-sizes, notype-code-routing, comdat,
+   eh-frame-unwind and vec-dead-remainder had no exec guard at all. Hosts
+   that link -m32 through a sysroot but cannot execute i386 (no
+   /lib/ld-linux.so.2, or a seccomp policy that SIGSYSes the ia32 gateway)
+   reported phantom codegen/linker failures. New shared
+   `tests/regression/i386_exec.sh` probe (build AND run); skip only the exec
+   legs. The fix also ADDED execution-independent laws so sandbox hosts keep
+   validating: copy-alias (COPY-per-member, exact exported sizes, no partial
+   range overlap — validated against BOTH lccc-ld's shared-slot and GNU ld's
+   split-slot layouts), notype (JMP_SLOT routing before the runtime compare),
+   comdat (structural link assertions + the x86-64 duplicate-signature
+   first-wins body check `movl $3` vs `movl $30`). The linker-suite gate is
+   deliberately NOT probe-gated (ci-gate-parity contract; documented in
+   ci_local.sh).
+3. **EGPR-base broadcast false rejects** (commit `408d39b2`): the central
+   post-encode decorator check read EVEX byte 1 with `& 0xF`, folding the APX
+   B4 bit (EGPR base, NOT inverted) into the map key — EVERY `{1toN}` load
+   with an r16-r31 base was rejected as `unsupported broadcast` although the
+   emitted encoding was correct (`vaddps 508(%r16){1to16}, %zmm5, %zmm6` =
+   `62 f9 54 58 58 70 7f`, byte-verified). Found on the whole EVEX surface,
+   not just the new families. The map is the low 3 bits; extracted `& 0x7`
+   at the source (the scalar branch had masked at its call site, hiding the
+   same bug).
+4. **AVX10.2 EVEX SM4** (same commit): GAS 2.47 encodes `vsm4key4`/
+   `vsm4rnds4` EVEX.128/256/512 rows (zmm byte-probed `62 f2 6e 48 da d9`;
+   EGPR bases, xmm16+; no mask/broadcast — every decorator rejected with its
+   own GAS message). The earlier "SDM v093 documents VEX.128/256 only" note
+   predates AVX10.2; the new arms implement the EVEX rows while keeping the
+   VEX preference for low-register spellings exactly like GAS.
+5. **encdiff verdict machinery** (commit `57405859`): whole-corpus self-run
+   exposed two verdict bugs — the mov-imm zero-extension equivalence stopped
+   at r15d and never canonicalised `movabs`, so the eight
+   `movq $u32, %r64` rows (incl. REX2/EGPR) were WRONG-BYTES false alarms
+   (lccc's zero-extending imm32 form is semantically identical and shorter);
+   and direct-branch comparisons used absolute objdump targets, so short vs
+   near encodings of one branch could never compare equal. After the fix:
+   x86-64 WRONG-BYTES 10 -> 0, BEATS 116 -> 124, longer only on the 2
+   documented data16 fixed-rel16 policy rows (now classified DECLINED-DATA16
+   like the DECLINED-FP precedent); i686 BEATS=6 ok=810 with zero losses.
+
+New corpus: `evex-redteam-s02.casefile` (32 cases: EGPR+broadcast regression
+pins, SM4 EVEX accept/reject, VFPCLASS imm/mask edges, pinned-convert
+aliases, lane insert/extract unsigned-imm and disp edges, VBMI2/compress
+edges, newly-probed GAS case law — k0 write-mask refusal, expand masks on
+destination, unsigned lane selectors, no z-alias for qq2ps, unsuffixed
+vfpclassbf16 VL-from-broadcast-count, negative disp8*N broadcast displacements).
+Nine new byte-exact encoder unit tests; every assertion independently
+verified against GAS 2.47 and the built lccc-x86 before committing.
+
+Whole-corpus validation on the final tree: asm-diff green in both modes
+(GAS 2.47 oracle), encdiff whole-corpus exit 0 in both modes,
+encdiff-semantic-validation green, rustfmt clean, clippy clean on lib+bins.
+Environmental limits of this sandbox (4 GiB cgroup, seccomp ia32 exec block,
+no swap): the cargo-test lib-test compile (rustc >2.8 GB) and the
+linker-suite i386 run legs remain hosted-CI-validated; the ledger records
+every snapshot as UNGATED for exactly that reason.
