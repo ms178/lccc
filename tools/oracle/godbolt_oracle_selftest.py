@@ -20,6 +20,7 @@ cases are checked directly.  Run: tools/oracle/godbolt_oracle_selftest.py
 
 import json
 import os
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -29,6 +30,13 @@ import godbolt_oracle as G  # noqa: E402
 # Imported second: `godbolt_oracle` puts the repo's `scripts/` on sys.path,
 # which is where the shared cache module lives.
 import godbolt_cache as GC  # noqa: E402
+
+# A file-scope ARRAY definition (`static unsigned char tbl[256];`) becomes a
+# `.comm`/`.local` symbol, which Compiler Explorer's asm view strips -- the
+# oracle's code then cannot be re-assembled locally.  MULTILINE is load-
+# bearing: the body handed to this pattern starts at `int main`, so without it
+# `^` can match only at offset 0 and the assertion never fires.
+FILE_SCOPE_STORAGE_RE = re.compile(r"(?m)^\s*static\s+\w+[^;]*\[")
 
 
 class TestStreamJoin(unittest.TestCase):
@@ -94,39 +102,163 @@ class TestOracleTable(unittest.TestCase):
 
 
 class TestProgramsAreLinkable(unittest.TestCase):
+    """The linkability contract applies to the programs this harness RUNS.
+
+    `tests/oracle/programs/` also holds delta kernels claimed by
+    `tests/oracle/delta_corpus.json`; those are measured by function name and
+    never linked, so `main`/`printf`/file-scope rules do not describe them.
+    `TestDirectoryPartition` below pins what does, and pins that the two
+    classes are disjoint and total -- so narrowing these three checks cannot
+    be used to smuggle a program out of them.
+    """
+
     def test_no_file_scope_objects(self):
         """Compiler Explorer's asm view strips `.comm`/`.local`, so a
         file-scope `static` array makes the oracle's code impossible to
         re-assemble locally.  The two programs that had one are the reason
         this check exists."""
-        import glob
-        import re
-        for path in glob.glob(os.path.join(G.PROGRAMS, "*.c")):
-            src = open(path).read()
+        for prog in G.standalone_programs():
+            src = Path(G.PROGRAMS, prog).read_text()
             body = src[src.index("int main"):]        # helpers are above
             self.assertNotRegex(
-                body, r"^\s*static\s+\w+[^;]*\[",                      # noqa
-                f"{os.path.basename(path)} declares file-scope storage")
+                body, FILE_SCOPE_STORAGE_RE,
+                f"{prog} declares file-scope storage")
+
+    def test_file_scope_pattern_actually_fires(self):
+        """Positive control.  This assertion was written with `^` and no
+        MULTILINE, so against a body that starts at `int main` it could only
+        ever match at offset 0 -- it never fired, and the check that two real
+        programs motivated was a no-op for as long as it existed.  A pattern
+        that cannot match is not a gate, so the pattern is now pinned against
+        the shape it exists to reject."""
+        bad = "int main(void)\n{\n\treturn 0;\n}\nstatic unsigned char tbl[256];\n"
+        self.assertRegex(bad, FILE_SCOPE_STORAGE_RE)
+        good = "int main(void)\n{\n\tstatic int scalar = 0;\n\treturn scalar;\n}\n"
+        self.assertNotRegex(good, FILE_SCOPE_STORAGE_RE)
 
     def test_no_rotates_by_the_full_width(self):
         """`x << 32` and `x << 64` are undefined even for unsigned types.
         Clang 23 and GCC fold them differently, so the program has no
-        defined answer and the oracle would report a phantom divergence."""
-        import glob
-        for path in glob.glob(os.path.join(G.PROGRAMS, "*.c")):
-            src = open(path).read()
+        defined answer and the oracle would report a phantom divergence.
+
+        Deliberately checked over BOTH classes: a kernel is compared against
+        oracles too, so an undefined shift poisons its delta exactly as it
+        poisons a program's semantics diff."""
+        for name in G._all_sources():
+            src = Path(G.PROGRAMS, name).read_text()
             # Only the helper needs the mask: `rotl(h, (i & 63) + 1)` at a
             # call site is safe precisely because the helper does `r &= 63`.
             if "rotl" in src:
                 self.assertRegex(
                     src, r"r\s*&=\s*(31|63)",
-                    f"{os.path.basename(path)} rotates without masking the count")
+                    f"{name} rotates without masking the count")
 
     def test_every_program_prints_something(self):
-        import glob
-        for path in glob.glob(os.path.join(G.PROGRAMS, "*.c")):
-            src = open(path).read()
-            self.assertIn("printf", src, os.path.basename(path))
+        for prog in G.standalone_programs():
+            src = Path(G.PROGRAMS, prog).read_text()
+            self.assertIn("printf", src, prog)
+
+
+class TestDirectoryPartition(unittest.TestCase):
+    """Every `.c` under `tests/oracle/programs/` belongs to exactly one class.
+
+    The sweep used to take "everything in the directory" as its definition of
+    "a program", which was sound while the directory held only programs.  A
+    partition that is not total is worse than no partition: a file in neither
+    class is measured by nobody and checked by nothing.
+    """
+
+    def test_partition_is_total_and_disjoint(self):
+        everything = set(G._all_sources())
+        standalone = set(G.standalone_programs())
+        kernels = set(G.delta_kernels())
+        self.assertEqual(standalone & kernels, set(),
+                         "a file cannot be both a runnable program and a kernel")
+        self.assertEqual(standalone | kernels, everything,
+                         "every .c in tests/oracle/programs is classified")
+        self.assertTrue(standalone, "the runnable-program corpus went empty")
+
+    def test_kernels_never_reach_the_sweep(self):
+        """The regression this partition exists for: a kernel handed to
+        `check()` links, fails on the missing `main`, and is reported as
+        `lccc did not build` -- a red row that is a category error."""
+        standalone = set(G.standalone_programs())
+        for kernel in G.delta_kernels():
+            self.assertNotIn(kernel, standalone)
+            src = Path(G.PROGRAMS, kernel).read_text()
+            self.assertNotIn("int main", src,
+                             f"{kernel} is corpus-claimed but has a main; "
+                             f"it is a program, not a kernel")
+
+    def test_standalone_programs_are_still_runnable(self):
+        for prog in G.standalone_programs():
+            src = Path(G.PROGRAMS, prog).read_text()
+            self.assertIn("int main", src, f"{prog} has no entry point")
+
+    def test_kernels_export_their_measured_function(self):
+        """A `static` measured function can be inlined away or dropped
+        entirely, which yields a zero-instruction row that reads as an
+        optimal result -- the same silent lie `_label_is_function` blocks on
+        the oracle side."""
+        with open(G.DELTA_CORPUS) as fh:
+            corpus = json.load(fh)
+        claimed = 0
+        for entry in corpus["entries"]:
+            path = os.path.join(G.REPO, entry["source"])
+            self.assertTrue(os.path.isfile(path),
+                            f"{entry['id']}: corpus claims a missing source {path}")
+            src = Path(path).read_text()
+            fn = re.escape(entry["function"])
+            # Both house styles: `unsigned global_match_probe(` on one line,
+            # and the return type on its own line above a column-0 name.
+            self.assertRegex(
+                src, rf"(?m)^(?:[A-Za-z_][A-Za-z0-9_]*[ \t*]+)?{fn}[ \t]*\(",
+                f"{entry['id']}: {entry['function']} is not defined at file scope")
+            self.assertNotRegex(
+                src, rf"(?m)^\s*static\b[^;{{}}]*\b{fn}\s*\(",
+                f"{entry['id']}: measured function {entry['function']} is static")
+            if os.path.dirname(path) == G.PROGRAMS:
+                claimed += 1
+        self.assertGreater(claimed, 0, "no kernel lives in tests/oracle/programs")
+
+    def test_unreadable_corpus_degrades_to_the_old_sweep(self):
+        """A JSON typo must not silently empty the sweep, and must not crash
+        it either: with no readable corpus nothing is claimed, so every file
+        is treated as a program and the linkability checks see all of them.
+
+        Only `G.DELTA_CORPUS` is repointed, at a throwaway path -- the real
+        corpus is a committed gate input and this test must not be able to
+        edit it.
+        """
+        import tempfile
+        saved = G.DELTA_CORPUS
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                G.DELTA_CORPUS = os.path.join(d, "missing.json")
+                self.assertEqual(G.corpus_kernel_sources(), set())
+                self.assertEqual(G.standalone_programs(), G._all_sources())
+
+                G.DELTA_CORPUS = os.path.join(d, "empty.json")
+                open(G.DELTA_CORPUS, "w").close()          # malformed JSON
+                self.assertEqual(G.corpus_kernel_sources(), set())
+
+                # A claim is authoritative by design, so a corpus entry that
+                # names a RUNNABLE program removes it from the sweep.  Pinned
+                # here so that is a decision rather than a surprise;
+                # test_kernels_never_reach_the_sweep rejects it for real files.
+                G.DELTA_CORPUS = os.path.join(d, "claims-a-program.json")
+                with open(G.DELTA_CORPUS, "w") as fh:
+                    json.dump({"entries": [
+                        {"id": "x", "source": "tests/oracle/programs/bitops.c",
+                         "function": "main"}]}, fh)
+                self.assertNotIn("bitops.c", G.standalone_programs())
+                self.assertIn("bitops.c", G.delta_kernels())
+        finally:
+            G.DELTA_CORPUS = saved
+        # ...and the real corpus is untouched and still authoritative.
+        self.assertEqual(G.DELTA_CORPUS, saved)
+        self.assertTrue(os.path.isfile(saved))
+        self.assertTrue(G.delta_kernels(), "the corpus claims no kernel")
 
 
 class TestRevalidateDropsStaleRecords(unittest.TestCase):
