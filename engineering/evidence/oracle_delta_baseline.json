@@ -1,0 +1,36 @@
+{
+  "schema": 1,
+  "flags": "-O2 -march=x86-64-v3",
+  "entries": {
+    "expat_name_length": {
+      "insns": 70,
+      "stack": 0,
+      "got": 0,
+      "push": 0
+    },
+    "expat_scan_document": {
+      "insns": 81,
+      "stack": 3,
+      "got": 0,
+      "push": 6
+    },
+    "gzip_crc32_loop": {
+      "insns": 14,
+      "stack": 0,
+      "got": 0,
+      "push": 0
+    },
+    "ra01_global_match_probe": {
+      "insns": 92,
+      "stack": 2,
+      "got": 0,
+      "push": 6
+    },
+    "zlib_ng_adler32_c": {
+      "insns": 270,
+      "stack": 14,
+      "got": 0,
+      "push": 6
+    }
+  }
+}

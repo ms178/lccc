@@ -1,0 +1,36 @@
+{
+  "schema": 1,
+  "flags": "-O2 -march=x86-64-v3",
+  "oracles": [
+    "gcc16.2",
+    "clang",
+    "icx"
+  ],
+  "entries": [
+    {
+      "id": "ra01_global_match_probe",
+      "source": "engineering/evidence/godbolt/ra01_global_remat.c",
+      "function": "global_match_probe"
+    },
+    {
+      "id": "zlib_ng_adler32_c",
+      "source": "tests/oracle/programs/zlib_ng_adler32_kernel.c",
+      "function": "zlib_ng_adler32_c"
+    },
+    {
+      "id": "gzip_crc32_loop",
+      "source": "tests/oracle/programs/gzip_crc32_kernel.c",
+      "function": "gzip_crc32_update_no_xor"
+    },
+    {
+      "id": "expat_name_length",
+      "source": "tests/oracle/programs/expat_name_scan_kernel.c",
+      "function": "expat_utf8_name_length"
+    },
+    {
+      "id": "expat_scan_document",
+      "source": "tests/oracle/programs/expat_name_scan_kernel.c",
+      "function": "expat_scan_document"
+    }
+  ]
+}
