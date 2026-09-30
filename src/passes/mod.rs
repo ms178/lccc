@@ -1057,12 +1057,14 @@ fn vectorize_entry(
 ///
 /// Measured on `lccc-arm`, it is also a regression rather than a wash:
 ///
-///     float dot-product + float max, -O2 -ffast-math
-///       two_wide_fast_math   95 insns
-///       two_wide (previous)  73 insns   (-23 %)
-///     whole arm corpus (14 files x 3 configs)
-///       two_wide_fast_math   6260 insns
-///       two_wide (previous)  6264 insns (+0.06 %, noise)
+/// ```text
+/// float dot-product + float max, -O2 -ffast-math
+///   two_wide_fast_math   95 insns
+///   two_wide (previous)  73 insns   (-23 %)
+/// whole arm corpus (14 files x 3 configs)
+///   two_wide_fast_math   6260 insns
+///   two_wide (previous)  6264 insns (+0.06 %, noise)
+/// ```
 ///
 /// So the fast-math late entry costs 23 % on the code it actually affects and
 /// buys nothing anywhere else. The late rerun keeps the previous AArch64

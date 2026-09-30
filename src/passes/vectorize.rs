@@ -584,6 +584,31 @@ fn vectorize_with_analysis_mode(
             total_changes += changes;
             continue;
         } else if !neon
+            && !late_minmax_only()
+            && x86_simd_available_pub()
+            && let Some(bcmp_pattern) = analyze_byte_compare_loop(func, loop_info)
+        {
+            // Byte-compare loop (`while (p < end && *p == *q) { p++; q++; }`,
+            // the LZ4 extend family): WIDTH-byte `vpcmpeqb`/`vpmovmskb`
+            // window phase with the ORIGINAL scalar loop kept as the
+            // fallback tail.  Picks 32B AVX2 / 16B SSE2 itself, so (unlike
+            // the byte-count and Adler arms) it deliberately does NOT
+            // exclude LCCC_FORCE_SSE2 and does not require AVX2.  Exactness
+            // and the label-space edge invariant are proven in the
+            // section epic; the analysis fails closed on every shape it
+            // cannot prove.
+            let n = transform_byte_compare_loop(func, &bcmp_pattern);
+            if n > 0 {
+                if debug {
+                    eprintln!(
+                        "[VEC] Byte-compare loop matched! {} changes (loop {})",
+                        n, idx
+                    );
+                }
+                total_changes += n;
+                continue;
+            }
+        } else if !neon
             && !force_two_wide
             && !late_minmax_only()
             && std::env::var("LCCC_FORCE_SSE2").is_err()
@@ -9308,6 +9333,747 @@ fn emit_scalar_count_tree(
         }
         MapExpr::Sqrt(_) | MapExpr::MinMax { .. } => None,
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Byte-compare loop epic: the LZ4 extend-loop family
+// ═══════════════════════════════════════════════════════════════════════
+//
+//     while (p < end && *p == *q) { p++; q++; }
+//
+// i.e. "two pointers advancing in lockstep until the first byte that
+// differs (or the bound)".  This is the shape of LZ4's extend-phase
+// comparison loops, and of any hand-written memmem/strstr-style byte
+// scan with a second stream.
+//
+// GCC 16.2, Clang 23.1 and ICX (2026-09 oracle pins, -O2
+// -march=x86-64-v3) all vectorize this shape with a 32-byte AVX2 window
+// (SSE2 16-byte window on the baseline ISA):
+//
+//     leaq 32(%rdi), %r8            ; room test: p + 32 < end
+//     cmpq %rsi, %r8
+//     jge  <tail>                   ; not enough room -> scalar tail
+//  .Lloop:
+//     vmovdqu (%rdi), %ymm2
+//     vmovdqu (%rdx), %ymm3
+//     vpcmpeqb %ymm3, %ymm2, %ymm0  ; per-byte equality mask
+//     vpmovmskb %ymm0, %eax
+//     cmpl $-1, %eax
+//     jne  <tail>                   ; a differing byte -> scalar tail
+//     addq $32, %rdi                ; advance both pointers by 32
+//     addq $32, %rdx
+//     (room re-test, back to .Lloop)
+//
+// Exactness argument (why this is a legal rewrite):
+//   * The window is loaded only when p + WIDTH <= end (the room test
+//     uses the SAME op the frontend chose for `p < end`, so the bound
+//     arithmetic's signedness is preserved), so every load is within
+//     the declared object (no OOB read).
+//   * `vpcmpeqb` + `vpmovmskb` == full means every lane is equal, which
+//     is equivalent to all WIDTH scalar iterations taking the "equal"
+//     branch; the pointer advance by WIDTH then reproduces exactly the
+//     state after those WIDTH scalar iterations.
+//   * Any partial-window mismatch (mask != full) or insufficient room
+//     hands control to the ORIGINAL scalar loop, which re-tests the
+//     window start byte-for-byte and produces the identical exit
+//     pointer.  The scalar loop is the fallback, not dead code: the
+//     vector phase is a fast path over the head of the run of equal
+//     bytes, the scalar loop keeps the tail.
+//   * The loop body has no stores (enforced below), so the two phases
+//     cannot observe each other's effects and cannot interleave
+//     differently from the original.
+//
+// The transform keeps the original loop blocks intact and prepends three
+// new blocks (vh / vbody / vstep): the preheader now enters the phase;
+// the phase either advances WIDTH bytes per iteration or hands control
+// to the original header, whose phis gain the phase live-in as an
+// incoming edge.
+//
+// Kill switch: LCCC_NO_BYTECMP_VEC=1 disables the arm entirely.
+//
+// HARD-WON INVARIANT (regression risk, do not "simplify"):
+// Terminator labels are `BlockId` values in LABEL space, and a block's
+// numeric label need NOT equal its index in `func.blocks` (the frontend
+// allocates labels in source order; later passes reorder the vector).
+// `loop_info.body` is an index set. Every edge comparison in this
+// section is therefore label-to-label; the index is recovered only for
+// the exit block, once, by label lookup. Comparing `label.0 as usize`
+// against an index set silently declines on any reordered function.
+
+/// The matched shape, in the vocabulary of the analyzed function.
+#[derive(Debug)]
+struct ByteComparePattern {
+    /// Block indices (into `func.blocks`) that the transform rewrites.
+    header_idx: usize,
+    preheader_idx: usize,
+    /// Block labels (label space) for the terminator rewiring.
+    preheader_label: BlockId,
+    header_label: BlockId,
+    /// The two loop-carried pointer phis (same type, distinct values).
+    p_phi: Value,
+    q_phi: Value,
+    p_pre: Value,
+    q_pre: Value,
+    /// The loop-invariant bound value of the `p < end` test.
+    end_val: Value,
+    /// Types as found in the loop: the pointer type, the pointer-add type
+    /// (latch increments), and the bound-compare type.
+    ptr_ty: IrType,
+    add_ty: IrType,
+    bound_ty: IrType,
+    /// The comparison op of the original `p < end` Cmp (Ult or Slt). The
+    /// phase room-test MUST reuse it: the frontend's choice encodes the
+    /// signedness of the bound arithmetic, and swapping it here changes
+    /// behaviour at the signed/unsigned boundary.
+    bound_op: IrCmpOp,
+}
+
+fn analyze_byte_compare_loop(
+    func: &IrFunction,
+    loop_info: &loop_analysis::NaturalLoop,
+) -> Option<ByteComparePattern> {
+    if std::env::var_os("LCCC_NO_BYTECMP_VEC").is_some() {
+        return None;
+    }
+    let debug = std::env::var_os("LCCC_DEBUG_VECTORIZE").is_some();
+    let decline = |why: &str| {
+        if debug {
+            eprintln!("[BCMP] {why}; declining");
+        }
+    };
+
+    let loop_blocks: FxHashSet<usize> = loop_info.body.iter().copied().collect();
+    let header_idx = loop_info.header;
+    if loop_blocks.len() != 3 {
+        decline(&format!(
+            "loop has {} blocks, want exactly 3",
+            loop_blocks.len()
+        ));
+        return None;
+    }
+
+    let defined_in_loop = |v: Value| -> bool {
+        loop_blocks.iter().any(|&bi| {
+            func.blocks[bi]
+                .instructions
+                .iter()
+                .any(|i| i.dest() == Some(v))
+        })
+    };
+
+    // ---- header: [Phi(p), Phi(q), Cmp(p vs end)] + 2-way branch --------
+    let hblock = &func.blocks[header_idx];
+    if hblock.instructions.len() != 3 {
+        decline(&format!(
+            "header has {} instructions, want [Phi, Phi, Cmp]",
+            hblock.instructions.len()
+        ));
+        return None;
+    }
+    let (p_phi, p_ty) = match &hblock.instructions[0] {
+        Instruction::Phi { dest, ty, .. } if matches!(ty, IrType::Ptr | IrType::I64) => {
+            (*dest, *ty)
+        }
+        _ => {
+            decline("header instr 0 is not a pointer phi");
+            return None;
+        }
+    };
+    let (q_phi, q_ty) = match &hblock.instructions[1] {
+        Instruction::Phi { dest, ty, .. } if matches!(ty, IrType::Ptr | IrType::I64) => {
+            (*dest, *ty)
+        }
+        _ => {
+            decline("header instr 1 is not a pointer phi");
+            return None;
+        }
+    };
+    if p_phi == q_phi || p_ty != q_ty {
+        decline("the two pointer phis must be distinct and same-typed");
+        return None;
+    }
+    let (bound_op, bound_ty, end_val) = match &hblock.instructions[2] {
+        Instruction::Cmp {
+            op, lhs, rhs, ty, ..
+        } if matches!(op, IrCmpOp::Ult | IrCmpOp::Slt) => {
+            let (lhs_v, rhs_v) = match (lhs, rhs) {
+                (Operand::Value(l), Operand::Value(r)) => (*l, *r),
+                _ => {
+                    decline("header Cmp sides must be values");
+                    return None;
+                }
+            };
+            // One side is p_phi, the other is a loop-invariant bound.
+            if lhs_v == p_phi {
+                if defined_in_loop(rhs_v) {
+                    decline("bound (rhs of header Cmp) is loop-defined");
+                    return None;
+                }
+                (*op, *ty, rhs_v)
+            } else if rhs_v == p_phi {
+                if defined_in_loop(lhs_v) {
+                    decline("bound (lhs of header Cmp) is loop-defined");
+                    return None;
+                }
+                (*op, *ty, lhs_v)
+            } else {
+                decline("header Cmp does not involve the p phi");
+                return None;
+            }
+        }
+        _ => {
+            decline("header instr 2 is not the bound Cmp (p < end)");
+            return None;
+        }
+    };
+
+    // ---- block roles ----------------------------------------------------
+    // Latch: the non-header loop block that branches to the header.
+    // Compare: the remaining loop block.
+    let mut latch_idx = None;
+    for &bi in &loop_info.body {
+        if bi == header_idx {
+            continue;
+        }
+        if matches!(
+            &func.blocks[bi].terminator,
+            Terminator::Branch(l) if *l == func.blocks[header_idx].label
+        ) {
+            latch_idx = Some(bi);
+        }
+    }
+    let Some(latch_idx) = latch_idx else {
+        decline("no latch block (Branch to header) found");
+        return None;
+    };
+    let compare_idx = *loop_blocks
+        .iter()
+        .find(|&&i| i != header_idx && i != latch_idx)
+        .expect("3 blocks: header, latch, compare");
+
+    // Preheader: the first non-loop block that branches to the header.
+    let mut preheader_idx = None;
+    for (bi, b) in func.blocks.iter().enumerate() {
+        if loop_blocks.contains(&bi) {
+            continue;
+        }
+        if matches!(&b.terminator, Terminator::Branch(l) if *l == func.blocks[header_idx].label) {
+            preheader_idx = Some(bi);
+            break;
+        }
+    }
+    let Some(preheader_idx) = preheader_idx else {
+        decline("no preheader (non-loop block branching to header) found");
+        return None;
+    };
+    let preheader_label = func.blocks[preheader_idx].label;
+    let header_label = func.blocks[header_idx].label;
+    let latch_label = func.blocks[latch_idx].label;
+
+    // ---- phi incomings: (preheader, latch) for both phis, plain values -
+    let mut p_pre = None;
+    let mut q_pre = None;
+    for inst in &hblock.instructions {
+        if let Instruction::Phi { dest, incoming, .. } = inst {
+            if incoming.len() != 2 {
+                decline(&format!("phi has {} incomings, want 2", incoming.len()));
+                return None;
+            }
+            let plain = |v: &Operand| match v {
+                Operand::Value(x) => Some(*x),
+                _ => None,
+            };
+            let pre = incoming
+                .iter()
+                .find(|(_, l)| *l == preheader_label)
+                .and_then(|(val, _)| plain(val));
+            let back = incoming
+                .iter()
+                .find(|(_, l)| *l == latch_label)
+                .and_then(|(val, _)| plain(val));
+            if pre.is_none() || back.is_none() {
+                decline("a header phi lacks a plain preheader/latch incoming");
+                return None;
+            }
+            if *dest == p_phi {
+                p_pre = pre;
+            } else if *dest == q_phi {
+                q_pre = pre;
+            }
+        }
+    }
+    let (p_pre, q_pre) = match (p_pre, q_pre) {
+        (Some(a), Some(b)) => (a, b),
+        _ => {
+            decline("phi pre-incoming map incomplete");
+            return None;
+        }
+    };
+    if defined_in_loop(p_pre) || defined_in_loop(q_pre) {
+        decline("a preheader incoming is loop-defined");
+        return None;
+    }
+
+    // ---- compare block: [Load, (Cast), Load, (Cast), Cmp] + branch -----
+    let cblock = &func.blocks[compare_idx];
+    let mut loads: Vec<(Value, Value, IrType)> = Vec::new(); // (dest, ptr, ty)
+    let mut cast_srcs: Vec<(Value, Value)> = Vec::new(); // (dest, src)
+    let mut cmps: Vec<(Value, Operand, Operand)> = Vec::new();
+    for inst in &cblock.instructions {
+        match inst {
+            Instruction::Load {
+                dest,
+                ptr,
+                ty,
+                volatile,
+                ..
+            } if !*volatile && matches!(ty, IrType::U8 | IrType::I8) => {
+                loads.push((*dest, *ptr, *ty));
+            }
+            Instruction::Cast { dest, src, .. } => {
+                if let Operand::Value(s) = src {
+                    cast_srcs.push((*dest, *s));
+                }
+            }
+            Instruction::Cmp {
+                dest,
+                op: IrCmpOp::Eq,
+                lhs,
+                rhs,
+                ..
+            } => cmps.push((*dest, lhs.clone(), rhs.clone())),
+            _ => {
+                decline("compare block contains an unsupported instruction");
+                return None;
+            }
+        }
+    }
+    if loads.len() != 2 || cmps.len() != 1 || cast_srcs.len() > 2 {
+        decline(&format!(
+            "compare block wants 2 loads + 1 Eq, found {} loads, {} casts, {} cmps",
+            loads.len(),
+            cast_srcs.len(),
+            cmps.len()
+        ));
+        return None;
+    }
+    // Both loads must read exactly the two phis (the casts, if any, sit
+    // between load and compare and are resolved on the Cmp side below).
+    let mut load_ptrs: Vec<u32> = loads.iter().map(|(_, p, _)| p.0).collect();
+    load_ptrs.sort();
+    let mut want = [p_phi.0, q_phi.0];
+    want.sort();
+    if load_ptrs != want.to_vec() {
+        decline("the two loads do not read exactly the p and q phis");
+        return None;
+    }
+    // The Eq compares the two load results (through optional casts).
+    let side_val = |op: &Operand| -> Option<Value> {
+        let v = match op {
+            Operand::Value(v) => *v,
+            _ => return None,
+        };
+        Some(
+            cast_srcs
+                .iter()
+                .find(|(d, _)| *d == v)
+                .map(|(_, s)| *s)
+                .unwrap_or(v),
+        )
+    };
+    let (cdest, clhs, crhs) = cmps.pop().expect("checked len 1");
+    let a = side_val(&clhs)?;
+    let b = side_val(&crhs)?;
+    let load_dests: Vec<Value> = loads.iter().map(|(d, _, _)| *d).collect();
+    if !load_dests.contains(&a) || !load_dests.contains(&b) || a == b {
+        decline("compare-block Eq does not compare the two loads");
+        return None;
+    }
+    let _ = cdest;
+
+    // ---- exit edges: both conditional blocks leave to the SAME ---------
+    // ---- non-loop block -------------------------------------------------
+    // (Label-space comparison — see the section invariant above.)
+    let loop_labels: FxHashSet<BlockId> =
+        loop_blocks.iter().map(|&i| func.blocks[i].label).collect();
+    let exit_of = |bi: usize| -> Option<BlockId> {
+        match &func.blocks[bi].terminator {
+            Terminator::CondBranch {
+                true_label,
+                false_label,
+                ..
+            } => {
+                let t_in = loop_labels.contains(true_label);
+                let f_in = loop_labels.contains(false_label);
+                if t_in && !f_in {
+                    Some(*false_label)
+                } else if f_in && !t_in {
+                    Some(*true_label)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    };
+    let header_exit_label = exit_of(header_idx)?;
+    let compare_exit_label = exit_of(compare_idx)?;
+    if header_exit_label != compare_exit_label || loop_labels.contains(&header_exit_label) {
+        decline("exit blocks differ or are loop-internal");
+        return None;
+    }
+
+    // Edge chains: header -> compare (its non-exit edge), compare -> latch
+    // (its non-exit edge).  The latch -> header branch is checked above.
+    for (bi, want_label) in [
+        (header_idx, func.blocks[compare_idx].label),
+        (compare_idx, latch_label),
+    ] {
+        match &func.blocks[bi].terminator {
+            Terminator::CondBranch {
+                true_label,
+                false_label,
+                ..
+            } => {
+                let other = if *true_label == header_exit_label {
+                    *false_label
+                } else {
+                    *true_label
+                };
+                if other != want_label {
+                    decline(&format!(
+                        "block {}'s other edge (-> {}) does not enter the expected block (-> {})",
+                        bi, other.0, want_label.0
+                    ));
+                    return None;
+                }
+            }
+            _ => {
+                decline(&format!(
+                    "block {} terminator is not a conditional branch",
+                    bi
+                ));
+                return None;
+            }
+        }
+    }
+
+    // ---- latch: exactly [Add(p,1), Add(q,1)], branch to header ---------
+    let lblock = &func.blocks[latch_idx];
+    if lblock.instructions.len() != 2 {
+        decline(&format!(
+            "latch has {} instructions, want 2 adds",
+            lblock.instructions.len()
+        ));
+        return None;
+    }
+    let mut adds: Vec<(Value, Value, IrType)> = Vec::new(); // (dest, lhs, ty)
+    for inst in &lblock.instructions {
+        match inst {
+            Instruction::BinOp {
+                dest,
+                op: IrBinOp::Add,
+                lhs,
+                rhs,
+                ty,
+            } => {
+                let one = match rhs {
+                    Operand::Const(c) => c.to_i64() == Some(1),
+                    _ => false,
+                };
+                if !one {
+                    decline("latch add is not +1");
+                    return None;
+                }
+                match lhs {
+                    Operand::Value(lv) => adds.push((*dest, *lv, *ty)),
+                    _ => {
+                        decline("latch add lhs is not a value");
+                        return None;
+                    }
+                }
+            }
+            _ => {
+                decline("latch instruction is not an add");
+                return None;
+            }
+        }
+    }
+    let ordered_pq = adds[0].1 == p_phi && adds[1].1 == q_phi;
+    let ordered_qp = adds[0].1 == q_phi && adds[1].1 == p_phi;
+    if !ordered_pq && !ordered_qp {
+        decline("latch adds do not cover exactly p and q");
+        return None;
+    }
+    if adds[0].2 != adds[1].2 {
+        decline("latch adds have different types");
+        return None;
+    }
+    let add_ty = adds[0].2;
+
+    // ---- no stores anywhere in the loop ---------------------------------
+    for &bi in &loop_blocks {
+        for inst in &func.blocks[bi].instructions {
+            if matches!(inst, Instruction::Store { .. }) {
+                decline("store in loop");
+                return None;
+            }
+        }
+    }
+
+    Some(ByteComparePattern {
+        header_idx,
+        preheader_idx,
+        preheader_label,
+        header_label,
+        p_phi,
+        q_phi,
+        p_pre,
+        q_pre,
+        end_val,
+        ptr_ty: p_ty,
+        add_ty,
+        bound_ty,
+        bound_op,
+    })
+}
+
+fn transform_byte_compare_loop(func: &mut IrFunction, p: &ByteComparePattern) -> usize {
+    let debug = std::env::var_os("LCCC_DEBUG_VECTORIZE").is_some();
+    let avx2 = x86_avx2_available_pub();
+    let sse2 = x86_simd_available_pub();
+    let (width, load_op, cmp_op, msb_op, full_mask) = if avx2 {
+        (
+            32i64,
+            IntrinsicOp::VecLoadI8x32,
+            IntrinsicOp::VecCmpI8x32,
+            IntrinsicOp::Pmovmskb256,
+            -1i32, // all 32 bits set
+        )
+    } else if sse2 {
+        (
+            16i64,
+            IntrinsicOp::VecLoadI8x16,
+            IntrinsicOp::VecCmpI8x16,
+            IntrinsicOp::Pmovmskb128,
+            0xFFFFi32,
+        )
+    } else {
+        return 0;
+    };
+
+    // ---- allocate everything up front (pre-mutation discipline) ---------
+    let mut nid = func.next_value_id;
+    let fresh = |n: &mut u32| {
+        let v = Value(*n);
+        *n += 1;
+        v
+    };
+    let new_label = |f: &mut IrFunction| {
+        let l = BlockId(f.next_label);
+        f.next_label += 1;
+        l
+    };
+    let vh_label = new_label(func);
+    let vbody_label = new_label(func);
+    let vstep_label = new_label(func);
+    let p_v = fresh(&mut nid);
+    let q_v = fresh(&mut nid);
+    let room_add = fresh(&mut nid);
+    let room_cmp = fresh(&mut nid);
+    let vload_a = fresh(&mut nid);
+    let vload_b = fresh(&mut nid);
+    let veq = fresh(&mut nid);
+    let vmsk = fresh(&mut nid);
+    let vfull = fresh(&mut nid);
+    let p_step = fresh(&mut nid);
+    let q_step = fresh(&mut nid);
+    func.next_value_id = nid;
+
+    let width_const = match p.add_ty {
+        IrType::I32 | IrType::U32 => IrConst::I32(width as i32),
+        _ => IrConst::I64(width),
+    };
+    let preheader_label = p.preheader_label;
+    let header_label = p.header_label;
+
+    // vh: the two phase phis, the room test (p + WIDTH < end), the split.
+    let vh_insts = vec![
+        Instruction::Phi {
+            dest: p_v,
+            ty: p.ptr_ty,
+            incoming: vec![
+                (Operand::Value(p.p_pre), preheader_label),
+                (Operand::Value(p_step), vstep_label),
+            ],
+        },
+        Instruction::Phi {
+            dest: q_v,
+            ty: p.ptr_ty,
+            incoming: vec![
+                (Operand::Value(p.q_pre), preheader_label),
+                (Operand::Value(q_step), vstep_label),
+            ],
+        },
+        Instruction::BinOp {
+            dest: room_add,
+            op: IrBinOp::Add,
+            lhs: Operand::Value(p_v),
+            rhs: Operand::Const(width_const.clone()),
+            ty: p.add_ty,
+        },
+        Instruction::Cmp {
+            dest: room_cmp,
+            // Reuse the ORIGINAL bound op: its signedness is the
+            // frontend's for the bound arithmetic (see the pattern doc).
+            op: p.bound_op,
+            lhs: Operand::Value(room_add),
+            rhs: Operand::Value(p.end_val),
+            ty: p.bound_ty,
+        },
+    ];
+    // vbody: load both windows, per-byte compare, mask, full test.
+    // VecLoadI8xNN takes (base, offset) — the offset is Const(0); the
+    // VecCmpI8xNN takes (lhs, rhs, predicate-immediate) — 0 == "eq".
+    let vbody_insts = vec![
+        Instruction::Intrinsic {
+            dest: Some(vload_a),
+            op: load_op,
+            dest_ptr: None,
+            args: vec![Operand::Value(p_v), Operand::Const(IrConst::I64(0))],
+        },
+        Instruction::Intrinsic {
+            dest: Some(vload_b),
+            op: load_op,
+            dest_ptr: None,
+            args: vec![Operand::Value(q_v), Operand::Const(IrConst::I64(0))],
+        },
+        Instruction::Intrinsic {
+            dest: Some(veq),
+            op: cmp_op,
+            dest_ptr: None,
+            args: vec![
+                Operand::Value(vload_a),
+                Operand::Value(vload_b),
+                Operand::Const(IrConst::I32(0)),
+            ],
+        },
+        Instruction::Intrinsic {
+            dest: Some(vmsk),
+            op: msb_op,
+            dest_ptr: None,
+            args: vec![Operand::Value(veq)],
+        },
+        Instruction::Cmp {
+            dest: vfull,
+            op: IrCmpOp::Eq,
+            lhs: Operand::Value(vmsk),
+            rhs: Operand::Const(IrConst::I32(full_mask)),
+            ty: IrType::I32,
+        },
+    ];
+    // vstep: advance both pointers by WIDTH, back to vh.
+    let vstep_insts = vec![
+        Instruction::BinOp {
+            dest: p_step,
+            op: IrBinOp::Add,
+            lhs: Operand::Value(p_v),
+            rhs: Operand::Const(width_const.clone()),
+            ty: p.add_ty,
+        },
+        Instruction::BinOp {
+            dest: q_step,
+            op: IrBinOp::Add,
+            lhs: Operand::Value(q_v),
+            rhs: Operand::Const(width_const),
+            ty: p.add_ty,
+        },
+    ];
+    let vh_term = Terminator::CondBranch {
+        cond: Operand::Value(room_cmp),
+        true_label: vbody_label,
+        false_label: header_label,
+    };
+    let vbody_term = Terminator::CondBranch {
+        cond: Operand::Value(vfull),
+        true_label: vstep_label,
+        false_label: header_label,
+    };
+    let vstep_term = Terminator::Branch(vh_label);
+
+    // ---- mutations (no bail-outs remain) --------------------------------
+    let mut changes = 0usize;
+    // 1. Preheader now enters the phase, not the loop.
+    match &mut func.blocks[p.preheader_idx].terminator {
+        Terminator::Branch(l) if *l == header_label => {
+            *l = vh_label;
+            changes += 1;
+        }
+        _ => {
+            // The analyzer guaranteed this shape; a mismatch would mean
+            // the CFG changed underneath the analysis. Do not half-apply.
+            if debug {
+                eprintln!("[BCMP] preheader terminator changed under the analysis; aborting");
+            }
+            return 0;
+        }
+    }
+    // 2. Header phis: retarget the preheader incoming to the phase
+    //    live-out (vh edge) and add the vbody edge.  PER-PHI: p_phi must
+    //    receive p_v and q_phi must receive q_v — a single value for both
+    //    would make the scalar tail compare A against A (regression from
+    //    the first iteration of this transform: a 9600-case driver caught
+    //    it; the tail's q register was initialized from p).
+    for inst in &mut func.blocks[p.header_idx].instructions {
+        if let Instruction::Phi { dest, incoming, .. } = inst {
+            let phase_val = if *dest == p.p_phi {
+                p_v
+            } else if *dest == p.q_phi {
+                q_v
+            } else {
+                continue;
+            };
+            let mut saw_pre = false;
+            for (val, lbl) in incoming.iter_mut() {
+                if *lbl == preheader_label {
+                    *val = Operand::Value(phase_val);
+                    *lbl = vh_label;
+                    saw_pre = true;
+                }
+            }
+            if saw_pre {
+                incoming.push((Operand::Value(phase_val), vbody_label));
+                changes += 1;
+            }
+        }
+    }
+    // 3. Append the three phase blocks.
+    func.blocks.push(BasicBlock {
+        label: vh_label,
+        instructions: vh_insts,
+        terminator: vh_term,
+        source_spans: vec![],
+    });
+    func.blocks.push(BasicBlock {
+        label: vbody_label,
+        instructions: vbody_insts,
+        terminator: vbody_term,
+        source_spans: vec![],
+    });
+    func.blocks.push(BasicBlock {
+        label: vstep_label,
+        instructions: vstep_insts,
+        terminator: vstep_term,
+        source_spans: vec![],
+    });
+    changes += 11; // 4 + 5 + 2 new instructions
+    if debug {
+        eprintln!(
+            "[BCMP] byte-compare loop vectorized ({}-byte windows): {} changes",
+            width, changes
+        );
+    }
+    changes
 }
 
 // ═══════════════════════════════════════════════════════════════════════
