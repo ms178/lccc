@@ -1989,11 +1989,24 @@ fn try_complete_unroll_general(
     }
 
     // Instruction budget: header non-phi + body, times trip. FP-heavy bodies
-    // get HALF the budget: their unrolled copies create simultaneously-live
-    // FP temps that the linear-scan XMM pool spills (nbody's advance: 1183
-    // insns / 476 stack-refs vs 594/159 un-unrolled — the unroll is code
-    // growth without runtime gain once the spills dominate). Integer bodies
-    // keep the full 512 budget.
+    // get HALF the budget. Two independent effects, both measured on nbody's
+    // `advance` (NBODIES 5, the inner j loop rolled, 5e6 steps):
+    //
+    //   * Register pressure.  The original observation was 1183 insns with
+    //     476 stack references after unrolling vs 594/159 rolled, i.e. the
+    //     linear-scan XMM pool spilled the extra simultaneously-live FP temps.
+    //     That part no longer holds: the allocator has since improved enough
+    //     that an unrolled `advance` spills nothing (0 rsp references).
+    //   * Code size / I-cache, which is the dominant term today.  Unrolling
+    //     the i loop by 5 grows the body 293 -> 1048 instructions (~1.2 KiB
+    //     -> ~4 KiB) and costs 48% wall time (390 ms -> 578 ms, medians of 9
+    //     reps, correctness `pass`) purely from the extra fetch footprint,
+    //     with no spill and no work removed from the inner loop.
+    //
+    // So the 256 FP budget is load-bearing, but for footprint rather than for
+    // spills.  Do not relax it on the strength of the "0 stack refs" number
+    // alone: re-measure wall time, not instruction count, before raising it.
+    // Integer bodies keep the full 512 budget.
     let header_nonphi: Vec<usize> = func.blocks[header]
         .instructions
         .iter()

@@ -955,6 +955,8 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
             {
                 let c = load_op_fuse::fuse_load_into_alu(&mut store, &mut infos);
                 trace("fuse_load_into_alu", pass_count, c, &store, &infos);
+                let c = load_op_fuse::fuse_zero_ext_cmp(&mut store, &mut infos);
+                trace("fuse_zero_ext_cmp", pass_count, c, &store, &infos);
                 changed |= c;
             }
         }

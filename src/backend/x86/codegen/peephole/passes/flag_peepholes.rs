@@ -1546,6 +1546,17 @@ fn flags_are_block_local(
 /// (`b`/`ae`/`a`/`be`), the CF predicates, `o`/`no` and `p`/`np` do not.
 const SF_CCS: &[&str] = &["s", "ns", "l", "nl", "le", "nle", "g", "ng", "ge", "nge"];
 
+/// Condition codes that select on ZF and CF alone, with every other flag
+/// masked out: `e/z/ne/nz` (ZF), `b/c/nae` (CF), `nb/nc/ae` (!CF) and
+/// `be/na` (CF|ZF), `a/nbe` (!CF|!ZF).  The SF/OF group (`s`, `l`, `le`, `g`,
+/// `ge` and their `n` forms) is deliberately absent, as is every
+/// whole-word/unknown reader.  A rewrite that changes SF, PF, OF or AF -- such
+/// as narrowing a `cmp` to its operands' common width -- may only proceed
+/// while [`flag_consumers_are_zf_cf_only`] holds.
+const ZF_CF_ONLY_CCS: &[&str] = &[
+    "e", "z", "ne", "nz", "b", "c", "nae", "nb", "nc", "ae", "be", "na", "a", "nbe",
+];
+
 /// Flag readers that provably do NOT read SF, so a rewrite whose only flag
 /// divergence is SF cannot be observed through them: the CF-carry group
 /// (`adc`/`sbb` and the two rotates that take CF as carry-in, `cmc`, `salc`,
@@ -1591,6 +1602,13 @@ struct ConsumerFacts {
     saw_consumer: bool,
     /// A consumer that reads something other than ZF was reached.
     saw_non_zf: bool,
+    /// A consumer that reads a flag outside {ZF, CF} was reached.  Weaker than
+    /// [`Self::saw_non_zf`]: a `jb`/`jbe` reads CF (and ZF) but nothing else,
+    /// so a rewrite that provably preserves ZF and CF alone may keep it.  A
+    /// consumer with no condition code is always charged here, because a
+    /// whole-word or unknown reader can select neither condition exclusively
+    /// and can observe AF, which no width-narrowing `cmp` preserves.
+    saw_outside_zf_cf: bool,
     /// A consumer that reads SF -- or the whole EFLAGS word, which contains it
     /// -- was reached.
     saw_sf_reader: bool,
@@ -1631,6 +1649,7 @@ fn walk_flag_consumers(store: &LineStore, infos: &[LineInfo], from: usize) -> Co
     let mut facts = ConsumerFacts {
         saw_consumer: false,
         saw_non_zf: false,
+        saw_outside_zf_cf: false,
         saw_sf_reader: false,
         saw_whole_reader: false,
         proved: true,
@@ -1679,6 +1698,18 @@ fn walk_flag_consumers(store: &LineStore, infos: &[LineInfo], from: usize) -> Co
                 continue;
             }
             let t = infos[n].trimmed(store.get(n));
+            // A blank line has no mnemonic, so `flags_effect` falls through to
+            // its fail-closed default and charges it with reading every flag --
+            // which made any walk that reached the end of a function (the
+            // padding after the last `ret`) report a whole-word reader and veto
+            // every flag-divergent rewrite.  Emitting nothing, a blank line
+            // cannot observe EFLAGS, so skipping it is strictly more precise
+            // and cannot license anything the writer before it did not already
+            // license.
+            if t.is_empty() {
+                n += 1;
+                continue;
+            }
             match infos[n].kind {
                 // A label is a position, not an effect: fall through it.
                 LineKind::Label => {
@@ -1734,12 +1765,16 @@ fn walk_flag_consumers(store: &LineStore, infos: &[LineInfo], from: usize) -> Co
                             if !matches!(cc, "e" | "z" | "ne" | "nz") {
                                 facts.saw_non_zf = true;
                             }
+                            if !ZF_CF_ONLY_CCS.contains(&cc) {
+                                facts.saw_outside_zf_cf = true;
+                            }
                             if SF_CCS.contains(&cc) {
                                 facts.saw_sf_reader = true;
                             }
                         }
                         None => {
                             facts.saw_non_zf = true;
+                            facts.saw_outside_zf_cf = true;
                             if !NON_SF_FLAG_READERS.iter().any(|p| t.starts_with(p)) {
                                 facts.saw_sf_reader = true;
                                 facts.saw_whole_reader = true;
@@ -1797,6 +1832,19 @@ pub(super) fn flag_consumers_are_zf_only(
 ) -> bool {
     let f = walk_flag_consumers(store, infos, from);
     f.proved && f.saw_consumer && !f.saw_non_zf
+}
+
+/// True when every consumer of the current flags selects only on ZF and CF
+/// (see [`ZF_CF_ONLY_CCS`]) and at least one consumer exists.  False also
+/// covers "could not prove", for the same reason [`flag_consumers_are_zf_only`]
+/// fails closed: an incomplete walk must not license a flag-divergent rewrite.
+pub(super) fn flag_consumers_are_zf_cf_only(
+    store: &LineStore,
+    infos: &[LineInfo],
+    from: usize,
+) -> bool {
+    let f = walk_flag_consumers(store, infos, from);
+    f.proved && f.saw_consumer && !f.saw_outside_zf_cf
 }
 
 /// True when some consumer of the current flags reads SF, or when the walk
