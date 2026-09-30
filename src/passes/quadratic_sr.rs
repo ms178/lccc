@@ -32,7 +32,10 @@ use super::loop_analysis;
 use crate::common::fx_hash::FxHashSet;
 use crate::common::types::IrType;
 use crate::ir::analysis::CfgAnalysis;
-use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Value};
+use crate::ir::reexports::{
+    Instruction, IrBinOp, IrConst, IrFunction, Operand, Value, replace_operand_value,
+    replace_terminator_value,
+};
 
 pub(crate) fn run(func: &mut IrFunction) -> usize {
     if std::env::var("CCC_NO_QUAD_SR").is_ok() {
@@ -432,37 +435,21 @@ fn reduce_loop(func: &mut IrFunction, lp: &loop_analysis::NaturalLoop, cfg: &Cfg
         });
     }
 
-    // Replace uses of final_val with idx_phi within the loop.
+    // Replace uses of final_val with idx_phi within the loop.  Both walks: a
+    // consumer in an `i8` GEP offset, a `Select`, a call argument or a terminator
+    // is as much a use as a binary operand, and the six-arm match this replaces
+    // left every one of them reading `final_val` while the recurrence phi it had
+    // just built had no readers left to serve (SSA stayed valid, so nothing
+    // complained — the transform simply did not do what it says).
     for &bi in &lp.body {
         for inst in &mut func.blocks[bi].instructions {
-            let replace = |op: &mut Operand| {
-                if let Operand::Value(v) = op {
-                    if *v == final_val {
-                        *v = idx_phi;
-                    }
-                }
-            };
-            match inst {
-                Instruction::BinOp { lhs, rhs, .. } => {
-                    replace(lhs);
-                    replace(rhs);
-                }
-                Instruction::Cmp { lhs, rhs, .. } => {
-                    replace(lhs);
-                    replace(rhs);
-                }
-                Instruction::Cast { src, .. }
-                | Instruction::Copy { src, .. }
-                | Instruction::UnaryOp { src, .. } => {
-                    replace(src);
-                }
-                Instruction::Store { val, .. } => {
-                    replace(val);
-                }
-                Instruction::Load { .. } => {}
-                _ => {}
-            }
+            replace_operand_value(inst, final_val, Operand::Value(idx_phi));
         }
+        replace_terminator_value(
+            &mut func.blocks[bi].terminator,
+            final_val,
+            Operand::Value(idx_phi),
+        );
     }
 
     func.next_value_id = next_id;

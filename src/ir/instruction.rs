@@ -1,6 +1,7 @@
 use super::constants::IrConst;
 use super::intrinsics::IntrinsicOp;
 use super::ops::{AtomicOrdering, AtomicRmwOp, IrBinOp, IrCmpOp, IrUnaryOp};
+use crate::common::fx_hash::FxHashMap;
 /// IR instruction definitions: the core SSA instruction set.
 ///
 /// This module defines the SSA IR instruction enum with 38 variants covering
@@ -1126,9 +1127,27 @@ impl Instruction {
 /// to list keeps reading the replaced value, and the resulting IR still
 /// validates because the stale read is a value that is still defined.
 ///
-/// This is the single canonical implementation; the passes that rewrite
-/// induction-variable uses share it rather than keeping private copies.
-pub fn replace_operand_value(inst: &mut Instruction, old: Value, new_op: Operand) {
+/// Returns the number of slots rewritten, so a caller that has to decide
+/// whether its transformation fired can use the count directly.  The return
+/// is deliberately **not** `#[must_use]`: most callers only want the effect.
+///
+/// The reach rules a caller must respect (a rewrite may not put the replacement behind itself) are
+/// in `docs/SESSION_FOLLOWUP_CANON_REWRITERS.md`; the vectorizer's outside-the-loop rewriters
+/// implement them in `rewrite_uses_where_available`.
+///
+/// This pair is the canonical form of the two-walk rewrite.  The passes that
+/// rewrite induction-variable uses route through it instead of keeping private
+/// copies (`iv_widen`, `iv_strength_reduce`, `quadratic_sr`,
+/// `loop_unroll`/`loop_rotate`, `range_check`, `nested_functions`, `vectorize`,
+/// `loop_memory_promote`); the map-valued form is
+/// [`replace_values_in_inst_map`].  The one deliberate exception is
+/// `split_ranges`, whose table must suppress phi-incoming rewrites
+/// (`rewrite_phi = false`), which a generic visitor cannot express — it carries
+/// that note beside the table, and `value_replacement_tests` pins the coverage
+/// both forms must have in common.
+#[inline]
+pub fn replace_operand_value(inst: &mut Instruction, old: Value, new_op: Operand) -> usize {
+    let mut rewritten = 0usize;
     let new_val = match new_op {
         Operand::Value(v) => Some(v),
         Operand::Const(_) => None,
@@ -1136,6 +1155,7 @@ pub fn replace_operand_value(inst: &mut Instruction, old: Value, new_op: Operand
     inst.for_each_operand_mut(|op| {
         if matches!(op, Operand::Value(v) if *v == old) {
             *op = new_op;
+            rewritten += 1;
         }
     });
     // A constant cannot stand in a bare `Value` slot, so those slots are left
@@ -1145,18 +1165,62 @@ pub fn replace_operand_value(inst: &mut Instruction, old: Value, new_op: Operand
         inst.for_each_value_use_mut(|field| {
             if *field == old {
                 *field = nv;
+                rewritten += 1;
             }
         });
     }
+    rewritten
+}
+
+/// The map-valued form of [`Instruction::replace_operand_value`]: every read of
+/// a value present as a key in `map` is redirected to that key's replacement.
+/// Both walks, for the reason above; destinations are never rewritten.
+#[inline]
+pub fn replace_values_in_inst_map(inst: &mut Instruction, map: &FxHashMap<u32, u32>) -> usize {
+    let mut rewritten = 0usize;
+    inst.for_each_operand_mut(|op| {
+        if let Operand::Value(v) = op {
+            if let Some(&to) = map.get(&v.0) {
+                *op = Operand::Value(Value(to));
+                rewritten += 1;
+            }
+        }
+    });
+    inst.for_each_value_use_mut(|field| {
+        if let Some(&to) = map.get(&field.0) {
+            field.0 = to;
+            rewritten += 1;
+        }
+    });
+    rewritten
 }
 
 /// Replace every read of `old` in a terminator with `new_op`.
-pub fn replace_terminator_value(term: &mut Terminator, old: Value, new_op: Operand) {
+#[inline]
+pub fn replace_terminator_value(term: &mut Terminator, old: Value, new_op: Operand) -> usize {
+    let mut rewritten = 0usize;
     term.for_each_operand_mut(|op| {
         if matches!(op, Operand::Value(v) if *v == old) {
             *op = new_op;
+            rewritten += 1;
         }
     });
+    rewritten
+}
+
+/// The map-valued form of [`Terminator::replace_terminator_value`].
+#[inline]
+pub fn replace_values_in_terminator_map(term: &mut Terminator, map: &FxHashMap<u32, u32>) -> usize {
+    let mut rewritten = 0usize;
+    term.for_each_operand_mut(|op| {
+        if let Operand::Value(v) = op {
+            if let Some(&to) = map.get(&v.0) {
+                *op = Operand::Value(Value(to));
+                rewritten += 1;
+            }
+        }
+    });
+    rewritten
 }
 
 impl Terminator {
@@ -1274,6 +1338,118 @@ mod value_replacement_tests {
         match term {
             Terminator::Return(Some(Operand::Value(v))) => assert_eq!(v, Value(6)),
             _ => panic!("return operand must be redirected"),
+        }
+    }
+
+    #[test]
+    fn returns_the_number_of_slots_rewritten() {
+        // GEP reads the old value twice (offset + base) plus once in the
+        // terminator: the count is what a caller uses to decide it fired.
+        let mut inst = gep(1, 7, 7);
+        assert_eq!(
+            replace_operand_value(&mut inst, Value(7), Operand::Value(Value(42))),
+            2
+        );
+        let mut term = Terminator::Switch {
+            val: Operand::Value(Value(42)),
+            cases: vec![],
+            default: BlockId(0),
+            ty: IrType::I32,
+        };
+        assert_eq!(
+            replace_terminator_value(&mut term, Value(42), Operand::Value(Value(9))),
+            1
+        );
+        // A value the instruction does not read is reported as zero rewrites.
+        let mut other = gep(1, 3, 3);
+        assert_eq!(
+            replace_operand_value(&mut other, Value(7), Operand::Value(Value(42))),
+            0
+        );
+    }
+
+    /// The bare-`Value` slots that the hand-rolled tables historically forgot.
+    /// `VaEnd`, `VaStart`, `VaCopy`, `Memcpy`, `StackRestore`, `InlineAsm`
+    /// outputs and `Intrinsic::dest_ptr` all hold a `Value` that is *not* an
+    /// `Operand`, so only the second walk reaches them; a table that groups them
+    /// with the field-less variants (`VaEnd { .. } => {}`) silently keeps the old
+    /// value.  Two such tables were found in the tree and fixed.
+    #[test]
+    fn bare_value_slots_are_covered_by_the_canonical_walk() {
+        let cases: Vec<Instruction> = vec![
+            Instruction::VaEnd {
+                va_list_ptr: Value(7),
+            },
+            Instruction::VaStart {
+                va_list_ptr: Value(7),
+            },
+            Instruction::VaCopy {
+                dest_ptr: Value(7),
+                src_ptr: Value(7),
+            },
+            Instruction::Memcpy {
+                dest: Value(9),
+                src: Value(7),
+                size: 8,
+            },
+            Instruction::StackRestore { ptr: Value(7) },
+            Instruction::InlineAsm {
+                template: String::new(),
+                inputs: vec![],
+                outputs: vec![("=r".to_string(), Value(7), None)],
+                clobbers: vec![],
+                operand_types: vec![IrType::I64],
+                goto_labels: vec![],
+                input_symbols: vec![],
+                seg_overrides: vec![],
+            },
+            Instruction::Intrinsic {
+                dest: None,
+                op: IntrinsicOp::Storedqu,
+                dest_ptr: Some(Value(7)),
+                args: vec![],
+            },
+        ];
+        for mut inst in cases {
+            let name = format!("{inst:?}");
+            let n = replace_operand_value(&mut inst, Value(7), Operand::Value(Value(70)));
+            assert!(n >= 1, "canonical walk missed a bare Value slot: {name}");
+            assert!(
+                !format!("{inst:?}").contains("Value(7)"),
+                "stale Value(7) survived the rewrite: {inst:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn map_form_matches_the_single_value_form() {
+        let mut map = FxHashMap::default();
+        map.insert(7u32, 70u32);
+        map.insert(8u32, 80u32);
+        let mut gep_inst = gep(1, 7, 8);
+        assert_eq!(replace_values_in_inst_map(&mut gep_inst, &map), 2);
+        match gep_inst {
+            Instruction::GetElementPtr { base, offset, .. } => {
+                assert_eq!(base, Value(70));
+                assert_eq!(offset, Operand::Value(Value(80)));
+            }
+            _ => unreachable!(),
+        }
+        let mut ender = Instruction::VaEnd {
+            va_list_ptr: Value(8),
+        };
+        assert_eq!(replace_values_in_inst_map(&mut ender, &map), 1);
+        let mut term = Terminator::CondBranch {
+            cond: Operand::Value(Value(7)),
+            true_label: BlockId(1),
+            false_label: BlockId(2),
+        };
+        assert_eq!(replace_values_in_terminator_map(&mut term, &map), 1);
+        match term {
+            Terminator::CondBranch { cond, .. } => {
+                assert_eq!(cond, Operand::Value(Value(70)));
+            }
+            _ => unreachable!(),
         }
     }
 }

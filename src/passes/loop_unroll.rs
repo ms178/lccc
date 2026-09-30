@@ -34,7 +34,8 @@ use crate::common::types::IrType;
 use crate::ir::analysis::CfgAnalysis;
 use crate::ir::reexports::{
     BasicBlock, BlockId, Instruction, IrBinOp, IrCmpOp, IrConst, IrFunction, Operand, Terminator,
-    Value,
+    Value, replace_operand_value, replace_terminator_value, replace_values_in_inst_map,
+    replace_values_in_terminator_map,
 };
 
 thread_local! {
@@ -1747,13 +1748,13 @@ impl LoopPhiModel {
 /// Substitute every header phi of `env` in one instruction / terminator.
 fn apply_env_inst(inst: &mut Instruction, env: &FxHashMap<u32, Operand>) {
     for (&id, repl) in env {
-        subst_value_with_operand(inst, id, repl);
+        replace_operand_value(inst, Value(id), (repl).clone());
     }
 }
 
 fn apply_env_term(term: &mut Terminator, env: &FxHashMap<u32, Operand>) {
     for (&id, repl) in env {
-        subst_value_in_terminator(term, id, repl);
+        replace_terminator_value(term, Value(id), (repl).clone());
     }
 }
 
@@ -1806,12 +1807,16 @@ fn rewrite_outside_uses(
         for inst in &mut block.instructions {
             apply_env_inst(inst, final_env);
             for (&old, &new) in extra_final {
-                subst_value_with_operand(inst, old, &Operand::Value(Value(new)));
+                replace_operand_value(inst, Value(old), (&Operand::Value(Value(new))).clone());
             }
         }
         apply_env_term(&mut block.terminator, final_env);
         for (&old, &new) in extra_final {
-            subst_value_in_terminator(&mut block.terminator, old, &Operand::Value(Value(new)));
+            replace_terminator_value(
+                &mut block.terminator,
+                Value(old),
+                (&Operand::Value(Value(new))).clone(),
+            );
         }
     }
 }
@@ -2228,8 +2233,8 @@ fn try_complete_unroll_general(
             // header_extra → this guard's own fresh outputs first, then the
             // last clone's values, then substitute the header phis with the
             // failing-entry environment.
-            replace_values_in_inst(&mut cloned, &fg_vmap);
-            replace_values_in_inst(&mut cloned, last_vmap);
+            replace_values_in_inst_map(&mut cloned, &fg_vmap);
+            replace_values_in_inst_map(&mut cloned, last_vmap);
             rename_inst_dest(&mut cloned, &fg_vmap);
             apply_env_inst(&mut cloned, &env_fg);
             fg_insts.push(cloned);
@@ -2273,7 +2278,7 @@ fn try_complete_unroll_general(
                 // Clone 1's env values are ORIGINAL body ids also present in
                 // this clone's vmap; substituting first would let the rename
                 // rewrite them into this clone's own definitions.
-                replace_values_in_inst(&mut cloned, &plan.vmap);
+                replace_values_in_inst_map(&mut cloned, &plan.vmap);
                 rename_inst_dest(&mut cloned, &plan.vmap);
                 apply_env_inst(&mut cloned, &plan.env);
                 insts.push(cloned);
@@ -2299,7 +2304,7 @@ fn try_complete_unroll_general(
                     continue; // dead IV increment
                 }
                 let mut cloned = inst.clone();
-                replace_values_in_inst(&mut cloned, &plan.vmap);
+                replace_values_in_inst_map(&mut cloned, &plan.vmap);
                 rename_inst_dest(&mut cloned, &plan.vmap);
                 apply_env_inst(&mut cloned, &plan.env);
                 if let Instruction::Phi { incoming, .. } = &mut cloned {
@@ -2314,7 +2319,7 @@ fn try_complete_unroll_general(
                 insts.push(cloned);
             }
             let mut term = orig.terminator.clone();
-            replace_values_in_terminator(&mut term, &plan.vmap);
+            replace_values_in_terminator_map(&mut term, &plan.vmap);
             if bi == latch {
                 if let Terminator::Branch(lbl) = &mut term {
                     if *lbl == header_label {
@@ -2723,9 +2728,9 @@ fn try_complete_unroll_two_block(
                 // Rename first, then substitute the header-phi environment.
                 // The env values are consts / invariants / previous-clone ids,
                 // none of which are keys in this clone's rename map.
-                replace_values_in_inst(&mut cloned, &vmap);
+                replace_values_in_inst_map(&mut cloned, &vmap);
                 rename_inst_dest(&mut cloned, &vmap);
-                subst_value_with_operand(&mut cloned, iv_phi.0, &iv_const);
+                replace_operand_value(&mut cloned, iv_phi, iv_const.clone());
                 apply_env_inst(&mut cloned, &env);
                 new_insts.push(cloned);
             }
@@ -3456,9 +3461,9 @@ fn try_partial_unroll_two_block(
                 for (&old, &new) in &vmaps[j] {
                     combined.insert(old, new);
                 }
-                replace_values_in_inst(&mut cloned, &combined);
+                replace_values_in_inst_map(&mut cloned, &combined);
             } else {
-                replace_values_in_inst(&mut cloned, &vmaps[j]);
+                replace_values_in_inst_map(&mut cloned, &vmaps[j]);
             }
             rename_inst_dest(&mut cloned, &vmaps[j]);
             body_insts.push(cloned);
@@ -3532,33 +3537,6 @@ fn try_partial_unroll_two_block(
 
     let _ = exit_target;
     true
-}
-
-pub(crate) fn subst_value_with_operand(inst: &mut Instruction, old_id: u32, new_op: &Operand) {
-    inst.for_each_operand_mut(|operand| {
-        if matches!(operand, Operand::Value(value) if value.0 == old_id) {
-            *operand = new_op.clone();
-        }
-    });
-    if let Operand::Value(replacement) = new_op {
-        inst.for_each_value_use_mut(|value| {
-            if value.0 == old_id {
-                *value = *replacement;
-            }
-        });
-    }
-}
-
-pub(crate) fn subst_value_in_terminator(
-    terminator: &mut Terminator,
-    old_id: u32,
-    new_op: &Operand,
-) {
-    terminator.for_each_operand_mut(|operand| {
-        if matches!(operand, Operand::Value(value) if value.0 == old_id) {
-            *operand = new_op.clone();
-        }
-    });
 }
 
 /// Evaluate an operand as an integer constant by looking through a bounded
@@ -4287,9 +4265,9 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
                 .iter()
                 .map(|inst| {
                     let mut cloned = inst.clone();
-                    replace_values_in_inst(&mut cloned, vmap);
+                    replace_values_in_inst_map(&mut cloned, vmap);
                     for (hid, prev) in &prev_carried {
-                        subst_value_with_operand(&mut cloned, *hid, prev);
+                        replace_operand_value(&mut cloned, Value(*hid), (prev).clone());
                     }
                     rename_inst_dest(&mut cloned, vmap);
                     cloned
@@ -4297,7 +4275,7 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
                 .collect();
 
             let mut new_term = orig.terminator.clone();
-            replace_values_in_terminator(&mut new_term, vmap);
+            replace_values_in_terminator_map(&mut new_term, vmap);
             replace_block_ids(&mut new_term, &blk_map);
 
             // Redirect latch edge from pre-latch block.
@@ -4609,7 +4587,7 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
                         if matches!(inst, Instruction::Phi { .. }) {
                             continue; // other blocks' phis select per-edge
                         }
-                        subst_value_with_operand(inst, dest.0, &Operand::Value(new_phi));
+                        replace_operand_value(inst, *dest, Operand::Value(new_phi));
                     }
                     // The terminator can also USE the carried value: a
                     // `Return(H)` after a counted loop is the canonical
@@ -4619,10 +4597,10 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
                     // the phi's PREHEADER value — 0 instead of 30 — because
                     // every early exit-check edge read the un-updated
                     // header phi).
-                    subst_value_in_terminator(
+                    replace_terminator_value(
                         &mut func.blocks[bi].terminator,
-                        dest.0,
-                        &Operand::Value(new_phi),
+                        *dest,
+                        Operand::Value(new_phi),
                     );
                 }
                 let succs: Vec<BlockId> = match &func.blocks[bi].terminator {
@@ -4740,15 +4718,6 @@ fn replace_op(op: &mut Operand, map: &FxHashMap<u32, u32>) {
     if let Operand::Value(v) = op {
         replace_val(v, map);
     }
-}
-
-fn replace_values_in_inst(inst: &mut Instruction, map: &FxHashMap<u32, u32>) {
-    inst.for_each_operand_mut(|operand| replace_op(operand, map));
-    inst.for_each_value_use_mut(|value| replace_val(value, map));
-}
-
-fn replace_values_in_terminator(term: &mut Terminator, map: &FxHashMap<u32, u32>) {
-    term.for_each_operand_mut(|operand| replace_op(operand, map));
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -7905,7 +7874,11 @@ mod tests {
         ];
         for instruction in &mut instructions {
             for old in 1..=23 {
-                subst_value_with_operand(instruction, old, &Operand::Value(Value(old + 1000)));
+                replace_operand_value(
+                    instruction,
+                    Value(old),
+                    (&Operand::Value(Value(old + 1000))).clone(),
+                );
             }
         }
         let mut uses: Vec<u32> = instructions
@@ -7923,8 +7896,16 @@ mod tests {
                 false_label: BlockId(2),
             },
         ];
-        subst_value_in_terminator(&mut terminators[0], 24, &Operand::Value(Value(1024)));
-        subst_value_in_terminator(&mut terminators[1], 25, &Operand::Value(Value(1025)));
+        replace_terminator_value(
+            &mut terminators[0],
+            Value(24),
+            (&Operand::Value(Value(1024))).clone(),
+        );
+        replace_terminator_value(
+            &mut terminators[1],
+            Value(25),
+            (&Operand::Value(Value(1025))).clone(),
+        );
         assert_eq!(terminators[0].used_values(), vec![1024]);
         assert_eq!(terminators[1].used_values(), vec![1025]);
     }

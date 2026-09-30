@@ -263,7 +263,7 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
     if !all_rewrites.is_empty() {
         for block in func.blocks.iter_mut() {
             for inst in block.instructions.iter_mut() {
-                super::tail_call_elim::replace_values_in_inst(inst, &all_rewrites);
+                crate::ir::instruction::replace_values_in_inst_map(inst, &all_rewrites);
             }
             match &mut block.terminator {
                 Terminator::CondBranch { cond, .. } => {

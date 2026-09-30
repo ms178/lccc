@@ -198,9 +198,19 @@ fn rewrite_value(v: &mut Value, map: &FxHashMap<u32, u32>) {
 }
 
 /// Rewrite every *use* of a mapped value. Destinations are left alone.
-/// Phi incoming is rewritten only when `rewrite_phi` is true — callers that
-/// just defined a replacement in *this* block must pass false (use-before-def).
-pub(crate) fn replace_values_in_inst(
+///
+/// Phi incoming is rewritten only when `rewrite_phi` is true — callers that just
+/// defined a replacement in *this* block must pass false (use-before-def).  That
+/// conditional is why this table still exists instead of delegating to
+/// [`crate::ir::instruction::replace_values_in_inst_map`]: the canonical walk
+/// visits every operand unconditionally, and there is no way to express "visit
+/// everything except the phi arms" through it.  The two must not drift, so keep
+/// the coverage identical to `for_each_operand_mut` + `for_each_value_use_mut`:
+/// `value_replacement_tests::bare_value_slots_are_covered_by_the_canonical_walk`
+/// in `ir::instruction` is the checklist, and the `VaEnd` bug this table used to
+/// have (`va_list_ptr` grouped with the field-less variants) is exactly the kind
+/// of drift that check catches.
+pub(crate) fn replace_values_in_inst_phi_aware(
     inst: &mut Instruction,
     map: &FxHashMap<u32, u32>,
     rewrite_phi: bool,
@@ -216,8 +226,13 @@ pub(crate) fn replace_values_in_inst(
         | Instruction::GetReturnF128Second { .. }
         | Instruction::GetStaticChain { .. }
         | Instruction::StackSave { .. }
-        | Instruction::ParamRef { .. }
-        | Instruction::VaEnd { .. } => {}
+        | Instruction::ParamRef { .. } => {}
+        // `VaEnd` is *not* field-less: `va_list_ptr` is a bare `Value`, so it
+        // belongs with the other varargs arms below.  It used to be listed with
+        // the definitions above, which silently left a stale `va_list` pointer
+        // behind whenever the map redirected one (the same class of bug the
+        // canonical walkers in `ir::instruction` exist to prevent).
+        Instruction::VaEnd { va_list_ptr } => rewrite_value(va_list_ptr, map),
         // Nested-function support: operand rewrites.
         Instruction::SetStaticChain { src } => rewrite_operand(src, map),
         Instruction::InitTrampoline { buffer, chain, .. } => {
@@ -332,7 +347,10 @@ pub(crate) fn replace_values_in_inst(
     }
 }
 
-pub(crate) fn replace_values_in_terminator(term: &mut Terminator, map: &FxHashMap<u32, u32>) {
+pub(crate) fn replace_values_in_terminator_phi_aware(
+    term: &mut Terminator,
+    map: &FxHashMap<u32, u32>,
+) {
     match term {
         Terminator::Return(Some(op)) => rewrite_operand(op, map),
         Terminator::CondBranch { cond, .. } => rewrite_operand(cond, map),
@@ -739,9 +757,9 @@ pub fn split_loop_transparent_ranges(func: &mut IrFunction, max_splits: usize) -
                 for inst in &mut block.instructions {
                     // Never rewrite Phis: incoming is a pred-side use and
                     // `new_val` is defined *after* the phis in the exit block.
-                    replace_values_in_inst(inst, &map, false);
+                    replace_values_in_inst_phi_aware(inst, &map, false);
                 }
-                replace_values_in_terminator(&mut block.terminator, &map);
+                replace_values_in_terminator_phi_aware(&mut block.terminator, &map);
             }
             splits += 1;
         }
@@ -996,9 +1014,9 @@ fn apply_local_call_split(func: &mut IrFunction, vid: u32, next_val: &mut u32) -
         // load sits at ci+2 after both inserts
         let first_after_load = (ci + 3).min(block.instructions.len());
         for inst in block.instructions[first_after_load..].iter_mut() {
-            replace_values_in_inst(inst, &map, false);
+            replace_values_in_inst_phi_aware(inst, &map, false);
         }
-        replace_values_in_terminator(&mut block.terminator, &map);
+        replace_values_in_terminator_phi_aware(&mut block.terminator, &map);
         wrapped += 1;
     }
 
@@ -1327,14 +1345,14 @@ mod tests {
         };
         let mut map = FxHashMap::default();
         map.insert(1, 99);
-        replace_values_in_inst(&mut inst, &map, false);
+        replace_values_in_inst_phi_aware(&mut inst, &map, false);
         match &inst {
             Instruction::Phi { incoming, .. } => {
                 assert!(matches!(incoming[0].0, Operand::Value(v) if v.0 == 1));
             }
             _ => panic!("phi vanished"),
         }
-        replace_values_in_inst(&mut inst, &map, true);
+        replace_values_in_inst_phi_aware(&mut inst, &map, true);
         match &inst {
             Instruction::Phi { incoming, .. } => {
                 assert!(matches!(incoming[0].0, Operand::Value(v) if v.0 == 99));
@@ -2083,7 +2101,7 @@ fn apply_block_splits(
         if !active.is_empty() {
             // `rewrite_phi = false`: a phi in THIS block reads on the
             // incoming edge, never at the top of the body.
-            replace_values_in_inst(&mut inst, &active, false);
+            replace_values_in_inst_phi_aware(&mut inst, &active, false);
         }
         out.push(inst);
     }
@@ -2109,7 +2127,7 @@ fn apply_block_splits(
     }
     func.blocks[bi].instructions = out;
     if !active.is_empty() {
-        replace_values_in_terminator(&mut func.blocks[bi].terminator, &active);
+        replace_values_in_terminator_phi_aware(&mut func.blocks[bi].terminator, &active);
     }
 
     // Successor phi operands coming from THIS block: the reload dominates
