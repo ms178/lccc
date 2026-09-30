@@ -1771,7 +1771,7 @@ mod tests {
     #[test]
     fn admission_refusals() {
         let (mut slots, mut types, mut uses, busy) = base_maps();
-        let empty: FxHashSet<u32> = FxHashSet::default();
+        let _empty: FxHashSet<u32> = FxHashSet::default();
         slots.insert(70, StackSlot(-8)); // 70: fine
         slots.insert(71, StackSlot(-16)); // 71: XMM domain via FAlu
         slots.insert(72, StackSlot(-24)); // 72: float type

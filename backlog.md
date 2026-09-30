@@ -43,6 +43,76 @@ An item with no reproducer does not belong here.
 
 ## P0 — largest measured gaps
 
+### IVOPTS-1 · **NEW 2026-09-30** — index-form addressing is never strength-reduced
+
+The largest single measured codegen defect, and the one that explains most of
+the honest corpus deficit (see
+[`ORACLE-METRIC-1`](engineering/evidence/ORACLE-METRIC-1/README.md): +15.8 % vs GCC over
+the 47 non-recursion benchmarks, median per-file ratio 1.17).
+
+`nbody`'s inner loop — 5 bodies × 5 000 000 iterations, the hottest loop in the
+corpus — is **110 instructions against GCC's 14 (7.9×)**, with **zero** stack
+references, so it is not register pressure. Per iteration we emit:
+
+| waste | count/iter | GCC's equivalent |
+|---|---:|---|
+| `imulq $56, %r9, %r15` — index×stride by multiply | 2 | `addq $56, %rax`, once |
+| `leaq bodies(%rip), %rcx` — static base re-materialised | 2 | hoisted to `%r12` outside |
+| `cmpl $5000000, -72(%rbp)` — outer bound from a stack slot | 3 | register |
+| `movsd`/`movupd`/`movq` data movement | 56 of 110 | displacement addressing |
+
+GCC walks the array with one pointer bump and reaches every field through a
+displacement (`vsubsd 8(%rax), %xmm7, %xmm2`). We stay in index form, recompute
+`i*56` twice, and move the results around. The signature is a missing
+**induction-variable strength reduction / IVopts** stage plus weak loop-invariant
+address hoisting, and it is the same signature in `spectral_norm` (+114 %),
+`moving_stats` (+66 %), `struct_copy` (+62 %) and `matmul` — the struct-array
+and FP kernels that dominate the real deficit table.
+
+Corpus-wide mnemonic census (51 programs, `-O2 -march=x86-64-v3`):
+
+| pattern | LCCC | GCC | ratio |
+|---|---:|---:|---:|
+| `movsd` scalar FP move | 171 | 54 | **3.2×** |
+| `leaq sym(%rip)` static base | 145 | 91 | **1.6×** |
+| `imul $const,` index scaling | 87 | 55 | **1.6×** |
+| stack refs | 655 | 773 | 0.85× (we are better) |
+
+Work order, cheapest first, each independently measurable:
+1. Hoist loop-invariant `leaq sym(%rip)` bases out of loops (145 → ≤91 target).
+2. Strength-reduce `idx*stride` on a unit-step induction variable to a stride
+   bump; prefer displacement addressing over materialised addresses.
+3. Coalesce the scalar FP register-to-register moves (171 → ~54 target).
+Do **not** start from the register allocator: these functions do not spill.
+
+Reproduction: `python3 scripts/oracle_asm.py tests/benchmark/programs/nbody.c
+--function main --flags "-O2 -march=x86-64-v3"`, then compare the inner loop
+against `gcc -S -O2 -march=x86-64-v3`.
+
+### METRIC-1 · **CLOSED 2026-09-30** — the oracle metric was ranking an inlining artifact
+
+`codegen_oracle.py --rank` reported a 1899-instruction deficit, worst first
+`zlib_ng_adler32::main` "204 behind icc=73". ICC's `main` is 73 instructions
+because ICC left `zlib_ng_adler32_c` out of line as two copies the
+single-function view never measured; whole translation unit, ICC is 43 % larger
+than us over the six files that table put on top. 16 of the 77 "behind" rows
+compared functions with different call counts and carried **781 of 1899 = 41 %**
+of the headline, including both top rows.
+
+Closed by adding a `calls` column, a per-row comparability marker, and a warning
+naming the rows that cannot be ranked; `jmp`/`b`/`j` are deliberately not
+counted as calls because a tail jump to an out-of-line copy is exactly the shape
+that fakes a smaller function. Guarded by
+`scripts/test_codegen_oracle.py` (11 cases, mutation-verified both ways) and
+registered in both CI drivers. Full method and numbers:
+[`ORACLE-METRIC-1`](engineering/evidence/ORACLE-METRIC-1/README.md).
+
+Two corollaries that outlive the fix: a corpus **total** is the wrong statistic
+here (four recursion benchmarks where GCC explodes carry the whole aggregate —
+all-51 says −12.5 %, the 47 say +15.8 %), so quote the **median per-file ratio
+and the larger/smaller counts**; and static instruction count remains a
+screening metric only, never PMU evidence.
+
 ### PF-SN-1 · AVX2 strict-reciprocal pack, target confirmation pending
 Current main `e5bc1911` emits legacy `movd`/`pinsrd` immediately before
 `vcvtdq2pd`/`vdivpd`. The follow-up replaces these with VEX forms **only
@@ -254,6 +324,73 @@ callee-save save/restore**, 23.8 % structural (alloca/address/wide/nongpr) and
 only **10.7 % are spills** — and `sha256_transform`, the RA-PRESSURE-3 target,
 has **zero** spill references.
 Evidence: [`engineering/evidence/SPILL-01/README.md`](engineering/evidence/SPILL-01/README.md).
+
+### DO-WHILE-BRANCH-1 · **NEW 2026-09-29** — bottom-tested backedges pay 4 instructions for one branch
+A bottom-tested loop's exit condition is materialised as an `i1`, zero-extended
+to `i32`, then `test`+`jne` — while the `cmp` that produced it sits in the same
+block, unused as a branch:
+
+    .LBB1:  addl $1, %esi
+            cmpl %edi, %esi
+            setl %r8b        <-- 3 instructions and 1 uop
+            movzbl %r8b, %r8d    wasted per iteration
+            testb %r8b, %r8b
+            jne .LBB1
+
+Measured scope (`-O2`, **no env vars**, counting `setCC` inside the loop body):
+all six bottom-tested shapes tested show it — `do{}while` with `<`, `!=`, `<=`,
+step 1 and step 2, returning the counter or a constant, and `for(;;){…break;}`.
+The TOP-tested `while` and the do-while the vectorizer turns into
+marching-pointer form both already emit `cmp` + `jCC` directly, so the machinery
+exists and this is a missing case in one lowering path, not a missing
+capability. 9 of the first 60 `tests/regression/*.c` emit at least one `setCC`.
+NOT the same item as LOOP-PREHEADER-2's rotation note: `loop_rotate` is opt-in
+(`CCC_LOOP_ROTATE=1`), and `CCC_DISABLE_PASSES=loop_rotate` leaves every count
+above unchanged, so this is the default bottom-tested lowering, not rotation.
+Reproducer: `int f(int n){int i=0; do{i++;}while(i<n); return i;}` — no
+pointers, no `main`, no specialisation involved.
+Done = the loop body contains no `setCC` and the backedge is a single `jCC`,
+pinned by an assembly gate, with no instruction-count regression elsewhere.
+Full analysis: `engineering/FOLLOWUP-2026-09-29-pr681-ci-red-audit-adjudication.md`.
+
+### LOOP-PREHEADER-3 · **NEW 2026-09-29** — LICM's must-execute rule is stricter than it needs to be
+`loop_preheader` makes a guarded loop's preheader dedicated, and LICM then
+hoists the loop BOUND — but a load in the loop BODY is still refused, because
+LICM requires the load's block to dominate *every* loop block, which only the
+header does. Measured on the SQLite `if (p == 0) return;` shape: steady-state
+memory operands per iteration go 2 -> 1 with the pass, not 1 -> 0
+(`check_loop_preheader.sh` contract 2 pins exactly that delta).
+The rule that is actually needed is weaker and still sound: a block *dominated
+by the header* is entered only when the loop is entered, because the loop-exit
+branch cannot be taken before the body's first instruction runs. "Must be the
+header" is a special case of "must be dominated by the header".
+This widens the gate that prevents the documented `sqlite3_get_auxdata` NULL
+segfault, so it needs the SQLite fixture, the `20051215-1.c` guarded-deref
+torture shape, and a differential sweep before it lands. Not a drive-by.
+When it lands, tighten `check_loop_preheader.sh` contract 2 from `-ne 1` to
+`-ne 0` — the gate was written so that this is a one-token edit.
+
+### LOOP-PREHEADER-4 · **CLOSED 2026-09-29** — the pass's module doc motivated itself with a loop it does not fire on
+*(numbered -4, not -2: LOOP-PREHEADER-2 is already taken by the `loop_rotate`
+default-enable item in `engineering/journal/2026-09-W3.md`.)*
+`src/passes/loop_preheader.rs` opened with `for (i = 0; i < n; i++) t += c[0];`
+as the shape a dedicated preheader unlocks. Measured: the pass prints nothing
+for that function, because its own profitability gate mirrors LICM's
+must-execute rule and the load sits in the body, not the header — that spelling
+is the `while_sum` shape, which the pass *refuses* on purpose.
+
+Closed: the docstring now leads with the do-while (guard outside the loop, so
+the load is in the header) and keeps the counted `for` as an explicit
+counter-example, and both shapes are pinned by
+`tests/regression/check_loop_preheader.sh` contracts 1 and 2, so the comment
+cannot drift away from the behaviour again.
+
+### WR-COND-RETEST · **NEW 2026-09-29** — second conditional store re-tests a live condition
+`void wr_cond(volatile u32 *p, volatile u32 *q, int c){ *(c?p:q)=1; *(c?p:q)=2; }`
+emits `testl %edx, %edx` twice — once for `cmovneq %rdi, %r8` and again for
+`cmovneq %rsi, %rdi` — instead of reusing the first select's result. One
+redundant `test` per pair of same-condition selects. Small; worth folding into whichever pass
+DO-WHILE-BRANCH-1 ends up needing.
 
 ### RA-CSAVE-1 · **NEW 2026-09-28** — callee-save save/restore traffic
 Opened from the SPILL-01 census: 562 of 1267 stack references (44.4 %) are

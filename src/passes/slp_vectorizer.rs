@@ -5247,7 +5247,7 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
             let positions: Vec<usize> = p.lane_vals.iter().map(|v| ctx.def_pos[&v.0]).collect();
             let hi = *positions.iter().max().unwrap();
             let lane_addr = eval_sym_addr(block, &ctx.def_pos, ptrs[0]);
-            for (li, &v) in p.lane_vals.iter().enumerate() {
+            for (li, &_v) in p.lane_vals.iter().enumerate() {
                 let pk = positions[li];
                 let lane_off = offs[li];
                 for q in pk + 1..hi {

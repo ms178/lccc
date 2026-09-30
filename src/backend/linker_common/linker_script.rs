@@ -814,7 +814,7 @@ fn parse_overlay(lx: &mut Lexer, out: &mut Vec<SectionsItem>) -> Result<(), Stri
     }
     let mut lma: Option<Expr> = None;
     loop {
-        let save = lx.save();
+        let _save = lx.save();
         match lx.next() {
             Tok::Punct("{") => break,
             Tok::Ident(k) if k == "AT" => {

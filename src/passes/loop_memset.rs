@@ -674,7 +674,7 @@ fn try_recognize_while(
     func: &IrFunction,
     header_idx: usize,
     body_idx: usize,
-    nested: bool,
+    _nested: bool,
     cfg: &CfgAnalysis,
 ) -> Option<Plan> {
     let header_label = func.blocks[header_idx].label;
@@ -1123,7 +1123,7 @@ fn census_body(
     func: &IrFunction,
     block_idx: usize,
     ivs: &[Iv],
-    defs: &FxHashMap<u32, usize>,
+    _defs: &FxHashMap<u32, usize>,
 ) -> Result<BodyCensus, String> {
     let header = &func.blocks[block_idx];
     let mut c = BodyCensus {

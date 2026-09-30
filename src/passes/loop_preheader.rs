@@ -7,11 +7,23 @@
 //!
 //! ```c
 //! int f(const int *c, int n) {          // `addl (%rdi), %edx` in the loop,
-//!     int t = 0;                        // every iteration, forever
-//!     for (int i = 0; i < n; i++) t += c[0];
+//!     if (n <= 0) return 0;             // every iteration, forever
+//!     int i = 0, t = 0;
+//!     do { t += c[0]; i++; } while (i < n);
 //!     return t;
 //! }
 //! ```
+//!
+//! The guard being *outside* the loop is load-bearing, not decoration: it puts
+//! the load in the loop header, which dominates every loop block, so LICM's
+//! must-execute rule is satisfied and only the dedicated-preheader rule is
+//! missing.  The guard-at-top spelling of the same body —
+//! `for (int i = 0; i < n; i++) t += c[0];` — lowers with the guard *as* the
+//! header, so the load sits in a block that does not dominate the loop and this
+//! pass correctly declines it.  An earlier revision of this comment used that
+//! spelling as the motivating example, which described a loop the pass refuses;
+//! both shapes are pinned in `tests/regression/check_loop_preheader.sh`
+//! (contracts 1 and 2) so the distinction cannot rot again.
 //!
 //! ## Why the shape matters, and why it is a *soundness* requirement
 //!
@@ -165,17 +177,50 @@ fn preheader_would_unlock_a_hoist(
     alloca_values: &FxHashSet<u32>,
     global_derived: &FxHashSet<u32>,
 ) -> bool {
-    for &block_idx in &natural_loop.body {
-        if block_idx >= func.blocks.len() {
-            continue;
-        }
-        if !natural_loop
+    // ONLY THE HEADER CAN QUALIFY -- proved, not assumed, and the proof is why
+    // this is not the O(|body|^2) scan it used to be.
+    //
+    //   Let B be a loop block that dominates every loop block.  The header H is
+    //   a loop block, so B dom H.  B is in the natural loop, so by definition of
+    //   a natural loop H dom B.  Dominance is antisymmetric, therefore B = H.
+    //
+    // `body` is an `FxHashSet`, so its iteration order is arbitrary: the old
+    // `for &block_idx in &natural_loop.body { if !body.all(dominates) ... }`
+    // form short-circuits only when a counterexample happens to come early, and
+    // the header -- the one block that never short-circuits -- sits at an
+    // expected position of |body|/2.  Expected cost was therefore
+    // ~|body|^2/2 dominance walks, each O(idom depth): ~12.5M walks on a
+    // 5 000-block loop.  Scanning the header alone is O(|body| * depth) once.
+    //
+    // Measured effect on this repo today: none that is resolvable, because the
+    // pass fires on 0 of the 51 benchmark programs at default settings (it only
+    // fires on the preheader fixtures, 1 insertion each) -- `loop_rotate` is
+    // opt-in and the profitability gate rejects the rest.  This is a latent
+    // scalability fix for large real-world loops (kernel/glibc-scale CFGs),
+    // not a measured corpus win, and it is recorded that way rather than being
+    // sold as a speedup.
+    //
+    // The debug assertion below is what keeps the proof honest: if LICM's
+    // must-execute rule is ever relaxed from "is the header" to something
+    // weaker, the scan-the-header-only shortcut silently stops being equivalent,
+    // and a debug build says so instead of quietly losing hoists.
+    debug_assert!(
+        natural_loop
             .body
             .iter()
-            .all(|&b| dominates_block(idom, block_idx, b))
-        {
-            continue; // not must-execute: LICM refuses the hoist anyway
-        }
+            .filter(|&&b| b != natural_loop.header && b < func.blocks.len())
+            .all(|&b| {
+                !natural_loop
+                    .body
+                    .iter()
+                    .all(|&other| dominates_block(idom, b, other))
+            }),
+        "a non-header loop block dominates every loop block; the \
+         header-only shortcut in preheader_would_unlock_a_hoist is no longer \
+         equivalent -- revisit the must-execute rule it relies on"
+    );
+    let block_idx = natural_loop.header;
+    if block_idx < func.blocks.len() {
         for inst in &func.blocks[block_idx].instructions {
             if let Instruction::Load { ptr, volatile, .. } = inst {
                 if *volatile || alloca_values.contains(&ptr.0) {
@@ -345,14 +390,21 @@ fn apply_insertions(func: &mut IrFunction, plans: &[Plan]) -> usize {
         if pred_idx == header_idx {
             continue; // a self-loop header: not a shape LICM hoists from
         }
-        // Block 0 is the function entry. Inserting before it would make the
-        // new block the entry, silently reparenting every parameter and
-        // alloca in the function. It is unreachable today -- an entry-block
-        // header has no predecessor outside the loop, so `find_preheader`
-        // returns `None` and no plan is ever made for it -- but the failure
-        // mode is catastrophic and the guard is free, so it is a refusal
-        // rather than an assertion: a future analysis change must lose the
-        // optimisation here, not the function.
+        // Block 0 is the function entry.  Inserting before it would make the
+        // new block the entry, silently reparenting every parameter and alloca
+        // in the function.  It is unreachable today -- an entry-block header
+        // has no predecessor outside the loop, so `find_preheader` returns
+        // `None` and no plan is ever made for it -- but the failure mode is
+        // catastrophic and the guard is free, so it is a refusal rather than
+        // an assertion: a future analysis change must lose the optimisation
+        // here, not the function.
+        //
+        // (A `debug_assert!` on this invariant was the first attempt and is the
+        // wrong instrument: it panics in debug builds and is compiled OUT of
+        // release, which inverts the intent for a guard whose entire purpose is
+        // to contain a catastrophic, otherwise-silent outcome.  Assertions
+        // document invariants you believe cannot be violated; refusals enforce
+        // the ones you are not willing to bet the function on.)
         if header_idx == 0 {
             continue;
         }

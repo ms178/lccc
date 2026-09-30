@@ -877,7 +877,6 @@ pub(super) fn fold_induction_copyback(store: &mut LineStore, infos: &mut [LineIn
         // Uses of `%D` in this window need no rewrite — `%D` already holds
         // the producer's value under the fold.
         let mut uses: Vec<usize> = Vec::new();
-        let mut last = c;
         let mut ok = true;
         for j in (c + 1)..len {
             if infos[j].is_nop() {
@@ -903,7 +902,6 @@ pub(super) fn fold_induction_copyback(store: &mut LineStore, infos: &mut [LineIn
                     break;
                 }
                 uses.push(j);
-                last = j;
             } else {
                 if writes_d || writes_t {
                     break;
@@ -967,7 +965,6 @@ pub(super) fn fold_induction_copyback(store: &mut LineStore, infos: &mut [LineIn
             })
             .collect();
         let mut rewritten_uses: Vec<(usize, String)> = Vec::with_capacity(all_uses.len());
-        let mut all_rewritable = true;
         for &j in &all_uses {
             let line = infos[j].trimmed(store.get(j)).to_string();
             let mut rw = line.clone();
@@ -975,7 +972,6 @@ pub(super) fn fold_induction_copyback(store: &mut LineStore, infos: &mut [LineIn
                 rw = replace_reg(&rw, from, to);
             }
             if rw == line || t_names.iter().any(|(from, _)| contains_reg(&rw, from)) {
-                all_rewritable = false;
                 break;
             }
             rewritten_uses.push((j, rw));

@@ -10322,7 +10322,7 @@ impl X86Codegen {
         let m0 = mem_of(self, &args[0]);
         let m1 = mem_of(self, &args[1]);
         match (m0, m1) {
-            (Some(m0), Some(m1)) => {
+            (Some(_m0), Some(m1)) => {
                 self.avx_load_arg(&args[0]);
                 self.state
                     .emit_fmt(format_args!("    {} {}, %ymm0, %ymm0", avx_inst, m1));

@@ -117,6 +117,12 @@ class AsmStats:
     spills: int = 0
     branches: int = 0
     vectors: int = 0
+    # Call sites inside this one function.  Ranked per-function gaps are only
+    # comparable between two compilers that put the SAME work in the function,
+    # and the call count is how you tell: a compiler that declines to inline
+    # shows a small body and a high call count, and "wins" the gap by charging
+    # the callee to nobody.  See engineering/evidence/ORACLE-METRIC-1.
+    calls: int = 0
 
 
 _OPTIMIZED_FUNCTION_SUFFIX = re.compile(
@@ -202,6 +208,14 @@ def _stats(lines: Iterable[str], arch: str) -> AsmStats:
         mnemonic = parts[0].lower()
         operands = parts[1] if len(parts) > 1 else ""
         stats.instructions += 1
+
+        # Counted before the per-arch branches so every target gets it.  `bl`
+        # and `blr` are AArch64 calls, `jal`/`jalr`/`call`/`tail` RISC-V, and
+        # `call` x86; `b`/`j` are NOT calls and are excluded deliberately,
+        # because a tail jump to an out-of-line copy is exactly the shape that
+        # makes one compiler's function look smaller than another's.
+        if mnemonic in {"call", "bl", "blr", "jal", "jalr", "tail"}:
+            stats.calls += 1
 
         if arch == "aarch64":
             if (mnemonic in {"b", "bl", "blr", "br", "ret", "cbz", "cbnz", "tbz", "tbnz"}
@@ -671,9 +685,10 @@ def _print_rank(rows: list[RankRow], verbose: bool, baseline: dict[str, Any]) ->
     unless verbose, with the total gap and the behind/tied/ahead split."""
     print(f"{'gap':>5} {'benchmark':<22} {'function':<22} "
           f"{'insns':>6} {'loads':>6} {'store':>6} {'spill':>6} "
-          f"{'brnch':>6} {'vec':>6}   best")
-    print("-" * 108)
+          f"{'brnch':>6} {'vec':>6} {'call':>5}   best")
+    print("-" * 114)
     total_gap = 0
+    suspect: list[str] = []
     for gap, bench, fname, local, best_name, per in rows:
         if gap <= 0 and not verbose:
             continue
@@ -685,17 +700,36 @@ def _print_rank(rows: list[RankRow], verbose: bool, baseline: dict[str, Any]) ->
             if old is not None:
                 change = gap - old
                 delta = f"  ({change:+d} vs baseline)" if change else "  (unchanged)"
+        # A gap between two functions with different call counts is not a
+        # codegen gap: the smaller one has moved work out of line and the
+        # oracle never measured where it went.  Flag it instead of ranking it.
+        flag = ""
+        if gap > 0 and best.calls != local.calls:
+            flag = "  <-- CALLS DIFFER, gap not comparable"
+            suspect.append(f"{bench}:{fname} (lccc {local.calls} calls vs "
+                           f"{best_name} {best.calls})")
         print(f"{gap:>5} {bench:<22} {fname:<22} "
               f"{local.instructions:6d} {local.loads:6d} {local.stores:6d} "
-              f"{local.spills:6d} {local.branches:6d} {local.vectors:6d}   "
-              f"{best_name}={best.instructions}{delta}")
-    print("-" * 108)
+              f"{local.spills:6d} {local.branches:6d} {local.vectors:6d} "
+              f"{local.calls:5d}   "
+              f"{best_name}={best.instructions}{delta}{flag}")
+    print("-" * 114)
     print(f"total instruction gap vs best-of-oracles: {total_gap}")
     behind = sum(1 for row in rows if row[0] > 0)
     ahead = sum(1 for row in rows if row[0] < 0)
     tied = sum(1 for row in rows if row[0] == 0)
     print(f"functions: {behind} behind, {tied} tied, {ahead} ahead "
           f"({len(rows)} compared)")
+    if suspect:
+        print(f"\nWARNING: {len(suspect)} of the {behind} 'behind' rows compare "
+              f"functions with DIFFERENT call counts, so their gap measures an "
+              f"inlining decision, not code generation:")
+        for s in suspect[:12]:
+            print(f"  {s}")
+        if len(suspect) > 12:
+            print(f"  ... and {len(suspect) - 12} more")
+        print("Re-measure those with --all-functions (whole translation unit) "
+              "before acting on them. See engineering/evidence/ORACLE-METRIC-1.")
 
 
 def _rank_markdown(rows: list[RankRow], verbose: bool, path: Path, flags: str) -> None:
@@ -710,18 +744,52 @@ def _rank_markdown(rows: list[RankRow], verbose: bool, path: Path, flags: str) -
         "",
         f"- flags: `{flags}`",
         "",
-        "| Gap | Benchmark | Function | LCCC insns | Best insns | Best compiler | LCCC loads | stores | spills | branches | vectors |",
-        "|---:|---|---|---:|---:|---|---:|---:|---:|---:|---:|",
+        "| Gap | Benchmark | Function | LCCC insns | Best insns | Best compiler | LCCC loads | stores | spills | branches | vectors | LCCC calls | Best calls | Comparable |",
+        "|---:|---|---|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|:--:|",
     ]
+    flagged: list[tuple[int, str, str, int, int]] = []
     for gap, bench, fname, local, best_name, per in rows:
         if gap <= 0 and not verbose:
             continue
         best = per[best_name]
+        # See _print_rank: a gap across differing call counts measures an
+        # inlining decision, not code generation, and must not be ranked as if
+        # it did.  The column keeps the row (hiding data is worse) but marks it.
+        same = best.calls == local.calls
+        if gap > 0 and not same:
+            flagged.append((gap, bench, fname, local.calls, best.calls))
         lines.append(
             f"| {gap} | `{bench}` | `{fname}` | {local.instructions} | "
             f"{best.instructions} | {best_name} | {local.loads} | {local.stores} | "
-            f"{local.spills} | {local.branches} | {local.vectors} |"
+            f"{local.spills} | {local.branches} | {local.vectors} | "
+            f"{local.calls} | {best.calls} | {'yes' if same else '**no**'} |"
         )
+    if flagged:
+        total = sum(g for g, *_ in flagged)
+        behind_total = sum(g for g, *_ in
+                           ((r[0],) for r in rows if r[0] > 0))
+        lines += [
+            "",
+            f"## {len(flagged)} rows are not comparable ({total} of {behind_total} "
+            f"of the deficit)",
+            "",
+            "A per-function instruction gap is only a codegen gap if both",
+            "compilers put the same work in that function. When the call counts",
+            "differ, the smaller body has moved work out of line and this",
+            "single-function view never measured where it went. On this corpus",
+            "that is not a corner case: it is the top of the table.",
+            "",
+            "| Gap | Benchmark | Function | LCCC calls | Best calls |",
+            "|---:|---|---|---:|---:|",
+        ]
+        for gap, bench, fname, lc, bc in sorted(flagged, reverse=True):
+            lines.append(f"| {gap} | `{bench}` | `{fname}` | {lc} | {bc} |")
+        lines += [
+            "",
+            "Re-measure these with `--all-functions` before acting on them.",
+            "Worked example, method, and the corpus-wide consequences:",
+            "`engineering/evidence/ORACLE-METRIC-1/README.md`.",
+        ]
     path.write_text("\n".join(lines) + "\n")
 
 

@@ -127,7 +127,7 @@ pub fn should_inline_site(
 }
 
 fn should_inline_impl(
-    caller: &IrFunction,
+    _caller: &IrFunction,
     callee: &IrFunction,
     cf: u64,
     df: u64,

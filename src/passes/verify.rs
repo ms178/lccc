@@ -330,7 +330,7 @@ fn verify_dominance(
     real_preds: &[FxHashSet<BlockId>],
     out: &mut Vec<Violation>,
 ) {
-    let push = |out: &mut Vec<Violation>, detail: String| {
+    let _push = |out: &mut Vec<Violation>, detail: String| {
         out.push(Violation {
             stage: stage.to_string(),
             function: func.name.clone(),

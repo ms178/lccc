@@ -535,7 +535,7 @@ impl I686Codegen {
             }
             IrBinOp::And | IrBinOp::Or | IrBinOp::Xor => {
                 self.emit_load_acc_pair(lhs);
-                let mn = match op {
+                let _mn = match op {
                     IrBinOp::And => "andl",
                     IrBinOp::Or => "orl",
                     _ => "xorl",

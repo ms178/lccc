@@ -136,6 +136,32 @@ def parse_env(path: Path) -> dict[str, str]:
     return env
 
 
+def corpus_contract_hint(stderr: str) -> str:
+    """Explain the corpus's single-TU contract when a fixture breaks it.
+
+    Discovery is `tests/regression/*.c` — non-recursive, one compiler
+    invocation per file, no extra sources.  A fixture that references symbols
+    defined in a sibling file therefore fails at link time here even though its
+    own gate script links it correctly, which reads as a compiler bug and is
+    not one.  Naming the fix in the failure message costs one function and
+    saves the next author a debugging session; a bare `undefined reference`
+    does not say "you put a support file where the corpus will pick it up".
+    """
+    if "undefined reference" not in stderr and "undefined symbol" not in stderr:
+        return ""
+    return (
+        "\n  note: this looks like the corpus's single-TU contract, not a "
+        "codegen bug.\n"
+        "  Every tests/regression/*.c is compiled standalone (see discover()); "
+        "a\n"
+        "  fixture whose symbols live in a sibling file must keep its support "
+        "files in\n"
+        "  a subdirectory and add a root-level wrapper TU that #includes them "
+        "— see\n"
+        "  minmax_reduction.c / minmax_refused.c."
+    )
+
+
 def discover(base_dirs: list[Path]) -> list[TestCase]:
     tests: list[TestCase] = []
     for directory in base_dirs:

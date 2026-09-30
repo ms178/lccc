@@ -1042,14 +1042,12 @@ fn try_transform_loop(
     // Chunk: discover K.
     let n_ops = body.ops.len();
     let mut chunks = None;
-    let mut k_used = 0usize;
     for k in (4..=96).step_by(4) {
         if n_ops % (4 * k) != 0 {
             continue;
         }
         if let Some(c) = try_chunk(&body, k) {
             chunks = Some(c);
-            k_used = k;
             break;
         }
     }

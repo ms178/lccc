@@ -318,18 +318,41 @@ gate "vec-dead-remainder" fast \
 gate "minmax-reduction" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_minmax_reduction.sh
 
-gate "hot-loop-metric" fast \
-    python3 scripts/test_hot_loop_metric.py
+# C11 5.1.2.3 access semantics: a volatile load/store is an observable side
+# effect, so no pass may forward, CSE, DCE or HOIST it.  These gates are the
+# only mechanical enforcement of that rule, and the hoist arm is the one that
+# matters: a `!*volatile` term was dropped from LICM's load arm by a
+# debug-print refactor, which turned `while (!regs[4]) {}` (the MMIO spin-wait
+# the Linux kernel is full of) into a load-once infinite loop.
+#
+# Why it shipped: `src/lib.rs` carried a crate-wide `#![allow(unused_variables,
+# ...)]`.  rustc *does* diagnose this exact bug -- deleting the guard leaves
+# the destructured `volatile` binding unread, and the lint names the file, the
+# line and the fix ("help: try ignoring the field: `volatile: _`").  The
+# crate-level allow is what silenced it.  That allow is now removed, so the
+# compiler is the first line of defence; the gates below are the second, and
+# `scripts/check_volatile_destructuring.py` is the third (it also covers the
+# `volatile: _` escape hatch, which the lint accepts silently by design).
+#
+# The hoist gates are mutation-verified in BOTH directions (see
+# engineering/FOLLOWUP-2026-09-29-pr681-ci-red-audit-adjudication.md): with the
+# guard deleted all four exit 1, and with it restored all four exit 0.  They are
+# a set for coverage, not redundancy -- they fail for different reasons on
+# different loop shapes.  check_volatile_spin_loop.sh asserts BOTH directions:
+# six volatile probes that must keep an access per iteration, and three
+# non-volatile controls that must be hoisted to zero, so a green run cannot mean
+# "hoisted nothing".  check_volatile_licm.sh pins the LICM diagnostic path.  Both
+# share tests/regression/lib_loop_bounds.sh with the loop-preheader gate, so
+# there is exactly one definition of "inside the loop body" in the tree.
+# check_volatile_access_semantics.sh is deliberately NOT in the mutation-verified
+# set -- it checks forwarding/CSE/DCE, not hoisting, and cannot see this
+# regression.  (It and check_volatile_pointer_subscript.sh are registered once,
+# further down, with the block that explains why they were unwired.)
+gate "volatile-spin-loop" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_volatile_spin_loop.sh
 
-# LICM must not hoist a volatile load out of its loop (C11 5.1.2.3): N
-# observable accesses must not become 1. The runtime cannot see this -- a
-# hoisted volatile load computes the same answer -- so the gate asserts it
-# structurally, with a non-volatile load in the same shape as the negative
-# control (that one MUST be hoisted, or the test proves nothing).
 gate "volatile-licm" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_volatile_licm.sh
-gate "loop-preheader" fast \
-    env CCC=target/fastbuild/lccc bash tests/regression/check_loop_preheader.sh
 
 # These two existed in the tree for a long time and were wired to NOTHING --
 # not ci.yml, not any of this script's gates, and unreachable from the corpus
@@ -349,14 +372,42 @@ gate "volatile-pointer-subscript" fast \
 gate "volatile-access-semantics" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_volatile_access_semantics.sh
 
-# Pure-logic gate: it exercises the oracle-verdict / oracle-agreement
-# classifier directly, so it needs neither a built linker nor a single
-# installed oracle linker.  That is the point -- the paths it pins (two
-# oracles going `inapplicable`, one crashing, the reference having no
-# opinion) are exactly the ones a host with only bfd installed never
-# executes end-to-end.
-gate "linker-oracle-verdict" fast \
-    python3 tests/linker/test_reloc_oracle_verdict.py
+# Static ratchet over every `Instruction::{Load,Store}` destructuring in the
+# crate: a `volatile` bound by value must be used in the arm body, or be
+# written `volatile: _` to say the discard is deliberate.  Fail-closed on
+# blocks it cannot delimit.  --self-test first so a broken parser cannot pass
+# by matching nothing.
+gate "volatile-destructuring-selftest" fast \
+    python3 scripts/check_volatile_destructuring.py --self-test
+
+gate "volatile-destructuring" fast \
+    python3 scripts/check_volatile_destructuring.py
+
+# A loop header with more than one out-of-loop predecessor must never be
+# treated as having a single preheader: `find_loop_preheader` answers for the
+# block the invariant loop bound is hoisted into, and a wrong answer there is a
+# use-before-def, not a missed optimisation.  Switch- and computed-goto-entered
+# loops, pinned against the host compiler at five optimisation levels.
+gate "multi-entry-loop" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_multi_entry_loop.sh
+
+# LOOP-PREHEADER-1: a preheader insertion that is structurally right but hoists
+# nothing is invisible to a runtime test, so the pass is pinned on the emitted
+# assembly with the pass both enabled and disabled (its Rust unit tests cover
+# only the pure functions).
+gate "loop-preheader" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_loop_preheader.sh
+
+gate "hot-loop-metric" fast \
+    python3 scripts/test_hot_loop_metric.py
+
+# Pure-logic gate for the codegen oracle's comparability guard.  A per-function
+# instruction gap between two compilers with different call counts measures an
+# inlining decision, not code generation; on this corpus 16 of 77 "behind" rows
+# were in that state and carried 41% of the headline deficit, including both top
+# rows.  No compiler and no network needed.
+gate "codegen-oracle-metric" fast \
+    python3 scripts/test_codegen_oracle.py
 
 # The full corpus gate is SLOW, so a source file that cannot even link used
 # to reach upstream on a green local run: tests/regression/*.c is globbed
@@ -754,6 +805,15 @@ gate "decimal64-indexed-fold" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_decimal64_indexed_fold.sh
 gate "decimal32-arm-width" fast \
     env CCC_ARM=target/fastbuild/lccc-arm bash tests/regression/check_decimal32_indexed_fold_arm.sh
+
+# Pure-logic gate: it exercises the oracle-verdict / oracle-agreement
+# classifier directly, so it needs neither a built linker nor a single
+# installed oracle linker.  That is the point -- the paths it pins (two
+# oracles going `inapplicable`, one crashing, the reference having no
+# opinion) are exactly the ones a host with only bfd installed never
+# executes end-to-end.
+gate "linker-oracle-verdict" fast \
+    python3 tests/linker/test_reloc_oracle_verdict.py
 
 if [ -x target/fastbuild/lccc-ld ]; then
     gate "linker-fuzz" fast env \

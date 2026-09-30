@@ -65,6 +65,29 @@ from typing import Any
 # Resolved identically by every importer: this file lives in <repo>/scripts/,
 # so the cache sits at <repo>/.godbolt-cache/ no matter which tool imports it
 # or what the process working directory is.
+#
+# WHAT THIS CACHE PROMISES, AND WHAT IT DOES NOT
+# ----------------------------------------------
+# A persistent cache pins records for weeks, so it answers a different question
+# than the in-process memo it replaced, and both questions are legitimate:
+#
+#   * "reproduce the table that was published" -- the default.  Records are
+#     returned exactly as stored, forever, which is what makes a number in
+#     `engineering/evidence/` re-derivable.
+#   * "measure the compiler CE is serving TODAY" -- `--revalidate` on
+#     `tools/oracle/godbolt_oracle.py`.  One `/api/compilers` request for the
+#     whole run, then every record whose compiler drifted (pinned channels) or
+#     that is older than `--max-age-days` (moving channels such as
+#     `cicxlatest`, where CE reports `(latest)` and there is no version to
+#     compare) is dropped and re-fetched.
+#
+# The CE compiler version is deliberately NOT part of `key()`: that would make
+# every compile a probe-then-compile pair, and for the moving channels the
+# version string carries no information anyway.  Provenance is stored IN the
+# record (`ce_semver`, `cached_at`) and compared out of band instead.  Bumping
+# a namespace below remains the way to invalidate a generation of records after
+# a FORMAT change; `--revalidate` is the way to invalidate them after a
+# COMPILER change.
 CACHE = Path(os.environ.get(
     "GODBOLT_CACHE",
     str(Path(__file__).resolve().parent.parent / ".godbolt-cache"),
@@ -180,6 +203,31 @@ def store_lines(namespace: str, lines: list[str], *parts: Any) -> None:
 # --------------------------------------------------------------------------
 # Introspection
 # --------------------------------------------------------------------------
+
+def iter_records(namespace: str):
+    """Yield ``(path, key)`` for every readable record in ``namespace``.
+
+    In-flight temporaries are skipped: `_atomic_write` renames them into place,
+    so a `.tmp.` name is a write that has not committed yet and reading it
+    would race the writer.
+    """
+    ns_dir = CACHE / namespace
+    if not ns_dir.is_dir():
+        return
+    for path in sorted(ns_dir.iterdir()):
+        if not path.is_file() or ".tmp." in path.name:
+            continue
+        yield path, path.name[: -len(".json")] if path.name.endswith(".json") else path.name
+
+
+def drop(path: Path) -> bool:
+    """Delete one record.  ``True`` if a file was removed."""
+    try:
+        path.unlink()
+        return True
+    except OSError:
+        return False
+
 
 def stats() -> dict[str, int]:
     """Record count per namespace. Used by the self-test and by ``--cache``."""

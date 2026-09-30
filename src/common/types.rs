@@ -541,7 +541,7 @@ impl StructLayoutBuilder {
         // position within the unit; for multi-byte units the access loads the
         // whole unit (sso_storage_ty) and byteswaps it before bit math.
         let unit_bits = (storage_mask * 8) as u32;
-        let (sso, sso_storage_ty, field_bit_in_storage, storage_ctype) = if self.reverse_sso {
+        let (sso, sso_storage_ty, field_bit_in_storage, _storage_ctype) = if self.reverse_sso {
             field_bit_in_storage = unit_bits - field_bit_in_storage - bw;
             if storage_mask >= 2 {
                 let unit_ctype =

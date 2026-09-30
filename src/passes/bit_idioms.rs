@@ -270,7 +270,7 @@ pub(super) fn match_bool_mux_algebra(
     c_dest: crate::ir::reexports::Value,
     c_ty: IrType,
     block_bi: usize,
-    index: usize,
+    _index: usize,
     defs: &[Option<Instruction>],
     use_counts: &[u32],
     def_loc: &[Option<(usize, usize)>],

@@ -747,7 +747,7 @@ pub(super) fn eliminate_move_relays(store: &mut LineStore, infos: &mut [LineInfo
             continue;
         }
         let copy_w = dest_width(dst_text).unwrap_or(0);
-        let src_mask = 1u16 << src_fam;
+        let _src_mask = 1u16 << src_fam;
         let dst_mask = 1u16 << dst_fam;
 
         let mut j = i + 1;
@@ -1791,7 +1791,32 @@ pub(super) fn retarget_producer_into_copy(store: &mut LineStore, infos: &mut [Li
 /// `retarget_producer_into_copy`.
 pub(super) fn fold_copy_into_lea_base(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
-    let mut lv = FileLiveness::new(store, infos);
+    // NOTE ON A REMOVED DEAD STORE.  This function used to carry
+    // `let mut lv = FileLiveness::new(store, infos);` plus `lv = lv2;` on the
+    // success path, under an `#[allow(unused_variables, unused_assignments)]`
+    // and a comment asserting the assignment was load-bearing because deleting
+    // it "measurably regressed codegen (sqlite_varint 256 -> 270 insns,
+    // gzip_crc32 65 -> 69) because it changed this loop's control flow".
+    //
+    // That claim was false and the reasoning was unsound.  `lv` was written
+    // twice and never read, `FileLiveness` has no `Drop` impl, so the store was
+    // inert by construction -- and a dead store in the *compiler's* source
+    // cannot change the compiler's *behaviour* in any case; LCCC is a
+    // deterministic function of its input, so "control flow in this loop" is
+    // not a mechanism that exists.  Measured, deleting it is a no-op: all 150
+    // asm outputs over tests/benchmark/programs + kernel_corpus at -O2 and
+    // -O2 -march=x86-64-v3 are byte-identical before and after, and the two
+    // cited files count 410 and 86 instructions either way (so the quoted 256
+    // and 65 do not correspond to a whole-TU count on this tree at all).  It
+    // also builds with zero warnings once the store is gone, so the `allow`
+    // was covering nothing but the store itself.
+    //
+    // Recorded rather than deleted silently because the measurement was
+    // presumably real for whoever took it -- most likely confounded by an
+    // unrelated edit or a different binary -- and an unexplained deletion
+    // invites someone to restore it.  The general rule it violates: a codegen
+    // delta attributed to a provably dead store is a measurement error, not a
+    // compiler quirk, and the fix is to re-measure, not to pin the dead code.
     let mut changed = false;
     let mut i = 0;
     while i < len {
@@ -1943,7 +1968,6 @@ pub(super) fn fold_copy_into_lea_base(store: &mut LineStore, infos: &mut [LineIn
         // Every line between `li` and `j` is a NOP, so "dead after the LEA"
         // is exactly "dead after the (deleted) copy" on the rewritten text.
         if provably_dead_lv(&lv2, store, infos, li, b_fam, &[li, j]) {
-            lv = lv2;
             changed = true;
             i = j + 1;
         } else {
@@ -1952,7 +1976,6 @@ pub(super) fn fold_copy_into_lea_base(store: &mut LineStore, infos: &mut [LineIn
             for (idx, orig, _) in rewrites {
                 replace_line(store, &mut infos[idx], idx, orig);
             }
-            // `lv` still describes the restored text.
         }
     }
     changed

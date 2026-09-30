@@ -51,7 +51,21 @@ int main(void)
     return handcfi() == 7 ? 0 : 3;
 }
 C
-for m in "" -m32; do
+# Probe the 32-bit toolchain ONCE, before the loop, and only then decide which
+# modes to run.  The probe used to sit inside the loop guarding just the
+# link-and-run step, so on a host without multilib the `-m32 -S` compile still
+# ran, died on `bits/libc-header-start.h: No such file or directory`, and
+# `set -e` turned a missing OPTIONAL toolchain into a red gate.  The i686 half
+# of this check is real and must not be weakened -- it is skipped, loudly, only
+# when the host genuinely cannot compile 32-bit code, exactly as
+# check_eh_frame_unwind.sh does.
+modes=("")
+if echo 'int main(void){return 0;}' | "$CCC" -m32 -x c - -o "$tmp/probe32" 2>/dev/null; then
+    modes+=("-m32")
+else
+    echo "SKIP -m32: no 32-bit toolchain" >&2
+fi
+for m in "${modes[@]}"; do
     "$CCC" $m -O2 -S "$tmp/t.c" -o "$tmp/cfi.s"
     "$CCC" $m -O2 -fno-asynchronous-unwind-tables -S "$tmp/t.c" -o "$tmp/nocfi.s"
     if ! diff <(grep -v '\.cfi_' "$tmp/cfi.s") <(grep -v '\.cfi_' "$tmp/nocfi.s") >"$tmp/d"; then
@@ -65,9 +79,7 @@ for m in "" -m32; do
         grep -n '\.cfi_' "$tmp/nocfi.s" >&2 || true
         exit 1
     fi
-    if [[ -z "$m" ]] || echo 'int main(void){return 0;}' | "$CCC" -m32 -x c - -o "$tmp/probe" 2>/dev/null; then
-        "$CCC" $m -O2 -fno-asynchronous-unwind-tables "$tmp/t.c" -o "$tmp/t"
-        "$tmp/t"
-    fi
+    "$CCC" $m -O2 -fno-asynchronous-unwind-tables "$tmp/t.c" -o "$tmp/t"
+    "$tmp/t"
 done
 echo "PASS: no-unwind codegen parity"

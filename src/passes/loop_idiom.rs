@@ -466,11 +466,11 @@ fn try_match_copy_loop(
     }
     let header = lp.header;
     let label_to_idx = analysis::build_label_map(func);
-    let header_label = func.blocks[header].label;
+    let _header_label = func.blocks[header].label;
 
     // Header must end in a conditional branch with one successor in the
     // loop (body entry) and one outside (the single exit).
-    let (cond_val, in_succ, exit_idx) = match &func.blocks[header].terminator {
+    let (cond_val, _in_succ, exit_idx) = match &func.blocks[header].terminator {
         Terminator::CondBranch {
             cond,
             true_label,
@@ -1616,7 +1616,7 @@ fn rewrite_copy_loop(func: &mut IrFunction, m: &CopyLoop, body: &FxHashSet<usize
     };
     // ---- Mutations begin (all remaining steps are infallible). ----
     let mut clone_of: FxHashMap<u32, Value> = FxHashMap::default();
-    let mut do_clone = |orig: Value, template: Instruction, func: &mut IrFunction| -> Value {
+    let mut do_clone = |_orig: Value, template: Instruction, func: &mut IrFunction| -> Value {
         let fresh = alloc_value(&mut *func);
         let mut inst = template;
         match &mut inst {

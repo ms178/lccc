@@ -1,7 +1,6 @@
 #![recursion_limit = "512"]
 #![allow(
     dead_code,
-    unused_variables,
     unused_mut,
     unused_assignments,
     unused_imports,
@@ -25,7 +24,13 @@
 //! fix a category can delete its line here and get an immediate, complete list
 //! of the remaining sites from a fresh `cargo clippy` run. Generated code is
 //! byte-identical with and without this block; it only affects compiler-build
-//! diagnostics. CI runs clippy advisory (`continue-on-error: true`).
+//! diagnostics. CI runs clippy **strict** -- `cargo clippy --all-targets
+//! --profile fastbuild --locked -j 2 -- -D warnings`, with no
+//! `continue-on-error` anywhere in `.github/workflows/ci.yml` -- so this list is
+//! load-bearing rather than advisory: any category removed from it before its
+//! sites are fixed turns hosted CI red. That is the intended failure mode, and
+//! the reason the list is kept to the exact set the tree violates instead of a
+//! comfortable superset.
 #![allow(
     clippy::bind_instead_of_map,
     clippy::chunks_exact_to_as_chunks,

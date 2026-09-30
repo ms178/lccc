@@ -961,7 +961,7 @@ impl super::InstructionEncoder {
                 // path always took the 05 + imm32 shape — for a byte
                 // destination the decoder then sees op eAX, imm32 and the
                 // stream desynchronizes.
-                let (opcode_len, imm_len) = if dst_num == 0 {
+                let (_opcode_len, imm_len) = if dst_num == 0 {
                     match size {
                         1 => {
                             self.bytes.push(0x04 + alu_op * 8);

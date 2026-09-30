@@ -1544,7 +1544,7 @@ pub(super) fn emit_executable(
     // builders below (rather than building and discarding) means a stripped
     // link also skips the sort and the string-table construction.
     let emit_symtab = !strip_all;
-    let symtab_shidx;
+    let _symtab_shidx;
     let strtab_shidx;
     let dynsym_shidx: u32;
     let dynstr_shidx: u32;
@@ -1678,7 +1678,13 @@ pub(super) fn emit_executable(
         }
 
         // .symtab and .strtab follow, then .shstrtab.
-        symtab_shidx = if emit_symtab { h as u16 } else { 0 };
+        // Bound as `_symtab_shidx`: the .symtab section index is computed here
+        // only to keep `h` (the running section-header count) consistent with
+        // the layout bfd emits -- nothing downstream reads it back, because a
+        // stripped link writes no symtab header at all.  The leading underscore
+        // is the point: with `unused_variables` enabled crate-wide this reads as
+        // "deliberately unread", not as a dropped use.
+        _symtab_shidx = if emit_symtab { h as u16 } else { 0 };
         strtab_shidx = if emit_symtab { h as u16 + 1 } else { 0 };
         if emit_symtab {
             h += 2;

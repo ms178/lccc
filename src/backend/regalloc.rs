@@ -2153,7 +2153,7 @@ pub(crate) fn compute_i686_mulacc_chains_with_config(
         // single-use widening casts (zext OR sext) become feeder candidates.
         // `op` is ALREADY canonicalized by the tail-loop caller.
         let resolve_addend =
-            |op: &Operand, use_point: u32, after_head: bool| -> Option<(Operand, Option<u32>)> {
+            |op: &Operand, use_point: u32, _after_head: bool| -> Option<(Operand, Option<u32>)> {
                 match op {
                     Operand::Const(c) if c.to_i64().is_some() => Some((op.clone(), None)),
                     Operand::Value(v) => {
