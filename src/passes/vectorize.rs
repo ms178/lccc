@@ -6870,11 +6870,13 @@ fn analyze_map_pattern(
                 store_val.0, parsed
             );
         }
-        let Some((byte_expr, _)) = parsed else {
+        let Some((byte_expr, root_range)) = parsed else {
             set_reject("byte map: tree is not byte-exact");
             return None;
         };
-        byte_expr
+        // The stored value is a VALUE: a bare compare root (`a[i] = b[i] > k`)
+        // must store C's 0/1, not the packed all-ones lane.
+        demask_operand(byte_expr, root_range).0
     } else {
         let parsed = parse_tree(store_val, 0);
         if debug {
@@ -6892,7 +6894,10 @@ fn analyze_map_pattern(
     // lanes only -- `map_lane_bits` returns `None` for FP element types and
     // the tree is left untouched.
     let expr = match map_lane_bits(&elem_ty) {
-        Some(bits) => fold_unsigned_range_masks(&expr, bits),
+        // Fold first (it canonicalises `and`/`or` of masks into `MaskConj`),
+        // then demask: every mask left in a value position becomes `m & 1`
+        // so the packed body and the scalar remainder mirror agree.
+        Some(bits) => demask_value_positions(fold_unsigned_range_masks(&expr, bits)),
         None => expr,
     };
     // 20 admits the recovered `&&`/`||` mask shapes (a two-compare
@@ -12083,6 +12088,12 @@ fn parse_byte_map_expr(
                     Some(MASK_RANGE),
                 ));
             }
+            // Any OTHER use of a mask as a VALUE (`a + (b > k)`, `x & (c == d)`,
+            // `(p > k) ^ (q < k)`, ...) must see C's 0/1 boolean, not the packed
+            // all-ones lane: demask first, so the packed body, the scalar
+            // remainder mirror and the range arithmetic below all agree.
+            let (l, lr) = demask_operand(l, lr);
+            let (r, rr) = demask_operand(r, rr);
             Some((
                 MapExpr::BinOp(*op, Box::new(l), Box::new(r)),
                 range_binop(*op, lr, rr),
@@ -12261,6 +12272,110 @@ fn parse_byte_map_expr(
         }
         _ => None,
     }
+}
+
+/// Is this node a lane MASK (all-ones / all-zeros per packed lane, a 0/1
+/// `setcc` in the scalar remainder mirror)?
+fn is_lane_mask(e: &MapExpr) -> bool {
+    matches!(e, MapExpr::Cmp(..) | MapExpr::MaskConj { .. })
+}
+
+/// `m & 1`: a lane mask converted to C's 0/1 boolean value.
+///
+/// Exact in BOTH interpreter worlds: a packed mask is all-ones or zero, so
+/// `m & 1` is that lane's 0/1; a scalar `setcc` is already 0/1, so `m & 1`
+/// is the `setcc`.  (Any other constant would NOT be world-independent --
+/// `m & k` is `-1 & k` packed but `1 & k` scalar -- which is why the
+/// strength-reducer's `m & k` rewrite is restricted to the packed tree.)
+fn mask_to_bool(m: MapExpr) -> MapExpr {
+    MapExpr::BinOp(
+        IrBinOp::And,
+        Box::new(m),
+        Box::new(MapExpr::Invariant(Operand::Const(IrConst::I32(1)))),
+    )
+}
+
+/// Is `e` the canonical demasked boolean `mask & 1` produced by
+/// [`mask_to_bool`]?  Used to keep [`demask_value_positions`] idempotent.
+fn is_demasked_bool(e: &MapExpr) -> bool {
+    let MapExpr::BinOp(IrBinOp::And, m, one) = e else {
+        return false;
+    };
+    is_lane_mask(m)
+        && matches!(
+            one.as_ref(),
+            MapExpr::Invariant(Operand::Const(c)) if c.to_i64() == Some(1)
+        )
+}
+
+/// Demask a parsed operand that is consumed as a VALUE: a mask-ranged
+/// operand becomes `mask & 1` with the exact 0/1 range; anything else is
+/// returned unchanged.
+fn demask_operand(e: MapExpr, range: WideRange) -> (MapExpr, WideRange) {
+    if range == Some(MASK_RANGE) {
+        (mask_to_bool(e), Some((0, 1)))
+    } else {
+        (e, range)
+    }
+}
+
+/// Rewrite every lane mask that appears in a VALUE position into `mask & 1`.
+///
+/// A packed compare produces -1/0 per lane while C's `a > b` is the 0/1
+/// boolean, and the same `MapExpr` is lowered twice: once to packed
+/// instructions and once to the scalar remainder mirror.  The two worlds
+/// agree on a mask only where it is *consumed as a condition* (`Select`
+/// condition, `MaskConj` operand).  Everywhere else (arithmetic operand,
+/// `Select` arm, stored root, compare operand) the mask must first become
+/// its boolean value -- otherwise `a[i] += (b[i] > k)` adds -1 in the vector
+/// body and +1 in the remainder.
+///
+/// Root positions count as values: the tree's result is stored.  Idempotent.
+fn demask_value_positions(expr: MapExpr) -> MapExpr {
+    fn go(e: MapExpr, want_value: bool) -> MapExpr {
+        match e {
+            MapExpr::Load(_) | MapExpr::Invariant(_) => e,
+            MapExpr::Cmp(op, l, r) => {
+                let rebuilt = MapExpr::Cmp(op, Box::new(go(*l, true)), Box::new(go(*r, true)));
+                if want_value { mask_to_bool(rebuilt) } else { rebuilt }
+            }
+            MapExpr::MaskConj { is_and, l, r } => {
+                let rebuilt = MapExpr::MaskConj {
+                    is_and,
+                    l: Box::new(go(*l, false)),
+                    r: Box::new(go(*r, false)),
+                };
+                if want_value { mask_to_bool(rebuilt) } else { rebuilt }
+            }
+            MapExpr::Select(c, t, f) => MapExpr::Select(
+                Box::new(go(*c, false)),
+                Box::new(go(*t, true)),
+                Box::new(go(*f, true)),
+            ),
+            MapExpr::BinOp(op, l, r) => {
+                // Already-canonical `mask & 1`: keep the mask in condition
+                // position instead of demasking it a second time.
+                if op == IrBinOp::And
+                    && ((is_lane_mask(&l) && !is_lane_mask(&r))
+                        || (is_lane_mask(&r) && !is_lane_mask(&l)))
+                    && (matches!(&*r, MapExpr::Invariant(Operand::Const(c)) if c.to_i64() == Some(1))
+                        || matches!(&*l, MapExpr::Invariant(Operand::Const(c)) if c.to_i64() == Some(1)))
+                {
+                    let (m, one) = if is_lane_mask(&l) { (*l, *r) } else { (*r, *l) };
+                    return MapExpr::BinOp(IrBinOp::And, Box::new(go(m, false)), Box::new(one));
+                }
+                MapExpr::BinOp(op, Box::new(go(*l, true)), Box::new(go(*r, true)))
+            }
+            MapExpr::MinMax { is_max, l, r } => MapExpr::MinMax {
+                is_max,
+                l: Box::new(go(*l, true)),
+                r: Box::new(go(*r, true)),
+            },
+            MapExpr::Sqrt(x) => MapExpr::Sqrt(Box::new(go(*x, true))),
+            MapExpr::Fma { .. } => e,
+        }
+    }
+    go(expr, true)
 }
 
 /// If `v` is the integer promotion of a byte-typed value, return that byte
@@ -27015,6 +27130,110 @@ mod map_expr_interpreter_tests {
             eval_mirror(&bad, &lanes, 32),
             "the 0/1-vs-all-ones asymmetry must be observable, or the guard is vacuous"
         );
+    }
+
+    /// REGRESSION (cond_inc miscompile, found by `scripts/vectorize_stress.py`):
+    /// `a[i] += (b[i] > k)` at byte/word/dword lanes added the packed
+    /// all-ones mask (-1) in the vector body but the scalar `setcc` (+1) in
+    /// the remainder.  `demask_value_positions` rewrites every mask used as a
+    /// VALUE into `mask & 1`, which both interpreters evaluate identically.
+    /// Each tree below diverges before the rewrite and agrees after, at every
+    /// lane width, over a domain including both signed extremes.
+    #[test]
+    fn demasked_value_position_masks_agree_across_interpreters() {
+        let k = |v: i32| MapExpr::Invariant(Operand::Const(IrConst::I32(v)));
+        let cmp = |op: IrCmpOp, s: usize, v: i32| {
+            MapExpr::Cmp(op, Box::new(MapExpr::Load(s)), Box::new(k(v)))
+        };
+        let bin = |op: IrBinOp, l: MapExpr, r: MapExpr| MapExpr::BinOp(op, Box::new(l), Box::new(r));
+        let trees: Vec<(&str, MapExpr)> = vec![
+            ("a + (b > k)", bin(IrBinOp::Add, MapExpr::Load(0), cmp(IrCmpOp::Slt, 1, 5))),
+            ("a - (b > k)", bin(IrBinOp::Sub, MapExpr::Load(0), cmp(IrCmpOp::Ult, 1, 5))),
+            ("a & (b > k)", bin(IrBinOp::And, MapExpr::Load(0), cmp(IrCmpOp::Slt, 1, 5))),
+            ("a | (b > k)", bin(IrBinOp::Or, MapExpr::Load(0), cmp(IrCmpOp::Eq, 1, 3))),
+            ("(a > k) ^ (b < k)", bin(IrBinOp::Xor, cmp(IrCmpOp::Slt, 0, 5), cmp(IrCmpOp::Ult, 1, 7))),
+            ("(a > k) + (b < k)", bin(IrBinOp::Add, cmp(IrCmpOp::Slt, 0, 5), cmp(IrCmpOp::Sle, 1, 7))),
+            ("root Cmp", cmp(IrCmpOp::Slt, 0, 5)),
+            (
+                "root MaskConj",
+                MapExpr::MaskConj {
+                    is_and: true,
+                    l: Box::new(cmp(IrCmpOp::Slt, 0, 5)),
+                    r: Box::new(cmp(IrCmpOp::Ule, 1, 9)),
+                },
+            ),
+            (
+                "select arm mask",
+                MapExpr::Select(
+                    Box::new(cmp(IrCmpOp::Slt, 0, 5)),
+                    Box::new(cmp(IrCmpOp::Eq, 1, 3)),
+                    Box::new(k(2)),
+                ),
+            ),
+            (
+                "mask compared with a load",
+                MapExpr::Cmp(
+                    IrCmpOp::Slt,
+                    Box::new(cmp(IrCmpOp::Slt, 0, 5)),
+                    Box::new(MapExpr::Load(1)),
+                ),
+            ),
+        ];
+        let mut diverged_before = 0usize;
+        for bits in [8u32, 16, 32] {
+            let m = (1i64 << bits) - 1;
+            let sign = 1i64 << (bits - 1);
+            let mut lane_sets: Vec<[i64; 2]> = Vec::new();
+            for a in [0, 1, 2, 3, 5, 6, 7, 9, 10, m, sign, sign - 1, sign + 1] {
+                for b in [0, 1, 3, 4, 5, 6, 8, 9, 10, m, sign, sign - 1, sign + 1] {
+                    let sx = |v: i64| {
+                        let v = v & m;
+                        if v & sign != 0 { v - (1i64 << bits) } else { v }
+                    };
+                    lane_sets.push([sx(a), sx(b)]);
+                }
+            }
+            for (name, tree) in &trees {
+                let fixed = demask_value_positions(tree.clone());
+                assert_eq!(
+                    demask_value_positions(fixed.clone()),
+                    fixed,
+                    "{name}: demask must be idempotent"
+                );
+                for lanes in &lane_sets {
+                    if eval_packed(tree, lanes, bits) != eval_mirror(tree, lanes, bits) {
+                        diverged_before += 1;
+                    }
+                    assert_eq!(
+                        eval_packed(&fixed, lanes, bits),
+                        eval_mirror(&fixed, lanes, bits),
+                        "{name}: packed/mirror divergence after demask at {bits}-bit lanes, lanes={lanes:?}\n  fixed = {fixed:?}"
+                    );
+                }
+            }
+        }
+        assert!(
+            diverged_before > 0,
+            "the un-demasked trees must diverge, or this test proves nothing"
+        );
+    }
+
+    /// The byte parser's range arithmetic must see a compare used as a value
+    /// as the boolean range [0, 1], never the packed-lane range [-1, 0].
+    #[test]
+    fn demask_operand_reports_boolean_range() {
+        let m = MapExpr::Cmp(
+            IrCmpOp::Slt,
+            Box::new(MapExpr::Load(0)),
+            Box::new(MapExpr::Invariant(Operand::Const(IrConst::I32(5)))),
+        );
+        let (e, r) = demask_operand(m.clone(), Some(MASK_RANGE));
+        assert_eq!(r, Some((0, 1)));
+        assert!(is_demasked_bool(&e));
+        // Non-mask operands pass through untouched.
+        let (same, r2) = demask_operand(MapExpr::Load(0), Some((0, 255)));
+        assert_eq!(same, MapExpr::Load(0));
+        assert_eq!(r2, Some((0, 255)));
     }
 
     /// Every tree the range fusion and the strength reduction produce must
