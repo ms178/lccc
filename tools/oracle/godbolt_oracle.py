@@ -71,6 +71,68 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 LCCC = os.environ.get("LCCC_BIN", os.path.join(REPO, "target/fastbuild/lccc"))
 PROGRAMS = os.path.join(REPO, "tests/oracle/programs")
 
+# `tests/oracle/programs/` holds two classes of file, and this harness only
+# owns one of them:
+#
+#   * standalone programs -- have a `main`, print a checksum, and are BUILT,
+#     RUN and stdout-diffed against every oracle.  That is this tool.
+#   * delta kernels -- claimed by `tests/oracle/delta_corpus.json`, measured
+#     by function name, deliberately without a `main` and without output, so
+#     that no compiler can inline the measured function away.  Those belong to
+#     `scripts/oracle_delta_gate.py`, which reads assembly and never links.
+#
+# Sweeping a kernel here is not a no-op: it links, fails with "undefined
+# reference to `main`", and is reported as `lccc did not build` -- a red row
+# that reads like a compiler regression and is a category error.  The corpus
+# is the single authority on which class a file is in, so a new file is
+# classified by claim rather than by a second hand-maintained list that can
+# drift from it.
+DELTA_CORPUS = os.path.join(REPO, "tests/oracle/delta_corpus.json")
+
+
+def corpus_kernel_sources() -> set:
+    """Normalised paths of every source `tests/oracle/delta_corpus.json` claims.
+
+    Sources may live outside `PROGRAMS` (the RA-01 probe does), so this
+    returns absolute paths and callers compare, never assume a basename.  An
+    unreadable or malformed corpus yields the empty set: the sweep then
+    behaves exactly as it did before kernels existed rather than dying on a
+    JSON typo -- the self-test pins the classification itself.
+    """
+    try:
+        with open(DELTA_CORPUS) as fh:
+            corpus = json.load(fh)
+    except (OSError, ValueError):
+        return set()
+    claimed = set()
+    for entry in corpus.get("entries", []):
+        source = entry.get("source")
+        if source:
+            claimed.add(os.path.normpath(os.path.join(REPO, source)))
+    return claimed
+
+
+def _all_sources() -> list:
+    return sorted(f for f in os.listdir(PROGRAMS) if f.endswith(".c"))
+
+
+def standalone_programs(filter_text: str = "") -> list:
+    """Runnable programs this harness owns: every `.c` the corpus does not claim."""
+    kernels = corpus_kernel_sources()
+    return [
+        f for f in _all_sources()
+        if filter_text in f
+        and os.path.normpath(os.path.join(PROGRAMS, f)) not in kernels
+    ]
+
+
+def delta_kernels() -> list:
+    """The `.c` files in `PROGRAMS` that the delta corpus claims."""
+    kernels = corpus_kernel_sources()
+    return [f for f in _all_sources()
+            if os.path.normpath(os.path.join(PROGRAMS, f)) in kernels]
+
+
 # id -> label.  Overridden by --oracles; ORACLE_SET selects a preset.
 ORACLE_SET = {
     "default": ["cg162", "cclang2310", "cicxlatest"],
@@ -641,9 +703,20 @@ def main(argv=None) -> int:
             print(f"{name:12s} {' '.join(ids)}")
         return 0
 
-    progs = sorted(f for f in os.listdir(PROGRAMS) if f.endswith(".c") and a.filter in f)
+    progs = standalone_programs(a.filter)
     if not progs:
-        print("no programs matched", file=sys.stderr)
+        # A filter that matches only delta kernels is a category error, not an
+        # empty result: say which tool measures those, so the answer is not
+        # "no programs matched" for a file that is sitting right there.
+        matched = delta_kernels()
+        if a.filter and any(a.filter in k for k in matched):
+            hits = ", ".join(k for k in matched if a.filter in k)
+            print(f"--filter {a.filter!r} matches delta kernel(s): {hits}\n"
+                  f"kernels are measured by function name, not executed; use\n"
+                  f"  python3 scripts/oracle_delta_gate.py --only <id>",
+                  file=sys.stderr)
+        else:
+            print("no programs matched", file=sys.stderr)
         return 2
     if not os.path.exists(LCCC):
         print(f"lccc not built: {LCCC}", file=sys.stderr)

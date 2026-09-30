@@ -3,10 +3,10 @@
 `tools/oracle/godbolt_oracle.py` answers two questions about lccc's code
 generation, in this order, and refuses to conflate them:
 
-1. **Is it correct?** Every program in `tests/oracle/programs/` is compiled by
-   lccc locally *and* by three independent vendor compilers on Compiler
-   Explorer, then **all four are executed** and their stdout and exit status
-   compared. A divergence is a miscompilation.
+1. **Is it correct?** Every *runnable* program in `tests/oracle/programs/` is
+   compiled by lccc locally *and* by three independent vendor compilers on
+   Compiler Explorer, then **all four are executed** and their stdout and exit
+   status compared. A divergence is a miscompilation.
 2. **How big is it?** Instruction counts and code size, reported as data.
 
 The order matters, and so does the refusal. `tools/linker/oracle_cmp.py`
@@ -16,6 +16,25 @@ correctness — **a miscompilation that is perfectly small still shows up as a
 win.** Size is the weaker signal and is treated as such here: it is never a
 pass/fail gate, because vectorising *reduces* the instruction count while
 *raising* throughput, so a size table alone can invert the truth.
+
+## Two classes of file in `tests/oracle/programs/`
+
+The directory holds two kinds of source, and this harness owns only the first:
+
+| class | shape | who measures it |
+|---|---|---|
+| **runnable program** | has `main`, prints a checksum | `godbolt_oracle.py` — built, run, stdout-diffed against every oracle |
+| **delta kernel** | no `main`, no output, exports the measured function | `scripts/oracle_delta_gate.py` — assembly only, never linked |
+
+`tests/oracle/delta_corpus.json` is the single authority on which is which: a
+file it claims is a kernel and is excluded from the sweep, everything else is a
+program and must satisfy the linkability contract. Kernels export the function
+under measurement precisely so no compiler can inline it away — which is also
+why they cannot be executed, and why handing one to this harness produced a
+`lccc did not build` row that read like a compiler regression.
+`--filter` naming a kernel says so and names the tool that measures it, rather
+than reporting "no programs matched". `godbolt_oracle_selftest.py` pins the
+partition as total and disjoint, so no file can escape both classifications.
 
 ## The oracles
 
