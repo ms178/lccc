@@ -4049,7 +4049,7 @@ mod float_const_stores {
         let o_path = dir.join("fconst.o");
         let bin = dir.join("fconst");
 
-        let pat = f64::from_bits(0xE000_0000_0000_0000);
+        let _pat = f64::from_bits(0xE000_0000_0000_0000);
         let stores: &[(i64, i64, OpSize)] = &[
             // (slot offset, immediate, size) — emission order matters: the
             // sign-bit-hi pattern is stored BEFORE the f32 1.5 whose bytes

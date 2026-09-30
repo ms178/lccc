@@ -1036,7 +1036,7 @@ fn fold_phi_diamonds(
             // Build the replacement: sub + unsigned compare (+ widening cast
             // to the phi's type when it is not the boolean type itself) — or,
             // for a full-domain range, the constant itself.
-            let (mut new_insts, replacement) = if matches!(plan, RangePlan::FullDomain) {
+            let (new_insts, replacement) = if matches!(plan, RangePlan::FullDomain) {
                 // The inside form is constant TRUE (outside: FALSE). The
                 // phi is rewritten IN PLACE into a Copy of the constant —
                 // every use keeps referencing phi_dest (Operand and

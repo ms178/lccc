@@ -1560,7 +1560,7 @@ impl I686Codegen {
                     }
                     return;
                 }
-                Some(SlotAddr::OverAligned(slot, id)) => {
+                Some(SlotAddr::OverAligned(slot, _id)) => {
                     // Inline the leal/addl/andl alignment ladder against %edx
                     // (emit_alloca_aligned_addr targets %ecx = the dest).
                     let align = self

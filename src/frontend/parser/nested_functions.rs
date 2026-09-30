@@ -153,15 +153,19 @@ impl Parser {
         self.consume_post_type_qualifiers();
 
         // One declarator: the function name and its parameter list.
-        let (name, derived, decl_mode, _decl_common, decl_aligned, _) =
+        let (name, derived, decl_mode, _decl_common, _decl_aligned, _) =
             self.parse_declarator_with_attrs();
-        let (_post_ctor, _post_dtor, post_mode, _post_common, post_aligned, _first_asm_reg) =
+        let (_post_ctor, _post_dtor, post_mode, _post_common, _post_aligned, _first_asm_reg) =
             self.parse_asm_and_attributes();
         let mode_kind = decl_mode.or(post_mode);
-        let mut alignment = decl_aligned;
-        if let Some(a) = post_aligned {
-            alignment = Some(alignment.map_or(a, |prev: usize| prev.max(a)));
-        }
+        // A function *definition*'s own `aligned(...)` attribute is not applied
+        // here; it is taken from the definition's PROTOTYPES instead (see the
+        // note at the `FunctionDef` construction below).  Computing it from the
+        // definition's declarator attributes produced a value nothing could
+        // consume, because a nested function's IR name is mangled
+        // (`parent.inner`) while `function_alignments` is keyed by the plain
+        // name.  The bindings are underscored at the destructuring sites above so
+        // that the intent is visible where the values are discarded.
 
         // A nested function definition requires a plain function declarator
         // (a name plus a trailing Function(...) derivation — not a pointer
@@ -242,6 +246,13 @@ impl Parser {
         let return_type = self.build_return_type(type_spec, &derived);
         // Alignment/asm-register attributes have no meaning on a function
         // definition; they are intentionally dropped (GCC warns similarly).
+        //
+        // Alignment for a function definition arrives through its PROTOTYPES:
+        // `lower_global_decl` records `decl.alignment` into
+        // `IrModule::function_alignments`, and codegen emits `.p2align` for a
+        // definition out of that map.  Reading it off the definition's own
+        // declarator attributes here could never reach that map, which is keyed by
+        // the plain function name.
 
         Some(FunctionDef {
             return_type,

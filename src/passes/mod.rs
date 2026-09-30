@@ -2694,6 +2694,22 @@ pub(crate) fn run_passes(
     // `zlib_ng_adler32` +1.05 % retired-instruction regression the flag was
     // introduced to prevent.
     //
+    // The static shape of that, on `zlib_ng_adler32` at
+    // `-O2 -march=x86-64-v3`: unscoped 312 instructions / 74 memory
+    // references / 49 ymm refs / a `subq $584, %rsp` spill frame; scoped
+    // 259 / 57 / 24 / none. Every vector-op count is exactly 2x, i.e. the
+    // twin re-vectorized the whole loop into a second, spilled copy rather
+    // than declining it. Causal isolation: `CCC_DISABLE_PASSES=latevec`
+    // reproduces the scoped output byte-for-byte, so the twin is the sole
+    // cause and not a co-factor. Output was correct in both cases, so this
+    // is code size and frame pressure, not a wrong-answer bug -- and
+    // runtime is neutral within +-1 % at 10x workload scale.
+    //
+    // `LateMinMaxOnlyScope` and that measured effect are ALREADY ON `main`.
+    // The numbers above record the shape of the flag for a reviewer to
+    // re-derive; they are not a result claimed for this commit, whose changes
+    // in this area are documentation only.
+    //
     // Deleting it instead is NOT the fix. Measured over 857 corpus +
     // benchmark files (-O2 -march=x86-64-v3) it is 1 429 instructions
     // SMALLER without the twin (-0.71 %), and 24 files shrink -- but that

@@ -466,11 +466,11 @@ fn try_match_copy_loop(
     }
     let header = lp.header;
     let label_to_idx = analysis::build_label_map(func);
-    let header_label = func.blocks[header].label;
+    let _header_label = func.blocks[header].label;
 
     // Header must end in a conditional branch with one successor in the
     // loop (body entry) and one outside (the single exit).
-    let (cond_val, in_succ, exit_idx) = match &func.blocks[header].terminator {
+    let (cond_val, _in_succ, exit_idx) = match &func.blocks[header].terminator {
         Terminator::CondBranch {
             cond,
             true_label,
@@ -1011,7 +1011,7 @@ fn try_match_copy_loop(
     // definition must dominate the preheader (the rewrite sinks the base
     // computation's *uses* into the preheader call — the defs themselves
     // stay put, but the call needs them available in the preheader).
-    let mut check_invariant = |v: Value, what: &str| -> Option<()> {
+    let check_invariant = |v: Value, what: &str| -> Option<()> {
         // Operand-free pure leaves are rematerializable anywhere (M2
         // clones them into the preheader); their position is irrelevant.
         if let Some(def) = defs.get(&v.0) {
@@ -1089,7 +1089,7 @@ fn try_match_copy_loop(
     // Single-use: the load feeds only the store (through a single-threaded
     // Copy chain); each bump feeds only its phi (through Copies). Any
     // second use is live state the rewrite cannot reproduce.
-    let mut check_single_threaded = |mut v: Value, end: Value, what: &str| -> Option<()> {
+    let check_single_threaded = |mut v: Value, end: Value, what: &str| -> Option<()> {
         for _ in 0..33 {
             if v == end {
                 if uses.get(&v.0).copied().unwrap_or(0) != 1 {
@@ -1509,7 +1509,7 @@ fn rewrite_copy_loop(func: &mut IrFunction, m: &CopyLoop, body: &FxHashSet<usize
         Reuse(Value),
         CloneLeaf(Instruction),
     }
-    let mut classify = |v: Value| -> Option<Mat> {
+    let classify = |v: Value| -> Option<Mat> {
         let mut reusable = false;
         if let Some(&db) = def_blocks.get(&v.0) {
             if !body.contains(&db) && dom.dominates(db, m.preheader) {
@@ -1616,7 +1616,7 @@ fn rewrite_copy_loop(func: &mut IrFunction, m: &CopyLoop, body: &FxHashSet<usize
     };
     // ---- Mutations begin (all remaining steps are infallible). ----
     let mut clone_of: FxHashMap<u32, Value> = FxHashMap::default();
-    let mut do_clone = |orig: Value, template: Instruction, func: &mut IrFunction| -> Value {
+    let do_clone = |_orig: Value, template: Instruction, func: &mut IrFunction| -> Value {
         let fresh = alloc_value(&mut *func);
         let mut inst = template;
         match &mut inst {
@@ -1628,10 +1628,10 @@ fn rewrite_copy_loop(func: &mut IrFunction, m: &CopyLoop, body: &FxHashSet<usize
         func.blocks[m.preheader].instructions.push(inst);
         fresh
     };
-    let mut use_val = |orig: Value,
-                       mat: Mat,
-                       func: &mut IrFunction,
-                       clone_of: &mut FxHashMap<u32, Value>|
+    let use_val = |orig: Value,
+                   mat: Mat,
+                   func: &mut IrFunction,
+                   clone_of: &mut FxHashMap<u32, Value>|
      -> Value {
         match mat {
             Mat::Reuse(v) => v,

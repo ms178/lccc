@@ -636,23 +636,63 @@ jobs:
           # 16-bit, float, guarded, multi-accumulator) stays scalar AND stays
           # correct.
           bash tests/regression/check_minmax_reduction.sh
-          # LICM must not hoist a volatile load out of its loop: N observable
-          # accesses must not become 1 (C11 5.1.2.3). The runtime cannot see
-          # this -- a hoisted volatile load computes the same answer -- so the
-          # gate asserts it structurally, with a non-volatile load in the same
-          # shape as the negative control.
+          # C11 5.1.2.3: a volatile access is observable, so no pass may
+          # forward, CSE, DCE or hoist it.  The hoist arm is the one that
+          # matters -- a dropped `!*volatile` term in LICM turned an MMIO
+          # spin-wait into a load-once infinite loop.  It linted clean only
+          # because `src/lib.rs` allowed `unused_variables` crate-wide; that
+          # allow is gone, so rustc now reports the deletion itself.  The
+          # static ratchet below is the third guard, and the only one that
+          # also polices the `volatile: _` escape hatch.
           bash tests/regression/check_volatile_licm.sh
           # Dedicated-preheader transform, asserted on emitted assembly.
+          # Canonical gate is the one upstream #688 landed: it covers the
+          # effect/soundness/refusal/negative-control/idempotence contracts.
           bash tests/regression/check_loop_preheader.sh
-          # Same unwired-gate fix as in ci_local.sh: these assert volatile
-          # access semantics that no runtime comparison can observe.
+          # Not a duplicate of the gate above, though both name the multi-entry
+          # shapes.  The gate above asserts those shapes are STRUCTURALLY
+          # refused (byte-identical with the pass on and off).  This one runs
+          # them and pins the answers against C semantics and the host compiler
+          # at five optimisation levels.  Read its own header before crediting
+          # it with more than that: no shape tried so far makes reduction
+          # detection fire on a multi-entry loop, so these cases do not
+          # currently reach the buggy branch and this is a behavioural smoke
+          # test and a compile contract, NOT a reproduction of the F2
+          # miscompile -- whose correctness rests on the dominance proof at
+          # `find_loop_preheader`.  What it does guarantee is that a future
+          # change to terminator handling cannot silently start producing wrong
+          # answers on switch- or computed-goto-entered loops.  A refusal check
+          # and a runtime contract are still not the same statement, which is
+          # why both are kept.
+          bash tests/regression/check_multi_entry_loop.sh
+          # These assert volatile access semantics that no runtime comparison
+          # can observe.  Wired independently by both sides of this rebase --
+          # the same two scripts were missing from CI in each -- so they appear
+          # once.
           bash tests/regression/check_volatile_pointer_subscript.sh
           bash tests/regression/check_volatile_access_semantics.sh
+          # An MMIO spin-wait whose `!*volatile` term is dropped in LICM becomes
+          # a load-once infinite loop.  Runtime-visible, but only on hardware
+          # that is not here, so it is asserted structurally like the others.
+          bash tests/regression/check_volatile_spin_loop.sh
+          # Self-test first: a parser that matches nothing would otherwise
+          # "pass" the ratchet vacuously, which is the failure mode a ratchet
+          # is most likely to have.
+          python3 scripts/check_volatile_destructuring.py --self-test
+          python3 scripts/check_volatile_destructuring.py
           # The loop-density metric decides which compiler wins on a kernel,
           # so its loop identification is tested like a pass: dominator-based
           # backedges, composite loops never measured, step recovery through
           # index addressing.
           python3 scripts/test_hot_loop_metric.py
+          # A per-function gap across differing call counts measures inlining,
+          # not codegen.  Known-answer test for the guard that says so.
+          python3 scripts/test_codegen_oracle.py
+          # One CE cache backs four oracle tools, and every way it can be
+          # wrong is silent: a forgeable key serves one program's result for
+          # another's, a truncated record reads as a hit instead of a miss,
+          # and a cached rate-limit blip strands an oracle out of every
+          # future sweep. Offline and deterministic, so it runs here.
           python3 scripts/test_godbolt_cache.py
           bash tests/regression/check_copy_alias_sizes.sh
           bash tests/regression/check_linker_notype_code.sh

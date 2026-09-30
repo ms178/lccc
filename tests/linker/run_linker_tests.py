@@ -9535,8 +9535,10 @@ def reloc_oracle_agreement(agree, notes, oracles):
     PASS rests on, and a rule that only ever runs against three real linkers
     on a well-stocked host is a rule nobody ever sees fail.
 
-    Three ways to fail, all fail-closed:
+    Four ways to fail, all fail-closed:
 
+    * **No oracles at all.** `floor` is derived from `len(oracles)`, so an
+      empty set would otherwise make the floor 0 and `all([])` vacuously true.
     * **Applicability floor.** `inapplicable` shrinks the agreement set, so
       it needs a floor.  With the normal three-oracle set, two oracles that
       fail to reach the relocation would otherwise leave ONE linker deciding
@@ -9567,7 +9569,7 @@ def reloc_oracle_agreement(agree, notes, oracles):
         return ("FAIL", "no oracles configured to cross-check against")
     applicable = [n for n, (v, _, _) in notes.items() if v != "inapplicable"]
     floor = min(2, len(oracles))
-    reference = oracles[0][0] if oracles else None
+    reference = oracles[0][0]
     if len(applicable) < floor:
         return ("FAIL",
                 "only %d of %d oracles could express an opinion, need %d: %s"

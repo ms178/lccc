@@ -1104,7 +1104,7 @@ pub(super) fn fold_store_relay(store: &mut LineStore, infos: &mut [LineInfo]) ->
             _ => None,
         };
 
-        if let Some((offset, size)) = stored {
+        if let Some((_offset, size)) = stored {
             // Check rax is dead after the store
             if is_rax_dead_after(store, infos, j + 1, len) {
                 // SOUNDNESS FIX: the folded store must write the SAME number
@@ -1411,7 +1411,7 @@ fn is_dst_establishing_move(
 fn resolve_alu_memfold_target(
     store: &LineStore,
     infos: &[LineInfo],
-    i: usize,
+    _i: usize,
     j: usize,
     load_reg: RegId,
 ) -> Option<(usize, Option<RegId>)> {

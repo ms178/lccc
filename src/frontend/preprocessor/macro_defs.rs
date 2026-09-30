@@ -756,7 +756,6 @@ impl MacroTable {
                     q += 2;
                 }
                 b'"' => {
-                    q += 1;
                     closed = true;
                     break;
                 }

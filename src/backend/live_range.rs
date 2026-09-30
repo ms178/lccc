@@ -2786,7 +2786,7 @@ impl LinearScanAllocator {
                 ));
             }
         }
-        for (reg, mut spans) in &mut by_reg {
+        for (reg, spans) in &mut by_reg {
             spans.sort_unstable();
             for w in spans.windows(2) {
                 let (prev, next) = (w[0], w[1]);

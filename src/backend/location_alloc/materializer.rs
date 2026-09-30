@@ -113,7 +113,7 @@ pub(super) fn materialize(
     // the fail-closed contract. Every site that needs an id must go
     // through this closure instead of `expect`-ing one.
     let id_overflow = std::cell::Cell::new(false);
-    let mut fresh_value = |next_val: &mut u32| -> Option<Value> {
+    let fresh_value = |next_val: &mut u32| -> Option<Value> {
         match next_value(next_val) {
             some @ Some(_) => some,
             None => {

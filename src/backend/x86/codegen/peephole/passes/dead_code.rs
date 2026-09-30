@@ -846,7 +846,7 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
         // Frame-pointer status: Form 1 establishes a frame pointer (so
         // `(%rbp)` is a genuine stack slot); Form 2 does not (so %rbp is a free
         // data register and `(%rbp)` is a pointer dereference, never a stack slot).
-        let mut rbp_is_frame;
+        let rbp_is_frame;
 
         if matches!(infos[i].kind, LineKind::Push { reg: 5 }) {
             rbp_is_frame = true;

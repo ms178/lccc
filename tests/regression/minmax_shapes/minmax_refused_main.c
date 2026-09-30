@@ -7,10 +7,13 @@
  * a checksum.  `check_minmax_reduction.sh` compares lccc's checksum against
  * the GCC oracle's for the same source.
  *
- * The program lives here (with a main, at the top level) so `run_regression.py`
- * can also compile and run it: a refused shape must not merely stay scalar, it
- * must stay *correct*, and the cheapest way to keep proving that is to let the
- * ordinary regression corpus run it too.
+ * The program lives in `minmax_shapes/` because the gate compiles it as its
+ * own object against `minmax_shapes.c`; a root-level `.c` would be picked up
+ * by `run_regression.py`'s `*.c` glob and fail to link on its own.  The
+ * corpus still runs it: `tests/regression/minmax_refused.c` is a complete TU
+ * that includes both `minmax_shapes.c` and this driver.  A refused shape must
+ * not merely stay scalar, it must stay *correct*, and the cheapest way to keep
+ * proving that is to let the ordinary regression corpus run it too.
  */
 #include <stdio.h>
 #include <limits.h>

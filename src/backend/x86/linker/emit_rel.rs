@@ -450,7 +450,7 @@ pub fn link_relocatable(objects: &[Elf64Object], output_path: &str) -> Result<()
 
     // shstrtab
     let mut shstrtab: Vec<u8> = vec![0];
-    let mut shstr = |t: &mut Vec<u8>, n: &str| -> u32 {
+    let shstr = |t: &mut Vec<u8>, n: &str| -> u32 {
         let o = t.len() as u32;
         t.extend_from_slice(n.as_bytes());
         t.push(0);

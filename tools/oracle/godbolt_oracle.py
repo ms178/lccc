@@ -202,6 +202,116 @@ def _join(stream, sep: str = "") -> str:
                    for part in stream)
 
 
+def _get_json(url: str, timeout: int = 60, attempts: int = 3):
+    """GET a JSON document from CE, or ``None`` on any failure.
+
+    Used only by ``--revalidate``, where a failed probe must not abort the
+    sweep: not knowing the current version is a reason to KEEP a cached record
+    (and say so), never a reason to delete it or to fail the run.
+    """
+    last = None
+    for attempt in range(attempts):
+        req = urllib.request.Request(
+            url, headers={"Accept": "application/json",
+                          "User-Agent": "lccc-codegen-research/2"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as fh:
+                return json.loads(fh.read().decode("utf-8", "replace"))
+        except Exception as e:            # noqa: BLE001 - probe must not raise
+            last = e
+            time.sleep(2 ** attempt)
+    print(f"  note: version probe failed ({type(last).__name__}: {last}); "
+          f"keeping cached records", file=sys.stderr)
+    return None
+
+
+def live_semvers(cids, timeout: int = 60) -> dict:
+    """``{cid: semver}`` from ONE ``/api/compilers/c`` request.
+
+    One request for the whole sweep, not one per compiler: this is the cheap
+    probe that makes cache staleness detectable without turning every compile
+    into a probe-then-compile pair.  Moving channels come back as
+    ``(trunk)``/``(latest)``, which is not a version -- the caller must treat
+    such a pair as "no drift information" rather than as a match, and fall
+    back to the age limit.
+    """
+    data = _get_json(f"{CE}/compilers/c", timeout=timeout)
+    if not isinstance(data, list):
+        return {}
+    want = set(cids)
+    return {c["id"]: (c.get("semver") or "")
+            for c in data if isinstance(c, dict) and c.get("id") in want}
+
+
+UNPINNED = ("(trunk)", "(latest)", "trunk", "latest", "")
+
+
+def revalidate(cids, max_age_days: float, timeout: int = 60) -> int:
+    """Drop cached oracle records that no longer describe the compiler CE runs.
+
+    Two independent reasons, because the channels are not alike:
+
+    * **Version drift** (pinned releases).  ``cg162`` means "x86-64 gcc 16.2";
+      if CE ever re-points the id, every record under it silently describes a
+      different compiler.  A record whose stored ``ce_semver`` differs from the
+      live one is dropped and re-fetched.
+    * **Age** (moving channels).  ``cicxlatest`` has no version to compare --
+      CE reports ``(latest)`` -- so the only available evidence is how long ago
+      the record was taken.  Records older than ``max_age_days`` are dropped.
+
+    Records written before provenance existed carry neither field; they are
+    treated as expired, because "unknown origin" is exactly what this command
+    is for.  Returns the number of records dropped.
+    """
+    live = live_semvers(cids, timeout=timeout)
+    now = time.time()
+    dropped = {"drift": 0, "aged": 0, "unpinned-probe-failed": 0}
+    kept = 0
+    for path, _key in godbolt_cache.iter_records(godbolt_cache.NS_ORACLE):
+        try:
+            rec = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue                      # unreadable: load_*() treats it as a miss
+        if not isinstance(rec, dict):
+            continue
+        cid = rec.get("id")
+        if cid not in cids:
+            kept += 1
+            continue
+        recorded = rec.get("ce_semver")
+        current = live.get(cid)
+        if recorded and current and current not in UNPINNED:
+            if recorded != current:
+                if godbolt_cache.drop(path):
+                    dropped["drift"] += 1
+                continue
+            kept += 1
+            continue                      # pinned and identical: keep, no age limit
+        # No usable version pair: fall back to age.
+        if not live:
+            dropped["unpinned-probe-failed"] += 1   # kept on disk; counted for the report
+            kept += 1
+            continue
+        stamped = rec.get("cached_at")
+        if not isinstance(stamped, (int, float)):
+            if godbolt_cache.drop(path):
+                dropped["aged"] += 1      # no provenance at all: unknown origin
+            continue
+        if (now - stamped) > max_age_days * 86400.0:
+            if godbolt_cache.drop(path):
+                dropped["aged"] += 1
+            continue
+        kept += 1
+    print(f"revalidate: dropped {dropped['drift']} drifted, "
+          f"{dropped['aged']} aged/unknown-provenance; kept {kept}")
+    if dropped["unpinned-probe-failed"]:
+        print(f"  note: {dropped['unpinned-probe-failed']} record(s) could not be "
+              f"version-checked (probe unavailable) and were kept on age alone")
+    for cid in sorted(cids):
+        print(f"  {cid:<14} live semver: {live.get(cid, '<probe failed>')}")
+    return dropped["drift"] + dropped["aged"]
+
+
 def remote(cid: str, source: str, flags: str, execute: bool, timeout: int) -> dict:
     """Compile on one oracle.  Never raises: every failure is a SKIP record.
 
@@ -211,13 +321,30 @@ def remote(cid: str, source: str, flags: str, execute: bool, timeout: int) -> di
     second sweep with a different --filter, or a re-run next week to reproduce
     a published table -- does not re-spend the rate limit on identical work.
 
+    The CE compiler version is deliberately NOT part of the key.  Putting it
+    there would double every request (probe the version, then compile), and CE
+    reports `(trunk)` / `(latest)` for the moving channels anyway, so for
+    `cicxlatest` the version string carries no information.  Instead each
+    record carries the semver it was compiled under (`ce_semver`) and the time
+    it was stored (`cached_at`), and `--revalidate` uses ONE `/api/compilers`
+    request for the whole sweep to drop every record that a pinned channel has
+    drifted away from, or that is older than `--max-age-days`.  That answers
+    both questions without conflating them: the cache as stored reproduces a
+    published table exactly, and `--revalidate` measures the compiler CE is
+    serving *today*.
+
     Not every result is cached. See `_TRANSPORT`: a rate-limit or network
     failure is retried next run, because caching it would make a transient
     blip indistinguishable from an oracle that genuinely cannot run the
     program, and would strand it out of every future sweep.
     """
     rec = {"id": cid, "vendor": VENDOR.get(cid, "?"), "ok": False,
-           "asm_insns": None, "stdout": None, "exit": None, "reason": None}
+           "asm_insns": None, "stdout": None, "exit": None, "reason": None,
+           # Provenance for --revalidate; see the docstring.  `ce_semver` is
+           # None when the version has not been probed this run, which is the
+           # normal case: probing costs a request and only --revalidate needs
+           # it.  A record with no semver is still TTL-checkable.
+           "ce_semver": None, "cached_at": time.time()}
     ck = (cid, flags, hashlib.sha256(source.encode()).hexdigest(), execute)
     if USE_CACHE:
         hit = godbolt_cache.load_json(godbolt_cache.NS_ORACLE, *ck)
@@ -467,10 +594,30 @@ def main(argv=None) -> int:
                          "(every request hits the network)")
     ap.add_argument("--cache-stats", action="store_true",
                     help="print the persistent cache's record counts and exit")
+    ap.add_argument("--revalidate", action="store_true",
+                    help="drop cached oracle records whose compiler version "
+                         "drifted or that are older than --max-age-days, then "
+                         "continue with the sweep (one /api/compilers request "
+                         "for the whole run)")
+    ap.add_argument("--max-age-days", type=float, default=28.0,
+                    help="age limit for records that cannot be version-checked "
+                         "(moving channels such as icx-latest, and records "
+                         "written before provenance was stored). 0 drops all "
+                         "of them. Default 28.")
     a = ap.parse_args(argv)
 
     global USE_CACHE
     USE_CACHE = not a.no_cache
+
+    # Resolved before the cache commands so `--revalidate` knows which
+    # compilers' records it is reasoning about.
+    cids = ([x.strip() for x in a.oracles.split(",") if x.strip()]
+            if a.oracles else ORACLE_SET[a.oracle_set])
+
+    if a.revalidate and USE_CACHE:
+        revalidate(set(cids), a.max_age_days)
+    elif a.revalidate:
+        print("--revalidate ignored: --no-cache is in effect", file=sys.stderr)
 
     if a.cache_stats:
         st = godbolt_cache.stats()
@@ -487,8 +634,6 @@ def main(argv=None) -> int:
             print(f"{name:12s} {' '.join(ids)}")
         return 0
 
-    cids = ([x.strip() for x in a.oracles.split(",") if x.strip()]
-            if a.oracles else ORACLE_SET[a.oracle_set])
     progs = sorted(f for f in os.listdir(PROGRAMS) if f.endswith(".c") and a.filter in f)
     if not progs:
         print("no programs matched", file=sys.stderr)

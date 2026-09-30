@@ -307,7 +307,7 @@ fn narrow_through_stores(
                         }
                     }
                 }
-                Instruction::Load { dest, ty, .. } => {
+                Instruction::Load { dest, ty: _ty, .. } => {
                     let id = dest.0 as usize;
                     if id <= max_id {
                         if let Some(t) = load_type_map[id] {
@@ -354,20 +354,19 @@ fn narrow_through_stores(
     // Disqualification is monotone; iterate until stable.
     loop {
         let mut disqualified = false;
-        let mut mark_bad =
-            |v: &Operand, ok: bool, ntype: &mut Vec<Option<IrType>>, max_id: usize| {
-                if let Operand::Value(vv) = v {
-                    let id = vv.0 as usize;
-                    if id <= max_id && ntype[id].is_some() && !ok {
-                        ntype[id] = None;
-                        true
-                    } else {
-                        false
-                    }
+        let mark_bad = |v: &Operand, ok: bool, ntype: &mut Vec<Option<IrType>>, max_id: usize| {
+            if let Operand::Value(vv) = v {
+                let id = vv.0 as usize;
+                if id <= max_id && ntype[id].is_some() && !ok {
+                    ntype[id] = None;
+                    true
                 } else {
                     false
                 }
-            };
+            } else {
+                false
+            }
+        };
         for block in &func.blocks {
             for inst in &block.instructions {
                 match inst {

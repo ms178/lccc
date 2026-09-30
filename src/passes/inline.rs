@@ -603,7 +603,7 @@ fn select_inline_site(
             // -finline-functions-called-once. Keep such callees exempt, up
             // to the same measured loop-nest ceiling as the -Os veto.
             let in_loop = loop_blocks.contains(&site.block_idx);
-            let loop_nest_merge = callee_data.has_loops
+            let _loop_nest_merge = callee_data.has_loops
                 && caller_has_loops
                 && callee_inst_count > MAX_SMALL_INLINE_INSTRUCTIONS;
             let size_cap_exempt = callee_data.is_single_call_site_static
@@ -942,7 +942,7 @@ fn inline_run_impl(module: &mut IrModule, size_optimized: bool, always_inline_on
                                 &{
                                     // Reconstruct IrFunction for callee from callee_map data
                                     // callee_map stores blocks, we need to create a dummy IrFunction
-                                    let mut dummy = crate::ir::reexports::IrFunction {
+                                    let dummy = crate::ir::reexports::IrFunction {
                                         name: callee_name.clone(),
                                         return_type: crate::common::types::IrType::I32,
                                         params: vec![],
@@ -1212,7 +1212,7 @@ fn inline_run_impl(module: &mut IrModule, size_optimized: bool, always_inline_on
                                 &{
                                     // Reconstruct IrFunction for callee from callee_map data
                                     // callee_map stores blocks, we need to create a dummy IrFunction
-                                    let mut dummy = crate::ir::reexports::IrFunction {
+                                    let dummy = crate::ir::reexports::IrFunction {
                                         name: callee_name.clone(),
                                         return_type: crate::common::types::IrType::I32,
                                         params: vec![],
@@ -1888,7 +1888,10 @@ fn analyze_va_arg_pack(func: &IrFunction) -> Option<VaArgPackPlan> {
         for block in &func.blocks {
             for inst in &block.instructions {
                 match inst {
-                    Instruction::Call { func: f, info } => {
+                    Instruction::Call {
+                        func: f,
+                        info: _info,
+                    } => {
                         if f == VP || f == VPLEN {
                             continue;
                         }

@@ -1863,7 +1863,7 @@ fn build_foldable_global_addr_set(
 
     loop {
         let mut bad: FxHashSet<u32> = FxHashSet::default();
-        let mut mark = |id: u32, bad: &mut FxHashSet<u32>| {
+        let mark = |id: u32, bad: &mut FxHashSet<u32>| {
             if live.contains(&id) {
                 bad.insert(id);
             }
@@ -2529,7 +2529,7 @@ pub(crate) fn build_folded_value_set(
     let use_counts = count_value_uses(func);
     let stab = analyze_base_stability(func);
     let gep_fold_map = build_gep_fold_map(func, &use_counts, &stab);
-    let indexed_gep_map = build_indexed_gep_map(func, &use_counts, &stab);
+    let _indexed_gep_map = build_indexed_gep_map(func, &use_counts, &stab);
     let global_addr_map = build_global_addr_map(func, tls_symbols, Some(absolute_symbols));
     let mut set = FxHashSet::default();
     for block in &func.blocks {
@@ -5636,7 +5636,25 @@ pub(super) fn generate_instruction(
             ptr,
             ty,
             seg_override,
-            volatile,
+            // Explicitly discarded, and deliberately so.  Volatility is an IR
+            // property, and this is the IR -> machine boundary: by here the
+            // optimizer has already refused to eliminate, forward, CSE, hoist
+            // or sink the access, and `generate_load` emits exactly one load
+            // instruction for every instruction it is handed, so no backend
+            // decision can change the access count.  The three places that CAN
+            // rewrite an access check the flag themselves before reaching
+            // this point -- the memory-reordering barrier predicate above
+            // (`Instruction::Load { volatile: true, .. }`), the memcmp fold,
+            // and x86 instruction selection, which declines both the volatile
+            // load and the split volatile store.
+            //
+            // Written as `volatile: _` rather than left bound-and-unused on
+            // purpose: `src/lib.rs` allows `unused_variables` crate-wide, so a
+            // silently dead safety flag is invisible to the build.  See
+            // `scripts/check_volatile_destructuring.py`, which fails when a
+            // `volatile` destructured from an IR access is not used and this
+            // explicit discard is not written instead.
+            volatile: _,
         } => {
             generate_load(
                 cg,

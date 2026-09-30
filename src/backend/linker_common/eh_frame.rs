@@ -1285,7 +1285,7 @@ mod tests {
     fn synth_two_cie_eh_frame() -> (Vec<u8>, usize, usize) {
         let a = synth_eh_frame(3, PCREL_SDATA4);
         let b = synth_eh_frame(2, ABS_UDATA8);
-        let split = a.len();
+        let _split = a.len();
         let mut out = a;
         // Re-point the second block's FDEs at its own CIE, which now starts at
         // `split` rather than 0.

@@ -2096,10 +2096,10 @@ pub(super) fn emit_shared_library(
     {
         let mut run_start: Option<(u64, u64, u64)> = None;
         let mut run_end: Option<(u64, u64)> = None;
-        let mut flush = |run: Option<(u64, u64, u64)>,
-                         end: Option<(u64, u64)>,
-                         out: &mut Vec<u8>,
-                         ph: &mut usize| {
+        let flush = |run: Option<(u64, u64, u64)>,
+                     end: Option<(u64, u64)>,
+                     out: &mut Vec<u8>,
+                     ph: &mut usize| {
             if let (Some((fo, va, al)), Some((fe, ae))) = (run, end) {
                 wphdr(out, *ph, PT_NOTE, PF_R, fo, va, fe - fo, ae - va, al);
                 *ph += 56;

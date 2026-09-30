@@ -242,12 +242,12 @@ pub fn collect_inline_asm_callee_saved_i686(
             let mut demand: i32 = 0;
             let mut op_idx = 0usize;
 
-            let mut account = |c: &str,
-                               op_idx: usize,
-                               ecx_gone: &mut bool,
-                               edx_gone: &mut bool,
-                               avail: &mut i32,
-                               demand: &mut i32| {
+            let account = |c: &str,
+                           op_idx: usize,
+                           ecx_gone: &mut bool,
+                           edx_gone: &mut bool,
+                           avail: &mut i32,
+                           demand: &mut i32| {
                 let c = c.trim_start_matches(['=', '+', '&', '%']);
                 if c.starts_with("@cc") {
                     return;

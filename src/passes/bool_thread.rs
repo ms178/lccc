@@ -214,7 +214,7 @@ fn thread_round(func: &mut IrFunction) -> usize {
         // would let a threaded predecessor pay the compare without the
         // merge's death, so it is rejected wholesale.
         let mut int_cmp: Option<(IrCmpOp, Operand, IrType, usize)> = None; // (op, rhs, ty, p_pos)
-        let mut phi_dests: Vec<Value> = Vec::new();
+        let phi_dests: Vec<Value>;
         {
             let merge = &func.blocks[mi];
             let mut dests: Vec<Value> = Vec::new();
@@ -962,7 +962,7 @@ mod tests {
             },
             source_spans: Vec::new(),
         };
-        let mut arm = |label: u32, src: Value, target: BlockId| BasicBlock {
+        let arm = |label: u32, src: Value, target: BlockId| BasicBlock {
             label: BlockId(label),
             instructions: vec![Instruction::Copy {
                 dest: vp,

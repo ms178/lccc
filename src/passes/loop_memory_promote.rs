@@ -1205,7 +1205,7 @@ fn find_promotion(func: &IrFunction) -> Option<PromotePlan> {
             }
 
             let mut alias = false;
-            let mut may_alias = |other: Value, other_ty: IrType| {
+            let may_alias = |other: Value, other_ty: IrType| {
                 !disjoint(&paths, ptr, load_ty, other, other_ty)
                     && !affine_disjoint(
                         func, &defs, &lp.body, &def_block, &multi_def, lp.header, ptr, load_ty,

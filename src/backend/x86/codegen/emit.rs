@@ -2773,7 +2773,7 @@ impl X86Codegen {
                     self.state
                         .out
                         .emit_instr_reg_reg("    movq", "rax", target_name);
-                } else if let Some(slot) = self.state.get_slot(v.0) {
+                } else if let Some(_slot) = self.state.get_slot(v.0) {
                     // Delegate to value_to_reg: it handles allocas (leaq with
                     // over-alignment), vector values, and — critically — loads
                     // small (4-byte) slots with `movl` instead of `movq`.
@@ -7917,7 +7917,7 @@ impl ArchCodegen for X86Codegen {
         let ra = &self.reg_assignments;
         let state = &self.state;
         let mut reject = false;
-        let is_load_store = matches!(
+        let _is_load_store = matches!(
             inst,
             crate::ir::reexports::Instruction::Load { .. }
                 | crate::ir::reexports::Instruction::Store { .. }
@@ -8160,9 +8160,7 @@ impl ArchCodegen for X86Codegen {
         // (4) A vreg that survives all three stages still trips the
         //     unresolvable gate and replays the window through the default
         //     path: the fail-safe, now the exception instead of the cliff.
-        let mut window_last_writes_fast: Option<
-            FxHashMap<u8, super::machinst_alloc::WindowWriteKind>,
-        > = None;
+        let window_last_writes_fast: Option<FxHashMap<u8, super::machinst_alloc::WindowWriteKind>>;
         let mut window_vreg_writers: FxHashMap<u8, u32> = FxHashMap::default();
         let reg_classified = super::machinst_alloc::classify_window(
             &self.machinst_buf,
