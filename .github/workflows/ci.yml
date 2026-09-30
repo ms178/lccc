@@ -749,6 +749,12 @@ jobs:
           # writing it, so a cmov chain sharing a condition needs one cmp.
           # Carries its own CCC_PEEPHOLE_SKIP negative control.
           bash tests/regression/check_redundant_flags_compare.sh
+          # Downward counter loops: `subl $1, %R; testl %R, %R; jne` keeps one
+          # instruction of pure overhead unless the consumer walk proves ZF is
+          # the only flag read.  Pins both directions (folded for ZF-only
+          # consumers, kept for `while ((n -= 3) > 0)`) plus a matcher
+          # self-test, so it cannot pass vacuously.
+          bash tests/regression/check_self_test_after_arith.sh
           # The loop-density metric decides which compiler wins on a kernel,
           # so its loop identification is tested like a pass: dominator-based
           # backedges, composite loops never measured, step recovery through
