@@ -631,6 +631,23 @@ jobs:
           # it is not -- including the alias-guard fallback, where the mirror
           # is live.
           bash tests/regression/check_vec_dead_remainder.sh
+          # MINMAX-1: integer min/max reductions lower to packed vpmin/vpmax
+          # on AVX2, and every shape the transform does not model (unsigned,
+          # 16-bit, float, guarded, multi-accumulator) stays scalar AND stays
+          # correct.
+          bash tests/regression/check_minmax_reduction.sh
+          # LICM must not hoist a volatile load out of its loop: N observable
+          # accesses must not become 1 (C11 5.1.2.3). The runtime cannot see
+          # this -- a hoisted volatile load computes the same answer -- so the
+          # gate asserts it structurally, with a non-volatile load in the same
+          # shape as the negative control.
+          bash tests/regression/check_volatile_licm.sh
+          # The loop-density metric decides which compiler wins on a kernel,
+          # so its loop identification is tested like a pass: dominator-based
+          # backedges, composite loops never measured, step recovery through
+          # index addressing.
+          python3 scripts/test_hot_loop_metric.py
+          python3 scripts/test_godbolt_cache.py
           bash tests/regression/check_copy_alias_sizes.sh
           bash tests/regression/check_linker_notype_code.sh
           bash tests/regression/check_got64_old_spelling.sh
@@ -686,6 +703,14 @@ jobs:
       # product; a linker-only rebuild should retain expensive object files.
       - name: Verify kernel tool-identity invalidation
         run: bash tests/regression/check_kernel_tool_identity.sh
+
+      # The relocation cross-check's decision logic, tested directly.  It
+      # needs no built linker and no oracle linker, so it runs on every host:
+      # the paths it pins (two oracles going `inapplicable`, one crashing,
+      # the reference having no opinion) are exactly the ones a host with
+      # only bfd installed never exercises end-to-end.
+      - name: Relocation oracle-verdict logic
+        run: python3 tests/linker/test_reloc_oracle_verdict.py
 
       # Deterministic bounded fuzzing catches parser/linker panics without
       # making ordinary PRs depend on an unbounded corpus or external fuzzer.
