@@ -3025,7 +3025,6 @@ impl Lowerer {
                 Operand::Const(IrConst::I128(_)) => IrType::I128,
                 _ => src_ty,
             };
-            let is128 = matches!(eff_ty, IrType::I128 | IrType::U128);
             let s = Self::int_suffix(eff_ty);
             let uns = if src_ct.is_unsigned() { "uns" } else { "" };
             let helper = format!("__bid_float{uns}{s}{d}");
@@ -3103,7 +3102,6 @@ impl Lowerer {
             let d = Self::int_suffix(dst_ty);
             let uns = if target_ct.is_unsigned() { "uns" } else { "" };
             let helper = format!("__bid_fix{uns}{s}{d}");
-            let ret128 = matches!(dst_ty, IrType::I128 | IrType::U128);
             let v =
                 self.emit_decimal_call(&helper, vec![(src, src_ty, src_w == 128)], dst_ty, false);
             return Operand::Value(v);

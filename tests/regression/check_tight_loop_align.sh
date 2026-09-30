@@ -95,8 +95,8 @@ EOF
 
 # ── 1. good: layer 1 accept + layer 2 bucket + achieved alignment ──
 dump=$({ CCC_DUMP_ALIGN=1 CCC_DEBUG_TIGHT=1 "$CCC" -O2 -c "$td/good.c" -o "$td/good.o"; } 2>&1)
-echo "$dump" | grep -q "func=good .*tight=yes" || bad "good: structural audit did not accept the loop"
-align=$(echo "$dump" | sed -n 's/.*\[TIGHT\].*header=\.LBB\([0-9]*\) span=\([0-9]*\) log2=\([0-9]*\) align=\([0-9]*\).*/\4/p' | head -1)
+grep -q "func=good .*tight=yes" <<<"$dump" || bad "good: structural audit did not accept the loop"
+align=$(echo "$dump" | sed -n 's/.*\[TIGHT\].*header=\.LBB\([0-9]*\) span=\([0-9]*\) log2=\([0-9]*\) align=\([0-9]*\).*/\4/p' | sed -n '1,1p')
 [ -n "$align" ] || bad "good: assembler did not resolve a tight bucket"
 note "good: tight bucket align=$align"
 # The first instruction after each executable padding run (a tight header
@@ -137,15 +137,15 @@ gcc -O2 "$td/good.c" -o "$td/good-gcc"
 
 # ── 2. caller: call in body rejects at layer 1, cascade remains ──
 dump=$({ CCC_DUMP_ALIGN=1 CCC_DEBUG_TIGHT=1 "$CCC" -O2 -c "$td/caller.c" -o "$td/caller.o"; } 2>&1)
-echo "$dump" | grep -q "tight=no (call" || bad "caller: body call did not reject tight promotion"
-echo "$dump" | grep -q "\[TIGHT\]" && bad "caller: assembler must not resolve a rejected loop"
+grep -q "tight=no (call" <<<"$dump" || bad "caller: body call did not reject tight promotion"
+grep -q "\[TIGHT\]" <<<"$dump" && bad "caller: assembler must not resolve a rejected loop"
 "$CCC" -O2 -S "$td/caller.c" -o "$td/caller.s"
 grep -qE '\.p2align 4,,10' "$td/caller.s" || bad "caller: ordinary bounded cascade must survive rejection"
 
 # ── 3. huge: layer 2 fail-closed on span>64, still correct output ──
 dump=$({ CCC_DUMP_ALIGN=1 CCC_DEBUG_TIGHT=1 "$CCC" -O2 -c "$td/huge.c" -o "$td/huge.o"; } 2>&1)
-echo "$dump" | grep -q "func=huge .*tight=yes" || bad "huge: structural audit should accept (encoded size unknown at IR)"
-echo "$dump" | grep -q "\[TIGHT\].*reject=span>64" || bad "huge: assembler must reject span>64"
+grep -q "func=huge .*tight=yes" <<<"$dump" || bad "huge: structural audit should accept (encoded size unknown at IR)"
+grep -q "\[TIGHT\].*reject=span>64" <<<"$dump" || bad "huge: assembler must reject span>64"
 gcc -O2 "$td/huge.c" -o "$td/huge-gcc"
 "$CCC" -O2 "$td/huge.c" -o "$td/huge-lccc"
 [ "$("$td/huge-gcc")" = "$("$td/huge-lccc")" ] || bad "huge: runtime output differs from GCC"
@@ -158,7 +158,7 @@ if grep -qE '\.p2align' <<<"$fbody"; then
     bad "tiny: a <=4-trip loop must receive no .p2align"
 fi
 { CCC_DUMP_ALIGN=1 "$CCC" -O2 -c "$td/tiny.c" -o "$td/tiny.o"; } 2>&1 \
-    | grep -q "tight=" && bad "tiny: no tight-loop audit line expected"
+    | grep -c "tight=" >/dev/null && bad "tiny: no tight-loop audit line expected"
 
 # ── 5. -S never leaks the private directive; A/B ladders documented ──
 "$CCC" -O2 -S "$td/good.c" -o "$td/good.s"
@@ -172,7 +172,7 @@ CCC_LOOP_ALIGN_HOT=5 "$CCC" -O2 -S "$td/good.c" -o "$td/good5.s"
 grep -qE '\.p2align 5' "$td/good5.s" || bad "CCC_LOOP_ALIGN_HOT=5 ladder head missing"
 grep -qE '\.p2align 4,,10' "$td/good5.s" || bad "CCC_LOOP_ALIGN_HOT=5 cascade tail missing"
 sed -n '/\.p2align 5/,/\.p2align 3/p' "$td/good5.s" \
-    | grep -qE '\.p2align 5[[:space:]]*$' || bad "force-32 head must be unconditional (no max-skip)"
+    | grep -cE '\.p2align 5[[:space:]]*$' >/dev/null || bad "force-32 head must be unconditional (no max-skip)"
 CCC_LOOP_ALIGN_HOT=6 "$CCC" -O2 -S "$td/good.c" -o "$td/good6.s"
 grep -qE '^\s*\.p2align 6[[:space:]]*$' "$td/good6.s" || bad "CCC_LOOP_ALIGN_HOT=6 ladder head missing"
 # Tight-off still keeps the ordinary cascade (only the strong tier is gated).
@@ -201,9 +201,9 @@ printf '.text\n.globl fg\nfg:\n.lccc_tight_loop .Lx\n.Lx:\nret\n' >"$td/ok.s"
 # ── 8. i686 cross compiler: same two-layer decision ──
 if [ -x "$CCC32" ] && i386_headers_ok "$CCC32"; then
     dump=$({ CCC_DUMP_ALIGN=1 CCC_DEBUG_TIGHT=1 "$CCC32" -O2 -c "$td/good.c" -o "$td/good32.o"; } 2>&1)
-    echo "$dump" | grep -q "func=good .*tight=yes" || bad "i686: structural audit did not accept"
-    echo "$dump" | grep -q "\[TIGHT\].*align=" || bad "i686: assembler did not resolve a bucket"
-    note "i686: $(echo "$dump" | grep -o '\[TIGHT\].*' | head -1)"
+    echo "$dump" | grep -c "func=good .*tight=yes" >/dev/null || bad "i686: structural audit did not accept"
+    echo "$dump" | grep -c "\[TIGHT\].*align=" >/dev/null || bad "i686: assembler did not resolve a bucket"
+    note "i686: $(echo "$dump" | grep -o '\[TIGHT\].*' | sed -n '1,1p')"
 fi
 
 if [ "$fail" -eq 0 ]; then

@@ -488,7 +488,7 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
             }
             // Only when no real block immediately precedes it (a same-function
             // predecessor is handled by the loop above).
-            let preceded_by_block = blocks.iter().any(|&(ps, pe, _, _)| pe == start);
+            let preceded_by_block = blocks.iter().any(|&(_ps, pe, _, _)| pe == start);
             if preceded_by_block {
                 continue;
             }

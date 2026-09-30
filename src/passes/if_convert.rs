@@ -248,16 +248,6 @@ fn rewrite_covered_arm_loads(
             }
         }
     }
-    let resolve = |v: &Value| -> Value {
-        let mut cur = *v;
-        for _ in 0..64 {
-            match copy_of.get(&cur) {
-                Some(&next) if next != cur => cur = next,
-                _ => break,
-            }
-        }
-        cur
-    };
 
     // Cloned defs: the rewrite loop below mutates func.blocks, so the map
     // must not hold borrows into it.
@@ -1678,12 +1668,12 @@ fn remap_shared_arm_operands(
     inst: &mut Instruction,
     map: &crate::common::fx_hash::FxHashMap<u32, u32>,
 ) {
-    let mut map_val = |v: &mut Value| {
+    let map_val = |v: &mut Value| {
         if let Some(&nv) = map.get(&v.0) {
             *v = Value(nv);
         }
     };
-    let mut map_op = |o: &mut Operand| {
+    let map_op = |o: &mut Operand| {
         if let Operand::Value(v) = o {
             map_val(v);
         }

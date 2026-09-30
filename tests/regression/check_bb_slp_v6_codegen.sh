@@ -88,7 +88,7 @@ if [ "$n_negd" -lt 1 ]; then
     echo "FAIL: v6_neg_f64x2 not the one-instruction sign-mask form"
     exit 1
 fi
-grep -q "\.LCVEC_" "$td/v6.s" && grep -A2 "\.LCVEC_.*:" "$td/v6.s" | grep -q "\.quad" || {
+grep -q "\.LCVEC_" "$td/v6.s" && grep -A2 "\.LCVEC_.*:" "$td/v6.s" | grep -c "\.quad" >/dev/null || {
     echo "FAIL: the vector const pool entry is missing/malformed"
     exit 1
 }

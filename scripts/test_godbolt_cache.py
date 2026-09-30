@@ -135,6 +135,20 @@ def test_corruption_is_a_miss() -> None:
     check("garbage json is a miss, not a crash",
           gc.load_json(gc.NS_ORACLE, *parts) is None)
 
+    # The TEXT path has to hold the same contract, and it is the one that
+    # silently did not: `errors="replace"` decoded non-UTF-8 bytes into U+FFFD
+    # and returned them as a HIT, so mangled assembly became the input to every
+    # downstream measurement instead of a re-fetch.  Truncation cannot produce
+    # this (writes are atomic renames) but a hand edit, bit rot or a partial
+    # network-filesystem sync all can.
+    tparts = ("corrupt", "text")
+    gc.store_text(gc.NS_ASM, "movl %eax, %ebx", *tparts)
+    gc.path_for(gc.NS_ASM, *tparts).write_bytes(b"movl \xff\xfe %eax, %ebx")
+    check("invalid utf-8 text is a miss, not U+FFFD mush",
+          gc.load_text(gc.NS_ASM, *tparts) is None)
+    check("invalid utf-8 text yields no lines either",
+          gc.load_lines(gc.NS_ASM, *tparts) is None)
+
 
 def test_undecodable_text_is_a_miss() -> None:
     """A text record that is not valid UTF-8 is a MISS, not a hit full of U+FFFD.
@@ -201,6 +215,25 @@ def test_concurrent_writers() -> None:
 
 
 def test_stats() -> None:
+    # An in-flight temporary must not be counted as a record.  `_atomic_write`
+    # names it `<stem>.tmp.<pid>.<tid>.json`, so the marker is in the middle of
+    # the name: an `endswith(".tmp")` filter matched nothing and the count was
+    # silently wrong for anyone reading cache telemetry mid-sweep.
+    ns_dir = gc.CACHE / gc.NS_ASM
+    ns_dir.mkdir(parents=True, exist_ok=True)
+    stray = ns_dir / "deadbeef.tmp.99999.99999.json"
+    stray.write_text("{}", encoding="utf-8")
+    try:
+        before = gc.stats().get(gc.NS_ASM, 0)
+        real = ns_dir / "deadbeef.json"
+        real.write_text("{}", encoding="utf-8")
+        after = gc.stats().get(gc.NS_ASM, 0)
+        check("stats ignores an in-flight .tmp. record", after - before == 1,
+              f"before={before} after={after}")
+        real.unlink()
+    finally:
+        stray.unlink(missing_ok=True)
+
     st = gc.stats()
     check("stats counts the asm namespace", st.get(gc.NS_ASM, 0) >= 3,
           f"{st}")

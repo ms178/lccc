@@ -65,31 +65,34 @@ from typing import Any
 # Resolved identically by every importer: this file lives in <repo>/scripts/,
 # so the cache sits at <repo>/.godbolt-cache/ no matter which tool imports it
 # or what the process working directory is.
+#
+# WHAT THIS CACHE PROMISES, AND WHAT IT DOES NOT
+# ----------------------------------------------
+# A persistent cache pins records for weeks, so it answers a different question
+# than the in-process memo it replaced, and both questions are legitimate:
+#
+#   * "reproduce the table that was published" -- the default.  Records are
+#     returned exactly as stored, forever, which is what makes a number in
+#     `engineering/evidence/` re-derivable.
+#   * "measure the compiler CE is serving TODAY" -- `--revalidate` on
+#     `tools/oracle/godbolt_oracle.py`.  One `/api/compilers` request for the
+#     whole run, then every record whose compiler drifted (pinned channels) or
+#     that is older than `--max-age-days` (moving channels such as
+#     `cicxlatest`, where CE reports `(latest)` and there is no version to
+#     compare) is dropped and re-fetched.
+#
+# The CE compiler version is deliberately NOT part of `key()`: that would make
+# every compile a probe-then-compile pair, and for the moving channels the
+# version string carries no information anyway.  Provenance is stored IN the
+# record (`ce_semver`, `cached_at`) and compared out of band instead.  Bumping
+# a namespace below remains the way to invalidate a generation of records after
+# a FORMAT change; `--revalidate` is the way to invalidate them after a
+# COMPILER change.
 CACHE = Path(os.environ.get(
     "GODBOLT_CACHE",
     str(Path(__file__).resolve().parent.parent / ".godbolt-cache"),
 ))
 
-# STALENESS, NOT VALIDITY
-# -----------------------
-# The key is (cid, flags, source, execute) and deliberately carries no compiler
-# version.  That is the right trade for this cache: a published table must stay
-# reproducible, and pinning a version into the key would force a probe request
-# before every compile -- double the requests against an API that rate-limits.
-#
-# The cost is that a *versioned* upstream channel (ICX most of all) can move
-# while a record stays "valid".  `tools/oracle/godbolt_oracle.py` closes that
-# gap from the other side: it records the Compiler Explorer version string
-# INSIDE the record and compares it against one cheap probe per compiler per
-# process, treating a mismatch as a miss so the sweep re-measures and
-# overwrites.  A record written before that field existed has `ce_version ==
-# None` and is still honoured -- invalidating every unversioned record at once
-# would be a far larger, and much less safe, change than the problem.
-#
-# To force a generation to be dropped wholesale after a format change, bump
-# the namespace below; that is the sanctioned way, and it is the right tool
-# when the KEY changes rather than when the compiler does.
-#
 # Namespaces currently in use. Adding one is the sanctioned way to invalidate
 # a generation of records after a format change.
 # v3/v2: the compiler's reported version (godbolt.compiler_fingerprint) is now
@@ -201,15 +204,29 @@ def store_lines(namespace: str, lines: list[str], *parts: Any) -> None:
 # Introspection
 # --------------------------------------------------------------------------
 
-def _is_record(f: Path) -> bool:
-    """True for a committed record, false for an in-flight temp file.
+def iter_records(namespace: str):
+    """Yield ``(path, key)`` for every readable record in ``namespace``.
 
-    ``_atomic_write`` names temps ``<stem>.tmp.<pid>.<tid><suffix>`` -- they keep
-    the record's own suffix, so filtering on ``endswith(".tmp")`` matched none
-    of them and counted every half-written file as a record.  The marker is the
-    infix, so match that.
+    In-flight temporaries are skipped: `_atomic_write` renames them into place,
+    so a `.tmp.` name is a write that has not committed yet and reading it
+    would race the writer.
     """
-    return f.is_file() and ".tmp." not in f.name
+    ns_dir = CACHE / namespace
+    if not ns_dir.is_dir():
+        return
+    for path in sorted(ns_dir.iterdir()):
+        if not path.is_file() or ".tmp." in path.name:
+            continue
+        yield path, path.name[: -len(".json")] if path.name.endswith(".json") else path.name
+
+
+def drop(path: Path) -> bool:
+    """Delete one record.  ``True`` if a file was removed."""
+    try:
+        path.unlink()
+        return True
+    except OSError:
+        return False
 
 
 def stats() -> dict[str, int]:
@@ -218,5 +235,9 @@ def stats() -> dict[str, int]:
     if not CACHE.is_dir():
         return out
     for ns in sorted(p.name for p in CACHE.iterdir() if p.is_dir()):
-        out[ns] = sum(1 for f in (CACHE / ns).iterdir() if _is_record(f))
+        # `_atomic_write` temps are "<stem>.tmp.<pid>.<tid><suffix>": they
+        # carry the real suffix, so `endswith(".tmp")` matched nothing and
+        # an aborted writer's leavings were counted as records.
+        out[ns] = sum(1 for f in (CACHE / ns).iterdir()
+                      if f.is_file() and ".tmp." not in f.name)
     return out

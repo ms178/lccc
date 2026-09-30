@@ -702,3 +702,95 @@ fn cltq_survives_a_partial_byte_write_followed_by_a_64_bit_read() {
     ));
     assert_eq!(rax_sign_extensions(&out), 1, "{}", out);
 }
+
+// ── Rule 4b: a use that cannot be rewritten aborts the WHOLE fold ──────────
+
+#[test]
+fn a_non_rewritable_use_aborts_the_whole_copyback_fold() {
+    // REGRESSION, and a real miscompile before the fix.
+    //
+    // `fold_induction_copyback` precomputes each use's rewritten form, then
+    // commits by retargeting the producer `%T -> %D` and deleting the copy.
+    // That commit is all-or-nothing: once the copy is gone `%T` is defined by
+    // nothing, so a use left un-rewritten reads an undefined register.
+    //
+    // The original code computed `all_rewritable = false` at the first
+    // inexpressible use and never read it -- it broke out of the scan and
+    // committed anyway.  Three things are needed to expose that, and each was
+    // found by probing, not by guessing:
+    //
+    //   1. the producer must be a `leaq`/`mov{l,q}` LOAD (`parse_copyback_producer`
+    //      accepts nothing else -- a `movzbl` producer never reaches this fold);
+    //   2. `%D` must stay LIVE, or an earlier pass deletes the copy as a dead
+    //      store and the fold never sees it;
+    //   3. one use must be inexpressible (`%ah`: `register_family_at` places it
+    //      in the `%eax` family, but `%ah` appears in no `REG_NAMES` slot at any
+    //      width, so `replace_reg` matches nothing and `rw == line`), and a
+    //      LATER use must exist to be left dangling (`addq %rdx, %r8`).
+    let out = run(&f(concat!(
+        "    leaq 8(%rdi), %rax\n",
+        "    movq %rax, %rdx\n",
+        "    movzbl %ah, %ecx\n",
+        "    movl %ecx, %r8d\n",
+        "    addq %rdx, %r8\n",
+        "    movq %r8, %rax\n",
+        "    ret"
+    )));
+
+    // The discriminating invariant: the register the surviving uses READ must
+    // be the register the producer WRITES.  Committing the fold moves the write
+    // to `%rdx`; refusing it leaves the write on `%rax` where `movzbl %ah` and
+    // `addq %rax` expect it.  Asserting on that relation -- rather than on the
+    // literal `movq %rax, %rdx` -- keeps the test valid even though a later,
+    // legitimate copy-propagation pass deletes the copy either way, and it is
+    // exactly what `gh/main` gets wrong:
+    //
+    //     gh/main:   leaq 8(%rdi), %rdx / movzbl %ah, %r8d / addq %rax, %r8
+    //     fixed:     leaq 8(%rdi), %rax / movzbl %ah, %r8d / addq %rax, %r8
+    //
+    // In the first, `%rax` is written by nothing: an undefined-register read.
+    assert!(
+        out.contains("leaq 8(%rdi), %rax"),
+        "the producer must still write %rax, the register the uses read:\n{}",
+        out
+    );
+    assert!(
+        !out.contains("leaq 8(%rdi), %rdx"),
+        "the producer must NOT have been retargeted to %rdx; that retarget is \
+         precisely what leaves every surviving %rax use undefined:\n{}",
+        out
+    );
+    assert!(
+        out.contains("addq %rax, %r8"),
+        "the later use must still read %rax:\n{}",
+        out
+    );
+}
+
+#[test]
+fn a_copyback_fold_still_fires_when_every_use_is_rewritable() {
+    // Positive control for the test above: the identical shape with `%ah` ->
+    // `%al`, so every use IS expressible.  Without this, a guard that refused
+    // everything would satisfy the regression test while silently disabling the
+    // fold -- the failure mode the gate exists to prevent.
+    let out = run(&f(concat!(
+        "    leaq 8(%rdi), %rax\n",
+        "    movq %rax, %rdx\n",
+        "    movzbl %al, %ecx\n",
+        "    movl %ecx, %r8d\n",
+        "    addq %rdx, %r8\n",
+        "    movq %r8, %rax\n",
+        "    ret"
+    )));
+    assert_eq!(
+        count(&out, "movq %rax, %rdx"),
+        0,
+        "the copy must be folded away here:\n{}",
+        out
+    );
+    assert!(
+        out.contains("leaq 8(%rdi), %rdx"),
+        "the producer must be retargeted into the copy destination:\n{}",
+        out
+    );
+}

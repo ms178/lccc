@@ -1265,15 +1265,31 @@ fn hoist_loop_invariants(
                     // before the guard (gcc.c-torture/execute/20051215-1.c).
                     // Require the load's original block to dominate every
                     // loop block, i.e. it is must-execute for any iteration.
-                    // Volatility is tested FIRST and unconditionally. It is not
-                    // a profitability judgement and not a question about the
-                    // surrounding CFG, so it must never be reordered behind,
-                    // or short-circuited by, any of the tests below: a volatile
-                    // access is part of the program's observable behaviour and
-                    // the loop must perform exactly as many of them as the
-                    // source does. Every other test here asks whether hoisting
-                    // is safe for a *non-volatile* load, and none of them may be
-                    // allowed to reach a volatile one.
+                    //
+                    // The volatility check is the FIRST arm on purpose, and it
+                    // is spelled as its own branch rather than folded into the
+                    // conjunction below, so that the safety condition cannot be
+                    // lost by editing the dominance expression.
+                    //
+                    // Regression history: a debug-print refactor of this chain
+                    // lost a `!*volatile` term and turned `while (!regs[4]) {}`
+                    // (MMIO spin-wait) into a load-once infinite loop.  It
+                    // compiled clean and *linted* clean only because
+                    // `src/lib.rs` carried a crate-wide
+                    // `#![allow(unused_variables, ...)]`; with that allow
+                    // removed rustc reports this exact deletion at this exact
+                    // line ("unused variable: `volatile` ... help: try ignoring
+                    // the field: `volatile: _`").  Three independent guards now
+                    // cover it: the lint, the gates below, and
+                    // `scripts/check_volatile_destructuring.py`.
+                    //
+                    // Gates that fail when this arm is deleted (mutation-
+                    // verified both directions):
+                    // `tests/regression/check_volatile_spin_loop.sh`,
+                    // `tests/regression/check_volatile_licm.sh`,
+                    // `tests/regression/check_volatile_pointer_subscript.sh`.
+                    // `check_volatile_access_semantics.sh` does NOT: it checks
+                    // forwarding/CSE/DCE and cannot observe a hoist.
                     if *volatile {
                         licm_debug(|| {
                             eprintln!(

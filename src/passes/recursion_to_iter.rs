@@ -233,11 +233,6 @@ pub(crate) fn recursion_to_iteration(func: &mut IrFunction) -> usize {
     let entry_label = func.blocks[0].label;
 
     // Determine the canonical types
-    let idx_ty = if ret_ty == IrType::I64 {
-        IrType::I64
-    } else {
-        param_ty
-    };
     let is_i32_param = matches!(param_ty, IrType::I32 | IrType::U32);
 
     // Replace entire function body

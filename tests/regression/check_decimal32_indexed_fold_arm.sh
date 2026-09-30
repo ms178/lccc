@@ -39,26 +39,26 @@ mkdir -p "$tmp"
 # Folded store: `str wN, [xB, xI, lsl #2]`.
 if ! grep -qE 'str w[0-9]+, \[x[0-9]+, x[0-9]+, lsl #2\]' "$tmp/out.s"; then
     echo "FAIL: no folded w-view D32 store in $tmp/out.s" >&2
-    grep -E 'str ' "$tmp/out.s" >&2 | head -10
+    grep -E 'str ' "$tmp/out.s" >&2 | sed -n '1,10p'
     exit 1
 fi
 # Plain array load through the w view (the T3 half of the fix).
 if ! grep -qE 'ldr w0, \[x[0-9]+\]' "$tmp/out.s"; then
     echo "FAIL: no w-view plain D32 load in $tmp/out.s" >&2
-    grep -E 'ldr ' "$tmp/out.s" >&2 | head -10
+    grep -E 'ldr ' "$tmp/out.s" >&2 | sed -n '1,10p'
     exit 1
 fi
 # Plain array store through the w view (the T1+T2 half of the fix).
 if ! grep -qE 'str w0, \[x[0-9]+\]' "$tmp/out.s"; then
     echo "FAIL: no w-view plain D32 store in $tmp/out.s" >&2
-    grep -E 'str ' "$tmp/out.s" >&2 | head -10
+    grep -E 'str ' "$tmp/out.s" >&2 | sed -n '1,10p'
     exit 1
 fi
 # No 64-bit indexed traffic anywhere: this file's only arrays are the two
 # _Decimal32 tables, so any SIB-scale x-view memory op is an over-access.
 if grep -qE '(ldr|str) x[0-9]+, \[x[0-9]+, x[0-9]+, lsl' "$tmp/out.s"; then
     echo "FAIL: 64-bit indexed memory traffic in $tmp/out.s" >&2
-    grep -E '(ldr|str) x[0-9]+, \[x[0-9]+, x[0-9]+, lsl' "$tmp/out.s" >&2 | head -10
+    grep -E '(ldr|str) x[0-9]+, \[x[0-9]+, x[0-9]+, lsl' "$tmp/out.s" >&2 | sed -n '1,10p'
     exit 1
 fi
 # No x-view memory traffic through a non-sp base at all: every remaining
@@ -67,7 +67,7 @@ fi
 # over-read/over-store.
 if grep -qE '(ldr|str) x[0-9]+, \[x' "$tmp/out.s"; then
     echo "FAIL: x-view array/global traffic in $tmp/out.s" >&2
-    grep -E '(ldr|str) x[0-9]+, \[x' "$tmp/out.s" >&2 | head -10
+    grep -E '(ldr|str) x[0-9]+, \[x' "$tmp/out.s" >&2 | sed -n '1,10p'
     exit 1
 fi
 # Encodability teeth (S19/F1+F3): a bare `mov xN/wN, #M` is only encodable
@@ -79,7 +79,7 @@ if grep -oE 'mov [xw][0-9]+, #-?[0-9]+' "$tmp/out.s" \
     | sed -E 's/^mov [xw][0-9]+, #(-?[0-9]+)$/\1/' \
     | awk '$1 > 65535 || $1 < -65536 { found = 1 } END { exit found ? 0 : 1 }'; then
     echo "FAIL: bare mov outside the encodable imm16 window in $tmp/out.s" >&2
-    grep -E 'mov [xw][0-9]+, #' "$tmp/out.s" >&2 | head -10
+    grep -E 'mov [xw][0-9]+, #' "$tmp/out.s" >&2 | sed -n '1,10p'
     exit 1
 fi
 echo "PASS: D32 AArch64 width (folded str wN SIB, w0 plain traffic, x-view is spills only)"

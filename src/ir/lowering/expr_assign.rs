@@ -307,8 +307,9 @@ impl Lowerer {
             self.resolve_bitfield_lvalue(lhs)?;
         let is_bool = self.is_bool_lvalue(lhs);
 
-        let current_val =
-            self.extract_bitfield_from_addr(field_addr, storage_ty, bit_offset, bit_width, sso);
+        let is_vol = self.expr_access_is_volatile(lhs);
+        let current_val = self
+            .extract_bitfield_from_addr(field_addr, storage_ty, bit_offset, bit_width, sso, is_vol);
         let current_ty = crate::ir::lowering::expr_types::bitfield_promoted_type(
             storage_ty,
             Some((bit_offset, bit_width)),
@@ -389,7 +390,7 @@ impl Lowerer {
             };
             let stored = self.emit_sso_store_fixup(widened, storage_ty, sso);
             self.emit(Instruction::Store {
-                volatile: false,
+                volatile,
                 val: stored,
                 ptr: addr,
                 ty: storage_ty,
@@ -542,7 +543,7 @@ impl Lowerer {
         // Read-modify-write low storage unit
         let old_low = self.fresh_value();
         self.emit(Instruction::Load {
-            volatile: false,
+            volatile,
             dest: old_low,
             ptr: addr,
             ty: storage_ty,
@@ -564,7 +565,7 @@ impl Lowerer {
         );
         let new_low_fixed = self.emit_sso_store_fixup(Operand::Value(new_low), storage_ty, sso);
         self.emit(Instruction::Store {
-            volatile: false,
+            volatile,
             val: new_low_fixed,
             ptr: addr,
             ty: storage_ty,
@@ -595,7 +596,7 @@ impl Lowerer {
         // Read-modify-write high storage unit
         let old_high = self.fresh_value();
         self.emit(Instruction::Load {
-            volatile: false,
+            volatile,
             dest: old_high,
             ptr: high_addr,
             ty: storage_ty,
@@ -617,7 +618,7 @@ impl Lowerer {
         );
         let new_high_fixed = self.emit_sso_store_fixup(Operand::Value(new_high), storage_ty, sso);
         self.emit(Instruction::Store {
-            volatile: false,
+            volatile,
             val: new_high_fixed,
             ptr: high_addr,
             ty: storage_ty,
@@ -723,6 +724,7 @@ impl Lowerer {
         bit_offset: u32,
         bit_width: u32,
         sso: SsoMode,
+        volatile: bool,
     ) -> Operand {
         let storage_bits = (storage_ty.size() * 8) as u32;
 
@@ -737,7 +739,7 @@ impl Lowerer {
             // Load low part, shift right by bit_offset to get low_bits at bit 0
             let low_loaded = self.fresh_value();
             self.emit(Instruction::Load {
-                volatile: false,
+                volatile,
                 dest: low_loaded,
                 ptr: addr,
                 ty: storage_ty,
@@ -774,7 +776,7 @@ impl Lowerer {
             let high_addr = self.emit_gep_offset(addr, storage_ty.size(), IrType::I8);
             let high_loaded = self.fresh_value();
             self.emit(Instruction::Load {
-                volatile: false,
+                volatile,
                 dest: high_loaded,
                 ptr: high_addr,
                 ty: storage_ty,
@@ -836,7 +838,7 @@ impl Lowerer {
             // Normal case: load single storage unit and extract
             let loaded = self.fresh_value();
             self.emit(Instruction::Load {
-                volatile: false,
+                volatile,
                 dest: loaded,
                 ptr: addr,
                 ty: storage_ty,

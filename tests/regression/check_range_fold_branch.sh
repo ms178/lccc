@@ -39,7 +39,7 @@ check_eq() { # <desc> <actual> <expected>
 check_absent() { # <desc> <file> <egrep-pattern>
     if grep -qE "$3" "$2"; then
         echo "FAIL: $1 -- forbidden pattern '$3' matched:" >&2
-        grep -nE "$3" "$2" | head -3 >&2
+        grep -nE "$3" "$2" | sed -n '1,3p' >&2
         fail=1
     fi
 }
@@ -195,7 +195,7 @@ done
 for opt in -O1 -O2 -O3 -Os; do
     if ! diff -q "$tmp/battery-O0.out" "$tmp/battery$opt.out" >/dev/null; then
         echo "FAIL: battery $opt output differs from -O0:" >&2
-        diff "$tmp/battery-O0.out" "$tmp/battery$opt.out" | head -5 >&2
+        diff "$tmp/battery-O0.out" "$tmp/battery$opt.out" | sed -n '1,5p' >&2
         fail=1
     fi
 done

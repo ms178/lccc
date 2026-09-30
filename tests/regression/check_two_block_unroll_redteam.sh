@@ -137,7 +137,7 @@ if [ "$legacy" -ne 0 ]; then
 fi
 
 f1=$(scoped_fn_asm f1_hash_chain "$td/rt.s")
-if ! printf '%s\n' "$f1" | grep -qE ' +cmp(l|q) \$[0-9-]+, [0-9-]*\(%r'; then
+if ! printf '%s\n' "$f1" | grep -cE ' +cmp(l|q) \$[0-9-]+, [0-9-]*\(%r' >/dev/null; then
     echo "FAIL: f1_hash_chain constant-key compare did not fold (no cmp \$imm, off(%reg))"
     exit 1
 fi

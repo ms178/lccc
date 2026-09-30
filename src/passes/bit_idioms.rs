@@ -270,7 +270,7 @@ pub(super) fn match_bool_mux_algebra(
     c_dest: crate::ir::reexports::Value,
     c_ty: IrType,
     block_bi: usize,
-    index: usize,
+    _index: usize,
     defs: &[Option<Instruction>],
     use_counts: &[u32],
     def_loc: &[Option<(usize, usize)>],
@@ -1885,7 +1885,7 @@ fn recognize_copysign_mem(func: &mut IrFunction) -> usize {
         // validated at match time; replacements are index-preserving so
         // earlier matches cannot disturb them — skip rather than rewrite
         // anything unexpected).
-        let mut stored_val = |idx: usize| -> Option<Operand> {
+        let stored_val = |idx: usize| -> Option<Operand> {
             match block.instructions.get(idx) {
                 Some(Instruction::Store { val, .. }) => Some(*val),
                 _ => None,

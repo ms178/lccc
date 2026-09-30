@@ -4611,7 +4611,7 @@ fn gdse_one_function(lines: &[String], kinds: &mut [LineKind], start: usize, end
             continue;
         }
         let sp_disp = disps[i];
-        let mut push_load = |off: i64, size: i32, out: &mut Vec<(i32, i32)>| {
+        let push_load = |off: i64, size: i32, out: &mut Vec<(i32, i32)>| {
             if let Ok(off) = i32::try_from(off) {
                 out.push((off, size));
             }

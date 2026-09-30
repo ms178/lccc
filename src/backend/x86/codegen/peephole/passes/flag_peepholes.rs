@@ -1651,7 +1651,7 @@ fn walk_flag_consumers(store: &LineStore, infos: &[LineInfo], from: usize) -> Co
             }
         }
     }
-    let mut resolve = |t: &str, facts: &mut ConsumerFacts| -> Option<usize> {
+    let resolve = |t: &str, facts: &mut ConsumerFacts| -> Option<usize> {
         let Some(target) = super::helpers::extract_jump_target(t) else {
             facts.proved = false;
             return None;

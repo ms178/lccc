@@ -125,7 +125,7 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
     // becomes more conservative).
     let mut use_counts = vec![0u32; if fill_use_counts { max_id + 1 } else { 0 }];
     {
-        let mut bump = |op: &Operand, uc: &mut Vec<u32>| {
+        let bump = |op: &Operand, uc: &mut Vec<u32>| {
             if let Operand::Value(v) = op {
                 let id = v.0 as usize;
                 if id < uc.len() {
@@ -5450,13 +5450,6 @@ mod tests {
             rhs: Operand::Value(Value(3)),
             ty: IrType::I32,
         });
-        let inst = Instruction::BinOp {
-            dest: Value(4),
-            op: IrBinOp::And,
-            lhs: Operand::Value(Value(2)),
-            rhs: Operand::Const(IrConst::I64(1)),
-            ty: IrType::I32,
-        };
         let got = simplify_binop(
             Value(4),
             IrBinOp::And,

@@ -72,7 +72,7 @@ curl -fsSL -o "$SRC/tools/le_byteshift.h" \
 
 # Sanity: a rate-limited or redirected fetch yields an HTML error page that
 # compiles into a wall of nonsense. Catch it here with a clear message.
-if ! head -1 "$SRC/relocs.c" | grep -q "SPDX-License-Identifier"; then
+if ! grep -c 'SPDX-License-Identifier' <(sed -n '1p' "$SRC/relocs.c") >/dev/null; then
   echo "error: relocs.c does not look like kernel source (download blocked?)" >&2
   head -3 "$SRC/relocs.c" >&2
   exit 1

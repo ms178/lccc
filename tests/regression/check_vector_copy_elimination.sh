@@ -119,7 +119,7 @@ expect_shape() { # name, exact instruction
     local body n
     body=$(fnbody "$work/shapes.s" "$1")
     n=$(printf '%s\n' "$body" | grep -c . || true)
-    if [[ "$n" -eq 2 ]] && printf '%s\n' "$body" | head -1 | grep -qxF "$2"; then
+    if [[ "$n" -eq 2 ]] && printf '%s\n' "$body" | sed -n '1,1p' | grep -cxF "$2" >/dev/null; then
         ok "$1 is exactly \`$2' plus ret (gcc/clang/icx parity)"
     else
         bad "$1 should be \`$2' plus ret, got $n lines:"; printf '%s\n' "$body" | note
@@ -154,8 +154,8 @@ expect_shape_re() { # name, regex for the one instruction
     local body n
     body=$(fnbody "$work/shapes.s" "$1")
     n=$(printf '%s\n' "$body" | grep -c . || true)
-    if [[ "$n" -eq 2 ]] && printf '%s\n' "$body" | head -1 | grep -qE "$2"; then
-        ok "$1 is exactly one \`$(printf '%s\n' "$body" | head -1 | cut -d' ' -f1)' plus ret (gcc/clang/icx parity)"
+    if [[ "$n" -eq 2 ]] && printf '%s\n' "$body" | sed -n '1,1p' | grep -cE "$2" >/dev/null; then
+        ok "$1 is exactly one \`$(printf '%s\n' "$body" | sed -n '1,1p' | cut -d' ' -f1)' plus ret (gcc/clang/icx parity)"
     else
         bad "$1 should match /$2/ plus ret, got $n lines:"; printf '%s\n' "$body" | note
     fi
@@ -170,8 +170,8 @@ expect_shape_re neg_f '^vxorps \.LCFP_[0-9]+\(%rip\), %xmm0, %xmm0$'
 # nobody's and may become the source's.
 cs=$(fnbody "$work/shapes.s" csign)
 if [[ "$(printf '%s\n' "$cs" | grep -c .)" -eq 4 ]] \
-   && ! printf '%s\n' "$cs" | grep -qE "$COPY_RE" \
-   && printf '%s\n' "$cs" | grep -q 'vorpd'; then
+   && ! printf '%s\n' "$cs" | grep -cE "$COPY_RE" >/dev/null \
+   && printf '%s\n' "$cs" | grep -c 'vorpd' >/dev/null; then
     ok "copysign is three bit ops plus ret (clang parity, one better than gcc)"
 else
     bad "copysign should be andpd/andpd/orpd plus ret with no register copy:"
@@ -386,7 +386,7 @@ EOF
             bad "exit status differs: lccc=$rc_l $ORACLE=$rc_o"
         elif ! diff -q "$work/out.lccc" "$work/out.oracle" >/dev/null; then
             bad "runtime output differs from $ORACLE on the legality-rule kernels:"
-            diff "$work/out.lccc" "$work/out.oracle" | head -10 | note
+            diff "$work/out.lccc" "$work/out.oracle" | sed -n '1,10p' | note
         else
             ok "runtime bit-exact vs $ORACLE on $(grep -c . "$work/out.lccc") output lines (every legality rule exercised)"
         fi
@@ -433,7 +433,7 @@ EOF
             ok "runtime kernel carries $n_copies vector register copies (budget 48: 42 residual + 6 direct arg-staging forms, each a folded 2-instruction %rax relay worth net -1 instruction)"
         else
             bad "runtime kernel carries $n_copies vector register copies, budget is 48"
-            insns "$work/runtime.s" | grep -E "$COPY_RE" | head -10 | note
+            insns "$work/runtime.s" | grep -E "$COPY_RE" | sed -n '1,10p' | note
         fi
         # RELAY COUNTER (2026-09-26): the two-instruction `%rax` relay pairs
         # (`movq %xmmK,%rax` immediately followed by `movq %rax,%xmmN`) that
@@ -663,12 +663,12 @@ EOF_ALGEBRA
         "$work/fma_algebra.oracle" > "$work/fa.oracle" 2>&1; rc_o=$?
         if [[ $rc_l -ne 0 ]]; then
             bad "a contracted FMA kernel does not compute the fused value:"
-            grep MISMATCH "$work/fa.lccc" | head -5 | note
+            grep MISMATCH "$work/fa.lccc" | sed -n '1,5p' | note
         elif [[ $rc_o -ne 0 ]]; then
             skipped "the reference compiler's own contracted kernels are not fused; nothing to compare"
         elif ! diff -q "$work/fa.lccc" "$work/fa.oracle" >/dev/null; then
             bad "builtin FMA output differs from $ORACLE:"
-            diff "$work/fa.lccc" "$work/fa.oracle" | head -10 | note
+            diff "$work/fa.lccc" "$work/fa.oracle" | sed -n '1,10p' | note
         else
             ok "FMA algebra kernel bit-exact vs $ORACLE on $(grep -c . "$work/fa.lccc") lines; 28 contracted kernels equal their builtin twins"
         fi
@@ -803,7 +803,7 @@ EOF_PACKED
             bad "packed FMA loop run failed (lccc=$rc_l oracle=$rc_o)"
         elif ! diff -q "$work/fp.lccc.out" "$work/fp.oracle.out" >/dev/null; then
             bad "packed FMA loop output differs from $ORACLE:"
-            diff "$work/fp.lccc.out" "$work/fp.oracle.out" | head -6 | note
+            diff "$work/fp.lccc.out" "$work/fp.oracle.out" | sed -n '1,6p' | note
         else
             ok "packed builtin-FMA loops bit-exact vs $ORACLE (37 elements: packed body + scalar remainder + in-place alias)"
         fi
@@ -914,7 +914,7 @@ EOF_SLW
             bad "SLP width kernels run failed (lccc=$rc_l oracle=$rc_o)"
         elif ! diff -q "$work/slw.lccc.out" "$work/slw.oracle.out" >/dev/null; then
             bad "SLP width kernels output differs from $ORACLE:"
-            diff "$work/slw.lccc.out" "$work/slw.oracle.out" | head -6 | note
+            diff "$work/slw.lccc.out" "$work/slw.oracle.out" | sed -n '1,6p' | note
         else
             ok "SLP packed-FMA contraction bit-exact at every family width (4x/2x F64, 8x/4x F32, add and sub) vs $ORACLE"
         fi
@@ -1023,7 +1023,7 @@ EOF_NEGATE
             fi
             "$work/negate.lccc" > "$work/neg.lccc" 2>&1
             if ! diff -q "$work/neg.lccc" "$work/neg.oracle" >/dev/null; then
-                neg_ok=0; bad "negation output differs from $ORACLE at $nf:"; diff "$work/neg.lccc" "$work/neg.oracle" | head -6 | note
+                neg_ok=0; bad "negation output differs from $ORACLE at $nf:"; diff "$work/neg.lccc" "$work/neg.oracle" | sed -n '1,6p' | note
             fi
         done
         if [[ "$neg_ok" -eq 1 ]]; then

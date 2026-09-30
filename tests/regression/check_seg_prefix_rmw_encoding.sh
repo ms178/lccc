@@ -72,7 +72,7 @@ int plain;
 void inc_plain(void) { asm volatile("incl %[var]" : [var] "+m"(plain)); }
 C
 "$CCC" -O2 -c -o "$tmp/n.o" "$tmp/n.c"
-if objdump -d --disassemble=inc_plain "$tmp/n.o" 2>/dev/null | grep -qE '^\s+[0-9a-f]+:\s+65'; then
+if objdump -d --disassemble=inc_plain "$tmp/n.o" 2>/dev/null | grep -cE '^\s+[0-9a-f]+:\s+65' >/dev/null; then
     echo "FAIL: %gs override sprayed onto a plain variable" >&2
     exit 1
 fi

@@ -1586,7 +1586,7 @@ fn transform_arx_loop(
     {
         let mut retained: Vec<Instruction> = Vec::new();
         for &bi in arx.order.iter() {
-            for (ii, inst) in func.blocks[bi].instructions.iter().enumerate() {
+            for inst in func.blocks[bi].instructions.iter() {
                 let is_iv_feed = matches!(
                     inst,
                     Instruction::BinOp {

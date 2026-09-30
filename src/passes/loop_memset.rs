@@ -674,7 +674,7 @@ fn try_recognize_while(
     func: &IrFunction,
     header_idx: usize,
     body_idx: usize,
-    nested: bool,
+    _nested: bool,
     cfg: &CfgAnalysis,
 ) -> Option<Plan> {
     let header_label = func.blocks[header_idx].label;
@@ -897,7 +897,7 @@ fn try_recognize_while(
     // recognized iv phi (reconstructible as init / init + n at the exit).
     let mut used_ivs: Vec<usize> = Vec::new();
     {
-        let mut fail = |what: &str| {
+        let fail = |what: &str| {
             if trace_enabled() {
                 eprintln!(
                     "[loop-memset] refuse: external use of non-iv {} (while-form)",
@@ -1123,7 +1123,7 @@ fn census_body(
     func: &IrFunction,
     block_idx: usize,
     ivs: &[Iv],
-    defs: &FxHashMap<u32, usize>,
+    _defs: &FxHashMap<u32, usize>,
 ) -> Result<BodyCensus, String> {
     let header = &func.blocks[block_idx];
     let mut c = BodyCensus {
@@ -1594,7 +1594,7 @@ fn apply_idiom(func: &mut IrFunction, plan: Plan) -> usize {
         )
     };
 
-    let mut start_of = |em: &mut Emitter, form: &AddrForm| -> Value {
+    let start_of = |em: &mut Emitter, form: &AddrForm| -> Value {
         match form {
             AddrForm::Indexed { base, base_off, .. } => {
                 if *base_off == 0 {

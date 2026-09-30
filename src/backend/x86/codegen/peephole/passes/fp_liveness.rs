@@ -1085,7 +1085,7 @@ fn analyse(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> F
     // Deferred slot reads/writes per line: (slot index, is_write).
     let mut slot_ops: Vec<Vec<(usize, bool)>> = Vec::with_capacity(lines.len());
 
-    let mut intern =
+    let intern =
         |slots: &mut Vec<(u8, i32, i32)>, base: u8, off: i32, size: i32| -> Option<usize> {
             if let Some(k) = slots
                 .iter()

@@ -126,10 +126,34 @@ else
 so contract 2 proves nothing"
 fi
 
+# ── 2b. magnitude: the hoist must actually reduce in-loop memory traffic ──
+# Contract 2 asserts a DIRECTION (the load moved out). That is necessary but
+# not sufficient: a transform could hoist the load and simultaneously push
+# other traffic INTO the loop -- a spill, a rematerialised address, a widened
+# accumulator slot -- and still satisfy contract 2 while making the steady
+# state slower. Counting every memory operand in the loop body pins the
+# magnitude instead, so the pass has to leave the loop strictly lighter.
+# Measured on this shape: 2 -> 1 (the p->nUsed load leaves; the accumulator's
+# own traffic stays). Asserted as an exact equality, not a <=, because a
+# number that silently drifts is a number nobody is watching.
+mem_operand='^[[:space:]]*[a-z][a-z0-9]*[[:space:]].*\(%r'
+on_mem=$(echo "$on_loop"  | grep -Ec "$mem_operand")
+off_mem=$(echo "$off_loop" | grep -Ec "$mem_operand")
+if [ "$on_mem" -eq 1 ] && [ "$off_mem" -eq 2 ]; then
+    echo "ok: in-loop memory operands go 2 -> 1 (the hoist is a net reduction)"
+elif [ "$on_mem" -ge "$off_mem" ]; then
+    fail "the pass did not reduce in-loop memory traffic ($off_mem -> $on_mem): \
+contract 2's direction held but the steady state is not lighter"
+else
+    fail "in-loop memory operand counts moved off the pinned 2 -> 1 \
+(got $off_mem -> $on_mem); if this is a deliberate improvement, re-measure and \
+update the expectation rather than widening it to a range"
+fi
+
 # ── 3. soundness: the load must not precede the NULL early return ───────
 on_body=$(fn_body guarded_sum "$td/on.s")
-ret_ln=$(echo "$on_body" | grep -nE '^[[:space:]]*ret' | head -1 | cut -d: -f1)
-ld_ln=$(echo "$on_body"  | grep -nE "$base_only"       | head -1 | cut -d: -f1)
+ret_ln=$(echo "$on_body" | grep -nE '^[[:space:]]*ret' | sed -n '1,1p' | cut -d: -f1)
+ld_ln=$(echo "$on_body"  | grep -nE "$base_only"       | sed -n '1,1p' | cut -d: -f1)
 if [ -n "$ret_ln" ] && [ -n "$ld_ln" ] && [ "$ret_ln" -lt "$ld_ln" ]; then
     echo "ok: the hoisted load sits after the p==0 early return (line $ld_ln > $ret_ln)"
 elif [ -z "$ld_ln" ]; then
@@ -146,7 +170,7 @@ for fn in invariant_ptr switch_entered computed_goto already_dedicated; do
     else
         fail "$fn changed between the two arms: the pass inserted where it \
 must not"
-        diff <(fn_body "$fn" "$td/on.s") <(fn_body "$fn" "$td/off.s") | head -8 >&2
+        diff <(fn_body "$fn" "$td/on.s") <(fn_body "$fn" "$td/off.s") | sed -n '1,8p' >&2
     fi
 done
 

@@ -1260,14 +1260,11 @@ impl Lowerer {
             return Operand::Value(field_addr);
         }
 
-        // For bitfields, use extract_bitfield_from_addr which handles split loads
-        // (packed bitfields that span storage unit boundaries).
-        if let Some((bit_offset, bit_width)) = bitfield {
-            return self
-                .extract_bitfield_from_addr(field_addr, storage_ty, bit_offset, bit_width, sso);
-        }
-
-        let dest = self.fresh_value();
+        // Volatility is resolved BEFORE the bitfield branch, because a bitfield
+        // access emits its own loads and stores in `extract_bitfield_from_addr`
+        // and must pass the same answer down.  Resolving it afterwards left the
+        // bitfield path emitting non-volatile accesses for a volatile object.
+        //
         // p->f dereferences p; s.f accesses s directly — both inherit the
         // base access's volatility (field-level quals are not tracked yet).
         let is_vol = if is_pointer {
@@ -1275,6 +1272,16 @@ impl Lowerer {
         } else {
             self.expr_access_is_volatile(base_expr)
         };
+
+        // For bitfields, use extract_bitfield_from_addr which handles split loads
+        // (packed bitfields that span storage unit boundaries).
+        if let Some((bit_offset, bit_width)) = bitfield {
+            return self.extract_bitfield_from_addr(
+                field_addr, storage_ty, bit_offset, bit_width, sso, is_vol,
+            );
+        }
+
+        let dest = self.fresh_value();
         self.emit(Instruction::Load {
             volatile: is_vol,
             dest,

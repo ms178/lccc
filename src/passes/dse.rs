@@ -220,7 +220,7 @@ impl DseContext {
 /// `Store.ptr`, or the base of a pointer chain that ends in such uses.
 /// `derived[v] = root` maps every SSA value that is a const-offset-derived
 /// pointer of an alloca.
-fn compute_closed_allocas(func: &IrFunction, defs: &FxHashMap<u32, PtrDef>) -> FxHashSet<u32> {
+fn compute_closed_allocas(func: &IrFunction, _defs: &FxHashMap<u32, PtrDef>) -> FxHashSet<u32> {
     let mut derived: FxHashMap<u32, u32> = FxHashMap::default();
     let mut closed: FxHashSet<u32> = FxHashSet::default();
     for block in &func.blocks {

@@ -18,12 +18,17 @@ No network: the stream shapes are the ones the API actually returns, and the
 cases are checked directly.  Run: tools/oracle/godbolt_oracle_selftest.py
 """
 
+import json
 import os
 import sys
 import unittest
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import godbolt_oracle as G  # noqa: E402
+# Imported second: `godbolt_oracle` puts the repo's `scripts/` on sys.path,
+# which is where the shared cache module lives.
+import godbolt_cache as GC  # noqa: E402
 
 
 class TestStreamJoin(unittest.TestCase):
@@ -122,6 +127,83 @@ class TestProgramsAreLinkable(unittest.TestCase):
         for path in glob.glob(os.path.join(G.PROGRAMS, "*.c")):
             src = open(path).read()
             self.assertIn("printf", src, os.path.basename(path))
+
+
+class TestRevalidateDropsStaleRecords(unittest.TestCase):
+    """`--revalidate` must drop exactly the records that no longer describe
+    the compiler CE is serving, and keep everything else.
+
+    Offline: `live_semvers` is stubbed, so this needs no network and no rate
+    limit.  Every case here is silent when wrong -- a kept drifted record
+    publishes one compiler's numbers under another's name, and a dropped good
+    record only costs a re-fetch, so neither shows up in a sweep's output.
+    """
+
+    LIVE = {"cg162": "16.2", "cclang2310": "23.1.0", "cicxlatest": "(latest)"}
+
+    def setUp(self):
+        import tempfile
+        import time
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._saved_cache = GC.CACHE
+        GC.CACHE = Path(self._tmp.name)
+        self.addCleanup(lambda: setattr(GC, "CACHE", self._saved_cache))
+        self._saved_probe = G.live_semvers
+        G.live_semvers = lambda cids, timeout=60: dict(self.LIVE)
+        self.addCleanup(lambda: setattr(G, "live_semvers", self._saved_probe))
+        self.now = time.time()
+
+    def _put(self, cid, semver, age_days, ident):
+        """Store one record; `ident` is carried in `reason` so survivors are
+        identifiable without depending on the cache key."""
+        GC.store_json(GC.NS_ORACLE,
+                      {"id": cid, "ok": True, "asm_insns": 1, "reason": ident,
+                       "ce_semver": semver,
+                       "cached_at": self.now - age_days * 86400.0},
+                      cid, "-O2", ident, False)
+
+    def _survivors(self):
+        return {json.loads(path.read_text())["reason"]
+                for path, _key in GC.iter_records(GC.NS_ORACLE)}
+
+    def test_drift_age_and_provenance(self):
+        # pinned and still matching: kept, however old (a pinned channel that
+        # has not moved is exactly the case the cache exists for)
+        self._put("cg162", "16.2", 200, "pinned-current-old")
+        # pinned but CE re-pointed the id: dropped, age irrelevant
+        self._put("cg162", "15.1", 1, "pinned-drifted")
+        # moving channel, fresh: kept (no version to compare, under the limit)
+        self._put("cicxlatest", "(latest)", 3, "moving-fresh")
+        # moving channel, old: dropped (age is the only available evidence)
+        self._put("cicxlatest", "(latest)", 90, "moving-aged")
+        # written before provenance existed: dropped, origin unknown
+        GC.store_json(GC.NS_ORACLE, {"id": "cg162", "ok": True, "asm_insns": 1},
+                      "cg162", "-O2", "legacy-no-provenance", False)
+        # a compiler this run did not ask about: untouched
+        self._put("crv64gtrunk", "(trunk)", 400, "other-compiler")
+
+        dropped = G.revalidate({"cg162", "cicxlatest"}, 28.0)
+        self.assertEqual(dropped, 3)
+        self.assertEqual(self._survivors(),
+                         {"pinned-current-old", "moving-fresh", "other-compiler"})
+
+    def test_a_failed_probe_keeps_records(self):
+        """Not knowing the current version is a reason to KEEP, never to
+        delete: a dropped record costs a re-fetch against a hard rate limit,
+        and a probe failure says nothing about the record."""
+        G.live_semvers = lambda cids, timeout=60: {}
+        self._put("cg162", "16.2", 1, "pinned")
+        self._put("cicxlatest", "(latest)", 1, "moving")
+        self.assertEqual(G.revalidate({"cg162", "cicxlatest"}, 28.0), 0)
+        self.assertEqual(self._survivors(), {"pinned", "moving"})
+
+    def test_zero_max_age_drops_everything_unversioned(self):
+        """`--max-age-days 0` means "re-measure the moving channels now"."""
+        self._put("cicxlatest", "(latest)", 0.0, "moving")
+        self._put("cg162", "16.2", 0.0, "pinned")
+        self.assertEqual(G.revalidate({"cicxlatest", "cg162"}, 0.0), 1)
+        self.assertEqual(self._survivors(), {"pinned"})
 
 
 if __name__ == "__main__":

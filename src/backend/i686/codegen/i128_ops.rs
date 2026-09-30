@@ -535,11 +535,6 @@ impl I686Codegen {
             }
             IrBinOp::And | IrBinOp::Or | IrBinOp::Xor => {
                 self.emit_load_acc_pair(lhs);
-                let mn = match op {
-                    IrBinOp::And => "andl",
-                    IrBinOp::Or => "orl",
-                    _ => "xorl",
-                };
                 // Identity folding: x&0 / x|0 / x^0 = skip (zero-AND writes
                 // zero, so emit `xorl reg,reg` for the 2-byte form); x&-1 /
                 // x|-1 / x^-1 likewise reduce. A zero-extended VALUE RHS has

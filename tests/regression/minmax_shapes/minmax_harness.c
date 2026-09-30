@@ -7,13 +7,20 @@
 #define MAXN 4096
 static int a[MAXN];
 
-/* Kernels under test: `minmax_shapes/minmax_kernels.c`.  They are compiled
- * separately (by lccc AND by the oracle) so a miscompile can be localised to
- * the vectorized side instead of being masked by the harness's own codegen. */
+/* Kernels under test: `minmax_kernels.c`.  They are compiled separately (by
+ * lccc AND by the oracle) so a miscompile can be localised to the vectorized
+ * side instead of being masked by the harness's own codegen — which is also
+ * why this file is not directly compilable and lives outside the corpus glob.
+ * `tests/regression/minmax_reduction.c` is the corpus entry: it defines
+ * LCCC_MINMAX_KERNELS_INLINE and gets one self-contained TU instead. */
+#ifdef LCCC_MINMAX_KERNELS_INLINE
+#include "minmax_kernels.c"
+#else
 void mnmax_kernel(const int *a, int n, int *mn, int *mx, int *sum);
 void from1_kernel(const int *a, int n, int *mn, int *mx);
 void strict_kernel(const int *a, int n, int *mn, int *mx);
 void ge_kernel(const int *a, int n, int *mn, int *mx);
+#endif
 
 static unsigned long long rs = 88172645463325252ULL;
 static unsigned long long rnd(void) {

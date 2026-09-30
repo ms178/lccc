@@ -1067,6 +1067,20 @@ impl Lowerer {
                 .symver_directives
                 .push((func.name.clone(), sv.clone()));
         }
+        // A definition's own `aligned(...)` attribute.  Prototypes register
+        // theirs in `lower_global_decl`; a definition has no declarator list to
+        // walk, so it registers here instead.  The key is the EMITTED name (the
+        // asm label when one exists), because that is what the emitter looks the
+        // alignment up by -- using the C name would silently miss every function
+        // renamed by `__asm__("...")`.
+        if let Some(align) = func.alignment {
+            let slot = self
+                .module
+                .function_alignments
+                .entry(ir_func.name.clone())
+                .or_insert(align);
+            *slot = (*slot).max(align);
+        }
         self.module.functions.push(ir_func);
         self.pop_scope();
         self.func_state = None;

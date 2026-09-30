@@ -859,7 +859,6 @@ fn analyze_iv(
                         continue;
                     }
                     let cur_lhs = matches!(lhs, Operand::Value(v) if v.0 == cur.0);
-                    let cur_rhs = matches!(rhs, Operand::Value(v) if v.0 == cur.0);
                     let other = if cur_lhs { rhs } else { lhs };
 
                     // **Integer-closure invariant.** Every widening identity

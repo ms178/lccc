@@ -1107,7 +1107,7 @@ mod tests {
         let mut m = IrModule::new();
         m.globals.push(gs_global("out"));
         // A reader: the store is observable, everything stays.
-        let mut f = gs_writer(
+        let f = gs_writer(
             "w",
             vec![Instruction::Load {
                 dest: Value(2),

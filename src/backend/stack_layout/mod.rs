@@ -317,8 +317,8 @@ pub fn calculate_stack_space_common(
                         // addresses); marking those as vectors would switch their
                         // codegen from value-load to leaq addressing.
                         if state.vector_values.contains(&src_val.0) {
-                            let was_new = state.protected_slot_values.insert(dest.0);
-                            let was_vec = state.vector_values.insert(dest.0);
+                            state.protected_slot_values.insert(dest.0);
+                            state.vector_values.insert(dest.0);
                             if state.vector128_values.contains(&src_val.0) {
                                 state.vector128_values.insert(dest.0);
                             }

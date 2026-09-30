@@ -634,7 +634,7 @@ fn collect_values_and_allocas(
     value_ids.reserve(hint);
     seen.reserve(hint);
 
-    let mut add = |id: u32, seen: &mut FxHashSet<u32>, value_ids: &mut Vec<u32>| {
+    let add = |id: u32, seen: &mut FxHashSet<u32>, value_ids: &mut Vec<u32>| {
         if seen.insert(id) {
             value_ids.push(id);
         }

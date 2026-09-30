@@ -330,14 +330,6 @@ fn verify_dominance(
     real_preds: &[FxHashSet<BlockId>],
     out: &mut Vec<Violation>,
 ) {
-    let push = |out: &mut Vec<Violation>, detail: String| {
-        out.push(Violation {
-            stage: stage.to_string(),
-            function: func.name.clone(),
-            detail,
-        });
-    };
-
     // ---- def map (check 7) -------------------------------------------------
     // value id -> (block idx, instruction idx). A second definition of the
     // same value id is an SSA violation on its own: consumers index def
@@ -413,7 +405,7 @@ fn verify_dominance(
                 // home (recorded in `asm_home_slots`) is a pointer USE --
                 // the asm writes through it; a fresh output slot is the
                 // definition itself and no use at all.
-                let mut check_op = |out: &mut Vec<Violation>, op: &Operand, what: &str| {
+                let check_op = |out: &mut Vec<Violation>, op: &Operand, what: &str| {
                     let Operand::Value(v) = op else { return };
                     let site = format!(
                         "block #{} ({:?}) at instruction #{} ({})",
@@ -647,7 +639,7 @@ impl Dominance {
             .enumerate()
             .map(|(bi, block)| {
                 let mut list: Vec<usize> = Vec::new();
-                let mut add = |label: BlockId, list: &mut Vec<usize>| {
+                let add = |label: BlockId, list: &mut Vec<usize>| {
                     if let Some(&to) = label_to_idx.get(&label) {
                         if reachable[to] && !list.contains(&to) {
                             list.push(to);

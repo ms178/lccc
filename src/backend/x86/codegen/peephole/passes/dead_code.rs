@@ -533,7 +533,7 @@ fn sib_frame_read_range(
     let rp = line[lp..].find(')')? + lp;
     let inside = &line[lp + 1..rp];
     let mut fields = inside.split(',');
-    let _base = fields.next()?;
+    fields.next()?;
     let idx = fields.next()?.trim();
     let scale: i32 = match fields.next().map(str::trim) {
         None | Some("") => 1,
@@ -846,7 +846,7 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
         // Frame-pointer status: Form 1 establishes a frame pointer (so
         // `(%rbp)` is a genuine stack slot); Form 2 does not (so %rbp is a free
         // data register and `(%rbp)` is a pointer dereference, never a stack slot).
-        let mut rbp_is_frame;
+        let rbp_is_frame;
 
         if matches!(infos[i].kind, LineKind::Push { reg: 5 }) {
             rbp_is_frame = true;

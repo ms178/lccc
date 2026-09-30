@@ -814,7 +814,6 @@ fn parse_overlay(lx: &mut Lexer, out: &mut Vec<SectionsItem>) -> Result<(), Stri
     }
     let mut lma: Option<Expr> = None;
     loop {
-        let save = lx.save();
         match lx.next() {
             Tok::Punct("{") => break,
             Tok::Ident(k) if k == "AT" => {
@@ -1338,7 +1337,7 @@ fn parse_primary(lx: &mut Lexer) -> Result<Expr, String> {
                 expect(lx, "(")?;
                 let a = parse_expr(lx)?;
                 expect(lx, ",")?;
-                let _common = parse_expr(lx)?;
+                parse_expr(lx)?;
                 expect(lx, ")")?;
                 Ok(Expr::Align1(Box::new(a)))
             }

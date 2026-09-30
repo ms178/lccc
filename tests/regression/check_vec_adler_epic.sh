@@ -92,7 +92,7 @@ loop_body=$(awk '
     inloop {print}
     inloop && /jae|jb |jmp/ && NR>1 {count++; if (count>=1 && /jae|jb /) exit}
 ' "$td/do8fn.s")
-if echo "$loop_body" | grep -qE 'vmovdqu[[:space:]]+%ymm[0-9]+,[[:space:]]*[0-9]+\(%rsp\)'; then
+if echo "$loop_body" | grep -cE 'vmovdqu[[:space:]]+%ymm[0-9]+,[[:space:]]*[0-9]+\(%rsp\)' >/dev/null; then
     echo "FAIL: vec_adler_epic contract — YMM slot store inside the vector loop (homing bug)"
     exit 1
 fi

@@ -524,7 +524,6 @@ fn analyze_loop(
             if !seen.insert(bi) {
                 continue;
             }
-            let label = func.blocks[bi].label;
             let mut succs: Vec<BlockId> = match &func.blocks[bi].terminator {
                 Terminator::Branch(l) => vec![*l],
                 Terminator::CondBranch {
@@ -2304,7 +2303,7 @@ fn try_complete_unroll_general(
                 rename_inst_dest(&mut cloned, &plan.vmap);
                 apply_env_inst(&mut cloned, &plan.env);
                 if let Instruction::Phi { incoming, .. } = &mut cloned {
-                    for (op, lbl) in incoming.iter_mut() {
+                    for (_op, lbl) in incoming.iter_mut() {
                         if *lbl == header_label {
                             *lbl = plan.header_copy;
                         } else if let Some(&nl) = label_map.get(lbl) {
@@ -3596,7 +3595,7 @@ fn operand_has_pointer_origin(func: &IrFunction, op: &Operand) -> bool {
             .iter()
             .flat_map(|block| block.instructions.iter())
             .find(|inst| inst.dest() == Some(value));
-        let mut push = |stack: &mut Vec<Value>, operand: &Operand| {
+        let push = |stack: &mut Vec<Value>, operand: &Operand| {
             if let Operand::Value(v) = operand {
                 stack.push(*v);
             }
@@ -4166,7 +4165,7 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
             if dest.0 == c.iv_phi.0 {
                 continue;
             }
-            if let Some((op, lbl)) = incoming.iter().find(|(_, l)| *l == latch_label) {
+            if let Some((op, _lbl)) = incoming.iter().find(|(_, l)| *l == latch_label) {
                 if let Operand::Value(_) = op {
                     carried.push((dest.0, op.clone(), ty.clone()));
                 }
@@ -4518,7 +4517,7 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
         let mut existing: FxHashMap<u32, ()> = FxHashMap::default();
         for inst in &func.blocks[exit_idx].instructions {
             if let Instruction::Phi { incoming, .. } = inst {
-                if let Some((Operand::Value(v), lbl)) =
+                if let Some((Operand::Value(v), _lbl)) =
                     incoming.iter().find(|(_, l)| *l == header_label)
                 {
                     existing.insert(v.0, ());

@@ -62,13 +62,13 @@ fn_body() { # print one function's asm body (label .. next .size/label)
 }
 
 # 1: the hardirq_ptr value read must carry the %fs override.
-fn_body read_hardirq_ptr | grep -Eq '%fs:.*hardirq_ptr|%fs:[[:space:]]*hardirq_ptr'
+fn_body read_hardirq_ptr | grep -Ec '%fs:.*hardirq_ptr|%fs:[[:space:]]*hardirq_ptr' >/dev/null
 
 # 2: the constant deref must carry %fs (absolute-address load = the CI SIGSEGV).
-fn_body direct_cast | grep -Eq '%fs:'
+fn_body direct_cast | grep -Ec '%fs:' >/dev/null
 
 # 3: the plain global read must NOT carry any segment override.
-if fn_body read_plain | grep -q '%fs:'; then
+if fn_body read_plain | grep -c '%fs:' >/dev/null; then
     echo "FAIL: %fs override leaked onto an unqualified global read" >&2
     exit 1
 fi

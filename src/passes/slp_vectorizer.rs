@@ -1888,8 +1888,8 @@ fn collect_seed_candidates(ctx: &BlockCtx) -> Vec<SeedCandidate> {
         // offset (store overwritten by a later store to the same address)
         // ends the current run; the earlier store stays scalar.
         let mut run: Vec<(i64, usize, Operand, Value)> = Vec::new();
-        let mut flush = |run: &mut Vec<(i64, usize, Operand, Value)>,
-                         candidates: &mut Vec<SeedCandidate>| {
+        let flush = |run: &mut Vec<(i64, usize, Operand, Value)>,
+                     candidates: &mut Vec<SeedCandidate>| {
             if run.len() >= 2 {
                 let mut offs: Vec<i64> = run.iter().map(|(o, ..)| *o).collect();
                 offs.dedup();
@@ -2421,9 +2421,9 @@ fn build_demoted_select_arm(
 
     // An arm is built by whichever rule fits: a further promoted select
     // recurses here, anything else goes to the ordinary pack builder.
-    let mut arm = |side: &[Operand],
-                   packs: &mut Vec<Pack>,
-                   dedup: &mut FxHashMap<Vec<LaneKey>, usize>|
+    let arm = |side: &[Operand],
+               packs: &mut Vec<Pack>,
+               dedup: &mut FxHashMap<Vec<LaneKey>, usize>|
      -> Option<usize> {
         let all_selects = side.iter().all(|o| {
             matches!(o, Operand::Value(v)
@@ -5247,7 +5247,7 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
             let positions: Vec<usize> = p.lane_vals.iter().map(|v| ctx.def_pos[&v.0]).collect();
             let hi = *positions.iter().max().unwrap();
             let lane_addr = eval_sym_addr(block, &ctx.def_pos, ptrs[0]);
-            for (li, &v) in p.lane_vals.iter().enumerate() {
+            for (li, &_v) in p.lane_vals.iter().enumerate() {
                 let pk = positions[li];
                 let lane_off = offs[li];
                 for q in pk + 1..hi {

@@ -25,7 +25,7 @@ printf 'int g(int x){ int y = x + 3; while (y > 0) y--; return y; }\n' > "$tmp/s
 "$CCC" -ggdb0 -c -o "$tmp/ggdb0.o" "$tmp/spans.c"
 cmp "$tmp/plain.o" "$tmp/g0.o"
 cmp "$tmp/plain.o" "$tmp/ggdb0.o"
-if objdump -h "$tmp/g0.o" | grep -q '\.debug'; then
+if objdump -h "$tmp/g0.o" | grep -c '\.debug' >/dev/null; then
     echo "FAIL: -g0 produced debug sections" >&2; exit 1
 fi
 

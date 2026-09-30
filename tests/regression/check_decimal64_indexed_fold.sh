@@ -22,13 +22,13 @@ mkdir -p "$tmp"
 # Structural: scale-8 SIB movsd on the load side (optional PF-06 disp) ...
 if ! grep -qE 'movsd -?[0-9]*\(%r[a-z0-9]+, *%r[a-z0-9]+, *8\), %xmm' "$tmp/out.s"; then
     echo "FAIL: no scale-8 SIB movsd load in $tmp/out.s" >&2
-    grep -E 'movsd' "$tmp/out.s" >&2 | head -10
+    grep -E 'movsd' "$tmp/out.s" >&2 | sed -n '1,10p'
     exit 1
 fi
 # ... and on the store side (optional PF-06 displacement).
 if ! grep -qE 'movsd %xmm[0-9]+, +-?[0-9]*\(%r[a-z0-9]+, *%r[a-z0-9]+, *8\)' "$tmp/out.s"; then
     echo "FAIL: no scale-8 SIB movsd store in $tmp/out.s" >&2
-    grep -E 'movsd' "$tmp/out.s" >&2 | head -10
+    grep -E 'movsd' "$tmp/out.s" >&2 | sed -n '1,10p'
     exit 1
 fi
 
@@ -39,7 +39,7 @@ timeout 300 "$CCC" -O2 -o "$tmp/bin-lccc" "$dir/decimal64_indexed_fold.c"
 "$tmp/bin-lccc" > "$tmp/got.out"
 if ! cmp -s "$tmp/expect.out" "$tmp/got.out"; then
     echo "FAIL: D64 indexed-fold stdout differs from gcc" >&2
-    diff "$tmp/expect.out" "$tmp/got.out" >&2 | head -10
+    diff "$tmp/expect.out" "$tmp/got.out" >&2 | sed -n '1,10p'
     exit 1
 fi
 echo "PASS: D64 indexed fold (SIB movsd load+store, sums agree with gcc)"

@@ -238,7 +238,7 @@ for m in "" -m32; do
         # __x86.get_pc_thunk.* copies: the pruning reports what it dropped.
         gceh=$(LCCC_DEBUG_GCEH=1 "$CCC" $m "$tmp/caller.o" "$tmp/callee.o" \
             -o "$tmp/mix-lld-gceh" -lpthread 2>&1 >/dev/null | grep '^\[gceh\]' || true)
-        dropped=$(sed -n 's/.*dropped_fdes=\([0-9]*\).*/\1/p' <<<"$gceh" | head -1)
+        dropped=$(sed -n 's/.*dropped_fdes=\([0-9]*\).*/\1/p' <<<"$gceh" | sed -n '1,1p')
         [[ "${dropped:-0}" -ge 1 ]] ||
             { echo "FAIL ($tag): i686 COMDAT FDE pruning not observed: '${gceh:-no [gceh] line}'" >&2; exit 1; }
     fi

@@ -203,16 +203,11 @@ pub(super) fn emit_executable(
         }
         (f, f1)
     };
-    let mut t_zone = std::time::Instant::now();
+    let mut t_zone = crate::backend::linker_common::lap_timer::LapTimer::new();
     macro_rules! zone {
         ($name:expr_2021) => {
             if ld_time {
-                eprintln!(
-                    "[ldtime]   emit/{:<18} {:>7.1} ms",
-                    $name,
-                    t_zone.elapsed().as_secs_f64() * 1e3
-                );
-                t_zone = std::time::Instant::now();
+                eprintln!("[ldtime]   emit/{:<18} {:>7.1} ms", $name, t_zone.lap_ms());
             }
         };
     }
@@ -1544,7 +1539,7 @@ pub(super) fn emit_executable(
     // builders below (rather than building and discarding) means a stripped
     // link also skips the sort and the string-table construction.
     let emit_symtab = !strip_all;
-    let symtab_shidx;
+    let _symtab_shidx;
     let strtab_shidx;
     let dynsym_shidx: u32;
     let dynstr_shidx: u32;
@@ -1599,9 +1594,9 @@ pub(super) fn emit_executable(
         linker_hdr_count = h as u16;
 
         // Output sections, in four ordered groups.
-        let mut assign = |pred: &dyn Fn(&OutputSection) -> bool,
-                          h: &mut usize,
-                          map: &mut FxHashMap<usize, u16>| {
+        let assign = |pred: &dyn Fn(&OutputSection) -> bool,
+                      h: &mut usize,
+                      map: &mut FxHashMap<usize, u16>| {
             for (i, sec) in output_sections.iter().enumerate() {
                 if pred(sec) {
                     map.insert(i, *h as u16);
@@ -1678,11 +1673,14 @@ pub(super) fn emit_executable(
         }
 
         // .symtab and .strtab follow, then .shstrtab.
-        symtab_shidx = if emit_symtab { h as u16 } else { 0 };
+        // Bound as `_symtab_shidx`: the .symtab section index is computed here
+        // only to keep `h` (the running section-header count) consistent with
+        // the layout bfd emits -- nothing downstream reads it back, because a
+        // stripped link writes no symtab header at all.  The leading underscore
+        // is the point: with `unused_variables` enabled crate-wide this reads as
+        // "deliberately unread", not as a dropped use.
+        _symtab_shidx = if emit_symtab { h as u16 } else { 0 };
         strtab_shidx = if emit_symtab { h as u16 + 1 } else { 0 };
-        if emit_symtab {
-            h += 2;
-        }
     }
 
     // ELF requires every STB_LOCAL entry before the first global entry.
@@ -1736,7 +1734,7 @@ pub(super) fn emit_executable(
         ));
     }
 
-    let mut sym_names: Vec<(&String, &GlobalSymbol)> = globals
+    let sym_names: Vec<(&String, &GlobalSymbol)> = globals
         .iter()
         .filter(|(_, g)| {
             emit_symtab
@@ -2031,10 +2029,10 @@ pub(super) fn emit_executable(
     {
         let mut run_start: Option<(u64, u64, u64)> = None; // (file_off, addr, align)
         let mut run_end: Option<(u64, u64)> = None; // (file_end, addr_end)
-        let mut flush = |run: Option<(u64, u64, u64)>,
-                         end: Option<(u64, u64)>,
-                         out: &mut Vec<u8>,
-                         ph: &mut usize| {
+        let flush = |run: Option<(u64, u64, u64)>,
+                     end: Option<(u64, u64)>,
+                     out: &mut Vec<u8>,
+                     ph: &mut usize| {
             if let (Some((fo, va, al)), Some((fe, ae))) = (run, end) {
                 wphdr(out, *ph, PT_NOTE, PF_R, fo, va, fe - fo, ae - va, al);
                 *ph += 56;

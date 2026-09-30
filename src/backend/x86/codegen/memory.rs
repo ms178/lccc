@@ -271,9 +271,18 @@ impl X86Codegen {
     /// - scale is 1, 2, 4, or 8
     ///
     /// Emits: `mov %src, (%base_reg,%index_reg,scale)`
-    fn try_emit_phase9_indexed_store(&mut self, val: &Operand, ptr: &Value, ty: IrType) -> bool {
+    // Phase 9 is DISABLED: the body below the early `return false` is kept as
+    // executable documentation of the SIB-addressing decomposition we intend to
+    // restore.  It still type-checks, so the decomposition cannot silently rot
+    // while the pass is off -- and because the dead body keeps referencing the
+    // parameters, no `#[allow(unused_variables)]` is needed here.  That matters:
+    // the lint is enabled crate-wide (see `src/lib.rs`) precisely because a
+    // silently dead safety binding is how PR #681's volatile miscompile hid, and
+    // a function-wide allow would mask a genuinely dead binding added to the
+    // live prologue above the `return false`.
+    fn try_emit_phase9_indexed_store(&mut self, _val: &Operand, _ptr: &Value, _ty: IrType) -> bool {
         // Phase 9 decomposes a variable-offset GEP into SIB addressing:
-        //   Store val, (GEP base, Mul(idx, scale))  →  movl %eax, (%base, %idx, scale)
+        //   Store _val, (GEP base, Mul(idx, scale))  →  movl %eax, (%base, %idx, scale)
         // However, variable-offset GEPs are always emitted as `leaq` instructions
         // (they are NOT in gep_fold_map, which only handles constant offsets).
         // By the time the Store is emitted, the GEP's source registers (base, idx)
@@ -281,8 +290,8 @@ impl X86Codegen {
         // The GEP result is already computed in a register/slot, so use it directly.
         return false;
 
-        // Check if ptr is defined by a GEP instruction
-        let gep_inst = match self.get_defining_instruction(ptr.0) {
+        // Check if _ptr is defined by a GEP instruction
+        let gep_inst = match self.get_defining_instruction(_ptr.0) {
             Some(inst) => inst,
             None => return false,
         };
@@ -357,7 +366,7 @@ impl X86Codegen {
         // register. This happens when the store value's register overlaps with
         // the base/index, or when operand_to_rax needs to use the register for
         // intermediate computations. If so, fall back to non-indexed store.
-        if let Operand::Value(v) = val {
+        if let Operand::Value(v) = _val {
             if let Some(val_reg) = self.fresh_home_of(v.0) {
                 let val_name = phys_reg_name(val_reg);
                 if val_name == base_reg || val_name == index_reg {
@@ -368,16 +377,16 @@ impl X86Codegen {
 
         // Load the value to be stored into the accumulator/xmm register.
         // FP constants load directly from the rodata constant pool into xmm0.
-        let fp_const = matches!(val, Operand::Const(IrConst::F64(_) | IrConst::F32(_)))
-            && matches!(ty, IrType::F64 | IrType::F32);
+        let fp_const = matches!(_val, Operand::Const(IrConst::F64(_) | IrConst::F32(_)))
+            && matches!(_ty, IrType::F64 | IrType::F32);
         if fp_const {
-            self.emit_fp_operand_to_xmm(val, ty, "xmm0");
+            self.emit_fp_operand_to_xmm(_val, _ty, "xmm0");
         } else {
-            self.operand_to_rax(val);
+            self.operand_to_rax(_val);
         }
 
         // Determine store instruction and source register based on type
-        let (store_instr, src_reg) = match ty {
+        let (store_instr, src_reg) = match _ty {
             IrType::F64 => {
                 if !fp_const {
                     // Convert from rax to xmm0
@@ -508,13 +517,22 @@ impl X86Codegen {
     /// - scale is 1, 2, 4, or 8
     ///
     /// Emits: `mov (%base_reg,%index_reg,scale), %dest`
-    fn try_emit_phase9_indexed_load(&mut self, dest: &Value, ptr: &Value, ty: IrType) -> bool {
+    // Phase 9 is DISABLED: the body below the early `return false` is kept as
+    // executable documentation of the SIB-addressing decomposition we intend to
+    // restore.  It still type-checks, so the decomposition cannot silently rot
+    // while the pass is off -- and because the dead body keeps referencing the
+    // parameters, no `#[allow(unused_variables)]` is needed here.  That matters:
+    // the lint is enabled crate-wide (see `src/lib.rs`) precisely because a
+    // silently dead safety binding is how PR #681's volatile miscompile hid, and
+    // a function-wide allow would mask a genuinely dead binding added to the
+    // live prologue above the `return false`.
+    fn try_emit_phase9_indexed_load(&mut self, _dest: &Value, _ptr: &Value, _ty: IrType) -> bool {
         // Disabled: same issue as try_emit_phase9_indexed_store — variable-offset
         // GEPs are already emitted, so base/index registers may be stale.
         return false;
 
-        // Check if ptr is defined by a GEP instruction
-        let gep_inst = match self.get_defining_instruction(ptr.0) {
+        // Check if _ptr is defined by a GEP instruction
+        let gep_inst = match self.get_defining_instruction(_ptr.0) {
             Some(inst) => inst,
             None => return false,
         };
@@ -577,7 +595,7 @@ impl X86Codegen {
         };
 
         // Determine load instruction and destination register based on type
-        let (load_instr, dest_reg) = match ty {
+        let (load_instr, dest_reg) = match _ty {
             IrType::F64 => ("movsd", "%xmm0"),
             IrType::F32 => ("movss", "%xmm0"),
             IrType::I64 | IrType::U64 => ("movq", "%rax"),
@@ -587,27 +605,27 @@ impl X86Codegen {
             _ => return false, // Unsupported type for indexed addressing
         };
 
-        // Emit indexed load: movX (%base,%index,scale), %dest
+        // Emit indexed load: movX (%base,%index,scale), %_dest
         self.state.emit_fmt(format_args!(
             "    {} (%{},%{},{}), {}",
             load_instr, base_reg, index_reg, scale, dest_reg
         ));
 
         // Update register cache - for FP types, value is in xmm0, for integers in rax
-        match ty {
+        match _ty {
             IrType::F64 | IrType::F32 | IrType::D64 | IrType::D32 => {
                 // For floating point, the value is in xmm0, not rax
                 // We need to move it to rax for the common code path
-                if matches!(ty, IrType::F64 | IrType::D64) {
+                if matches!(_ty, IrType::F64 | IrType::D64) {
                     self.state.emit("    movq %xmm0, %rax");
                 } else {
                     self.state.emit("    movd %xmm0, %eax");
                 }
-                self.state.park_acc(dest.0, false);
+                self.state.park_acc(_dest.0, false);
             }
             _ => {
                 // Integer types are already in rax
-                self.state.park_acc(dest.0, false);
+                self.state.park_acc(_dest.0, false);
             }
         }
 

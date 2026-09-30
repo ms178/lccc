@@ -5383,7 +5383,7 @@ impl X86Codegen {
                 let in_half = lane & 3;
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
-                let mut finish = |this: &mut Self| {
+                let finish = |this: &mut Self| {
                     if this.isa.sse41 {
                         this.state
                             .emit_fmt(format_args!("    pextrd ${}, %xmm1, %eax", in_half));
@@ -7791,11 +7791,11 @@ impl X86Codegen {
                 this.state.vector_dying_values.contains(&v.0)
                     && this.state.vec_live_regs.get(&v.0).copied() == Some(name)
             };
-            let mut emit_2xx = |this: &mut Self,
-                                form: &'static str,
-                                src2: String,
-                                dst: &'static str,
-                                consumed_pending: bool| {
+            let emit_2xx = |this: &mut Self,
+                            form: &'static str,
+                            src2: String,
+                            dst: &'static str,
+                            consumed_pending: bool| {
                 if consumed_pending {
                     // The held operand's store never fires: its only use
                     // is this instruction (the VDEFER single-use window).
@@ -10322,7 +10322,7 @@ impl X86Codegen {
         let m0 = mem_of(self, &args[0]);
         let m1 = mem_of(self, &args[1]);
         match (m0, m1) {
-            (Some(m0), Some(m1)) => {
+            (Some(_m0), Some(m1)) => {
                 self.avx_load_arg(&args[0]);
                 self.state
                     .emit_fmt(format_args!("    {} {}, %ymm0, %ymm0", avx_inst, m1));

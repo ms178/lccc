@@ -153,7 +153,7 @@ got_order=$(printf '%s\n' "$rows" | lccc_rank_size_rows | awk '{print $1}')
 expect_eq "rows come out largest-delta-first (ties keep input order)" \
           "$got_order" "$want_order"
 expect_eq "the signed delta column survives the ranking unchanged" \
-          "$(printf '%s\n' "$rows" | lccc_rank_size_rows | head -1 | awk '{print $4}')" "+1598"
+          "$(printf '%s\n' "$rows" | lccc_rank_size_rows | sed -n '1,1p' | awk '{print $4}')" "+1598"
 
 # The reverted pipeline must produce something DIFFERENT, otherwise this test
 # would pass with the bug back in place.  `sort -k4 -n -r` reads every "+N" as 0.
@@ -162,7 +162,7 @@ if [[ $buggy_order == "$got_order" ]]; then
     say_fail "the buggy pipeline reproduced the fixed order; this test cannot catch a revert"
 else
     printf 'ok   the reverted pipeline is detectably wrong (its top row: %s)\n' \
-           "$(printf '%s\n' "$buggy_order" | head -1)"
+           "$(printf '%s\n' "$buggy_order" | sed -n '1,1p')"
 fi
 
 # Row count and content must survive: ranking reorders, it never drops or edits.

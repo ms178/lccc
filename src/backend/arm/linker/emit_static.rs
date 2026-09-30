@@ -118,7 +118,6 @@ pub(super) fn emit_executable(
     }
 
     let rx_filesz = offset; // RX segment: [0, rx_filesz)
-    let _rx_memsz = rx_filesz;
 
     // Pre-count IFUNC symbols so we can reserve space for IPLT stubs in the RX gap.
     // Each IPLT stub is 16 bytes (ADRP + LDR + BR + NOP), placed in the gap between

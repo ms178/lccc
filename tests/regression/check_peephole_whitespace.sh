@@ -99,11 +99,11 @@ if want_phase 1 "$ONLY_PHASE"; then
     note "== phase 1: in-tree corpus, seven paddings"
     out=$(cargo_test peephole_output_is_invariant_to_trailing_whitespace 2>&1)
     if grep -q "test result: ok" <<<"$out"; then
-        runs=$(grep -oE "[0-9]+ passed" <<<"$out" | head -1)
+        runs=$(grep -oE "[0-9]+ passed" <<<"$out" | sed -n '1,1p')
         ok "peephole output is invariant to trailing whitespace ($runs)"
     else
         bad "peephole output is NOT whitespace-invariant"
-        grep -E "every failure:|^  [a-z]|PANIC|first difference" <<<"$out" | head -30 >&2
+        grep -E "every failure:|^  [a-z]|PANIC|first difference" <<<"$out" | sed -n '1,30p' >&2
     fi
 fi
 
@@ -120,7 +120,7 @@ if want_phase 2 "$ONLY_PHASE"; then
         ok "the pipeline never panics on any operand spelling (exhaustive matrix)"
     else
         bad "the pipeline panics on some operand spelling"
-        grep -E "PANIC|on input:|panicked" <<<"$out" | head -20 >&2
+        grep -E "PANIC|on input:|panicked" <<<"$out" | sed -n '1,20p' >&2
     fi
 fi
 
@@ -168,7 +168,7 @@ if want_phase 3 "$ONLY_PHASE"; then
                 ok "whitespace invariance holds over $generated freshly generated assembly files"
             else
                 bad "whitespace invariance FAILS on freshly generated assembly"
-                grep -E "every failure:|^  [a-z]|PANIC|first difference" <<<"$out" | head -30 >&2
+                grep -E "every failure:|^  [a-z]|PANIC|first difference" <<<"$out" | sed -n '1,30p' >&2
             fi
         fi
     fi
@@ -222,10 +222,10 @@ if want_phase 4 "$ONLY_PHASE"; then
                 bad "assembling $name with padding from $variant produced different code"
                 if command -v objdump >/dev/null 2>&1; then
                     diff <(objdump -d "$a/${name%.s}.o" 2>/dev/null) \
-                         <(objdump -d "$variant/${name%.s}.o" 2>/dev/null) | head -20 >&2
+                         <(objdump -d "$variant/${name%.s}.o" 2>/dev/null) | sed -n '1,20p' >&2
                 fi
             done
-        done < <(find "$corpus_dir" -maxdepth 1 -name '*.s' | LC_ALL=C sort | head -14)
+        done < <(find "$corpus_dir" -maxdepth 1 -name '*.s' | LC_ALL=C sort | sed -n '1,14p')
         note "   compared $compared padded/unpadded object pairs ($skipped sources did not assemble)"
         if (( differ == 0 )); then
             if (( compared < 10 )); then

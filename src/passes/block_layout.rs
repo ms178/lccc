@@ -643,12 +643,12 @@ pub(crate) fn relayout_blocks_static_chain(func: &mut IrFunction) -> usize {
         .filter(|b| reachable.contains(b))
         .map(|b| head_key(b, &placed_pred, &last_pred_pos))
         .collect();
-    let mut place = |b: usize,
-                     is_placed: &mut Vec<bool>,
-                     placed_pred: &mut Vec<usize>,
-                     last_pred_pos: &mut Vec<usize>,
-                     placed: &mut Vec<usize>,
-                     heads: &mut std::collections::BinaryHeap<HeadKey>| {
+    let place = |b: usize,
+                 is_placed: &mut Vec<bool>,
+                 placed_pred: &mut Vec<usize>,
+                 last_pred_pos: &mut Vec<usize>,
+                 placed: &mut Vec<usize>,
+                 heads: &mut std::collections::BinaryHeap<HeadKey>| {
         let pos = placed.len();
         is_placed[b] = true;
         placed.push(b);

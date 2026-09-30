@@ -1053,7 +1053,7 @@ pub fn emit_shared_library(
     section_headers.push(("".into(), 0, 0, 0, 0, 0, 0, 0, 0, 0));
 
     // .gnu.hash
-    let _sh_name = add_shstrtab_name(".gnu.hash", &mut shstrtab_data);
+    add_shstrtab_name(".gnu.hash", &mut shstrtab_data);
     section_headers.push((
         ".gnu.hash".into(),
         0x6ffffff6,
@@ -1068,7 +1068,7 @@ pub fn emit_shared_library(
     ));
 
     // .dynsym
-    let _sh_name = add_shstrtab_name(".dynsym", &mut shstrtab_data);
+    add_shstrtab_name(".dynsym", &mut shstrtab_data);
     section_headers.push((
         ".dynsym".into(),
         SHT_DYNSYM,
@@ -1083,7 +1083,7 @@ pub fn emit_shared_library(
     ));
 
     // .dynstr
-    let _sh_name = add_shstrtab_name(".dynstr", &mut shstrtab_data);
+    add_shstrtab_name(".dynstr", &mut shstrtab_data);
     section_headers.push((
         ".dynstr".into(),
         SHT_STRTAB,
@@ -1109,7 +1109,7 @@ pub fn emit_shared_library(
         if ms.sh_flags & SHF_ALLOC == 0 && ms.sh_type != SHT_RISCV_ATTRIBUTES {
             continue;
         }
-        let _sh_name = add_shstrtab_name(&ms.name, &mut shstrtab_data);
+        add_shstrtab_name(&ms.name, &mut shstrtab_data);
         let sh_offset = if ms.sh_type == SHT_NOBITS {
             0
         } else {
@@ -1131,7 +1131,7 @@ pub fn emit_shared_library(
     }
 
     // .rela.dyn
-    let _sh_name = add_shstrtab_name(".rela.dyn", &mut shstrtab_data);
+    add_shstrtab_name(".rela.dyn", &mut shstrtab_data);
     section_headers.push((
         ".rela.dyn".into(),
         SHT_RELA,
@@ -1146,7 +1146,7 @@ pub fn emit_shared_library(
     ));
 
     // .dynamic
-    let _sh_name = add_shstrtab_name(".dynamic", &mut shstrtab_data);
+    add_shstrtab_name(".dynamic", &mut shstrtab_data);
     section_headers.push((
         ".dynamic".into(),
         SHT_DYNAMIC,
@@ -1162,7 +1162,7 @@ pub fn emit_shared_library(
 
     // .got
     if got_size > 0 {
-        let _sh_name = add_shstrtab_name(".got", &mut shstrtab_data);
+        add_shstrtab_name(".got", &mut shstrtab_data);
         section_headers.push((
             ".got".into(),
             SHT_PROGBITS,
@@ -1179,7 +1179,7 @@ pub fn emit_shared_library(
 
     // .got.plt
     if got_plt_size > 0 {
-        let _sh_name = add_shstrtab_name(".got.plt", &mut shstrtab_data);
+        add_shstrtab_name(".got.plt", &mut shstrtab_data);
         section_headers.push((
             ".got.plt".into(),
             SHT_PROGBITS,
@@ -1196,7 +1196,7 @@ pub fn emit_shared_library(
 
     // .plt
     if plt_size > 0 {
-        let _sh_name = add_shstrtab_name(".plt", &mut shstrtab_data);
+        add_shstrtab_name(".plt", &mut shstrtab_data);
         section_headers.push((
             ".plt".into(),
             SHT_PROGBITS,
@@ -1213,7 +1213,7 @@ pub fn emit_shared_library(
 
     // .rela.plt
     if rela_plt_size > 0 {
-        let _sh_name = add_shstrtab_name(".rela.plt", &mut shstrtab_data);
+        add_shstrtab_name(".rela.plt", &mut shstrtab_data);
         section_headers.push((
             ".rela.plt".into(),
             SHT_RELA,
@@ -1235,7 +1235,7 @@ pub fn emit_shared_library(
         .iter()
         .find(|ms| ms.name == ".riscv.attributes")
     {
-        let _sh_name = add_shstrtab_name(".riscv.attributes", &mut shstrtab_data);
+        add_shstrtab_name(".riscv.attributes", &mut shstrtab_data);
         attr_file_offset = elf.len() as u64;
         attr_size = ms.data.len() as u64;
         elf.extend_from_slice(&ms.data);
@@ -1254,7 +1254,7 @@ pub fn emit_shared_library(
     }
 
     // .shstrtab
-    let _shstrtab_name_off = add_shstrtab_name(".shstrtab", &mut shstrtab_data);
+    add_shstrtab_name(".shstrtab", &mut shstrtab_data);
     let shstrtab_idx = section_headers.len();
     let shstrtab_file_offset = elf.len() as u64;
     elf.extend_from_slice(&shstrtab_data);

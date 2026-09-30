@@ -445,8 +445,36 @@ impl Parser {
         outer_pointers
     }
 
-    /// Parse a function parameter list: (params...) or (void) or ()
+    /// Parse a function parameter list: (params...) or (void) or ().
+    ///
+    /// The alignment pending when a parameter list begins belongs to the
+    /// ENCLOSING declaration, not to the parameters.  For
+    /// `__attribute__((aligned(64))) void f(int x)` the specifier-level
+    /// alignment is already in `parsed_alignas` when the `(` is reached, and the
+    /// per-parameter capture inside the list merges into that slot and takes it,
+    /// so the function silently lost its own alignment -- for every NON-EMPTY
+    /// parameter list, while `f(void)` and `f()` kept it.  Measured against GCC
+    /// 14, which honours the attribute in both spellings: the earlier version of
+    /// this file honoured it only for parameterless functions, in both the
+    /// definition channel and the prototype channel (the prototype channel has
+    /// the same take, so a declaration `aligned(64) void f(int x);` registered
+    /// nothing).  Hold the value aside for the duration of the list instead: the
+    /// per-parameter take then only ever sees a parameter's OWN attributes,
+    /// which is also what removes the leak into the next parameter that the take
+    /// exists to prevent.
     pub(super) fn parse_param_list(&mut self) -> (Vec<ParamDecl>, bool) {
+        let decl_alignas = self.attrs.parsed_alignas.take();
+        let decl_alignas_type = self.attrs.parsed_alignas_type.take();
+        let result = self.parse_param_list_inner();
+        // Single restore point, deliberately: every exit from the list --
+        // including the K&R identifier-list path -- goes through here, so no
+        // early return can drop an enclosing declaration's alignment.
+        self.attrs.parsed_alignas = decl_alignas;
+        self.attrs.parsed_alignas_type = decl_alignas_type;
+        result
+    }
+
+    fn parse_param_list_inner(&mut self) -> (Vec<ParamDecl>, bool) {
         let open = self.peek_span();
         self.expect_context(&TokenKind::LParen, "for parameter list");
         let mut params = Vec::with_capacity(8);

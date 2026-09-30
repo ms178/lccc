@@ -4704,7 +4704,7 @@ mod regression_tests {
         ]
         .join("\n")
             + "\n";
-        let mut store = LineStore::new(asm.clone());
+        let store = LineStore::new(asm.clone());
         let mut infos: Vec<LineInfo> = (0..store.len())
             .map(|i| classify_line(store.get(i)))
             .collect();

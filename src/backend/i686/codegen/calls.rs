@@ -330,7 +330,7 @@ impl I686Codegen {
             }
         }
         items.sort_by(|a, b| b.0.cmp(&a.0));
-        for &(base, arg_i) in &items {
+        for &(_base, arg_i) in &items {
             match &arg_classes[arg_i] {
                 call_abi::CallArgClass::IntReg { reg_idx } => {
                     let dest_reg = regparm_regs[*reg_idx];

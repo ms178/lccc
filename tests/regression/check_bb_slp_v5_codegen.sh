@@ -56,7 +56,7 @@ fail=0
 expect() {  # expect <desc> <func> <grep-args...>
     local desc=$1 fn=$2
     shift 2
-    if ! scoped "$fn" | grep -qE "$@"; then
+    if ! scoped "$fn" | grep -cE "$@" >/dev/null; then
         echo "FAIL: $desc ($fn: missing '$*')"
         fail=1
     fi
@@ -64,7 +64,7 @@ expect() {  # expect <desc> <func> <grep-args...>
 refuse() {  # refuse <desc> <func> <grep-args...>
     local desc=$1 fn=$2
     shift 2
-    if scoped "$fn" | grep -qE "$@"; then
+    if scoped "$fn" | grep -cE "$@" >/dev/null; then
         echo "FAIL: $desc ($fn: unexpected '$*')"
         fail=1
     fi
@@ -98,11 +98,11 @@ rot_one_load() {  # rot_one_load <func> <shl-imm> <shr-imm>
         echo "FAIL: rotate shared-operand ($fn: $n_vec input-pointer loads (want 1), $n_shl shl)"
         fail=1
     fi
-    if ! scoped "$fn" | grep -qE "vpsrld [$]${shr_imm}|vpsrlq [$]${shr_imm}"; then
+    if ! scoped "$fn" | grep -cE "vpsrld [$]${shr_imm}|vpsrlq [$]${shr_imm}" >/dev/null; then
         echo "FAIL: rotate complementary shr ($fn)"
         fail=1
     fi
-    if ! scoped "$fn" | grep -qE 'vpor|por '; then
+    if ! scoped "$fn" | grep -cE 'vpor|por ' >/dev/null; then
         echo "FAIL: rotate or ($fn)"
         fail=1
     fi

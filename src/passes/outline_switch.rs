@@ -1413,7 +1413,7 @@ fn replace_case_with_call(
     outlined_name: &str,
     end_block: BlockId,
     block_map: &FxHashMap<BlockId, usize>,
-    global_max_block_id: &mut u32,
+    _global_max_block_id: &mut u32,
 ) {
     // Find the entry block index.
     let entry_idx = match block_map.get(&case.entry_block) {

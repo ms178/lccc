@@ -177,7 +177,7 @@ if "$ORACLE" "${FLAGS[@]}" -o "$work/staging.oracle" "$work/staging.c" -lm 2>/de
         fi
         "$work/staging.lccc" > "$work/stg.lccc" 2>&1
         if ! diff -q "$work/stg.lccc" "$work/stg.oracle" >/dev/null; then
-            stg_ok=0; bad "staging output differs from $ORACLE at $cf:"; diff "$work/stg.lccc" "$work/stg.oracle" | head -8 | note
+            stg_ok=0; bad "staging output differs from $ORACLE at $cf:"; diff "$work/stg.lccc" "$work/stg.oracle" | sed -n '1,8p' | note
         fi
     done
     if [[ "$stg_ok" -eq 1 ]]; then

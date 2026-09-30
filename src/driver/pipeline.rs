@@ -949,7 +949,7 @@ impl Driver {
             if let Err(error_count) = sema.analyze(&ast) {
                 return Err(format!("{} error(s) during semantic analysis", error_count));
             }
-            let mut diagnostics = sema.take_diagnostics();
+            let diagnostics = sema.take_diagnostics();
             // -Werror promotion applies to the syntax check too: a TU whose
             // warnings are promoted to errors must fail -fsyntax-only.
             if diagnostics.has_errors() {
