@@ -45,6 +45,61 @@ pub(super) enum FlagsEffect {
     Reads,
 }
 
+/// Bits for the arithmetic flags a rewrite can be observed through.
+pub(super) const F_ZF: u8 = 1 << 0;
+pub(super) const F_CF: u8 = 1 << 1;
+pub(super) const F_SF: u8 = 1 << 2;
+pub(super) const F_OF: u8 = 1 << 3;
+pub(super) const F_PF: u8 = 1 << 4;
+pub(super) const F_AF: u8 = 1 << 5;
+/// Every arithmetic flag.  The default for anything not listed below: a mask
+/// narrower than the truth is a miscompile, a mask wider than the truth only
+/// costs a missed fold.
+pub(super) const F_ALL: u8 = F_ZF | F_CF | F_SF | F_OF | F_PF | F_AF;
+
+/// The flags a writer instruction can clobber, as a bitmask.
+///
+/// [`walk_flag_consumers`] used to treat every `FlagsEffect::Writes` as a
+/// total clobber.  That is sound but far too coarse for a rewrite that
+/// PROVES it preserves ZF and CF, because two very common flag setters write
+/// only CF:
+///
+/// ```asm
+///     cmpl  %r9d, %r8d
+///     jb    .Lkeep        ; an allowed ZF/CF consumer; pushes .Lkeep
+///     addl  $1, %eax      ; a real clobber, on the fall-through only
+/// .Lkeep:
+///     stc                 ; writes CF -- and ONLY CF
+///     jo    .Loverflow    ; reads OF, which `stc` left intact
+/// ```
+///
+/// Stopping at `stc` hides `jo` from the walk, and `jo` observes exactly the
+/// OF that a narrowing `cmp` changes.  So the fold was admitted on a path
+/// where it is observable.  This function lets such a writer be stepped over
+/// without pretending it clobbered everything.
+///
+/// Only three families are narrowed, and each is a direct SDM statement:
+/// `stc`/`clc`/`cmc` define CF alone; `sahf` loads SF/ZF/AF/PF/CF from AH and
+/// explicitly leaves OF alone; `cld`/`std` touch DF, which is not one of the
+/// six arithmetic flags.  Everything else -- including `shld`/`shrd`/`bt*`,
+/// which do write OF and AF, and every unrecognised mnemonic -- returns
+/// [`F_ALL`], so no existing call can become less conservative than before.
+pub(super) fn flags_written_mask(t: &str) -> u8 {
+    let base = t.strip_prefix('v').unwrap_or(t);
+    let mnem = base
+        .split(|c: char| c == ' ' || c == '\t')
+        .next()
+        .unwrap_or(base);
+    match mnem {
+        "stc" | "clc" | "cmc" => F_CF,
+        // SDM: "LAHF/SAHF ... The OF flag is not affected."
+        "sahf" => F_SF | F_ZF | F_PF | F_AF | F_CF,
+        // Direction flag only; none of the six arithmetic flags change.
+        "cld" | "std" => 0,
+        _ => F_ALL,
+    }
+}
+
 /// Mnemonic prefixes that never touch EFLAGS.
 const FLAG_NEUTRAL_PREFIXES: &[&str] = &[
     "movl ",
@@ -1546,6 +1601,17 @@ fn flags_are_block_local(
 /// (`b`/`ae`/`a`/`be`), the CF predicates, `o`/`no` and `p`/`np` do not.
 const SF_CCS: &[&str] = &["s", "ns", "l", "nl", "le", "nle", "g", "ng", "ge", "nge"];
 
+/// Condition codes that select on ZF and CF alone, with every other flag
+/// masked out: `e/z/ne/nz` (ZF), `b/c/nae` (CF), `nb/nc/ae` (!CF) and
+/// `be/na` (CF|ZF), `a/nbe` (!CF|!ZF).  The SF/OF group (`s`, `l`, `le`, `g`,
+/// `ge` and their `n` forms) is deliberately absent, as is every
+/// whole-word/unknown reader.  A rewrite that changes SF, PF, OF or AF -- such
+/// as narrowing a `cmp` to its operands' common width -- may only proceed
+/// while [`flag_consumers_are_zf_cf_only`] holds.
+const ZF_CF_ONLY_CCS: &[&str] = &[
+    "e", "z", "ne", "nz", "b", "c", "nae", "nb", "nc", "ae", "be", "na", "a", "nbe",
+];
+
 /// Flag readers that provably do NOT read SF, so a rewrite whose only flag
 /// divergence is SF cannot be observed through them: the CF-carry group
 /// (`adc`/`sbb` and the two rotates that take CF as carry-in, `cmc`, `salc`,
@@ -1591,6 +1657,13 @@ struct ConsumerFacts {
     saw_consumer: bool,
     /// A consumer that reads something other than ZF was reached.
     saw_non_zf: bool,
+    /// A consumer that reads a flag outside {ZF, CF} was reached.  Weaker than
+    /// [`Self::saw_non_zf`]: a `jb`/`jbe` reads CF (and ZF) but nothing else,
+    /// so a rewrite that provably preserves ZF and CF alone may keep it.  A
+    /// consumer with no condition code is always charged here, because a
+    /// whole-word or unknown reader can select neither condition exclusively
+    /// and can observe AF, which no width-narrowing `cmp` preserves.
+    saw_outside_zf_cf: bool,
     /// A consumer that reads SF -- or the whole EFLAGS word, which contains it
     /// -- was reached.
     saw_sf_reader: bool,
@@ -1627,10 +1700,21 @@ struct ConsumerFacts {
 /// over-approximates which flags a consumer sees -- at a join it may attribute
 /// another predecessor's flags to this walk -- and over-approximation here only
 /// ever reports MORE consumers, which fails closed.
-fn walk_flag_consumers(store: &LineStore, infos: &[LineInfo], from: usize) -> ConsumerFacts {
+/// `preserved` is the set of flags the rewrite under test PROVES it leaves
+/// unchanged.  A writer that clobbers none of the other flags cannot expose
+/// the rewrite, so the walk steps over it instead of stopping -- which is what
+/// keeps `stc` from hiding the `jo` behind it.  Pass `0` to reproduce the
+/// original "any writer ends the walk" behaviour exactly.
+fn walk_flag_consumers(
+    store: &LineStore,
+    infos: &[LineInfo],
+    from: usize,
+    preserved: u8,
+) -> ConsumerFacts {
     let mut facts = ConsumerFacts {
         saw_consumer: false,
         saw_non_zf: false,
+        saw_outside_zf_cf: false,
         saw_sf_reader: false,
         saw_whole_reader: false,
         proved: true,
@@ -1679,6 +1763,18 @@ fn walk_flag_consumers(store: &LineStore, infos: &[LineInfo], from: usize) -> Co
                 continue;
             }
             let t = infos[n].trimmed(store.get(n));
+            // A blank line has no mnemonic, so `flags_effect` falls through to
+            // its fail-closed default and charges it with reading every flag --
+            // which made any walk that reached the end of a function (the
+            // padding after the last `ret`) report a whole-word reader and veto
+            // every flag-divergent rewrite.  Emitting nothing, a blank line
+            // cannot observe EFLAGS, so skipping it is strictly more precise
+            // and cannot license anything the writer before it did not already
+            // license.
+            if t.is_empty() {
+                n += 1;
+                continue;
+            }
             match infos[n].kind {
                 // A label is a position, not an effect: fall through it.
                 LineKind::Label => {
@@ -1716,8 +1812,17 @@ fn walk_flag_consumers(store: &LineStore, infos: &[LineInfo], from: usize) -> Co
                 _ => {}
             }
             match flags_effect(t) {
-                // The flags die here on this path.
-                FlagsEffect::Writes => break,
+                // The flags die here on this path -- UNLESS this writer only
+                // clobbers flags the rewrite already proves it preserves.  A
+                // CF-only writer cannot reveal a ZF/CF-preserving rewrite, and
+                // stopping there would hide every consumer behind it.
+                FlagsEffect::Writes => {
+                    if flags_written_mask(t) & !preserved != 0 {
+                        break;
+                    }
+                    n += 1;
+                    continue;
+                }
                 FlagsEffect::Neutral => {
                     n += 1;
                     continue;
@@ -1734,12 +1839,16 @@ fn walk_flag_consumers(store: &LineStore, infos: &[LineInfo], from: usize) -> Co
                             if !matches!(cc, "e" | "z" | "ne" | "nz") {
                                 facts.saw_non_zf = true;
                             }
+                            if !ZF_CF_ONLY_CCS.contains(&cc) {
+                                facts.saw_outside_zf_cf = true;
+                            }
                             if SF_CCS.contains(&cc) {
                                 facts.saw_sf_reader = true;
                             }
                         }
                         None => {
                             facts.saw_non_zf = true;
+                            facts.saw_outside_zf_cf = true;
                             if !NON_SF_FLAG_READERS.iter().any(|p| t.starts_with(p)) {
                                 facts.saw_sf_reader = true;
                                 facts.saw_whole_reader = true;
@@ -1795,8 +1904,39 @@ pub(super) fn flag_consumers_are_zf_only(
     infos: &[LineInfo],
     from: usize,
 ) -> bool {
-    let f = walk_flag_consumers(store, infos, from);
+    let f = walk_flag_consumers(store, infos, from, 0);
     f.proved && f.saw_consumer && !f.saw_non_zf
+}
+
+/// True when every consumer of the current flags selects only on ZF and CF
+/// (see [`ZF_CF_ONLY_CCS`]) and at least one consumer exists.  False also
+/// covers "could not prove", for the same reason [`flag_consumers_are_zf_only`]
+/// fails closed: an incomplete walk must not license a flag-divergent rewrite.
+pub(super) fn flag_consumers_are_zf_cf_only(
+    store: &LineStore,
+    infos: &[LineInfo],
+    from: usize,
+) -> bool {
+    let f = walk_flag_consumers(store, infos, from, 0);
+    f.proved && f.saw_consumer && !f.saw_outside_zf_cf
+}
+
+/// [`flag_consumers_are_zf_cf_only`] for a rewrite that PROVES it preserves
+/// ZF and CF, so a writer touching only those two cannot expose it.
+///
+/// This is strictly more precise, never less: the only difference is that a
+/// CF-only writer (`stc`, `clc`, `cmc`) or an OF-preserving one (`sahf`) no
+/// longer terminates the walk, so consumers standing behind it are examined
+/// instead of skipped.  In `cmp; jb; ...; stc; jo` the old code stopped at
+/// `stc` and never saw the `jo`; here the `jo` is reached and vetoes the
+/// rewrite, which is the correct answer because the rewrite does change OF.
+pub(super) fn flag_consumers_are_zf_cf_only_preserving_zf_cf(
+    store: &LineStore,
+    infos: &[LineInfo],
+    from: usize,
+) -> bool {
+    let f = walk_flag_consumers(store, infos, from, F_ZF | F_CF);
+    f.proved && f.saw_consumer && !f.saw_outside_zf_cf
 }
 
 /// True when some consumer of the current flags reads SF, or when the walk
@@ -1819,7 +1959,7 @@ pub(super) fn flags_reach_an_sf_consumer(
     infos: &[LineInfo],
     from: usize,
 ) -> bool {
-    let f = walk_flag_consumers(store, infos, from);
+    let f = walk_flag_consumers(store, infos, from, 0);
     !f.proved || f.saw_sf_reader
 }
 
@@ -1841,7 +1981,7 @@ pub(super) fn flags_reach_a_whole_flags_reader(
     infos: &[LineInfo],
     from: usize,
 ) -> bool {
-    let f = walk_flag_consumers(store, infos, from);
+    let f = walk_flag_consumers(store, infos, from, 0);
     !f.proved || f.saw_whole_reader
 }
 
@@ -3179,7 +3319,7 @@ mod tests {
         let at = (0..store.len())
             .find(|&i| infos[i].trimmed(store.get(i)).contains(marker))
             .expect("marker line not found");
-        walk_flag_consumers(&store, &infos, at + 1)
+        walk_flag_consumers(&store, &infos, at + 1, 0)
     }
 
     #[test]
