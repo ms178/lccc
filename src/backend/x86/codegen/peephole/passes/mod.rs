@@ -952,11 +952,19 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
             }
         }
         if !sk("load_alu_fuse") {
-            {
-                let c = load_op_fuse::fuse_load_into_alu(&mut store, &mut infos);
-                trace("fuse_load_into_alu", pass_count, c, &store, &infos);
-                changed |= c;
-            }
+            let c = load_op_fuse::fuse_load_into_alu(&mut store, &mut infos);
+            trace("fuse_load_into_alu", pass_count, c, &store, &infos);
+            changed |= c;
+        }
+        // `fuse_zero_ext_cmp` has its OWN skip name. It used to share
+        // `load_alu_fuse` with `fuse_load_into_alu`, which made the two
+        // inseparable in an A/B: `CCC_PEEPHOLE_SKIP=load_alu_fuse` turned off
+        // both, so a differential attributed to this fold could actually have
+        // been the sibling's win. One transform, one switch.
+        if !sk("zero_ext_cmp") {
+            let c = load_op_fuse::fuse_zero_ext_cmp(&mut store, &mut infos);
+            trace("fuse_zero_ext_cmp", pass_count, c, &store, &infos);
+            changed |= c;
         }
         // Generic move-relay elimination and windowed lea->memory folding.
         // Both are block-local; see relay_and_lea.rs for the two deadness

@@ -1601,3 +1601,669 @@ mod tests {
         assert_eq!(may_write_families(t.trim(), &li(t)), 0);
     }
 }
+
+// ── zero-extended byte/word compare → memory-operand `cmp` ──────────────
+//
+// A byte-compare loop — LZ4/DEFLATE match extension, `memcmp`, hand-written
+// scanners — lowers to two zero-extending loads and a full-width compare:
+//
+//     movzbl (%rax), %r8d          cmpb  (%rbx), %r8b
+//     movzbl (%rbx), %r9d    ->    ...
+//     cmpl  %r9d, %r8d
+//
+// That is GCC's, Clang's and ICX's shape.  Measured on `lz4_compress.c` with
+// `-DMATCH_RICH=1` (the 96-byte-repeat input that actually reaches the
+// extension loop): GCC emits 4 instructions per iteration, lccc 7.  The
+// generic [`fuse_load_into_alu`] declines the pattern for two independent
+// reasons — it parses only the same-width `movl`/`movq` loads, and it demands
+// the consumer carry the load's exact width.  Neither holds for a
+// zero-extending load feeding a wider compare.
+//
+// ## Why the narrowing is flag-for-flag exact
+//
+// Both operands are zero-extensions of the same narrow width, so as integers
+// `X` and `Y` lie in `[0, 2^n)`.  The full-width compare computes `X - Y`; the
+// narrow one computes the low `n` bits of the same difference, and because
+// `|X - Y| < 2^n` no borrow escapes the low half, so:
+//
+// * **ZF** — `X == Y` iff the narrow difference is zero.  Identical.
+// * **CF** — the unsigned borrow `X <u Y`.  The narrow subtraction borrows on
+//   exactly the same condition.  Identical.
+// * **SF** — bit `n-1` of a possibly-negative difference, against bit 31/63
+//   of the wide one.  **Differs**, and is masked out by the condition codes.
+// * **PF, OF, AF** — all differ.  Masked out, and unreachable by any `cc`.
+//
+// So the fold is licensed only under [`flag_consumers_are_zf_cf_only`], which
+// is exactly the {ZF, CF} condition-code set.  A `js`/`jg`/`jp` downstream
+// vetoes it, as does any whole-word reader (`lahf`, `pushf`, inline asm, an
+// unrecognised mnemonic), and so does a flag-flow walk that could not prove it
+// reached every consumer.  On the two flags that do survive the rewrite the
+// result is not merely equivalent but identical, for any operand values.
+
+/// A zero-extending narrow load: `movz{bl,wl,bq,wq} <mem>, %dst`.
+/// Returns `(narrow_suffix, mem, dest_fam, dest_is_64)`.
+fn parse_zero_ext_load(t: &str) -> Option<(&'static str, &str, RegId, bool)> {
+    let (suf, dest_is_64, rest) = if let Some(r) = t.strip_prefix("movzbl ") {
+        ("b", false, r)
+    } else if let Some(r) = t.strip_prefix("movzwl ") {
+        ("w", false, r)
+    } else if let Some(r) = t.strip_prefix("movzbq ") {
+        ("b", true, r)
+    } else if let Some(r) = t.strip_prefix("movzwq ") {
+        ("w", true, r)
+    } else {
+        return None;
+    };
+    let (src, dst) = split_two_operands(rest)?;
+    if !is_plain_memory_operand(src) {
+        return None;
+    }
+    let fam = plain_gp_operand(dst)?;
+    // The destination must be the exact register spelling of its bank, the
+    // same shape discipline `parse_memory_load` applies.
+    let expect = if dest_is_64 {
+        REG_NAMES[0][fam as usize]
+    } else {
+        REG_NAMES[1][fam as usize]
+    };
+    if dst != expect {
+        return None;
+    }
+    Some((suf, src, fam, dest_is_64))
+}
+
+/// `cmp{l,q} %a, %b` with both operands plain GP registers of the suffix width.
+fn parse_reg_reg_cmp(t: &str) -> Option<(bool, RegId, RegId)> {
+    let (op, is_q, src, dst) = parse_reg_reg_alu(t)?;
+    if op != "cmp" || src == dst {
+        return None;
+    }
+    Some((is_q, src, dst))
+}
+
+/// Fuse `movz{n} memA, X; movz{n} memB, Y; cmp{W} %Y, %X` into
+/// `movz{n} memA, X; cmp{n} memB, X` — and the mirrored operand order — when
+/// the folded register dies at the compare and only ZF/CF select on it.
+/// See the comment above for the flag argument.
+pub(super) fn fuse_zero_ext_cmp(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut lv = FileLiveness::new(store, infos);
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        // All three lines must be plain, unpinned and ADJACENT.  Adjacency is
+        // what makes the window trivially memory-safe: the only memory access
+        // between the first load and the compare is the second load, and the
+        // compare contributes none.  Loads are `Other`; the compare is
+        // classified `Cmp`.
+        let plain = |infos: &[LineInfo], n: usize, cmp_ok: bool| {
+            n < infos.len()
+                && !infos[n].is_nop()
+                && !infos[n].pinned
+                && match infos[n].kind {
+                    LineKind::Other { .. } => true,
+                    LineKind::Cmp => cmp_ok,
+                    _ => false,
+                }
+        };
+        if !plain(infos, i, false) {
+            i += 1;
+            continue;
+        }
+        let first = infos[i].trimmed(store.get(i)).to_string();
+        let Some((suf_a, _mem_a, fam_a, wide_a)) = parse_zero_ext_load(&first) else {
+            i += 1;
+            continue;
+        };
+        let j = next_insn(infos, i + 1, len);
+        if !plain(infos, j, false) {
+            i += 1;
+            continue;
+        }
+        let second = infos[j].trimmed(store.get(j)).to_string();
+        let Some((suf_b, mem_b, fam_b, wide_b)) = parse_zero_ext_load(&second) else {
+            i += 1;
+            continue;
+        };
+        // Equal narrow widths, and distinct destinations.  Equal widths are
+        // not an aesthetic choice: a 16-bit compare of an 8-bit load would
+        // read one byte PAST the address the deleted load touched, which can
+        // fault against a page boundary.  Requiring equality keeps the folded
+        // memory access bit-for-bit the one the load performed.
+        if suf_a != suf_b || fam_a == fam_b || wide_a != wide_b {
+            i += 1;
+            continue;
+        }
+        let k = next_insn(infos, j + 1, len);
+        if !plain(infos, k, true) {
+            i += 1;
+            continue;
+        }
+        let cons = infos[k].trimmed(store.get(k)).to_string();
+        let Some((is_q, src_fam, dst_fam)) = parse_reg_reg_cmp(&cons) else {
+            i += 1;
+            continue;
+        };
+        // The compare must be the full width of the registers it reads: a
+        // `cmpl` over 32-bit `movzbl` destinations, `cmpq` over 64-bit
+        // `movzbq` ones.  Any other pairing means the compare is already
+        // narrower or wider than the values, which this pass does not model.
+        if is_q != wide_a {
+            i += 1;
+            continue;
+        }
+        // ── The operand-slot problem, and why it is not patched ──────────
+        //
+        // `cmpl %S, %D` computes `D - S` in AT&T order, and a `cmp` may take
+        // its memory operand in EITHER slot:
+        //
+        //     cmp mem, reg   ->  reg - mem        (reg is dst)
+        //     cmp reg, mem   ->  mem - reg        (mem is dst)
+        //
+        // So folding either load is expressible, and the tempting general form
+        // is "keep one register, delete the other load, put the memory in the
+        // matching slot".  Implemented that way it is WRONG, and wrong in a
+        // way that compiles, links and returns a plausible answer.
+        //
+        // Taking the mirrored case -- `cmpl %X, %Y`, i.e. the FIRST load's
+        // register in the source slot and the SECOND load's in the
+        // destination slot -- and keeping the first load's register while
+        // deleting the second is the version that is correct, and it is also
+        // the version with NO address and NO ordering question:
+        //
+        //     cmpl %r8d, %r9d  +  movzbl (%rcx),%r8d  +  movzbl (%rbx),%r9d
+        //       ->   cmpb %r8b, (%rbx)          (r9 deleted)
+        //
+        // The first load keeps its own register and its own address, so its
+        // effective address is never re-evaluated and nothing can observe a
+        // changed address.  The second load's read simply moves DOWN to the
+        // compare, so the two reads stay in source order.  Both properties
+        // fall out of the construction; there is no guard to get wrong and
+        // no case left to audit.
+        //
+        // The shape this replaces is the genuinely dangerous one.  Deleting
+        // the FIRST load instead keeps the second, and then:
+        //
+        //   * if the first load's address uses the second load's
+        //     destination register, the read is re-issued from the NEW value
+        //     (`movzbl (%r8),%r8d` style) -- a different address entirely;
+        //   * the first load's read moves DOWN past the second load's, so two
+        //     sequenced reads swap order, which is observable through
+        //     volatile and atomic accesses and changes which one faults
+        //     first.
+        //
+        // So this pass deletes the second load in BOTH arms.  The arm that
+        // deletes the first load is not merely unguarded, it is not
+        // expressible: its only AT&T spelling computes `S - D` where the
+        // source computed `D - S`.  For an unsigned consumer that inverts
+        // CF, so `jb` silently becomes `ja` and `jbe` becomes `jae`.  That
+        // was a live miscompile, not a theoretical one: assembling the
+        // pass's own output for
+        //
+        //     movzbl (%rdi),%r8d ; movzbl (%rsi),%r9d ; cmpl %r8d,%r9d ; setb %al
+        //
+        // and running it returns 0 where the input returns 1 for
+        // a=200, b=100.  `setb` reads only CF, so the ZF/CF consumer law
+        // admitted it.
+        //
+        // Therefore: exactly one delete site (the second load), exactly one
+        // memory operand (the second load's), exactly one kept register (the
+        // first load's), and the AT&T slot is the only thing that varies.
+        let pick = if src_fam == fam_b && dst_fam == fam_a {
+            // S is the second load: `cmp mem_S, D` keeps D in the dst slot.
+            (fam_a, mem_b, true)
+        } else if src_fam == fam_a && dst_fam == fam_b {
+            // D is the second load: `cmp S, mem_D` puts the memory in the dst
+            // slot, which is what makes the subtraction `D - S` and not `S - D`.
+            (fam_a, mem_b, false)
+        } else {
+            i += 1;
+            continue;
+        };
+        let (keep_fam, fold_mem, keep_is_dst) = pick;
+        // The folded register must be dead the moment the compare retires.
+        // It is always the SECOND load's destination: we never delete the
+        // first, so the first load's address register is untouched by this.
+        if lv.live_after(k, fam_b) != Some(false) {
+            i += 1;
+            continue;
+        }
+        // Only ZF and CF may select on the result.  `from` is the line AFTER
+        // the flag writer, the convention every other caller follows.
+        if !super::flag_peepholes::flag_consumers_are_zf_cf_only_preserving_zf_cf(
+            store,
+            infos,
+            k + 1,
+        ) {
+            i += 1;
+            continue;
+        }
+        let narrow_bank = if suf_a == "b" { 3 } else { 2 };
+        let keep = REG_NAMES[narrow_bank][keep_fam as usize];
+        let new_line = if keep_is_dst {
+            format!("    cmp{suf_a} {fold_mem}, {keep}")
+        } else {
+            format!("    cmp{suf_a} {keep}, {fold_mem}")
+        };
+        mark_nop(&mut infos[j]);
+        replace_line(store, &mut infos[k], k, new_line);
+        lv.refresh_span(store, infos, j, k);
+        changed = true;
+        i = k + 1;
+    }
+    changed
+}
+
+#[cfg(test)]
+mod zec_tests {
+    use super::*;
+
+    /// The lz4_compress.c `-DMATCH_RICH=1` match-extension loop, verbatim
+    /// from the peephole input, with the branch the flags feed.
+    const EXTEND: &str = "f:\n    movzbl (%rcx), %r8d\n    movzbl (%rbx), %r9d\n    cmpl %r9d, %r8d\n    jne .L16\n    addq $1, %rcx\n    addq $1, %rbx\n    cmpq %r13, %rcx\n    jb .Ltop\n";
+
+    fn lines(asm: &str) -> Vec<String> {
+        asm.lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
+    fn has(out: &[String], needle: &str) -> bool {
+        out.iter().any(|l| l == needle)
+    }
+
+    /// Runs the pass over `body`, appending the branch targets the snippets
+    /// forward-reference and a flag writer at each, so the flag walk is given
+    /// a realistic block to resolve rather than running off into directives.
+    fn fold(body: &str) -> Vec<String> {
+        let asm = format!(
+            "    .text\n    .globl f\n    .type f, @function\nf:\n    .cfi_startproc\n{body}\n.L16:\n    testl %eax, %eax\n.Ltop:\n    ret\n    .cfi_endproc\n    .size f, .-f\n"
+        );
+        let mut store = LineStore::new(asm);
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        fuse_zero_ext_cmp(&mut store, &mut infos);
+        lines(&store.build_result(|i| infos[i].is_nop()))
+    }
+
+    #[test]
+    fn folds_the_match_extension_loop_to_gcc_shape() {
+        let out = fold(EXTEND);
+        assert!(has(&out, "cmpb (%rbx), %r8b"), "{out:?}");
+        assert!(
+            !out.iter().any(|l| l.starts_with("movzbl (%rbx)")),
+            "{out:?}"
+        );
+        assert!(
+            has(&out, "movzbl (%rcx), %r8d"),
+            "retained load must survive: {out:?}"
+        );
+    }
+
+    /// The mirrored operand order used to MISCOMPILE, and this is the
+    /// regression that says so in a form a reviewer can check.
+    ///
+    /// `cmpl %r8d, %r9d` is `r9 - r8`.  The old mirror arm kept `r9` and
+    /// emitted `cmpb %r9b, (%rcx)`, i.e. `(%rcx) - r9` = `r8 - r9`: the
+    /// subtraction was INVERTED.  For an unsigned consumer that flips CF, so
+    /// `jb` became `ja`.  `setb` reads only CF, so the ZF/CF law admitted it.
+    /// Assembling the old output and running it returns 0 where the input
+    /// returns 1 for a=200, b=100.
+    ///
+    /// The fix is not a guard -- it is that the pass never deletes the FIRST
+    /// load, so the only legal AT&T spelling is the one that preserves `D - S`.
+    #[test]
+    fn mirrored_operand_order_preserves_the_subtraction_direction() {
+        let out = fold(
+            "f:\n    movzbl (%rcx), %r8d\n    movzbl (%rbx), %r9d\n    cmpl %r8d, %r9d\n    jne .L16\n",
+        );
+        // r9 (the SECOND load) is deleted; r8 (the FIRST load) survives, so
+        // its effective address is never re-evaluated.
+        assert!(
+            has(&out, "movzbl (%rcx), %r8d"),
+            "first load must survive: {out:?}"
+        );
+        assert!(
+            !out.iter().any(|l| l.starts_with("movzbl (%rbx)")),
+            "second load must be the deleted one: {out:?}"
+        );
+        // `cmp mem, reg` = reg - mem = r8 - r9 is WRONG here; the source was
+        // `cmpl %r8d, %r9d` = r9 - r8, so the memory must land in the dst
+        // slot: `cmp %r8b, (%rbx)` = (%rbx) - r8b = r9 - r8.
+        assert!(has(&out, "cmpb %r8b, (%rbx)"), "{out:?}");
+        assert!(
+            !has(&out, "cmpb %r9b, (%rcx)"),
+            "the CF-inverting spelling must never be produced: {out:?}"
+        );
+    }
+
+    /// The address-dependency hazard that motivated the guard the old mirror
+    /// arm needed.  With the first load never deleted, this is not merely
+    /// refused -- it is impossible, because the first load keeps both its
+    /// address register and its value register.  Pin it so that a future
+    /// "optimisation" that reintroduces a first-load delete is caught here
+    /// rather than by a miscompile.
+    #[test]
+    fn a_load_addressed_by_the_other_loads_destination_is_never_reordered() {
+        // %r8 is the first load's destination AND the second load's address.
+        // Deleting the first load and re-issuing its read at the compare would
+        // read from the post-load %r8 -- a different address.
+        let out = fold(
+            "f:\n    movzbl (%rcx), %r8d\n    movzbl (%r8), %r9d\n    cmpl %r8d, %r9d\n    jne .L16\n",
+        );
+        assert!(
+            has(&out, "movzbl (%rcx), %r8d"),
+            "first load must survive: {out:?}"
+        );
+        assert!(
+            has(&out, "cmpb %r8b, (%r8)"),
+            "second load folds, first does not: {out:?}"
+        );
+        // The surviving load must still read the ORIGINAL address %rcx, and
+        // the folded memory operand must be the SECOND load's own memory.
+        assert!(
+            !out.iter().any(|l| l == "cmpb %r8b, (%rcx)"),
+            "must not re-issue the first load's read: {out:?}"
+        );
+    }
+
+    /// Source-order preservation.  Deleting the FIRST load would move its read
+    /// DOWN past the second load's, swapping two sequenced reads.  Deleting
+    /// the second load moves its read down to the compare, which is still
+    /// after the first read, so the order mem_a-then-mem_b is preserved and
+    /// volatile/atomic semantics and fault order are untouched.
+    #[test]
+    fn the_deleted_load_is_always_the_second_one() {
+        for cmp_line in ["cmpl %r9d, %r8d", "cmpl %r8d, %r9d"] {
+            let out = fold(&format!(
+                "f:\n    movzbl (%rcx), %r8d\n    movzbl (%rbx), %r9d\n    {cmp_line}\n    jne .L16\n"
+            ));
+            assert!(
+                out.iter().any(|l| l.starts_with("movzbl (%rcx)")),
+                "the FIRST read must never be the deleted one ({cmp_line}): {out:?}"
+            );
+        }
+    }
+
+    /// The Review-AI control-flow attack, verbatim.  `jb` is an allowed ZF/CF
+    /// consumer and is walked, its target is queued, and the queue is reached
+    /// only through `stc`, which writes CF and NOTHING ELSE.  The old walker
+    /// treated every writer as a total clobber, stopped at `stc`, and never
+    /// reached the `jo` behind it -- so it reported "ZF/CF only" for a block
+    /// containing a consumer of OF, which is precisely the flag the narrowing
+    /// changes.  Byte values 0x7f and 0xff give equal CF and different OF.
+    ///
+    /// The fold must be REFUSED here, and it is, because the walk now steps
+    /// over `stc` (it clobbers only CF, which the fold preserves) and reaches
+    /// `jo`, which reads OF.
+    #[test]
+    fn a_cf_only_flag_setter_does_not_hide_an_of_consumer() {
+        let out = fold(
+            "f:\n    movzbl (%rcx), %r8d\n    movzbl (%rbx), %r9d\n    cmpl %r9d, %r8d\n    jb .Lkeep\n    addl $1, %eax\n.Lkeep:\n    stc\n    jo .Loverflow\n    ret\n.Loverflow:\n    ret\n",
+        );
+        assert!(
+            has(&out, "cmpl %r9d, %r8d"),
+            "must refuse: `jo` behind `stc` reads OF: {out:?}"
+        );
+        assert!(
+            out.iter().any(|l| l.starts_with("movzbl (%rbx)")),
+            "the folded load must be left alone: {out:?}"
+        );
+    }
+
+    /// The precise half of the same fix, in the direction that must NOT
+    /// regress: a CF-only writer must not make the walk give up on a block
+    /// whose ONLY consumers really are ZF/CF.  This is the common shape --
+    /// a compare feeding `jb` with a `clc` in the middle of the path -- and
+    /// refusing it would throw away the fold for no reason.
+    #[test]
+    fn a_cf_only_flag_setter_does_not_veto_a_genuine_zf_cf_block() {
+        let out = fold(
+            "f:\n    movzbl (%rcx), %r8d\n    movzbl (%rbx), %r9d\n    cmpl %r9d, %r8d\n    jb .Lkeep\n    clc\n.Lkeep:\n    jae .L16\n    ret\n",
+        );
+        assert!(has(&out, "cmpb (%rbx), %r8b"), "must still fold: {out:?}");
+    }
+
+    /// `sahf` leaves OF alone (SDM), so it is stepped over exactly like `stc`
+    /// -- but only for a rewrite that preserves ZF and CF, and `sahf` writes
+    /// ZF.  So for THIS fold `sahf` is a clobber and must stop the walk, and a
+    /// consumer behind it is unaccounted for -- which is why the walk is
+    /// fail-closed and the fold is refused rather than assumed safe.
+    #[test]
+    fn sahf_is_treated_as_a_zf_clobber() {
+        let out = fold(
+            "f:\n    movzbl (%rcx), %r8d\n    movzbl (%rbx), %r9d\n    cmpl %r9d, %r8d\n    jb .Lkeep\n    sahf\n.Lkeep:\n    jo .Loverflow\n    ret\n.Loverflow:\n    ret\n",
+        );
+        assert!(
+            has(&out, "cmpl %r9d, %r8d"),
+            "sahf writes ZF, so the block after it is unproved: {out:?}"
+        );
+    }
+
+    /// ── The check that actually catches a wrong fold ────────────────────
+    ///
+    /// Every other test here compares TEXT.  That is not enough, and this is
+    /// the demonstration: the pass shipped a mirrored arm that emitted
+    /// `cmpb %r9b, (%rcx)` for `cmpl %r8d, %r9d` -- the memory in the wrong
+    /// AT&T slot, so the compare computed `r8 - r9` where the source computed
+    /// `r9 - r8`.  For an unsigned consumer that inverts CF, so `jb` became
+    /// `ja`.  It compiled, it assembled, it linked, the instruction count went
+    /// DOWN, the flag-law test passed, and the answer was wrong.
+    ///
+    /// So: run the pass, take the assembly it really produced, assemble that,
+    /// run it, and compare against running the assembly it replaced.  A
+    /// textual assertion can agree with a miscompile; an executed one cannot.
+    ///
+    /// Skips (rather than fails) when no assembler is present, so the test is
+    /// honest about what it proved instead of quietly passing.
+    #[test]
+    fn the_emitted_assembly_computes_the_same_predicate_as_its_input() {
+        // `a > b` on two unsigned chars.  The compare the peephole sees is
+        // `cmpl %first, %second` with a CF-only consumer, which is the shape
+        // that reached the broken mirror arm.
+        const SRC: &str = "f:\n    movzbl (%rdi), %r8d\n    movzbl (%rsi), %r9d\n    cmpl %r8d, %r9d\n    setb %al\n    movzbl %al, %eax\n    ret\n";
+
+        /// Assemble `asm` as the body of `main`, call it for four
+        /// discriminating argument pairs, and return the summed results.
+        ///
+        /// Returns `Err` with the reason instead of skipping.  A harness that
+        /// quietly stops testing is indistinguishable from a passing test --
+        /// and that is exactly how this check managed to sit green with the
+        /// inversion bug live: its first version returned early on a malformed
+        /// wrapper, so it never once ran the folded code.
+        fn run_asm(asm: &str, tag: &str) -> Result<i64, String> {
+            let dir = std::env::temp_dir().join(format!("zec_exec_{tag}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            // Keep instructions only: drop directives, labels, comments, blanks.
+            let body: Vec<&str> = asm
+                .lines()
+                .map(str::trim)
+                .filter(|l| {
+                    !l.is_empty() && !l.starts_with('.') && !l.starts_with('#') && !l.ends_with(':')
+                })
+                .collect();
+            assert!(!body.is_empty(), "{tag}: nothing extracted from {asm:?}");
+            // The pass output becomes `zf`, a C-callable function.  The
+            // driver is ordinary C so the process starts normally: a
+            // hand-rolled `main` in .s fights libc's startup and segfaults for
+            // reasons that have nothing to do with the fold.
+            let mut asm_lines: Vec<String> = vec![
+                "    .text".into(),
+                "    .globl zf".into(),
+                "    .type zf,@function".into(),
+                "zf:".into(),
+            ];
+            asm_lines.extend(body.iter().map(|l| (*l).to_string()));
+            let wrapper = asm_lines.join("\n");
+            let drv = "#include <stdio.h>\n                      unsigned char zf(unsigned char*,unsigned char*);\n                      int main(void){\n                        unsigned char p[2],q[2]; int t=0;\n                        p[0]=200;q[0]=100;t+=zf(p,q);\n                        p[0]=100;q[0]=200;t+=zf(p,q);\n                        p[0]=0;  q[0]=0;  t+=zf(p,q);\n                        p[0]=255;q[0]=0;  t+=zf(p,q);\n                        printf(\"%d\\n\", t); return 0; }\n";
+            let s = dir.join("f.s");
+            std::fs::write(&s, &wrapper).map_err(|e| e.to_string())?;
+            let d = dir.join("d.c");
+            std::fs::write(&d, drv).map_err(|e| e.to_string())?;
+            let exe = dir.join("a.out");
+            let st = std::process::Command::new("gcc")
+                .args([
+                    s.to_str().unwrap(),
+                    d.to_str().unwrap(),
+                    "-o",
+                    exe.to_str().unwrap(),
+                ])
+                .output()
+                .map_err(|e| format!("{tag}: cannot run gcc: {e}"))?;
+            if !st.status.success() {
+                return Err(format!(
+                    "{tag}: assembler/linker rejected it:\n{wrapper}\n---\n{}",
+                    String::from_utf8_lossy(&st.stderr)
+                ));
+            }
+            let st = std::process::Command::new(&exe)
+                .output()
+                .map_err(|e| format!("{tag}: cannot execute: {e}"))?;
+            let t: i64 = String::from_utf8_lossy(&st.stdout)
+                .trim()
+                .parse()
+                .map_err(|_| {
+                    format!(
+                        "{tag}: driver printed {:?}",
+                        String::from_utf8_lossy(&st.stdout)
+                    )
+                })?;
+            Ok(t)
+        }
+
+        // Input, run as-is.
+        let before = run_asm(SRC, "before").expect("harness: unfolded source must run");
+        // Same input, through the pass.
+        let folded_lines = fold(SRC);
+        let folded: Vec<String> = folded_lines.iter().map(|l| format!("    {l}")).collect();
+        let after = run_asm(&folded.join("\n"), "after")
+            .unwrap_or_else(|e| panic!("harness: folded output must run -- {e}\n{folded_lines:?}"));
+        assert_eq!(
+            before, after,
+            "the fold changed the predicate: input returned {before}, folded returned {after}\nfolded: {folded_lines:?}"
+        );
+        // Sanity: this input is one where a wrong answer is actually possible.
+        // a>b, b>a, a<b, b<b for (200,100) => 1 + 0 + 0 + 0.
+        // 2 of the 4 pairs satisfy `a > b`.  A harness that cannot tell the
+        // two operand orders apart would return a different number here.
+        assert_eq!(before, 2, "harness: the four pairs must discriminate");
+    }
+
+    #[test]
+    fn folds_word_wide_zero_extension() {
+        let out = fold(
+            "f:\n    movzwl (%rcx), %r8d\n    movzwl (%rbx), %r9d\n    cmpl %r9d, %r8d\n    jne .L16\n",
+        );
+        assert!(has(&out, "cmpw (%rbx), %r8w"), "{out:?}");
+    }
+
+    #[test]
+    fn folds_64_bit_zero_extension() {
+        let out = fold(
+            "f:\n    movzbq (%rcx), %r8\n    movzbq (%rbx), %r9\n    cmpq %r9, %r8\n    jne .L16\n",
+        );
+        assert!(has(&out, "cmpb (%rbx), %r8b"), "{out:?}");
+    }
+
+    #[test]
+    fn preserves_cf_selecting_branches() {
+        // `jb`/`jbe`/`jae`/`ja` read CF (and ZF) and nothing else, so the
+        // flag-preserving narrowing is legal and must fire.
+        for br in ["jb", "jbe", "jae", "ja", "jne", "je"] {
+            let out = fold(&format!(
+                "f:\n    movzbl (%rcx), %r8d\n    movzbl (%rbx), %r9d\n    cmpl %r9d, %r8d\n    {br} .L16\n"
+            ));
+            assert!(
+                has(&out, "cmpb (%rbx), %r8b"),
+                "{br} should permit the fold: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_when_a_consumer_selects_on_sf() {
+        // `js` reads SF, which the byte compare does NOT preserve: the 32-bit
+        // result is negative whenever r8d < r9d, while the 8-bit one borrows
+        // instead.  This is what makes the fold unsound.
+        for br in ["js", "jns", "jg", "jng", "jl", "jge", "jp", "jo"] {
+            let out = fold(&format!(
+                "f:\n    movzbl (%rcx), %r8d\n    movzbl (%rbx), %r9d\n    cmpl %r9d, %r8d\n    {br} .L16\n"
+            ));
+            assert!(
+                has(&out, "cmpl %r9d, %r8d"),
+                "{br} must veto the fold: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_setcc_selecting_on_sf() {
+        // `sets` is a ZF/SF consumer reached without a branch, so the walk
+        // must still charge it with reading outside {ZF, CF}.
+        let out = fold(
+            "f:\n    movzbl (%rcx), %r8d\n    movzbl (%rbx), %r9d\n    cmpl %r9d, %r8d\n    sets %al\n    movzbl %al, %eax\n",
+        );
+        assert!(has(&out, "cmpl %r9d, %r8d"), "{out:?}");
+    }
+
+    #[test]
+    fn refuses_a_whole_flag_reader() {
+        // `lahf` captures the entire EFLAGS word, AF included, so no
+        // narrowing is permissible.
+        let out = fold(
+            "f:\n    movzbl (%rcx), %r8d\n    movzbl (%rbx), %r9d\n    cmpl %r9d, %r8d\n    lahf\n",
+        );
+        assert!(has(&out, "cmpl %r9d, %r8d"), "{out:?}");
+    }
+
+    #[test]
+    fn refuses_mismatched_narrow_widths() {
+        // A 16-bit compare of an 8-bit load would read ONE BYTE PAST the
+        // address the deleted load touched, which can fault at a page edge.
+        let out = fold(
+            "f:\n    movzbl (%rcx), %r8d\n    movzwl (%rbx), %r9d\n    cmpl %r9d, %r8d\n    jne .L16\n",
+        );
+        assert!(has(&out, "cmpl %r9d, %r8d"), "{out:?}");
+    }
+
+    #[test]
+    fn refuses_when_the_folded_register_is_live_after() {
+        let out = fold(
+            "f:\n    movzbl (%rcx), %r8d\n    movzbl (%rbx), %r9d\n    cmpl %r9d, %r8d\n    jne .L16\n    movl %r9d, %eax\n",
+        );
+        assert!(has(&out, "cmpl %r9d, %r8d"), "{out:?}");
+    }
+
+    #[test]
+    fn refuses_a_non_adjacent_triple() {
+        // A store between the loads could alias the second load's memory
+        // operand, so the pass only folds strictly adjacent triples.
+        let out = fold(
+            "f:\n    movzbl (%rcx), %r8d\n    movl %eax, (%rbx)\n    movzbl (%rbx), %r9d\n    cmpl %r9d, %r8d\n    jne .L16\n",
+        );
+        assert!(has(&out, "cmpl %r9d, %r8d"), "{out:?}");
+    }
+
+    #[test]
+    fn never_widens_the_memory_access_of_a_sign_extending_load() {
+        // `movsbl` is NOT a zero extension: folding it would compare the
+        // sign-extended value against the byte.
+        let out = fold(
+            "f:\n    movsbl (%rcx), %r8d\n    movsbl (%rbx), %r9d\n    cmpl %r9d, %r8d\n    jne .L16\n",
+        );
+        assert!(has(&out, "cmpl %r9d, %r8d"), "{out:?}");
+    }
+
+    #[test]
+    fn refuses_a_plain_full_width_pair() {
+        // The pre-existing `fuse_load_into_alu` already owns `movl`/`movq`;
+        // this pass must not double-handle or perturb it.
+        let out = fold(
+            "f:\n    movl (%rcx), %r8d\n    movl (%rbx), %r9d\n    cmpl %r9d, %r8d\n    jne .L16\n",
+        );
+        assert!(has(&out, "cmpl %r9d, %r8d"), "{out:?}");
+    }
+}
