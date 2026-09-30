@@ -5636,7 +5636,25 @@ pub(super) fn generate_instruction(
             ptr,
             ty,
             seg_override,
-            volatile,
+            // Explicitly discarded, and deliberately so.  Volatility is an IR
+            // property, and this is the IR -> machine boundary: by here the
+            // optimizer has already refused to eliminate, forward, CSE, hoist
+            // or sink the access, and `generate_load` emits exactly one load
+            // instruction for every instruction it is handed, so no backend
+            // decision can change the access count.  The three places that CAN
+            // rewrite an access check the flag themselves before reaching
+            // this point -- the memory-reordering barrier predicate above
+            // (`Instruction::Load { volatile: true, .. }`), the memcmp fold,
+            // and x86 instruction selection, which declines both the volatile
+            // load and the split volatile store.
+            //
+            // Written as `volatile: _` rather than left bound-and-unused on
+            // purpose: `src/lib.rs` allows `unused_variables` crate-wide, so a
+            // silently dead safety flag is invisible to the build.  See
+            // `scripts/check_volatile_destructuring.py`, which fails when a
+            // `volatile` destructured from an IR access is not used and this
+            // explicit discard is not written instead.
+            volatile: _,
         } => {
             generate_load(
                 cg,

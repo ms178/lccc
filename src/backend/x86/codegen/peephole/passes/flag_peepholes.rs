@@ -24,7 +24,7 @@
 //! conditional branch elsewhere may consume flags that were set before a label.
 
 use super::super::types::*;
-use super::helpers::{get_dest_reg, writes_family_full};
+use super::helpers::{get_dest_reg, writes_family, writes_family_full};
 use super::liveness::FileLiveness;
 use super::relay_and_lea::{
     dead_in_block_after, family_private_to, function_range, line_refs_family, plain_gp_operand,
@@ -1949,6 +1949,221 @@ pub(super) fn narrow_dead_sign_extension(store: &mut LineStore, infos: &mut [Lin
     changed
 }
 
+// ── 7. redundant compare feeding a chain of cmovs ──────────────────────────
+
+/// `cmp A,B …(flag-preserving)… cmp A,B` → drop the **second** `cmp`.
+///
+/// # Why the second one is dead
+///
+/// `CMOVcc` READS EFLAGS but does not WRITE it. That is the whole reason this
+/// transform exists: a comparison computed for one conditional move is still
+/// intact for the next one, because nothing in between has disturbed it.
+///
+/// The backend emits one `cmp` per `cmov`. When if-conversion turns a chain of
+/// branches that share a condition into a chain of `cmov`s, every `cmov` after
+/// the first gets its own re-computation of a comparison the flags already
+/// hold. SQLite's varint decoder is the canonical case: the two tail arms test
+/// the same byte, and the emitted loop carried
+///
+/// ```text
+///     cmpb $-128, %r10b
+///     movl %r11d, %edx
+///     cmovbl %r12d, %edx
+///     cmpb $-128, %r10b        <-- recomputes flags nobody changed
+///     movl $3, %ecx
+///     movl $4, %ebx
+///     cmovbl %ecx, %ebx
+/// ```
+///
+/// which is one dead instruction on the slowest arm of the loop, in the one
+/// shape the kernel spends most of its time in.
+///
+/// # What makes it sound
+///
+/// The two instructions must be *textually* identical — same mnemonic, same
+/// width suffix, same operand text — so they compute identical flags, and
+/// every line between them must be one of:
+///
+///   * a no-op, a directive, or a label-free run of flag-`Neutral` code;
+///   * a flag reader that does not also write (`cmov`, `setcc`) — reading the
+///     flags cannot change them, and `adc`/`sbb`/`rcl`/`rcr`, which do, are
+///     excluded by [`reader_also_writes_flags`];
+///   * and, crucially, none of them may WRITE a register named by either
+///     operand.
+///
+/// That last clause is not decoration. Deleting the operand-write guards was
+/// tried, and it miscompiles two corpus tests — `bb_slp_i64_to_i32_select`
+/// (`gt_big[2]: got 6 want 100000`) and `array_string_init_matrix_O0`. Note
+/// that a hand-written C fixture does *not* reproduce this: the register
+/// allocator normally gives the two compares different registers, so the
+/// texts differ and the fold declines anyway. The hazard only opens where
+/// allocation reuses one register across the redefinition, and the corpus is
+/// where those shapes live.
+///
+/// Control flow, calls and inline asm are barriers, so a label or a branch
+/// target between the two ends the search. That also means the fold can never
+/// reach across a basic block, where the flags' liveness this reasoning
+/// depends on would have to be re-established.
+///
+/// # Memory operands are refused outright
+///
+/// If either operand names memory, two textually identical compares are *not*
+/// necessarily equal: a store between them can change what the load reads,
+/// and nothing in the `LineInfo` model lets us prove it did not. Rather than
+/// guess, the fold declines. The real-world case this targets is a compare
+/// against a register or an immediate, so nothing is lost, and a wrong fold
+/// here would be a miscompile rather than a missed optimisation.
+pub(super) fn fold_redundant_flags_compare(store: &LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut j = 0;
+    while j < len {
+        if infos[j].is_nop() || infos[j].pinned {
+            j += 1;
+            continue;
+        }
+        let t = infos[j].trimmed(store.get(j));
+
+        // Accept only `cmp`/`test` with an explicit width suffix; the bare
+        // forms are assembler defaults and are not what the backend emits.
+        let Some(args) = strip_width_suffix(t, "cmp").or_else(|| strip_width_suffix(t, "test"))
+        else {
+            j += 1;
+            continue;
+        };
+        let Some((a, b)) = split_two_operands(args) else {
+            j += 1;
+            continue;
+        };
+        // Refuse memory operands: see the module note above.
+        if a.contains('(') || b.contains('(') || a.contains('[') || b.contains('[') {
+            j += 1;
+            continue;
+        }
+        // Aliasing operands (`test %rax,%rax`) collapse to one family, and the
+        // single write check below then covers both, so no extra case is needed.
+        let fam_a = register_family_fast(a);
+        let fam_b = register_family_fast(b);
+
+        // Walk forward over flag-preserving lines looking for the same compare.
+        let mut k = j + 1;
+        while k < len {
+            if infos[k].is_nop() || infos[k].kind == LineKind::Directive {
+                k += 1;
+                continue;
+            }
+            if infos[k].pinned || infos[k].is_barrier() {
+                break;
+            }
+            let tk = infos[k].trimmed(store.get(k));
+            // Identity is tested FIRST, before the flag classification below.
+            // A `cmp` is itself a flag writer, so classifying first would break
+            // out of the walk on the very line this pass exists to delete.
+            if tk == t {
+                mark_nop(&mut infos[k]);
+                changed = true;
+                break;
+            }
+            match flags_effect(tk) {
+                // Someone recomputed the flags: the compare we walked from no
+                // longer describes them.
+                FlagsEffect::Writes => break,
+                // Reads the flags *and* writes them (adc/sbb/rcl/rcr/int).
+                FlagsEffect::Reads if reader_also_writes_flags(tk) => break,
+                // `flags_effect` answers "might this line touch flags?" and
+                // deliberately answers `Reads` -- "assume the worst" -- for
+                // every mnemonic it does not recognise. That is the correct
+                // fail-CLOSED answer for its other callers, but this fold needs
+                // the opposite polarity: it is about to DELETE a compare, so it
+                // needs *proof* that the line left EFLAGS alone. Treating the
+                // unknown-`Reads` catch-all as "preserves flags" inverted the
+                // conservative default into a fail-OPEN one, and every flag
+                // writer missing from the tables (adox, daa, kortest*, the x87
+                // fcomi family, pcmpistri) silently re-based the
+                // flags the following cmov reads. See `preserves_eflags`.
+                FlagsEffect::Reads | FlagsEffect::Neutral => {
+                    if !preserves_eflags(tk) {
+                        break;
+                    }
+                }
+            }
+            // A redefinition of either operand register makes the second
+            // compare see a different value, even though the text matches.
+            //
+            // `reg_refs` is the classifier's complete register bitmask for the
+            // whole line (every operand, not just the destination), so it also
+            // covers instructions whose single-destination model does not fit:
+            // `xchgq %rcx, %rax` writes BOTH operands, and `mulxq %rsi, %rcx,
+            // %rdx` writes two of its three. `writes_family` alone only sees
+            // the parsed destination and let both folds delete a compare that
+            // was reading a register the line had just clobbered. The mask
+            // conflates reads with writes, which is the conservative direction
+            // for a compare we are about to delete.
+            let refs = infos[k].reg_refs;
+            if fam_a != REG_NONE
+                && (writes_family(&infos[k], tk, fam_a) || refs & (1u16 << fam_a) != 0)
+            {
+                break;
+            }
+            if fam_b != REG_NONE
+                && fam_b != fam_a
+                && (writes_family(&infos[k], tk, fam_b) || refs & (1u16 << fam_b) != 0)
+            {
+                break;
+            }
+            k += 1;
+        }
+        j += 1;
+    }
+    changed
+}
+
+/// Proof that `t` leaves EFLAGS unmodified — the question
+/// `fold_redundant_flags_compare` actually needs.
+///
+/// `flags_effect` answers a deliberately different question ("might this line
+/// touch flags?") and returns `FlagsEffect::Reads` as its catch-all, which is
+/// fail-CLOSED for the transforms that consult it. A fold that *deletes* a
+/// compare needs the converse: a positive proof that nothing between the two
+/// compares rewrote the flags the later `cmov`/`jcc` will read. Answering that
+/// with `Reads` would invert the conservative default into a fail-OPEN one, so
+/// the polarity is fixed here, once, rather than at each call site.
+///
+/// The allowlist is the set of instructions the SDM documents as reading
+/// EFLAGS without writing it, plus the families `flags_effect` has already
+/// proven neutral. Everything else — including every mnemonic `flags_effect`
+/// does not know — is treated as a writer and blocks the fold. That direction
+/// is the safe one: a missed fold costs one instruction, a wrong one is a
+/// miscompile.
+#[inline]
+fn preserves_eflags(t: &str) -> bool {
+    // Documented pure readers of the condition codes.
+    if t.starts_with("cmov")
+        || t.starts_with("set")
+        || t.starts_with("lahf")
+        || t.starts_with("pushf")
+        || t.starts_with("salc")
+    {
+        return true;
+    }
+    // `Neutral` is `flags_effect`'s *positive* verdict, reached only through
+    // explicit tables (register push/pop, the BMI2 VEX shifts, `fp_data_op`).
+    // `Reads` is its unknown-mnemonic catch-all and proves nothing.
+    matches!(flags_effect(t), FlagsEffect::Neutral)
+}
+
+/// `"cmpq 1, %rax"` → `Some("1, %rax")`; `"cmpl $0, 8(%rbx)"` → `Some("$0, 8(%rbx)")`.
+/// Returns `None` unless the mnemonic is exactly `base` plus one of the four
+/// width suffixes, so `cmpps`/`cmpxchg` can never be mistaken for `cmp`.
+fn strip_width_suffix<'a>(t: &'a str, base: &str) -> Option<&'a str> {
+    let rest = t.strip_prefix(base)?;
+    let rest = rest.strip_prefix(['b', 'w', 'l', 'q'])?;
+    if !rest.starts_with(' ') {
+        return None;
+    }
+    Some(rest.trim_start())
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::super::peephole_optimize;
@@ -3059,5 +3274,140 @@ mod tests {
         );
         let f = facts("    popfq\n    js .LBB5\n.LBB5:\n    ret\n");
         assert!(f.proved && !f.saw_sf_reader, "popf replaces the flags");
+    }
+
+    // ==================== fold_redundant_flags_compare ====================
+    //
+    // This fold DELETES a compare, so every test here is a "must NOT fold"
+    // unless the comment says otherwise. The input always carries exactly two
+    // identical compares; a correct peephole keeps BOTH (2), and 1 means the
+    // second was wrongly deleted. `reg_refs` and copy-propagation rewrite
+    // register names freely, so the tests count `cmpb $-128,` rather than
+    // matching a specific register.
+
+    fn two_cmp_case(mid: &str) -> String {
+        format!(
+            "main:\n    .cfi_startproc\n    cmpb $-128, %rcx\n    {mid}\n    \
+             cmpb $-128, %rcx\n    cmovb %rsi, %rcx\n    .cfi_endproc\n    ret\n"
+        )
+    }
+    fn n_cmp(out: &str) -> usize {
+        out.matches("cmpb $-128,").count()
+    }
+
+    /// A flag-preserving, non-clobbering line between two identical compares:
+    /// the exact redundancy this pass exists to remove. If this ever stops
+    /// folding, the pass has become a pessimisation and every other test below
+    /// is vacuous.
+    #[test]
+    fn flags_compare_folds_the_redundant_compare() {
+        let out = run(&two_cmp_case("movq %rsi, %rdx"));
+        assert_eq!(
+            n_cmp(&out),
+            1,
+            "movq preserves flags and writes neither operand"
+        );
+        // ...and the negative control still holds the fold off.
+        let kept = run(&two_cmp_case("addl %esi, %edi"));
+        assert_eq!(
+            n_cmp(&kept),
+            2,
+            "addl writes flags: both compares must survive"
+        );
+    }
+
+    /// `flags_effect` answers "might this touch flags?" and returns `Reads` for
+    /// anything unrecognised. Every real flag writer that lands in that
+    /// catch-all must still block a fold that deletes a compare. Each of these
+    /// reproduced a wrong fold before `preserves_eflags` existed.
+    #[test]
+    fn flags_compare_refuses_across_unmodelled_flag_writers() {
+        // `adox` writes OF; its `adcx` sibling is caught only because it
+        // happens to share the "adc" prefix, so both are pinned here.
+        for mid in [
+            "adoxq %rsi, %r8",            // OF
+            "adcxq %rsi, %r8",            // CF
+            "daa",                        // AF/CF
+            "kortestw %ax, %bx",          // ZF/CF
+            "fcomip %st(1)",              // ZF/PF/CF
+            "fcomip %st(1)",              // ZF/PF/CF
+            "pcmpistri $0, (%rax), %rdx", // ZF/CF/SF/OF + EAX
+        ] {
+            let out = run(&two_cmp_case(mid));
+            assert_eq!(
+                n_cmp(&out),
+                2,
+                "`{mid}` writes EFLAGS: 2nd compare must survive"
+            );
+        }
+    }
+
+    /// `xchgq %rcx, %rax` writes BOTH operands and `mulxq %rsi, %rcx, %rdx`
+    /// writes two of its three, so neither fits a single-destination model.
+    /// `writes_family` saw only the parsed destination and let the fold delete
+    /// a compare whose operand the line had just clobbered.
+    #[test]
+    fn flags_compare_refuses_across_multi_destination_writes() {
+        for mid in ["xchgq %rcx, %rax", "mulxq %rsi, %rcx, %rdx"] {
+            let out = run(&two_cmp_case(mid));
+            assert_eq!(
+                n_cmp(&out),
+                2,
+                "`{mid}` writes %rcx: 2nd compare must survive"
+            );
+        }
+    }
+
+    /// Pins the SSE/AVX and MXCSR classes of the shared `flags_effect` oracle.
+    ///
+    /// These were re-derived from the SDM prose and got it wrong, so they are
+    /// pinned to what the hardware actually does. A pushfq/popq probe around
+    /// each instruction (x86-64, 2026-09-30) gives:
+    ///
+    ///     cmpps    unchanged      cmppd    unchanged
+    ///     movaps   unchanged      stmxcsr  unchanged
+    ///     comiss   WRITES EFLAGS
+    ///
+    /// The packed SSE compares write the per-element mask to the DESTINATION
+    /// and leave EFLAGS alone; only the *scalar* COMISS/UCOMISS family sets
+    /// ZF/PF/CF. LDMXCSR likewise does not write EFLAGS for any value tested,
+    /// including ones with SIMD exception status bits set. The pre-existing
+    /// `sse_arith_is_flag_neutral_not_a_flag_writer` test was already right and
+    /// caught the wrong reclassification; this one exists so the boundary is
+    /// stated in both directions rather than only on the side that was wrong.
+    #[test]
+    fn sse_compare_and_mxcsr_classes_match_hardware() {
+        // Measured flag-neutral on this x86-64 host.
+        for t in [
+            "cmpps $0, %xmm0, %xmm1",
+            "cmppd $0, %xmm0, %xmm1",
+            "ldmxcsr (%rax)",
+            "stmxcsr (%rax)",
+            "movaps %xmm0, %xmm1",
+        ] {
+            assert_eq!(
+                flags_effect(t),
+                FlagsEffect::Neutral,
+                "{t} leaves EFLAGS alone"
+            );
+        }
+        // Measured to set ZF/PF/CF.
+        for t in [
+            "comiss %xmm0, %xmm1",
+            "comisd %xmm0, %xmm1",
+            "ucomiss %xmm0, %xmm1",
+            "ucomisd %xmm0, %xmm1",
+            "vcomiss %xmm0, %xmm1",
+            "vucomisd %xmm0, %xmm1",
+        ] {
+            assert_eq!(flags_effect(t), FlagsEffect::Writes, "{t} sets ZF/PF/CF");
+        }
+        // The scalar/packed CMPSS/CMPSD spellings are unmodelled, so they land
+        // on the unknown catch-all. `Reads` is fail-closed -- it can only make
+        // a transform refuse a fold it could have made -- so leaving them there
+        // is correct-by-default rather than a gap worth closing on a guess.
+        for t in ["cmpss $0, %xmm0, %xmm1", "cmpsd $0, %xmm0, %xmm1"] {
+            assert_eq!(flags_effect(t), FlagsEffect::Reads, "{t} is unmodelled");
+        }
     }
 }

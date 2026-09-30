@@ -37,13 +37,17 @@
  * loop is entered, which means p != 0. The NULL path branches to `ret0`
  * without ever passing through `pre`. The dereference-before-NULL-test
  * bug is therefore still impossible, by construction rather than by
- * refusal.
+ * refusal -- and this file still segfaults deterministically if a
+ * preheader is ever spliced onto the wrong edge, which is the signal we
+ * want.
  *
  * So the contract this file pins has shifted from "LICM must refuse this
  * shape" to "the hoist must land in the guarded preheader and nowhere
- * else". A compiler that hoists into the guard block still segfaults in
- * phase 1 below, which is exactly the signal we want. Run with
- * CCC_DISABLE_PASSES=loop_preheader to exercise the original refusal path.
+ * else". An earlier revision of this comment claimed the load "must not be
+ * hoisted"; that stopped being true when `loop_preheader` landed, the test
+ * kept passing, and a reader taking it literally would have gone looking
+ * for a non-bug. Run with CCC_DISABLE_PASSES=loop_preheader to exercise
+ * the original refusal path.
  */
 #include <stdio.h>
 #include <string.h>

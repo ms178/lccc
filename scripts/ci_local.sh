@@ -130,6 +130,37 @@ gate() {
     fi
 }
 
+# Cheapest possible gate, and the one that catches the failure mode that is
+# hardest to notice: a merge conflict committed into a shell script is a
+# syntax error only when the shell REACHES the line, so every gate above the
+# damage still prints PASS for a suite that never ran. Runs before `build` so
+# the breakage is reported as itself rather than as a mystery later.
+gate "no-conflict-markers" fast \
+    python3 scripts/check_no_conflict_markers.py
+
+# Same reasoning, and equally compiler-independent: a workflow file is not a
+# shell script, so Actions step scaffolding pasted into a `run: |` block is
+# valid YAML that dies with exit 127 on the hosted runner. It is invisible
+# locally because no local gate parses the workflow, and it takes down every
+# gate sequenced below it.
+gate "ci-workflow-shell" fast \
+    python3 scripts/check_ci_workflow_shell.py
+
+# The helper scripts are tools, not gates, so the suite that runs the gates
+# never runs them -- which is how `ab_interleaved.py` shipped with an import
+# that cannot resolve and stayed dead for an entire series. This checks every
+# helper's imports against the AST, without executing them.
+gate "script-imports" fast \
+    python3 scripts/check_script_imports.py
+
+# The volatile ratchet is a pure static scan of `src/`. It needs no compiler,
+# so running it before the build means a dropped `!*volatile` guard is
+# reported even when the build is broken.
+gate "volatile-destructuring-selftest" fast \
+    python3 scripts/check_volatile_destructuring.py --self-test
+gate "volatile-destructuring" fast \
+    python3 scripts/check_volatile_destructuring.py
+
 # ---------------------------------------------------------------- build ----
 gate "build" fast ./scripts/build_lccc_fast.sh
 
@@ -318,36 +349,64 @@ gate "vec-dead-remainder" fast \
 gate "minmax-reduction" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_minmax_reduction.sh
 
-gate "hot-loop-metric" fast \
-    python3 scripts/test_hot_loop_metric.py
-
-# LICM must not hoist a volatile load out of its loop (C11 5.1.2.3): N
-# observable accesses must not become 1. The runtime cannot see this -- a
-# hoisted volatile load computes the same answer -- so the gate asserts it
-# structurally, with a non-volatile load in the same shape as the negative
-# control (that one MUST be hoisted, or the test proves nothing).
-gate "volatile-licm" fast \
-    env CCC=target/fastbuild/lccc bash tests/regression/check_volatile_licm.sh
-gate "loop-preheader" fast \
-    env CCC=target/fastbuild/lccc bash tests/regression/check_loop_preheader.sh
-
-# These two existed in the tree for a long time and were wired to NOTHING --
-# not ci.yml, not any of this script's gates, and unreachable from the corpus
-# runner (they assert on emitted assembly, not on runtime output, and the
-# spin-wait probe would simply hang and report TIMEOUT if it regressed).
-# That is how a deleted `!*volatile` in LICM's Load arm survived review: the
-# test that exists precisely to catch it never ran. Wired now.
+# Observable-access gates.  Three instruments, because each catches a
+# different way the `volatile` contract gets broken and each was proved to do
+# so by mutation (reintroducing the guard deletion in licm.rs):
 #
-# `check_volatile_pointer_subscript.sh` is the direct counterpart to the LICM
-# guard: `while (!regs[STATUS]) ;` -- the archetypal MMIO spin wait -- must
-# keep its load inside the loop, and the same qualifier must also defeat
-# dead-store elimination and load CSE on subscripted/pointer-arithmetic
-# forms. `check_volatile_access_semantics.sh` guards the wider pipeline
-# (forwarding, CSE, DCE, mem2reg promotion) rather than one pass.
+#   volatile-spin-loop        BEHAVIOURAL.  Asserts a volatile access is
+#                             positioned between the loop header and the
+#                             backward branch.  The only one of the three
+#                             that catches a HOIST (a hoist keeps the access
+#                             count at one, which is why the subscript gate
+#                             below stays green on a miscompiled spin loop --
+#                             measured, not assumed).
+#   volatile-pointer-subscript BEHAVIOURAL.  Asserts the qualifier survives
+#                             subscript/pointer arithmetic, i.e. no CSE, no
+#                             dead-store elimination, no forward.
+#   volatile-destructuring    STATIC.  Fails when a `volatile` destructured
+#                             from an IR access is bound and never used, which
+#                             is exactly how a guard disappears in a refactor.
+#                             Costs no build, so it runs first in a review.
+#
+# All three are fast: they need only $CCC (or, for the static one, nothing but
+# the source tree) and no oracle linkers.
+gate "volatile-spin-loop" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_volatile_spin_loop.sh
+
 gate "volatile-pointer-subscript" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_volatile_pointer_subscript.sh
 gate "volatile-access-semantics" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_volatile_access_semantics.sh
+
+# End-to-end contract for the loop-preheader pass.  Its unit tests can only
+# reach the pure terminator helpers, so they cannot observe whether a
+# preheader was actually inserted -- a Rust-side suite passes identically
+# whether the pass fires once or never.  This gate asserts the emitted
+# assembly in both directions: the shape it must improve (hoisted) and the
+# shapes it must decline (byte-identical, load still in the loop).
+gate "loop-preheader" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_loop_preheader.sh
+
+# LICM must not hoist a volatile load out of its loop (C11 5.1.2.3): N
+# observable accesses must not become 1.  The runtime cannot see this -- a
+# hoisted volatile load computes the same answer -- so the gate asserts it
+# structurally, with a non-volatile load in the same shape as the negative
+# control (that one MUST be hoisted, or the test proves nothing).
+# Complements the three observable-access gates above: those cover spin
+# loops, subscripts and the destructuring refactor; this one covers the
+# do-while shape, where a hoist is legal-looking and easy to miss.
+gate "volatile-licm" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_volatile_licm.sh
+
+# One comparison, one set of flags. `cmov` reads EFLAGS without writing it, so
+# a `cmov` chain that shares a condition needs ONE `cmp`, not one per `cmov`.
+# The gate carries its own negative control (CCC_PEEPHOLE_SKIP) so a build
+# where the pass silently stopped running cannot pass it.
+gate "redundant-flags-compare" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_redundant_flags_compare.sh
+
+gate "hot-loop-metric" fast \
+    python3 scripts/test_hot_loop_metric.py
 
 # Pure-logic gate: it exercises the oracle-verdict / oracle-agreement
 # classifier directly, so it needs neither a built linker nor a single
@@ -358,13 +417,16 @@ gate "volatile-access-semantics" fast \
 gate "linker-oracle-verdict" fast \
     python3 tests/linker/test_reloc_oracle_verdict.py
 
-# The full corpus gate is SLOW, so a source file that cannot even link used
-# to reach upstream on a green local run: tests/regression/*.c is globbed
+# The full corpus gate is SLOW, so a source file that cannot even link used to
+# reach upstream on a green local run: tests/regression/*.c is globbed
 # non-recursively and compiled standalone, so a multi-file driver dropped in
-# that directory fails to link.  --compile-only is the cheap half of that
-# gate (no execution, no GCC reference build) and catches exactly this.
+# that directory fails to link.  --compile-only is the cheap half of that gate
+# (no execution, no GCC reference build) and catches exactly this, in seconds.
+# Failure detail names the non-self-contained file instead of printing a wall
+# of `undefined reference` lines.
 gate "regression-corpus-link" fast \
     python3 tests/regression/run_regression.py --lccc "$LCCC" -j 2 --compile-only
+
 gate "copy-alias-sizes" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_copy_alias_sizes.sh
 

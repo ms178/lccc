@@ -1147,6 +1147,19 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
                 changed |= c;
             }
         }
+        if !sk("flags_compare") {
+            {
+                let c = flag_peepholes::fold_redundant_flags_compare(&store, &mut infos);
+                trace(
+                    "fold_redundant_flags_compare",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
+        }
         if !sk("self_test") {
             {
                 let c = flag_peepholes::eliminate_redundant_self_test(&store, &mut infos);

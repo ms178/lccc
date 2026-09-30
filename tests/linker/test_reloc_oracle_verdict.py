@@ -59,6 +59,11 @@ THREE = [("bfd", ["gcc", "-fuse-ld=bfd"]),
          ("mold", ["gcc", "-fuse-ld=mold"]),
          ("wild", ["gcc", "-B/shim"])]
 ONE = [("bfd", ["gcc", "-fuse-ld=bfd"])]
+# The real host set: lld is the oracle that implements linker scripts.
+THREE_LLD = [("bfd", ["gcc", "-fuse-ld=bfd"]),
+             ("lld", ["gcc", "-fuse-ld=lld"]),
+             ("mold", ["gcc", "-fuse-ld=mold"])]
+TWO = [("bfd", ["gcc", "-fuse-ld=bfd"]), ("mold", ["gcc", "-fuse-ld=mold"])]
 
 BFD_TRUNC = b"p.o: relocation R_X86_64_PC32 against symbol `farpc' can not be" \
             b" used; recompile with -fPIC: relocation truncated to fit"
@@ -74,6 +79,10 @@ def _notes(**kw):
 
 # ── reloc_oracle_verdict ────────────────────────────────────────────────────
 # (label, kind, stderr, rc, expected, why)
+MOLD_SCRIPT = (b"mold: fatal: t.ld:1: ENTRY(probe)\n"
+              b"                     ^ unknown linker script token\n"
+              b"collect2: error: ld returned 1 exit status 1")
+
 VERDICT_CASES = [
     # ── exit status dominates everything ──
     ("exec", "PC32", BFD_TRUNC, 0, "accepted",
@@ -97,6 +106,29 @@ VERDICT_CASES = [
      "shared path: GNU ld words its R_X86_64_32 refusal its own way"),
     ("shared", "32", b"", 1, "refused",
      "shared path: even an unexplained refusal counts"),
+    # ── `incapable`: the fixture was rejected before any relocation ──
+    # These exercise the PRODUCER, not the agreement function.  The
+    # `incapable` class was, until now, reachable only by hand-writing it
+    # into a notes dict -- so every `incapable` case below the agreement
+    # function passed while the real pipeline could never emit the class.
+    # The recorded mold 2.37.1 stderr, verbatim.
+    ("script", "PC32", MOLD_SCRIPT, 1, "incapable",
+     "mold cannot parse the minimal -T script: a missing FEATURE, so the "
+     "quorum is taken over the oracles that could have answered"),
+    # The same stderr on a path with no script must NOT be excused: the
+    # script mention is a red herring there, and silently narrowing the
+    # quorum off a path that never had a script would be exactly the
+    # false-green the split exists to prevent.
+    ("exec", "PC32", MOLD_SCRIPT, 1, "inapplicable",
+     "no script on this path, so 'linker script' in the text excuses nothing"),
+    ("shared", "32", MOLD_SCRIPT, 1, "refused",
+     "the shared shortcut still wins: any refusal counts"),
+    # Naming the relocation beats the script excuse -- if the oracle got as
+    # far as discussing R_X86_64_PC32 it clearly reached it, and the
+    # fixture was not what stopped it.
+    ("script", "PC32", BFD_TRUNC + b" (while reading t.ld)", 1, "refused",
+     "a refusal that NAMES the relocation is an opinion even if a script "
+     "is also mentioned: the oracle demonstrably reached the relocation"),
     # ── the wording is not part of the contract ──
     ("exec", "PC32", BFD_TRUNC, 1, "refused",
      "bfd's spelling: 'relocation truncated to fit'"),
@@ -126,9 +158,13 @@ VERDICT_CASES = [
 
 # ── reloc_oracle_agreement ──────────────────────────────────────────────────
 def _agree(notes):
-    """Rebuild the `agree` list exactly as the caller does."""
+    """Rebuild the `agree` list exactly as the caller does.
+
+    `incapable` is `continue`d by the caller before an oracle ever runs, so it
+    must not be turned into a `(name, False)` disagreement here either.
+    """
     return [(n, v == "refused") for n, (v, _, _) in notes.items()
-            if v != "inapplicable"]
+            if v not in ("inapplicable", "incapable")]
 
 
 def _case(name, notes, oracles, want_status, want_substring=""):
@@ -146,6 +182,7 @@ def _n(v, rc=1, err=b"x"):
 
 
 AGREEMENT_CASES = [
+
     # ── the happy path ──
     _case("all three refuse",
           _notes(bfd=_n("refused"), mold=_n("refused"), wild=_n("refused")),
@@ -198,7 +235,54 @@ AGREEMENT_CASES = [
     # the notes must not be mistaken for evidence.
     _case("notes without any configured oracle still fails",
           _notes(bfd=_n("refused"), mold=_n("refused")), [], "FAIL", "no oracles"),
+    # A third route to the same shape: notes that CLAIM agreement, with no
+    # oracle configured to back the claim. The notes are not evidence, and a
+    # reader scanning a passing report should not be able to mistake them for
+    # a quorum. Distinct from the case above, which seeds refused notes.
+    _case("an empty oracle set fails even if notes claim agreement",
+          _notes(bfd=_n("refused")), [], "FAIL", "no oracles"),
 ]
+AGREEMENT_CASES += [
+    # ── `incapable`: a missing FEATURE (probed structurally), not a missing
+    #    opinion.  mold advertises -T but cannot parse even a minimal
+    #    SECTIONS, so on a host with mold installed the script-path
+    #    cross-checks used to drop to a single opinion and fail.  These pin
+    #    the fix: exclude the feature gap, keep the quorum over the oracles
+    #    that could answer, and never let the exclusion hide a disagreement.
+    _case("an incapable oracle is excluded; quorum is over the capable ones",
+          _notes(bfd=_n("refused"), lld=_n("refused"),
+                 mold=_n("incapable", 1, b"cannot parse a -T linker scriptb")),
+          THREE_LLD, "PASS", "not counted"),
+    _case("incapable does not rescue a disagreement",
+          _notes(bfd=_n("refused"), lld=_n("accepted", 0),
+                 mold=_n("incapable", 1, b"cannot parse a -T linker scriptb")),
+          THREE_LLD, "FAIL", "disagree"),
+    _case("incapable does not rescue a silent refusal",
+          _notes(bfd=_n("refused"), lld=_n("silent"),
+                 mold=_n("incapable", 1, b"cannot parse a -T linker scriptb")),
+          THREE_LLD, "FAIL", "disagree"),
+    _case("every oracle incapable is not a vacuous PASS",
+          _notes(bfd=_n("incapable", 1, b"cannot parse a -T linker scriptb"),
+                 lld=_n("incapable", 1, b"cannot parse a -T linker scriptb"),
+                 mold=_n("incapable", 1, b"cannot parse a -T linker scriptb")),
+          THREE_LLD, "FAIL"),
+    _case("incapable narrows the quorum honestly, and says so",
+          _notes(bfd=_n("refused"), mold=_n("incapable", 1, b"no -T support")),
+          TWO, "PASS", "agreed by 1 of 2"),
+    # An `inapplicable` oracle could still have answered, so it does NOT
+    # shrink the quorum -- only a structural `incapable` does.  Here lld could
+    # have had an opinion and merely did not, so the floor stays 2 and bfd's
+    # lone refusal is correctly not enough.
+    _case("inapplicable still counts against the quorum; only incapable frees a seat",
+          _notes(bfd=_n("refused"), lld=_n("inapplicable"),
+                 mold=_n("incapable", 1, b"no -T support")),
+          THREE_LLD, "FAIL", "need 2"),
+    _case("the reference being incapable still fails",
+          _notes(bfd=_n("incapable", 1, b"no -T support"),
+                 lld=_n("refused"), mold=_n("refused")),
+          THREE_LLD, "FAIL"),
+]
+
 
 
 def main() -> int:
