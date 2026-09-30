@@ -1265,14 +1265,15 @@ fn hoist_loop_invariants(
                     // before the guard (gcc.c-torture/execute/20051215-1.c).
                     // Require the load's original block to dominate every
                     // loop block, i.e. it is must-execute for any iteration.
-                    // Volatility is checked FIRST and unconditionally. It is
-                    // not a profitability judgement and not a legality of the
-                    // surrounding CFG: a volatile access is part of the
-                    // program's observable behaviour, so the loop must
-                    // perform exactly as many of them as the source does.
-                    // Every other test below is about whether hoisting is
-                    // *safe for a non-volatile load*, and none of them may
-                    // be allowed to reach a volatile one.
+                    // Volatility is tested FIRST and unconditionally. It is not
+                    // a profitability judgement and not a question about the
+                    // surrounding CFG, so it must never be reordered behind,
+                    // or short-circuited by, any of the tests below: a volatile
+                    // access is part of the program's observable behaviour and
+                    // the loop must perform exactly as many of them as the
+                    // source does. Every other test here asks whether hoisting
+                    // is safe for a *non-volatile* load, and none of them may be
+                    // allowed to reach a volatile one.
                     if *volatile {
                         licm_debug(|| {
                             eprintln!(

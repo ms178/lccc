@@ -274,6 +274,16 @@ fn x86_fma_enabled() -> bool {
 /// Restrict this thread's vectorizer run to the reductions the LATE rerun
 /// exists for: Select-shaped integer min/max.
 ///
+/// Scope guard rather than a setter. The flag is global per thread, so a
+/// set/clear pair around a call is a manual `defer`: every future edit that
+/// adds an early return, a `?`, or a second call site between the two lines
+/// silently widens or narrows the *next* pass too, and the symptom is a
+/// vectorizer that behaves differently depending on what ran before it in the
+/// same compilation unit — the "works alone, breaks in batch" class. Holding
+/// it in a `Drop` makes the pairing structural, and it also keeps the scope
+/// visible at the call site (`let _guard = ...`) rather than implied by two
+/// statements that happen to be adjacent.
+///
 /// Why the late run is narrowed at all: the unrestricted rerun also picks up
 /// the guarded-sum reduction in `zlib_ng_adler32`. That transform is not free
 /// and it is not a win — measured with `valgrind --tool=callgrind` on the
@@ -289,17 +299,13 @@ fn x86_fma_enabled() -> bool {
 /// Re-opening the rest is a real follow-up (see `backlog.md` MINMAX-4): the
 /// steady-state gain is genuine, so the work is the accumulator/traffic side,
 /// not the transform's legality.
-///
-/// Deliberately **not** `pub(crate)`, even though its siblings in this file
-/// are. The other flags are set once by `run_passes` before any pass runs and
-/// are simply read thereafter; this one is scoped to a single call, so it
-/// must be paired with a matching restore. Exposing the setter would invite
-/// an unpaired `set(true)` -- and because the flag is thread-local, a leaked
-/// `true` survives the current translation unit and silently restricts
-/// vectorization in the next one this worker thread compiles. Keeping the
-/// setter private makes [`LateMinMaxOnlyScope`] the only way to raise the
-/// flag, so the invariant is enforced by the type system rather than by
-/// whoever edits this file next.
+/// Private on purpose: the only correct way to move this flag is through
+/// `LateMinMaxOnlyScope`, which pairs the set with the restore in a `Drop` and
+/// refuses to nest. A `pub(crate)` setter is an escape hatch around exactly
+/// that invariant — a caller outside this module can set the flag and return
+/// without restoring it, reintroducing the "works alone, breaks in batch"
+/// failure the scope exists to prevent. Nothing outside `vectorize.rs` needs
+/// it, and the compiler is the thing that keeps it that way.
 fn set_late_minmax_only(enabled: bool) {
     LATE_MINMAX_ONLY.with(|f| f.set(enabled));
 }
@@ -19350,6 +19356,164 @@ fn find_loop_preheader(
 }
 
 /// Transform reduction loop to use AVX2 256-bit vectorization (4×F64, 8×I32, etc.).
+/// Hoist a reduction's DYNAMIC trip-count bound out of the loop, computing it
+/// once instead of once per iteration.
+///
+/// Shared by the AVX2 and SSE2/NEON reduction transforms. They used to carry
+/// byte-identical copies of this block: it is one computation with two
+/// spellings, not two computations to be kept in step by hand.
+///
+/// WHY OUT OF THE LOOP. The min/max reductions reach this path with an I64
+/// limit, and re-dividing it in the steady-state body cost 6 of the loop's 10
+/// instructions -- 0.3125 insn/byte against GCC's 0.125 on that shape. LICM
+/// runs before the vectorizer and the late rerun runs after it, so nothing
+/// else hoists it. `LShr` is exact for the UNSIGNED division `UDiv` denotes
+/// and every vector width is a power of two, so the whole bound becomes one
+/// instruction that runs once.
+///
+/// WHERE IT GOES. The preheader when the loop has a single one satisfying
+/// BOTH preconditions below, and the header otherwise. The header is always
+/// correct and only slower, so the first precondition is a performance guard.
+/// The second is not: a preheader that does not dominate the header would
+/// leave the bound's def failing to dominate its use, which is a miscompile.
+/// Neither precondition implies the other, so both are required.
+///
+/// Returns the rewritten limit operand and how many instructions were added,
+/// so the caller can keep its own change tally.
+fn emit_invariant_vector_bound(
+    func: &mut IrFunction,
+    pattern: &ReductionPattern,
+    limit_val: Value,
+    vec_width: u64,
+    byte_stride: u64,
+    use_byte_iv: bool,
+    next_val_id: &mut u32,
+    debug: bool,
+) -> (Operand, usize) {
+    let limit_ty = match &func.blocks[pattern.header_idx].instructions[pattern.exit_cmp_inst_idx] {
+        Instruction::Cmp { ty, .. } => *ty,
+        _ => IrType::I64,
+    };
+    // AUD-3: the hoisted bound computation USES the limit, so it may
+    // only go into the preheader if the limit's definition is already
+    // available there. Without this a limit defined inside the loop
+    // (the header being the reachable case) is referenced before its
+    // def -- an SSA violation a plain compile does not surface but
+    // CCC_VALIDATE_SSA does. The CFG is built lazily, inside the
+    // filter, so a loop with no preheader pays nothing and the common
+    // path is unchanged; when the check fails we fall back to the
+    // header, which is correct either way and only slower.
+    let preheader_idx =
+        find_loop_preheader(func, pattern.header_idx, &pattern.loop_blocks).filter(|&pre_idx| {
+            let cfg = CfgAnalysis::build(func);
+            // TWO independent preconditions, both required.
+            //
+            // (1) The limit's def must already be available in the
+            //     preheader, or the hoisted bound reads it before it
+            //     is defined.
+            // (2) The preheader must DOMINATE the header, or the
+            //     bound's own def does not dominate its use inside
+            //     the loop.
+            //
+            // (1) does not imply (2): it constrains where the limit
+            // comes from, never where `pre_idx` sits relative to the
+            // loop. Failing either one falls back to the header,
+            // which is correct and only slower.
+            strict_external_value_available(func, &cfg, &pattern.loop_blocks, pre_idx, limit_val)
+                && strict_cfg_dominates(&cfg, pre_idx, pattern.header_idx)
+        });
+    let width_pow2 = vec_width.is_power_of_two();
+    let stride_pow2 = byte_stride.is_power_of_two();
+    let const_of = |v: u64| match limit_ty {
+        IrType::I32 => IrConst::I32(v as i32),
+        IrType::I64 => IrConst::I64(v as i64),
+        _ => IrConst::I64(v as i64),
+    };
+
+    let div_dest = Value(*next_val_id);
+    *next_val_id += 1;
+    let div_inst = Instruction::BinOp {
+        dest: div_dest,
+        op: if width_pow2 {
+            IrBinOp::LShr
+        } else {
+            IrBinOp::UDiv
+        },
+        lhs: Operand::Value(limit_val),
+        rhs: Operand::Const(const_of(if width_pow2 {
+            vec_width.trailing_zeros() as u64
+        } else {
+            vec_width
+        })),
+        ty: limit_ty,
+    };
+
+    // The byte-stride scaling (only under the byte-offset IV scheme)
+    // is part of the SAME invariant computation, so it lives beside
+    // the division rather than in the loop.
+    let mul_dest = Value(*next_val_id);
+    let byte_limit_inst = if use_byte_iv {
+        *next_val_id += 1;
+        Some(Instruction::BinOp {
+            dest: mul_dest,
+            op: if stride_pow2 {
+                IrBinOp::Shl
+            } else {
+                IrBinOp::Mul
+            },
+            lhs: Operand::Value(div_dest),
+            rhs: Operand::Const(const_of(if stride_pow2 {
+                byte_stride.trailing_zeros() as u64
+            } else {
+                byte_stride
+            })),
+            ty: limit_ty,
+        })
+    } else {
+        None
+    };
+
+    let has_byte_limit = byte_limit_inst.is_some();
+    match preheader_idx {
+        Some(pre_idx) => {
+            func.blocks[pre_idx].instructions.push(div_inst);
+            if let Some(mul_inst) = byte_limit_inst {
+                func.blocks[pre_idx].instructions.push(mul_inst);
+            }
+        }
+        None => {
+            func.blocks[pattern.header_idx]
+                .instructions
+                .insert(pattern.exit_cmp_inst_idx, div_inst);
+            if let Some(mul_inst) = byte_limit_inst {
+                func.blocks[pattern.header_idx]
+                    .instructions
+                    .insert(pattern.exit_cmp_inst_idx + 1, mul_inst);
+            }
+        }
+    }
+    let added = 1 + has_byte_limit as usize;
+
+    if debug {
+        eprintln!(
+            "[VEC-RED]   Divided dynamic limit in {}: Value({})",
+            if preheader_idx.is_some() {
+                "the preheader"
+            } else {
+                "the header (no single preheader)"
+            },
+            div_dest.0
+        );
+    }
+
+    let bound = if has_byte_limit {
+        Operand::Value(mul_dest)
+    } else {
+        Operand::Value(div_dest)
+    };
+    (bound, added)
+}
+
 fn transform_reduction_avx2(
     func: &mut IrFunction,
     pattern: &ReductionPattern,
@@ -19597,161 +19761,18 @@ fn transform_reduction_avx2(
             }
         }
         Operand::Value(limit_val) => {
-            // Dynamic limit: divide ONCE, OUTSIDE the loop, with a shift.
-            //
-            // This used to insert the division into the HEADER - i.e. inside
-            // the loop - so every iteration re-divided a value that never
-            // changes. LICM runs before the vectorizer (and the late rerun
-            // runs after it), so nothing hoisted it again. The min/max
-            // reductions reach this path with an I64 limit, and a 64-bit
-            // `divq` in the steady-state body cost 6 of the loop's 10
-            // instructions: 0.3125 insn/byte against GCC's 0.125. Hoisting
-            // into the preheader and using LShr (exact for the UNSIGNED
-            // division UDiv denotes, and every vector width is a power of
-            // two) turns the whole bound computation into one instruction
-            // that runs once.  Falls back to the header when the loop has no
-            // single preheader: correct either way, only slower.
-            let limit_ty =
-                match &func.blocks[pattern.header_idx].instructions[pattern.exit_cmp_inst_idx] {
-                    Instruction::Cmp { ty, .. } => *ty,
-                    _ => IrType::I64,
-                };
-            // AUD-3, CORRECTED: this filter is a REDUNDANT fail-closed
-            // guard, not a bug fix. It was added on the belief that the
-            // limit's definition might not be available at the preheader.
-            // That belief was wrong, and here is the proof, so nobody
-            // "fixes" this again or cites it as a correctness patch:
-            //
-            //   1. `reduction_remainder_references_sound` runs before any
-            //      transform and requires `invariant(&pattern.limit)`.
-            //   2. `invariant` requires `plan_remainder_reference` to yield
-            //      `RemainderRefPlan::UseOriginal`, which is returned iff
-            //      the definition's block is NOT in `loop_blocks`.
-            //   3. The original body used the limit, so SSA legality makes
-            //      the definition dominate the body block.
-            //   4. `find_loop_preheader` returns `Some` only for a UNIQUE
-            //      outside predecessor (it returns `None` on "several
-            //      entries"), so every entry to the loop passes it.
-            //   5. Therefore the definition is reachable on every path
-            //      into the preheader and cannot lie after it (it is
-            //      outside the loop), so it is available at the point we
-            //      append to.
-            //
-            // Kept anyway because it is nearly free -- the CFG is built
-            // lazily inside the filter, so a loop with no preheader pays
-            // nothing -- and a redundant refusal costs one missed
-            // optimization while a missing refusal costs a miscompile.
-            // It should never fire; if it ever does, the proof above is
-            // wrong and the bug is upstream of this filter.
-            //
-            // The `strict_cfg_dominates` conjunct is the RUNTIME FORM of
-            // step 4: it re-checks, against the built CFG, exactly the
-            // property uniqueness already guarantees. It is therefore also
-            // redundant -- but unlike step 4 it stays true if
-            // `find_loop_preheader` is ever weakened to admit several
-            // entries, which is precisely when the proof stops holding.
-            // Defence in depth for an invariant that lives in another
-            // function.
-            let preheader_idx = find_loop_preheader(func, pattern.header_idx, &pattern.loop_blocks)
-                .filter(|&pre_idx| {
-                    let cfg = CfgAnalysis::build(func);
-                    strict_external_value_available(
-                        func,
-                        &cfg,
-                        &pattern.loop_blocks,
-                        pre_idx,
-                        *limit_val,
-                    ) && strict_cfg_dominates(&cfg, pre_idx, pattern.header_idx)
-                });
-            let width_pow2 = vec_width.is_power_of_two();
-            let stride_pow2 = byte_stride.is_power_of_two();
-            let const_of = |v: u64| match limit_ty {
-                IrType::I32 => IrConst::I32(v as i32),
-                IrType::I64 => IrConst::I64(v as i64),
-                _ => IrConst::I64(v as i64),
-            };
-
-            let div_dest = Value(next_val_id);
-            next_val_id += 1;
-            let div_inst = Instruction::BinOp {
-                dest: div_dest,
-                op: if width_pow2 {
-                    IrBinOp::LShr
-                } else {
-                    IrBinOp::UDiv
-                },
-                lhs: Operand::Value(*limit_val),
-                rhs: Operand::Const(const_of(if width_pow2 {
-                    vec_width.trailing_zeros() as u64
-                } else {
-                    vec_width
-                })),
-                ty: limit_ty,
-            };
-
-            // The byte-stride scaling (only under the byte-offset IV scheme)
-            // is part of the SAME invariant computation, so it lives beside
-            // the division rather than in the loop.
-            let mul_dest = Value(next_val_id);
-            let byte_limit_inst = if use_byte_iv {
-                next_val_id += 1;
-                Some(Instruction::BinOp {
-                    dest: mul_dest,
-                    op: if stride_pow2 {
-                        IrBinOp::Shl
-                    } else {
-                        IrBinOp::Mul
-                    },
-                    lhs: Operand::Value(div_dest),
-                    rhs: Operand::Const(const_of(if stride_pow2 {
-                        byte_stride.trailing_zeros() as u64
-                    } else {
-                        byte_stride
-                    })),
-                    ty: limit_ty,
-                })
-            } else {
-                None
-            };
-
-            let has_byte_limit = byte_limit_inst.is_some();
-            match preheader_idx {
-                Some(pre_idx) => {
-                    func.blocks[pre_idx].instructions.push(div_inst);
-                    if let Some(mul_inst) = byte_limit_inst {
-                        func.blocks[pre_idx].instructions.push(mul_inst);
-                    }
-                }
-                None => {
-                    func.blocks[pattern.header_idx]
-                        .instructions
-                        .insert(pattern.exit_cmp_inst_idx, div_inst);
-                    if let Some(mul_inst) = byte_limit_inst {
-                        func.blocks[pattern.header_idx]
-                            .instructions
-                            .insert(pattern.exit_cmp_inst_idx + 1, mul_inst);
-                    }
-                }
-            }
-            changes += 1 + has_byte_limit as usize;
-
-            if debug {
-                eprintln!(
-                    "[VEC-RED]   Divided dynamic limit in {}: Value({})",
-                    if preheader_idx.is_some() {
-                        "the preheader"
-                    } else {
-                        "the header (no single preheader)"
-                    },
-                    div_dest.0
-                );
-            }
-
-            if has_byte_limit {
-                Operand::Value(mul_dest)
-            } else {
-                Operand::Value(div_dest)
-            }
+            let (bound, added) = emit_invariant_vector_bound(
+                func,
+                pattern,
+                *limit_val,
+                vec_width,
+                byte_stride,
+                use_byte_iv,
+                &mut next_val_id,
+                debug,
+            );
+            changes += added;
+            bound
         }
         _ => {
             if debug {
@@ -20998,161 +21019,18 @@ fn transform_reduction_sse2(
             }
         }
         Operand::Value(limit_val) => {
-            // Dynamic limit: divide ONCE, OUTSIDE the loop, with a shift.
-            //
-            // This used to insert the division into the HEADER - i.e. inside
-            // the loop - so every iteration re-divided a value that never
-            // changes. LICM runs before the vectorizer (and the late rerun
-            // runs after it), so nothing hoisted it again. The min/max
-            // reductions reach this path with an I64 limit, and a 64-bit
-            // `divq` in the steady-state body cost 6 of the loop's 10
-            // instructions: 0.3125 insn/byte against GCC's 0.125. Hoisting
-            // into the preheader and using LShr (exact for the UNSIGNED
-            // division UDiv denotes, and every vector width is a power of
-            // two) turns the whole bound computation into one instruction
-            // that runs once.  Falls back to the header when the loop has no
-            // single preheader: correct either way, only slower.
-            let limit_ty =
-                match &func.blocks[pattern.header_idx].instructions[pattern.exit_cmp_inst_idx] {
-                    Instruction::Cmp { ty, .. } => *ty,
-                    _ => IrType::I64,
-                };
-            // AUD-3, CORRECTED: this filter is a REDUNDANT fail-closed
-            // guard, not a bug fix. It was added on the belief that the
-            // limit's definition might not be available at the preheader.
-            // That belief was wrong, and here is the proof, so nobody
-            // "fixes" this again or cites it as a correctness patch:
-            //
-            //   1. `reduction_remainder_references_sound` runs before any
-            //      transform and requires `invariant(&pattern.limit)`.
-            //   2. `invariant` requires `plan_remainder_reference` to yield
-            //      `RemainderRefPlan::UseOriginal`, which is returned iff
-            //      the definition's block is NOT in `loop_blocks`.
-            //   3. The original body used the limit, so SSA legality makes
-            //      the definition dominate the body block.
-            //   4. `find_loop_preheader` returns `Some` only for a UNIQUE
-            //      outside predecessor (it returns `None` on "several
-            //      entries"), so every entry to the loop passes it.
-            //   5. Therefore the definition is reachable on every path
-            //      into the preheader and cannot lie after it (it is
-            //      outside the loop), so it is available at the point we
-            //      append to.
-            //
-            // Kept anyway because it is nearly free -- the CFG is built
-            // lazily inside the filter, so a loop with no preheader pays
-            // nothing -- and a redundant refusal costs one missed
-            // optimization while a missing refusal costs a miscompile.
-            // It should never fire; if it ever does, the proof above is
-            // wrong and the bug is upstream of this filter.
-            //
-            // The `strict_cfg_dominates` conjunct is the RUNTIME FORM of
-            // step 4: it re-checks, against the built CFG, exactly the
-            // property uniqueness already guarantees. It is therefore also
-            // redundant -- but unlike step 4 it stays true if
-            // `find_loop_preheader` is ever weakened to admit several
-            // entries, which is precisely when the proof stops holding.
-            // Defence in depth for an invariant that lives in another
-            // function.
-            let preheader_idx = find_loop_preheader(func, pattern.header_idx, &pattern.loop_blocks)
-                .filter(|&pre_idx| {
-                    let cfg = CfgAnalysis::build(func);
-                    strict_external_value_available(
-                        func,
-                        &cfg,
-                        &pattern.loop_blocks,
-                        pre_idx,
-                        *limit_val,
-                    ) && strict_cfg_dominates(&cfg, pre_idx, pattern.header_idx)
-                });
-            let width_pow2 = vec_width.is_power_of_two();
-            let stride_pow2 = byte_stride.is_power_of_two();
-            let const_of = |v: u64| match limit_ty {
-                IrType::I32 => IrConst::I32(v as i32),
-                IrType::I64 => IrConst::I64(v as i64),
-                _ => IrConst::I64(v as i64),
-            };
-
-            let div_dest = Value(next_val_id);
-            next_val_id += 1;
-            let div_inst = Instruction::BinOp {
-                dest: div_dest,
-                op: if width_pow2 {
-                    IrBinOp::LShr
-                } else {
-                    IrBinOp::UDiv
-                },
-                lhs: Operand::Value(*limit_val),
-                rhs: Operand::Const(const_of(if width_pow2 {
-                    vec_width.trailing_zeros() as u64
-                } else {
-                    vec_width
-                })),
-                ty: limit_ty,
-            };
-
-            // The byte-stride scaling (only under the byte-offset IV scheme)
-            // is part of the SAME invariant computation, so it lives beside
-            // the division rather than in the loop.
-            let mul_dest = Value(next_val_id);
-            let byte_limit_inst = if use_byte_iv {
-                next_val_id += 1;
-                Some(Instruction::BinOp {
-                    dest: mul_dest,
-                    op: if stride_pow2 {
-                        IrBinOp::Shl
-                    } else {
-                        IrBinOp::Mul
-                    },
-                    lhs: Operand::Value(div_dest),
-                    rhs: Operand::Const(const_of(if stride_pow2 {
-                        byte_stride.trailing_zeros() as u64
-                    } else {
-                        byte_stride
-                    })),
-                    ty: limit_ty,
-                })
-            } else {
-                None
-            };
-
-            let has_byte_limit = byte_limit_inst.is_some();
-            match preheader_idx {
-                Some(pre_idx) => {
-                    func.blocks[pre_idx].instructions.push(div_inst);
-                    if let Some(mul_inst) = byte_limit_inst {
-                        func.blocks[pre_idx].instructions.push(mul_inst);
-                    }
-                }
-                None => {
-                    func.blocks[pattern.header_idx]
-                        .instructions
-                        .insert(pattern.exit_cmp_inst_idx, div_inst);
-                    if let Some(mul_inst) = byte_limit_inst {
-                        func.blocks[pattern.header_idx]
-                            .instructions
-                            .insert(pattern.exit_cmp_inst_idx + 1, mul_inst);
-                    }
-                }
-            }
-            changes += 1 + has_byte_limit as usize;
-
-            if debug {
-                eprintln!(
-                    "[VEC-RED]   Divided dynamic limit in {}: Value({})",
-                    if preheader_idx.is_some() {
-                        "the preheader"
-                    } else {
-                        "the header (no single preheader)"
-                    },
-                    div_dest.0
-                );
-            }
-
-            if has_byte_limit {
-                Operand::Value(mul_dest)
-            } else {
-                Operand::Value(div_dest)
-            }
+            let (bound, added) = emit_invariant_vector_bound(
+                func,
+                pattern,
+                *limit_val,
+                vec_width,
+                byte_stride,
+                use_byte_iv,
+                &mut next_val_id,
+                debug,
+            );
+            changes += added;
+            bound
         }
         _ => {
             if debug {

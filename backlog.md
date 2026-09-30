@@ -131,6 +131,71 @@ width): 10 -> 4 insns per trip. Both the AVX2 and the SSE2 transform, corpus
 A/B shows no regression. See
 [`engineering/evidence/MINMAX-1/README.md`](engineering/evidence/MINMAX-1/README.md).
 
+* **MINMAX-5 · extract the duplicated dynamic-limit hoist (LOW-3).** The
+  ~110-line hoist is cloned verbatim between `transform_reduction_avx2` and
+  `transform_reduction_sse2`. Mechanical, and the right call eventually, but
+  it must be its OWN commit with its own re-measurement: it touches the single
+  largest behavioural change in MINMAX-1, and spending a correctness session's
+  validation budget on a maintainability wart with no defect behind it is the
+  wrong order. Deferred deliberately, with the reasoning recorded, rather than
+  skipped silently.
+
+**Gate/observability follow-ups from the PR #681 audit** (detail and
+measurements in
+[`engineering/evidence/PR681-AUDIT-RESPONSE/README.md`](engineering/evidence/PR681-AUDIT-RESPONSE/README.md)):
+
+* **OBS-1 · `src/lib.rs` carries `#![allow(unused_variables)]` crate-wide.**
+  This, not any rustc limitation, is why a deleted `!*volatile` guard in
+  `licm.rs` reached a green Clippy job: rustc *does* lint refutable-pattern
+  bindings (verified: `rustc -D warnings` errors on the exact shape), and this
+  crate has the lint switched off. Until it is addressed, a dropped
+  observable-access guard in any pass is invisible to the build.
+  `scripts/check_volatile_destructuring.py` covers the one field where silence
+  is a miscompile. The right follow-up is a **counted ratchet** over
+  `unused_variables` sites — measure today, never raise it — in the style of
+  `check_env_test_hygiene.sh`, migrating the safety-relevant sites first.
+* **OBS-2 · widen the ratchet to the other observable-access fields.**
+  `Instruction` carries a second flag, `semantic_volatile`, which has the same
+  silent-drop exposure and currently **no instrument at all**. `AtomicLoad` /
+  `AtomicRmw` / `AtomicStore` are excluded on the *argument* that `_Atomic`
+  accesses are already unremovable; that is an argument, not a measurement.
+* **OBS-3 · `check_volatile_spin_loop.sh` asserts on the INNERMOST loop.**
+  A volatile access hoisted from an inner loop into an outer one would pass.
+  Not reachable today (no pass sinks outward), but the helper should support
+  "inside any enclosing loop" and the gate should say which it means.
+* **OBS-4 · `loop_preheader` is 528 lines of CFG surgery, default-on at -O2,
+  and fires ~0 times at default settings.** Measured: byte-identical output
+  with and without it on every guard-at-top shape, including the SQLite
+  `if (p == 0) return 0;` case its own docstring cites; it fires under
+  `CCC_LOOP_ROTATE=1` (18x, per the W3 journal) and on a plain `-O2` `do`-while
+  shape. Either find the shape family it is actually good for and measure the
+  insertion rate over the golden workloads, or gate it off by default. Today
+  it is paid for on every `-O2` compile and its value is invisible.
+  `tests/regression/check_loop_preheader.sh` now pins both directions.
+* **OBS-5 · an access COUNT cannot see a HOIST.**
+  `check_volatile_pointer_subscript.sh` passed green on a compiler that hoists
+  a volatile MMIO load out of its spin loop, because hoisting preserves the
+  count. Measured, not assumed. Any future gate asserting on emitted code
+  should ask about POSITION; `tests/regression/lib_loop_bounds.sh` is the
+  shared primitive.
+
+* **OBS-6 · `reloc_pc32_out_of_range_diagnosed_on_script_path` cannot pass on
+  a host whose non-reference linkers cannot parse the fixture's script.**
+  Measured on this box: 300 pass / 1 fail, with
+  `only 1 of 2 oracles could express an opinion, need 2` -- bfd refuses, and
+  mold 2.37 answers `unknown linker script token` for the fixture's
+  `ENTRY(probe)`, so it is `inapplicable` and the applicability floor of 2 is
+  never met. This is the fail-closed rule working **as designed** (see the
+  "two inapplicable out of three is NOT a cross-check" known-answer case), and
+  it is not a regression: on a host with bfd + lld + wild it passes. The
+  defect is in the *fixture*, not the rule: a fixture whose linker script
+  needs a token some oracles lack makes the test host-dependent in a way that
+  reads as "lccc is unconformant". Fix by giving the fixture a script every
+  configured oracle can parse, or by reporting an incapable oracle as an
+  explicit `SKIP` for the case with the reason attached, rather than folding
+  it into a FAIL that reads like a conformance verdict. Do NOT lower the
+  floor.
+
 **Named follow-ups, in value order** (all measured, all refused today so
 they stay CORRECT rather than fast):
 
@@ -143,7 +208,7 @@ they stay CORRECT rather than fast):
   even though the steady-state loop it produces is denser (14 -> 12 insns per
   32 bytes). The prologue, the extra accumulator traffic and the spills cost
   more than the packed body saves *on this workload*. The rerun is therefore
-  scoped to min/max (`set_late_minmax_only`), which keeps the 12x min/max win
+  scoped to min/max (`LateMinMaxOnlyScope`), which keeps the 12x min/max win
   and leaves every other kernel byte-identical (adler32 is now 332 static
   instructions and 0.3750 insn/byte — better than the 335 / 0.4375 baseline,
   from the preheader-division fix alone). Re-open with a PROFITABILITY guard
@@ -495,6 +560,51 @@ lccc failures). Setup: `tools/linker/setup_oracles.sh`,
 `tests/linker/setup_oracles.sh`.
 
 ---
+
+### PERF-1 · Byte-width and masked sum reductions are not vectorized
+
+Isolated with a four-case experiment (`-O3 -march=x86-64-v3`, vector
+instructions emitted per loop):
+
+| shape | LCCC | GCC 16.2 |
+|---|---:|---:|
+| `c += p[i]`, `int *` | 18 | 25 |
+| `c += p[i]`, `signed char *` | **2** | 43 |
+| `if (p[i]) c++`, `int *` | **1** | 22 |
+| `if (p[i]) c++`, `signed char *` | **1** | 46 |
+
+So plain I32 sum reductions vectorize and nothing else does — neither byte
+width nor masked reduction, at any width.
+
+Consequence: `sieve` runs 1.121x slower than GCC, and LCCC emits **zero**
+vector instructions for the whole file. GCC vectorizes the prime-counting
+loop as `vpcmpeqb` -> `vpmovsxbw` -> `vpsubd`.
+
+Blocker: `src/ir/intrinsics.rs` has only I32->I64 widening
+(`VecWidenAddI32x4ToI64x2`, `VecLoadWidenI32ToI64x2`). There is no I8->I32
+widening op in the IR or the x86 backend, so this needs a new intrinsic, its
+`vpmovsxbwd`+`vpaddd` lowering, vectorizer pattern matching for I8 element
+types, and remainder handling — three layers, and a miscompile if rushed.
+Start from the four-case table, not from the symptom.
+
+### PERF-2 · No loop interchange pass (matmul 1.399x, worst kernel)
+
+`grep -rn "interchange" src/passes/` finds nothing. GCC rewrites
+`C[i][j] += A[i][k]*B[k][j]` from i,k,j into i,j,k so `C[i][j]` is contiguous
+and `A[i][k]` is broadcast, and unrolls k by 2. LCCC keeps source order and
+stores the accumulator to memory on every k iteration.
+
+`matmul` is the worst ratio in the benchmark corpus at 1.399x. Interchange
+needs dependence analysis to prove legality plus index remapping to rewrite
+the nest — a project, not a patch.
+
+### PERF-3 · Register-move gap in zlib_ng_adler32 is code size, not speed
+
+LCCC emits 39 reg->reg moves against GCC's 12, which looks alarming. Measured
+per block: the moves are spread across cold blocks, and the hot inner loop
+(`.LBB13`, 29 instructions) contains only **2** of them. The kernel already
+runs **faster** than GCC (0.930x). Recorded so the next engineer does not
+spend a day on it: it is a size defect on a kernel that already wins.
 
 ## Closed this cycle (do not re-open without new evidence)
 <!-- durable here for grep-ability; narrative in engineering/journal/2026-09-W2.md and 2026-09-W3.md -->

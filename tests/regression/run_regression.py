@@ -264,11 +264,16 @@ def compile_one(lccc: Path, gcc: str, test: TestCase, workdir: Path,
                           time.monotonic() - start, 0.0, phases + ["gen:fail"])
         phases.append("gen:ok")
         if compile_only:
-            # `--compile-only` promises "compile+link, do not run it". The
-            # instrumented build has linked, which is the whole contract on
-            # this path; training and the -fprofile-use rebuild both EXECUTE
-            # the program, so honouring the flag here is what keeps the fast
-            # link gate fast -- and honest about what it did.
+            # `--compile-only` promises "compile+link, do not run it", and the
+            # generate build has already linked -- which is the whole point of
+            # this gate: it is what catches a source file that is not
+            # self-contained.
+            #
+            # Stop HERE, not at the corpus's own early return further down.
+            # Everything after this point on the PGO path EXECUTES the program:
+            # the training run, and then the -fprofile-use rebuild. Reaching
+            # them under a flag documented as "do not run it" both breaks the
+            # contract and makes the fast link gate slow for no benefit.
             return Result(test.name, "pass", "",
                           time.monotonic() - start, 0.0, phases + ["link:ok"])
         rc, so, se = run_checked([str(out)], env=env, cwd=workdir)

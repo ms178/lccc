@@ -94,6 +94,13 @@ zlib-ng-validation/
 /-
 .base_ref
 
+# Benchmark assembly dumps. The A/B and oracle scripts emit these into the
+# repository root (61 of them, ~21k lines, on 2026-09-30), and the snapshot
+# tool's `git add -A -N` swept every one of them into a deliverable patch.
+# Generated, machine-specific, and worthless in review: ignore the root-level
+# form only, so a checked-in .s under tests/ or tools/ is still tracked.
+/*.s
+
 # QEMU TCG plugin API header — GPLv2+ upstream, fetched on demand by
 # scripts/qemu_icount_plugin/build.sh; never vendored into this permissive tree.
 /scripts/qemu_icount_plugin/qemu-plugin.h

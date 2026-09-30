@@ -67,6 +67,15 @@ import urllib.request
 
 CE = "https://godbolt.org/api"
 
+# Seconds allowed for the compiler-identity probe.  It is a nicety, never a
+# blocker, so it gets a short leash and is allowed to fail.
+_VERSION_TIMEOUT = 20
+
+# (cid, cached_version, live_version) for every record this run had to
+# re-measure because the oracle moved under it.  Reported at the end of a
+# sweep: a silently-empty counter is how a stale table gets republished.
+_STALE_EVICTED: list[tuple[str, str | None, str | None]] = []
+
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 LCCC = os.environ.get("LCCC_BIN", os.path.join(REPO, "target/fastbuild/lccc"))
 PROGRAMS = os.path.join(REPO, "tests/oracle/programs")
@@ -155,6 +164,68 @@ def _post(url: str, payload: dict, timeout: int = 120, attempts: int = 5) -> dic
     raise last
 
 
+# ── compiler identity, for cache staleness ────────────────────────────────
+#
+# The persistent cache is keyed by (cid, flags, source digest, execute) and
+# nothing else, so a record stays "valid" forever.  That is a deliberate
+# trade -- reproducing a published table must not depend on whether an upstream
+# channel moved -- but it has a failure mode: a *versioned* channel (ICX in
+# particular, which is described in this file as "a moving target") updates,
+# and a sweep next month silently reports last month's numbers as current.
+#
+# The version is deliberately NOT part of the cache key.  Putting it there
+# would require probing the compiler before every compile, doubling the
+# request count against an API that rate-limits.  Instead the version is
+# recorded in the payload and compared on the way out, and the probe is one
+# request per (cid, process) rather than one per record.
+_VERSION_PROBE: dict[str, str | None] = {}
+
+
+def _get(url: str, timeout: int = 120) -> list:
+    """GET a JSON list from Compiler Explorer, with the same retry policy.
+
+    Split out of `_post` rather than reusing it: `/api/compilers` is a plain
+    GET with no payload, and the version probe must not spend the POST
+    attempt budget or inherit its "raise on a real client error" semantics --
+    a probe that fails for any reason is simply "unknown", never a crash.
+    """
+    last = None
+    for attempt in range(2):
+        try:
+            req = urllib.request.Request(
+                url, headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=timeout) as fh:
+                return json.loads(fh.read().decode("utf-8", "replace"))
+        except Exception as e:                       # noqa: BLE001
+            last = e
+            if attempt == 0:
+                time.sleep(1.0)
+    raise last
+
+
+def _compiler_version(cid: str) -> str | None:
+    """Compiler Explorer's current version string for `cid`, or None.
+
+    One request per compiler per process.  A transport failure returns None
+    rather than raising: version drift detection is an improvement over
+    trusting a stale record, never a reason to fail a sweep, and a sweep run
+    offline must behave exactly as it did before this existed.
+    """
+    if cid in _VERSION_PROBE:
+        return _VERSION_PROBE[cid]
+    version = None
+    try:
+        listing = _get(f"{CE}/compilers", timeout=_VERSION_TIMEOUT)
+        for c in listing or ():
+            if c.get("id") == cid:
+                version = c.get("version") or c.get("fullVersion") or None
+                break
+    except _TRANSPORT:
+        version = None
+    _VERSION_PROBE[cid] = version
+    return version
+
+
 def _ce_call(cid: str, source: str, flags: str, execute: bool, timeout: int) -> dict:
     """Compile `source` on Compiler Explorer with `cid`; optionally execute.
 
@@ -217,12 +288,25 @@ def remote(cid: str, source: str, flags: str, execute: bool, timeout: int) -> di
     program, and would strand it out of every future sweep.
     """
     rec = {"id": cid, "vendor": VENDOR.get(cid, "?"), "ok": False,
-           "asm_insns": None, "stdout": None, "exit": None, "reason": None}
+           "asm_insns": None, "stdout": None, "exit": None, "reason": None,
+           # Recorded, not keyed on.  See `_compiler_version`.
+           "ce_version": _compiler_version(cid)}
     ck = (cid, flags, hashlib.sha256(source.encode()).hexdigest(), execute)
     if USE_CACHE:
         hit = godbolt_cache.load_json(godbolt_cache.NS_ORACLE, *ck)
         if hit is not None:
-            return hit
+            # Staleness, not validity, is the question here.  A record whose
+            # compiler has since been rebuilt describes a compiler that no
+            # longer exists, so it is a miss: the sweep then re-measures and
+            # overwrites it.  A record with no recorded version predates this
+            # field and is still honoured -- refusing every unversioned record
+            # would silently invalidate the whole cache at once, which is the
+            # opposite of a safe default.
+            live = rec["ce_version"]
+            cached = hit.get("ce_version")
+            if live is None or cached is None or cached == live:
+                return hit
+            _STALE_EVICTED.append((cid, cached, live))
 
     def safe(execute_it):
         """Return ``(response, error, was_transport_failure)``."""
@@ -619,6 +703,21 @@ def main(argv=None) -> int:
     ndiv = sum(1 for r in rows if r["status"] == "DIVERGES")
     print(f"\n== {npass} agree, {ndiv} diverge, {len(rows) - npass - ndiv} error "
           f"({len(rows)} programs) ==")
+
+    # Compiler drift report.  A non-empty counter means the oracle rebuilt
+    # under a versioned channel and every record pinned to the old one was
+    # re-measured rather than replayed -- which is the difference between
+    # this table describing the compilers that exist now and describing the
+    # ones that existed when it was first run.  Printed unconditionally (with
+    # a count of zero) so "nothing drifted" is a stated fact, not an absence
+    # a reader has to infer.
+    if _STALE_EVICTED:
+        print(f"\n== {len(_STALE_EVICTED)} cached record(s) re-measured: the "
+              f"oracle moved under them ==")
+        for cid, was, now in sorted(set(_STALE_EVICTED)):
+            print(f"   {cid:12s} {was} -> {now}")
+    elif _VERSION_PROBE:
+        print("\n== cache: every record matches its compiler's current version ==")
 
     if a.json:
         with open(a.json, "w") as fh:

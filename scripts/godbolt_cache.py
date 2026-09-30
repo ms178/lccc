@@ -70,6 +70,26 @@ CACHE = Path(os.environ.get(
     str(Path(__file__).resolve().parent.parent / ".godbolt-cache"),
 ))
 
+# STALENESS, NOT VALIDITY
+# -----------------------
+# The key is (cid, flags, source, execute) and deliberately carries no compiler
+# version.  That is the right trade for this cache: a published table must stay
+# reproducible, and pinning a version into the key would force a probe request
+# before every compile -- double the requests against an API that rate-limits.
+#
+# The cost is that a *versioned* upstream channel (ICX most of all) can move
+# while a record stays "valid".  `tools/oracle/godbolt_oracle.py` closes that
+# gap from the other side: it records the Compiler Explorer version string
+# INSIDE the record and compares it against one cheap probe per compiler per
+# process, treating a mismatch as a miss so the sweep re-measures and
+# overwrites.  A record written before that field existed has `ce_version ==
+# None` and is still honoured -- invalidating every unversioned record at once
+# would be a far larger, and much less safe, change than the problem.
+#
+# To force a generation to be dropped wholesale after a format change, bump
+# the namespace below; that is the sanctioned way, and it is the right tool
+# when the KEY changes rather than when the compiler does.
+#
 # Namespaces currently in use. Adding one is the sanctioned way to invalidate
 # a generation of records after a format change.
 # v3/v2: the compiler's reported version (godbolt.compiler_fingerprint) is now
@@ -181,15 +201,22 @@ def store_lines(namespace: str, lines: list[str], *parts: Any) -> None:
 # Introspection
 # --------------------------------------------------------------------------
 
+def _is_record(f: Path) -> bool:
+    """True for a committed record, false for an in-flight temp file.
+
+    ``_atomic_write`` names temps ``<stem>.tmp.<pid>.<tid><suffix>`` -- they keep
+    the record's own suffix, so filtering on ``endswith(".tmp")`` matched none
+    of them and counted every half-written file as a record.  The marker is the
+    infix, so match that.
+    """
+    return f.is_file() and ".tmp." not in f.name
+
+
 def stats() -> dict[str, int]:
     """Record count per namespace. Used by the self-test and by ``--cache``."""
     out: dict[str, int] = {}
     if not CACHE.is_dir():
         return out
     for ns in sorted(p.name for p in CACHE.iterdir() if p.is_dir()):
-        # `_atomic_write` temps are "<stem>.tmp.<pid>.<tid><suffix>": they
-        # carry the real suffix, so `endswith(".tmp")` matched nothing and
-        # an aborted writer's leavings were counted as records.
-        out[ns] = sum(1 for f in (CACHE / ns).iterdir()
-                      if f.is_file() and ".tmp." not in f.name)
+        out[ns] = sum(1 for f in (CACHE / ns).iterdir() if _is_record(f))
     return out
