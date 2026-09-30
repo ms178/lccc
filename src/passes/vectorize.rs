@@ -12379,11 +12379,7 @@ fn demask_value_positions(expr: MapExpr) -> MapExpr {
                     } else {
                         (*r, *l)
                     };
-                    return MapExpr::BinOp(
-                        IrBinOp::And,
-                        Box::new(go(m, false)),
-                        Box::new(one),
-                    );
+                    return MapExpr::BinOp(IrBinOp::And, Box::new(go(m, false)), Box::new(one));
                 }
                 MapExpr::BinOp(op, Box::new(go(*l, true)), Box::new(go(*r, true)))
             }
