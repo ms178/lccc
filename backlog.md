@@ -110,6 +110,103 @@ GHASH/mulpack for the multi-source shape rule).
 
 ## Tier 1 — measured, largest first
 
+### MINMAX-1 · **LANDED 2026-09-29** — integer min/max reductions on x86-64
+`min`/`max` over `int[]` stayed scalar on x86-64 although the packed
+machinery was finished: the reduction only becomes a `Select` after
+`if_convert`, which runs AFTER the main vectorizer, and the late rerun that
+catches it was gated on `matches!(target, Aarch64)` while its own comment
+promised the x86-64 rerun. Fixed (shared early/late dispatch table, opened
+to x86-64), plus `ReductionKind::Min` (`vpminsd`, new
+`VecHorizontalMinI32x8`) and admission of the ordinary IV-indexed-GEP shape
+at `iv_init == 0`.
+Measured `-O3 -march=x86-64-v3`, steady-state density: `min_i32`/`max_i32`
+**1.5 -> 0.1250 insn/byte** (12x; level with gcc 16.2 and icx, behind clang
+23.1's 4x-unrolled 0.0547 only). Pinned oracles: clang 23.1 0.0547, gcc 16.2
+0.1250, icx 0.1250, icc 0.5625.
+Second defect found and fixed on the way (MINMAX-1b): a dynamic loop bound
+was divided by the vector width with a `UDiv` inserted into the loop HEADER,
+so the min/max steady state carried a real 64-bit `divq` — 6 of its 10
+instructions. Now emitted once in the preheader as `LShr` (power-of-two
+width): 10 -> 4 insns per trip. Both the AVX2 and the SSE2 transform, corpus
+A/B shows no regression. See
+[`engineering/evidence/MINMAX-1/README.md`](engineering/evidence/MINMAX-1/README.md).
+
+**Named follow-ups, in value order** (all measured, all refused today so
+they stay CORRECT rather than fast):
+
+* **MINMAX-4 · the rest of the late rerun (measured, deliberately off).**
+  The unrestricted rerun also fires the Adler-32 epic and the guarded-sum
+  transforms on `zlib_ng_adler32`. Measured on the benchmark program itself
+  (`-O3 -march=x86-64-v3`, `valgrind --tool=callgrind`, whole program):
+  **396,349,832 -> 400,499,785 retired instructions (+1.05 %)**, static
+  instructions 335 -> 370 (+10.4 %), stack references 32 -> 44 (+37.5 %) —
+  even though the steady-state loop it produces is denser (14 -> 12 insns per
+  32 bytes). The prologue, the extra accumulator traffic and the spills cost
+  more than the packed body saves *on this workload*. The rerun is therefore
+  scoped to min/max (`set_late_minmax_only`), which keeps the 12x min/max win
+  and leaves every other kernel byte-identical (adler32 is now 332 static
+  instructions and 0.3750 insn/byte — better than the 335 / 0.4375 baseline,
+  from the preheader-division fix alone). Re-open with a PROFITABILITY guard
+  (prologue + epilogue cost vs trip count), not by deleting the transform.
+
+* **MINMAX-2 · multi-accumulator min/max.** `for (...) { if (a[i]<mn) ...;
+  if (a[i]>mx) ...; }`, and the same loop with a sum. Two of the corpus's
+  worst kernels are this shape (`moving_stats`: lccc 149 insns/trip vs icc
+  0.625 insn/byte; `fir_filter`, `conv_u8_3x3` are nearby). The pattern
+  models ONE accumulator, so it refuses; the follow-up is to populate
+  `SecondaryAccumulator` with a `kind` and wire the min/max epilogue per
+  accumulator. The refusal exists because NOT doing this produced
+  `sum == 0` for every n below the vector width.
+* **MINMAX-3 · 16-bit and unsigned lanes.** `vpminsw`/`vpmaxsw` are SSE2
+  baseline (`vpmin*`/`vpmax*` for 8-bit need SSE4.1, `vpminud`/`vpmaxud`
+  too). `moving_stats` is `short` data: lccc 3.0 insn/byte vs gcc 0.125.
+* **LOOP-PREHEADER-2 · fix `loop_rotate`'s condition lowering, then enable
+  rotation (measured blocker).** `loop_rotate` makes the loop body the header,
+  which is what turns LICM's derived-pointer load hoisting from dead to live —
+  with rotation plus the dedicated preheaders from LOOP-PREHEADER-1 the
+  `fir_filter` FIR hot loop goes **56 -> 38 instructions (-32 %)**. Rotation is
+  OFF by default because it is **+209 static instructions (+2.6 %)** across the
+  51 benchmark programs at `-O3 -march=x86-64-v3`, and the entire cost is one
+  lowering defect: the rotated latch materialises the loop condition as an `i1`
+  value instead of keeping a comparison, so the backend emits `setl %bl;
+  movzbl %bl,%ebx; testb %bl,%bl; jne` where a single `jl` belongs. Three
+  instructions per iteration, in every rotated loop. Fix the condition
+  lowering, re-measure, then re-evaluate enabling rotation at `-O2+` — which
+  would simultaneously make LOOP-PREHEADER-1 pay corpus-wide. Evidence:
+  [`engineering/evidence/LOOP-PREHEADER-1/`](engineering/evidence/LOOP-PREHEADER-1/README.md).
+  **Blocking defect, already known:** `loop_rotate` leaves invalid SSA on 2 of
+  the 51 benchmark programs (`fir_filter.c`, `moving_stats.c`): under
+  `CCC_VALIDATE_SSA=1` both abort with `SSA PHI-ARITY VIOLATION after phase
+  'after iter=0 loop_rotate'` — phi incoming-label sets that do not match the
+  rewritten CFG. Verified NOT caused by LOOP-PREHEADER-1 (reproduces with
+  `CCC_DISABLE_PASSES=loop_preheader`, and fires before that pass runs). Fix the phi
+  rewriting before touching the condition lowering.
+
+* **LOOP-PREHEADER-3 · the pass has no dedicated gate (coverage debt).**
+  `src/passes/loop_preheader.rs` is a CFG-mutating pass enabled by default at
+  `-O2`, and nothing in `tests/` or `scripts/ci_local.sh` asserts it fires.
+  What covers it today is indirect:
+  `licm_no_speculative_load_nondedicated_preheader.c` segfaults if the
+  inserted block lands on the wrong edge, and `verify_after_pass` catches a
+  broken phi — but a silent regression to "inserts nothing" passes both.
+  The gate to write (model it on `check_volatile_licm.sh`, which gets this
+  right): assert on emitted assembly that
+  `int f(const int *c, int n){int t=0;for(int i=0;i<n;i++)t+=c[0];return t;}`
+  loads `(%rdi)` **once outside** the steady-state loop, and **inside** it
+  under `CCC_DISABLE_PASSES=loop_preheader` — that delta is the negative
+  control, and without it the gate passes vacuously on a compiler that hoists
+  nothing. Add the SQLite NULL-guard shape (runtime, no segfault), a
+  `switch`-entered and a computed-`goto` loop (the shapes where a preheader
+  must NOT be claimed), and an already-dedicated loop asserting idempotence
+  via `CCC_DEBUG_LOOP_PREHEADER`.
+
+* **RED-WIDEN-1 · widening reductions.** `int s; for (i) s += a[i];` with
+  `a` of `short`/`unsigned char`: lccc stays scalar (3.0 / 5.0 insn/byte)
+  where gcc does 0.28 / 0.53. Needs the detector to accept
+  `accumulator_type != element_type` and a widen-then-fold body
+  (`vpmovsxwd`/`vpmovzxbd` + `vpaddd`).
+
+
 ### ZERO-REM-1 · **LANDED 2026-09-28** — dead vectorizer remainder loops
 The map vectorizer emitted its scalar mirror (the `N % W` tail loop, which
 doubles as the runtime dependence guard's fallback) even when a constant trip

@@ -51,6 +51,7 @@ pub(crate) mod loop_idiom;
 pub(crate) mod loop_invert;
 pub(crate) mod loop_memory_promote;
 pub(crate) mod loop_memset;
+pub(crate) mod loop_preheader;
 pub(crate) mod loop_rotate;
 pub(crate) mod loop_unroll;
 pub(crate) mod narrow;
@@ -923,7 +924,7 @@ fn run_inline_phase(
 /// -m16 -Os/-Oz compile ran without ANY inlining — the exact corpus where
 /// helper inlining matters most), and "univsr" likewise disabled "ivsr".
 /// Tokens are compared trimmed and exactly; "all" keeps its global meaning.
-fn pass_disabled(disabled: impl AsRef<str>, pass: &str) -> bool {
+pub(crate) fn pass_disabled(disabled: impl AsRef<str>, pass: &str) -> bool {
     disabled.as_ref().split(',').any(|tok| {
         let tok = tok.trim();
         tok == "all" || tok == pass
@@ -1009,6 +1010,82 @@ fn target_min_rotate_bits(target: crate::backend::Target) -> u32 {
 /// Run optimization passes for the requested optimization level.
 ///
 /// `opt_level`: 0=-O0, 1=-O1, 2=-O2, 3=-O3, 4=-Os, 5=-Oz.
+/// ONE dispatch table for the early vectorizer run and the late (post
+/// if-conversion) rerun.
+///
+/// Sharing it is deliberate: a loop that only becomes analyzable once its
+/// branch diamond is if-converted must be transformed with exactly the
+/// ISA/FP configuration the early pass used. A second, divergent table is
+/// how "the late pass vectorizes something the early pass would have
+/// refused" bugs start.
+fn vectorize_entry(
+    target: crate::backend::Target,
+    fp_reassoc: bool,
+    fp_contract: FpContract,
+    x86_avx: bool,
+) -> fn(&mut IrFunction) -> usize {
+    match (target, fp_reassoc, fp_contract, x86_avx) {
+        (crate::backend::Target::Aarch64, true, _, _) => {
+            vectorize::vectorize_function_two_wide_fast_math
+        }
+        (crate::backend::Target::Aarch64, false, _, _) => vectorize::vectorize_function_two_wide,
+        (_, true, FpContract::Fast, true) => vectorize::vectorize_function_fast_math,
+        (_, true, FpContract::Fast, false) => {
+            vectorize::vectorize_function_fast_math_without_fixed_slp
+        }
+        (_, true, FpContract::Off | FpContract::OnExpr, true) => {
+            vectorize::vectorize_function_reassoc
+        }
+        (_, true, FpContract::Off | FpContract::OnExpr, false) => {
+            vectorize::vectorize_function_reassoc_without_fixed_slp
+        }
+        // contract=fast without reassoc: reductions stay order-locked,
+        // map trees may fuse (GCC-parity for -ffp-contract=fast).
+        (_, false, FpContract::Fast, _) => vectorize::vectorize_function_contract,
+        (_, false, _, _) => vectorize::vectorize_function,
+    }
+}
+
+/// The LATE rerun's entry point. Differs from `vectorize_entry` in exactly
+/// one arm, and deliberately so.
+///
+/// `vectorize_entry` selects `vectorize_function_two_wide_fast_math` for
+/// AArch64 under `-ffast-math`. Sharing it with the late rerun silently
+/// changed AArch64's late behaviour from `two_wide` (fp_reassoc = false) to
+/// `two_wide_fast_math` (fp_reassoc = true) -- an unmeasured new class of
+/// late reassociation on a target this work otherwise does not touch.
+///
+/// Measured on `lccc-arm`, it is also a regression rather than a wash:
+///
+///     float dot-product + float max, -O2 -ffast-math
+///       two_wide_fast_math   95 insns
+///       two_wide (previous)  73 insns   (-23 %)
+///     whole arm corpus (14 files x 3 configs)
+///       two_wide_fast_math   6260 insns
+///       two_wide (previous)  6264 insns (+0.06 %, noise)
+///
+/// So the fast-math late entry costs 23 % on the code it actually affects and
+/// buys nothing anywhere else. The late rerun keeps the previous AArch64
+/// entry; reopening this needs a measurement that shows the reassociation
+/// wins on real AArch64 float kernels, not a smaller total elsewhere.
+///
+/// x86-64 and every other target are unaffected: they fall through to the
+/// same `vectorize_entry` the early pass uses.
+fn late_vectorize_entry(
+    target: crate::backend::Target,
+    fp_reassoc: bool,
+    fp_contract: FpContract,
+    x86_avx: bool,
+) -> fn(&mut IrFunction) -> usize {
+    if matches!(target, crate::backend::Target::Aarch64) {
+        // The pre-existing AArch64 late entry. `vectorize_function_two_wide`
+        // is argument-for-argument what the late rerun used before the
+        // dispatch table was shared.
+        return vectorize::vectorize_function_two_wide;
+    }
+    vectorize_entry(target, fp_reassoc, fp_contract, x86_avx)
+}
+
 pub(crate) fn run_passes(
     module: &mut IrModule,
     opt_level: u32,
@@ -1762,28 +1839,7 @@ pub(crate) fn run_passes(
             )
             && !pass_disabled(&disabled, "vectorize")
         {
-            let vectorize_fn = match (target, fp_reassoc, fp_contract, x86_avx) {
-                (crate::backend::Target::Aarch64, true, _, _) => {
-                    vectorize::vectorize_function_two_wide_fast_math
-                }
-                (crate::backend::Target::Aarch64, false, _, _) => {
-                    vectorize::vectorize_function_two_wide
-                }
-                (_, true, FpContract::Fast, true) => vectorize::vectorize_function_fast_math,
-                (_, true, FpContract::Fast, false) => {
-                    vectorize::vectorize_function_fast_math_without_fixed_slp
-                }
-                (_, true, FpContract::Off | FpContract::OnExpr, true) => {
-                    vectorize::vectorize_function_reassoc
-                }
-                (_, true, FpContract::Off | FpContract::OnExpr, false) => {
-                    vectorize::vectorize_function_reassoc_without_fixed_slp
-                }
-                // contract=fast without reassoc: reductions stay order-locked,
-                // map trees may fuse (GCC-parity for -ffp-contract=fast).
-                (_, false, FpContract::Fast, _) => vectorize::vectorize_function_contract,
-                (_, false, _, _) => vectorize::vectorize_function,
-            };
+            let vectorize_fn = vectorize_entry(target, fp_reassoc, fp_contract, x86_avx);
             let n = timed_pass!(
                 "vectorize",
                 run_on_visited(module, &dirty, &mut changed, vectorize_fn)
@@ -2149,6 +2205,51 @@ pub(crate) fn run_passes(
             total_changes_excl_dce += n;
         }
 
+        // Phase 5-pre: dedicated loop preheaders (LOOP-PREHEADER-1).
+        //
+        // Runs immediately BEFORE the shared GVN/LICM/IVSR analysis, because
+        // that block computes one CFG snapshot and shares it across all three
+        // passes: inserting a block after the snapshot is taken would leave it
+        // describing a CFG that no longer exists.  Doing it here also means
+        // GVN and IVSR see the same shape LICM does.
+        //
+        // WHY IT EXISTS: LICM refuses to hoist a derived-pointer load (a
+        // parameter, a call result, a GEP chain — anything that can fault)
+        // unless the loop's preheader is dedicated, because hoisting one into a
+        // preheader that also branches elsewhere dereferences on paths that
+        // never entered the loop (the SQLite jsonCacheSearch NULL segfault).
+        // That gate is correct — but LCCC never CREATED a dedicated preheader,
+        // and the frontend lowers a counted loop with the guard's conditional
+        // branch as the loop's only outside edge.  A preheader with two
+        // successors is never dedicated, so the gate refused essentially every
+        // invariant load in the corpus:
+        //
+        //     for (i = 0; i < n; i++) t += c[0];   // `addl (%rdi), %edx`
+        //                                          // reloaded every iteration
+        //
+        // Splicing an empty block onto that edge makes the preheader
+        // dedicated.  The new block runs exactly when the loop is entered, and
+        // LICM additionally requires the hoisted load's original block to
+        // dominate every loop block, so nothing executes on a path that never
+        // entered the loop.
+        //
+        // -O2+ only (an -Os build would rather reload).  Kill switches:
+        // `CCC_DISABLE_PASSES=loop_preheader`.
+        if opt_level >= 2 && !optimize_for_size && loop_preheader::enabled(&disabled) {
+            let n = timed_pass!(
+                "loop_preheader",
+                run_on_visited(module, &dirty, &mut changed, loop_preheader::run_function)
+            );
+            if n > 0 {
+                verify::verify_after_pass(module, "loop_preheader");
+                for c in changed.iter_mut() {
+                    *c = true;
+                }
+            }
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
         // Phases 5-6a: GVN + LICM + IVSR with shared CFG analysis.
         //
         // These three passes all need CFG + dominator + loop analysis. Since GVN
@@ -2487,12 +2588,44 @@ pub(crate) fn run_passes(
     // (conditional I64 sums are the x86 shape: the widening reduction
     // machinery handles the Select-guard form).
     // CCC_DISABLE_PASSES=latevec disables.
-    if matches!(target, crate::backend::Target::Aarch64)
-        && !optimize_for_size
+    if matches!(
+        target,
+        crate::backend::Target::Aarch64 | crate::backend::Target::X86_64
+    ) && !optimize_for_size
         && !pass_disabled(&disabled, "latevec")
         && !pass_disabled(&disabled, "vectorize")
     {
-        let n = module.for_each_function(vectorize::vectorize_function_two_wide_late);
+        // SAME entry point as the early pass (see the shared dispatch table
+        // above): x86-64 therefore reruns the AVX2 vectorizer, which is what
+        // unlocks Select-shaped reductions - integer min/max and guarded
+        // sums - that only exist after this loop's if_convert phase.
+        //
+        // BE CAREFUL WHAT THIS IS ATTRIBUTED TO. Before this change this
+        // rerun was AArch64-only, and x86-64 was served by the separate
+        // `vectorize_function_late` twin further down, which passes the
+        // same analysis flags. So "the VecMaxI32x8 machinery was dead code
+        // on x86" is FALSE and must not be repeated: x86-64 did rerun the
+        // vectorizer. What the twin lacked, and what this entry supplies,
+        // is the mode wrapper's diamond/if-chain PRE-CONVERSION (the Select
+        // a min/max reduction needs is created there) plus its two legality
+        // bails. The measured win (min/max over int[]: 1.5 -> 0.1250
+        // insn/byte, matching gcc 16.2 and icx) is attributable to that
+        // pre-conversion and to the admission fixes, NOT to "opening" a
+        // rerun that was already open.
+        let late_fn = late_vectorize_entry(target, fp_reassoc, fp_contract, x86_avx);
+        // SCOPE: min/max reductions only. The unrestricted rerun also
+        // transforms the guarded-sum reduction in `zlib_ng_adler32`, which
+        // measured +1.05 % retired instructions (callgrind, whole program)
+        // for a denser but more spill- and prologue-heavy loop. Admitting
+        // only what the rerun exists for keeps the min/max win and leaves
+        // every other kernel byte-identical. See `set_late_minmax_only`.
+        // RAII, not set/reset: a panic between the two calls used to leave
+        // the restriction set for the rest of this worker thread's life, and
+        // because the flag is thread-local it leaked into the next
+        // translation unit compiled on that thread.
+        let _late_scope = vectorize::LateMinMaxOnlyScope::enter();
+        let n = module.for_each_function(late_fn);
+        drop(_late_scope);
         if n > 0 {
             // The vectorizer's block surgery does not maintain source_spans;
             // drop any that no longer align with their block's instructions
@@ -2553,12 +2686,36 @@ pub(crate) fn run_passes(
     // x86-64 twin: rerun the AVX2 vectorizer for Select-shaped reductions
     // (conditional sums) that if_convert materialized. Same idempotence and
     // cleanup contract as the AArch64 branch above.
+    // AUD-4 / AUD-6: the x86-64 late rerun. Kept, but now SCOPED.
+    //
+    // It used to run outside `LateMinMaxOnlyScope`, so every reduction the
+    // scope flag deliberately excludes -- guarded sums above all -- was
+    // reachable through it, which is the direct cause of the
+    // `zlib_ng_adler32` +1.05 % retired-instruction regression the flag was
+    // introduced to prevent.
+    //
+    // Deleting it instead is NOT the fix. Measured over 857 corpus +
+    // benchmark files (-O2 -march=x86-64-v3) it is 1 429 instructions
+    // SMALLER without the twin (-0.71 %), and 24 files shrink -- but that
+    // number is a mirage: the twin is also what vectorizes the late
+    // map-shaped loops, and `check_vec_dead_remainder.sh` catches one of
+    // them (`shape_u16_tail`, `d[i] = (u16)(s[i] + 5u)`) dropping to
+    // scalar. Losing real vectorization makes code smaller; it is not a
+    // win. The correct fix is to scope the twin, not to remove it.
+    //
+    // Scoping it required narrowing the flag: `LATE_MINMAX_ONLY` used to
+    // gate the map and stencil vectorizers as well as reduction admission,
+    // which would have killed the same u16 map loop. It now restricts
+    // reduction admission only (see `vectorize.rs`), which is the part the
+    // zlib_ng_adler32 measurement actually justifies.
     if matches!(target, crate::backend::Target::X86_64)
         && !optimize_for_size
         && !pass_disabled(&disabled, "latevec")
         && !pass_disabled(&disabled, "vectorize")
     {
+        let _late_scope = vectorize::LateMinMaxOnlyScope::enter();
         let n = module.for_each_function(vectorize::vectorize_function_late);
+        drop(_late_scope);
         if n > 0 {
             for func in &mut module.functions {
                 for block in &mut func.blocks {
@@ -2612,12 +2769,6 @@ pub(crate) fn run_passes(
             });
         }
     }
-
-    // DCE can remove aggregate-copy consumers that previously made forwarding
-    // unsafe (for example a full returned struct whose only surviving use is
-    // one field load). Re-run forwarding before final loop promotion.
-    // Honors the same kill switch as the first invocation (a gate that only
-    // silences one of two callsites is a debugging trap, not a gate).
     if !std::env::var("CCC_NO_AGG_COPY_FWD").is_ok() {
         for _ in 0..8 {
             if module.for_each_function(aggregate_copy_forward::run) == 0 {

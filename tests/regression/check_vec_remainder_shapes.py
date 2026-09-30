@@ -6,8 +6,15 @@ the right answers; it cannot prove the transform FIRED.  A map vectorizer that
 silently stops vectorizing still passes every output check, so this script
 pins the shape of the emitted code per function:
 
-    loops      number of backward branches inside the function, i.e. the
-               number of loops it contains
+    loops      number of loops = strongly connected components of the
+               function's CFG that contain a cycle.  Backward branches are
+               NOT used: lccc lays the vectorized loop, the exit block and
+               the scalar mirror out in an order that makes some
+               logically-forward edges point at lower addresses, and a
+               rotated loop can put its back edge physically before its
+               header.  A branch count therefore under-reports; an SCC is
+               layout-independent, which is what "how many loops does this
+               function contain" actually needs.  See `count_loops`.
     packed     instructions naming an %xmm/%ymm register
 
 and asserts, for every shape in `vec_dead_remainder_shapes.c`:
@@ -18,7 +25,7 @@ and asserts, for every shape in `vec_dead_remainder_shapes.c`:
                                   guard's fallback and must be kept)
 
 A shape that stops vectorizing is a FAIL, not a skip: `packed == 0` would make
-"1 loop" true for the wrong reason (a scalar loop also has one back edge).
+"1 loop" true for the wrong reason -- a purely scalar loop is also one loop.
 The two shapes the map vectorizer does not handle today (16-bit elements and
 the `s[i + 1]` stream) are listed explicitly and are asserted to stay scalar,
 so the gap is documented and any change to it is visible.
@@ -61,7 +68,7 @@ def _skippable(line: str) -> bool:
         return True
     return bool(_DIRECTIVE.match(line)) and not _LABEL_DEF.match(line)
 
-# function -> expected number of loops (backward branches)
+# function -> expected number of loops (CFG SCCs containing a cycle; see `count_loops`)
 EXPECT_LOOPS: dict[str, int] = {
     # Exact multiples of the packed width: the mirror cannot iterate.
     "shape_u32_exact": 1,

@@ -176,6 +176,32 @@ def run_checked(cmd: list[str], *, env: dict[str, str], cwd: Path,
         return -9, out, f"TIMEOUT after {timeout}s"
 
 
+def _compile_fail_detail(src: str, stderr: str) -> str:
+    """Explain a compile failure, not just report it.
+
+    The corpus is `tests/regression/*.c`, globbed non-recursively and each
+    file compiled as a self-contained program. The failure mode that actually
+    happens is a multi-file *driver* landing in that directory: its kernels
+    live in a sibling file, so it links standalone only by accident, and the
+    raw error is a wall of `undefined reference to ...` naming symbols the
+    reader has never heard of, with no hint about the real cause. Naming the
+    cause turns a triage into a one-line fix and costs nothing otherwise.
+    """
+    detail = f"lccc compile failed:\n{stderr[-2000:]}"
+    if "undefined reference" not in stderr and "undefined symbols" not in stderr:
+        return detail
+    name = Path(src).name
+    return (
+        f"{detail}\n\n"
+        f"{src} has unresolved externs, so it is not a self-contained program.\n"
+        f"Every tests/regression/*.c is globbed non-recursively by this runner\n"
+        f"and compiled standalone, so a file here must define everything it\n"
+        f"calls. If {name} is the driver for a multi-file test, move it into a\n"
+        f"subdirectory (e.g. tests/regression/<name>/) -- subdirectories are\n"
+        f"outside the glob by construction, which is the point."
+    )
+
+
 def host_lacks_i386_headers(gcc: str, src: str, flags: str) -> bool:
     """True when a `-m32` compile fails for want of 32-bit libc headers.
 
@@ -201,7 +227,16 @@ def host_lacks_i386_headers(gcc: str, src: str, flags: str) -> bool:
     return "No such file or directory" in err and "bits/" in err
 
 
-def compile_one(lccc: Path, gcc: str, test: TestCase, workdir: Path) -> Result:
+def compile_one(lccc: Path, gcc: str, test: TestCase, workdir: Path,
+                compile_only: bool = False) -> Result:
+    """Compile (and, unless `compile_only`, run and differentially compare).
+
+    `--compile-only` exists because the corpus gate GitHub CI runs is a SLOW
+    gate locally, so a source file that cannot even link used to reach
+    upstream on a green local run. Linking is the cheap half: no execution,
+    no GCC reference build, no stdout comparison -- and it is exactly the
+    half that catches a non-self-contained file.
+    """
     start = time.monotonic()
     phases: list[str] = []
     env = dict(test.env)
@@ -228,6 +263,14 @@ def compile_one(lccc: Path, gcc: str, test: TestCase, workdir: Path) -> Result:
                           f"lccc PGO-generate compile failed:\n{se[-2000:]}",
                           time.monotonic() - start, 0.0, phases + ["gen:fail"])
         phases.append("gen:ok")
+        if compile_only:
+            # `--compile-only` promises "compile+link, do not run it". The
+            # instrumented build has linked, which is the whole contract on
+            # this path; training and the -fprofile-use rebuild both EXECUTE
+            # the program, so honouring the flag here is what keeps the fast
+            # link gate fast -- and honest about what it did.
+            return Result(test.name, "pass", "",
+                          time.monotonic() - start, 0.0, phases + ["link:ok"])
         rc, so, se = run_checked([str(out)], env=env, cwd=workdir)
         if rc != 0:
             return Result(test.name, "fail",
@@ -262,9 +305,12 @@ def compile_one(lccc: Path, gcc: str, test: TestCase, workdir: Path) -> Result:
                 phases + ["compile:host-skip"],
             )
         return Result(test.name, "fail",
-                      f"lccc compile failed:\n{se[-2000:]}",
+                      _compile_fail_detail(src, se),
                       time.monotonic() - start, 0.0, phases + ["compile:fail"])
     phases.append("compile:ok")
+    if compile_only:
+        return Result(test.name, "pass", "",
+                      time.monotonic() - start, 0.0, phases + ["link:ok"])
     if not out.exists():
         return Result(test.name, "fail",
                       f"internal: compile rc=0 but no binary at {out}; cwd={workdir}; stderr={se[-1500:]}",
@@ -337,6 +383,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 2)
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("--json", type=Path, help="write machine-readable results")
+    parser.add_argument("--compile-only", action="store_true",
+                        help="compile+link every corpus file but do not run it "
+                             "or build the GCC reference; catches a source file "
+                             "that is not self-contained, in seconds")
     parser.add_argument(
         "--extra-dir", type=Path, action="append", default=[],
         help="additional source directories to sweep (default: the benchmark programs)",
@@ -409,7 +459,8 @@ def main(argv: list[str] | None = None) -> int:
             for test in tests:
                 workdir = workroot / test.name
                 workdir.mkdir(parents=True, exist_ok=True)
-                futures[pool.submit(compile_one, args.lccc, args.gcc, test, workdir)] = test
+                futures[pool.submit(compile_one, args.lccc, args.gcc, test,
+                                    workdir, args.compile_only)] = test
             for fut in as_completed(futures):
                 res = fut.result()
                 report(res)
