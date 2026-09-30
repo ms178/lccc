@@ -899,7 +899,11 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
                 out.emit_fmt(format_args!("    divl {}", div32));
                 out.emit("    jmp 2f");
                 out.emit("1:");
-                out.emit(if *signed { "    cqto" } else { "    xorl %edx, %edx" });
+                out.emit(if *signed {
+                    "    cqto"
+                } else {
+                    "    xorl %edx, %edx"
+                });
                 out.emit_fmt(format_args!("    {}{} {}", mnem, suffix, div_str));
                 out.emit("2:");
             } else {
@@ -1285,12 +1289,16 @@ pub fn emit_machinsts(insts: &[MachInst], out: &mut AsmOutput) {
         // `xorl %edx,%edx` / `cqto` immediately before a width-bypassed 64-bit
         // divide is dead: the guard overwrites %rdx and the slow path redoes
         // the set-up itself (see the `MachInst::Div` arm).
-        if matches!(insts[i], MachInst::XorRdx | MachInst::Cqto { size: OpSize::S64 })
-            && matches!(
-                insts.get(i + 1),
-                Some(MachInst::Div { size: OpSize::S64, .. })
-            )
-            && crate::backend::x86::cpu_model::active().bypass_div64()
+        if matches!(
+            insts[i],
+            MachInst::XorRdx | MachInst::Cqto { size: OpSize::S64 }
+        ) && matches!(
+            insts.get(i + 1),
+            Some(MachInst::Div {
+                size: OpSize::S64,
+                ..
+            })
+        ) && crate::backend::x86::cpu_model::active().bypass_div64()
         {
             i += 1;
             continue;

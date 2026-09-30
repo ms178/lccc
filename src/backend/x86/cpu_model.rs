@@ -2777,10 +2777,18 @@ mod tests {
         assert_eq!(X86Cpu::from_name("meteorlake"), Some(MeteorLake));
         // CPUID signatures: MTL-M/P 0xAA, MTL-S 0xAC, ARL-U 0xB5.
         for m in [0xAA, 0xAC, 0xB5] {
-            assert_eq!(X86Cpu::from_signature(true, false, 6, m), MeteorLake, "{m:#x}");
+            assert_eq!(
+                X86Cpu::from_signature(true, false, 6, m),
+                MeteorLake,
+                "{m:#x}"
+            );
         }
         for m in [0xB7, 0xBA, 0xBF] {
-            assert_eq!(X86Cpu::from_signature(true, false, 6, m), RaptorLake, "{m:#x}");
+            assert_eq!(
+                X86Cpu::from_signature(true, false, 6, m),
+                RaptorLake,
+                "{m:#x}"
+            );
         }
         let (mtl, rpl) = (MeteorLake.tune(), RaptorLake.tune());
         // [uops.info] MTL-P: VMULPD 3 cycles; ADL-P/EMR (Raptor Cove): 4.
@@ -2794,7 +2802,10 @@ mod tests {
         assert_eq!(mtl.cache.l2.kib, 2048);
         // Crestmont: DIV r64 11–33 (Gracemont 11–44), 2 MiB cluster L2.
         let e = mtl.ecore.expect("hybrid");
-        assert_eq!((e.name, e.div64_latency, e.cluster_l2_kib), ("crestmont", 33, 2048));
+        assert_eq!(
+            (e.name, e.div64_latency, e.cluster_l2_kib),
+            ("crestmont", 33, 2048)
+        );
         assert_eq!(e.lea3_latency, Gracemont.tune().lea3_latency);
         assert_eq!(resolve(None, Some("meteorlake")).cpu, MeteorLake);
     }
@@ -2836,7 +2847,10 @@ mod tests {
             );
             assert_eq!(cpu.tune().bypass_div64(), on, "{cpu:?}");
         }
-        assert!(!X86Tune::GENERIC.bypass_div64(), "untuned builds must not change");
+        assert!(
+            !X86Tune::GENERIC.bypass_div64(),
+            "untuned builds must not change"
+        );
     }
 
     #[test]
