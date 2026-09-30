@@ -226,6 +226,13 @@ pub struct JumpDetection {
     pub is_conditional: bool,
     /// Whether this is already in short form (e.g., jecxz, loop).
     pub already_short: bool,
+    /// Whether a dead 0x66 (the `data16` word in 64-bit mode) is spliced in
+    /// front of the opcode. In 64-bit mode the prefix is architecturally
+    /// dead on near branches, so the row underneath is chosen exactly as
+    /// for the un-prefixed branch (short when disp8-reachable, near
+    /// otherwise) and the splice byte rides along: every length and byte
+    /// offset the relaxer touches shifts by one.
+    pub prefix66: bool,
 }
 
 // ─── Internal types ───────────────────────────────────────────────────
@@ -341,6 +348,11 @@ struct JumpInfo {
     /// Whether this writer shortened the jump and can restore its long form.
     /// Short-only instructions remain false.
     can_grow: bool,
+    /// A dead 0x66 precedes the opcode (`data16` on a 64-bit near branch):
+    /// the short form is `66 eb/7x rel8` (3 bytes) and the near form is
+    /// `66 e9/0f 8x rel32` (6/7 bytes) — one byte and one displacement
+    /// position longer than the plain rows.
+    prefix66: bool,
 }
 
 /// Apply a source-level branch addend. Negative effective targets are
@@ -2224,6 +2236,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         is_conditional: jump_det.is_conditional,
                         relaxed: true,
                         can_grow: false,
+                        prefix66: jump_det.prefix66,
                     });
                 } else if instr_len > 2 {
                     // The architecture has already identified this as a near
@@ -2238,6 +2251,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         is_conditional: jump_det.is_conditional,
                         relaxed: false,
                         can_grow: false,
+                        prefix66: jump_det.prefix66,
                     });
                 }
             }
@@ -3611,12 +3625,15 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         continue;
                     };
                     // A forward target moves left with the jump's own shrink;
-                    // a backward target does not.
+                    // a backward target does not. The backward arm measures
+                    // from the SHORT form's end: 2 bytes, or 3 with a dead
+                    // 0x66 (`data16` in 64-bit mode) riding in front.
                     let old_len = jump.len as i64;
+                    let short_len = 2 + i64::from(jump.prefix66);
                     let short_disp = if (target_off as i64) > jump.offset as i64 {
                         target_off as i64 - (jump.offset as i64 + old_len)
                     } else {
-                        target_off as i64 - (jump.offset as i64 + 2)
+                        target_off as i64 - (jump.offset as i64 + short_len)
                     };
                     let fits_short = (-128..=127).contains(&short_disp);
                     if first_pass && !jump.relaxed {
@@ -3688,12 +3705,12 @@ impl<A: X86Arch> ElfWriterCore<A> {
             self.apply_jump_transitions_sequential(sec_idx, actions);
             return;
         }
-        let reloc_pos = |offset: usize, is_conditional: bool| {
+        let reloc_pos = |offset: usize, is_conditional: bool, prefix66: bool| {
             (if is_conditional {
                 offset + 2
             } else {
                 offset + 1
-            }) as u64
+            } + usize::from(prefix66)) as u64
         };
         let mut edits: Vec<(usize, bool)> = actions
             .iter()
@@ -3708,7 +3725,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             .filter(|&&(_, shrink)| shrink)
             .map(|&(j, _)| {
                 let jump = &self.sections[sec_idx].jumps[j];
-                reloc_pos(jump.offset, jump.is_conditional)
+                reloc_pos(jump.offset, jump.is_conditional, jump.prefix66)
             })
             .collect();
         if !dropped.is_empty() {
@@ -3728,25 +3745,34 @@ impl<A: X86Arch> ElfWriterCore<A> {
             let (offset, old_len) = (jump.offset, jump.len);
             data.extend_from_slice(&old[cursor..offset]);
             let new_len = if shrink {
-                // near jcc 0x0f 0x8x rel / jmp 0xe9 rel -> short 0x7x / 0xeb disp8
+                // near jcc 0x0f 0x8x rel / jmp 0xe9 rel -> short 0x7x / 0xeb disp8.
+                // With a dead 0x66 (`data16`, 64-bit) the prefix byte rides
+                // along and every source index shifts by one.
+                if jump.prefix66 {
+                    data.push(0x66);
+                }
                 if jump.is_conditional {
-                    data.push(0x70 + (old[offset + 1] - 0x80));
+                    data.push(0x70 + (old[offset + usize::from(jump.prefix66) + 1] - 0x80));
                 } else {
                     data.push(0xEB);
                 }
                 data.push(0);
-                2
+                2 + usize::from(jump.prefix66)
             } else {
                 // short 0x7x / 0xeb disp8 -> near 0x0f 0x8x / 0xe9 rel16/32;
                 // the unconditional form keeps its old second byte as the
                 // first displacement byte, as the in-place splice did.
                 let grow = jump.long_len - old_len;
+                if jump.prefix66 {
+                    data.push(0x66);
+                }
+                let op = usize::from(jump.prefix66);
                 if jump.is_conditional {
                     data.push(0x0f);
-                    data.push(0x80 + (old[offset] - 0x70));
+                    data.push(0x80 + (old[offset + op] - 0x70));
                 } else {
                     data.push(0xE9);
-                    data.push(old[offset + 1]);
+                    data.push(old[offset + op + 1]);
                 }
                 data.resize(data.len() + grow, 0);
                 jump.long_len
@@ -3776,14 +3802,14 @@ impl<A: X86Arch> ElfWriterCore<A> {
             if shrink {
                 jump.relaxed = true;
                 jump.can_grow = true;
-                jump.len = 2;
+                jump.len = 2 + usize::from(jump.prefix66);
                 continue;
             }
             jump.relaxed = false;
             jump.len = jump.long_len;
             let rel16 = jump.long_len == if jump.is_conditional { 4 } else { 3 };
             let reloc = ElfRelocation {
-                offset: reloc_pos(jump.offset, jump.is_conditional),
+                offset: reloc_pos(jump.offset, jump.is_conditional, jump.prefix66),
                 symbol: jump.target.clone(),
                 reloc_type: if rel16 {
                     A::reloc_pc16().expect("rel16 branch without architecture relocation")
@@ -3817,41 +3843,53 @@ impl<A: X86Arch> ElfWriterCore<A> {
         });
         for (j, shrink) in order {
             let jump = &self.sections[sec_idx].jumps[j];
-            let (offset, old_len, long_len, is_conditional) =
-                (jump.offset, jump.len, jump.long_len, jump.is_conditional);
+            let (offset, old_len, long_len, is_conditional, prefix66) = (
+                jump.offset,
+                jump.len,
+                jump.long_len,
+                jump.is_conditional,
+                jump.prefix66,
+            );
             let (target, target_addend) = (jump.target.clone(), jump.target_addend);
             let reloc_pos = (if is_conditional {
                 offset + 2
             } else {
                 offset + 1
-            }) as u64;
+            } + usize::from(prefix66)) as u64;
             let data = &mut self.sections[sec_idx].data;
+            let op = usize::from(prefix66);
             if shrink {
                 if is_conditional {
-                    data[offset] = 0x70 + (data[offset + 1] - 0x80);
+                    data[offset + op] = 0x70 + (data[offset + op + 1] - 0x80);
                 } else {
-                    data[offset] = 0xEB;
+                    data[offset + op] = 0xEB;
                 }
-                data[offset + 1] = 0;
-                data.drain(offset + 2..offset + old_len);
+                data[offset + op + 1] = 0;
+                data.drain(offset + op + 2..offset + old_len);
                 self.sections[sec_idx]
                     .relocations
                     .retain(|r| r.offset != reloc_pos);
-                self.shift_after(sec_idx, offset + 1, 2 - old_len as i64, None);
+                self.shift_after(sec_idx, offset + 1, 2 + op as i64 - old_len as i64, None);
                 let jump = &mut self.sections[sec_idx].jumps[j];
                 jump.relaxed = true;
                 jump.can_grow = true;
-                jump.len = 2;
+                jump.len = 2 + op;
             } else {
                 let grow = long_len - old_len;
                 if is_conditional {
-                    let cc = data[offset] - 0x70;
-                    data.splice(offset + 2..offset + 2, std::iter::repeat_n(0u8, grow));
-                    data[offset] = 0x0f;
-                    data[offset + 1] = 0x80 + cc;
+                    let cc = data[offset + op] - 0x70;
+                    data.splice(
+                        offset + op + 2..offset + op + 2,
+                        std::iter::repeat_n(0u8, grow),
+                    );
+                    data[offset + op] = 0x0f;
+                    data[offset + op + 1] = 0x80 + cc;
                 } else {
-                    data.splice(offset + 2..offset + 2, std::iter::repeat_n(0u8, grow));
-                    data[offset] = 0xE9;
+                    data.splice(
+                        offset + op + 2..offset + op + 2,
+                        std::iter::repeat_n(0u8, grow),
+                    );
+                    data[offset + op] = 0xE9;
                 }
                 self.shift_after(sec_idx, offset + 1, grow as i64, None);
                 let rel16 = long_len == if is_conditional { 4 } else { 3 };
@@ -4009,7 +4047,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     } else {
                         moved(&visited, &cumulative, label_off, label_seq) + jump.target_addend
                     };
-                    let disp = target - (here + 2);
+                    let disp = target - (here + 2 + i64::from(jump.prefix66));
                     if !(-128..=127).contains(&disp) {
                         let delta = (jump.long_len - jump.len) as i64;
                         stretch += delta;
@@ -4107,12 +4145,12 @@ impl<A: X86Arch> ElfWriterCore<A> {
             );
             // A leading 0x67 address-size override (the i686 `addr16`
             // word or a 16-bit counter spelling) sits between the jump
-            // opcode and its displacement byte.
+            // opcode and its displacement byte; so does a dead 0x66 (the
+            // 64-bit `data16` word) in front of `66 eb/7x rel8`.
             let disp_at = jump.offset as usize
-                + if self.sections[sec_idx].data.get(jump.offset as usize) == Some(&0x67) {
-                    2
-                } else {
-                    1
+                + match self.sections[sec_idx].data.get(jump.offset as usize) {
+                    Some(&0x66) | Some(&0x67) => 2,
+                    _ => 1,
                 };
             let Some(target_off) = target else {
                 // Unresolvable target (undefined/external). A short-only
@@ -4129,12 +4167,12 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 // into the next instruction.
                 // A leading 0x67 address-size override (the i686 `addr16`
                 // word or a 16-bit counter spelling) sits between the jump
-                // opcode and its displacement byte.
+                // opcode and its displacement byte; so does a dead 0x66 (the
+                // 64-bit `data16` word) in front of `66 eb/7x rel8`.
                 let disp_at = jump.offset as usize
-                    + if self.sections[sec_idx].data.get(jump.offset as usize) == Some(&0x67) {
-                        2
-                    } else {
-                        1
+                    + match self.sections[sec_idx].data.get(jump.offset as usize) {
+                        Some(&0x66) | Some(&0x67) => 2,
+                        _ => 1,
                     };
                 if !jump.can_grow
                     && !self.sections[sec_idx]

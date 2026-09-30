@@ -1,0 +1,41 @@
+# encdiff corpus: 64-bit data16 branch rows.
+#
+# The x86-64 encoder treats the `data16` word on a direct near branch as a
+# DEAD prefix byte (Intel SDM: operand-size prefixes have no effect on near
+# branches in 64-bit mode; hardware-proven — the decoder consumes the full
+# 4-byte displacement after 66 e9/e8/0f 8x). lccc emits `66 <normal-row>`:
+# near targets relax to `66 eb/7x rel8` (GAS parity), far and external
+# targets keep the rel32 row + R_X86_64_PLT32.
+#
+# GAS 2.47 emits the truncated rel16 field for far/external targets
+# (66 e9/e8/0f 8x + R_X86_64_PC16) — encodings that MIS-EXECUTE on real
+# hardware (the decoder reads two bytes past the instruction). encdiff
+# therefore reports these rows as ORACLE-INVALID, not as a length race:
+# lccc's longer form is the shortest VALID encoding.
+#
+# These rows cannot live in tests/asm-diff/*.casefile: the asm-diff
+# contract is byte-equality with GNU as, and GAS's bytes here are the
+# invalid ones. Run with:
+#   scripts/encdiff.py --lccc ./target/fastbuild/lccc \
+#       --file tests/encdiff-corpus/data16-branches-64.insn
+#
+# Local labels are scaffolded by encdiff's local_label_scaffold (the
+# matching `N:` lands immediately after the instruction); a `+N` addend
+# pushes the scaffolded target out of disp8 range to exercise the far
+# (rel32) rows.
+data16 jmp foo
+data16 je foo
+data16 jne foo
+data16 call foo
+data16 jmp 1f
+data16 je 1f
+data16 jne 1f
+data16 call 1f
+data16 jmp 1f+300
+data16 je 1f+300
+data16 jne 1f+300
+data16 call 1f+300
+data16 jmp 1b
+data16 je 1b
+data16 jne 1b
+data16 call 1b

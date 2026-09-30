@@ -34,6 +34,16 @@ GCC=${GCC_BIN:-gcc}
 tmp=${TMPDIR:-/tmp}/lccc-eh-frame.$$
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp"
+# Shared host i386-execution probe: this gate's -m32 leg executes 32-bit
+# binaries (backtrace, forced unwind, gc-sections runs), and a host can
+# link -m32 yet refuse to execute the result (i386_exec.sh has the
+# taxonomy). The compile-level FDE check below stays unconditional.
+source "$(dirname "$0")/i386_exec.sh"
+i386_run=1
+if ! i386_exec_ok "$GCC" "$tmp"; then
+    i386_run=0
+    echo "note -m32: host cannot execute i386; -m32 unwind runs skipped, FDE shapes still checked"
+fi
 
 cat >"$tmp/bt.c" <<'C'
 #include <execinfo.h>
@@ -186,9 +196,14 @@ print(bad, " ".join(augs))
 PY
 
 for m in "" -m32; do
-    if [[ -n "$m" ]] && ! echo 'int main(void){return 0;}' | "$GCC" -m32 -x c - -o "$tmp/probe" 2>/dev/null; then
-        echo "SKIP -m32: no 32-bit toolchain"
-        continue
+    if [[ -n "$m" && "$i386_run" != 1 ]]; then
+        if ! echo 'int main(void){return 0;}' | "$GCC" -m32 -x c - -o "$tmp/linkprobe" 2>/dev/null; then
+            echo "SKIP -m32: no 32-bit toolchain"
+            continue
+        fi
+        m32_noexec=1
+    else
+        m32_noexec=0
     fi
     tag=${m:-x86-64}
     "$CCC" $m -O2 -c "$tmp/callee.c" -o "$tmp/callee.o"
@@ -200,32 +215,39 @@ for m in "" -m32; do
         echo "FAIL ($tag): $fdes FDEs for $funcs functions in callee.o" >&2
         exit 1
     fi
+    # Everything below is built in every case; the EXECUTIONS and their
+    # value comparisons run only where the host can execute this mode
+    # (m32_noexec is set per-leg above). The .eh_frame_hdr parsing and
+    # the gceh pruning counters are link/parse-level and stay on.
     "$CCC" $m -O2 "$tmp/bt.c" -o "$tmp/bt"
-    "$tmp/bt" || { echo "FAIL ($tag): backtrace stopped inside lccc frames" >&2; exit 1; }
     "$GCC" $m -O2 -fexceptions -c "$tmp/caller.c" -o "$tmp/caller.o"
     "$GCC" $m "$tmp/caller.o" "$tmp/callee.o" -o "$tmp/mix-gld" -lpthread
-    "$tmp/mix-gld" || { echo "FAIL ($tag): forced unwind through lccc frame (GNU ld)" >&2; exit 1; }
     "$CCC" $m "$tmp/caller.o" "$tmp/callee.o" -o "$tmp/mix-lld" -lpthread
-    "$tmp/mix-lld" || { echo "FAIL ($tag): forced unwind through lccc frame (lccc link)" >&2; exit 1; }
-
     "$GCC" $m -O2 -fexceptions -ffunction-sections -c "$tmp/gc.c" -o "$tmp/gc.o"
     "$GCC" $m -Wl,--gc-sections "$tmp/gc.o" -o "$tmp/gc-gld"
     "$CCC" $m -Wl,--gc-sections "$tmp/gc.o" -o "$tmp/gc-lld"
-    "$tmp/gc-lld" >/dev/null || { echo "FAIL ($tag): gc-sections link does not run" >&2; exit 1; }
+    "$GCC" $m -O2 "$tmp/pop.c" -o "$tmp/pop-gcc"
+    "$CCC" $m -O2 "$tmp/pop.c" -o "$tmp/pop"
+    if [[ $m32_noexec == 0 ]]; then
+        "$tmp/bt" || { echo "FAIL ($tag): backtrace stopped inside lccc frames" >&2; exit 1; }
+        "$tmp/mix-gld" || { echo "FAIL ($tag): forced unwind through lccc frame (GNU ld)" >&2; exit 1; }
+        "$tmp/mix-lld" || { echo "FAIL ($tag): forced unwind through lccc frame (lccc link)" >&2; exit 1; }
+        "$tmp/gc-lld" >/dev/null || { echo "FAIL ($tag): gc-sections link does not run" >&2; exit 1; }
+        want=$("$tmp/pop-gcc")
+        got=$("$tmp/pop")
+        if [[ "$got" != "$want" ]]; then
+            echo "FAIL ($tag): backtrace past callee-popping calls saw $got frames, GCC build $want" >&2
+            exit 1
+        fi
+    else
+        echo "note ($tag): host cannot execute this mode; builds, links and .eh_frame_hdr parsing still checked"
+    fi
     read -r bad augs < <(python3 "$tmp/ehhdr.py" "$tmp/gc-lld")
     read -r _ ref_augs < <(python3 "$tmp/ehhdr.py" "$tmp/gc-gld")
     want=$(tr ' ' '\n' <<<"$ref_augs" | grep -c zPLR || true)
     got=$(tr ' ' '\n' <<<"$augs" | grep -c zPLR || true)
     if [[ "$bad" != 0 || "$got" != "$want" ]]; then
         echo "FAIL ($tag): .eh_frame_hdr after --gc-sections: bad=$bad zPLR FDEs=$got (GNU ld: $want) [$augs]" >&2
-        exit 1
-    fi
-    "$GCC" $m -O2 "$tmp/pop.c" -o "$tmp/pop-gcc"
-    "$CCC" $m -O2 "$tmp/pop.c" -o "$tmp/pop"
-    want=$("$tmp/pop-gcc")
-    got=$("$tmp/pop")
-    if [[ "$got" != "$want" ]]; then
-        echo "FAIL ($tag): backtrace past callee-popping calls saw $got frames, GCC build $want" >&2
         exit 1
     fi
     for f in "$tmp/mix-lld" "$tmp/bt" "$tmp/pop"; do

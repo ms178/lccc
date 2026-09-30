@@ -520,18 +520,128 @@ def _vcmp_imm_symmetric(text: str) -> bool:
 _GP32_TO_64 = {
     "eax": "rax", "ebx": "rbx", "ecx": "rcx", "edx": "rdx",
     "esi": "rsi", "edi": "rdi", "ebp": "rbp", "esp": "rsp",
-    **{f"r{n}d": f"r{n}" for n in range(8, 16)},
+    **{f"r{n}d": f"r{n}" for n in range(8, 32)},
 }
-_MOV_IMM = re.compile(r"^(movabs|mov)\s+\$(0x[0-9a-f]+|\d+),%(\w+)$")
+# 64-bit GPR names including the APX EGPR range: `movabs $val,%rN` (the
+# imm64 form) canonicalises onto the same `mov $val,%rN` spelling as the
+# zero-extending imm32 form when the value fits unsigned 32 bits — they
+# write identical register contents (x86-64 zero-extends every 32-bit
+# write), so a length comparison between them is a pure encoding choice.
+_GP64_FULL = {
+    "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+    *(f"r{n}" for n in range(8, 32)),
+}
+_MOV_IMM = re.compile(r"^(movabs|mov)\s+\$(0x[0-9a-f]+|\d+),%([a-z0-9]+)$")
+# Direct branch whose objdump spelling differs by encoding choice.
+# objdump renders a 66-prefixed SHORT branch (`66 eb d8`, `66 74 d8`)
+# as `data16 jmp/je` — on hardware the 66 is a dead prefix there
+# (64-bit: near branches ignore operand-size prefixes per the Intel
+# SDM; 32-bit: the only effect is EIP truncation to 16 bits, which no
+# in-corpus payload can observe), so the spelling is unified with the
+# plain short form in BOTH modes. In 64-bit mode the LOOP family rides
+# the same rule (hardware-verified: `66 e2` still decrements the full
+# RCX), so `data16 loop` unifies too; in 32-bit mode it does NOT —
+# `66 e2` is LOOPW, a genuinely different instruction that counts CX
+# instead of ECX. In 32-bit mode `jmpw` (66 e9 rel16) is the same
+# transfer as `jmp` (e9 rel32) for any in-payload target (< 64 KiB)
+# and is unified. `callw` is NEVER unified with `call`: the 16-bit call
+# pushes a 2-byte return address where the 32-bit call pushes 4 — a
+# real semantic difference in every mode. In 64-bit mode `jmpw` and
+# `callw` render the truncated rel16 rows the DECODER REJECTS (it reads
+# a full 4-byte displacement; see invalid_64_data16_branch) — they are
+# never equivalence partners.
+_DEAD66_BRANCH_ALWAYS = re.compile(r"^data16\s+(j[a-z]+)\b")
+_DEAD66_BRANCH_64 = re.compile(r"^data16\s+(j[a-z]+|loop[a-z]*)\b")
+_BRANCH_W32 = re.compile(r"^jmpw\b")
+# Direct branch to an absolute target: rewritten with BOTH comparison
+# invariants (see _branch_marker).
+_BRANCH_TARGET = re.compile(
+    r"^((?:data16\s+)?(?:j[a-z]+|jmp|call|loop[a-z]*))\s+(0x[0-9a-f]+)$")
+# A rewritten branch marker: mnemonic, absolute target, end-relative
+# displacement. Two encodings of one branch are equivalent when EITHER
+# the absolute targets match (label BEFORE the instruction: its position
+# is independent of this instruction's encoding) OR the end-relative
+# displacements match (label AFTER: it rides at a fixed distance from
+# the instruction end). Comparing only one arm misjudges the other
+# direction — end-relative alone breaks backward labels, absolute alone
+# breaks forward ones.
+_BRANCH_MARK = re.compile(r"^(.*?) @a=(0x[0-9a-f]+) @d=([+-]0x[0-9a-f]+)$")
 
 
-def _canon_insn(insn: str) -> str:
+def invalid_64_data16_branch(data: bytes) -> bool:
+    """True for a 66-prefixed near branch with a 2-byte displacement
+    field — architecturally invalid in 64-bit mode.
+
+    Intel SDM: operand-size prefixes have no effect on near branches in
+    64-bit mode; the decoder consumes a FULL 4-byte displacement after
+    `66 e8` / `66 e9` / `66 0f 8x` regardless of the prefix. A payload
+    that stops after a 2-byte field therefore desynchronises the
+    instruction stream — the decoder reads two bytes of whatever
+    follows and jumps through them (hardware-verified on a Xeon: the
+    fault RIP is exactly insn_end + disp32(read from past the payload)).
+    GAS 2.47 emits these truncated rows for `data16 jmp/je/call` with
+    far or external targets (with R_X86_64_PC16); the payload lengths
+    4 (e8/e9) and 5 (0f 8x) identify them unambiguously — the valid
+    dead-prefix forms are 6 and 7 bytes.
+    """
+    if len(data) >= 3 and data[0] == 0x66:
+        if data[1] in (0xE8, 0xE9):
+            return len(data) == 4
+        if data[1] == 0x0F and 0x80 <= data[2] <= 0x8F:
+            return len(data) == 5
+    return False
+
+
+def _branch_marker(insn: str, addr: int, nbytes: int) -> str:
+    """Rewrite a direct branch's absolute target with both invariants."""
+    m = _BRANCH_TARGET.match(insn)
+    if not m:
+        return insn
+    target = int(m.group(2), 16)
+    return f"{m.group(1)} @a={target:#x} @d={target - (addr + nbytes):+#x}"
+
+
+def _stream_equal(a: str, b: str) -> bool:
+    """Compare two canonical instruction streams.
+
+    Plain lines must match exactly. Branch-marker lines match when the
+    mnemonic agrees and EITHER branch invariant does (see
+    _branch_marker) — the encoding-independent statement of "transfers
+    to the same place" for a corpus whose labels sit immediately before
+    or after the instruction.
+    """
+    la, lb = a.split("\n"), b.split("\n")
+    if len(la) != len(lb):
+        return False
+    for x, y in zip(la, lb):
+        if x == y:
+            continue
+        ma, mb = _BRANCH_MARK.match(x), _BRANCH_MARK.match(y)
+        if ma and mb and ma.group(1) == mb.group(1) and (
+                ma.group(2) == mb.group(2) or ma.group(3) == mb.group(3)):
+            continue
+        return False
+    return True
+
+
+def _canon_insn(insn: str, bits32: bool = False) -> str:
     """Canonicalise disassembly spellings that differ only by encoding choice."""
     insn = insn.split("#")[0].strip().lower()
     # Objdump marks an EVEX-only mnemonic's legal VEX row with a GNU pseudo
     # prefix (`{vex} vpdpbusds`). It describes the selected encoding, not a
     # different architectural instruction, so remove it for semantic compare.
     insn = re.sub(r"^\{vex(?:2|3)?\}\s+", "", insn)
+    # 66-prefixed SHORT branches (`data16 jmp 0x3` = `66 eb 01`) are the
+    # dead-prefix spellings of the plain short rows in every mode; in
+    # 32-bit mode `jmpw` additionally transfers to the same place as
+    # `jmp` for any in-payload target. In 32-bit mode the LOOP family
+    # keeps its `data16` marker (LOOPW counts CX, not ECX); in 64-bit
+    # mode it is dead too (see the block comment above).
+    if bits32:
+        insn = _DEAD66_BRANCH_ALWAYS.sub(r"\1", insn)
+        insn = _BRANCH_W32.sub("jmp", insn)
+    else:
+        insn = _DEAD66_BRANCH_64.sub(r"\1", insn)
     insn = _SCALE1.sub(r"(%\1)", insn)
     insn = _ZERODISP.sub("(", insn)
     insn = re.sub(r"\s+", " ", insn)
@@ -547,8 +657,16 @@ def _canon_insn(insn: str) -> str:
     if m:
         val = int(m.group(2), 0)
         reg = m.group(3)
-        if reg in _GP32_TO_64 and 0 <= val <= 0xFFFFFFFF:
-            insn = f"mov ${val:#x},%{_GP32_TO_64[reg]}"
+        if 0 <= val <= 0xFFFFFFFF:
+            # Zero-extension equivalence: writing a 32-bit register (the
+            # imm32 opcode, incl. the REX2/EGPR rows objdump prints as
+            # %r16d) and movabs-ing the same zero-extended value into the
+            # 64-bit register produce identical register contents, so both
+            # canonicalise to `mov $val,%r64` (covers %r16d-%r31d too).
+            if reg in _GP32_TO_64:
+                insn = f"mov ${val:#x},%{_GP32_TO_64[reg]}"
+            elif reg in _GP64_FULL:
+                insn = f"mov ${val:#x},%{reg}"
     return insn
 
 
@@ -576,10 +694,17 @@ def decodes_same(objdump: str, a: bytes, b: bytes,
             return None
         out = []
         for line in r.stdout.splitlines():
-            m = re.match(r"^\s+[0-9a-f]+:\s+((?:[0-9a-f]{2} )+)\s*\t(.*)$", line)
+            m = re.match(
+                r"^\s+([0-9a-f]+):\s+((?:[0-9a-f]{2} )+)\s*\t(.*)$", line)
             if not m:
                 continue
-            insn = _canon_insn(m.group(2))
+            insn = _canon_insn(m.group(3), bits32=bits32)
+            # Branch targets: rewrite with both comparison invariants so
+            # a short and a near encoding of the same branch compare
+            # equal exactly when they transfer to the same place (see
+            # _branch_marker / _stream_equal).
+            insn = _branch_marker(
+                insn, int(m.group(1), 16), len(m.group(2).split()))
             # Objdump renders undecodable bytes as `.byte` (and some versions
             # use `(bad)`). Two undecodable streams are not equivalent code.
             if not insn or insn == "(bad)" or insn.startswith(".byte"):
@@ -593,7 +718,7 @@ def decodes_same(objdump: str, a: bytes, b: bytes,
         return None
     if da is None or db is None:
         return None
-    return da == db
+    return _stream_equal(da, db)
 
 
 def _roundtrip_same_as(row: Row, references: list[bytes],
@@ -639,6 +764,41 @@ def classify(row: Row, bits32: bool = False) -> None:
         row.verdict = "NO-ORACLE" if row.lccc.ok else "both-reject"
         return
 
+    # In 64-bit mode, a 66-prefixed near branch whose displacement field
+    # is 2 bytes is architecturally invalid (the decoder reads a full
+    # 4-byte field; see invalid_64_data16_branch). Such oracle bytes are
+    # not a length race to win or lose — they are not encodings at all —
+    # so they are partitioned out before any comparison. The same bytes
+    # from LCCC would be a codegen bug and are reported immediately.
+    if not bits32:
+        if (row.lccc.ok and row.lccc.data is not None
+                and invalid_64_data16_branch(row.lccc.data)):
+            row.verdict = "WRONG-BYTES"
+            row.note = ("LCCC emitted a 66-prefixed near branch with a"
+                        " 2-byte displacement field — architecturally"
+                        " invalid in 64-bit mode (the decoder consumes a"
+                        " full 4-byte field and desynchronises)")
+            return
+        valid = {k: v for k, v in ok_oracles.items()
+                 if not invalid_64_data16_branch(v.data)}
+        invalid_who = sorted(set(ok_oracles) - set(valid))
+        if not valid:
+            row.verdict = "ORACLE-INVALID"
+            row.note = ("every oracle form is a truncated 66-prefixed"
+                        " near branch (2-byte displacement field):"
+                        " hardware reads a full 4-byte field in 64-bit"
+                        " mode and desynchronises; refused to chase —"
+                        " LCCC keeps the requested prefix on the normal"
+                        " row, the shortest valid encoding of the"
+                        " prefixed request")
+            return
+        if invalid_who:
+            row.note = ("invalid oracle bytes excluded from the"
+                        f" comparison ({','.join(invalid_who)}: 2-byte"
+                        " displacement field on a 66-prefixed near"
+                        " branch)")
+            ok_oracles = valid
+
     lengths = {k: len(v.data) for k, v in ok_oracles.items()}
     best = min(lengths.values())
     best_who = sorted(k for k, n in lengths.items() if n == best)
@@ -676,6 +836,45 @@ def classify(row: Row, bits32: bool = False) -> None:
     ref = next(iter(bytesets))
     if row.lccc.data == ref:
         row.verdict = "ok"
+    elif is_declined_data16_relax(row.insn) and n > len(ref):
+        # The fixed-rel16 policy (32-bit mode keeps `data16 je 1f` on the
+        # rel16 row where GAS relaxes to `66 74 rel8`). A decline is only
+        # honest after the round-trip proves the two forms are the same
+        # program: an UNVERIFIED decline would mask a real mis-encoding
+        # forever, so verification failure escalates instead.
+        same = _roundtrip_same_as(row, [ref], bits32=bits32)
+        if same is True:
+            row.verdict = "DECLINED-DATA16"
+            row.note = (row.note + " | " if row.note else "") + (
+                f"{len(ref)}B form from gas relaxes the explicit 16-bit"
+                " displacement to the short row; refused (fixed-rel16"
+                " policy, see prefix-words.casefile)"
+                " | round-trip verified against the relaxed form")
+        elif same is False and bits32 and _DATA16_LOOP.match(row.insn):
+            # The LOOP family in 32-bit mode is NOT a size decline: the
+            # 66 prefix is ALIVE on E0-E3 (it selects the 16-bit CX
+            # counter — LOOPW/JCXZ), so LCCC's `66 e2 rel8` and GAS's
+            # prefix-dropped `e2 rel8` are different instructions. GAS
+            # discards the user's prefix with a warning; LCCC honors it
+            # (silently dropping it would change the program). Reported
+            # as a deliberate policy divergence, not a mis-encoding.
+            row.verdict = "DECLINED-DATA16"
+            row.note = (row.note + " | " if row.note else "") + (
+                f"{len(ref)}B form from gas DROPS the data16 prefix"
+                " (warning: skipping prefixes) making LOOP count ECX;"
+                " LCCC keeps `66 e2` = LOOPW (CX counter) — the prefix"
+                " is architecturally alive on E0-E3 in 32-bit mode, so"
+                " the forms are different instructions by policy, not"
+                " equivalent encodings")
+        elif same is False:
+            row.verdict = "WRONG-BYTES"
+            row.note = (row.note + " | " if row.note else "") + (
+                "LCCC disassembly differs from the relaxed oracle form"
+                " (data16 row: decline cannot be claimed)")
+        else:
+            row.verdict = "UNVERIFIED-BYTES"
+            row.note = (row.note + " | " if row.note else "") + (
+                "objdump could not verify the data16 decline (fail-closed)")
     elif n < len(ref):
         row.note = (f"oracles agree on {len(ref)}B"
                     f" ({','.join(sorted(ok_oracles))})")
@@ -710,6 +909,28 @@ def is_declined_fp_swap(insn: str) -> bool:
     return bool(parts) and parts[0] in _FP_NONCOMMUTATIVE
 
 
+# An EXPLICIT `data16` branch names the 16-bit displacement form itself.
+# In 32-bit mode lccc's fixed-rel16 policy keeps `data16 je 1f` on the
+# rel16 near row even for a target GAS would relax down to the
+# 66-prefixed SHORT form (3B); on short-only rows (loop/jrcxz) GAS DROPS
+# the dead prefix with a warning where lccc keeps it. Both divergences
+# are deliberate policies, classified separately so LONGER keeps its
+# signal — and only after the round-trip proves equivalence (see
+# classify). `call` is not here: it has no short row, so GAS never
+# "relaxes" a data16 call — its truncated form is a hardware-invalid
+# encoding handled by invalid_64_data16_branch instead.
+_DECLINED_DATA16_RELAX = re.compile(
+    r"^data16\s+(?:j[a-z]+|loop[a-z]*)\b", re.I)
+# The LOOP/E0-E3 family: the 66 prefix is architecturally ALIVE on it in
+# 32-bit mode (16-bit CX counter — LOOPW/JCXZ), unlike the jmp/jcc short
+# rows where it is dead. Used to pick the counter-width policy note.
+_DATA16_LOOP = re.compile(r"^data16\s+(?:loop[a-z]*|jcxz|jecxz)\b", re.I)
+
+
+def is_declined_data16_relax(insn: str) -> bool:
+    return _DECLINED_DATA16_RELAX.match(insn) is not None
+
+
 # Shorter encodings that are simply WRONG. Every one of these was produced by
 # an oracle and rejected here after checking what the bytes actually do.
 #
@@ -739,6 +960,8 @@ SEVERITY = {
     "ok": 7,
     "DECLINED-FP": 7,   # shorter form exists but changes NaN payload
     "DECLINED-WRONG": 7, # shorter form exists but is not equivalent
+    "DECLINED-DATA16": 7, # shorter form relaxes the requested 16-bit field
+    "ORACLE-INVALID": 7,  # every oracle form is hardware-invalid; LCCC is right
     "both-reject": 8,
     "NO-ORACLE": 9,
 }

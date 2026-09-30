@@ -51,6 +51,20 @@ int main(void)
     return handcfi() == 7 ? 0 : 3;
 }
 C
+# Host i386-execution probe. The previous probe only tested whether lccc
+# could LINK -m32; a host with a 32-bit sysroot links fine yet still
+# refuses to execute the result (no /lib/ld-linux.so.2, or a seccomp
+# policy that SIGSYSes the ia32 syscall gateway). Gating the run leg on a
+# link probe made such hosts report a codegen failure that never
+# happened. The assembly-parity and CFI-survival checks above are
+# compile-only and stay unconditional for every mode.
+i386_run_ok() {
+    local rc=0
+    echo 'int main(void){return 0;}' \
+        | "$CCC" -m32 -x c -o "$tmp/probe" - >/dev/null 2>&1 || return 1
+    "$tmp/probe" >/dev/null 2>&1 || rc=$?
+    [[ $rc -eq 0 ]]
+}
 for m in "" -m32; do
     "$CCC" $m -O2 -S "$tmp/t.c" -o "$tmp/cfi.s"
     "$CCC" $m -O2 -fno-asynchronous-unwind-tables -S "$tmp/t.c" -o "$tmp/nocfi.s"
@@ -65,9 +79,11 @@ for m in "" -m32; do
         grep -n '\.cfi_' "$tmp/nocfi.s" >&2 || true
         exit 1
     fi
-    if [[ -z "$m" ]] || echo 'int main(void){return 0;}' | "$CCC" -m32 -x c - -o "$tmp/probe" 2>/dev/null; then
+    if [[ -z "$m" ]] || i386_run_ok; then
         "$CCC" $m -O2 -fno-asynchronous-unwind-tables "$tmp/t.c" -o "$tmp/t"
         "$tmp/t"
+    else
+        echo "SKIP${m:+ ($m)}: host cannot execute i386; assembly parity and CFI survival still asserted"
     fi
 done
 echo "PASS: no-unwind codegen parity"

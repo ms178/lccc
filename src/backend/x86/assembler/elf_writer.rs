@@ -27,15 +27,17 @@ impl X86Arch for X86_64Arch {
 
         // Detect jump instructions for relaxation
         let jump = {
-            // An explicit `data16` prefix is a 16-bit displacement request,
-            // not a rel32 jump: the encoded form is `66 e9 rel16` (5 bytes),
-            // which the length check below would read as a 5-byte E9 rel32
-            // jump and the relaxer would then "shrink" by overwriting the
-            // first opcode byte with EB — dropping the 66/segment prefixes
-            // and leaving the displacement reloc dangling. GAS relaxes such
-            // branches to `66 eb rel8` for near local targets; lccc keeps
-            // the requested rel16 (the same fixed-rel16 policy the .code16
-            // branches document) and the PC16 in-place fold resolves it.
+            // A `data16`-prefixed jmp/jcc registers like its plain sibling:
+            // in 64-bit mode the 0x66 the central splice prepends is an
+            // architecturally dead prefix on near branches (Intel SDM; the
+            // decoder consumes the full 4-byte displacement regardless), so
+            // the row underneath is selected exactly as without the prefix
+            // and every length is one byte longer. Near targets relax to
+            // `66 eb/7x rel8` — byte-identical to GAS — and far or external
+            // targets keep `66 e9/0f 8x rel32`, the shortest VALID form
+            // (GAS 2.47 truncates the field to rel16 there, which
+            // mis-executes: the decoder reads two bytes past the
+            // instruction). `call` never registers (it has no short row).
             let data16 = instr
                 .prefixes
                 .iter()
@@ -46,15 +48,16 @@ impl X86Arch for X86_64Arch {
             // conditional (length 5 != 6) and is never relaxed.
             let mnem_lower = instr.mnemonic.to_ascii_lowercase();
             let mnem: &str = mnem_lower.strip_suffix(".s").unwrap_or(&mnem_lower);
-            let is_jump = !data16 && mnem.starts_with('j') && mnem.len() >= 2;
+            let is_jump = mnem.starts_with('j') && mnem.len() >= 2;
             if is_jump && instr.operands.len() == 1 {
                 if let Operand::Label(_) = &instr.operands[0] {
                     let is_conditional = mnem != "jmp";
-                    let expected_len = if is_conditional { 6 } else { 5 };
+                    let expected_len = if is_conditional { 6 } else { 5 } + usize::from(data16);
                     if instr_len == expected_len {
                         Some(JumpDetection {
                             is_conditional,
                             already_short: false,
+                            prefix66: data16,
                         })
                     } else {
                         None
@@ -122,6 +125,7 @@ impl X86Arch for X86_64Arch {
                         Some(JumpDetection {
                             is_conditional: true,
                             already_short: true,
+                            prefix66: false,
                         })
                     } else {
                         let expected_len = if is_conditional { 6 } else { 5 };
@@ -129,6 +133,7 @@ impl X86Arch for X86_64Arch {
                             Some(JumpDetection {
                                 is_conditional,
                                 already_short: false,
+                                prefix66: false,
                             })
                         } else {
                             None
