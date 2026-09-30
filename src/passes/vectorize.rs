@@ -12295,17 +12295,27 @@ fn mask_to_bool(m: MapExpr) -> MapExpr {
     )
 }
 
-/// Is `e` the canonical demasked boolean `mask & 1` produced by
-/// [`mask_to_bool`]?  Used to keep [`demask_value_positions`] idempotent.
-fn is_demasked_bool(e: &MapExpr) -> bool {
-    let MapExpr::BinOp(IrBinOp::And, m, one) = e else {
+/// Does this `And` have exactly one lane mask and a constant `1`?
+///
+/// This recognizes the canonical `mask & 1` conversion produced by
+/// [`mask_to_bool`], keeping [`demask_value_positions`] idempotent.
+fn is_demasked_bool(op: IrBinOp, lhs: &MapExpr, rhs: &MapExpr) -> bool {
+    if op != IrBinOp::And {
         return false;
+    }
+    let is_one = |e: &MapExpr| {
+        matches!(e, MapExpr::Invariant(Operand::Const(c)) if c.to_i64() == Some(1))
     };
-    is_lane_mask(m)
-        && matches!(
-            one.as_ref(),
-            MapExpr::Invariant(Operand::Const(c)) if c.to_i64() == Some(1)
-        )
+    let lhs_is_mask = is_lane_mask(lhs);
+    let rhs_is_mask = is_lane_mask(rhs);
+    if lhs_is_mask == rhs_is_mask {
+        return false;
+    }
+    if lhs_is_mask {
+        is_one(rhs)
+    } else {
+        is_one(lhs)
+    }
 }
 
 /// Demask a parsed operand that is consumed as a VALUE: a mask-ranged
@@ -12337,7 +12347,11 @@ fn demask_value_positions(expr: MapExpr) -> MapExpr {
             MapExpr::Load(_) | MapExpr::Invariant(_) => e,
             MapExpr::Cmp(op, l, r) => {
                 let rebuilt = MapExpr::Cmp(op, Box::new(go(*l, true)), Box::new(go(*r, true)));
-                if want_value { mask_to_bool(rebuilt) } else { rebuilt }
+                if want_value {
+                    mask_to_bool(rebuilt)
+                } else {
+                    rebuilt
+                }
             }
             MapExpr::MaskConj { is_and, l, r } => {
                 let rebuilt = MapExpr::MaskConj {
@@ -12345,7 +12359,11 @@ fn demask_value_positions(expr: MapExpr) -> MapExpr {
                     l: Box::new(go(*l, false)),
                     r: Box::new(go(*r, false)),
                 };
-                if want_value { mask_to_bool(rebuilt) } else { rebuilt }
+                if want_value {
+                    mask_to_bool(rebuilt)
+                } else {
+                    rebuilt
+                }
             }
             MapExpr::Select(c, t, f) => MapExpr::Select(
                 Box::new(go(*c, false)),
@@ -12355,14 +12373,13 @@ fn demask_value_positions(expr: MapExpr) -> MapExpr {
             MapExpr::BinOp(op, l, r) => {
                 // Already-canonical `mask & 1`: keep the mask in condition
                 // position instead of demasking it a second time.
-                if op == IrBinOp::And
-                    && ((is_lane_mask(&l) && !is_lane_mask(&r))
-                        || (is_lane_mask(&r) && !is_lane_mask(&l)))
-                    && (matches!(&*r, MapExpr::Invariant(Operand::Const(c)) if c.to_i64() == Some(1))
-                        || matches!(&*l, MapExpr::Invariant(Operand::Const(c)) if c.to_i64() == Some(1)))
-                {
+                if is_demasked_bool(op, &l, &r) {
                     let (m, one) = if is_lane_mask(&l) { (*l, *r) } else { (*r, *l) };
-                    return MapExpr::BinOp(IrBinOp::And, Box::new(go(m, false)), Box::new(one));
+                    return MapExpr::BinOp(
+                        IrBinOp::And,
+                        Box::new(go(m, false)),
+                        Box::new(one),
+                    );
                 }
                 MapExpr::BinOp(op, Box::new(go(*l, true)), Box::new(go(*r, true)))
             }
@@ -27141,18 +27158,66 @@ mod map_expr_interpreter_tests {
     /// lane width, over a domain including both signed extremes.
     #[test]
     fn demasked_value_position_masks_agree_across_interpreters() {
-        let k = |v: i32| MapExpr::Invariant(Operand::Const(IrConst::I32(v)));
-        let cmp = |op: IrCmpOp, s: usize, v: i32| {
-            MapExpr::Cmp(op, Box::new(MapExpr::Load(s)), Box::new(k(v)))
-        };
-        let bin = |op: IrBinOp, l: MapExpr, r: MapExpr| MapExpr::BinOp(op, Box::new(l), Box::new(r));
+        fn constant(v: i32) -> MapExpr {
+            MapExpr::Invariant(Operand::Const(IrConst::I32(v)))
+        }
+
+        fn cmp(op: IrCmpOp, stream: usize, value: i32) -> MapExpr {
+            MapExpr::Cmp(
+                op,
+                Box::new(MapExpr::Load(stream)),
+                Box::new(constant(value)),
+            )
+        }
+
+        fn bin(op: IrBinOp, lhs: MapExpr, rhs: MapExpr) -> MapExpr {
+            MapExpr::BinOp(op, Box::new(lhs), Box::new(rhs))
+        }
+
+        fn signed_lane(value: i64, bits: u32) -> i64 {
+            let mask = (1i64 << bits) - 1;
+            let sign = 1i64 << (bits - 1);
+            let value = value & mask;
+            if value & sign != 0 {
+                value - (1i64 << bits)
+            } else {
+                value
+            }
+        }
+
         let trees: Vec<(&str, MapExpr)> = vec![
-            ("a + (b > k)", bin(IrBinOp::Add, MapExpr::Load(0), cmp(IrCmpOp::Slt, 1, 5))),
-            ("a - (b > k)", bin(IrBinOp::Sub, MapExpr::Load(0), cmp(IrCmpOp::Ult, 1, 5))),
-            ("a & (b > k)", bin(IrBinOp::And, MapExpr::Load(0), cmp(IrCmpOp::Slt, 1, 5))),
-            ("a | (b > k)", bin(IrBinOp::Or, MapExpr::Load(0), cmp(IrCmpOp::Eq, 1, 3))),
-            ("(a > k) ^ (b < k)", bin(IrBinOp::Xor, cmp(IrCmpOp::Slt, 0, 5), cmp(IrCmpOp::Ult, 1, 7))),
-            ("(a > k) + (b < k)", bin(IrBinOp::Add, cmp(IrCmpOp::Slt, 0, 5), cmp(IrCmpOp::Sle, 1, 7))),
+            (
+                "a + (b > k)",
+                bin(IrBinOp::Add, MapExpr::Load(0), cmp(IrCmpOp::Slt, 1, 5)),
+            ),
+            (
+                "a - (b > k)",
+                bin(IrBinOp::Sub, MapExpr::Load(0), cmp(IrCmpOp::Ult, 1, 5)),
+            ),
+            (
+                "a & (b > k)",
+                bin(IrBinOp::And, MapExpr::Load(0), cmp(IrCmpOp::Slt, 1, 5)),
+            ),
+            (
+                "a | (b > k)",
+                bin(IrBinOp::Or, MapExpr::Load(0), cmp(IrCmpOp::Eq, 1, 3)),
+            ),
+            (
+                "(a > k) ^ (b < k)",
+                bin(
+                    IrBinOp::Xor,
+                    cmp(IrCmpOp::Slt, 0, 5),
+                    cmp(IrCmpOp::Ult, 1, 7),
+                ),
+            ),
+            (
+                "(a > k) + (b < k)",
+                bin(
+                    IrBinOp::Add,
+                    cmp(IrCmpOp::Slt, 0, 5),
+                    cmp(IrCmpOp::Sle, 1, 7),
+                ),
+            ),
             ("root Cmp", cmp(IrCmpOp::Slt, 0, 5)),
             (
                 "root MaskConj",
@@ -27167,7 +27232,7 @@ mod map_expr_interpreter_tests {
                 MapExpr::Select(
                     Box::new(cmp(IrCmpOp::Slt, 0, 5)),
                     Box::new(cmp(IrCmpOp::Eq, 1, 3)),
-                    Box::new(k(2)),
+                    Box::new(constant(2)),
                 ),
             ),
             (
@@ -27181,16 +27246,27 @@ mod map_expr_interpreter_tests {
         ];
         let mut diverged_before = 0usize;
         for bits in [8u32, 16, 32] {
-            let m = (1i64 << bits) - 1;
+            let mask = (1i64 << bits) - 1;
             let sign = 1i64 << (bits - 1);
-            let mut lane_sets: Vec<[i64; 2]> = Vec::new();
-            for a in [0, 1, 2, 3, 5, 6, 7, 9, 10, m, sign, sign - 1, sign + 1] {
-                for b in [0, 1, 3, 4, 5, 6, 8, 9, 10, m, sign, sign - 1, sign + 1] {
-                    let sx = |v: i64| {
-                        let v = v & m;
-                        if v & sign != 0 { v - (1i64 << bits) } else { v }
-                    };
-                    lane_sets.push([sx(a), sx(b)]);
+            let edge_values = [
+                0,
+                1,
+                2,
+                3,
+                5,
+                6,
+                7,
+                9,
+                10,
+                mask,
+                sign,
+                sign - 1,
+                sign + 1,
+            ];
+            let mut lane_sets = Vec::with_capacity(edge_values.len() * edge_values.len());
+            for &a in &edge_values {
+                for &b in &edge_values {
+                    lane_sets.push([signed_lane(a, bits), signed_lane(b, bits)]);
                 }
             }
             for (name, tree) in &trees {
@@ -27229,7 +27305,10 @@ mod map_expr_interpreter_tests {
         );
         let (e, r) = demask_operand(m.clone(), Some(MASK_RANGE));
         assert_eq!(r, Some((0, 1)));
-        assert!(is_demasked_bool(&e));
+        let MapExpr::BinOp(op, lhs, rhs) = &e else {
+            panic!("demasked operand should be a boolean And");
+        };
+        assert!(is_demasked_bool(*op, lhs, rhs));
         // Non-mask operands pass through untouched.
         let (same, r2) = demask_operand(MapExpr::Load(0), Some((0, 255)));
         assert_eq!(same, MapExpr::Load(0));
