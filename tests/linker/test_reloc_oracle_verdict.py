@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import subprocess
 import sys
 
 
@@ -251,20 +252,20 @@ AGREEMENT_CASES += [
     #    that could answer, and never let the exclusion hide a disagreement.
     _case("an incapable oracle is excluded; quorum is over the capable ones",
           _notes(bfd=_n("refused"), lld=_n("refused"),
-                 mold=_n("incapable", 1, b"cannot parse a -T linker scriptb")),
+                 mold=_n("incapable", 1, b"cannot parse a -T linker script")),
           THREE_LLD, "PASS", "not counted"),
     _case("incapable does not rescue a disagreement",
           _notes(bfd=_n("refused"), lld=_n("accepted", 0),
-                 mold=_n("incapable", 1, b"cannot parse a -T linker scriptb")),
+                 mold=_n("incapable", 1, b"cannot parse a -T linker script")),
           THREE_LLD, "FAIL", "disagree"),
     _case("incapable does not rescue a silent refusal",
           _notes(bfd=_n("refused"), lld=_n("silent"),
-                 mold=_n("incapable", 1, b"cannot parse a -T linker scriptb")),
+                 mold=_n("incapable", 1, b"cannot parse a -T linker script")),
           THREE_LLD, "FAIL", "disagree"),
     _case("every oracle incapable is not a vacuous PASS",
-          _notes(bfd=_n("incapable", 1, b"cannot parse a -T linker scriptb"),
-                 lld=_n("incapable", 1, b"cannot parse a -T linker scriptb"),
-                 mold=_n("incapable", 1, b"cannot parse a -T linker scriptb")),
+          _notes(bfd=_n("incapable", 1, b"cannot parse a -T linker script"),
+                 lld=_n("incapable", 1, b"cannot parse a -T linker script"),
+                 mold=_n("incapable", 1, b"cannot parse a -T linker script")),
           THREE_LLD, "FAIL"),
     _case("incapable narrows the quorum honestly, and says so",
           _notes(bfd=_n("refused"), mold=_n("incapable", 1, b"no -T support")),
@@ -285,6 +286,71 @@ AGREEMENT_CASES += [
 
 
 
+REQUIRED_CASES = [
+    # (label, oracles, required, want_missing)
+    ("a fully stocked host satisfies bfd,lld",
+     [("bfd", []), ("lld", []), ("mold", [])], ["bfd", "lld"], []),
+    ("a host without lld is caught -- the silent-narrowing case",
+     [("bfd", []), ("mold", [])], ["bfd", "lld"], ["lld"]),
+    ("bfd alone cannot satisfy a two-oracle quorum",
+     [("bfd", [])], ["bfd", "lld"], ["lld"]),
+    ("mold present but lld absent is still missing",
+     [("bfd", []), ("mold", []), ("wild", [])], ["lld"], ["lld"]),
+    ("an empty requirement is always satisfied",
+     [("bfd", [])], [], []),
+    ("every missing name is reported, not just the first",
+     [("bfd", [])], ["bfd", "lld", "mold"], ["lld", "mold"]),
+]
+
+
+def _required_cases(RLT):
+    out = []
+    for label, oracles, required, want in REQUIRED_CASES:
+        got = RLT.missing_required_oracles(oracles, required)
+        ok = got == want
+        detail = "" if ok else "want %r, got %r" % (want, got)
+        out.append((label, ok, detail))
+    return out
+
+
+# ── the CLI exit contract, at the PROCESS level ────────────────────────────
+# `missing_required_oracles` above is a predicate test. It passed while the
+# flag it belongs to was completely inert, because the bottom of
+# run_linker_tests.py was a bare `main()` and main() RETURNS its exit code
+# rather than calling sys.exit: the process exited 0, ran zero tests, printed
+# FAIL, and both CI harnesses -- which key off exit status alone -- called it
+# PASS. A predicate test cannot see that. Only a subprocess can.
+CLI_CASES = [
+    ("a missing required oracle exits 2, runs nothing, and says so",
+     ["--require-oracles", "definitely-missing"], 2, b"not registered"),
+    ("the same with --strict, exactly as ci_local.sh invokes it",
+     ["--strict", "--require-oracles", "definitely-missing"], 2, b"not registered"),
+    ("requiring only bfd proceeds: the check is not a blanket blocker",
+     ["--require-oracles", "bfd", "--list"], 0, None),
+    ("no --require-oracles at all proceeds",
+     ["--list"], 0, None),
+]
+
+
+def _cli_cases(RLT):
+    import importlib.util as _iu
+    out = []
+    for label, extra, want_rc, want_err in CLI_CASES:
+        argv = [sys.executable, RLT.__file__, "--lccc", "/bin/true"] + extra
+        r = subprocess.run(argv, capture_output=True, timeout=180)
+        ok = r.returncode == want_rc and (want_err is None or want_err in r.stderr)
+        detail = "want rc=%d%s, got rc=%d; stderr=%r" % (
+            want_rc, "" if want_err is None else " stderr~%r" % want_err,
+            r.returncode, r.stderr[:160])
+        if ok and want_rc == 2:
+            # A gate that reports failure must not also have run the suite.
+            if r.stdout.strip():
+                ok, detail = False, "exited 2 but still produced %d stdout line(s)" % len(
+                    r.stdout.splitlines())
+        out.append((label, ok, "" if ok else detail))
+    return out
+
+
 def main() -> int:
     failures = 0
     print("== reloc_oracle_verdict ==")
@@ -300,13 +366,27 @@ def main() -> int:
         print("  %-4s %s" % ("ok" if ok else "FAIL", name))
         if not ok:
             print("        %s" % detail)
+    print("== CLI exit contract (subprocess) ==")
+    cli = _cli_cases(RLT)
+    for name, ok, detail in cli:
+        failures += 0 if ok else 1
+        print("  %-4s %s" % ("ok" if ok else "FAIL", name))
+        if not ok:
+            print("        %s" % detail)
+    print("== missing_required_oracles ==")
+    req = _required_cases(RLT)
+    for name, ok, detail in req:
+        failures += 0 if ok else 1
+        print("  %-4s %s" % ("ok" if ok else "FAIL", name))
+        if not ok:
+            print("        %s" % detail)
     print()
-    total = len(VERDICT_CASES) + len(AGREEMENT_CASES)
+    total = len(VERDICT_CASES) + len(AGREEMENT_CASES) + len(req) + len(cli)
     if failures:
         print("FAILED: %d of %d cases" % (failures, total))
         return 1
-    print("PASS: all %d cases (%d verdict, %d agreement)" % (
-        total, len(VERDICT_CASES), len(AGREEMENT_CASES)))
+    print("PASS: all %d cases (%d verdict, %d agreement, %d required, %d cli)" % (
+        total, len(VERDICT_CASES), len(AGREEMENT_CASES), len(req), len(cli)))
     return 0
 
 

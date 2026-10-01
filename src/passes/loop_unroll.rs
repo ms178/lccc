@@ -1056,7 +1056,11 @@ fn mirror_cmp(op: IrCmpOp) -> IrCmpOp {
 }
 
 /// `!(a OP b)`  ⇔  `a NEGATE(OP) b`  (total order on integers).
-fn negate_cmp(op: IrCmpOp) -> IrCmpOp {
+///
+/// Shared with `iv_strength_reduce`'s affine exit-compare fold, which has to
+/// invert the operator when it moves a `const - iv` form onto the IV.  One
+/// table, so the two cannot drift.
+pub(crate) fn negate_cmp(op: IrCmpOp) -> IrCmpOp {
     match op {
         IrCmpOp::Slt => IrCmpOp::Sge,
         IrCmpOp::Sge => IrCmpOp::Slt,

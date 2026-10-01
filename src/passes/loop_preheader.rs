@@ -134,9 +134,19 @@ fn is_dedicated_to(term: &Terminator, label: BlockId) -> bool {
 }
 
 /// Emit a pass diagnostic when `CCC_DEBUG_LOOP_PREHEADER` is set.
+///
+/// The variable is read once per process. `std::env::var` is a real call
+/// that walks `environ`, and `check_env_test_hygiene.sh` budgets env reads
+/// per pass, so a `OnceLock<bool>` is both the cheaper and the
+/// policy-consistent answer.
+fn debug_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CCC_DEBUG_LOOP_PREHEADER").is_ok())
+}
+
 #[inline]
 fn debug(f: impl FnOnce()) {
-    if std::env::var("CCC_DEBUG_LOOP_PREHEADER").is_ok() {
+    if debug_enabled() {
         f();
     }
 }
@@ -151,42 +161,84 @@ fn debug(f: impl FnOnce()) {
 /// without a census, so the counters live here and are reported per function
 /// under `CCC_DEBUG_LOOP_PREHEADER`.
 ///
-/// Thread-local because the pass runs under `--rank`'s worker threads, exactly
-/// like the surrounding pipeline; a plain `static` would race and a
-/// `RefCell` would panic there.
+/// NOT a `thread_local!`. It is a plain `&mut Census` threaded through the
+/// call graph and owned by `run_function`. A thread-local was wrong twice
+/// over: `run_function` is called once per function on the same worker
+/// thread, so nothing ever reset it and every function's report printed
+/// the running total of all previous ones under its own name; and the
+/// `bump()` read-modify-WRITE-back dance existed only to work around
+/// `Cell`. A stack local in `run_function` is per-function by
+/// construction and is race-free without any thread-local reasoning.
 #[derive(Default, Clone, Copy)]
 struct Census {
+    /// Merged natural loops in the FINAL round -- the steady state.
     loops: usize,
     no_profit: usize,
     no_single_pred: usize,
     already_dedicated: usize,
     indirect_pred: usize,
+    /// A header or preheader index outside `func.blocks`: a malformed CFG
+    /// the pass must not act on. It used to be added to `loops` and to no
+    /// bucket at all, which is why the buckets did not sum to `loops`.
+    out_of_range: usize,
+    /// Loops this round planned an insertion for. Non-zero only in a round
+    /// that inserted; the final round plans nothing, which is why it stops
+    /// the fixpoint.
+    planned: usize,
+    /// Running total over ALL rounds. The only field that accumulates: it is
+    /// the answer to "what did this pass actually do", as opposed to the
+    /// rejection buckets, which describe the code as it now stands.
     inserted: usize,
 }
 
-// The census is a plain `&mut Census` threaded through the call graph, NOT a
-// `thread_local!`. A thread-local was wrong twice over: `run_function` is
-// called once per function on the same worker thread, so nothing ever reset it
-// and every function's report printed the running total of all previous ones
-// under its own name; and the `bump()` read-modify-WRITE-back dance existed
-// only to work around `Cell`. A stack local in `run_function` is per-function
-// by construction and is also race-free without any thread-local reasoning.
+impl Census {
+    /// Every merged loop lands in exactly one bucket, so the buckets always
+    /// sum to `loops`. The round loop `debug_assert!`s this, which is the
+    /// point: a new `continue` that forgets to classify becomes a test
+    /// failure instead of a number that quietly stops adding up. That is
+    /// the whole difference between a census you can trust and one that
+    /// only looks like data.
+    fn accounted(&self) -> usize {
+        self.no_profit
+            + self.no_single_pred
+            + self.already_dedicated
+            + self.indirect_pred
+            + self.out_of_range
+            + self.planned
+    }
+}
 
 fn report_census(func_name: &str, c: Census) {
-    // Reuse the existing `debug` gate rather than reading the environment
-    // again: every extra `env::var` in the pass pipeline is budgeted by
-    // check_env_test_hygiene.sh, and the census must not spend that budget to
-    // print diagnostics nobody asked for.
+    // `inserted` is the pass's total work; the rest is the steady state the
+    // last round settled on. `already_dedicated` therefore counts loops this
+    // pass itself dedicated on an earlier round -- which is the healthy
+    // outcome, not a rejection.
+    //
+    // `planned` MUST be reported. It is one of the six buckets `accounted()`
+    // sums, and the gate in tests/regression/check_loop_preheader.sh checks
+    // the REPORTED numbers rather than trusting the in-process assert (which
+    // a build with debug-assertions off would not run). Leaving this field
+    // out made the gate's equation `loops == five buckets` while the code's
+    // was `loops == six`, so the two disagreed by construction and the gate
+    // was only passing because the reported round is the fixpoint, where
+    // nothing is planned. Emitting it is what makes the two the same
+    // equation.
     debug(|| {
         eprintln!(
-            "[LOOP-PREHEADER-CENSUS] {func_name}: loops={loops} inserted={inserted}          rejected: profitability={no_profit} no_single_outside_pred={no_single_pred}          already_dedicated={already_dedicated} indirect_pred={indirect_pred}",
+            "[LOOP-PREHEADER-CENSUS] {func_name}: loops={loops} inserted={inserted} \
+             planned={planned} \
+             rejected: profitability={no_profit} no_single_outside_pred={no_single_pred} \
+             already_dedicated={already_dedicated} indirect_pred={indirect_pred} \
+             out_of_range={out_of_range}",
             func_name = func_name,
             loops = c.loops,
             inserted = c.inserted,
+            planned = c.planned,
             no_profit = c.no_profit,
             no_single_pred = c.no_single_pred,
             already_dedicated = c.already_dedicated,
             indirect_pred = c.indirect_pred,
+            out_of_range = c.out_of_range,
         );
     });
 }
@@ -208,13 +260,21 @@ struct Plan {
 /// would only carry an empty block.
 ///
 /// The load must also sit in a block LICM's must-execute rule accepts: LICM
-/// requires the hoisted load's block to dominate **every** loop block, which
-/// in a natural loop means the block must be the header.  In the guard-at-top
-/// shape the header is the guard block and holds no loads — which is exactly
-/// why the ungated version of this pass measured a small *regression*
-/// corpus-wide (27 inserted preheaders, +7 instructions): it paid for blocks
-/// that could not unlock anything.  This check mirrors LICM's rule rather than
-/// hard-coding "the header", so it stays correct if that rule is relaxed.
+/// requires the hoisted load's block to dominate **every** loop block.  In the
+/// guard-at-top shape the header is the guard block and holds no loads — which
+/// is exactly why the ungated version of this pass measured a small
+/// *regression* corpus-wide (27 inserted preheaders, +7 instructions): it paid
+/// for blocks that could not unlock anything.
+///
+/// This check DOES hard-code the header, and that is deliberate. It is not a
+/// re-derivation of LICM's rule that would track it automatically; it is the
+/// conclusion of the dominance proof in the body below, which shows that no
+/// other block can satisfy the rule *under LICM's rule as it stands today*.
+/// The coupling is therefore one-directional and needs a human to revisit it:
+/// if LICM is ever changed to hoist out of a block that does not dominate the
+/// whole loop, this check will silently under-report, and the pass will
+/// insert fewer preheaders than LICM could have used. The proof's PREMISE,
+/// not just its result, is the thing that has to keep holding.
 ///
 /// It is a cheap syntactic pre-filter, not a re-implementation of LICM's alias
 /// analysis: if the load proves unhoistable for some other reason (a store
@@ -233,56 +293,72 @@ fn preheader_would_unlock_a_hoist(
     //   a loop block, so B dom H.  B is in the natural loop, so by definition of
     //   a natural loop H dom B.  Dominance is antisymmetric, therefore B = H.
     //
-    // This is what makes the scan below header-only.  The alternative -- asking
-    // of every loop block whether it dominates every other -- cannot be made
-    // cheap: `body` is an `FxHashSet`, so its iteration order is arbitrary and
-    // the "yes" case (the header itself) never short-circuits, so the expected
-    // cost is ~|body|^2/2 dominance walks of O(idom depth) each, ~12.5M walks on
-    // a 5 000-block loop.  The header-only form is O(|body| * depth) once.
+    // Cost.  The previous version walked every block of the body and asked
+    // whether *it* dominated the body: |body| x |body| dominance queries,
+    // each O(depth) up the idom chain, so O(|body|^2 * depth).  For a
+    // 5000-block loop at depth 1 that is 2.5e7 steps to recompute one
+    // yes/no.  That figure is arithmetic, not a measurement, and it is a
+    // WORST case -- real loops are small and shallow, so the typical cost
+    // was never near it.  It is kept because it is what motivated the
+    // change, and stated as what it is so nobody reads it as a profile.
+    // What is actually measured is the outcome: the whole corpus is 20
+    // census reports plus the gate's two effect contracts.  The
+    // `dominates_block` call is kept rather than assumed away, so a
+    // malformed idom degrades to "do not insert" rather than "insert anyway".
     //
-    // Measured effect on this repo today: none that is resolvable, because the
-    // pass fires on 0 of the 51 benchmark programs at default settings (it only
-    // fires on the preheader fixtures, 1 insertion each) -- `loop_rotate` is
-    // opt-in and the profitability gate rejects the rest.  This is a latent
-    // scalability fix for large real-world loops (kernel/glibc-scale CFGs),
-    // not a measured corpus win, and it is recorded that way rather than being
-    // sold as a speedup.
+    // UPSTREAM ADDED A `debug_assert!` HERE INSTEAD, and this comment records
+    // why it was rejected rather than kept. It is worse on both axes.
     //
-    // The assertion below keeps the proof honest: if LICM's must-execute rule is
-    // ever relaxed from "is the header" to something weaker, the header-only
-    // shortcut silently stops being equivalent, and a debug build says so instead
-    // of quietly losing hoists.
+    // 1. It cannot fail, so it guards nothing. It asserts that no non-header
+    //    body block dominates the header. A natural loop is DEFINED so that
+    //    the header dominates every block in its body, so if some b != header
+    //    also dominated the header, then (header dom b) and (b dom header)
+    //    both hold and dominance antisymmetry forces b == header -- a
+    //    contradiction. The assert is therefore true by construction of
+    //    `NaturalLoop`, and holds or falls with the natural-loop builder, not
+    //    with anything this pass decides. It verifies a theorem about the
+    //    input data, and would have to be deleted if the natural-loop code
+    //    changed, but it is not evidence for the decision below.
     //
-    // It costs one dominance walk per block, not one per (block, block) pair.
-    // "Some non-header block dominates every loop block" and "some non-header
-    // block dominates the header" are the same statement: dominating the header
-    // is necessary, and the header is itself a loop block.  The pair-scan form
-    // would pay the O(|body|^2 * depth) the shortcut above exists to avoid.
-    debug_assert!(
-        natural_loop
-            .body
-            .iter()
-            .filter(|&&b| b != natural_loop.header && b < func.blocks.len())
-            .all(|&b| !dominates_block(idom, b, natural_loop.header)),
-        "a non-header loop block dominates the header; the \
-         header-only shortcut in preheader_would_unlock_a_hoist is no longer \
-         equivalent -- revisit the must-execute rule it relies on"
-    );
-    let block_idx = natural_loop.header;
-    if block_idx < func.blocks.len() {
-        for inst in &func.blocks[block_idx].instructions {
-            if let Instruction::Load { ptr, volatile, .. } = inst {
-                if *volatile || alloca_values.contains(&ptr.0) {
-                    continue;
-                }
-                if global_derived.contains(&ptr.0) {
-                    continue; // LICM's global path does not need this shape
-                }
-                return true;
-            }
-        }
+    // 2. It does not detect the failure its own comment names. The comment
+    //    claimed it would catch "LICM's must-execute rule being relaxed, so
+    //    the header-only shortcut silently stops being equivalent". Relaxing
+    //    LICM changes what LICM hoists; it changes nothing about dominance
+    //    among loop blocks. The assert would stay green through exactly the
+    //    regression it was written to catch.
+    //
+    // 3. It costs the same as the check it replaced. The assert walks the body
+    //    with one dominance query per block -- O(|body| * depth) -- which is
+    //    exactly the `all(dominates_block(idom, header, b))` below. So the
+    //    change bought nothing in debug and, in release, swapped an always-on
+    //    fail-closed guard for one that is compiled out. `fastbuild` inherits
+    //    `release`, so the shipping compiler would have had no check at all.
+    //
+    // The `all(...)` below is kept because it is the real invariant and it is
+    // cheap enough to always run: it is the same dominance fact LICM itself
+    // consults, it is what makes "header-only" an inference rather than a
+    // guess, and on a malformed idom it returns false -- do not insert --
+    // rather than inserting a preheader LICM would not have used.
+    let header = natural_loop.header;
+    if header >= func.blocks.len() {
+        return false;
     }
-    false
+    if !natural_loop
+        .body
+        .iter()
+        .all(|&b| dominates_block(idom, header, b))
+    {
+        return false; // not must-execute: LICM refuses the hoist anyway
+    }
+    func.blocks[header]
+        .instructions
+        .iter()
+        .any(|inst| match inst {
+            Instruction::Load { ptr, volatile, .. } => {
+                !*volatile && !alloca_values.contains(&ptr.0) && !global_derived.contains(&ptr.0)
+            }
+            _ => false,
+        })
 }
 
 /// `true` when `a` dominates `b` in the immediate-dominator tree.
@@ -367,8 +443,8 @@ fn plan_insertions(
     );
     for natural_loop in loops {
         let header = natural_loop.header;
-        census.loops += 1;
         if header >= func.blocks.len() {
+            census.out_of_range += 1;
             continue;
         }
         let header_label = func.blocks[header].label;
@@ -378,6 +454,7 @@ fn plan_insertions(
             continue; // zero or several outside predecessors: LICM skips it too
         };
         if pred >= func.blocks.len() {
+            census.out_of_range += 1;
             continue;
         }
         let pred_block = &func.blocks[pred];
@@ -412,6 +489,7 @@ fn plan_insertions(
         });
         let new_label = BlockId(next_label);
         next_label = next_label.saturating_add(1);
+        census.planned += 1;
         plans.push(Plan {
             header_label,
             pred_label: pred_block.label,
@@ -522,11 +600,15 @@ pub fn run_function(func: &mut IrFunction) -> usize {
     if func.is_declaration || func.blocks.len() < 2 {
         return 0;
     }
-    // Per-function census. Declared before the loop so the counter starts at
-    // zero for THIS function; `report_census` borrows `func.name` directly so
-    // the -O2 path stops allocating a String per function for a diagnostic
-    // that is almost never enabled.
-    let mut census = Census::default();
+    // Per-function census. `steady` is rebuilt from scratch every round and
+    // only the LAST one is reported: the fixpoint re-walks every loop on
+    // every round, so accumulating into one census counted a single loop
+    // once per round -- one guarded loop reported `loops=2 inserted=1`,
+    // and a loop the pass had just dedicated was counted in the rejection
+    // buckets of a later round as if it had refused it. The rejection
+    // buckets now describe the code as it finally stands, and `inserted`
+    // is the one field that accumulates.
+    let mut steady = Census::default();
     let allocas = alloca_values(func);
     let globals = global_derived_values(func);
     let mut total = 0usize;
@@ -538,22 +620,43 @@ pub fn run_function(func: &mut IrFunction) -> usize {
         let cfg = analysis::CfgAnalysis::build(func);
         let loops =
             loop_analysis::find_natural_loops(cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
+        steady = Census::default();
         if loops.is_empty() {
             break;
         }
         let loops = loop_analysis::merge_loops_by_header(loops);
+        // EVERY merged loop, profitable or not. The profitability filter
+        // below used to be the only place `loops` was counted, so the
+        // headline number silently excluded exactly the loops the pass had
+        // rejected.
+        steady.loops = loops.len();
         // Profitability gate: only loops that could actually unlock a hoist.
         let paying: Vec<&NaturalLoop> = loops
             .iter()
             .filter(|l| {
                 let ok = preheader_would_unlock_a_hoist(func, l, &cfg.idom, &allocas, &globals);
                 if !ok {
-                    census.no_profit += 1;
+                    steady.no_profit += 1;
                 }
                 ok
             })
             .collect();
-        let plans = plan_insertions(func, &paying, &cfg, &mut census);
+        let plans = plan_insertions(func, &paying, &cfg, &mut steady);
+        // A hard assert, not `debug_assert!`: `fastbuild` inherits `release`,
+        // which has `debug-assertions = false`, so a debug assert here is
+        // compiled out of the binary AND out of `cargo test` -- it would
+        // enforce nothing at all. The check is one add and one compare per
+        // round (a function settles in ~2 rounds), so it is free next to the
+        // CFG rebuild that precedes it, and it is the only thing standing
+        // between a future unclassified `continue` and a census that quietly
+        // stops adding up -- which is the exact failure this whole change
+        // exists to remove.
+        assert_eq!(
+            steady.loops,
+            steady.accounted(),
+            "every merged loop must be classified exactly once, or the census \
+             is not the sum of its parts"
+        );
         if plans.is_empty() {
             break;
         }
@@ -562,9 +665,12 @@ pub fn run_function(func: &mut IrFunction) -> usize {
             break;
         }
         total += n;
-        census.inserted += n;
     }
-    report_census(&func.name, census);
+    // `inserted` is assigned AFTER the loop, not inside it: `steady` is
+    // rebuilt from scratch every round, so writing it per round would be
+    // wiped by the next round's reset.
+    steady.inserted = total;
+    report_census(&func.name, steady);
     total
 }
 
@@ -594,8 +700,8 @@ mod tests {
     //! hoisted, and the shapes that must come out byte-identical with the
     //! pass disabled.
     use super::*;
-    use crate::common::types::IrType;
-    use crate::ir::reexports::{IrConst, Operand};
+    use crate::common::types::{AddressSpace, IrType};
+    use crate::ir::reexports::{IrConst, Operand, Value};
 
     fn cond(t: u32, f: u32) -> Terminator {
         Terminator::CondBranch {
@@ -603,6 +709,127 @@ mod tests {
             true_label: BlockId(t),
             false_label: BlockId(f),
         }
+    }
+
+    /// The header-only scan is sound only while the header dominates EVERY
+    /// block of the loop body -- that is LICM's must-execute rule, and it is
+    /// what makes "only the header can qualify" an inference rather than a
+    /// guess. `NaturalLoop` does not enforce it: `header` and `body` are
+    /// public fields with no validation, so a caller can hand this pass a
+    /// loop whose body contains a block the header does not dominate.
+    ///
+    /// This test calls `preheader_would_unlock_a_hoist` ITSELF on exactly that
+    /// input, because a test of a guard has to reach the code under test. An
+    /// earlier version re-derived the predicate locally and passed with the
+    /// guard deleted -- the same "green for the wrong reason" defect this
+    /// series exists to remove.
+    ///
+    /// It also pins why the `debug_assert!` upstream added in the function's
+    /// place was rejected. That assert asks a different question ("does some
+    /// non-header body block dominate the header?"), which holds for every
+    /// well-formed natural loop and so cannot fail; it stays green through
+    /// the very input below, which is the regression its comment promised to
+    /// catch.
+    #[test]
+    fn header_only_scan_fails_closed_when_the_header_does_not_dominate_the_body() {
+        // 0 (entry) -> 1 (header) -> 2      the header dominates 2
+        // 0 (entry) -> 3                    the header does NOT dominate 3
+        let idom: Vec<usize> = vec![0, 0, 1, 0];
+        let mut blocks: Vec<BasicBlock> = (0..4)
+            .map(|i| BasicBlock {
+                label: BlockId(i),
+                instructions: Vec::new(),
+                terminator: Terminator::Unreachable,
+                source_spans: Vec::new(),
+            })
+            .collect();
+        // The header holds a hoistable load, so the dominance check is the
+        // ONLY thing that can turn this answer to `false`.
+        blocks[1].instructions.push(Instruction::Load {
+            dest: Value(0),
+            ptr: Value(7),
+            ty: IrType::I64,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        });
+        let mut func = IrFunction::new("t".into(), IrType::I32, Vec::new(), false);
+        func.blocks = blocks;
+
+        let mut malformed = NaturalLoop {
+            header: 1,
+            body: FxHashSet::default(),
+        };
+        malformed.body.insert(1);
+        malformed.body.insert(2);
+        malformed.body.insert(3); // sibling of the header: NOT dominated by it
+
+        let empty: FxHashSet<u32> = FxHashSet::default();
+        assert!(
+            !preheader_would_unlock_a_hoist(&func, &malformed, &idom, &empty, &empty),
+            "a body the header does not fully dominate must NOT unlock a hoist"
+        );
+
+        // Same CFG, body pruned to what the header really dominates. Without
+        // this the assertion above could be satisfied by a function that
+        // always answers `false`.
+        let mut well_formed = NaturalLoop {
+            header: 1,
+            body: FxHashSet::default(),
+        };
+        well_formed.body.insert(1);
+        well_formed.body.insert(2);
+        assert!(
+            preheader_would_unlock_a_hoist(&func, &well_formed, &idom, &empty, &empty),
+            "with the body pruned to the header's dominance the load must be found"
+        );
+
+        // The assert upstream added, on the input that breaks the invariant:
+        // it PASSES, so it was guarding nothing.
+        let discarded_assert_holds = malformed
+            .body
+            .iter()
+            .filter(|&&b| b != malformed.header)
+            .all(|&b| !dominates_block(&idom, b, malformed.header));
+        assert!(
+            discarded_assert_holds,
+            "the discarded debug_assert passes on the very input that breaks \
+             the invariant it was offered as a guard for"
+        );
+    }
+
+    /// The census is only useful if its headline number is the sum of its
+    /// reasons. `accounted()` is what the round loop asserts against
+    /// `loops`, and `out_of_range` is the bucket that used to be missing:
+    /// an index outside `func.blocks` was counted in `loops` and in no
+    /// bucket at all, so the parts could not add up.
+    #[test]
+    fn census_buckets_partition_the_loops() {
+        let mut c = Census {
+            loops: 6,
+            no_profit: 1,
+            no_single_pred: 1,
+            already_dedicated: 2,
+            indirect_pred: 1,
+            out_of_range: 1,
+            planned: 0,
+            inserted: 2,
+        };
+        assert_eq!(c.loops, c.accounted(), "buckets must sum to loops");
+
+        // A loop the pass refused without a reason is exactly the drift this
+        // catches: it is in `loops` and in no bucket.
+        c.no_profit -= 1;
+        assert_ne!(c.loops, c.accounted());
+
+        // A planned loop is its own bucket, not a rejection.
+        let mut p = Census {
+            loops: 1,
+            planned: 1,
+            ..Census::default()
+        };
+        assert_eq!(p.loops, p.accounted());
+        p.inserted = 1;
+        assert_eq!(p.loops, p.accounted(), "inserted is a total, not a bucket");
     }
 
     #[test]

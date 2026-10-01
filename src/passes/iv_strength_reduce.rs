@@ -21,10 +21,11 @@
 //! by subsequent DCE.
 
 use super::loop_analysis::{self, NaturalLoop};
+use super::loop_unroll::negate_cmp;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
 use crate::ir::analysis;
-use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Value};
+use crate::ir::reexports::{Instruction, IrBinOp, IrCmpOp, IrConst, IrFunction, Operand, Value};
 
 /// Maximum byte stride eligible for pointer induction. Matrix row strides are
 /// routinely several KiB (256 doubles = 2048 bytes), and are especially worth
@@ -153,7 +154,12 @@ pub(crate) fn ivsr_with_analysis(
             }
             continue;
         }
-        let changed = reduce_loop(func, natural_loop, &cfg.preds, scalar_derived);
+        // Fold the affine offset out of the exit comparison FIRST: it leaves
+        // the loop body with fewer instructions, so the strength reduction
+        // that follows works on the cheaper form.
+        let affine = fold_affine_exit_compares(func, natural_loop, &cfg.preds);
+
+        let changed = reduce_loop(func, natural_loop, &cfg.preds, scalar_derived) + affine;
         if changed > 0 {
             kept_bodies.push(natural_loop.body.clone());
         }
@@ -161,6 +167,281 @@ pub(crate) fn ivsr_with_analysis(
     }
 
     total_reductions
+}
+
+fn fold_affine_exit_compares(
+    func: &mut IrFunction,
+    natural_loop: &NaturalLoop,
+    preds: &analysis::FlatAdj,
+) -> usize {
+    let body = &natural_loop.body;
+    let header = natural_loop.header;
+
+    // `Add` definitions that live INSIDE the loop, by value id.
+    let mut adds: FxHashMap<u32, (Operand, Operand, IrType, IrBinOp)> = FxHashMap::default();
+    // Use counts over the WHOLE function: a use in another block still pins
+    // the `Add`, so folding would leave the `lea` behind.
+    let mut uses: FxHashMap<u32, usize> = FxHashMap::default();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for inst in &block.instructions {
+            if let Instruction::BinOp {
+                dest,
+                op: op @ (IrBinOp::Add | IrBinOp::Sub),
+                lhs,
+                rhs,
+                ty,
+            } = inst
+            {
+                if body.contains(&bi) {
+                    adds.entry(dest.0).or_insert((*lhs, *rhs, *ty, *op));
+                }
+            }
+            let mut inst = inst.clone();
+            inst.for_each_operand_mut(|o| {
+                if let Operand::Value(v) = o {
+                    *uses.entry(v.0).or_insert(0) += 1;
+                }
+            });
+        }
+    }
+    if adds.is_empty() {
+        return 0;
+    }
+
+    let preheader = loop_analysis::find_preheader(header, body, preds);
+    let mut next_id = func.next_value_id;
+    let mut folded = 0usize;
+    let mut new_preheader: Vec<Instruction> = Vec::new();
+
+    for bi in 0..func.blocks.len() {
+        if !body.contains(&bi) {
+            continue;
+        }
+        for ii in 0..func.blocks[bi].instructions.len() {
+            let (dest, cop, lhs, rhs, ty) = match &func.blocks[bi].instructions[ii] {
+                Instruction::Cmp {
+                    dest,
+                    op,
+                    lhs,
+                    rhs,
+                    ty,
+                } => (*dest, *op, *lhs, *rhs, *ty),
+                _ => continue,
+            };
+            if !ty.is_integer() || ty.is_128bit() {
+                continue;
+            }
+            // Ordered comparisons only. The rewrite moves `c` across the
+            // comparison, so it is valid exactly when `iv + c` cannot wrap.
+            //
+            // For a SIGNED compare a wrap is signed overflow, i.e. undefined
+            // behaviour, so every execution the source admits is non-wrapping
+            // and the identity holds on all of them.
+            //
+            // For an UNSIGNED compare the wrap is fully defined and the
+            // identity genuinely fails -- verified on hardware, not merely
+            // argued: with iv = 2^64-2, c = 1, k = 0, `ult(iv+c, k)` is 0
+            // while `ult(iv, k-c)` is 1. An unsigned compare may therefore
+            // fold only when the wrap is ruled out structurally, which
+            // `offset_proves_no_unsigned_wrap` decides per candidate once the
+            // offset and the compared type are known.
+            //
+            // `unsigned` has to be computed BEFORE the guard below. Computing
+            // it after makes the whole unsigned path unreachable, so it would
+            // silently never fold while still reading as if it were enabled.
+            let unsigned = matches!(
+                cop,
+                IrCmpOp::Ult | IrCmpOp::Ule | IrCmpOp::Ugt | IrCmpOp::Uge
+            );
+            if !unsigned
+                && !matches!(
+                    cop,
+                    IrCmpOp::Slt | IrCmpOp::Sle | IrCmpOp::Sgt | IrCmpOp::Sge
+                )
+            {
+                continue;
+            }
+
+            // Try the left side as `iv + c`, then the right. Exactly one of
+            // them may be the `Add`; when both are values the left is tried
+            // first and the right only if the left is not a single-use add.
+            let mut applied: Option<(Operand, Operand, IrCmpOp)> = None;
+            for (cand, keep, mirrored) in [(lhs, rhs, false), (rhs, lhs, true)] {
+                let Operand::Value(av) = cand else { continue };
+                let Some(&(a_lhs, a_rhs, a_ty, a_op)) = adds.get(&av.0) else {
+                    continue;
+                };
+                if a_ty != ty {
+                    continue;
+                }
+                // `x + c` moves the offset to the far side unchanged; `c - x`
+                // becomes `x` on the other side of the comparison, so the
+                // operator has to be inverted and the bound becomes `c - k`.
+                // All four affine shapes reduce to "the IV, an offset, and
+                // whether the comparison must be inverted".
+                //   iv + k   -> c = +k          iv - k   -> c = -k
+                //   k + iv   -> c = +k          k - iv   -> c = +k, INVERTED
+                // The `iv - k` form is the common `i - K` bound and needs no
+                // inversion; only `k - iv` puts the IV on the far side.
+                let (iv, c, negated) = match (a_op, a_lhs, a_rhs) {
+                    (IrBinOp::Add, Operand::Value(v), Operand::Const(k)) => match k.to_i64() {
+                        Some(kv) => (v, kv, false),
+                        None => continue,
+                    },
+                    (IrBinOp::Add, Operand::Const(k), Operand::Value(v)) => match k.to_i64() {
+                        Some(kv) => (v, kv, false),
+                        None => continue,
+                    },
+                    (IrBinOp::Sub, Operand::Value(v), Operand::Const(k)) => {
+                        match k.to_i64().and_then(i64::checked_neg) {
+                            Some(neg) => (v, neg, false),
+                            None => continue,
+                        }
+                    }
+                    (IrBinOp::Sub, Operand::Const(k), Operand::Value(v)) => match k.to_i64() {
+                        Some(kv) => (v, kv, true),
+                        None => continue,
+                    },
+                    _ => continue,
+                };
+                // The offset must be an exact constant of the compared type.
+                if ty.truncate_i64(c) != c {
+                    continue;
+                }
+                // Unsigned: fold only when the addition provably cannot wrap.
+                if unsigned && !offset_proves_no_unsigned_wrap(c, keep, ty) {
+                    continue;
+                }
+                if uses.get(&av.0).copied().unwrap_or(0) != 1 {
+                    continue;
+                }
+                let new_other = match keep {
+                    Operand::Const(k) => {
+                        let Some(kv) = k.to_i64() else { continue };
+                        let kv = ty.truncate_i64(kv);
+                        let bound = if negated {
+                            c.checked_sub(kv)
+                        } else {
+                            kv.checked_sub(c)
+                        };
+                        let Some(bound) = bound else { continue };
+                        let Some(kc) = const_for_int_ty(ty, bound) else {
+                            continue;
+                        };
+                        Operand::Const(kc)
+                    }
+                    Operand::Value(v) => {
+                        // Only an already-loop-invariant side can absorb the
+                        // offset; anything else would trade a per-trip `lea`
+                        // for a per-trip `sub`.
+                        if !is_loop_invariant(v.0, body, func) {
+                            continue;
+                        }
+                        let nv = Value(next_id);
+                        next_id += 1;
+                        if negated {
+                            // bound = c - v
+                            let Some(kcv) = const_for_int_ty(ty, c) else {
+                                continue;
+                            };
+                            new_preheader.push(Instruction::BinOp {
+                                dest: nv,
+                                op: IrBinOp::Sub,
+                                lhs: Operand::Const(kcv),
+                                rhs: Operand::Value(v),
+                                ty,
+                            });
+                        } else {
+                            // bound = v - c
+                            let Some(kcv) = const_for_int_ty(ty, c) else {
+                                continue;
+                            };
+                            new_preheader.push(Instruction::BinOp {
+                                dest: nv,
+                                op: IrBinOp::Sub,
+                                lhs: Operand::Value(v),
+                                rhs: Operand::Const(kcv),
+                                ty,
+                            });
+                        }
+                        Operand::Value(nv)
+                    }
+                };
+                let new_cop = if negated { negate_cmp(cop) } else { cop };
+                applied = Some(if mirrored {
+                    (new_other, Operand::Value(iv), new_cop)
+                } else {
+                    (Operand::Value(iv), new_other, new_cop)
+                });
+                break;
+            }
+            let Some((nl, nr, new_cop)) = applied else {
+                continue;
+            };
+            func.blocks[bi].instructions[ii] = Instruction::Cmp {
+                dest,
+                op: new_cop,
+                lhs: nl,
+                rhs: nr,
+                ty,
+            };
+            folded += 1;
+        }
+    }
+
+    if folded == 0 {
+        return 0;
+    }
+    if let Some(ph) = preheader {
+        let at = func.blocks[ph].instructions.len();
+        for (k, inst) in new_preheader.into_iter().enumerate() {
+            func.blocks[ph].instructions.insert(at + k, inst);
+        }
+    }
+    func.next_value_id = next_id;
+    folded
+}
+
+/// Can `iv + c` be shown not to wrap, in `ty`, for this loop?
+///
+/// Only meaningful for UNSIGNED comparisons, where the wrap is defined
+/// behaviour rather than UB. The proof used here is deliberately the one that
+/// needs no trip-count analysis:
+///
+/// `iv` is an induction variable that is incremented by a POSITIVE constant
+/// and compared against a bound BEFORE the increment takes effect; therefore
+/// on every iteration that reaches the compare, `iv <= k`. When the offset is
+/// non-negative and the bound `k` is itself a non-negative constant that does
+/// not exceed the type's maximum, then `iv + c <= k + c`, and the sum is
+/// bounded by a value representable in `ty` -- so it cannot wrap. With a
+/// negative offset, or a value bound, or an offset large enough to push
+/// `k + c` past the maximum, the wrap is genuinely possible and the rewrite is
+/// declined.
+///
+/// Anything requiring the trip count, the step, or a range analysis is out of
+/// scope: a bound that is merely "loop invariant" says nothing about its
+/// magnitude, and assuming otherwise is exactly the unsoundness this guard
+/// exists to prevent.
+fn offset_proves_no_unsigned_wrap(c: i64, keep: Operand, ty: IrType) -> bool {
+    if c < 0 {
+        return false; // `iv - |c|` can underflow below zero
+    }
+    // Only a literal bound proves a magnitude. A loop-invariant VALUE is not
+    // enough: `end - v` is loop invariant and unbounded.
+    let Operand::Const(k) = keep else {
+        return false;
+    };
+    let Some(kv) = k.to_i64() else { return false };
+    if kv < 0 || ty.truncate_i64(kv) != kv {
+        return false;
+    }
+    // `iv <= k` on every iteration, so `iv + c <= k + c`; require that ceiling
+    // to be representable in the compared type.
+    let Some(ceil) = kv.checked_add(c) else {
+        return false;
+    };
+    let ceiling = ty.truncate_i64(ceil);
+    ceiling == ceil && ceil >= 0
 }
 
 /// Try to strength-reduce induction variables in a single loop.
@@ -1778,6 +2059,251 @@ mod tests {
             .filter(|i| matches!(i, Instruction::Phi { .. }))
             .count();
         assert_eq!(phis, 1, "widened domain must fail closed");
+    }
+
+    /// Build the canonical shape the exit-compare fold targets:
+    ///
+    ///     header:  %i = phi(0, %i_next)
+    ///     latch:   %t = i + 4 ; %c = slt %t, %n ; br %c, header, exit
+    ///
+    /// `cmp_op` selects the comparison so the same fixture covers both the
+    /// signed case that must fold and the unsigned case that must not.
+    fn affine_exit_fixture(cmp_op: IrCmpOp, add_ty: IrType, cmp_ty: IrType) -> IrFunction {
+        let mut func = IrFunction::new("affine_exit".to_string(), IrType::I64, vec![], false);
+        // 0: preheader -- %n = 100, %zero = 0
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Copy {
+                    dest: Value(0),
+                    src: Operand::Const(IrConst::I64(100)),
+                },
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Const(IrConst::I64(0)),
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        // 1: header -- %i = phi(0, %i_next)
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![Instruction::Phi {
+                dest: Value(2),
+                ty: IrType::I64,
+                incoming: vec![
+                    (Operand::Value(Value(1)), BlockId(0)),
+                    (Operand::Value(Value(6)), BlockId(2)),
+                ],
+            }],
+            terminator: Terminator::Branch(BlockId(2)),
+            source_spans: Vec::new(),
+        });
+        // 2: latch -- %t = i + 4 ; %c = cmp %t, %n
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![
+                Instruction::BinOp {
+                    dest: Value(3),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(2)),
+                    rhs: Operand::Const(IrConst::I64(4)),
+                    ty: add_ty,
+                },
+                Instruction::Cmp {
+                    dest: Value(4),
+                    op: cmp_op,
+                    lhs: Operand::Value(Value(3)),
+                    rhs: Operand::Value(Value(0)),
+                    ty: cmp_ty,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(4)),
+                true_label: BlockId(1),
+                false_label: BlockId(3),
+            },
+            source_spans: Vec::new(),
+        });
+        // 3: exit
+        func.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: vec![],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 10;
+        func
+    }
+
+    fn run_fold(func: &mut IrFunction) -> usize {
+        let mut cfg = analysis::CfgAnalysis::build(func);
+        let loops =
+            loop_analysis::find_natural_loops(cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
+        let loops = loop_analysis::merge_loops_by_header(loops);
+        let mut n = 0;
+        for l in &loops {
+            n += fold_affine_exit_compares(func, l, &cfg.preds);
+        }
+        let _ = &mut cfg;
+        n
+    }
+
+    /// The positive: a SIGNED affine exit compare folds, the offset moves to
+    /// the invariant side, and the `Sub` lands in the PREHEADER so it is
+    /// computed once instead of once per trip.
+    #[test]
+    fn signed_affine_exit_compare_folds_into_the_preheader() {
+        let mut func = affine_exit_fixture(IrCmpOp::Slt, IrType::I64, IrType::I64);
+        assert_eq!(run_fold(&mut func), 1, "the signed form must fold");
+
+        let latch_cmp = func.blocks[2]
+            .instructions
+            .iter()
+            .find_map(|i| match i {
+                Instruction::Cmp { lhs, rhs, .. } => Some((*lhs, *rhs)),
+                _ => None,
+            })
+            .expect("latch compare");
+        // The induction variable is now compared directly...
+        assert!(
+            matches!(latch_cmp.0, Operand::Value(v) if v.0 == 2),
+            "lhs must be the IV, got {:?}",
+            latch_cmp.0
+        );
+        // ...against a value the preheader computed, not against %t.
+        let Operand::Value(bound) = latch_cmp.1 else {
+            panic!("rhs must be the folded bound, got {:?}", latch_cmp.1)
+        };
+        assert_ne!(bound.0, 3, "must not compare against the `iv + 4` temp");
+        let sub = func.blocks[0]
+            .instructions
+            .iter()
+            .find_map(|i| match i {
+                Instruction::BinOp {
+                    dest,
+                    op: IrBinOp::Sub,
+                    rhs,
+                    ..
+                } if *dest == bound => Some(*rhs),
+                _ => None,
+            })
+            .expect("the preheader must compute the folded bound");
+        assert!(
+            matches!(sub, Operand::Const(IrConst::I64(4))),
+            "the bound must be %n - 4, got {:?}",
+            sub
+        );
+    }
+
+    /// The negative that matters most: UNSIGNED. `ult(iv + c, k)` is NOT
+    /// `ult(iv, k - c)` when the sum wraps -- the wrap is fully defined, not
+    /// UB -- so the fold must decline. This is the pointer-loop case, and it
+    /// is exactly the shape the rewrite would silently corrupt.
+    #[test]
+    fn unsigned_affine_exit_compare_is_refused() {
+        for op in [IrCmpOp::Ult, IrCmpOp::Ule, IrCmpOp::Ugt, IrCmpOp::Uge] {
+            let mut func = affine_exit_fixture(op, IrType::I64, IrType::I64);
+            assert_eq!(
+                run_fold(&mut func),
+                0,
+                "{op:?} must not fold: the wrap is defined"
+            );
+        }
+    }
+
+    /// The unsigned refusal is not caution -- it is required. With
+    /// iv = 2^64-2, c = 1, k = 0 the two forms disagree on hardware:
+    /// `ult(iv+c, k)` is 0, `ult(iv, k - c)` is 1. Every unsigned fixture
+    /// here must therefore decline unless the wrap is structurally excluded.
+    #[test]
+    fn unsigned_affine_exit_compare_needs_a_no_wrap_proof() {
+        // A loop-invariant VALUE bound proves nothing about magnitude, so the
+        // common pointer shape (`i + 4 < end`) must keep declining.
+        let mut func = affine_exit_fixture(IrCmpOp::Ult, IrType::I64, IrType::I64);
+        assert_eq!(
+            run_fold(&mut func),
+            0,
+            "an unbounded invariant bound cannot prove the add cannot wrap"
+        );
+
+        // A negative offset is the `i - K` form; under an unsigned compare
+        // `iv - K` can underflow below zero, so it must decline even though
+        // the same shape folds when signed.
+        let mut func = affine_exit_fixture(IrCmpOp::Ule, IrType::I64, IrType::I64);
+        func.blocks[2].instructions[0] = Instruction::BinOp {
+            dest: Value(3),
+            op: IrBinOp::Sub,
+            lhs: Operand::Value(Value(2)),
+            rhs: Operand::Const(IrConst::I64(4)),
+            ty: IrType::I64,
+        };
+        assert_eq!(run_fold(&mut func), 0, "`iv - K` underflows under Ule");
+    }
+
+    /// The proof the guard accepts: a LITERAL bound with room to spare, which
+    /// is what a constant-bound loop looks like. Regression test for the
+    /// ordering bug: `unsigned` was originally classified after the
+    /// signed-only guard, which made this whole path unreachable -- the code
+    /// read as if unsigned folding were enabled while silently never firing.
+    #[test]
+    fn unsigned_folds_when_a_literal_bound_proves_no_wrap() {
+        let mut func = affine_exit_fixture(IrCmpOp::Ult, IrType::I64, IrType::I64);
+        // The fixture's bound is a Copy-defined VALUE. Point the compare at a
+        // LITERAL: iv <= 100 on every iteration and 100 + 4 is representable,
+        // so `iv + 4` provably cannot wrap.
+        func.blocks[2].instructions[1] = Instruction::Cmp {
+            dest: Value(4),
+            op: IrCmpOp::Ult,
+            lhs: Operand::Value(Value(3)),
+            rhs: Operand::Const(IrConst::I64(100)),
+            ty: IrType::I64,
+        };
+        assert_eq!(
+            run_fold(&mut func),
+            1,
+            "literal bound with headroom must fold"
+        );
+    }
+
+    /// ...and the same literal must be REJECTED when the offset would push the
+    /// sum past the type's maximum: the boundary the guard exists to get right.
+    #[test]
+    fn unsigned_declines_when_the_sum_would_overflow_the_type() {
+        let mut func = affine_exit_fixture(IrCmpOp::Ult, IrType::I64, IrType::I64);
+        func.blocks[2].instructions[1] = Instruction::Cmp {
+            dest: Value(4),
+            op: IrCmpOp::Ult,
+            lhs: Operand::Value(Value(3)),
+            rhs: Operand::Const(IrConst::I64(i64::MAX)),
+            ty: IrType::I64,
+        };
+        assert_eq!(run_fold(&mut func), 0, "MAX + 4 wraps; must decline");
+    }
+
+    /// A `BinOp` type that disagrees with the compare's is a different
+    /// expression entirely (the compare sees a converted value), so folding
+    /// would compare the wrong quantity.
+    #[test]
+    fn an_add_of_a_different_type_is_refused() {
+        let mut func = affine_exit_fixture(IrCmpOp::Slt, IrType::I32, IrType::I64);
+        assert_eq!(run_fold(&mut func), 0, "mismatched widths must not fold");
+    }
+
+    /// When the `Add` has a second user the sum is still needed, so folding
+    /// the compare would leave the address computation behind and trade a
+    /// removed instruction for an added one.
+    #[test]
+    fn an_add_with_a_second_user_is_refused() {
+        let mut func = affine_exit_fixture(IrCmpOp::Slt, IrType::I64, IrType::I64);
+        // %t is now read twice: by the compare and by a copy in the exit.
+        func.blocks[3].instructions.push(Instruction::Copy {
+            dest: Value(7),
+            src: Operand::Value(Value(3)),
+        });
+        func.next_value_id = 10;
+        assert_eq!(run_fold(&mut func), 0, "a shared `iv + c` must not fold");
     }
 
     /// The affine shape `(i + 1) * 56` with no GEP: the derived recurrence

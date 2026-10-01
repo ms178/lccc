@@ -13,12 +13,16 @@
 #   2. EFFECT       `guarded_sum` (the SQLite shape) loads p->nUsed ONCE,
 #                   OUTSIDE the loop, when the pass runs -- and reloads it
 #                   every iteration when the pass is disabled. That delta is
-#                   the entire point of the pass.
+#                   the entire point of the pass. `dowhile_sum` (2b) is the
+#                   same contract on a do/while, which is entered by FALLING
+#                   IN rather than by a back edge: a different lowering, and
+#                   the case that would catch a preheader wrongly claimed on
+#                   the fall-in edge. Both carry their own negative control.
 #   3. SOUNDNESS    the hoisted load sits AFTER the `p == 0` early return. If
 #                   it were hoisted into the guard block instead of a
 #                   dedicated preheader, the NULL path would dereference it.
 #                   This is the miscompile the pass was written to prevent.
-#   4. SCOPE        four shapes the pass must NOT touch are each left
+#   4. SCOPE        seven shapes the pass must NOT touch are each left
 #                   byte-identical between the two arms:
 #                     `invariant_ptr`     no guard, nothing to unlock;
 #                     `switch_entered`    two outside edges -- no single block
@@ -27,11 +31,24 @@
 #                                         bound undefined on the other path;
 #                     `computed_goto`     IndirectBranch into the header --
 #                                         there is no edge to reroute;
-#                     `already_dedicated` the while-form already has one.
+#                     `already_dedicated` the while-form already has one;
+#                     `while_sum`         guard-at-top, so the header is
+#                                         itself a loop block and is not
+#                                         must-execute;
+#                     `null_guard_sum`    the guard block is the unique
+#                                         outside predecessor but also
+#                                         branches to the early return, so
+#                                         it is not DEDICATED -- hoisting
+#                                         `p[0]` into it would deref NULL;
+#                     `alloca_sum`        every load reads an alloca, so a
+#                                         preheader unlocks nothing and the
+#                                         inserted block is pure cost.
 #                   `switch_entered` and `computed_goto` are the miscompile
 #                   shapes: counting only Branch edges would report one of
 #                   two entering blocks as *the* preheader, and the def of
 #                   the hoisted bound would then not dominate its use.
+#                   `null_guard_sum` is the soundness shape the pass's own
+#                   docstring cites; `alloca_sum` is the profitability shape.
 #   5. CONTROL      contract 2's disabled-pass arm is the negative control.
 #                   Without it, a pass that never fired would also show a
 #                   single load outside the loop and pass vacuously.
@@ -40,6 +57,13 @@
 #                   dedicated preheader" and inserts nothing further. A pass
 #                   that kept inserting would either loop forever or emit a
 #                   chain of empty blocks.
+#   7. CENSUS      every merged loop the final round settled on lands in
+#                   exactly one bucket, so `loops` equals the sum of its
+#                   reasons. The pass asserts this internally, but
+#                   `fastbuild` inherits `release`, where `debug-assertions`
+#                   is off, so that assert is compiled out of a CI binary;
+#                   checking the REPORTED numbers here is what makes the
+#                   invariant profile-independent and end-to-end.
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 
@@ -163,8 +187,32 @@ else
 the NULL path would dereference"
 fi
 
+# ── 2b. effect, second positive shape: the do/while lowering ────────────
+# `guarded_sum` proves the hoist fires for a `for` loop entered from a
+# guard. `dowhile_sum` is the same rule on a do/while, where the loop is
+# entered by FALLING IN rather than by a back edge -- a different lowering,
+# and the one case that would catch a preheader inserted on the fall-in
+# edge. Same contract, so the same measurement.
+dw_on_loop=$(loop_region dowhile_sum "$td/on.s")
+dw_off_loop=$(loop_region dowhile_sum "$td/off.s")
+dw_on_in=$(echo "$dw_on_loop"  | grep -Ec "$base_only")
+dw_off_in=$(echo "$dw_off_loop" | grep -Ec "$base_only")
+
+if [ "$dw_on_in" -eq 0 ]; then
+    echo "ok: dowhile_sum hoists c[0] out of the do/while body"
+else
+    fail "dowhile_sum still loads c[0] inside the loop ($dw_on_in access(es))"
+fi
+if [ "$dw_off_in" -ge 1 ]; then
+    echo "ok: negative control -- do/while reloads every iteration with the pass off"
+else
+    fail "negative control failed for dowhile_sum: the pass-off build also has \
+no in-loop load, so that half of the contract proves nothing"
+fi
+
 # ── 4. scope: every shape the pass must refuse is left untouched ───────
-for fn in invariant_ptr switch_entered computed_goto already_dedicated; do
+for fn in invariant_ptr switch_entered computed_goto already_dedicated \
+         while_sum null_guard_sum alloca_sum; do
     if diff <(fn_body "$fn" "$td/on.s") <(fn_body "$fn" "$td/off.s") >/dev/null; then
         echo "ok: $fn is byte-identical (pass correctly declined)"
     else
@@ -184,6 +232,51 @@ if [ "$inserts" -ge 1 ] && [ "$settled" -ge 1 ]; then
 else
     fail "idempotence broken: inserts=$inserts settled=$settled (want >=1 each). \
 Trace was:\n$trace"
+fi
+
+# ── 6. the census is the sum of its parts ───────────────────────────────
+# The six buckets here are exactly the six `Census::accounted()` sums in
+# src/passes/loop_preheader.rs: no_profit, no_single_pred, already_dedicated,
+# indirect_pred, out_of_range, planned. Adding a bucket on the Rust side
+# without adding it here makes this check a DIFFERENT equation from the one
+# the code asserts, which is worse than not checking at all -- it looks like
+# a real invariant and silently drifts. `planned` was missing from both the
+# report and this list.
+#
+# The pass asserts this internally, but `fastbuild` inherits `release`, where
+# `debug-assertions` is off, so that assert would be compiled out of a CI
+# binary. Checking the REPORTED numbers here makes the invariant
+# profile-independent and end-to-end: every merged loop the final round
+# settled on must appear in exactly one bucket.
+trace=$(CCC_DEBUG_LOOP_PREHEADER=1 "$ccc" -O2 $march -S "$src" -o /dev/null 2>&1)
+census_lines=$(printf '%s\n' "$trace" | grep -c "LOOP-PREHEADER-CENSUS")
+if [ "$census_lines" -eq 0 ]; then
+    fail "no census was reported; contract 6 cannot be checked and the \
+census is not observable, so 'the pass never fires' is indistinguishable \
+from 'the pass is blind'"
+else
+    unbalanced=$(printf '%s\n' "$trace" | grep "LOOP-PREHEADER-CENSUS" | awk '
+        { b = 0
+          for (i = 1; i <= NF; i++) {
+              split($i, kv, "=")
+              if      (kv[1] == "loops")                   loops = kv[2] + 0
+              else if (kv[1] == "profitability")           b += kv[2] + 0
+              else if (kv[1] == "no_single_outside_pred")  b += kv[2] + 0
+              else if (kv[1] == "already_dedicated")       b += kv[2] + 0
+              else if (kv[1] == "indirect_pred")           b += kv[2] + 0
+              else if (kv[1] == "out_of_range")            b += kv[2] + 0
+              else if (kv[1] == "planned")                b += kv[2] + 0
+          }
+          if (loops != b) n++ }
+        END { print n + 0 }')
+    if [ "$unbalanced" -eq 0 ]; then
+        echo "ok: census is balanced across $census_lines report(s) -- every \
+loop is in exactly one bucket"
+    else
+        fail "$unbalanced census report(s) where loops != sum(buckets): the \
+rejection buckets do not partition the loops, so the headline number and \
+its reasons have drifted apart"
+    fi
 fi
 
 exit $rc

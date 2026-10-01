@@ -949,3 +949,46 @@ lz4 −15.3 %); RA web-wide in-loop-use supply (+3.63/+4.33 % sha256,A/B)
 `CCC_PHI_ACYCLIC_ORDER=1`); SROA split `0.0`/`-0.0` bit-exact zero
 (CG-07); epilogue-suffix sharing (CG-09); OP-42 transactional sinking;
 RA mode-6 stays opt-in (RA-28/28b); TLS CSE merge (3→2).
+
+## VOLATILE-1 — scope `unused_variables` to the memory-motion passes
+
+Deferred deliberately, with the measurement that justifies deferring it
+rather than a guess. `src/lib.rs` carries a crate-wide
+`#![allow(dead_code, unused_variables, unused_mut, unused_assignments,
+unused_imports, unreachable_code)]`, which is *why* a 674-line Python
+ratchet exists to watch one field that rustc would otherwise cover.
+
+Lifting the crate-level `unused_variables` allow and running `cargo check`
+surfaces **87** warnings:
+
+| file | count |
+| --- | --- |
+| `src/passes/vectorize.rs` | 18 |
+| `src/backend/x86/codegen/memory.rs` | 6 |
+| `src/passes/loop_unroll.rs` | 4 |
+| `src/passes/loop_idiom.rs` | 3 |
+| `src/backend/x86/codegen/peephole/passes/local_patterns.rs` | 3 |
+| `src/backend/i686/codegen/peephole.rs` | 3 |
+| everything else (17 files) | 2 each or fewer |
+
+LICM, GVN, DSE and if-convert are **already clean**, so scoping the lint to
+the memory-motion modules is ~29 fixes, concentrated in one 27k-line file.
+That is its own change, not something to carry inside a codegen fix.
+
+**The measurement is mildly reassuring.** None of the 18
+`vectorize.rs` unused variables is a `volatile` binding, so no instance of
+the bug class the ratchet exists for is hiding in the most volatile-heavy
+pass in the tree. The names are `fresh`, `p_back`, `iv_derived`, `debug`,
+`changes`, `dest`, `gep_ty`, `ty`, `vec_sum_value`, `rem_iv_unused`,
+`add_intrinsic`, `mul_intrinsic`, `iv_width_const`, …
+
+Steps when taken: add `#![warn(unused_variables)]` at the top of each
+memory-motion module (an inner lint attribute overrides the crate-level
+`allow`), fix the ~29, and let `cargo clippy -- -D warnings` enforce it
+permanently. Then the Python ratchet can shrink to what only it can see.
+
+Related: the ratchet's own docstring now lists all four of its blind spots
+and pins each in `--self-test`. Closing the fourth — a sibling `match`
+arm's use satisfying the window — needs the arm boundary re-derived, i.e. a
+parser rather than a regex query. That is the highest-value thing the gate
+could grow.

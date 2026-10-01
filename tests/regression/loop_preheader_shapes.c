@@ -108,6 +108,75 @@ int already_dedicated(const int *c, int n) {
 }
 
 /* ---------------------------------------------------------------------- */
+/* 6. do/while, guard outside -- a SECOND positive shape.                  */
+/*    The guard is outside the loop, so the loop header is the body and   */
+/*    the derived-pointer load sits in a block that dominates every loop  */
+/*    block: LICM's must-execute rule holds. With a dedicated preheader   */
+/*    the load hoists; with the pass disabled it stays in the loop. This  */
+/*    is the one shape that exercises the do/while lowering, where the    */
+/*    loop is entered by falling in rather than by a back edge.          */
+/* ---------------------------------------------------------------------- */
+int dowhile_sum(const int *c, int n)
+{
+    if (n <= 0)
+        return 0;
+    int i = 0, t = 0;
+    do {
+        t += c[0];
+        i++;
+    } while (i < n);
+    return t;
+}
+
+/* ---------------------------------------------------------------------- */
+/* 7. guard-at-top while -- the header is NOT must-execute.               */
+/*    `while (n-- > 0)` lowers with the test folded into the loop header, */
+/*    so the header is a loop block and no block inside the body can      */
+/*    dominate it. LICM skips the hoist; the pass must not insert.        */
+/* ---------------------------------------------------------------------- */
+int while_sum(const int *c, int n)
+{
+    int t = 0;
+    while (n-- > 0)
+        t += c[0];
+    return t;
+}
+
+/* ---------------------------------------------------------------------- */
+/* 8. the soundness case the pass's own docstring cites.                  */
+/*    `if (p == 0) return 0;` makes that block the loop's unique outside */
+/*    predecessor, so it *is* the preheader -- but it also branches to   */
+/*    the early return, so it is not DEDICATED, and hoisting `p[0]` into */
+/*    it would dereference NULL on the path that took the early exit.    */
+/*    This must stay in the loop at every setting.                       */
+/* ---------------------------------------------------------------------- */
+int null_guard_sum(const char *p, int n)
+{
+    if (p == 0)
+        return 0;
+    int t = 0;
+    for (int i = 0; i < n; i++)
+        t += p[0];
+    return t;
+}
+
+/* ---------------------------------------------------------------------- */
+/* 9. not profitable -- every load reads an alloca.                       */
+/*    An alloca never needs a dedicated preheader (LICM's alloca path is  */
+/*    independent of it), so an inserted empty block is pure cost: the   */
+/*    regression the ungated version of this pass measured corpus-wide.  */
+/* ---------------------------------------------------------------------- */
+int alloca_sum(int n)
+{
+    int a[64], t = 0;
+    for (int i = 0; i < 64; i++)
+        a[i] = i;
+    for (int j = 0; j < n && j < 64; j++)
+        t += a[j];
+    return t;
+}
+
+/* ---------------------------------------------------------------------- */
 /* Runtime cross-check: every shape against a scalar reference.            */
 /* Exits non-zero on the first disagreement so the corpus runner (which    */
 /* only compares stdout/exit status) also catches a semantic regression,   */
@@ -150,6 +219,40 @@ int main(void) {
     /* already_dedicated */
     if (already_dedicated(c0, 3) != 21)
         return 9;
+
+    /* dowhile_sum: c[0] == 7 summed n times; n <= 0 yields 0 */
+    if (dowhile_sum(c0, 5) != 35)
+        return 10;
+    if (dowhile_sum(c0, 0) != 0)
+        return 11;
+    if (dowhile_sum(c0, -3) != 0)
+        return 12;
+
+    /* while_sum: same arithmetic, guard-at-top lowering */
+    if (while_sum(c0, 4) != 28)
+        return 13;
+    if (while_sum(c0, 0) != 0)
+        return 14;
+
+    /* null_guard_sum: p[0] == 7, summed n times; NULL yields 0 */
+    {
+        const char s0[1] = { 7 };
+        if (null_guard_sum(s0, 6) != 42)
+            return 15;
+        if (null_guard_sum(0, 6) != 0)
+            return 16;
+    }
+
+    /* alloca_sum: a[j] == j, summed over min(n, 64) */
+    {
+        int want = 0;
+        for (int j = 0; j < 10 && j < 64; j++)
+            want += j;
+        if (alloca_sum(10) != want)
+            return 17;
+        if (alloca_sum(0) != 0)
+            return 18;
+    }
 
     return 0;
 }

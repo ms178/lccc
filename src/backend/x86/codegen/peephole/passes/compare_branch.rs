@@ -654,18 +654,57 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
             // which requires a `%` prefix, so it evaluated to REG_NONE and
             // never fired): every family whose definition is NOPed must be
             // dead after the fused jump. Unknown liveness refuses.
-            let lv = FileLiveness::new(store, infos);
-            let setcc_dead = lv.live_after(jcc_pos, setcc_fam) == Some(false);
+            //
+            // "After the fused jump" is evaluated on the POST-TRANSFORM text,
+            // not on the text as it stands. Asking the pre-transform analysis
+            // is the wrong question, and at a loop latch it is unanswerable
+            // at family granularity: the only thing that makes the carrier
+            // live at the latch is the zero-extending relay that this very
+            // fusion deletes, reached around the back edge. In
+            //
+            //     .LBB1: ... ; setl %r8b ; movzbl %r8b, %r8d ; testb %r8b, %r8b
+            //     jne .LBB1
+            //
+            // `%r8` is genuinely live at the `jne` in the ORIGINAL text -- the
+            // `movzbl` really does read the byte on the next iteration -- so
+            // the gate refused, permanently and for every loop whose test
+            // branched backwards, even though the fusion removes the
+            // definition and that read together. A byte-wide `setl` cannot
+            // kill the family, so no family-granular fixpoint can ever see the
+            // back edge as dead. Re-deriving liveness with the window removed
+            // answers the question the gate actually means, and does so
+            // exactly rather than by relaxing the gate.
+            //
+            // Monotonicity (why this cannot regress a site that fuses today):
+            // every removed line PRECEDES the jcc, so none of them is on a
+            // path out of it; the only effect is to delete a read of the
+            // carrier from elsewhere in the function, which can only shrink
+            // `live_in(jcc)`. A site that fuses today still fuses.
+            let nops: Vec<usize> = (1..=test_scan)
+                .filter(|&s| !transparent_skip[s])
+                .map(|s| seq_indices[s])
+                .collect();
+            let scratch_text = store.build_result(|n| nops.contains(&n));
+            let scratch_store = LineStore::new(scratch_text);
+            let scratch_infos: Vec<LineInfo> = (0..scratch_store.len())
+                .map(|n| classify_line(scratch_store.get(n)))
+                .collect();
+            let lv = FileLiveness::new(&scratch_store, &scratch_infos);
+            // `seq_indices` is strictly increasing and every removed line comes
+            // from `1..=test_scan`, so all of them precede `jcc_pos` and the
+            // jcc shifts down by exactly their number.
+            let jcc_scratch = jcc_pos - nops.len();
+            let setcc_dead = lv.live_after(jcc_scratch, setcc_fam) == Some(false);
             let relay_dead = relay_fam
-                .map(|f| lv.live_after(jcc_pos, f) == Some(false))
+                .map(|f| lv.live_after(jcc_scratch, f) == Some(false))
                 .unwrap_or(true);
             if !setcc_dead || !relay_dead {
                 if std::env::var_os("CCC_DEBUG_CMP_FUSE").is_some() {
                     eprintln!(
                         "[CMPFUSE] refusing non-legacy fusion (setcc_fam={} setcc_live_after={:?} relay_live_after={:?})",
                         setcc_fam,
-                        lv.live_after(jcc_pos, setcc_fam),
-                        relay_fam.map(|f| lv.live_after(jcc_pos, f))
+                        lv.live_after(jcc_scratch, setcc_fam),
+                        relay_fam.map(|f| lv.live_after(jcc_scratch, f))
                     );
                 }
                 i += 1;

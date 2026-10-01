@@ -37,9 +37,19 @@ jobs:
       # in addition to `bfd` because it is the oracle that implements linker
       # scripts -- mold accepts -T but its parser rejects even a minimal
       # SECTIONS, so with mold alone every script-path relocation cross-check
-      # had a single opinion, which is not a cross-check.  The suite probes
-      # script capability structurally per oracle, so this stays honest even
-      # on a host where one of them is missing.
+      # would have a single opinion, which is not a cross-check.
+      #
+      # Two independent safeguards, because either alone is insufficient:
+      #   * The suite infers a per-oracle `incapable` verdict from the LINKER
+      #     DIAGNOSTIC (a regex for "linker script"/"t.ld" in stderr), which
+      #     excludes mold from the script-path quorum rather than counting its
+      #     silence as agreement.  That is a negative inference, not a probe:
+      #     it can be fooled by a diagnostic that quotes the script name.
+      #   * `--require-oracles bfd,lld` below makes the run FAIL if lld is not
+      #     actually registered, which is the failure this job is most exposed
+      #     to -- the `apt-get install` can succeed, or appear to, without the
+      #     oracle being usable, and without this flag the suite would still
+      #     return PASS on a one-member quorum.
       - name: Install differential linker oracles
         run: |
           sudo apt-get update
@@ -767,6 +777,9 @@ jobs:
           # consumers, kept for `while ((n -= 3) > 0)`) plus a matcher
           # self-test, so it cannot pass vacuously.
           bash tests/regression/check_self_test_after_arith.sh
+          bash tests/regression/check_cmp_fuse_latch_liveness.sh
+          bash tests/regression/check_bytecmp_edge_sweep.sh
+          bash tests/regression/check_affine_exit_compare.sh
           # The loop-density metric decides which compiler wins on a kernel,
           # so its loop identification is tested like a pass: dominator-based
           # backedges, composite loops never measured, step recovery through
@@ -885,6 +898,7 @@ jobs:
           LCCC_RELOCS_TOOL="$HOME/.cache/lccc-kernel-tools/bin/relocs" \
             python3 tests/linker/run_linker_tests.py \
               --lccc target/fastbuild/lccc --strict -v \
+              --require-oracles bfd,lld \
               --json "$RUNNER_TEMP/linker-results.json"
 
       # Passing cases delete their scratch directories, so what remains is

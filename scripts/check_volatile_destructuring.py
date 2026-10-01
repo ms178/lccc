@@ -59,6 +59,58 @@ Fail-closed: an unparseable file, or a body the scanner cannot delimit, is a
 violation rather than a skip.  A rule that cannot read the code must not
 report the code clean.
 
+WHAT IT CANNOT SEE
+------------------
+Four refactors remove a volatile guard and leave the code compiling.  Three
+of them are invisible here, and all four are pinned in `--self-test` as
+EXPECTED results so the gap is written down rather than assumed away:
+
+  1. `volatile: _`                       BY DESIGN.  The rule above calls
+     this the reviewable opt-out: it is an explicit statement that
+     volatility was considered and does not matter, which is a different
+     claim from "nobody looked".  It is a hole only if a reviewer reads
+     past it.
+  2. A `..` arm that never names the field.  `Instruction::Load { .. }`
+     binds nothing, so this ratchet is not invoked at all -- there is no
+     `volatile` binding to check.  Closing it means requiring every
+     Load/Store pattern in the memory-motion passes to name `volatile`,
+     and 353 existing `..` patterns in `src/` would have to be made to.
+  3. A use that is only a debug print.  This one WAS a hole -- the
+     docstring above promised to catch exactly this -- and is now closed:
+     `_is_debug_only_use` does not count a `volatile` that only reaches
+     a logging macro.
+  4. A SIBLING arm's use.  The window is a line distance
+     (`USE_DISTANCE_LINES`), not an arm boundary, so in
+
+         match inst {
+             Instruction::Load  { ptr, ty, volatile, .. } => { log!(volatile); .. }
+             Instruction::Store { .., volatile } => { .. *volatile .. }
+         }
+
+     the Store arm's legitimate use sits inside the Load arm's window and
+     satisfies it.  Fixing this means re-deriving the arm boundary, which
+     the design above deliberately avoids; it is a parser, not a regex
+     query, and is the single highest-value thing this gate could grow.
+
+None of the four is a reason not to run the gate: each still catches the
+plain "bound and never read" case, which is the common one.
+
+A COMPILER-NATIVE BACKSTOP, AND WHY IT IS NOT WIRING YET
+--------------------------------------------------------
+rustc's own `unused_variables` would cover blind spots 2-4 for free, and
+`--self-test` says why it is not simply switched on.  `src/lib.rs` carries
+a crate-wide `#![allow(dead_code, unused_variables, ...)]`, so lifting it
+surfaces 87 warnings, 18 of them in `src/passes/vectorize.rs` (27k lines),
+6 in `codegen/memory.rs`, 3 in `local_patterns.rs`, 2 in `memory_fold.rs`;
+LICM, GVN, DSE and if-convert are already clean.  Scoping the lint to the
+memory-motion modules is therefore ~29 fixes -- worth doing, and worth
+doing as its own change rather than inside a codegen fix.
+
+It was measured here before being deferred, and the answer is mildly
+reassuring: NONE of the 18 `vectorize.rs` unused variables is a `volatile`
+binding, so there is no instance of this bug class hiding in the most
+volatile-heavy pass in the tree.
+
 Self-test
 ---------
 `--self-test` runs the detector over synthetic snippets -- including the
@@ -97,6 +149,85 @@ _ACCESS_RE = re.compile(r"Instruction::(?P<kind>Load|Store)\s*\{")
 # finds a "use" and the dropped flag ships.  Only a bare mention counts, which
 # is what `*volatile`, `!volatile`, `volatile &&` and `(&volatile)` all are.
 _USE_RE = re.compile(r"\bvolatile\b(?!\s*:)")
+
+# A `volatile` that only reaches a LOGGING macro is not a guard. It is the
+# single most realistic way to delete a volatile check without deleting the
+# binding: `if !ty.is_128bit() || volatile || ...` becomes
+# `if !ty.is_128bit() || ...`, and the field is kept alive by a debug print.
+# The binding still compiles, still counts as "used" to rustc, and the gate's
+# own docstring promises to catch exactly this -- so a plain word search
+# reports the file clean while the guard is gone.
+#
+# The window scanned is from the start of the `volatile` occurrence back to
+# the nearest line/statement/block boundary. Anything not recognised as a
+# logging macro still counts as a real use, so this errs towards permissiveness
+# and cannot invent a violation out of an ordinary guard.
+_LOG_MACRO_RE = re.compile(
+    r"\b(?:eprint|print|dbg|panic|unreachable|todo|unimplemented|assert|"
+    r"assert_eq|assert_ne|debug|trace|info|warn|error|log)"
+    r"!\s*[\[(]"
+)
+
+
+_DELIM_OPEN = {"(": ")", "[": "]", "{": "}"}
+
+
+def _match_delim(src: str, open_idx: int) -> int:
+    """Index of the delimiter closing `src[open_idx]`, or -1 if unbalanced.
+
+    A distinct, non-brace-aware version of `_match_brace`: a macro argument
+    list may itself contain nested `[...]`/`(...)`, e.g. `dbg!(v, [1, 2])`.
+    String literals are already blanked by `_strip_comments` by the time this
+    runs, so `{}` inside a format string cannot desynchronise the scan.
+    """
+    want = _DELIM_OPEN[src[open_idx]]
+    stack = [want]
+    i = open_idx + 1
+    while i < len(src) and stack:
+        ch = src[i]
+        if ch in _DELIM_OPEN:
+            stack.append(_DELIM_OPEN[ch])
+        elif ch in (")", "]", "}"):
+            if ch != stack[-1]:
+                return -1
+            stack.pop()
+        i += 1
+    return i - 1 if not stack else -1
+
+
+def _is_debug_only_use(src: str, pos: int) -> bool:
+    """True when the `volatile` at `pos` is an ARGUMENT of a logging macro.
+
+    This is a depth scan, not "is there a logging macro somewhere earlier in
+    this line segment". The weaker test is wrong: it exempts any `volatile`
+    that merely shares a statement with a debug call, including
+
+        if debug_probe!(ptr) || volatile { ... }
+
+    where `volatile` is a real guard and the macro is a different term of the
+    same condition. Only a token lexically inside the macro's own delimiters
+    is a non-use, so a nested argument list counts and a sibling term does
+    not.
+    """
+    start = max(
+        src.rfind("\n", 0, pos),
+        src.rfind(";", 0, pos),
+        src.rfind("{", 0, pos),
+    ) + 1
+    for m in _LOG_MACRO_RE.finditer(src, start, pos):
+        open_idx = m.end() - 1
+        close_idx = _match_delim(src, open_idx)
+        if close_idx >= 0 and open_idx < pos < close_idx:
+            return True
+    return False
+
+
+def _has_real_use(src: str, lo: int, hi: int) -> bool:
+    """True when the window contains a `volatile` use that is not a debug print."""
+    for m in _USE_RE.finditer(src, lo, hi):
+        if not _is_debug_only_use(src, m.start()):
+            return True
+    return False
 # Tokens that put the following `Instruction::Load { .. }` in PATTERN position.
 # `if let X { .. } = e` and `match e { X { .. } => .. }` both introduce a
 # pattern; the `=` that follows the pattern is outside the window we look at,
@@ -565,7 +696,7 @@ def check_source(text: str, origin: str) -> list[str]:
                 f"inside a {span}-line block, past the {MAX_SCAN_LINES}-line "
                 f"scan cap; refusing to claim this site is clean")
             continue
-        if not _USE_RE.search(src, close_idx + 1, end):
+        if not _has_real_use(src, close_idx + 1, end):
             violations.append(
                 f"{origin}:{line}: binds `volatile` from Instruction::{kind} "
                 f"and never uses it -- an observable-access guard was dropped "
@@ -587,13 +718,13 @@ _SELF_TEST_CASES = [
              if dominates { helper(ptr, ty) } else { false }
          } else { false }
      }
-     """, True),
+     """, True, False),
     ("explicit discard is fine",
      """
      fn f(inst: &Instruction) -> bool {
          if let Instruction::Load { ptr, volatile: _, .. } = inst { helper(ptr) } else { false }
      }
-     """, False),
+     """, False, False),
     ("binding with a real use is fine",
      """
      fn f(inst: &Instruction) -> bool {
@@ -601,7 +732,7 @@ _SELF_TEST_CASES = [
              if *volatile { false } else { helper(ptr) }
          } else { false }
      }
-     """, False),
+     """, False, False),
     ("match arm, not if-let",
      """
      fn f(inst: &Instruction) -> bool {
@@ -612,7 +743,7 @@ _SELF_TEST_CASES = [
              _ => false,
          }
      }
-     """, False),
+     """, False, False),
     ("a dropped store guard is caught too",
      """
      fn f(inst: &Instruction) -> bool {
@@ -620,13 +751,13 @@ _SELF_TEST_CASES = [
              sink(ptr, val)
          } else { false }
      }
-     """, True),
+     """, True, False),
     ("`volatile: false` construction is not a binding",
      """
      fn make() -> Instruction {
          Instruction::Load { dest, ptr, ty, seg, volatile: false }
      }
-     """, False),
+     """, False, False),
     ("a mention inside a comment does not count as a use",
      """
      fn f(inst: &Instruction) -> bool {
@@ -635,7 +766,7 @@ _SELF_TEST_CASES = [
              helper(ptr)
          } else { false }
      }
-     """, True),
+     """, True, False),
     ("a mention inside a string does not count as a use",
      """
      fn f(inst: &Instruction) -> bool {
@@ -644,7 +775,7 @@ _SELF_TEST_CASES = [
              helper(ptr)
          } else { false }
      }
-     """, True),
+     """, True, False),
     ("`volatile_x` is a different identifier",
      """
      fn f(inst: &Instruction) -> bool {
@@ -653,7 +784,7 @@ _SELF_TEST_CASES = [
              helper(ptr, volatile_x)
          } else { false }
      }
-     """, True),
+     """, True, False),
     # The shapes that produced false positives while this gate was being
     # written.  Each one is a real construct from src/passes, and each was
     # first reported as a dead binding: they all bind `volatile` from an IR
@@ -668,7 +799,7 @@ _SELF_TEST_CASES = [
          if *seg_override != AddressSpace::Default || *volatile { continue; }
          sink(ptr, val)
      }
-     """, False),
+     """, False, False),
     ("or-pattern binding into a tuple",
      """
      fn f(inst: &Instruction) -> bool {
@@ -681,7 +812,7 @@ _SELF_TEST_CASES = [
          if !*volatile && *seg == AddressSpace::Default { helper(ptr, ty) }
          else { false }
      }
-     """, False),
+     """, False, False),
     ("remapping `match`: the PATTERN is not a dead binding",
      """
      fn f(inst: &Instruction) -> bool {
@@ -697,7 +828,7 @@ _SELF_TEST_CASES = [
              _ => inst,
          }
      }
-     """, False),
+     """, False, False),
     ("remapping `match`: the CONSTRUCTION is not a binding at all",
      """
      fn f(inst: &Instruction) -> bool {
@@ -713,7 +844,7 @@ _SELF_TEST_CASES = [
              _ => inst,
          }
      }
-     """, False),
+     """, False, False),
     ("remapping `match` with the guard actually dropped",
      """
      fn f(inst: &Instruction) -> bool {
@@ -729,7 +860,7 @@ _SELF_TEST_CASES = [
              _ => inst,
          }
      }
-     """, True),
+     """, True, False),
     # Rule 2: volatility passed as a parameter.  The first case is the OLD
     # `store_bitfield_split` signature verbatim -- the commit that hid the
     # volatile-bitfield bug by renaming the parameter instead of using it.
@@ -740,48 +871,197 @@ _SELF_TEST_CASES = [
                              _volatile: bool, sso: SsoMode) {
          let x = self.load(addr, storage_ty);
      }
-     """, True),
+     """, True, False),
     ("a volatile parameter the body reads is fine",
      """
      fn store_bitfield_split(&mut self, addr: Value, volatile: bool, sso: SsoMode) {
          self.emit(Store { volatile, ptr: addr });
      }
-     """, False),
+     """, False, False),
     ("a volatile parameter never read is flagged",
      """
      fn lower(&mut self, volatile: bool, addr: Value) {
          self.emit(Load { volatile: false, ptr: addr });
      }
-     """, True),
+     """, True, False),
     ("explicit discard of a parameter is fine",
      """
      fn lower(&mut self, volatile: bool, addr: Value) {
          let _ = volatile;
          self.emit(Load { ptr: addr });
      }
-     """, False),
+     """, False, False),
     ("a pointer type that mentions volatile is not a flag",
      """
      fn describe(ptr: *volatile u8, len: usize) -> usize { len }
-     """, False),
+     """, False, False),
     ("a trait method declaration has no body and is not judged",
      """
      trait T { fn lower(&self, volatile: bool, addr: Value) -> u8; }
-     """, False),
+     """, False, False),
     ("unterminated body fails closed",
      """
      fn f(inst: &Instruction) -> bool {
          if let Instruction::Load { ptr, volatile, .. } = inst { helper(ptr)
      }
-     """, True),
+     """, True, False),
+    # ── the three documented blind spots, pinned so they stay documented ──
+    # Each of these is a refactor that removes a volatile guard and leaves the
+    # binding compiling. They are recorded as EXPECTED RESULTS, not as
+    # expectations that they should one day fail: the gate cannot see them,
+    # and a gate that quietly stops checking something is worse than one that
+    # says so.
+    # The two cases below are the ONLY coverage of _is_debug_only_use, so
+    # they must discriminate: with that function deleted they must go clean.
+    # `volatile` is passed as a MACRO ARGUMENT, never inside a string literal
+    # -- _strip_comments blanks literals, so `eprintln!("volatile={volatile}")`
+    # never put `volatile` in the window at all and the case was a violation
+    # for an entirely unrelated reason. It passed whether or not the feature
+    # existed. The `mutation_test()` below enforces that property
+    # mechanically -- it mutates the feature and requires the suite to go
+    # red -- so this class of test cannot rot back.
+    ("guard deleted, binding kept alive by a debug ARGUMENT",
+     """
+     fn f(inst: &Instruction) -> bool {
+         if let Instruction::Load { ptr, ty, volatile, .. } = inst {
+             dbg!(ptr, volatile);
+             helper(ptr, ty)
+         } else { false }
+     }
+     """, True, False),
+    ("guard deleted, binding kept alive by an assert ARGUMENT",
+     """
+     fn f(inst: &Instruction) -> bool {
+         if let Instruction::Load { ptr, ty, volatile, .. } = inst {
+             assert!(!volatile, "x");
+             helper(ptr, ty)
+         } else { false }
+     }
+     """, True, False),
+    # F4 regression. `volatile` is a SIBLING TERM of the condition, not an
+    # argument of dbg!. The old "is a logging macro somewhere earlier in this
+    # line segment" test found `dbg!` and wrongly exempted it, so a perfectly
+    # ordinary guard was reported as a dropped one. The depth scan requires
+    # the token to be inside the macro's delimiters, so this is clean.
+    ("`volatile` beside a debug macro is still a real use",
+     """
+     fn f(inst: &Instruction) -> bool {
+         if let Instruction::Load { ptr, ty, volatile, .. } = inst {
+             if dbg!(ptr) || volatile { return true; }
+             helper(ptr, ty)
+         } else { false }
+     }
+     """, False, False),
+    ("nested arg list: `dbg!((p, 1), volatile)` is exempt, so it is a violation",
+     """
+     fn f(inst: &Instruction) -> bool {
+         if let Instruction::Load { ptr, ty, volatile, .. } = inst {
+             dbg!((ptr, 1), volatile);
+             helper(ptr, ty)
+         } else { false }
+     }
+     """, True, False),
+    ("a SIBLING arm's use satisfies the window",
+     """
+     fn f(inst: &Instruction) -> bool {
+         match inst {
+             Instruction::Load { ptr, ty, volatile, .. } => {
+                 dbg!(ptr, volatile);
+                 helper(ptr, ty)
+             }
+             Instruction::Store { val, ptr, ty, seg_override, volatile } => {
+                 helper(ptr, ty, *volatile, val, seg_override)
+             }
+             _ => false,
+         }
+     }
+     """, False, True),
+    ("by design: `volatile: _` is the reviewable opt-out",
+     """
+     fn f(inst: &Instruction) -> bool {
+         if let Instruction::Load { ptr, ty, volatile: _, .. } = inst {
+             helper(ptr, ty)
+         } else { false }
+     }
+     """, False, False),
+    ("blind spot: a `..` arm never mentions volatile at all",
+     """
+     fn f(inst: &Instruction) -> bool {
+         match inst {
+             Instruction::Load { .. } => helper(inst),
+             _ => false,
+         }
+     }
+     """, False, False),
 ]
+
+
+def mutation_test() -> int:
+    """Prove the self-test can actually fail.
+
+    The whole point of _is_debug_only_use is a hole nobody was looking for.
+    A regression test for a hole is worthless if it cannot distinguish "the
+    hole is closed" from "the detector cannot see this shape at all" -- and
+    mine could not, for its whole life: the case it shipped with put
+    `volatile` inside a string literal, which _strip_comments blanks, so the
+    window never saw it and the case reported a violation for an unrelated
+    reason. Deleting the feature entirely left the suite 19/19 green.
+
+    So rather than trust that the cases look discriminating, mutate the
+    feature and require the suite to go red. Two mutations:
+      DELETE  _has_real_use ignores _is_debug_only_use (pre-PR behaviour)
+      WEAK    _is_debug_only_use degrades to "a macro appears earlier here"
+    Each must kill >=1 case. This is the check that would have caught it.
+    """
+    global _has_real_use, _is_debug_only_use
+    real_use, is_debug = _has_real_use, _is_debug_only_use
+
+    def _deleted(src, lo, hi):
+        return bool(_USE_RE.search(src, lo, hi))
+
+    def _weak(src, pos):
+        start = max(src.rfind("\n", 0, pos), src.rfind(";", 0, pos),
+                    src.rfind("{", 0, pos)) + 1
+        return bool(_LOG_MACRO_RE.search(src, start, pos))
+
+    failures = 0
+    try:
+        for name, new_use, new_debug in (("DELETE", _deleted, is_debug),
+                                         ("WEAK", real_use, _weak)):
+            _has_real_use = new_use
+            _is_debug_only_use = new_debug
+            killed = [c[0] for c in _SELF_TEST_CASES
+                      if bool(check_source(c[1], "<mutation>")) != c[2]]
+            gaps = {c[0] for c in _SELF_TEST_CASES if c[3]}
+            killed = [k for k in killed if k not in gaps]
+            ok = bool(killed)
+            failures += 0 if ok else 1
+            print("  %-4s mutation %-7s kills %d case(s)%s"
+                  % ("ok" if ok else "FAIL", name, len(killed),
+                     ("  e.g. %s" % killed[0]) if killed else "  <-- MUTANT SURVIVED"))
+    finally:
+        _has_real_use, _is_debug_only_use = real_use, is_debug
+    return failures
 
 
 def self_test() -> int:
     failures = 0
     print("== volatile-destructuring ratchet self-test ==")
-    for label, src, expect in _SELF_TEST_CASES:
+    closed = 0
+    for label, src, expect, known_gap in _SELF_TEST_CASES:
         got = check_source(src, "<self-test>")
+        if known_gap:
+            # A known gap is a case we KNOW we miss. Expectation is "clean".
+            # If it ever starts reporting a violation the gap has been closed,
+            # which is progress -- report it as such and do not fail the run,
+            # so that closing a gap is never punished as a regression.
+            if got:
+                closed += 1
+                print("  GAP-  %-46s KNOWN GAP CLOSED -- update the expectation"
+                      % label)
+            else:
+                print("  gap   %-46s still a known gap" % label)
+            continue
         ok = bool(got) == expect
         failures += 0 if ok else 1
         print("  %-4s %-46s expect=%-9s got=%s"
@@ -793,6 +1073,9 @@ def self_test() -> int:
         print("SELF-TEST FAILED: %d/%d" % (failures, len(_SELF_TEST_CASES)))
     else:
         print("self-test: PASS")
+    if closed:
+        print("  %d known gap(s) now closed -- tighten the expectations above"
+              % closed)
     return failures
 
 
@@ -802,9 +1085,18 @@ def main() -> int:
     ap.add_argument("--self-test", action="store_true",
                     help="verify the detector against known-bad and known-good "
                          "shapes, then exit")
+    ap.add_argument("--mutation-test", action="store_true",
+                    help="prove the self-test can fail: mutate the "
+                         "debug-only-use feature and require the suite to "
+                         "notice")
     args = ap.parse_args()
     if args.self_test:
-        return 1 if self_test() else 0
+        bad = self_test()
+        print("== discrimination proof (mutate the feature) ==")
+        bad += mutation_test()
+        return 1 if bad else 0
+    if args.mutation_test:
+        return 1 if mutation_test() else 0
 
     src_root = args.root / "src"
     if not src_root.is_dir():

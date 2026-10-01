@@ -626,6 +626,22 @@ pub(super) fn plain_gp_operand(text: &str) -> Option<RegId> {
     if fam == REG_NONE || fam > REG_GP_MAX {
         return None;
     }
+    // `register_family_fast` dispatches on the first four bytes and never
+    // looks at the length, so it maps `%raxfoo` to %rax and `%rdiblah` to
+    // %rdi. That is the right trade for a hot prefix lookup, but it is wrong
+    // for a predicate whose whole job is to answer "is this token exactly a
+    // bare register?". Every caller below then compares the spelling against
+    // REG_NAMES to recover the width, so a longer token would pass the
+    // family test and then fall through every width comparison -- accepted
+    // here, silently useless later. Require an exact spelling.
+    let f = fam as usize;
+    if text != REG_NAMES[0][f]
+        && text != REG_NAMES[1][f]
+        && text != REG_NAMES[2][f]
+        && text != REG_NAMES[3][f]
+    {
+        return None;
+    }
     Some(fam)
 }
 
@@ -3279,7 +3295,47 @@ fn rename_plain_family_reads(t: &str, from: RegId, to: RegId) -> Option<String> 
 #[cfg(test)]
 mod tests {
     use super::super::super::peephole_optimize;
-    use super::{SibAddr, compose_sib, operand_start, parse_disp, splice_lea_into_mem_operand};
+    use super::{
+        SibAddr, compose_sib, operand_start, parse_disp, plain_gp_operand,
+        splice_lea_into_mem_operand,
+    };
+
+    /// `plain_gp_operand` answers "is this token exactly a bare GP register",
+    /// which is what lets the memory-operand allowlist reject a store operand
+    /// without a denylist. `register_family_fast` only inspects the first four
+    /// bytes, so without the exact-spelling guard a token that merely *starts*
+    /// with a register name was accepted: `%raxfoo` read as %rax. That is
+    /// the shape a misspelt or newly-parsed operand would take, and it is
+    /// exactly the hole the allowlist exists to close.
+    #[test]
+    fn plain_gp_operand_requires_an_exact_spelling() {
+        for good in [
+            "%rax", "%eax", "%ax", "%al", "%rdx", "%r8", "%r15", "%rdi", "%sil",
+        ] {
+            assert!(
+                plain_gp_operand(good).is_some(),
+                "{good} is a real register spelling and must be accepted"
+            );
+        }
+        for bad in [
+            "%raxfoo", "%eaxbar", "%rdiblah", "%r8x", "%rax ", "%rax,", "%rcx_tl",
+        ] {
+            assert!(
+                plain_gp_operand(bad).is_none(),
+                "{bad} is not a register spelling and must be rejected"
+            );
+        }
+    }
+
+    /// The allowlist this predicate serves: a memory operand is never a
+    /// plain register, and a store between two compares is what the
+    /// redundant-compare fold must never delete across.
+    #[test]
+    fn plain_gp_operand_rejects_memory_operands() {
+        assert!(plain_gp_operand("-128(%rax)").is_none());
+        assert!(plain_gp_operand("(%rax)").is_none());
+        assert!(plain_gp_operand("%rax").is_some());
+    }
 
     fn run(asm: &str) -> String {
         peephole_optimize(asm.to_string())

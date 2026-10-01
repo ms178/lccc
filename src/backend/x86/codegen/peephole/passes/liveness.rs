@@ -32,7 +32,7 @@
 //!   and `%r10` (static chain), and clobbers the caller-saved set.
 
 use super::super::types::*;
-use super::helpers::{get_dest_reg, is_read_modify_write, src_mentions_family};
+use super::helpers::{get_dest_reg, is_read_modify_write, src_mentions_family, writes_family_full};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 /// All 16 GP families.
@@ -1336,7 +1336,47 @@ impl FileLiveness {
                 let dest = get_dest_reg(&infos[n]);
                 if dest != REG_NONE && dest <= REG_GP_MAX {
                     let bit = 1u16 << dest;
-                    writes |= bit;
+                    // KILL and USE are two different questions. They were
+                    // being answered by one conflated test, and each half was
+                    // wrong in a way that cancelled the other's damage --
+                    // which is why neither showed up in a test until both
+                    // were separated.
+                    //
+                    // KILL (`writes`): does the old value of the FAMILY cease
+                    // to exist? Only a >=32-bit redefinition does; a byte or
+                    // word destination preserves the rest of the register.
+                    // `helpers::writes_family_full` is the canonical answer,
+                    // and it is the SAME predicate the delete-a-definition
+                    // passes ask, so liveness and acceptance can never
+                    // disagree about whether a destination kills its family.
+                    //
+                    // USE (`reads`): does the new value depend on the old
+                    // one? For a pure write that is exactly "the source names
+                    // the destination family" -- `src_mentions_family`.
+                    //
+                    // The removed code gated the USE answer on the
+                    // destination also being full width, which is a KILL
+                    // condition leaking into a USE question. Two consequences,
+                    // both observed in the rotated-loop shape that blocks the
+                    // compare/branch fusion at every loop latch
+                    // (engineering/FOLLOWUP-2026-09-30-affine-exit-compare.md):
+                    //
+                    //  * `setl %r8b` (partial destination, and with no source
+                    //   register at all -- its input is FLAGS) was modelled
+                    //   as READING `%r8`. Every setcc inside a loop then
+                    //   pinned `%r8` live-in at the header around the back
+                    //   edge, so the carrier could never be proven dead and
+                    //   the fusion refused forever.
+                    //  * Compensating for that over-broad USE, the same code
+                    //   claimed a FULL kill for the same partial write. The
+                    //   `live_out & !writes` intersection then dropped `%r8`
+                    //   for a successor that reads its preserved upper bytes
+                    //   -- an over-approximating KILL, i.e. a genuinely live
+                    //   definition presented to every acceptance pass as
+                    //   dead. That is a miscompile waiting for a consumer.
+                    if writes_family_full(&infos[n], t, dest) {
+                        writes |= bit;
+                    }
                     // A pure write does not read its destination; anything else
                     // (add, cmov, inc, shifts, xchg) does.
                     if is_pure_write_mnemonic(t) {
@@ -1344,14 +1384,7 @@ impl FileLiveness {
                         // middle operand, 16-bit and high-byte reads, and
                         // strips `#` comments so comment commas never move
                         // the source boundary).
-                        let src_reads_dest = src_mentions_family(t, dest);
-                        let name64 = REG_NAMES[0][dest as usize];
-                        let name32 = REG_NAMES[1][dest as usize];
-                        // A partial write (8/16-bit destination) preserves the
-                        // rest of the register, so the old value stays live.
-                        let dst_text = t[t.rfind(',').map(|c| c + 1).unwrap_or(0)..].trim();
-                        let full = dst_text == name64 || dst_text == name32;
-                        if !src_reads_dest && full {
+                        if !src_mentions_family(t, dest) {
                             reads &= !bit;
                         }
                     } else if t.starts_with("xor") {
@@ -1552,6 +1585,116 @@ mod tests {
 
     fn edit(store: &mut LineStore, infos: &mut [LineInfo], n: usize, text: &str) {
         replace_line(store, &mut infos[n], n, format!("    {text}"));
+    }
+
+    /// KILL and USE are separate questions, and this is the loop-latch shape
+    /// that proved they had been conflated
+    /// (engineering/FOLLOWUP-2026-09-30-affine-exit-compare.md).
+    ///
+    ///     setl %r8b            -- input is FLAGS, not %r8; writes the low BYTE
+    ///     movzbl %r8b, %r8d   -- reads the low byte, zero-extends to 32 bits
+    ///
+    /// The old model answered both questions with one test gated on the
+    /// destination being full width, and was wrong in both directions:
+    /// `setl` was recorded as READING `%r8` (it never does), while the very
+    /// same line was recorded as KILLING the whole 64-bit family (it only
+    /// writes the low byte, so `live_out & !writes` dropped `%r8` for a
+    /// successor reading the preserved upper bytes -- a live definition
+    /// presented to every acceptance pass as dead).
+    ///
+    /// These are asserted as raw effects, not inferred from a fusion firing,
+    /// so the property is pinned independently of any consumer.
+    #[test]
+    fn a_setcc_destination_is_neither_a_use_nor_a_full_width_kill() {
+        let r8 = register_family_fast("%r8");
+        let bit = 1u16 << r8;
+        let asm = concat!(
+            "main:\n",
+            "    .cfi_startproc\n",
+            "    setl %r8b\n",
+            "    movzbl %r8b, %r8d\n",
+            "    .cfi_endproc\n",
+            "    ret\n",
+        );
+        let (store, _infos, lv) = build(asm);
+        let setcc = line_of(&store, "setl %r8b");
+        let relay = line_of(&store, "movzbl %r8b, %r8d");
+        for n in [setcc, relay] {
+            assert!(
+                lv.known[n],
+                "line {n} must be analysable, or this test is vacuous"
+            );
+        }
+
+        // `setl` consumes FLAGS. It must not be modelled as reading `%r8`:
+        // that spurious use is what pinned the carrier live around a back
+        // edge and made the compare/branch fusion refuse permanently.
+        assert_eq!(
+            lv.effect[setcc].0 & bit,
+            0,
+            "`setl %r8b` must not read `%r8` -- its input is FLAGS:\n{}",
+            store.get(setcc)
+        );
+        // ...and an 8-bit destination does not retire the preserved upper
+        // bytes, so it is not a kill of the family either.
+        assert_eq!(
+            lv.effect[setcc].1 & bit,
+            0,
+            "`setl %r8b` writes only the low byte, so it must not kill `%r8`:\n{}",
+            store.get(setcc)
+        );
+
+        // The relay is the opposite on both counts, and must stay that way:
+        // it DOES consume the byte, and its 32-bit write zero-extends, which
+        // retires the old 64-bit value.
+        assert_eq!(
+            lv.effect[relay].0 & bit,
+            bit,
+            "`movzbl %r8b, %r8d` consumes the byte and must be a use:\n{}",
+            store.get(relay)
+        );
+        assert_eq!(
+            lv.effect[relay].1 & bit,
+            bit,
+            "`movzbl %r8b, %r8d` zero-extends to 32 bits and is a full kill:\n{}",
+            store.get(relay)
+        );
+    }
+
+    /// The conflation above was partly self-cancelling, so pin the direction
+    /// that makes it LOUD instead: a pure write whose destination is a whole
+    /// register and whose source is a different family kills and does not
+    /// use.  This is the `movq $4096, %rcx` shape -- dropping the kill here
+    /// would keep an address pinned live across a whole function.
+    #[test]
+    fn a_full_width_pure_write_kills_and_does_not_use() {
+        let rcx = register_family_fast("%rcx");
+        let bit = 1u16 << rcx;
+        let asm = concat!(
+            "main:\n",
+            "    .cfi_startproc\n",
+            "    movl %eax, %ecx\n",
+            "    .cfi_endproc\n",
+            "    ret\n",
+        );
+        let (store, _infos, lv) = build(asm);
+        let n = line_of(&store, "movl %eax, %ecx");
+        assert!(
+            lv.known[n],
+            "line {n} must be analysable, or this test is vacuous"
+        );
+        assert_eq!(
+            lv.effect[n].0 & bit,
+            0,
+            "must not read `%rcx`:\n{}",
+            store.get(n)
+        );
+        assert_eq!(
+            lv.effect[n].1 & bit,
+            bit,
+            "must kill `%rcx`:\n{}",
+            store.get(n)
+        );
     }
 
     /// Straight-line fold (the copy-propagation shape): spliced, exact.

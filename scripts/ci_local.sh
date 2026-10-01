@@ -439,6 +439,46 @@ gate "redundant-flags-compare" fast \
 gate "self-test-after-arith" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_self_test_after_arith.sh
 
+# Compare/branch fusion across a loop LATCH.  The gate is fail-closed on
+# carrier liveness, and it used to refuse on every backward branch: it asked
+# the liveness question of the pre-transform text, where the carrier really is
+# live because the zero-extending relay the fusion deletes reads the byte again
+# around the back edge.  A byte-wide `setl` cannot kill the 64-bit family, so no
+# family-granular fixpoint could ever resolve it -- the fusion was unreachable,
+# not merely unlucky, and a rotated `cmp/setcc/movzbl/test/jne` latch cost three
+# instructions per iteration.  Pinning it END TO END is the point: a unit test
+# of the liveness predicate passes or fails independently of whether the real
+# pipeline fires, which is the `incapable` failure mode from this same series.
+# Measured pre/post on one input: 5 instructions at the latch versus 2.
+gate "cmp-fuse-latch-liveness" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_cmp_fuse_latch_liveness.sh
+
+# Byte-compare window phase, page boundaries.  Upstream's guard driver parks q
+# at one safe offset (512), but the guard under test --
+# `q + (WIDTH-1) <= (q | 4095)` -- has all its meaning at the page END.  The
+# configuration that matters is p LONG (so the room test passes and the phase
+# runs), q's mismatch EARLY (so the scalar loop stops inside the page), and q
+# near the page end (so the window crosses into PROT_NONE).  Tying p's length
+# to the mismatch index -- the obvious way to write the sweep -- makes the
+# phase never run, and the sweep then passes with the page guard DELETED.  This
+# one was mutation-verified: forcing `page_ok` always-true must SIGSEGV here.
+gate "bytecmp-edge-sweep" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_bytecmp_edge_sweep.sh
+
+# Affine exit-compare folding.  `for (i = 0; i + C < n; i++)` materialises the
+# sum on every trip (`addq $1,%rdx; leaq 4(%rdx),%rsi; cmpq %r8,%rsi; jb`) when
+# the only thing that lea feeds is the loop's own guard.  The identity
+# `slt(iv + c, k) == slt(iv, k - c)` moves the offset to the invariant side.
+# Measured with Callgrind on a 2000x28-trip loop: 549863 Ir -> 493863 (-10.2%),
+# exactly the one instruction removed per trip times 56000 trips.
+#
+# Restricted to the four SIGNED ordered comparisons, and the gate pins that
+# restriction: for `ult(iv + c, k)` the wrap is DEFINED rather than UB and the
+# identity genuinely fails, so folding a pointer loop would be a silent
+# miscompile.  The gate carries that shape as its negative control.
+gate "affine-exit-compare" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_affine_exit_compare.sh
+
 # A gate must not report a FAILURE that did not happen.  Under `set -o
 # pipefail` a consumer that stops reading early (`head`, `grep -q`) kills its
 # producer with SIGPIPE and the pipeline then reports 141, so `if ... | grep -q`
@@ -898,7 +938,8 @@ if [ -x target/fastbuild/lccc-ld ]; then
         PATH="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin:$PATH" \
         LCCC_REQUIRE_I386=1 \
         LCCC_RELOCS_TOOL="$HOME/.cache/lccc-kernel-tools/bin/relocs" \
-        python3 tests/linker/run_linker_tests.py --lccc target/fastbuild/lccc --strict
+        python3 tests/linker/run_linker_tests.py --lccc target/fastbuild/lccc --strict \
+        --require-oracles bfd,lld
 else
     echo "SKIP  linker fuzz + linker suite (target/fastbuild/lccc-ld not built)"
     SKIPPED=$((SKIPPED + 4))
