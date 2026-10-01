@@ -1110,6 +1110,20 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
         // it (`movsbq %bl, %r11` -- the shape the IR's `Cast(bool -> i32)`
         // produces, which the "same family only" rule used to bail on).
         let mut tested_fam = bool_fam;
+        // EVERY family a widening copy defines, not just the last one.
+        //
+        // The idiom this pass matches is `setCC %al; movzbl %al, %rN; test
+        // %rN, %rN; cmovCC`, and the pass deletes all of those lines.  A source
+        // can widen the same boolean twice (`movzbl %al, %r8d; movzbl %al,
+        // %r9d`) -- and then `tested_fam` names only `%r9`, so every guard
+        // tested the last destination while the deletion also took `%r8`'s
+        // definition.  A surviving `cmovne %r8d, %ebx` would read a value
+        // nobody defines any more.  Tracking the whole set makes the
+        // intervening-line scan, the cmov-operand check and the deadness proof
+        // all cover every definition the rewrite removes, and the fold still
+        // fires whenever all of them really are dead -- so this costs reach
+        // only for shapes that were never sound.
+        let mut widened_mask: u16 = 0;
         while let Some(n) = next_real(infos, k, len) {
             k = n;
             if infos[n].pinned || infos[n].is_barrier() {
@@ -1135,6 +1149,7 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
                     // ones impossible.
                     if sfam == bool_fam && src == breg && dfam != REG_NONE && dfam <= REG_GP_MAX {
                         tested_fam = dfam;
+                        widened_mask |= 1u16 << dfam;
                         owned.push(n);
                         continue;
                     }
@@ -1166,8 +1181,7 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
                 // allocator is free to place it after the test.  Such lines
                 // stay in the output; they only have to avoid the flags and
                 // the registers we are about to delete.
-                let tested_mask = 1u16 << tested_fam;
-                if infos[n].reg_refs & (bool_mask | tested_mask) != 0
+                if infos[n].reg_refs & (bool_mask | widened_mask) != 0
                     || flags_effect(tn) != FlagsEffect::Neutral
                 {
                     break;
@@ -1176,8 +1190,7 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
             }
             // Any other line: it must neither touch the boolean (or its
             // widened copy) nor the flags.
-            let tested_mask = 1u16 << tested_fam;
-            if infos[n].reg_refs & (bool_mask | tested_mask) != 0
+            if infos[n].reg_refs & (bool_mask | widened_mask) != 0
                 || flags_effect(tn) != FlagsEffect::Neutral
             {
                 break;
@@ -1209,9 +1222,9 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
                 continue;
             }
         };
-        // The cmov must not read the boolean or its widened copy (it would
-        // lose the definition we are deleting).
-        if infos[cmov_i].reg_refs & (bool_mask | (1u16 << tested_fam)) != 0 {
+        // The cmov must not read the boolean or ANY of its widened copies (it
+        // would lose a definition we are deleting).
+        if infos[cmov_i].reg_refs & (bool_mask | widened_mask) != 0 {
             i += 1;
             continue;
         }
@@ -1235,10 +1248,22 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
         let bool_dead = matches!(lv.live_after(cmov_i, bool_fam), Some(false))
             || dead_in_block_after(store, infos, cmov_i + 1, bool_fam)
             || family_private_to(store, infos, i, bool_fam, &owned);
-        let tested_dead = tested_fam == bool_fam
-            || matches!(lv.live_after(cmov_i, tested_fam), Some(false))
-            || dead_in_block_after(store, infos, cmov_i + 1, tested_fam);
-        if !bool_dead || !tested_dead {
+        // Every widened copy the rewrite deletes needs its own deadness proof:
+        // one live copy is enough to make the deletion observable.
+        let mut widened_dead = true;
+        for fam in 0..=REG_GP_MAX {
+            if widened_mask & (1u16 << fam) == 0 || fam == bool_fam {
+                continue;
+            }
+            let dead = matches!(lv.live_after(cmov_i, fam), Some(false))
+                || dead_in_block_after(store, infos, cmov_i + 1, fam)
+                || family_private_to(store, infos, i, fam, &owned);
+            if !dead {
+                widened_dead = false;
+                break;
+            }
+        }
+        if !bool_dead || !widened_dead {
             i += 1;
             continue;
         }
@@ -3825,5 +3850,57 @@ mod tests {
         for t in ["cmpss $0, %xmm0, %xmm1", "cmpsd $0, %xmm0, %xmm1"] {
             assert_eq!(flags_effect(t), FlagsEffect::Reads, "{t} is unmodelled");
         }
+    }
+}
+
+#[cfg(test)]
+mod widened_copy_tracking_tests {
+    //! `setCC; movzbl %al, %rN; test %rN, %rN; cmovCC` deletes every widening
+    //! copy it walks over, so it must prove every one of them dead.  The scan
+    //! used to remember only the LAST destination while deleting all of them,
+    //! which let a `cmov` read the earlier copy's (now deleted) definition.
+    use super::super::peephole_optimize;
+
+    fn run(asm: &str) -> String {
+        peephole_optimize(asm.to_string())
+    }
+
+    fn f(body: &str) -> String {
+        format!(".text\nf:\n.cfi_startproc\n{body}\n.cfi_endproc\n")
+    }
+
+    #[test]
+    fn refuses_when_the_cmov_reads_an_earlier_widened_copy() {
+        let out = run(&f(
+            "    cmpq $0, %rdi\n    setne %al\n    movzbl %al, %r8d\n    movzbl %al, %r9d\n    testl %r9d, %r9d\n    cmovne %r8d, %ebx\n    movl %ebx, %eax\n    ret",
+        ));
+        assert!(
+            out.contains("setne %al"),
+            "boolean deleted while %%r8 was still read: {out}"
+        );
+        assert!(
+            out.contains("movzbl %al, %r8d"),
+            "%%r8 definition deleted: {out}"
+        );
+        // No fusion: the `test` (and therefore the whole idiom) survives, and
+        // the `cmov` still reads the definition it had.  The input's own
+        // `cmovne` is a SURVIVOR here -- the bug would have been deleting the
+        // `%r8d` definition under it, not removing it.
+        assert!(out.contains("testl %r9d, %r9d"), "fusion fired: {out}");
+        assert!(
+            out.contains("cmovne %r8d, %ebx"),
+            "the select changed shape: {out}"
+        );
+    }
+
+    #[test]
+    fn still_fuses_the_single_widening_shape() {
+        // Control for the test above: one widening copy, used by the `test`,
+        // dead afterwards -- the fold must still fire.
+        let out = run(&f(
+            "    cmpq $0, %rdi\n    setne %al\n    movzbl %al, %r8d\n    testl %r8d, %r8d\n    jne .Lx\n    movl $1, %eax\n    ret\n.Lx:\n    xorl %eax, %eax\n    ret",
+        ));
+        assert!(!out.contains("setne"), "fold did not fire: {out}");
+        assert!(out.contains("ne .Lx") || out.contains("e .Lx"), "{out}");
     }
 }

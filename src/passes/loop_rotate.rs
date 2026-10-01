@@ -1126,7 +1126,18 @@ fn try_rotate_loop(
     }
     // 7b. ZERO-ROT-AFFINE: fold the cloned exit comparison's affine operand
     //     into its constant bound (see `canonicalise_affine_exit_cmps`).
-    let affine_folds = canonicalise_affine_exit_cmps(&mut cloned_insts);
+    //
+    // `CCC_NO_AFFINE_EXIT_FOLD` must cover BOTH producers of the fold -- this
+    // clone and the standalone pass.  The switch exists so a misbehaving fold
+    // can be turned off without turning off rotation (which is a separate,
+    // older transformation), and a switch that quietly leaves half the fold
+    // running is worse than no switch: it makes the A/B that condemns the fold
+    // the same A/B that hides it.
+    let affine_folds = if affine_fold_enabled() {
+        canonicalise_affine_exit_cmps(&mut cloned_insts)
+    } else {
+        0
+    };
     if debug && affine_folds > 0 {
         eprintln!("[ROT] affine exit-compare folds: {affine_folds}");
     }
@@ -1314,20 +1325,18 @@ fn canonicalise_affine_exit_cmps(cloned: &mut [Instruction]) -> usize {
             (_, Operand::Value(v)) if is_foldable(*v) => (*v, true),
             _ => continue,
         };
-        // Signed order only -- see the doc comment.
-        let folded_op = if flipped {
-            match op {
-                IrCmpOp::Slt => IrCmpOp::Sgt,
-                IrCmpOp::Sle => IrCmpOp::Sge,
-                IrCmpOp::Sgt => IrCmpOp::Slt,
-                IrCmpOp::Sge => IrCmpOp::Sle,
-                _ => continue,
-            }
-        } else {
-            match op {
-                IrCmpOp::Slt | IrCmpOp::Sle | IrCmpOp::Sgt | IrCmpOp::Sge => *op,
-                _ => continue,
-            }
+        // Signed order only -- see the doc comment.  The OPERATOR DOES NOT
+        // CHANGE in either orientation: `iv + C op N` is `iv op N - C`, and
+        // `N op (iv + C)` is `(N - C) op iv` -- subtracting the same constant
+        // from both sides is what preserves the relation, and it is also why
+        // the rewrite is exact rather than approximate.  (An earlier revision
+        // mirrored the operator in the flipped case while ALSO swapping the
+        // operands; two negations do not cancel, so `N > iv + C` came out as
+        // `(N - C) < iv` -- for N=100, C=4, iv=0 that turned the true `100 > 4`
+        // into the false `96 < 0`.  Pinned by `affine_fold_orientation_tests`.)
+        let folded_op = match op {
+            IrCmpOp::Slt | IrCmpOp::Sle | IrCmpOp::Sgt | IrCmpOp::Sge => *op,
+            _ => continue,
         };
         let Some((iv_op, c, add_ty)) = affine.get(&affine_val.0) else {
             continue;
@@ -2337,5 +2346,137 @@ mod tests {
             src: Operand::Value(Value(3)),
         });
         assert_eq!(fold_affine_exit_compares(&mut f), 0);
+    }
+}
+
+#[cfg(test)]
+mod affine_fold_orientation_tests {
+    //! `canonicalise_affine_exit_cmps` folds the rotated latch's cloned exit
+    //! comparison.  Its algebra is the whole content of the pass, and it had a
+    //! wrong half: with the affine operand on the RIGHT it swapped the operands
+    //! *and* mirrored the operator, and two negations do not cancel, so
+    //! `N > iv + C` became `(N - C) < iv` -- for N=100, C=4, iv=0 the true
+    //! `100 > 4` came out as the false `96 < 0`.
+    //!
+    //! These tests do not check the SHAPE of the rewrite; they check that it is
+    //! an EQUIVALENCE, by evaluating the source predicate and the rewritten
+    //! comparison over a sweep of induction-variable values, for every signed
+    //! relation in both orientations.  A shape assertion would have passed on
+    //! the broken version -- it produced a comparison of exactly the expected
+    //! shape -- which is precisely why the algebra needs an oracle.
+    use super::*;
+
+    /// The IV value both sides are evaluated at.
+    const IV: u32 = 1;
+    /// The cloned `iv + C` temporary.
+    const TEMP: u32 = 100;
+
+    fn build(flipped: bool, op: IrCmpOp, c: i64, n: i64) -> Vec<Instruction> {
+        let add = Instruction::BinOp {
+            dest: Value(TEMP),
+            op: IrBinOp::Add,
+            lhs: Operand::Value(Value(IV)),
+            rhs: Operand::Const(IrConst::from_i64(c, IrType::I64)),
+            ty: IrType::I64,
+        };
+        let n_konst = Operand::Const(IrConst::from_i64(n, IrType::I64));
+        let cmp = Instruction::Cmp {
+            dest: Value(101),
+            lhs: if flipped {
+                n_konst.clone()
+            } else {
+                Operand::Value(Value(TEMP))
+            },
+            op,
+            rhs: if flipped {
+                Operand::Value(Value(TEMP))
+            } else {
+                n_konst
+            },
+            ty: IrType::I64,
+        };
+        vec![add, cmp]
+    }
+
+    /// Evaluate the (possibly rewritten) comparison at `iv`.  Only the IV and
+    /// constants may appear once the fold has run; the temporary appearing means
+    /// the fold did not fire.
+    fn eval_folded(cmp: &Instruction, iv: i64) -> Option<bool> {
+        let Instruction::Cmp { lhs, op, rhs, .. } = cmp else {
+            return None;
+        };
+        let value = |o: &Operand| -> Option<i64> {
+            match o {
+                Operand::Const(c) => c.to_i64(),
+                Operand::Value(v) if v.0 == IV => Some(iv),
+                _ => None,
+            }
+        };
+        Some(op.eval_i64(value(lhs)?, value(rhs)?))
+    }
+
+    /// The source predicate, evaluated directly from the C-level relation.
+    fn eval_source(flipped: bool, op: IrCmpOp, c: i64, n: i64, iv: i64) -> bool {
+        let temp = iv + c;
+        if flipped {
+            op.eval_i64(n, temp)
+        } else {
+            op.eval_i64(temp, n)
+        }
+    }
+
+    #[test]
+    fn all_signed_relations_in_both_orientations_are_equivalences() {
+        let relations = [IrCmpOp::Slt, IrCmpOp::Sle, IrCmpOp::Sgt, IrCmpOp::Sge];
+        let mut checked = 0usize;
+        for flipped in [false, true] {
+            for op in relations {
+                for &c in &[0i64, 1, 4, 7] {
+                    for &n in &[0i64, 1, 5, 16, 4096] {
+                        for iv in [-33i64, -1, 0, 1, 2, 5, 17, 100, 4095] {
+                            let mut insts = build(flipped, op, c, n);
+                            let folded = canonicalise_affine_exit_cmps(&mut insts);
+                            // `iv + C` must not overflow for the source to be
+                            // defined; skip the wrapping cases.
+                            if iv.checked_add(c).is_none() {
+                                continue;
+                            }
+                            // The fold is allowed to refuse when `N - C` is not
+                            // representable; when it fires it must be exact.
+                            if folded == 0 {
+                                continue;
+                            }
+                            let Some(after) = eval_folded(&insts[1], iv) else {
+                                // Still refers to the temporary: refused.
+                                continue;
+                            };
+                            let before = eval_source(flipped, op, c, n, iv);
+                            assert_eq!(
+                                before, after,
+                                "fold changed the predicate: flipped={flipped} op={op:?} c={c} \
+                                 n={n} iv={iv} ({before} -> {after})"
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            checked > 400,
+            "expected a broad sweep, checked only {checked}"
+        );
+    }
+
+    #[test]
+    fn the_flipped_oracle_catches_the_regression_it_was_written_for() {
+        // The exact shape the audit reported: `100 > (iv + 4)` at `iv = 0` is
+        // true.  The broken rewrite produced `96 < 0` (false).  Pin the value
+        // pair so the oracle above cannot silently stop covering it.
+        let mut insts = build(true, IrCmpOp::Sgt, 4, 100);
+        assert_eq!(canonicalise_affine_exit_cmps(&mut insts), 1);
+        let after = eval_folded(&insts[1], 0).expect("fold must leave a constant bound");
+        assert!(after, "100 > (0 + 4) must stay true after folding");
+        assert_eq!(eval_source(true, IrCmpOp::Sgt, 4, 100, 0), after);
     }
 }

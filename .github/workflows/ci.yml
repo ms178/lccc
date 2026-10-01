@@ -802,6 +802,14 @@ jobs:
           bash tests/regression/check_select_from_compare.sh
           bash tests/regression/check_affine_loop_fold.sh
           bash tests/regression/check_phi_acyclic_order.sh
+          # The FMA contract gate (packed arm exact at 4, zero under
+          # -ffp-contract=off / -mno-fma, unproven shapes refused) and the wide
+          # inclusive-bound envelope behind it.  A regression test that nothing
+          # runs is the defect these were written to fix, so they run here AND
+          # in ci_local.sh -- scripts/check_ci_gate_parity.py fails if the two
+          # lists drift, which is how this line came to exist.
+          bash tests/regression/check_fma_gating.sh
+          python3 tests/regression/verify_pr713_audit.py --quiet
           python3 scripts/check_doc_links.py
           bash tests/regression/check_ra_web_inloop_use.sh
           bash tests/regression/check_store_alu_cross_join.sh

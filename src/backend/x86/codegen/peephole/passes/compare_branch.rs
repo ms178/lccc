@@ -713,9 +713,21 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
         // PRODUCER cmp's flags where the dropped `testq`'s flags used to
         // be. A reader (cmov/setCC/adc/sbb/conditional jump/pushfq) before
         // the next full flag writer would observe the wrong flags.
-        let guard_end = (seq_indices[test_scan + 1] + 64).min(len);
+        // The window is capped so the walk stays linear and needs no liveness
+        // machinery.  Exhausting the CAP is not evidence that the flags stop
+        // mattering -- it is the absence of evidence -- so it refuses.  Running
+        // out of CODE is a boundary: there is nothing left that could read the
+        // flags.  Conflating the two is a fail-open gate, and the first
+        // version of this guard conflated them in the other direction: it
+        // refused whenever the window closed, including at the end of the
+        // section, which turned a correct fold into a missed one (caught by
+        // `test_condition_codes`, whose input ends right after the jump).  So
+        // the rule is stated exactly: a full flag writer, or the end of the
+        // scanned region, ends the hazard; the cap alone does not.
+        let cap_end = (seq_indices[test_scan + 1] + 64).min(len);
         let mut flags_hazard = false;
-        for g in (seq_indices[test_scan + 1] + 1)..guard_end {
+        let mut boundary = cap_end == len;
+        for g in (seq_indices[test_scan + 1] + 1)..cap_end {
             if infos[g].is_nop() || matches!(infos[g].kind, LineKind::Directive | LineKind::Empty) {
                 continue;
             }
@@ -733,8 +745,12 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
                 break;
             }
             if flags_full_writer(&gt) {
+                boundary = true;
                 break;
             }
+        }
+        if !boundary {
+            flags_hazard = true;
         }
         if flags_hazard {
             if std::env::var_os("CCC_DEBUG_CMP_FUSE").is_some() {
@@ -1173,5 +1189,80 @@ mod compare_branch_fusion_tests {
         ));
         assert!(out.contains("jne .Lx"), "{}", out);
         assert!(out.contains("setl %al"), "{}", out);
+    }
+}
+
+#[cfg(test)]
+mod flags_horizon_tests {
+    //! The post-branch flags scan is bounded at 64 lines, and it used to treat
+    //! "reached the horizon" as "the flags are dead" -- a fail-open gate.  A
+    //! reader further away than the horizon, with no writer in between, would
+    //! observe the PRODUCER cmp's flags where the deleted `test`'s flags used to
+    //! be.  These pin the fail-closed behaviour and its control.
+    //!
+    //! The filler lines are assembler directives: the scan walks SLOTS, so
+    //! directives advance it toward the horizon, and unlike real instructions
+    //! they cannot be deleted by another pass between here and the assertion.
+    use super::super::peephole_optimize;
+
+    fn run(asm: &str) -> String {
+        peephole_optimize(asm.to_string())
+    }
+
+    fn f(body: &str) -> String {
+        format!(".text\nf:\n.cfi_startproc\n{body}\n.cfi_endproc\n")
+    }
+
+    /// `n` alignment directives, each on its own line.  The trailing newline is
+    /// load-bearing: without it the directive is glued to the FOLLOWING line,
+    /// the reader the test means to place never exists as an instruction, and
+    /// the test passes for the wrong reason.
+    fn filler(n: usize) -> String {
+        (0..n).map(|_| "    .p2align 3\n".to_string()).collect()
+    }
+
+    #[test]
+    fn refuses_when_a_flag_reader_sits_past_the_horizon() {
+        let body = format!(
+            "    cmpl %eax, %ebx\n    setl %al\n    movzbq %al, %rax\n    testq %rax, %rax\n    jne .Lx\n{}    setne %cl\n    ret\n.Lx:\n    xorl %eax, %eax\n    ret",
+            filler(70)
+        );
+        let out = run(&f(&body));
+        assert!(
+            out.contains("setl"),
+            "fused although a flag reader sits past the horizon: {out}"
+        );
+    }
+
+    #[test]
+    fn fuses_when_the_code_ends_inside_the_window() {
+        // The other half of the fail-closed rule, and the case that made the
+        // first version of this guard a regression: a short section ends before
+        // the cap, so there is nothing left that could read the flags.  Without
+        // this, "refuse at the horizon" silently becomes "refuse at the end of
+        // every small function", which is a missed fold rather than a wrong
+        // one -- the kind of defect no correctness oracle can see.
+        let out = run(&f(
+            "    cmpl %eax, %ebx\n    setl %al\n    movzbq %al, %rax\n    testq %rax, %rax\n    jne .Lx\n.Lx:\n    ret",
+        ));
+        assert!(
+            out.contains("jl .Lx"),
+            "the fold was refused although nothing follows the section: {out}"
+        );
+    }
+
+    #[test]
+    fn fuses_when_the_horizon_finds_a_flag_writer() {
+        // Control: the same gap, but a full flag writer inside the window
+        // before the reader -- the walk reaches it, so the fused jump is safe.
+        let body = format!(
+            "    cmpl %eax, %ebx\n    setl %al\n    movzbq %al, %rax\n    testq %rax, %rax\n    jne .Lx\n{}    cmpl $1, %edx\n    setne %cl\n    ret\n.Lx:\n    xorl %eax, %eax\n    ret",
+            filler(10)
+        );
+        let out = run(&f(&body));
+        assert!(
+            out.contains("jl .Lx"),
+            "control did not fuse, so the refusal above proves nothing: {out}"
+        );
     }
 }

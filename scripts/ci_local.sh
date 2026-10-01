@@ -512,6 +512,20 @@ gate "select-from-compare" fast \
 gate "affine-loop-fold" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_affine_loop_fold.sh
 
+# The FMA contract gate.  It is registered here because a regression test that
+# nothing runs is the defect it was written to fix: the audit found the packed
+# matmul arm contracting unconditionally, the fix shipped, and nothing pinned
+# it -- so a later refactor could have removed the gate and every suite would
+# still have gone green.
+gate "fma-contract-gating" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_fma_gating.sh
+
+# The wide envelope behind that gate: 19 sizes x bound forms plus a runtime
+# bound.  Two seconds, and it is the sweep that found the inclusive-bound
+# miscompile -- the shell gate pins counts, this one proves the numbers.
+gate "audit-envelope" fast \
+    env LCCC=target/fastbuild/lccc python3 tests/regression/verify_pr713_audit.py --quiet
+
 gate "phi-acyclic-copy-order" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_phi_acyclic_order.sh
 

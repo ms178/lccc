@@ -271,6 +271,17 @@ fn x86_fma_enabled() -> bool {
     X86_FMA_AVAILABLE.with(|f| f.get())
 }
 
+/// May the matmul/FMA arms run on this target under this contract?
+///
+/// One predicate rather than two inline checks: the question "is fused
+/// arithmetic permitted here" has exactly one answer, and the two ways a
+/// caller can be wrong about it (`-ffp-contract=off`, `-mno-fma`) are the two
+/// halves of this function.  `neon` skips the ISA half because AArch64 has
+/// `fmla` in its baseline, so only the language contract can withdraw it.
+fn fma_transform_allowed(neon: bool, fp_contract: FpContract) -> bool {
+    fp_contract == FpContract::Fast && (neon || x86_fma_enabled())
+}
+
 /// Restrict this thread's vectorizer run to the reductions the LATE rerun
 /// exists for: Select-shaped integer min/max.
 ///
@@ -523,7 +534,7 @@ fn vectorize_with_analysis_mode(
         } else {
             analyze_loop_pattern(func, loop_info, cfg)
         };
-        if let Some(pattern) = matmul_pattern {
+        if let Some(mut pattern) = matmul_pattern {
             // Select vector width: default to AVX2 (4-wide) unless explicitly disabled
             let use_sse2 =
                 force_two_wide || std::env::var("LCCC_FORCE_SSE2").is_ok() || !x86_avx2_available();
@@ -545,11 +556,38 @@ fn vectorize_with_analysis_mode(
                 Operand::Const(c) => c.to_i64().is_some_and(|n| n < 2 * machine_step_width),
                 _ => false,
             };
+            // SEMANTIC + TARGET PRECONDITION.  This arm is an FMA transform --
+            // every packed step it emits is a fused multiply-add (`vfmadd231pd`
+            // / `fmla`), and THAT, not the memory layout, is what changes the
+            // program's numerics.  Two independent switches decide whether the
+            // user asked for fused arithmetic, and the arm honoured neither:
+            //
+            //   * `-ffp-contract=off` says the language's contraction licence is
+            //     withdrawn, so `a*b+c` must round twice.  The general
+            //     contraction path already checks `fp_contract` before choosing
+            //     a madd op; this arm did not, and `-O2 -ffp-contract=off` still
+            //     emitted `vfmadd231pd`.
+            //   * `-mno-fma` says the target has no FMA3 unit at all; emitting
+            //     the instruction is an illegal-instruction fault on that
+            //     machine.  `x86_fma_enabled()` is the resolved target answer.
+            //
+            // Both are checked here, before any IR is touched, so an unasked-for
+            // contraction stays scalar (and therefore bit-exact) instead of
+            // becoming a silent rounding difference.  NEON's `fmla` is baseline
+            // on AArch64, so only the contract half applies there.
             if skip_small {
                 if debug {
                     eprintln!(
                         "[VEC] Skip: constant trip count < 2x machine step width ({})",
                         machine_step_width
+                    );
+                }
+            } else if !fma_transform_allowed(neon, fp_contract) {
+                if debug {
+                    eprintln!(
+                        "[VEC] Skip matmul arm: fused arithmetic not requested/available \
+                         (fp_contract={fp_contract:?}, x86_fma={})",
+                        x86_fma_enabled()
                     );
                 }
             } else if use_sse2 {
@@ -558,7 +596,7 @@ fn vectorize_with_analysis_mode(
                         "[VEC] Matmul pattern matched! Transforming to FmaF64x2 (SSE2, 2-wide)"
                     );
                 }
-                total_changes += transform_to_fma_f64x2(func, &pattern);
+                total_changes += transform_to_fma_f64x2(func, &mut pattern);
             } else {
                 // Use AVX2 by default (or if LCCC_FORCE_AVX2 is set)
                 if debug {
@@ -566,7 +604,7 @@ fn vectorize_with_analysis_mode(
                         "[VEC] Matmul pattern matched! Transforming to FmaF64x4 (AVX2, 4-wide)"
                     );
                 }
-                total_changes += transform_to_fma_f64x4(func, &pattern);
+                total_changes += transform_to_fma_f64x4(func, &mut pattern);
             }
         } else if !neon
             && !force_two_wide
@@ -1210,6 +1248,97 @@ fn analyze_loop_pattern(
         return None;
     }
     let (exit_cmp_inst_idx, exit_cmp_dest, limit) = exit_cmp_info?;
+
+    // ── The exit test must BE the loop's exit test ────────────────────────
+    //
+    // Everything downstream is written against "the header's comparison is the
+    // loop's exit condition, and the header is the loop's only exit": the
+    // transform rewrites that comparison's non-IV operand in place to the byte
+    // limit, retargets the not-taken edge at the scalar remainder, and (for the
+    // quad shape) elides the remainder entirely.  The matcher used to take the
+    // FIRST IV-derived comparison it saw in the header and the FIRST outside
+    // successor it could find, which accepts a header whose branch tests some
+    // other value, and accepts loops that leave from a block other than the
+    // header.  Either makes the "limit" a number the loop does not actually
+    // respect.  Prove the shape instead of assuming it:
+    //
+    //   * the header's terminator is a CondBranch on exactly this comparison's
+    //     destination, and exactly one of its two successors stays in the loop
+    //     (so the other is the exit);
+    //   * no OTHER block of the loop leaves it -- an early exit would bypass the
+    //     remainder and the transform's exit retargeting;
+    //   * no call, atomic or volatile access is in the body: those are
+    //     per-ITERATION effects and the vector form runs the body once per
+    //     GROUP.  `is_pure` does not rescue this, because the hazard is the
+    //     call's ARGUMENTS -- they are derived from the IV, whose units this
+    //     transform changes (element index -> byte offset / quad index), so
+    //     even a pure call would be handed a different value.
+    {
+        let Terminator::CondBranch {
+            cond,
+            true_label,
+            false_label,
+            ..
+        } = &func.blocks[header_idx].terminator
+        else {
+            set_reject("matmul loop header does not end in a conditional branch");
+            return None;
+        };
+        if cond != &Operand::Value(exit_cmp_dest) {
+            set_reject("matmul loop header branch does not test the IV comparison");
+            return None;
+        }
+        let in_loop = |label: &BlockId| {
+            label_to_idx
+                .get(label)
+                .copied()
+                .is_some_and(|i| loop_info.body.contains(&i))
+        };
+        if in_loop(true_label) == in_loop(false_label) {
+            set_reject("matmul loop header does not have exactly one in-loop successor");
+            return None;
+        }
+        for &bi in &loop_info.body {
+            if bi == header_idx || bi >= func.blocks.len() {
+                continue;
+            }
+            match &func.blocks[bi].terminator {
+                Terminator::CondBranch {
+                    true_label,
+                    false_label,
+                    ..
+                } => {
+                    if !in_loop(true_label) || !in_loop(false_label) {
+                        set_reject("matmul loop has a side exit below the header");
+                        return None;
+                    }
+                }
+                Terminator::Branch(target) => {
+                    if !in_loop(target) {
+                        set_reject("matmul loop has an unconditional side exit");
+                        return None;
+                    }
+                }
+                _ => {}
+            }
+            for inst in &func.blocks[bi].instructions {
+                if matches!(
+                    inst,
+                    Instruction::Call { .. }
+                        | Instruction::CallIndirect { .. }
+                        | Instruction::Load { volatile: true, .. }
+                        | Instruction::Store { volatile: true, .. }
+                        | Instruction::AtomicLoad { .. }
+                        | Instruction::AtomicStore { .. }
+                        | Instruction::AtomicRmw { .. }
+                        | Instruction::AtomicCmpxchg { .. }
+                ) {
+                    set_reject("matmul loop body has an observable effect (call/atomic/volatile)");
+                    return None;
+                }
+            }
+        }
+    }
 
     // Search all blocks in the loop to find the one with the store instruction.
     // This is the actual computation block we want to vectorize.
@@ -17643,9 +17772,27 @@ fn insert_remainder_loop(
 }
 
 /// Transform the loop to use FmaF64x2 intrinsics.
-fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) -> usize {
+fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &mut VectorizablePattern) -> usize {
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
     let mut changes = 0;
+
+    // BOUND-NORMALIZATION PRECONDITION, and the FIRST mutation when it
+    // applies: the transform's arithmetic reads `pattern.limit` as an
+    // exclusive element count, so an inclusive source bound (`j <= N-1`) must
+    // be converted to `j < N` BEFORE anything else looks at the limit.  See
+    // `normalize_iv_exit_comparison` for the wrong-code history this prevents.
+    // It runs before the dominance/entry-edge preconditions because it only
+    // rewrites the exit comparison (and may hoist one `+1` into the header),
+    // which cannot invalidate either of them -- both reason about the loop's
+    // bases and CFG, not about the bound operand.
+    let mut next_val_id = func.next_value_id;
+    if !normalize_iv_exit_comparison(func, pattern, &mut next_val_id, debug) {
+        if debug {
+            eprintln!("[VEC] exit comparison is not a supported counted-loop bound; skipping loop");
+        }
+        return 0;
+    }
+    func.next_value_id = next_val_id;
 
     // DOMINANCE PRECONDITION -- before any IR is touched: the scalar
     // remainder must be able to reference every base with a dominating
@@ -18261,11 +18408,229 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
     changes
 }
 
+/// Canonicalize the loop's IV exit comparison to the EXCLUSIVE-trip form the
+/// whole transform is written against, and rewrite `pattern.limit` to match.
+///
+/// The transform's arithmetic treats `pattern.limit` as an exclusive element
+/// count: the byte limit is `(limit / 16) * 128`, the scalar remainder runs
+/// `while j < limit`, and the quad shape's `const_trip_covers_exactly(&limit,
+/// 0, 16, 8)` proof is a divisibility statement about `limit`.  The matcher,
+/// however, took the non-IV operand of the header comparison and ignored the
+/// OPERATOR (`op: _`), so for an inclusive source loop `for (j = 0; j <= N-1;
+/// j++)` it handed the transform `N-1` where the trip count is `N`.
+///
+/// That was not a precision-of-ambition bug, it was wrong code, and it
+/// reproduced on unmodified `main` (N=17 quad matmul with `j <= N-1`:
+/// checksum 10222.297959 against 4196.600000 for `j < N` and for every
+/// reference compiler; 240 of 289 result cells wrong, including a full
+/// 16-element group written past the row).  Two defects composed:
+///
+///   * the header comparison is rewritten IN PLACE with the byte limit while
+///     keeping its operator, so `Sle` became `byte_off <= byte_limit` -- true
+///     for one extra group, i.e. the vector body ran past the bound;
+///   * the scalar remainder compares `Slt` against the same `limit`, which for
+///     an inclusive source bound is one element short.
+///
+/// Fixing the symptom in either place would leave the other, and would leave
+/// every future consumer of `pattern.limit` to re-derive the convention.  So
+/// the convention is established ONCE, here, at the boundary between matcher
+/// and transform: the comparison is rewritten to the canonical ascending
+/// exclusive form (`iv < T`, the operand-swapped `T > iv`, or the ascending
+/// `iv != T`), `T` is materialised when the operator was inclusive, and
+/// `pattern.limit` becomes `T`.
+///
+/// Refusals, each with its reason:
+///   * unsigned operators (`Ult`/`Ule`/`Ugt`/`Uge`): the transform's own
+///     arithmetic (the remainder's `Slt`, `(n/16)*128`) is signed;
+///   * descending orientation (`iv > limit` with the IV on the left, and its
+///     `>=` twin): those need a different vector shape, not a rewritten bound;
+///   * `Eq` as a continuation test: an ascending IV never continues through it;
+///   * an IV-derived operand that is not the IV itself: the transform tracks
+///     the IV's units, and a scaled/offset derived value needs its own unit
+///     conversion;
+///   * an inclusive bound whose `+1` overflows the IV's type.
+///
+/// `Ne` is accepted: for the ascending unit-step IV this transform requires,
+/// `iv != T` and `iv < T` agree on every value actually reached, and the
+/// remainder's `Slt` is the same predicate one bound earlier.  A NON-unit or
+/// non-ascending step never reaches here (`fma_iv_starts_at_zero` and the
+/// latch-increment check pin the recurrence).
+///
+/// Returns `false` when the shape is not exactly this; the caller must then
+/// leave the loop alone.
+fn normalize_iv_exit_comparison(
+    func: &mut IrFunction,
+    pattern: &mut VectorizablePattern,
+    next_val_id: &mut u32,
+    debug: bool,
+) -> bool {
+    let iv = pattern.iv;
+    let (iv_on_left, bound, cmp_ty) = {
+        let Some(block) = func.blocks.get(pattern.header_idx) else {
+            return false;
+        };
+        let Some(Instruction::Cmp { lhs, rhs, ty, .. }) =
+            block.instructions.get(pattern.exit_cmp_inst_idx)
+        else {
+            return false;
+        };
+        match (lhs, rhs) {
+            (Operand::Value(l), _) if *l == iv => (true, rhs.clone(), *ty),
+            (_, Operand::Value(r)) if *r == iv => (false, lhs.clone(), *ty),
+            _ => {
+                if debug {
+                    eprintln!("[VEC] exit comparison does not name the IV itself; refusing");
+                }
+                return false;
+            }
+        }
+    };
+    if !matches!(cmp_ty, IrType::I32 | IrType::I64) {
+        return false;
+    }
+    let op = {
+        let Some(block) = func.blocks.get(pattern.header_idx) else {
+            return false;
+        };
+        let Some(Instruction::Cmp { op, .. }) = block.instructions.get(pattern.exit_cmp_inst_idx)
+        else {
+            return false;
+        };
+        *op
+    };
+    // Canonical operator + whether the bound needs +1 to become exclusive.
+    let (new_op, inclusive) = match (iv_on_left, op) {
+        (true, IrCmpOp::Slt) => (IrCmpOp::Slt, false),
+        (true, IrCmpOp::Sle) => (IrCmpOp::Slt, true),
+        (true, IrCmpOp::Ne) => (IrCmpOp::Ne, false),
+        (false, IrCmpOp::Sgt) => (IrCmpOp::Sgt, false),
+        (false, IrCmpOp::Sge) => (IrCmpOp::Sgt, true),
+        (false, IrCmpOp::Ne) => (IrCmpOp::Ne, false),
+        (_, IrCmpOp::Ult | IrCmpOp::Ule | IrCmpOp::Ugt | IrCmpOp::Uge) => {
+            if debug {
+                eprintln!("[VEC] unsigned exit comparison on a signed-IV transform; refusing");
+            }
+            return false;
+        }
+        _ => {
+            if debug {
+                eprintln!(
+                    "[VEC] exit comparison {op:?} (iv_on_left={iv_on_left}) has no exclusive-trip form; refusing"
+                );
+            }
+            return false;
+        }
+    };
+    // Materialise the exclusive bound.
+    let exclusive = if !inclusive {
+        bound
+    } else {
+        match &bound {
+            Operand::Const(c) => {
+                let Some(v) = c.to_i64() else { return false };
+                let Some(plus) = v.checked_add(1) else {
+                    if debug {
+                        eprintln!("[VEC] inclusive bound overflows the IV type; refusing");
+                    }
+                    return false;
+                };
+                let konst = match cmp_ty {
+                    IrType::I32 => IrConst::I32(plus as i32),
+                    _ => IrConst::I64(plus),
+                };
+                Operand::Const(konst)
+            }
+            Operand::Value(v) => {
+                // Runtime bound: hoist `limit + 1` into the header, BEFORE the
+                // comparison that consumes it.  The operand is loop-invariant
+                // (the matcher requires it), so header placement dominates both
+                // the rewritten comparison and the scalar remainder.
+                let dest = Value(*next_val_id);
+                *next_val_id += 1;
+                let add = Instruction::BinOp {
+                    dest,
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(*v),
+                    rhs: Operand::Const(match cmp_ty {
+                        IrType::I32 => IrConst::I32(1),
+                        _ => IrConst::I64(1),
+                    }),
+                    ty: cmp_ty,
+                };
+                let Some(block) = func.blocks.get_mut(pattern.header_idx) else {
+                    return false;
+                };
+                block.instructions.insert(pattern.exit_cmp_inst_idx, add);
+                pattern.exit_cmp_inst_idx += 1; // the comparison moved one slot down
+                Operand::Value(dest)
+            }
+        }
+    };
+    let Some(block) = func.blocks.get_mut(pattern.header_idx) else {
+        return false;
+    };
+    let Some(Instruction::Cmp { op, .. }) = block.instructions.get_mut(pattern.exit_cmp_inst_idx)
+    else {
+        return false;
+    };
+    *op = new_op;
+    pattern.limit = exclusive;
+    true
+}
+
+/// Fail-closed operator guard for the REDUCTION transforms.
+///
+/// They consume the same `pattern.limit` under the same exclusive-trip
+/// convention, but their shapes and their byte/element arithmetic are their
+/// own; rather than rewrite their bound (which would need the same proof per
+/// transform), they accept only the comparisons that already ARE the canonical
+/// ascending exclusive test.  An inclusive or unsigned reduction bound simply
+/// stays scalar -- the reduction is not lost from the program, only its
+/// vectorization.  (The FMA path needs no equivalent: it normalizes.)
+fn reduction_exit_is_canonical(func: &IrFunction, pattern: &VectorizablePattern) -> bool {
+    let Some(block) = func.blocks.get(pattern.header_idx) else {
+        return false;
+    };
+    let Some(Instruction::Cmp {
+        lhs, op, rhs, ty, ..
+    }) = block.instructions.get(pattern.exit_cmp_inst_idx)
+    else {
+        return false;
+    };
+    if !matches!(ty, IrType::I32 | IrType::I64) {
+        return false;
+    }
+    let iv = pattern.iv;
+    match (lhs, rhs) {
+        (Operand::Value(l), _) if *l == iv => matches!(op, IrCmpOp::Slt | IrCmpOp::Ne),
+        (_, Operand::Value(r)) if *r == iv => matches!(op, IrCmpOp::Sgt | IrCmpOp::Ne),
+        _ => false,
+    }
+}
+
 /// Transform loop to use AVX2 FmaF64x4 intrinsic (4-wide, 256-bit).
 /// Same pattern as SSE2 but processes 4 elements per iteration instead of 2.
-fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) -> usize {
+fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &mut VectorizablePattern) -> usize {
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
     let mut changes = 0;
+
+    // BOUND-NORMALIZATION PRECONDITION, and the FIRST mutation when it
+    // applies: the transform's arithmetic reads `pattern.limit` as an
+    // exclusive element count, so an inclusive source bound (`j <= N-1`) must
+    // be converted to `j < N` BEFORE anything else looks at the limit.  See
+    // `normalize_iv_exit_comparison` for the wrong-code history this prevents.
+    // It runs before the dominance/entry-edge preconditions because it only
+    // rewrites the exit comparison (and may hoist one `+1` into the header),
+    // which cannot invalidate either of them -- both reason about the loop's
+    // bases and CFG, not about the bound operand.
+    let mut next_val_id = func.next_value_id;
+    if !normalize_iv_exit_comparison(func, pattern, &mut next_val_id, debug) {
+        if debug {
+            eprintln!("[VEC] exit comparison is not a supported counted-loop bound; skipping loop");
+        }
+        return 0;
+    }
+    func.next_value_id = next_val_id;
 
     // DOMINANCE PRECONDITION -- before any IR is touched: the scalar
     // remainder must be able to reference every base with a dominating

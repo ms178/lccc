@@ -4371,6 +4371,31 @@ mod movslq_relay_call_tests {
 ///   value;
 /// * the flags are dead after the store: the removed trio was flag-neutral and
 ///   `add` writes flags, so a later flag reader would see different flags.
+///
+/// VOLATILE POLICY -- what this fold does and does not decide.
+///
+/// The folded form performs exactly ONE read and ONE write of the object, in
+/// the source's order, with no access to any other location in between; the
+/// trio it replaces performs the same one read and one write.  Access COUNT and
+/// ORDER are therefore preserved, which is the observable contract `volatile`
+/// states for a single-threaded observer -- and the only one the standard
+/// guarantees, since C11 5.1.2.4p25 makes conflicting accesses to a non-atomic
+/// object from another thread undefined behaviour regardless of `volatile`.
+///
+/// What the fused form changes is granularity: the read and the write become
+/// indivisible, so no other agent can interleave between them.  That is a
+/// stronger guarantee than the abstract machine gives, never a weaker one, and
+/// it is the reason the shape is emitted at all: `h += 3` on a `volatile long`
+/// already reaches this pass as `addq $3, h(%rip)` from the IR lowering, at
+/// `-O0` as well as `-O2` (verified on the tree that added this note).  The
+/// DECISION therefore lives where volatility is visible -- the IR/isel layer --
+/// and not here: this pass matches assembly TEXT, in which a volatile load is
+/// indistinguishable from any other load, so a volatility test here could only
+/// be a claim about something this layer cannot see.  The residual is recorded
+/// rather than hidden: a fused RMW is not a substitute for `_Atomic`, and code
+/// that needs the read/write pair to be interruptible by an ISR (a lock-free
+/// ring producer, an MMIO FIFO) must use atomics, exactly as it must against
+/// GCC, which keeps the pair separate but gives no ordering guarantee either.
 pub(super) fn fold_memory_rmw(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     use super::flag_peepholes::flags_dead_after;
     use super::relay_and_lea::line_refs_family;
