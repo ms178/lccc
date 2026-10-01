@@ -40,8 +40,24 @@ cd "$repo_root"
 # Assembled so this file does not match its own check.
 MARKER='FIX''ME'
 # Budget for check 3.  Measured with the same pipeline the check uses; lower it
-# whenever a pass is migrated, and never raise it.
-ENV_READ_BUDGET=157
+# whenever a pass is migrated, and NEVER raise it -- a new codegen switch is
+# resolved once in `run_passes` (which this count deliberately excludes), not
+# read per call site.  The byte-compare epic's `LCCC_NO_BYTECMP_VEC` kill
+# switch follows that rule, so the arm now costs nothing here; it did not
+# start that way, and the intermediate number belongs in the record because
+# the commit that introduced the arm shipped it at the higher one:
+#
+#     git show <commit>:src/passes/*.rs | grep -c 'env::var\(\|env::var_os('
+#
+#   155  at the epic's base (920a2a78^)
+#   158  at the epic landing (920a2a78) -- the arm read its kill switch and
+#        its debug trace per candidate loop
+#   155  now (measured 2026-10-01 on the hardened tree): the policy is
+#        resolved once in `run_passes`, so three per-loop reads disappeared
+#
+# The pre-epic baseline is restored exactly, which is the property this
+# ratchet exists to protect.
+ENV_READ_BUDGET=155
 
 fail=0
 report() { # report <label> <offending lines>

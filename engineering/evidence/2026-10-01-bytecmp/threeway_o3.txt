@@ -1,0 +1,8 @@
+3-way interleaved, 25 samples/arm, lz4_compress.c -DMATCH_RICH -O3 -march=x86-64-v3
+  gcc          min   15.228 ms   median   17.575 ms
+  lccc-novec   min   21.387 ms   median   25.199 ms
+  lccc-arm     min   14.252 ms   median   19.121 ms
+  checksums: {'gcc': '007c8f9a0a8617e8', 'lccc-novec': '007c8f9a0a8617e8', 'lccc-arm': '007c8f9a0a8617e8'} IDENTICAL
+  lccc-novec vs gcc: min delta +40.44%   wins 0/25
+  lccc-arm vs gcc: min delta -6.41%   wins 11/25
+  lccc-arm vs lccc-novec: min delta -33.36%   wins 25/25

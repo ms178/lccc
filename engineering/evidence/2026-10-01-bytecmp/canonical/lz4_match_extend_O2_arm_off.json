@@ -1,0 +1,1586 @@
+{
+  "aggregate_lccc_vs_best_reference": {
+    "arithmetic_mean_ratio": 1.2647329122673154,
+    "best": {
+      "benchmark": "lz4_match_extend",
+      "ratio": 1.2647329122673154,
+      "reference": "gcc"
+    },
+    "geometric_mean_ratio": 1.2647329122673154,
+    "interpretation": "LCCC / fastest available reference paired median; <1 means LCCC faster",
+    "n_correct_benchmarks": 1,
+    "worst": {
+      "benchmark": "lz4_match_extend",
+      "ratio": 1.2647329122673154,
+      "reference": "gcc"
+    }
+  },
+  "aggregate_lccc_vs_gcc": {
+    "arithmetic_mean_ratio": 1.2647329122673154,
+    "best": {
+      "benchmark": "lz4_match_extend",
+      "ratio": 1.2647329122673154
+    },
+    "geometric_mean_ratio": 1.2647329122673154,
+    "interpretation": "LCCC/GCC paired median ratios; <1 means LCCC faster",
+    "n_correct_benchmarks": 1,
+    "worst": {
+      "benchmark": "lz4_match_extend",
+      "ratio": 1.2647329122673154
+    }
+  },
+  "benchmarks": [
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "gcc": {
+          "binary_bytes": 16160,
+          "child_cpu_s": 0.06841499999999995,
+          "command": [
+            "/usr/bin/gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_gcc",
+            "/home/user/lccc/tests/benchmark/programs/lz4_compress.c",
+            "-DMATCH_RICH=1",
+            "-DPASSES=2048"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "2c8e7054fa444f5a68405d8c25975534d736073cb842b3a3d6dec53dd1ecd4a4",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 2368,
+          "wall_s": 0.068709582
+        },
+        "lccc": {
+          "binary_bytes": 7720,
+          "child_cpu_s": 0.192227,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_lccc",
+            "/home/user/lccc/tests/benchmark/programs/lz4_compress.c",
+            "-DMATCH_RICH=1",
+            "-DPASSES=2048"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "2c8e7054fa444f5a68405d8c25975534d736073cb842b3a3d6dec53dd1ecd4a4",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 2579,
+          "wall_s": 0.19252583
+        }
+      },
+      "correctness": {
+        "gcc": {
+          "matches_baseline": true,
+          "output": "29f49acaab81f800",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "29f49acaab81f800",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "LZ4 repeat-rich input / byte match extension",
+      "name": "lz4_match_extend",
+      "ratios_from_lccc": {
+        "gcc": {
+          "cv": 0.057640701538196434,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.05009924087440476,
+          "max": 1.3633019744560368,
+          "mean": 1.2472594520141738,
+          "median": 1.2647329122673154,
+          "median_ci95_bootstrap": [
+            1.2146336713929107,
+            1.2668936264695194
+          ],
+          "min": 1.098008460350578,
+          "n": 15,
+          "outlier_count_mad": 0,
+          "raw": [
+            {
+              "ratio": 1.2146336713929107,
+              "round": 0
+            },
+            {
+              "ratio": 1.2647329122673154,
+              "round": 1
+            },
+            {
+              "ratio": 1.2658698964951292,
+              "round": 2
+            },
+            {
+              "ratio": 1.2668936264695194,
+              "round": 3
+            },
+            {
+              "ratio": 1.2113484552197473,
+              "round": 4
+            },
+            {
+              "ratio": 1.202774278935381,
+              "round": 5
+            },
+            {
+              "ratio": 1.2654051606465173,
+              "round": 6
+            },
+            {
+              "ratio": 1.272982737193234,
+              "round": 7
+            },
+            {
+              "ratio": 1.3633019744560368,
+              "round": 8
+            },
+            {
+              "ratio": 1.335122616253449,
+              "round": 9
+            },
+            {
+              "ratio": 1.260400910433177,
+              "round": 10
+            },
+            {
+              "ratio": 1.1280894199449238,
+              "round": 11
+            },
+            {
+              "ratio": 1.098008460350578,
+              "round": 12
+            },
+            {
+              "ratio": 1.3347239172316743,
+              "round": 13
+            },
+            {
+              "ratio": 1.2246037429230148,
+              "round": 14
+            }
+          ],
+          "stdev": 0.07189290981424343
+        }
+      },
+      "ratios_to_gcc": {
+        "lccc": {
+          "cv": 0.057640701538196434,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.05009924087440476,
+          "max": 1.3633019744560368,
+          "mean": 1.2472594520141738,
+          "median": 1.2647329122673154,
+          "median_ci95_bootstrap": [
+            1.2146336713929107,
+            1.2668936264695194
+          ],
+          "min": 1.098008460350578,
+          "n": 15,
+          "outlier_count_mad": 0,
+          "raw": [
+            {
+              "ratio": 1.2146336713929107,
+              "round": 0
+            },
+            {
+              "ratio": 1.2647329122673154,
+              "round": 1
+            },
+            {
+              "ratio": 1.2658698964951292,
+              "round": 2
+            },
+            {
+              "ratio": 1.2668936264695194,
+              "round": 3
+            },
+            {
+              "ratio": 1.2113484552197473,
+              "round": 4
+            },
+            {
+              "ratio": 1.202774278935381,
+              "round": 5
+            },
+            {
+              "ratio": 1.2654051606465173,
+              "round": 6
+            },
+            {
+              "ratio": 1.272982737193234,
+              "round": 7
+            },
+            {
+              "ratio": 1.3633019744560368,
+              "round": 8
+            },
+            {
+              "ratio": 1.335122616253449,
+              "round": 9
+            },
+            {
+              "ratio": 1.260400910433177,
+              "round": 10
+            },
+            {
+              "ratio": 1.1280894199449238,
+              "round": 11
+            },
+            {
+              "ratio": 1.098008460350578,
+              "round": 12
+            },
+            {
+              "ratio": 1.3347239172316743,
+              "round": 13
+            },
+            {
+              "ratio": 1.2246037429230148,
+              "round": 14
+            }
+          ],
+          "stdev": 0.07189290981424343
+        }
+      },
+      "rounds": [
+        {
+          "order": [
+            "lccc",
+            "gcc"
+          ],
+          "round": 0,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 1.1386080000000005,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.139183719
+            },
+            "lccc": {
+              "child_cpu_s": 1.3831790000000002,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.383690903
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "lccc"
+          ],
+          "round": 1,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 1.0033949999999994,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.003898634
+            },
+            "lccc": {
+              "child_cpu_s": 1.2664050000000007,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.269663643
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "gcc"
+          ],
+          "round": 2,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 1.035615,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.036367361
+            },
+            "lccc": {
+              "child_cpu_s": 1.3112359999999992,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.311906244
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "lccc"
+          ],
+          "round": 3,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 1.0147849999999998,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.015287276
+            },
+            "lccc": {
+              "child_cpu_s": 1.284999000000001,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.286260979
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "gcc"
+          ],
+          "round": 4,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 1.072139,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.072835374
+            },
+            "lccc": {
+              "child_cpu_s": 1.2989499999999996,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.299577473
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "lccc"
+          ],
+          "round": 5,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 1.051167000000003,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.051894733
+            },
+            "lccc": {
+              "child_cpu_s": 1.2646679999999968,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.265191929
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "lccc"
+          ],
+          "round": 6,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 1.0575970000000012,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.058226209
+            },
+            "lccc": {
+              "child_cpu_s": 1.3383359999999982,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.339084906
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "gcc"
+          ],
+          "round": 7,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 1.1455100000000016,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.146123818
+            },
+            "lccc": {
+              "child_cpu_s": 1.4585030000000003,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.458995835
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "lccc"
+          ],
+          "round": 8,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 1.0887320000000003,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.089406986
+            },
+            "lccc": {
+              "child_cpu_s": 1.484380999999999,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.485190695
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "gcc"
+          ],
+          "round": 9,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 1.0625779999999985,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.063110243
+            },
+            "lccc": {
+              "child_cpu_s": 1.418482000000001,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.419382529
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "gcc"
+          ],
+          "round": 10,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 1.051801000000001,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.052354005
+            },
+            "lccc": {
+              "child_cpu_s": 1.3259499999999989,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.326387946
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "lccc"
+          ],
+          "round": 11,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 0.966618000000004,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 0.967118198
+            },
+            "lccc": {
+              "child_cpu_s": 1.090568999999995,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.090995807
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "gcc"
+          ],
+          "round": 12,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 1.1053970000000035,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.106106173
+            },
+            "lccc": {
+              "child_cpu_s": 1.2136190000000013,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.214513936
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "gcc"
+          ],
+          "round": 13,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 0.9645500000000027,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 0.964943816
+            },
+            "lccc": {
+              "child_cpu_s": 1.2872759999999985,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.28793359
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "lccc"
+          ],
+          "round": 14,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 1.0070739999999958,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.007649953
+            },
+            "lccc": {
+              "child_cpu_s": 1.233351000000006,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.233971904
+            }
+          }
+        }
+      ],
+      "runs": {
+        "gcc": [
+          {
+            "child_cpu_s": 1.1386080000000005,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.139183719
+          },
+          {
+            "child_cpu_s": 1.0033949999999994,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.003898634
+          },
+          {
+            "child_cpu_s": 1.035615,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.036367361
+          },
+          {
+            "child_cpu_s": 1.0147849999999998,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.015287276
+          },
+          {
+            "child_cpu_s": 1.072139,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.072835374
+          },
+          {
+            "child_cpu_s": 1.051167000000003,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.051894733
+          },
+          {
+            "child_cpu_s": 1.0575970000000012,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.058226209
+          },
+          {
+            "child_cpu_s": 1.1455100000000016,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.146123818
+          },
+          {
+            "child_cpu_s": 1.0887320000000003,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.089406986
+          },
+          {
+            "child_cpu_s": 1.0625779999999985,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.063110243
+          },
+          {
+            "child_cpu_s": 1.051801000000001,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.052354005
+          },
+          {
+            "child_cpu_s": 0.966618000000004,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 0.967118198
+          },
+          {
+            "child_cpu_s": 1.1053970000000035,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.106106173
+          },
+          {
+            "child_cpu_s": 0.9645500000000027,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 0.964943816
+          },
+          {
+            "child_cpu_s": 1.0070739999999958,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.007649953
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 1.3831790000000002,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.383690903
+          },
+          {
+            "child_cpu_s": 1.2664050000000007,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.269663643
+          },
+          {
+            "child_cpu_s": 1.3112359999999992,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.311906244
+          },
+          {
+            "child_cpu_s": 1.284999000000001,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.286260979
+          },
+          {
+            "child_cpu_s": 1.2989499999999996,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.299577473
+          },
+          {
+            "child_cpu_s": 1.2646679999999968,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.265191929
+          },
+          {
+            "child_cpu_s": 1.3383359999999982,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.339084906
+          },
+          {
+            "child_cpu_s": 1.4585030000000003,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.458995835
+          },
+          {
+            "child_cpu_s": 1.484380999999999,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.485190695
+          },
+          {
+            "child_cpu_s": 1.418482000000001,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.419382529
+          },
+          {
+            "child_cpu_s": 1.3259499999999989,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.326387946
+          },
+          {
+            "child_cpu_s": 1.090568999999995,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.090995807
+          },
+          {
+            "child_cpu_s": 1.2136190000000013,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.214513936
+          },
+          {
+            "child_cpu_s": 1.2872759999999985,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.28793359
+          },
+          {
+            "child_cpu_s": 1.233351000000006,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.233971904
+          }
+        ]
+      },
+      "runtime": {
+        "gcc": {
+          "child_cpu": {
+            "cv": 0.05208337895621558,
+            "mad": 0.03701600000000127,
+            "max": 1.1455100000000016,
+            "mean": 1.051037733333334,
+            "median": 1.051801000000001,
+            "median_ci95_bootstrap": [
+              1.0070739999999958,
+              1.072139
+            ],
+            "min": 0.9645500000000027,
+            "n": 15,
+            "outlier_count_mad": 0,
+            "stdev": 0.05474159656248189
+          },
+          "quality_warnings": [
+            "wall-clock coefficient of variation is 5.2% (>5%)"
+          ],
+          "raw_wall_s": [
+            1.139183719,
+            1.003898634,
+            1.036367361,
+            1.015287276,
+            1.072835374,
+            1.051894733,
+            1.058226209,
+            1.146123818,
+            1.089406986,
+            1.063110243,
+            1.052354005,
+            0.967118198,
+            1.106106173,
+            0.964943816,
+            1.007649953
+          ],
+          "wall": {
+            "cv": 0.052106610579512116,
+            "mad": 0.037066728999999965,
+            "max": 1.146123818,
+            "mean": 1.0516337665333333,
+            "median": 1.052354005,
+            "median_ci95_bootstrap": [
+              1.007649953,
+              1.072835374
+            ],
+            "min": 0.964943816,
+            "n": 15,
+            "outlier_count_mad": 0,
+            "stdev": 0.05479707114501796
+          }
+        },
+        "lccc": {
+          "child_cpu": {
+            "cv": 0.07607121438657259,
+            "mad": 0.03938599999999859,
+            "max": 1.484380999999999,
+            "mean": 1.3106602666666665,
+            "median": 1.2989499999999996,
+            "median_ci95_bootstrap": [
+              1.2646679999999968,
+              1.3831790000000002
+            ],
+            "min": 1.090568999999995,
+            "n": 15,
+            "outlier_count_mad": 1,
+            "stdev": 0.09970351813356239
+          },
+          "quality_warnings": [
+            "wall-clock coefficient of variation is 7.6% (>5%)",
+            "1 MAD outlier(s) retained (never silently discarded)"
+          ],
+          "raw_wall_s": [
+            1.383690903,
+            1.269663643,
+            1.311906244,
+            1.286260979,
+            1.299577473,
+            1.265191929,
+            1.339084906,
+            1.458995835,
+            1.485190695,
+            1.419382529,
+            1.326387946,
+            1.090995807,
+            1.214513936,
+            1.28793359,
+            1.233971904
+          ],
+          "wall": {
+            "cv": 0.07598153905384732,
+            "mad": 0.039507433000000036,
+            "max": 1.485190695,
+            "mean": 1.3115165546,
+            "median": 1.299577473,
+            "median_ci95_bootstrap": [
+              1.269663643,
+              1.339084906
+            ],
+            "min": 1.090995807,
+            "n": 15,
+            "outlier_count_mad": 1,
+            "stdev": 0.09965104631310717
+          }
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/lz4_compress.c",
+      "source_sha256": "2c8e7054fa444f5a68405d8c25975534d736073cb842b3a3d6dec53dd1ecd4a4",
+      "tags": [
+        "workload",
+        "lz4",
+        "compression",
+        "byte-compare"
+      ],
+      "warmups": {
+        "gcc": [
+          {
+            "child_cpu_s": 1.055059,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.056223308
+          },
+          {
+            "child_cpu_s": 1.1131190000000002,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.113590588
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 1.422753,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.425470851
+          },
+          {
+            "child_cpu_s": 1.2650539999999997,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_k8tfl64s/lz4_match_extend_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.265458851
+          }
+        ]
+      },
+      "warnings": []
+    }
+  ],
+  "compilers": [
+    {
+      "binary_sha256": "8b142f0774c7be12ef11bbc3c50c7a4d7e12f2e1459ca1fb39947ea87a174bfd",
+      "executable": "/home/user/lccc/target/fastbuild/lccc",
+      "flags": [
+        "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "-O2",
+        "-march=x86-64-v3"
+      ],
+      "key": "lccc",
+      "label": "LCCC"
+    },
+    {
+      "binary_sha256": "a23ecab8ff08f09ad8c80602c2c5df7f49e09c25905cb8975902e101bf72635f",
+      "executable": "/usr/bin/gcc",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3"
+      ],
+      "key": "gcc",
+      "label": "GCC"
+    }
+  ],
+  "metadata": {
+    "compiler_versions": {
+      "gcc": "gcc (Debian 14.2.0-19) 14.2.0",
+      "lccc": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0"
+    },
+    "cpu_governors": {},
+    "cpu_models": [
+      "Intel(R) Xeon(R) Processor @ 2.60GHz"
+    ],
+    "git": {
+      "repo": "/home/user/lccc",
+      "revision": "cdcf30de147db72b5d7266a40147639cf4a23f15",
+      "status": "?? engineering/evidence/2026-10-01-bytecmp/"
+    },
+    "hypervisor_detected": true,
+    "meminfo": "MemTotal:        2032608 kB\nMemFree:          333260 kB\nMemAvailable:    1762360 kB\nBuffers:            8416 kB\nCached:          1525344 kB\nSwapCached:         4852 kB\nActive:           624116 kB\nInactive:         957816 kB\nActive(anon):      10708 kB\nInactive(anon):    37796 kB\nActive(file):     613408 kB\nInactive(file):   920020 kB\nUnevictable:           8 kB\nMlocked:               4 kB\nSwapTotal:       4194300 kB\nSwapFree:        3981480 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:                56 kB\nWriteback:             0 kB\nAnonPages:         46780 kB\nMapped:            32348 kB\nShmem:               328 kB\nKReclaimable:      54820 kB\nSlab:              73932 kB\nSReclaimable:      54820 kB\nSUnreclaim:        19112 kB\nKernelStack:        2240 kB\nPageTables:         3256 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:     5210604 kB\nCommitted_AS:     600644 kB\nVmallocTotal:   34359738367 kB\nVmallocUsed:        6348 kB\nVmallocChunk:          0 kB\nPercpu:              640 kB\nAnonHugePages:      8192 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:       2048 kB\nHugetlb:               0 kB\nDirectMap4k:       36864 kB\nDirectMap2M:     1011712 kB\nDirectMap1G:     3145728 kB",
+    "pinning": {
+      "allowed_cpus": [
+        0,
+        1
+      ],
+      "applied": true,
+      "cpu": 0,
+      "reason": "taskset pinning",
+      "requested": "auto"
+    },
+    "platform": "Linux-6.1.158+-x86_64-with-glibc2.41",
+    "pmu": {
+      "available": false,
+      "perf_event_paranoid": "2",
+      "perf_path": null,
+      "probed": true,
+      "reason": "perf is not installed"
+    },
+    "python": "3.13.14 (main, Jul 14 2026, 04:45:36) [GCC 14.2.0]",
+    "swap": "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n/swapfile                               file\t\t4194300\t\t212820\t\t-2",
+    "timestamp_utc": "2026-10-01T01:45:49.144091+00:00",
+    "uname": [
+      "Linux",
+      "e2b.local",
+      "6.1.158+",
+      "#1 SMP PREEMPT_DYNAMIC Fri Jul 17 14:31:34 UTC 2026",
+      "x86_64"
+    ],
+    "work_root": {
+      "candidates": [
+        {
+          "free_bytes": 14148284416,
+          "path": "/home/user/lccc"
+        },
+        {
+          "free_bytes": 14148284416,
+          "path": "/var/tmp"
+        },
+        {
+          "free_bytes": 1040560128,
+          "path": "/tmp"
+        }
+      ],
+      "free_bytes": 14148284416,
+      "reason": "largest writable candidate among repository, /var/tmp, /tmp",
+      "selected": "/home/user/lccc"
+    }
+  },
+  "runner_warnings": [],
+  "schema": "lccc-bench-v2",
+  "settings": {
+    "common_cflags": [
+      "-march=x86-64-v3"
+    ],
+    "compiler_order_policy": "randomized independently in every paired round",
+    "opt": "-O2",
+    "outlier_policy": "MAD outliers counted and reported; none are removed",
+    "reps": 15,
+    "seed": 20260810,
+    "skip_perf": false,
+    "timer": "time.perf_counter_ns wall-clock plus resource.RUSAGE_CHILDREN CPU time",
+    "warmup": 2
+  },
+  "unavailable_compilers": {}
+}

@@ -1057,12 +1057,14 @@ fn vectorize_entry(
 ///
 /// Measured on `lccc-arm`, it is also a regression rather than a wash:
 ///
-///     float dot-product + float max, -O2 -ffast-math
-///       two_wide_fast_math   95 insns
-///       two_wide (previous)  73 insns   (-23 %)
-///     whole arm corpus (14 files x 3 configs)
-///       two_wide_fast_math   6260 insns
-///       two_wide (previous)  6264 insns (+0.06 %, noise)
+/// ```text
+/// float dot-product + float max, -O2 -ffast-math
+///   two_wide_fast_math   95 insns
+///   two_wide (previous)  73 insns   (-23 %)
+/// whole arm corpus (14 files x 3 configs)
+///   two_wide_fast_math   6260 insns
+///   two_wide (previous)  6264 insns (+0.06 %, noise)
+/// ```
 ///
 /// So the fast-math late entry costs 23 % on the code it actually affects and
 /// buys nothing anywhere else. The late rerun keeps the previous AArch64
@@ -1218,9 +1220,17 @@ pub(crate) fn run_passes(
     // previous always-emit-the-mirror behaviour so the win stays re-measurable
     // without rebuilding a historical tree.
     let no_map_zero_rem = std::env::var_os("CCC_NO_MAP_ZERO_REM").is_some();
+    // Byte-compare epic kill switch.  Snapshotted in the same place for the
+    // same reason: the arm's pattern scan runs per candidate loop, so the
+    // environment read must not live in the scan (see the section doc in
+    // `vectorize.rs`; the ratchet in
+    // tests/regression/check_env_test_hygiene.sh counts reads OUTSIDE this
+    // file, which is exactly the discipline being enforced).
+    let no_bytecmp_vec = std::env::var_os("LCCC_NO_BYTECMP_VEC").is_some();
     vectorize::set_no_map_vec(no_map_vec);
     vectorize::set_no_map_i64_unroll(no_map_i64_unroll);
     vectorize::set_no_map_zero_rem(no_map_zero_rem);
+    vectorize::set_no_bytecmp_vec(no_bytecmp_vec);
     // Linux's `.code16gcc` setup image has a hard 32 KiB code+data+BSS limit
     // and only six generally usable GPRs.  On the real linux-cachymod setup
     // corpus these four transformations increase final machine-code size by

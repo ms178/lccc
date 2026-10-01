@@ -477,6 +477,18 @@ jobs:
           CCC: target/fastbuild/lccc
         run: bash tests/regression/check_vectorize_isa_gate.sh
 
+      # Byte-compare window phase (`while (p < end && *p == *q)`, the
+      # match-extension shape): 32B AVX2 / 16B SSE2 windows, the q-side
+      # PAGE-CROSSING guard (without it the phase loads into a PROT_NONE
+      # page and dies -- mutation-verified), the exact ctz mismatch exit,
+      # and the LCCC_NO_BYTECMP_VEC kill switch.  Both behavioural drivers
+      # run under every width configuration and are compared against GCC,
+      # which does not vectorize this shape at all.
+      - name: Verify byte-compare window phase
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_bytecmp_vec_codegen.sh
+
       # Vector copy elimination (peephole passes/vector_copy.rs): the GP copy
       # machinery declines every vector family by construction, so the
       # codegen's fresh-temporary bracketing reached the assembler as

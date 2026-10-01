@@ -690,6 +690,15 @@ gate "vec-adler-epic" fast \
 gate "vectorize-isa-gate" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_vectorize_isa_gate.sh
 
+# Byte-compare window phase (`while (p < end && *p == *q)`, the
+# match-extension shape): emission contract (32B AVX2 / 16B SSE2 windows,
+# exactly one q-side page guard per phase, ctz-based exact mismatch exit),
+# the kill switch, and both behavioural drivers executed against GCC under
+# every width configuration.  The guard-page driver is the one that
+# SIGSEGVs if the page guard is ever removed.
+gate "bytecmp-window-phase" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_bytecmp_vec_codegen.sh
+
 # Constant-array promotion: fully-constant local arrays become .rodata
 # globals. Emission contracts (the .LCA_ global, store elimination,
 # rip-relative references, alignment preservation) AND the fail-closed
