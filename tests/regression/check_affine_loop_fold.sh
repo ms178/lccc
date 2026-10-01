@@ -17,6 +17,12 @@
 #
 # Contracts:
 #
+#   4. WRAPAROUND PROBES.  `wrap_affine_fold.c` / `wrap_loop_fold.c` are the
+#      shapes where an unsigned add wraps and then feeds a signed compare --
+#      the inputs a fold without the no-overflow licence gets wrong.  Each
+#      probe carries its own reference implementation, must print `exact`, and
+#      must print the SAME thing with the fold killed.
+#
 #   1. ORACLE PARITY.  `affine_loop_fold.c` reports the iteration count of
 #      every kernel as well as its checksum (a wrong fold shows up first as a
 #      wrong count), and its stdout must equal the GCC oracle's, byte for
@@ -143,6 +149,30 @@ grep -qE "leaq 4\(" <<< "$rtb" \
 rts=$(body "$work/fold.s" refuse_rt_start)
 grep -qE "leaq 4\(" <<< "$rts" \
     || bad "refuse_rt_start: expected the unfolded offset (runtime seed must not fold)"
+
+# ── contract 4: the wraparound probes ────────────────────────────────────────
+# The fold's licence is signed-no-overflow: `iv + C` must not wrap for the
+# equivalence to hold.  These two probes are the shapes where a signed ADD
+# would be UB but the SOURCE is an unsigned add feeding a signed cast -- the IR
+# cannot tell the two apart (no nsw flag), so they are exactly the inputs on
+# which a careless fold goes wrong.  Each probe carries its own reference
+# implementation and prints MISMATCH/MISCOMPILE if the fold moved a value, so
+# the contract is a stdout comparison rather than an assembly shape: the pass
+# may fold or refuse per case, and either is fine as long as the ANSWER holds.
+for probe in wrap_affine_fold wrap_loop_fold; do
+    src="tests/regression/$probe.c"
+    "$CCC" -O2 -o "$work/$probe.bin" "$src" || bad "$probe: compile failed"
+    out=$("$work/$probe.bin") || bad "$probe: exit status $?"
+    grep -q "MISCOMPILE\|MISMATCH" <<< "$out" && bad "$probe: $out"
+    grep -q "exact" <<< "$out" || bad "$probe: unexpected output: $out"
+    # Same answer with the fold killed: the probe must not depend on the fold.
+    CCC_NO_AFFINE_EXIT_FOLD=1 "$CCC" -O2 -o "$work/$probe.off.bin" "$src" \
+        || bad "$probe: compile failed under the kill switch"
+    out_off=$("$work/$probe.off.bin") || bad "$probe (kill switch): exit status $?"
+    [[ "$out" == "$out_off" ]] \
+        || bad "$probe: kill switch changed the answer ($out vs $out_off)"
+    echo "  wrap probe $probe: exact, and identical with the fold killed"
+done
 
 if [[ $fail -ne 0 ]]; then
     echo "check_affine_loop_fold: FAILED" >&2
