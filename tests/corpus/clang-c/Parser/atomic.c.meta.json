@@ -1,0 +1,47 @@
+{
+  "bytes": 3388,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "duplicate '_Atomic' declaration specifier"
+    },
+    {
+      "kind": "error",
+      "msg": "_Atomic cannot be applied to atomic type '_Atomic(int)'"
+    },
+    {
+      "kind": "error",
+      "msg": "_Atomic cannot be applied to qualified type 'const_int' (aka 'const int')"
+    },
+    {
+      "kind": "error",
+      "msg": "_Atomic cannot be applied to function type 'int_fn' (aka 'int (void)')"
+    },
+    {
+      "kind": "error",
+      "msg": "_Atomic cannot be applied to array type 'atomic_int_array' (aka '_Atomic(int)[3]')"
+    },
+    {
+      "kind": "warning",
+      "msg": "'_Atomic' ignored on this declaration"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c11",
+    " --c99"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/atomic.sft.c",
+  "remark": null,
+  "sha256": "1070927fb28a5fba172f92373b7ec9378325802657d7e0d7d35a2f94440fa9eb",
+  "test_number_uses": 0,
+  "type": "fn"
+}

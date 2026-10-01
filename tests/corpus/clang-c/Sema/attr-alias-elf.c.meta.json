@@ -1,0 +1,82 @@
+{
+  "bytes": 2839,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "alias must point to a defined variable or function"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "alias must point to a defined variable or function"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "alias definition is part of a cycle"
+    },
+    {
+      "kind": "error",
+      "msg": "alias definition is part of a cycle"
+    },
+    {
+      "kind": "error",
+      "msg": "alias definition is part of a cycle"
+    },
+    {
+      "kind": "error",
+      "msg": "alias must point to a defined variable or function"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "alias must point to a defined variable or function"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "alias must point to a defined variable or function"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "alias will always resolve to test2_bar even if weak definition of test2_foo is overridden"
+    },
+    {
+      "kind": "warning",
+      "msg": "alias will not be in section 'test' but in the same section as the aliasee"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-alias-elf.sft.c",
+  "remark": null,
+  "sha256": "0be29e89e5eaeaadb7a66a09eb87447c6b442d4b24ba477fcc0da3f9c424a196",
+  "test_number_uses": 0,
+  "type": "fn"
+}

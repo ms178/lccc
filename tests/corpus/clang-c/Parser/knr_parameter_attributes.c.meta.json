@@ -1,0 +1,21 @@
+{
+  "bytes": 282,
+  "cases": null,
+  "category": "Parser",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c99"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/knr_parameter_attributes.sft.c",
+  "remark": null,
+  "sha256": "184dcd92d05f6071cfced9f9568755516b42b61ec140c6b86a38ef15f0df48f1",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,26 @@
+{
+  "bytes": 179,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/CompoundStmtScope.sft.c",
+  "remark": null,
+  "sha256": "552dbc172f8784b4c47759257989c903384068706fdd803cfa022c0b857ba710",
+  "test_number_uses": 0,
+  "type": "fn"
+}

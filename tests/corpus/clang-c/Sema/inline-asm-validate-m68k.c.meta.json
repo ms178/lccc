@@ -1,0 +1,74 @@
+{
+  "bytes": 2559,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "value '0' out of range for constraint 'I'"
+    },
+    {
+      "kind": "error",
+      "msg": "value '9' out of range for constraint 'I'"
+    },
+    {
+      "kind": "error",
+      "msg": "value '-32769' out of range for constraint 'J'"
+    },
+    {
+      "kind": "error",
+      "msg": "value '32768' out of range for constraint 'J'"
+    },
+    {
+      "kind": "error",
+      "msg": "value '-9' out of range for constraint 'L'"
+    },
+    {
+      "kind": "error",
+      "msg": "value '0' out of range for constraint 'L'"
+    },
+    {
+      "kind": "error",
+      "msg": "value '23' out of range for constraint 'N'"
+    },
+    {
+      "kind": "error",
+      "msg": "value '32' out of range for constraint 'N'"
+    },
+    {
+      "kind": "error",
+      "msg": "value '18' out of range for constraint 'O'"
+    },
+    {
+      "kind": "error",
+      "msg": "value '7' out of range for constraint 'P'"
+    },
+    {
+      "kind": "error",
+      "msg": "value '16' out of range for constraint 'P'"
+    },
+    {
+      "kind": "error",
+      "msg": "value '1' out of range for constraint 'C0'"
+    },
+    {
+      "kind": "no-diagnostics",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 10,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DINVALID --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/inline-asm-validate-m68k.sft.c",
+  "remark": null,
+  "sha256": "5321b32f4fa5337fbd604f45d5f05ce81ef1e018879d6fd55a00839c633168ef",
+  "test_number_uses": 0,
+  "type": "fn"
+}

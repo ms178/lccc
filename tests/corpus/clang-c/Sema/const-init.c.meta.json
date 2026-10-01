@@ -1,0 +1,26 @@
+{
+  "bytes": 414,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "must be initialized by a constant expression"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/const-init.sft.c",
+  "remark": null,
+  "sha256": "76390887bfbefdd5740b8e88941ded38125ffc265a9822325dabb6e64012f545",
+  "test_number_uses": 0,
+  "type": "fn"
+}

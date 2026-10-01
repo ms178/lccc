@@ -1,0 +1,58 @@
+{
+  "bytes": 6168,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "value of #pragma pack(show) == 4"
+    },
+    {
+      "kind": "warning",
+      "msg": "value of #pragma pack(show) == 8"
+    },
+    {
+      "kind": "error",
+      "msg": "expected #pragma pack parameter to be '1', '2', '4', '8', or '16'"
+    },
+    {
+      "kind": "warning",
+      "msg": "value of #pragma pack(show) == 8"
+    },
+    {
+      "kind": "warning",
+      "msg": "missing '(' after '#pragma align' - ignoring"
+    },
+    {
+      "kind": "warning",
+      "msg": "#pragma options align=reset failed: stack empty"
+    },
+    {
+      "kind": "warning",
+      "msg": "value of #pragma pack(show) == 2"
+    },
+    {
+      "kind": "error",
+      "msg": "specifying an identifier within `#pragma pack` is not supported on this target"
+    },
+    {
+      "kind": "warning",
+      "msg": "#pragma pack(pop, ...) failed: stack empty"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 10,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/aix-pragma-pack-and-align.sft.c",
+  "remark": null,
+  "sha256": "af0e4aeaf34703295ccfa0453a1ea202225f8117f94fc6bd67f03a31a4f59a0a",
+  "test_number_uses": 0,
+  "type": "fn"
+}

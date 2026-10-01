@@ -1,0 +1,21 @@
+{
+  "bytes": 7928,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 23,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/atomic-ops-fp-minmax.sft.c",
+  "remark": null,
+  "sha256": "9486555b85a8b6a2be19b1ecd185de73e56e9ef23669a2bd58085c7298ca07b5",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,70 @@
+{
+  "bytes": 2288,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "attribute 'visibility' is ignored, place it after \"struct\" to apply attribute to type declaration"
+    },
+    {
+      "kind": "warning",
+      "msg": "attribute 'aligned' is ignored, place it after \"struct\" to apply attribute to type declaration"
+    },
+    {
+      "kind": "warning",
+      "msg": "attribute 'visibility' is ignored, place it after \"union\" to apply attribute to type declaration"
+    },
+    {
+      "kind": "warning",
+      "msg": "attribute 'aligned' is ignored, place it after \"union\" to apply attribute to type declaration"
+    },
+    {
+      "kind": "warning",
+      "msg": "attribute 'visibility' is ignored, place it after \"enum\" to apply attribute to type declaration"
+    },
+    {
+      "kind": "warning",
+      "msg": "attribute 'aligned' is ignored, place it after \"enum\" to apply attribute to type declaration"
+    },
+    {
+      "kind": "warning",
+      "msg": "attribute 'visibility' is ignored, place it after \"struct\" to apply attribute to type declaration"
+    },
+    {
+      "kind": "warning",
+      "msg": "attribute 'aligned' is ignored, place it after \"struct\" to apply attribute to type declaration"
+    },
+    {
+      "kind": "warning",
+      "msg": "attribute 'visibility' is ignored, place it after \"union\" to apply attribute to type declaration"
+    },
+    {
+      "kind": "warning",
+      "msg": "attribute 'aligned' is ignored, place it after \"union\" to apply attribute to type declaration"
+    },
+    {
+      "kind": "warning",
+      "msg": "attribute 'visibility' is ignored, place it after \"enum\" to apply attribute to type declaration"
+    },
+    {
+      "kind": "warning",
+      "msg": "attribute 'aligned' is ignored, place it after \"enum\" to apply attribute to type declaration"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-declspec-ignored.sft.c",
+  "remark": null,
+  "sha256": "95d503cda7f811e8f2a15d0d3aa6262575f33b40e11647aabbd616f150eb5860",
+  "test_number_uses": 0,
+  "type": "fp"
+}

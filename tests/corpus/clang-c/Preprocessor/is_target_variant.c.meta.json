@@ -1,0 +1,21 @@
+{
+  "bytes": 2160,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 74,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DMAC -DIOS -DCATALYST -DZIPPERED --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/is_target_variant.sft.c",
+  "remark": null,
+  "sha256": "0189333104a980eb151f3ea20f322e3bbd708c83027eb8f03f90bea5cec6c4f9",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,102 @@
+{
+  "bytes": 5297,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "duplicate '__forceinline' declaration specifier"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": "'E2' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "note",
+      "msg": "'e' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "warning",
+      "msg": "'E2' is deprecated"
+    },
+    {
+      "kind": "warning",
+      "msg": "'e' is deprecated"
+    },
+    {
+      "kind": "note",
+      "msg": "to match this '['"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ']'"
+    },
+    {
+      "kind": "warning",
+      "msg": "__declspec attribute 'frobble' is not supported"
+    },
+    {
+      "kind": "error",
+      "msg": "__declspec attributes must be an identifier or string literal"
+    },
+    {
+      "kind": "warning",
+      "msg": "__declspec attribute '\"testing\"' is not supported"
+    },
+    {
+      "kind": "error",
+      "msg": "parentheses must be omitted if 'deprecated' attribute's argument list is empty"
+    },
+    {
+      "kind": "warning",
+      "msg": "__declspec attribute 'frobble' is not supported"
+    },
+    {
+      "kind": "warning",
+      "msg": "__declspec attribute 'unknown' is not supported"
+    },
+    {
+      "kind": "warning",
+      "msg": "qualifiers after comma in declarator list are ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "qualifiers after comma in declarator list are ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "qualifiers after comma in declarator list are ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "qualifiers after comma in declarator list are ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "qualifiers after comma in declarator list are ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "qualifiers after comma in declarator list are ignored"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 3,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--ms_extensions --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/MicrosoftExtensions.sft.c",
+  "remark": null,
+  "sha256": "43f6c9d76319c437a5e37d29a43b567775592cbdc7905318cb6f6075b89d03cc",
+  "test_number_uses": 0,
+  "type": "fn"
+}

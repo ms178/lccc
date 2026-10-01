@@ -1,0 +1,134 @@
+{
+  "bytes": 5559,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "'f0' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "note",
+      "msg": "'f2' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "note",
+      "msg": "explicitly marked unavailable"
+    },
+    {
+      "kind": "note",
+      "msg": "'f5' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "note",
+      "msg": "'f6' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "warning",
+      "msg": "'f0' is deprecated: first deprecated in tvOS 12.1"
+    },
+    {
+      "kind": "warning",
+      "msg": "'f2' is deprecated: first deprecated in tvOS 13.0"
+    },
+    {
+      "kind": "error",
+      "msg": "f4' is unavailable: obsoleted in tvOS 13.0"
+    },
+    {
+      "kind": "warning",
+      "msg": "'f5' is deprecated: first deprecated in tvOS 13.0"
+    },
+    {
+      "kind": "warning",
+      "msg": "'f6' is deprecated: first deprecated in tvOS 13.0"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": "'f0_tvos' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "note",
+      "msg": "'f2_tvos' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "note",
+      "msg": "explicitly marked unavailable"
+    },
+    {
+      "kind": "note",
+      "msg": "'f5b_tvos' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "note",
+      "msg": "'f5c_tvos' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "note",
+      "msg": "'f6_tvos' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "warning",
+      "msg": "'f0_tvos' is deprecated: first deprecated in tvOS 12.1"
+    },
+    {
+      "kind": "warning",
+      "msg": "'f2_tvos' is deprecated: first deprecated in tvOS 13.0"
+    },
+    {
+      "kind": "error",
+      "msg": "'f4_tvos' is unavailable: obsoleted in tvOS 13.0"
+    },
+    {
+      "kind": "warning",
+      "msg": "'f5b_tvos' is deprecated: first deprecated in tvOS 13.0"
+    },
+    {
+      "kind": "warning",
+      "msg": "'f5c_tvos' is deprecated: first deprecated in tvOS 13.0"
+    },
+    {
+      "kind": "warning",
+      "msg": "'f6_tvos' is deprecated: first deprecated in tvOS 13.0"
+    },
+    {
+      "kind": "note",
+      "msg": "'f11' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "warning",
+      "msg": "'f11' is deprecated: first deprecated in tvOS 9.2"
+    },
+    {
+      "kind": "note",
+      "msg": "'f11' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "warning",
+      "msg": "'f11' is deprecated: first deprecated in tvOS 9.3"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DUSE_VERSION_MAP --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-availability-tvos.sft.c",
+  "remark": null,
+  "sha256": "38a1dd98636dfdc8e1065ab01ecb3d45a59acc79a00d6c927966e034b3c0c370",
+  "test_number_uses": 0,
+  "type": "fn"
+}

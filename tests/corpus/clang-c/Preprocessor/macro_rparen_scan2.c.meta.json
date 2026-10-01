@@ -1,0 +1,21 @@
+{
+  "bytes": 212,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/macro_rparen_scan2.sft.c",
+  "remark": null,
+  "sha256": "6c83bd8d4b81c413be84753b3d5b9f6ad36b5492dfa226ac51f3efb0e95d6457",
+  "test_number_uses": 0,
+  "type": "fp"
+}

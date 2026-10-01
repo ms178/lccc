@@ -1,0 +1,21 @@
+{
+  "bytes": 903,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w --ms_compatibility -w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/offsetof-ucrt.sft.c",
+  "remark": null,
+  "sha256": "d79f6e332709773fae8434f0676166575463c4f4313bc411f03d37be9449b890",
+  "test_number_uses": 0,
+  "type": "fp"
+}

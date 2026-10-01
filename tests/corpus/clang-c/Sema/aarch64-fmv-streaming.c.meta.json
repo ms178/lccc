@@ -1,0 +1,34 @@
+{
+  "bytes": 2614,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c --target linux_aarch64"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/aarch64-fmv-streaming.sft.c",
+  "remark": null,
+  "sha256": "7587b0c56e04e2473979be59655865a4d67cb85dd3326a75b70c0e58d345e1fe",
+  "test_number_uses": 0,
+  "type": "fn"
+}

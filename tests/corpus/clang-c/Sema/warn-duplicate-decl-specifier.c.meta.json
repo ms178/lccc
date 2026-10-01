@@ -1,0 +1,38 @@
+{
+  "bytes": 1138,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "duplicate 'const' declaration specifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "multiple identical address spaces specified for type"
+    },
+    {
+      "kind": "warning",
+      "msg": "duplicate 'const' declaration specifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "duplicate 'volatile' declaration specifier"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 13,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-duplicate-decl-specifier.sft.c",
+  "remark": null,
+  "sha256": "d1683041175d5440433612507563688d7f57d1418599fb72c94e608cb988be2c",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,24 @@
+{
+  "bytes": 765,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 12,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c17 --strict_gnu",
+    " --c23 --strict_gnu",
+    " --c17",
+    " --c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/gnu-builtins.sft.c",
+  "remark": null,
+  "sha256": "a436e57e742f0a60b9bd3672775ebcc8df1193c3652597acbc44a868fec822d1",
+  "test_number_uses": 0,
+  "type": "fp"
+}

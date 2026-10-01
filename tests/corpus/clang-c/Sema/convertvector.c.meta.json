@@ -1,0 +1,38 @@
+{
+  "bytes": 784,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "same number of elements"
+    },
+    {
+      "kind": "error",
+      "msg": "second argument to __builtin_convertvector must be of vector type"
+    },
+    {
+      "kind": "error",
+      "msg": "must be a vector"
+    },
+    {
+      "kind": "error",
+      "msg": "first argument to __builtin_convertvector must be a vector"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/convertvector.sft.c",
+  "remark": null,
+  "sha256": "85e97a18f376fabb5d36e89435e63f8751d83859fd587057a7280563be126555",
+  "test_number_uses": 0,
+  "type": "fn"
+}

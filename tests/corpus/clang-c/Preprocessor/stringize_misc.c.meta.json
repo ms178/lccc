@@ -1,0 +1,26 @@
+{
+  "bytes": 910,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DTEST1 -w -DTEST2 --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/stringize_misc.sft.c",
+  "remark": null,
+  "sha256": "554ec49f2f544590e4e91cb193dd2154e99e103f86c531f17fcee9648ca32806",
+  "test_number_uses": 0,
+  "type": "fn"
+}

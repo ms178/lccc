@@ -1,0 +1,102 @@
+{
+  "bytes": 3041,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from 'int' to 'unsigned short' changes value from 65536 to 0"
+    },
+    {
+      "kind": "error",
+      "msg": "argument to '__builtin_arm_trap' must be a constant integer"
+    },
+    {
+      "kind": "error",
+      "msg": "argument to '__builtin_arm_trap' must be a constant integer"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DTEST1 --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/builtins-arm64.sft.c",
+  "remark": null,
+  "sha256": "994ff4ec8b2734e817dd1a3b44e36bfdcaa009bf283f2215a036f9239587944f",
+  "test_number_uses": 0,
+  "type": "fn"
+}

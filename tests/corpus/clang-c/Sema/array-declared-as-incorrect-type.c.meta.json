@@ -1,0 +1,46 @@
+{
+  "bytes": 529,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of 'a2'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of 'a4'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of 'a5'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/array-declared-as-incorrect-type.sft.c",
+  "remark": null,
+  "sha256": "b45f75705e0bd597841fcebdcc4d61604a50c434e1021514b370ae87f54205ba",
+  "test_number_uses": 0,
+  "type": "fn"
+}

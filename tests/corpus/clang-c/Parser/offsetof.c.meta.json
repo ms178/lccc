@@ -1,0 +1,30 @@
+{
+  "bytes": 381,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "expected ')'"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ')'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/offsetof.sft.c",
+  "remark": null,
+  "sha256": "cd108ad7cae773016f0b7e1e71a431fa4b9011c9a45dcecc801f110555d28c51",
+  "test_number_uses": 0,
+  "type": "fn"
+}

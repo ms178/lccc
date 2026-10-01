@@ -1,0 +1,38 @@
+{
+  "bytes": 1402,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "implicit conversion loses integer precision: 'int' to 'char' on negation"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion loses integer precision: 'int' to 'unsigned char' on negation"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion loses integer precision: 'int' to 'short' on negation"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion loses integer precision: 'int' to 'unsigned short' on negation"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/implicit-int-conversion-on-int.sft.c",
+  "remark": null,
+  "sha256": "f496cf803cacf81bf406c9fcb5527d6cca66e79b2f7d357175a3a55c819214bc",
+  "test_number_uses": 0,
+  "type": "fp"
+}

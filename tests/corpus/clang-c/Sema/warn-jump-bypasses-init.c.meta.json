@@ -1,0 +1,21 @@
+{
+  "bytes": 1920,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 9,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--ms_compatibility --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-jump-bypasses-init.sft.c",
+  "remark": null,
+  "sha256": "6ec4eb53769c6e24bae0949610936b0cb776d7e4265bb929070c68d95ff1fd1a",
+  "test_number_uses": 0,
+  "type": "fp"
+}

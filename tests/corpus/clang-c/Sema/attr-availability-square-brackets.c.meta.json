@@ -1,0 +1,46 @@
+{
+  "bytes": 1531,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "feature cannot be deprecated in macOS version 10.2 before it was introduced in version 10.4; attribute ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "feature cannot be obsoleted in iOS version 2.1 before it was deprecated in version 3.0; attribute ignored"
+    },
+    {
+      "kind": "note",
+      "msg": "'ATSFontGetName' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "warning",
+      "msg": "'ATSFontGetName' is deprecated: first deprecated in macOS 9.0 - use CTFontCopyFullName"
+    },
+    {
+      "kind": "error",
+      "msg": "'should' is not an availability stage; use 'introduced', 'deprecated', or 'obsoleted'"
+    },
+    {
+      "kind": "warning",
+      "msg": "unknown platform 'this' in availability macro"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-availability-square-brackets.sft.c",
+  "remark": null,
+  "sha256": "8f9b52781590de0701b4b9ed069863cde0a379f7b3574572c7cbadc1cf8a584d",
+  "test_number_uses": 0,
+  "type": "fn"
+}

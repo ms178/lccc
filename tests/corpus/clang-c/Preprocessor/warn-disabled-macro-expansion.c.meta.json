@@ -1,0 +1,42 @@
+{
+  "bytes": 512,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "recursive macro"
+    },
+    {
+      "kind": "warning",
+      "msg": "recursive macro"
+    },
+    {
+      "kind": "warning",
+      "msg": "recursive macro"
+    },
+    {
+      "kind": "warning",
+      "msg": "recursive macro"
+    },
+    {
+      "kind": "warning",
+      "msg": "recursive macro"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 21,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/warn-disabled-macro-expansion.sft.c",
+  "remark": null,
+  "sha256": "e52a34ffa186f60c792d50ae5f3f03f3e5be7cbfc023637637e05d76d2f6793b",
+  "test_number_uses": 0,
+  "type": "fp"
+}

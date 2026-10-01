@@ -1,0 +1,338 @@
+{
+  "bytes": 9105,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' only applies to non-K&R-style functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' only applies to non-K&R-style functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' only applies to non-K&R-style functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' only applies to non-K&R-style functions"
+    },
+    {
+      "kind": "error",
+      "msg": "misplaced 'ATTR_NAME'"
+    },
+    {
+      "kind": "error",
+      "msg": "expected identifier"
+    },
+    {
+      "kind": "error",
+      "msg": "expected identifier or '('"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' only applies to non-K&R-style functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' only applies to function types"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' only applies to function types"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' only applies to function types"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' only applies to function types"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' only applies to function types"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' only applies to function types"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' only applies to function types"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' cannot appear here"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' cannot appear here"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' cannot appear here"
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration does not declare anything"
+    },
+    {
+      "kind": "error",
+      "msg": "misplaced 'ATTR_NAME'"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' cannot appear here"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' only applies to non-K&R-style functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' only applies to non-K&R-style functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' only applies to function types; type here is 'double'"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' only applies to function types; type here is 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "misplaced 'ATTR_NAME'"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' cannot appear here"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' only applies to non-K&R-style functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' only applies to non-K&R-style functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' only applies to non-K&R-style functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' only applies to non-K&R-style functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' cannot be applied to a declaration"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' only applies to function types"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' cannot be applied to a declaration"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' cannot appear here"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' only applies to function types"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' only applies to function types"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' only applies to function types"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' cannot be applied to a declaration"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' only applies to function types"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' cannot be applied to a declaration"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' only applies to function types"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' cannot be applied to a statement"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' cannot be applied to a statement"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' cannot be applied to a statement"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' cannot be applied to a statement"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' only applies to non-K&R-style functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' cannot be applied to a statement"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' cannot be applied to a statement"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' cannot be applied to a statement"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' cannot be applied to a statement"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' only applies to function types"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' only applies to non-K&R-style functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' only applies to function types; type here is 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' cannot be applied to a statement"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' cannot appear here"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' cannot appear here"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATTR_NAME' cannot appear here"
+    },
+    {
+      "kind": "error",
+      "msg": "expected '(' after ''__arm_inout''"
+    },
+    {
+      "kind": "error",
+      "msg": "expected string literal as argument of '__arm_inout' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "expected string literal as argument of '__arm_inout' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "expected '(' after ''__arm_inout''"
+    },
+    {
+      "kind": "error",
+      "msg": "expected function body after function declarator"
+    },
+    {
+      "kind": "error",
+      "msg": "expected string literal as argument of '__arm_inout' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ')'"
+    },
+    {
+      "kind": "error",
+      "msg": "expected parameter declarator"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ')'"
+    },
+    {
+      "kind": "note",
+      "msg": "to match this '('"
+    },
+    {
+      "kind": "error",
+      "msg": "function cannot return function type 'void ()'"
+    },
+    {
+      "kind": "error",
+      "msg": "'__arm_streaming' only applies to function types; type here is 'int ()'"
+    },
+    {
+      "kind": "warning",
+      "msg": "'__arm_streaming' only applies to non-K&R-style functions"
+    },
+    {
+      "kind": "error",
+      "msg": "function cannot return function type 'void ()'"
+    },
+    {
+      "kind": "error",
+      "msg": "'__arm_streaming' only applies to function types; type here is 'int ()'"
+    },
+    {
+      "kind": "warning",
+      "msg": "'__arm_streaming' only applies to non-K&R-style functions"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 9,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c --target linux_aarch64"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/c2x-attribute-keywords.sft.c",
+  "remark": null,
+  "sha256": "c106ac4fac4653da678fb4986e22bebe40a362dabed20a1730fbda492f1b311d",
+  "test_number_uses": 0,
+  "type": "fn"
+}

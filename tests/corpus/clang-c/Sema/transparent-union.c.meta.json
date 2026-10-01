@@ -1,0 +1,170 @@
+{
+  "bytes": 5249,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "passing argument to parameter here"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible type"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible type"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting types"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting types"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting types"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting types"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting types"
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting types"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting types"
+    },
+    {
+      "kind": "note",
+      "msg": "passing argument to parameter 'i' here"
+    },
+    {
+      "kind": "error",
+      "msg": "passing 'TU' to parameter of incompatible type 'int *'"
+    },
+    {
+      "kind": "note",
+      "msg": "alignment of first field"
+    },
+    {
+      "kind": "warning",
+      "msg": "alignment of field"
+    },
+    {
+      "kind": "note",
+      "msg": "alignment of first field"
+    },
+    {
+      "kind": "warning",
+      "msg": "alignment of field"
+    },
+    {
+      "kind": "note",
+      "msg": "size of first field is 8 bits"
+    },
+    {
+      "kind": "warning",
+      "msg": "size of field"
+    },
+    {
+      "kind": "note",
+      "msg": "size of first field is 8 bits"
+    },
+    {
+      "kind": "warning",
+      "msg": "size of field"
+    },
+    {
+      "kind": "warning",
+      "msg": "floating"
+    },
+    {
+      "kind": "warning",
+      "msg": "field"
+    },
+    {
+      "kind": "warning",
+      "msg": "first field of a transparent union cannot have vector type 'int4' (vector of 4 'int' values); transparent_union attribute ignored"
+    },
+    {
+      "kind": "note",
+      "msg": "alignment of first field is 32 bits"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "field has incomplete type 'void'"
+    },
+    {
+      "kind": "warning",
+      "msg": "flexible array member 'b' in a union is a GNU extension"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "field has incomplete type 'struct stb'"
+    },
+    {
+      "kind": "error",
+      "msg": "field has incomplete type 'struct stb'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 3,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/transparent-union.sft.c",
+  "remark": null,
+  "sha256": "c96d3899b6f216491ffcaaae89c5deb57d9f8fd0b1898577ffe4355ca429fd1e",
+  "test_number_uses": 0,
+  "type": "fn"
+}

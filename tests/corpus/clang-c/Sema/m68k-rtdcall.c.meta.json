@@ -1,0 +1,43 @@
+{
+  "bytes": 2211,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c89",
+    " --c89"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/m68k-rtdcall.sft.c",
+  "remark": null,
+  "sha256": "e3aa0d568877b232f427628e14d8d2ce6118504d73bee42b972d93e513ed31ea",
+  "test_number_uses": 0,
+  "type": "fn"
+}

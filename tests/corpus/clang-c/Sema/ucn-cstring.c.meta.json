@@ -1,0 +1,38 @@
+{
+  "bytes": 784,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "\\U used with no following hex digits"
+    },
+    {
+      "kind": "error",
+      "msg": "incomplete universal character name"
+    },
+    {
+      "kind": "error",
+      "msg": "incomplete universal character name"
+    },
+    {
+      "kind": "error",
+      "msg": "universal character name refers to a control character"
+    }
+  ],
+  "has_main": true,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/ucn-cstring.sft.c",
+  "remark": null,
+  "sha256": "056e6f43abe683abf49e9370de390e72801991b8673d1b446789f34ac95c89f2",
+  "test_number_uses": 0,
+  "type": "fn"
+}

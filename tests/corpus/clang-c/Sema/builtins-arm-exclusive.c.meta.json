@@ -1,0 +1,218 @@
+{
+  "bytes": 10716,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "address argument to atomic builtin must be a pointer to"
+    },
+    {
+      "kind": "error",
+      "msg": "__int128 is not supported on this target"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to function call"
+    },
+    {
+      "kind": "warning",
+      "msg": "passing 'const char *' to parameter of type 'volatile char *' discards qualifiers"
+    },
+    {
+      "kind": "error",
+      "msg": "address argument to atomic builtin must be a pointer to"
+    },
+    {
+      "kind": "error",
+      "msg": "passing 'struct Simple' to parameter of incompatible type 'struct Simple *'"
+    },
+    {
+      "kind": "error",
+      "msg": "is not a structure or union"
+    },
+    {
+      "kind": "error",
+      "msg": "__int128 is not supported on this target"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to function call"
+    },
+    {
+      "kind": "error",
+      "msg": "address argument to load or store exclusive builtin must be a pointer to 8 byte type"
+    },
+    {
+      "kind": "error",
+      "msg": "address argument to load or store exclusive builtin must be a pointer to 8 byte type"
+    },
+    {
+      "kind": "error",
+      "msg": "address argument to load or store exclusive builtin must be a pointer to 8 byte type"
+    },
+    {
+      "kind": "error",
+      "msg": "address argument to load or store exclusive builtin must be a pointer to 8 byte type"
+    },
+    {
+      "kind": "error",
+      "msg": "address argument to load or store exclusive builtin must be a pointer to 8 byte type"
+    },
+    {
+      "kind": "error",
+      "msg": "address argument to load or store exclusive builtin must be a pointer to 8 byte type"
+    },
+    {
+      "kind": "error",
+      "msg": "address argument to load or store exclusive builtin must be a pointer to 8 byte type"
+    },
+    {
+      "kind": "error",
+      "msg": "address argument to load or store exclusive builtin must be a pointer to 8 byte type"
+    },
+    {
+      "kind": "error",
+      "msg": "address argument to atomic builtin must be a pointer to"
+    },
+    {
+      "kind": "error",
+      "msg": "__int128 is not supported on this target"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to function call"
+    },
+    {
+      "kind": "error",
+      "msg": "address argument to load or store exclusive builtin must be a pointer to 8 byte type"
+    },
+    {
+      "kind": "error",
+      "msg": "address argument to load or store exclusive builtin must be a pointer to 8 byte type"
+    },
+    {
+      "kind": "error",
+      "msg": "address argument to load or store exclusive builtin must be a pointer to 8 byte type"
+    },
+    {
+      "kind": "error",
+      "msg": "address argument to load or store exclusive builtin must be a pointer to 8 byte type"
+    },
+    {
+      "kind": "error",
+      "msg": "address argument to load or store exclusive builtin must be a pointer to 8 byte type"
+    },
+    {
+      "kind": "error",
+      "msg": "address argument to load or store exclusive builtin must be a pointer to 8 byte type"
+    },
+    {
+      "kind": "error",
+      "msg": "address argument to load or store exclusive builtin must be a pointer to 8 byte type"
+    },
+    {
+      "kind": "warning",
+      "msg": "passing 'const char *' to parameter of type 'volatile char *' discards qualifiers"
+    },
+    {
+      "kind": "error",
+      "msg": "address argument to atomic builtin must be a pointer to"
+    },
+    {
+      "kind": "error",
+      "msg": "passing 'struct Simple' to parameter of incompatible type 'struct Simple *'"
+    },
+    {
+      "kind": "error",
+      "msg": "is not a structure or union"
+    },
+    {
+      "kind": "error",
+      "msg": "__int128 is not supported on this target"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to function call"
+    },
+    {
+      "kind": "error",
+      "msg": "address argument to atomic builtin must be a pointer to"
+    },
+    {
+      "kind": "error",
+      "msg": "__int128 is not supported on this target"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to function call"
+    },
+    {
+      "kind": "warning",
+      "msg": "passing 'const char *' to parameter of type 'volatile char *' discards qualifiers"
+    },
+    {
+      "kind": "error",
+      "msg": "address argument to atomic builtin must be a pointer to"
+    },
+    {
+      "kind": "error",
+      "msg": "passing 'struct Simple' to parameter of incompatible type 'struct Simple *'"
+    },
+    {
+      "kind": "error",
+      "msg": "is not a structure or union"
+    },
+    {
+      "kind": "error",
+      "msg": "__int128 is not supported on this target"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to function call"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to function call"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 12,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/builtins-arm-exclusive.sft.c",
+  "remark": null,
+  "sha256": "444bca5bf6a42cd6ea619c1052a3cb030b7edfc97028413e54b66047885f6531",
+  "test_number_uses": 0,
+  "type": "fn"
+}

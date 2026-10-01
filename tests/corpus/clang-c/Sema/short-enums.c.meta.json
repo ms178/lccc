@@ -1,0 +1,21 @@
+{
+  "bytes": 241,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/short-enums.sft.c",
+  "remark": null,
+  "sha256": "aff759607d81a19d324cdd21b5a4c1992d0fa8e348a096b1ca8ef8f298bc2f89",
+  "test_number_uses": 0,
+  "type": "fp"
+}

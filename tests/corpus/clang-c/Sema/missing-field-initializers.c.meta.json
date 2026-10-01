@@ -1,0 +1,46 @@
+{
+  "bytes": 1542,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "missing field 'b' initializer"
+    },
+    {
+      "kind": "warning",
+      "msg": "missing field 'b' initializer"
+    },
+    {
+      "kind": "warning",
+      "msg": "missing field 'b' initializer"
+    },
+    {
+      "kind": "warning",
+      "msg": "missing field 'b' initializer"
+    },
+    {
+      "kind": "warning",
+      "msg": "missing field 'e' initializer"
+    },
+    {
+      "kind": "warning",
+      "msg": "missing field 'b' initializer"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/missing-field-initializers.sft.c",
+  "remark": null,
+  "sha256": "46a4fb98ffcdbca7cd0a259f8fe32289fff78214c983455dcf29d81a2d23cf16",
+  "test_number_uses": 0,
+  "type": "fp"
+}

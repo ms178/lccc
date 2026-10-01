@@ -1,0 +1,26 @@
+{
+  "bytes": 338,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "no-diagnostics",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c --target linux_aarch64"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/aarch64-sve-alias-attribute.sft.c",
+  "remark": null,
+  "sha256": "7b90c33ffc506b0bf3f7a760da2e0e5ecdd7e90de45ec91cf689df60bc7c1f33",
+  "test_number_uses": 0,
+  "type": "fp"
+}

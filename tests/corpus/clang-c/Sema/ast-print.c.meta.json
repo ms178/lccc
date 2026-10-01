@@ -1,0 +1,50 @@
+{
+  "bytes": 3668,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "use of GNU old-style field designator extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "'EnumWithAttributes' is deprecated"
+    },
+    {
+      "kind": "note",
+      "msg": "'EnumWithAttributes' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 14,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/ast-print.sft.c",
+  "remark": null,
+  "sha256": "baf50150aae7f6561d49eaa60dd2f1dac41235722ba6f690e2f66e0a4fdf33c7",
+  "test_number_uses": 0,
+  "type": "fp"
+}

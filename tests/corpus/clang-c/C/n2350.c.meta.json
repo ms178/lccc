@@ -1,0 +1,42 @@
+{
+  "bytes": 2464,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "defining a type within '__builtin_offsetof' is a C23 extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "defining a type within '__builtin_offsetof' is a C23 extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "defining a type within '__builtin_offsetof' is a C23 extension"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 15,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c89",
+    " --c99",
+    " --c11",
+    " --c17",
+    " --c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C23/n2350.sft.c",
+  "remark": null,
+  "sha256": "a59063b917a315f985e9e3e303e3718d017e2af23e18401097e4adb7c86968aa",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,158 @@
+{
+  "bytes": 3760,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "cannot jump from this goto statement to its label"
+    },
+    {
+      "kind": "note",
+      "msg": "jump enters a defer statement"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot jump from this goto statement to its label"
+    },
+    {
+      "kind": "note",
+      "msg": "jump bypasses defer statement"
+    },
+    {
+      "kind": "note",
+      "msg": "jump exits a defer statement"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot jump from this goto statement to its label"
+    },
+    {
+      "kind": "note",
+      "msg": "jump exits a defer statement"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot jump from this goto statement to its label"
+    },
+    {
+      "kind": "note",
+      "msg": "jump enters a defer statement"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot jump from this goto statement to its label"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot jump from this goto statement to its label"
+    },
+    {
+      "kind": "note",
+      "msg": "jump bypasses defer statement"
+    },
+    {
+      "kind": "note",
+      "msg": "jump bypasses defer statement"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot jump from this goto statement to its label"
+    },
+    {
+      "kind": "note",
+      "msg": "jump bypasses defer statement"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot jump from this goto statement to its label"
+    },
+    {
+      "kind": "note",
+      "msg": "jump exits a defer statement"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot jump from this goto statement to its label"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot return from a defer statement"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot return from a defer statement"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot break out of a defer statement"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot break out of a defer statement"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot continue loop outside of enclosing defer statement"
+    },
+    {
+      "kind": "note",
+      "msg": "jump bypasses defer statement"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot jump from switch statement to this case label"
+    },
+    {
+      "kind": "note",
+      "msg": "jump enters a defer statement"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot jump from switch statement to this case label"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot break out of a defer statement"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot jump from switch statement to this case label"
+    },
+    {
+      "kind": "note",
+      "msg": "jump enters a defer statement"
+    },
+    {
+      "kind": "note",
+      "msg": "jump bypasses defer statement"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot break out of a defer statement"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot jump from switch statement to this case label"
+    },
+    {
+      "kind": "note",
+      "msg": "jump enters a defer statement"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/defer-ts.sft.c",
+  "remark": null,
+  "sha256": "f709dd71bb6ca82fcd008e1796a358890929e46461ae73937fd651c9751dc8bf",
+  "test_number_uses": 0,
+  "type": "fn"
+}

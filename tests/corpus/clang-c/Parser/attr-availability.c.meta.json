@@ -1,0 +1,78 @@
+{
+  "bytes": 3039,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "redundant 'introduced' availability change; only the last specified change will be used"
+    },
+    {
+      "kind": "error",
+      "msg": "redundant 'unavailable' availability change; only the last specified change will be used"
+    },
+    {
+      "kind": "warning",
+      "msg": "'unavailable' availability overrides all other availability information"
+    },
+    {
+      "kind": "warning",
+      "msg": "encoding prefix 'L' on an unevaluated string literal has no effect"
+    },
+    {
+      "kind": "warning",
+      "msg": "encoding prefix 'L' on an unevaluated string literal has no effect"
+    },
+    {
+      "kind": "warning",
+      "msg": "encoding prefix 'u8' on an unevaluated string literal has no effect"
+    },
+    {
+      "kind": "warning",
+      "msg": "encoding prefix 'u8' on an unevaluated string literal has no effect"
+    },
+    {
+      "kind": "warning",
+      "msg": "encoding prefix 'u' on an unevaluated string literal has no effect"
+    },
+    {
+      "kind": "warning",
+      "msg": "encoding prefix 'u' on an unevaluated string literal has no effect"
+    },
+    {
+      "kind": "error",
+      "msg": "unexpected parameter 'environment' in availability attribute, not permitted in C/C++"
+    },
+    {
+      "kind": "error",
+      "msg": "expected string literal for optional message in 'availability' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "expected '=' after 'message'"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ')'"
+    },
+    {
+      "kind": "note",
+      "msg": "to match this '('"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c11"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/attr-availability.sft.c",
+  "remark": null,
+  "sha256": "72f01225ad61d21ebce96b13d3eeb3b7983223d3f12347341aaa2fe3432c6115",
+  "test_number_uses": 0,
+  "type": "fn"
+}

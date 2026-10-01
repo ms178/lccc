@@ -1,0 +1,30 @@
+{
+  "bytes": 314,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "unknown attribute 'nomips16' ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "unknown attribute 'mips16' ignored"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/mips16_attr_not_allowed.sft.c",
+  "remark": null,
+  "sha256": "98b7d7435411b52665416b78692b694b4d7f0976ddeb48856347c58fa9001db5",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,46 @@
+{
+  "bytes": 1059,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'nomips16' attribute takes no arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'mips16' attribute takes no arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'nomips16' attribute takes no arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'mips16' attribute takes no arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "attribute only applies to functions"
+    },
+    {
+      "kind": "error",
+      "msg": "attribute only applies to functions"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/mips16_attr_allowed.sft.c",
+  "remark": null,
+  "sha256": "35a808d1e49ae13602e6c9c0f3c64c52afb03a5ecf9d26836c3e8103eabcf789",
+  "test_number_uses": 0,
+  "type": "fn"
+}

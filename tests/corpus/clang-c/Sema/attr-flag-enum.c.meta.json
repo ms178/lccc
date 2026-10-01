@@ -1,0 +1,86 @@
+{
+  "bytes": 2761,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "enumeration value 'g' is out of range of flags in enumeration type 'enum (unnamed at"
+    },
+    {
+      "kind": "warning",
+      "msg": "enumeration value 'gd' is out of range"
+    },
+    {
+      "kind": "warning",
+      "msg": "enumeration value 'ge' is out of range"
+    },
+    {
+      "kind": "warning",
+      "msg": "enumeration value 'gi' is out of range"
+    },
+    {
+      "kind": "warning",
+      "msg": "enumeration value 'hc' is out of range"
+    },
+    {
+      "kind": "warning",
+      "msg": "integer constant not in range of enumerated type"
+    },
+    {
+      "kind": "warning",
+      "msg": "integer constant not in range of enumerated type"
+    },
+    {
+      "kind": "warning",
+      "msg": "integer constant not in range of enumerated type"
+    },
+    {
+      "kind": "warning",
+      "msg": "case value not in enumerated type"
+    },
+    {
+      "kind": "warning",
+      "msg": "case value not in enumerated type"
+    },
+    {
+      "kind": "warning",
+      "msg": "case value not in enumerated type"
+    },
+    {
+      "kind": "warning",
+      "msg": "case value not in enumerated type"
+    },
+    {
+      "kind": "warning",
+      "msg": "case value not in enumerated type"
+    },
+    {
+      "kind": "warning",
+      "msg": "case value not in enumerated type"
+    },
+    {
+      "kind": "warning",
+      "msg": "case value not in enumerated type"
+    },
+    {
+      "kind": "warning",
+      "msg": "integer constant not in range of enumerated type"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c11"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-flag-enum.sft.c",
+  "remark": null,
+  "sha256": "4a9bbbe141210a108bc37538955ec196a80ce1233313871a39a561bee1a1e3b7",
+  "test_number_uses": 0,
+  "type": "fp"
+}

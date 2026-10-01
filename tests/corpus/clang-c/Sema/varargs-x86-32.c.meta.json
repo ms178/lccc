@@ -1,0 +1,26 @@
+{
+  "bytes": 246,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "this builtin is only available on x86-64 and aarch64 targets"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/varargs-x86-32.sft.c",
+  "remark": null,
+  "sha256": "ec629d9dfa34b1ac08a3539802572c008cc37ee710aa1ab719698eeff0481aba",
+  "test_number_uses": 0,
+  "type": "fn"
+}

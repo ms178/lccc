@@ -1,0 +1,34 @@
+{
+  "bytes": 1106,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "expression is not a string literal"
+    },
+    {
+      "kind": "error",
+      "msg": "expression is not a string literal"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid argument 'unsupported' to __builtin_allow_sanitize_check"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/builtin-allow-sanitize-check.sft.c",
+  "remark": null,
+  "sha256": "70abd74cc0d70bff2cf77ef6a691577b38f4ff5c14cb059935a584b32fb6d778",
+  "test_number_uses": 0,
+  "type": "fn"
+}

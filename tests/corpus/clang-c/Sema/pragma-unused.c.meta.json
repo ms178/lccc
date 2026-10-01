@@ -1,0 +1,70 @@
+{
+  "bytes": 1699,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "unused"
+    },
+    {
+      "kind": "warning",
+      "msg": "missing '(' after '#pragma unused' - ignoring"
+    },
+    {
+      "kind": "warning",
+      "msg": "unused"
+    },
+    {
+      "kind": "warning",
+      "msg": "expected '#pragma unused' argument to be a variable name"
+    },
+    {
+      "kind": "warning",
+      "msg": "expected '#pragma unused' argument to be a variable name"
+    },
+    {
+      "kind": "warning",
+      "msg": "undeclared variable 'x' used as an argument for '#pragma unused'"
+    },
+    {
+      "kind": "warning",
+      "msg": "unused"
+    },
+    {
+      "kind": "warning",
+      "msg": "expected '#pragma unused' argument to be a variable name"
+    },
+    {
+      "kind": "warning",
+      "msg": "undeclared variable 'undeclared' used as an argument for '#pragma unused'"
+    },
+    {
+      "kind": "warning",
+      "msg": "unused parameter 'x'"
+    },
+    {
+      "kind": "warning",
+      "msg": "'x' was marked unused but was used"
+    },
+    {
+      "kind": "warning",
+      "msg": "'x' was marked unused but was used"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/pragma-unused.sft.c",
+  "remark": null,
+  "sha256": "0d8223aa6862fb00c08fffc6bda35d0f9bfb5287fff9c5c50c15267ff2f01d2c",
+  "test_number_uses": 0,
+  "type": "fp"
+}

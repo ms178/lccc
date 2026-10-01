@@ -1,0 +1,68 @@
+{
+  "bytes": 4892,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "temporary whose address is used as value of local variable 'p' will be destroyed at the end of the full-expression"
+    },
+    {
+      "kind": "warning",
+      "msg": "object backing the pointer 'p' will be destroyed at the end of the full-expression"
+    },
+    {
+      "kind": "warning",
+      "msg": "object backing the pointer 'p' will be destroyed at the end of the full-expression"
+    },
+    {
+      "kind": "warning",
+      "msg": "temporary whose address is used as value of local variable 'p' will be destroyed at the end of the full-expression"
+    },
+    {
+      "kind": "warning",
+      "msg": "temporary whose address is used as value of local variable 'r' will be destroyed at the end of the full-expression"
+    },
+    {
+      "kind": "warning",
+      "msg": "object backing the pointer 'p' will be destroyed at the end of the full-expression"
+    },
+    {
+      "kind": "warning",
+      "msg": "temporary whose address is used as value of local variable 'q' will be destroyed at the end of the full-expression"
+    },
+    {
+      "kind": "warning",
+      "msg": "object backing the pointer 'q' will be destroyed at the end of the full-expression"
+    },
+    {
+      "kind": "warning",
+      "msg": "object backing the pointer 'q' will be destroyed at the end of the full-expression"
+    },
+    {
+      "kind": "warning",
+      "msg": "temporary whose address is used as value of local variable 'p' will be destroyed at the end of the full-expression"
+    },
+    {
+      "kind": "warning",
+      "msg": "object backing the pointer 'p' will be destroyed at the end of the full-expression"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 26,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c99",
+    " --c11",
+    " --c++11 --c++"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C11/n1285.sft.c",
+  "remark": null,
+  "sha256": "5a38fe4694d193efd12ab439f60a1009a0648e909933afb2b8f4dba74e6095f5",
+  "test_number_uses": 0,
+  "type": "fp"
+}

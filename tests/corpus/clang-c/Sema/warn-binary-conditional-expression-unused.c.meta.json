@@ -1,0 +1,38 @@
+{
+  "bytes": 459,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "expression result unused"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression result unused"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression result unused"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression result unused"
+    }
+  ],
+  "has_main": true,
+  "header_lines": 3,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-binary-conditional-expression-unused.sft.c",
+  "remark": null,
+  "sha256": "7c928f5504ba3bc3fbdcfc5955674532cbc766dc08bbc9647fe999348758620d",
+  "test_number_uses": 0,
+  "type": "fp"
+}

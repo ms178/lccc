@@ -1,0 +1,374 @@
+{
+  "bytes": 18525,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "identifier 'catch' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'class' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'const_cast' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'delete' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'dynamic_cast' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'explicit' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'export' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'friend' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'mutable' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'namespace' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'new' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'operator' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'private' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'protected' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'public' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'reinterpret_cast' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'static_cast' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'template' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'typename' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'typeid' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'using' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'virtual' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'wchar_t' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'char8_t' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'char16_t' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'char32_t' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'noexcept' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'co_await' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'co_return' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'co_yield' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'consteval' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'constinit' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'concept' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'requires' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'catch' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'class' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'const_cast' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'delete' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'dynamic_cast' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'explicit' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'export' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'friend' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'mutable' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'namespace' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'new' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'operator' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'private' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'protected' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'public' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'reinterpret_cast' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'static_cast' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'template' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'this' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'throw' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'try' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'typename' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'typeid' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'using' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'virtual' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'wchar_t' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'char8_t' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'char16_t' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'char32_t' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'noexcept' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'co_await' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'co_return' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'co_yield' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'consteval' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'constinit' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'concept' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'requires' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'throw' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'try' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'this' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'private' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'decltype' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'decltype' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'and' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'and_eq' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'bitand' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'bitor' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'compl' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'not' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'not_eq' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'or' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'or_eq' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'xor' conflicts with a C++ keyword"
+    },
+    {
+      "kind": "warning",
+      "msg": "identifier 'xor_eq' conflicts with a C++ keyword"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 11,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/c++-keyword-in-c.sft.c",
+  "remark": null,
+  "sha256": "659dd6a9bd90e9e90ccce3b704d3b0b71d5559d32aaf02a69f53678ae4f70c6a",
+  "test_number_uses": 0,
+  "type": "fp"
+}

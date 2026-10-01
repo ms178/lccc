@@ -1,0 +1,46 @@
+{
+  "bytes": 949,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'maybe_undef' attribute only applies to parameters"
+    },
+    {
+      "kind": "warning",
+      "msg": "'maybe_undef' attribute only applies to parameters"
+    },
+    {
+      "kind": "warning",
+      "msg": "'maybe_undef' attribute only applies to parameters"
+    },
+    {
+      "kind": "error",
+      "msg": "'maybe_undef' attribute takes no arguments"
+    },
+    {
+      "kind": "warning",
+      "msg": "'maybe_undef' attribute only applies to parameters"
+    },
+    {
+      "kind": "warning",
+      "msg": "'maybe_undef' attribute only applies to parameters"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-maybeundef.sft.c",
+  "remark": null,
+  "sha256": "8f550695c17d8b320bff13f593b3ec9e5e12b0829f2dc7293faf88311215082d",
+  "test_number_uses": 0,
+  "type": "fn"
+}

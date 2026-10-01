@@ -1,0 +1,78 @@
+{
+  "bytes": 2357,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "a function definition without a prototype is deprecated in all versions of C and is not supported in C23"
+    },
+    {
+      "kind": "warning",
+      "msg": "too few arguments"
+    },
+    {
+      "kind": "warning",
+      "msg": "a function definition without a prototype is deprecated in all versions of C and is not supported in C23"
+    },
+    {
+      "kind": "warning",
+      "msg": "too many arguments"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "promoted type 'double' of K&R function parameter is not compatible with the parameter type 'float' declared in a previous prototype"
+    },
+    {
+      "kind": "warning",
+      "msg": "a function definition without a prototype is deprecated in all versions of C and is not supported in C23"
+    },
+    {
+      "kind": "warning",
+      "msg": "promoted type 'char *' of K&R function parameter is not compatible with the parameter type 'const char *' declared in a previous prototype"
+    },
+    {
+      "kind": "warning",
+      "msg": "a function definition without a prototype is deprecated in all versions of C and is not supported in C23"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from 'double' to 'int' changes value from 42.1 to 42"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from 'double' to 'int' changes value from 42.1 to 42"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "a function definition without a prototype is deprecated in all versions of C and is not supported in C23"
+    },
+    {
+      "kind": "warning",
+      "msg": "promoted type 'int' of K&R function parameter is not compatible with the parameter type 'short' declared in a previous prototype"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/knr-def-call.sft.c",
+  "remark": null,
+  "sha256": "41898a5cf0cc97df1a46dc6fb87811d993c70f23e3f8126f02578fa624d1a343",
+  "test_number_uses": 0,
+  "type": "fp"
+}

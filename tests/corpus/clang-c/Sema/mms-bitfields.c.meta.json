@@ -1,0 +1,21 @@
+{
+  "bytes": 1043,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/mms-bitfields.sft.c",
+  "remark": null,
+  "sha256": "5f065615f06404f2ea768ca2b8a38a2e90fad65c8ece4e4e0523d614377fe2da",
+  "test_number_uses": 0,
+  "type": "fp"
+}

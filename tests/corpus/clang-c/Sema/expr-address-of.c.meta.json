@@ -1,0 +1,122 @@
+{
+  "bytes": 3723,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "address of bit-field requested"
+    },
+    {
+      "kind": "error",
+      "msg": "address of bit-field requested"
+    },
+    {
+      "kind": "error",
+      "msg": "address of bit-field requested"
+    },
+    {
+      "kind": "error",
+      "msg": "address of register variable requested"
+    },
+    {
+      "kind": "error",
+      "msg": "address of register variable requested"
+    },
+    {
+      "kind": "error",
+      "msg": "address of vector element requested"
+    },
+    {
+      "kind": "error",
+      "msg": "address of vector element requested"
+    },
+    {
+      "kind": "error",
+      "msg": "address of register variable requested"
+    },
+    {
+      "kind": "error",
+      "msg": "address of register variable requested"
+    },
+    {
+      "kind": "error",
+      "msg": "address of register variable requested"
+    },
+    {
+      "kind": "error",
+      "msg": "address of register variable requested"
+    },
+    {
+      "kind": "error",
+      "msg": "address of register variable requested"
+    },
+    {
+      "kind": "error",
+      "msg": "address of register variable requested"
+    },
+    {
+      "kind": "error",
+      "msg": "address of register variable requested"
+    },
+    {
+      "kind": "error",
+      "msg": "address of register variable requested"
+    },
+    {
+      "kind": "error",
+      "msg": "address of register variable requested"
+    },
+    {
+      "kind": "error",
+      "msg": "address of register variable requested"
+    },
+    {
+      "kind": "error",
+      "msg": "address of register variable requested"
+    },
+    {
+      "kind": "error",
+      "msg": "address of register variable requested"
+    },
+    {
+      "kind": "error",
+      "msg": "address of bit-field requested"
+    },
+    {
+      "kind": "error",
+      "msg": "address of bit-field requested"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot take the address of an rvalue of type 'void'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot take the address of an rvalue of type 'void'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot take the address of an rvalue of type 'void'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot take the address of an rvalue of type 'void'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 3,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/expr-address-of.sft.c",
+  "remark": null,
+  "sha256": "f3c220616b266cb9c0bd5961ced6d53009a747df969fa7d048776d773997ca4d",
+  "test_number_uses": 0,
+  "type": "fn"
+}

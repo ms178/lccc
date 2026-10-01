@@ -1,0 +1,38 @@
+{
+  "bytes": 1979,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "excess elements in vector initializer"
+    },
+    {
+      "kind": "warning",
+      "msg": "excess elements in array initializer"
+    },
+    {
+      "kind": "warning",
+      "msg": "excess elements in array initializer"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/vector-init.sft.c",
+  "remark": null,
+  "sha256": "14f05cdc3bed1f0f971de2283110f336ea37a1b06a33be1d2c4d9ec92fd36251",
+  "test_number_uses": 0,
+  "type": "fn"
+}

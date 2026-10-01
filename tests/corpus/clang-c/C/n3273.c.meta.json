@@ -1,0 +1,26 @@
+{
+  "bytes": 518,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'alignof' on an incomplete array type is incompatible with C standards before C2y"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 9,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C2y/n3273.sft.c",
+  "remark": null,
+  "sha256": "b412c3c32afb760feea3dacf31a00e70bbe485fe90d6a459f1d109e0525d6737",
+  "test_number_uses": 0,
+  "type": "fp"
+}

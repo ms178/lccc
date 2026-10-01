@@ -1,0 +1,26 @@
+{
+  "bytes": 371,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'#pragma alloc_text' is applicable only to functions"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--ms_extensions --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/pragma-ms-alloc-text.sft.c",
+  "remark": null,
+  "sha256": "12a27eaf84b008e859582d8b22a9c6d1cc1758b29426810002b6d06d25c113d1",
+  "test_number_uses": 0,
+  "type": "fn"
+}

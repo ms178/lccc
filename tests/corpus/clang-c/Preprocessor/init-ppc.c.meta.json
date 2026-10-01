@@ -1,0 +1,24 @@
+{
+  "bytes": 45577,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 1039,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w --c11",
+    " --c11 --strict_gnu",
+    " --c17",
+    " --c99"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/init-ppc.sft.c",
+  "remark": null,
+  "sha256": "d59d2ed50bbbea090628b96e2f7022233bf78d7404524dfbe9287e291d525cad",
+  "test_number_uses": 0,
+  "type": "fp"
+}

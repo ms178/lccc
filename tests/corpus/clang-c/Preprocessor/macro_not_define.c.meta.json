@@ -1,0 +1,21 @@
+{
+  "bytes": 216,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 10,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/macro_not_define.sft.c",
+  "remark": null,
+  "sha256": "16c3f6c81ffe5b074676ecdc8d9d90f24d86fee7041761fd0a897713d1b12fee",
+  "test_number_uses": 0,
+  "type": "fp"
+}

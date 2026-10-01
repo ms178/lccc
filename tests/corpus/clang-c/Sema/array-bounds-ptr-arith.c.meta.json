@@ -1,0 +1,30 @@
+{
+  "bytes": 1898,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "declared here"
+    },
+    {
+      "kind": "warning",
+      "msg": "the pointer incremented by 9 refers past the end of the array (that has type 'unsigned char[8]')"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/array-bounds-ptr-arith.sft.c",
+  "remark": null,
+  "sha256": "d7ab535be44dbbed45bc43e2a49a286edee34bb08d32bc0b2477edea0a6da455",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,58 @@
+{
+  "bytes": 3690,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    }
+  ],
+  "has_main": true,
+  "header_lines": 8,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--ms_extensions -w -DMSVC --ms_extensions -w -DMSVC --ms_extensions -w -DMSVC -w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/callingconv-cast.sft.c",
+  "remark": null,
+  "sha256": "f7f9df1c20ba112ddb7eb78075310dd15f8fa24bbc6009803b57f6072b31d013",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,28 @@
+{
+  "bytes": 501,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "implicit '0' return value from 'main' is a C99 extension"
+    }
+  ],
+  "has_main": true,
+  "header_lines": 9,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c89",
+    " --c89",
+    " --c89"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/main-no-return-c89-1.sft.c",
+  "remark": null,
+  "sha256": "9a8e622cd76df9b11ebc117fa6cc417355d3e94460f0eeb124d4938f9e03f6b0",
+  "test_number_uses": 0,
+  "type": "fp"
+}

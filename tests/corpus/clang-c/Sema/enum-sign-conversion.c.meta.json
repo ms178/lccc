@@ -1,0 +1,21 @@
+{
+  "bytes": 1549,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/enum-sign-conversion.sft.c",
+  "remark": null,
+  "sha256": "3929cd0170f8f93f47921aa4d97838ac3a2d8af3bdb74037a7ed22ca5d096719",
+  "test_number_uses": 0,
+  "type": "fp"
+}

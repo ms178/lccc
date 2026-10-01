@@ -1,0 +1,26 @@
+{
+  "bytes": 254,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "expected '(' after 'typeof_unqual'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C23/n2930.sft.c",
+  "remark": null,
+  "sha256": "8d522a652c47a357b62715f6a6eda6b896f88d545d28e5bb2848bc3678066dfa",
+  "test_number_uses": 0,
+  "type": "fn"
+}

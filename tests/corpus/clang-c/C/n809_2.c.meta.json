@@ -1,0 +1,21 @@
+{
+  "bytes": 2707,
+  "cases": null,
+  "category": "C",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c99"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C99/n809_2.sft.c",
+  "remark": null,
+  "sha256": "f83bb4a198b2c6f1cd322c54d73eb9de04bf7c5e9c4c87654d3e48b88c99c3bf",
+  "test_number_uses": 0,
+  "type": "fp"
+}

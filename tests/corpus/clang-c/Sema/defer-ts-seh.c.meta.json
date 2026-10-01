@@ -1,0 +1,26 @@
+{
+  "bytes": 391,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "cannot __leave a defer statement"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23 --ms_compatibility -w"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/defer-ts-seh.sft.c",
+  "remark": null,
+  "sha256": "2d2799b997c66f181ab5b4768e96db9a721dad3dc4d46b935124bfba87552854",
+  "test_number_uses": 0,
+  "type": "fn"
+}

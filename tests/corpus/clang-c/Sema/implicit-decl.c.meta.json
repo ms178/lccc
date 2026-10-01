@@ -1,0 +1,88 @@
+{
+  "bytes": 5408,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "call to undeclared function '_CFCalendarDecomposeAbsoluteTimeV'; ISO C99 and later do not support implicit function declarations"
+    },
+    {
+      "kind": "note",
+      "msg": "previous implicit declaration"
+    },
+    {
+      "kind": "error",
+      "msg": "call to undeclared function 'printg'; ISO C99 and later do not support implicit function declarations"
+    },
+    {
+      "kind": "note",
+      "msg": "did you mean 'printf'?"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin '__builtin_is_les'"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting types"
+    },
+    {
+      "kind": "note",
+      "msg": "'sformatf' declared here"
+    },
+    {
+      "kind": "error",
+      "msg": "call to undeclared function 'formatd'; ISO C99 and later do not support implicit function declarations"
+    },
+    {
+      "kind": "note",
+      "msg": "did you mean 'sformatf'?"
+    },
+    {
+      "kind": "error",
+      "msg": "call to undeclared function 'bark'; ISO C99 and later do not support implicit function declarations"
+    },
+    {
+      "kind": "error",
+      "msg": "call to undeclared function 'bork'; ISO C99 and later do not support implicit function declarations"
+    },
+    {
+      "kind": "error",
+      "msg": "call to undeclared function 'a'; ISO C99 and later do not support implicit function declarations"
+    },
+    {
+      "kind": "error",
+      "msg": "call to undeclared function 'a'; ISO C99 and later do not support implicit function declarations"
+    },
+    {
+      "kind": "error",
+      "msg": "fields must have a constant size: 'variable length array in structure' extension will never be supported"
+    },
+    {
+      "kind": "warning",
+      "msg": "call to undeclared function 'bark'; ISO C99 and later do not support implicit function declarations"
+    },
+    {
+      "kind": "error",
+      "msg": "call to undeclared function 'bark'; ISO C99 and later do not support implicit function declarations"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 11,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c99",
+    " --c11",
+    " --c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/implicit-decl.sft.c",
+  "remark": null,
+  "sha256": "8a2eb2828c77aea12c2aae7d6cc0bf5deb1fba8d9c9e73a9a13917b56097e5b9",
+  "test_number_uses": 0,
+  "type": "fn"
+}

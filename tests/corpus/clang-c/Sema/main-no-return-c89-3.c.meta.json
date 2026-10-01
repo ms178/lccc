@@ -1,0 +1,21 @@
+{
+  "bytes": 189,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": true,
+  "header_lines": 7,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c89"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/main-no-return-c89-3.sft.c",
+  "remark": null,
+  "sha256": "4e686cb3db2124d6f03fd79657a5f6687653422408af1b6ae1c4e0bc63397438",
+  "test_number_uses": 0,
+  "type": "fp"
+}

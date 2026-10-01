@@ -1,0 +1,26 @@
+{
+  "bytes": 359,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-availability-iosmac-infer-from-macos-no-sdk-settings.sft.c",
+  "remark": null,
+  "sha256": "1a9b219a2f8f7b275fd0c0c9825945ce10d274aee7641cbf78d49485692299e5",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,42 @@
+{
+  "bytes": 908,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "sizeof on array function parameter will return size of 'int *' instead of 'int[10]'"
+    },
+    {
+      "kind": "warning",
+      "msg": "sizeof on array function parameter will return size of 'int *' instead of 'int[10]'"
+    },
+    {
+      "kind": "warning",
+      "msg": "sizeof on array function parameter will return size of 'int *' instead of 'int[10]'"
+    },
+    {
+      "kind": "warning",
+      "msg": "sizeof on array function parameter will return size of 'int *' instead of 'Arr' (aka 'int[10]')"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-sizeof-arrayarg.sft.c",
+  "remark": null,
+  "sha256": "a7a0cd06d09b3ddc6dd9dc51b8e787dafec7f30e6c8cf1e05d2b61987c4abd8d",
+  "test_number_uses": 0,
+  "type": "fp"
+}

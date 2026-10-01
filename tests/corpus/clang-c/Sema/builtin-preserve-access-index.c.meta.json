@@ -1,0 +1,34 @@
+{
+  "bytes": 1250,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "too many arguments to function call, expected 1, have 2"
+    },
+    {
+      "kind": "warning",
+      "msg": "returning 'const int *' from a function with result type 'void *' discards qualifiers"
+    },
+    {
+      "kind": "warning",
+      "msg": "returning 'const volatile int *' from a function with result type 'const void *' discards qualifiers"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/builtin-preserve-access-index.sft.c",
+  "remark": null,
+  "sha256": "b71d098f778a40aa56f53f4d518489a6ac40759bdd4972b830a5e999bcc6d9a3",
+  "test_number_uses": 0,
+  "type": "fn"
+}

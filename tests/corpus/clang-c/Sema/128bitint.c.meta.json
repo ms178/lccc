@@ -1,0 +1,34 @@
+{
+  "bytes": 1453,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "integer literal is too large to be represented in any integer type"
+    },
+    {
+      "kind": "error",
+      "msg": "integer literal is too large to be represented in any integer type"
+    },
+    {
+      "kind": "error",
+      "msg": "__int128 is not supported on this target"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DHAVE -DHAVE_NOT -DHAVE -DHAVE_NOT --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/128bitint.sft.c",
+  "remark": null,
+  "sha256": "a1c2df0bf6be624be004c668fdb7721d165634bd7f5dcd241b127176a79d19bf",
+  "test_number_uses": 0,
+  "type": "fn"
+}

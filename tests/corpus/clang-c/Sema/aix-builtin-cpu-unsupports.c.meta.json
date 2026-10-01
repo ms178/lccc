@@ -1,0 +1,58 @@
+{
+  "bytes": 1190,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "invalid cpu feature string for builtin"
+    },
+    {
+      "kind": "warning",
+      "msg": "invalid cpu feature string for builtin"
+    },
+    {
+      "kind": "warning",
+      "msg": "invalid cpu feature string for builtin"
+    },
+    {
+      "kind": "warning",
+      "msg": "invalid cpu feature string for builtin"
+    },
+    {
+      "kind": "warning",
+      "msg": "invalid cpu feature string for builtin"
+    },
+    {
+      "kind": "warning",
+      "msg": "invalid cpu feature string for builtin"
+    },
+    {
+      "kind": "warning",
+      "msg": "invalid cpu feature string for builtin"
+    },
+    {
+      "kind": "warning",
+      "msg": "invalid cpu feature string for builtin"
+    },
+    {
+      "kind": "warning",
+      "msg": "invalid cpu feature string for builtin"
+    }
+  ],
+  "has_main": true,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/aix-builtin-cpu-unsupports.sft.c",
+  "remark": null,
+  "sha256": "0b02822704c2158137b93016622d0b63714d15c8c164c7af7529dc9e15faa635",
+  "test_number_uses": 0,
+  "type": "fp"
+}

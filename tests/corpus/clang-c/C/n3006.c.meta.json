@@ -1,0 +1,134 @@
+{
+  "bytes": 5663,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "field 'x' has type 'int' here"
+    },
+    {
+      "kind": "error",
+      "msg": "type 'struct S1' has incompatible definitions"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use 'auto' with array in C"
+    },
+    {
+      "kind": "note",
+      "msg": "field 'x' has type 'char' here"
+    },
+    {
+      "kind": "note",
+      "msg": "field 'a' has type 'int' here"
+    },
+    {
+      "kind": "error",
+      "msg": "type 'union U1' has incompatible definitions"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use 'auto' with array in C"
+    },
+    {
+      "kind": "note",
+      "msg": "field 'a' has type 'char' here"
+    },
+    {
+      "kind": "note",
+      "msg": "enumerator 'BAR' with value 1 here"
+    },
+    {
+      "kind": "error",
+      "msg": "type 'enum E1' has incompatible definitions"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use 'auto' with array in C"
+    },
+    {
+      "kind": "note",
+      "msg": "enumerator 'ONE' with value 0 here"
+    },
+    {
+      "kind": "error",
+      "msg": "use of empty enum"
+    },
+    {
+      "kind": "error",
+      "msg": "variable has incomplete type 'enum E4'"
+    },
+    {
+      "kind": "note",
+      "msg": "forward declaration of 'enum E4'"
+    },
+    {
+      "kind": "error",
+      "msg": "variable has incomplete type 'struct S1'"
+    },
+    {
+      "kind": "note",
+      "msg": "forward declaration of 'struct S1'"
+    },
+    {
+      "kind": "error",
+      "msg": "variable has incomplete type 'union U1'"
+    },
+    {
+      "kind": "note",
+      "msg": "forward declaration of 'union U1'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'FOO'"
+    },
+    {
+      "kind": "error",
+      "msg": "constexpr variable 'i' must be initialized by a constant expression"
+    },
+    {
+      "kind": "note",
+      "msg": "read of object outside its lifetime is not allowed in a constant expression"
+    },
+    {
+      "kind": "error",
+      "msg": "variable 'j' declared with deduced type 'auto' cannot appear in its own initializer"
+    },
+    {
+      "kind": "warning",
+      "msg": "default initialization of an object of type 'const struct S' leaves the object uninitialized"
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of 's'"
+    },
+    {
+      "kind": "warning",
+      "msg": "left operand of comma operator has no effect"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C23/n3006.sft.c",
+  "remark": null,
+  "sha256": "14e53d060b223e1c4b6c8d155d4b0d9206163bae947c987808224bb7eef7eea7",
+  "test_number_uses": 0,
+  "type": "fn"
+}

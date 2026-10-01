@@ -1,0 +1,22 @@
+{
+  "bytes": 2835,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": true,
+  "header_lines": 7,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c",
+    " --c++11 --c++"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/code_align_ast.sft.c",
+  "remark": null,
+  "sha256": "1829e6fff96f34df6230e401a98a1433dbc63ec9533396aedd7d340c043c5876",
+  "test_number_uses": 0,
+  "type": "fp"
+}

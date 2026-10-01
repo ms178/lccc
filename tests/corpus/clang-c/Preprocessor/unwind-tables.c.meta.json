@@ -1,0 +1,21 @@
+{
+  "bytes": 899,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 15,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/unwind-tables.sft.c",
+  "remark": null,
+  "sha256": "46c0dfcd91220d37f5c7e44c8111828f84de96227d879a7d958617e9d72f3568",
+  "test_number_uses": 0,
+  "type": "fp"
+}

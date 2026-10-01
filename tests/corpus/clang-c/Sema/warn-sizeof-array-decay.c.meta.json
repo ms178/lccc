@@ -1,0 +1,42 @@
+{
+  "bytes": 875,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "sizeof on pointer operation will return size of 'int *' instead of 'int[20]'"
+    },
+    {
+      "kind": "warning",
+      "msg": "sizeof on pointer operation will return size of 'char *' instead of 'char[10]'"
+    },
+    {
+      "kind": "warning",
+      "msg": "sizeof on pointer operation will return size of 'int *' instead of 'int[20]'"
+    },
+    {
+      "kind": "warning",
+      "msg": "sizeof on pointer operation will return size of 'char *' instead of 'char[10]'"
+    },
+    {
+      "kind": "warning",
+      "msg": "sizeof on pointer operation will return size of 'char *' instead of 'char[10]'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-sizeof-array-decay.sft.c",
+  "remark": null,
+  "sha256": "3369fab2da8c383be89a040e9219b69673341edaf939ce4ba29831c445265e18",
+  "test_number_uses": 0,
+  "type": "fp"
+}

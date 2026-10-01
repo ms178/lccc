@@ -1,0 +1,35 @@
+{
+  "bytes": 391,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "variable length array"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable length array"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable length array"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c99",
+    " --c89"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-vla.sft.c",
+  "remark": null,
+  "sha256": "04d5fb9fefffc968cb3566918e0b2e36d35061de11db487855b4229fdd6871a1",
+  "test_number_uses": 0,
+  "type": "fp"
+}

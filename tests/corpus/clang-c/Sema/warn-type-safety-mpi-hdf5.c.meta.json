@@ -1,0 +1,119 @@
+{
+  "bytes": 14819,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "argument type 'long *' doesn't match specified 'mpi' type tag that requires 'int *'"
+    },
+    {
+      "kind": "warning",
+      "msg": "argument type 'struct pair_int_int *' doesn't match specified 'mpi' type tag"
+    },
+    {
+      "kind": "warning",
+      "msg": "argument type 'struct pair_float_int *' doesn't match specified 'mpi' type tag"
+    },
+    {
+      "kind": "warning",
+      "msg": "argument type 'long *' doesn't match specified 'mpi' type tag"
+    },
+    {
+      "kind": "warning",
+      "msg": "argument type 'long *' doesn't match specified 'mpi' type tag that requires 'int *'"
+    },
+    {
+      "kind": "warning",
+      "msg": "argument type 'long *' doesn't match specified 'mpi' type tag that requires 'int *'"
+    },
+    {
+      "kind": "warning",
+      "msg": "argument type 'int *' doesn't match specified 'mpi' type tag that requires 'char *'"
+    },
+    {
+      "kind": "warning",
+      "msg": "specified mpi type tag requires a null pointer"
+    },
+    {
+      "kind": "warning",
+      "msg": "argument type 'long *' doesn't match specified 'mpi' type tag that requires 'int *'"
+    },
+    {
+      "kind": "warning",
+      "msg": "argument type 'struct S1 *' doesn't match specified 'mpi' type tag that requires 'struct S2 *'"
+    },
+    {
+      "kind": "warning",
+      "msg": "argument type 'long *' doesn't match specified 'mpi' type tag that requires 'struct S1 *'"
+    },
+    {
+      "kind": "warning",
+      "msg": "argument type 'struct S1 *' doesn't match specified 'mpi' type tag that requires 'int *'"
+    },
+    {
+      "kind": "warning",
+      "msg": "argument type 'enum E1 *' doesn't match specified 'mpi' type tag that requires 'int *'"
+    },
+    {
+      "kind": "warning",
+      "msg": "argument type 'int *' doesn't match specified 'mpi' type tag that requires 'enum E1 *'"
+    },
+    {
+      "kind": "warning",
+      "msg": "argument type 'struct S1 *' doesn't match specified 'mpi' type tag"
+    },
+    {
+      "kind": "warning",
+      "msg": "argument type 'struct S4 *' doesn't match specified 'mpi' type tag"
+    },
+    {
+      "kind": "warning",
+      "msg": "argument type 'union U1 *' doesn't match specified 'mpi' type tag"
+    },
+    {
+      "kind": "warning",
+      "msg": "argument type 'union U2 *' doesn't match specified 'mpi' type tag"
+    },
+    {
+      "kind": "warning",
+      "msg": "argument type 'signed char *' doesn't match specified 'hdf5' type tag that requires 'unsigned char *'"
+    },
+    {
+      "kind": "warning",
+      "msg": "argument type 'unsigned char *' doesn't match specified 'hdf5' type tag that requires 'signed char *'"
+    },
+    {
+      "kind": "warning",
+      "msg": "argument type 'int *' doesn't match specified 'hdf5' type tag that requires 'unsigned char *'"
+    },
+    {
+      "kind": "warning",
+      "msg": "argument type 'int *' doesn't match specified 'hdf5' type tag that requires 'signed char *'"
+    },
+    {
+      "kind": "warning",
+      "msg": "argument type 'long *' doesn't match specified 'hdf5' type tag that requires 'int *'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 25,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c99 -DOPEN_MPI",
+    " --c99 -DMPICH",
+    " --c++03 --c++ -DOPEN_MPI",
+    " --c++03 --c++ -DMPICH",
+    " --c99 -DOPEN_MPI",
+    " --c99 -DMPICH"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-type-safety-mpi-hdf5.sft.c",
+  "remark": null,
+  "sha256": "b2979a85a4f577427dad9c2a8c815566022332e5b15ec4cbbdd0c4f3e59336ef",
+  "test_number_uses": 0,
+  "type": "fp"
+}

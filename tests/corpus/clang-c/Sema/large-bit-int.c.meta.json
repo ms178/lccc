@@ -1,0 +1,30 @@
+{
+  "bytes": 545,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "signed _BitInt of bit sizes greater than 1024 not supported"
+    },
+    {
+      "kind": "error",
+      "msg": "unsigned _BitInt of bit sizes greater than 1024 not supported"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w --c --target linux_aarch64"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/large-bit-int.sft.c",
+  "remark": null,
+  "sha256": "153d26e838338dd4403a933cb1ad97cc8a38f8ce89195360673575c5f41bb710",
+  "test_number_uses": 0,
+  "type": "fn"
+}

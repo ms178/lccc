@@ -1,0 +1,50 @@
+{
+  "bytes": 2679,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "include the header <xmmintrin.h> or explicitly provide a declaration for '_mm_getcsr'"
+    },
+    {
+      "kind": "note",
+      "msg": "include the header <xmmintrin.h> or explicitly provide a declaration for '_mm_setcsr'"
+    },
+    {
+      "kind": "note",
+      "msg": "include the header <xmmintrin.h> or explicitly provide a declaration for '_mm_sfence'"
+    },
+    {
+      "kind": "note",
+      "msg": "include the header <emmintrin.h> or explicitly provide a declaration for '_mm_clflush'"
+    },
+    {
+      "kind": "note",
+      "msg": "include the header <emmintrin.h> or explicitly provide a declaration for '_mm_lfence'"
+    },
+    {
+      "kind": "note",
+      "msg": "include the header <emmintrin.h> or explicitly provide a declaration for '_mm_mfence'"
+    },
+    {
+      "kind": "note",
+      "msg": "include the header <emmintrin.h> or explicitly provide a declaration for '_mm_pause'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/implicit-intel-builtin-decl.sft.c",
+  "remark": null,
+  "sha256": "5541f66a934e7c4cd697c95ad393aa225afb69a8a3b7bb53e7d6ddc5b36704f3",
+  "test_number_uses": 0,
+  "type": "fp"
+}

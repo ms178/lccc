@@ -1,0 +1,70 @@
+{
+  "bytes": 1732,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'import_name' attribute takes one argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'import_name' attribute only applies to functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'import_name' attribute takes one argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'import_name' attribute takes one argument"
+    },
+    {
+      "kind": "note",
+      "msg": "previous attribute is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "import name (bar) does not match the import name (foo) of the previous declaration"
+    },
+    {
+      "kind": "error",
+      "msg": "'import_module' attribute takes one argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'import_module' attribute only applies to functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'import_module' attribute takes one argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'import_module' attribute takes one argument"
+    },
+    {
+      "kind": "note",
+      "msg": "previous attribute is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "import module (bar) does not match the import module (foo) of the previous declaration"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-wasm.sft.c",
+  "remark": null,
+  "sha256": "3526585d8cee276d905fd0033ba26590e28ebdaa23f50e28d68ca74852968bbf",
+  "test_number_uses": 0,
+  "type": "fn"
+}

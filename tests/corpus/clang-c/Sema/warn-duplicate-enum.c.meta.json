@@ -1,0 +1,70 @@
+{
+  "bytes": 1925,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "element 'A1' also has value 0"
+    },
+    {
+      "kind": "warning",
+      "msg": "element 'A3' has been implicitly assigned 0 which another element has been assigned"
+    },
+    {
+      "kind": "note",
+      "msg": "element 'B1' also has value -1"
+    },
+    {
+      "kind": "warning",
+      "msg": "element 'B2' has been implicitly assigned 0 which another element has been assigned"
+    },
+    {
+      "kind": "warning",
+      "msg": "element 'B5' has been implicitly assigned -1 which another element has been assigned"
+    },
+    {
+      "kind": "note",
+      "msg": "element 'B6' also has value 0"
+    },
+    {
+      "kind": "warning",
+      "msg": "element 'C1' has been implicitly assigned 0 which another element has been assigned"
+    },
+    {
+      "kind": "note",
+      "msg": "element 'C3' also has value 0"
+    },
+    {
+      "kind": "warning",
+      "msg": "element 'D3' has been implicitly assigned 2 which another element has been assigned"
+    },
+    {
+      "kind": "note",
+      "msg": "element 'D5' also has value 2"
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of enumerator 'VALUE'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DCPP --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-duplicate-enum.sft.c",
+  "remark": null,
+  "sha256": "5f9a45aaa4fd5e466f91b08ffdadeb99f77b8da4a340a7076ea35a00d4f90255",
+  "test_number_uses": 0,
+  "type": "fn"
+}

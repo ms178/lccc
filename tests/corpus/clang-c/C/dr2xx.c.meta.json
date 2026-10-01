@@ -1,0 +1,179 @@
+{
+  "bytes": 18089,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "imaginary types are not supported"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid preprocessing directive"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": "callee declares array parameter as static here"
+    },
+    {
+      "kind": "warning",
+      "msg": "array argument is too small; contains 4 elements, callee requires at least 10"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'i'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid preprocessing directive"
+    },
+    {
+      "kind": "warning",
+      "msg": "embedding a directive within macro arguments has undefined behavior"
+    },
+    {
+      "kind": "note",
+      "msg": "previous use is here"
+    },
+    {
+      "kind": "error",
+      "msg": "use of 'dr251_fred' with tag type that does not match previous declaration"
+    },
+    {
+      "kind": "warning",
+      "msg": "a function declaration without a prototype is deprecated in all versions of C"
+    },
+    {
+      "kind": "note",
+      "msg": "'dr252_proto' declared here"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to function call, expected 0, have 1"
+    },
+    {
+      "kind": "error",
+      "msg": "argument type 'void' is incomplete"
+    },
+    {
+      "kind": "warning",
+      "msg": "passing arguments to 'dr252_no_proto' without a prototype is deprecated in all versions of C and is not supported in C23"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "overflow in expression; result is -2'147'483'648 with type 'int'"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression is not an integer constant expression; folding it to a constant is a GNU extension"
+    },
+    {
+      "kind": "note",
+      "msg": "value 2147483648 is outside the range of representable values of type 'int'"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression is not an integer constant expression; folding it to a constant is a GNU extension"
+    },
+    {
+      "kind": "note",
+      "msg": "value 2147483648 is outside the range of representable values of type 'int'"
+    },
+    {
+      "kind": "warning",
+      "msg": "left operand of comma operator has no effect"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression which evaluates to zero treated as a null pointer constant of type 'char *'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible integer to pointer conversion initializing 'char *' with an expression of type 'int'"
+    },
+    {
+      "kind": "warning",
+      "msg": "left operand of comma operator has no effect"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible integer to pointer conversion assigning to 'char *' from 'int'"
+    },
+    {
+      "kind": "warning",
+      "msg": "left operand of comma operator has no effect"
+    },
+    {
+      "kind": "warning",
+      "msg": "left operand of comma operator has no effect"
+    },
+    {
+      "kind": "warning",
+      "msg": "left operand of comma operator has no effect"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression which evaluates to zero treated as a null pointer constant of type 'char *'"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "expression with side effects has no effect in an unevaluated context"
+    },
+    {
+      "kind": "note",
+      "msg": "forward declaration of 'struct NotCompleted'"
+    },
+    {
+      "kind": "error",
+      "msg": "variable has incomplete type 'struct NotCompleted'"
+    },
+    {
+      "kind": "error",
+      "msg": "argument may not have 'void' type"
+    },
+    {
+      "kind": "warning",
+      "msg": "integer literal is too large to be represented in a signed integer type, interpreting as unsigned"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 3,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c89",
+    " --c99",
+    " --c99 -w --ms_compatibility",
+    " --c11",
+    " --c17",
+    " --c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/drs/dr2xx.sft.c",
+  "remark": null,
+  "sha256": "57411a3b56de6e9d61dcf45dd178bb2104a5aec474e43891d2442478f382ded0",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,42 @@
+{
+  "bytes": 2088,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 18,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--ms_extensions -w --ms_extensions -w --ms_extensions -w -DEXTERN_C='extern' --ms_extensions -w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/calling-conv-complete-params.sft.c",
+  "remark": null,
+  "sha256": "c696707e071d7fcb636edbba5844074f5a1bd6ebd397d79b8fe2b7162f5f4951",
+  "test_number_uses": 0,
+  "type": "fn"
+}

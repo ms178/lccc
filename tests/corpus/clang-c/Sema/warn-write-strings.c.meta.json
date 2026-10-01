@@ -1,0 +1,21 @@
+{
+  "bytes": 2245,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 12,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-write-strings.sft.c",
+  "remark": null,
+  "sha256": "68b96943f1de278fdcf44e8822fad222d6e5d33a7f2eab0aa4ed6a17c7397050",
+  "test_number_uses": 0,
+  "type": "fp"
+}

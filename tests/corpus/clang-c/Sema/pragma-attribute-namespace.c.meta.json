@@ -1,0 +1,86 @@
+{
+  "bytes": 2266,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "when applied to this declaration"
+    },
+    {
+      "kind": "error",
+      "msg": "'#pragma clang attribute pop' with no matching '#pragma clang attribute push'"
+    },
+    {
+      "kind": "error",
+      "msg": "'#pragma clang attribute NotMyNamespace.pop' with no matching '#pragma clang attribute NotMyNamespace.push'"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "namespace can only apply to 'push' or 'pop' directives"
+    },
+    {
+      "kind": "error",
+      "msg": "expected '.' after pragma attribute namespace 'Misc'"
+    },
+    {
+      "kind": "error",
+      "msg": "'annotate' attribute"
+    },
+    {
+      "kind": "warning",
+      "msg": "unused attribute"
+    },
+    {
+      "kind": "note",
+      "msg": "ends here"
+    },
+    {
+      "kind": "note",
+      "msg": "when applied to this declaration"
+    },
+    {
+      "kind": "warning",
+      "msg": "unused attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "'annotate' attribute"
+    },
+    {
+      "kind": "note",
+      "msg": "ends here"
+    },
+    {
+      "kind": "note",
+      "msg": "when applied to this declaration"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 10,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/pragma-attribute-namespace.sft.c",
+  "remark": null,
+  "sha256": "0c9e7c5fb3f544ff2a3b9f6b5d12f0036e0ce3976ef4b701f12fec3371e052ad",
+  "test_number_uses": 0,
+  "type": "fn"
+}

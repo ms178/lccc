@@ -1,0 +1,38 @@
+{
+  "bytes": 548,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "empty enumeration types are a Microsoft extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "empty enumeration types are a Microsoft extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "enumeration types with a fixed underlying type are a Microsoft extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "empty enumeration types are a Microsoft extension"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--ms_extensions --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/ms-empty-enum.sft.c",
+  "remark": null,
+  "sha256": "11d3a954b287b9e89a8072784ac9faf0d69799a255a1868b124be5388a5f2449",
+  "test_number_uses": 0,
+  "type": "fp"
+}

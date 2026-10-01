@@ -1,0 +1,62 @@
+{
+  "bytes": 1123,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "expected identifier in '#pragma weak'"
+    },
+    {
+      "kind": "warning",
+      "msg": "expected identifier in '#pragma weak'"
+    },
+    {
+      "kind": "warning",
+      "msg": "expected identifier in '#pragma weak'"
+    },
+    {
+      "kind": "warning",
+      "msg": "weak identifier 'y' never declared"
+    },
+    {
+      "kind": "warning",
+      "msg": "extra tokens at end of '#pragma weak'"
+    },
+    {
+      "kind": "warning",
+      "msg": "extra tokens at end of '#pragma weak'"
+    },
+    {
+      "kind": "error",
+      "msg": "expected expression"
+    },
+    {
+      "kind": "error",
+      "msg": "expected statement"
+    },
+    {
+      "kind": "error",
+      "msg": "expected statement"
+    },
+    {
+      "kind": "error",
+      "msg": "expected statement"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/pragma-weak.sft.c",
+  "remark": null,
+  "sha256": "260aeecac92fdbee4b342771fe3377b6b81bfe5b4cf8374a8135954e3a2f6a25",
+  "test_number_uses": 0,
+  "type": "fn"
+}

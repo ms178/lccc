@@ -1,0 +1,254 @@
+{
+  "bytes": 9826,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "statement requires expression of scalar type ('__vector_quad' invalid)"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid argument type '__vector_quad' to unary expression"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression ('__vector_quad' and '__vector_quad')"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression ('__vector_quad' and '__vector_quad')"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression ('__vector_quad' and '__vector_quad')"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid argument type '__vector_quad' to unary expression"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression ('__vector_quad' and '__vector_quad')"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression ('__vector_quad' and '__vector_quad')"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression ('__vector_quad' and '__vector_quad')"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression ('__vector_quad' and 'int')"
+    },
+    {
+      "kind": "error",
+      "msg": "used type '__vector_quad' where arithmetic or pointer type is required"
+    },
+    {
+      "kind": "error",
+      "msg": "subscripted value is not an array, pointer, or vector"
+    },
+    {
+      "kind": "error",
+      "msg": "used type '__vector_quad' where arithmetic or pointer type is required"
+    },
+    {
+      "kind": "error",
+      "msg": "used type '__vector_quad' where arithmetic or pointer type is required"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "statement requires expression of scalar type ('__vector_pair' invalid)"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid argument type '__vector_pair' to unary expression"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression ('__vector_pair' and '__vector_pair')"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression ('__vector_pair' and '__vector_pair')"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression ('__vector_pair' and '__vector_pair')"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid argument type '__vector_pair' to unary expression"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression ('__vector_pair' and '__vector_pair')"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression ('__vector_pair' and '__vector_pair')"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression ('__vector_pair' and '__vector_pair')"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression ('__vector_pair' and 'int')"
+    },
+    {
+      "kind": "error",
+      "msg": "used type '__vector_pair' where arithmetic or pointer type is required"
+    },
+    {
+      "kind": "error",
+      "msg": "subscripted value is not an array, pointer, or vector"
+    },
+    {
+      "kind": "error",
+      "msg": "used type '__vector_pair' where arithmetic or pointer type is required"
+    },
+    {
+      "kind": "error",
+      "msg": "used type '__vector_pair' where arithmetic or pointer type is required"
+    },
+    {
+      "kind": "error",
+      "msg": "passing 'float' to parameter of incompatible type 'long'"
+    },
+    {
+      "kind": "error",
+      "msg": "passing 'int' to parameter of incompatible type 'long'"
+    },
+    {
+      "kind": "error",
+      "msg": "passing '__vector_pair *' to parameter of incompatible type 'const __vector_pair *'"
+    },
+    {
+      "kind": "error",
+      "msg": "passing 'unsigned char' to parameter of incompatible type 'long'"
+    },
+    {
+      "kind": "error",
+      "msg": "passing '__vector int' (vector of 4 'int' values) to parameter of incompatible type 'const __vector_pair *'"
+    },
+    {
+      "kind": "error",
+      "msg": "passing 'unsigned short' to parameter of incompatible type '__vector_pair *'"
+    },
+    {
+      "kind": "error",
+      "msg": "passing 'int *restrict' to parameter of incompatible type '__vector_quad *'"
+    },
+    {
+      "kind": "error",
+      "msg": "passing 'int *volatile' to parameter of incompatible type '__vector_quad *'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 15,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/ppc-pair-mma-types.sft.c",
+  "remark": null,
+  "sha256": "dd0f762423b3982dc7212843138079162d9a737f73a737691747081aace965bb",
+  "test_number_uses": 0,
+  "type": "fn"
+}

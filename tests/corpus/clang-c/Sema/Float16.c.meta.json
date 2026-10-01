@@ -1,0 +1,26 @@
+{
+  "bytes": 1024,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "no-diagnostics",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 15,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DHAVE -DHAVE -DHAVE -DHAVE -DHAVE -DHAVE -DHAVE --c --target linux_aarch64"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/Float16.sft.c",
+  "remark": null,
+  "sha256": "6cd965fe49cc0105a57ca40ebf2ac9fc374c1b2c4bb6cc6b9ff49daf1de4e7d4",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,26 @@
+{
+  "bytes": 502,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "always_inline function 'test1' requires target feature 'htm', but would be inlined into function 'test2' that is compiled without support for 'htm'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/ppc-attr-target-inline.sft.c",
+  "remark": null,
+  "sha256": "20b91e5cd29df2ad5431f1b5f8998a905c83c2be6f2ecdbed2026d49e6ef0975",
+  "test_number_uses": 0,
+  "type": "fn"
+}

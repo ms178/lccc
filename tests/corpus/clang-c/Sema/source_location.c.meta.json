@@ -1,0 +1,24 @@
+{
+  "bytes": 1603,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 11,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c90 -DCONST_STRINGS",
+    " --c90",
+    " --c90 --ms_extensions -DMS -DCONST_STRINGS",
+    " --c90 --ms_extensions -DMS"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/source_location.sft.c",
+  "remark": null,
+  "sha256": "72974fd2cc41c2e8c8e9445c73e80e25d27f7d216df4f2cf5dab323aba8a915d",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,148 @@
+{
+  "bytes": 9560,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'unsigned int' but the argument has type 'int', which differs in signedness"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'unsigned int' but the argument has type 'int', which differs in signedness"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'int' but the argument has type 'unsigned int', which differs in signedness"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'unsigned long' but the argument has type 'long', which differs in signedness"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'unsigned long' but the argument has type 'long', which differs in signedness"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'long' but the argument has type 'unsigned long', which differs in signedness"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'unsigned long long' but the argument has type 'long long', which differs in signedness"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'unsigned long long' but the argument has type 'long long', which differs in signedness"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'long long' but the argument has type 'unsigned long long', which differs in signedness"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'unsigned int' but the argument has underlying type 'int', which differs in signedness"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'unsigned int' but the argument has underlying type 'int', which differs in signedness"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'int' but the argument has underlying type 'unsigned int', which differs in signedness"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'unsigned long' but the argument has underlying type 'long', which differs in signedness"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'unsigned long' but the argument has underlying type 'long', which differs in signedness"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'long' but the argument has underlying type 'unsigned long', which differs in signedness"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'unsigned int *' but the argument has type 'int *', which differs in signedness"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'unsigned int *' but the argument has type 'int *', which differs in signedness"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'int *' but the argument has type 'unsigned int *', which differs in signedness"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'unsigned long *' but the argument has type 'long *', which differs in signedness"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'unsigned long *' but the argument has type 'long *', which differs in signedness"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'long *' but the argument has type 'unsigned long *', which differs in signedness"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'unsigned long long *' but the argument has type 'long long *', which differs in signedness"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'unsigned long long *' but the argument has type 'long long *', which differs in signedness"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'long long *' but the argument has type 'unsigned long long *', which differs in signedness"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'unsigned int *' but the argument has type 'enum enum_int *', which differs in signedness"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'unsigned int *' but the argument has type 'enum enum_int *', which differs in signedness"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'int *' but the argument has type 'enum enum_unsigned *', which differs in signedness"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'unsigned long *' but the argument has type 'enum enum_long *', which differs in signedness"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'unsigned long *' but the argument has type 'enum enum_long *', which differs in signedness"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'long *' but the argument has type 'enum enum_unsigned_long *', which differs in signedness"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 20,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c11 -w",
+    " --c11",
+    " --c11 -w",
+    " --c11",
+    " --c11",
+    " --c11",
+    " --c11"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/format-strings-signedness.sft.c",
+  "remark": null,
+  "sha256": "ccb81f3a4b6d2bb795719b17cf0acad6fae051cb4235eaa4bcb384f21807aed0",
+  "test_number_uses": 0,
+  "type": "fp"
+}

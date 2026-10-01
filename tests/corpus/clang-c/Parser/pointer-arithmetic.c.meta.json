@@ -1,0 +1,30 @@
+{
+  "bytes": 427,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "invalid operands"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/pointer-arithmetic.sft.c",
+  "remark": null,
+  "sha256": "2ccc32f19a1c08e08c23ffc33bbef582005b32eb0696e54f9ce3d13d3d00f86c",
+  "test_number_uses": 0,
+  "type": "fn"
+}

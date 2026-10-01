@@ -1,0 +1,30 @@
+{
+  "bytes": 801,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "pointer to function type 'int (void)' may not be 'restrict' qualified"
+    },
+    {
+      "kind": "error",
+      "msg": "restrict requires a pointer or reference ('t7' (aka 'int[2]')"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/restrict-qualifier.sft.c",
+  "remark": null,
+  "sha256": "39946f81f05508bb581c8d47b8cf7e966c4e26e3ba0d50e0835fb12605cc133a",
+  "test_number_uses": 0,
+  "type": "fn"
+}

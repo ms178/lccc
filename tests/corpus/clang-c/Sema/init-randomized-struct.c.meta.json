@@ -1,0 +1,46 @@
+{
+  "bytes": 3955,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "a randomized struct can only be initialized with a designated initializer"
+    },
+    {
+      "kind": "error",
+      "msg": "a randomized struct can only be initialized with a designated initializer"
+    },
+    {
+      "kind": "error",
+      "msg": "a randomized struct can only be initialized with a designated initializer"
+    },
+    {
+      "kind": "error",
+      "msg": "a randomized struct can only be initialized with a designated initializer"
+    },
+    {
+      "kind": "error",
+      "msg": "a randomized struct can only be initialized with a designated initializer"
+    },
+    {
+      "kind": "error",
+      "msg": "a randomized struct can only be initialized with a designated initializer"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 22,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/init-randomized-struct.sft.c",
+  "remark": null,
+  "sha256": "75f449e4d111cc838475880deb151348acd2d40165f5f8e994a14f00e1ffe07f",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,70 @@
+{
+  "bytes": 1744,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "value '-2049' out of range for constraint 'I'"
+    },
+    {
+      "kind": "error",
+      "msg": "value '2048' out of range for constraint 'I'"
+    },
+    {
+      "kind": "error",
+      "msg": "value '-1' out of range for constraint 'J'"
+    },
+    {
+      "kind": "error",
+      "msg": "value '1' out of range for constraint 'J'"
+    },
+    {
+      "kind": "error",
+      "msg": "value '-1' out of range for constraint 'K'"
+    },
+    {
+      "kind": "error",
+      "msg": "value '32' out of range for constraint 'K'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid type 'void' in asm input for constraint 's'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid type 'void' in asm input for constraint 'S'"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicts with asm clobber list"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicts with asm clobber list"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicts with asm clobber list"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicts with asm clobber list"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/inline-asm-validate-riscv.sft.c",
+  "remark": null,
+  "sha256": "7e341356883e04128126ddd4a96ea06f7e50a3cfc647385c09e4c8bc18fc3d3a",
+  "test_number_uses": 0,
+  "type": "fn"
+}

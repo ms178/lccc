@@ -1,0 +1,201 @@
+{
+  "bytes": 4131,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "control character"
+    },
+    {
+      "kind": "error",
+      "msg": "control character"
+    },
+    {
+      "kind": "error",
+      "msg": "control character"
+    },
+    {
+      "kind": "error",
+      "msg": "control character"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "character '$' cannot be specified by a universal character name"
+    },
+    {
+      "kind": "warning",
+      "msg": "whitespace"
+    },
+    {
+      "kind": "error",
+      "msg": "character '@' cannot be specified by a universal character name"
+    },
+    {
+      "kind": "warning",
+      "msg": "whitespace"
+    },
+    {
+      "kind": "error",
+      "msg": "character '`' cannot be specified by a universal character name"
+    },
+    {
+      "kind": "warning",
+      "msg": "whitespace"
+    },
+    {
+      "kind": "error",
+      "msg": "character '$' cannot be specified by a universal character name"
+    },
+    {
+      "kind": "error",
+      "msg": "character '@' cannot be specified by a universal character name"
+    },
+    {
+      "kind": "error",
+      "msg": "character '`' cannot be specified by a universal character name"
+    },
+    {
+      "kind": "error",
+      "msg": "character '$' cannot be specified by a universal character name"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "character '@' cannot be specified by a universal character name"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "character '`' cannot be specified by a universal character name"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 9,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c99",
+    " --c23",
+    " --c11",
+    " --c++11 --c++"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/ucn-allowed-chars.sft.c",
+  "remark": null,
+  "sha256": "99a1869200041b5a5ea6491706943e3acf76882faf92ba5f2824c9959e2986e4",
+  "test_number_uses": 0,
+  "type": "fn"
+}

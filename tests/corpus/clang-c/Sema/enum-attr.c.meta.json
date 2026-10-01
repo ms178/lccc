@@ -1,0 +1,102 @@
+{
+  "bytes": 3395,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'enum_extensibility' attribute argument not supported: 'arg1'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'open'"
+    },
+    {
+      "kind": "error",
+      "msg": "'enum_extensibility' attribute takes one argument"
+    },
+    {
+      "kind": "warning",
+      "msg": "'enum_extensibility' attribute only applies to enums"
+    },
+    {
+      "kind": "warning",
+      "msg": "integer constant not in range of enumerated type"
+    },
+    {
+      "kind": "warning",
+      "msg": "enumeration value 'A1' not handled in switch"
+    },
+    {
+      "kind": "warning",
+      "msg": "case value not in enumerated type"
+    },
+    {
+      "kind": "warning",
+      "msg": "default label in switch which covers all enumeration"
+    },
+    {
+      "kind": "warning",
+      "msg": "integer constant not in range of enumerated type"
+    },
+    {
+      "kind": "warning",
+      "msg": "enumeration value 'B1' not handled in switch"
+    },
+    {
+      "kind": "warning",
+      "msg": "case value not in enumerated type"
+    },
+    {
+      "kind": "warning",
+      "msg": "default label in switch which covers all enumeration"
+    },
+    {
+      "kind": "warning",
+      "msg": "enumeration value 'C1' not handled in switch"
+    },
+    {
+      "kind": "warning",
+      "msg": "integer constant not in range of enumerated type"
+    },
+    {
+      "kind": "warning",
+      "msg": "enumeration value 'D1' not handled in switch"
+    },
+    {
+      "kind": "warning",
+      "msg": "case value not in enumerated type"
+    },
+    {
+      "kind": "warning",
+      "msg": "integer constant not in range of enumerated type"
+    },
+    {
+      "kind": "warning",
+      "msg": "enumeration value 'E1' not handled in switch"
+    },
+    {
+      "kind": "warning",
+      "msg": "case value not in enumerated type"
+    },
+    {
+      "kind": "warning",
+      "msg": "enumeration value 'F1' not handled in switch"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/enum-attr.sft.c",
+  "remark": null,
+  "sha256": "2b1fe5657c772d4d15f222d9065832983a3ad2e4ad5c1d5886e021eb890bbf74",
+  "test_number_uses": 0,
+  "type": "fn"
+}

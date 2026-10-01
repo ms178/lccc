@@ -1,0 +1,222 @@
+{
+  "bytes": 7993,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of PPC MMA type"
+    },
+    {
+      "kind": "error",
+      "msg": "statement requires expression of scalar type ('__dmr1024' invalid)"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid argument type '__dmr1024' to unary expression"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression ('__dmr1024' and '__dmr1024')"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression ('__dmr1024' and '__dmr1024')"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression ('__dmr1024' and '__dmr1024')"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid argument type '__dmr1024' to unary expression"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression ('__dmr1024' and '__dmr1024')"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression ('__dmr1024' and '__dmr1024')"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression ('__dmr1024' and '__dmr1024')"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression ('__dmr1024' and 'int')"
+    },
+    {
+      "kind": "error",
+      "msg": "used type '__dmr1024' where arithmetic or pointer type is required"
+    },
+    {
+      "kind": "error",
+      "msg": "subscripted value is not an array, pointer, or vector"
+    },
+    {
+      "kind": "error",
+      "msg": "used type '__dmr1024' where arithmetic or pointer type is required"
+    },
+    {
+      "kind": "error",
+      "msg": "used type '__dmr1024' where arithmetic or pointer type is required"
+    },
+    {
+      "kind": "error",
+      "msg": "statement requires expression of scalar type ('__dmr2048' invalid)"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid argument type '__dmr2048' to unary expression"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression ('__dmr2048' and '__dmr2048')"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression ('__dmr2048' and '__dmr2048')"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression ('__dmr2048' and '__dmr2048')"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid argument type '__dmr2048' to unary expression"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression ('__dmr2048' and '__dmr2048')"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression ('__dmr2048' and '__dmr2048')"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression ('__dmr2048' and '__dmr2048')"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression ('__dmr2048' and 'int')"
+    },
+    {
+      "kind": "error",
+      "msg": "used type '__dmr2048' where arithmetic or pointer type is required"
+    },
+    {
+      "kind": "error",
+      "msg": "subscripted value is not an array, pointer, or vector"
+    },
+    {
+      "kind": "error",
+      "msg": "used type '__dmr2048' where arithmetic or pointer type is required"
+    },
+    {
+      "kind": "error",
+      "msg": "used type '__dmr2048' where arithmetic or pointer type is required"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 15,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/ppc-dmf-types.sft.c",
+  "remark": null,
+  "sha256": "b867c4866ab00f4820ba0bf479926f51a5c9181b981484242774eeb449e618de",
+  "test_number_uses": 0,
+  "type": "fn"
+}

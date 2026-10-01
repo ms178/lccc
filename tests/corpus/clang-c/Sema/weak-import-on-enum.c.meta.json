@@ -1,0 +1,21 @@
+{
+  "bytes": 276,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/weak-import-on-enum.sft.c",
+  "remark": null,
+  "sha256": "0e306ac1f39416bb57da746195d7e9e1474bdd5d688079572adb5058932a6958",
+  "test_number_uses": 0,
+  "type": "fp"
+}

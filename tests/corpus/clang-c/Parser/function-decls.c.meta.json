@@ -1,0 +1,21 @@
+{
+  "bytes": 227,
+  "cases": null,
+  "category": "Parser",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/function-decls.sft.c",
+  "remark": null,
+  "sha256": "95ab70d9d6a0901874d4dad080ed4dbfeaab52662677576e275b7f18f5eb1573",
+  "test_number_uses": 0,
+  "type": "fp"
+}

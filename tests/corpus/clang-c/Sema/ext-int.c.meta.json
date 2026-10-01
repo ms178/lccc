@@ -1,0 +1,26 @@
+{
+  "bytes": 2898,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "width of bit-field 'A' (8 bits) exceeds the width of its type (4 bits)"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/ext-int.sft.c",
+  "remark": null,
+  "sha256": "59af17eb86a8f53198ec4435ce2c56ce901190e3c1f652ef02a685f3cebdac0d",
+  "test_number_uses": 0,
+  "type": "fn"
+}

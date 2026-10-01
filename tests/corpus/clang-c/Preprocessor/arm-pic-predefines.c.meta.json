@@ -1,0 +1,21 @@
+{
+  "bytes": 790,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 16,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/arm-pic-predefines.sft.c",
+  "remark": null,
+  "sha256": "b7a042c69b42c96df056370655e4445abe9eb84edf8028401117d203c33e1704",
+  "test_number_uses": 0,
+  "type": "fp"
+}

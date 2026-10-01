@@ -1,0 +1,21 @@
+{
+  "bytes": 346,
+  "cases": null,
+  "category": "Parser",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--ms_extensions --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/declspec-supported.sft.c",
+  "remark": null,
+  "sha256": "8e80becc0352eeae64ac513f216faaf369b5011fed1abccd351283a55eb1ba33",
+  "test_number_uses": 0,
+  "type": "fp"
+}

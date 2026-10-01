@@ -1,0 +1,74 @@
+{
+  "bytes": 1752,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'stdcall' only applies to function types; type here is 'int'"
+    },
+    {
+      "kind": "warning",
+      "msg": "'fastcall' only applies to function types; type here is 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "fastcall and stdcall attributes are not compatible"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "function declared 'fastcall' here was previously declared 'stdcall'"
+    },
+    {
+      "kind": "error",
+      "msg": "not compatible"
+    },
+    {
+      "kind": "error",
+      "msg": "not compatible"
+    },
+    {
+      "kind": "error",
+      "msg": "not compatible"
+    },
+    {
+      "kind": "error",
+      "msg": "not compatible"
+    },
+    {
+      "kind": "error",
+      "msg": "not compatible"
+    },
+    {
+      "kind": "error",
+      "msg": "not compatible"
+    },
+    {
+      "kind": "error",
+      "msg": "not compatible"
+    },
+    {
+      "kind": "error",
+      "msg": "not compatible"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/stdcall-fastcall.sft.c",
+  "remark": null,
+  "sha256": "b2d165d5efae4384e6b829d3607887233054738633a2083d2336ae0cf592c2d6",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,106 @@
+{
+  "bytes": 4769,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "vector operands do not have the same elements sizes"
+    },
+    {
+      "kind": "error",
+      "msg": "vector operands do not have the same elements sizes"
+    },
+    {
+      "kind": "error",
+      "msg": "vector operands do not have the same elements sizes"
+    },
+    {
+      "kind": "error",
+      "msg": "vector operands do not have the same elements sizes"
+    },
+    {
+      "kind": "warning",
+      "msg": "vector operands do not have the same elements sizes"
+    },
+    {
+      "kind": "warning",
+      "msg": "vector operands do not have the same elements sizes"
+    },
+    {
+      "kind": "warning",
+      "msg": "vector operands do not have the same elements sizes"
+    },
+    {
+      "kind": "warning",
+      "msg": "vector operands do not have the same elements sizes"
+    },
+    {
+      "kind": "error",
+      "msg": "vector operands do not have the same elements sizes"
+    },
+    {
+      "kind": "error",
+      "msg": "vector operands do not have the same elements sizes"
+    },
+    {
+      "kind": "error",
+      "msg": "vector operands do not have the same elements sizes"
+    },
+    {
+      "kind": "error",
+      "msg": "vector operands do not have the same elements sizes"
+    },
+    {
+      "kind": "warning",
+      "msg": "vector operands do not have the same elements sizes"
+    },
+    {
+      "kind": "warning",
+      "msg": "vector operands do not have the same elements sizes"
+    },
+    {
+      "kind": "warning",
+      "msg": "vector operands do not have the same elements sizes"
+    },
+    {
+      "kind": "warning",
+      "msg": "vector operands do not have the same elements sizes"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'char' from incompatible type"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'int' from incompatible type"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'unsigned char' from incompatible type"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'unsigned short' from incompatible type"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'unsigned int' from incompatible type"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DERR -DEXT -DERR -DEXT --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/vecshift.sft.c",
+  "remark": null,
+  "sha256": "83b743dc0a44647d7f17c013b548e678baba268a6d28a3ea82853e1278c5354b",
+  "test_number_uses": 0,
+  "type": "fn"
+}

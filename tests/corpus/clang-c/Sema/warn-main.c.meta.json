@@ -1,0 +1,54 @@
+{
+  "bytes": 1231,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    }
+  ],
+  "has_main": true,
+  "header_lines": 7,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-main.sft.c",
+  "remark": null,
+  "sha256": "6681bc461cd13b2b289623f9be0bce92c3ebd7a1bcac817d95a86064ebd9bb68",
+  "test_number_uses": 0,
+  "type": "fn"
+}

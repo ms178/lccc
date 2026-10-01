@@ -1,0 +1,78 @@
+{
+  "bytes": 2019,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'naked' attribute only applies to functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'naked' attribute takes no arguments"
+    },
+    {
+      "kind": "note",
+      "msg": "attribute is here"
+    },
+    {
+      "kind": "error",
+      "msg": "non-ASM statement in naked function is not supported"
+    },
+    {
+      "kind": "note",
+      "msg": "attribute is here"
+    },
+    {
+      "kind": "error",
+      "msg": "parameter references not allowed in naked functions"
+    },
+    {
+      "kind": "note",
+      "msg": "attribute is here"
+    },
+    {
+      "kind": "error",
+      "msg": "parameter references not allowed in naked functions"
+    },
+    {
+      "kind": "note",
+      "msg": "attribute is here"
+    },
+    {
+      "kind": "error",
+      "msg": "non-ASM statement in naked function is not supported"
+    },
+    {
+      "kind": "note",
+      "msg": "attribute is here"
+    },
+    {
+      "kind": "error",
+      "msg": "non-ASM statement in naked function is not supported"
+    },
+    {
+      "kind": "note",
+      "msg": "attribute is here"
+    },
+    {
+      "kind": "error",
+      "msg": "non-ASM statement in naked function is not supported"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-naked.sft.c",
+  "remark": null,
+  "sha256": "2087286d5825a41da078cf31a3124d5a3ffca15fd1c94d373502307c523e80a4",
+  "test_number_uses": 0,
+  "type": "fn"
+}

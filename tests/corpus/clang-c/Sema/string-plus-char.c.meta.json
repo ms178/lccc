@@ -1,0 +1,50 @@
+{
+  "bytes": 1565,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "adding 'char' to a string pointer does not append to the string"
+    },
+    {
+      "kind": "warning",
+      "msg": "adding 'char' to a string pointer does not append to the string"
+    },
+    {
+      "kind": "warning",
+      "msg": "adding 'char' to a string pointer does not append to the string"
+    },
+    {
+      "kind": "warning",
+      "msg": "adding 'char' to a string pointer does not append to the string"
+    },
+    {
+      "kind": "warning",
+      "msg": "adding 'char' to a string pointer does not append to the string"
+    },
+    {
+      "kind": "warning",
+      "msg": "adding 'char' to a string pointer does not append to the string"
+    },
+    {
+      "kind": "warning",
+      "msg": "adding 'char' to a string pointer does not append to the string"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/string-plus-char.sft.c",
+  "remark": null,
+  "sha256": "673c4ccdeb552fda3932a1732b714ae2e23df2583758f2181989a040ee1c19a8",
+  "test_number_uses": 0,
+  "type": "fp"
+}

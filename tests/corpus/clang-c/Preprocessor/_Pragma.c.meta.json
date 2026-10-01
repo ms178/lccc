@@ -1,0 +1,50 @@
+{
+  "bytes": 668,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "system_header ignored in main file"
+    },
+    {
+      "kind": "warning",
+      "msg": "unknown pragma ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "unknown pragma ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "foo \\\\ bar"
+    },
+    {
+      "kind": "error",
+      "msg": "_Pragma takes a parenthesized string literal"
+    },
+    {
+      "kind": "error",
+      "msg": "_Pragma takes a parenthesized string literal"
+    },
+    {
+      "kind": "error",
+      "msg": "_Pragma takes a parenthesized string literal"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/_Pragma.sft.c",
+  "remark": null,
+  "sha256": "a8cae89901dd092bebd6778a63d4481a32648003c993c0d1146bab6a1753b3b4",
+  "test_number_uses": 0,
+  "type": "fn"
+}

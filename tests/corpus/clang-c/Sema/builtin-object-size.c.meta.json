@@ -1,0 +1,66 @@
+{
+  "bytes": 4165,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "too few arguments to function"
+    },
+    {
+      "kind": "error",
+      "msg": "argument value -1 is outside the valid range [0, 3]"
+    },
+    {
+      "kind": "error",
+      "msg": "argument value 4 is outside the valid range [0, 3]"
+    },
+    {
+      "kind": "warning",
+      "msg": "'vsnprintf' will always overflow; destination buffer has size 11, but size argument is 42"
+    },
+    {
+      "kind": "error",
+      "msg": "argument value 4 is outside the valid range [0, 3]"
+    },
+    {
+      "kind": "warning",
+      "msg": "'memccpy' will always overflow; destination buffer has size 5, but size argument is 10"
+    },
+    {
+      "kind": "error",
+      "msg": "has incomplete type"
+    },
+    {
+      "kind": "error",
+      "msg": "has incomplete type"
+    },
+    {
+      "kind": "error",
+      "msg": "has incomplete type"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression result unused"
+    },
+    {
+      "kind": "warning",
+      "msg": "address of array"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 16,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "%-DDYNAMIC %-DDYNAMIC --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/builtin-object-size.sft.c",
+  "remark": null,
+  "sha256": "cf4ab339f887112523ab6f1b419f97d8c1b66bec3513db1a2b96a90af891e1f6",
+  "test_number_uses": 0,
+  "type": "fn"
+}

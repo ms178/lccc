@@ -1,0 +1,21 @@
+{
+  "bytes": 1634,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 9,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--ms_extensions --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/_Pragma-location.sft.c",
+  "remark": null,
+  "sha256": "45e18aec65032a1c535eb7296e5079361f22a93bf8a23c76b24805715a68b344",
+  "test_number_uses": 0,
+  "type": "fp"
+}

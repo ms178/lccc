@@ -1,0 +1,30 @@
+{
+  "bytes": 569,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "#pragma redefine_extname is applicable to external C declarations only; not applied to function 'foo_static'"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of '__int128_t' as different kind of symbol"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/redefine_extname.sft.c",
+  "remark": null,
+  "sha256": "96b3a752610917f5b8a42ac98b7486eb9292a9efc34830ecc324dd6c0e7e684c",
+  "test_number_uses": 0,
+  "type": "fn"
+}

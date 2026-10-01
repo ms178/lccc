@@ -1,0 +1,31 @@
+{
+  "bytes": 877,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "constexpr initializer evaluates to 255 which is not exactly representable in type 'const char'"
+    },
+    {
+      "kind": "error",
+      "msg": "constexpr initializer evaluates to -1 which is not exactly representable in type 'const unsigned int'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23",
+    " --c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/embed_constexpr.sft.c",
+  "remark": null,
+  "sha256": "27d2139302a3adcc54ed8a41b067d1c3802e356e6588ca0e00a9210b7dd36f6b",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,102 @@
+{
+  "bytes": 2896,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "empty struct has size 0 in C, size 1 in C++"
+    },
+    {
+      "kind": "warning",
+      "msg": "empty union has size 0 in C, size 1 in C++"
+    },
+    {
+      "kind": "warning",
+      "msg": "struct has size 0 in C, size 1 in C++"
+    },
+    {
+      "kind": "warning",
+      "msg": "union has size 0 in C, size 1 in C++"
+    },
+    {
+      "kind": "warning",
+      "msg": "struct has size 0 in C, size 1 in C++"
+    },
+    {
+      "kind": "warning",
+      "msg": "union has size 0 in C, size 1 in C++"
+    },
+    {
+      "kind": "warning",
+      "msg": "struct has size 0 in C, size 1 in C++"
+    },
+    {
+      "kind": "warning",
+      "msg": "union has size 0 in C, size 1 in C++"
+    },
+    {
+      "kind": "warning",
+      "msg": "struct has size 0 in C, non-zero size in C++"
+    },
+    {
+      "kind": "warning",
+      "msg": "subtraction of pointers to type 'struct emp_1' of zero size has undefined behavior"
+    },
+    {
+      "kind": "warning",
+      "msg": "subtraction of pointers to type 'struct emp_1' of zero size has undefined behavior"
+    },
+    {
+      "kind": "warning",
+      "msg": "subtraction of pointers to type 'struct emp_1' of zero size has undefined behavior"
+    },
+    {
+      "kind": "warning",
+      "msg": "subtraction of pointers to type 'struct emp_1' of zero size has undefined behavior"
+    },
+    {
+      "kind": "warning",
+      "msg": "subtraction of pointers to type 'struct emp_1' of zero size has undefined behavior"
+    },
+    {
+      "kind": "warning",
+      "msg": "subtraction of pointers to type 'union emp_2' of zero size has undefined behavior"
+    },
+    {
+      "kind": "note",
+      "msg": "forward declaration of 'struct A'"
+    },
+    {
+      "kind": "error",
+      "msg": "arithmetic on a pointer to an incomplete type 'struct A'"
+    },
+    {
+      "kind": "warning",
+      "msg": "subtraction of pointers to type 'struct emp_1[10]' of zero size has undefined behavior"
+    },
+    {
+      "kind": "error",
+      "msg": "arithmetic on a pointer to an incomplete type 'struct emp_1[]'"
+    },
+    {
+      "kind": "warning",
+      "msg": "subtraction of pointers to type 'int[0]' of zero size has undefined behavior"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/empty1.sft.c",
+  "remark": null,
+  "sha256": "d82e5940ccc256c7e9a9d5aec9692d2216baa6871d98c97ef95f21f744d72e74",
+  "test_number_uses": 0,
+  "type": "fn"
+}

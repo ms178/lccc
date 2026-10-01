@@ -1,0 +1,21 @@
+{
+  "bytes": 149,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/embed_file_not_found_quote.sft.c",
+  "remark": null,
+  "sha256": "14c215f782f67c0f454182db294d4e82ee492021efd1885da74a15ea68310830",
+  "test_number_uses": 0,
+  "type": "fn"
+}

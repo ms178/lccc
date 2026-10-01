@@ -1,0 +1,94 @@
+{
+  "bytes": 3546,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "static assertion expression is not an integral constant expression"
+    },
+    {
+      "kind": "warning",
+      "msg": "'_Static_assert' with no message is a C23 extension"
+    },
+    {
+      "kind": "error",
+      "msg": "static assertion failed: this fails"
+    },
+    {
+      "kind": "error",
+      "msg": "static assertion failed"
+    },
+    {
+      "kind": "warning",
+      "msg": "'_Static_assert' with no message is a C23 extension"
+    },
+    {
+      "kind": "error",
+      "msg": "expected identifier"
+    },
+    {
+      "kind": "note",
+      "msg": "to match this '('"
+    },
+    {
+      "kind": "error",
+      "msg": "expected parameter declarator"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ')'"
+    },
+    {
+      "kind": "note",
+      "msg": "to match this '('"
+    },
+    {
+      "kind": "error",
+      "msg": "expected parameter declarator"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ')'"
+    },
+    {
+      "kind": "error",
+      "msg": "static assertion failed: this fails"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression is not an integer constant expression; folding it to a constant is a GNU extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "a function definition without a prototype is deprecated in all versions of C and is not supported in C23"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ';' at end of declaration"
+    },
+    {
+      "kind": "error",
+      "msg": "expected identifier or '('"
+    },
+    {
+      "kind": "error",
+      "msg": "type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 11,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C11/n1330.sft.c",
+  "remark": null,
+  "sha256": "936bbe495ad52c17a1aa54704654816f651be71880a63b6fdfc03abfee5791c3",
+  "test_number_uses": 0,
+  "type": "fn"
+}

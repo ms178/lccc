@@ -1,0 +1,54 @@
+{
+  "bytes": 1105,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "use of GNU statement expression extension"
+    },
+    {
+      "kind": "error",
+      "msg": "expected expression"
+    },
+    {
+      "kind": "error",
+      "msg": "expected expression"
+    },
+    {
+      "kind": "warning",
+      "msg": "label followed by a declaration is a C23 extension"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'b'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'w'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'x'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'c'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/decls.sft.c",
+  "remark": null,
+  "sha256": "a87a10823218d3bfa45fc2e666f2fe2aaf7b18ef2736096510094ac3da1e3038",
+  "test_number_uses": 0,
+  "type": "fn"
+}

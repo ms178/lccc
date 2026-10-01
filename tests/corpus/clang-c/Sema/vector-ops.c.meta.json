@@ -1,0 +1,310 @@
+{
+  "bytes": 13557,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid argument type 'v2f' (vector of 2 'float' values) to unary"
+    },
+    {
+      "kind": "warning",
+      "msg": "incompatible vector types assigning to 'v2u' (vector of 2 'unsigned int' values) from '__attribute__((__vector_size__(2 * sizeof(int)))) int' (vector of 2 'int' values"
+    },
+    {
+      "kind": "error",
+      "msg": "size of array has non-integer type 'v2u' (vector of 2 'unsigned int' values"
+    },
+    {
+      "kind": "error",
+      "msg": "array subscript is not an integer"
+    },
+    {
+      "kind": "warning",
+      "msg": "converts between pointers to integer types with different sign"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector types 'v2u' (vector of 2 'unsigned int' values) and 'v2u'"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector types 'v2u' (vector of 2 'unsigned int' values) and 'v2u'"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector types 'v2s' (vector of 2 'int' values) and 'v2u' (vector of 2 'unsigned int' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector types 'v2s' (vector of 2 'int' values) and 'v2u' (vector of 2 'unsigned int' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector types 'v2u' (vector of 2 'unsigned int' values) and 'v2f' (vector of 2 'float' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector types 'v2u' (vector of 2 'unsigned int' values) and 'v2f' (vector of 2 'float' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector types 'v2s' (vector of 2 'int' values) and 'v2f' (vector of 2 'float' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector types 'v2s' (vector of 2 'int' values) and 'v2f' (vector of 2 'float' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector types 'v2s' (vector of 2 'int' values) and 'v2s'"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector types 'v2s' (vector of 2 'int' values) and 'v2s'"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector types 'v2u' (vector of 2 'unsigned int' values) and 'v2u'"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector types 'v2u' (vector of 2 'unsigned int' values) and 'v2u'"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector types 'v2s' (vector of 2 'int' values) and 'v2u' (vector of 2 'unsigned int' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector types 'v2s' (vector of 2 'int' values) and 'v2u' (vector of 2 'unsigned int' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector types 'v2s' (vector of 2 'int' values) and 'v2f' (vector of 2 'float' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector types 'v2s' (vector of 2 'int' values) and 'v2f' (vector of 2 'float' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector types 'v2u' (vector of 2 'unsigned int' values) and 'v2f' (vector of 2 'float' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector types 'v2u' (vector of 2 'unsigned int' values) and 'v2f' (vector of 2 'float' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector types 'v2f' (vector of 2 'float' values) and 'v2f'"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector types 'v2f' (vector of 2 'float' values) and 'v2f'"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector types 'v2s' (vector of 2 'int' values) and 'v2f' (vector of 2 'float' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector types 'v2s' (vector of 2 'int' values) and 'v2f' (vector of 2 'float' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector types 'v2u' (vector of 2 'unsigned int' values) and 'v2f' (vector of 2 'float' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector types 'v2u' (vector of 2 'unsigned int' values) and 'v2f' (vector of 2 'float' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector types 'v2u' (vector of 2 'unsigned int' values) and 'v2u'"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector types 'v2u' (vector of 2 'unsigned int' values) and 'v2u'"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector types 'v2s' (vector of 2 'int' values) and 'v2s'"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector types 'v2s' (vector of 2 'int' values) and 'v2s'"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector types 'v2s' (vector of 2 'int' values) and 'v2u' (vector of 2 'unsigned int' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector types 'v2s' (vector of 2 'int' values) and 'v2u' (vector of 2 'unsigned int' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector type 'v2u' (vector of 2 'unsigned int' values) and non-vector type 'unsigned int' is only supported in C++"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector type 'v2u' (vector of 2 'unsigned int' values) and non-vector type 'unsigned int' is only supported in C++"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between scalar type 'unsigned int' and vector type 'v2s' (vector of 2 'int' values) as implicit conversion would cause truncation"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between scalar type 'unsigned int' and vector type 'v2s' (vector of 2 'int' values) as implicit conversion would cause truncation"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between scalar type 'unsigned int' and vector type 'v2s' (vector of 2 'int' values) as implicit conversion would cause truncation"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between scalar type 'unsigned int' and vector type 'v2s' (vector of 2 'int' values) as implicit conversion would cause truncation"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector type 'v2u' (vector of 2 'unsigned int' values) and non-vector type 'unsigned int' is only supported in C++"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector type 'v2u' (vector of 2 'unsigned int' values) and non-vector type 'unsigned int' is only supported in C++"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between scalar type 'unsigned int' and vector type 'v2f' (vector of 2 'float' values) as implicit conversion would cause truncation"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between scalar type 'unsigned int' and vector type 'v2f' (vector of 2 'float' values) as implicit conversion would cause truncation"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between scalar type 'unsigned int' and vector type 'v2f' (vector of 2 'float' values) as implicit conversion would cause truncation"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between scalar type 'unsigned int' and vector type 'v2f' (vector of 2 'float' values) as implicit conversion would cause truncation"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector type 'v2u' (vector of 2 'unsigned int' values) and non-vector type 'int' is only supported in C++"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector type 'v2u' (vector of 2 'unsigned int' values) and non-vector type 'int' is only supported in C++"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector type 'v2s' (vector of 2 'int' values) and non-vector type 'int' is only supported in C++"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector type 'v2s' (vector of 2 'int' values) and non-vector type 'int' is only supported in C++"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector type 'v2s' (vector of 2 'int' values) and non-vector type 'int' is only supported in C++"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector type 'v2s' (vector of 2 'int' values) and non-vector type 'int' is only supported in C++"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector type 'v2u' (vector of 2 'unsigned int' values) and non-vector type 'int' is only supported in C++"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector type 'v2u' (vector of 2 'unsigned int' values) and non-vector type 'int' is only supported in C++"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between scalar type 'int' and vector type 'v2f' (vector of 2 'float' values) as implicit conversion would cause truncation"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between scalar type 'int' and vector type 'v2f' (vector of 2 'float' values) as implicit conversion would cause truncation"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between scalar type 'int' and vector type 'v2f' (vector of 2 'float' values) as implicit conversion would cause truncation"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between scalar type 'int' and vector type 'v2f' (vector of 2 'float' values) as implicit conversion would cause truncation"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector type 'v2u' (vector of 2 'unsigned int' values) and non-vector type 'float' is only supported in C++"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector type 'v2u' (vector of 2 'unsigned int' values) and non-vector type 'float' is only supported in C++"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector type 'v2s' (vector of 2 'int' values) and non-vector type 'float' is only supported in C++"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector type 'v2s' (vector of 2 'int' values) and non-vector type 'float' is only supported in C++"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector type 'v2s' (vector of 2 'int' values) and non-vector type 'float' is only supported in C++"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector type 'v2s' (vector of 2 'int' values) and non-vector type 'float' is only supported in C++"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector type 'v2u' (vector of 2 'unsigned int' values) and non-vector type 'float' is only supported in C++"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector type 'v2u' (vector of 2 'unsigned int' values) and non-vector type 'float' is only supported in C++"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector type 'v2f' (vector of 2 'float' values) and non-vector type 'float' is only supported in C++"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector type 'v2f' (vector of 2 'float' values) and non-vector type 'float' is only supported in C++"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector type 'v2f' (vector of 2 'float' values) and non-vector type 'float' is only supported in C++"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector type 'v2f' (vector of 2 'float' values) and non-vector type 'float' is only supported in C++"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 3,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/vector-ops.sft.c",
+  "remark": null,
+  "sha256": "ca1eda2984058d075e0b11913890d9045616c34b38ab79cea4aea551248db711",
+  "test_number_uses": 0,
+  "type": "fn"
+}

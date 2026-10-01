@@ -1,0 +1,42 @@
+{
+  "bytes": 1001,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "variable 'x' is declared here"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'x' is uninitialized when used here"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'y' is uninitialized when used here"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'z' is uninitialized when used here"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'w' is uninitialized when used here"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/uninit-variables-vectors.sft.c",
+  "remark": null,
+  "sha256": "44b3bd235bdb3e6e7a3d02caf7c2132aeba282716c3f66524078612b31a4dc35",
+  "test_number_uses": 0,
+  "type": "fp"
+}

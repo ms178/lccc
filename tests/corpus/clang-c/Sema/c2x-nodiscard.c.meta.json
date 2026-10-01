@@ -1,0 +1,74 @@
+{
+  "bytes": 2623,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'nodiscard' attribute only applies to Objective-C methods, enums, structs, unions, classes, functions, function pointers, and typedefs"
+    },
+    {
+      "kind": "warning",
+      "msg": "ignoring return value of type 'S4' declared with 'nodiscard' attribute"
+    },
+    {
+      "kind": "warning",
+      "msg": "ignoring return value of type 'S3' declared with 'nodiscard' attribute: Wrong"
+    },
+    {
+      "kind": "warning",
+      "msg": "ignoring return value of function declared with 'nodiscard' attribute"
+    },
+    {
+      "kind": "warning",
+      "msg": "ignoring return value of type 'E2' declared with 'nodiscard' attribute"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression result unused"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression result unused"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression result unused"
+    },
+    {
+      "kind": "warning",
+      "msg": "ignoring return value of type 'error_info' declared with 'nodiscard'"
+    },
+    {
+      "kind": "warning",
+      "msg": "ignoring return value of function declared with 'nodiscard' attribute"
+    },
+    {
+      "kind": "warning",
+      "msg": "'[[nodiscard]]' attribute ignored when applied to a typedef"
+    },
+    {
+      "kind": "warning",
+      "msg": "'warn_unused' attribute only applies to structs, unions, and classes"
+    },
+    {
+      "kind": "warning",
+      "msg": "ignoring return value of type 'WURInt' declared with 'warn_unused_result' attribute"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/c2x-nodiscard.sft.c",
+  "remark": null,
+  "sha256": "7f56fcd5ef01d7250b35d5b53140b4f13aa978be804d9be948605493a9ebc797",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,62 @@
+{
+  "bytes": 1322,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'nomicromips' attribute takes no arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'micromips' attribute takes no arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "attribute only applies to functions"
+    },
+    {
+      "kind": "error",
+      "msg": "attribute only applies to functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'mips16' and 'micromips' attributes are not compatible"
+    },
+    {
+      "kind": "note",
+      "msg": "conflicting attribute is here"
+    },
+    {
+      "kind": "error",
+      "msg": "'micromips' and 'mips16' attributes are not compatible"
+    },
+    {
+      "kind": "note",
+      "msg": "conflicting attribute is here"
+    },
+    {
+      "kind": "error",
+      "msg": "'micromips' and 'mips16' attributes are not compatible"
+    },
+    {
+      "kind": "note",
+      "msg": "conflicting attribute is here"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-micromips.sft.c",
+  "remark": null,
+  "sha256": "b89b0dbd9cd8a5a70ba79c3388819e66546671179d96f2fbb3d57e3b98262dec",
+  "test_number_uses": 0,
+  "type": "fn"
+}

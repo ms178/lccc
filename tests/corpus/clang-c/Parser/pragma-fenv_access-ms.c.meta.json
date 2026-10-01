@@ -1,0 +1,26 @@
+{
+  "bytes": 873,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'#pragma fenv_access' can only appear at file scope or at the start of a compound statement"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 14,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w --ms_extensions --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/pragma-fenv_access-ms.sft.c",
+  "remark": null,
+  "sha256": "8796be293710abfb098e9a47507d85548430e44da002cb509d792b51b4816a87",
+  "test_number_uses": 0,
+  "type": "fn"
+}

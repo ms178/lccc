@@ -1,0 +1,21 @@
+{
+  "bytes": 524,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 9,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--ms_extensions --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/whitespace-ms-extensions.sft.c",
+  "remark": null,
+  "sha256": "35f9960a7a6f34ae174004538f1adab16f4e65fed755b6796dfd3d3a7900ca64",
+  "test_number_uses": 0,
+  "type": "fp"
+}

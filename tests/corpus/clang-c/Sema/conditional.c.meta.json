@@ -1,0 +1,34 @@
+{
+  "bytes": 1332,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "returning 'void' from a function with incompatible result type 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "returning 'void' from a function with incompatible result type 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible operand types ('mat5' (aka 'float __attribute__((matrix_type(5, 5)))') and 'mat4' (aka 'float __attribute__((matrix_type(4, 4)))'))"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/conditional.sft.c",
+  "remark": null,
+  "sha256": "65e07a55163945ff3f2c25b41aa6c7ac74c20df2318823cb7620ef6c9078e08f",
+  "test_number_uses": 0,
+  "type": "fn"
+}

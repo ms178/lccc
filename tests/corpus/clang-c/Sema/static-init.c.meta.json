@@ -1,0 +1,38 @@
+{
+  "bytes": 743,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "initializer element is not a compile-time constant"
+    },
+    {
+      "kind": "error",
+      "msg": "initializer element is not a compile-time constant"
+    },
+    {
+      "kind": "error",
+      "msg": "initializer element is not a compile-time constant"
+    },
+    {
+      "kind": "error",
+      "msg": "initializer element is not a compile-time constant"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/static-init.sft.c",
+  "remark": null,
+  "sha256": "cc90bc37c8799e727c579fb06c1d2b542f29a8a912964699623f093d5617c980",
+  "test_number_uses": 0,
+  "type": "fn"
+}

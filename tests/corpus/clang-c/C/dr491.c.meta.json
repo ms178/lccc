@@ -1,0 +1,50 @@
+{
+  "bytes": 1583,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "macro name is a reserved identifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "macro name is a reserved identifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "macro name is a reserved identifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "macro name is a reserved identifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "redefining builtin macro"
+    },
+    {
+      "kind": "warning",
+      "msg": "macro name is a reserved identifier"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 3,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c89",
+    " --c99",
+    " --c11",
+    " --c17",
+    " --c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/drs/dr491.sft.c",
+  "remark": null,
+  "sha256": "dbf57d043770513b91586dd8431845b33b748bfd7448e4c22e72375282b61c2e",
+  "test_number_uses": 0,
+  "type": "fp"
+}

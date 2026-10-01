@@ -1,0 +1,30 @@
+{
+  "bytes": 784,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "atomic store requires runtime support that is not available for this target"
+    },
+    {
+      "kind": "error",
+      "msg": "atomic load requires runtime support that is not available for this target"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/atomic-requires-library-error.sft.c",
+  "remark": null,
+  "sha256": "026ccb5fbbbc1ef34b5766f208adaec3852a45b1f653cdc83bdb3aa139cd11f5",
+  "test_number_uses": 0,
+  "type": "fn"
+}

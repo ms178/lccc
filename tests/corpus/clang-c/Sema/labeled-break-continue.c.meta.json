@@ -1,0 +1,190 @@
+{
+  "bytes": 5328,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'break' label does not name an enclosing loop or 'switch'"
+    },
+    {
+      "kind": "error",
+      "msg": "'continue' label does not name an enclosing loop"
+    },
+    {
+      "kind": "error",
+      "msg": "'break' label does not name an enclosing loop or 'switch'"
+    },
+    {
+      "kind": "error",
+      "msg": "'continue' label does not name an enclosing loop"
+    },
+    {
+      "kind": "error",
+      "msg": "'break' label does not name an enclosing loop or 'switch'"
+    },
+    {
+      "kind": "error",
+      "msg": "'continue' label does not name an enclosing loop"
+    },
+    {
+      "kind": "error",
+      "msg": "'break' label does not name an enclosing loop or 'switch'"
+    },
+    {
+      "kind": "error",
+      "msg": "'continue' label does not name an enclosing loop"
+    },
+    {
+      "kind": "error",
+      "msg": "'break' label does not name an enclosing loop or 'switch'"
+    },
+    {
+      "kind": "error",
+      "msg": "'break' label does not name an enclosing loop or 'switch'"
+    },
+    {
+      "kind": "error",
+      "msg": "'break' label does not name an enclosing loop or 'switch'"
+    },
+    {
+      "kind": "error",
+      "msg": "'continue' label does not name an enclosing loop"
+    },
+    {
+      "kind": "error",
+      "msg": "'continue' label does not name an enclosing loop"
+    },
+    {
+      "kind": "error",
+      "msg": "'continue' label does not name an enclosing loop"
+    },
+    {
+      "kind": "error",
+      "msg": "'break' label does not name an enclosing loop or 'switch'"
+    },
+    {
+      "kind": "error",
+      "msg": "'break' label does not name an enclosing loop or 'switch'"
+    },
+    {
+      "kind": "error",
+      "msg": "'break' label does not name an enclosing loop or 'switch'"
+    },
+    {
+      "kind": "error",
+      "msg": "'continue' label does not name an enclosing loop"
+    },
+    {
+      "kind": "error",
+      "msg": "'continue' label does not name an enclosing loop"
+    },
+    {
+      "kind": "error",
+      "msg": "'continue' label does not name an enclosing loop"
+    },
+    {
+      "kind": "error",
+      "msg": "'break' label does not name an enclosing loop or 'switch'"
+    },
+    {
+      "kind": "error",
+      "msg": "'continue' label does not name an enclosing loop"
+    },
+    {
+      "kind": "error",
+      "msg": "label of 'continue' refers to a switch statement"
+    },
+    {
+      "kind": "error",
+      "msg": "'break' label does not name an enclosing loop or 'switch'"
+    },
+    {
+      "kind": "error",
+      "msg": "'break' label does not name an enclosing loop or 'switch'"
+    },
+    {
+      "kind": "error",
+      "msg": "'break' label does not name an enclosing loop or 'switch'"
+    },
+    {
+      "kind": "error",
+      "msg": "'continue' label does not name an enclosing loop"
+    },
+    {
+      "kind": "error",
+      "msg": "'break' label does not name an enclosing loop or 'switch'"
+    },
+    {
+      "kind": "error",
+      "msg": "'continue' label does not name an enclosing loop"
+    },
+    {
+      "kind": "error",
+      "msg": "'break' label does not name an enclosing loop or 'switch'"
+    },
+    {
+      "kind": "error",
+      "msg": "'continue' label does not name an enclosing loop"
+    },
+    {
+      "kind": "error",
+      "msg": "'break' label does not name an enclosing loop or 'switch'"
+    },
+    {
+      "kind": "error",
+      "msg": "'continue' label does not name an enclosing loop"
+    },
+    {
+      "kind": "error",
+      "msg": "'break' label does not name an enclosing loop or 'switch'"
+    },
+    {
+      "kind": "error",
+      "msg": "'continue' label does not name an enclosing loop"
+    },
+    {
+      "kind": "error",
+      "msg": "'break' label does not name an enclosing loop or 'switch'"
+    },
+    {
+      "kind": "error",
+      "msg": "'continue' label does not name an enclosing loop"
+    },
+    {
+      "kind": "error",
+      "msg": "label of 'continue' refers to a switch statement"
+    },
+    {
+      "kind": "error",
+      "msg": "'break' label does not name an enclosing loop or 'switch'"
+    },
+    {
+      "kind": "error",
+      "msg": "'continue' label does not name an enclosing loop"
+    },
+    {
+      "kind": "error",
+      "msg": "'break' label does not name an enclosing loop or 'switch'"
+    },
+    {
+      "kind": "error",
+      "msg": "'continue' label does not name an enclosing loop"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/labeled-break-continue.sft.c",
+  "remark": null,
+  "sha256": "0d0a9ec1554cf66e32d6febc5697da5aa57363d286ccfee8a8c3aa5eaa606166",
+  "test_number_uses": 0,
+  "type": "fn"
+}

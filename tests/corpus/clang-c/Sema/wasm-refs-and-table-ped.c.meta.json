@@ -1,0 +1,26 @@
+{
+  "bytes": 245,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "no-diagnostics",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/wasm-refs-and-table-ped.sft.c",
+  "remark": null,
+  "sha256": "04cedcf58ac29bcb4a02f6d8db8cfb120aaa55e1ef4b19cf78a760ff4442728b",
+  "test_number_uses": 0,
+  "type": "fp"
+}

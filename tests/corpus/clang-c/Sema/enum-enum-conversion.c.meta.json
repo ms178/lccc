@@ -1,0 +1,38 @@
+{
+  "bytes": 951,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from enumeration type 'enum UE1' to different enumeration type 'enum UE2'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from enumeration type 'enum UE1' to different enumeration type 'enum SE1'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from enumeration type 'enum SE1' to different enumeration type 'enum UE1'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from enumeration type 'enum SE1' to different enumeration type 'enum SE2'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/enum-enum-conversion.sft.c",
+  "remark": null,
+  "sha256": "d28693953b62e3a231f529cd3fbf015f1da903d89984a37f2ac18e038c9d19d2",
+  "test_number_uses": 0,
+  "type": "fp"
+}

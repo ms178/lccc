@@ -1,0 +1,42 @@
+{
+  "bytes": 710,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'CONCAT'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'foo'"
+    },
+    {
+      "kind": "error",
+      "msg": "expected expression"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'atomic_load'"
+    },
+    {
+      "kind": "error",
+      "msg": "accessing a member of an atomic structure or union is undefined behavior"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/c23-delayed-typo-correction-crashes.sft.c",
+  "remark": null,
+  "sha256": "ff9b45e1dbf45546310e8235d7469f0b8619a4fdbe95ed9ac3d6fc1ad32283d2",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,23 @@
+{
+  "bytes": 2211,
+  "cases": null,
+  "category": "Parser",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 9,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c11",
+    " --c99",
+    " --c11"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/c11-keywords.sft.c",
+  "remark": null,
+  "sha256": "5e867e7c8c7ca3ff0a762ff9a94743cb427fc35d688adb8475201a2046b6a0e1",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,42 @@
+{
+  "bytes": 2026,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "cast from 'char *' to 'short *' increases required alignment from 1 to 2"
+    },
+    {
+      "kind": "warning",
+      "msg": "cast from 'char *' to 'int *' increases required alignment from 1 to 4"
+    },
+    {
+      "kind": "warning",
+      "msg": "cast from 'char *' to 'struct A *' increases required alignment from 1 to 16"
+    },
+    {
+      "kind": "error",
+      "msg": "unknown type name 'doesnotexist'"
+    },
+    {
+      "kind": "warning",
+      "msg": "cast from 'int *' to 'void **' increases required alignment from 4 to 8"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-cast-align.sft.c",
+  "remark": null,
+  "sha256": "0e8fc11d4cdce6d1d0f6b800dc7b36979049426fc2ae448d2feeb7380c8d940b",
+  "test_number_uses": 0,
+  "type": "fn"
+}

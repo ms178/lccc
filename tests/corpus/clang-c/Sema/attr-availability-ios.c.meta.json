@@ -1,0 +1,66 @@
+{
+  "bytes": 1737,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "'f0' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "note",
+      "msg": "'f2' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "note",
+      "msg": "explicitly marked unavailable"
+    },
+    {
+      "kind": "note",
+      "msg": "'f5' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "note",
+      "msg": "'f6' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "error",
+      "msg": "unexpected parameter 'environment' in availability attribute, not permitted in C/C++"
+    },
+    {
+      "kind": "warning",
+      "msg": "'f0' is deprecated: first deprecated in iOS 2.1"
+    },
+    {
+      "kind": "warning",
+      "msg": "'f2' is deprecated: first deprecated in iOS 3.0"
+    },
+    {
+      "kind": "error",
+      "msg": "f4' is unavailable: obsoleted in iOS 3.0"
+    },
+    {
+      "kind": "warning",
+      "msg": "'f5' is deprecated: first deprecated in iOS 3.0"
+    },
+    {
+      "kind": "warning",
+      "msg": "'f6' is deprecated: first deprecated in iOS 3.0"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-availability-ios.sft.c",
+  "remark": null,
+  "sha256": "dfc3e42d5a84091f4d55590006d4ef745600bc3bc49f4e2048cb19f07f64123e",
+  "test_number_uses": 0,
+  "type": "fn"
+}

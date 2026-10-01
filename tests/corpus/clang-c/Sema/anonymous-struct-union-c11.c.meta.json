@@ -1,0 +1,31 @@
+{
+  "bytes": 466,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "anonymous structs are a C11 extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "anonymous unions are a C11 extension"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c99",
+    " --c11"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/anonymous-struct-union-c11.sft.c",
+  "remark": null,
+  "sha256": "70b34efaa7932baf1cb8181754a3229ac0dfb5b437bc39ef9acd775eb2675d35",
+  "test_number_uses": 0,
+  "type": "fp"
+}

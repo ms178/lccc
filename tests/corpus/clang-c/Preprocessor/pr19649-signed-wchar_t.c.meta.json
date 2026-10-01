@@ -1,0 +1,21 @@
+{
+  "bytes": 254,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/pr19649-signed-wchar_t.sft.c",
+  "remark": null,
+  "sha256": "ac8655eca094c97b4884280a53133d37e2f255bfbe6eab844d3d78e85be1a305",
+  "test_number_uses": 0,
+  "type": "fp"
+}

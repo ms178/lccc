@@ -1,0 +1,26 @@
+{
+  "bytes": 3981,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "initializer-string for character array is too long, array size is 0 but initializer has size 1 (including the null terminating character); did you mean to use the 'nonstring' attribute?"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-nonstring_safe.sft.c",
+  "remark": null,
+  "sha256": "717ce6b6e2f57bafcd828f67f6534722a83392414521ac398102f162ef9521d9",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,21 @@
+{
+  "bytes": 801,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 34,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/is_target_unknown.sft.c",
+  "remark": null,
+  "sha256": "dd48b26d1b61daa2632fc027e000a1af5601fa9a54a1d92a69bdf2a30f64f5aa",
+  "test_number_uses": 0,
+  "type": "fp"
+}

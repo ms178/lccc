@@ -1,0 +1,86 @@
+{
+  "bytes": 2932,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "tentative array definition assumed to have one element"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer to integer conversion"
+    },
+    {
+      "kind": "warning",
+      "msg": "tentative array definition assumed to have one element"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of 'sizeof' to an incomplete type 'int[]'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of 'sizeof' to an incomplete type 'int[]'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of 'sizeof' to an incomplete type 'int[]'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "incompatible redeclaration of library function"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting types"
+    },
+    {
+      "kind": "warning",
+      "msg": "incompatible redeclaration of library function"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting types"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting types"
+    },
+    {
+      "kind": "warning",
+      "msg": "incompatible redeclaration of library function"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting types"
+    },
+    {
+      "kind": "error",
+      "msg": "incomplete type"
+    },
+    {
+      "kind": "error",
+      "msg": "passing 'double' to parameter of incompatible type 'int *'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/extern-redecl.sft.c",
+  "remark": null,
+  "sha256": "b994e9c63833a307279f61f157f9d59979f06b69fa8ed337a7af34361a108254",
+  "test_number_uses": 0,
+  "type": "fn"
+}

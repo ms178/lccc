@@ -1,0 +1,26 @@
+{
+  "bytes": 424,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'long long' is an extension"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c89"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/extension.sft.c",
+  "remark": null,
+  "sha256": "850690cec374b1ddfa7ddaca72334f51627b6b792b3d8ba0bf8f52aaa9bdf66d",
+  "test_number_uses": 0,
+  "type": "fp"
+}

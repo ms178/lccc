@@ -1,0 +1,34 @@
+{
+  "bytes": 2136,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "size of register 'x1' does not match variable size"
+    },
+    {
+      "kind": "error",
+      "msg": "size of register 'x2' does not match variable size"
+    },
+    {
+      "kind": "error",
+      "msg": "register 'f1' unsuitable for global register variables on this target"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/riscv-asm.sft.c",
+  "remark": null,
+  "sha256": "7bd277bcc4d1ac7078a85340c1cc32e0e22f458bd3918ff2796a7d644e4268a6",
+  "test_number_uses": 0,
+  "type": "fn"
+}

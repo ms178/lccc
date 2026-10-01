@@ -1,0 +1,38 @@
+{
+  "bytes": 1379,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "bitwise negation of a boolean expression always evaluates to 'true'; did you mean logical negation?"
+    },
+    {
+      "kind": "warning",
+      "msg": "bitwise negation of a boolean expression always evaluates to 'true'; did you mean logical negation?"
+    },
+    {
+      "kind": "warning",
+      "msg": "bitwise negation of a boolean expression; did you mean logical negation?"
+    },
+    {
+      "kind": "warning",
+      "msg": "bitwise negation of a boolean expression always evaluates to 'true'; did you mean logical negation?"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 10,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-bitwise-negation-bool.sft.c",
+  "remark": null,
+  "sha256": "0d6b9236f779360048c8755113ce18623e9b975200340831e362dabaf53faeff",
+  "test_number_uses": 0,
+  "type": "fp"
+}

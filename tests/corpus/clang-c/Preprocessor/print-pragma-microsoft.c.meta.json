@@ -1,0 +1,21 @@
+{
+  "bytes": 648,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 22,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--ms_extensions --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/print-pragma-microsoft.sft.c",
+  "remark": null,
+  "sha256": "672947a92f6e8e61a67fd62363ce22d0121c1220d297787b9da47232a0d658b0",
+  "test_number_uses": 0,
+  "type": "fp"
+}

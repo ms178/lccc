@@ -1,0 +1,21 @@
+{
+  "bytes": 11207,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 288,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/init-ve.sft.c",
+  "remark": null,
+  "sha256": "fda6eb0e47189cbfd2a1da0ea9a3c413fda86e3be71fc3ed1b51aa31d2b076ab",
+  "test_number_uses": 0,
+  "type": "fp"
+}

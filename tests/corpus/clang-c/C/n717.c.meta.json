@@ -1,0 +1,103 @@
+{
+  "bytes": 3916,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "incomplete universal character name; treating as '\\' followed by identifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "incomplete universal character name; treating as '\\' followed by identifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "incomplete universal character name; treating as '\\' followed by identifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "incomplete universal character name; treating as '\\' followed by identifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "incomplete universal character name; treating as '\\' followed by identifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "incomplete universal character name; treating as '\\' followed by identifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "incomplete universal character name; treating as '\\' followed by identifier"
+    },
+    {
+      "kind": "note",
+      "msg": "did you mean to use '\\u'?"
+    },
+    {
+      "kind": "warning",
+      "msg": "incomplete universal character name; treating as '\\' followed by identifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "incomplete universal character name; treating as '\\' followed by identifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "incomplete universal character name; treating as '\\' followed by identifier"
+    },
+    {
+      "kind": "error",
+      "msg": "character '$' cannot be specified by a universal character name"
+    },
+    {
+      "kind": "error",
+      "msg": "character '$' cannot be specified by a universal character name"
+    },
+    {
+      "kind": "error",
+      "msg": "character '@' cannot be specified by a universal character name"
+    },
+    {
+      "kind": "error",
+      "msg": "character '`' cannot be specified by a universal character name"
+    },
+    {
+      "kind": "error",
+      "msg": "character '@' cannot be specified by a universal character name"
+    },
+    {
+      "kind": "error",
+      "msg": "character '`' cannot be specified by a universal character name"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid universal character"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid universal character"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid universal character"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 14,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c99",
+    " --c99"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C99/n717.sft.c",
+  "remark": null,
+  "sha256": "71b9e7888120885bd86e0f4086bac93e70b1c162b8fe80f6b7535b2d9d36cd8d",
+  "test_number_uses": 0,
+  "type": "fn"
+}

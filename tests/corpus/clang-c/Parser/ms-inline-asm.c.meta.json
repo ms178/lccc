@@ -1,0 +1,58 @@
+{
+  "bytes": 1892,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "use of undeclared label 'label'"
+    },
+    {
+      "kind": "error",
+      "msg": "unknown token in expression"
+    },
+    {
+      "kind": "error",
+      "msg": "offset operator cannot yet handle constants"
+    },
+    {
+      "kind": "note",
+      "msg": "bit-field is declared here"
+    },
+    {
+      "kind": "note",
+      "msg": "bit-field is declared here"
+    },
+    {
+      "kind": "error",
+      "msg": "an inline asm block cannot have an operand which is a bit-field"
+    },
+    {
+      "kind": "error",
+      "msg": "an inline asm block cannot have an operand which is a bit-field"
+    },
+    {
+      "kind": "note",
+      "msg": "to match this"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 10,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/ms-inline-asm.sft.c",
+  "remark": null,
+  "sha256": "1f8fb9f7855cebb4aa0eefc92b495d045a9d08eabff88041aab0f1b24dda9e97",
+  "test_number_uses": 0,
+  "type": "fn"
+}

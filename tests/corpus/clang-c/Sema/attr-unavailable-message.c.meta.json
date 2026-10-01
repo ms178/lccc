@@ -1,0 +1,86 @@
+{
+  "bytes": 2115,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'unavailable' attribute takes no more than 1 argument"
+    },
+    {
+      "kind": "note",
+      "msg": "'foo' has been explicitly marked unavailable here"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": "explicitly marked unavailable"
+    },
+    {
+      "kind": "error",
+      "msg": "expected string literal as argument of '__unavailable__' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "'foo' is unavailable: USE IFOO INSTEAD"
+    },
+    {
+      "kind": "error",
+      "msg": "'dfoo' is unavailable: NO LONGER"
+    },
+    {
+      "kind": "error",
+      "msg": "'bar' is unavailable"
+    },
+    {
+      "kind": "error",
+      "msg": "'dfoo' is unavailable: NO LONGER"
+    },
+    {
+      "kind": "note",
+      "msg": "'b' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "note",
+      "msg": "'foo' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "'fee' is unavailable"
+    },
+    {
+      "kind": "warning",
+      "msg": "'a' is deprecated"
+    },
+    {
+      "kind": "warning",
+      "msg": "'b' is deprecated"
+    },
+    {
+      "kind": "error",
+      "msg": "'r' is unavailable"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-unavailable-message.sft.c",
+  "remark": null,
+  "sha256": "ec7c3338f3b101fb92b6829043169657a46d6a62096ac1dee457566e289b1027",
+  "test_number_uses": 0,
+  "type": "fn"
+}

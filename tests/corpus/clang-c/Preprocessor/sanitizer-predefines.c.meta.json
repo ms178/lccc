@@ -1,0 +1,21 @@
+{
+  "bytes": 761,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 12,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c --target linux_aarch64"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/sanitizer-predefines.sft.c",
+  "remark": null,
+  "sha256": "5ee97ccd21b120ddb110a0384e69892d5fd7090fbaf6d96e63ae6e9a642d66fd",
+  "test_number_uses": 0,
+  "type": "fp"
+}

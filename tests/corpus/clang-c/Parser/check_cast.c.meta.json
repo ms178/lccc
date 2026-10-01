@@ -1,0 +1,30 @@
+{
+  "bytes": 370,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "used type 'struct foo' where arithmetic or pointer type is required"
+    },
+    {
+      "kind": "error",
+      "msg": "operand of type 'struct foo' where arithmetic or pointer type is required"
+    }
+  ],
+  "has_main": true,
+  "header_lines": 3,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/check_cast.sft.c",
+  "remark": null,
+  "sha256": "5a48be8d119430740243ab6e60ffc7d22803d61f3c2ebd776bf02d3ad5fbfd36",
+  "test_number_uses": 0,
+  "type": "fn"
+}

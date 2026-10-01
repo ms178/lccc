@@ -1,0 +1,30 @@
+{
+  "bytes": 1147,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "no-diagnostics",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 3,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c89 -DC89",
+    " --c99 -DC99",
+    " --c11 -DC11",
+    " --c17 -DC17",
+    " --c23 -DC2X"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/drs/dr411.sft.c",
+  "remark": null,
+  "sha256": "f576abc11e85aaca0475ef572a3a11493a4993c88c0c1433b38ea16a3399a3f5",
+  "test_number_uses": 0,
+  "type": "fp"
+}

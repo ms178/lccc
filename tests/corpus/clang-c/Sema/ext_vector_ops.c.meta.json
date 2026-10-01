@@ -1,0 +1,254 @@
+{
+  "bytes": 8818,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid argument type 'v2f' (vector of 2 'float' values) to unary"
+    },
+    {
+      "kind": "error",
+      "msg": "size of array has non-integer type 'v2u' (vector of 2 'unsigned int' values"
+    },
+    {
+      "kind": "error",
+      "msg": "array subscript is not an integer"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'unsigned int' from incompatible type 'v2u'"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'unsigned int' from incompatible type 'v2u'"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'unsigned int' from incompatible type 'v2u'"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'unsigned int' from incompatible type 'v2u'"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'unsigned int' from incompatible type 'v2u'"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'unsigned int' from incompatible type 'v2u'"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'unsigned int' from incompatible type 'v2u'"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'unsigned int' from incompatible type 'v2u'"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'unsigned int' from incompatible type 'v2u'"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'unsigned int' from incompatible type 'v2u'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression"
+    },
+    {
+      "kind": "error",
+      "msg": "used type 'v2f' (vector of 2 'float' values) where integer is required"
+    },
+    {
+      "kind": "error",
+      "msg": "used type 'v2f' (vector of 2 'float' values) where integer is required"
+    },
+    {
+      "kind": "error",
+      "msg": "used type 'float' where integer is required"
+    },
+    {
+      "kind": "error",
+      "msg": "used type 'v2f' (vector of 2 'float' values) where integer is required"
+    },
+    {
+      "kind": "error",
+      "msg": "used type 'v2f' (vector of 2 'float' values) where integer is required"
+    },
+    {
+      "kind": "error",
+      "msg": "used type 'v2f' (vector of 2 'float' values) where integer is required"
+    },
+    {
+      "kind": "error",
+      "msg": "used type 'float' where integer is required"
+    },
+    {
+      "kind": "error",
+      "msg": "used type 'v2f' (vector of 2 'float' values) where integer is required"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression"
+    },
+    {
+      "kind": "error",
+      "msg": "used type 'v2f' (vector of 2 'float' values) where integer is required"
+    },
+    {
+      "kind": "error",
+      "msg": "used type 'v2f' (vector of 2 'float' values) where integer is required"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'float' from incompatible type 'v2f'"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'float' from incompatible type 'v2f'"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'float' from incompatible type 'v2f'"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'float' from incompatible type 'v2f'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression"
+    },
+    {
+      "kind": "error",
+      "msg": "used type 'float' where integer is required"
+    },
+    {
+      "kind": "error",
+      "msg": "used type 'float' where integer is required"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'enum Enum' from incompatible type 'v2u'"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'enum Enum' from incompatible type 'v2u'"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'enum Enum' from incompatible type 'v2u'"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'enum Enum' from incompatible type 'v2u'"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'enum Enum' from incompatible type 'v2u'"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'enum Enum' from incompatible type 'v2u'"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'enum Enum' from incompatible type 'v2u'"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'enum Enum' from incompatible type 'v2u'"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'enum Enum' from incompatible type 'v2u'"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'enum Enum' from incompatible type 'v2u'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between vector and non-scalar values"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between vector and non-scalar values"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/ext_vector_ops.sft.c",
+  "remark": null,
+  "sha256": "73d473379124e6df33ca59832a2f7f959c77f044444aff67deda6c78fc77bf6c",
+  "test_number_uses": 0,
+  "type": "fn"
+}

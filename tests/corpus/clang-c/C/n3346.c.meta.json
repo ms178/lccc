@@ -1,0 +1,58 @@
+{
+  "bytes": 3410,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "initializing 'struct S' with an expression of incompatible type 'struct T'"
+    },
+    {
+      "kind": "error",
+      "msg": "array initializer must be an initializer list"
+    },
+    {
+      "kind": "error",
+      "msg": "initializing 'float' with an expression of incompatible type 'char[23]'"
+    },
+    {
+      "kind": "error",
+      "msg": "initializing wide char array with non-wide string literal"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "initializing wide char array with non-wide string literal"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "initializing wide char array with non-wide string literal"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 14,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c99"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C2y/n3346.sft.c",
+  "remark": null,
+  "sha256": "87e3f95bf48e9a1c7b1095eb96ccc123266520709532ef45d8afc476d45acccd",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,30 @@
+{
+  "bytes": 199,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    }
+  ],
+  "has_main": true,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/cxx-as-c.sft.c",
+  "remark": null,
+  "sha256": "4fa4dba1a6a22a364c308d699ce4c51f7d568c6988bcbcf615e5f08d4346da8a",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,21 @@
+{
+  "bytes": 186,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": true,
+  "header_lines": 6,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/undefined-internal-typeof-c23.sft.c",
+  "remark": null,
+  "sha256": "96e330f2f751a28ee62fa8ff582355ffec69639962c52cb4af4011f446217d27",
+  "test_number_uses": 0,
+  "type": "fp"
+}

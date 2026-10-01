@@ -1,0 +1,98 @@
+{
+  "bytes": 4247,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'alloc_size' attribute takes at least 1 argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'alloc_size' attribute takes at least 1 argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'alloc_size' attribute parameter 1 is out of bounds"
+    },
+    {
+      "kind": "error",
+      "msg": "'alloc_size' attribute parameter 1 is out of bounds"
+    },
+    {
+      "kind": "error",
+      "msg": "'alloc_size' attribute parameter 1 is out of bounds"
+    },
+    {
+      "kind": "error",
+      "msg": "'alloc_size' attribute parameter 1 is out of bounds"
+    },
+    {
+      "kind": "error",
+      "msg": "'alloc_size' attribute parameter 2 is out of bounds"
+    },
+    {
+      "kind": "error",
+      "msg": "'alloc_size' attribute parameter 2 is out of bounds"
+    },
+    {
+      "kind": "warning",
+      "msg": "'alloc_size' attribute only applies to return values that are pointers"
+    },
+    {
+      "kind": "warning",
+      "msg": "'alloc_size' attribute only applies to non-K&R-style functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'alloc_size' attribute argument may only refer to a function parameter of integer type"
+    },
+    {
+      "kind": "error",
+      "msg": "'alloc_size' attribute requires parameter 1 to be an integer constant"
+    },
+    {
+      "kind": "error",
+      "msg": "'alloc_size' attribute requires parameter 2 to be an integer constant"
+    },
+    {
+      "kind": "error",
+      "msg": "integer constant expression evaluates to value 2147483648 that cannot be represented in a 32-bit signed integer type"
+    },
+    {
+      "kind": "warning",
+      "msg": "'alloc_size' attribute only applies to non-K&R-style functions"
+    },
+    {
+      "kind": "warning",
+      "msg": "'alloc_size' attribute only applies to non-K&R-style functions"
+    },
+    {
+      "kind": "warning",
+      "msg": "'alloc_size' attribute only applies to non-K&R-style functions"
+    },
+    {
+      "kind": "warning",
+      "msg": "'alloc_size' attribute only applies to non-K&R-style functions"
+    },
+    {
+      "kind": "warning",
+      "msg": "'alloc_size' attribute only applies to non-K&R-style functions"
+    }
+  ],
+  "has_main": true,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/alloc-size.sft.c",
+  "remark": null,
+  "sha256": "f1dbefa5023d86b8f52dbd0cae1e1900b2e2cafc280d3c5d1f42e00cb30985b3",
+  "test_number_uses": 0,
+  "type": "fn"
+}

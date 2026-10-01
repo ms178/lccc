@@ -1,0 +1,46 @@
+{
+  "bytes": 789,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'always_inline' and 'not_tail_called' attributes are not compatible"
+    },
+    {
+      "kind": "note",
+      "msg": "conflicting attribute is here"
+    },
+    {
+      "kind": "error",
+      "msg": "'not_tail_called' and 'always_inline' attributes are not compatible"
+    },
+    {
+      "kind": "note",
+      "msg": "conflicting attribute is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "'not_tail_called' attribute only applies to functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'not_tail_called' attribute takes no arguments"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-notail.sft.c",
+  "remark": null,
+  "sha256": "277c2978143d90f9977e4a36c014d6fc572c4113b1b75aa6981ead2a05813fae",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,94 @@
+{
+  "bytes": 3360,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": "here"
+    },
+    {
+      "kind": "warning",
+      "msg": "availability does not match previous declaration"
+    },
+    {
+      "kind": "note",
+      "msg": "here"
+    },
+    {
+      "kind": "warning",
+      "msg": "availability does not match previous declaration"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "'evenNewer' is only available on iOS 27 or newer"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DNEW -DAPP_EXT --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-availability-ios-aligned-versions.sft.c",
+  "remark": null,
+  "sha256": "8daa430c0aaf3aaf0d02472110cc68eca616821ed091d17186321fbb1367bb58",
+  "test_number_uses": 0,
+  "type": "fn"
+}

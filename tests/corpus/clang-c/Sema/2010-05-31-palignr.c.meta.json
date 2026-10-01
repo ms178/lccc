@@ -1,0 +1,21 @@
+{
+  "bytes": 187766,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": true,
+  "header_lines": 21,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/2010-05-31-palignr.sft.c",
+  "remark": null,
+  "sha256": "6e2299aaec963ffa0ffc657a6d413860d736bfb6ebdfb236a6011ddeee8c51bc",
+  "test_number_uses": 0,
+  "type": "fn"
+}

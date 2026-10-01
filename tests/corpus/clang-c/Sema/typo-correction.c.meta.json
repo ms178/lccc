@@ -1,0 +1,190 @@
+{
+  "bytes": 5167,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "type specifier missing, defaults to 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'b'"
+    },
+    {
+      "kind": "note",
+      "msg": "'foobar' declared here"
+    },
+    {
+      "kind": "error",
+      "msg": "type specifier missing, defaults to 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'goobar'; did you mean 'foobar'?"
+    },
+    {
+      "kind": "error",
+      "msg": "initializer element is not a compile-time constant"
+    },
+    {
+      "kind": "note",
+      "msg": "'SOME_ENUM' declared here"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'SOME_ENUM_'; did you mean 'SOME_ENUM'"
+    },
+    {
+      "kind": "note",
+      "msg": "'banana' declared here"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'bandana'; did you mean 'banana'?"
+    },
+    {
+      "kind": "error",
+      "msg": "call to undeclared function 'foo'; ISO C99 and later do not support implicit function declarations"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier '__v2di'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'c'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'errij'"
+    },
+    {
+      "kind": "note",
+      "msg": "'afunction' declared here"
+    },
+    {
+      "kind": "note",
+      "msg": "passing argument to parameter here"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'THIS_IS_AN_ERROR'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'afunction_'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer to integer conversion passing 'long (int)' to parameter of type 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'structVar1'"
+    },
+    {
+      "kind": "error",
+      "msg": "no member named 'fieldName1' in 'struct rdar38642201'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'structVar2'"
+    },
+    {
+      "kind": "error",
+      "msg": "no member named 'fieldName2' in 'struct rdar38642201'"
+    },
+    {
+      "kind": "note",
+      "msg": "'the_value' declared here"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'the_walue'"
+    },
+    {
+      "kind": "note",
+      "msg": "'the_value' declared here"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'the_walue'"
+    },
+    {
+      "kind": "note",
+      "msg": "'the_value' declared here"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'the_walue'"
+    },
+    {
+      "kind": "note",
+      "msg": "'the_value' declared here"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'the_walue'; did you mean 'the_value'?"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/typo-correction.sft.c",
+  "remark": null,
+  "sha256": "432b58a3011b52038177611aa6771033de24627f650f90fdead774b223743070",
+  "test_number_uses": 0,
+  "type": "fn"
+}

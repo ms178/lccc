@@ -1,0 +1,26 @@
+{
+  "bytes": 200,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "ordered comparison between pointer and integer"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c11"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/integral-to-ptr.sft.c",
+  "remark": null,
+  "sha256": "e289df6ceec0809a3ec2d41a3c7333c070eee930882603e8ec0a09c28ffcb607",
+  "test_number_uses": 0,
+  "type": "fp"
+}

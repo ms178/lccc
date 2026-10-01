@@ -1,0 +1,21 @@
+{
+  "bytes": 34007,
+  "cases": null,
+  "category": "Parser",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 9,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DHUGE --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/parser_overflow.sft.c",
+  "remark": null,
+  "sha256": "df413cf260464147d39f351cc7f9b933241cccaa4dc42f34ed4f76a93a2ff795",
+  "test_number_uses": 0,
+  "type": "fp"
+}

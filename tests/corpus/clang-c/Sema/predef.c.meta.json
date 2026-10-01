@@ -1,0 +1,46 @@
+{
+  "bytes": 780,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "predefined identifier is only valid"
+    },
+    {
+      "kind": "warning",
+      "msg": "initializing 'char *' with an expression of type 'const char[1]' discards qualifiers"
+    },
+    {
+      "kind": "error",
+      "msg": "variable is not assignable"
+    },
+    {
+      "kind": "warning",
+      "msg": "predefined identifier is only valid"
+    },
+    {
+      "kind": "warning",
+      "msg": "predefined identifier is only valid"
+    },
+    {
+      "kind": "warning",
+      "msg": "predefined identifier is only valid"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/predef.sft.c",
+  "remark": null,
+  "sha256": "1d0163810f730644903ab70200ff5ddc658b7c287fda8ccd86ffd22dca91c060",
+  "test_number_uses": 0,
+  "type": "fn"
+}

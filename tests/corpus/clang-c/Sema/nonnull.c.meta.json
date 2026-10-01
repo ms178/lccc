@@ -1,0 +1,178 @@
+{
+  "bytes": 7375,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "null passed to a callee that requires a non-null argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'nonnull' attribute requires parameter 1 to be an integer constant"
+    },
+    {
+      "kind": "warning",
+      "msg": "'nonnull' attribute only applies to pointer arguments"
+    },
+    {
+      "kind": "warning",
+      "msg": "'nonnull' attribute when used on parameters takes no arguments"
+    },
+    {
+      "kind": "warning",
+      "msg": "'nonnull' attribute only applies to pointer arguments"
+    },
+    {
+      "kind": "warning",
+      "msg": "null passed to a callee that requires a non-null argument"
+    },
+    {
+      "kind": "warning",
+      "msg": "'returns_nonnull' attribute only applies to return values that are pointers"
+    },
+    {
+      "kind": "warning",
+      "msg": "'returns_nonnull' attribute only applies to return values that are pointers"
+    },
+    {
+      "kind": "warning",
+      "msg": "'nonnull' attribute only applies to functions, methods, and parameters"
+    },
+    {
+      "kind": "warning",
+      "msg": "'returns_nonnull' attribute only applies to Objective-C methods and functions"
+    },
+    {
+      "kind": "warning",
+      "msg": "null returned from function that requires a non-null return value"
+    },
+    {
+      "kind": "warning",
+      "msg": "null passed to a callee that requires a non-null argument"
+    },
+    {
+      "kind": "warning",
+      "msg": "null passed to a callee that requires a non-null argument"
+    },
+    {
+      "kind": "warning",
+      "msg": "null passed"
+    },
+    {
+      "kind": "warning",
+      "msg": "null passed"
+    },
+    {
+      "kind": "warning",
+      "msg": "null passed"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "null passed"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "null passed"
+    },
+    {
+      "kind": "warning",
+      "msg": "null passed"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of nonnull parameter 'pointer' equal to a null pointer is 'false' on first encounter"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of nonnull parameter 'pv' equal to a null pointer is 'false' on first encounter"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of nonnull parameter 'pointer' equal to a null pointer is 'false' on first encounter"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of nonnull parameter 'pv' equal to a null pointer is 'false' on first encounter"
+    },
+    {
+      "kind": "note",
+      "msg": "declared 'nonnull' here"
+    },
+    {
+      "kind": "warning",
+      "msg": "nonnull parameter 'pointer' will evaluate to 'true' on first encounter"
+    },
+    {
+      "kind": "note",
+      "msg": "declared 'nonnull' here"
+    },
+    {
+      "kind": "warning",
+      "msg": "nonnull parameter 'p' will evaluate to 'true' on first encounter"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of nonnull function call 'returns_nonnull_whee()' equal to a null pointer is 'false' on first encounter"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of nonnull function call 'returns_nonnull_whee()' not equal to a null pointer is 'true' on first encounter"
+    },
+    {
+      "kind": "warning",
+      "msg": "nonnull function call 'returns_nonnull_whee()' will evaluate to 'true' on first encounter"
+    },
+    {
+      "kind": "warning",
+      "msg": "nonnull function call 'returns_nonnull_whee()' will evaluate to 'true' on first encounter"
+    },
+    {
+      "kind": "warning",
+      "msg": "nonnull function call 'returns_nonnull_whee()' will evaluate to 'true' on first encounter"
+    },
+    {
+      "kind": "warning",
+      "msg": "nonnull function call 'returns_nonnull_whee()' will evaluate to 'true' on first encounter"
+    },
+    {
+      "kind": "warning",
+      "msg": "null passed to a callee that requires a non-null argument"
+    }
+  ],
+  "has_main": true,
+  "header_lines": 8,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/nonnull.sft.c",
+  "remark": null,
+  "sha256": "20fa2cceae5ff7a90f33dac8517c9c7ad42abe34f81659412fc5cefb266a0298",
+  "test_number_uses": 0,
+  "type": "fn"
+}

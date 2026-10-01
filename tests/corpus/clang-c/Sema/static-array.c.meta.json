@@ -1,0 +1,110 @@
+{
+  "bytes": 3004,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "zero size arrays are an extension"
+    },
+    {
+      "kind": "note",
+      "msg": "callee declares array parameter as static here"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": "callee declares array parameter as static here"
+    },
+    {
+      "kind": "warning",
+      "msg": "null passed to a callee that requires a non-null argument"
+    },
+    {
+      "kind": "warning",
+      "msg": "null passed to a callee that requires a non-null argument"
+    },
+    {
+      "kind": "warning",
+      "msg": "array argument is too small; contains 2 elements, callee requires at least 3"
+    },
+    {
+      "kind": "warning",
+      "msg": "null passed to a callee that requires a non-null argument"
+    },
+    {
+      "kind": "warning",
+      "msg": "array argument is too small; is of size 4, callee requires at least 12"
+    },
+    {
+      "kind": "warning",
+      "msg": "array argument is too small; is of size 4, callee requires at least 12"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer types"
+    },
+    {
+      "kind": "error",
+      "msg": "'static' used in array declarator outside of function prototype"
+    },
+    {
+      "kind": "error",
+      "msg": "'static' used in array declarator outside of function prototype"
+    },
+    {
+      "kind": "error",
+      "msg": "type qualifier used in array declarator outside of function prototype"
+    },
+    {
+      "kind": "error",
+      "msg": "type qualifier used in array declarator outside of function prototype"
+    },
+    {
+      "kind": "error",
+      "msg": "type qualifier used in array declarator outside of function prototype"
+    },
+    {
+      "kind": "error",
+      "msg": "'static' used in array declarator outside of function prototype"
+    },
+    {
+      "kind": "error",
+      "msg": "'static' used in non-outermost array type derivation"
+    },
+    {
+      "kind": "error",
+      "msg": "type qualifier used in non-outermost array type derivation"
+    },
+    {
+      "kind": "error",
+      "msg": "'static' used in non-outermost array type derivation"
+    },
+    {
+      "kind": "error",
+      "msg": "'x' declared as array of functions of type 'int (void)'"
+    },
+    {
+      "kind": "error",
+      "msg": "block pointer to non-function type is invalid"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/static-array.sft.c",
+  "remark": null,
+  "sha256": "2a53df24d0bb380299a3096263f3b43b36fbffbcfdb1adcb6e0918e5246309d1",
+  "test_number_uses": 0,
+  "type": "fn"
+}

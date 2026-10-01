@@ -1,0 +1,58 @@
+{
+  "bytes": 3231,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from 'int' to enumeration type 'enum E1' is invalid in C++"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from 'int' to enumeration type 'enum E1' is invalid in C++"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from 'int' to enumeration type 'enum E1' is invalid in C++"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from 'int' to enumeration type 'enum E1' is invalid in C++"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from enumeration type 'enum E2' to different enumeration type 'enum E1'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from enumeration type 'enum E2' to different enumeration type 'enum E1'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from enumeration type 'enum E2' to different enumeration type 'enum E1'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from 'int' to enumeration type 'enum E1' is invalid in C++"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from 'int' to enumeration type 'enum E1' is invalid in C++"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 9,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/implicit-int-enum-conversion.sft.c",
+  "remark": null,
+  "sha256": "a5c0f904ecfbb4aa1927cb3cf6aa6cb0fd9e781df6e3c138add802ac33c25f44",
+  "test_number_uses": 0,
+  "type": "fp"
+}

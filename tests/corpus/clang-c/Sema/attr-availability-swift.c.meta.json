@@ -1,0 +1,26 @@
+{
+  "bytes": 1442,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "only 'unavailable' and 'deprecated' are supported for Swift availability"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 17,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-availability-swift.sft.c",
+  "remark": null,
+  "sha256": "77954663032a151fad32ff1700c4ee3f7a6725eba6e44067e25b2876a17f2839",
+  "test_number_uses": 0,
+  "type": "fp"
+}

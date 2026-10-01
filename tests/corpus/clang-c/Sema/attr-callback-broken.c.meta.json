@@ -1,0 +1,206 @@
+{
+  "bytes": 10021,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'callback' attribute specifies no callback callee"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "'callback' attribute references function of type 'void (int)' which expects 1 argument but attribute specifies 2 parameter index arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'callback' attribute references function of type 'void (int, int)' which expects 2 arguments but attribute specifies 1 parameter index argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'callback' attribute references function of type 'int (int)' which expects 1 argument but attribute specifies 0 parameter index arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'callback' attribute references function of type 'void (int, int)' which expects 2 arguments but attribute specifies 1 parameter index argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'callback' attribute specifies invalid callback callee"
+    },
+    {
+      "kind": "error",
+      "msg": "'callback' attribute parameter 1 is out of bounds"
+    },
+    {
+      "kind": "error",
+      "msg": "'callback' attribute parameter 2 is out of bounds"
+    },
+    {
+      "kind": "error",
+      "msg": "'callback' attribute parameter 1 is out of bounds"
+    },
+    {
+      "kind": "error",
+      "msg": "'callback' attribute parameter 2 is out of bounds"
+    },
+    {
+      "kind": "error",
+      "msg": "'callback' attribute parameter 2 is out of bounds"
+    },
+    {
+      "kind": "error",
+      "msg": "multiple 'callback' attributes specified"
+    },
+    {
+      "kind": "error",
+      "msg": "multiple 'callback' attributes specified"
+    },
+    {
+      "kind": "error",
+      "msg": "'callback' attribute specifies invalid callback callee"
+    },
+    {
+      "kind": "error",
+      "msg": "'callback' argument at position 1 references unavailable implicit 'this'"
+    },
+    {
+      "kind": "error",
+      "msg": "'callback' argument at position 2 references unavailable implicit 'this'"
+    },
+    {
+      "kind": "error",
+      "msg": "'callback' argument at position 2 references unavailable implicit 'this'"
+    },
+    {
+      "kind": "error",
+      "msg": "'callback' attribute callee may not be variadic"
+    },
+    {
+      "kind": "error",
+      "msg": "'callback' attribute callee may not be variadic"
+    },
+    {
+      "kind": "error",
+      "msg": "'callback' attribute references function of type 'void (int, ...)' which expects 1 argument but attribute specifies 6 parameter index arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'callback' attribute references function of type 'void (void *, double, int, ...)' which expects 3 arguments but attribute specifies 6 parameter index arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'callback' attribute references function of type 'void (int, ...)' which expects 1 argument but attribute specifies 2 parameter index arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'callback' attribute references function of type 'void (int, ...)' which expects 1 argument but attribute specifies 5 parameter index arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'callback' attribute argument 'cb' is not a known function parameter"
+    },
+    {
+      "kind": "error",
+      "msg": "'callback' attribute argument 'ab' is not a known function parameter"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "'callback' attribute references function of type 'void (int)' which expects 1 argument but attribute specifies 2 parameter index arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'callback' attribute references function of type 'void (int, int)' which expects 2 arguments but attribute specifies 1 parameter index argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'callback' attribute references function of type 'int (int)' which expects 1 argument but attribute specifies 0 parameter index arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'callback' attribute references function of type 'void (int, int)' which expects 2 arguments but attribute specifies 1 parameter index argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'callback' attribute specifies invalid callback callee"
+    },
+    {
+      "kind": "error",
+      "msg": "multiple 'callback' attributes specified"
+    },
+    {
+      "kind": "error",
+      "msg": "multiple 'callback' attributes specified"
+    },
+    {
+      "kind": "error",
+      "msg": "'callback' attribute specifies invalid callback callee"
+    },
+    {
+      "kind": "error",
+      "msg": "'callback' argument at position 1 references unavailable implicit 'this'"
+    },
+    {
+      "kind": "error",
+      "msg": "'callback' argument at position 2 references unavailable implicit 'this'"
+    },
+    {
+      "kind": "error",
+      "msg": "'callback' argument at position 2 references unavailable implicit 'this'"
+    },
+    {
+      "kind": "error",
+      "msg": "'callback' attribute callee may not be variadic"
+    },
+    {
+      "kind": "error",
+      "msg": "'callback' attribute callee may not be variadic"
+    },
+    {
+      "kind": "error",
+      "msg": "'callback' attribute references function of type 'void (int, ...)' which expects 1 argument but attribute specifies 6 parameter index arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'callback' attribute references function of type 'void (void *, double, int, ...)' which expects 3 arguments but attribute specifies 6 parameter index arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'callback' attribute references function of type 'void (int, ...)' which expects 1 argument but attribute specifies 2 parameter index arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'callback' attribute references function of type 'void (int, ...)' which expects 1 argument but attribute specifies 5 parameter index arguments"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-callback-broken.sft.c",
+  "remark": null,
+  "sha256": "c74760051c7ce4902278a650162317b244dabae3763f94bbe6bf03ed9a38823e",
+  "test_number_uses": 0,
+  "type": "fn"
+}

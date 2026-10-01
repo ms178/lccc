@@ -1,0 +1,21 @@
+{
+  "bytes": 1030,
+  "cases": null,
+  "category": "Parser",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 17,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/altivec-zvector-bool.sft.c",
+  "remark": null,
+  "sha256": "5d32f6214505f481053db27e41839069c45bf2da641d7233d5521b0496cb3b2f",
+  "test_number_uses": 0,
+  "type": "fp"
+}

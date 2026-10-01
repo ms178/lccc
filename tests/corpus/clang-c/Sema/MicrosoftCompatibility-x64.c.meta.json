@@ -1,0 +1,21 @@
+{
+  "bytes": 500,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 10,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w -w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/MicrosoftCompatibility-x64.sft.c",
+  "remark": null,
+  "sha256": "a11dd23a616e09e791e5430a35da59c089e8b08efe8e297a476d26cef3f157ef",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,21 @@
+{
+  "bytes": 3807,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 14,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DNO_JMP_BUF -DWRONG_JMP_BUF -DRIGHT_JMP_BUF -DONLY_JMP_BUF -DNO_SETJMP -DNO_JMP_BUF -DWRONG_JMP_BUF -DRIGHT_JMP_BUF -DONLY_JMP_BUF -DNO_SETJMP --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/builtin-setjmp.sft.c",
+  "remark": null,
+  "sha256": "8de6ff1b7b9015a8d4c12f1620ced27b441c7560e742b6e0b0c3a4e8b46fbece",
+  "test_number_uses": 0,
+  "type": "fp"
+}

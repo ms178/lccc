@@ -1,0 +1,30 @@
+{
+  "bytes": 849,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "no-diagnostics",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 13,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w -w -w --c --target linux_aarch64"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/swift-call-conv.sft.c",
+  "remark": null,
+  "sha256": "4f5a0990332b19fbc696f841b3f68138610ea7fc3e23faba2b3b93f33ce6ab80",
+  "test_number_uses": 0,
+  "type": "fp"
+}

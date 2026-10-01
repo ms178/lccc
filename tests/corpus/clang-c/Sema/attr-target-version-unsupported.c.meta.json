@@ -1,0 +1,21 @@
+{
+  "bytes": 239,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-target-version-unsupported.sft.c",
+  "remark": null,
+  "sha256": "684f43e706e8dbff20f99576e8c6b4d53fd718ad906f9f6f107ce403ce2865d4",
+  "test_number_uses": 0,
+  "type": "fp"
+}

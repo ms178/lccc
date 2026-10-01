@@ -1,0 +1,26 @@
+{
+  "bytes": 442,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "expression is not an integer constant expression"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/PR2963-enum-constant.sft.c",
+  "remark": null,
+  "sha256": "c4483b0d1c85ff740a5e7f89af6d2631789adfc78f318730c4e892b7182f711c",
+  "test_number_uses": 0,
+  "type": "fp"
+}

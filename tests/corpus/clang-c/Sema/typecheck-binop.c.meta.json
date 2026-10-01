@@ -1,0 +1,50 @@
+{
+  "bytes": 871,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "forward declaration of 'struct incomplete'"
+    },
+    {
+      "kind": "error",
+      "msg": "not pointers to compatible types"
+    },
+    {
+      "kind": "error",
+      "msg": "arithmetic on a pointer to an incomplete type 'struct incomplete'"
+    },
+    {
+      "kind": "warning",
+      "msg": "arithmetic on a pointer to void is a GNU extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "arithmetic on pointers to void is a GNU extension"
+    },
+    {
+      "kind": "error",
+      "msg": "not pointers to compatible types"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/typecheck-binop.sft.c",
+  "remark": null,
+  "sha256": "19ca8a4a7f086ed57233a974329a4a20a41f5507cbb3628b5fef148faff6d27c",
+  "test_number_uses": 0,
+  "type": "fn"
+}

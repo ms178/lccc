@@ -1,0 +1,26 @@
+{
+  "bytes": 210,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "block declared 'noreturn' should not return"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/block-return-2.sft.c",
+  "remark": null,
+  "sha256": "69e5c25ecfc7930d44776808e50146f1a8b25be08e4c0c5a2d4c41348f5f52f5",
+  "test_number_uses": 0,
+  "type": "fn"
+}

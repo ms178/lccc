@@ -1,0 +1,202 @@
+{
+  "bytes": 7409,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "format specifies type '_Fract' but the argument has type 'short'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type '_Fract' but the argument has type 'unsigned short'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type '_Fract' but the argument has type 'int'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type '_Fract' but the argument has type 'unsigned int'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type '_Fract' but the argument has type 'long'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type '_Fract' but the argument has type 'unsigned long'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type '_Fract' but the argument has type 'float'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type '_Fract' but the argument has type 'double'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type '_Fract' but the argument has type 'char'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type '_Fract' but the argument has type 'unsigned char'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type '_Fract' but the argument has type 'short _Fract'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type '_Fract' but the argument has type 'long _Fract'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'unsigned _Fract' but the argument has type 'unsigned short _Fract'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'unsigned _Fract' but the argument has type 'unsigned long _Fract'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type '_Accum' but the argument has type 'short _Accum'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type '_Accum' but the argument has type 'long _Accum'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'unsigned _Accum' but the argument has type 'unsigned short _Accum'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'unsigned _Accum' but the argument has type 'unsigned long _Accum'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type '_Fract' but the argument has type 'unsigned _Fract'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'unsigned _Fract' but the argument has type '_Fract'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type '_Accum' but the argument has type 'unsigned _Accum'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'unsigned _Accum' but the argument has type '_Accum'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type '_Fract' but the argument has type '_Accum'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'unsigned _Fract' but the argument has type 'unsigned _Accum'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type '_Accum' but the argument has type '_Fract'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'unsigned _Accum' but the argument has type 'unsigned _Fract'"
+    },
+    {
+      "kind": "warning",
+      "msg": "length modifier 'z' results in undefined behavior or no effect with 'r' conversion specifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "length modifier 'll' results in undefined behavior or no effect with 'r' conversion specifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "length modifier 'hh' results in undefined behavior or no effect with 'r' conversion specifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "flag '+' results in undefined behavior with 'R' conversion specifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "flag '+' results in undefined behavior with 'R' conversion specifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "flag '+' results in undefined behavior with 'R' conversion specifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "flag '+' results in undefined behavior with 'K' conversion specifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "flag '+' results in undefined behavior with 'K' conversion specifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "flag '+' results in undefined behavior with 'K' conversion specifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "flag ' ' results in undefined behavior with 'R' conversion specifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "flag ' ' results in undefined behavior with 'R' conversion specifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "flag ' ' results in undefined behavior with 'R' conversion specifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "flag ' ' results in undefined behavior with 'K' conversion specifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "flag ' ' results in undefined behavior with 'K' conversion specifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "flag ' ' results in undefined behavior with 'K' conversion specifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "invalid conversion specifier 'k'"
+    },
+    {
+      "kind": "warning",
+      "msg": "invalid conversion specifier 'K'"
+    },
+    {
+      "kind": "warning",
+      "msg": "invalid conversion specifier 'r'"
+    },
+    {
+      "kind": "warning",
+      "msg": "invalid conversion specifier 'R'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DWITHOUT_FIXED_POINT --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/format-fixed-point.sft.c",
+  "remark": null,
+  "sha256": "649673a5d4b05a7e83f6bb667f7023ba46e62f41cf7be16734091c9c3e924645",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,46 @@
+{
+  "bytes": 882,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "more '%' conversions than data arguments"
+    },
+    {
+      "kind": "warning",
+      "msg": "more '%' conversions than data arguments"
+    },
+    {
+      "kind": "warning",
+      "msg": "format string is empty"
+    },
+    {
+      "kind": "warning",
+      "msg": "format string is empty"
+    },
+    {
+      "kind": "warning",
+      "msg": "format string is empty"
+    },
+    {
+      "kind": "warning",
+      "msg": "format string is empty"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-format_arg.sft.c",
+  "remark": null,
+  "sha256": "9ca19797783e113666471bf1a633b36de3ce662184ec7d402d7b2f04d842df57",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,42 @@
+{
+  "bytes": 1005,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "tentative definition of variable with internal linkage has incomplete non-array type 'struct foo'"
+    },
+    {
+      "kind": "error",
+      "msg": "tentative definition has type 'struct foo' that is never completed"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "tentative definition of variable with internal linkage has incomplete non-array type 'struct bar'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 11,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C2y/n3347.sft.c",
+  "remark": null,
+  "sha256": "b68a1df40747e5a02ed6d67f0215d7aa08ececa74815a06383d5096b24e6fa33",
+  "test_number_uses": 0,
+  "type": "fn"
+}

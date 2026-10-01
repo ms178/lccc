@@ -1,0 +1,21 @@
+{
+  "bytes": 694,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 12,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w --ms_compatibility -w"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/static_assert.sft.c",
+  "remark": null,
+  "sha256": "9281993ad4e17936951e224303da02d7975f51550da6ef9ccbbd5b0754ca53a0",
+  "test_number_uses": 0,
+  "type": "fp"
+}

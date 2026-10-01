@@ -1,0 +1,122 @@
+{
+  "bytes": 7371,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "operand of type 'struct Aggregate' where arithmetic or pointer type is required"
+    },
+    {
+      "kind": "error",
+      "msg": "operand of type 'enum Enum' where arithmetic or pointer type is required"
+    },
+    {
+      "kind": "error",
+      "msg": "operand of type '_Bool' where arithmetic or pointer type is required"
+    },
+    {
+      "kind": "error",
+      "msg": "used type 'char *' where integer is required"
+    },
+    {
+      "kind": "error",
+      "msg": "used type 'struct Aggregate' where integer is required"
+    },
+    {
+      "kind": "error",
+      "msg": "used type '_Bool' where integer is required"
+    },
+    {
+      "kind": "error",
+      "msg": "used type 'enum Enum' where integer is required"
+    },
+    {
+      "kind": "warning",
+      "msg": "ignoring return value of function declared with const attribute"
+    },
+    {
+      "kind": "warning",
+      "msg": "ignoring return value of function declared with const attribute"
+    },
+    {
+      "kind": "warning",
+      "msg": "ignoring return value of function declared with const attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "requested alignment must be 1 or greater"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "requested alignment is not a power of 2"
+    },
+    {
+      "kind": "error",
+      "msg": "requested alignment is not a power of 2"
+    },
+    {
+      "kind": "error",
+      "msg": "requested alignment must be 128 or smaller"
+    },
+    {
+      "kind": "error",
+      "msg": "requested alignment must be 2147483648 or smaller"
+    },
+    {
+      "kind": "error",
+      "msg": "requested alignment must be 2147483648 or smaller"
+    },
+    {
+      "kind": "error",
+      "msg": "requested alignment must be 9223372036854775808 or smaller"
+    },
+    {
+      "kind": "error",
+      "msg": "requested alignment must be 9223372036854775808 or smaller"
+    },
+    {
+      "kind": "error",
+      "msg": "requested alignment is not a power of 2"
+    },
+    {
+      "kind": "error",
+      "msg": "static assertion expression is not an integral constant expression"
+    },
+    {
+      "kind": "error",
+      "msg": "static assertion expression is not an integral constant expression"
+    },
+    {
+      "kind": "error",
+      "msg": "operand of type 'char *(void)' where arithmetic or pointer type is required"
+    },
+    {
+      "kind": "error",
+      "msg": "operand of type 'char *(*)(void)' where arithmetic or pointer type is required"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DALIGN_BUILTIN=__builtin_align_down -DRETURNS_BOOL=0 -DALIGN_BUILTIN=__builtin_align_up -DRETURNS_BOOL=0 -DALIGN_BUILTIN=__builtin_is_aligned -DRETURNS_BOOL=1 --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/builtin-align.sft.c",
+  "remark": null,
+  "sha256": "3a5ece0a48e917e4bc9f1c2ad5f542fdf24a427be978fed74c6297222be68b52",
+  "test_number_uses": 0,
+  "type": "fn"
+}

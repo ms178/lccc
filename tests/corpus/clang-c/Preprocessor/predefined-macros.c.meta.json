@@ -1,0 +1,21 @@
+{
+  "bytes": 17196,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 327,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w --ms_compatibility --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/predefined-macros.sft.c",
+  "remark": null,
+  "sha256": "c25e636684436677aaf8cc49c318fd1fba7d67a760e57ca121fa8c08f7495334",
+  "test_number_uses": 0,
+  "type": "fp"
+}

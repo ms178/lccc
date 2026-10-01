@@ -1,0 +1,42 @@
+{
+  "bytes": 1034,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "unknown type name 'wchar_t'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of 'g' with a different type: 'unsigned short' vs '__wchar_t'"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--ms_extensions -w -w --ms_extensions -w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/ms-wchar.sft.c",
+  "remark": null,
+  "sha256": "72a4cb1b5b39becd3b0bd1e9503578a4219b2a4fc612cb22f987dd052b3338fc",
+  "test_number_uses": 0,
+  "type": "fn"
+}

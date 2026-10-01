@@ -1,0 +1,34 @@
+{
+  "bytes": 536,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "enumeration value 'E0' not handled in switch"
+    },
+    {
+      "kind": "warning",
+      "msg": "enumeration value 'E0' not handled in switch"
+    },
+    {
+      "kind": "warning",
+      "msg": "enumeration value 'E0' not handled in switch"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/c23-switch.sft.c",
+  "remark": null,
+  "sha256": "f6469ef7dc1a2b3170c972833e65740e2a9ab58ced8a2de469c4db830d3ce607",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,21 @@
+{
+  "bytes": 531,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 14,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--check-prefix=CHECK-DARWIN --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/predefined-nullability.sft.c",
+  "remark": null,
+  "sha256": "b634e9dcb27c14e121b88362c21102c4e36de25aeeb7143bdf769e36ca12aa9a",
+  "test_number_uses": 0,
+  "type": "fp"
+}

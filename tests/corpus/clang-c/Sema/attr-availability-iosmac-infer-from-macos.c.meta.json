@@ -1,0 +1,70 @@
+{
+  "bytes": 2534,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "'f2' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": "'fObs' has been explicitly marked unavailable here"
+    },
+    {
+      "kind": "warning",
+      "msg": "'f2' is deprecated: first deprecated in macCatalyst 13.1"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "'fObs' is unavailable: obsoleted in macCatalyst 13.1"
+    },
+    {
+      "kind": "note",
+      "msg": "here"
+    },
+    {
+      "kind": "note",
+      "msg": "here"
+    },
+    {
+      "kind": "note",
+      "msg": "here"
+    },
+    {
+      "kind": "warning",
+      "msg": "'f15_2' is deprecated: first deprecated in macCatalyst 13.3"
+    },
+    {
+      "kind": "warning",
+      "msg": "'f15_3' is deprecated: first deprecated in macCatalyst 13.3.1"
+    },
+    {
+      "kind": "warning",
+      "msg": "'f15_4' is deprecated: first deprecated in macCatalyst 13.4"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DIOS14 --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-availability-iosmac-infer-from-macos.sft.c",
+  "remark": null,
+  "sha256": "c2af4d85a81aa413901eac9f2d0f46dad3bb1f33570a050a199e774b00a25141",
+  "test_number_uses": 0,
+  "type": "fn"
+}

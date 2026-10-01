@@ -1,0 +1,70 @@
+{
+  "bytes": 2158,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "magnitude of floating-point constant too small for type 'float'; minimum is 1.40129846E-45"
+    },
+    {
+      "kind": "warning",
+      "msg": "magnitude of floating-point constant too large for type 'float'; maximum is 3.40282347E+38"
+    },
+    {
+      "kind": "warning",
+      "msg": "magnitude of floating-point constant too small for type 'float'; minimum is 1.40129846E-45"
+    },
+    {
+      "kind": "warning",
+      "msg": "magnitude of floating-point constant too large for type 'float'; maximum is 3.40282347E+38"
+    },
+    {
+      "kind": "warning",
+      "msg": "magnitude of floating-point constant too small for type 'double'; minimum is 4.9406564584124654E-324"
+    },
+    {
+      "kind": "warning",
+      "msg": "magnitude of floating-point constant too large for type 'double'; maximum is 1.7976931348623157E+308"
+    },
+    {
+      "kind": "warning",
+      "msg": "magnitude of floating-point constant too small for type 'double'; minimum is 4.9406564584124654E-324"
+    },
+    {
+      "kind": "warning",
+      "msg": "magnitude of floating-point constant too large for type 'double'; maximum is 1.7976931348623157E+308"
+    },
+    {
+      "kind": "warning",
+      "msg": "magnitude of floating-point constant too small for type 'long double'; minimum is 3.64519953188247460253E-4951"
+    },
+    {
+      "kind": "warning",
+      "msg": "magnitude of floating-point constant too large for type 'long double'; maximum is 1.18973149535723176502E+4932"
+    },
+    {
+      "kind": "warning",
+      "msg": "magnitude of floating-point constant too small for type 'long double'; minimum is 3.64519953188247460253E-4951"
+    },
+    {
+      "kind": "warning",
+      "msg": "magnitude of floating-point constant too large for type 'long double'; maximum is 1.18973149535723176502E+4932"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c99"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-literal-range.sft.c",
+  "remark": null,
+  "sha256": "fcf3e661777c66133e5363c97e0e9e6737e7c777fe0fd47fe51bcfa43271a473",
+  "test_number_uses": 0,
+  "type": "fp"
+}

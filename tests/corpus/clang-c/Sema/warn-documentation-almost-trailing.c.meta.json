@@ -1,0 +1,30 @@
+{
+  "bytes": 613,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "not a Doxygen trailing comment"
+    },
+    {
+      "kind": "warning",
+      "msg": "not a Doxygen trailing comment"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-documentation-almost-trailing.sft.c",
+  "remark": null,
+  "sha256": "192fc23b0c69652a53465211b757d3467a6d1dab58856f19b9d623d221e8f171",
+  "test_number_uses": 0,
+  "type": "fp"
+}

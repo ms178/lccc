@@ -1,0 +1,34 @@
+{
+  "bytes": 1240,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "cast from 'int (*)(long)' to 'f2 *' (aka 'int (*)(void *)') converts to incompatible function type"
+    },
+    {
+      "kind": "warning",
+      "msg": "cast from 'int (*)(long)' to 'f4 *' (aka 'void (*)()') converts to incompatible function type"
+    },
+    {
+      "kind": "warning",
+      "msg": "cast from 'int (*)(long)' to 'f6 *' (aka 'int (*)(long, int)') converts to incompatible function type"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-cast-function-type.sft.c",
+  "remark": null,
+  "sha256": "86de21eeed1db5ec689d023a51e15918b8cf55eaf4a04ef9730c10cc680e0486",
+  "test_number_uses": 0,
+  "type": "fp"
+}

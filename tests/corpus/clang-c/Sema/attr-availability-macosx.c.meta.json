@@ -1,0 +1,70 @@
+{
+  "bytes": 2620,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "'f2' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "note",
+      "msg": "explicitly marked unavailable"
+    },
+    {
+      "kind": "note",
+      "msg": "'f5' has been explicitly marked unavailable here"
+    },
+    {
+      "kind": "note",
+      "msg": "'f6' has been explicitly marked unavailable here"
+    },
+    {
+      "kind": "warning",
+      "msg": "'f2' is deprecated: first deprecated in macOS 10.5"
+    },
+    {
+      "kind": "error",
+      "msg": "f4' is unavailable: obsoleted in macOS 10.5"
+    },
+    {
+      "kind": "error",
+      "msg": "'f5' is unavailable: not available on macOS"
+    },
+    {
+      "kind": "error",
+      "msg": "'f6' is unavailable: introduced in macOS 10.6"
+    },
+    {
+      "kind": "note",
+      "msg": "'not_yet_introduced_struct' has been explicitly marked unavailable here"
+    },
+    {
+      "kind": "error",
+      "msg": "'not_yet_introduced_struct' is unavailable: introduced in macOS 10.6"
+    },
+    {
+      "kind": "note",
+      "msg": "'type_info' has been explicitly marked unavailable here"
+    },
+    {
+      "kind": "error",
+      "msg": "'type_info' is unavailable: introduced in macOS 10.9"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-availability-macosx.sft.c",
+  "remark": null,
+  "sha256": "5bbe216b9dc5d2f9d651a3ec6823e3d4484b3a64cea714f41a43dc1b2c4f00f7",
+  "test_number_uses": 0,
+  "type": "fn"
+}

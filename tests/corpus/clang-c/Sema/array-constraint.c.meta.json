@@ -1,0 +1,78 @@
+{
+  "bytes": 1599,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "array has incomplete element type"
+    },
+    {
+      "kind": "error",
+      "msg": "variable has incomplete type 'struct s'"
+    },
+    {
+      "kind": "error",
+      "msg": "array has incomplete element type"
+    },
+    {
+      "kind": "warning",
+      "msg": "'struct vari' may not be used as an array element due to flexible array member"
+    },
+    {
+      "kind": "error",
+      "msg": "'foo' declared as array of functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'foo2' declared as array of functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'f' declared as array of functions"
+    },
+    {
+      "kind": "error",
+      "msg": "size of array has non-integer type 'float'"
+    },
+    {
+      "kind": "error",
+      "msg": "array with a negative size"
+    },
+    {
+      "kind": "warning",
+      "msg": "zero size arrays are an extension"
+    },
+    {
+      "kind": "error",
+      "msg": "variable length array declaration not allowed at file scope"
+    },
+    {
+      "kind": "note",
+      "msg": "passing argument to parameter here"
+    },
+    {
+      "kind": "warning",
+      "msg": "passing 'const char[5]' to parameter of type 'char *' discards qualifiers"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/array-constraint.sft.c",
+  "remark": null,
+  "sha256": "2a9bb1a726655369599028a575d4d05f5f22611050065af773ec769c5f801ff6",
+  "test_number_uses": 0,
+  "type": "fn"
+}

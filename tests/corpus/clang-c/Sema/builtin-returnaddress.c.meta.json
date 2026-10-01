@@ -1,0 +1,38 @@
+{
+  "bytes": 948,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "calling '__builtin_return_address' with a nonzero argument is unsafe"
+    },
+    {
+      "kind": "warning",
+      "msg": "calling '__builtin_frame_address' with a nonzero argument is unsafe"
+    },
+    {
+      "kind": "warning",
+      "msg": "calling '__builtin_return_address' with a nonzero argument is unsafe"
+    },
+    {
+      "kind": "note",
+      "msg": "in instantiation of function template specialization 'RA<2>' requested here"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/builtin-returnaddress.sft.c",
+  "remark": null,
+  "sha256": "06511a88a304e960c3eb01f8768d36781299b3f38e5fb3e16f4527c93251311c",
+  "test_number_uses": 0,
+  "type": "fp"
+}

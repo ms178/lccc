@@ -1,0 +1,33 @@
+{
+  "bytes": 1066,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "previous initialization with side effects is here (side effects will not occur at run time)"
+    },
+    {
+      "kind": "warning",
+      "msg": "initializer overrides prior initialization of this subobject"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 3,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c99",
+    " --c11",
+    " --c17",
+    " --c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/drs/dr208.sft.c",
+  "remark": null,
+  "sha256": "2c50dfb4c8737af2d1d6f8c61ca66a21ede919fc8152eac5f83a888fc21e176d",
+  "test_number_uses": 0,
+  "type": "fp"
+}

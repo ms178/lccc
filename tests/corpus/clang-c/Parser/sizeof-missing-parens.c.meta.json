@@ -1,0 +1,30 @@
+{
+  "bytes": 330,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "expected parentheses around type name in sizeof expression"
+    },
+    {
+      "kind": "error",
+      "msg": "expected parentheses around type name in sizeof expression"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/sizeof-missing-parens.sft.c",
+  "remark": null,
+  "sha256": "f59d55ab8e69b1975127442a415dd71d62867ccce2fc605f5fcbf93dddb1d514",
+  "test_number_uses": 0,
+  "type": "fn"
+}

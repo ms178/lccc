@@ -1,0 +1,30 @@
+{
+  "bytes": 364,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/typo-correction-no-hang.sft.c",
+  "remark": null,
+  "sha256": "d04848c24b4d7fee1bd07fab64505b91ce72745028739d02b156b98f4326395e",
+  "test_number_uses": 0,
+  "type": "fn"
+}

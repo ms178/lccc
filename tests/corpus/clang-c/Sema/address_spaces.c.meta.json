@@ -1,0 +1,130 @@
+{
+  "bytes": 4279,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "parameter may not be qualified with an address space"
+    },
+    {
+      "kind": "error",
+      "msg": "parameter may not be qualified with an address space"
+    },
+    {
+      "kind": "error",
+      "msg": "type specifier missing, defaults to 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "multiple address spaces specified for type"
+    },
+    {
+      "kind": "error",
+      "msg": "multiple address spaces specified for type"
+    },
+    {
+      "kind": "warning",
+      "msg": "multiple identical address spaces specified for type"
+    },
+    {
+      "kind": "error",
+      "msg": "automatic variable qualified with an address space"
+    },
+    {
+      "kind": "error",
+      "msg": "automatic variable qualified with an address space"
+    },
+    {
+      "kind": "error",
+      "msg": "automatic variable qualified with an address space"
+    },
+    {
+      "kind": "error",
+      "msg": "address space is negative"
+    },
+    {
+      "kind": "error",
+      "msg": "address space is larger than the maximum supported"
+    },
+    {
+      "kind": "error",
+      "msg": "address space is larger than the maximum supported"
+    },
+    {
+      "kind": "error",
+      "msg": "address space is larger than the maximum supported"
+    },
+    {
+      "kind": "error",
+      "msg": "returning '__attribute__((address_space(256))) void *' from a function with result type 'void *' changes address space of pointer"
+    },
+    {
+      "kind": "note",
+      "msg": "passing argument to parameter 'p' here"
+    },
+    {
+      "kind": "error",
+      "msg": "changes address space of pointer"
+    },
+    {
+      "kind": "error",
+      "msg": "function type may not be qualified with an address space"
+    },
+    {
+      "kind": "error",
+      "msg": "function type may not be qualified with an address space"
+    },
+    {
+      "kind": "error",
+      "msg": "field may not be qualified with an address space"
+    },
+    {
+      "kind": "error",
+      "msg": "field may not be qualified with an address space"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'Foobar'"
+    },
+    {
+      "kind": "error",
+      "msg": "'address_space' attribute requires an integer constant"
+    },
+    {
+      "kind": "error",
+      "msg": "conditional operator with the second and third operands of type  ('_AS1 char *' and '_AS2 char *') which are pointers to non-overlapping address spaces"
+    },
+    {
+      "kind": "error",
+      "msg": "arithmetic operation with operands of type  ('_AS1 char *' and '_AS2 char *') which are pointers to non-overlapping address spaces"
+    },
+    {
+      "kind": "error",
+      "msg": "compound literal in function scope may not be qualified with an address space"
+    },
+    {
+      "kind": "error",
+      "msg": "compound literal in function scope may not be qualified with an address space"
+    },
+    {
+      "kind": "error",
+      "msg": "compound literal in function scope may not be qualified with an address space"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/address_spaces.sft.c",
+  "remark": null,
+  "sha256": "275e4ff6aed1270e9118bf34f7b53af48773081975bb2f2de5c516e3aba1fb2c",
+  "test_number_uses": 0,
+  "type": "fn"
+}

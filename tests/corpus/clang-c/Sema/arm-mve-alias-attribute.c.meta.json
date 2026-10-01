@@ -1,0 +1,50 @@
+{
+  "bytes": 1377,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'__clang_arm_builtin_alias' attribute can only be applied to an ARM builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "'__clang_arm_builtin_alias' attribute takes one argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'__clang_arm_builtin_alias' attribute takes one argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'__clang_arm_builtin_alias' attribute requires parameter 1 to be an identifier"
+    },
+    {
+      "kind": "error",
+      "msg": "'__clang_arm_builtin_alias' attribute requires parameter 1 to be an identifier"
+    },
+    {
+      "kind": "error",
+      "msg": "'__clang_arm_builtin_alias' attribute takes one argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'__clang_arm_builtin_alias' attribute only applies to functions"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/arm-mve-alias-attribute.sft.c",
+  "remark": null,
+  "sha256": "cf0f0cd331cd11269a9f83c94e423324ca8b31e5886c8457fbf8ab67841db561",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,22 @@
+{
+  "bytes": 894,
+  "cases": null,
+  "category": "C",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 22,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c99",
+    " --c99"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C99/n570.sft.c",
+  "remark": null,
+  "sha256": "c99a68bf65a61ff8ee87bef36de7ae1d313698cf70439da069f2196ad5f97060",
+  "test_number_uses": 0,
+  "type": "fp"
+}

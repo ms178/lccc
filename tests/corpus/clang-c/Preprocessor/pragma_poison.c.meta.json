@@ -1,0 +1,30 @@
+{
+  "bytes": 574,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "attempt to use a poisoned identifier"
+    },
+    {
+      "kind": "error",
+      "msg": "attempt to use a poisoned identifier"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/pragma_poison.sft.c",
+  "remark": null,
+  "sha256": "c47b96fecfe42ea57236e79b047b42b06bad672c18ca990fbff8508d13c01ab0",
+  "test_number_uses": 0,
+  "type": "fn"
+}

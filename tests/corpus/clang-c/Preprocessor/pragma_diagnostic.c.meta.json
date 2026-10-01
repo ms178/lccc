@@ -1,0 +1,46 @@
+{
+  "bytes": 2609,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "no previous prototype for function 'ppp'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "no previous prototype for function 'ppr'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "no previous prototype for function 'pps'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 49,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w -DAVOID_UNKNOWN_WARNING -DINITIAL_UNDEF --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/pragma_diagnostic.sft.c",
+  "remark": null,
+  "sha256": "3bb02e26499b7d6045498e3eeaef847b2d68f2cedf2ac40ac287aa18fd82ae77",
+  "test_number_uses": 0,
+  "type": "fn"
+}

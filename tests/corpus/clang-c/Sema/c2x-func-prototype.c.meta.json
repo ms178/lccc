@@ -1,0 +1,23 @@
+{
+  "bytes": 1094,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23",
+    " --c17",
+    " --c99"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/c2x-func-prototype.sft.c",
+  "remark": null,
+  "sha256": "5332b12edbdb15cd89cd617952f121f7375c63aaa85a5d2ca87720de4c925ddf",
+  "test_number_uses": 0,
+  "type": "fn"
+}

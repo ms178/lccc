@@ -1,0 +1,21 @@
+{
+  "bytes": 814,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 35,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/ifdef-recover.sft.c",
+  "remark": null,
+  "sha256": "718704bb3ee334af83797848e9b9af883dd351b7b2863710a76c3cd5ded69b4c",
+  "test_number_uses": 0,
+  "type": "fn"
+}

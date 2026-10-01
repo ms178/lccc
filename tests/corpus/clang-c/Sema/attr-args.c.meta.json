@@ -1,0 +1,122 @@
+{
+  "bytes": 3405,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "candidate function"
+    },
+    {
+      "kind": "note",
+      "msg": "candidate function"
+    },
+    {
+      "kind": "error",
+      "msg": "'noreturn' attribute takes no arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'always_inline' attribute takes no arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'cdecl' attribute takes no arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'const' attribute takes no arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'fastcall' attribute takes no arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'restrict' attribute takes no arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'malloc' attribute takes no more than 2 arguments"
+    },
+    {
+      "kind": "warning",
+      "msg": "'malloc' attribute ignored because Clang does not yet support this attribute signature"
+    },
+    {
+      "kind": "error",
+      "msg": "'malloc' argument for deallocator is not a function"
+    },
+    {
+      "kind": "error",
+      "msg": "'malloc' argument 'a' is not a function"
+    },
+    {
+      "kind": "error",
+      "msg": "'malloc' argument 'ambigious_func' is not a single function"
+    },
+    {
+      "kind": "error",
+      "msg": "'malloc' argument 'func_b' must take a pointer type as its first argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'malloc' attribute parameter 2 is out of bounds"
+    },
+    {
+      "kind": "error",
+      "msg": "'malloc' argument '2' refers to non-pointer type 'int' of 'func_a'"
+    },
+    {
+      "kind": "error",
+      "msg": "'nothrow' attribute takes no arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'stdcall' attribute takes no arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'used' attribute takes no arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'unused' attribute takes no arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'weak' attribute takes no arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'__format_arg__' attribute parameter 1 is out of bounds"
+    },
+    {
+      "kind": "error",
+      "msg": "'alloc_size' attribute parameter 1 is out of bounds"
+    },
+    {
+      "kind": "error",
+      "msg": "'malloc' argument 'gh159080_a' must take a pointer type as its first argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'malloc' argument 'gh159080_c' must take a pointer type as its first argument"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 3,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-args.sft.c",
+  "remark": null,
+  "sha256": "22d79454b4a0e8d92801301c5685bcafa53b4d2500fbf6e181493bdf47efd4c9",
+  "test_number_uses": 0,
+  "type": "fn"
+}

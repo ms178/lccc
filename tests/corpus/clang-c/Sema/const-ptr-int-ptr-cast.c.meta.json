@@ -1,0 +1,21 @@
+{
+  "bytes": 2592,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 48,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/const-ptr-int-ptr-cast.sft.c",
+  "remark": null,
+  "sha256": "e534536ac67b65b6dffdd9d09c1ab8870a3a1b4679e1e4402753a5d96ef48c80",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,21 @@
+{
+  "bytes": 145,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c99"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/arg-scope-c99.sft.c",
+  "remark": null,
+  "sha256": "0a4219f7d06588e704cfb1b05e4cfce857f962cd564bcd13e5d6936c862fce5a",
+  "test_number_uses": 0,
+  "type": "fp"
+}

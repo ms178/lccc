@@ -1,0 +1,378 @@
+{
+  "bytes": 19612,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "too few arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "signed value must have pointer type; type here is 'struct A'"
+    },
+    {
+      "kind": "error",
+      "msg": "passing 'struct A' to parameter of incompatible type 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "does not identify a valid pointer authentication key for the current target"
+    },
+    {
+      "kind": "error",
+      "msg": "does not identify a valid pointer authentication key for the current target"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer types initializing 'float *' with an expression of type 'int *'"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "blended pointer must have pointer type; type here is 'struct A'"
+    },
+    {
+      "kind": "error",
+      "msg": "blended integer must have integer type; type here is 'struct A'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible integer to pointer conversion initializing 'float *' with an expression of type"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "argument must be a string literal"
+    },
+    {
+      "kind": "error",
+      "msg": "argument must be a string literal"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible integer to pointer conversion initializing 'void *' with an expression of type '__size_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "signed value must have pointer type; type here is 'struct A'"
+    },
+    {
+      "kind": "error",
+      "msg": "passing 'struct A' to parameter of incompatible type 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "extra discriminator must have pointer or integer type; type here is 'struct A'"
+    },
+    {
+      "kind": "warning",
+      "msg": "signing a null pointer will yield a non-null pointer"
+    },
+    {
+      "kind": "error",
+      "msg": "does not identify a valid pointer authentication key for the current target"
+    },
+    {
+      "kind": "error",
+      "msg": "does not identify a valid pointer authentication key for the current target"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer types initializing 'float *' with an expression of type 'int *'"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "signed value must have pointer type; type here is 'struct A'"
+    },
+    {
+      "kind": "error",
+      "msg": "passing 'struct A' to parameter of incompatible type 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "extra discriminator must have pointer or integer type; type here is 'struct A'"
+    },
+    {
+      "kind": "warning",
+      "msg": "authenticating a null pointer will almost certainly trap"
+    },
+    {
+      "kind": "error",
+      "msg": "does not identify a valid pointer authentication key for the current target"
+    },
+    {
+      "kind": "error",
+      "msg": "does not identify a valid pointer authentication key for the current target"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer types initializing 'float *' with an expression of type 'int *'"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "signed value must have pointer type; type here is 'struct A'"
+    },
+    {
+      "kind": "error",
+      "msg": "passing 'struct A' to parameter of incompatible type 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "extra discriminator must have pointer or integer type; type here is 'struct A'"
+    },
+    {
+      "kind": "error",
+      "msg": "passing 'struct A' to parameter of incompatible type 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "extra discriminator must have pointer or integer type; type here is 'struct A'"
+    },
+    {
+      "kind": "warning",
+      "msg": "authenticating a null pointer will almost certainly trap"
+    },
+    {
+      "kind": "error",
+      "msg": "does not identify a valid pointer authentication key for the current target"
+    },
+    {
+      "kind": "error",
+      "msg": "does not identify a valid pointer authentication key for the current target"
+    },
+    {
+      "kind": "error",
+      "msg": "does not identify a valid pointer authentication key for the current target"
+    },
+    {
+      "kind": "error",
+      "msg": "does not identify a valid pointer authentication key for the current target"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer types initializing 'float *' with an expression of type 'int *'"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "signed value must have pointer or integer type; type here is 'struct A'"
+    },
+    {
+      "kind": "error",
+      "msg": "extra discriminator must have pointer or integer type; type here is 'struct A'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible integer to pointer conversion initializing 'int *' with an expression of type"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "signed value must have pointer type; type here is 'struct A'"
+    },
+    {
+      "kind": "error",
+      "msg": "passing 'struct A' to parameter of incompatible type 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "extra discriminator must have pointer or integer type; type here is 'struct A'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer types initializing 'float *' with an expression of type 'int *'"
+    },
+    {
+      "kind": "error",
+      "msg": "argument to ptrauth_sign_constant must refer to a global variable or function"
+    },
+    {
+      "kind": "error",
+      "msg": "does not identify a valid pointer authentication key for the current target"
+    },
+    {
+      "kind": "error",
+      "msg": "discriminator argument to ptrauth_sign_constant must be a constant integer, the address of the global variable where the result will be stored, or a blend of the two"
+    },
+    {
+      "kind": "error",
+      "msg": "discriminator argument to ptrauth_sign_constant must be a constant integer, the address of the global variable where the result will be stored, or a blend of the two"
+    },
+    {
+      "kind": "error",
+      "msg": "does not identify a valid pointer authentication key for the current target"
+    },
+    {
+      "kind": "error",
+      "msg": "discriminator argument to ptrauth_sign_constant must be a constant integer, the address of the global variable where the result will be stored, or a blend of the two"
+    },
+    {
+      "kind": "error",
+      "msg": "discriminator argument to ptrauth_sign_constant must be a constant integer, the address of the global variable where the result will be stored, or a blend of the two"
+    },
+    {
+      "kind": "error",
+      "msg": "argument to ptrauth_sign_constant must refer to a global variable or function"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "signed value must have pointer type; type here is 'struct A'"
+    },
+    {
+      "kind": "error",
+      "msg": "passing 'struct A' to parameter of incompatible type 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "extra discriminator must have pointer or integer type; type here is 'struct A'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer types initializing 'float *' with an expression of type 'int *'"
+    },
+    {
+      "kind": "error",
+      "msg": "argument to ptrauth_sign_constant must refer to a global variable or function"
+    },
+    {
+      "kind": "error",
+      "msg": "does not identify a valid pointer authentication key for the current target"
+    },
+    {
+      "kind": "error",
+      "msg": "discriminator argument to ptrauth_sign_constant must be a constant integer, the address of the global variable where the result will be stored, or a blend of the two"
+    },
+    {
+      "kind": "error",
+      "msg": "discriminator argument to ptrauth_sign_constant must be a constant integer, the address of the global variable where the result will be stored, or a blend of the two"
+    },
+    {
+      "kind": "error",
+      "msg": "argument to ptrauth_sign_constant must refer to a global variable or function"
+    },
+    {
+      "kind": "error",
+      "msg": "discriminator argument to ptrauth_sign_constant must be a constant integer, the address of the global variable where the result will be stored, or a blend of the two"
+    },
+    {
+      "kind": "error",
+      "msg": "discriminator argument to ptrauth_sign_constant must be a constant integer, the address of the global variable where the result will be stored, or a blend of the two"
+    },
+    {
+      "kind": "error",
+      "msg": "discriminator argument to ptrauth_sign_constant must be a constant integer, the address of the global variable where the result will be stored, or a blend of the two"
+    },
+    {
+      "kind": "error",
+      "msg": "does not identify a valid pointer authentication key for the current target"
+    },
+    {
+      "kind": "error",
+      "msg": "discriminator argument to ptrauth_sign_constant must be a constant integer, the address of the global variable where the result will be stored, or a blend of the two"
+    },
+    {
+      "kind": "error",
+      "msg": "discriminator argument to ptrauth_sign_constant must be a constant integer, the address of the global variable where the result will be stored, or a blend of the two"
+    },
+    {
+      "kind": "error",
+      "msg": "argument to ptrauth_sign_constant must refer to a global variable or function"
+    },
+    {
+      "kind": "error",
+      "msg": "discriminator argument to ptrauth_sign_constant must be a constant integer, the address of the global variable where the result will be stored, or a blend of the two"
+    },
+    {
+      "kind": "error",
+      "msg": "discriminator argument to ptrauth_sign_constant must be a constant integer, the address of the global variable where the result will be stored, or a blend of the two"
+    },
+    {
+      "kind": "error",
+      "msg": "discriminator argument to ptrauth_sign_constant must be a constant integer, the address of the global variable where the result will be stored, or a blend of the two"
+    },
+    {
+      "kind": "error",
+      "msg": "argument to ptrauth_sign_constant must refer to a global variable or function"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 20,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/ptrauth.sft.c",
+  "remark": null,
+  "sha256": "76607fe34bea89064dd7dcbda5a70d1e62a95874c70c9d57d9dec5920557a57d",
+  "test_number_uses": 0,
+  "type": "fn"
+}

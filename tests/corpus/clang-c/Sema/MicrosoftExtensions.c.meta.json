@@ -1,0 +1,242 @@
+{
+  "bytes": 7933,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "flexible array member 'a' in otherwise empty struct is a Microsoft extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "flexible array member 'a' in otherwise empty struct is a Microsoft extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "flexible array member 'c1' in a union is a Microsoft extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "flexible array member 'c2' in a union is a Microsoft extension"
+    },
+    {
+      "kind": "error",
+      "msg": "'uuid' attribute is not supported in C"
+    },
+    {
+      "kind": "error",
+      "msg": "'uuid' attribute is not supported in C"
+    },
+    {
+      "kind": "warning",
+      "msg": "anonymous structs are a Microsoft extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "anonymous structs are a Microsoft extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "anonymous unions are a Microsoft extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "anonymous structs are a Microsoft extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "anonymous unions are a Microsoft extension"
+    },
+    {
+      "kind": "error",
+      "msg": "no member named 'bad1' in 'struct test'"
+    },
+    {
+      "kind": "error",
+      "msg": "no member named 'bad2' in 'struct test'"
+    },
+    {
+      "kind": "warning",
+      "msg": "enumeration types with a fixed underlying type are a Microsoft extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "enumeration types with a fixed underlying type are a Microsoft extension"
+    },
+    {
+      "kind": "error",
+      "msg": "unknown type name 'UNKNOWN'"
+    },
+    {
+      "kind": "warning",
+      "msg": "anonymous structs are a Microsoft extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "anonymous structs are a Microsoft extension"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": "'e1' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "note",
+      "msg": "'DS1' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "note",
+      "msg": "'Dfunc1' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "error",
+      "msg": "expected string literal as argument of 'deprecated' attribute"
+    },
+    {
+      "kind": "warning",
+      "msg": "'e1' is deprecated: This is deprecated"
+    },
+    {
+      "kind": "warning",
+      "msg": "'DS1' is deprecated"
+    },
+    {
+      "kind": "warning",
+      "msg": "'Dfunc1' is deprecated: This is also deprecated"
+    },
+    {
+      "kind": "error",
+      "msg": "'__sptr' attribute only applies to pointer arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'__sptr' attribute only applies to pointer arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'__sptr' and '__uptr' attributes are not compatible"
+    },
+    {
+      "kind": "warning",
+      "msg": "attribute '__sptr' is already applied"
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of 'ptr_func'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of 'ptr_func2'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of 'ptr_func3'"
+    },
+    {
+      "kind": "warning",
+      "msg": "attribute '__sptr' is already applied"
+    },
+    {
+      "kind": "error",
+      "msg": "'__ptr32' attribute only applies to pointer arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ';' after top level declarator"
+    },
+    {
+      "kind": "error",
+      "msg": "'__ptr32' and '__ptr64' attributes are not compatible"
+    },
+    {
+      "kind": "warning",
+      "msg": "attribute '__ptr32' is already applied"
+    },
+    {
+      "kind": "error",
+      "msg": "'__sptr' attribute only applies to pointer arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'__ptr32' attribute only applies to pointer arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'__ptr64' attribute only applies to pointer arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'__ptr32' attribute only applies to pointer arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'__ptr32' and '__ptr64' attributes are not compatible"
+    },
+    {
+      "kind": "warning",
+      "msg": "attribute '__ptr32' is already applied"
+    },
+    {
+      "kind": "error",
+      "msg": "'__ptr32' and '__ptr64' attributes are not compatible"
+    },
+    {
+      "kind": "warning",
+      "msg": "attribute '__ptr64' is already applied"
+    },
+    {
+      "kind": "error",
+      "msg": "'__ptr32' and '__ptr64' attributes are not compatible"
+    },
+    {
+      "kind": "error",
+      "msg": "'__ptr32' and '__ptr64' attributes are not compatible"
+    },
+    {
+      "kind": "note",
+      "msg": "passing argument to parameter 'ap' here"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer types passing 'my_va_list'"
+    },
+    {
+      "kind": "warning",
+      "msg": "initializing 'int *' with an expression of type '__unaligned int *' discards qualifiers"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w --ms_extensions --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/MicrosoftExtensions.sft.c",
+  "remark": null,
+  "sha256": "97d5559541555709a41a5c9c0bc91cd9e2db02f5cbb4a62c37ff45005bcbbd27",
+  "test_number_uses": 0,
+  "type": "fn"
+}

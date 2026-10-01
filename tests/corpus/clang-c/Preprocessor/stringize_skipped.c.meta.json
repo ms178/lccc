@@ -1,0 +1,21 @@
+{
+  "bytes": 238,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/stringize_skipped.sft.c",
+  "remark": null,
+  "sha256": "525722d9a4b09e4812577509402d89dd97f00f6a0b59190e2353194d4fd6f1ed",
+  "test_number_uses": 0,
+  "type": "fn"
+}

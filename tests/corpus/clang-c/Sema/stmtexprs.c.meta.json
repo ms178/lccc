@@ -1,0 +1,26 @@
+{
+  "bytes": 474,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/stmtexprs.sft.c",
+  "remark": null,
+  "sha256": "d42d29be0f1c5bd812da91cc86ab2d2e2e7499517b74ffa78359b23801b42eb0",
+  "test_number_uses": 0,
+  "type": "fp"
+}

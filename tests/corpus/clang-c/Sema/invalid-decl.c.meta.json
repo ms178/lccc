@@ -1,0 +1,62 @@
+{
+  "bytes": 1391,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "expected identifier"
+    },
+    {
+      "kind": "error",
+      "msg": "function cannot return function type"
+    },
+    {
+      "kind": "error",
+      "msg": "field 'globals_size' declared as a function"
+    },
+    {
+      "kind": "error",
+      "msg": "unknown type name 'UndefinedType'"
+    },
+    {
+      "kind": "error",
+      "msg": "field 'fun' declared as a function"
+    },
+    {
+      "kind": "error",
+      "msg": "expected identifier"
+    },
+    {
+      "kind": "error",
+      "msg": "unknown type name 'hid_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "a parameter list without types is only allowed in a function definition"
+    },
+    {
+      "kind": "error",
+      "msg": "incomplete type"
+    },
+    {
+      "kind": "error",
+      "msg": "ISO C requires a named parameter before '...'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/invalid-decl.sft.c",
+  "remark": null,
+  "sha256": "fe9dab7284c79a61c0b2e6c826c1b04092d15e628e96a4972e23c4dd7788ecf3",
+  "test_number_uses": 0,
+  "type": "fn"
+}

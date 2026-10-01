@@ -1,0 +1,251 @@
+{
+  "bytes": 11214,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "illegal initializer (only variables can be initialized)"
+    },
+    {
+      "kind": "error",
+      "msg": "initializer element is not a compile-time constant"
+    },
+    {
+      "kind": "error",
+      "msg": "initializer element is not a compile-time constant"
+    },
+    {
+      "kind": "warning",
+      "msg": "'extern' variable has an initializer"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer to integer conversion initializing 'long' with an expression of type 'char[4]'"
+    },
+    {
+      "kind": "error",
+      "msg": "illegal initializer (only variables can be initialized)"
+    },
+    {
+      "kind": "error",
+      "msg": "variable-sized object may not be initialized"
+    },
+    {
+      "kind": "warning",
+      "msg": "excess elements in scalar initializer"
+    },
+    {
+      "kind": "warning",
+      "msg": "excess elements in array initializer"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible integer to pointer conversion initializing 'struct threeElements *' with an expression of type 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "declaration of block scope identifier with linkage cannot have an initializer"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer to integer conversion initializing 'long' with an expression of type 'char[4]'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from 'double' to 'long' changes value from 5.8 to 5"
+    },
+    {
+      "kind": "warning",
+      "msg": "excess elements in scalar initializer"
+    },
+    {
+      "kind": "warning",
+      "msg": "excess elements in array initializer"
+    },
+    {
+      "kind": "warning",
+      "msg": "excess elements in array initializer"
+    },
+    {
+      "kind": "error",
+      "msg": "array has incomplete element type 'short[][2]'"
+    },
+    {
+      "kind": "error",
+      "msg": "array has incomplete element type 'short[]'"
+    },
+    {
+      "kind": "error",
+      "msg": "array has incomplete element type 'int[]'"
+    },
+    {
+      "kind": "warning",
+      "msg": "initializer-string for char array is too long"
+    },
+    {
+      "kind": "warning",
+      "msg": "excess elements in char array initializer"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer to integer conversion initializing 'int' with an expression of type 'char[7]'"
+    },
+    {
+      "kind": "warning",
+      "msg": "excess elements in char array initializer"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer to integer conversion initializing 'int' with an expression of type 'char[6]'"
+    },
+    {
+      "kind": "warning",
+      "msg": "initializer-string for char array is too long"
+    },
+    {
+      "kind": "warning",
+      "msg": "zero size arrays are an extension"
+    },
+    {
+      "kind": "error",
+      "msg": "variable-sized object may not be initialized"
+    },
+    {
+      "kind": "error",
+      "msg": "variable-sized object may not be initialized"
+    },
+    {
+      "kind": "warning",
+      "msg": "braces around scalar initializer"
+    },
+    {
+      "kind": "warning",
+      "msg": "braces around scalar initializer"
+    },
+    {
+      "kind": "warning",
+      "msg": "braces around scalar initializer"
+    },
+    {
+      "kind": "warning",
+      "msg": "initializer-string for char array is too long"
+    },
+    {
+      "kind": "warning",
+      "msg": "zero size arrays are an extension"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer to integer conversion initializing 'char' with an expression of type 'char[4]'"
+    },
+    {
+      "kind": "error",
+      "msg": "initializing 'int' with an expression of incompatible type 'struct foo'"
+    },
+    {
+      "kind": "warning",
+      "msg": "flexible array initialization is a GNU extension"
+    },
+    {
+      "kind": "note",
+      "msg": "initialized flexible array member 'b' is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "excess elements in struct initializer"
+    },
+    {
+      "kind": "warning",
+      "msg": "too many braces around scalar initializer"
+    },
+    {
+      "kind": "error",
+      "msg": "variable-sized object may not be initialized"
+    },
+    {
+      "kind": "warning",
+      "msg": "empty struct is a GNU extension"
+    },
+    {
+      "kind": "error",
+      "msg": "initializer for aggregate with no elements"
+    },
+    {
+      "kind": "error",
+      "msg": "initializer for aggregate with no elements"
+    },
+    {
+      "kind": "warning",
+      "msg": "struct without named members is a GNU extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "empty struct is a GNU extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "excess elements in struct initializer"
+    },
+    {
+      "kind": "warning",
+      "msg": "anonymous unions are a C11 extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "excess elements in array initializer"
+    },
+    {
+      "kind": "warning",
+      "msg": "initialization of an array of type 'int[5]' from a compound literal of type 'int[5]' is a GNU extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "initialization of an array of type 'int[5]' from a compound literal of type 'int[5]' is a GNU extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "initialization of an array of type 'int[]' from a compound literal of type 'int[5]' is a GNU extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "initialization of an array of type 'int[]' from a compound literal of type 'int[5]' is a GNU extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "initialization of an array of type 'int[]' from a compound literal of type 'int5' (aka 'int[5]') is a GNU extension"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot initialize array of type 'int[5]' with array of type 'int[3]'"
+    },
+    {
+      "kind": "error",
+      "msg": "initializer element is not a compile-time constant"
+    },
+    {
+      "kind": "error",
+      "msg": "variable length array declaration not allowed at file scope"
+    },
+    {
+      "kind": "error",
+      "msg": "variable-sized object may not be initialized"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    " --c99 --strict_gnu",
+    " --c99 --strict_gnu"
+  ],
+  "options_all": "--set_flag=no_checking_pragmas",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/array-init.sft.c",
+  "remark": null,
+  "sha256": "378771655eb339aab9c3d41e73429e1121439c3684e867264f4dfdbeaf266fe0",
+  "test_number_uses": 0,
+  "type": "fn"
+}

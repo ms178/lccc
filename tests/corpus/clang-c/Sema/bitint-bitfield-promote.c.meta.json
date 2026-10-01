@@ -1,0 +1,26 @@
+{
+  "bytes": 1321,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "width of bit-field 'oh_no' (72 bits) exceeds the width of its type (28 bits)"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/bitint-bitfield-promote.sft.c",
+  "remark": null,
+  "sha256": "8c2526bfa80229a9f2ef3b6193f22526487361927bf1072e861853421a8ee410",
+  "test_number_uses": 0,
+  "type": "fn"
+}

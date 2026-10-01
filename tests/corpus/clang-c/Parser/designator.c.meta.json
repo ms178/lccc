@@ -1,0 +1,30 @@
+{
+  "bytes": 403,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "use of GNU 'missing =' extension in designator"
+    },
+    {
+      "kind": "error",
+      "msg": "expected '=' or another designator"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/designator.sft.c",
+  "remark": null,
+  "sha256": "95b92b8ad05559597ca0f7f9b4ed15e8f76620bb8c961352bced63c77e900a10",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,21 @@
+{
+  "bytes": 232,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/align-arm-apcs.sft.c",
+  "remark": null,
+  "sha256": "e74dfef07dc726a68696320cc9ed804a475f37b8e70c1e3f91b12d5b1fea3edb",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,54 @@
+{
+  "bytes": 1621,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of parameter 'x'"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to block call"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to block call"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to block call"
+    },
+    {
+      "kind": "warning",
+      "msg": "omitting the parameter name in a function definition is a C23 extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "omitting the parameter name in a function definition is a C23 extension"
+    },
+    {
+      "kind": "error",
+      "msg": "type specifier missing"
+    }
+  ],
+  "has_main": true,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/block-args.sft.c",
+  "remark": null,
+  "sha256": "838fd1bb139618605052a41bbb683c886679773ed0f4f10f037152671621613a",
+  "test_number_uses": 0,
+  "type": "fn"
+}

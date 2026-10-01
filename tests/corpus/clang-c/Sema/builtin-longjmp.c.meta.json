@@ -1,0 +1,30 @@
+{
+  "bytes": 1519,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "__builtin_longjmp is not supported for the current target"
+    },
+    {
+      "kind": "error",
+      "msg": "__builtin_setjmp is not supported for the current target"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 18,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w --c --target linux_aarch64"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/builtin-longjmp.sft.c",
+  "remark": null,
+  "sha256": "c399cf85fed856d5720db0771404caf4e93a78215f6614b6b00d2419d339be81",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,21 @@
+{
+  "bytes": 469,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 11,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/defer-ts.sft.c",
+  "remark": null,
+  "sha256": "51fba3b8acb410033ce15ba8f07cb16a0d178848790f86491520a909675c2dc7",
+  "test_number_uses": 0,
+  "type": "fp"
+}

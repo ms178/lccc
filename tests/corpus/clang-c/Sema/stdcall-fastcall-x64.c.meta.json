@@ -1,0 +1,74 @@
+{
+  "bytes": 2353,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'stdcall' only applies to function types; type here is 'int'"
+    },
+    {
+      "kind": "warning",
+      "msg": "'fastcall' only applies to function types; type here is 'int'"
+    },
+    {
+      "kind": "warning",
+      "msg": "'stdcall' calling convention is not supported for this target"
+    },
+    {
+      "kind": "warning",
+      "msg": "'stdcall' calling convention is not supported for this target"
+    },
+    {
+      "kind": "warning",
+      "msg": "'fastcall' calling convention is not supported for this target"
+    },
+    {
+      "kind": "warning",
+      "msg": "'fastcall' calling convention is not supported for this target"
+    },
+    {
+      "kind": "warning",
+      "msg": "'stdcall' calling convention is not supported for this target"
+    },
+    {
+      "kind": "warning",
+      "msg": "'fastcall' calling convention is not supported for this target"
+    },
+    {
+      "kind": "warning",
+      "msg": "'stdcall' calling convention is not supported for this target"
+    },
+    {
+      "kind": "warning",
+      "msg": "'stdcall' calling convention is not supported for this target"
+    },
+    {
+      "kind": "warning",
+      "msg": "'fastcall' calling convention is not supported for this target"
+    },
+    {
+      "kind": "warning",
+      "msg": "'stdcall' calling convention is not supported for this target"
+    },
+    {
+      "kind": "warning",
+      "msg": "'fastcall' calling convention is not supported for this target"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/stdcall-fastcall-x64.sft.c",
+  "remark": null,
+  "sha256": "77dab399096c23721852f51329403d7a3818c4197648fe84896054b1ab5def54",
+  "test_number_uses": 0,
+  "type": "fp"
+}

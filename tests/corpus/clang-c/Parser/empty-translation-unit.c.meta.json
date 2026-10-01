@@ -1,0 +1,22 @@
+{
+  "bytes": 306,
+  "cases": null,
+  "category": "Parser",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 16,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c99",
+    " --c99"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/empty-translation-unit.sft.c",
+  "remark": null,
+  "sha256": "f48c047cd09fa0e6210fe6ca6dd8017beb7dc0d41826e7ccbea1cdb0a5bfa1e6",
+  "test_number_uses": 0,
+  "type": "fp"
+}

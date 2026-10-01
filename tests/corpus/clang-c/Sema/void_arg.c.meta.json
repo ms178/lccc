@@ -1,0 +1,50 @@
+{
+  "bytes": 863,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "argument may not have 'void' type"
+    },
+    {
+      "kind": "error",
+      "msg": "must be the first and only parameter"
+    },
+    {
+      "kind": "error",
+      "msg": "must be the first and only parameter"
+    },
+    {
+      "kind": "error",
+      "msg": "argument may not have 'void' type"
+    },
+    {
+      "kind": "error",
+      "msg": "must be the first and only parameter"
+    },
+    {
+      "kind": "error",
+      "msg": "must be the first and only parameter"
+    },
+    {
+      "kind": "error",
+      "msg": "parameter must not have type qualifiers"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/void_arg.sft.c",
+  "remark": null,
+  "sha256": "bcc93716a0af329a6a8c4ec63175b7838396d55d0cc9b2f49176bbfa9dd966c4",
+  "test_number_uses": 0,
+  "type": "fn"
+}

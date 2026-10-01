@@ -1,0 +1,142 @@
+{
+  "bytes": 3942,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "(aka 'double (*restrict)[5]')"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting types for 'func'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting types for 'h'"
+    },
+    {
+      "kind": "error",
+      "msg": "parameter list without types"
+    },
+    {
+      "kind": "error",
+      "msg": "type specifier missing, defaults to 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "expected parameter declarator"
+    },
+    {
+      "kind": "error",
+      "msg": "expected parameter declarator"
+    },
+    {
+      "kind": "error",
+      "msg": "expected parameter declarator"
+    },
+    {
+      "kind": "warning",
+      "msg": "too many arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "void function 't13' should not return a value"
+    },
+    {
+      "kind": "error",
+      "msg": "non-void function 't14' should return a value"
+    },
+    {
+      "kind": "error",
+      "msg": "parameter 'y' was not declared, defaults to 'int'; ISO C99 and later do not support implicit int"
+    },
+    {
+      "kind": "error",
+      "msg": "type specifier missing, defaults to 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "function declared in block scope cannot have 'static' storage class"
+    },
+    {
+      "kind": "error",
+      "msg": "illegal storage class on function"
+    },
+    {
+      "kind": "error",
+      "msg": "incomplete result type 'struct incomplete_test' in function definition"
+    },
+    {
+      "kind": "note",
+      "msg": "forward declaration of 'struct incomplete_test'"
+    },
+    {
+      "kind": "warning",
+      "msg": "'gnu_inline' attribute requires function to be marked 'inline', attribute ignored"
+    },
+    {
+      "kind": "error",
+      "msg": "unknown type name 'foo_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "unknown type name 'unknown_type'"
+    },
+    {
+      "kind": "error",
+      "msg": "unknown type name 'unknown_type'"
+    },
+    {
+      "kind": "error",
+      "msg": "requires a comma"
+    },
+    {
+      "kind": "error",
+      "msg": "function definition is not allowed here"
+    },
+    {
+      "kind": "note",
+      "msg": "passing argument to parameter 'a' here"
+    },
+    {
+      "kind": "note",
+      "msg": "passing argument to parameter 'a' here"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer types passing 'int *' to parameter of type 'int (*)[3]'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer types passing 'int *' to parameter of type 'int (*)[3]'"
+    },
+    {
+      "kind": "warning",
+      "msg": "function cannot return qualified void type 'const void'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/function.sft.c",
+  "remark": null,
+  "sha256": "969fb402aafb265fc113c106b045c42efc0cf9c1f7b05d4031d27d1b33b48e1b",
+  "test_number_uses": 0,
+  "type": "fn"
+}

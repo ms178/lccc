@@ -1,0 +1,226 @@
+{
+  "bytes": 7413,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "cannot jump from this goto statement to its label"
+    },
+    {
+      "kind": "note",
+      "msg": "jump bypasses initialization of variable length array"
+    },
+    {
+      "kind": "note",
+      "msg": "jump bypasses initialization of variable length array"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot jump from this goto statement to its label"
+    },
+    {
+      "kind": "note",
+      "msg": "jump bypasses initialization of VLA typedef"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot jump from this goto statement to its label"
+    },
+    {
+      "kind": "note",
+      "msg": "jump bypasses initialization of variable with __attribute__((cleanup))"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot jump from this goto statement to its label"
+    },
+    {
+      "kind": "note",
+      "msg": "jump bypasses initialization of variable length array"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared label 'x'"
+    },
+    {
+      "kind": "note",
+      "msg": "jump bypasses initialization of variable length array"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot jump from switch statement to this case label"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot jump from this goto statement to its label"
+    },
+    {
+      "kind": "note",
+      "msg": "jump bypasses initialization of variable length array"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot jump from this goto statement to its label"
+    },
+    {
+      "kind": "note",
+      "msg": "jump bypasses initialization of variable length array"
+    },
+    {
+      "kind": "note",
+      "msg": "jump enters a statement expression"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot jump from this goto statement to its label"
+    },
+    {
+      "kind": "note",
+      "msg": "jump bypasses initialization of variable length array"
+    },
+    {
+      "kind": "note",
+      "msg": "jump bypasses initialization of variable length array"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot jump from this goto statement to its label"
+    },
+    {
+      "kind": "note",
+      "msg": "jump bypasses initialization of variable length array"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot jump from this goto statement to its label"
+    },
+    {
+      "kind": "note",
+      "msg": "jump enters a statement expression"
+    },
+    {
+      "kind": "note",
+      "msg": "jump bypasses initialization of variable length array"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot jump from this indirect goto statement to one of its possible targets"
+    },
+    {
+      "kind": "note",
+      "msg": "jump bypasses initialization of variable length array"
+    },
+    {
+      "kind": "note",
+      "msg": "possible target of indirect goto"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot jump from this goto statement to its label"
+    },
+    {
+      "kind": "note",
+      "msg": "jump bypasses initialization of VLA typedef"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot jump from this goto statement to its label"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "cannot jump from this goto statement to its label"
+    },
+    {
+      "kind": "note",
+      "msg": "jump bypasses initialization of variable length array"
+    },
+    {
+      "kind": "note",
+      "msg": "jump bypasses initialization of variable length array"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot jump from switch statement to this case label"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot jump from this goto statement to its label"
+    },
+    {
+      "kind": "note",
+      "msg": "jump bypasses initialization of variable length array"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot jump from this indirect goto statement to one of its possible targets"
+    },
+    {
+      "kind": "note",
+      "msg": "jump bypasses initialization"
+    },
+    {
+      "kind": "note",
+      "msg": "possible target"
+    },
+    {
+      "kind": "error",
+      "msg": "use of address-of-label extension outside of a function body"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot jump from this goto statement to its label"
+    },
+    {
+      "kind": "note",
+      "msg": "jump enters a statement expression"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot jump from this goto statement to its label"
+    },
+    {
+      "kind": "note",
+      "msg": "jump enters a statement expression"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot jump from this goto statement to its label"
+    },
+    {
+      "kind": "note",
+      "msg": "jump enters a statement expression"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot jump from this asm goto statement to one of its possible targets"
+    },
+    {
+      "kind": "note",
+      "msg": "jump bypasses initialization of variable length array"
+    },
+    {
+      "kind": "note",
+      "msg": "possible target of asm goto statement"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    " --c99 --strict_gnu"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/scope-check.sft.c",
+  "remark": null,
+  "sha256": "69c96f95bc32a13b0bf2c957aae282ff7103bdea256c00a8070bf30bdd7ae4a9",
+  "test_number_uses": 0,
+  "type": "fn"
+}

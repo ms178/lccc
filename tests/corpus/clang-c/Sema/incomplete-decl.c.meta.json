@@ -1,0 +1,46 @@
+{
+  "bytes": 2466,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "variable has incomplete type 'void'"
+    },
+    {
+      "kind": "error",
+      "msg": "variable has incomplete type 'void'"
+    },
+    {
+      "kind": "error",
+      "msg": "definition of variable with array type needs an explicit size or an initializer"
+    },
+    {
+      "kind": "error",
+      "msg": "variable has incomplete type 'void'"
+    },
+    {
+      "kind": "error",
+      "msg": "variable has incomplete type 'struct foo'"
+    },
+    {
+      "kind": "error",
+      "msg": "variable has incomplete type 'struct bar'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/incomplete-decl.sft.c",
+  "remark": null,
+  "sha256": "3bf6e8e8a1822f561491ded66dd4d31712c8f4ce08ae97aa9f8a79124cdab37f",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,21 @@
+{
+  "bytes": 377,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": true,
+  "header_lines": 6,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-printf-insufficient-data-args.sft.c",
+  "remark": null,
+  "sha256": "903a6d6c809e5f27431bd23c4583942ef5d9e5a3cbfe6ce93a62e8a52e20df4a",
+  "test_number_uses": 0,
+  "type": "fp"
+}

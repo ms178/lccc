@@ -1,0 +1,30 @@
+{
+  "bytes": 1393,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "initializing wide char array with non-wide string literal"
+    },
+    {
+      "kind": "error",
+      "msg": "initializing char array with wide string literal"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w -DSHORT_WCHAR --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/wchar.sft.c",
+  "remark": null,
+  "sha256": "274bd65e6fec641d13edeb30d52666faf0781e93be2824fb7dcdee5fe279155a",
+  "test_number_uses": 0,
+  "type": "fn"
+}

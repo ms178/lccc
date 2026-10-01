@@ -1,0 +1,23 @@
+{
+  "bytes": 713,
+  "cases": null,
+  "category": "Parser",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 11,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23",
+    " --c23",
+    " --c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/labeled-break-continue.sft.c",
+  "remark": null,
+  "sha256": "77d0ddfb74b4dda09e6571f0c7b5ded0f3c6dac724ae0d5223ad942fd299c1ad",
+  "test_number_uses": 0,
+  "type": "fp"
+}

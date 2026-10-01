@@ -1,0 +1,42 @@
+{
+  "bytes": 1027,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "argument to __builtin_vectorelements must be of vector type"
+    },
+    {
+      "kind": "error",
+      "msg": "argument to __builtin_vectorelements must be of vector type"
+    },
+    {
+      "kind": "error",
+      "msg": "argument to __builtin_vectorelements must be of vector type"
+    },
+    {
+      "kind": "error",
+      "msg": "argument to __builtin_vectorelements must be of vector type"
+    },
+    {
+      "kind": "error",
+      "msg": "argument to __builtin_vectorelements must be of vector type"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c --target linux_aarch64"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/builtin_vectorelements.sft.c",
+  "remark": null,
+  "sha256": "5fab5c6d6c17f7ef48e149a0d1aee589b234dcde3582ed1e8d29fc59a7d67e46",
+  "test_number_uses": 0,
+  "type": "fn"
+}

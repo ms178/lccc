@@ -1,0 +1,46 @@
+{
+  "bytes": 1346,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting types for 'testNoCfCheck'"
+    },
+    {
+      "kind": "warning",
+      "msg": "'nocf_check' attribute only applies to function"
+    },
+    {
+      "kind": "warning",
+      "msg": "'nocf_check' attribute only applies to function"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible function pointer types"
+    },
+    {
+      "kind": "error",
+      "msg": "'nocf_check' attribute takes no arguments"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-nocf_check.sft.c",
+  "remark": null,
+  "sha256": "230e78860ef33780acd6ae041a051c5b9d5233d93a41eb4d2a3b96cb4cbdf03b",
+  "test_number_uses": 0,
+  "type": "fn"
+}

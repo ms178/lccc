@@ -1,0 +1,21 @@
+{
+  "bytes": 997,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 19,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/embed_parameter_unrecognized.sft.c",
+  "remark": null,
+  "sha256": "a1afa251d596568d74db1f2de9bdb5136056f3079172c710845a82bec2a3ed8b",
+  "test_number_uses": 0,
+  "type": "fn"
+}

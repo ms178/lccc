@@ -1,0 +1,21 @@
+{
+  "bytes": 1943,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 48,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/riscv-cf-protection-return.sft.c",
+  "remark": null,
+  "sha256": "9934fa117fe465e414f2e5a1ae8a9b5b498f1bb747d0c3916453effafb8048a7",
+  "test_number_uses": 0,
+  "type": "fp"
+}

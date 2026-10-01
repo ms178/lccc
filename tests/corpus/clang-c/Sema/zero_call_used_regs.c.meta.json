@@ -1,0 +1,38 @@
+{
+  "bytes": 1065,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "takes one argument"
+    },
+    {
+      "kind": "error",
+      "msg": "takes one argument"
+    },
+    {
+      "kind": "error",
+      "msg": "expected string literal"
+    },
+    {
+      "kind": "warning",
+      "msg": "argument not supported: hello"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/zero_call_used_regs.sft.c",
+  "remark": null,
+  "sha256": "5b45aaf1eeaba840c28e4e7ef2ea3d0c698f08dc9e0e506acacf2fcfc36f53ec",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,57 @@
+{
+  "bytes": 2414,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'guard' attribute only applies to functions"
+    },
+    {
+      "kind": "warning",
+      "msg": "'guard' attribute only applies to functions"
+    },
+    {
+      "kind": "warning",
+      "msg": "'guard' attribute only applies to functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'guard' attribute takes one argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'guard' attribute requires an identifier"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'nocf'"
+    },
+    {
+      "kind": "warning",
+      "msg": "'guard' attribute argument not supported: 'cf'"
+    },
+    {
+      "kind": "warning",
+      "msg": "unknown attribute 'guard' ignored"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 15,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--ms_extensions --ms_extensions --c",
+    " --c++11 --c++ -w -w",
+    " --c++11 --c++",
+    " --c++11 --c++"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-guard_nocf.sft.c",
+  "remark": null,
+  "sha256": "17a07a396a2aee134334ca6ef092fb7d1f1e59a01eb5a007f2faf9ddfaf092c1",
+  "test_number_uses": 0,
+  "type": "fn"
+}

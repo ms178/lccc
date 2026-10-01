@@ -1,0 +1,21 @@
+{
+  "bytes": 911,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 16,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/openmp-macro-expansion.sft.c",
+  "remark": null,
+  "sha256": "8446e2f6c5a4966105441efbe5006dd2e203b0f26f6a49547d4dcf79ae74c3bd",
+  "test_number_uses": 0,
+  "type": "fp"
+}

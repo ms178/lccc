@@ -1,0 +1,26 @@
+{
+  "bytes": 169,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "unknown attribute 'endian' ignored"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-endian.sft.c",
+  "remark": null,
+  "sha256": "b16537e950e822254c767a9d191992c291eef5c140237307e163b1be8d413001",
+  "test_number_uses": 0,
+  "type": "fp"
+}

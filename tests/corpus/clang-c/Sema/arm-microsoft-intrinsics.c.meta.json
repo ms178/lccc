@@ -1,0 +1,30 @@
+{
+  "bytes": 496,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--ms_extensions --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/arm-microsoft-intrinsics.sft.c",
+  "remark": null,
+  "sha256": "eed4ac1a1bf6114c4437d3aecdca6fb75d92739c6a97f33d68c3152400aaddb2",
+  "test_number_uses": 0,
+  "type": "fn"
+}

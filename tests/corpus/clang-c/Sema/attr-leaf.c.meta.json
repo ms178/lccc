@@ -1,0 +1,30 @@
+{
+  "bytes": 531,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'leaf' attribute takes no argument"
+    },
+    {
+      "kind": "warning",
+      "msg": "'leaf' attribute only applies to functions"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-leaf.sft.c",
+  "remark": null,
+  "sha256": "12c214c50f44ce5c1705972ed97c1621297b7d66f78be9bf99f6398f891ffe0f",
+  "test_number_uses": 0,
+  "type": "fn"
+}

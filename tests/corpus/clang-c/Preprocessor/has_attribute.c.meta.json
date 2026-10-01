@@ -1,0 +1,26 @@
+{
+  "bytes": 1850,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "function-like macro '__has_cpp_attribute' is not defined"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/has_attribute.sft.c",
+  "remark": null,
+  "sha256": "ed6cfa4e020fd7f176ae6813a4d5c189c59c6cdb06f1598a92d5780e42fe8df2",
+  "test_number_uses": 0,
+  "type": "fn"
+}

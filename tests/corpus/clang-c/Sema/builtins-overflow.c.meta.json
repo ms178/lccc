@@ -1,0 +1,54 @@
+{
+  "bytes": 1909,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call, expected 3, have 0"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to function call, expected 3, have 4"
+    },
+    {
+      "kind": "error",
+      "msg": "operand argument to overflow builtin must be an integer type ('const char *' invalid)"
+    },
+    {
+      "kind": "error",
+      "msg": "operand argument to overflow builtin must be an integer type ('const char *' invalid)"
+    },
+    {
+      "kind": "error",
+      "msg": "result argument to overflow builtin must be a pointer to a non-const integer type ('int' invalid)"
+    },
+    {
+      "kind": "error",
+      "msg": "result argument to overflow builtin must be a pointer to a non-const integer type ('float *' invalid)"
+    },
+    {
+      "kind": "error",
+      "msg": "result argument to overflow builtin must be a pointer to a non-const integer type ('const unsigned int *' invalid)"
+    },
+    {
+      "kind": "error",
+      "msg": "__builtin_mul_overflow does not support 'signed _BitInt' operands of more than 128 bits"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 9,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/builtins-overflow.sft.c",
+  "remark": null,
+  "sha256": "7edeb7e6b2eb188fb706d7b1b878b284b847c9fe2c0640af0c67b66fcf252e06",
+  "test_number_uses": 0,
+  "type": "fn"
+}

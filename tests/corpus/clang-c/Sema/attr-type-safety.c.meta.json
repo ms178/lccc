@@ -1,0 +1,70 @@
+{
+  "bytes": 2330,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'clang::type_tag_for_datatype' attribute requires parameter 1 to be an identifier"
+    },
+    {
+      "kind": "error",
+      "msg": "expected a type"
+    },
+    {
+      "kind": "error",
+      "msg": "unknown type name 'not_a_type'"
+    },
+    {
+      "kind": "error",
+      "msg": "expected identifier"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid comparison flag 'not_a_flag'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid comparison flag 'not_a_flag'"
+    },
+    {
+      "kind": "error",
+      "msg": "'clang::pointer_with_type_tag' attribute requires exactly 3 arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "attribute parameter 2 is out of bounds"
+    },
+    {
+      "kind": "error",
+      "msg": "attribute parameter 2 is out of bounds"
+    },
+    {
+      "kind": "error",
+      "msg": "attribute parameter 3 is out of bounds"
+    },
+    {
+      "kind": "error",
+      "msg": "attribute parameter 3 is out of bounds"
+    },
+    {
+      "kind": "error",
+      "msg": "attribute parameter 2 is out of bounds"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-type-safety.sft.c",
+  "remark": null,
+  "sha256": "d3638427c5cd533a1f08d7bc9fc1791b5adfc7cec3c5b0ce0696d443d194133f",
+  "test_number_uses": 0,
+  "type": "fn"
+}

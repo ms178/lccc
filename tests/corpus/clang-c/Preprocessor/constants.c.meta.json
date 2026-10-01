@@ -1,0 +1,21 @@
+{
+  "bytes": 1439,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 33,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/constants.sft.c",
+  "remark": null,
+  "sha256": "eefc68576655bc65afa53a2524eb3ee7ca5703284958e6bf513a5a80c7364ac2",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,22 @@
+{
+  "bytes": 2166,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c11",
+    " --c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/has_c_attribute.sft.c",
+  "remark": null,
+  "sha256": "f201bee90ab2fc74dab4b17314bc1f54bbfedfddba3625e967ce2d991636c540",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,62 @@
+{
+  "bytes": 1911,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'void' as parameter must not have type qualifiers"
+    },
+    {
+      "kind": "error",
+      "msg": "'void' as parameter must not have type qualifiers"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid storage class specifier in function declarator"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid storage class specifier in function declarator"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid storage class specifier in function declarator"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid storage class specifier in function declarator"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid storage class specifier in function declarator"
+    },
+    {
+      "kind": "error",
+      "msg": "function parameter cannot be constexpr"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Thread_local' is only allowed on variable declarations"
+    },
+    {
+      "kind": "error",
+      "msg": "'void' must be the first and only parameter if specified"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 17,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C2y/n3344.sft.c",
+  "remark": null,
+  "sha256": "5dd8b2e9ae77d4607b583bb5cc823bfbb3400e8d7c1fff4265da301d422e091b",
+  "test_number_uses": 0,
+  "type": "fn"
+}

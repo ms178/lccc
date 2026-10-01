@@ -1,0 +1,21 @@
+{
+  "bytes": 12847,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 23,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c --target linux_aarch64"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/ptrauth-atomic-ops.sft.c",
+  "remark": null,
+  "sha256": "5506090d352070df04e480b2c4a8bbd1f1495a1565df908b8a86d5f0b9f2b1ed",
+  "test_number_uses": 0,
+  "type": "fn"
+}

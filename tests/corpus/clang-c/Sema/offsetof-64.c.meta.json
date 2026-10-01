@@ -1,0 +1,38 @@
+{
+  "bytes": 784,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "folded to constant"
+    },
+    {
+      "kind": "warning",
+      "msg": "folded to constant"
+    },
+    {
+      "kind": "error",
+      "msg": "array is too large"
+    },
+    {
+      "kind": "error",
+      "msg": "initializer element is not a compile-time constant"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/offsetof-64.sft.c",
+  "remark": null,
+  "sha256": "9432602807b9935fb75fd0d125b0c951663d4f87729ad78439a327d38aecc39e",
+  "test_number_uses": 0,
+  "type": "fn"
+}

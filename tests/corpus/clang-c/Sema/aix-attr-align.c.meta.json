@@ -1,0 +1,30 @@
+{
+  "bytes": 1836,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "alignment of 16 bytes for a struct member is not binary compatible with IBM XL C/C++ for AIX 16.1.0 or older"
+    },
+    {
+      "kind": "note",
+      "msg": "passing byval argument 's' with potentially incompatible alignment here"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 10,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/aix-attr-align.sft.c",
+  "remark": null,
+  "sha256": "6d6abb7eb3e88cb5064abb13f13e1dd06ae5daa1bb09f123f747a9670532e53f",
+  "test_number_uses": 0,
+  "type": "fp"
+}

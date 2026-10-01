@@ -1,0 +1,134 @@
+{
+  "bytes": 4568,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "conversion specifier is not supported by ISO C"
+    },
+    {
+      "kind": "warning",
+      "msg": "conversion specifier is not supported by ISO C"
+    },
+    {
+      "kind": "warning",
+      "msg": "conversion specifier is not supported by ISO C"
+    },
+    {
+      "kind": "warning",
+      "msg": "conversion specifier is not supported by ISO C"
+    },
+    {
+      "kind": "warning",
+      "msg": "conversion specifier is not supported by ISO C"
+    },
+    {
+      "kind": "warning",
+      "msg": "conversion specifier is not supported by ISO C"
+    },
+    {
+      "kind": "warning",
+      "msg": "conversion specifier is not supported by ISO C"
+    },
+    {
+      "kind": "warning",
+      "msg": "conversion specifier is not supported by ISO C"
+    },
+    {
+      "kind": "warning",
+      "msg": "conversion specifier is not supported by ISO C"
+    },
+    {
+      "kind": "warning",
+      "msg": "conversion specifier is not supported by ISO C"
+    },
+    {
+      "kind": "warning",
+      "msg": "conversion specifier is not supported by ISO C"
+    },
+    {
+      "kind": "warning",
+      "msg": "conversion specifier is not supported by ISO C"
+    },
+    {
+      "kind": "warning",
+      "msg": "conversion specifier is not supported by ISO C"
+    },
+    {
+      "kind": "warning",
+      "msg": "conversion specifier is not supported by ISO C"
+    },
+    {
+      "kind": "warning",
+      "msg": "conversion specifier is not supported by ISO C"
+    },
+    {
+      "kind": "warning",
+      "msg": "conversion specifier is not supported by ISO C"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 11,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DALLOWED -DALLOWED -w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/format-strings-darwin.sft.c",
+  "remark": null,
+  "sha256": "ca190535872e751472743d977d67490b169a2ec35ec2903756fbd3c48d6b7b35",
+  "test_number_uses": 0,
+  "type": "fp"
+}

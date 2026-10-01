@@ -1,0 +1,58 @@
+{
+  "bytes": 2691,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "size argument in 'strlcpy' call appears to be size of the source; expected the size of the destination"
+    },
+    {
+      "kind": "warning",
+      "msg": "size argument in 'strlcpy' call appears to be size of the source; expected the size of the destination"
+    },
+    {
+      "kind": "warning",
+      "msg": "size argument in 'strlcat' call appears to be size of the source; expected the size of the destination"
+    },
+    {
+      "kind": "warning",
+      "msg": "size argument in 'strlcpy' call appears to be size of the source; expected the size of the destination"
+    },
+    {
+      "kind": "warning",
+      "msg": "size argument in 'strlcpy' call appears to be size of the source; expected the size of the destination"
+    },
+    {
+      "kind": "warning",
+      "msg": "size argument in 'strlcpy' call appears to be size of the source; expected the size of the destination"
+    },
+    {
+      "kind": "warning",
+      "msg": "size argument in 'strlcpy' call appears to be size of the source; expected the size of the destination"
+    },
+    {
+      "kind": "warning",
+      "msg": "size argument in 'strlcpy' call appears to be size of the source; expected the size of the destination"
+    },
+    {
+      "kind": "warning",
+      "msg": "size argument in 'strlcpy' call appears to be size of the source; expected the size of the destination"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-strlcpycat-size.sft.c",
+  "remark": null,
+  "sha256": "4b952eacb198de8d485c080383ad837453d55cbb70b29920cfe36ff4b8e61d23",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,30 @@
+{
+  "bytes": 404,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "read-only variable is not assignable"
+    },
+    {
+      "kind": "error",
+      "msg": "read-only variable is not assignable"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/2007-10-01-BuildArrayRef.sft.c",
+  "remark": null,
+  "sha256": "e2c424b8cfebb0b42c62acd21b3d6f49b0f8a17d56365bfeee148f711dbb9d80",
+  "test_number_uses": 0,
+  "type": "fn"
+}

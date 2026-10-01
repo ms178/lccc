@@ -1,0 +1,21 @@
+{
+  "bytes": 419,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 9,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/align-systemz.sft.c",
+  "remark": null,
+  "sha256": "074144d3313d76e6ac57e1f63e85f4aee71436496f58d0c894f91f13ba6a1e82",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,21 @@
+{
+  "bytes": 7267,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 9,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c --target linux_aarch64"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/aarch64-sme-streaming-nonstreaming-vl-checks.sft.c",
+  "remark": null,
+  "sha256": "da11ecc6dfd03c0fddc219b989e947c8222ca123fa6f51a51088568b85ecebd4",
+  "test_number_uses": 0,
+  "type": "fp"
+}

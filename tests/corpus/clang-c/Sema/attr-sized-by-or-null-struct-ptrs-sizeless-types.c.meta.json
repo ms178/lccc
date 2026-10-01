@@ -1,0 +1,34 @@
+{
+  "bytes": 828,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-sized-by-or-null-struct-ptrs-sizeless-types.sft.c",
+  "remark": null,
+  "sha256": "36f46d07ce95c9372287fec048f7885cc1006a55e2a228273819ae6069d450e2",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,39 @@
+{
+  "bytes": 2898,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "_Atomic cannot be applied to array type 'array'"
+    },
+    {
+      "kind": "error",
+      "msg": "_Atomic cannot be applied to array type 'array'"
+    },
+    {
+      "kind": "error",
+      "msg": "controlling expression type 'void *' not compatible with any generic association type"
+    },
+    {
+      "kind": "warning",
+      "msg": "pointer type mismatch ('const int (*)[1]' and 'int (*)[1]')"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 14,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23",
+    " --c17"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C23/n2607.sft.c",
+  "remark": null,
+  "sha256": "6667335a6a6049f8c4e98ee90cc9608be898736809f162072ec1cbf3ecb9e407",
+  "test_number_uses": 0,
+  "type": "fn"
+}

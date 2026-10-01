@@ -1,0 +1,70 @@
+{
+  "bytes": 1641,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "previous implicit declaration"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'h'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'g'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'h'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'g'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of 'PR34822_foo' as different kind of symbol"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "use of out-of-scope declaration of 'PR34822_bar' whose type is not compatible with that of an implicit declaration"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'g'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'h'"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting types for 'g'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 3,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c90"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/implicit-decl-c90.sft.c",
+  "remark": null,
+  "sha256": "8d58b21387d7ffc2b2aeaf0cbdbc5cb94b789e54befb9bd1eb2419aa1f89efca",
+  "test_number_uses": 0,
+  "type": "fn"
+}

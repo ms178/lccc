@@ -1,0 +1,46 @@
+{
+  "bytes": 927,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "subscript of pointer to incomplete type 'int[]'"
+    },
+    {
+      "kind": "error",
+      "msg": "variable length array must be bound in function definition"
+    },
+    {
+      "kind": "error",
+      "msg": "variable length array must be bound in function definition"
+    },
+    {
+      "kind": "error",
+      "msg": "variable length array must be bound in function definition"
+    },
+    {
+      "kind": "error",
+      "msg": "variable length array must be bound in function definition"
+    },
+    {
+      "kind": "error",
+      "msg": "variable length array must be bound in function definition"
+    }
+  ],
+  "has_main": true,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/crash-invalid-array.sft.c",
+  "remark": null,
+  "sha256": "d3c38e800e367234ddede18c37e3ab33e0a1e162e558abb14c9b57e3feeab934",
+  "test_number_uses": 0,
+  "type": "fn"
+}

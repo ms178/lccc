@@ -1,0 +1,42 @@
+{
+  "bytes": 947,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "forward declaration of 'struct f'"
+    },
+    {
+      "kind": "error",
+      "msg": "incomplete type 'struct f' where a complete type is required"
+    },
+    {
+      "kind": "warning",
+      "msg": "ISO C does not allow indirection on operand of type 'void *'"
+    },
+    {
+      "kind": "warning",
+      "msg": "ISO C does not allow indirection on operand of type 'void *'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot increment value of type 'void'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 14,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C2y/n3481.sft.c",
+  "remark": null,
+  "sha256": "2bf0f01a177bff2978c76150250c2b978f37d9cea4fa6d40e820fd4f3f359c4b",
+  "test_number_uses": 0,
+  "type": "fn"
+}

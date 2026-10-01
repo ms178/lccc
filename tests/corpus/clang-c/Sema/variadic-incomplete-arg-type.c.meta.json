@@ -1,0 +1,34 @@
+{
+  "bytes": 418,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "forward declaration of 'struct __CFError'"
+    },
+    {
+      "kind": "error",
+      "msg": "argument type 'struct __CFError' is incomplete"
+    },
+    {
+      "kind": "error",
+      "msg": "argument type 'void' is incomplete"
+    }
+  ],
+  "has_main": true,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/variadic-incomplete-arg-type.sft.c",
+  "remark": null,
+  "sha256": "ad19037ab52c08b9b216e4ce468dbc564a83f74c2ab00c654ce411437e8b0161",
+  "test_number_uses": 0,
+  "type": "fn"
+}

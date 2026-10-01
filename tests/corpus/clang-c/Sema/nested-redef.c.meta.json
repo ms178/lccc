@@ -1,0 +1,50 @@
+{
+  "bytes": 760,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "error",
+      "msg": "nested redefinition of 'X'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "error",
+      "msg": "nested redefinition of 'G'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "nested redefinition of 'G'"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of 'G'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 3,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/nested-redef.sft.c",
+  "remark": null,
+  "sha256": "0adb76e13d709dac8f9331c9aa9648b675bb352a9ad7ae3fcbc160c18ef4783b",
+  "test_number_uses": 0,
+  "type": "fn"
+}

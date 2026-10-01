@@ -1,0 +1,50 @@
+{
+  "bytes": 1823,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "incompatible block pointer types initializing 'int *(^)()' with an expression of type 'int *const (^)()'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible block pointer types initializing 'int (^)(int, char (^)(float))' with an expression of type 'int (^)(int, char (^)(double))'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid block pointer conversion assigning to 'int *const (^)()' from 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid block pointer conversion initializing 'int (^)()' with an expression of type 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid block pointer conversion initializing 'int (^)()' with an expression of type 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to block call"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to block"
+    }
+  ],
+  "has_main": true,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/block-call.sft.c",
+  "remark": null,
+  "sha256": "4e282ae8b7a04412ef5d32c7727f0487a531a2c60f77fa074d7eb39e46ce9b65",
+  "test_number_uses": 0,
+  "type": "fn"
+}

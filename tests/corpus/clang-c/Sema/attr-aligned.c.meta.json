@@ -1,0 +1,34 @@
+{
+  "bytes": 2605,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "requested alignment is not a power of 2"
+    },
+    {
+      "kind": "error",
+      "msg": "requested alignment must be 4294967296 bytes or smaller"
+    },
+    {
+      "kind": "error",
+      "msg": "requested alignment must be 4294967296 bytes or smaller"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-aligned.sft.c",
+  "remark": null,
+  "sha256": "b67ba8462f01219826e4d9dcaab5ad22101742fba9dfdef221bbf4c8e48b4b9c",
+  "test_number_uses": 0,
+  "type": "fn"
+}

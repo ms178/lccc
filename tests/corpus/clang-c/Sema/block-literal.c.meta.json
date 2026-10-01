@@ -1,0 +1,42 @@
+{
+  "bytes": 1737,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'break' statement not in loop or switch statement"
+    },
+    {
+      "kind": "error",
+      "msg": "'continue' statement not in loop statement"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared label 'foo'"
+    },
+    {
+      "kind": "error",
+      "msg": "variable is not assignable (missing __block type specifier)"
+    },
+    {
+      "kind": "error",
+      "msg": "type specifier missing, defaults to 'int'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/block-literal.sft.c",
+  "remark": null,
+  "sha256": "462d2d26570179453d1571d9ccce24227744f7c0015a19f570b5159d535b2272",
+  "test_number_uses": 0,
+  "type": "fn"
+}

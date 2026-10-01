@@ -1,0 +1,42 @@
+{
+  "bytes": 613,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of 'f'"
+    },
+    {
+      "kind": "error",
+      "msg": "parameter 'x' was not declared, defaults to 'int'; ISO C99 and later do not support implicit int"
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of a 'extern inline' function 'g' is not supported in C99 mode"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 3,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/redefinition.sft.c",
+  "remark": null,
+  "sha256": "c4fe357e9c8493c2b87e0272fa150d460ba094563bb711d72301aca10c07b877",
+  "test_number_uses": 0,
+  "type": "fn"
+}

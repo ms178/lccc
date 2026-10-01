@@ -1,0 +1,21 @@
+{
+  "bytes": 553,
+  "cases": null,
+  "category": "Parser",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/altivec-non-type-vector.sft.c",
+  "remark": null,
+  "sha256": "aeb22ec995e66eb7b348745107622e5650ea2fcba16110f3ca76cef28da24eb0",
+  "test_number_uses": 0,
+  "type": "fp"
+}

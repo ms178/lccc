@@ -1,0 +1,30 @@
+{
+  "bytes": 875,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "incompatible function pointer types initializing 'Fn_noret'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible function pointer types initializing 'Fn_noret_noproto'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/initialize-noreturn.sft.c",
+  "remark": null,
+  "sha256": "c857c8ece90525b06d0b3f57bb2ca78b357e2006b3f3442f2feb8e8b896dc01b",
+  "test_number_uses": 0,
+  "type": "fn"
+}

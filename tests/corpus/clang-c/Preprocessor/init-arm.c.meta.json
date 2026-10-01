@@ -1,0 +1,21 @@
+{
+  "bytes": 74483,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 1523,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w ARM-DARWIN-CXX -w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/init-arm.sft.c",
+  "remark": null,
+  "sha256": "db3645fe88faa7d6ec92cf68ae8445e8b13275d3561bbb0f8c569386940add8c",
+  "test_number_uses": 0,
+  "type": "fp"
+}

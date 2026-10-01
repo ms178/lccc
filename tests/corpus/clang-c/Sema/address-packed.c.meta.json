@@ -1,0 +1,21 @@
+{
+  "bytes": 8140,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 47,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/address-packed.sft.c",
+  "remark": null,
+  "sha256": "1ee736b8a402fa57a9b2b97fba6a6d51aa551ee9a34818ca696fd2aee1213105",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,93 @@
+{
+  "bytes": 9692,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 31,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "%-DX32TYPE=ULONG --c89 %-DX32TYPE=ULONG %-DX32TYPE=ULONG",
+    " --c++03 --c++ %-DX32TYPE=LLONG",
+    " --c99 %-DX32TYPE=LLONG",
+    " --c11 %-DX32TYPE=LLONG",
+    " --c++11 --c++ %-DX32TYPE=LLONG",
+    " --c++14 --c++ %-DX32TYPE=LLONG %-DX64TYPE=ULONG",
+    " --c89 %-DX64TYPE=ULONG %-DX64TYPE=ULONG",
+    " --c++03 --c++ %-DX64TYPE=ULLONG",
+    " --c99 %-DX64TYPE=ULLONG",
+    " --c11 %-DX64TYPE=ULLONG",
+    " --c++11 --c++ %-DX64TYPE=ULLONG",
+    " --c++14 --c++ %-DX64TYPE=ULLONG"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/PR16678.sft.c",
+  "remark": null,
+  "sha256": "d2da08182a6b4ec09fb1d9836634dfb5a63f8b399519cdc276963eb5db276ec8",
+  "test_number_uses": 0,
+  "type": "fp"
+}

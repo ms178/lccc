@@ -1,0 +1,110 @@
+{
+  "bytes": 2384,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "pasting formed 'x+', an invalid preprocessing token"
+    },
+    {
+      "kind": "error",
+      "msg": "pasting formed '.test', an invalid preprocessing token"
+    },
+    {
+      "kind": "error",
+      "msg": "'##' cannot appear at end of macro expansion"
+    },
+    {
+      "kind": "error",
+      "msg": "'##' cannot appear at end of macro expansion"
+    },
+    {
+      "kind": "error",
+      "msg": "'##' cannot appear at end of macro expansion"
+    },
+    {
+      "kind": "error",
+      "msg": "'##' cannot appear at end of macro expansion"
+    },
+    {
+      "kind": "error",
+      "msg": "'##' cannot appear at start of macro expansion"
+    },
+    {
+      "kind": "error",
+      "msg": "'##' cannot appear at start of macro expansion"
+    },
+    {
+      "kind": "error",
+      "msg": "'##' cannot appear at start of macro expansion"
+    },
+    {
+      "kind": "error",
+      "msg": "'##' cannot appear at start of macro expansion"
+    },
+    {
+      "kind": "error",
+      "msg": "'##' cannot appear at start of macro expansion"
+    },
+    {
+      "kind": "error",
+      "msg": "'##' cannot appear at start of macro expansion"
+    },
+    {
+      "kind": "error",
+      "msg": "attempt to use a poisoned identifier"
+    },
+    {
+      "kind": "error",
+      "msg": "attempt to use a poisoned identifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "__VA_ARGS__ can only appear in the expansion of a C99 variadic macro"
+    },
+    {
+      "kind": "error",
+      "msg": "'#' is not followed by a macro parameter"
+    },
+    {
+      "kind": "note",
+      "msg": "macro 'PR21379A' defined here"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments provided to function-like macro invocation"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": "macro 'PR21379B' defined here"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments provided to function-like macro invocation"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/macro_paste_bad.sft.c",
+  "remark": null,
+  "sha256": "a6f31937e434dddf1a4487c00d02874916af0f995aeea0e50e545fe7166564aa",
+  "test_number_uses": 0,
+  "type": "fn"
+}

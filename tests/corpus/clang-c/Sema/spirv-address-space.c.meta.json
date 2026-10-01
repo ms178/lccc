@@ -1,0 +1,42 @@
+{
+  "bytes": 1448,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "returning '_AS2 void *' from a function with result type 'void *' changes address space of pointer"
+    },
+    {
+      "kind": "error",
+      "msg": "returning '_AS5 void *' from a function with result type 'void *' changes address space of pointer"
+    },
+    {
+      "kind": "error",
+      "msg": "returning '_AS999 void *' from a function with result type 'void *' changes address space of pointer"
+    },
+    {
+      "kind": "error",
+      "msg": "returning '__local void *' from a function with result type 'void *' changes address space of pointer"
+    },
+    {
+      "kind": "error",
+      "msg": "returning 'void *' from a function with result type '_AS1 void *' changes address space of pointer"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 12,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/spirv-address-space.sft.c",
+  "remark": null,
+  "sha256": "25ba0795f2e6a6faf3b077468b078508d7ef7374a89f0e6a04e449634d283c78",
+  "test_number_uses": 0,
+  "type": "fn"
+}

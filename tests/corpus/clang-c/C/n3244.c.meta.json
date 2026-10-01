@@ -1,0 +1,94 @@
+{
+  "bytes": 4336,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "address of register variable requested"
+    },
+    {
+      "kind": "error",
+      "msg": "address of register variable requested"
+    },
+    {
+      "kind": "note",
+      "msg": "forward declaration of 'struct F'"
+    },
+    {
+      "kind": "error",
+      "msg": "variable has incomplete type 'struct F'"
+    },
+    {
+      "kind": "error",
+      "msg": "variable has incomplete type 'struct G'"
+    },
+    {
+      "kind": "note",
+      "msg": "forward declaration of 'struct G'"
+    },
+    {
+      "kind": "error",
+      "msg": "definition of variable with array type needs an explicit size or an initializer"
+    },
+    {
+      "kind": "error",
+      "msg": "function declared in block scope cannot have 'static' storage class"
+    },
+    {
+      "kind": "note",
+      "msg": "declared with '_Alignas' attribute here"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Alignas' must be specified on definition if it is specified on any declaration"
+    },
+    {
+      "kind": "note",
+      "msg": "declared with '_Alignas' attribute here"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Alignas' must be specified on definition if it is specified on any declaration"
+    },
+    {
+      "kind": "note",
+      "msg": "declared with '_Alignas' attribute here"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Alignas' must be specified on definition if it is specified on any declaration"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Alignas' must be specified on definition if it is specified on any declaration"
+    },
+    {
+      "kind": "note",
+      "msg": "declared with '_Alignas' attribute here"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redeclaration has different alignment requirement (16 vs 8)"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 15,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C2y/n3244.sft.c",
+  "remark": null,
+  "sha256": "05929a3812988e397528f670b92995818f0e52a812a33b0941bb97d6cc02a67a",
+  "test_number_uses": 0,
+  "type": "fn"
+}

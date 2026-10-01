@@ -1,0 +1,21 @@
+{
+  "bytes": 587,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/address-packed-member-memops.sft.c",
+  "remark": null,
+  "sha256": "2c1cc37e583fcef4127c125b6b0cccddc6c4b2b2e44db78091bc8d10028228cf",
+  "test_number_uses": 0,
+  "type": "fp"
+}

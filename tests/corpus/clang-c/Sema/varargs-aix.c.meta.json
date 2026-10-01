@@ -1,0 +1,21 @@
+{
+  "bytes": 239,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/varargs-aix.sft.c",
+  "remark": null,
+  "sha256": "13aad22abd2e4b10689538471450e79e8fe6950508dc1141c735dc995bf2e944",
+  "test_number_uses": 0,
+  "type": "fp"
+}

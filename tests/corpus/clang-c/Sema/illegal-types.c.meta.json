@@ -1,0 +1,39 @@
+{
+  "bytes": 426,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'type name' declared as array of functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'p' declared as array of functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'type name' declared as array of references"
+    },
+    {
+      "kind": "error",
+      "msg": "'p' declared as array of references"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c",
+    " --c++03 --c++"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/illegal-types.sft.c",
+  "remark": null,
+  "sha256": "8e54f8750dd08a9a4f008ce56a27516434757fdb073f6d1b02ebeb6d275c2998",
+  "test_number_uses": 0,
+  "type": "fn"
+}

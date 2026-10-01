@@ -1,0 +1,21 @@
+{
+  "bytes": 288,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    " --c89 --strict_gnu"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/no-warn-void-ptr-uneval.sft.c",
+  "remark": null,
+  "sha256": "81e1e210d746d0fdfa9024d7a30621c4687844c560c564a28bec7567ef7bef66",
+  "test_number_uses": 0,
+  "type": "fp"
+}

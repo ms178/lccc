@@ -1,0 +1,75 @@
+{
+  "bytes": 5255,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "type 'void ()' in generic association not an object type"
+    },
+    {
+      "kind": "error",
+      "msg": "type 'int[n]' in generic association is a variably modified type"
+    },
+    {
+      "kind": "note",
+      "msg": "compatible type 'void (*)()' specified here"
+    },
+    {
+      "kind": "error",
+      "msg": "type 'void (*)(void)' in generic association compatible with previously specified type 'void (*)()'"
+    },
+    {
+      "kind": "error",
+      "msg": "controlling expression type 'void (*)()' compatible with 2 generic association types"
+    },
+    {
+      "kind": "note",
+      "msg": "compatible type 'void (*)(int)' specified here"
+    },
+    {
+      "kind": "note",
+      "msg": "compatible type 'void (*)(void)' specified here"
+    },
+    {
+      "kind": "error",
+      "msg": "controlling expression type 'int' not compatible with any generic association type"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot increment value of type 'int ()'"
+    },
+    {
+      "kind": "warning",
+      "msg": "due to lvalue conversion of the controlling expression, association of type 'const int' will never be selected because it is qualified"
+    },
+    {
+      "kind": "warning",
+      "msg": "due to lvalue conversion of the controlling expression, association of type 'volatile int' will never be selected because it is qualified"
+    },
+    {
+      "kind": "warning",
+      "msg": "due to lvalue conversion of the controlling expression, association of type 'int[12]' will never be selected because it is of array type"
+    },
+    {
+      "kind": "warning",
+      "msg": "due to lvalue conversion of the controlling expression, association of type 'const struct Test' will never be selected because it is qualified"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c11",
+    " --c99"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/generic-selection.sft.c",
+  "remark": null,
+  "sha256": "4b7d3e88652a417afe5de6d9a973090613a644af028a3a76b418f36dec4c4158",
+  "test_number_uses": 0,
+  "type": "fn"
+}

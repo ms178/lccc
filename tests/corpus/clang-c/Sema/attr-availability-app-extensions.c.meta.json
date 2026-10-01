@@ -1,0 +1,46 @@
+{
+  "bytes": 1648,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "'f0' has been explicitly marked unavailable here"
+    },
+    {
+      "kind": "note",
+      "msg": "'f1' has been explicitly marked unavailable here"
+    },
+    {
+      "kind": "note",
+      "msg": "'f2' has been explicitly marked unavailable here"
+    },
+    {
+      "kind": "error",
+      "msg": "'f0' is unavailable: not available on"
+    },
+    {
+      "kind": "error",
+      "msg": "'f1' is unavailable"
+    },
+    {
+      "kind": "error",
+      "msg": "'f2' is unavailable: not available on"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DTVOS=1 --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-availability-app-extensions.sft.c",
+  "remark": null,
+  "sha256": "c33ca6bacd2852358dd4a30ade477b4c8654adc7b1b7915611cdd1f32508ad5d",
+  "test_number_uses": 0,
+  "type": "fn"
+}

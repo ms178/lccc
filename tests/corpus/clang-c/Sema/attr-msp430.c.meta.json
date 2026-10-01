@@ -1,0 +1,46 @@
+{
+  "bytes": 963,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'interrupt' attribute only applies to functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'interrupt' attribute requires an integer constant"
+    },
+    {
+      "kind": "error",
+      "msg": "'interrupt' attribute takes one argument"
+    },
+    {
+      "kind": "warning",
+      "msg": "MSP430 'interrupt' attribute only applies to functions that have a 'void' return type"
+    },
+    {
+      "kind": "warning",
+      "msg": "MSP430 'interrupt' attribute only applies to functions that have no parameters"
+    },
+    {
+      "kind": "error",
+      "msg": "'interrupt' attribute parameter 64 is out of bounds"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-msp430.sft.c",
+  "remark": null,
+  "sha256": "c52b8001c7eb57416da0e54a1305a7dfd10cb7285628fe9e5d165de6a46d5735",
+  "test_number_uses": 0,
+  "type": "fn"
+}

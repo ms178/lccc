@@ -1,0 +1,26 @@
+{
+  "bytes": 6098,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "no-diagnostics",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 12,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--ms_compatibility --ms_compatibility --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/flexible-array-in-union.sft.c",
+  "remark": null,
+  "sha256": "4ab8616cc79468087f91c61f1d67ba571e2eb633a71b73c5db5f327643310841",
+  "test_number_uses": 0,
+  "type": "fp"
+}

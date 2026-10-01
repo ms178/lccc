@@ -1,0 +1,50 @@
+{
+  "bytes": 1439,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "nullability specifier '_Nullable' conflicts with existing specifier '_Nonnull'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "nullability specifier '_Nonnull' conflicts with existing specifier '_Nullable'"
+    },
+    {
+      "kind": "warning",
+      "msg": "null returned from function that requires a non-null return value"
+    },
+    {
+      "kind": "warning",
+      "msg": "null passed to a callee that requires a non-null argument"
+    },
+    {
+      "kind": "warning",
+      "msg": "null passed to a callee that requires a non-null argument"
+    }
+  ],
+  "has_main": true,
+  "header_lines": 10,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/non-null-warning.sft.c",
+  "remark": null,
+  "sha256": "d5c1965ec5aa83c96ef47259584ea8d252e9409b388f1e83bc16f54c9ce1806b",
+  "test_number_uses": 0,
+  "type": "fp"
+}

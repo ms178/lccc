@@ -1,0 +1,21 @@
+{
+  "bytes": 308,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "%-DEXPECTED_STRUCT_SIZE=5 %-DEXPECTED_STRUCT_SIZE=6 --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/fpack-struct.sft.c",
+  "remark": null,
+  "sha256": "dc953e1bbe69026624b1ed1e8f05914d2ab46524770097b20f12b5a216d609fb",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,21 @@
+{
+  "bytes": 1323,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 26,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/riscv-atomics.sft.c",
+  "remark": null,
+  "sha256": "f536d906566004e8e29b825cf95c6a5e9be9474a05c5d706c2d46c9454f4ea9f",
+  "test_number_uses": 0,
+  "type": "fp"
+}

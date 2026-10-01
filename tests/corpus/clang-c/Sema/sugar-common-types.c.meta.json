@@ -1,0 +1,54 @@
+{
+  "bytes": 1119,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "incompatible type 'B1'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible type 'X2'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible type 'Y2'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible type 'B2'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible type 'B3'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible type 'B4'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible type 'B5'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible type 'B6'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c99 --target linux_aarch64"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/sugar-common-types.sft.c",
+  "remark": null,
+  "sha256": "6938ae957d4642b87b35f63df2f23bc1e83d9fb09469fd3e4528a962f5270834",
+  "test_number_uses": 0,
+  "type": "fn"
+}

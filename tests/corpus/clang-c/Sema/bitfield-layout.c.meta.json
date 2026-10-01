@@ -1,0 +1,21 @@
+{
+  "bytes": 7414,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 26,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/bitfield-layout.sft.c",
+  "remark": null,
+  "sha256": "47d220dd06f46475946c4125bde3ea1f792273e9418921f8e01d69b36a8dc8d0",
+  "test_number_uses": 0,
+  "type": "fp"
+}

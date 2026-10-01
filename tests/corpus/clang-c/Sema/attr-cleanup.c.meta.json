@@ -1,0 +1,90 @@
+{
+  "bytes": 2752,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'cleanup' attribute only applies to local variables"
+    },
+    {
+      "kind": "warning",
+      "msg": "'cleanup' attribute only applies to local variables"
+    },
+    {
+      "kind": "warning",
+      "msg": "'cleanup' attribute only applies to local variables"
+    },
+    {
+      "kind": "error",
+      "msg": "'cleanup' attribute takes one argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'cleanup' attribute takes one argument"
+    },
+    {
+      "kind": "warning",
+      "msg": "'cleanup' attribute only applies to local variables"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'h'"
+    },
+    {
+      "kind": "error",
+      "msg": "'cleanup' argument 'v3' is not a function"
+    },
+    {
+      "kind": "error",
+      "msg": "'cleanup' function 'c2' must take 1 parameter"
+    },
+    {
+      "kind": "error",
+      "msg": "'cleanup' function 'c3' parameter has type 'struct s' which is incompatible with type 'int *'"
+    },
+    {
+      "kind": "note",
+      "msg": "'c5' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "warning",
+      "msg": "'c5' is deprecated"
+    },
+    {
+      "kind": "error",
+      "msg": "'cleanup' argument is not a function"
+    },
+    {
+      "kind": "warning",
+      "msg": "'cleanup' attribute only applies to local variables"
+    },
+    {
+      "kind": "warning",
+      "msg": "attempt to call free on non-heap object 'p'"
+    },
+    {
+      "kind": "warning",
+      "msg": "passing 2-byte aligned argument to 4-byte aligned parameter 1 of 'c1' may result in an unaligned pointer access"
+    },
+    {
+      "kind": "warning",
+      "msg": "calling 'func1' is a violation of trusted computing base 'TCB2'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-cleanup.sft.c",
+  "remark": null,
+  "sha256": "5550babe9af559da01cf21da342a335323e969dfcf6708d3e098720c22e84e2c",
+  "test_number_uses": 0,
+  "type": "fn"
+}

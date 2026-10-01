@@ -1,0 +1,50 @@
+{
+  "bytes": 1250,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "invalid or misplaced branch protection specification 'foo'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid or misplaced branch protection specification '<empty>'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid or misplaced branch protection specification '<empty>'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid or misplaced branch protection specification 'bkey'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid or misplaced branch protection specification 'leaf'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid or misplaced branch protection specification 'leaf'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid or misplaced branch protection specification 'leaf'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c --target linux_aarch64"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/aarch64-branch-protection-attr-err.sft.c",
+  "remark": null,
+  "sha256": "84de495ee703ea0790e9e79ffa0e57b4a83e8dbadd5fde0627f05645af967200",
+  "test_number_uses": 0,
+  "type": "fn"
+}

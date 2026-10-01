@@ -1,0 +1,90 @@
+{
+  "bytes": 2957,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "expression is not a string literal"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid special register for builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid special register for builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid special register for builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid special register for builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid special register for builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid special register for builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid special register for builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid special register for builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid special register for builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid special register for builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid special register for builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid special register for builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid special register for builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid special register for builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid special register for builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid special register for builtin"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/arm-special-register.sft.c",
+  "remark": null,
+  "sha256": "936415d2b14821e6c884c7b62ace3b9908e5eac073575837787a2d2452af0d48",
+  "test_number_uses": 0,
+  "type": "fn"
+}

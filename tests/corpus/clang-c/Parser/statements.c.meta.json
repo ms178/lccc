@@ -1,0 +1,86 @@
+{
+  "bytes": 2698,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "if statement has empty body"
+    },
+    {
+      "kind": "warning",
+      "msg": "if statement has empty body"
+    },
+    {
+      "kind": "warning",
+      "msg": "if statement has empty body"
+    },
+    {
+      "kind": "warning",
+      "msg": "if statement has empty body"
+    },
+    {
+      "kind": "error",
+      "msg": "expected expression"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ';' after return statement"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'undecl'"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ';' after expression"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ';' after expression"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ';' after return statement"
+    },
+    {
+      "kind": "warning",
+      "msg": "ISO C does not allow an attribute list to appear here"
+    },
+    {
+      "kind": "warning",
+      "msg": "ISO C does not allow an attribute list to appear here"
+    },
+    {
+      "kind": "warning",
+      "msg": "ISO C does not allow an attribute list to appear here"
+    },
+    {
+      "kind": "warning",
+      "msg": "ISO C does not allow an attribute list to appear here"
+    },
+    {
+      "kind": "warning",
+      "msg": "ISO C does not allow an attribute list to appear here"
+    },
+    {
+      "kind": "warning",
+      "msg": "ISO C does not allow an attribute list to appear here"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/statements.sft.c",
+  "remark": null,
+  "sha256": "0922418e3ebeafb56b5979919117e9bcaf5bda1981a1130b71c2a39d7fc35643",
+  "test_number_uses": 0,
+  "type": "fn"
+}

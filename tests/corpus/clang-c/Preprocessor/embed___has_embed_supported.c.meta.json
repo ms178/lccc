@@ -1,0 +1,21 @@
+{
+  "bytes": 945,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 26,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/embed___has_embed_supported.sft.c",
+  "remark": null,
+  "sha256": "fa3fc14b92a67843337e4ff4f174e90b18867801b5ae48c947b6584662d873bc",
+  "test_number_uses": 0,
+  "type": "fp"
+}

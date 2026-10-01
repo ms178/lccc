@@ -1,0 +1,21 @@
+{
+  "bytes": 3320,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 64,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/suggest-typoed-directive.sft.c",
+  "remark": null,
+  "sha256": "aa8ef7e74042a294490efd81a47f766e564807033d13bdb69c419ccc595f419b",
+  "test_number_uses": 0,
+  "type": "fp"
+}

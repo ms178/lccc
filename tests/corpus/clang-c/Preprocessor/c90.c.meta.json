@@ -1,0 +1,22 @@
+{
+  "bytes": 533,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 17,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c89",
+    " --c89"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/c90.sft.c",
+  "remark": null,
+  "sha256": "44ad2e224b1172ca00867a4292ffdfc46646554419e8fd81c20e417e84e863d3",
+  "test_number_uses": 0,
+  "type": "fn"
+}

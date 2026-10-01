@@ -1,0 +1,67 @@
+{
+  "bytes": 9861,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "expected identifier or '('"
+    },
+    {
+      "kind": "error",
+      "msg": "expected expression"
+    },
+    {
+      "kind": "error",
+      "msg": "expected identifier or '('"
+    },
+    {
+      "kind": "error",
+      "msg": "expected expression"
+    },
+    {
+      "kind": "error",
+      "msg": "expected expression"
+    },
+    {
+      "kind": "error",
+      "msg": "expected expression"
+    },
+    {
+      "kind": "error",
+      "msg": "expected expression"
+    },
+    {
+      "kind": "error",
+      "msg": "expected expression"
+    },
+    {
+      "kind": "warning",
+      "msg": "'_Alignof' applied to an expression is a GNU extension"
+    },
+    {
+      "kind": "error",
+      "msg": "expected expression"
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration does not declare anything"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23",
+    " --c17"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/c2x-auto.sft.c",
+  "remark": null,
+  "sha256": "91b264199318014462df12d726dccbb99ee35a677a05fe0081f36dd48e6fcaf3",
+  "test_number_uses": 0,
+  "type": "fn"
+}

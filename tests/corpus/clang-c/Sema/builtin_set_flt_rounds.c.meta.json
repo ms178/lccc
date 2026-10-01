@@ -1,0 +1,26 @@
+{
+  "bytes": 464,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "passing 'struct S' to parameter of incompatible type"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/builtin_set_flt_rounds.sft.c",
+  "remark": null,
+  "sha256": "f6f0b8559183884eb90b5116a2e3fbe0fa6d3c1b096bce84e991e31788db5339",
+  "test_number_uses": 0,
+  "type": "fn"
+}

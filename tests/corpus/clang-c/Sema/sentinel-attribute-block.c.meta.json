@@ -1,0 +1,26 @@
+{
+  "bytes": 295,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'sentinel' attribute requires named arguments"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/sentinel-attribute-block.sft.c",
+  "remark": null,
+  "sha256": "b1f3a4e55612036e4b44f4d104547cdb7ac13465771a364e8da4716e50393cd8",
+  "test_number_uses": 0,
+  "type": "fp"
+}

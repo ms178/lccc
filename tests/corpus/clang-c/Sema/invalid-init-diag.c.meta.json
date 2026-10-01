@@ -1,0 +1,26 @@
+{
+  "bytes": 170,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "with an expression of incompatible type 'int'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/invalid-init-diag.sft.c",
+  "remark": null,
+  "sha256": "40cdf1eecae1b0f01faf22fa0081dbc6537e602db1aaa6c803d153dbbcc74e14",
+  "test_number_uses": 0,
+  "type": "fn"
+}

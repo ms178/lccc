@@ -1,0 +1,21 @@
+{
+  "bytes": 497,
+  "cases": null,
+  "category": "Parser",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 9,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/altivec-csk-bool.sft.c",
+  "remark": null,
+  "sha256": "dcf7361ee3d6779336e4a1d2c0cc9f1e5e8749ac89fe2ca6144fdef79a730005",
+  "test_number_uses": 0,
+  "type": "fp"
+}

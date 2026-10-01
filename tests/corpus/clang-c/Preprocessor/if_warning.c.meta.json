@@ -1,0 +1,46 @@
+{
+  "bytes": 739,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'foo' is not defined, evaluates to 0"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "extra tokens"
+    },
+    {
+      "kind": "warning",
+      "msg": "character constant too long for its type"
+    },
+    {
+      "kind": "warning",
+      "msg": "multi-character character constant"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/if_warning.sft.c",
+  "remark": null,
+  "sha256": "2eb5a9e6c367dcd0e4c59a03754cbb96777599f44b94010b0bae0e17d6db37f0",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,62 @@
+{
+  "bytes": 1357,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "'INT1' is deprecated: Please avoid INT1"
+    },
+    {
+      "kind": "warning",
+      "msg": "'INT1' is deprecated: Please avoid INT1"
+    },
+    {
+      "kind": "note",
+      "msg": "'f1' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "warning",
+      "msg": "'INT1' is deprecated: Please avoid INT1"
+    },
+    {
+      "kind": "note",
+      "msg": "'Color' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "warning",
+      "msg": "'Color' is deprecated: Please avoid Color"
+    },
+    {
+      "kind": "note",
+      "msg": "'g2' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "warning",
+      "msg": "'f1' is deprecated: Please avoid f1"
+    },
+    {
+      "kind": "warning",
+      "msg": "'g2' is deprecated: Please avoid g2"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-deprecated-message.sft.c",
+  "remark": null,
+  "sha256": "6d451601a69e70886a101d5356d7c394c674e82cf08d30ccb558c095aee72f44",
+  "test_number_uses": 0,
+  "type": "fp"
+}

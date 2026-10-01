@@ -1,0 +1,21 @@
+{
+  "bytes": 842,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 40,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/dump_macros.sft.c",
+  "remark": null,
+  "sha256": "2641d40f22d169ec9cbc94c0f882e4e126a7630b70420962af0b504411fc2680",
+  "test_number_uses": 0,
+  "type": "fp"
+}

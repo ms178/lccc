@@ -1,0 +1,58 @@
+{
+  "bytes": 1482,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'a' length modifier is not supported by ISO C"
+    },
+    {
+      "kind": "warning",
+      "msg": "'a' length modifier is not supported by ISO C"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'char **' but the argument has type 'float *'"
+    },
+    {
+      "kind": "warning",
+      "msg": "'a' length modifier is not supported by ISO C"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'wchar_t **' (aka 'int **') but the argument has type 'float *'"
+    },
+    {
+      "kind": "warning",
+      "msg": "'a' length modifier is not supported by ISO C"
+    },
+    {
+      "kind": "warning",
+      "msg": "'S' conversion specifier is not supported by ISO C"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'char **' but the argument has type 'float *'"
+    },
+    {
+      "kind": "warning",
+      "msg": "'a' length modifier is not supported by ISO C"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c89"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/format-strings-c90.sft.c",
+  "remark": null,
+  "sha256": "c159df33f9189f684a399a500bdfdf5c094c7a3a545d8072612987a60180d09a",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,26 @@
+{
+  "bytes": 262,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c99"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/traditional_arg_scope.sft.c",
+  "remark": null,
+  "sha256": "c5d4c82cbb5c03bb1a31fe585b2fedd9ceac2807570dbf4581c765b36971fd30",
+  "test_number_uses": 0,
+  "type": "fn"
+}

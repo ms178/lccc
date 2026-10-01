@@ -1,0 +1,70 @@
+{
+  "bytes": 2014,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "call to undeclared library function '_byteswap_ushort'"
+    },
+    {
+      "kind": "note",
+      "msg": "include the header <stdlib.h> or explicitly provide a declaration for '_byteswap_ushort'"
+    },
+    {
+      "kind": "error",
+      "msg": "call to undeclared library function '_byteswap_uint64'"
+    },
+    {
+      "kind": "note",
+      "msg": "include the header <stdlib.h> or explicitly provide a declaration for '_byteswap_uint64'"
+    },
+    {
+      "kind": "warning",
+      "msg": "incompatible redeclaration of library function '_byteswap_ulong'"
+    },
+    {
+      "kind": "note",
+      "msg": "'_byteswap_ulong' is a builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "call to undeclared library function '__mulh'"
+    },
+    {
+      "kind": "note",
+      "msg": "include the header <intrin.h> or explicitly provide a declaration for '__mulh'"
+    },
+    {
+      "kind": "error",
+      "msg": "call to undeclared library function '__umulh'"
+    },
+    {
+      "kind": "note",
+      "msg": "include the header <intrin.h> or explicitly provide a declaration for '__umulh'"
+    },
+    {
+      "kind": "error",
+      "msg": "call to undeclared function '__mulh'; ISO C99 and later do not support implicit function declarations"
+    },
+    {
+      "kind": "error",
+      "msg": "call to undeclared function '__umulh'; ISO C99 and later do not support implicit function declarations"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--ms_extensions --ms_extensions --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/implicit-ms-builtin-decl.sft.c",
+  "remark": null,
+  "sha256": "0ecfd28f5765cbd07865f7b86dff8e637c1ff9e34749eae1eb78feb2315d98f6",
+  "test_number_uses": 0,
+  "type": "fn"
+}

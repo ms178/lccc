@@ -1,0 +1,26 @@
+{
+  "bytes": 389,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "call to undeclared function 'frobble'; ISO C99 and later do not support implicit function declarations"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 9,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C99/n636.sft.c",
+  "remark": null,
+  "sha256": "b9766b57ffab12ccca534d2ac402eeb90c35bb7e3e5bc73685a098bcd9b8231b",
+  "test_number_uses": 0,
+  "type": "fn"
+}

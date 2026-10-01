@@ -1,0 +1,58 @@
+{
+  "bytes": 1824,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from 'long' to 'float' may lose precision"
+    },
+    {
+      "kind": "warning",
+      "msg": "changes value from 222222222222 to 222222221312"
+    },
+    {
+      "kind": "warning",
+      "msg": "changes value from 222222222222 to 222222221312"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from 'long' to 'float' may lose precision"
+    },
+    {
+      "kind": "warning",
+      "msg": "changes value from 222222222222 to 222222221312"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from 'int' to 'float' changes value from 44444445 to 44444444"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from 'int' to 'float' may lose precision"
+    },
+    {
+      "kind": "warning",
+      "msg": "changes value from 222222222222 to 222222221312"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from 'long' to 'float' may lose precision"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DNONCONST=1 --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/implicit-int-float-conversion.sft.c",
+  "remark": null,
+  "sha256": "e1138d6303e1fe1ef5a7c99d868635f3437124aec844264084beafff44f9cd5f",
+  "test_number_uses": 0,
+  "type": "fp"
+}

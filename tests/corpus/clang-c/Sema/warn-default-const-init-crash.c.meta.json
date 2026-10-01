@@ -1,0 +1,30 @@
+{
+  "bytes": 428,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "field has incomplete type 'struct GH140887'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-default-const-init-crash.sft.c",
+  "remark": null,
+  "sha256": "9fe92afe475a5c680d826e6578e4a7b077df03610e3cc73454df70ff579715fb",
+  "test_number_uses": 0,
+  "type": "fn"
+}

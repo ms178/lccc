@@ -1,0 +1,54 @@
+{
+  "bytes": 1257,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'aarch64_vector_pcs' only applies to function types; type here is 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "'aarch64_vector_pcs' attribute takes no arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "not compatible"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "function declared 'aarch64_vector_pcs' here was previously declared 'cdecl'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "function declared 'aarch64_vector_pcs' here was previously declared without calling convention"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible function pointer types"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c --target linux_aarch64"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/aarch64-vpcs.sft.c",
+  "remark": null,
+  "sha256": "6888ecb6eaa2085f5b17a411b3e80367f002b656e2d6fa8e227f32603a88a88f",
+  "test_number_uses": 0,
+  "type": "fn"
+}

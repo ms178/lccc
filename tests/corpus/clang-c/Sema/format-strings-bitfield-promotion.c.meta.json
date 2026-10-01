@@ -1,0 +1,38 @@
+{
+  "bytes": 892,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'long' but the argument has type 'int'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'unsigned long' but the argument has type 'int'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'long' but the argument has type 'int'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'unsigned long' but the argument has type 'unsigned int'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/format-strings-bitfield-promotion.sft.c",
+  "remark": null,
+  "sha256": "c663d3206982505de0cce96475728986e314e8549bf5c3520aecce535e37ed23",
+  "test_number_uses": 0,
+  "type": "fp"
+}

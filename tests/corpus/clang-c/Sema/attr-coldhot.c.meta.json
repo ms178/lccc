@@ -1,0 +1,62 @@
+{
+  "bytes": 1141,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'__cold__' attribute only applies to functions"
+    },
+    {
+      "kind": "warning",
+      "msg": "'__hot__' attribute only applies to functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'__cold__' and 'hot' attributes are not compatible"
+    },
+    {
+      "kind": "note",
+      "msg": "conflicting attribute is here"
+    },
+    {
+      "kind": "error",
+      "msg": "'__hot__' and 'cold' attributes are not compatible"
+    },
+    {
+      "kind": "note",
+      "msg": "conflicting attribute is here"
+    },
+    {
+      "kind": "note",
+      "msg": "conflicting attribute is here"
+    },
+    {
+      "kind": "error",
+      "msg": "'hot' and 'cold' attributes are not compatible"
+    },
+    {
+      "kind": "note",
+      "msg": "conflicting attribute is here"
+    },
+    {
+      "kind": "error",
+      "msg": "'cold' and 'hot' attributes are not compatible"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-coldhot.sft.c",
+  "remark": null,
+  "sha256": "586e47994a9171425d869d3a4af89daa3196a278340482820c17efb2f0a7f15d",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,21 @@
+{
+  "bytes": 1272,
+  "cases": null,
+  "category": "Parser",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--ms_extensions --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/ms-if-exists.sft.c",
+  "remark": null,
+  "sha256": "6f4c240c276623b55c4aaa77efd63283b3db1985f5e923a37e25ac804b150919",
+  "test_number_uses": 0,
+  "type": "fp"
+}

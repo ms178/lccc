@@ -1,0 +1,54 @@
+{
+  "bytes": 2575,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "expected '(' after 'typeof'"
+    },
+    {
+      "kind": "error",
+      "msg": "expected '(' after 'typeof'"
+    },
+    {
+      "kind": "error",
+      "msg": "expected '(' after 'typeof_unqual'"
+    },
+    {
+      "kind": "error",
+      "msg": "expected '(' after 'typeof_unqual'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot combine with previous 'typeof' declaration specifier"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot combine with previous 'typeof_unqual' declaration specifier"
+    },
+    {
+      "kind": "error",
+      "msg": "a type specifier is required for all declarations"
+    },
+    {
+      "kind": "error",
+      "msg": "expected identifier or '('"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/c2x-typeof.sft.c",
+  "remark": null,
+  "sha256": "feaf4683b2e018540fc904d008d02d3400914af98e12597702b8df4eb532476f",
+  "test_number_uses": 0,
+  "type": "fn"
+}

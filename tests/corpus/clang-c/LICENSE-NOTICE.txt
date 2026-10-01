@@ -1,0 +1,7 @@
+Files in this directory originate from the EDG C/C++ front end test
+suite (https://github.com/edgcpp/compiler), subtrees
+tests/tests/imported/clang/**, licensed Apache-2.0 WITH LLVM
+exception (see the LICENSE.txt in that subtree).  Each adapted file
+carries an SPDX attribution header.  No GPL-licensed GNU testsuite
+material is present here; those are referenced by name only in
+../gnu-torture-manifest.jsonl.

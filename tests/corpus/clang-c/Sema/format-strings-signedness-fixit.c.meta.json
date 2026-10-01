@@ -1,0 +1,21 @@
+{
+  "bytes": 2667,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 52,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/format-strings-signedness-fixit.sft.c",
+  "remark": null,
+  "sha256": "1b0078b6129dfc2ae20b928fe6fc6009f5b10469fc840ddd3e422ab8372b3b7d",
+  "test_number_uses": 0,
+  "type": "fp"
+}

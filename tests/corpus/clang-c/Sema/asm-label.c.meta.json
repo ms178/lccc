@@ -1,0 +1,46 @@
+{
+  "bytes": 895,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "cannot apply asm label to function after its first use"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting asm label"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot apply asm label to variable after its first use"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting asm label"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/asm-label.sft.c",
+  "remark": null,
+  "sha256": "f467b44224831431eeeb81282c129eb4d5290750c1dff5860c55697439fd0c8e",
+  "test_number_uses": 0,
+  "type": "fn"
+}

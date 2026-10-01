@@ -1,0 +1,21 @@
+{
+  "bytes": 128,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-Dfoo='bar\\' --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/macro_backslash.sft.c",
+  "remark": null,
+  "sha256": "25333280da9c0aa2dfb0c2a068b26caa39d6ffa1a5d6f482411f83ea5272a2c9",
+  "test_number_uses": 0,
+  "type": "fp"
+}

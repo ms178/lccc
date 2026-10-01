@@ -1,0 +1,142 @@
+{
+  "bytes": 5309,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "relational comparison result unused"
+    },
+    {
+      "kind": "warning",
+      "msg": "relational comparison result unused"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression result unused"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression result unused"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression result unused"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression result unused"
+    },
+    {
+      "kind": "warning",
+      "msg": "ignoring return value of function declared with const attribute"
+    },
+    {
+      "kind": "warning",
+      "msg": "relational comparison result unused"
+    },
+    {
+      "kind": "warning",
+      "msg": "relational comparison result unused"
+    },
+    {
+      "kind": "warning",
+      "msg": "relational comparison result unused"
+    },
+    {
+      "kind": "warning",
+      "msg": "relational comparison result unused"
+    },
+    {
+      "kind": "warning",
+      "msg": "relational comparison result unused"
+    },
+    {
+      "kind": "warning",
+      "msg": "relational comparison result unused"
+    },
+    {
+      "kind": "warning",
+      "msg": "relational comparison result unused"
+    },
+    {
+      "kind": "warning",
+      "msg": "ignoring return value of function declared with 'warn_unused_result' attribute"
+    },
+    {
+      "kind": "warning",
+      "msg": "ignoring return value of function declared with 'warn_unused_result' attribute"
+    },
+    {
+      "kind": "warning",
+      "msg": "ignoring return value of function declared with pure attribute"
+    },
+    {
+      "kind": "warning",
+      "msg": "ignoring return value of function declared with const attribute"
+    },
+    {
+      "kind": "warning",
+      "msg": "ignoring return value of function declared with const attribute"
+    },
+    {
+      "kind": "warning",
+      "msg": "ignoring return value of function declared with 'warn_unused_result' attribute"
+    },
+    {
+      "kind": "warning",
+      "msg": "'warn_unused_result' attribute only applies to Objective-C methods, enums, structs, unions, classes, functions, function pointers, and typedefs"
+    },
+    {
+      "kind": "warning",
+      "msg": "ignoring return value of function declared with 'warn_unused_result' attribute"
+    },
+    {
+      "kind": "warning",
+      "msg": "attribute 'warn_unused_result' cannot be applied to functions without return value"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression result unused; should this cast be to 'void'?"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression result unused"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression result unused"
+    },
+    {
+      "kind": "warning",
+      "msg": "ignoring return value"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression result unused"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression result unused"
+    },
+    {
+      "kind": "warning",
+      "msg": "ignoring return value"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/unused-expr.sft.c",
+  "remark": null,
+  "sha256": "f894e41c7e522f49d0f4957efb2eb875e14a8426d2311b7cde058ad39d676f1f",
+  "test_number_uses": 0,
+  "type": "fp"
+}

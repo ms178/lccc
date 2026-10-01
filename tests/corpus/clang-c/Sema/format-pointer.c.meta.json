@@ -1,0 +1,31 @@
+{
+  "bytes": 2482,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'void **' but the argument has type 'int (*)[2]'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'void **' but the argument has type 'nullptr_t *'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 12,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23",
+    " --c23"
+  ],
+  "options_all": "--set_flag=no_checking_pragmas",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/format-pointer.sft.c",
+  "remark": null,
+  "sha256": "80bb6c25e47a8eb1abbcfde33159f09c3b63115ba9938b149c223074ed0a4c71",
+  "test_number_uses": 0,
+  "type": "fp"
+}

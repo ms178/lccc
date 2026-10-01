@@ -1,0 +1,42 @@
+{
+  "bytes": 756,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "expression which evaluates to zero treated as a null pointer constant"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression which evaluates to zero treated as a null pointer constant"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression which evaluates to zero treated as a null pointer constant"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression which evaluates to zero treated as a null pointer constant"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression which evaluates to zero treated as a null pointer constant"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-null.sft.c",
+  "remark": null,
+  "sha256": "a2366e3d2481f71af985af1b5e4d38efa15b932f78fffecd910a9f9868953449",
+  "test_number_uses": 0,
+  "type": "fp"
+}

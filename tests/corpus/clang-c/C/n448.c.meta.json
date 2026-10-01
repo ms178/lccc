@@ -1,0 +1,47 @@
+{
+  "bytes": 1980,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "restrict requires a pointer or reference ('int' is invalid)"
+    },
+    {
+      "kind": "error",
+      "msg": "pointer to function type 'void (void)' may not be 'restrict' qualified"
+    },
+    {
+      "kind": "warning",
+      "msg": "due to lvalue conversion of the controlling expression, association of type 'int *restrict' will never be selected because it is qualified"
+    },
+    {
+      "kind": "warning",
+      "msg": "initializing 'int **' with an expression of type 'int *restrict *restrict' discards qualifiers"
+    },
+    {
+      "kind": "warning",
+      "msg": "initializing 'int **restrict' with an expression of type 'int *restrict *restrict' discards qualifiers"
+    },
+    {
+      "kind": "error",
+      "msg": "constexpr variable cannot have type 'int *const restrict'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 15,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c99",
+    " --c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C99/n448.sft.c",
+  "remark": null,
+  "sha256": "671d611ddc4af4cfdc43ff68ea4821eb7a0b7cf47072851cbd4dbfe3c2664572",
+  "test_number_uses": 0,
+  "type": "fn"
+}

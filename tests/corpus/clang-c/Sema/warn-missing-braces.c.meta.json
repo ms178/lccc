@@ -1,0 +1,26 @@
+{
+  "bytes": 192,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "suggest braces"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-missing-braces.sft.c",
+  "remark": null,
+  "sha256": "63d08ef718f0bba010ce5ec02fb38556efb167b562533f2fc4f0fedf58640e36",
+  "test_number_uses": 0,
+  "type": "fp"
+}

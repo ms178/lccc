@@ -1,0 +1,90 @@
+{
+  "bytes": 5206,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "a function declaration without a prototype is deprecated in all versions of C"
+    },
+    {
+      "kind": "warning",
+      "msg": "a function declaration without a prototype is deprecated in all versions of C"
+    },
+    {
+      "kind": "warning",
+      "msg": "a function declaration without a prototype is deprecated in all versions of C"
+    },
+    {
+      "kind": "warning",
+      "msg": "a function declaration without a prototype is deprecated in all versions of C"
+    },
+    {
+      "kind": "warning",
+      "msg": "a function declaration without a prototype is deprecated in all versions of C"
+    },
+    {
+      "kind": "warning",
+      "msg": "a function declaration without a prototype is deprecated in all versions of C"
+    },
+    {
+      "kind": "warning",
+      "msg": "a function declaration without a prototype is deprecated in all versions of C"
+    },
+    {
+      "kind": "warning",
+      "msg": "a function declaration without a prototype is deprecated in all versions of C"
+    },
+    {
+      "kind": "warning",
+      "msg": "a function declaration without a prototype is deprecated in all versions of C"
+    },
+    {
+      "kind": "warning",
+      "msg": "a function declaration without a prototype is deprecated in all versions of C"
+    },
+    {
+      "kind": "warning",
+      "msg": "a function definition without a prototype is deprecated in all versions of C and is not supported in C23"
+    },
+    {
+      "kind": "warning",
+      "msg": "a function declaration without a prototype is deprecated in all versions of C"
+    },
+    {
+      "kind": "warning",
+      "msg": "a function declaration without a prototype is deprecated in all versions of C and is treated as a zero-parameter prototype in C23, conflicting with a subsequent definition"
+    },
+    {
+      "kind": "warning",
+      "msg": "a function definition without a prototype is deprecated in all versions of C and is not supported in C23"
+    },
+    {
+      "kind": "warning",
+      "msg": "parameter 'p2' was not declared, defaults to 'int'; ISO C99 and later do not support implicit int"
+    },
+    {
+      "kind": "warning",
+      "msg": "a function definition without a prototype is deprecated in all versions of C and is not supported in C23"
+    },
+    {
+      "kind": "warning",
+      "msg": "a function definition without a prototype is deprecated in all versions of C and is not supported in C23"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-strict-prototypes.sft.c",
+  "remark": null,
+  "sha256": "2f179fe60480fb713998928a2eb61d3a8ab341f1c7aa092725d2457993cf62c1",
+  "test_number_uses": 0,
+  "type": "fp"
+}

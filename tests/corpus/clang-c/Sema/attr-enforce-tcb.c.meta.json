@@ -1,0 +1,86 @@
+{
+  "bytes": 3017,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "calling 'foo3' is a violation of trusted computing base 'bar'"
+    },
+    {
+      "kind": "warning",
+      "msg": "calling 'foo4' is a violation of trusted computing base 'bar'"
+    },
+    {
+      "kind": "warning",
+      "msg": "calling 'foo7' is a violation of trusted computing base 'bar'"
+    },
+    {
+      "kind": "warning",
+      "msg": "calling 'foo1' is a violation of trusted computing base 'bar2'"
+    },
+    {
+      "kind": "warning",
+      "msg": "calling 'foo4' is a violation of trusted computing base 'bar'"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-enforce-tcb.sft.c",
+  "remark": null,
+  "sha256": "7942548705fbfbceb617b0a96cbce938cfc9b8c0b4b176593ba7f005515cdd8e",
+  "test_number_uses": 0,
+  "type": "fp"
+}

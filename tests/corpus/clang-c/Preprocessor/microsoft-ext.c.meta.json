@@ -1,0 +1,21 @@
+{
+  "bytes": 2028,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--ms_compatibility --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/microsoft-ext.sft.c",
+  "remark": null,
+  "sha256": "716b8b9b34a7002c92dc697aff610af7918e97d81bff5b4123286b5554fcf58f",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,21 @@
+{
+  "bytes": 68845,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 837,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/aarch64-target-features.sft.c",
+  "remark": null,
+  "sha256": "de484ef75ec3177515b1d0277b1c317c3c0b14d64fdd010f4088e44385556740",
+  "test_number_uses": 0,
+  "type": "fp"
+}

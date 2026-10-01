@@ -1,0 +1,34 @@
+{
+  "bytes": 1403,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'ms_struct' attribute only applies to structs, unions, and classes"
+    },
+    {
+      "kind": "warning",
+      "msg": "'ms_struct' attribute only applies to"
+    },
+    {
+      "kind": "warning",
+      "msg": "__declspec attribute 'ms_struct' is not supported"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 14,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--ms_extensions --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/pragma-ms_struct.sft.c",
+  "remark": null,
+  "sha256": "12f897942c954d9b48a55d37a77f84ee78c54e3bc8e4a59c55e8bf34e7959d5b",
+  "test_number_uses": 0,
+  "type": "fp"
+}

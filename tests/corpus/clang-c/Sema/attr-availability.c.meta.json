@@ -1,0 +1,214 @@
+{
+  "bytes": 11456,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "feature cannot be deprecated in macOS version 10.2 before it was introduced in version 10.4; attribute ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "feature cannot be obsoleted in iOS version 2.1 before it was deprecated in version 3.0; attribute ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "unknown platform 'otheros' in availability macro"
+    },
+    {
+      "kind": "note",
+      "msg": "'ATSFontGetName' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "note",
+      "msg": "'ATSFontGetPostScriptName' has been explicitly marked unavailable here"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "'ATSFontGetName' is deprecated: first deprecated in macOS 9.0 - use CTFontCopyFullName"
+    },
+    {
+      "kind": "error",
+      "msg": "'ATSFontGetPostScriptName' is unavailable: obsoleted in macOS 9.0 - use ATSFontGetFullPostScriptName"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "only available on macOS 10.8 or newer"
+    },
+    {
+      "kind": "warning",
+      "msg": "only available on macOS 10.8 or newer"
+    },
+    {
+      "kind": "warning",
+      "msg": "only available on macOS 10.8 or newer"
+    },
+    {
+      "kind": "warning",
+      "msg": "does not guard availability here"
+    },
+    {
+      "kind": "warning",
+      "msg": "only available on macOS 10.8 or newer"
+    },
+    {
+      "kind": "warning",
+      "msg": "attribute 'availability' is ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "feature cannot be deprecated in iOS version 3.0 before it was introduced in version 4.0; attribute ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "feature cannot be deprecated in iOS version 3.0 before it was introduced in version 4.0; attribute ignored"
+    },
+    {
+      "kind": "note",
+      "msg": "previous attribute is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "availability does not match previous declaration"
+    },
+    {
+      "kind": "note",
+      "msg": "previous attribute is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "availability does not match previous declaration"
+    },
+    {
+      "kind": "warning",
+      "msg": "'availability' attribute only applies to named declarations"
+    },
+    {
+      "kind": "note",
+      "msg": "previous attribute is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "availability does not match previous declaration"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "deprecated"
+    },
+    {
+      "kind": "error",
+      "msg": "unavailable"
+    },
+    {
+      "kind": "error",
+      "msg": "unavailable"
+    },
+    {
+      "kind": "warning",
+      "msg": "deprecated"
+    },
+    {
+      "kind": "error",
+      "msg": "unavailable"
+    },
+    {
+      "kind": "error",
+      "msg": "unavailable"
+    },
+    {
+      "kind": "error",
+      "msg": "unavailable"
+    },
+    {
+      "kind": "error",
+      "msg": "unavailable"
+    },
+    {
+      "kind": "error",
+      "msg": "unavailable"
+    },
+    {
+      "kind": "error",
+      "msg": "unavailable"
+    },
+    {
+      "kind": "error",
+      "msg": "unavailable"
+    },
+    {
+      "kind": "error",
+      "msg": "unavailable"
+    },
+    {
+      "kind": "error",
+      "msg": "unavailable"
+    },
+    {
+      "kind": "error",
+      "msg": "unavailable"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "%-D --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-availability.sft.c",
+  "remark": null,
+  "sha256": "73de3d0210ac6dfd6fb0acd389a604dd5321bf84772186038465d8805b0a0d66",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,34 @@
+{
+  "bytes": 3026,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'x' causes a section type conflict with a prior #pragma section"
+    },
+    {
+      "kind": "note",
+      "msg": "declared here"
+    },
+    {
+      "kind": "error",
+      "msg": "this causes a section type conflict with 'y'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 28,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/pragma-clang-section.sft.c",
+  "remark": null,
+  "sha256": "1eaa3670021d5299c1b280c7cfb0db821431f17cee605dd0984286f762eadf81",
+  "test_number_uses": 0,
+  "type": "fn"
+}

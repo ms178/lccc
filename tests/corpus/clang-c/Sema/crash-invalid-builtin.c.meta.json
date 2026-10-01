@@ -1,0 +1,26 @@
+{
+  "bytes": 407,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "type specifier missing, defaults to 'int'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/crash-invalid-builtin.sft.c",
+  "remark": null,
+  "sha256": "ca2e6fbea11916584c4b3f5bb44793cb9a4a74884dff5c2f24996db372c21dfb",
+  "test_number_uses": 0,
+  "type": "fn"
+}

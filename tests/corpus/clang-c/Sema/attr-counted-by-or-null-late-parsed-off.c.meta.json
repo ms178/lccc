@@ -1,0 +1,26 @@
+{
+  "bytes": 827,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 10,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "%-DNEEDS_LATE_PARSING %-DNEEDS_LATE_PARSING --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-counted-by-or-null-late-parsed-off.sft.c",
+  "remark": null,
+  "sha256": "43bfa69e51640291a6d39fbc83ecc13e1f52a8dabb51d3e513b06bb831b50d10",
+  "test_number_uses": 0,
+  "type": "fn"
+}

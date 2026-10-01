@@ -1,0 +1,26 @@
+{
+  "bytes": 588,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "passing a type argument as the first operand to '_Generic' is incompatible with C standards before C2y"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 9,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C2y/n3260.sft.c",
+  "remark": null,
+  "sha256": "84c944fc8823e63373f5e8b0ab669747ba47ac58057a0639cf1c76057006830a",
+  "test_number_uses": 0,
+  "type": "fp"
+}

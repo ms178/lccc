@@ -1,0 +1,30 @@
+{
+  "bytes": 869,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "cannot convert between vector values of different size"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion loses integer precision"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/ext_vector_conversions.sft.c",
+  "remark": null,
+  "sha256": "fea9e639e1ddb9383124dc33a4bbcadda4fbe6f840411ee9ed9c3b135fcba20b",
+  "test_number_uses": 0,
+  "type": "fn"
+}

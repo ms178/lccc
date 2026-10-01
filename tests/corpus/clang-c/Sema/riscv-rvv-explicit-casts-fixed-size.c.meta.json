@@ -1,0 +1,21 @@
+{
+  "bytes": 2750,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 14,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/riscv-rvv-explicit-casts-fixed-size.sft.c",
+  "remark": null,
+  "sha256": "eca7e16e486452f525d10dcff9a5f1df0aa2476bf7cb7cfff947b49c888f9040",
+  "test_number_uses": 0,
+  "type": "fp"
+}

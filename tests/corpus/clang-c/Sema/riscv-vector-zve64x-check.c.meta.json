@@ -1,0 +1,102 @@
+{
+  "bytes": 2512,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_int8mf8_t' requires the 'zve64x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_int8mf8_t' requires the 'zve64x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_int8mf8_t' requires the 'zve64x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_int8mf8_t' requires the 'zve64x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_int16mf4_t' requires the 'zve64x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_int16mf4_t' requires the 'zve64x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_int16mf4_t' requires the 'zve64x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_int16mf4_t' requires the 'zve64x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_int32mf2_t' requires the 'zve64x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_int32mf2_t' requires the 'zve64x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_int32mf2_t' requires the 'zve64x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_int32mf2_t' requires the 'zve64x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_int64m1_t' requires the 'zve64x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_int64m1_t' requires the 'zve64x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_int64m1_t' requires the 'zve64x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_int64m1_t' requires the 'zve64x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_bool64_t' requires the 'zve64x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_bool64_t' requires the 'zve64x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_bool64_t' requires the 'zve64x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_bool64_t' requires the 'zve64x' extension"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 10,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/riscv-vector-zve64x-check.sft.c",
+  "remark": null,
+  "sha256": "37f6490b8bffdd2a48ca59de75e10dcae2cffbf0772b222aa127fd2d28a0b5cb",
+  "test_number_uses": 0,
+  "type": "fn"
+}

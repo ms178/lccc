@@ -1,0 +1,198 @@
+{
+  "bytes": 9425,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call, expected 4, have 3"
+    },
+    {
+      "kind": "error",
+      "msg": "synchronization scope argument to atomic operation is invalid"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call, expected 3, have 2"
+    },
+    {
+      "kind": "error",
+      "msg": "synchronization scope argument to atomic operation is invalid"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call, expected 4, have 3"
+    },
+    {
+      "kind": "error",
+      "msg": "synchronization scope argument to atomic operation is invalid"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call, expected 4, have 3"
+    },
+    {
+      "kind": "error",
+      "msg": "synchronization scope argument to atomic operation is invalid"
+    },
+    {
+      "kind": "error",
+      "msg": "address argument to atomic builtin must be a pointer ('int' invalid)"
+    },
+    {
+      "kind": "error",
+      "msg": "address argument to atomic builtin must be a pointer ('int' invalid)"
+    },
+    {
+      "kind": "error",
+      "msg": "address argument to atomic builtin must be a pointer ('int' invalid)"
+    },
+    {
+      "kind": "error",
+      "msg": "address argument to atomic builtin must be a pointer ('int' invalid)"
+    },
+    {
+      "kind": "error",
+      "msg": "address argument to atomic builtin must be a pointer ('int' invalid)"
+    },
+    {
+      "kind": "error",
+      "msg": "address argument to atomic builtin must be a pointer ('int' invalid)"
+    },
+    {
+      "kind": "error",
+      "msg": "address argument to atomic builtin must be a pointer ('int' invalid)"
+    },
+    {
+      "kind": "error",
+      "msg": "address argument to atomic builtin must be a pointer ('int' invalid)"
+    },
+    {
+      "kind": "error",
+      "msg": "address argument to atomic builtin must be a pointer ('int' invalid)"
+    },
+    {
+      "kind": "error",
+      "msg": "address argument to atomic builtin must be a pointer ('int' invalid)"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call, expected 4, have 3"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call, expected 4, have 3"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call, expected 4, have 3"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call, expected 4, have 3"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call, expected 4, have 3"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call, expected 4, have 3"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call, expected 4, have 3"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call, expected 4, have 3"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call, expected 4, have 3"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call, expected 4, have 3"
+    },
+    {
+      "kind": "error",
+      "msg": "synchronization scope argument to atomic operation is invalid"
+    },
+    {
+      "kind": "error",
+      "msg": "synchronization scope argument to atomic operation is invalid"
+    },
+    {
+      "kind": "error",
+      "msg": "synchronization scope argument to atomic operation is invalid"
+    },
+    {
+      "kind": "error",
+      "msg": "synchronization scope argument to atomic operation is invalid"
+    },
+    {
+      "kind": "error",
+      "msg": "synchronization scope argument to atomic operation is invalid"
+    },
+    {
+      "kind": "error",
+      "msg": "synchronization scope argument to atomic operation is invalid"
+    },
+    {
+      "kind": "error",
+      "msg": "synchronization scope argument to atomic operation is invalid"
+    },
+    {
+      "kind": "error",
+      "msg": "synchronization scope argument to atomic operation is invalid"
+    },
+    {
+      "kind": "error",
+      "msg": "synchronization scope argument to atomic operation is invalid"
+    },
+    {
+      "kind": "error",
+      "msg": "synchronization scope argument to atomic operation is invalid"
+    },
+    {
+      "kind": "error",
+      "msg": "address argument to atomic operation must be a pointer to integer ('float *' invalid)"
+    },
+    {
+      "kind": "error",
+      "msg": "address argument to atomic operation must be a pointer to integer ('float *' invalid)"
+    },
+    {
+      "kind": "error",
+      "msg": "address argument to atomic operation must be a pointer to integer ('float *' invalid)"
+    },
+    {
+      "kind": "error",
+      "msg": "address argument to atomic operation must be a pointer to integer ('float *' invalid)"
+    },
+    {
+      "kind": "error",
+      "msg": "address argument to atomic operation must be a pointer to integer ('float *' invalid)"
+    },
+    {
+      "kind": "error",
+      "msg": "address argument to atomic operation must be a pointer to integer ('float *' invalid)"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/scoped-atomic-ops.sft.c",
+  "remark": null,
+  "sha256": "6e92cb08790d6252a20825431fc396ee6655e34e138ed210a07c8e9d786a86de",
+  "test_number_uses": 0,
+  "type": "fn"
+}

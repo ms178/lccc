@@ -1,0 +1,130 @@
+{
+  "bytes": 5874,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'scanf' may overflow; destination buffer in argument 4 has size 10, but the corresponding specifier may require size 11"
+    },
+    {
+      "kind": "warning",
+      "msg": "'scanf' may overflow; destination buffer in argument 4 has size 10, but the corresponding specifier may require size 12"
+    },
+    {
+      "kind": "warning",
+      "msg": "'scanf' may overflow; destination buffer in argument 2 has size 20, but the corresponding specifier may require size 21"
+    },
+    {
+      "kind": "warning",
+      "msg": "'scanf' may overflow; destination buffer in argument 2 has size 20, but the corresponding specifier may require size 22"
+    },
+    {
+      "kind": "warning",
+      "msg": "'scanf' may overflow; destination buffer in argument 2 has size 10, but the corresponding specifier may require size 11"
+    },
+    {
+      "kind": "warning",
+      "msg": "'scanf' may overflow; destination buffer in argument 2 has size 10, but the corresponding specifier may require size 11"
+    },
+    {
+      "kind": "warning",
+      "msg": "'scanf' may overflow; destination buffer in argument 4 has size 10, but the corresponding specifier may require size 11"
+    },
+    {
+      "kind": "warning",
+      "msg": "'scanf' may overflow; destination buffer in argument 4 has size 10, but the corresponding specifier may require size 12"
+    },
+    {
+      "kind": "warning",
+      "msg": "'scanf' may overflow; destination buffer in argument 2 has size 20, but the corresponding specifier may require size 21"
+    },
+    {
+      "kind": "warning",
+      "msg": "'scanf' may overflow; destination buffer in argument 2 has size 20, but the corresponding specifier may require size 22"
+    },
+    {
+      "kind": "warning",
+      "msg": "'scanf' may overflow; destination buffer in argument 4 has size 10, but the corresponding specifier may require size 11"
+    },
+    {
+      "kind": "warning",
+      "msg": "'scanf' may overflow; destination buffer in argument 2 has size 20, but the corresponding specifier may require size 21"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sscanf' may overflow; destination buffer in argument 5 has size 10, but the corresponding specifier may require size 11"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sscanf' may overflow; destination buffer in argument 5 has size 10, but the corresponding specifier may require size 12"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sscanf' may overflow; destination buffer in argument 3 has size 20, but the corresponding specifier may require size 21"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sscanf' may overflow; destination buffer in argument 3 has size 20, but the corresponding specifier may require size 22"
+    },
+    {
+      "kind": "warning",
+      "msg": "'fscanf' may overflow; destination buffer in argument 5 has size 10, but the corresponding specifier may require size 11"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "'fscanf' may overflow; destination buffer in argument 5 has size 10, but the corresponding specifier may require size 12"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "'fscanf' may overflow; destination buffer in argument 3 has size 20, but the corresponding specifier may require size 21"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "'fscanf' may overflow; destination buffer in argument 3 has size 20, but the corresponding specifier may require size 22"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-fortify-scanf.sft.c",
+  "remark": null,
+  "sha256": "7fbe68aba5756a95445176b8828751a57b96efa610804ee9a7c8f77d70158dca",
+  "test_number_uses": 0,
+  "type": "fp"
+}

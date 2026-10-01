@@ -1,0 +1,21 @@
+{
+  "bytes": 3125,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 21,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/pragma-pack-2.sft.c",
+  "remark": null,
+  "sha256": "9525a40493e9e4d4b96130ba55cf8c9122736c78a3fcf9a01f11bb4aabc2646f",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,26 @@
+{
+  "bytes": 198,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "no-diagnostics",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/negative-shift-wrapv.sft.c",
+  "remark": null,
+  "sha256": "093d6ea26a3a8494eaf3cbfee287f8224c2178692ebf2ed5050a2256de14a3a9",
+  "test_number_uses": 0,
+  "type": "fp"
+}

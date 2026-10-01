@@ -1,0 +1,38 @@
+{
+  "bytes": 1745,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'const' qualifier on function type 'f' (aka 'int (void)') has no effect"
+    },
+    {
+      "kind": "warning",
+      "msg": "'volatile' qualifier on function type 'f' (aka 'int (void)') has no effect"
+    },
+    {
+      "kind": "warning",
+      "msg": "'const' qualifier on function type 'f' (aka 'int (void)') has no effect"
+    },
+    {
+      "kind": "warning",
+      "msg": "'volatile' qualifier on function type 'f' (aka 'int (void)') has no effect"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 12,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C2y/n3342.sft.c",
+  "remark": null,
+  "sha256": "92e7a165aa39581d16a49132b332135deaae6a72ef5e4e79a1254f0f997e1b33",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,42 @@
+{
+  "bytes": 563,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "while loop outside of a function"
+    },
+    {
+      "kind": "error",
+      "msg": "while loop outside of a function"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting types for 'overload_return'"
+    },
+    {
+      "kind": "error",
+      "msg": "while loop outside of a function"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/while-loop-outside-function.sft.c",
+  "remark": null,
+  "sha256": "8763f8dec0c60492272674a656363fc8ff244009542bc59bc081a098c4355e3e",
+  "test_number_uses": 0,
+  "type": "fn"
+}

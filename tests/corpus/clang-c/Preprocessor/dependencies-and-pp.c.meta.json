@@ -1,0 +1,21 @@
+{
+  "bytes": 1295,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 45,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/dependencies-and-pp.sft.c",
+  "remark": null,
+  "sha256": "19beaf564c8edd98bdff302799bf271735b5f962bd22e6df9dd00ccb19111006",
+  "test_number_uses": 0,
+  "type": "fp"
+}

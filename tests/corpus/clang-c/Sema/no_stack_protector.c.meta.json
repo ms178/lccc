@@ -1,0 +1,30 @@
+{
+  "bytes": 492,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'no_stack_protector' attribute only applies to functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'no_stack_protector' attribute takes no arguments"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/no_stack_protector.sft.c",
+  "remark": null,
+  "sha256": "5d39f344003981e04cfd7161aed83a51758a1e83420201b79e273aa64c7861e4",
+  "test_number_uses": 0,
+  "type": "fn"
+}

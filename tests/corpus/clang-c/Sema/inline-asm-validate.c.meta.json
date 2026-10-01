@@ -1,0 +1,26 @@
+{
+  "bytes": 421,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "value size does not match register size specified by the constraint and modifier"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/inline-asm-validate.sft.c",
+  "remark": null,
+  "sha256": "86bdada4146620a570c639939430d0413202f42c0b192f05c374537b3d2187f2",
+  "test_number_uses": 0,
+  "type": "fp"
+}

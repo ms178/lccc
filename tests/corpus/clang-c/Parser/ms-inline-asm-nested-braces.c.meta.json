@@ -1,0 +1,38 @@
+{
+  "bytes": 325,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "to match this"
+    },
+    {
+      "kind": "note",
+      "msg": "to match this"
+    },
+    {
+      "kind": "note",
+      "msg": "to match this"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/ms-inline-asm-nested-braces.sft.c",
+  "remark": null,
+  "sha256": "86af735c22b4d19a6a38509c96cd32444b74e7fa4c69fc86e872df775fea941e",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,54 @@
+{
+  "bytes": 1431,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'warning' attribute takes one argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'warning' attribute only applies to functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'warning' attribute cannot be applied to a statement"
+    },
+    {
+      "kind": "error",
+      "msg": "expected string literal as argument of 'warning' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "'error' and 'warning' attributes are not compatible"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "'warning' attribute does not appear on the first declaration"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-warning.sft.c",
+  "remark": null,
+  "sha256": "f823aadd409b76582ab68a5103c6d4367bf133f6c7b3872d3f1bc2ea260f5c81",
+  "test_number_uses": 0,
+  "type": "fn"
+}

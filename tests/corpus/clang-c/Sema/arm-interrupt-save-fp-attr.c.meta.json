@@ -1,0 +1,42 @@
+{
+  "bytes": 1561,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "`interrupt_save_fp` only applies to targets that have a VFP unit enabled for this compilation; this will be treated as a regular `interrupt` attribute"
+    },
+    {
+      "kind": "warning",
+      "msg": "'interrupt_save_fp' attribute argument not supported: irq"
+    },
+    {
+      "kind": "error",
+      "msg": "'interrupt_save_fp' attribute requires a string"
+    },
+    {
+      "kind": "error",
+      "msg": "'interrupt_save_fp' attribute takes no more than 1 argument"
+    },
+    {
+      "kind": "error",
+      "msg": "interrupt service routine cannot be called directly"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/arm-interrupt-save-fp-attr.sft.c",
+  "remark": null,
+  "sha256": "008c670d196e576dc0d42203190da504be5daf8e8ec9b32f76dba366fdf246c9",
+  "test_number_uses": 0,
+  "type": "fn"
+}

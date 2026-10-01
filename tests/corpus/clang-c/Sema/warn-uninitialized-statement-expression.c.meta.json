@@ -1,0 +1,38 @@
+{
+  "bytes": 1208,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "variable 'i' is uninitialized when used within its own initialization"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'my_widget' is uninitialized when used within its own initialization"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'a' is uninitialized when used within its own initialization"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'a' is uninitialized when used within its own initialization"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-uninitialized-statement-expression.sft.c",
+  "remark": null,
+  "sha256": "7af45538828df98d9b305733c9418d501b4d8174f3abd5b845df524bd015a255",
+  "test_number_uses": 0,
+  "type": "fp"
+}

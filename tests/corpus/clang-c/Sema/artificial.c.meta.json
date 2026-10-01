@@ -1,0 +1,26 @@
+{
+  "bytes": 251,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'artificial' attribute only applies to inline functions"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/artificial.sft.c",
+  "remark": null,
+  "sha256": "cc2b188ab03f6b9e7d786cb5347d3a83a64b54c07d970614ae90c46680195c47",
+  "test_number_uses": 0,
+  "type": "fp"
+}

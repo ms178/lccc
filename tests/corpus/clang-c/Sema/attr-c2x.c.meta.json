@@ -1,0 +1,38 @@
+{
+  "bytes": 1838,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "'foo2' has been explicitly marked unavailable here"
+    },
+    {
+      "kind": "error",
+      "msg": "'foo2' is unavailable: not available - replaced"
+    },
+    {
+      "kind": "warning",
+      "msg": "unknown attribute 'gnu::abi_tag' ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "unknown attribute 'gnu::init_priority' ignored"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-c2x.sft.c",
+  "remark": null,
+  "sha256": "e1e37d5a23b7a92a9c8df956d175fb6cef76bbaf582b7edfa0a894e720f6c768",
+  "test_number_uses": 0,
+  "type": "fn"
+}

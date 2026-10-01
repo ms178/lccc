@@ -1,0 +1,21 @@
+{
+  "bytes": 59690,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 1168,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "AARCH64-DARWIN AARCH64-DARWIN-CXX -w -w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/init-aarch64.sft.c",
+  "remark": null,
+  "sha256": "36453174b5a72b7786e3429bc11387a1f8783d123dbe1c5788d97a5a1ddea582",
+  "test_number_uses": 0,
+  "type": "fp"
+}

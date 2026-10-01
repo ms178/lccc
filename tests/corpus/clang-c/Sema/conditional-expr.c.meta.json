@@ -1,0 +1,178 @@
+{
+  "bytes": 6400,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "incomplete type 'void' is not assignable"
+    },
+    {
+      "kind": "warning",
+      "msg": "ISO C does not allow indirection on operand of type 'void *'"
+    },
+    {
+      "kind": "error",
+      "msg": "incomplete type 'void' is not assignable"
+    },
+    {
+      "kind": "warning",
+      "msg": "ISO C does not allow indirection on operand of type 'void *'"
+    },
+    {
+      "kind": "error",
+      "msg": "incomplete type 'void' is not assignable"
+    },
+    {
+      "kind": "warning",
+      "msg": "pointer type mismatch ('double *' and 'int *')"
+    },
+    {
+      "kind": "warning",
+      "msg": "ISO C does not allow indirection on operand of type 'void *'"
+    },
+    {
+      "kind": "error",
+      "msg": "incomplete type 'void' is not assignable"
+    },
+    {
+      "kind": "warning",
+      "msg": "ISO C does not allow indirection on operand of type 'void *'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer types assigning to 'int *' from 'double *'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer types assigning to 'double *' from 'int *'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer types assigning to 'int *' from 'double *'"
+    },
+    {
+      "kind": "warning",
+      "msg": "discards qualifiers"
+    },
+    {
+      "kind": "warning",
+      "msg": "discards qualifiers"
+    },
+    {
+      "kind": "warning",
+      "msg": "pointer type mismatch"
+    },
+    {
+      "kind": "warning",
+      "msg": "operand of ? changes signedness: 'long' to 'unsigned long'"
+    },
+    {
+      "kind": "warning",
+      "msg": "operand of ? changes signedness: 'int' to 'unsigned long'"
+    },
+    {
+      "kind": "warning",
+      "msg": "operand of ? changes signedness: 'short' to 'unsigned long'"
+    },
+    {
+      "kind": "warning",
+      "msg": "operand of ? changes signedness: 'long' to 'unsigned long'"
+    },
+    {
+      "kind": "warning",
+      "msg": "operand of ? changes signedness: 'int' to 'unsigned long'"
+    },
+    {
+      "kind": "warning",
+      "msg": "operand of ? changes signedness: 'short' to 'unsigned long'"
+    },
+    {
+      "kind": "warning",
+      "msg": "operand of ? changes signedness: 'int' to 'unsigned long'"
+    },
+    {
+      "kind": "warning",
+      "msg": "operand of ? changes signedness: 'int' to 'unsigned long'"
+    },
+    {
+      "kind": "warning",
+      "msg": "operand of ? changes signedness: 'int' to 'unsigned long'"
+    },
+    {
+      "kind": "error",
+      "msg": "read-only variable is not assignable"
+    },
+    {
+      "kind": "error",
+      "msg": "read-only variable is not assignable"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression result unused"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression result unused"
+    },
+    {
+      "kind": "error",
+      "msg": "conditional operator with the second and third operands of type  ('__attribute__((address_space(2))) int *' and '__attribute__((address_space(3))) int *') which are pointers to non-overlapping address spaces"
+    },
+    {
+      "kind": "error",
+      "msg": "conditional operator with the second and third operands of type  ('__attribute__((address_space(2))) int *' and 'int *') which are pointers to non-overlapping address spaces"
+    },
+    {
+      "kind": "warning",
+      "msg": "C99 forbids conditional expressions with only one void side"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of address of 'x' not equal to a null pointer is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "pointer/integer type mismatch in conditional expression ('int' and 'void *')"
+    },
+    {
+      "kind": "error",
+      "msg": "non-pointer operand type 'struct A' incompatible with NULL"
+    },
+    {
+      "kind": "error",
+      "msg": "non-pointer operand type 'struct A' incompatible with NULL"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible operand types"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible operand types"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible operand types"
+    },
+    {
+      "kind": "error",
+      "msg": "non-pointer operand type 'struct A' incompatible with NULL"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 3,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/conditional-expr.sft.c",
+  "remark": null,
+  "sha256": "4f87d27cc29a9a11e907383f48c4790e10fe10416d3be5b5adc43db545975e05",
+  "test_number_uses": 0,
+  "type": "fn"
+}

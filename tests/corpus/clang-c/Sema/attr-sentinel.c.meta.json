@@ -1,0 +1,94 @@
+{
+  "bytes": 2633,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": "function has been explicitly marked sentinel here"
+    },
+    {
+      "kind": "note",
+      "msg": "function has been explicitly marked sentinel here"
+    },
+    {
+      "kind": "note",
+      "msg": "function has been explicitly marked sentinel here"
+    },
+    {
+      "kind": "note",
+      "msg": "function has been explicitly marked sentinel here"
+    },
+    {
+      "kind": "warning",
+      "msg": "missing sentinel in function call"
+    },
+    {
+      "kind": "warning",
+      "msg": "missing sentinel in function call"
+    },
+    {
+      "kind": "warning",
+      "msg": "missing sentinel in function call"
+    },
+    {
+      "kind": "warning",
+      "msg": "not enough variable arguments in 'foo7' declaration to fit a sentinel"
+    },
+    {
+      "kind": "warning",
+      "msg": "not enough variable arguments in 'foo12' declaration to fit a sentinel"
+    },
+    {
+      "kind": "warning",
+      "msg": "missing sentinel in function call"
+    },
+    {
+      "kind": "warning",
+      "msg": "missing sentinel in function call"
+    },
+    {
+      "kind": "note",
+      "msg": "function has been explicitly marked sentinel here"
+    },
+    {
+      "kind": "note",
+      "msg": "function has been explicitly marked sentinel here"
+    },
+    {
+      "kind": "note",
+      "msg": "function has been explicitly marked sentinel here"
+    },
+    {
+      "kind": "warning",
+      "msg": "missing sentinel in function call"
+    },
+    {
+      "kind": "warning",
+      "msg": "missing sentinel in function call"
+    },
+    {
+      "kind": "warning",
+      "msg": "missing sentinel in function call"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-sentinel.sft.c",
+  "remark": null,
+  "sha256": "04cc5cd70ef84ef93a333bbc1b34eebcdfe3c8fbfc3e137b760c706ef2ba7638",
+  "test_number_uses": 0,
+  "type": "fp"
+}

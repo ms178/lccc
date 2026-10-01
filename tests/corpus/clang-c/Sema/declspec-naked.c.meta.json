@@ -1,0 +1,26 @@
+{
+  "bytes": 544,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 9,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w -w -w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/declspec-naked.sft.c",
+  "remark": null,
+  "sha256": "577ff374788c643051bc30aa4b32fa952b94f7ecf19e4049433155b08db69074",
+  "test_number_uses": 0,
+  "type": "fn"
+}

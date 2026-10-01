@@ -1,0 +1,86 @@
+{
+  "bytes": 3191,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'int' but the argument has type 'long'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'char *' but the argument has type 'long'"
+    },
+    {
+      "kind": "warning",
+      "msg": "more '%' conversions than data arguments"
+    },
+    {
+      "kind": "warning",
+      "msg": "data argument not used by format string"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'void *' but the argument has type 'int'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'char *' but the argument has type 'int'"
+    },
+    {
+      "kind": "warning",
+      "msg": "more '%' conversions than data arguments"
+    },
+    {
+      "kind": "warning",
+      "msg": "data argument not used by format string"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'void *' but the argument has type 'int'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'char *' but the argument has type 'int'"
+    },
+    {
+      "kind": "warning",
+      "msg": "more '%' conversions than data arguments"
+    },
+    {
+      "kind": "warning",
+      "msg": "data argument not used by format string"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'int' but the argument has type 'long'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'long' but the argument has type 'int'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'int' but the argument has type 'long'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'long' but the argument has type 'int'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/format-strings-freebsd.sft.c",
+  "remark": null,
+  "sha256": "56b5897f32f6ce3a544ede01d044d917a44a8876942b536ad37b9aa25cbc496e",
+  "test_number_uses": 0,
+  "type": "fp"
+}

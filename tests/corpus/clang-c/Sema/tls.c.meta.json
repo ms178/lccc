@@ -1,0 +1,21 @@
+{
+  "bytes": 885,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 24,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w -w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/tls.sft.c",
+  "remark": null,
+  "sha256": "ac2b7729dc1589edd1b92aa2a2373559c0153625698f1e9c1654d6ebce9fff8d",
+  "test_number_uses": 0,
+  "type": "fp"
+}

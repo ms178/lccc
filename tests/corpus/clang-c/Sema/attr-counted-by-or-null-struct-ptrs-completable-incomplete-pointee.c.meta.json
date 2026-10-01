@@ -1,0 +1,550 @@
+{
+  "bytes": 44132,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "arithmetic on a pointer to an incomplete type 'struct IncompleteTy'"
+    },
+    {
+      "kind": "error",
+      "msg": "arithmetic on a pointer to an incomplete type 'struct IncompleteTy'"
+    },
+    {
+      "kind": "error",
+      "msg": "arithmetic on a pointer to an incomplete type 'struct IncompleteTy'"
+    },
+    {
+      "kind": "error",
+      "msg": "arithmetic on a pointer to an incomplete type 'Incomplete_t' (aka 'struct IncompleteTy')"
+    },
+    {
+      "kind": "error",
+      "msg": "arithmetic on a pointer to an incomplete type 'Incomplete_t' (aka 'struct IncompleteTy')"
+    },
+    {
+      "kind": "error",
+      "msg": "arithmetic on a pointer to an incomplete type 'Incomplete_t' (aka 'struct IncompleteTy')"
+    },
+    {
+      "kind": "error",
+      "msg": "arithmetic on a pointer to an incomplete type 'struct IncompleteTy'"
+    },
+    {
+      "kind": "error",
+      "msg": "arithmetic on a pointer to an incomplete type 'struct IncompleteTy'"
+    },
+    {
+      "kind": "error",
+      "msg": "arithmetic on a pointer to an incomplete type 'struct IncompleteTy'"
+    },
+    {
+      "kind": "error",
+      "msg": "arithmetic on a pointer to an incomplete type 'Incomplete_t' (aka 'struct IncompleteTy')"
+    },
+    {
+      "kind": "error",
+      "msg": "arithmetic on a pointer to an incomplete type 'Incomplete_t' (aka 'struct IncompleteTy')"
+    },
+    {
+      "kind": "error",
+      "msg": "arithmetic on a pointer to an incomplete type 'Incomplete_t' (aka 'struct IncompleteTy')"
+    },
+    {
+      "kind": "error",
+      "msg": "arithmetic on a pointer to an incomplete type 'struct IncompleteTy'"
+    },
+    {
+      "kind": "error",
+      "msg": "arithmetic on a pointer to an incomplete type 'struct IncompleteTy'"
+    },
+    {
+      "kind": "error",
+      "msg": "arithmetic on a pointer to an incomplete type 'struct IncompleteTy'"
+    },
+    {
+      "kind": "error",
+      "msg": "arithmetic on a pointer to an incomplete type 'struct IncompleteTy'"
+    },
+    {
+      "kind": "error",
+      "msg": "arithmetic on a pointer to an incomplete type 'struct IncompleteTy'"
+    },
+    {
+      "kind": "error",
+      "msg": "arithmetic on a pointer to an incomplete type 'struct IncompleteTy'"
+    },
+    {
+      "kind": "error",
+      "msg": "arithmetic on a pointer to an incomplete type 'Incomplete_t' (aka 'struct IncompleteTy')"
+    },
+    {
+      "kind": "error",
+      "msg": "arithmetic on a pointer to an incomplete type 'Incomplete_t' (aka 'struct IncompleteTy')"
+    },
+    {
+      "kind": "error",
+      "msg": "arithmetic on a pointer to an incomplete type 'Incomplete_t' (aka 'struct IncompleteTy')"
+    },
+    {
+      "kind": "error",
+      "msg": "arithmetic on a pointer to an incomplete type 'Incomplete_t' (aka 'struct IncompleteTy')"
+    },
+    {
+      "kind": "error",
+      "msg": "arithmetic on a pointer to an incomplete type 'Incomplete_t' (aka 'struct IncompleteTy')"
+    },
+    {
+      "kind": "error",
+      "msg": "arithmetic on a pointer to an incomplete type 'Incomplete_t' (aka 'struct IncompleteTy')"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 19,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-counted-by-or-null-struct-ptrs-completable-incomplete-pointee.sft.c",
+  "remark": null,
+  "sha256": "1eb88da41f9c7f7bf4db8e787418fa068886e5c6f856b4985ffb4e6e33906aea",
+  "test_number_uses": 0,
+  "type": "fn"
+}

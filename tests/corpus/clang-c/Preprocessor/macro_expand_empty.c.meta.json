@@ -1,0 +1,21 @@
+{
+  "bytes": 957,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 16,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/macro_expand_empty.sft.c",
+  "remark": null,
+  "sha256": "ababfacb144ebb6500c6da65fa01d63b4ec4956db31db033ce3ae77e8448a818",
+  "test_number_uses": 0,
+  "type": "fp"
+}

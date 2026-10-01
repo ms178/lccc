@@ -1,0 +1,30 @@
+{
+  "bytes": 484,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "argument to '__builtin_arm_tcancel' must be a constant integer"
+    },
+    {
+      "kind": "error",
+      "msg": "argument value 74565 is outside the valid range [0, 65535]"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 3,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c --target linux_aarch64"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/aarch64-tme-tcancel-errors.sft.c",
+  "remark": null,
+  "sha256": "813418ddb8d23c09299d9bd34d8c53640248ddef7c9b571c01d011d5d576ffb9",
+  "test_number_uses": 0,
+  "type": "fn"
+}

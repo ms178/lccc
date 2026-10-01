@@ -1,0 +1,21 @@
+{
+  "bytes": 674,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 30,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DPEDANTIC --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/expr_define_expansion.sft.c",
+  "remark": null,
+  "sha256": "f4d78e3dcef9fc54e9f48c572925e8749d38566387cda7a73cada6f84af9e376",
+  "test_number_uses": 0,
+  "type": "fn"
+}

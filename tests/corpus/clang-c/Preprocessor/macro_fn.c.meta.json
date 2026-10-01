@@ -1,0 +1,100 @@
+{
+  "bytes": 3154,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "too many arguments provided to function-like macro invocation"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments provided to function-like macro invocation"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments provided to function-like macro invocation"
+    },
+    {
+      "kind": "warning",
+      "msg": "empty macro arguments are a C99 feature"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments provided to function-like macro invocation"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments provided to function-like macro invocation"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments provided to function-like macro invocation"
+    },
+    {
+      "kind": "warning",
+      "msg": "empty macro arguments are a C99 feature"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments provided to function-like macro invocation"
+    },
+    {
+      "kind": "warning",
+      "msg": "empty macro arguments are a C99 feature"
+    },
+    {
+      "kind": "warning",
+      "msg": "empty macro arguments are a C99 feature"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments provided to function-like macro invocation"
+    },
+    {
+      "kind": "warning",
+      "msg": "empty macro arguments are a C99 feature"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "variadic macros are a C99 feature"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "variadic macros are a C99 feature"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 17,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c89",
+    " --c89 -DOMIT_VARIADIC_MACRO_ARGS -DVARIADIC_MACRO_ARGS_REMOVE_COMMA",
+    " --c89 -DOMIT_VARIADIC_MACRO_ARGS"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/macro_fn.sft.c",
+  "remark": null,
+  "sha256": "3f92acbfc59e29dfe2438516610f0b4d506c7b9204900aef9d1d6758c508d8fc",
+  "test_number_uses": 0,
+  "type": "fn"
+}

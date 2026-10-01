@@ -1,0 +1,38 @@
+{
+  "bytes": 4367,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'++' on an object of complex type is a C2y extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "'++' on an object of complex type is a C2y extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "'--' on an object of complex type is a C2y extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "'--' on an object of complex type is a C2y extension"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 10,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C2y/n3259.sft.c",
+  "remark": null,
+  "sha256": "12e1410a52a43c97e2ca6def92b5f300882f212228bd529e558bf4e369efa6ce",
+  "test_number_uses": 0,
+  "type": "fp"
+}

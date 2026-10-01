@@ -1,0 +1,21 @@
+{
+  "bytes": 956,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/incompatible-function-pointer-types-strict.sft.c",
+  "remark": null,
+  "sha256": "b30a64da9ee45b4ee9a4262f09d440e67a8f9673cdc19d87265e31dccfa68309",
+  "test_number_uses": 0,
+  "type": "fp"
+}

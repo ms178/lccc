@@ -1,0 +1,21 @@
+{
+  "bytes": 445,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/x86_64-linux-android.sft.c",
+  "remark": null,
+  "sha256": "8c41a254819afe2872b9e0adebb6406fc3e39ce3968a04099444ddbcbfe0a138",
+  "test_number_uses": 0,
+  "type": "fp"
+}

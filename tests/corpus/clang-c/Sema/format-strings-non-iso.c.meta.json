@@ -1,0 +1,66 @@
+{
+  "bytes": 1989,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'q' length modifier is not supported by ISO C"
+    },
+    {
+      "kind": "warning",
+      "msg": "'q' length modifier is not supported by ISO C"
+    },
+    {
+      "kind": "warning",
+      "msg": "'m' length modifier is not supported by ISO C"
+    },
+    {
+      "kind": "warning",
+      "msg": "'S' conversion specifier is not supported by ISO C"
+    },
+    {
+      "kind": "warning",
+      "msg": "'C' conversion specifier is not supported by ISO C"
+    },
+    {
+      "kind": "warning",
+      "msg": "using length modifier 'L' with conversion specifier 'i' is not supported by ISO C"
+    },
+    {
+      "kind": "warning",
+      "msg": "using length modifier 'L' with conversion specifier 'o' is not supported by ISO C"
+    },
+    {
+      "kind": "warning",
+      "msg": "using length modifier 'L' with conversion specifier 'u' is not supported by ISO C"
+    },
+    {
+      "kind": "warning",
+      "msg": "using length modifier 'L' with conversion specifier 'x' is not supported by ISO C"
+    },
+    {
+      "kind": "warning",
+      "msg": "using length modifier 'L' with conversion specifier 'X' is not supported by ISO C"
+    },
+    {
+      "kind": "warning",
+      "msg": "positional arguments are not supported by ISO C"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c99"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/format-strings-non-iso.sft.c",
+  "remark": null,
+  "sha256": "16f88e0dee63cff4a4222cbb444c4be4ac3b85023eebfb31bfe1aa06d3b4fa8f",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,179 @@
+{
+  "bytes": 4989,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": "'g' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "'f' is deprecated"
+    },
+    {
+      "kind": "warning",
+      "msg": "'f' is deprecated"
+    },
+    {
+      "kind": "warning",
+      "msg": "'g' is deprecated"
+    },
+    {
+      "kind": "warning",
+      "msg": "'var' is deprecated"
+    },
+    {
+      "kind": "warning",
+      "msg": "'var' is deprecated"
+    },
+    {
+      "kind": "note",
+      "msg": "'old_fn' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "warning",
+      "msg": "'old_fn' is deprecated"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "'x' is deprecated"
+    },
+    {
+      "kind": "warning",
+      "msg": "'x' is deprecated"
+    },
+    {
+      "kind": "warning",
+      "msg": "'x' is deprecated"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "'foo_dep' is deprecated"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "unknown attribute 'invalid_attribute' ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "'bar_dep' is deprecated"
+    },
+    {
+      "kind": "warning",
+      "msg": "'foo_dep' is deprecated"
+    },
+    {
+      "kind": "warning",
+      "msg": "'bar_dep' is deprecated"
+    },
+    {
+      "kind": "warning",
+      "msg": "'foo_dep' is deprecated"
+    },
+    {
+      "kind": "warning",
+      "msg": "'foo_dep' is deprecated"
+    },
+    {
+      "kind": "warning",
+      "msg": "'foo_dep' is deprecated"
+    },
+    {
+      "kind": "warning",
+      "msg": "'foo_dep' is deprecated"
+    },
+    {
+      "kind": "warning",
+      "msg": "'foo_dep' is deprecated"
+    },
+    {
+      "kind": "warning",
+      "msg": "'foo_dep' is deprecated"
+    },
+    {
+      "kind": "warning",
+      "msg": "'foo_dep' is deprecated"
+    },
+    {
+      "kind": "warning",
+      "msg": "'foo_dep' is deprecated"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": "'test20_a' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "warning",
+      "msg": "'Test20' is deprecated"
+    },
+    {
+      "kind": "warning",
+      "msg": "'test20_a' is deprecated"
+    },
+    {
+      "kind": "warning",
+      "msg": "'test20_b' is deprecated"
+    },
+    {
+      "kind": "warning",
+      "msg": "'foo_dep' is deprecated"
+    },
+    {
+      "kind": "warning",
+      "msg": "'foo_dep' is deprecated"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "'test23_ty' is deprecated"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c89",
+    " --c99"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-deprecated.sft.c",
+  "remark": null,
+  "sha256": "ef7c6f838b14963c520f65da9402ccd27bf584f3cce8d5fecad3f784414e2425",
+  "test_number_uses": 0,
+  "type": "fp"
+}

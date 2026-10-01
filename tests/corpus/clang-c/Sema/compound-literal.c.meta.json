@@ -1,0 +1,82 @@
+{
+  "bytes": 2713,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "initializer element is not a compile-time constant"
+    },
+    {
+      "kind": "error",
+      "msg": "initializer element is not a compile-time constant"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer to integer conversion initializing 'long' with an expression of type 'char[2]'"
+    },
+    {
+      "kind": "warning",
+      "msg": "empty struct is a GNU extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "use of an empty initializer is a C23 extension"
+    },
+    {
+      "kind": "note",
+      "msg": "forward declaration of 'struct Incomplete'"
+    },
+    {
+      "kind": "error",
+      "msg": "variable has incomplete type"
+    },
+    {
+      "kind": "error",
+      "msg": "compound literal cannot be of variable-length array type"
+    },
+    {
+      "kind": "error",
+      "msg": "variable has incomplete type"
+    },
+    {
+      "kind": "error",
+      "msg": "illegal initializer type 'void (void)'"
+    },
+    {
+      "kind": "warning",
+      "msg": "use of an empty initializer is a C23 extension"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "compound literal cannot be of variable-length array type"
+    },
+    {
+      "kind": "error",
+      "msg": "compound literal cannot be of variable-length array type"
+    },
+    {
+      "kind": "error",
+      "msg": "compound literal cannot be of variable-length array type"
+    }
+  ],
+  "has_main": true,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/compound-literal.sft.c",
+  "remark": null,
+  "sha256": "f9f828649e7df26e4dd9ec91d3589801243c801cb5b57b12c6f94a7cbc7ae7df",
+  "test_number_uses": 0,
+  "type": "fn"
+}

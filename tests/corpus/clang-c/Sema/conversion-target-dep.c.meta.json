@@ -1,0 +1,38 @@
+{
+  "bytes": 1450,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "implicit conversion loses floating-point precision: 'long double' to '_Float16'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion increases floating-point precision: '_Float16' to 'long double'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion when assigning computation result loses floating-point precision: 'long double' to '_Float16'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion increases floating-point precision: '_Float16' to 'long double'"
+    }
+  ],
+  "has_main": true,
+  "header_lines": 8,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/conversion-target-dep.sft.c",
+  "remark": null,
+  "sha256": "6a608682591f34cde148f9d0e1efc359310dcab03548da3c25e95142984c4250",
+  "test_number_uses": 0,
+  "type": "fp"
+}

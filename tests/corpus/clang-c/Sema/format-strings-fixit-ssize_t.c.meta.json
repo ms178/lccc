@@ -1,0 +1,23 @@
+{
+  "bytes": 810,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c99",
+    " --c99",
+    " --c99"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/format-strings-fixit-ssize_t.sft.c",
+  "remark": null,
+  "sha256": "75bd4fe5ec65ae86d162cf29cded2e7d601eb4b3958186ec42612b45bfe71d5c",
+  "test_number_uses": 0,
+  "type": "fp"
+}

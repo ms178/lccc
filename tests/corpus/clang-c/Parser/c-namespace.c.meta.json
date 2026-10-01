@@ -1,0 +1,21 @@
+{
+  "bytes": 110,
+  "cases": null,
+  "category": "Parser",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 3,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/c-namespace.sft.c",
+  "remark": null,
+  "sha256": "220427853b826feb41ea759342e840eef54dd90735255e2d4c373eab9710f5c8",
+  "test_number_uses": 0,
+  "type": "fp"
+}

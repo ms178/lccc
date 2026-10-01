@@ -1,0 +1,30 @@
+{
+  "bytes": 709,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "#pragma align(packed) may not be compatible with objects generated with AIX XL C/C++"
+    },
+    {
+      "kind": "warning",
+      "msg": "#pragma align(packed) may not be compatible with objects generated with AIX XL C/C++"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/aix-pragma-align-packed-warn.sft.c",
+  "remark": null,
+  "sha256": "7c197b40f175fb5bad914f361db4e9c0bfb3d3784c38d04de625d8f539234735",
+  "test_number_uses": 0,
+  "type": "fp"
+}

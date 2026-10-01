@@ -1,0 +1,174 @@
+{
+  "bytes": 6915,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "declared here"
+    },
+    {
+      "kind": "error",
+      "msg": "expected '__except' or '__finally' block"
+    },
+    {
+      "kind": "error",
+      "msg": "call to undeclared function '__except'; ISO C99 and later do not support implicit function declarations"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call, expected 1, have 0"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ';' after expression"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "undeclared identifier 'try_scope'"
+    },
+    {
+      "kind": "error",
+      "msg": "expected expression"
+    },
+    {
+      "kind": "error",
+      "msg": "filter expression has non-integral type 'const char *'"
+    },
+    {
+      "kind": "error",
+      "msg": "undeclared identifier"
+    },
+    {
+      "kind": "error",
+      "msg": "undeclared identifier"
+    },
+    {
+      "kind": "error",
+      "msg": "only allowed in __finally block"
+    },
+    {
+      "kind": "error",
+      "msg": "only allowed in __finally block"
+    },
+    {
+      "kind": "error",
+      "msg": "only allowed in __finally block"
+    },
+    {
+      "kind": "error",
+      "msg": "only allowed in __finally block"
+    },
+    {
+      "kind": "error",
+      "msg": "only allowed in __finally block"
+    },
+    {
+      "kind": "error",
+      "msg": "only allowed in __finally block"
+    },
+    {
+      "kind": "error",
+      "msg": "only allowed in __except filter expression"
+    },
+    {
+      "kind": "error",
+      "msg": "only allowed in __except filter expression"
+    },
+    {
+      "kind": "error",
+      "msg": "builtin functions must be directly called"
+    },
+    {
+      "kind": "error",
+      "msg": "only allowed in __except block or filter expression"
+    },
+    {
+      "kind": "error",
+      "msg": "only allowed in __except block or filter expression"
+    },
+    {
+      "kind": "error",
+      "msg": "only allowed in __except filter expression"
+    },
+    {
+      "kind": "error",
+      "msg": "'__leave' statement not in __try block"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ';' after __leave statement"
+    },
+    {
+      "kind": "error",
+      "msg": "'__leave' statement not in __try block"
+    },
+    {
+      "kind": "error",
+      "msg": "'__leave' statement not in __try block"
+    },
+    {
+      "kind": "error",
+      "msg": "'__leave' statement not in __try block"
+    },
+    {
+      "kind": "warning",
+      "msg": "jump out of __finally block has undefined behavior"
+    },
+    {
+      "kind": "warning",
+      "msg": "jump out of __finally block has undefined behavior"
+    },
+    {
+      "kind": "warning",
+      "msg": "jump out of __finally block has undefined behavior"
+    },
+    {
+      "kind": "warning",
+      "msg": "jump out of __finally block has undefined behavior"
+    },
+    {
+      "kind": "warning",
+      "msg": "jump out of __finally block has undefined behavior"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'undeclared_identifier'"
+    },
+    {
+      "kind": "warning",
+      "msg": "jump out of __finally block has undefined behavior"
+    },
+    {
+      "kind": "warning",
+      "msg": "jump out of __finally block has undefined behavior"
+    },
+    {
+      "kind": "warning",
+      "msg": "jump out of __finally block has undefined behavior"
+    },
+    {
+      "kind": "warning",
+      "msg": "jump out of __finally block has undefined behavior"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 9,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w -DBORLAND -w --ms_extensions --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/__try.sft.c",
+  "remark": null,
+  "sha256": "f9547c8bff528bbc0f9d4a5b52425ad9e3e7ff57b5852cd62835d92864cac338",
+  "test_number_uses": 0,
+  "type": "fn"
+}

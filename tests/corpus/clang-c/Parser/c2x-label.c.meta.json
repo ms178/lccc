@@ -1,0 +1,22 @@
+{
+  "bytes": 1028,
+  "cases": null,
+  "category": "Parser",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c17",
+    " --c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/c2x-label.sft.c",
+  "remark": null,
+  "sha256": "ef9fdd8ed735ea60e371124bcf6e921bf3b66533edd49ba91f522de45028895a",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,30 @@
+{
+  "bytes": 351,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'cmse_nonsecure_call' attribute ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "'cmse_nonsecure_entry' attribute ignored"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/arm-no-cmse.sft.c",
+  "remark": null,
+  "sha256": "65802bdf3e090f2bc6616a45ef5e54c11f0a6542327fc8a7ad43742fd1fea255",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,106 @@
+{
+  "bytes": 4543,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "implicit conversion increases floating-point precision: 'float' to 'double'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion increases floating-point precision: 'float' to 'long double'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion increases floating-point precision: 'double' to 'long double'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion increases floating-point precision: 'float' to 'double'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion increases floating-point precision: 'float' to 'long double'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion increases floating-point precision: 'double' to 'long double'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion increases floating-point precision: 'float' to 'double'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion increases floating-point precision: 'float' to 'long double'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion increases floating-point precision: 'double' to 'long double'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion increases floating-point precision: 'float' to 'double'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion increases floating-point precision: 'float' to 'long double'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion increases floating-point precision: 'double' to 'long double'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion increases floating-point precision: 'float' to 'double'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion increases floating-point precision: 'float' to 'double'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion increases floating-point precision: 'float' to 'long double'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion increases floating-point precision: 'float' to 'long double'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion increases floating-point precision: 'double' to 'long double'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion increases floating-point precision: 'double' to 'long double'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion increases floating-point precision: 'float' to 'double'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion increases floating-point precision: 'float' to 'long double'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion increases floating-point precision: 'double' to 'long double'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-double-promotion.sft.c",
+  "remark": null,
+  "sha256": "b07df32d14517f4995f92d3df768a07014a8e539233ed0c7244965bd2fde8bbb",
+  "test_number_uses": 0,
+  "type": "fp"
+}

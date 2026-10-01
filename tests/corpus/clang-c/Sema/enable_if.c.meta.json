@@ -1,0 +1,174 @@
+{
+  "bytes": 9483,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "candidate disabled: must specify mode when using O_CREAT"
+    },
+    {
+      "kind": "note",
+      "msg": "candidate function not viable: requires 3 arguments, but 2 were provided"
+    },
+    {
+      "kind": "error",
+      "msg": "no matching function for call to 'open'"
+    },
+    {
+      "kind": "note",
+      "msg": "'strnlen' has been explicitly marked unavailable here"
+    },
+    {
+      "kind": "error",
+      "msg": "'strnlen' is unavailable: 'maxlen' is larger than the buffer size"
+    },
+    {
+      "kind": "note",
+      "msg": "'isdigit' has been explicitly marked unavailable here"
+    },
+    {
+      "kind": "warning",
+      "msg": "ignoring return value of function declared with pure attribute"
+    },
+    {
+      "kind": "warning",
+      "msg": "ignoring return value of function declared with pure attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "'isdigit' is unavailable: 'c' must have the value of an unsigned char or EOF"
+    },
+    {
+      "kind": "note",
+      "msg": "'isdigit2' has been explicitly marked unavailable here"
+    },
+    {
+      "kind": "error",
+      "msg": "'isdigit2' is unavailable: 'c' must have the value of an unsigned char or EOF"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'n'"
+    },
+    {
+      "kind": "warning",
+      "msg": "'enable_if' attribute only applies to functions"
+    },
+    {
+      "kind": "error",
+      "msg": "expected string literal as argument of 'enable_if' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "'enable_if' attribute requires exactly 2 arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'unresolvedid'"
+    },
+    {
+      "kind": "error",
+      "msg": "'enable_if' attribute expression never produces a constant expression"
+    },
+    {
+      "kind": "error",
+      "msg": "initializing 'void (*)(void)' with an expression of incompatible type '<overloaded function type>'"
+    },
+    {
+      "kind": "error",
+      "msg": "initializing 'void (*)(void)' with an expression of incompatible type '<overloaded function type>'"
+    },
+    {
+      "kind": "error",
+      "msg": "address of overloaded function 'f2' is ambiguous"
+    },
+    {
+      "kind": "error",
+      "msg": "address of overloaded function 'f2' is ambiguous"
+    },
+    {
+      "kind": "error",
+      "msg": "initializing 'void (*)(int)' with an expression of incompatible type '<overloaded function type>'"
+    },
+    {
+      "kind": "error",
+      "msg": "initializing 'void (*)(int)' with an expression of incompatible type '<overloaded function type>'"
+    },
+    {
+      "kind": "error",
+      "msg": "address of overloaded function 'f3' does not match required type 'void'"
+    },
+    {
+      "kind": "error",
+      "msg": "address of overloaded function 'f3' does not match required type 'void'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot take address of function 'f4' because it has one or more non-tautological enable_if conditions"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot take address of function 'f4' because it has one or more non-tautological enable_if conditions"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "no matching"
+    },
+    {
+      "kind": "error",
+      "msg": "no matching"
+    },
+    {
+      "kind": "error",
+      "msg": "no matching"
+    },
+    {
+      "kind": "error",
+      "msg": "no matching"
+    },
+    {
+      "kind": "error",
+      "msg": "no matching"
+    },
+    {
+      "kind": "error",
+      "msg": "no matching"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DCODEGEN --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/enable_if.sft.c",
+  "remark": null,
+  "sha256": "7eea2428700ee9e3ddf4eb7e2f334c75d271681ec9eaea3835b33fae07481f7c",
+  "test_number_uses": 0,
+  "type": "fn"
+}

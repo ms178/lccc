@@ -1,0 +1,26 @@
+{
+  "bytes": 882,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "attribute only applies to functions"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/x86-attr-force-align-arg-pointer.sft.c",
+  "remark": null,
+  "sha256": "a98fb179b081ce48d86e6fcc7bf78d5a4e750d2ba926f3de4be262968a7f0aa7",
+  "test_number_uses": 0,
+  "type": "fp"
+}

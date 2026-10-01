@@ -1,0 +1,42 @@
+{
+  "bytes": 1905,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "duplicate 'generated_declaration' clause in an 'external_source_symbol' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "'external_source_symbol' attribute takes at least 1 argument"
+    },
+    {
+      "kind": "warning",
+      "msg": "'external_source_symbol' attribute only applies to named declarations"
+    },
+    {
+      "kind": "error",
+      "msg": "duplicate 'generated_declaration' clause in an 'external_source_symbol' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "'clang::external_source_symbol' attribute takes at least 1 argument"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-external-source-symbol.sft.c",
+  "remark": null,
+  "sha256": "102ec6bd8ba745910b67213d444bfb69dbf01e79d399614d93d47b753f3a81a9",
+  "test_number_uses": 0,
+  "type": "fn"
+}

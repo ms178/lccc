@@ -1,0 +1,86 @@
+{
+  "bytes": 2899,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "mode 'V4QI' is not supported for enumeration types"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "mode 'V8HI' is not supported for enumeration types"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "mode 'V2SI' is not supported for enumeration types"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "mode 'V4DI' is not supported for enumeration types"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "mode 'V4QI' is not supported for enumeration types"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "mode 'V8HI' is not supported for enumeration types"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": "forward declaration of 'enum Y'"
+    },
+    {
+      "kind": "error",
+      "msg": "variable has incomplete type 'enum X'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "variable has incomplete type 'IncompleteYType' (aka 'enum Y')"
+    }
+  ],
+  "has_main": true,
+  "header_lines": 9,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-mode-enums.sft.c",
+  "remark": null,
+  "sha256": "1861c2e19eb3b4cd041fd3a71c32fa3a7d82c83d38363759e5f9d043588e60a0",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,38 @@
+{
+  "bytes": 888,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "subtraction of address-of-label expressions is not supported with ptrauth indirect gotos"
+    },
+    {
+      "kind": "error",
+      "msg": "subtraction of address-of-label expressions is not supported with ptrauth indirect gotos"
+    },
+    {
+      "kind": "error",
+      "msg": "subtraction of address-of-label expressions is not supported with ptrauth indirect gotos"
+    },
+    {
+      "kind": "error",
+      "msg": "addition of address-of-label expressions is not supported with ptrauth indirect gotos"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c --target linux_aarch64"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/ptrauth-indirect-goto.sft.c",
+  "remark": null,
+  "sha256": "abef679afce8dd6c9a256a217e8a9f8d509ad2d7d564cdf9c63ae4ab5e58c024",
+  "test_number_uses": 0,
+  "type": "fn"
+}

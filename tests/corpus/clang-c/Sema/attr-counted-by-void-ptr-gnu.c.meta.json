@@ -1,0 +1,21 @@
+{
+  "bytes": 3796,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 18,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-counted-by-void-ptr-gnu.sft.c",
+  "remark": null,
+  "sha256": "239b8155af8215b1acd01e60a2967bb3c3f25a0b37fdf7f5b42678674aa270a1",
+  "test_number_uses": 0,
+  "type": "fp"
+}

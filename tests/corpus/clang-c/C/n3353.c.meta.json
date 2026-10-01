@@ -1,0 +1,66 @@
+{
+  "bytes": 9762,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "invalid suffix 'o' on integer constant"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid digit '8' in octal constant"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid suffix 'o8' on integer constant"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid suffix 'xG' on integer constant"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid suffix '.' on integer constant"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid suffix '.1' on integer constant"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid suffix 'e1' on integer constant"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid suffix 'E1' on integer constant"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid suffix 'o'0'1' on integer constant"
+    },
+    {
+      "kind": "warning",
+      "msg": "#line directive interprets number as decimal, not octal"
+    },
+    {
+      "kind": "error",
+      "msg": "#line directive requires a simple digit sequence"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 12,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C2y/n3353.sft.c",
+  "remark": null,
+  "sha256": "6430a01087377641602017958a099e78323fe17bf893da77617b5a476140ccab",
+  "test_number_uses": 0,
+  "type": "fn"
+}

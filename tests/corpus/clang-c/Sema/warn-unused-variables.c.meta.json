@@ -1,0 +1,42 @@
+{
+  "bytes": 819,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "unused"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'Y'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'Y1'"
+    },
+    {
+      "kind": "warning",
+      "msg": "unused"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'Y'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-unused-variables.sft.c",
+  "remark": null,
+  "sha256": "8a51bc5c597e0ee466d5289a71e277a8a4e0544a0fd051bcd7934c2a5da699fe",
+  "test_number_uses": 0,
+  "type": "fn"
+}

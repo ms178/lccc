@@ -1,0 +1,30 @@
+{
+  "bytes": 304,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "forward declaration of 'struct T'"
+    },
+    {
+      "kind": "error",
+      "msg": "incomplete definition of type 'struct T'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c90"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/recover-expr-gh88008-nocrash.sft.c",
+  "remark": null,
+  "sha256": "b7d35f71008163933f289af56b46d53c1ef44da6b89b705c3cb90f9466c7e24b",
+  "test_number_uses": 0,
+  "type": "fn"
+}

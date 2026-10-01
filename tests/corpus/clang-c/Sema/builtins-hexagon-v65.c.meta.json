@@ -1,0 +1,21 @@
+{
+  "bytes": 503,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/builtins-hexagon-v65.sft.c",
+  "remark": null,
+  "sha256": "af528180b55cd6e9bc558a9d538ecb58df6f250edf132394aa1289c5bf4fe939",
+  "test_number_uses": 0,
+  "type": "fp"
+}

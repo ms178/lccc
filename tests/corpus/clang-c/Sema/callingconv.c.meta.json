@@ -1,0 +1,114 @@
+{
+  "bytes": 3947,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'fastcall' attribute takes no arguments"
+    },
+    {
+      "kind": "warning",
+      "msg": "fastcall calling convention is not supported on variadic function"
+    },
+    {
+      "kind": "warning",
+      "msg": "stdcall calling convention is not supported on variadic function"
+    },
+    {
+      "kind": "error",
+      "msg": "variadic function cannot use thiscall calling convention"
+    },
+    {
+      "kind": "error",
+      "msg": "'cdecl' attribute takes no arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible function pointer types"
+    },
+    {
+      "kind": "error",
+      "msg": "'pcs' attribute takes one argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'pcs' attribute takes one argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'pcs' attribute requires a string"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid PCS type"
+    },
+    {
+      "kind": "error",
+      "msg": "expected string literal as argument of 'pcs' attribute"
+    },
+    {
+      "kind": "warning",
+      "msg": "'pcs' calling convention is not supported for this target"
+    },
+    {
+      "kind": "warning",
+      "msg": "'pcs' calling convention is not supported for this target"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid PCS type"
+    },
+    {
+      "kind": "warning",
+      "msg": "'aarch64_vector_pcs' calling convention is not supported for this target"
+    },
+    {
+      "kind": "warning",
+      "msg": "'aarch64_sve_pcs' calling convention is not supported for this target"
+    },
+    {
+      "kind": "warning",
+      "msg": "'amdgpu_kernel' calling convention is not supported for this target"
+    },
+    {
+      "kind": "warning",
+      "msg": "'device_kernel' calling convention is not supported for this target"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sycl_kernel' attribute ignored"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "function declared 'stdcall' here was previously declared without calling convention"
+    },
+    {
+      "kind": "warning",
+      "msg": "'stdcall' attribute only applies to functions and methods"
+    },
+    {
+      "kind": "warning",
+      "msg": "vectorcall calling convention is not supported on builtin function"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--ms_compatibility -DWIN --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/callingconv.sft.c",
+  "remark": null,
+  "sha256": "c487f65d6ab83830502addf28f419faad599bcb106850dc019a0e33406b1ae84",
+  "test_number_uses": 0,
+  "type": "fn"
+}

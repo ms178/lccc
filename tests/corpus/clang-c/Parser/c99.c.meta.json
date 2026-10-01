@@ -1,0 +1,27 @@
+{
+  "bytes": 579,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "imaginary types are not supported"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c99",
+    " --c89"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/c99.sft.c",
+  "remark": null,
+  "sha256": "8a61a1414ec0c2e2d7e93ec01310f08d8f2ee11931cd92071f4cd47dee637030",
+  "test_number_uses": 0,
+  "type": "fn"
+}

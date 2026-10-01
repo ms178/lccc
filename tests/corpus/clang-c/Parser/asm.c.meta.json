@@ -1,0 +1,74 @@
+{
+  "bytes": 1440,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'a'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'b'"
+    },
+    {
+      "kind": "warning",
+      "msg": "'gnu::deprecated' attribute ignored"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use an empty string literal in 'asm'"
+    },
+    {
+      "kind": "error",
+      "msg": "expected '(' after 'asm'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use wide string literal in 'asm'"
+    },
+    {
+      "kind": "error",
+      "msg": "expected string literal in 'asm'"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "expected string literal in 'asm'"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ';' after top-level asm block"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/asm.sft.c",
+  "remark": null,
+  "sha256": "f9c19bae5be3afee1863bcd4d92e92c95ccf9a67898388bd8867b4998d96a691",
+  "test_number_uses": 0,
+  "type": "fn"
+}

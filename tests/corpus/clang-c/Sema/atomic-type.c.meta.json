@@ -1,0 +1,42 @@
+{
+  "bytes": 1067,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "_Atomic cannot be applied to function type"
+    },
+    {
+      "kind": "error",
+      "msg": "_Atomic cannot be applied to incomplete type"
+    },
+    {
+      "kind": "error",
+      "msg": "_Atomic cannot be applied to array type"
+    },
+    {
+      "kind": "error",
+      "msg": "_Atomic cannot be applied to qualified type"
+    },
+    {
+      "kind": "error",
+      "msg": "_Atomic cannot be applied to atomic type"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/atomic-type.sft.c",
+  "remark": null,
+  "sha256": "b240e13eccfe9e86a027ac1bbbf7d555ed2c31bb431b0e8831c67ed94fe6988a",
+  "test_number_uses": 0,
+  "type": "fn"
+}

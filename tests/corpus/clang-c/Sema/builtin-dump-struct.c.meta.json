@@ -1,0 +1,62 @@
+{
+  "bytes": 2472,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call, expected 2, have 0"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call, expected 2, have 1"
+    },
+    {
+      "kind": "error",
+      "msg": "expected pointer to struct as 1st argument to '__builtin_dump_struct', found 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "expected a callable expression as 2nd argument to '__builtin_dump_struct', found 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "expected pointer to struct as 1st argument to '__builtin_dump_struct', found 'void *'"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to function call, expected 1, have 2"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to function call, expected 0, have 2"
+    },
+    {
+      "kind": "error",
+      "msg": "expected pointer to struct as 1st argument to '__builtin_dump_struct', found 'struct A'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/builtin-dump-struct.sft.c",
+  "remark": null,
+  "sha256": "71b6982a1b28d4073108cfd13e88b313af36e99122687109315a4bdbd07ec17f",
+  "test_number_uses": 0,
+  "type": "fn"
+}

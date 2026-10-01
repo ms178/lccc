@@ -1,0 +1,374 @@
+{
+  "bytes": 16810,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "initialize the variable 'x' to silence this warning"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'x' is uninitialized when used here"
+    },
+    {
+      "kind": "note",
+      "msg": "initialize the variable 'x' to silence this warning"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'x' is uninitialized when used here"
+    },
+    {
+      "kind": "note",
+      "msg": "initialize the variable 'y' to silence this warning"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'y' is uninitialized when used here"
+    },
+    {
+      "kind": "note",
+      "msg": "initialize the variable 'x' to silence this warning"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'x' is uninitialized when used here"
+    },
+    {
+      "kind": "note",
+      "msg": "initialize the variable 'x' to silence this warning"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'x' is used uninitialized whenever 'if' condition is false"
+    },
+    {
+      "kind": "note",
+      "msg": "remove the 'if' if its condition is always true"
+    },
+    {
+      "kind": "note",
+      "msg": "uninitialized use occurs here"
+    },
+    {
+      "kind": "note",
+      "msg": "variable 'x' is declared here"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'x' may be uninitialized when used here"
+    },
+    {
+      "kind": "note",
+      "msg": "initialize the variable 'x' to silence this warning"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'x' may be uninitialized when used here"
+    },
+    {
+      "kind": "note",
+      "msg": "initialize the variable 'x' to silence this warning"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'x' may be uninitialized when used here"
+    },
+    {
+      "kind": "note",
+      "msg": "initialize the variable 'x' to silence this warning"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'x' may be uninitialized when used here"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'i' is uninitialized when used here"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'x' is uninitialized when used within its own initialization"
+    },
+    {
+      "kind": "note",
+      "msg": "initialize the variable 'x' to silence this warning"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'x' is uninitialized when used here"
+    },
+    {
+      "kind": "note",
+      "msg": "initialize the variable 'z' to silence this warning"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'z' is used uninitialized whenever '||' condition is true"
+    },
+    {
+      "kind": "note",
+      "msg": "uninitialized use occurs here"
+    },
+    {
+      "kind": "note",
+      "msg": "initialize the variable 'z' to silence this warning"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'z' is used uninitialized whenever '||' condition is true"
+    },
+    {
+      "kind": "note",
+      "msg": "uninitialized use occurs here"
+    },
+    {
+      "kind": "note",
+      "msg": "initialize the variable 'val' to silence this warning"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'val' may be uninitialized when used here"
+    },
+    {
+      "kind": "note",
+      "msg": "initialize the variable 'x' to silence this warning"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'x' is uninitialized when used here"
+    },
+    {
+      "kind": "note",
+      "msg": "initialize the variable 'x' to silence this warning"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'x' is uninitialized when used here"
+    },
+    {
+      "kind": "note",
+      "msg": "initialize the variable 'len' to silence this warning"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'len' is uninitialized when used here"
+    },
+    {
+      "kind": "note",
+      "msg": "initialize the variable 'x' to silence this warning"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'x' is uninitialized when captured by block"
+    },
+    {
+      "kind": "note",
+      "msg": "initialize the variable 'x' to silence this warning"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'x' is uninitialized when used here"
+    },
+    {
+      "kind": "note",
+      "msg": "initialize the variable 'pc' to silence this warning"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'pc' is uninitialized when used here"
+    },
+    {
+      "kind": "note",
+      "msg": "initialize the variable 'y' to silence this warning"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'y' is uninitialized when used here"
+    },
+    {
+      "kind": "note",
+      "msg": "initialize the variable 'y' to silence this warning"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'y' is uninitialized when used here"
+    },
+    {
+      "kind": "note",
+      "msg": "initialize the variable 'y' to silence this warning"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'y' is used uninitialized whenever 'if' condition is false"
+    },
+    {
+      "kind": "note",
+      "msg": "remove the 'if' if its condition is always true"
+    },
+    {
+      "kind": "note",
+      "msg": "uninitialized use occurs here"
+    },
+    {
+      "kind": "note",
+      "msg": "initialize the variable 'x' to silence this warning"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'x' is uninitialized when used here"
+    },
+    {
+      "kind": "note",
+      "msg": "initialize the variable 'y' to silence this warning"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'y' is uninitialized when used here"
+    },
+    {
+      "kind": "note",
+      "msg": "initialize the variable 'i' to silence this warning"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'i' is uninitialized when used here"
+    },
+    {
+      "kind": "note",
+      "msg": "initialize the variable 'x' to silence this warning"
+    },
+    {
+      "kind": "warning",
+      "msg": "switch condition has boolean value"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'x' may be uninitialized when used here"
+    },
+    {
+      "kind": "note",
+      "msg": "initialize the variable 'x' to silence this warning"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'x' is uninitialized when used here"
+    },
+    {
+      "kind": "note",
+      "msg": "initialize the variable 'new_len' to silence this warning"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'new_len' may be uninitialized when used here"
+    },
+    {
+      "kind": "note",
+      "msg": "initialize the variable 'i' to silence this warning"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'i' is uninitialized when used here"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'a' is uninitialized when used here"
+    },
+    {
+      "kind": "note",
+      "msg": "variable 'a' is declared here"
+    },
+    {
+      "kind": "note",
+      "msg": "initialize the variable 'c' to silence this warning"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'c' is uninitialized when used here"
+    },
+    {
+      "kind": "note",
+      "msg": "initialize"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'k' is uninitialized"
+    },
+    {
+      "kind": "note",
+      "msg": "initialize"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'k' may be uninitialized"
+    },
+    {
+      "kind": "note",
+      "msg": "initialize"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'a' is uninitialized"
+    },
+    {
+      "kind": "note",
+      "msg": "initialize"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'sum' is uninitialized"
+    },
+    {
+      "kind": "note",
+      "msg": "initialize"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'x' is uninitialized"
+    },
+    {
+      "kind": "note",
+      "msg": "initialize"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'x' is uninitialized"
+    },
+    {
+      "kind": "note",
+      "msg": "initialize the variable 'x' to silence this warning"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable 'x' is uninitialized when used here"
+    },
+    {
+      "kind": "warning",
+      "msg": "field in 'with_explicit_field' requires explicit initialization but is not explicitly initialized"
+    },
+    {
+      "kind": "warning",
+      "msg": "field 'y' requires explicit initialization but is not explicitly initialized"
+    },
+    {
+      "kind": "warning",
+      "msg": "field 'flex_arr' requires explicit initialization but is not explicitly initialized"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/uninit-variables.sft.c",
+  "remark": null,
+  "sha256": "a29320c18c3a6e748d0756aff25490c1313abe6055deb80ecea43375d2cff6cd",
+  "test_number_uses": 0,
+  "type": "fp"
+}

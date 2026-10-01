@@ -1,0 +1,21 @@
+{
+  "bytes": 736,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 30,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/expr_invalid_tok.sft.c",
+  "remark": null,
+  "sha256": "a160fbfc921e79015507b7d82aebc1f6e307ec6f29c8aa8d12b5c6af27193b80",
+  "test_number_uses": 0,
+  "type": "fp"
+}

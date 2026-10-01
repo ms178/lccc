@@ -1,0 +1,230 @@
+{
+  "bytes": 8543,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 1 with boolean expression is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 1 with boolean expression is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 2 with boolean expression is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant -1 with boolean expression is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 0 with boolean expression is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 2 with boolean expression is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant -1 with boolean expression is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 0 with boolean expression is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 2 with boolean expression is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant -1 with boolean expression is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 1 with boolean expression is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 2 with boolean expression is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant -1 with boolean expression is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 1 with boolean expression is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 4 with boolean expression is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant -1 with boolean expression is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 1 with boolean expression is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 4 with boolean expression is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 1 with boolean expression is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 4 with boolean expression is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant -1 with boolean expression is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 2 with boolean expression is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant -1 with boolean expression is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 2 with boolean expression is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant -1 with boolean expression is always true"
+    },
+    {
+      "kind": "error",
+      "msg": "chained comparison 'X > Y < Z' does not behave the same as a mathematical expression"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 0 with boolean expression is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 2 with boolean expression is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant -1 with boolean expression is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 1 with boolean expression is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 2 with boolean expression is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant -1 with boolean expression is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 1 with boolean expression is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 2 with boolean expression is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant -1 with boolean expression is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 0 with boolean expression is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 2 with boolean expression is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant -1 with boolean expression is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 0 with boolean expression is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 4 with boolean expression is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 0 with boolean expression is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 4 with boolean expression is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 0 with boolean expression is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 4 with boolean expression is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant -1 with boolean expression is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 2 with boolean expression is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant -1 with boolean expression is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 2 with boolean expression is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant -1 with boolean expression is always true"
+    },
+    {
+      "kind": "error",
+      "msg": "chained comparison 'X < Y > Z' does not behave the same as a mathematical expression"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant -1 with boolean expression is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 2 with boolean expression is always true"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/bool-compare.sft.c",
+  "remark": null,
+  "sha256": "e12f07370d53db1a55aaf4aef726a4c56c17b2e2d1565ac37bb2630ee543c928",
+  "test_number_uses": 0,
+  "type": "fn"
+}

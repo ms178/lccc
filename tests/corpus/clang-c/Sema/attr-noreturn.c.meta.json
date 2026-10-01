@@ -1,0 +1,46 @@
+{
+  "bytes": 1842,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "function declared 'noreturn' should not return"
+    },
+    {
+      "kind": "warning",
+      "msg": "'noreturn' only applies to function types; type here is 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "'noreturn' attribute takes no arguments"
+    },
+    {
+      "kind": "warning",
+      "msg": "function 'f3' declared 'noreturn' should not return"
+    },
+    {
+      "kind": "error",
+      "msg": "function 'f4' declared 'noreturn' should not return"
+    },
+    {
+      "kind": "error",
+      "msg": "'noreturn' attribute takes no arguments"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-noreturn.sft.c",
+  "remark": null,
+  "sha256": "d64d10e989b7fdbdce8dd4bf4176767b7dc195567b48f0dcaf3d908af1257902",
+  "test_number_uses": 0,
+  "type": "fn"
+}

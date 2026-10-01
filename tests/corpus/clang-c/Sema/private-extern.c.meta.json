@@ -1,0 +1,98 @@
+{
+  "bytes": 2433,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "previous definition"
+    },
+    {
+      "kind": "error",
+      "msg": "non-static declaration of 'g0' follows static declaration"
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition"
+    },
+    {
+      "kind": "error",
+      "msg": "static declaration of 'g3' follows non-static declaration"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration"
+    },
+    {
+      "kind": "error",
+      "msg": "static declaration of 'g4' follows non-static declaration"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration"
+    },
+    {
+      "kind": "error",
+      "msg": "static declaration of 'g5' follows non-static declaration"
+    },
+    {
+      "kind": "note",
+      "msg": "previous"
+    },
+    {
+      "kind": "error",
+      "msg": "extern declaration of 'g6' follows non-extern declaration"
+    },
+    {
+      "kind": "note",
+      "msg": "previous"
+    },
+    {
+      "kind": "error",
+      "msg": "extern declaration of 'g7' follows non-extern declaration"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration"
+    },
+    {
+      "kind": "error",
+      "msg": "non-extern declaration of 'g8' follows extern declaration"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration"
+    },
+    {
+      "kind": "error",
+      "msg": "non-extern declaration of 'g9' follows extern declaration"
+    },
+    {
+      "kind": "error",
+      "msg": "declaration of block scope identifier with linkage cannot have an initializer"
+    },
+    {
+      "kind": "error",
+      "msg": "declaration of block scope identifier with linkage cannot have an initializer"
+    },
+    {
+      "kind": "warning",
+      "msg": "'extern' variable has an initializer"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/private-extern.sft.c",
+  "remark": null,
+  "sha256": "425c4356e326b6cb4a322ffa246587782263958396cf4da038eeabd53b74e272",
+  "test_number_uses": 0,
+  "type": "fn"
+}

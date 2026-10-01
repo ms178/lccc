@@ -1,0 +1,22 @@
+{
+  "bytes": 2832,
+  "cases": null,
+  "category": "C",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 36,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23",
+    " --c17"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C23/n3029.sft.c",
+  "remark": null,
+  "sha256": "d7ee971bf609fe313df57009f4fa9c0b578cedfa8a31d9c8f60600a7097fd1cd",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,21 @@
+{
+  "bytes": 1000,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 14,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-availability-ios-fallback-aligned-versions.sft.c",
+  "remark": null,
+  "sha256": "326ce8b3e02d866de6716e2f537d65c5aa9e27d765527730cf8de71830fda0c5",
+  "test_number_uses": 0,
+  "type": "fp"
+}

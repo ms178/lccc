@@ -1,0 +1,98 @@
+{
+  "bytes": 5573,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "redefinition of typedef 'x' is a C11 feature"
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "redefinition of typedef 'w' is a C11 feature"
+    },
+    {
+      "kind": "warning",
+      "msg": "extra tokens at end of #line directive"
+    },
+    {
+      "kind": "error",
+      "msg": "#line directive requires a simple digit sequence"
+    },
+    {
+      "kind": "error",
+      "msg": "#line directive requires a simple digit sequence"
+    },
+    {
+      "kind": "warning",
+      "msg": "#line directive interprets number as decimal, not octal"
+    },
+    {
+      "kind": "warning",
+      "msg": "GNU line marker directive interprets number as decimal, not octal"
+    },
+    {
+      "kind": "warning",
+      "msg": "this style of line directive is a GNU extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "#line directive with zero argument is a GNU extension"
+    },
+    {
+      "kind": "error",
+      "msg": "unknown type name 'undefined'"
+    },
+    {
+      "kind": "warning",
+      "msg": "this style of line directive is a GNU extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "this style of line directive is a GNU extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "this style of line directive is a GNU extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "this style of line directive is a GNU extension"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "this style of line directive is a GNU extension"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 61,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c99"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/line-directive.sft.c",
+  "remark": null,
+  "sha256": "be90f4ff97fae25ad196aae268f93e756395d5e2915852426d5d8c6f7c85e898",
+  "test_number_uses": 0,
+  "type": "fn"
+}

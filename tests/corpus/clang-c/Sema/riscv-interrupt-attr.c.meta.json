@@ -1,0 +1,86 @@
+{
+  "bytes": 4131,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "repeated RISC-V 'interrupt' attribute"
+    },
+    {
+      "kind": "note",
+      "msg": "repeated RISC-V 'interrupt' attribute is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "repeated RISC-V 'interrupt' attribute"
+    },
+    {
+      "kind": "note",
+      "msg": "repeated RISC-V 'interrupt' attribute is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "'interrupt' attribute only applies to functions"
+    },
+    {
+      "kind": "warning",
+      "msg": "RISC-V 'interrupt' attribute only applies to functions that have a 'void' return type"
+    },
+    {
+      "kind": "warning",
+      "msg": "RISC-V 'interrupt' attribute only applies to functions that have no parameters"
+    },
+    {
+      "kind": "error",
+      "msg": "'interrupt' attribute takes no more than 2 arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "expected string literal as argument of 'interrupt' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "expected string literal as argument of 'interrupt' attribute"
+    },
+    {
+      "kind": "warning",
+      "msg": "'interrupt' attribute argument not supported: \"USER\""
+    },
+    {
+      "kind": "warning",
+      "msg": "'interrupt' attribute argument not supported: \"user\""
+    },
+    {
+      "kind": "warning",
+      "msg": "'interrupt' attribute argument not supported: \"MACHINE\""
+    },
+    {
+      "kind": "warning",
+      "msg": "'interrupt' attribute argument not supported"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V 'interrupt' attribute contains invalid combination of interrupt types"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V 'interrupt' attribute contains invalid combination of interrupt types"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 10,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DCHECK_IR -DCHECK_IR --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/riscv-interrupt-attr.sft.c",
+  "remark": null,
+  "sha256": "6d6158790382971a867606031fb2f74a51e7389c9f83c5cd08a7c47545f440d1",
+  "test_number_uses": 0,
+  "type": "fn"
+}

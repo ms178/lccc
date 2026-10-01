@@ -1,0 +1,50 @@
+{
+  "bytes": 1293,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "parameters cannot have __fp16 type; did you forget * ?"
+    },
+    {
+      "kind": "error",
+      "msg": "parameters cannot have __fp16 type; did you forget * ?"
+    },
+    {
+      "kind": "error",
+      "msg": "parameters cannot have __fp16 type; did you forget * ?"
+    },
+    {
+      "kind": "error",
+      "msg": "parameters cannot have __fp16 type; did you forget * ?"
+    },
+    {
+      "kind": "error",
+      "msg": "function return value cannot have __fp16 type; did you forget * ?"
+    },
+    {
+      "kind": "error",
+      "msg": "function return value cannot have __fp16 type; did you forget * ?"
+    },
+    {
+      "kind": "error",
+      "msg": "function return value cannot have __fp16 type; did you forget * ?"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/riscv-fp16.sft.c",
+  "remark": null,
+  "sha256": "be3dbe804995a0df1693a6ccfc1ec31f06b9a799a0c57d489cc0ab311748519e",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,21 @@
+{
+  "bytes": 345,
+  "cases": null,
+  "category": "Parser",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--ms_extensions --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/MicrosoftExtensionsInlineAsm.sft.c",
+  "remark": null,
+  "sha256": "b5fffe54e3c641889ede7068dbad001a6e6b84db6ab325d498f67f535ab3be70",
+  "test_number_uses": 0,
+  "type": "fp"
+}

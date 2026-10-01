@@ -1,0 +1,86 @@
+{
+  "bytes": 2748,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "struct defined within a struct or union is not visible in C++"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "enum defined within a struct or union is not visible in C++"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "struct defined within a struct or union is not visible in C++"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "struct defined within a struct or union is not visible in C++"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "enum defined within a struct or union is not visible in C++"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "struct defined within a struct or union is not visible in C++"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "struct defined within a struct or union is not visible in C++"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "enum defined within a struct or union is not visible in C++"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/decl-hidden-in-c++.sft.c",
+  "remark": null,
+  "sha256": "0bb9519e57e6a688e80d2a848541fa607a33f695d13a1490987e138c2c40c1d8",
+  "test_number_uses": 0,
+  "type": "fp"
+}

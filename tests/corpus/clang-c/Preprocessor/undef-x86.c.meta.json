@@ -1,0 +1,21 @@
+{
+  "bytes": 369,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 14,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/undef-x86.sft.c",
+  "remark": null,
+  "sha256": "66c8044e9cb786b5473322fe765b66205c042a4544d1670be86934bed84c3b1e",
+  "test_number_uses": 0,
+  "type": "fp"
+}

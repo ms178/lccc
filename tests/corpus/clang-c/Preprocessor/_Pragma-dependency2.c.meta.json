@@ -1,0 +1,26 @@
+{
+  "bytes": 170,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "file not found"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/_Pragma-dependency2.sft.c",
+  "remark": null,
+  "sha256": "a0cc1c14fee97970d5a4d10a7f31102f5d81241ec7fbdf9461a0c4bb5037240b",
+  "test_number_uses": 0,
+  "type": "fn"
+}

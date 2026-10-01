@@ -1,0 +1,34 @@
+{
+  "bytes": 521,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-target-mv-bad-target.sft.c",
+  "remark": null,
+  "sha256": "69f4ee33aacaf721123ca6a158d6e2f1643bfbad9fd757994032f54956440b18",
+  "test_number_uses": 0,
+  "type": "fn"
+}

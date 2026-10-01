@@ -1,0 +1,58 @@
+{
+  "bytes": 1222,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "requires argument of floating point type"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "requires argument of floating point type"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from 'double' to 'int' changes value from 4.5 to 4"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'invalid'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'inf'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 3,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/builtin-unary-fp.sft.c",
+  "remark": null,
+  "sha256": "a15b69180db18975c20d0e3cf79e2c0d79ddc1361395c8bf1cee21fb55092da9",
+  "test_number_uses": 0,
+  "type": "fn"
+}

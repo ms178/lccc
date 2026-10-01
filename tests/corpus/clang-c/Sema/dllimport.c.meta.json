@@ -1,0 +1,295 @@
+{
+  "bytes": 12336,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "initializer element is not a compile-time constant"
+    },
+    {
+      "kind": "error",
+      "msg": "definition of dllimport data"
+    },
+    {
+      "kind": "error",
+      "msg": "definition of dllimport data"
+    },
+    {
+      "kind": "error",
+      "msg": "definition of dllimport data"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "'GlobalRedecl3' redeclared without 'dllimport' attribute: previous 'dllimport' ignored"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redeclaration of 'GlobalRedecl4' cannot add 'dllimport' attribute"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "redeclaration of 'GlobalRedecl5' should not add 'dllimport' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "'StaticGlobal' must have external linkage when declared 'dllimport'"
+    },
+    {
+      "kind": "error",
+      "msg": "'ThreadLocalGlobal' cannot be thread local when declared 'dllimport'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redeclaration of 'LocalRedecl1' with a different type: 'int' vs 'float'"
+    },
+    {
+      "kind": "error",
+      "msg": "redeclaration of 'LocalRedecl2' with a different type: 'int *' vs 'float'"
+    },
+    {
+      "kind": "error",
+      "msg": "redeclaration of 'LocalRedecl3' with a different type: 'int' vs 'float'"
+    },
+    {
+      "kind": "error",
+      "msg": "definition of dllimport data"
+    },
+    {
+      "kind": "error",
+      "msg": "definition of dllimport data"
+    },
+    {
+      "kind": "error",
+      "msg": "'StaticLocalVar' must have external linkage when declared 'dllimport'"
+    },
+    {
+      "kind": "error",
+      "msg": "dllimport cannot be applied to non-inline function definition"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "'redecl2' redeclared without 'dllimport' attribute: previous 'dllimport' ignored"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "redeclaration of 'redecl4' should not add 'dllimport' attribute"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "redeclaration of 'redecl5' should not add 'dllimport' attribute"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "unknown type name 'unknowntype'"
+    },
+    {
+      "kind": "error",
+      "msg": "unknown type name 'unknowntype'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting types for 'redecl9'"
+    },
+    {
+      "kind": "error",
+      "msg": "'staticFunc' must have external linkage when declared 'dllimport'"
+    },
+    {
+      "kind": "error",
+      "msg": "'staticLocal' must have external linkage when declared 'dllimport'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 14,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w --ms_extensions --c99 -DMS -w --ms_extensions",
+    " --c11 -DMS --ms_extensions",
+    " --c11 -DGNU --ms_extensions",
+    " --c99 -DGNU -w --ms_extensions",
+    " --c99 -DMS -w --ms_extensions",
+    " --c99 -DWI -w --ms_extensions",
+    " --c11 -DWI --ms_extensions",
+    " --c11 -DWI --ms_extensions",
+    " --c99 -DWI --ms_extensions",
+    " --c11 -DWI --target linux_aarch64"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/dllimport.sft.c",
+  "remark": null,
+  "sha256": "824495171f3d94e50f36e26884c778c98f0997a890653dd3281227f786669a31",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,38 @@
+{
+  "bytes": 580,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "device files are not yet supported by '#embed' directive"
+    },
+    {
+      "kind": "error",
+      "msg": "device files are not yet supported by '#embed' directive"
+    },
+    {
+      "kind": "error",
+      "msg": "device files are not yet supported by '#embed' directive"
+    },
+    {
+      "kind": "error",
+      "msg": "device files are not yet supported by '#embed' directive"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/embed-reject-device-files-lin.sft.c",
+  "remark": null,
+  "sha256": "9a0870bc1262302253d83210c130ed728ad2d7e33f38a4d480fafd31bf0daff0",
+  "test_number_uses": 0,
+  "type": "fn"
+}

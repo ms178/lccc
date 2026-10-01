@@ -1,0 +1,254 @@
+{
+  "bytes": 7773,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "expression is not a string literal"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid special register for builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid special register for builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid special register for builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid special register for builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid special register for builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid special register for builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid special register for builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid special register for builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid special register for builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid special register for builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid special register for builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid special register for builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid special register for builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid special register for builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid special register for builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid special register for builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid special register for builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "must be a constant integer"
+    },
+    {
+      "kind": "error",
+      "msg": "must be a constant integer"
+    },
+    {
+      "kind": "error",
+      "msg": "must be a constant integer"
+    },
+    {
+      "kind": "error",
+      "msg": "must be a constant integer"
+    },
+    {
+      "kind": "error",
+      "msg": "must be a constant integer"
+    },
+    {
+      "kind": "error",
+      "msg": "must be a constant integer"
+    },
+    {
+      "kind": "error",
+      "msg": "must be a constant integer"
+    },
+    {
+      "kind": "error",
+      "msg": "must be a constant integer"
+    },
+    {
+      "kind": "error",
+      "msg": "must be a constant integer"
+    },
+    {
+      "kind": "error",
+      "msg": "must be a constant integer"
+    },
+    {
+      "kind": "error",
+      "msg": "must be a constant integer"
+    },
+    {
+      "kind": "error",
+      "msg": "must be a constant integer"
+    },
+    {
+      "kind": "error",
+      "msg": "must be a constant integer"
+    },
+    {
+      "kind": "error",
+      "msg": "must be a constant integer"
+    },
+    {
+      "kind": "error",
+      "msg": "must be a constant integer"
+    },
+    {
+      "kind": "error",
+      "msg": "must be a constant integer"
+    },
+    {
+      "kind": "error",
+      "msg": "must be a constant integer"
+    },
+    {
+      "kind": "error",
+      "msg": "must be a constant integer"
+    },
+    {
+      "kind": "error",
+      "msg": "must be a constant integer"
+    },
+    {
+      "kind": "error",
+      "msg": "must be a constant integer"
+    },
+    {
+      "kind": "error",
+      "msg": "outside the valid range"
+    },
+    {
+      "kind": "error",
+      "msg": "outside the valid range"
+    },
+    {
+      "kind": "error",
+      "msg": "outside the valid range"
+    },
+    {
+      "kind": "error",
+      "msg": "outside the valid range"
+    },
+    {
+      "kind": "error",
+      "msg": "outside the valid range"
+    },
+    {
+      "kind": "error",
+      "msg": "outside the valid range"
+    },
+    {
+      "kind": "error",
+      "msg": "outside the valid range"
+    },
+    {
+      "kind": "error",
+      "msg": "outside the valid range"
+    },
+    {
+      "kind": "error",
+      "msg": "outside the valid range"
+    },
+    {
+      "kind": "error",
+      "msg": "outside the valid range"
+    },
+    {
+      "kind": "error",
+      "msg": "outside the valid range"
+    },
+    {
+      "kind": "error",
+      "msg": "outside the valid range"
+    },
+    {
+      "kind": "error",
+      "msg": "outside the valid range"
+    },
+    {
+      "kind": "error",
+      "msg": "outside the valid range"
+    },
+    {
+      "kind": "error",
+      "msg": "outside the valid range"
+    },
+    {
+      "kind": "error",
+      "msg": "outside the valid range"
+    },
+    {
+      "kind": "error",
+      "msg": "outside the valid range"
+    },
+    {
+      "kind": "error",
+      "msg": "outside the valid range"
+    },
+    {
+      "kind": "error",
+      "msg": "outside the valid range"
+    },
+    {
+      "kind": "error",
+      "msg": "outside the valid range"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c --target linux_aarch64"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/aarch64-special-register.sft.c",
+  "remark": null,
+  "sha256": "df57008120e4c143765885bae1d652ab31ec85108edc245dd7a7b1847856219a",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,26 @@
+{
+  "bytes": 220,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c99"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/if-scope-c99.sft.c",
+  "remark": null,
+  "sha256": "79df100c3b2b4c3b07c132f13990d9038e36e325fecb7be84c9d26e6208a9aed",
+  "test_number_uses": 0,
+  "type": "fn"
+}

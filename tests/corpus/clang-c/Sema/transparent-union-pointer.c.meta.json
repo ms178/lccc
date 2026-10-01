@@ -1,0 +1,21 @@
+{
+  "bytes": 324,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/transparent-union-pointer.sft.c",
+  "remark": null,
+  "sha256": "bdf6c5f17d72b2dd0bbda27f9aabf0c1b5c23300d2202ad656e6fe71c4d33568",
+  "test_number_uses": 0,
+  "type": "fp"
+}

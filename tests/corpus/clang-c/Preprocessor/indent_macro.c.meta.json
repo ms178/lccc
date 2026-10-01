@@ -1,0 +1,21 @@
+{
+  "bytes": 201,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/indent_macro.sft.c",
+  "remark": null,
+  "sha256": "d65a114851756f5d8a4d1f423bfeb0542aa045846a13b3962fd03f604e173070",
+  "test_number_uses": 0,
+  "type": "fp"
+}

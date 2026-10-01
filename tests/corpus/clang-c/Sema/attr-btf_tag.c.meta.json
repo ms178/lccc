@@ -1,0 +1,46 @@
+{
+  "bytes": 1741,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'btf_decl_tag' attribute takes one argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'btf_decl_tag' attribute takes one argument"
+    },
+    {
+      "kind": "error",
+      "msg": "expected string literal as argument of 'btf_decl_tag' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "'btf_decl_tag' attribute only applies to variables, functions, structs, unions, classes, non-static data members, and typedefs"
+    },
+    {
+      "kind": "error",
+      "msg": "'btf_decl_tag' attribute only applies to variables, functions, structs, unions, classes, non-static data members, and typedefs"
+    },
+    {
+      "kind": "error",
+      "msg": "'btf_decl_tag' attribute only applies to variables, functions, structs, unions, classes, non-static data members, and typedefs"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 12,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-btf_tag.sft.c",
+  "remark": null,
+  "sha256": "5af269ace527568e44e7ca1b2571e212cf70617da030d525774bc42c4f2cd905",
+  "test_number_uses": 0,
+  "type": "fn"
+}

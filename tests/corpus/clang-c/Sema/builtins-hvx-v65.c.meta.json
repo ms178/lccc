@@ -1,0 +1,26 @@
+{
+  "bytes": 753,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "no-diagnostics",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/builtins-hvx-v65.sft.c",
+  "remark": null,
+  "sha256": "bf44e66048bc9be3610e65b1a647280d6c157bb663528f5a6647f9e6f9ddcc8b",
+  "test_number_uses": 0,
+  "type": "fp"
+}

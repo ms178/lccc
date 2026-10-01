@@ -1,0 +1,21 @@
+{
+  "bytes": 436,
+  "cases": null,
+  "category": "Parser",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 9,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/pragma-visibility2.sft.c",
+  "remark": null,
+  "sha256": "55cf12de095f43335eea3f7c52467e0082f92d99769073dcbef38628510cda52",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,30 @@
+{
+  "bytes": 367,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "function declared 'cdecl' here was previously declared 'stdcall'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 3,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--ms_compatibility -w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/MicrosoftCompatibility-x86.sft.c",
+  "remark": null,
+  "sha256": "f7c402796bbd4c7b2698f382372eb84fc5da779ceb02b997bffed756b4636232",
+  "test_number_uses": 0,
+  "type": "fn"
+}

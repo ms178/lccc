@@ -1,0 +1,31 @@
+{
+  "bytes": 614,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "expected ';' after top level declarator"
+    },
+    {
+      "kind": "warning",
+      "msg": "'_Alignas' attribute ignored"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c11",
+    " --c99"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/c1x-alignas.sft.c",
+  "remark": null,
+  "sha256": "91aa21146ecedc4e84065d5a36cf337353223fd9292c4243cddfece2455895d7",
+  "test_number_uses": 0,
+  "type": "fn"
+}

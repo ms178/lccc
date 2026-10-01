@@ -1,0 +1,74 @@
+{
+  "bytes": 2553,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "functions may not be declared with 'cmse_nonsecure_call' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible function pointer types initializing 'callback_1t'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible function pointer types initializing 'callback_ns_1t'"
+    },
+    {
+      "kind": "warning",
+      "msg": "'cmse_nonsecure_entry' cannot be applied to functions with internal linkage"
+    },
+    {
+      "kind": "error",
+      "msg": "functions may not be declared with 'cmse_nonsecure_call' attribute"
+    },
+    {
+      "kind": "warning",
+      "msg": "'cmse_nonsecure_call' only applies to function types; type here is 'int'"
+    },
+    {
+      "kind": "warning",
+      "msg": "'cmse_nonsecure_entry' attribute only applies to functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'cmse_nonsecure_entry' attribute takes no arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'cmse_nonsecure_call' attribute takes no argument"
+    },
+    {
+      "kind": "warning",
+      "msg": "passing union across security boundary via return value may leak information"
+    },
+    {
+      "kind": "warning",
+      "msg": "passing union across security boundary via parameter 1 may leak information"
+    },
+    {
+      "kind": "warning",
+      "msg": "passing union across security boundary via parameter 0 may leak information"
+    },
+    {
+      "kind": "warning",
+      "msg": "passing union across security boundary via parameter 2 may leak information"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/arm-cmse.sft.c",
+  "remark": null,
+  "sha256": "8f5fc20aef55c1231b143ba586ced7d54285a14b59ad0a8732f935135c661273",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,35 @@
+{
+  "bytes": 909,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "requires inclusion of the header <stdio.h>"
+    },
+    {
+      "kind": "warning",
+      "msg": "a function declaration without a prototype is deprecated in all versions of C"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 10,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c99 -DPREDECLARE",
+    " --c99"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/vfprintf-valid-redecl.sft.c",
+  "remark": null,
+  "sha256": "21ad88c849e72dc39d28ff9c116f45404a1af4994006cda97efcf26e3f7c279a",
+  "test_number_uses": 0,
+  "type": "fp"
+}

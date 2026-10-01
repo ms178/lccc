@@ -1,0 +1,21 @@
+{
+  "bytes": 1882,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 40,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/pragma_unknown.sft.c",
+  "remark": null,
+  "sha256": "a0d48a1bebf509eb11f5832d7fd11ff2383843fbb026f3c5574c85405812a583",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,21 @@
+{
+  "bytes": 107,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/macro_paste_bcpl_comment.sft.c",
+  "remark": null,
+  "sha256": "4f1798f19755e39bbac5e935d3e2ebca05ff68f7e2bb9636b7c361ba6559894e",
+  "test_number_uses": 0,
+  "type": "fp"
+}

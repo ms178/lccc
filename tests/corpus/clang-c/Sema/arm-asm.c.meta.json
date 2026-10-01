@@ -1,0 +1,38 @@
+{
+  "bytes": 713,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "invalid output constraint '=&b' in asm"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicts with asm clobber list"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicts with asm clobber list"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicts with asm clobber list"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/arm-asm.sft.c",
+  "remark": null,
+  "sha256": "7dcf3e1f83336e5577b76769de85c57bfbae8abcdb8b27381ace8dff547b39dd",
+  "test_number_uses": 0,
+  "type": "fn"
+}

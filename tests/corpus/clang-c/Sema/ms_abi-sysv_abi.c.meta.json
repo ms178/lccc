@@ -1,0 +1,46 @@
+{
+  "bytes": 1035,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'ms_abi' only applies to function types; type here is 'int'"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sysv_abi' only applies to function types; type here is 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "cdecl and ms_abi attributes are not compatible"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "function declared 'cdecl' here was previously declared 'ms_abi'"
+    },
+    {
+      "kind": "error",
+      "msg": "cdecl and ms_abi attributes are not compatible"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/ms_abi-sysv_abi.sft.c",
+  "remark": null,
+  "sha256": "9a449090915ac264559661d615a6946ee356d1fd95742557c05c3d9ec0822c6e",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,26 @@
+{
+  "bytes": 400,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "passing a type argument as the first operand to '_Generic' is a C2y extension"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/generic-selection-type-extension-pedantic.sft.c",
+  "remark": null,
+  "sha256": "27ef6271a3bd7536ca65af29a49ead5791eace465ff0f2b3c783a82652a81fb5",
+  "test_number_uses": 0,
+  "type": "fp"
+}

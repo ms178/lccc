@@ -1,0 +1,21 @@
+{
+  "bytes": 8630,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 193,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w --ms_extensions --ms_compatibility -w --ms_extensions --ms_compatibility -w --ms_extensions --ms_compatibility -w --ms_extensions --ms_compatibility -w --ms_extensions --ms_compatibility -w --ms_extensions --ms_compatibility -w --ms_extensions --ms_compatibility -w -w -w -w -w -w -w -w -w -w -w -w --c --target linux_aarch64"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/predefined-win-macros.sft.c",
+  "remark": null,
+  "sha256": "ec56cf5bc66cb20202a9ae2c1456539d50b776aaa2920018515c53e7f993b692",
+  "test_number_uses": 0,
+  "type": "fp"
+}

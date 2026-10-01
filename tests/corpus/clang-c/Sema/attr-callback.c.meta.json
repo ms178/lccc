@@ -1,0 +1,21 @@
+{
+  "bytes": 961,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-callback.sft.c",
+  "remark": null,
+  "sha256": "c56b42b1fc17847c2f6851bc9ec174837edff0b00d38fbce27e3b3ac37fa4335",
+  "test_number_uses": 0,
+  "type": "fp"
+}

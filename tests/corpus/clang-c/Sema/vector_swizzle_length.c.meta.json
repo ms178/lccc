@@ -1,0 +1,21 @@
+{
+  "bytes": 283,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/vector_swizzle_length.sft.c",
+  "remark": null,
+  "sha256": "eb252595166d5fb2e5c1f363dd9aa64a68d5d4128816d9fc9d9ad1b19d4f0501",
+  "test_number_uses": 0,
+  "type": "fp"
+}

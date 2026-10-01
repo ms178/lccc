@@ -1,0 +1,21 @@
+{
+  "bytes": 3253,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 52,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c --target linux_aarch64"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/aarch64-fp16-target.sft.c",
+  "remark": null,
+  "sha256": "a940b6c839d5578c19be2f74d535074d07e004c47dc15016501de94d2a3dfb9d",
+  "test_number_uses": 0,
+  "type": "fn"
+}

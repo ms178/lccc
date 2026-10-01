@@ -1,0 +1,70 @@
+{
+  "bytes": 2839,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "star modifier used outside of function prototype"
+    },
+    {
+      "kind": "error",
+      "msg": "array has incomplete element type 'int[]'"
+    },
+    {
+      "kind": "error",
+      "msg": "star modifier used outside of function prototype"
+    },
+    {
+      "kind": "error",
+      "msg": "star modifier used outside of function prototype"
+    },
+    {
+      "kind": "error",
+      "msg": "array has incomplete element type 'int[]'"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "array has incomplete element type 'int[]'"
+    },
+    {
+      "kind": "error",
+      "msg": "star modifier used outside of function prototype"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "array has incomplete element type 'int[]'"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "array has incomplete element type 'int[]'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 15,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C2y/n3348.sft.c",
+  "remark": null,
+  "sha256": "b62ab1c34bc7d31c86869684942d1e02c48cf7bb1cb91f883ff3066f02cab6ef",
+  "test_number_uses": 0,
+  "type": "fn"
+}

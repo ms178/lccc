@@ -1,0 +1,21 @@
+{
+  "bytes": 1040,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 28,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/pragma_diagnostic_output.sft.c",
+  "remark": null,
+  "sha256": "93317f1721c54ffb0ffe2722693eaedabd3b324e30d4f41ee227afe83fb49eeb",
+  "test_number_uses": 0,
+  "type": "fp"
+}

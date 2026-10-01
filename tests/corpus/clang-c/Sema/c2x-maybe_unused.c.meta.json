@@ -1,0 +1,34 @@
+{
+  "bytes": 1019,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "unused variable"
+    },
+    {
+      "kind": "warning",
+      "msg": "unused typedef 'I'"
+    },
+    {
+      "kind": "warning",
+      "msg": "unused label 'other_label'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/c2x-maybe_unused.sft.c",
+  "remark": null,
+  "sha256": "5c058c8e3019bab2136e783657e9c8686da280c6c1f3832ca29661a0f0d84a0e",
+  "test_number_uses": 0,
+  "type": "fp"
+}

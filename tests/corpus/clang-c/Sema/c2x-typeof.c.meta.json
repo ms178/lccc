@@ -1,0 +1,78 @@
+{
+  "bytes": 5434,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "redeclaration of 'n' with a different type: 'typeof (i)' (aka 'int') vs 'const int'"
+    },
+    {
+      "kind": "error",
+      "msg": "redeclaration of 'n' with a different type: 'typeof_unqual (n)' (aka 'int') vs 'const int'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redeclaration of 'k' with a different type: 'typeof_unqual (j)' (aka 'int') vs 'typeof (j)' (aka 'const int')"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redeclaration of 'm' with a different type: 'typeof_unqual(const int)' (aka 'int') vs 'typeof(const int)' (aka 'const int')"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redeclaration of 'i2' with a different type: 'typeof_unqual (i2)' (aka 'int') vs 'typeof (i2)' (aka '_Atomic(int)')"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of 'typeof' to bit-field"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of 'typeof_unqual' to bit-field"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redeclaration of 'type_attr_test_2' with a different type: '__attribute__((address_space(0))) int' vs 'typeof_unqual (type_attr_test_2_obj)' (aka 'int')"
+    },
+    {
+      "kind": "error",
+      "msg": "parameter may not be qualified with an address space"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/c2x-typeof.sft.c",
+  "remark": null,
+  "sha256": "d0dc84586f90d72ad685010950aa5622dbc2f24059a165404fa77ee862827e45",
+  "test_number_uses": 0,
+  "type": "fn"
+}

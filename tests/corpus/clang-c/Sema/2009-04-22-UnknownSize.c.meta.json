@@ -1,0 +1,26 @@
+{
+  "bytes": 215,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/2009-04-22-UnknownSize.sft.c",
+  "remark": null,
+  "sha256": "6fbba925430c9ff6a846d15fb267f229b372c10fc6b21245f955b4f6ce48ecad",
+  "test_number_uses": 0,
+  "type": "fn"
+}

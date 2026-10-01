@@ -1,0 +1,38 @@
+{
+  "bytes": 1582,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "excess elements in vector initializer"
+    },
+    {
+      "kind": "error",
+      "msg": "number of elements must be either one or match the size of the vector"
+    },
+    {
+      "kind": "warning",
+      "msg": "excess elements in vector initializer"
+    },
+    {
+      "kind": "warning",
+      "msg": "excess elements in vector initializer"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/altivec-init.sft.c",
+  "remark": null,
+  "sha256": "63468c6c4895414ae38d00330fd5d6f581d1fc20cb5dc631cf59a01191485f19",
+  "test_number_uses": 0,
+  "type": "fn"
+}

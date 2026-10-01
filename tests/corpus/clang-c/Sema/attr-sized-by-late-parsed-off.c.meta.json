@@ -1,0 +1,26 @@
+{
+  "bytes": 787,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 10,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "%-DNEEDS_LATE_PARSING %-DNEEDS_LATE_PARSING --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-sized-by-late-parsed-off.sft.c",
+  "remark": null,
+  "sha256": "5da586849bf7f833ee419434bde1c396f50ce3ba48d323368f8a0cae7ec8db83",
+  "test_number_uses": 0,
+  "type": "fn"
+}

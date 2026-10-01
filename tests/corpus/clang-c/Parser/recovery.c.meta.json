@@ -1,0 +1,118 @@
+{
+  "bytes": 2433,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "exponent"
+    },
+    {
+      "kind": "error",
+      "msg": "exponent"
+    },
+    {
+      "kind": "error",
+      "msg": "identifier"
+    },
+    {
+      "kind": "error",
+      "msg": "identifier"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "no member named 'hello'"
+    },
+    {
+      "kind": "error",
+      "msg": "no member named 'hello'"
+    },
+    {
+      "kind": "error",
+      "msg": "no member named 'hello'"
+    },
+    {
+      "kind": "error",
+      "msg": "extraneous ')' after condition, expected a statement"
+    },
+    {
+      "kind": "note",
+      "msg": "to match this '('"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ')'"
+    },
+    {
+      "kind": "warning",
+      "msg": "extra ';' outside of a function"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier"
+    },
+    {
+      "kind": "error",
+      "msg": "expected expression"
+    },
+    {
+      "kind": "note",
+      "msg": "forward declaration of 'struct forward'"
+    },
+    {
+      "kind": "error",
+      "msg": "incomplete definition of type"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ';' after expression"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ';' after expression"
+    },
+    {
+      "kind": "note",
+      "msg": "'intptr_t' declared here"
+    },
+    {
+      "kind": "error",
+      "msg": "unknown type name 'intptr'; did you mean 'intptr_t'?"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ';' at end of declaration"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ';' after expression"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ';' after expression"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ';' after expression"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/recovery.sft.c",
+  "remark": null,
+  "sha256": "97ff14fd0ddbc45060d83d102d8b1b27e02d31a32edf55f66f1c5c4a257ae5f0",
+  "test_number_uses": 0,
+  "type": "fn"
+}

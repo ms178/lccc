@@ -1,0 +1,154 @@
+{
+  "bytes": 5447,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "'f0' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "note",
+      "msg": "'f2' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "note",
+      "msg": "'f3' has been explicitly marked unavailable here"
+    },
+    {
+      "kind": "note",
+      "msg": "'f32' has been explicitly marked unavailable here"
+    },
+    {
+      "kind": "note",
+      "msg": "'f5' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "note",
+      "msg": "'f6' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "note",
+      "msg": "'f7' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "note",
+      "msg": "'f8' has been explicitly marked unavailable here"
+    },
+    {
+      "kind": "note",
+      "msg": "'f9' has been explicitly marked unavailable here"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "'f5' is deprecated: first deprecated in macCatalyst"
+    },
+    {
+      "kind": "warning",
+      "msg": "'f6' is deprecated: first deprecated in macCatalyst"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "'f9' is unavailable"
+    },
+    {
+      "kind": "note",
+      "msg": "here"
+    },
+    {
+      "kind": "note",
+      "msg": "here"
+    },
+    {
+      "kind": "note",
+      "msg": "here"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 13,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-D APPEXT --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-availability-maccatalyst.sft.c",
+  "remark": null,
+  "sha256": "85f7a9942e2597178ba667d8074551513aedeca15c24a91c6c393f5c2f187762",
+  "test_number_uses": 0,
+  "type": "fn"
+}

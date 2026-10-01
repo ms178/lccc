@@ -1,0 +1,58 @@
+{
+  "bytes": 1390,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "variable named 'main' with external linkage has undefined behavior"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable named 'main' with external linkage has undefined behavior"
+    },
+    {
+      "kind": "no-diagnostics",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "variable named 'main' with external linkage has undefined behavior"
+    },
+    {
+      "kind": "no-diagnostics",
+      "msg": ""
+    },
+    {
+      "kind": "no-diagnostics",
+      "msg": ""
+    },
+    {
+      "kind": "no-diagnostics",
+      "msg": ""
+    },
+    {
+      "kind": "no-diagnostics",
+      "msg": ""
+    },
+    {
+      "kind": "no-diagnostics",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 13,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DTEST1 -DTEST2 -DTEST3 -DTEST4 -DTEST5 -DTEST6 -DTEST7 -DTEST8 -DTEST9 --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-extern-main.sft.c",
+  "remark": null,
+  "sha256": "8d30f2ff39dd64cc91b21f57eeea4c705aaa9e40980f081b0ca8f66873fc1f2a",
+  "test_number_uses": 0,
+  "type": "fp"
+}

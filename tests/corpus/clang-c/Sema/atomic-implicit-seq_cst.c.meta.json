@@ -1,0 +1,326 @@
+{
+  "bytes": 15023,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit use of sequentially-consistent atomic may incur stronger memory barriers than necessary"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c11"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/atomic-implicit-seq_cst.sft.c",
+  "remark": null,
+  "sha256": "fc89df15d539ad5a59624bee0052581bce9d854bf6f9a3de3bd7bd28b15b56d4",
+  "test_number_uses": 0,
+  "type": "fp"
+}

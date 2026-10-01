@@ -1,0 +1,166 @@
+{
+  "bytes": 3635,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration shadows a variable in the global scope"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration shadows a variable in the global scope"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration shadows a local variable"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration shadows a local variable"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration shadows a local variable"
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration shadows a local variable"
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration shadows a variable in the global scope"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration shadows a local variable"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration shadows a local variable"
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration shadows a variable in the global scope"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration shadows a variable in the global scope"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration shadows a variable in the global scope"
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration shadows a variable in the global scope"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "non-static declaration of 'i' follows static declaration"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration shadows a variable in the global scope"
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration shadows a local variable"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration shadows a local variable"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration shadows a local variable"
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration shadows a local variable"
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration shadows a local variable"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-shadow.sft.c",
+  "remark": null,
+  "sha256": "31cb63267361466d492d1d1cf84370b600c8d629aeeb00d58ee40de2915bee49",
+  "test_number_uses": 0,
+  "type": "fn"
+}

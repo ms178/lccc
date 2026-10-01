@@ -1,0 +1,286 @@
+{
+  "bytes": 13873,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'overloadable' attribute only applies to functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'clang::overloadable' attribute cannot be applied to types"
+    },
+    {
+      "kind": "error",
+      "msg": "'overloadable' attribute takes no arguments"
+    },
+    {
+      "kind": "note",
+      "msg": "previous overload of function is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redeclaration of 'f' must have the 'overloadable' attribute"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "note",
+      "msg": "candidate function"
+    },
+    {
+      "kind": "note",
+      "msg": "candidate function"
+    },
+    {
+      "kind": "error",
+      "msg": "no matching function for call to 'accept_funcptr'"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting types for 'f'"
+    },
+    {
+      "kind": "note",
+      "msg": "marked unavailable here"
+    },
+    {
+      "kind": "error",
+      "msg": "'promote' is unavailable"
+    },
+    {
+      "kind": "error",
+      "msg": "'overloadable' function 'f0' must have a prototype"
+    },
+    {
+      "kind": "error",
+      "msg": "'overloadable' function 'f1' must have a prototype"
+    },
+    {
+      "kind": "error",
+      "msg": "'overloadable' function 'invalid' must have a prototype"
+    },
+    {
+      "kind": "error",
+      "msg": "redeclaration of 'invalid' must not have the 'overloadable' attribute"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call, expected 1, have 0"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": "here"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting types"
+    },
+    {
+      "kind": "error",
+      "msg": "initializing 'void (*)(int *)' with an expression of incompatible type '<overloaded function type>'"
+    },
+    {
+      "kind": "error",
+      "msg": "initializing 'void *' with an expression of incompatible type '<overloaded function type>'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible function pointer types initializing 'void (*)(int *)' with an expression of type 'void (*)(void *)'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible function pointer types initializing 'void (*)(void *)' with an expression of type '<overloaded function type>'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible function pointer types initializing 'void (*)(int *)' with an expression of type '<overloaded function type>'"
+    },
+    {
+      "kind": "error",
+      "msg": "call to 'foo' is ambiguous"
+    },
+    {
+      "kind": "error",
+      "msg": "call to 'foo' is ambiguous"
+    },
+    {
+      "kind": "error",
+      "msg": "call to 'bar' is ambiguous"
+    },
+    {
+      "kind": "error",
+      "msg": "call to 'bar' is ambiguous"
+    },
+    {
+      "kind": "error",
+      "msg": "call to 'foo' is ambiguous"
+    },
+    {
+      "kind": "error",
+      "msg": "call to 'foo' is ambiguous"
+    },
+    {
+      "kind": "note",
+      "msg": "previous"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of 'wg_foo' as different kind of symbol"
+    },
+    {
+      "kind": "note",
+      "msg": "previous overload"
+    },
+    {
+      "kind": "error",
+      "msg": "must have the 'overloadable' attribute"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "must have the 'overloadable' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "must have the 'overloadable' attribute"
+    },
+    {
+      "kind": "note",
+      "msg": "previous unmarked overload"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "must not have the 'overloadable' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "must have the 'overloadable' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "must have the 'overloadable' attribute"
+    },
+    {
+      "kind": "note",
+      "msg": "previous overload"
+    },
+    {
+      "kind": "error",
+      "msg": "must have the 'overloadable' attribute"
+    },
+    {
+      "kind": "note",
+      "msg": "previous overload"
+    },
+    {
+      "kind": "error",
+      "msg": "must have the 'overloadable' attribute"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "at most one overload for a given name may lack the 'overloadable' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "at most one overload for a given name may lack the 'overloadable' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "at most one overload for a given name may lack the 'overloadable' attribute"
+    },
+    {
+      "kind": "note",
+      "msg": "previous overload"
+    },
+    {
+      "kind": "error",
+      "msg": "must have the 'overloadable' attribute"
+    },
+    {
+      "kind": "note",
+      "msg": "previous unmarked overload"
+    },
+    {
+      "kind": "error",
+      "msg": "must not have the 'overloadable' attribute"
+    },
+    {
+      "kind": "note",
+      "msg": "previous unmarked overload"
+    },
+    {
+      "kind": "error",
+      "msg": "must not have the 'overloadable' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting types for 'to_foo9'"
+    },
+    {
+      "kind": "error",
+      "msg": "at most one overload for a given name may lack the 'overloadable' attribute"
+    },
+    {
+      "kind": "note",
+      "msg": "previous unmarked overload"
+    },
+    {
+      "kind": "error",
+      "msg": "at most one overload for a given name may lack the 'overloadable' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "must have the 'overloadable' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "must have the 'overloadable' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "ISO C requires a named parameter before '...'"
+    },
+    {
+      "kind": "error",
+      "msg": "'clang::overloadable' attribute cannot be applied to types"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/overloadable.sft.c",
+  "remark": null,
+  "sha256": "d211976adb0462b20540a46c18ac612305ed842e3767a0238906acd304ef14fd",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,21 @@
+{
+  "bytes": 220,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/enum-increment.sft.c",
+  "remark": null,
+  "sha256": "28f5b62ce6ea6e3dbac15b9be2b9b59442138e6e5cf99e53c98998cfc157d1e0",
+  "test_number_uses": 0,
+  "type": "fp"
+}

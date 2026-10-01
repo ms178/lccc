@@ -1,0 +1,26 @@
+{
+  "bytes": 458,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'cleanup' function 'close' parameter has type 'typeof (open()) *' (aka 'int *') which is incompatible with type 'float *'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/type-dependent-attrs.sft.c",
+  "remark": null,
+  "sha256": "5ba153f7532337b8ff42a30a714df39565457be6ba569c6cd897aea7bd44de25",
+  "test_number_uses": 0,
+  "type": "fn"
+}

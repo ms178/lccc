@@ -1,0 +1,34 @@
+{
+  "bytes": 1314,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "implicit conversion"
+    },
+    {
+      "kind": "error",
+      "msg": "_Pragma takes a parenthesized string literal"
+    },
+    {
+      "kind": "error",
+      "msg": "expected identifier or '('"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/_Pragma-in-macro-arg.sft.c",
+  "remark": null,
+  "sha256": "e1db7558dc0027822f255089313a895bf92b2d17f02762fcc90ed335cd6016ee",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,70 @@
+{
+  "bytes": 1244,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "previous"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting types for 'blapp'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting types for 'yarp'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting types for 'blarg'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting types for 'blerp'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting types for 'foo'"
+    },
+    {
+      "kind": "warning",
+      "msg": "incompatible redeclaration of library function 'rintf'"
+    },
+    {
+      "kind": "note",
+      "msg": "'rintf' is a builtin with type 'float (float)'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/prototype-redecls.sft.c",
+  "remark": null,
+  "sha256": "d5278ad3efa2a4abe21aca0bd96ffbc2b3e2f83b7970c6dcb8dfee239bf878eb",
+  "test_number_uses": 0,
+  "type": "fn"
+}

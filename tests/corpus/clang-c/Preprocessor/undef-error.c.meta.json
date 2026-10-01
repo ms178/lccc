@@ -1,0 +1,21 @@
+{
+  "bytes": 200,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/undef-error.sft.c",
+  "remark": null,
+  "sha256": "102d9cbb660219386cab0f90fb070f8f1134c87da79d98df57c0e212275e0eef",
+  "test_number_uses": 0,
+  "type": "fn"
+}

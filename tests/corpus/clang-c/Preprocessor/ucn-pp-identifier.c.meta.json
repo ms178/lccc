@@ -1,0 +1,148 @@
+{
+  "bytes": 7935,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "\\u used with no following hex digits"
+    },
+    {
+      "kind": "warning",
+      "msg": "incomplete universal character name"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "incomplete universal character name; treating as '\\' followed by identifier"
+    },
+    {
+      "kind": "error",
+      "msg": "hex escape sequence out of range"
+    },
+    {
+      "kind": "warning",
+      "msg": "incomplete delimited universal character name; treating as '\\' 'u' '{' identifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "incomplete delimited universal character name; treating as '\\' 'u' '{' identifier"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "'NOTATHING' is not a valid Unicode character name"
+    },
+    {
+      "kind": "error",
+      "msg": "macro name must be an identifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "incomplete universal character name; treating as '\\' followed by identifier"
+    },
+    {
+      "kind": "error",
+      "msg": "'GREEK_SMALL-LETTERALPHA' is not a valid Unicode character name"
+    },
+    {
+      "kind": "note",
+      "msg": "characters names in Unicode escape sequences are sensitive to case and whitespaces"
+    },
+    {
+      "kind": "error",
+      "msg": "'\ud83e\udd21' is not a valid Unicode character name"
+    },
+    {
+      "kind": "error",
+      "msg": "macro name must be an identifier"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "trigraph converted"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "character <U+202D> not allowed in an identifier"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 58,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c99 -DTRIGRAPHS=1",
+    " --c23 -DTRIGRAPHS=1 -DTRIGRAPHS=1 -DTRIGRAPHS=1",
+    " --c99 -w"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/ucn-pp-identifier.sft.c",
+  "remark": null,
+  "sha256": "0a8245e900a7cc9658149f33e309f06b68b2e518da0de9f65ed5a9edc4985794",
+  "test_number_uses": 0,
+  "type": "fn"
+}

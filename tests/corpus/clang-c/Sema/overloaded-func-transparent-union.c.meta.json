@@ -1,0 +1,21 @@
+{
+  "bytes": 583,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": true,
+  "header_lines": 6,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/overloaded-func-transparent-union.sft.c",
+  "remark": null,
+  "sha256": "72a438f76bbf4e95d6084de71f90f5de34c4c0957ad5d69f82770f193081037a",
+  "test_number_uses": 0,
+  "type": "fp"
+}

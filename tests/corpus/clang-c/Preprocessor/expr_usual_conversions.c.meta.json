@@ -1,0 +1,26 @@
+{
+  "bytes": 484,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "right side of operator converted from negative value to unsigned: -2 to 18446744073709551614"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/expr_usual_conversions.sft.c",
+  "remark": null,
+  "sha256": "89a11942f1889a44ed999daccd3de879ab16523cd6f6bc94368cfed8bb148189",
+  "test_number_uses": 0,
+  "type": "fp"
+}

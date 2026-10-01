@@ -1,0 +1,21 @@
+{
+  "bytes": 4347,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 12,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DCHECK_IR -DRV64 --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/riscv-interrupt-attr-qci.sft.c",
+  "remark": null,
+  "sha256": "bd2e1c502fc817a29b9fdc6534d4164c713df2e2be4c03ef0f70377176460b9f",
+  "test_number_uses": 0,
+  "type": "fp"
+}

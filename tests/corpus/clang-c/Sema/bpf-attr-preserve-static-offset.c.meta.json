@@ -1,0 +1,21 @@
+{
+  "bytes": 834,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 18,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/bpf-attr-preserve-static-offset.sft.c",
+  "remark": null,
+  "sha256": "3bca9117364cb4adff454914d4c0ba5aab76f106b124a4447c8b4917217fa13a",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,146 @@
+{
+  "bytes": 3652,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to function call"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting types for 'g0'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting types for 'g2'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting types for 'f1'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "static declaration of 'g3' follows non-static declaration"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of 'f2' as different kind of symbol"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of 'f2' as different kind of symbol"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting types for 'outer1'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of 'outer5' as different kind of symbol"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting types for 'outer2'"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting types for 'outer3'"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting types for 'outer4'"
+    },
+    {
+      "kind": "warning",
+      "msg": "use of out-of-scope declaration of 'outer6'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'outer8'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "promoted type 'int' of K&R function parameter is not compatible with the parameter type 'short' declared in a previous prototype"
+    },
+    {
+      "kind": "note",
+      "msg": "passing argument to parameter here"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible integer to pointer conversion passing 'int' to parameter of type 'int *'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting types for 'f4'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/function-redecl.sft.c",
+  "remark": null,
+  "sha256": "7e58aed343bff759a1f23ea21edb754ffe8957ae3337c9dacd839e7cfe2fd1c3",
+  "test_number_uses": 0,
+  "type": "fn"
+}

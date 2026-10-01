@@ -1,0 +1,30 @@
+{
+  "bytes": 3453,
+  "cases": null,
+  "category": "Parser",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 19,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c17 -DTEST_SPELLING",
+    " --c17 -DTEST_SPELLING --ms_compatibility",
+    " --c23",
+    " --c99",
+    " --c99",
+    " --c++17 --c++",
+    " --c++17 --c++",
+    " --c++03 --c++",
+    " --c++03 --c++",
+    " --c++17 --c++"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/static_assert.sft.c",
+  "remark": null,
+  "sha256": "919120a8679e5b52bc39413a129123a9c01b854ab77c9b8155303e77b6658b65",
+  "test_number_uses": 0,
+  "type": "fn"
+}

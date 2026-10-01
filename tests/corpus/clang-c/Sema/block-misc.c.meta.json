@@ -1,0 +1,190 @@
+{
+  "bytes": 6262,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "assignment to cast is illegal, lvalue casts are not supported"
+    },
+    {
+      "kind": "error",
+      "msg": "block pointer to non-function type is invalid"
+    },
+    {
+      "kind": "error",
+      "msg": "block pointer to non-function type is invalid"
+    },
+    {
+      "kind": "error",
+      "msg": "block pointer to non-function type is invalid"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared label 'somelabel'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared label 'somelabel'"
+    },
+    {
+      "kind": "error",
+      "msg": "'case' statement not in switch statement"
+    },
+    {
+      "kind": "error",
+      "msg": "'break' statement not in loop or switch statement"
+    },
+    {
+      "kind": "error",
+      "msg": "'break' statement not in loop or switch statement"
+    },
+    {
+      "kind": "error",
+      "msg": "type name requires a specifier or qualifier"
+    },
+    {
+      "kind": "error",
+      "msg": "initializer element is not a compile-time constant"
+    },
+    {
+      "kind": "note",
+      "msg": "passing argument to parameter 'comp' here"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible block pointer types passing 'int (^)(void)' to parameter of type 'long (^)()'"
+    },
+    {
+      "kind": "error",
+      "msg": "__block attribute not allowed, only allowed on local variables"
+    },
+    {
+      "kind": "error",
+      "msg": "__block attribute not allowed, only allowed on local variables"
+    },
+    {
+      "kind": "error",
+      "msg": "__block attribute not allowed, only allowed on local variables"
+    },
+    {
+      "kind": "error",
+      "msg": "__block attribute not allowed, only allowed on local variables"
+    },
+    {
+      "kind": "error",
+      "msg": "__block attribute not allowed on declaration with a variably modified type"
+    },
+    {
+      "kind": "error",
+      "msg": "__block attribute not allowed on declaration with a variably modified type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible operand types ('void (^)(int)' and 'void (*)(int)')"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression"
+    },
+    {
+      "kind": "note",
+      "msg": "variable 'blockA' declared const here"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot assign to variable 'blockA' with const-qualified type 'void (^const)(void)"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot jump"
+    },
+    {
+      "kind": "note",
+      "msg": "jump bypasses setup of __block variable"
+    },
+    {
+      "kind": "note",
+      "msg": "declared here"
+    },
+    {
+      "kind": "note",
+      "msg": "declared here"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot refer to declaration with a variably modified type inside block"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot refer to declaration with a variably modified type inside block"
+    },
+    {
+      "kind": "note",
+      "msg": "declared here"
+    },
+    {
+      "kind": "note",
+      "msg": "declared here"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot refer to declaration with an array type inside block"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot refer to declaration with an array type inside block"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/block-misc.sft.c",
+  "remark": null,
+  "sha256": "b03ae52f433346103c18183a789674b971727c0ef52203f56977e5ba3082b4d2",
+  "test_number_uses": 0,
+  "type": "fn"
+}

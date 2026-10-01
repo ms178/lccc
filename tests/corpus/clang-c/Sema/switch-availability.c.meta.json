@@ -1,0 +1,46 @@
+{
+  "bytes": 1626,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "enumeration values 'Ed', 'Vim', and 'Emacs' not handled in switch"
+    },
+    {
+      "kind": "warning",
+      "msg": "enumeration value 'New' not handled in switch"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "enumeration value 'Blue' not handled in switch"
+    },
+    {
+      "kind": "warning",
+      "msg": "non-void function does not return a value in all control paths"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DNO_DEPRECATED_CASE --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/switch-availability.sft.c",
+  "remark": null,
+  "sha256": "6527a9456f290ffc8511d630ae9a100f22d2f60f8be423bd62988e7c42dd9305",
+  "test_number_uses": 0,
+  "type": "fp"
+}

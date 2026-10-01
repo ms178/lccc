@@ -1,0 +1,21 @@
+{
+  "bytes": 242,
+  "cases": null,
+  "category": "Parser",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 9,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/crash-report.sft.c",
+  "remark": null,
+  "sha256": "a4c7517e27958b7d7a242327d4a3b42cd4cd0a03adc8889f7a226952ac1dc31f",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,38 @@
+{
+  "bytes": 1178,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 12,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DWARN_PEDANTIC --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/enable_if-ext.sft.c",
+  "remark": null,
+  "sha256": "644b73aff206f63bc8a7037d9b9b8eb0d92ab702757659a52348ec6eb7ac15dd",
+  "test_number_uses": 0,
+  "type": "fp"
+}

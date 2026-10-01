@@ -1,0 +1,21 @@
+{
+  "bytes": 855,
+  "cases": null,
+  "category": "C",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 18,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C99/digraphs.sft.c",
+  "remark": null,
+  "sha256": "1e064e75e59b66d4ae45b9cd89019614fa4e7f17531d3c841adf3c55d6dde3be",
+  "test_number_uses": 0,
+  "type": "fp"
+}

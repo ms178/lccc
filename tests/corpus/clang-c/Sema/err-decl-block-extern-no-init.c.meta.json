@@ -1,0 +1,30 @@
+{
+  "bytes": 409,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "declaration of block scope identifier with linkage cannot have an initializer"
+    },
+    {
+      "kind": "error",
+      "msg": "declaration of block scope identifier with linkage cannot have an initializer"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 3,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/err-decl-block-extern-no-init.sft.c",
+  "remark": null,
+  "sha256": "48bcbe7e1ebe3d2fe6b28ec5f7bacc5169780247be8b66fb03b15cb4af6b5733",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,22 @@
+{
+  "bytes": 724,
+  "cases": null,
+  "category": "Parser",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23",
+    " --c17"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/c2x-func-prototype.sft.c",
+  "remark": null,
+  "sha256": "60aadb0e86c13aa39e95c2d4686a14433217882aa6486c3d0d6f49e66eaa71bb",
+  "test_number_uses": 0,
+  "type": "fn"
+}

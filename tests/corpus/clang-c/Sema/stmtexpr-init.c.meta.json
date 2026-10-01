@@ -1,0 +1,30 @@
+{
+  "bytes": 612,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "statement expression not allowed at file scope"
+    },
+    {
+      "kind": "error",
+      "msg": "initializer element is not a compile-time constant"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/stmtexpr-init.sft.c",
+  "remark": null,
+  "sha256": "60d9a53957c4f34344d0c0933ed9665d9542cb6996e9f44c026e6bd83a1d3a4a",
+  "test_number_uses": 0,
+  "type": "fn"
+}

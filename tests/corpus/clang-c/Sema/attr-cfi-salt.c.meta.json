@@ -1,0 +1,107 @@
+{
+  "bytes": 3316,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'cfi_salt' attribute takes one argument"
+    },
+    {
+      "kind": "error",
+      "msg": "expected string literal as argument of 'cfi_salt' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "'cfi_salt' attribute takes one argument"
+    },
+    {
+      "kind": "warning",
+      "msg": "'cfi_salt' only applies to function types"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting types for 'baz_fn'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting types for 'mux_fn'"
+    },
+    {
+      "kind": "warning",
+      "msg": "'cfi_salt' only applies to function types"
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "error",
+      "msg": "typedef redefinition with different type"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting types for 'func1'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible function pointer types initializing 'void (*)(int)' with an expression of type 'void (int)'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting types for 'func2'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible function pointer types initializing 'void (*)(int)' with an expression of type 'void (int)'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible function pointer types initializing 'void (*)(int)' with an expression of type 'void (int)'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible function pointer types initializing 'void (*)(int)' with an expression of type 'void (int)'"
+    },
+    {
+      "kind": "error",
+      "msg": "attribute only applies to non-K&R-style functions"
+    },
+    {
+      "kind": "error",
+      "msg": "attribute only applies to non-K&R-style functions"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c11",
+    " --c89 -DKNR"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-cfi-salt.sft.c",
+  "remark": null,
+  "sha256": "ed525346023166a880bfccb0c82a29f06eed521692d419961d388be4aadf0ae8",
+  "test_number_uses": 0,
+  "type": "fn"
+}

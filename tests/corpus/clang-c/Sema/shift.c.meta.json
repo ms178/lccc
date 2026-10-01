@@ -1,0 +1,21 @@
+{
+  "bytes": 2926,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 51,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/shift.sft.c",
+  "remark": null,
+  "sha256": "a730db7d6d0ab9f058d8c073c2742bb81abbbd307f28e7822fc33146b5b55fc0",
+  "test_number_uses": 0,
+  "type": "fn"
+}

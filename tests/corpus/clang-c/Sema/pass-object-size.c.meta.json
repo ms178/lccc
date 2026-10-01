@@ -1,0 +1,154 @@
+{
+  "bytes": 5474,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'pass_object_size' attribute takes one argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'pass_object_size' attribute requires parameter 1 to be an integer constant"
+    },
+    {
+      "kind": "error",
+      "msg": "'pass_object_size' attribute requires integer constant between 0 and 3 inclusive"
+    },
+    {
+      "kind": "error",
+      "msg": "'pass_object_size' attribute requires integer constant between 0 and 3 inclusive"
+    },
+    {
+      "kind": "error",
+      "msg": "integer constant expression evaluates to value 4294967296 that cannot be represented in a 32-bit unsigned integer type"
+    },
+    {
+      "kind": "error",
+      "msg": "'pass_object_size' attribute only applies to constant pointer arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'pass_object_size' attribute only applies to constant pointer arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "pass_object_size attribute only applies to constant pointer arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'pass_object_size' attribute can only be applied once per parameter"
+    },
+    {
+      "kind": "error",
+      "msg": "'pass_dynamic_object_size' attribute takes one argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'pass_dynamic_object_size' attribute only applies to constant pointer arguments"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting pass_object_size attributes on parameters"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting pass_object_size attributes on parameters"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting pass_object_size attributes on parameters"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": "passing argument to parameter 'p' here"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot take address of function 'NotOverloaded' because parameter 1 has pass_object_size attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot take address of function 'NotOverloaded' because parameter 1 has pass_object_size attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible function pointer types initializing 'void (*)(void *)' with an expression of type '<overloaded function type>'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible function pointer types initializing 'void (*)(void *)' with an expression of type '<overloaded function type>'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot take address of function 'NotOverloaded' because parameter 1 has pass_object_size attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot take address of function 'NotOverloaded' because parameter 1 has pass_object_size attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot take address of function 'NotOverloaded' because parameter 1 has pass_object_size attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot take address of function 'NotOverloaded' because parameter 1 has pass_object_size attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot take address of function 'NotOverloaded' because parameter 1 has pass_object_size attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer types passing 'int *' to parameter of type 'char *'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting pass_object_size attributes on parameters"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting pass_object_size attributes on parameters"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/pass-object-size.sft.c",
+  "remark": null,
+  "sha256": "14bfb76ab0f9799b95693e07a5873e41228bd29246c2ceb94e2284eed34d1da8",
+  "test_number_uses": 0,
+  "type": "fn"
+}

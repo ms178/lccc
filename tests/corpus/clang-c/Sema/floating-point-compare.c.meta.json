@@ -1,0 +1,66 @@
+{
+  "bytes": 2018,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "comparing floating point with =="
+    },
+    {
+      "kind": "warning",
+      "msg": "comparing floating point with =="
+    },
+    {
+      "kind": "warning",
+      "msg": "floating-point comparison is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "floating-point comparison is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparing floating point with =="
+    },
+    {
+      "kind": "warning",
+      "msg": "floating-point comparison is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "floating-point comparison is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "floating-point comparison is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "floating-point comparison is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "floating-point comparison is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "floating-point comparison is always false"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/floating-point-compare.sft.c",
+  "remark": null,
+  "sha256": "127a14df6e5937c2327b4a8fe22a97fb4ab614e8e18879779709e109381e5ca7",
+  "test_number_uses": 0,
+  "type": "fp"
+}

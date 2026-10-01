@@ -1,0 +1,26 @@
+{
+  "bytes": 603,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "expression with side effects has no effect in an unevaluated context"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c89"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/expr-comma.sft.c",
+  "remark": null,
+  "sha256": "aa26d3b2bbd3f1732eb499f437458cf4de62b163b8621b069247a96dfc8507c0",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,38 @@
+{
+  "bytes": 1336,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "returning '_AS2 void *' from a function with result type 'void *' changes address space of pointer"
+    },
+    {
+      "kind": "error",
+      "msg": "returning '_AS999 void *' from a function with result type 'void *' changes address space of pointer"
+    },
+    {
+      "kind": "error",
+      "msg": "returning '__local void *' from a function with result type 'void *' changes address space of pointer"
+    },
+    {
+      "kind": "error",
+      "msg": "returning 'void *' from a function with result type '_AS1 void *' changes address space of pointer"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 12,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/amdgcn-address-spaces.sft.c",
+  "remark": null,
+  "sha256": "28484a1dc08b5c02ca197d1227a282f469d3b42f385c96eef98cc6e1ec0478d4",
+  "test_number_uses": 0,
+  "type": "fn"
+}

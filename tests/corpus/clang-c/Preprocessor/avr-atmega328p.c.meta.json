@@ -1,0 +1,21 @@
+{
+  "bytes": 487,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 14,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/avr-atmega328p.sft.c",
+  "remark": null,
+  "sha256": "aca8d08fe05567b7e92851416667dd4861e63c02bd474aee8bb4e2b59a0d1102",
+  "test_number_uses": 0,
+  "type": "fp"
+}

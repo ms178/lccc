@@ -1,0 +1,28 @@
+{
+  "bytes": 582,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c",
+    " --c++03 --c++",
+    " --c++11 --c++"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/shift-count-overflow.sft.c",
+  "remark": null,
+  "sha256": "35a981e159574d82c59699f955b6ba3d3f7fd213f2c47b329049b181390d05f4",
+  "test_number_uses": 0,
+  "type": "fp"
+}

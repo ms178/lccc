@@ -1,0 +1,30 @@
+{
+  "bytes": 401,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "incompatible function pointer types"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible function pointer types"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/callingconv-sysv_abi.sft.c",
+  "remark": null,
+  "sha256": "0c86f860bd25df42b7647dbc3f590c8d600100bd76fbfacd17aa5183407be5f7",
+  "test_number_uses": 0,
+  "type": "fn"
+}

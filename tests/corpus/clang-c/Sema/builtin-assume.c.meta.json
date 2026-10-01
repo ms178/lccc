@@ -1,0 +1,50 @@
+{
+  "bytes": 1448,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "assumption is ignored because it contains (potential) side-effects"
+    },
+    {
+      "kind": "warning",
+      "msg": "assumption is ignored because it contains (potential) side-effects"
+    },
+    {
+      "kind": "warning",
+      "msg": "assumption is ignored because it contains (potential) side-effects"
+    },
+    {
+      "kind": "warning",
+      "msg": "assumption is ignored because it contains (potential) side-effects"
+    },
+    {
+      "kind": "warning",
+      "msg": "assumption is ignored because it contains (potential) side-effects"
+    },
+    {
+      "kind": "warning",
+      "msg": "assumption is ignored because it contains (potential) side-effects"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable length array"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--ms_extensions --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/builtin-assume.sft.c",
+  "remark": null,
+  "sha256": "64a7cde3838ad42113a8ac1102354b0fc0dcf102ca7a1689f25af0b6464c7146",
+  "test_number_uses": 0,
+  "type": "fp"
+}

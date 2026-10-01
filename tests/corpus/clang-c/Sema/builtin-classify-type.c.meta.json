@@ -1,0 +1,21 @@
+{
+  "bytes": 3300,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/builtin-classify-type.sft.c",
+  "remark": null,
+  "sha256": "1f4f22c101537b1c991e467128507b9a6ceecb5bf38997f423467e65cb53c09d",
+  "test_number_uses": 0,
+  "type": "fp"
+}

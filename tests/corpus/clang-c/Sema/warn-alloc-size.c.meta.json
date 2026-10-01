@@ -1,0 +1,82 @@
+{
+  "bytes": 3349,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "allocation of insufficient size '8' for type 'struct Foo' with size '40'"
+    },
+    {
+      "kind": "warning",
+      "msg": "allocation of insufficient size '8' for type 'struct Foo' with size '40'"
+    },
+    {
+      "kind": "warning",
+      "msg": "allocation of insufficient size '8' for type 'struct Foo' with size '40'"
+    },
+    {
+      "kind": "warning",
+      "msg": "allocation of insufficient size '4' for type 'struct Foo' with size '40'"
+    },
+    {
+      "kind": "warning",
+      "msg": "allocation of insufficient size '8' for type 'struct Foo' with size '40'"
+    },
+    {
+      "kind": "warning",
+      "msg": "allocation of insufficient size '8' for type 'struct Foo' with size '40'"
+    },
+    {
+      "kind": "warning",
+      "msg": "allocation of insufficient size '4' for type 'struct Foo' with size '40'"
+    },
+    {
+      "kind": "warning",
+      "msg": "allocation of insufficient size '4' for type 'struct Foo' with size '40'"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "initializing 'int *' with an expression of type 'unsigned int *' converts between pointers to integer types with different sign"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "allocation of insufficient size '1' for type 'int' with size '4'"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "allocation of insufficient size '1' for type 'int' with size '4'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 3,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-alloc-size.sft.c",
+  "remark": null,
+  "sha256": "0cc0810a66ead4dd55d10f64a69ae1e4849122eb373407c24e04f899470ec40b",
+  "test_number_uses": 0,
+  "type": "fp"
+}

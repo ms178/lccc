@@ -1,0 +1,42 @@
+{
+  "bytes": 934,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'__min_vector_width__' attribute requires an integer constant"
+    },
+    {
+      "kind": "warning",
+      "msg": "attribute '__min_vector_width__' is already applied with different arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'__min_vector_width__' attribute takes one argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'__min_vector_width__' attribute takes one argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'__min_vector_width__' attribute only applies to functions"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-min-vector-width.sft.c",
+  "remark": null,
+  "sha256": "4aee67c5ab426738bac5979a2c477986eda907728f8015b94e11276ee591417a",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,35 @@
+{
+  "bytes": 755,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call, expected at least 1, have 0"
+    },
+    {
+      "kind": "error",
+      "msg": "must be wide string constants"
+    },
+    {
+      "kind": "error",
+      "msg": "must be wide string constants"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w --ms_extensions --c",
+    " --c++11 --c++ -w --ms_extensions -w --ms_extensions"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/ms-annotation.sft.c",
+  "remark": null,
+  "sha256": "2163a3154ca92cfe7a9d9efaa618994874e4acff007006c8045055fee58328bc",
+  "test_number_uses": 0,
+  "type": "fn"
+}

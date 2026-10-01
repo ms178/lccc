@@ -1,0 +1,66 @@
+{
+  "bytes": 2432,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "array subscript is of type 'char'"
+    },
+    {
+      "kind": "warning",
+      "msg": "array subscript is of type 'char'"
+    },
+    {
+      "kind": "warning",
+      "msg": "array subscript is of type 'char'"
+    },
+    {
+      "kind": "warning",
+      "msg": "array subscript is of type 'char'"
+    },
+    {
+      "kind": "warning",
+      "msg": "array subscript is of type 'char'"
+    },
+    {
+      "kind": "warning",
+      "msg": "array subscript is of type 'char'"
+    },
+    {
+      "kind": "warning",
+      "msg": "array subscript is of type 'char'"
+    },
+    {
+      "kind": "warning",
+      "msg": "array subscript is of type 'char'"
+    },
+    {
+      "kind": "note",
+      "msg": "array 'array' declared here"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-char-subscripts.sft.c",
+  "remark": null,
+  "sha256": "20ac51217629de61376a6f4b757046b4fefba7141bf89fae3b6a47f906a47667",
+  "test_number_uses": 0,
+  "type": "fp"
+}

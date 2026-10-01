@@ -1,0 +1,26 @@
+{
+  "bytes": 336,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from 'float' to 'int' changes value from 1.4 to 1"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/implicit-cast.sft.c",
+  "remark": null,
+  "sha256": "2421227e80fb2105927b71cde391323f57e4c6036effd89964a5d5e577e9e309",
+  "test_number_uses": 0,
+  "type": "fp"
+}

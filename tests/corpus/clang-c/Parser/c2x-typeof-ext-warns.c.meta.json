@@ -1,0 +1,25 @@
+{
+  "bytes": 1653,
+  "cases": null,
+  "category": "Parser",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 18,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23",
+    " --c11",
+    " --c11 --strict_gnu",
+    " --c11 --strict_gnu",
+    " --c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/c2x-typeof-ext-warns.sft.c",
+  "remark": null,
+  "sha256": "c49ea64947ad4580095e0fde23a5d039741aca030c71ca949f00e8fe5cdd6244",
+  "test_number_uses": 0,
+  "type": "fp"
+}

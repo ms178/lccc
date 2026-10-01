@@ -1,0 +1,26 @@
+{
+  "bytes": 247,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "address of stack memory associated with local variable 'i' returned"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c99"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-lifetimebound.sft.c",
+  "remark": null,
+  "sha256": "d7aec59f889a9b3fe1db7d35ff83c1efafabf7b1173b329ec5f68ce473b68d7c",
+  "test_number_uses": 0,
+  "type": "fp"
+}

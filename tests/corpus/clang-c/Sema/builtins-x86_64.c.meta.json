@@ -1,0 +1,194 @@
+{
+  "bytes": 5486,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "use of unknown builtin"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/builtins-x86_64.sft.c",
+  "remark": null,
+  "sha256": "46f6e0722d34570b33c44d321c168c393e13abd37098376933fcfb3fc330eaec",
+  "test_number_uses": 0,
+  "type": "fn"
+}

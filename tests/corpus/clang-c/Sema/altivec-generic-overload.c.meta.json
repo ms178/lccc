@@ -1,0 +1,30 @@
+{
+  "bytes": 4983,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "call to 'convert2' is ambiguous"
+    },
+    {
+      "kind": "error",
+      "msg": "call to 'convert2' is ambiguous"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/altivec-generic-overload.sft.c",
+  "remark": null,
+  "sha256": "183c25d795800e85d2af1b8e792f85f0a85618e1d732dad601799eedcec72357",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,70 @@
+{
+  "bytes": 3237,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "use of bitwise '|' with boolean operands"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "use of bitwise '|' with boolean operands"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "use of bitwise '|' with boolean operands"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "use of bitwise '|' with boolean operands"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "use of bitwise '|' with boolean operands"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "use of bitwise '|' with boolean operands"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 12,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-bitwise-or-bool.sft.c",
+  "remark": null,
+  "sha256": "0f94c8801ceeb469a3080917069c0a07bd7bb124a7594e2ac1071f760ba5fd4a",
+  "test_number_uses": 0,
+  "type": "fp"
+}

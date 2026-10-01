@@ -1,0 +1,438 @@
+{
+  "bytes": 16387,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "invalid type 'void' in asm input"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid lvalue in asm output"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid lvalue in asm output"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid input constraint '[' in asm"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid input constraint '[foo' in asm"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid input constraint '[symbolic_name]' in asm"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid input constraint '' in asm"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid input constraint '' in asm"
+    },
+    {
+      "kind": "error",
+      "msg": "unknown register name 'foo' in asm"
+    },
+    {
+      "kind": "error",
+      "msg": "unknown register name '204' in asm"
+    },
+    {
+      "kind": "error",
+      "msg": "unknown register name '-1' in asm"
+    },
+    {
+      "kind": "error",
+      "msg": "unknown register name '+1' in asm"
+    },
+    {
+      "kind": "error",
+      "msg": "asm-specifier for input or output variable conflicts with asm clobber list"
+    },
+    {
+      "kind": "error",
+      "msg": "asm-specifier for input or output variable conflicts with asm clobber list"
+    },
+    {
+      "kind": "error",
+      "msg": "asm-specifier for input or output variable conflicts with asm clobber list"
+    },
+    {
+      "kind": "error",
+      "msg": "asm-specifier for input or output variable conflicts with asm clobber list"
+    },
+    {
+      "kind": "error",
+      "msg": "asm-specifier for input or output variable conflicts with asm clobber list"
+    },
+    {
+      "kind": "error",
+      "msg": "asm-specifier for input or output variable conflicts with asm clobber list"
+    },
+    {
+      "kind": "error",
+      "msg": "asm-specifier for input or output variable conflicts with asm clobber list"
+    },
+    {
+      "kind": "error",
+      "msg": "wide string"
+    },
+    {
+      "kind": "error",
+      "msg": "wide string"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid type 'const volatile void' in asm input for constraint 'r'"
+    },
+    {
+      "kind": "warning",
+      "msg": "ISO C does not allow indirection on operand of type 'const volatile void *'"
+    },
+    {
+      "kind": "warning",
+      "msg": "ISO C does not allow indirection on operand of type 'const volatile void *'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid type 'void' in asm input for constraint 'r'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid lvalue in asm input for constraint 'm'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid lvalue in asm input for constraint 'm'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid % escape in inline assembly string"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid % escape in inline assembly string"
+    },
+    {
+      "kind": "error",
+      "msg": "unknown symbolic operand name in inline assembly string"
+    },
+    {
+      "kind": "error",
+      "msg": "unterminated symbolic operand name in inline assembly string"
+    },
+    {
+      "kind": "error",
+      "msg": "empty symbolic operand name in inline assembly string"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operand number in inline asm string"
+    },
+    {
+      "kind": "error",
+      "msg": "input with type 'unsigned long long' matching output with type 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid input constraint '0' in asm"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid input constraint '1[foo]' in asm"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid input constraint '[foo]1' in asm"
+    },
+    {
+      "kind": "warning",
+      "msg": "ignored asm label 'a_asm' on automatic variable"
+    },
+    {
+      "kind": "warning",
+      "msg": "ignored asm label 'aa_asm' on automatic variable"
+    },
+    {
+      "kind": "error",
+      "msg": "unknown register name 'rr_asm' in asm"
+    },
+    {
+      "kind": "error",
+      "msg": "unknown register name '%' in asm"
+    },
+    {
+      "kind": "error",
+      "msg": "unknown register name 'cc' in asm"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid % escape in inline assembly string"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "dereference of pointer to incomplete type 'struct S'"
+    },
+    {
+      "kind": "error",
+      "msg": "dereference of pointer to incomplete type 'struct S'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid output constraint '=' in asm"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid output constraint '=&' in asm"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid output constraint '+?' in asm"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid output constraint '+!' in asm"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid output constraint '+#' in asm"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid output constraint '+*' in asm"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid output constraint '=%' in asm"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid output constraint '=,=' in asm"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid output constraint '=i' in asm"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid output constraint '+i' in asm"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid output constraint '=ii' in asm"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid output constraint '=n' in asm"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid output constraint '+n' in asm"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid output constraint '=nn' in asm"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid output constraint '=F' in asm"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid output constraint '+F' in asm"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid output constraint '=FF' in asm"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid output constraint '=E' in asm"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid output constraint '+E' in asm"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid output constraint '=EE' in asm"
+    },
+    {
+      "kind": "error",
+      "msg": "unsupported type for named register variable"
+    },
+    {
+      "kind": "error",
+      "msg": "unsupported type for named register variable"
+    },
+    {
+      "kind": "error",
+      "msg": "register 'edi' unsuitable for global register variables on this target"
+    },
+    {
+      "kind": "error",
+      "msg": "size of register 'esp' does not match variable size"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid output constraint '=f' in asm"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid output constraint '+f' in asm"
+    },
+    {
+      "kind": "error",
+      "msg": "asm constraint has an unexpected number of alternatives: 1 vs 2"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid output constraint '+&m' in asm"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid output constraint '+#r' in asm"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid input constraint '[g]' in asm"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid input constraint '11m' in asm"
+    },
+    {
+      "kind": "error",
+      "msg": "reference to a bit-field in asm input with a memory constraint '=rm'"
+    },
+    {
+      "kind": "error",
+      "msg": "reference to a bit-field in asm output with a memory constraint 'm'"
+    },
+    {
+      "kind": "error",
+      "msg": "reference to a vector element in asm input with a memory constraint '=rm'"
+    },
+    {
+      "kind": "error",
+      "msg": "reference to a vector element in asm output with a memory constraint 'm'"
+    },
+    {
+      "kind": "error",
+      "msg": "reference to a global register variable in asm input with a memory constraint '=rm'"
+    },
+    {
+      "kind": "error",
+      "msg": "reference to a global register variable in asm output with a memory constraint 'm'"
+    },
+    {
+      "kind": "note",
+      "msg": "constraint '1' is already present here"
+    },
+    {
+      "kind": "error",
+      "msg": "more than one input constraint matches the same output '1'"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "unsupported inline asm: input with type 'st_size64' (aka 'struct _st_size64') matching output with type 'long long'"
+    },
+    {
+      "kind": "error",
+      "msg": "unsupported inline asm: input with type 'st_size32' (aka 'struct _st_size32') matching output with type 'st_size64' (aka 'struct _st_size64')"
+    },
+    {
+      "kind": "error",
+      "msg": "impossible constraint in asm: cannot store value into a register"
+    },
+    {
+      "kind": "error",
+      "msg": "unsupported inline asm: input with type 'st_size128' (aka 'struct _st_size128') matching output with type 'long long'"
+    },
+    {
+      "kind": "error",
+      "msg": "unsupported inline asm: input with type 'char' matching output with type 'double'"
+    },
+    {
+      "kind": "error",
+      "msg": "unsupported inline asm: input with type 'double' matching output with type 'char'"
+    },
+    {
+      "kind": "error",
+      "msg": "unsupported inline asm: input with type 'st_size64' (aka 'struct _st_size64') matching output with type 'double'"
+    },
+    {
+      "kind": "error",
+      "msg": "unsupported inline asm: input with type 'double' matching output with type 'st_size64' (aka 'struct _st_size64')"
+    },
+    {
+      "kind": "error",
+      "msg": "unsupported inline asm: input with type 'int2' (vector of 2 'int' values) matching output with type 'double'"
+    },
+    {
+      "kind": "error",
+      "msg": "unsupported inline asm: input with type 'double' matching output with type 'int2' (vector of 2 'int' values)"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/asm.sft.c",
+  "remark": null,
+  "sha256": "3fe560846b5ecd519d4488e81c7ad3e7ddb9cd3cc7d29ba92d71caf5e856878b",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,62 @@
+{
+  "bytes": 1155,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from 'double' to 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "non-object type 'void (int)' is not assignable"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/ucn-identifiers.sft.c",
+  "remark": null,
+  "sha256": "ca458a8afaa2a311aa878f8c11c684fdf2b27736e3a5884f5ef0acd506dd8acb",
+  "test_number_uses": 0,
+  "type": "fn"
+}

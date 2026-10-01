@@ -1,0 +1,21 @@
+{
+  "bytes": 91269,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 1920,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "I386-DECLSPEC-GNU I386-DECLSPEC-GNU --ms_extensions I386-DECLSPEC-MS I386-DECLSPEC-MS --ms_extensions I386-DECLSPEC-MS I386-DECLSPEC-MS -w -w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/init-x86.sft.c",
+  "remark": null,
+  "sha256": "2c892644b706f0ef431b9a870ec1e7e125086a4576ddfc1e1e5d31e6600234e8",
+  "test_number_uses": 0,
+  "type": "fp"
+}

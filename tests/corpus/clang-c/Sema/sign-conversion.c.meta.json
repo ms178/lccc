@@ -1,0 +1,30 @@
+{
+  "bytes": 669,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "implicit conversion changes signedness"
+    },
+    {
+      "kind": "warning",
+      "msg": "operand of ? changes signedness"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/sign-conversion.sft.c",
+  "remark": null,
+  "sha256": "5afca39db9b143861646cf18f52e15f530f51eebc3521d936c0599df679d2cc2",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,78 @@
+{
+  "bytes": 2099,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "expected 'volatile', 'inline', 'goto', or '('"
+    },
+    {
+      "kind": "error",
+      "msg": "expected 'volatile', 'inline', 'goto', or '('"
+    },
+    {
+      "kind": "error",
+      "msg": "expected 'volatile', 'inline', 'goto', or '('"
+    },
+    {
+      "kind": "error",
+      "msg": "duplicate asm qualifier 'volatile'"
+    },
+    {
+      "kind": "error",
+      "msg": "duplicate asm qualifier 'volatile'"
+    },
+    {
+      "kind": "error",
+      "msg": "duplicate asm qualifier 'inline'"
+    },
+    {
+      "kind": "error",
+      "msg": "duplicate asm qualifier 'inline'"
+    },
+    {
+      "kind": "error",
+      "msg": "duplicate asm qualifier 'goto'"
+    },
+    {
+      "kind": "error",
+      "msg": "duplicate asm qualifier 'goto'"
+    },
+    {
+      "kind": "error",
+      "msg": "meaningless 'volatile' on asm outside function"
+    },
+    {
+      "kind": "error",
+      "msg": "meaningless 'inline' on asm outside function"
+    },
+    {
+      "kind": "error",
+      "msg": "meaningless 'goto' on asm outside function"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/asm-qualifiers.sft.c",
+  "remark": null,
+  "sha256": "d729c544f4c1a645e516358e6f9ccfadc8ab57776fe1d3aa488a291600d34785",
+  "test_number_uses": 0,
+  "type": "fn"
+}

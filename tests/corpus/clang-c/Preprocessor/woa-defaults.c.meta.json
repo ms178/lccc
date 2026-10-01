@@ -1,0 +1,21 @@
+{
+  "bytes": 1347,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 40,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w -w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/woa-defaults.sft.c",
+  "remark": null,
+  "sha256": "e21bc2c4f5d61a6bf7976afe1a3d02b72edb1008a77203113fe4de77ffa27624",
+  "test_number_uses": 0,
+  "type": "fp"
+}

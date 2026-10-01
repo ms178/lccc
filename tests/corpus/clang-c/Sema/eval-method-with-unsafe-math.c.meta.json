@@ -1,0 +1,21 @@
+{
+  "bytes": 3822,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 33,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/eval-method-with-unsafe-math.sft.c",
+  "remark": null,
+  "sha256": "4a6c05c42b97fbc4743623fd12e41f67a9b03b3e8dbd50b745d79921073c20a7",
+  "test_number_uses": 0,
+  "type": "fp"
+}

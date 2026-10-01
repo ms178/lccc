@@ -1,0 +1,54 @@
+{
+  "bytes": 1076,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "no previous extern declaration for non-static variable 'vbad1'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "no previous extern declaration for non-static variable 'vbad2'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": "declare 'static' if the variable is not intended to be used outside of this translation unit"
+    },
+    {
+      "kind": "warning",
+      "msg": "no previous extern declaration for non-static variable 'vbad3'"
+    },
+    {
+      "kind": "warning",
+      "msg": "no previous extern declaration for non-static variable 'vbad4'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-missing-variable-declarations.sft.c",
+  "remark": null,
+  "sha256": "8bddfcec8b470bd2e88c7f3adedf59aa350ff8e71e31897a35dde7fbb9f2e8c4",
+  "test_number_uses": 0,
+  "type": "fp"
+}

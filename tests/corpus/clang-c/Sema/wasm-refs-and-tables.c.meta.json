@@ -1,0 +1,343 @@
+{
+  "bytes": 10552,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "pointer to WebAssembly reference type is not allowed"
+    },
+    {
+      "kind": "error",
+      "msg": "pointer to WebAssembly reference type is not allowed"
+    },
+    {
+      "kind": "error",
+      "msg": "pointer to WebAssembly reference type is not allowed"
+    },
+    {
+      "kind": "error",
+      "msg": "only zero-length WebAssembly tables are currently supported"
+    },
+    {
+      "kind": "error",
+      "msg": "only zero-length WebAssembly tables are currently supported"
+    },
+    {
+      "kind": "error",
+      "msg": "only zero-length WebAssembly tables are currently supported"
+    },
+    {
+      "kind": "error",
+      "msg": "WebAssembly table must be static"
+    },
+    {
+      "kind": "error",
+      "msg": "multi-dimensional arrays of WebAssembly references are not allowed"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot form a pointer to a WebAssembly table"
+    },
+    {
+      "kind": "error",
+      "msg": "only zero-length WebAssembly tables are currently supported"
+    },
+    {
+      "kind": "error",
+      "msg": "field has sizeless type '__externref_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "field has sizeless type '__externref_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "field has sizeless type '__externref_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "multi-dimensional arrays of WebAssembly references are not allowed"
+    },
+    {
+      "kind": "error",
+      "msg": "pointer to WebAssembly reference type is not allowed"
+    },
+    {
+      "kind": "error",
+      "msg": "pointer to WebAssembly reference type is not allowed"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot form a pointer to a WebAssembly table"
+    },
+    {
+      "kind": "error",
+      "msg": "field has sizeless type '__externref_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "field has sizeless type '__externref_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "field has sizeless type '__externref_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "multi-dimensional arrays of WebAssembly references are not allowed"
+    },
+    {
+      "kind": "error",
+      "msg": "pointer to WebAssembly reference type is not allowed"
+    },
+    {
+      "kind": "error",
+      "msg": "pointer to WebAssembly reference type is not allowed"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot form a pointer to a WebAssembly table"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use WebAssembly table as a function parameter"
+    },
+    {
+      "kind": "error",
+      "msg": "multi-dimensional arrays of WebAssembly references are not allowed"
+    },
+    {
+      "kind": "error",
+      "msg": "pointer to WebAssembly reference type is not allowed"
+    },
+    {
+      "kind": "error",
+      "msg": "pointer to WebAssembly reference type is not allowed"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot form a pointer to a WebAssembly table"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use WebAssembly table as a function parameter"
+    },
+    {
+      "kind": "error",
+      "msg": "pointer to WebAssembly reference type is not allowed"
+    },
+    {
+      "kind": "error",
+      "msg": "pointer to WebAssembly reference type is not allowed"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot form a pointer to a WebAssembly table"
+    },
+    {
+      "kind": "warning",
+      "msg": "attribute '__funcref' is already applied"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot take address of WebAssembly reference"
+    },
+    {
+      "kind": "error",
+      "msg": "pointer to WebAssembly reference type is not allowed"
+    },
+    {
+      "kind": "error",
+      "msg": "pointer to WebAssembly reference type is not allowed"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of 'sizeof' to sizeless type '__externref_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of 'sizeof' to sizeless type '__externref_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of 'sizeof' to WebAssembly table"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of 'sizeof' to WebAssembly table"
+    },
+    {
+      "kind": "error",
+      "msg": "multi-dimensional arrays of WebAssembly references are not allowed"
+    },
+    {
+      "kind": "error",
+      "msg": "pointer to WebAssembly reference type is not allowed"
+    },
+    {
+      "kind": "error",
+      "msg": "pointer to WebAssembly reference type is not allowed"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of 'alignof' to sizeless type '__externref_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of 'alignof' to sizeless type '__externref_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of 'alignof' to sizeless type '__externref_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of 'alignof' to sizeless type '__externref_t'"
+    },
+    {
+      "kind": "warning",
+      "msg": "'_Alignof' applied to an expression is a GNU extension"
+    },
+    {
+      "kind": "error",
+      "msg": "multi-dimensional arrays of WebAssembly references are not allowed"
+    },
+    {
+      "kind": "error",
+      "msg": "pointer to WebAssembly reference type is not allowed"
+    },
+    {
+      "kind": "error",
+      "msg": "pointer to WebAssembly reference type is not allowed"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot pass expression of type '__externref_t' to variadic function"
+    },
+    {
+      "kind": "error",
+      "msg": "WebAssembly table cannot be declared within a function"
+    },
+    {
+      "kind": "error",
+      "msg": "WebAssembly table cannot be declared within a function"
+    },
+    {
+      "kind": "error",
+      "msg": "multi-dimensional arrays of WebAssembly references are not allowed"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot form a pointer to a WebAssembly table"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use WebAssembly table as a function parameter"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression ('__attribute__((address_space(1))) __externref_t[0]' and 'int')"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression ('int' and '__attribute__((address_space(1))) __externref_t[0]')"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression ('__attribute__((address_space(1))) __externref_t[0]' and '__attribute__((address_space(1))) __externref_t[0]')"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid argument type '__attribute__((address_space(1))) __externref_t *' to unary expression"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid argument type '__attribute__((address_space(1))) __externref_t *' to unary expression"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression ('int' and '__attribute__((address_space(1))) __externref_t[0]')"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression ('__attribute__((address_space(1))) __externref_t[0]' and 'int')"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use a WebAssembly table within a branch of a conditional expression"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use a WebAssembly table within a branch of a conditional expression"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot cast from a WebAssembly table"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot assign a WebAssembly table"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot assign a WebAssembly table"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot form a reference to a WebAssembly table"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot subscript a WebAssembly table"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot subscript a WebAssembly table"
+    },
+    {
+      "kind": "error",
+      "msg": "WebAssembly table cannot be declared within a function"
+    },
+    {
+      "kind": "error",
+      "msg": "WebAssembly table cannot be declared within a function"
+    },
+    {
+      "kind": "error",
+      "msg": "WebAssembly table cannot be declared within a function"
+    },
+    {
+      "kind": "error",
+      "msg": "WebAssembly table cannot be declared within a function"
+    },
+    {
+      "kind": "error",
+      "msg": "WebAssembly table cannot be declared within a function"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot return a WebAssembly table"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 9,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c",
+    " --c++17 --c++"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/wasm-refs-and-tables.sft.c",
+  "remark": null,
+  "sha256": "aefb8e5eef6d13c4e6c30b600b560aad0ad19333c987dedf594ab0543631eb86",
+  "test_number_uses": 0,
+  "type": "fn"
+}

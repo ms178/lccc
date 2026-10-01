@@ -1,0 +1,206 @@
+{
+  "bytes": 7577,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "[[]] attributes are a C23 extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "[[]] attributes are a C23 extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "[[]] attributes are a C23 extension"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "[[]] attributes are a C23 extension"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "[[]] attributes are a C23 extension"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "[[]] attributes are a C23 extension"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "1st argument must be a pointer to a valid matrix element type"
+    },
+    {
+      "kind": "error",
+      "msg": "row dimension is outside the allowed range [1, 1048575]"
+    },
+    {
+      "kind": "error",
+      "msg": "column dimension is outside the allowed range [1, 1048575]"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer to integer conversion casting 'char[1]' to type '__size_t' (aka 'unsigned long')"
+    },
+    {
+      "kind": "error",
+      "msg": "1st argument must be a pointer to a valid matrix element type"
+    },
+    {
+      "kind": "error",
+      "msg": "casting 'struct Foo' to incompatible type '__size_t' (aka 'unsigned long')"
+    },
+    {
+      "kind": "error",
+      "msg": "column argument must be a constant unsigned integer expression"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "1st argument must be a matrix"
+    },
+    {
+      "kind": "error",
+      "msg": "2nd argument must be a pointer to a valid matrix element type"
+    },
+    {
+      "kind": "error",
+      "msg": "casting 'struct Foo' to incompatible type '__size_t' (aka 'unsigned long')"
+    },
+    {
+      "kind": "error",
+      "msg": "2nd argument must be a pointer to a valid matrix element type"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/matrix-type-builtins.sft.c",
+  "remark": null,
+  "sha256": "6d4a52709c5336c23c1fa2b73fa332c3a41126119a7943c33be06959f541d76a",
+  "test_number_uses": 0,
+  "type": "fn"
+}

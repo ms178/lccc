@@ -1,0 +1,21 @@
+{
+  "bytes": 18795,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 50,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/zvk-invalid-zvknha.sft.c",
+  "remark": null,
+  "sha256": "3e2518c713ca34a87a4491cc772e818ee9e17f947c7c17afcab92bd52e22e99a",
+  "test_number_uses": 0,
+  "type": "fn"
+}

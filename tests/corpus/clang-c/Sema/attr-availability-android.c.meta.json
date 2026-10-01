@@ -1,0 +1,54 @@
+{
+  "bytes": 1878,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "'f2' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": "explicitly marked unavailable"
+    },
+    {
+      "kind": "note",
+      "msg": "'f5' has been explicitly marked unavailable here"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "'f5' is unavailable: not available on Android"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "%-D --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-availability-android.sft.c",
+  "remark": null,
+  "sha256": "8a163e255f5cf473938fed88e4f8dc9c5316123073f29c79329790a8358de5d8",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,21 @@
+{
+  "bytes": 973,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/arm_inline_asm_constraints_no_fp_regs.sft.c",
+  "remark": null,
+  "sha256": "40da3db6a730a0e7299606a6309a388c1e9b4a54f41a8c381b613038b99be0c5",
+  "test_number_uses": 0,
+  "type": "fp"
+}

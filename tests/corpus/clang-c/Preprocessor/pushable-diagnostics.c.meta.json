@@ -1,0 +1,66 @@
+{
+  "bytes": 2162,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "multi-character character constant"
+    },
+    {
+      "kind": "warning",
+      "msg": "multi-character character constant"
+    },
+    {
+      "kind": "warning",
+      "msg": "pragma diagnostic pop could not pop, no matching push"
+    },
+    {
+      "kind": "warning",
+      "msg": "no previous prototype for function 'ppr1'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "no previous prototype for function 'ppt2'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "no previous prototype for function 'ppt3'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "no previous prototype for function 'pps1'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/pushable-diagnostics.sft.c",
+  "remark": null,
+  "sha256": "49f3c9b02360f2ba9625b4f3288f879a0bb9515621b0d3cdbba2a0eb949b6023",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,70 @@
+{
+  "bytes": 2634,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'preserve_most' attribute takes no arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible function pointer types initializing 'void (*)(void *) __attribute__((cdecl))' with an expression of type '__attribute__((preserve_most)) void (void *)'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible function pointer types initializing 'void (*)(void *)' with an expression of type '__attribute__((preserve_most)) void (void *)'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "function declared 'preserve_most' here was previously declared without calling convention"
+    },
+    {
+      "kind": "warning",
+      "msg": "'preserve_most' attribute only applies to functions and methods"
+    },
+    {
+      "kind": "error",
+      "msg": "'preserve_all' attribute takes no arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible function pointer types initializing 'void (*)(void *) __attribute__((cdecl))' with an expression of type '__attribute__((preserve_all)) void (void *)'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible function pointer types initializing 'void (*)(void *)' with an expression of type '__attribute__((preserve_all)) void (void *)'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "function declared 'preserve_all' here was previously declared without calling convention"
+    },
+    {
+      "kind": "warning",
+      "msg": "'preserve_all' attribute only applies to functions and methods"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w -w -w --c --target linux_aarch64"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/preserve-call-conv.sft.c",
+  "remark": null,
+  "sha256": "6746e0e56d5c8bae7846e240d580a717b2376d8a5faadc3d9d76ddf4a1a2e5b8",
+  "test_number_uses": 0,
+  "type": "fn"
+}

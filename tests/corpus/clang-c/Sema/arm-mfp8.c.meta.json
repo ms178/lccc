@@ -1,0 +1,30 @@
+{
+  "bytes": 494,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "used type '__mfp8' where arithmetic or pointer type is required"
+    },
+    {
+      "kind": "error",
+      "msg": "operand of type '__mfp8' where arithmetic or pointer type is required"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c --target linux_aarch64"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/arm-mfp8.sft.c",
+  "remark": null,
+  "sha256": "62e2a51fe844895509cc5ee83fc898b36e057c54213b034f6f090efadba7bd3d",
+  "test_number_uses": 0,
+  "type": "fn"
+}

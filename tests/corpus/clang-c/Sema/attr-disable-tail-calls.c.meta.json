@@ -1,0 +1,54 @@
+{
+  "bytes": 1238,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'naked' and 'disable_tail_calls' attributes are not compatible"
+    },
+    {
+      "kind": "error",
+      "msg": "'disable_tail_calls' and 'naked' attributes are not compatible"
+    },
+    {
+      "kind": "warning",
+      "msg": "'disable_tail_calls' attribute only applies to functions and Objective-C methods"
+    },
+    {
+      "kind": "error",
+      "msg": "'disable_tail_calls' attribute takes no arguments"
+    },
+    {
+      "kind": "note",
+      "msg": "conflicting attribute is here"
+    },
+    {
+      "kind": "error",
+      "msg": "'disable_tail_calls' and 'naked' attributes are not compatible"
+    },
+    {
+      "kind": "note",
+      "msg": "conflicting attribute is here"
+    },
+    {
+      "kind": "error",
+      "msg": "'naked' and 'disable_tail_calls' attributes are not compatible"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-disable-tail-calls.sft.c",
+  "remark": null,
+  "sha256": "5fcdcc85a14b6b3b516eb306d9add4e9905c9eb224fb1db660ea3865d0c39c5c",
+  "test_number_uses": 0,
+  "type": "fn"
+}

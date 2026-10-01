@@ -1,0 +1,26 @@
+{
+  "bytes": 182,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "argument may not have 'void' type"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/2009-07-17-VoidParameter.sft.c",
+  "remark": null,
+  "sha256": "7843d12649255944761fe483b0f6a1bb3be2be5cd219674ebdb4acacbd3a26df",
+  "test_number_uses": 0,
+  "type": "fn"
+}

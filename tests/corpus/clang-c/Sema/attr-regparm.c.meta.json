@@ -1,0 +1,62 @@
+{
+  "bytes": 1371,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'regparm' attribute requires an integer constant"
+    },
+    {
+      "kind": "error",
+      "msg": "'regparm' parameter must be between 0 and 3 inclusive"
+    },
+    {
+      "kind": "error",
+      "msg": "'regparm' parameter must be between 0 and 3 inclusive"
+    },
+    {
+      "kind": "error",
+      "msg": "'regparm' attribute takes one argument"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "function declared with regparm(2) attribute was previously declared with the regparm(3) attribute"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "function declared with regparm(2) attribute was previously declared with the regparm(3) attribute"
+    },
+    {
+      "kind": "warning",
+      "msg": "'regparm' only applies to function types; type here is 'void'"
+    },
+    {
+      "kind": "warning",
+      "msg": "GCC does not allow the 'gnu::regparm' attribute to be written on a type"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-regparm.sft.c",
+  "remark": null,
+  "sha256": "edc8bae08c780b38f5446a54cb32fbe745799d7ff8a46db8f1f5b699365d3c0e",
+  "test_number_uses": 0,
+  "type": "fn"
+}

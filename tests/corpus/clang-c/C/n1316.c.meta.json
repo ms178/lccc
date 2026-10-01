@@ -1,0 +1,62 @@
+{
+  "bytes": 1193,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "passing argument to parameter here"
+    },
+    {
+      "kind": "note",
+      "msg": "passing argument to parameter here"
+    },
+    {
+      "kind": "error",
+      "msg": "initializing 'float' with an expression of incompatible type 'void *'"
+    },
+    {
+      "kind": "error",
+      "msg": "initializing 'void *' with an expression of incompatible type 'float'"
+    },
+    {
+      "kind": "error",
+      "msg": "passing 'float' to parameter of incompatible type 'void *'"
+    },
+    {
+      "kind": "error",
+      "msg": "passing 'void *' to parameter of incompatible type 'float'"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'void *' from incompatible type 'float'"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'float' from incompatible type 'void *'"
+    },
+    {
+      "kind": "error",
+      "msg": "initializing 'void *' with an expression of incompatible type 'float'"
+    },
+    {
+      "kind": "error",
+      "msg": "initializing 'float' with an expression of incompatible type 'void *'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C11/n1316.sft.c",
+  "remark": null,
+  "sha256": "cb1dac4d5401cb1720f47c58f180fe06a06cf289d0cad0f7688c217c354c5b0e",
+  "test_number_uses": 0,
+  "type": "fn"
+}

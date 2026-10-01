@@ -1,0 +1,21 @@
+{
+  "bytes": 766,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 22,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w -w -w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/comment_save_macro.sft.c",
+  "remark": null,
+  "sha256": "a3a44b043053a6a7fe0b8a97b1965ad1ea06daeb836463cf042b24beff56bef5",
+  "test_number_uses": 0,
+  "type": "fp"
+}

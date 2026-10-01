@@ -1,0 +1,30 @@
+{
+  "bytes": 1622,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "integer overflow in preprocessor expression"
+    },
+    {
+      "kind": "warning",
+      "msg": "integer overflow in preprocessor expression"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 10,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C99/n736.sft.c",
+  "remark": null,
+  "sha256": "e39096857c5e233f1a3410bd96dfc91c2182d3a563aaf061edaab64c97293e87",
+  "test_number_uses": 0,
+  "type": "fp"
+}

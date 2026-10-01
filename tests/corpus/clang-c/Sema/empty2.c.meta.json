@@ -1,0 +1,62 @@
+{
+  "bytes": 1115,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "empty struct is a GNU extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "empty union is a GNU extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "struct without named members is a GNU extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "union without named members is a GNU extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "struct without named members is a GNU extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "union without named members is a GNU extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "struct without named members is a GNU extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "union without named members is a GNU extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "struct without named members is a GNU extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "union without named members is a GNU extension"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/empty2.sft.c",
+  "remark": null,
+  "sha256": "8a1ff9ee20fc4328782b8e13777d71cdb5e254af79ffbe95131412e320e4c694",
+  "test_number_uses": 0,
+  "type": "fp"
+}

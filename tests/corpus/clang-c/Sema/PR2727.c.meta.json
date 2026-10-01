@@ -1,0 +1,22 @@
+{
+  "bytes": 272,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c90",
+    " --c99"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/PR2727.sft.c",
+  "remark": null,
+  "sha256": "3fdbdc17c4b9ba1fb038049bf1b186ec7735d96b4c845d5fc1be689481ed7faf",
+  "test_number_uses": 0,
+  "type": "fp"
+}

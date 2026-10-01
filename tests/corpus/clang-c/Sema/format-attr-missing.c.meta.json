@@ -1,0 +1,183 @@
+{
+  "bytes": 9742,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "diagnostic behavior may be improved by adding the 'format(printf, 1, 0)' attribute to the declaration of 'f1'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "diagnostic behavior may be improved by adding the 'format(scanf, 1, 0)' attribute to the declaration of 'f2'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "diagnostic behavior may be improved by adding the 'format(printf, 1, 2)' attribute to the declaration of 'f3'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "diagnostic behavior may be improved by adding the 'format(scanf, 1, 2)' attribute to the declaration of 'f4'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "diagnostic behavior may be improved by adding the 'format(printf, 2, 3)' attribute to the declaration of 'f5'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "diagnostic behavior may be improved by adding the 'format(printf, 2, 3)' attribute to the declaration of 'f6'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "diagnostic behavior may be improved by adding the 'format_matches(printf, 1, \"%d %f \\\"'\")' attribute to the declaration of 'f9'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "diagnostic behavior may be improved by adding the 'format(scanf, 1, 2)' attribute to the declaration of 'f10'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "passing 'scanf' format string where 'printf' format string is expected"
+    },
+    {
+      "kind": "warning",
+      "msg": "diagnostic behavior may be improved by adding the 'format(printf, 1, 2)' attribute to the declaration of 'f11'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "diagnostic behavior may be improved by adding the 'format(printf, 1, 0)' attribute to the declaration of 'f12'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "diagnostic behavior may be improved by adding the 'format(printf, 1, 0)' attribute to the declaration of 'f13'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "passing 'printf' format string where 'scanf' format string is expected"
+    },
+    {
+      "kind": "warning",
+      "msg": "diagnostic behavior may be improved by adding the 'format(scanf, 1, 2)' attribute to the declaration of 'f14'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "diagnostic behavior may be improved by adding the 'format(printf, 1, 3)' attribute to the declaration of 'f15'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "diagnostic behavior may be improved by adding the 'format(printf, 2, 3)' attribute to the declaration of 'f15'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "diagnostic behavior may be improved by adding the 'format(printf, 1, 2)' attribute to the declaration of 'f16'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "diagnostic behavior may be improved by adding the 'format(printf, 1, 2)' attribute to the declaration of 'f17'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "diagnostic behavior may be improved by adding the 'format(strftime, 3, 0)' attribute to the declaration of 'f20'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "diagnostic behavior may be improved by adding the 'format(strfmon, 3, 4)' attribute to the declaration of 'f21'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "diagnostic behavior may be improved by adding the 'format(printf, 1, 2)' attribute to the declaration of 'f22'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23",
+    " --c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/format-attr-missing.sft.c",
+  "remark": null,
+  "sha256": "e8d2062c7064c2c9a7002c1896aa0d1dae6c6432eae87f47539d952ee1a6cb19",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,50 @@
+{
+  "bytes": 927,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "attribute only applies to"
+    },
+    {
+      "kind": "error",
+      "msg": "attribute only applies to"
+    },
+    {
+      "kind": "error",
+      "msg": "attribute only applies to"
+    },
+    {
+      "kind": "error",
+      "msg": "attribute only applies to"
+    },
+    {
+      "kind": "error",
+      "msg": "attribute only applies to"
+    },
+    {
+      "kind": "error",
+      "msg": "attribute only applies to"
+    },
+    {
+      "kind": "error",
+      "msg": "attribute takes no arguments"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/bpf-attr-preserve-static-offset-warns.sft.c",
+  "remark": null,
+  "sha256": "180e986533522fca2c7dbcc936f85345554870b814e9174e259d6dea8bbf7f7b",
+  "test_number_uses": 0,
+  "type": "fn"
+}

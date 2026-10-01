@@ -1,0 +1,44 @@
+{
+  "bytes": 2158,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "type specifier missing, defaults to 'int'"
+    },
+    {
+      "kind": "warning",
+      "msg": "type specifier missing, defaults to 'int'"
+    },
+    {
+      "kind": "warning",
+      "msg": "type specifier missing, defaults to 'int'"
+    },
+    {
+      "kind": "warning",
+      "msg": "type specifier missing, defaults to 'int'"
+    },
+    {
+      "kind": "warning",
+      "msg": "type specifier missing, defaults to 'int'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 3,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c89",
+    " --c99",
+    " --c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/implicit-int.sft.c",
+  "remark": null,
+  "sha256": "02ed5024833821fb5f47d4a0b0c8e3934ba97bcfb0088c422c843f22043eeea2",
+  "test_number_uses": 0,
+  "type": "fp"
+}

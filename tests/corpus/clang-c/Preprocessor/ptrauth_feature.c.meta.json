@@ -1,0 +1,21 @@
+{
+  "bytes": 6425,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 40,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/ptrauth_feature.sft.c",
+  "remark": null,
+  "sha256": "46400028007d68eb84e48337707fb66aa6837ccc28bf33ffaed19a8c47b6f225",
+  "test_number_uses": 0,
+  "type": "fp"
+}

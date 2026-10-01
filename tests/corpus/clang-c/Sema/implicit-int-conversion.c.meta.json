@@ -1,0 +1,30 @@
+{
+  "bytes": 717,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "no-diagnostics",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DSMALL=char -DBIG=int -DNO_DIAG -DSMALL=char -DBIG=int -DSMALL=float -DBIG=double -DNO_DIAG -DSMALL=float -DBIG=double --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/implicit-int-conversion.sft.c",
+  "remark": null,
+  "sha256": "be0635704de9a73a7a1e2ef536f69efa9ebe7d80550e59d1c812a57f34c11a52",
+  "test_number_uses": 0,
+  "type": "fp"
+}

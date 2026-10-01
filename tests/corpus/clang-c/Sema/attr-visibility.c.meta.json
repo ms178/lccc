@@ -1,0 +1,70 @@
+{
+  "bytes": 1845,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "target does not support 'protected' visibility; using 'default'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous attribute is here"
+    },
+    {
+      "kind": "error",
+      "msg": "visibility does not match previous declaration"
+    },
+    {
+      "kind": "note",
+      "msg": "previous attribute is here"
+    },
+    {
+      "kind": "error",
+      "msg": "visibility does not match previous declaration"
+    },
+    {
+      "kind": "error",
+      "msg": "visibility does not match previous declaration"
+    },
+    {
+      "kind": "note",
+      "msg": "previous attribute is here"
+    },
+    {
+      "kind": "note",
+      "msg": "previous attribute is here"
+    },
+    {
+      "kind": "error",
+      "msg": "visibility does not match previous declaration"
+    },
+    {
+      "kind": "warning",
+      "msg": "'visibility' attribute ignored"
+    },
+    {
+      "kind": "error",
+      "msg": "'type_visibility' attribute only applies to types and namespaces"
+    },
+    {
+      "kind": "error",
+      "msg": "'visibility' attribute requires a string"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-visibility.sft.c",
+  "remark": null,
+  "sha256": "5227ca5fa3c71e3b1278810677894ffc9c499f4bb9564954a961540aab3ef5fa",
+  "test_number_uses": 0,
+  "type": "fn"
+}

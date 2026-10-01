@@ -1,0 +1,21 @@
+{
+  "bytes": 196,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/invalid-__has_warning1.sft.c",
+  "remark": null,
+  "sha256": "7cf4876e3cd0f5278aeb33916869a24d9c5443fb7a0a4187d627f73b66b45e64",
+  "test_number_uses": 0,
+  "type": "fn"
+}

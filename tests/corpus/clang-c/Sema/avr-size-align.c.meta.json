@@ -1,0 +1,21 @@
+{
+  "bytes": 2559,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/avr-size-align.sft.c",
+  "remark": null,
+  "sha256": "b0a98c0e8f3228f7e77b01728f4e7b1debfdb89f1b09fdbacac48437e3b0c03c",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,21 @@
+{
+  "bytes": 148,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/unterminated.sft.c",
+  "remark": null,
+  "sha256": "374cdf52c9b301ab8524677fbd16bfe8a1d3c798ed319a833859981d1b9dce0e",
+  "test_number_uses": 0,
+  "type": "fn"
+}

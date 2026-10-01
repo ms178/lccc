@@ -1,0 +1,82 @@
+{
+  "bytes": 4147,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'size' argument to memset is '0'; did you mean to transpose the last two arguments?"
+    },
+    {
+      "kind": "warning",
+      "msg": "setting buffer to a 'sizeof' expression; did you mean to transpose the last two arguments?"
+    },
+    {
+      "kind": "warning",
+      "msg": "'size' argument to memset is '0'; did you mean to transpose the last two arguments?"
+    },
+    {
+      "kind": "warning",
+      "msg": "'size' argument to memset is '0'; did you mean to transpose the last two arguments?"
+    },
+    {
+      "kind": "warning",
+      "msg": "setting buffer to a 'sizeof' expression; did you mean to transpose the last two arguments?"
+    },
+    {
+      "kind": "warning",
+      "msg": "'size' argument to memset is '0'; did you mean to transpose the last two arguments?"
+    },
+    {
+      "kind": "warning",
+      "msg": "setting buffer to a 'sizeof' expression; did you mean to transpose the last two arguments?"
+    },
+    {
+      "kind": "warning",
+      "msg": "setting buffer to a 'sizeof' expression; did you mean to transpose the last two arguments?"
+    },
+    {
+      "kind": "warning",
+      "msg": "setting buffer to a 'sizeof' expression; did you mean to transpose the last two arguments?"
+    },
+    {
+      "kind": "warning",
+      "msg": "'size' argument to bzero is '0'"
+    },
+    {
+      "kind": "warning",
+      "msg": "'size' argument to bzero is '0'"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sizeof'"
+    },
+    {
+      "kind": "warning",
+      "msg": "'size' argument to memset"
+    },
+    {
+      "kind": "warning",
+      "msg": "'size' argument to memset"
+    },
+    {
+      "kind": "warning",
+      "msg": "'size' argument to bzero"
+    }
+  ],
+  "has_main": true,
+  "header_lines": 9,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/transpose-memset.sft.c",
+  "remark": null,
+  "sha256": "9b9e85329813a2bdb54181122607f55b4d262a18e0517ec511a486833ed75824",
+  "test_number_uses": 0,
+  "type": "fp"
+}

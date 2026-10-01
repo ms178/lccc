@@ -1,0 +1,122 @@
+{
+  "bytes": 6113,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'capability' attribute only applies to structs, unions, classes, and typedefs"
+    },
+    {
+      "kind": "error",
+      "msg": "'shared_capability' attribute only applies to structs, unions, classes, and typedefs"
+    },
+    {
+      "kind": "warning",
+      "msg": "'acquire_capability' attribute only applies to functions"
+    },
+    {
+      "kind": "warning",
+      "msg": "'try_acquire_capability' attribute only applies to functions"
+    },
+    {
+      "kind": "warning",
+      "msg": "'release_capability' attribute only applies to functions"
+    },
+    {
+      "kind": "error",
+      "msg": "expected string literal as argument of 'capability' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "expected string literal as argument of 'shared_capability' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "'capability' attribute takes one argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'shared_capability' attribute takes one argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'requires_capability' attribute takes at least 1 argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'requires_shared_capability' attribute takes at least 1 argument"
+    },
+    {
+      "kind": "warning",
+      "msg": "'requires_capability' attribute requires arguments whose type is annotated with 'capability' attribute; type here is 'int'"
+    },
+    {
+      "kind": "warning",
+      "msg": "'requires_shared_capability' attribute requires arguments whose type is annotated with 'capability' attribute; type here is 'struct NotACapability'"
+    },
+    {
+      "kind": "warning",
+      "msg": "'assert_capability' attribute without capability arguments can only be applied to non-static methods of a class"
+    },
+    {
+      "kind": "warning",
+      "msg": "'assert_shared_capability' attribute without capability arguments can only be applied to non-static methods of a class"
+    },
+    {
+      "kind": "warning",
+      "msg": "'acquire_capability' attribute without capability arguments can only be applied to non-static methods of a class"
+    },
+    {
+      "kind": "warning",
+      "msg": "'acquire_shared_capability' attribute without capability arguments can only be applied to non-static methods of a class"
+    },
+    {
+      "kind": "warning",
+      "msg": "'release_capability' attribute without capability arguments can only be applied to non-static methods of a class"
+    },
+    {
+      "kind": "warning",
+      "msg": "'release_shared_capability' attribute without capability arguments can only be applied to non-static methods of a class"
+    },
+    {
+      "kind": "warning",
+      "msg": "'release_generic_capability' attribute without capability arguments can only be applied to non-static methods of a class"
+    },
+    {
+      "kind": "warning",
+      "msg": "'try_acquire_capability' attribute without capability arguments can only be applied to non-static methods of a class"
+    },
+    {
+      "kind": "warning",
+      "msg": "'try_acquire_shared_capability' attribute without capability arguments can only be applied to non-static methods of a class"
+    },
+    {
+      "kind": "error",
+      "msg": "'try_acquire_capability' attribute takes at least 1 argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'try_acquire_shared_capability' attribute takes at least 1 argument"
+    },
+    {
+      "kind": "warning",
+      "msg": "'requires_capability' attribute requires arguments whose type is annotated with 'capability' attribute; type here is 'int'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-capabilities.sft.c",
+  "remark": null,
+  "sha256": "ea15202ed4ced46d7aac73f4f607103723ab68d358ad43cb6eca7bf135be697d",
+  "test_number_uses": 0,
+  "type": "fn"
+}

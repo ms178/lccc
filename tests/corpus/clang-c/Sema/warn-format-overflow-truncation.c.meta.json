@@ -1,0 +1,50 @@
+{
+  "bytes": 15553,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'snprintf' size argument is too large; destination buffer has size 10, but size argument is 11"
+    },
+    {
+      "kind": "warning",
+      "msg": "'snprintf' size argument is too large; destination buffer has size 10, but size argument is 12"
+    },
+    {
+      "kind": "warning",
+      "msg": "'vsnprintf' size argument is too large; destination buffer has size 10, but size argument is 11"
+    },
+    {
+      "kind": "warning",
+      "msg": "format string contains '\\0' within the string body"
+    },
+    {
+      "kind": "warning",
+      "msg": "format string contains '\\0' within the string body"
+    },
+    {
+      "kind": "warning",
+      "msg": "format string contains '\\0' within the string body"
+    },
+    {
+      "kind": "warning",
+      "msg": "format string contains '\\0' within the string body"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 11,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-format-overflow-truncation.sft.c",
+  "remark": null,
+  "sha256": "809aeeeba9f658f45e6ea84b679bb83e2ecc63e792ce58f466f3237ca1caf50a",
+  "test_number_uses": 0,
+  "type": "fp"
+}

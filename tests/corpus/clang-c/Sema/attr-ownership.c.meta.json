@@ -1,0 +1,98 @@
+{
+  "bytes": 3208,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'ownership_takes' attribute requires parameter 1 to be an identifier"
+    },
+    {
+      "kind": "error",
+      "msg": "'ownership_returns' attribute takes no more than 2 arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'ownership_holds' attribute parameter 1 is out of bounds"
+    },
+    {
+      "kind": "error",
+      "msg": "'ownership_holds' attribute takes at least 2 arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'ownership_holds' attribute parameter 1 is out of bounds"
+    },
+    {
+      "kind": "error",
+      "msg": "'ownership_takes' attribute takes at least 2 arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'ownership_holds' attribute parameter 3 is out of bounds"
+    },
+    {
+      "kind": "warning",
+      "msg": "'ownership_takes' attribute only applies to non-K&R-style functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'ownership_holds' attribute only applies to pointer arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'ownership_returns' attribute only applies to integer arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'ownership_returns' attribute only applies to integer arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'ownership_takes' and 'ownership_holds' attributes are not compatible"
+    },
+    {
+      "kind": "error",
+      "msg": "'ownership_returns' attribute index does not match; here it is 1"
+    },
+    {
+      "kind": "note",
+      "msg": "declared with index 2 here"
+    },
+    {
+      "kind": "warning",
+      "msg": "'ownership_takes' attribute only applies to non-K&R-style functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'ownership_takes' attribute class does not match; here it is 'foo'"
+    },
+    {
+      "kind": "note",
+      "msg": "declared with class 'foo1' here"
+    },
+    {
+      "kind": "error",
+      "msg": "'ownership_returns' attribute only applies to functions that return a pointer"
+    },
+    {
+      "kind": "error",
+      "msg": "'ownership_returns' attribute only applies to functions that return a pointer"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-ownership.sft.c",
+  "remark": null,
+  "sha256": "67a3a6625b2c83def15a3517e26c1cbb30f3bc4e4df3a3480175440f8ddb5618",
+  "test_number_uses": 0,
+  "type": "fn"
+}

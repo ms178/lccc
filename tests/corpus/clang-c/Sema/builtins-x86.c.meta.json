@@ -1,0 +1,190 @@
+{
+  "bytes": 9502,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "this builtin is only available on 32-bit targets"
+    },
+    {
+      "kind": "error",
+      "msg": "this builtin is only available on 32-bit targets"
+    },
+    {
+      "kind": "error",
+      "msg": "argument value 32 is outside the valid range [0, 31]"
+    },
+    {
+      "kind": "error",
+      "msg": "argument value 32 is outside the valid range [0, 31]"
+    },
+    {
+      "kind": "error",
+      "msg": "argument value 32 is outside the valid range [0, 31]"
+    },
+    {
+      "kind": "error",
+      "msg": "argument value 32 is outside the valid range [0, 31]"
+    },
+    {
+      "kind": "error",
+      "msg": "argument value 32 is outside the valid range [0, 31]"
+    },
+    {
+      "kind": "error",
+      "msg": "argument value 32 is outside the valid range [0, 31]"
+    },
+    {
+      "kind": "error",
+      "msg": "argument value 8 is outside the valid range [0, 7]"
+    },
+    {
+      "kind": "error",
+      "msg": "argument value 8 is outside the valid range [0, 7]"
+    },
+    {
+      "kind": "error",
+      "msg": "argument value 8 is outside the valid range [0, 7]"
+    },
+    {
+      "kind": "error",
+      "msg": "argument value 8 is outside the valid range [0, 7]"
+    },
+    {
+      "kind": "error",
+      "msg": "argument value 8 is outside the valid range [0, 7]"
+    },
+    {
+      "kind": "error",
+      "msg": "argument value 8 is outside the valid range [0, 7]"
+    },
+    {
+      "kind": "error",
+      "msg": "argument value 8 is outside the valid range [0, 7]"
+    },
+    {
+      "kind": "error",
+      "msg": "argument value 8 is outside the valid range [0, 7]"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid rounding argument"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid rounding argument"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid rounding argument"
+    },
+    {
+      "kind": "error",
+      "msg": "scale argument must be 1, 2, 4, or 8"
+    },
+    {
+      "kind": "error",
+      "msg": "argument value 1024 is outside the valid range [0, 255]"
+    },
+    {
+      "kind": "error",
+      "msg": "argument value 1024 is outside the valid range [0, 255]"
+    },
+    {
+      "kind": "error",
+      "msg": "argument value 1024 is outside the valid range [0, 255]"
+    },
+    {
+      "kind": "error",
+      "msg": "argument value 1024 is outside the valid range [0, 255]"
+    },
+    {
+      "kind": "error",
+      "msg": "argument value 1024 is outside the valid range [0, 255]"
+    },
+    {
+      "kind": "error",
+      "msg": "argument value 1024 is outside the valid range [0, 255]"
+    },
+    {
+      "kind": "error",
+      "msg": "argument value 1024 is outside the valid range [0, 255]"
+    },
+    {
+      "kind": "error",
+      "msg": "argument value 1024 is outside the valid range [0, 255]"
+    },
+    {
+      "kind": "error",
+      "msg": "argument value 1024 is outside the valid range [0, 255]"
+    },
+    {
+      "kind": "error",
+      "msg": "argument value 1024 is outside the valid range [0, 255]"
+    },
+    {
+      "kind": "error",
+      "msg": "argument value 1024 is outside the valid range [0, 255]"
+    },
+    {
+      "kind": "error",
+      "msg": "argument value 1024 is outside the valid range [0, 255]"
+    },
+    {
+      "kind": "error",
+      "msg": "argument value 1024 is outside the valid range [0, 255]"
+    },
+    {
+      "kind": "error",
+      "msg": "argument value 1024 is outside the valid range [0, 255]"
+    },
+    {
+      "kind": "error",
+      "msg": "argument value 1024 is outside the valid range [0, 255]"
+    },
+    {
+      "kind": "error",
+      "msg": "argument value 1024 is outside the valid range [0, 255]"
+    },
+    {
+      "kind": "error",
+      "msg": "argument value 1024 is outside the valid range [0, 255]"
+    },
+    {
+      "kind": "error",
+      "msg": "argument value 1024 is outside the valid range [0, 255]"
+    },
+    {
+      "kind": "error",
+      "msg": "argument to '__builtin_ia32_lwpins32' must be a constant integer"
+    },
+    {
+      "kind": "error",
+      "msg": "argument to '__builtin_ia32_lwpval32' must be a constant integer"
+    },
+    {
+      "kind": "error",
+      "msg": "argument to '__builtin_ia32_lwpins64' must be a constant integer"
+    },
+    {
+      "kind": "error",
+      "msg": "argument to '__builtin_ia32_lwpval64' must be a constant integer"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/builtins-x86.sft.c",
+  "remark": null,
+  "sha256": "a8a76e5cf21f0244ef53b39a38368b3ef368cf6d417b306f4a2aad799b56f20d",
+  "test_number_uses": 0,
+  "type": "fn"
+}

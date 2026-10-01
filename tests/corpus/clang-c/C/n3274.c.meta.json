@@ -1,0 +1,26 @@
+{
+  "bytes": 656,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "imaginary types are not supported"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 14,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C2y/n3274.sft.c",
+  "remark": null,
+  "sha256": "fd1d7b7814877d762da9b1f827ac9a77e208abf4cf29b8a0e85ec76a9a20c4be",
+  "test_number_uses": 0,
+  "type": "fn"
+}

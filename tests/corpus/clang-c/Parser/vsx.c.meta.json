@@ -1,0 +1,30 @@
+{
+  "bytes": 578,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "cannot use 'long double' with '__vector'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use 'long double' with '__vector'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/vsx.sft.c",
+  "remark": null,
+  "sha256": "5e45b42b26cf7fb59e4a5589229594cbb7d5bf507148b636ba7cbd7df3043e0d",
+  "test_number_uses": 0,
+  "type": "fn"
+}

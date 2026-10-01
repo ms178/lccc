@@ -1,0 +1,26 @@
+{
+  "bytes": 606,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "extension"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 10,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/extension-warning.sft.c",
+  "remark": null,
+  "sha256": "f680809b5919ae7e8b7639c6ace9dfd7a62a02a7008f4cfa8ca15e612aac7426",
+  "test_number_uses": 0,
+  "type": "fp"
+}

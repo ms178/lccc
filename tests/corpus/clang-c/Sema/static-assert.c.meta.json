@@ -1,0 +1,129 @@
+{
+  "bytes": 7500,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "static assertion failed: 0 is nonzero"
+    },
+    {
+      "kind": "error",
+      "msg": "static assertion failed: 0 is nonzero"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "static assertion failed: 0 is nonzero"
+    },
+    {
+      "kind": "error",
+      "msg": "static assertion failed due to requirement 'sizeof(char) == sizeof(short)': type size mismatch"
+    },
+    {
+      "kind": "note",
+      "msg": "evaluates to '1 == 2'"
+    },
+    {
+      "kind": "error",
+      "msg": "expected a type"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ';' after '_Static_assert'"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of address of 'static_var' not equal to a null pointer is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "encoding prefix 'L' on an unevaluated string literal has no effect"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid escape sequence '\\xFFFFFFFF' in an unevaluated string literal"
+    },
+    {
+      "kind": "error",
+      "msg": "hex escape sequence out of range"
+    },
+    {
+      "kind": "warning",
+      "msg": "encoding prefix 'L' on an unevaluated string literal has no effect"
+    },
+    {
+      "kind": "error",
+      "msg": "static assertion failed: \u1234"
+    },
+    {
+      "kind": "warning",
+      "msg": "encoding prefix 'L' on an unevaluated string literal has no effect"
+    },
+    {
+      "kind": "error",
+      "msg": "hex escape sequence out of range"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid escape sequence '\\x1ff' in an unevaluated string literal"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid escape sequence '\\x123' in an unevaluated string literal"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid escape sequence '\\xfffff' in an unevaluated string literal"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c11 --ms_compatibility -DMS",
+    " --c99 --ms_compatibility -DMS",
+    " --c99",
+    " --c++11 --c++"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/static-assert.sft.c",
+  "remark": null,
+  "sha256": "594d19a57e1a40043e7bf3d127d9cf535cb9bd2aa92acae4cab0ded67050846f",
+  "test_number_uses": 0,
+  "type": "fn"
+}

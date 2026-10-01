@@ -1,0 +1,50 @@
+{
+  "bytes": 2434,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "unknown escape sequence '\\y'"
+    },
+    {
+      "kind": "warning",
+      "msg": "unknown escape sequence '\\y'"
+    },
+    {
+      "kind": "warning",
+      "msg": "this has a \t tab escape and an invalid d escape"
+    },
+    {
+      "kind": "warning",
+      "msg": "unknown escape sequence '\\d'"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 3,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c89 --ms_extensions",
+    " --c99 --ms_extensions",
+    " --c11 --ms_extensions",
+    " --c17 --ms_extensions",
+    " --c23 --ms_extensions"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/drs/dr324.sft.c",
+  "remark": null,
+  "sha256": "81307771430f739a9938bf5b924e59a837aa509606684abe17a66a8d82ad699b",
+  "test_number_uses": 0,
+  "type": "fn"
+}

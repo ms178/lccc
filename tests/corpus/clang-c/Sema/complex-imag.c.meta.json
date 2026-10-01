@@ -1,0 +1,30 @@
+{
+  "bytes": 730,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "cannot take the address of an rvalue of type 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot take the address of an rvalue of type 'double'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/complex-imag.sft.c",
+  "remark": null,
+  "sha256": "a2878b10fed477e245ce3828d41d13df432ec3f09a7f828a28808631d4b38c2a",
+  "test_number_uses": 0,
+  "type": "fn"
+}

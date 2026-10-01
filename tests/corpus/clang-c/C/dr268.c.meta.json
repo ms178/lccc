@@ -1,0 +1,30 @@
+{
+  "bytes": 2017,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "no-diagnostics",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 3,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c89",
+    " --c99",
+    " --c11",
+    " --c17",
+    " --c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/drs/dr268.sft.c",
+  "remark": null,
+  "sha256": "b948e59b5d67a9c1b7668571902c3c72f7636c4e73cb4d23593288d3ea85eff3",
+  "test_number_uses": 0,
+  "type": "fp"
+}

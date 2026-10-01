@@ -1,0 +1,26 @@
+{
+  "bytes": 481,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "use of undeclared label 'A'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/block-labels.sft.c",
+  "remark": null,
+  "sha256": "fd402a6cebacbe95868f35ce800ac738f3bcd3480d8dee7260b2779b75834d85",
+  "test_number_uses": 0,
+  "type": "fn"
+}

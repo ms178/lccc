@@ -1,0 +1,21 @@
+{
+  "bytes": 2289,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 54,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DLOCAL_VIS --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/pragma_module.sft.c",
+  "remark": null,
+  "sha256": "da164f4839a8e924af30d59bcf3ede8c22aa90ea5d5262e5b31d2d5b2b63065c",
+  "test_number_uses": 0,
+  "type": "fn"
+}

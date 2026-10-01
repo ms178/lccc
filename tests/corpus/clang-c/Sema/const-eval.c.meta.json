@@ -1,0 +1,106 @@
+{
+  "bytes": 5745,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "not an integer constant expression"
+    },
+    {
+      "kind": "error",
+      "msg": "not an integer constant expression"
+    },
+    {
+      "kind": "error",
+      "msg": "not an integer constant expression"
+    },
+    {
+      "kind": "error",
+      "msg": "array size is negative"
+    },
+    {
+      "kind": "warning",
+      "msg": "folded to constant array"
+    },
+    {
+      "kind": "warning",
+      "msg": "folded to constant array"
+    },
+    {
+      "kind": "warning",
+      "msg": "folded to constant array"
+    },
+    {
+      "kind": "error",
+      "msg": "not a compile-time constant"
+    },
+    {
+      "kind": "error",
+      "msg": "not a compile-time constant"
+    },
+    {
+      "kind": "error",
+      "msg": "variable length array"
+    },
+    {
+      "kind": "error",
+      "msg": "not a compile-time constant"
+    },
+    {
+      "kind": "error",
+      "msg": "not a compile-time constant"
+    },
+    {
+      "kind": "error",
+      "msg": "variable length array"
+    },
+    {
+      "kind": "error",
+      "msg": "not an integer constant expression"
+    },
+    {
+      "kind": "error",
+      "msg": "not an integer constant expression"
+    },
+    {
+      "kind": "error",
+      "msg": "not an integer constant expression"
+    },
+    {
+      "kind": "warning",
+      "msg": "the pointer incremented by 18'446'744'073'709'551'615 refers past the last possible element for an array in 64-bit address space containing 64-bit (8-byte) elements (max possible 2'305'843'009'213'693'952 elements)"
+    },
+    {
+      "kind": "warning",
+      "msg": "refers past the last possible element"
+    },
+    {
+      "kind": "warning",
+      "msg": "refers past the last possible element"
+    },
+    {
+      "kind": "warning",
+      "msg": "refers past the last possible element"
+    },
+    {
+      "kind": "error",
+      "msg": "not a compile-time constant"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/const-eval.sft.c",
+  "remark": null,
+  "sha256": "0a2d2ebf516c3a518ca9985774326366ff5106f720f71545ff73b99eb9a2032e",
+  "test_number_uses": 0,
+  "type": "fn"
+}

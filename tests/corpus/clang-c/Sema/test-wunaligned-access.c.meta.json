@@ -1,0 +1,138 @@
+{
+  "bytes": 11892,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "field b within 'struct U1' is less aligned than 'struct T1' and is usually due to 'struct U1' being packed, which can lead to unaligned accesses"
+    },
+    {
+      "kind": "warning",
+      "msg": "field b within 'struct U2' is less aligned than 'struct T1' and is usually due to 'struct U2' being packed, which can lead to unaligned accesses"
+    },
+    {
+      "kind": "warning",
+      "msg": "field d within 'struct U7' is less aligned than 'struct T1' and is usually due to 'struct U7' being packed, which can lead to unaligned accesses"
+    },
+    {
+      "kind": "warning",
+      "msg": "field d within 'struct U10' is less aligned than 'struct T1' and is usually due to 'struct U10' being packed, which can lead to unaligned accesses"
+    },
+    {
+      "kind": "warning",
+      "msg": "field b within 'struct U12' is less aligned than 'struct T1' and is usually due to 'struct U12' being packed, which can lead to unaligned accesses"
+    },
+    {
+      "kind": "warning",
+      "msg": "field b within 'struct U13' is less aligned than 'struct T1' and is usually due to 'struct U13' being packed, which can lead to unaligned accesses"
+    },
+    {
+      "kind": "warning",
+      "msg": "field b within 'struct U14' is less aligned than 'struct T1' and is usually due to 'struct U14' being packed, which can lead to unaligned accesses"
+    },
+    {
+      "kind": "warning",
+      "msg": "field b within 'struct U15' is less aligned than 'struct T1' and is usually due to 'struct U15' being packed, which can lead to unaligned accesses"
+    },
+    {
+      "kind": "warning",
+      "msg": "field c within 'struct U18' is less aligned than 'struct T1' and is usually due to 'struct U18' being packed, which can lead to unaligned accesses"
+    },
+    {
+      "kind": "warning",
+      "msg": "field b within 'struct U19' is less aligned than 'struct T1' and is usually due to 'struct U19' being packed, which can lead to unaligned accesses"
+    },
+    {
+      "kind": "warning",
+      "msg": "field d within 'struct U21' is less aligned than 'struct T1' and is usually due to 'struct U21' being packed, which can lead to unaligned accesses"
+    },
+    {
+      "kind": "warning",
+      "msg": "field d within 'struct U22' is less aligned than 'struct T1' and is usually due to 'struct U22' being packed, which can lead to unaligned accesses"
+    },
+    {
+      "kind": "warning",
+      "msg": "field b within 'struct U23' is less aligned than 'struct T1' and is usually due to 'struct U23' being packed, which can lead to unaligned accesses"
+    },
+    {
+      "kind": "warning",
+      "msg": "field b within 'struct U24' is less aligned than 'struct T1' and is usually due to 'struct U24' being packed, which can lead to unaligned accesses"
+    },
+    {
+      "kind": "warning",
+      "msg": "field b within 'struct T2' is less aligned than 'struct T1' and is usually due to 'struct T2' being packed, which can lead to unaligned accesses"
+    },
+    {
+      "kind": "warning",
+      "msg": "field b within 'struct U30' is less aligned than 'struct T3' and is usually due to 'struct U30' being packed, which can lead to unaligned accesses"
+    },
+    {
+      "kind": "warning",
+      "msg": "field b within 'struct U34' is less aligned than 'struct T1' and is usually due to 'struct U34' being packed, which can lead to unaligned accesses"
+    },
+    {
+      "kind": "warning",
+      "msg": "field d within 'struct U35' is less aligned than 'struct T4' and is usually due to 'struct U35' being packed, which can lead to unaligned accesses"
+    },
+    {
+      "kind": "warning",
+      "msg": "field b within 'struct T5' is less aligned than 'struct T1' and is usually due to 'struct T5' being packed, which can lead to unaligned accesses"
+    },
+    {
+      "kind": "warning",
+      "msg": "field b within 'struct U37' is less aligned than 'struct T3' and is usually due to 'struct U37' being packed, which can lead to unaligned accesses"
+    },
+    {
+      "kind": "warning",
+      "msg": "field b within 'struct A1' is less aligned than 'struct T1' and is usually due to 'struct A1' being packed, which can lead to unaligned accesses"
+    },
+    {
+      "kind": "warning",
+      "msg": "field b within 'struct A4' is less aligned than 'struct T1' and is usually due to 'struct A4' being packed, which can lead to unaligned accesses"
+    },
+    {
+      "kind": "warning",
+      "msg": "field b within 'struct A5' is less aligned than 'struct T1' and is usually due to 'struct A5' being packed, which can lead to unaligned accesses"
+    },
+    {
+      "kind": "warning",
+      "msg": "field b within 'struct U41' is less aligned than 'struct A3' and is usually due to 'struct U41' being packed, which can lead to unaligned accesses"
+    },
+    {
+      "kind": "warning",
+      "msg": "field b within 'struct U44' is less aligned than 'struct A10' and is usually due to 'struct U44' being packed, which can lead to unaligned accesses"
+    },
+    {
+      "kind": "warning",
+      "msg": "field b within 'struct U45' is less aligned than 'struct A10' and is usually due to 'struct U45' being packed, which can lead to unaligned accesses"
+    },
+    {
+      "kind": "warning",
+      "msg": "field b within 'struct U46' is less aligned than 'struct A2' and is usually due to 'struct U46' being packed, which can lead to unaligned accesses"
+    },
+    {
+      "kind": "warning",
+      "msg": "field b within 'struct U47' is less aligned than 'struct A8' and is usually due to 'struct U47' being packed, which can lead to unaligned accesses"
+    },
+    {
+      "kind": "warning",
+      "msg": "field b within 'struct U48' is less aligned than 'struct A8' and is usually due to 'struct U48' being packed, which can lead to unaligned accesses"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 17,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/test-wunaligned-access.sft.c",
+  "remark": null,
+  "sha256": "cec638977cda902352e41d3faf40479717479fcc988114c95ebe06f3e220306d",
+  "test_number_uses": 0,
+  "type": "fp"
+}

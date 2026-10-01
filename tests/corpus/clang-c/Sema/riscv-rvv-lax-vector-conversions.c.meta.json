@@ -1,0 +1,21 @@
+{
+  "bytes": 5485,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 11,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/riscv-rvv-lax-vector-conversions.sft.c",
+  "remark": null,
+  "sha256": "59b44aaa992d4196c1146d5f484c7b7ba516ab07a4cb90a3faa2bdb6d11a577a",
+  "test_number_uses": 0,
+  "type": "fp"
+}

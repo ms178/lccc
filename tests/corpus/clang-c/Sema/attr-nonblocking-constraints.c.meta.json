@@ -1,0 +1,34 @@
+{
+  "bytes": 2952,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "function does not permit inference of 'nonblocking' because it is declared 'blocking'"
+    },
+    {
+      "kind": "warning",
+      "msg": "function with 'nonblocking' attribute must not call non-'nonblocking' function 'hasproto'"
+    },
+    {
+      "kind": "warning",
+      "msg": "function with 'nonblocking' attribute must not call non-'nonblocking' function 'longjmp'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 13,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c89"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-nonblocking-constraints.sft.c",
+  "remark": null,
+  "sha256": "02ad46bb6929ad77fc4db08424bbae4cdbbf2c2b80caa2592e45db4968c9178c",
+  "test_number_uses": 0,
+  "type": "fp"
+}

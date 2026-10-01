@@ -1,0 +1,162 @@
+{
+  "bytes": 5269,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "unknown attribute 'unknown_attribute' ignored"
+    },
+    {
+      "kind": "error",
+      "msg": "'noreturn' attribute cannot be applied to a statement"
+    },
+    {
+      "kind": "error",
+      "msg": "'noreturn' attribute cannot be applied to a statement"
+    },
+    {
+      "kind": "error",
+      "msg": "'noreturn' attribute cannot be applied to a statement"
+    },
+    {
+      "kind": "error",
+      "msg": "'noreturn' attribute cannot be applied to a statement"
+    },
+    {
+      "kind": "error",
+      "msg": "'unavailable' attribute cannot be applied to a statement"
+    },
+    {
+      "kind": "warning",
+      "msg": "unknown attribute 'unknown_attribute' ignored"
+    },
+    {
+      "kind": "error",
+      "msg": "'unused' attribute cannot be applied to a statement"
+    },
+    {
+      "kind": "warning",
+      "msg": "unknown attribute 'uuid' ignored"
+    },
+    {
+      "kind": "error",
+      "msg": "'visibility' attribute cannot be applied to a statement"
+    },
+    {
+      "kind": "error",
+      "msg": "'carries_dependency' attribute cannot be applied to a statement"
+    },
+    {
+      "kind": "error",
+      "msg": "'fastcall' attribute cannot be applied to a statement"
+    },
+    {
+      "kind": "warning",
+      "msg": "'noinline' attribute only applies to functions and statements"
+    },
+    {
+      "kind": "error",
+      "msg": "'weakref' attribute only applies to variables and functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'carries_dependency' attribute cannot be applied to a statement"
+    },
+    {
+      "kind": "error",
+      "msg": "'carries_dependency' attribute cannot be applied to a statement"
+    },
+    {
+      "kind": "error",
+      "msg": "'carries_dependency' attribute cannot be applied to a statement"
+    },
+    {
+      "kind": "error",
+      "msg": "'carries_dependency' attribute cannot be applied to a statement"
+    },
+    {
+      "kind": "error",
+      "msg": "'carries_dependency' attribute cannot be applied to a statement"
+    },
+    {
+      "kind": "error",
+      "msg": "'carries_dependency' attribute cannot be applied to a statement"
+    },
+    {
+      "kind": "error",
+      "msg": "'carries_dependency' attribute cannot be applied to a statement"
+    },
+    {
+      "kind": "error",
+      "msg": "'carries_dependency' attribute cannot be applied to a statement"
+    },
+    {
+      "kind": "error",
+      "msg": "'carries_dependency' attribute cannot be applied to a statement"
+    },
+    {
+      "kind": "error",
+      "msg": "'carries_dependency' attribute cannot be applied to a statement"
+    },
+    {
+      "kind": "error",
+      "msg": "'carries_dependency' attribute cannot be applied to a statement"
+    },
+    {
+      "kind": "error",
+      "msg": "'carries_dependency' attribute cannot be applied to a statement"
+    },
+    {
+      "kind": "error",
+      "msg": "'carries_dependency' attribute cannot be applied to a statement"
+    },
+    {
+      "kind": "error",
+      "msg": "expected identifier or '('"
+    },
+    {
+      "kind": "error",
+      "msg": "expected identifier or '('"
+    },
+    {
+      "kind": "error",
+      "msg": "expected identifier or '('"
+    },
+    {
+      "kind": "error",
+      "msg": "'nomerge' attribute takes no arguments"
+    },
+    {
+      "kind": "warning",
+      "msg": "'nomerge' attribute is ignored because there exists no call expression inside the statement"
+    },
+    {
+      "kind": "error",
+      "msg": "'nomerge' attribute only applies to functions, statements and variables"
+    },
+    {
+      "kind": "warning",
+      "msg": "'nomerge' attribute is ignored because 'i' is not a function pointer"
+    },
+    {
+      "kind": "error",
+      "msg": "'nomerge' attribute only applies to functions, statements and variables"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/stmt-attributes.sft.c",
+  "remark": null,
+  "sha256": "ef7bb5d4da646a4362eff7bcfeb592e8b38f3d331a0a70d99f0f409e02031d14",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,46 @@
+{
+  "bytes": 2018,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'btf_type_tag' attribute takes one argument"
+    },
+    {
+      "kind": "error",
+      "msg": "expected string literal as argument of 'btf_type_tag' attribute"
+    },
+    {
+      "kind": "note",
+      "msg": "compatible type 'int  __attribute__((btf_type_tag(\"tag1\")))*' (aka 'int *') specified here"
+    },
+    {
+      "kind": "error",
+      "msg": "type 'int *' in generic association compatible with previously specified type 'int  __attribute__((btf_type_tag(\"tag1\")))*' (aka 'int *')"
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of 'bar2'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 11,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-btf_type_tag.sft.c",
+  "remark": null,
+  "sha256": "93ceba36ebf898858235ef86aacc69ea652f259802e3afe85840c4325b114d91",
+  "test_number_uses": 0,
+  "type": "fn"
+}

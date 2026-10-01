@@ -1,0 +1,34 @@
+{
+  "bytes": 1335,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "type name requires a specifier or qualifier"
+    },
+    {
+      "kind": "error",
+      "msg": "type specifier missing, defaults to 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/invalid-struct-init.sft.c",
+  "remark": null,
+  "sha256": "057dd79aebf0faf889c91511e4815c928ed18ebde7d37dc134237fb028675368",
+  "test_number_uses": 0,
+  "type": "fn"
+}

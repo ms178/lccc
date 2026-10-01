@@ -1,0 +1,26 @@
+{
+  "bytes": 149,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "C does not support default arguments"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 3,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/default1.sft.c",
+  "remark": null,
+  "sha256": "5ab24a0674077629c8003c2c1c245f7db219b6866ab8c95fcba8f018fd81149a",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,62 @@
+{
+  "bytes": 1064,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "declaration of anonymous union must be a definition"
+    },
+    {
+      "kind": "error",
+      "msg": "size of array has non-integer type 'void'"
+    },
+    {
+      "kind": "error",
+      "msg": "unknown type name 'y'"
+    },
+    {
+      "kind": "error",
+      "msg": "expected identifier or '('"
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration does not declare anything"
+    },
+    {
+      "kind": "warning",
+      "msg": "typedef requires a name"
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration does not declare anything"
+    },
+    {
+      "kind": "error",
+      "msg": "declaration of anonymous struct must be a definition"
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration does not declare anything"
+    },
+    {
+      "kind": "error",
+      "msg": "illegal storage class on file-scoped variable"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/decl-invalid.sft.c",
+  "remark": null,
+  "sha256": "51660e5c40945a2ffcbfd28298ad250f3319f507f90702d5a438e7d611dc570d",
+  "test_number_uses": 0,
+  "type": "fn"
+}

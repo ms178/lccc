@@ -1,0 +1,46 @@
+{
+  "bytes": 819,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'UINT8_MIN'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'UINT8_MIN'"
+    },
+    {
+      "kind": "error",
+      "msg": "accessing a member of an atomic structure or union is undefined behavior"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'j'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'a'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'a_struct'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/delayed-typo-correction-crashes.sft.c",
+  "remark": null,
+  "sha256": "018ab26717933206c54998e2893d5dec335ea5e5147ac507273e011dc37a5462",
+  "test_number_uses": 0,
+  "type": "fn"
+}

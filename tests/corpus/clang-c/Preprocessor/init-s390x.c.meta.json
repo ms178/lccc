@@ -1,0 +1,21 @@
+{
+  "bytes": 9328,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 211,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/init-s390x.sft.c",
+  "remark": null,
+  "sha256": "4b29f92082158539c341d07c24fc85806770d2d52c09ca900801b485ac563414",
+  "test_number_uses": 0,
+  "type": "fp"
+}

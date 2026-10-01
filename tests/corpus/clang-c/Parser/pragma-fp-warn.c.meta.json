@@ -1,0 +1,21 @@
+{
+  "bytes": 1140,
+  "cases": null,
+  "category": "Parser",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 21,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "%-DEXPOK %-DEXPOK %-DEXPOK %-DEXPOK --c --target linux_aarch64"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/pragma-fp-warn.sft.c",
+  "remark": null,
+  "sha256": "8f78926a1a345b0c973d433b9dc7337d083af68fda2b0b721d729e439a2b145b",
+  "test_number_uses": 0,
+  "type": "fp"
+}

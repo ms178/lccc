@@ -1,0 +1,90 @@
+{
+  "bytes": 6171,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "imaginary types are not supported"
+    },
+    {
+      "kind": "error",
+      "msg": "imaginary types are not supported"
+    },
+    {
+      "kind": "error",
+      "msg": "imaginary types are not supported"
+    },
+    {
+      "kind": "error",
+      "msg": "imaginary types are not supported"
+    },
+    {
+      "kind": "error",
+      "msg": "imaginary types are not supported"
+    },
+    {
+      "kind": "error",
+      "msg": "imaginary types are not supported"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression"
+    },
+    {
+      "kind": "warning",
+      "msg": "plain '_Complex' requires a type specifier; assuming '_Complex double'"
+    },
+    {
+      "kind": "warning",
+      "msg": "plain '_Complex' requires a type specifier; assuming '_Complex double'"
+    },
+    {
+      "kind": "error",
+      "msg": "imaginary types are not supported"
+    },
+    {
+      "kind": "warning",
+      "msg": "'++' on an object of complex type is a C2y extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "'++' on an object of complex type is a C2y extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "'--' on an object of complex type is a C2y extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "'--' on an object of complex type is a C2y extension"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 20,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c99"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C99/n809.sft.c",
+  "remark": null,
+  "sha256": "87b2c11dd09c3234ce0b5b790b731fc23cc72ad6d3d426b467cbd563454fca0d",
+  "test_number_uses": 0,
+  "type": "fn"
+}

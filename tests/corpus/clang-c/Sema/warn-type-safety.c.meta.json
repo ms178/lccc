@@ -1,0 +1,136 @@
+{
+  "bytes": 7681,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'pointer_with_type_tag' attribute requires exactly 3 arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "attribute parameter 2 is out of bounds"
+    },
+    {
+      "kind": "error",
+      "msg": "attribute parameter 2 is out of bounds"
+    },
+    {
+      "kind": "error",
+      "msg": "attribute parameter 3 is out of bounds"
+    },
+    {
+      "kind": "error",
+      "msg": "attribute parameter 3 is out of bounds"
+    },
+    {
+      "kind": "error",
+      "msg": "attribute parameter 2 is out of bounds"
+    },
+    {
+      "kind": "error",
+      "msg": "attribute requires parameter 2 to be an integer constant"
+    },
+    {
+      "kind": "error",
+      "msg": "attribute requires parameter 3 to be an integer constant"
+    },
+    {
+      "kind": "error",
+      "msg": "'pointer_with_type_tag' attribute only applies to non-K&R-style functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'pointer_with_type_tag' attribute only applies to pointer arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'pointer_with_type_tag' attribute only applies to pointer arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'type_tag_for_datatype' attribute requires parameter 1 to be an identifier"
+    },
+    {
+      "kind": "error",
+      "msg": "expected a type"
+    },
+    {
+      "kind": "error",
+      "msg": "unknown type name 'not_a_type'"
+    },
+    {
+      "kind": "error",
+      "msg": "expected identifier"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid comparison flag 'not_a_flag'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid comparison flag 'not_a_flag'"
+    },
+    {
+      "kind": "error",
+      "msg": "'type_tag_for_datatype' attribute only applies to variables"
+    },
+    {
+      "kind": "warning",
+      "msg": "this type tag was not designed to be used with this function"
+    },
+    {
+      "kind": "warning",
+      "msg": "this type tag was not designed to be used with this function"
+    },
+    {
+      "kind": "warning",
+      "msg": "argument type 'long *' doesn't match specified 'c' type tag that requires 'int *'"
+    },
+    {
+      "kind": "warning",
+      "msg": "argument type 'E_char_signed *' (aka 'signed char *') doesn't match specified 'e' type tag that requires 'E_char *' (aka 'char *')"
+    },
+    {
+      "kind": "warning",
+      "msg": "argument type 'E_char_unsigned *' (aka 'unsigned char *') doesn't match specified 'e' type tag that requires 'E_char *' (aka 'char *')"
+    },
+    {
+      "kind": "warning",
+      "msg": "argument type 'int' doesn't match specified 'fcntl' type tag that requires 'struct flock *'"
+    },
+    {
+      "kind": "warning",
+      "msg": "argument type 'struct flock *' doesn't match specified 'fcntl' type tag that requires 'int'"
+    },
+    {
+      "kind": "warning",
+      "msg": "left operand of comma operator has no effect"
+    },
+    {
+      "kind": "warning",
+      "msg": "argument type 'int *' doesn't match specified 'f' type tag that requires 'float *'"
+    },
+    {
+      "kind": "warning",
+      "msg": "argument type 'float *' doesn't match specified 'f' type tag that requires 'int *'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c99",
+    " --c++03 --c++",
+    " --c99"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-type-safety.sft.c",
+  "remark": null,
+  "sha256": "99d110605fd138a6c0dd0ca10ea548b1c493c3be37d307338d013dc014c360e3",
+  "test_number_uses": 0,
+  "type": "fn"
+}

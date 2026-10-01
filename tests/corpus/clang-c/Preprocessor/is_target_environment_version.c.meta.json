@@ -1,0 +1,21 @@
+{
+  "bytes": 216,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/is_target_environment_version.sft.c",
+  "remark": null,
+  "sha256": "ecd2e141d4d7d928d0b4f571b8eeebb2f15f8f120c52f3a4cb2d875a07a03f9b",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,179 @@
+{
+  "bytes": 5034,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "expected identifier or '('"
+    },
+    {
+      "kind": "error",
+      "msg": "character <U+1F477> not allowed in an identifier"
+    },
+    {
+      "kind": "error",
+      "msg": "expected identifier or '('"
+    },
+    {
+      "kind": "error",
+      "msg": "character <U+1F477> not allowed in an identifier"
+    },
+    {
+      "kind": "error",
+      "msg": "unexpected character <U+1F477>"
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration does not declare anything"
+    },
+    {
+      "kind": "error",
+      "msg": "character <U+1F477> not allowed in an identifier"
+    },
+    {
+      "kind": "error",
+      "msg": "unexpected character <U+1F550>"
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration does not declare anything"
+    },
+    {
+      "kind": "error",
+      "msg": "character <U+1F550> not allowed in an identifier"
+    },
+    {
+      "kind": "error",
+      "msg": "unexpected character <U+1F480>"
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration does not declare anything"
+    },
+    {
+      "kind": "error",
+      "msg": "character <U+1F480> not allowed in an identifier"
+    },
+    {
+      "kind": "error",
+      "msg": "unexpected character <U+1F44A>"
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration does not declare anything"
+    },
+    {
+      "kind": "error",
+      "msg": "character <U+1F44A> not allowed in an identifier"
+    },
+    {
+      "kind": "error",
+      "msg": "unexpected character <U+1F680>"
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration does not declare anything"
+    },
+    {
+      "kind": "error",
+      "msg": "character <U+1F680> not allowed in an identifier"
+    },
+    {
+      "kind": "error",
+      "msg": "unexpected character <U+1F600>"
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration does not declare anything"
+    },
+    {
+      "kind": "error",
+      "msg": "character <U+1F600> not allowed in an identifier"
+    },
+    {
+      "kind": "error",
+      "msg": "expected identifier or '('"
+    },
+    {
+      "kind": "error",
+      "msg": "expected identifier or '('"
+    },
+    {
+      "kind": "error",
+      "msg": "character <U+0662> not allowed at the start of an identifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration does not declare anything"
+    },
+    {
+      "kind": "error",
+      "msg": "expected identifier or '('"
+    },
+    {
+      "kind": "warning",
+      "msg": "mathematical notation character <U+2070> in an identifier is a Clang extension"
+    },
+    {
+      "kind": "error",
+      "msg": "expected identifier or '('"
+    },
+    {
+      "kind": "warning",
+      "msg": "mathematical notation character <U+00B9> in an identifier is a Clang extension"
+    },
+    {
+      "kind": "error",
+      "msg": "character <U+00B2> not allowed at the start of an identifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration does not declare anything"
+    },
+    {
+      "kind": "warning",
+      "msg": "mathematical notation character <U+00B2> in an identifier is a Clang extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "mathematical notation character <U+2202> in an identifier is a Clang extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "mathematical notation character <U+2202> in an identifier is a Clang extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "mathematical notation character <U+2207> in an identifier is a Clang extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "mathematical notation character <U+2207> in an identifier is a Clang extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "mathematical notation character <U+221E> in an identifier is a Clang extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "mathematical notation character <U+221E> in an identifier is a Clang extension"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 25,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23",
+    " --c23 -DPP_ONLY=1 -w"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C23/n2836_n2939.sft.c",
+  "remark": null,
+  "sha256": "565b6de6707e476f7f03bc71ee0fba9a2333ad33ff20f93703c21395fd9d6437",
+  "test_number_uses": 0,
+  "type": "fn"
+}

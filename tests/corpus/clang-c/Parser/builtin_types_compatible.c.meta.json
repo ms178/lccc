@@ -1,0 +1,30 @@
+{
+  "bytes": 2309,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'__builtin_choose_expr' requires a constant expression"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'int' from incompatible type 'struct xx'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/builtin_types_compatible.sft.c",
+  "remark": null,
+  "sha256": "b896ed9f15d6106cfd6fa24892baa417c9e477e5bda06042fac6a2e8af2cbc85",
+  "test_number_uses": 0,
+  "type": "fn"
+}

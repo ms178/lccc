@@ -1,0 +1,21 @@
+{
+  "bytes": 622,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 9,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/builtin-memcpy.sft.c",
+  "remark": null,
+  "sha256": "078424f2e4aca13e9c708a4d0c185b3f460f8bcde1e7863c094b7a04e62dad76",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,58 @@
+{
+  "bytes": 1439,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "no previous prototype for function"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "multi-character character constant"
+    },
+    {
+      "kind": "warning",
+      "msg": "macro is not used"
+    },
+    {
+      "kind": "warning",
+      "msg": "multi-character character constant"
+    },
+    {
+      "kind": "warning",
+      "msg": "macro is not used"
+    },
+    {
+      "kind": "warning",
+      "msg": "multi-character character constant"
+    },
+    {
+      "kind": "error",
+      "msg": "macro is not used"
+    },
+    {
+      "kind": "error",
+      "msg": "multi-character character constant"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 10,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/Weverything_pragma.sft.c",
+  "remark": null,
+  "sha256": "961ab1316d22a57ef3569f49dce89248d075d30d8e174225396aba34c76117c4",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,26 @@
+{
+  "bytes": 242,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "duplicate 'const' declaration specifier"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C99/n505.sft.c",
+  "remark": null,
+  "sha256": "902c7a91978ed2cdd7a8298287ddb313068a753976b35eb7feca7f4b12cdad4d",
+  "test_number_uses": 0,
+  "type": "fp"
+}

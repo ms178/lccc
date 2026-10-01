@@ -1,0 +1,21 @@
+{
+  "bytes": 376,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 13,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/pp-record.sft.c",
+  "remark": null,
+  "sha256": "3db1a81ff5014935617e4487801a7e203ae91e24916325350c4000104514e0cb",
+  "test_number_uses": 0,
+  "type": "fp"
+}

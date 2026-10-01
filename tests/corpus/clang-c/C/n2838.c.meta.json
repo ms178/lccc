@@ -1,0 +1,34 @@
+{
+  "bytes": 696,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "array is too large (295'147'905'179'352'825'841 elements)"
+    },
+    {
+      "kind": "error",
+      "msg": "array is too large (18'446'744'073'709'551'615 elements)"
+    },
+    {
+      "kind": "error",
+      "msg": "array is too large (9'223'372'036'854'775'807 elements)"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C23/n2838.sft.c",
+  "remark": null,
+  "sha256": "df924e3ca396cf295aa77f50026110392d9a215342aba0585cce55374ce656ff",
+  "test_number_uses": 0,
+  "type": "fn"
+}

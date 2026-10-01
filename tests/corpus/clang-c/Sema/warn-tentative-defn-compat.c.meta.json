@@ -1,0 +1,46 @@
+{
+  "bytes": 1297,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "duplicate declaration of 'i' is invalid in C++"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "duplicate declaration of 'j' is invalid in C++"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "duplicate declaration of 'k' is invalid in C++"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-tentative-defn-compat.sft.c",
+  "remark": null,
+  "sha256": "058ef3b195f9a89f4f31cfb63bf72eabc54d09e630594edb34465dca95061976",
+  "test_number_uses": 0,
+  "type": "fp"
+}

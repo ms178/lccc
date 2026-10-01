@@ -1,0 +1,70 @@
+{
+  "bytes": 2638,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "forward references to 'enum' types are a Microsoft extension"
+    },
+    {
+      "kind": "note",
+      "msg": "forward declaration of"
+    },
+    {
+      "kind": "error",
+      "msg": "variable has incomplete type 'enum ENUM1'"
+    },
+    {
+      "kind": "warning",
+      "msg": "enumerator value is not representable in the underlying type 'int'"
+    },
+    {
+      "kind": "warning",
+      "msg": "enumerator value is not representable in the underlying type 'int'"
+    },
+    {
+      "kind": "warning",
+      "msg": "function 'f6' declared 'noreturn' should not return"
+    },
+    {
+      "kind": "error",
+      "msg": "requested alignment must be 8192 bytes or smaller"
+    },
+    {
+      "kind": "warning",
+      "msg": "__declspec attribute 'aligned' is not supported"
+    },
+    {
+      "kind": "warning",
+      "msg": "__declspec attribute 'appdomain' is not supported"
+    },
+    {
+      "kind": "warning",
+      "msg": "__declspec attribute '__noreturn__' is not supported"
+    },
+    {
+      "kind": "error",
+      "msg": "unknown type name 'size_t'"
+    },
+    {
+      "kind": "warning",
+      "msg": "'__forceinline' attribute only applies to functions and statements"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--ms_compatibility -DMSVCCOMPAT -w --ms_extensions -w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/MicrosoftCompatibility.sft.c",
+  "remark": null,
+  "sha256": "217ff0a80beb22d2401b36597459d03cd8ef0b7244a62d845f743446f500733b",
+  "test_number_uses": 0,
+  "type": "fn"
+}

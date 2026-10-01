@@ -1,0 +1,30 @@
+{
+  "bytes": 434,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "folded to constant array"
+    },
+    {
+      "kind": "warning",
+      "msg": "folded to constant array"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c99"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/typedef-variable-type.sft.c",
+  "remark": null,
+  "sha256": "2fcf527e464e5241a6c3a502c1bf35ee69d9901104681cc7e50c2675dd16201c",
+  "test_number_uses": 0,
+  "type": "fp"
+}

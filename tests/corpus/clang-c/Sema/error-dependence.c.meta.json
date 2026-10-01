@@ -1,0 +1,38 @@
+{
+  "bytes": 1012,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call"
+    },
+    {
+      "kind": "error",
+      "msg": "builtin functions must be directly called"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/error-dependence.sft.c",
+  "remark": null,
+  "sha256": "96bf92987c3979b243f9289d1f51cc8014f7e5014338fb1b9e58f91775866127",
+  "test_number_uses": 0,
+  "type": "fn"
+}

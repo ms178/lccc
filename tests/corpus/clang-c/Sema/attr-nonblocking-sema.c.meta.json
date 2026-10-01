@@ -1,0 +1,30 @@
+{
+  "bytes": 523,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'nonblocking' function must have a prototype"
+    },
+    {
+      "kind": "error",
+      "msg": "'nonblocking' function must have a prototype"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c89"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-nonblocking-sema.sft.c",
+  "remark": null,
+  "sha256": "e9648a298dcb9dc07188dd5b9b5660d0b73324cebe798a649a6257567b54b380",
+  "test_number_uses": 0,
+  "type": "fn"
+}

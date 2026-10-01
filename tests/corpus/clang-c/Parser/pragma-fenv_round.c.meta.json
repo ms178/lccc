@@ -1,0 +1,30 @@
+{
+  "bytes": 554,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'#pragma STDC FENV_ROUND' can only appear at file scope or at the start of a compound statement"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/pragma-fenv_round.sft.c",
+  "remark": null,
+  "sha256": "ce4409ef2fdc551bb24efa5df94d95e59530f180bb59bda302526268d1e74da0",
+  "test_number_uses": 0,
+  "type": "fn"
+}

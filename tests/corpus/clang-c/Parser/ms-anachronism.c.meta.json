@@ -1,0 +1,26 @@
+{
+  "bytes": 241,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'__cdecl' only applies to function types; type here is 'struct"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w --ms_extensions --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/ms-anachronism.sft.c",
+  "remark": null,
+  "sha256": "2f0c11935aeb5be28eaff7e11973e95dfbb61b289e7e74db7771d8491b5612e0",
+  "test_number_uses": 0,
+  "type": "fp"
+}

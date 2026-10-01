@@ -1,0 +1,46 @@
+{
+  "bytes": 1126,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'short' but the argument has type '_Bool'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'unsigned short' but the argument has type '_Bool'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'short' but the argument has type 'unsigned char'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'unsigned short' but the argument has type 'unsigned char'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'short' but the argument has type 'signed char'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'unsigned short' but the argument has type 'signed char'"
+    }
+  ],
+  "has_main": true,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/format-type-confusion.sft.c",
+  "remark": null,
+  "sha256": "86e6c4e5159e34904ca42a36f060128fca3673090c543d4d106aa14dcd3c8a0a",
+  "test_number_uses": 0,
+  "type": "fp"
+}

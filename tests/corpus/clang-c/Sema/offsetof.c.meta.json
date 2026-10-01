@@ -1,0 +1,58 @@
+{
+  "bytes": 2306,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "no member named 'f2'"
+    },
+    {
+      "kind": "error",
+      "msg": "offsetof requires struct"
+    },
+    {
+      "kind": "error",
+      "msg": "no member named 'f2'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "offsetof of incomplete type 'struct incomplete'"
+    },
+    {
+      "kind": "error",
+      "msg": "array has incomplete element type 'struct incomplete'"
+    },
+    {
+      "kind": "note",
+      "msg": "bit-field is declared here"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot compute offset of bit-field 'j'"
+    },
+    {
+      "kind": "warning",
+      "msg": "indirection of non-volatile null pointer"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/offsetof.sft.c",
+  "remark": null,
+  "sha256": "281aef4e45858936e5263464b8a68b93ed736d09697403a4ef9d8122ac3c8c57",
+  "test_number_uses": 0,
+  "type": "fn"
+}

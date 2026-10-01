@@ -1,0 +1,28 @@
+{
+  "bytes": 377,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'signal' attribute only applies to functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'signal' attribute takes no arguments"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 3,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/avr-signal-attr.sft.c",
+  "remark": null,
+  "sha256": "2317e570021d32eba4d6599d95a8b1579405161c609f615867c7c47abdadbe5c",
+  "test_number_uses": 0,
+  "type": "fn"
+}

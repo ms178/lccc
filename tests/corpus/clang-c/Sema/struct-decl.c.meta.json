@@ -1,0 +1,78 @@
+{
+  "bytes": 2983,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "folded to constant"
+    },
+    {
+      "kind": "error",
+      "msg": "array size is negative"
+    },
+    {
+      "kind": "warning",
+      "msg": "field 'hdr' with variable sized type 'struct pppoe_tag' not at the end of a struct or class is a GNU extension"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "duplicate member 'a'"
+    },
+    {
+      "kind": "warning",
+      "msg": "'static' ignored on this declaration"
+    },
+    {
+      "kind": "warning",
+      "msg": "'const' ignored on this declaration"
+    },
+    {
+      "kind": "error",
+      "msg": "'inline' can only appear on functions"
+    },
+    {
+      "kind": "warning",
+      "msg": "'noreturn' attribute only applies to functions and methods"
+    },
+    {
+      "kind": "warning",
+      "msg": "field 'a' with variable sized type 'struct FlexibleArrayMem' not at the end of a struct or class is a GNU extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "field 'a' with variable sized type 'struct FlexibleArrayMem' not at the end of a struct or class is a GNU extension"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "field 'a' with variable sized type 'struct FlexibleArrayMem' not at the end of a struct or class is a GNU extension"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/struct-decl.sft.c",
+  "remark": null,
+  "sha256": "f3d809ef806b4ba213340828ac78765fa91f40e931310a4cf63c69f755b96c65",
+  "test_number_uses": 0,
+  "type": "fn"
+}

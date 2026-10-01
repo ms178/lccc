@@ -1,0 +1,314 @@
+{
+  "bytes": 19141,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "[[]] attributes are a C23 extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "[[]] attributes are a C23 extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "[[]] attributes are a C23 extension"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "[[]] attributes are a C23 extension"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid argument type 'v2i64' (vector of 2 'long long' values) to unary expression"
+    },
+    {
+      "kind": "error",
+      "msg": "used type 'v2i64' (vector of 2 'long long' values) where arithmetic or pointer type is required"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector type 'v2i64' (vector of 2 'long long' values) and non-vector type 'int' is only supported in C++"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector type 'v2i64' (vector of 2 'long long' values) and non-vector type 'int' is only supported in C++"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector types 'v2i64' (vector of 2 'long long' values) and 'v2i64' is only supported in C++"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector types 'v2i64' (vector of 2 'long long' values) and 'v2i64' is only supported in C++"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between scalar type 'int' and vector type 'v4f32' (vector of 4 'float' values) as implicit conversion would cause truncation"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparing floating point with == or != is unsafe"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparing floating point with == or != is unsafe"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparing floating point with == or != is unsafe"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparing floating point with == or != is unsafe"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between scalar type 'unsigned int' and vector type 'v4f32' (vector of 4 'float' values) as implicit conversion would cause truncation"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between scalar type 'unsigned long long' and vector type 'v4f32' (vector of 4 'float' values) as implicit conversion would cause truncation"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between scalar type 'unsigned long long' and vector type 'v4f64' (vector of 4 'double' values) as implicit conversion would cause truncation"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between scalar type 'int' and vector type 'v4f32' (vector of 4 'float' values) as implicit conversion would cause truncation"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between scalar type 'long long' and vector type 'v4f32' (vector of 4 'float' values) as implicit conversion would cause truncation"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between scalar type 'long long' and vector type 'v4f64' (vector of 4 'double' values) as implicit conversion would cause truncation"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion loses integer precision: 'long long' to 'v2i32' (vector of 2 'int' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between scalar type 'long long' and vector type 'v2i16' (vector of 2 'short' values) as implicit conversion would cause truncation"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion loses integer precision: 'int' to 'v2i16' (vector of 2 'short' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between scalar type 'long long' and vector type 'v2i8' (vector of 2 'char' values) as implicit conversion would cause truncation"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between scalar type 'int' and vector type 'v2i8' (vector of 2 'char' values) as implicit conversion would cause truncation"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion loses integer precision: 'short' to 'v2i8' (vector of 2 'char' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between scalar type 'unsigned long long' and vector type 'v2i64' (vector of 2 'long long' values) as implicit conversion would cause truncation"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion loses integer precision: 'unsigned long long' to 'v2i32' (vector of 2 'int' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between scalar type 'unsigned int' and vector type 'v2i32' (vector of 2 'int' values) as implicit conversion would cause truncation"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between scalar type 'unsigned long long' and vector type 'v2i16' (vector of 2 'short' values) as implicit conversion would cause truncation"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion loses integer precision: 'unsigned int' to 'v2i16' (vector of 2 'short' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between scalar type 'unsigned short' and vector type 'v2i16' (vector of 2 'short' values) as implicit conversion would cause truncation"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between scalar type 'unsigned long long' and vector type 'v2i8' (vector of 2 'char' values) as implicit conversion would cause truncation"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between scalar type 'unsigned int' and vector type 'v2i8' (vector of 2 'char' values) as implicit conversion would cause truncation"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion loses integer precision: 'unsigned short' to 'v2i8' (vector of 2 'char' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between scalar type 'unsigned char' and vector type 'v2i8' (vector of 2 'char' values) as implicit conversion would cause truncation"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion changes signedness: 'long long' to 'v2u64' (vector of 2 'unsigned long long' values)"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion changes signedness: 'int' to 'v2u64' (vector of 2 'unsigned long long' values)"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion changes signedness: 'short' to 'v2u64' (vector of 2 'unsigned long long' values)"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion changes signedness: 'char' to 'v2u64' (vector of 2 'unsigned long long' values)"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion loses integer precision: 'long long' to 'v2u32' (vector of 2 'unsigned int' values)"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion changes signedness: 'int' to 'v2u32' (vector of 2 'unsigned int' values)"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion changes signedness: 'short' to 'v2u32' (vector of 2 'unsigned int' values)"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion changes signedness: 'char' to 'v2u32' (vector of 2 'unsigned int' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between scalar type 'long long' and vector type 'v2u16' (vector of 2 'unsigned short' values) as implicit conversion would cause truncation"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion loses integer precision: 'int' to 'v2u16' (vector of 2 'unsigned short' values)"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion changes signedness: 'short' to 'v2u16' (vector of 2 'unsigned short' values)"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion changes signedness: 'char' to 'v2u16' (vector of 2 'unsigned short' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between scalar type 'long long' and vector type 'v2u8' (vector of 2 'unsigned char' values) as implicit conversion would cause truncation"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between scalar type 'int' and vector type 'v2u8' (vector of 2 'unsigned char' values) as implicit conversion would cause truncation"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion loses integer precision: 'short' to 'v2u8' (vector of 2 'unsigned char' values)"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion changes signedness: 'char' to 'v2u8' (vector of 2 'unsigned char' values)"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion loses integer precision: 'unsigned long long' to 'v2u32' (vector of 2 'unsigned int' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between scalar type 'unsigned long long' and vector type 'v2u16' (vector of 2 'unsigned short' values) as implicit conversion would cause truncation"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion loses integer precision: 'unsigned int' to 'v2u16' (vector of 2 'unsigned short' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between scalar type 'unsigned long long' and vector type 'v2u8' (vector of 2 'unsigned char' values) as implicit conversion would cause truncation"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between scalar type 'unsigned int' and vector type 'v2u8' (vector of 2 'unsigned char' values) as implicit conversion would cause truncation"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion loses integer precision: 'unsigned short' to 'v2u8' (vector of 2 'unsigned char' values)"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from 'long' to 'v2u32' (vector of 2 'unsigned int' values) changes value from 8589934591 to 4294967295"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from 'int' to 'v2u16' (vector of 2 'unsigned short' values) changes value from 131071 to 65535"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between scalar type 'int' and vector type 'v2u8' (vector of 2 'unsigned char' values) as implicit conversion would cause truncation"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from 'long' to 'v2i32' (vector of 2 'int' values) changes value from 2147483648 to -2147483648"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from 'int' to 'v2i16' (vector of 2 'short' values) changes value from 32768 to -32768"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from 'int' to 'v2i8' (vector of 2 'char' values) changes value from 128 to -128"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from 'long' to 'v2i32' (vector of 2 'int' values) changes value from -2147483649 to 2147483647"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from 'int' to 'v2i16' (vector of 2 'short' values) changes value from -32769 to 32767"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between scalar type 'int' and vector type 'v2i8' (vector of 2 'char' values) as implicit conversion would cause truncation"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/vector-gcc-compat.sft.c",
+  "remark": null,
+  "sha256": "84a8ce3fa83ce73a99f83dbb25a269cae18d8187c51f205458b1404bb193fff0",
+  "test_number_uses": 0,
+  "type": "fn"
+}

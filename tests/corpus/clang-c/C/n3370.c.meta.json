@@ -1,0 +1,98 @@
+{
+  "bytes": 6534,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "empty case range specified"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "expression is not an integer constant expression"
+    },
+    {
+      "kind": "error",
+      "msg": "case value is not a constant expression"
+    },
+    {
+      "kind": "note",
+      "msg": "function parameter 'i' with unknown value cannot be used in a constant expression"
+    },
+    {
+      "kind": "error",
+      "msg": "expression is not an integer constant expression"
+    },
+    {
+      "kind": "error",
+      "msg": "case value is not a constant expression"
+    },
+    {
+      "kind": "note",
+      "msg": "function parameter 'i' with unknown value cannot be used in a constant expression"
+    },
+    {
+      "kind": "error",
+      "msg": "integer constant expression must have integer type, not 'float'"
+    },
+    {
+      "kind": "error",
+      "msg": "conversion from 'float' to 'int' is not allowed in a converted constant expression"
+    },
+    {
+      "kind": "error",
+      "msg": "integer constant expression must have integer type, not 'char[2]'"
+    },
+    {
+      "kind": "error",
+      "msg": "value of type 'const char[2]' is not implicitly convertible to 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "duplicate case value '11'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous case defined here"
+    },
+    {
+      "kind": "note",
+      "msg": "previous case defined here"
+    },
+    {
+      "kind": "error",
+      "msg": "duplicate case value '20'"
+    },
+    {
+      "kind": "warning",
+      "msg": "overflow converting case value to switch condition type (256 to 0)"
+    },
+    {
+      "kind": "warning",
+      "msg": "overflow converting case value to switch condition type (257 to 1)"
+    },
+    {
+      "kind": "warning",
+      "msg": "overflow converting case value to switch condition type (258 to 2)"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 15,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C2y/n3370.sft.c",
+  "remark": null,
+  "sha256": "b1caacd2c72624757827f3361d4a94ebd7d229b366f49715bcc19e5bff43c962",
+  "test_number_uses": 0,
+  "type": "fn"
+}

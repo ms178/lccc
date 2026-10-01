@@ -1,0 +1,26 @@
+{
+  "bytes": 309,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "invalid cpu name for builtin"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c --target linux_aarch64"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/check-aux-builtins.sft.c",
+  "remark": null,
+  "sha256": "8bc4c0d9585807782bfec3306a6bec76dc53607f1c66422fbd5104a8562a4680",
+  "test_number_uses": 0,
+  "type": "fn"
+}

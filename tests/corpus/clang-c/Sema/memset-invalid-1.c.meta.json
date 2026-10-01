@@ -1,0 +1,30 @@
+{
+  "bytes": 553,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'memset' call operates on objects of type 'struct __incomplete' while the size is based on a different type 'incomplete'"
+    },
+    {
+      "kind": "note",
+      "msg": "did you mean to dereference the argument to 'sizeof' (and multiply it by the number of elements)?"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/memset-invalid-1.sft.c",
+  "remark": null,
+  "sha256": "7315a28928282d7399a860a2efdbd5febb51bf4ae68bfbf5f55c0739b00a2e53",
+  "test_number_uses": 0,
+  "type": "fp"
+}

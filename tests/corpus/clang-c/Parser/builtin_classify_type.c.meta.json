@@ -1,0 +1,26 @@
+{
+  "bytes": 548,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "builtin functions must be directly called"
+    }
+  ],
+  "has_main": true,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/builtin_classify_type.sft.c",
+  "remark": null,
+  "sha256": "e107671a993cc1965a355feff1416e9a64ebb160954e5e8dfbab4183eee1ff2e",
+  "test_number_uses": 0,
+  "type": "fn"
+}

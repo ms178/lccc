@@ -1,0 +1,30 @@
+{
+  "bytes": 2199,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "invalid input constraint 's' in asm"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid type 'void' in asm input for constraint 'S'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DVERIFY --c --target linux_aarch64"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/inline-asm-validate-aarch64.sft.c",
+  "remark": null,
+  "sha256": "e6052be9d785856c5d492cf77a64171b86ffc247d2b407dee6bf4c937be4557c",
+  "test_number_uses": 0,
+  "type": "fn"
+}

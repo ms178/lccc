@@ -1,0 +1,54 @@
+{
+  "bytes": 1398,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "expected string literal as argument of 'annotate' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "expected string literal as argument of 'annotate' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "second argument to __builtin_annotation must be a non-wide string constant"
+    },
+    {
+      "kind": "error",
+      "msg": "second argument to __builtin_annotation must be a non-wide string constant"
+    },
+    {
+      "kind": "error",
+      "msg": "first argument to __builtin_annotation must be an integer"
+    },
+    {
+      "kind": "error",
+      "msg": "'annotate' attribute takes at least 1 argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'clang::annotate' attribute takes at least 1 argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'clang::annotate' attribute takes at least 1 argument"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/annotate.sft.c",
+  "remark": null,
+  "sha256": "0743dc0ff08f061465d2aaf1bccc4f9e730ed4e876da1dd9926f117620d881fd",
+  "test_number_uses": 0,
+  "type": "fn"
+}

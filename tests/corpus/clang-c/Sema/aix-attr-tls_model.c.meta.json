@@ -1,0 +1,26 @@
+{
+  "bytes": 618,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "no-diagnostics",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 9,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/aix-attr-tls_model.sft.c",
+  "remark": null,
+  "sha256": "50d08e7090506bd04f223ee9fea02d73470c131a176f8fa2f08b4ae55255f513",
+  "test_number_uses": 0,
+  "type": "fp"
+}

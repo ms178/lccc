@@ -1,0 +1,38 @@
+{
+  "bytes": 1184,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "type specifier missing"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 10,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--ms_extensions --ms_extensions -w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/macro_paste_msextensions.sft.c",
+  "remark": null,
+  "sha256": "ae879711d547e80262edf5accf1edde477c59dbbba3f4603ca7d0867722483f1",
+  "test_number_uses": 0,
+  "type": "fn"
+}

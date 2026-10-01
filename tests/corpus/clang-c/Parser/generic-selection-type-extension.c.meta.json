@@ -1,0 +1,27 @@
+{
+  "bytes": 2256,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "expected expression"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23",
+    " --c++17 --c++"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/generic-selection-type-extension.sft.c",
+  "remark": null,
+  "sha256": "967031c41f260d1fe7617e9e479252f520cee74f90ac2cd223708e0c1d5319ee",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,38 @@
+{
+  "bytes": 652,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redeclaration of 'x'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer types"
+    },
+    {
+      "kind": "error",
+      "msg": "initializing 'struct x' with an expression of incompatible type 'struct x'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/struct-compat.sft.c",
+  "remark": null,
+  "sha256": "9757129ef6ddb33d857bd9c0abc666e4e640893c070bfdfac8e0db7278d8b705",
+  "test_number_uses": 0,
+  "type": "fn"
+}

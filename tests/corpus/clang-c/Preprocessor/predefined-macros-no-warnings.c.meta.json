@@ -1,0 +1,21 @@
+{
+  "bytes": 14001,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 189,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w -w -w -w -w -w -w -w -w -w -w -w -w -w -w --c --target linux_aarch64"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/predefined-macros-no-warnings.sft.c",
+  "remark": null,
+  "sha256": "6fe0dfd1b400b22baa8febfb28f6ef4aa9efd987ffec46250dbaf39d24fb40af",
+  "test_number_uses": 0,
+  "type": "fp"
+}

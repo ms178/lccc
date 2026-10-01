@@ -1,0 +1,182 @@
+{
+  "bytes": 8892,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "expected expression"
+    },
+    {
+      "kind": "error",
+      "msg": "expected expression"
+    },
+    {
+      "kind": "error",
+      "msg": "expected expression"
+    },
+    {
+      "kind": "error",
+      "msg": "expected expression"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Countof' requires an argument of array type; 'int' invalid"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Countof' requires an argument of array type; 'int' invalid"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Countof' requires an argument of array type; 'int' invalid"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of '_Countof' to a function type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of '_Countof' to an incomplete type 'struct S'"
+    },
+    {
+      "kind": "note",
+      "msg": "forward declaration of 'struct S'"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Countof' requires an argument of array type; 'struct T' invalid"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Countof' requires an argument of array type; 'struct U' invalid"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Countof' requires an argument of array type; 'int (*)[3]' invalid"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Countof' requires an argument of array type; 'int *' invalid"
+    },
+    {
+      "kind": "error",
+      "msg": "static assertion expression is not an integral constant expression"
+    },
+    {
+      "kind": "error",
+      "msg": "static assertion expression is not an integral constant expression"
+    },
+    {
+      "kind": "error",
+      "msg": "static assertion expression is not an integral constant expression"
+    },
+    {
+      "kind": "error",
+      "msg": "static assertion expression is not an integral constant expression"
+    },
+    {
+      "kind": "error",
+      "msg": "static assertion expression is not an integral constant expression"
+    },
+    {
+      "kind": "error",
+      "msg": "static assertion expression is not an integral constant expression"
+    },
+    {
+      "kind": "error",
+      "msg": "static assertion expression is not an integral constant expression"
+    },
+    {
+      "kind": "error",
+      "msg": "static assertion expression is not an integral constant expression"
+    },
+    {
+      "kind": "error",
+      "msg": "static assertion expression is not an integral constant expression"
+    },
+    {
+      "kind": "error",
+      "msg": "static assertion expression is not an integral constant expression"
+    },
+    {
+      "kind": "error",
+      "msg": "static assertion expression is not an integral constant expression"
+    },
+    {
+      "kind": "error",
+      "msg": "static assertion expression is not an integral constant expression"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Countof' requires an argument of array type; 'int *' invalid"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Countof' requires an argument of array type; 'int *' invalid"
+    },
+    {
+      "kind": "note",
+      "msg": "passing argument to parameter"
+    },
+    {
+      "kind": "note",
+      "msg": "passing argument to parameter"
+    },
+    {
+      "kind": "note",
+      "msg": "passing argument to parameter"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer types passing 'int (*)[5]' to parameter of type 'int (*)[3]'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer types passing 'int (*)[5]' to parameter of type 'int (*)[3]'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer types passing 'int (*)[5]' to parameter of type 'int (*)[3]'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of '_Countof' to an incomplete type 'int[]'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of '_Countof' to an incomplete type 'int[][6][3]'"
+    },
+    {
+      "kind": "warning",
+      "msg": "zero size arrays are an extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "zero size arrays are an extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "zero size arrays are an extension"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of '_Countof' to an incomplete type 'int[]'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 23,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C2y/n3369.sft.c",
+  "remark": null,
+  "sha256": "5321fda90e40d78d6c4fdb082f34162e2be1ba05f38d4206e2d4835c133ff898",
+  "test_number_uses": 0,
+  "type": "fn"
+}

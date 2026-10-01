@@ -1,0 +1,186 @@
+{
+  "bytes": 10648,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "no-diagnostics",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of unsigned enum expression < 0 is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of 0 <= unsigned enum expression is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of 0 > unsigned enum expression is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of unsigned enum expression >= 0 is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison 4294967295 >= 'enum A' is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison 'enum A' > 4294967295 is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison 'enum A' <= 4294967295 is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison 4294967295 < 'enum A' is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of unsigned enum expression < 0 is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of 0 <= unsigned enum expression is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of 0 > unsigned enum expression is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of unsigned enum expression >= 0 is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison 4294967295 >= 'enum A' is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison 'enum A' > 4294967295 is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison 'enum A' <= 4294967295 is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison 4294967295 < 'enum A' is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 4294967295 with expression of type 'enum A' is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 4294967295 with expression of type 'enum A' is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 4294967295 with expression of type 'enum A' is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 4294967295 with expression of type 'enum A' is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 4294967295 with expression of type 'enum A' is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 4294967295 with expression of type 'enum A' is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 4294967295 with expression of type 'enum A' is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 4294967295 with expression of type 'enum A' is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison 'enum A' < -2147483648 is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison -2147483648 <= 'enum A' is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison -2147483648 > 'enum A' is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison 'enum A' >= -2147483648 is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison 2147483647 >= 'enum A' is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison 'enum A' > 2147483647 is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison 'enum A' <= 2147483647 is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison 2147483647 < 'enum A' is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant -2147483648 with expression of type 'enum A' is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant -2147483648 with expression of type 'enum A' is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant -2147483648 with expression of type 'enum A' is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant -2147483648 with expression of type 'enum A' is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant -2147483648 with expression of type 'enum A' is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant -2147483648 with expression of type 'enum A' is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant -2147483648 with expression of type 'enum A' is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant -2147483648 with expression of type 'enum A' is always true"
+    }
+  ],
+  "has_main": true,
+  "header_lines": 9,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DUNSIGNED -w -DSIGNED -DUNSIGNED -DSILENCE -w -DSIGNED -DSILENCE -DUNSIGNED -DUNSIGNED -DSILENCE --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/tautological-constant-enum-compare.sft.c",
+  "remark": null,
+  "sha256": "313190317117b38132618ca312acd2e33b6604c429c48bb026599a3c0803afdc",
+  "test_number_uses": 0,
+  "type": "fp"
+}

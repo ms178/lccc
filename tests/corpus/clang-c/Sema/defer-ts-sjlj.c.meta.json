@@ -1,0 +1,94 @@
+{
+  "bytes": 2634,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "cannot use '__builtin_setjmp' inside a defer statement"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use '__builtin_longjmp' inside a defer statement"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use 'setjmp' inside a defer statement"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use '_setjmp' inside a defer statement"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use 'sigsetjmp' inside a defer statement"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use '__sigsetjmp' inside a defer statement"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use 'longjmp' inside a defer statement"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use '_longjmp' inside a defer statement"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use 'siglongjmp' inside a defer statement"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use '__builtin_setjmp' inside a defer statement"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use '__builtin_longjmp' inside a defer statement"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use 'setjmp' inside a defer statement"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use '_setjmp' inside a defer statement"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use 'sigsetjmp' inside a defer statement"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use '__sigsetjmp' inside a defer statement"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use 'longjmp' inside a defer statement"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use '_longjmp' inside a defer statement"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use 'siglongjmp' inside a defer statement"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/defer-ts-sjlj.sft.c",
+  "remark": null,
+  "sha256": "f0e817562734f81706cb17c1916cc80b8510445bebeb60ac3a9bd95ca34a500e",
+  "test_number_uses": 0,
+  "type": "fn"
+}

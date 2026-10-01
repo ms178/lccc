@@ -1,0 +1,26 @@
+{
+  "bytes": 322,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'char *' but the argument has type 'unsigned int'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/no-format-y2k-turnsoff-format.sft.c",
+  "remark": null,
+  "sha256": "f534da8377d8f5a49943a11bd490979db1af5840156494ccb54bb683a32b93af",
+  "test_number_uses": 0,
+  "type": "fp"
+}

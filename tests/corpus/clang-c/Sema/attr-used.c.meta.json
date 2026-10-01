@@ -1,0 +1,38 @@
+{
+  "bytes": 849,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'used' attribute ignored on a non-definition declaration"
+    },
+    {
+      "kind": "warning",
+      "msg": "'used' attribute ignored on a non-definition declaration"
+    },
+    {
+      "kind": "warning",
+      "msg": "'used' attribute only applies to variables with non-local storage, functions, and Objective-C methods"
+    },
+    {
+      "kind": "warning",
+      "msg": "'used' attribute only applies to variables with non-local storage, functions, and Objective-C methods"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-used.sft.c",
+  "remark": null,
+  "sha256": "ebaee339b8bb1c201f2f86e0bcc2e1c1aca64b1255e0b6e3ce2c01647c849139",
+  "test_number_uses": 0,
+  "type": "fp"
+}

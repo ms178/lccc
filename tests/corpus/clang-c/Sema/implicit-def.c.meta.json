@@ -1,0 +1,22 @@
+{
+  "bytes": 183,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c89",
+    " --c99"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/implicit-def.sft.c",
+  "remark": null,
+  "sha256": "8a0e1411e030dadd9e14561547442bb6fd1acc5392a0c3bb4817d330cce2b307",
+  "test_number_uses": 0,
+  "type": "fp"
+}

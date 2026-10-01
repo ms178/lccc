@@ -1,0 +1,21 @@
+{
+  "bytes": 2462,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": true,
+  "header_lines": 21,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/variadic-block.sft.c",
+  "remark": null,
+  "sha256": "7a6fdd0943a9e2a215cff7d0d5dbf1ae96c7dcdbb0c937fcc7aff3de0178bb23",
+  "test_number_uses": 0,
+  "type": "fp"
+}

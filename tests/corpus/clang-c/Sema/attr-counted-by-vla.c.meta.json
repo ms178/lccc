@@ -1,0 +1,138 @@
+{
+  "bytes": 6992,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'bork'"
+    },
+    {
+      "kind": "note",
+      "msg": "'count' declared here"
+    },
+    {
+      "kind": "error",
+      "msg": "'counted_by' field 'count' isn't within the same struct as the annotated flexible array"
+    },
+    {
+      "kind": "note",
+      "msg": "'count' declared here"
+    },
+    {
+      "kind": "error",
+      "msg": "'counted_by' field 'count' isn't within the same struct as the annotated flexible array"
+    },
+    {
+      "kind": "note",
+      "msg": "'count' declared here"
+    },
+    {
+      "kind": "error",
+      "msg": "'counted_by' field 'count' isn't within the same struct as the annotated flexible array"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'count'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'count'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'count'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'blork'"
+    },
+    {
+      "kind": "note",
+      "msg": "'global' declared here"
+    },
+    {
+      "kind": "error",
+      "msg": "field 'global' in 'counted_by' not inside structure"
+    },
+    {
+      "kind": "error",
+      "msg": "'counted_by' requires a non-boolean integer type argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'counted_by' requires a non-boolean integer type argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'counted_by' on arrays only applies to C99 flexible array members"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'crount'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-counted-by-vla.sft.c",
+  "remark": null,
+  "sha256": "e842624eb4bbec331990369e90f2d7637eac5838cab8438a42e2515c41ce40b5",
+  "test_number_uses": 0,
+  "type": "fn"
+}

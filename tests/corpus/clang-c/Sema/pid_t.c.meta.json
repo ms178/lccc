@@ -1,0 +1,21 @@
+{
+  "bytes": 290,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/pid_t.sft.c",
+  "remark": null,
+  "sha256": "d467accc0fd48cf13cd49ed09f78f20f6b5121f34f53c18573497aa161030076",
+  "test_number_uses": 0,
+  "type": "fp"
+}

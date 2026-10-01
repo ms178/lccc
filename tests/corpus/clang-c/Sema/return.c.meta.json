@@ -1,0 +1,134 @@
+{
+  "bytes": 7692,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "non-void function 't14' should return a value"
+    },
+    {
+      "kind": "warning",
+      "msg": "void function 't15' should not return a value"
+    },
+    {
+      "kind": "warning",
+      "msg": "non-void function does not return a value"
+    },
+    {
+      "kind": "warning",
+      "msg": "non-void function does not return a value"
+    },
+    {
+      "kind": "warning",
+      "msg": "non-void function does not return a value"
+    },
+    {
+      "kind": "warning",
+      "msg": "non-void function does not return a value"
+    },
+    {
+      "kind": "warning",
+      "msg": "non-void function does not return a value in all control paths"
+    },
+    {
+      "kind": "warning",
+      "msg": "non-void function does not return a value in all control paths"
+    },
+    {
+      "kind": "warning",
+      "msg": "non-void function does not return a value"
+    },
+    {
+      "kind": "warning",
+      "msg": "non-void function does not return a value"
+    },
+    {
+      "kind": "warning",
+      "msg": "non-void function does not return a value"
+    },
+    {
+      "kind": "warning",
+      "msg": "non-void function does not return a value"
+    },
+    {
+      "kind": "warning",
+      "msg": "non-void function does not return a value in all control paths"
+    },
+    {
+      "kind": "warning",
+      "msg": "non-void function does not return a value"
+    },
+    {
+      "kind": "warning",
+      "msg": "non-void function does not return a value in all control paths"
+    },
+    {
+      "kind": "warning",
+      "msg": "non-void function does not return a value"
+    },
+    {
+      "kind": "warning",
+      "msg": "non-void function does not return a value in all control paths"
+    },
+    {
+      "kind": "warning",
+      "msg": "non-void function does not return a value"
+    },
+    {
+      "kind": "warning",
+      "msg": "parameter 'x' was not declared, defaults to 'int'; ISO C99 and later do not support implicit int"
+    },
+    {
+      "kind": "warning",
+      "msg": "non-void function does not return a value"
+    },
+    {
+      "kind": "warning",
+      "msg": "non-void function does not return a value"
+    },
+    {
+      "kind": "warning",
+      "msg": "non-void function does not return a value in all control paths"
+    },
+    {
+      "kind": "warning",
+      "msg": "non-void function does not return a value"
+    },
+    {
+      "kind": "warning",
+      "msg": "'const' type qualifier on return type has no effect"
+    },
+    {
+      "kind": "warning",
+      "msg": "'const volatile' type qualifiers on return type have no effect"
+    },
+    {
+      "kind": "warning",
+      "msg": "'const volatile restrict' type qualifiers on return type have no effect"
+    },
+    {
+      "kind": "warning",
+      "msg": "'const' type qualifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "non-void function does not return a value in all control paths"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/return.sft.c",
+  "remark": null,
+  "sha256": "650bd9aea9ca7e59f6fb0859c64483c6c8c96da76365869c1134007fefe81153",
+  "test_number_uses": 0,
+  "type": "fp"
+}

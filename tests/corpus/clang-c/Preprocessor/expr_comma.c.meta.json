@@ -1,0 +1,22 @@
+{
+  "bytes": 249,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 12,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c89",
+    " --c99"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/expr_comma.sft.c",
+  "remark": null,
+  "sha256": "5b0247fef5276898a98a472ab78de8215377eefa4b564ce78090423d55c800d6",
+  "test_number_uses": 0,
+  "type": "fp"
+}

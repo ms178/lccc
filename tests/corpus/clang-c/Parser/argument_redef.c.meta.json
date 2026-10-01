@@ -1,0 +1,30 @@
+{
+  "bytes": 201,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of 'A'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/argument_redef.sft.c",
+  "remark": null,
+  "sha256": "473e6d4e147e553d42f8be2e90bfd46e3281e89d4ea53086e30a33955b0aafc4",
+  "test_number_uses": 0,
+  "type": "fn"
+}

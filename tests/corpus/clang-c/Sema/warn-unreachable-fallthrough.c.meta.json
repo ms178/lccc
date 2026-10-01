@@ -1,0 +1,29 @@
+{
+  "bytes": 647,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "fallthrough annotation in unreachable code"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23",
+    " --c23",
+    " --c23",
+    " --c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-unreachable-fallthrough.sft.c",
+  "remark": null,
+  "sha256": "6b65b1e9594295841f47c19f367efbed43c55904e583c88308e0550b2babb659",
+  "test_number_uses": 0,
+  "type": "fp"
+}

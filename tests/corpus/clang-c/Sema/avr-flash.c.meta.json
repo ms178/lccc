@@ -1,0 +1,42 @@
+{
+  "bytes": 751,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "unknown type name '__flash1'"
+    },
+    {
+      "kind": "error",
+      "msg": "unknown type name '__flash2'"
+    },
+    {
+      "kind": "error",
+      "msg": "unknown type name '__flash3'"
+    },
+    {
+      "kind": "error",
+      "msg": "unknown type name '__flash4'"
+    },
+    {
+      "kind": "error",
+      "msg": "unknown type name '__flash5'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/avr-flash.sft.c",
+  "remark": null,
+  "sha256": "5113df86769e55f6c777c1ab64224630b5140ee0bf092ed3b588f950c3f19364",
+  "test_number_uses": 0,
+  "type": "fn"
+}

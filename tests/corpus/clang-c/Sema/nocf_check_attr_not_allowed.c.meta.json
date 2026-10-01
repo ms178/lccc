@@ -1,0 +1,26 @@
+{
+  "bytes": 495,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/nocf_check_attr_not_allowed.sft.c",
+  "remark": null,
+  "sha256": "f6ed69474415e0c92cc9538c2779e614dcc74409ac7210914c0523db6cd6a74e",
+  "test_number_uses": 0,
+  "type": "fp"
+}

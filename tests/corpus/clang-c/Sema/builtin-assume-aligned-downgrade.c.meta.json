@@ -1,0 +1,30 @@
+{
+  "bytes": 532,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "non-pointer argument to '__builtin_assume_aligned' is not allowed"
+    },
+    {
+      "kind": "error",
+      "msg": "non-pointer argument to '__builtin_assume_aligned' is not allowed"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/builtin-assume-aligned-downgrade.sft.c",
+  "remark": null,
+  "sha256": "5d6e54762ae58a8701875b88b77bbe28a27540fd96a05e4544cd50970a10059e",
+  "test_number_uses": 0,
+  "type": "fn"
+}

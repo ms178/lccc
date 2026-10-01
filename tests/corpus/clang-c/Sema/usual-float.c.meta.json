@@ -1,0 +1,21 @@
+{
+  "bytes": 284,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/usual-float.sft.c",
+  "remark": null,
+  "sha256": "71cea31fc6b1f94a7ccb75059ff69b6b715c049d037e32e2fa92a72afc8ccea3",
+  "test_number_uses": 0,
+  "type": "fp"
+}

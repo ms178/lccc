@@ -1,0 +1,21 @@
+{
+  "bytes": 217,
+  "cases": null,
+  "category": "Parser",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/namelookup-bug-2.sft.c",
+  "remark": null,
+  "sha256": "21a0cccb77d5dca925102c6ce2b6ff6ecf3f1bb0d9d548dbb57a8fac041c7bff",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,202 @@
+{
+  "bytes": 16894,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "comparison 'unsigned char' > 255 is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison 'short' <= 32767 is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison 'short' > 32767 is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison 32767 < 'short' is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison 32767 >= 'short' is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison 'short' < -32768 is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison 'short' >= -32768 is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison -32768 <= 'short' is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison -32768 > 'short' is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison 'short' < -32768 is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison 'short' >= -32768 is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison -32768 <= 'short' is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison -32768 > 'short' is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison 'unsigned short' <= 65535 is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison 'unsigned short' > 65535 is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison 65535 < 'unsigned short' is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison 65535 >= 'unsigned short' is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison 'unsigned short' <= 65535 is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison 'unsigned short' > 65535 is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison 65535 < 'unsigned short' is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison 65535 >= 'unsigned short' is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "result of comparison 'int' > 2147483647 is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    }
+  ],
+  "has_main": true,
+  "header_lines": 19,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DTEST=2 -DTEST=2 -DTEST -DTEST -DTEST -DTEST --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/tautological-constant-compare.sft.c",
+  "remark": null,
+  "sha256": "60761d13556d6c04c288e147ab584032c71b5914c1bf243f935dba03ca34a2d0",
+  "test_number_uses": 0,
+  "type": "fp"
+}

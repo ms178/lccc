@@ -1,0 +1,410 @@
+{
+  "bytes": 8365,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "cannot use '_Complex' with '__vector'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use '_Complex' with '__vector'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible type"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible type"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible type"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible type"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible type"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible type"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible type"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid argument"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands"
+    },
+    {
+      "kind": "error",
+      "msg": "integer is required"
+    },
+    {
+      "kind": "error",
+      "msg": "integer is required"
+    },
+    {
+      "kind": "error",
+      "msg": "integer is required"
+    },
+    {
+      "kind": "error",
+      "msg": "integer is required"
+    },
+    {
+      "kind": "error",
+      "msg": "integer is required"
+    },
+    {
+      "kind": "error",
+      "msg": "integer is required"
+    },
+    {
+      "kind": "error",
+      "msg": "integer is required"
+    },
+    {
+      "kind": "error",
+      "msg": "integer is required"
+    },
+    {
+      "kind": "error",
+      "msg": "integer is required"
+    },
+    {
+      "kind": "error",
+      "msg": "integer is required"
+    },
+    {
+      "kind": "error",
+      "msg": "integer is required"
+    },
+    {
+      "kind": "error",
+      "msg": "integer is required"
+    },
+    {
+      "kind": "error",
+      "msg": "integer is required"
+    },
+    {
+      "kind": "error",
+      "msg": "integer is required"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/zvector2.sft.c",
+  "remark": null,
+  "sha256": "c30a0e1250977b82e9f2580a7c73453922ec4bdb612b5055a293bebbf37f2c91",
+  "test_number_uses": 0,
+  "type": "fn"
+}

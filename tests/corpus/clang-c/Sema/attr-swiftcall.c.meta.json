@@ -1,0 +1,102 @@
+{
+  "bytes": 4966,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'swiftcall' only applies to function types; type here is 'int'"
+    },
+    {
+      "kind": "warning",
+      "msg": "'swiftasynccall' only applies to function types; type here is 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "variadic function cannot use swiftcall calling convention"
+    },
+    {
+      "kind": "error",
+      "msg": "variadic function cannot use swiftasynccall calling convention"
+    },
+    {
+      "kind": "error",
+      "msg": "function with no prototype cannot use the swiftcall calling convention"
+    },
+    {
+      "kind": "error",
+      "msg": "function with no prototype cannot use the swiftasynccall calling convention"
+    },
+    {
+      "kind": "error",
+      "msg": "vectorcall and swiftcall attributes are not compatible"
+    },
+    {
+      "kind": "error",
+      "msg": "vectorcall and swiftasynccall attributes are not compatible"
+    },
+    {
+      "kind": "error",
+      "msg": "'swift_indirect_result' parameter can only be used with swiftcall or swiftasynccall calling convention"
+    },
+    {
+      "kind": "error",
+      "msg": "'swift_indirect_result' parameters must be first parameters of function"
+    },
+    {
+      "kind": "error",
+      "msg": "'swift_indirect_result' parameter must have pointer type; type here is 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "'swift_error_result' parameter can only be used with swiftcall calling convention"
+    },
+    {
+      "kind": "error",
+      "msg": "'swift_error_result' parameter must follow 'swift_context' parameter"
+    },
+    {
+      "kind": "error",
+      "msg": "'swift_error_result' parameter must have pointer to unqualified pointer type; type here is 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "'swift_error_result' parameter must have pointer to unqualified pointer type; type here is 'int *'"
+    },
+    {
+      "kind": "error",
+      "msg": "'swift_context' parameter can only be used with swiftcall or swiftasynccall calling convention"
+    },
+    {
+      "kind": "error",
+      "msg": "'swift_context' parameter must have pointer type; type here is 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "'swift_async_context' parameter must have pointer type; type here is 'int'"
+    },
+    {
+      "kind": "warning",
+      "msg": "'swift_async_context' attribute only applies to parameters"
+    },
+    {
+      "kind": "error",
+      "msg": "'swift_async_context' attribute takes no arguments"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 12,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-swiftcall.sft.c",
+  "remark": null,
+  "sha256": "bc28e2b0352a3dbadc755b6f56f75d5af51919b845e7ce8f3410ca6050432aeb",
+  "test_number_uses": 0,
+  "type": "fn"
+}

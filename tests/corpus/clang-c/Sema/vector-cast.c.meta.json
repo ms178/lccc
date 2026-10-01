@@ -1,0 +1,82 @@
+{
+  "bytes": 3626,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": "passing argument to parameter 'X' here"
+    },
+    {
+      "kind": "warning",
+      "msg": "incompatible vector types passing 't3' (vector of 4 'float' values) to parameter of type 't2' (vector of 16 'char' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between scalar type 'double' and vector type 'float2' (vector of 2 'float' values) as implicit conversion would cause truncation"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'double' from incompatible type 'float2' (vector of 2 'float' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'double' from incompatible type 'float2'"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'double' from incompatible type 'float2'"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'void *' from incompatible type 'short_sizeof_pointer'"
+    },
+    {
+      "kind": "warning",
+      "msg": "incompatible vector types initializing 'vUInt32' (vector of 4 'unsigned int' values) with an expression of type 'float16' (vector of 4 'float' values)"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/vector-cast.sft.c",
+  "remark": null,
+  "sha256": "67a49b37ef344b0a0670488263c61719b8b5125b8aa3a051dea0b34c33db1f48",
+  "test_number_uses": 0,
+  "type": "fn"
+}

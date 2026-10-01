@@ -1,0 +1,70 @@
+{
+  "bytes": 2247,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "cast from function call of type 'int' to non-matching type 'float'"
+    },
+    {
+      "kind": "warning",
+      "msg": "cast from function call of type 'char' to non-matching type 'double'"
+    },
+    {
+      "kind": "warning",
+      "msg": "cast from function call of type 'long' to non-matching type '_Bool'"
+    },
+    {
+      "kind": "warning",
+      "msg": "cast from function call of type 'float' to non-matching type 'int'"
+    },
+    {
+      "kind": "warning",
+      "msg": "cast from function call of type 'double' to non-matching type 'long'"
+    },
+    {
+      "kind": "warning",
+      "msg": "cast from function call of type '_Complex double' to non-matching type 'double'"
+    },
+    {
+      "kind": "warning",
+      "msg": "cast from function call of type 'enum e' to non-matching type 'int'"
+    },
+    {
+      "kind": "warning",
+      "msg": "cast from function call of type '_Bool' to non-matching type 'int'"
+    },
+    {
+      "kind": "warning",
+      "msg": "cast from function call of type 'char *' to non-matching type 'unsigned long'"
+    },
+    {
+      "kind": "warning",
+      "msg": "cast from function call of type 'int *' to non-matching type 'long'"
+    },
+    {
+      "kind": "warning",
+      "msg": "cast from function call of type 'int' to non-matching type '_Fract'"
+    },
+    {
+      "kind": "warning",
+      "msg": "cast from function call of type '_Fract' to non-matching type 'int'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-bad-function-cast.sft.c",
+  "remark": null,
+  "sha256": "ba540458d95b253b33917758965a3e881838678ec07184e9d341cd47ef1b586a",
+  "test_number_uses": 0,
+  "type": "fp"
+}

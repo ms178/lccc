@@ -1,0 +1,46 @@
+{
+  "bytes": 816,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "comparison of distinct pointer types ('int *' and 'char *')"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of distinct pointer types ('char *' and 'struct foo *')"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of distinct pointer types ('struct foo *' and 'struct bar *')"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison between pointer and integer ('int *' and 'int')"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison between pointer and integer ('short' and 'int *')"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of distinct pointer types ('int *' and 'char *')"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/pointer_promotion.sft.c",
+  "remark": null,
+  "sha256": "3b6247a3f0cee4425722abb3dae6c837d612fd02c04fa9ff69baf9a358632774",
+  "test_number_uses": 0,
+  "type": "fp"
+}

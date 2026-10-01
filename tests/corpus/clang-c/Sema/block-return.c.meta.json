@@ -1,0 +1,110 @@
+{
+  "bytes": 5680,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "incompatible block pointer types initializing 'short (^)(void)' with an expression of type 'int (^)(void)'"
+    },
+    {
+      "kind": "error",
+      "msg": "return type 'int' must match previous return type 'void' when block literal has unspecified explicit return type"
+    },
+    {
+      "kind": "error",
+      "msg": "return type 'void' must match previous return type 'int' when block literal has unspecified explicit return type"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible block pointer types initializing 'double (^)(void)' with an expression of type 'float (^)(void)'"
+    },
+    {
+      "kind": "error",
+      "msg": "return type 'double' must match previous return type 'float' when block literal has unspecified explicit return type"
+    },
+    {
+      "kind": "error",
+      "msg": "return type 'int' must match previous return type 'float' when block literal has unspecified explicit return type"
+    },
+    {
+      "kind": "error",
+      "msg": "return type 'int' must match previous return type 'char *' when block literal has unspecified explicit return type"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible block pointer types returning 'int (^)(void)' from a function with result type 'CL' (aka 'void (^)(void)')"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible block pointer types initializing 'int (^)(const char *)' with an expression of type 'int (^)(char *)'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible function pointer types initializing 'int (*)(const char *)' with an expression of type 'int (char *)'"
+    },
+    {
+      "kind": "error",
+      "msg": "returning block that lives on the local stack"
+    },
+    {
+      "kind": "error",
+      "msg": "returning block that lives on the local stack"
+    },
+    {
+      "kind": "error",
+      "msg": "returning block that lives on the local stack"
+    },
+    {
+      "kind": "error",
+      "msg": "returning block that lives on the local stack"
+    },
+    {
+      "kind": "error",
+      "msg": "block cannot return array type"
+    },
+    {
+      "kind": "error",
+      "msg": "function cannot return array type"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "block declared 'noreturn' should not return"
+    },
+    {
+      "kind": "error",
+      "msg": "block declared 'noreturn' should not return"
+    },
+    {
+      "kind": "warning",
+      "msg": "void block literal should not return void expression"
+    },
+    {
+      "kind": "note",
+      "msg": "here"
+    },
+    {
+      "kind": "error",
+      "msg": "passing 'enum Test8 (^)(int)' to parameter of type 'char (^)(int)'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/block-return.sft.c",
+  "remark": null,
+  "sha256": "92f25ad9476f3f8e80688d920a335bc6d1270b059bd3b8424080fa8adfafe402",
+  "test_number_uses": 0,
+  "type": "fn"
+}

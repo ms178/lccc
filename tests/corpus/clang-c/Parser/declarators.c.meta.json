@@ -1,0 +1,174 @@
+{
+  "bytes": 5371,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "a function declaration without a prototype is deprecated in all versions of C"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot return"
+    },
+    {
+      "kind": "error",
+      "msg": "'static' may not be used without an array size"
+    },
+    {
+      "kind": "warning",
+      "msg": "a function definition without a prototype is deprecated in all versions of C and is not supported in C23"
+    },
+    {
+      "kind": "error",
+      "msg": "unexpected type name 'atype': expected identifier"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of parameter 'x'"
+    },
+    {
+      "kind": "warning",
+      "msg": "a function definition without a prototype is deprecated in all versions of C and is not supported in C23"
+    },
+    {
+      "kind": "error",
+      "msg": "expected identifier or '('"
+    },
+    {
+      "kind": "error",
+      "msg": "unknown type name 'foo_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "unknown type name 'foo_t'"
+    },
+    {
+      "kind": "warning",
+      "msg": "a function declaration without a prototype is deprecated in all versions of C"
+    },
+    {
+      "kind": "error",
+      "msg": "must use 'struct' tag to refer to type 'xyz'"
+    },
+    {
+      "kind": "error",
+      "msg": "must use 'enum' tag to refer to type 'myenum'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer types returning 'int *' from a function with result type 'float *'"
+    },
+    {
+      "kind": "error",
+      "msg": "type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int"
+    },
+    {
+      "kind": "error",
+      "msg": "type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int"
+    },
+    {
+      "kind": "error",
+      "msg": "type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ';' at end of declaration list"
+    },
+    {
+      "kind": "warning",
+      "msg": "expected ';' at end of declaration list"
+    },
+    {
+      "kind": "error",
+      "msg": "expected identifier or '('"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ';' after top level declarator"
+    },
+    {
+      "kind": "error",
+      "msg": "'long struct' is invalid"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ';' at end of declaration"
+    },
+    {
+      "kind": "warning",
+      "msg": "a function definition without a prototype is deprecated in all versions of C and is not supported in C23"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ';' at end of declaration"
+    },
+    {
+      "kind": "warning",
+      "msg": "a function definition without a prototype is deprecated in all versions of C and is not supported in C23"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ';' at end of declaration"
+    },
+    {
+      "kind": "warning",
+      "msg": "a function definition without a prototype is deprecated in all versions of C and is not supported in C23"
+    },
+    {
+      "kind": "error",
+      "msg": "extraneous ')' before ';'"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ';'"
+    },
+    {
+      "kind": "warning",
+      "msg": "struct without named members is a GNU extension"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ';'"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "expected identifier"
+    },
+    {
+      "kind": "error",
+      "msg": "expected identifier"
+    },
+    {
+      "kind": "error",
+      "msg": "expected '= constant-expression' or end of enumerator definition"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "expected '= constant-expression' or end of enumerator definition"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c99"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/declarators.sft.c",
+  "remark": null,
+  "sha256": "7ac269ba0f6517e19d68a550bb019af3bc34d1efda297aa11ce8e0c424824318",
+  "test_number_uses": 0,
+  "type": "fn"
+}

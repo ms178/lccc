@@ -1,0 +1,86 @@
+{
+  "bytes": 2686,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "expected string literal as argument of 'section' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "mach-o section specifier requires a segment and section separated by a comma"
+    },
+    {
+      "kind": "error",
+      "msg": "'section' attribute only applies to functions, global variables, Objective-C methods, and Objective-C properties"
+    },
+    {
+      "kind": "note",
+      "msg": "previous attribute is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "section does not match previous declaration"
+    },
+    {
+      "kind": "error",
+      "msg": "'section' attribute only applies to"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "section attribute is specified on redeclared variable"
+    },
+    {
+      "kind": "note",
+      "msg": "declared here"
+    },
+    {
+      "kind": "error",
+      "msg": "'const_global_var' causes a section type conflict with 'test3'"
+    },
+    {
+      "kind": "note",
+      "msg": "declared here"
+    },
+    {
+      "kind": "error",
+      "msg": "'mut_global_var' causes a section type conflict with 'test4'"
+    },
+    {
+      "kind": "note",
+      "msg": "declared here"
+    },
+    {
+      "kind": "error",
+      "msg": "'test5' causes a section type conflict with 'global_seg5sec5'"
+    },
+    {
+      "kind": "note",
+      "msg": "declared here"
+    },
+    {
+      "kind": "error",
+      "msg": "'test6' causes a section type conflict with 'global_seg6sec6'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-section.sft.c",
+  "remark": null,
+  "sha256": "138664a59270bead0173a9a3563fc8d1bc285ce1267da09eb3273e153a31eba5",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,30 @@
+{
+  "bytes": 1032,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-conditional-enum-types-mismatch.sft.c",
+  "remark": null,
+  "sha256": "bf9bb112182908202df6018154b72bbb6ba8b37ef597f01004b83f63c7671347",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,21 @@
+{
+  "bytes": 545,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/mingw-macro-qualified-type.sft.c",
+  "remark": null,
+  "sha256": "7e3cd0d39a50770a0940ff41ceb635eb06ae7dd24e5bfb1a9fc780fc3f707b4d",
+  "test_number_uses": 0,
+  "type": "fp"
+}

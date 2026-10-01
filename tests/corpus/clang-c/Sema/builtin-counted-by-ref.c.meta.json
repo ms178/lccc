@@ -1,0 +1,114 @@
+{
+  "bytes": 9018,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call, expected 1, have 0"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to function call, expected 1, have 3"
+    },
+    {
+      "kind": "error",
+      "msg": "'__builtin_counted_by_ref' argument must reference a member with the 'counted_by' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "'__builtin_counted_by_ref' argument must reference a member with the 'counted_by' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "'__builtin_counted_by_ref' argument must reference a member with the 'counted_by' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "'__builtin_counted_by_ref' argument must reference a member with the 'counted_by' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "'__builtin_counted_by_ref' argument must reference a member with the 'counted_by' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "'__builtin_counted_by_ref' argument must reference a member with the 'counted_by' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "'__builtin_counted_by_ref' argument must reference a member with the 'counted_by' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "'__builtin_counted_by_ref' argument must reference a member with the 'counted_by' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "'__builtin_counted_by_ref' argument cannot have side-effects"
+    },
+    {
+      "kind": "error",
+      "msg": "'__builtin_counted_by_ref' argument cannot have side-effects"
+    },
+    {
+      "kind": "error",
+      "msg": "value returned by '__builtin_counted_by_ref' cannot be assigned to a variable"
+    },
+    {
+      "kind": "error",
+      "msg": "value returned by '__builtin_counted_by_ref' cannot be assigned to a variable"
+    },
+    {
+      "kind": "error",
+      "msg": "value returned by '__builtin_counted_by_ref' cannot be passed into a function"
+    },
+    {
+      "kind": "error",
+      "msg": "value returned by '__builtin_counted_by_ref' cannot be assigned to a variable"
+    },
+    {
+      "kind": "error",
+      "msg": "value returned by '__builtin_counted_by_ref' cannot be assigned to a variable"
+    },
+    {
+      "kind": "error",
+      "msg": "value returned by '__builtin_counted_by_ref' cannot be assigned to a variable"
+    },
+    {
+      "kind": "error",
+      "msg": "value returned by '__builtin_counted_by_ref' cannot be returned from a function"
+    },
+    {
+      "kind": "error",
+      "msg": "value returned by '__builtin_counted_by_ref' cannot be used in a binary expression"
+    },
+    {
+      "kind": "error",
+      "msg": "value returned by '__builtin_counted_by_ref' cannot be used in an array subscript expression"
+    },
+    {
+      "kind": "error",
+      "msg": "'__builtin_counted_by_ref' argument must reference a member with the 'counted_by' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "'__builtin_counted_by_ref' argument must reference a member with the 'counted_by' attribute"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c99"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/builtin-counted-by-ref.sft.c",
+  "remark": null,
+  "sha256": "4160288e781584b0cea6c535cfeefd06366568534f8dabacbaa84d0061dad5a6",
+  "test_number_uses": 0,
+  "type": "fn"
+}

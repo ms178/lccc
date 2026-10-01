@@ -1,0 +1,42 @@
+{
+  "bytes": 760,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "must use 'struct' tag to refer to type 'GH140887'"
+    },
+    {
+      "kind": "error",
+      "msg": "expected member name or ';' after declaration specifiers"
+    },
+    {
+      "kind": "error",
+      "msg": "field has incomplete type 'struct GH140887'"
+    },
+    {
+      "kind": "error",
+      "msg": "constexpr variable 'a' must be initialized by a constant expression"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/c2y-invalid-constexpr.sft.c",
+  "remark": null,
+  "sha256": "1f0b0c403013444fccf472b0c0367520ee2b3befcad50e07d54b8fdfdafd366c",
+  "test_number_uses": 0,
+  "type": "fn"
+}

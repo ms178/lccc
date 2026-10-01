@@ -1,0 +1,30 @@
+{
+  "bytes": 531,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "width of bit-field 'b' (8 bits) exceeds the width of its type (1 bit)"
+    },
+    {
+      "kind": "no-diagnostics",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 12,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C11/n1356.sft.c",
+  "remark": null,
+  "sha256": "b2fb45c2bedd22039412f9fe1f624d465141df713282c89e878e93204fd0a169",
+  "test_number_uses": 0,
+  "type": "fn"
+}

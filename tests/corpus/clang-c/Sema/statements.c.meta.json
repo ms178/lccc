@@ -1,0 +1,86 @@
+{
+  "bytes": 3523,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "returning 'void' from a function with incompatible result type 'int'"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression result unused"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression result unused"
+    },
+    {
+      "kind": "error",
+      "msg": "statement expression not allowed at file scope"
+    },
+    {
+      "kind": "warning",
+      "msg": "returning address of label, which is local"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'env'"
+    },
+    {
+      "kind": "warning",
+      "msg": "switch condition has boolean value"
+    },
+    {
+      "kind": "warning",
+      "msg": "enumeration value 'g' not handled in switch"
+    },
+    {
+      "kind": "warning",
+      "msg": "enumeration values 'f' and 'g' not handled in switch"
+    },
+    {
+      "kind": "warning",
+      "msg": "enumeration values 'e', 'f', and 'g' not handled in switch"
+    },
+    {
+      "kind": "warning",
+      "msg": "5 enumeration values not handled in switch: 'c', 'd', 'e'..."
+    },
+    {
+      "kind": "warning",
+      "msg": "expression result unused"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'int' from incompatible type 'void'"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'int' from incompatible type 'void'"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'int' from incompatible type 'void'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/statements.sft.c",
+  "remark": null,
+  "sha256": "e6496562a5cf4107f1deea54bb4887c1b95fd1f3f6c618277218023fa90e8d9b",
+  "test_number_uses": 0,
+  "type": "fn"
+}

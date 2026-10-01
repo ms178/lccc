@@ -1,0 +1,38 @@
+{
+  "bytes": 1407,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 9,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "%-DSILENCE --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-alloca.sft.c",
+  "remark": null,
+  "sha256": "d9882b42577d6603283e65ec28ca03e0f4cb1dc52a90254434abe01865ed9872",
+  "test_number_uses": 0,
+  "type": "fp"
+}

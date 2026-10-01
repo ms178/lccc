@@ -1,0 +1,26 @@
+{
+  "bytes": 970,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 3,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/darwin-align-cast.sft.c",
+  "remark": null,
+  "sha256": "0033931fafe65371db26e6b905675f84111be4bdac1210bcac94c55f04628cf0",
+  "test_number_uses": 0,
+  "type": "fp"
+}

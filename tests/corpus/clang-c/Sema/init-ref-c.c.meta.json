@@ -1,0 +1,26 @@
+{
+  "bytes": 333,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "non-const lvalue reference to type '__builtin_va_list' cannot bind to a value of unrelated type 'struct EmptyStruct'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/init-ref-c.sft.c",
+  "remark": null,
+  "sha256": "901ffc6f57c79a82ce12f8dcae989280abd8cd58b01bdaefe3f94d06904d120b",
+  "test_number_uses": 0,
+  "type": "fn"
+}

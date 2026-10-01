@@ -1,0 +1,30 @@
+{
+  "bytes": 411,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "incompatible pointer"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c99"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/decl-type-merging.sft.c",
+  "remark": null,
+  "sha256": "ea485a0d3f4c5b4a8a67e5f8cceb0193348429bb7b00343c16c5304b3ec54bb7",
+  "test_number_uses": 0,
+  "type": "fn"
+}

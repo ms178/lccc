@@ -1,0 +1,30 @@
+{
+  "bytes": 282,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of 'p1' with a different type: 'int *' vs '__unaligned int *'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--ms_extensions --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/unaligned-qualifier.sft.c",
+  "remark": null,
+  "sha256": "bb977ead20e4fcaad5d87e2b9b56408e656f6d8750cd22664b40f6d6342aa914",
+  "test_number_uses": 0,
+  "type": "fn"
+}

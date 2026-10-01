@@ -1,0 +1,54 @@
+{
+  "bytes": 1298,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "requested alignment is not a power of 2"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer to integer conversion passing 'unsigned int *' to parameter of type"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to function call, expected 2, have 3"
+    },
+    {
+      "kind": "error",
+      "msg": "requested alignment is not a power of 2"
+    },
+    {
+      "kind": "error",
+      "msg": "must be a constant integer"
+    },
+    {
+      "kind": "error",
+      "msg": "requested alignment must be 8 or greater"
+    },
+    {
+      "kind": "warning",
+      "msg": "second argument to __builtin_alloca_with_align is supposed to be in bits"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/builtin-alloca-with-align.sft.c",
+  "remark": null,
+  "sha256": "e36b7381b3529c2c332067e8646087e73a987b7f9010859b3e69ba98b4c97873",
+  "test_number_uses": 0,
+  "type": "fn"
+}

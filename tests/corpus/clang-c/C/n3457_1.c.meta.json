@@ -1,0 +1,26 @@
+{
+  "bytes": 1109,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'__COUNTER__' value cannot exceed 2'147'483'647"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 16,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C2y/n3457_1.sft.c",
+  "remark": null,
+  "sha256": "02a8cae4d3268c3482a2baaf8cd2b116144de509c30f86903cfd8655111d2b13",
+  "test_number_uses": 0,
+  "type": "fn"
+}

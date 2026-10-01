@@ -1,0 +1,26 @@
+{
+  "bytes": 418,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/ptrauth-struct-function-ptr-field.sft.c",
+  "remark": null,
+  "sha256": "f5dfdbcf478bf82f56f1b16946ba14bb55be6dc0dae1a01d7fde1ef88b436622",
+  "test_number_uses": 0,
+  "type": "fn"
+}

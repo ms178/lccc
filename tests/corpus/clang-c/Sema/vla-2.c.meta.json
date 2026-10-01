@@ -1,0 +1,42 @@
+{
+  "bytes": 984,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "shift count >= width of type"
+    },
+    {
+      "kind": "warning",
+      "msg": "left operand of comma operator has no effect"
+    },
+    {
+      "kind": "warning",
+      "msg": "shift count >= width of type"
+    },
+    {
+      "kind": "warning",
+      "msg": "left operand of comma operator has no effect"
+    },
+    {
+      "kind": "warning",
+      "msg": "left operand of comma operator has no effect"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/vla-2.sft.c",
+  "remark": null,
+  "sha256": "ae15d2d5308d2f23406a2569825e1d2eda72ac447329ca705ef3a2974882d208",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,21 @@
+{
+  "bytes": 170,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/unnamed-bitfield-init.sft.c",
+  "remark": null,
+  "sha256": "9b3f163aac6d368f8079575ce5d5d1daf7630874f21dd1b8fc33b7ddd06c5725",
+  "test_number_uses": 0,
+  "type": "fp"
+}

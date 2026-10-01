@@ -1,0 +1,30 @@
+{
+  "bytes": 595,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-sized-by-or-null-vla-sizeless-types.sft.c",
+  "remark": null,
+  "sha256": "491b00d4c337d01da068a6fc2788aeab4b11471fcc59b24177f1870591ffa00e",
+  "test_number_uses": 0,
+  "type": "fn"
+}

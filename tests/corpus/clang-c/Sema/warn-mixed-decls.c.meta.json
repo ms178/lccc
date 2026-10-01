@@ -1,0 +1,38 @@
+{
+  "bytes": 1297,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 29,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c89",
+    " --c89",
+    " --c99",
+    " --c11",
+    " --c89",
+    " --c99",
+    " --c89",
+    " --c99",
+    " --c11"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-mixed-decls.sft.c",
+  "remark": null,
+  "sha256": "687b8cb506649ab58be07f68fdf288387138a775146d8fdc0e2786f08546d0a9",
+  "test_number_uses": 0,
+  "type": "fp"
+}

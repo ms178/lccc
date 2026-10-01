@@ -1,0 +1,21 @@
+{
+  "bytes": 488,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/macro_fn_comma_swallow.sft.c",
+  "remark": null,
+  "sha256": "8eb96e2732f9ce60f8171c4607f305b212149de52a4dca6be4052967b961071c",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,62 @@
+{
+  "bytes": 2263,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "'f2' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "note",
+      "msg": "'f3' has been explicitly marked unavailable here"
+    },
+    {
+      "kind": "note",
+      "msg": "explicitly marked unavailable"
+    },
+    {
+      "kind": "note",
+      "msg": "'f5' has been explicitly marked unavailable here"
+    },
+    {
+      "kind": "warning",
+      "msg": "Fuchsia API Level prohibits specifying a minor or sub-minor version"
+    },
+    {
+      "kind": "warning",
+      "msg": "Fuchsia API Level prohibits specifying a minor or sub-minor version"
+    },
+    {
+      "kind": "warning",
+      "msg": "'f2' is deprecated: first deprecated in Fuchsia 16"
+    },
+    {
+      "kind": "error",
+      "msg": "'f3' is unavailable: introduced in Fuchsia 19"
+    },
+    {
+      "kind": "error",
+      "msg": "f4' is unavailable: obsoleted in Fuchsia 16"
+    },
+    {
+      "kind": "error",
+      "msg": "'f5' is unavailable: not available on Fuchsia"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 12,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-availability-fuchsia.sft.c",
+  "remark": null,
+  "sha256": "738312af67f36875ff73d1b4c4772915e10bfdd3448cc39931d915e5a0da351b",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,26 @@
+{
+  "bytes": 1726,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "expected integer or identifier in '#pragma pack'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 32,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/pragma-pack.sft.c",
+  "remark": null,
+  "sha256": "f2cd8dda0b2e6b95bc8cffb257d3cbd515c4cf7dec72ab30cd310cbab8f996e5",
+  "test_number_uses": 0,
+  "type": "fp"
+}

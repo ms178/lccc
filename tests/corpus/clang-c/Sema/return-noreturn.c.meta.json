@@ -1,0 +1,34 @@
+{
+  "bytes": 1249,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "function 'test1' could be declared with attribute 'noreturn'"
+    },
+    {
+      "kind": "warning",
+      "msg": "function declared 'noreturn' should not return"
+    },
+    {
+      "kind": "warning",
+      "msg": "function declared 'noreturn' should not return"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/return-noreturn.sft.c",
+  "remark": null,
+  "sha256": "9bc6c92d9c0d2e72c725a916daaf8866d4208792d52d7d51e9cbb78ad5c37b50",
+  "test_number_uses": 0,
+  "type": "fp"
+}

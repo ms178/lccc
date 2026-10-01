@@ -1,0 +1,21 @@
+{
+  "bytes": 7293,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 156,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/pragma-attribute-strict-subjects.sft.c",
+  "remark": null,
+  "sha256": "3f24d4e07f5bd813406050ad2ddc3cb603eb77427168ed07cb7052dcf9b462f5",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,110 @@
+{
+  "bytes": 3777,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "incompatible vector types assigning to 'v2s' (vector of 2 'int' values) from 'v2u' (vector of 2 'unsigned int' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'v2s' (vector of 2 'int' values) from incompatible type 'v1s' (vector of 1 'int' value)"
+    },
+    {
+      "kind": "warning",
+      "msg": "incompatible vector types assigning to 'v2s' (vector of 2 'int' values) from 'v2f' (vector of 2 'float' values)"
+    },
+    {
+      "kind": "warning",
+      "msg": "incompatible vector types assigning to 'v2s' (vector of 2 'int' values) from 'v4ss' (vector of 4 'short' values)"
+    },
+    {
+      "kind": "warning",
+      "msg": "incompatible vector types assigning to 'v2u' (vector of 2 'unsigned int' values) from 'v2s' (vector of 2 'int' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'v2u' (vector of 2 'unsigned int' values) from incompatible type 'v1s' (vector of 1 'int' value)"
+    },
+    {
+      "kind": "warning",
+      "msg": "incompatible vector types assigning to 'v2u' (vector of 2 'unsigned int' values) from 'v2f' (vector of 2 'float' values)"
+    },
+    {
+      "kind": "warning",
+      "msg": "incompatible vector types assigning to 'v2u' (vector of 2 'unsigned int' values) from 'v4ss' (vector of 4 'short' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'v1s' (vector of 1 'int' value) from incompatible type 'v2s' (vector of 2 'int' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'v1s' (vector of 1 'int' value) from incompatible type 'v2u' (vector of 2 'unsigned int' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'v1s' (vector of 1 'int' value) from incompatible type 'v2f' (vector of 2 'float' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'v1s' (vector of 1 'int' value) from incompatible type 'v4ss'"
+    },
+    {
+      "kind": "warning",
+      "msg": "incompatible vector types assigning to 'v2f' (vector of 2 'float' values) from 'v2s' (vector of 2 'int' values)"
+    },
+    {
+      "kind": "warning",
+      "msg": "incompatible vector types assigning to 'v2f' (vector of 2 'float' values) from 'v2u' (vector of 2 'unsigned int' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'v2f' (vector of 2 'float' values) from incompatible type 'v1s' (vector of 1 'int' value)"
+    },
+    {
+      "kind": "warning",
+      "msg": "incompatible vector types assigning to 'v2f' (vector of 2 'float' values) from 'v4ss' (vector of 4 'short' values)"
+    },
+    {
+      "kind": "warning",
+      "msg": "incompatible vector types assigning to 'v4ss' (vector of 4 'short' values) from 'v2s' (vector of 2 'int' values)"
+    },
+    {
+      "kind": "warning",
+      "msg": "incompatible vector types assigning to 'v4ss' (vector of 4 'short' values) from 'v2u' (vector of 2 'unsigned int' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'v4ss' (vector of 4 'short' values) from incompatible type 'v1s' (vector of 1 'int' value)"
+    },
+    {
+      "kind": "warning",
+      "msg": "incompatible vector types assigning to 'v4ss' (vector of 4 'short' values) from 'v2f'"
+    },
+    {
+      "kind": "note",
+      "msg": "passing argument to parameter here"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer types passing 'const unsigned int *' to parameter of type 'longlongvec *'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 3,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/vector-assign.sft.c",
+  "remark": null,
+  "sha256": "6539c43e963052d5807964508779adbb512b9cecc5026af13422c28e8df7df0d",
+  "test_number_uses": 0,
+  "type": "fn"
+}

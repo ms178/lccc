@@ -1,0 +1,26 @@
+{
+  "bytes": 518,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/clear_cache.sft.c",
+  "remark": null,
+  "sha256": "9ed69883af143563ad19d15210a7551d4da50754426d296d1e3cc735d163575a",
+  "test_number_uses": 0,
+  "type": "fp"
+}

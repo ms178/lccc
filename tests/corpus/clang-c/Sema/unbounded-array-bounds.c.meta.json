@@ -1,0 +1,42 @@
+{
+  "bytes": 7486,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "tentative array definition"
+    },
+    {
+      "kind": "warning",
+      "msg": "tentative array definition"
+    },
+    {
+      "kind": "note",
+      "msg": "declared here"
+    },
+    {
+      "kind": "note",
+      "msg": "declared here"
+    },
+    {
+      "kind": "warning",
+      "msg": "tentative array definition"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/unbounded-array-bounds.sft.c",
+  "remark": null,
+  "sha256": "48042c0e1e323155b1ac774cc3f23ea6238e90736ad5f7e7dc4214601e595f3c",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,30 @@
+{
+  "bytes": 651,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'extern' variable has an initializer"
+    },
+    {
+      "kind": "error",
+      "msg": "'selectany' can only be applied to data items with external linkage"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w -w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-selectany.sft.c",
+  "remark": null,
+  "sha256": "bfcbb764a90dac2062e07dc282d1b5507e78aec180d1a36945d7f7652efaca3c",
+  "test_number_uses": 0,
+  "type": "fn"
+}

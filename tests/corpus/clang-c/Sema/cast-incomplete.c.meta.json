@@ -1,0 +1,50 @@
+{
+  "bytes": 533,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "forward declaration"
+    },
+    {
+      "kind": "note",
+      "msg": "forward declaration"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "cast to incomplete type"
+    },
+    {
+      "kind": "error",
+      "msg": "cast to incomplete type"
+    },
+    {
+      "kind": "error",
+      "msg": "cast to incomplete type"
+    },
+    {
+      "kind": "error",
+      "msg": "cast to incomplete type"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/cast-incomplete.sft.c",
+  "remark": null,
+  "sha256": "45e37aa8d74f200ad689e025c3a6babbb3d1ac54260bb6814602c640debc7098",
+  "test_number_uses": 0,
+  "type": "fn"
+}

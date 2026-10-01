@@ -1,0 +1,38 @@
+{
+  "bytes": 3461,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 117,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/elifdef.sft.c",
+  "remark": null,
+  "sha256": "6b230240b5c115b28db7c0417b6391677d3f27e141f5d6655b1e002b59bdbca1",
+  "test_number_uses": 0,
+  "type": "fn"
+}

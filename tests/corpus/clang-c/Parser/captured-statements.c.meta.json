@@ -1,0 +1,30 @@
+{
+  "bytes": 309,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "extra tokens at end of #pragma clang __debug captured directive"
+    },
+    {
+      "kind": "error",
+      "msg": "expected '{'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/captured-statements.sft.c",
+  "remark": null,
+  "sha256": "01c7213952b462ca72f644e178c3f455fa7f13b717ef381ebe92855ea78b8abf",
+  "test_number_uses": 0,
+  "type": "fn"
+}

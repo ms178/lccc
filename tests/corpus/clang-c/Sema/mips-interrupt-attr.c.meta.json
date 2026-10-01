@@ -1,0 +1,78 @@
+{
+  "bytes": 2470,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'interrupt' attribute only applies to functions and methods"
+    },
+    {
+      "kind": "error",
+      "msg": "expected string literal as argument of 'interrupt' attribute"
+    },
+    {
+      "kind": "warning",
+      "msg": "'interrupt' attribute argument not supported: 'EIC'"
+    },
+    {
+      "kind": "error",
+      "msg": "'interrupt' attribute takes no more than 1 argument"
+    },
+    {
+      "kind": "warning",
+      "msg": "MIPS 'interrupt' attribute only applies to functions that have a 'void' return type"
+    },
+    {
+      "kind": "warning",
+      "msg": "MIPS 'interrupt' attribute only applies to functions that have no parameters"
+    },
+    {
+      "kind": "error",
+      "msg": "'mips16' and 'interrupt' attributes are not compatible"
+    },
+    {
+      "kind": "note",
+      "msg": "conflicting attribute is here"
+    },
+    {
+      "kind": "error",
+      "msg": "'interrupt' and 'mips16' attributes are not compatible"
+    },
+    {
+      "kind": "note",
+      "msg": "conflicting attribute is here"
+    },
+    {
+      "kind": "error",
+      "msg": "'mips16' and 'interrupt' attributes are not compatible"
+    },
+    {
+      "kind": "note",
+      "msg": "conflicting attribute is here"
+    },
+    {
+      "kind": "error",
+      "msg": "'interrupt' and 'mips16' attributes are not compatible"
+    },
+    {
+      "kind": "note",
+      "msg": "conflicting attribute is here"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 3,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/mips-interrupt-attr.sft.c",
+  "remark": null,
+  "sha256": "d00cf168f13dd52ff57c2227103d7d867c9314776b760f74ac0e65a5a6e24c22",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,21 @@
+{
+  "bytes": 2195,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 19,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/header_lookup1.sft.c",
+  "remark": null,
+  "sha256": "9dd55c48e80c77bd12e4f5bb7db5b08fa73d6687168d2eea686f0884b0e5ae67",
+  "test_number_uses": 0,
+  "type": "fp"
+}

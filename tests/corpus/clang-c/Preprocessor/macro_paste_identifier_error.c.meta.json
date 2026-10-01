@@ -1,0 +1,21 @@
+{
+  "bytes": 418,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--ms_extensions --ms_extensions --ms_extensions -w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/macro_paste_identifier_error.sft.c",
+  "remark": null,
+  "sha256": "ab5a2430a54db62ed8f3b8d0209eee4a5859eb5d6d7cc92e56e5a1011337904b",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,30 @@
+{
+  "bytes": 432,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "expression result unused"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression result unused"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c11"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/typerep-typespec.sft.c",
+  "remark": null,
+  "sha256": "9c77bd25226dc5f7ba66ceb2342af0f9c60f9d9a1c8ba34cf1bd01459378b6f9",
+  "test_number_uses": 0,
+  "type": "fp"
+}

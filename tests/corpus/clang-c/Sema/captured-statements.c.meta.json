@@ -1,0 +1,70 @@
+{
+  "bytes": 2010,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "use of undeclared label 'L1'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared label 'L3'"
+    },
+    {
+      "kind": "error",
+      "msg": "'break' statement not in loop or switch statement"
+    },
+    {
+      "kind": "error",
+      "msg": "'continue' statement not in loop statement"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot return from default captured statement"
+    },
+    {
+      "kind": "note",
+      "msg": "'x' declared here"
+    },
+    {
+      "kind": "error",
+      "msg": "__block variable 'x' cannot be captured in a captured statement"
+    },
+    {
+      "kind": "error",
+      "msg": "variable is not assignable (missing __block type specifier)"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "__block variable 'a' cannot be captured in a captured statement"
+    },
+    {
+      "kind": "error",
+      "msg": "__block variable 'a' cannot be captured in a captured statement"
+    },
+    {
+      "kind": "error",
+      "msg": "variable is not assignable (missing __block type specifier)"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/captured-statements.sft.c",
+  "remark": null,
+  "sha256": "c166de82702c53439d9c73d50fee8ff210ef63cee49df66276d5e8ac85984b99",
+  "test_number_uses": 0,
+  "type": "fn"
+}

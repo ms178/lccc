@@ -1,0 +1,78 @@
+{
+  "bytes": 2379,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting types for 'foo'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of 'funcdef2'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of 'g0'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of 'g1'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of 'sizeof' to an incomplete type 'int[]'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer types passing 'int (*)[10]' to parameter of type 'int (*)[11]"
+    },
+    {
+      "kind": "note",
+      "msg": "passing argument to parameter here"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer types passing 'int (*)[5]' to parameter of type 'int (*)[10]"
+    },
+    {
+      "kind": "error",
+      "msg": "member reference base type 'char' is not a structure or union"
+    },
+    {
+      "kind": "error",
+      "msg": "member reference base type 'char' is not a structure or union"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/merge-decls.sft.c",
+  "remark": null,
+  "sha256": "cd15852b7263f2f191b0ea47921f2a907b8f3030d124f660b36e84f2b26e9104",
+  "test_number_uses": 0,
+  "type": "fn"
+}

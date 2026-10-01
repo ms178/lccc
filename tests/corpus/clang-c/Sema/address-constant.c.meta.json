@@ -1,0 +1,21 @@
+{
+  "bytes": 222,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/address-constant.sft.c",
+  "remark": null,
+  "sha256": "0672114cc5d757552a4548220b119ccfb51abc005e5be063807988242451240e",
+  "test_number_uses": 0,
+  "type": "fp"
+}

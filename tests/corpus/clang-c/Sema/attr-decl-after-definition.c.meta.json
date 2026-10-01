@@ -1,0 +1,62 @@
+{
+  "bytes": 1545,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "must precede definition"
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "must precede definition"
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "must precede definition"
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "must precede definition"
+    },
+    {
+      "kind": "note",
+      "msg": "previous attribute is here"
+    },
+    {
+      "kind": "error",
+      "msg": "visibility does not match previous declaration"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-decl-after-definition.sft.c",
+  "remark": null,
+  "sha256": "6f3600c7003c94892336a41fa14628675d9897d50cc73d64650f6a52122e2ed0",
+  "test_number_uses": 0,
+  "type": "fn"
+}

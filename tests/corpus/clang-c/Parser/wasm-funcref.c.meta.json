@@ -1,0 +1,30 @@
+{
+  "bytes": 530,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "invalid use of '__funcref' keyword outside the WebAssembly triple"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid use of '__funcref' keyword outside the WebAssembly triple"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/wasm-funcref.sft.c",
+  "remark": null,
+  "sha256": "a2d766b4ff7146b4e58f2cc458f29f102926b8b7fbbe1b56540599355eff1e49",
+  "test_number_uses": 0,
+  "type": "fn"
+}

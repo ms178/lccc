@@ -1,0 +1,30 @@
+{
+  "bytes": 584,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "shift count is negative"
+    },
+    {
+      "kind": "warning",
+      "msg": "shift count is negative"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/shift-bool.sft.c",
+  "remark": null,
+  "sha256": "a0cad5c0dbae1409c8b4ce70b61ca2cfa66391f0f7c0f13783defec32f25b12a",
+  "test_number_uses": 0,
+  "type": "fp"
+}

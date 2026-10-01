@@ -1,0 +1,21 @@
+{
+  "bytes": 3194,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": true,
+  "header_lines": 15,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w -w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/tautological-unsigned-enum-zero-compare.sft.c",
+  "remark": null,
+  "sha256": "d4c06f34431d306c19a5984b2aafabc8e8bb49664c7e382d15c23fcb1981c23a",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,21 @@
+{
+  "bytes": 316,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/struct-cast.sft.c",
+  "remark": null,
+  "sha256": "7fb39977dacb347069f5cd2b59c360ea703453c9b69fb4fd1ba55ed2db17676f",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,26 @@
+{
+  "bytes": 238,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "tentative array definition assumed to have one element"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/tentative-array-decl.sft.c",
+  "remark": null,
+  "sha256": "a327482c61db5187f8f1aac583d74cc6b70dc375ff187a3864f17c8ac013cae9",
+  "test_number_uses": 0,
+  "type": "fp"
+}

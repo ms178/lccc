@@ -1,0 +1,30 @@
+{
+  "bytes": 825,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'_Thread_local' variables must have global storage"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Thread_local' variables must have global storage"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/thread_local.sft.c",
+  "remark": null,
+  "sha256": "3463205a2eeb8b9e9a0eec8026416d78d093f2a0c8ad984e7bbe499011aceed7",
+  "test_number_uses": 0,
+  "type": "fn"
+}

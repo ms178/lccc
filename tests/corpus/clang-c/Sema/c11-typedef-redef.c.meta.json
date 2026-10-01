@@ -1,0 +1,38 @@
+{
+  "bytes": 589,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of typedef for variably-modified type 'int[N]'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of typedef for variably-modified type 'vla2' (aka 'int[N]')"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c11"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/c11-typedef-redef.sft.c",
+  "remark": null,
+  "sha256": "08f76d942bc5a6664b9f7cf69029af10c8cb0bdd6651203ad8fccc11d26e7a82",
+  "test_number_uses": 0,
+  "type": "fn"
+}

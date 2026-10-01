@@ -1,0 +1,30 @@
+{
+  "bytes": 592,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "implicit conversion loses integer precision"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion loses integer precision: 'long' to 'int'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/conversion-64-32.sft.c",
+  "remark": null,
+  "sha256": "7eff3b0e9504dfcf7fcd4b9afcebf907a82416c0ef87eab4d0a72a1fc6d3682e",
+  "test_number_uses": 0,
+  "type": "fp"
+}

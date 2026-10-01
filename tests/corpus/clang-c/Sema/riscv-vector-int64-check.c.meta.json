@@ -1,0 +1,21 @@
+{
+  "bytes": 18746,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 51,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/riscv-vector-int64-check.sft.c",
+  "remark": null,
+  "sha256": "63682b198a1e51697b474d2fb29e0dc502b59ffb9738db7f16f0a46656d7f64a",
+  "test_number_uses": 0,
+  "type": "fn"
+}

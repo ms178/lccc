@@ -1,0 +1,21 @@
+{
+  "bytes": 1783,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 31,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/SOURCE_DATE_EPOCH.sft.c",
+  "remark": null,
+  "sha256": "27775518259feba11a81f4fa3029cac5a9896a01c76d4a062a7555aeb2bfc37f",
+  "test_number_uses": 0,
+  "type": "fp"
+}

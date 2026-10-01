@@ -1,0 +1,78 @@
+{
+  "bytes": 2184,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "passing argument to parameter 'x' here"
+    },
+    {
+      "kind": "warning",
+      "msg": "passing 'unsigned int *' to parameter of type 'int *' converts between pointers to integer types with different sign"
+    },
+    {
+      "kind": "note",
+      "msg": "passing argument to parameter"
+    },
+    {
+      "kind": "warning",
+      "msg": "converts between pointers to integer types where one is of the unique plain 'char' type and the other is not"
+    },
+    {
+      "kind": "warning",
+      "msg": "converts between pointers to integer types where one is of the unique plain 'char' type and the other is not"
+    },
+    {
+      "kind": "warning",
+      "msg": "converts between pointers to integer types where one is of the unique plain 'char' type and the other is not"
+    },
+    {
+      "kind": "warning",
+      "msg": "converts between pointers to integer types where one is of the unique plain 'char' type and the other is not"
+    },
+    {
+      "kind": "warning",
+      "msg": "converts between pointers to integer types where one is of the unique plain 'char' type and the other is not"
+    },
+    {
+      "kind": "note",
+      "msg": "passing argument to parameter"
+    },
+    {
+      "kind": "warning",
+      "msg": "converts between pointers to integer types where one is of the unique plain 'char' type and the other is not"
+    },
+    {
+      "kind": "warning",
+      "msg": "converts between pointers to integer types where one is of the unique plain 'char' type and the other is not"
+    },
+    {
+      "kind": "warning",
+      "msg": "converts between pointers to integer types where one is of the unique plain 'char' type and the other is not"
+    },
+    {
+      "kind": "warning",
+      "msg": "converts between pointers to integer types where one is of the unique plain 'char' type and the other is not"
+    },
+    {
+      "kind": "warning",
+      "msg": "converts between pointers to integer types where one is of the unique plain 'char' type and the other is not"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/incompatible-sign.sft.c",
+  "remark": null,
+  "sha256": "47a200d700a8313d2d671d6a720273cb02921964dcade481569dc0d54fbe8196",
+  "test_number_uses": 0,
+  "type": "fp"
+}

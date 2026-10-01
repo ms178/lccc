@@ -1,0 +1,42 @@
+{
+  "bytes": 628,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "expected '('"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ','"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ':'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous default generic association is here"
+    },
+    {
+      "kind": "error",
+      "msg": "duplicate default generic association"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c11"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/c1x-generic-selection.sft.c",
+  "remark": null,
+  "sha256": "9b8b68527b1b726e0c9018d29765f519c12c7dd86e86c048ded2f9b9b548b95e",
+  "test_number_uses": 0,
+  "type": "fn"
+}

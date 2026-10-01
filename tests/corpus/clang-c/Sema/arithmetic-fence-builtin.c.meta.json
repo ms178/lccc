@@ -1,0 +1,62 @@
+{
+  "bytes": 3102,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operand of type 'stype' where floating, complex or a vector of such types is required"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call, expected 1, have 0"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to function call, expected 1, have 2"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operand of type 'int' where floating, complex or a vector of such types is required"
+    },
+    {
+      "kind": "note",
+      "msg": "in instantiation of function template specialization 'addT<float>' requested here"
+    },
+    {
+      "kind": "note",
+      "msg": "in instantiation of function template specialization 'addT<int>' requested here"
+    },
+    {
+      "kind": "error",
+      "msg": "builtin is not supported on this target"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 13,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DPPC -DPPC -DPPC -DPPC --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/arithmetic-fence-builtin.sft.c",
+  "remark": null,
+  "sha256": "0a693a44d8ece5d3583016017c99c318cb1890712107770b0acae6bcf3022f65",
+  "test_number_uses": 0,
+  "type": "fn"
+}

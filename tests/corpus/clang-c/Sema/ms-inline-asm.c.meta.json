@@ -1,0 +1,138 @@
+{
+  "bytes": 4279,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "__asm used with no assembly instructions"
+    },
+    {
+      "kind": "error",
+      "msg": "unknown directive"
+    },
+    {
+      "kind": "error",
+      "msg": "unknown token in expression"
+    },
+    {
+      "kind": "error",
+      "msg": "unknown token in expression"
+    },
+    {
+      "kind": "error",
+      "msg": "unable to lookup expression"
+    },
+    {
+      "kind": "error",
+      "msg": "unable to lookup expression"
+    },
+    {
+      "kind": "error",
+      "msg": "unable to lookup expression"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "unknown token in expression"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "Unable to lookup field reference!"
+    },
+    {
+      "kind": "error",
+      "msg": "Unable to lookup field reference!"
+    },
+    {
+      "kind": "error",
+      "msg": "unexpected token in argument list"
+    },
+    {
+      "kind": "error",
+      "msg": "Expected 'PTR' or 'ptr' token!"
+    },
+    {
+      "kind": "note",
+      "msg": "attribute is here"
+    },
+    {
+      "kind": "error",
+      "msg": "parameter references not allowed in naked functions"
+    },
+    {
+      "kind": "note",
+      "msg": "inline assembly label 'foo' declared here"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot jump from this goto statement to label 'foo' inside an inline assembly block"
+    },
+    {
+      "kind": "note",
+      "msg": "inline assembly label 'foo' declared here"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot jump from this goto statement to label 'foo' inside an inline assembly block"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot jump from this goto statement to label 'foo' inside an inline assembly block"
+    },
+    {
+      "kind": "note",
+      "msg": "inline assembly label 'foo' declared here"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot jump from this goto statement to label 'foo' inside an inline assembly block"
+    },
+    {
+      "kind": "note",
+      "msg": "inline assembly label 'foo' declared here"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared label 'foo'"
+    },
+    {
+      "kind": "warning",
+      "msg": "unused label 'bar'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--ms_extensions --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/ms-inline-asm.sft.c",
+  "remark": null,
+  "sha256": "b6b2ad480e9109681f2ec2bd788410cb98d81ba99e10bffd4fb3920c7b58227c",
+  "test_number_uses": 0,
+  "type": "fn"
+}

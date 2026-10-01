@@ -1,0 +1,38 @@
+{
+  "bytes": 1821,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "call to 'promote_or_convert' is ambiguous"
+    },
+    {
+      "kind": "error",
+      "msg": "call to 'promote_or_convert' is ambiguous"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 3,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/overloadable-complex.sft.c",
+  "remark": null,
+  "sha256": "7a57772a776c3399a865aaef87a7d8da5dd2f648bcdaa8a4682c78a85d78e36a",
+  "test_number_uses": 0,
+  "type": "fn"
+}

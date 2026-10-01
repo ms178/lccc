@@ -1,0 +1,134 @@
+{
+  "bytes": 4269,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "invalid application of 'sizeof' to sizeless type '__SVInt8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of '__alignof' to sizeless type '__SVInt8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of 'sizeof' to sizeless type '__SVInt16_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of '__alignof' to sizeless type '__SVInt16_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of 'sizeof' to sizeless type '__SVInt32_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of '__alignof' to sizeless type '__SVInt32_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of 'sizeof' to sizeless type '__SVInt64_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of '__alignof' to sizeless type '__SVInt64_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of 'sizeof' to sizeless type '__SVUint8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of '__alignof' to sizeless type '__SVUint8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of 'sizeof' to sizeless type '__SVUint16_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of '__alignof' to sizeless type '__SVUint16_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of 'sizeof' to sizeless type '__SVUint32_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of '__alignof' to sizeless type '__SVUint32_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of 'sizeof' to sizeless type '__SVUint64_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of '__alignof' to sizeless type '__SVUint64_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of 'sizeof' to sizeless type '__SVFloat16_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of '__alignof' to sizeless type '__SVFloat16_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of 'sizeof' to sizeless type '__SVFloat32_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of '__alignof' to sizeless type '__SVFloat32_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of 'sizeof' to sizeless type '__SVFloat64_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of '__alignof' to sizeless type '__SVFloat64_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of 'sizeof' to sizeless type '__SVBfloat16_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of '__alignof' to sizeless type '__SVBfloat16_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of 'sizeof' to sizeless type '__SVMfloat8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of '__alignof' to sizeless type '__SVMfloat8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of 'sizeof' to sizeless type '__SVBool_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of '__alignof' to sizeless type '__SVBool_t'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c --target linux_aarch64"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/aarch64-sve-types.sft.c",
+  "remark": null,
+  "sha256": "9add491b51f21a9fea7874dcce5fc28da27e45756b690d28fb4acedb65509a75",
+  "test_number_uses": 0,
+  "type": "fn"
+}

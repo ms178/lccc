@@ -1,0 +1,286 @@
+{
+  "bytes": 15897,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "memcpy' will always overflow; destination buffer has size 10, but size argument is 20"
+    },
+    {
+      "kind": "warning",
+      "msg": "memcpy' will always overflow; destination buffer has size 8, but size argument is 20"
+    },
+    {
+      "kind": "warning",
+      "msg": "'strncat' size argument is too large; destination buffer has size 10, but size argument is 20"
+    },
+    {
+      "kind": "warning",
+      "msg": "'strncpy' size argument is too large; destination buffer has size 10, but size argument is 20"
+    },
+    {
+      "kind": "warning",
+      "msg": "'stpncpy' size argument is too large; destination buffer has size 10, but size argument is 20"
+    },
+    {
+      "kind": "warning",
+      "msg": "'strcpy' will always overflow; destination buffer has size 4, but the source string has length 5 (including NUL byte)"
+    },
+    {
+      "kind": "warning",
+      "msg": "'strcat' will always overflow; destination buffer has size 4, but the source string has length 5 (including NUL byte)"
+    },
+    {
+      "kind": "warning",
+      "msg": "'stpcpy' will always overflow; destination buffer has size 4, but the source string has length 5 (including NUL byte)"
+    },
+    {
+      "kind": "warning",
+      "msg": "'memmove' will always overflow; destination buffer has size 10, but size argument is 20"
+    },
+    {
+      "kind": "warning",
+      "msg": "'memset' will always overflow; destination buffer has size 10, but size argument is 11"
+    },
+    {
+      "kind": "warning",
+      "msg": "'snprintf' size argument is too large; destination buffer has size 10, but size argument is 11"
+    },
+    {
+      "kind": "warning",
+      "msg": "'snprintf' will always be truncated; specified size is 3, but format string expands to at least 5"
+    },
+    {
+      "kind": "warning",
+      "msg": "'snprintf' will always be truncated; specified size is 4, but format string expands to at least 5"
+    },
+    {
+      "kind": "warning",
+      "msg": "'snprintf' will always be truncated; specified size is 1, but format string expands to at least 2"
+    },
+    {
+      "kind": "warning",
+      "msg": "'snprintf' will always be truncated; specified size is 1, but format string expands to at least 2"
+    },
+    {
+      "kind": "warning",
+      "msg": "'snprintf' will always be truncated; specified size is 1, but format string expands to at least 2"
+    },
+    {
+      "kind": "warning",
+      "msg": "'snprintf' will always be truncated; specified size is 1, but format string expands to at least 2"
+    },
+    {
+      "kind": "warning",
+      "msg": "'vsnprintf' size argument is too large; destination buffer has size 10, but size argument is 11"
+    },
+    {
+      "kind": "warning",
+      "msg": "'vsnprintf' will always be truncated; specified size is 3, but format string expands to at least 5"
+    },
+    {
+      "kind": "warning",
+      "msg": "'vsnprintf' will always be truncated; specified size is 4, but format string expands to at least 5"
+    },
+    {
+      "kind": "warning",
+      "msg": "'vsnprintf' will always be truncated; specified size is 1, but format string expands to at least 2"
+    },
+    {
+      "kind": "warning",
+      "msg": "'vsnprintf' will always be truncated; specified size is 1, but format string expands to at least 2"
+    },
+    {
+      "kind": "warning",
+      "msg": "'vsnprintf' will always be truncated; specified size is 1, but format string expands to at least 2"
+    },
+    {
+      "kind": "warning",
+      "msg": "'vsnprintf' will always be truncated; specified size is 1, but format string expands to at least 2"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sprintf' will always overflow; destination buffer has size 5, but format string expands to at least 6"
+    },
+    {
+      "kind": "warning",
+      "msg": "format string contains '\\0' within the string body"
+    },
+    {
+      "kind": "warning",
+      "msg": "format string contains '\\0' within the string body"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sprintf' will always overflow; destination buffer has size 2, but format string expands to at least 5"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sprintf' will always overflow; destination buffer has size 5, but format string expands to at least 6"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sprintf' will always overflow; destination buffer has size 1, but format string expands to at least 2"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sprintf' will always overflow; destination buffer has size 1, but format string expands to at least 2"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sprintf' will always overflow; destination buffer has size 1, but format string expands to at least 2"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sprintf' will always overflow; destination buffer has size 1, but format string expands to at least 2"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sprintf' will always overflow; destination buffer has size 1, but format string expands to at least 2"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sprintf' will always overflow; destination buffer has size 1, but format string expands to at least 2"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sprintf' will always overflow; destination buffer has size 1, but format string expands to at least 2"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sprintf' will always overflow; destination buffer has size 1, but format string expands to at least 2"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sprintf' will always overflow; destination buffer has size 1, but format string expands to at least 2"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sprintf' will always overflow; destination buffer has size 1, but format string expands to at least 2"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sprintf' will always overflow; destination buffer has size 1, but format string expands to at least 2"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sprintf' will always overflow; destination buffer has size 1, but format string expands to at least 2"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sprintf' will always overflow; destination buffer has size 3, but format string expands to at least 4"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sprintf' will always overflow; destination buffer has size 2, but format string expands to at least 3"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sprintf' will always overflow; destination buffer has size 2, but format string expands to at least 3"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sprintf' will always overflow; destination buffer has size 5, but format string expands to at least 6"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sprintf' will always overflow; destination buffer has size 8, but format string expands to at least 9"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sprintf' will always overflow; destination buffer has size 8, but format string expands to at least 9"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sprintf' will always overflow; destination buffer has size 9, but format string expands to at least 10"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sprintf' will always overflow; destination buffer has size 11, but format string expands to at least 12"
+    },
+    {
+      "kind": "warning",
+      "msg": "format string contains '\\0' within the string body"
+    },
+    {
+      "kind": "warning",
+      "msg": "format string contains '\\0' within the string body"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sprintf' will always overflow; destination buffer has size 6, but format string expands to at least 8"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sprintf' will always overflow; destination buffer has size 6, but format string expands to at least 7"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sprintf' will always overflow; destination buffer has size 6, but format string expands to at least 7"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sprintf' will always overflow; destination buffer has size 6, but format string expands to at least 7"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sprintf' will always overflow; destination buffer has size 6, but format string expands to at least 7"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sprintf' will always overflow; destination buffer has size 6, but format string expands to at least 7"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sprintf' will always overflow; destination buffer has size 6, but format string expands to at least 7"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sprintf' will always overflow; destination buffer has size 6, but format string expands to at least 7"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sprintf' will always overflow; destination buffer has size 6, but format string expands to at least 7"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sprintf' will always overflow; destination buffer has size 6, but format string expands to at least 7"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sprintf' will always overflow; destination buffer has size 6, but format string expands to at least 7"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sprintf' will always overflow; destination buffer has size 6, but format string expands to at least 7"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sprintf' will always overflow; destination buffer has size 6, but format string expands to at least 8"
+    },
+    {
+      "kind": "warning",
+      "msg": "'memcpy' will always overflow; destination buffer has size 9, but size argument is 10"
+    },
+    {
+      "kind": "note",
+      "msg": "in instantiation of function template specialization 'call_memcpy_dep<9, 10>' requested here"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 12,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DUSE_BUILTINS -DUSE_BUILTINS -DUSE_BUILTINS -DUSE_BUILTINS --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-fortify-source.sft.c",
+  "remark": null,
+  "sha256": "b8fc5a10222c61e97c7d855ae33546f509629166a3dcf25e48fd4bfa0580a558",
+  "test_number_uses": 0,
+  "type": "fp"
+}

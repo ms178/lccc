@@ -1,0 +1,166 @@
+{
+  "bytes": 6821,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "initializing 'int *' with an expression of type 'const int *' discards qualifiers"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer types initializing 'int *' with an expression of type 'unsigned long *'"
+    },
+    {
+      "kind": "error",
+      "msg": "_Atomic cannot be applied to type 'auto' in C23"
+    },
+    {
+      "kind": "error",
+      "msg": "'auto' not allowed here"
+    },
+    {
+      "kind": "error",
+      "msg": "a type specifier is required for all declarations"
+    },
+    {
+      "kind": "error",
+      "msg": "_Atomic cannot be applied to type 'auto' in C23"
+    },
+    {
+      "kind": "error",
+      "msg": "'auto' not allowed here"
+    },
+    {
+      "kind": "error",
+      "msg": "'auto' not allowed in function prototype"
+    },
+    {
+      "kind": "error",
+      "msg": "'auto' not allowed in function return type"
+    },
+    {
+      "kind": "error",
+      "msg": "'auto' not allowed in function prototype"
+    },
+    {
+      "kind": "error",
+      "msg": "'auto' not allowed in function return type"
+    },
+    {
+      "kind": "error",
+      "msg": "expected expression"
+    },
+    {
+      "kind": "error",
+      "msg": "expected expression"
+    },
+    {
+      "kind": "error",
+      "msg": "'auto' not allowed in array declaration"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use 'auto' with array in C"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use 'auto' with array in C"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use 'auto' with array in C"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use 'auto' with array in C"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use 'auto' with array in C"
+    },
+    {
+      "kind": "error",
+      "msg": "'auto' not allowed in struct member"
+    },
+    {
+      "kind": "error",
+      "msg": "'auto' not allowed in typedef"
+    },
+    {
+      "kind": "error",
+      "msg": "'auto' not allowed in typedef"
+    },
+    {
+      "kind": "error",
+      "msg": "'auto' not allowed in function prototype"
+    },
+    {
+      "kind": "error",
+      "msg": "'auto' not allowed here"
+    },
+    {
+      "kind": "error",
+      "msg": "declaration of variable 'something' with deduced type 'auto' requires an initializer"
+    },
+    {
+      "kind": "warning",
+      "msg": "type inference of a declaration other than a plain identifier with optional trailing attributes is a Clang extension"
+    },
+    {
+      "kind": "error",
+      "msg": "expected expression"
+    },
+    {
+      "kind": "error",
+      "msg": "controlling expression type 'short' not compatible with any generic association type"
+    },
+    {
+      "kind": "warning",
+      "msg": "excess elements in scalar initializer"
+    },
+    {
+      "kind": "error",
+      "msg": "expected expression"
+    },
+    {
+      "kind": "warning",
+      "msg": "type inference of a declaration other than a plain identifier with optional trailing attributes is a Clang extension"
+    },
+    {
+      "kind": "error",
+      "msg": "variable 'ptr2' with type 'auto *' has incompatible initializer of type 'int'"
+    },
+    {
+      "kind": "warning",
+      "msg": "type inference of a declaration other than a plain identifier with optional trailing attributes is a Clang extension"
+    },
+    {
+      "kind": "error",
+      "msg": "variable 'a' declared with deduced type 'auto' cannot appear in its own initializer"
+    },
+    {
+      "kind": "error",
+      "msg": "variable 'a' declared with deduced type 'auto' cannot appear in its own initializer"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression ('double' and 'int')"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C23/n3007.sft.c",
+  "remark": null,
+  "sha256": "8d36c86b0c425949b5e848c9b66b0532d65eefdcfa4943030e925cb54e74a123",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,38 @@
+{
+  "bytes": 520,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "previous definition"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of 'both3'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of 'a3'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/pragma-weak.sft.c",
+  "remark": null,
+  "sha256": "54d5337292070886bec49d94fe9e71afb99a0ee35bf9fbaadc5d02e62b7648b6",
+  "test_number_uses": 0,
+  "type": "fn"
+}

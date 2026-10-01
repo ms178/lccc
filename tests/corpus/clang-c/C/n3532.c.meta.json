@@ -1,0 +1,58 @@
+{
+  "bytes": 1563,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "incomplete definition of type 'struct Incomplete'"
+    },
+    {
+      "kind": "error",
+      "msg": "incomplete definition of type 'union AlsoIncomplete'"
+    },
+    {
+      "kind": "error",
+      "msg": "incomplete definition of type 'struct Incomplete'"
+    },
+    {
+      "kind": "error",
+      "msg": "incomplete definition of type 'union AlsoIncomplete'"
+    },
+    {
+      "kind": "error",
+      "msg": "no member named 'f' in 'struct S'"
+    },
+    {
+      "kind": "error",
+      "msg": "no member named 'f' in 'union U'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 16,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23",
+    " --c17",
+    " --c11",
+    " --c99",
+    " --c89"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C2y/n3532.sft.c",
+  "remark": null,
+  "sha256": "cf7e9610e868f1f3465070be3a59b75be3e7e84abc881b99128137fe439b5452",
+  "test_number_uses": 0,
+  "type": "fn"
+}

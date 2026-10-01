@@ -1,0 +1,21 @@
+{
+  "bytes": 613,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 10,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/varargs_unreachable.sft.c",
+  "remark": null,
+  "sha256": "8098190d5fc37a6d09308efd8b0ec30d3e84e886106b7ccb08dc7a66ba5ec10b",
+  "test_number_uses": 0,
+  "type": "fp"
+}

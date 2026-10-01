@@ -1,0 +1,30 @@
+{
+  "bytes": 521,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "incompatible redeclaration of library function 'calloc'"
+    },
+    {
+      "kind": "note",
+      "msg": "'calloc' is a builtin with type 'void *"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/implicit-builtin-redecl.sft.c",
+  "remark": null,
+  "sha256": "a593ea9af669dd82c4bb946d07a5a0e8841a31cdacb5cd2e39743febf799785e",
+  "test_number_uses": 0,
+  "type": "fp"
+}

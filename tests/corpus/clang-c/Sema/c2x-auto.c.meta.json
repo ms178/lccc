@@ -1,0 +1,111 @@
+{
+  "bytes": 5428,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "declaration of variable 'undefined' with deduced type 'auto' requires an initializer"
+    },
+    {
+      "kind": "error",
+      "msg": "'auto' cannot be signed or unsigned"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Complex auto' is invalid"
+    },
+    {
+      "kind": "warning",
+      "msg": "use of GNU statement expression extension"
+    },
+    {
+      "kind": "error",
+      "msg": "expected expression"
+    },
+    {
+      "kind": "error",
+      "msg": "expected expression"
+    },
+    {
+      "kind": "error",
+      "msg": "expected expression"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use 'auto' with array in C"
+    },
+    {
+      "kind": "error",
+      "msg": "expected expression"
+    },
+    {
+      "kind": "warning",
+      "msg": "initializing 'int *' with an expression of type 'const int *' discards qualifiers"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer types initializing 'int *' with an expression of type 'unsigned long *'"
+    },
+    {
+      "kind": "warning",
+      "msg": "type inference of a declaration other than a plain identifier with optional trailing attributes is a Clang extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "type inference of a declaration other than a plain identifier with optional trailing attributes is a Clang extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "type inference of a declaration other than a plain identifier with optional trailing attributes is a Clang extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "type inference of a declaration other than a plain identifier with optional trailing attributes is a Clang extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "type inference of a declaration other than a plain identifier with optional trailing attributes is a Clang extension"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer to integer conversion assigning to 'int' from 'int *'; remove &"
+    },
+    {
+      "kind": "warning",
+      "msg": "use of GNU statement expression extension"
+    },
+    {
+      "kind": "error",
+      "msg": "variable 'a' declared with deduced type 'auto' cannot appear in its own initializer"
+    },
+    {
+      "kind": "error",
+      "msg": "variable 'a' declared with deduced type 'auto' cannot appear in its own initializer"
+    },
+    {
+      "kind": "error",
+      "msg": "'auto' not allowed in function prototype"
+    },
+    {
+      "kind": "error",
+      "msg": "'auto' not allowed in function return type"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23",
+    " --c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/c2x-auto.sft.c",
+  "remark": null,
+  "sha256": "e450ba23502192d7065793602581b5669bb9ad64b7e9e3ba795f5aed793a0134",
+  "test_number_uses": 0,
+  "type": "fn"
+}

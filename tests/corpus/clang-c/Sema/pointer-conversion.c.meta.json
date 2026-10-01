@@ -1,0 +1,34 @@
+{
+  "bytes": 388,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "discards qualifiers in nested pointer types"
+    },
+    {
+      "kind": "warning",
+      "msg": "discards qualifiers in nested pointer types"
+    },
+    {
+      "kind": "warning",
+      "msg": "discards qualifiers in nested pointer types"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/pointer-conversion.sft.c",
+  "remark": null,
+  "sha256": "6ad173e0c875c72fcf88f31fc2ae5022ebbd8e2ed2d250a83f9de12d2e712b1b",
+  "test_number_uses": 0,
+  "type": "fp"
+}

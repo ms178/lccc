@@ -1,0 +1,21 @@
+{
+  "bytes": 2713,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 21,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-malloc.sft.c",
+  "remark": null,
+  "sha256": "70db44c391bf86ce18afdc44f4a2776c0659059f81a2559fb96eb6333b3e76be",
+  "test_number_uses": 0,
+  "type": "fp"
+}

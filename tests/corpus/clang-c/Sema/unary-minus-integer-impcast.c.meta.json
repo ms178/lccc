@@ -1,0 +1,42 @@
+{
+  "bytes": 889,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "higher order bits are zeroes after implicit conversion"
+    },
+    {
+      "kind": "warning",
+      "msg": "the resulting value is always non-negative after implicit conversion"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/unary-minus-integer-impcast.sft.c",
+  "remark": null,
+  "sha256": "b985123167e33eadab31e54b2a8539dcb3e2819c58c7a3646dc14631380b18aa",
+  "test_number_uses": 0,
+  "type": "fp"
+}

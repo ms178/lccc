@@ -1,0 +1,66 @@
+{
+  "bytes": 1565,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'weak_import' attribute cannot be specified on a definition"
+    },
+    {
+      "kind": "warning",
+      "msg": "'weak' attribute only applies to variables, functions, and classes"
+    },
+    {
+      "kind": "warning",
+      "msg": "'weak_import' attribute only applies to variables and functions"
+    },
+    {
+      "kind": "error",
+      "msg": "weak declaration cannot have internal linkage"
+    },
+    {
+      "kind": "error",
+      "msg": "weak declaration cannot have internal linkage"
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "'C' cannot be declared 'weak_import'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "'C2' cannot be declared 'weak_import'"
+    },
+    {
+      "kind": "error",
+      "msg": "weak declaration cannot have internal linkage"
+    },
+    {
+      "kind": "error",
+      "msg": "weak declaration cannot have internal linkage"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-weak.sft.c",
+  "remark": null,
+  "sha256": "b6f67f8441732a746398ffc63218fbae7bc66bcd94d003fad0cfb600da2cb483",
+  "test_number_uses": 0,
+  "type": "fn"
+}

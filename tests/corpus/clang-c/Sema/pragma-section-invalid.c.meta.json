@@ -1,0 +1,21 @@
+{
+  "bytes": 384,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--ms_extensions --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/pragma-section-invalid.sft.c",
+  "remark": null,
+  "sha256": "30a3d8c19bfe8856e48e304512168883d161b3c1b0a60ef782af5ff613eb6b41",
+  "test_number_uses": 0,
+  "type": "fn"
+}

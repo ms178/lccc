@@ -1,0 +1,62 @@
+{
+  "bytes": 1867,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from 'int' to 'u8' (aka 'unsigned char') changes value from 65535 to 255"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from 'int' to 'u8' (aka 'unsigned char') changes value from 65535 to 255"
+    },
+    {
+      "kind": "warning",
+      "msg": "shift count >= width of type"
+    },
+    {
+      "kind": "warning",
+      "msg": "shift count >= width of type"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from 'int' to 'u8' (aka 'unsigned char') changes value from 65535 to 255"
+    },
+    {
+      "kind": "warning",
+      "msg": "left operand of comma operator has no effect"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from 'int' to 'u8' (aka 'unsigned char') changes value from 65535 to 255"
+    },
+    {
+      "kind": "warning",
+      "msg": "shift count >= width of type"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from 'int' to 'u8' (aka 'unsigned char') changes value from 65535 to 255"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from 'int' to 'u8' (aka 'unsigned char') changes value from 65535 to 255"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-unreachable-file-scope.sft.c",
+  "remark": null,
+  "sha256": "d0ca2c3041224e0456aec223caad0bff0188d91543c3a21d99b04b22aef7c1b1",
+  "test_number_uses": 0,
+  "type": "fp"
+}

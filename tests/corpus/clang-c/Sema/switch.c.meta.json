@@ -1,0 +1,290 @@
+{
+  "bytes": 9799,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "statement not in switch"
+    },
+    {
+      "kind": "note",
+      "msg": "previous case"
+    },
+    {
+      "kind": "warning",
+      "msg": "overflow"
+    },
+    {
+      "kind": "error",
+      "msg": "duplicate case value '42'"
+    },
+    {
+      "kind": "warning",
+      "msg": "empty case range"
+    },
+    {
+      "kind": "note",
+      "msg": "previous case"
+    },
+    {
+      "kind": "error",
+      "msg": "duplicate case value"
+    },
+    {
+      "kind": "note",
+      "msg": "previous case"
+    },
+    {
+      "kind": "error",
+      "msg": "duplicate case value"
+    },
+    {
+      "kind": "warning",
+      "msg": "no case matching constant switch condition '0'"
+    },
+    {
+      "kind": "warning",
+      "msg": "switch statement has empty body"
+    },
+    {
+      "kind": "note",
+      "msg": "put the semicolon on a separate line to silence this warning"
+    },
+    {
+      "kind": "error",
+      "msg": "expression is not an integer constant expression"
+    },
+    {
+      "kind": "error",
+      "msg": "expression is not an integer constant expression"
+    },
+    {
+      "kind": "error",
+      "msg": "expression is not an integer constant expression"
+    },
+    {
+      "kind": "error",
+      "msg": "expression is not an integer constant expression"
+    },
+    {
+      "kind": "note",
+      "msg": "previous case defined here"
+    },
+    {
+      "kind": "error",
+      "msg": "multiple default labels in one switch"
+    },
+    {
+      "kind": "warning",
+      "msg": "overflow converting case value"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'va'"
+    },
+    {
+      "kind": "warning",
+      "msg": "enumeration value 'B' not handled in switch"
+    },
+    {
+      "kind": "warning",
+      "msg": "case value not in enumerated type 'enum (unnamed"
+    },
+    {
+      "kind": "warning",
+      "msg": "case value not in enumerated type 'enum (unnamed"
+    },
+    {
+      "kind": "warning",
+      "msg": "case value not in enumerated type 'enum (unnamed"
+    },
+    {
+      "kind": "warning",
+      "msg": "case value not in enumerated type 'enum (unnamed"
+    },
+    {
+      "kind": "warning",
+      "msg": "case value not in enumerated type 'enum (unnamed"
+    },
+    {
+      "kind": "warning",
+      "msg": "case value not in enumerated type 'enum (unnamed"
+    },
+    {
+      "kind": "warning",
+      "msg": "case value not in enumerated type 'enum (unnamed"
+    },
+    {
+      "kind": "warning",
+      "msg": "enumeration value 'B' not handled in switch"
+    },
+    {
+      "kind": "warning",
+      "msg": "case value not in enumerated type 'enum (unnamed"
+    },
+    {
+      "kind": "warning",
+      "msg": "case value not in enumerated type 'enum (unnamed"
+    },
+    {
+      "kind": "warning",
+      "msg": "case value not in enumerated type 'enum (unnamed"
+    },
+    {
+      "kind": "warning",
+      "msg": "case value not in enumerated type 'enum (unnamed"
+    },
+    {
+      "kind": "warning",
+      "msg": "case value not in enumerated type 'enum (unnamed"
+    },
+    {
+      "kind": "warning",
+      "msg": "case value not in enumerated type 'enum (unnamed"
+    },
+    {
+      "kind": "warning",
+      "msg": "case value not in enumerated type 'enum (unnamed"
+    },
+    {
+      "kind": "warning",
+      "msg": "case value not in enumerated type 'enum (unnamed"
+    },
+    {
+      "kind": "warning",
+      "msg": "case value not in enumerated type 'enum (unnamed"
+    },
+    {
+      "kind": "warning",
+      "msg": "enumeration value 'A' not handled in switch"
+    },
+    {
+      "kind": "warning",
+      "msg": "enumeration value 'A' not explicitly handled in switch"
+    },
+    {
+      "kind": "warning",
+      "msg": "enumeration value 'val3' not handled in switch"
+    },
+    {
+      "kind": "warning",
+      "msg": "no case matching constant switch condition '1'"
+    },
+    {
+      "kind": "warning",
+      "msg": "no case matching constant switch condition '53'"
+    },
+    {
+      "kind": "warning",
+      "msg": "switch condition has boolean value"
+    },
+    {
+      "kind": "warning",
+      "msg": "case value not in enumerated type"
+    },
+    {
+      "kind": "warning",
+      "msg": "default label in switch which covers all enumeration values"
+    },
+    {
+      "kind": "warning",
+      "msg": "case value not in enumerated type 'Ints'"
+    },
+    {
+      "kind": "warning",
+      "msg": "default label in switch which covers all enumeration values"
+    },
+    {
+      "kind": "note",
+      "msg": "previous case"
+    },
+    {
+      "kind": "error",
+      "msg": "duplicate case value '5'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous case"
+    },
+    {
+      "kind": "error",
+      "msg": "duplicate case value: '7' and 'kTest19Enum1' both equal '7'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous case"
+    },
+    {
+      "kind": "error",
+      "msg": "duplicate case value 'kTest19Enum1'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous case"
+    },
+    {
+      "kind": "error",
+      "msg": "duplicate case value: 'kTest19Enum1' and 'kTest19Enum2' both equal '7'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous case"
+    },
+    {
+      "kind": "error",
+      "msg": "duplicate case value 'kTest19Enum2'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous case"
+    },
+    {
+      "kind": "error",
+      "msg": "duplicate case value: '3' and 'a' both equal '3'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous case"
+    },
+    {
+      "kind": "error",
+      "msg": "duplicate case value 'a'"
+    },
+    {
+      "kind": "warning",
+      "msg": "case value not in enumerated type 'enum ExtendedEnum1'"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "overflow"
+    },
+    {
+      "kind": "warning",
+      "msg": "overflow"
+    },
+    {
+      "kind": "warning",
+      "msg": "overflow"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/switch.sft.c",
+  "remark": null,
+  "sha256": "0d2c38423c6803e40f930908a1f9fd6a92ab675c4567b8c48c501d5932c7420f",
+  "test_number_uses": 0,
+  "type": "fn"
+}

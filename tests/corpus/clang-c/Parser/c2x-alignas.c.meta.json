@@ -1,0 +1,62 @@
+{
+  "bytes": 1585,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'_Alignas' attribute ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "'alignas' attribute ignored"
+    },
+    {
+      "kind": "error",
+      "msg": "an attribute list cannot appear here"
+    },
+    {
+      "kind": "error",
+      "msg": "an attribute list cannot appear here"
+    },
+    {
+      "kind": "error",
+      "msg": "an attribute list cannot appear here"
+    },
+    {
+      "kind": "error",
+      "msg": "an attribute list cannot appear here"
+    },
+    {
+      "kind": "error",
+      "msg": "an attribute list cannot appear here"
+    },
+    {
+      "kind": "error",
+      "msg": "an attribute list cannot appear here"
+    },
+    {
+      "kind": "error",
+      "msg": "an attribute list cannot appear here"
+    },
+    {
+      "kind": "error",
+      "msg": "an attribute list cannot appear here"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/c2x-alignas.sft.c",
+  "remark": null,
+  "sha256": "b2ebc6ea7342a05333554649e0c745091c1ce197e8467955c05c0430a27ee156",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,42 @@
+{
+  "bytes": 551,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "a function definition without a prototype is deprecated in all versions of C and is not supported in C23"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of parameter"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of parameter"
+    },
+    {
+      "kind": "warning",
+      "msg": "too many arguments"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c99"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/arg-duplicate.sft.c",
+  "remark": null,
+  "sha256": "402270ee01d7ee1a9d256e293a73f9c2a260b189a7714a0a5b1bbb7d54a784f8",
+  "test_number_uses": 0,
+  "type": "fn"
+}

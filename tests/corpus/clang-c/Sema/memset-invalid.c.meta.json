@@ -1,0 +1,26 @@
+{
+  "bytes": 259,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "incompatible redeclaration of library function 'memset'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/memset-invalid.sft.c",
+  "remark": null,
+  "sha256": "6dd6c61429850581c2a2f5c47f4fb670f5cff7d4eb512b3e78deb4cef6d8f552",
+  "test_number_uses": 0,
+  "type": "fp"
+}

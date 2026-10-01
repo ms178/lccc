@@ -1,0 +1,75 @@
+{
+  "bytes": 1465,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "previous"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ';'"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Noreturn' keyword must precede function declarator"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Noreturn' can only appear on functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Noreturn' can only appear on functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Noreturn' can only appear on functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Noreturn' can only appear on functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Noreturn' can only appear on functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Noreturn' can only appear on functions"
+    },
+    {
+      "kind": "error",
+      "msg": "type name does not allow function specifier to be specified"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Noreturn' can only appear on functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Noreturn' can only appear on functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Noreturn' can only appear on functions"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c11",
+    " --c99"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/c11-noreturn.sft.c",
+  "remark": null,
+  "sha256": "dba1ce34edf2f9676d301493914bc441abe2baa4a3bef5e902369a2fad0ad3f6",
+  "test_number_uses": 0,
+  "type": "fn"
+}

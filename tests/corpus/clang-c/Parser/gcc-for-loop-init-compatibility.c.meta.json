@@ -1,0 +1,28 @@
+{
+  "bytes": 456,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 10,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c89",
+    " --c89 --strict_gnu",
+    " --c99 -DC99"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/gcc-for-loop-init-compatibility.sft.c",
+  "remark": null,
+  "sha256": "24bc49eb33b41468fe706a3ee0642167502ee29c848cd1eece61a0bae1f52b7b",
+  "test_number_uses": 0,
+  "type": "fp"
+}

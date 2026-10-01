@@ -1,0 +1,24 @@
+{
+  "bytes": 7193,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 9,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23",
+    " --c23",
+    " --c23",
+    " --c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/implicit-void-ptr-cast.sft.c",
+  "remark": null,
+  "sha256": "541eff51597ac63cfbe6884ca2b85966e3d897d3b63113354a4339ac1a7b9970",
+  "test_number_uses": 0,
+  "type": "fp"
+}

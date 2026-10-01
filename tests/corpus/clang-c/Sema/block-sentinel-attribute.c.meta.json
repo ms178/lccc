@@ -1,0 +1,54 @@
+{
+  "bytes": 1541,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'sentinel' attribute only supported for variadic blocks"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sentinel' attribute only supported for variadic blocks"
+    },
+    {
+      "kind": "note",
+      "msg": "block has been explicitly marked sentinel here"
+    },
+    {
+      "kind": "note",
+      "msg": "block has been explicitly marked sentinel here"
+    },
+    {
+      "kind": "note",
+      "msg": "block has been explicitly marked sentinel here"
+    },
+    {
+      "kind": "warning",
+      "msg": "missing sentinel in block call"
+    },
+    {
+      "kind": "warning",
+      "msg": "missing sentinel in block call"
+    },
+    {
+      "kind": "warning",
+      "msg": "missing sentinel in block call"
+    }
+  ],
+  "has_main": true,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/block-sentinel-attribute.sft.c",
+  "remark": null,
+  "sha256": "96b8414c4f24ec47a4ef6ccacb7148eb4eeb659006a19e1c962a5183a5958abc",
+  "test_number_uses": 0,
+  "type": "fp"
+}

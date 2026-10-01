@@ -1,0 +1,26 @@
+{
+  "bytes": 298,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "pasting formed '/*', an invalid preprocessing token"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/macro_paste_c_block_comment.sft.c",
+  "remark": null,
+  "sha256": "7ce2dd222185522acdbbfc7bf67a7e9296a76f9f3d1356b10ede6058b1bdae27",
+  "test_number_uses": 0,
+  "type": "fn"
+}

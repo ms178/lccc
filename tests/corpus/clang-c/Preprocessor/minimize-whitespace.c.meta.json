@@ -1,0 +1,21 @@
+{
+  "bytes": 2509,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 16,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w -w -w -w -w -w -w -w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/minimize-whitespace.sft.c",
+  "remark": null,
+  "sha256": "435cfab675af95a8bdabecd45a89d9bfd44976287394a572803ef9a02f0e1f64",
+  "test_number_uses": 0,
+  "type": "fp"
+}

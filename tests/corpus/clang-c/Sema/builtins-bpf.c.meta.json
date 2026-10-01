@@ -1,0 +1,54 @@
+{
+  "bytes": 2907,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "__builtin_preserve_field_info argument 1 not a field access"
+    },
+    {
+      "kind": "error",
+      "msg": "__builtin_preserve_field_info argument 1 not a field access"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible integer to pointer conversion returning 'unsigned int' from a function with result type 'void *'"
+    },
+    {
+      "kind": "error",
+      "msg": "__builtin_preserve_field_info argument 2 not a constant"
+    },
+    {
+      "kind": "error",
+      "msg": "__builtin_preserve_field_info argument 2 not a constant"
+    },
+    {
+      "kind": "error",
+      "msg": "__builtin_preserve_enum_value argument 1 invalid"
+    },
+    {
+      "kind": "error",
+      "msg": "__builtin_preserve_enum_value argument 1 invalid"
+    },
+    {
+      "kind": "error",
+      "msg": "__builtin_preserve_type_info argument 1 invalid"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/builtins-bpf.sft.c",
+  "remark": null,
+  "sha256": "ae4fb8ab6408bdebe2286b2499fd289b63548aeecb9d8fb988074423401bf564",
+  "test_number_uses": 0,
+  "type": "fn"
+}

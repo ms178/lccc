@@ -1,0 +1,35 @@
+{
+  "bytes": 1003,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "variable length arrays are a C99 feature"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 19,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c89",
+    " --c89",
+    " --c89",
+    " --c89",
+    " --c89",
+    " --c99",
+    " --c99",
+    " --c99",
+    " --c89",
+    " --c99"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/vla-ext.sft.c",
+  "remark": null,
+  "sha256": "39f6fe467e5493cb895e5a2b21cfdd7a36e33ff6b13d6d79a3b29c4e95270789",
+  "test_number_uses": 0,
+  "type": "fp"
+}

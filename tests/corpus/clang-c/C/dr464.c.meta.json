@@ -1,0 +1,30 @@
+{
+  "bytes": 715,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "no-diagnostics",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 3,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c89",
+    " --c99",
+    " --c11",
+    " --c17",
+    " --c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/drs/dr464.sft.c",
+  "remark": null,
+  "sha256": "2ea3af662c0a54fe163c3a3a3ed2389c519d868f46a3e1baec680c9c72f7facb",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,21 @@
+{
+  "bytes": 9855,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 214,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/riscv-target-features-sifive.sft.c",
+  "remark": null,
+  "sha256": "479ff4c11f0c04381f91b4e64910cbf028fe1bd3a7cbea5917a1dd142eec557e",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,30 @@
+{
+  "bytes": 267,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "expected ';' after top level declarator"
+    },
+    {
+      "kind": "error",
+      "msg": "#endif without #if"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/diag-crash.sft.c",
+  "remark": null,
+  "sha256": "5401878f071fc420e2321ed13389aa1e5098bdcdfbee9b131493cb434b299659",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,98 @@
+{
+  "bytes": 2244,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "tentative definition of variable with internal linkage has incomplete non-array type 'struct a'"
+    },
+    {
+      "kind": "error",
+      "msg": "array has incomplete element type 'struct a'"
+    },
+    {
+      "kind": "error",
+      "msg": "tentative definition has type 'struct b' that is never completed"
+    },
+    {
+      "kind": "note",
+      "msg": "forward declaration of 'struct b'"
+    },
+    {
+      "kind": "warning",
+      "msg": "'extern' variable has an initializer"
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of 'i1'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "static declaration of 'i5' follows non-static declaration"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "non-static declaration of 'i2' follows static declaration"
+    },
+    {
+      "kind": "warning",
+      "msg": "use of __private_extern__ on a declaration may not produce external symbol private to the linkage unit and is deprecated"
+    },
+    {
+      "kind": "note",
+      "msg": "use __attribute__((visibility(\"hidden\"))) attribute instead"
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of 'redef'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "static declaration of 'i6' follows non-static declaration"
+    },
+    {
+      "kind": "warning",
+      "msg": "tentative definition of variable with internal linkage has incomplete array type 'int[]'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/tentative-decls.sft.c",
+  "remark": null,
+  "sha256": "a4698e468586906b8be74a96c398d18316cbd191d84b7da74d363381f5b30878",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -43,6 +43,23 @@ def gcc_include() -> str:
 
 INCLUDE = gcc_include()
 
+# ---------------------------------------------------------------------------
+# Fixed Callgrind/Cachegrind cache geometry — DO NOT autodiscover.
+#
+# Valgrind's cache simulation otherwise probes the host CPU, so the same
+# binary reports different I1/LL miss counts on every machine/restore.  We pin
+# a mainstream desktop geometry (32 KiB 8-way 64 B-line L1i/L1d, 32 MiB
+# 16-way LLC) so paired A/B ratios and absolute counts are comparable across
+# sessions and hosts.  Callgrind models I1, D1 and LL only (no L2) — that is a
+# tool limit, not an oversight.  Same doctrine as the EDG front end's
+# benchmark harness (edgcpp/compiler `dev_tools/bin/edg-bench`), which pins
+# this exact geometry for the same reason.  Overrides exist for deliberate
+# what-if runs but MUST be recorded in the artifact manifest if used.
+# ---------------------------------------------------------------------------
+CG_I1 = os.environ.get("LCCC_CG_I1", "32768,8,64")
+CG_D1 = os.environ.get("LCCC_CG_D1", "32768,8,64")
+CG_LL = os.environ.get("LCCC_CG_LL", "33554432,16,64")
+
 # Fast/medium corpus; heavy multi-second drivers are opt-in (they take
 # minutes each under ~30x Callgrind instrumentation).
 DEFAULT_FAST = [
@@ -74,6 +91,10 @@ def callgrind(binpath, outdir):
     p = subprocess.run(
         ["valgrind", "--tool=callgrind", "--cache-sim=yes",
          "--branch-sim=yes", "--quiet",
+         # FIXED cache geometry (see CG_* below): Valgrind otherwise
+         # autodiscovers the host caches and the simulated miss counts stop
+         # being comparable across hosts/restores.
+         f"--I1={CG_I1}", f"--D1={CG_D1}", f"--LL={CG_LL}",
          f"--callgrind-out-file={cg}", str(binpath)],
         capture_output=True, text=True, env=env, timeout=1200)
     if p.returncode != 0:

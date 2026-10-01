@@ -1,0 +1,35 @@
+{
+  "bytes": 2279,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'_Countof' is a C2y extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "'_Countof' is a C2y extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "'_Countof' is a C2y extension"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 3,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23",
+    " --c89"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C2y/n3369_1.sft.c",
+  "remark": null,
+  "sha256": "ddb9022b87d0de84a2b85daa3c8c884bfbd7a1fac58545618d1a1f58e3c86fdc",
+  "test_number_uses": 0,
+  "type": "fp"
+}

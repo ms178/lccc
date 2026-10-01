@@ -1,0 +1,106 @@
+{
+  "bytes": 4426,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "type specifier missing, defaults to 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "expected identifier"
+    },
+    {
+      "kind": "error",
+      "msg": "type specifier missing, defaults to 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "type specifier missing, defaults to 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "expected parameter declarator"
+    },
+    {
+      "kind": "error",
+      "msg": "expected identifier"
+    },
+    {
+      "kind": "error",
+      "msg": "type specifier missing, defaults to 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "expected parameter declarator"
+    },
+    {
+      "kind": "error",
+      "msg": "expected identifier"
+    },
+    {
+      "kind": "error",
+      "msg": "type specifier missing, defaults to 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "expected parameter declarator"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "GCC does not allow 'nonnull' attribute in this position on a function definition"
+    },
+    {
+      "kind": "warning",
+      "msg": "GCC does not allow 'noreturn' attribute in this position on a function definition"
+    },
+    {
+      "kind": "warning",
+      "msg": "GCC does not allow 'nonnull' attribute in this position on a function definition"
+    },
+    {
+      "kind": "warning",
+      "msg": "GCC does not allow 'pure' attribute in this position on a function definition"
+    },
+    {
+      "kind": "warning",
+      "msg": "GCC does not allow 'nonnull' attribute in this position on a function definition"
+    },
+    {
+      "kind": "warning",
+      "msg": "GCC does not allow 'pure' attribute in this position on a function definition"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ')'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c99"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/attributes.sft.c",
+  "remark": null,
+  "sha256": "a9608130fbf638eb61d551fd6070ea689b79d6e8c271d3cb729351ec040e36f0",
+  "test_number_uses": 0,
+  "type": "fn"
+}

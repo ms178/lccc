@@ -1,0 +1,94 @@
+{
+  "bytes": 4446,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'bork'"
+    },
+    {
+      "kind": "note",
+      "msg": "'size' declared here"
+    },
+    {
+      "kind": "error",
+      "msg": "'sized_by_or_null' field 'size' isn't within the same struct as the annotated pointer"
+    },
+    {
+      "kind": "note",
+      "msg": "'size' declared here"
+    },
+    {
+      "kind": "error",
+      "msg": "'sized_by_or_null' field 'size' isn't within the same struct as the annotated pointer"
+    },
+    {
+      "kind": "note",
+      "msg": "'size' declared here"
+    },
+    {
+      "kind": "error",
+      "msg": "'sized_by_or_null' field 'size' isn't within the same struct as the annotated pointer"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'size'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'size'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'size'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'blork'"
+    },
+    {
+      "kind": "note",
+      "msg": "'global' declared here"
+    },
+    {
+      "kind": "error",
+      "msg": "field 'global' in 'sized_by_or_null' not inside structure"
+    },
+    {
+      "kind": "error",
+      "msg": "'sized_by_or_null' requires a non-boolean integer type argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'sized_by_or_null' requires a non-boolean integer type argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'sized_by_or_null' only applies to pointers; did you mean to use 'counted_by'?"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'crount'"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 9,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-sized-by-or-null-last-field.sft.c",
+  "remark": null,
+  "sha256": "a9681317e2623679ee37fa60392aa0ab99a9e9f325e5ebafd9134ccc3c4c47fd",
+  "test_number_uses": 0,
+  "type": "fn"
+}

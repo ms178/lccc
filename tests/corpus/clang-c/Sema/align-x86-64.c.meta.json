@@ -1,0 +1,26 @@
+{
+  "bytes": 546,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "size of array element"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/align-x86-64.sft.c",
+  "remark": null,
+  "sha256": "e78eea0dae8280e869b7d530c5d55dfa22775373a9893551afdea1ad154acb3d",
+  "test_number_uses": 0,
+  "type": "fn"
+}

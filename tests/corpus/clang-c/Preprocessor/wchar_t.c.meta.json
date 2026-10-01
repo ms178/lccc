@@ -1,0 +1,21 @@
+{
+  "bytes": 8641,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 125,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w -w -w -w -w CHECK-ARM64-DARWIN -w -w -w -w -w -w -w -w -w -w -w -w -w -w -w -w -w -w -w -w CHECK-DARWIN CHECK-DARWIN CHECK-DARWIN CHECK-DARWIN CHECK-DARWIN CHECK-DARWIN CHECK-DARWIN CHECK-DARWIN CHECK-DARWIN CHECK-DARWIN CHECK-DARWIN -w CHECK-DARWIN -w CHECK-DARWIN -w CHECK-DARWIN -w CHECK-DARWIN -w -w -w -w -w -w -w -w --c --target linux_aarch64"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/wchar_t.sft.c",
+  "remark": null,
+  "sha256": "e00785fe2ec3ac9be82f88fded9ed15c85ed68dcec83b125c9f1476a98ab62d6",
+  "test_number_uses": 0,
+  "type": "fp"
+}

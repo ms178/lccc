@@ -1,0 +1,21 @@
+{
+  "bytes": 5032,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 46,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/nullptr.sft.c",
+  "remark": null,
+  "sha256": "06c62d6e848337b0a06b834bda75d7507404d072f46c7c5b23df32bac064092e",
+  "test_number_uses": 0,
+  "type": "fn"
+}

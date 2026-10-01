@@ -1,0 +1,21 @@
+{
+  "bytes": 491,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 10,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w -w -w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/macro_fn_varargs_named.sft.c",
+  "remark": null,
+  "sha256": "24db4a90985364870d2252635ac4d984cf4efba976050a64b6c1b144ca111eb9",
+  "test_number_uses": 0,
+  "type": "fp"
+}

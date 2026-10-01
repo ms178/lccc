@@ -1,0 +1,90 @@
+{
+  "bytes": 2429,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "logical expression with vector types 'half4' (vector of 4 '__fp16' values) and 'half4' is only supported in C++"
+    },
+    {
+      "kind": "error",
+      "msg": "logical expression with vector types 'half4' (vector of 4 '__fp16' values) and 'half4' is only supported in C++"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid conversion between"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid conversion between"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between vector"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between vector"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between vector"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between vector"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between vector"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid argument type"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot increment value of type"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot increment value of type"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/fp16vec-sema.sft.c",
+  "remark": null,
+  "sha256": "464700351657b369240c879176abf256a636b06c1751659cedf5dcc8a15d4e21",
+  "test_number_uses": 0,
+  "type": "fn"
+}

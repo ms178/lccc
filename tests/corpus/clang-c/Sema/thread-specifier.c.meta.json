@@ -1,0 +1,172 @@
+{
+  "bytes": 7774,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "' is only allowed on variable declarations"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "cannot combine with previous 'auto' declaration specifier"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Thread_local' variables must have global storage"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Thread_local' variables must have global storage"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "cannot combine with previous 'register' declaration specifier"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "error",
+      "msg": "non-thread-local declaration of 't15' follows thread-local declaration"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "thread-local declaration of 't16' follows non-thread-local declaration"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "thread-local declaration of 't17' with static initialization follows declaration with dynamic initialization"
+    },
+    {
+      "kind": "warning",
+      "msg": "'_Thread_local' is a C11 extension"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "'_Thread_local' is a C11 extension"
+    },
+    {
+      "kind": "error",
+      "msg": "thread-local declaration of 't18' with dynamic initialization follows declaration with static initialization"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "must be initialized by a constant expression"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 10,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DGNU -DGNU --c",
+    " --c++03 --c++",
+    " --c11 -DC11 -D__thread=_Thread_local -DC11 -D__thread=_Thread_local",
+    " --c++03 --c++ -DCXX11 -D__thread=thread_local",
+    " --c++11 --c++ -DC11 -D__thread=_Thread_local",
+    " --c++11 --c++",
+    " --c99 -D__thread=_Thread_local -DC99"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/thread-specifier.sft.c",
+  "remark": null,
+  "sha256": "d16881dbb3498cd8bc5daa44eb9616fa043410f17bd7707da91d303194e95b73",
+  "test_number_uses": 0,
+  "type": "fn"
+}

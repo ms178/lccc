@@ -1,0 +1,214 @@
+{
+  "bytes": 5322,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_int8m1_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_int8m1_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_int8m1_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_int8m1_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_int16m1_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_int16m1_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_int16m1_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_int16m1_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_int32m1_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_int32m1_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_int32m1_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_int32m1_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_int8m1x2_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_int8m1x2_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_int8m1x2_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_int8m1x2_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_int16m1x2_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_int16m1x2_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_int16m1x2_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_int16m1x2_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_int32m1x2_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_int32m1x2_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_int32m1x2_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_int32m1x2_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_bool1_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_bool1_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_bool1_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_bool1_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_bool2_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_bool2_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_bool2_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_bool2_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_bool4_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_bool4_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_bool4_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_bool4_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_bool8_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_bool8_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_bool8_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_bool8_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_bool16_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_bool16_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_bool16_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_bool16_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_bool32_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_bool32_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_bool32_t' requires the 'zve32x' extension"
+    },
+    {
+      "kind": "error",
+      "msg": "RISC-V type '__rvv_bool32_t' requires the 'zve32x' extension"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/riscv-vector-zve32x-check.sft.c",
+  "remark": null,
+  "sha256": "e9e0648d220551030d8ab32c93f1338cb5427aba2ff6090d488ce4cbe9651bcb",
+  "test_number_uses": 0,
+  "type": "fn"
+}

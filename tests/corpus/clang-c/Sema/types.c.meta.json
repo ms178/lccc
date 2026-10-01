@@ -1,0 +1,114 @@
+{
+  "bytes": 3916,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'restrict' qualifier on an array of pointers is a C23 extension"
+    },
+    {
+      "kind": "error",
+      "msg": "'long __int128' is invalid"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot combine with previous"
+    },
+    {
+      "kind": "note",
+      "msg": "here"
+    },
+    {
+      "kind": "error",
+      "msg": "different types ('int' vs '__int128_t' (aka '__int128'))"
+    },
+    {
+      "kind": "note",
+      "msg": "here"
+    },
+    {
+      "kind": "error",
+      "msg": "different types ('int' vs '__uint128_t' (aka 'unsigned __int128'))"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of 'j' with a different type: 'int[42]' vs 'int[4]'"
+    },
+    {
+      "kind": "error",
+      "msg": "GNU decimal type extension not supported"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid vector element type"
+    },
+    {
+      "kind": "warning",
+      "msg": "'aligned' attribute ignored when parsing type"
+    },
+    {
+      "kind": "error",
+      "msg": "vector size too large"
+    },
+    {
+      "kind": "error",
+      "msg": "vector size too large"
+    },
+    {
+      "kind": "error",
+      "msg": "zero vector size"
+    },
+    {
+      "kind": "error",
+      "msg": "vector size too large"
+    },
+    {
+      "kind": "error",
+      "msg": "vector size too large"
+    },
+    {
+      "kind": "error",
+      "msg": "zero vector size"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid vector element type"
+    },
+    {
+      "kind": "error",
+      "msg": "illegal vector component name 's'"
+    },
+    {
+      "kind": "error",
+      "msg": "expected identifier or '('"
+    },
+    {
+      "kind": "error",
+      "msg": "expected identifier or '('"
+    },
+    {
+      "kind": "error",
+      "msg": "block pointer to non-function type is invalid"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 9,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/types.sft.c",
+  "remark": null,
+  "sha256": "b7f89222b615cb9b284f2db86814cb21845526ca38cf7ceafb932c95eec8a1b5",
+  "test_number_uses": 0,
+  "type": "fn"
+}

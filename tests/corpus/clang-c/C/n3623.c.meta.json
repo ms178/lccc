@@ -1,0 +1,21 @@
+{
+  "bytes": 3069,
+  "cases": null,
+  "category": "C",
+  "expected": [],
+  "has_main": true,
+  "header_lines": 25,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DSTD1 -DSTD2 -DGNU1 -DGNU2 -DGNU3 -DGNU4 -DGNU5 -DGNU6 -DGNU7 -DDARWIN1 -w --ms_compatibility -DMS1 -w --ms_compatibility -DMS2 -DINVALID1 -DINVALID2 --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C2y/n3623.sft.c",
+  "remark": null,
+  "sha256": "974d74fdf5b6c9636cae162b3a32138d7931812b30a23af1f3c4f088e36492e0",
+  "test_number_uses": 0,
+  "type": "fp"
+}

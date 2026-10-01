@@ -1,0 +1,42 @@
+{
+  "bytes": 938,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call"
+    },
+    {
+      "kind": "error",
+      "msg": "expression is not a string literal"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible integer to pointer conversion"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to function call"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible integer to pointer conversion"
+    }
+  ],
+  "has_main": true,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c --target linux_aarch64"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/builtin-allow-runtime-check.sft.c",
+  "remark": null,
+  "sha256": "578f7995862d5e89fbb005d6f4a8fb8fae1afd6f23e5872d800d18a4776438e3",
+  "test_number_uses": 0,
+  "type": "fn"
+}

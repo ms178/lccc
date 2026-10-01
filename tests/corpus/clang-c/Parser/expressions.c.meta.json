@@ -1,0 +1,70 @@
+{
+  "bytes": 2016,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "indirection of non-volatile null pointer"
+    },
+    {
+      "kind": "note",
+      "msg": "consider using __builtin_trap"
+    },
+    {
+      "kind": "note",
+      "msg": "to match"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ')'"
+    },
+    {
+      "kind": "note",
+      "msg": "to match"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ')'"
+    },
+    {
+      "kind": "error",
+      "msg": "expected parentheses around type name in sizeof expression"
+    },
+    {
+      "kind": "error",
+      "msg": "expected parentheses around type name in sizeof expression"
+    },
+    {
+      "kind": "error",
+      "msg": "expected parentheses around type name in __alignof expression"
+    },
+    {
+      "kind": "error",
+      "msg": "expected parentheses around type name in _Alignof expression"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'foobar'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'fizbin'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/expressions.sft.c",
+  "remark": null,
+  "sha256": "ef64d28e359f2c84ee520958279214afa04a456713d3feb577757a46bb2b232f",
+  "test_number_uses": 0,
+  "type": "fn"
+}

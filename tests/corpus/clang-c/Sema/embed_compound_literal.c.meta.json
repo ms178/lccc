@@ -1,0 +1,21 @@
+{
+  "bytes": 311,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/embed_compound_literal.sft.c",
+  "remark": null,
+  "sha256": "83dc0d36956cc9b1e086ee820e2d8fcf0754cdcb5af1a0e6e079c0d7f703c44a",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,30 @@
+{
+  "bytes": 1268,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "returning 'v4f' (vector of 4 'float' values) from a function with incompatible result type 'v4b' (vector of 4 'bool' values"
+    },
+    {
+      "kind": "error",
+      "msg": "returning 'v8i' (vector of 8 'int' values) from a function with incompatible result type 'v4b' (vector of 4 'bool' values)"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/vector-bool-assign.sft.c",
+  "remark": null,
+  "sha256": "1e491070b38f4f10d97641954afe2b5be9e1b06e1eeb948d58f4b7b666748ea6",
+  "test_number_uses": 0,
+  "type": "fn"
+}

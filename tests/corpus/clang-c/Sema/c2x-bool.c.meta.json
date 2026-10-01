@@ -1,0 +1,27 @@
+{
+  "bytes": 1206,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "to null from a constant boolean expression"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23",
+    " --c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/c2x-bool.sft.c",
+  "remark": null,
+  "sha256": "f4cff32a9677d4bb80b11a1f1f896cbfaba254c02c2ccd59227b2d3f1b8451f9",
+  "test_number_uses": 0,
+  "type": "fp"
+}

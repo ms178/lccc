@@ -1,0 +1,66 @@
+{
+  "bytes": 1968,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'alloc_align' attribute only applies to return values that are pointers"
+    },
+    {
+      "kind": "warning",
+      "msg": "'alloc_align' attribute only applies to non-K&R-style functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'alloc_align' attribute parameter 1 is out of bounds"
+    },
+    {
+      "kind": "error",
+      "msg": "'alloc_align' attribute parameter 1 is out of bounds"
+    },
+    {
+      "kind": "error",
+      "msg": "'alloc_align' attribute argument may only refer to a function parameter of integer type"
+    },
+    {
+      "kind": "error",
+      "msg": "'alloc_align' attribute requires parameter 1 to be an integer constant"
+    },
+    {
+      "kind": "error",
+      "msg": "'alloc_align' attribute takes one argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'alloc_align' attribute takes one argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'alloc_align' attribute takes one argument"
+    },
+    {
+      "kind": "warning",
+      "msg": "requested alignment is not a power of 2"
+    },
+    {
+      "kind": "warning",
+      "msg": "requested alignment must be 4294967296 bytes or smaller; maximum alignment assumed"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/alloc-align-attr.sft.c",
+  "remark": null,
+  "sha256": "e3dc11e5d4846acc564bc62234bfae6dacd6bf237d026da4b093207507c4e530",
+  "test_number_uses": 0,
+  "type": "fn"
+}

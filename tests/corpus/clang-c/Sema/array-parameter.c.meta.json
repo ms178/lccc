@@ -1,0 +1,62 @@
+{
+  "bytes": 1377,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "previously declared as 'int[]' here"
+    },
+    {
+      "kind": "warning",
+      "msg": "argument 'a' of type 'int[2]' with mismatched bound"
+    },
+    {
+      "kind": "note",
+      "msg": "previously declared as 'int[3]' here"
+    },
+    {
+      "kind": "warning",
+      "msg": "argument 'a' of type 'int[2]' with mismatched bound"
+    },
+    {
+      "kind": "note",
+      "msg": "previously declared as 'int[*]' here"
+    },
+    {
+      "kind": "warning",
+      "msg": "argument 'a' of type 'int[n]' with mismatched bound"
+    },
+    {
+      "kind": "warning",
+      "msg": "argument 'a' of type 'int[]' with mismatched bound"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "argument 'a' of type 'int[2]' with mismatched bound"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 3,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/array-parameter.sft.c",
+  "remark": null,
+  "sha256": "c9ac12f07c5e7fdbd6c8600e5e37d7b3b4573b7594e7f9f951da355d03ab4f87",
+  "test_number_uses": 0,
+  "type": "fp"
+}

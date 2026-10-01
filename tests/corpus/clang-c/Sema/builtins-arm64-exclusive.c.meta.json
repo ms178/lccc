@@ -1,0 +1,98 @@
+{
+  "bytes": 4959,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "address argument to atomic builtin must be a pointer to"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to function call"
+    },
+    {
+      "kind": "warning",
+      "msg": "passing 'const char *' to parameter of type 'volatile char *' discards qualifiers"
+    },
+    {
+      "kind": "error",
+      "msg": "address argument to atomic builtin must be a pointer to"
+    },
+    {
+      "kind": "error",
+      "msg": "passing 'struct Simple' to parameter of incompatible type 'struct Simple *'"
+    },
+    {
+      "kind": "error",
+      "msg": "is not a structure or union"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to function call"
+    },
+    {
+      "kind": "error",
+      "msg": "address argument to atomic builtin must be a pointer to"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to function call"
+    },
+    {
+      "kind": "warning",
+      "msg": "passing 'const char *' to parameter of type 'volatile char *' discards qualifiers"
+    },
+    {
+      "kind": "error",
+      "msg": "address argument to atomic builtin must be a pointer to"
+    },
+    {
+      "kind": "error",
+      "msg": "passing 'struct Simple' to parameter of incompatible type 'struct Simple *'"
+    },
+    {
+      "kind": "error",
+      "msg": "is not a structure or union"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to function call"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to function call"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/builtins-arm64-exclusive.sft.c",
+  "remark": null,
+  "sha256": "c3c55f557427b0a50ed106f3df12fa421aad4d785aa237e89b1517238da35877",
+  "test_number_uses": 0,
+  "type": "fn"
+}

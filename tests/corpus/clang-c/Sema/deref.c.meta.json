@@ -1,0 +1,34 @@
+{
+  "bytes": 745,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "address of an expression of type 'void'"
+    },
+    {
+      "kind": "warning",
+      "msg": "ISO C does not allow indirection on operand of type 'void *'"
+    },
+    {
+      "kind": "warning",
+      "msg": "address of an expression of type 'void'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c90"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/deref.sft.c",
+  "remark": null,
+  "sha256": "e3d1c61682b4f14e16558c9b4d468f07a4ea3ff78fb97842479d580d75339125",
+  "test_number_uses": 0,
+  "type": "fp"
+}

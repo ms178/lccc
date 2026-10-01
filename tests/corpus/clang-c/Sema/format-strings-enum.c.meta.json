@@ -1,0 +1,56 @@
+{
+  "bytes": 2163,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'long long'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'unsigned int' but the argument has underlying type"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'unsigned int'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'unsigned int' but the argument has type 'enum forward_declared *"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'char *' but the argument has type 'enum forward_declared *"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'unsigned long *' but the argument has type 'enum forward_declared *"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'void **' but the argument has type 'enum forward_declared *"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 14,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c",
+    " --c++11 --c++",
+    " --c++11 --c++"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/format-strings-enum.sft.c",
+  "remark": null,
+  "sha256": "e8ae438fb0433df5a9d31fdb40138200afbf9eae57a8208d44fb195c01272652",
+  "test_number_uses": 0,
+  "type": "fp"
+}

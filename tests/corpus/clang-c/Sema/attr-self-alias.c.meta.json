@@ -1,0 +1,26 @@
+{
+  "bytes": 223,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "alias definition is part of a cycle"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-self-alias.sft.c",
+  "remark": null,
+  "sha256": "d9db61cf153a50315278eb2c612acd5206c2f1e892af5eb434ba9ae67e7d94db",
+  "test_number_uses": 0,
+  "type": "fn"
+}

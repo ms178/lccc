@@ -1,0 +1,21 @@
+{
+  "bytes": 2265,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-availability-visionos.sft.c",
+  "remark": null,
+  "sha256": "c138fa68521a948cbe3798e608b44effe22f58bb0783eeb6a0a3d3c9a67e1d65",
+  "test_number_uses": 0,
+  "type": "fp"
+}

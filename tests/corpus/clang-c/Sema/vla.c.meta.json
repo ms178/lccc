@@ -1,0 +1,162 @@
+{
+  "bytes": 4970,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "not a compile-time constant"
+    },
+    {
+      "kind": "error",
+      "msg": "fields must have a constant size"
+    },
+    {
+      "kind": "error",
+      "msg": "variable length array declaration cannot have 'extern' linkage"
+    },
+    {
+      "kind": "error",
+      "msg": "variably modified type declaration not allowed at file scope"
+    },
+    {
+      "kind": "error",
+      "msg": "variable length array declaration not allowed at file scope"
+    },
+    {
+      "kind": "error",
+      "msg": "variably modified type declaration not allowed at file scope"
+    },
+    {
+      "kind": "error",
+      "msg": "variable length array declaration cannot have 'static' storage duration"
+    },
+    {
+      "kind": "error",
+      "msg": "variable length array declaration cannot have 'extern' linkage"
+    },
+    {
+      "kind": "error",
+      "msg": "variably modified type declaration cannot have 'extern' linkage"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable length array folded to constant array as an extension"
+    },
+    {
+      "kind": "error",
+      "msg": "star modifier used outside of function prototype"
+    },
+    {
+      "kind": "error",
+      "msg": "variably modified type"
+    },
+    {
+      "kind": "error",
+      "msg": "variably modified type"
+    },
+    {
+      "kind": "error",
+      "msg": "variable-sized object may not be initialized"
+    },
+    {
+      "kind": "error",
+      "msg": "variable length array must be bound in function definition"
+    },
+    {
+      "kind": "error",
+      "msg": "variable length array must be bound in function definition"
+    },
+    {
+      "kind": "warning",
+      "msg": "use of GNU statement expression extension"
+    },
+    {
+      "kind": "error",
+      "msg": "variable length array in struct"
+    },
+    {
+      "kind": "error",
+      "msg": "call to undeclared function 'implicitly_declared'; ISO C99 and later do not support implicit function declarations"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer types"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer types"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot jump"
+    },
+    {
+      "kind": "note",
+      "msg": "bypasses initialization of variable length array"
+    },
+    {
+      "kind": "warning",
+      "msg": "folded to constant array as an extension"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot jump from this goto statement to its label"
+    },
+    {
+      "kind": "note",
+      "msg": "variable length array"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable length array folded to constant array as an extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable length array folded to constant array as an extension"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot jump from this goto statement to its label"
+    },
+    {
+      "kind": "note",
+      "msg": "variable length array"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable length array folded to constant array as an extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable length array folded to constant array as an extension"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/vla.sft.c",
+  "remark": null,
+  "sha256": "22da6feb1ab41d12c0d8885ac0b432772a8c8d441eda465dfdd6757a68892fd2",
+  "test_number_uses": 0,
+  "type": "fn"
+}

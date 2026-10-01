@@ -1,0 +1,21 @@
+{
+  "bytes": 2704,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 11,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/format-strings-size_t.sft.c",
+  "remark": null,
+  "sha256": "026a5780ce00ef92ffacaae6a0d6b299d31bf6959fc50562c0ca39c3371665f4",
+  "test_number_uses": 0,
+  "type": "fp"
+}

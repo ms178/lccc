@@ -1,0 +1,30 @@
+{
+  "bytes": 1097,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "#pragma options align=reset failed: stack empty"
+    },
+    {
+      "kind": "warning",
+      "msg": "#pragma pack(pop, ...) failed: stack empty"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/pragma-pack-and-options-align.sft.c",
+  "remark": null,
+  "sha256": "0d866c9180ed92694fca40656fbd9447b12fc7519a7384c6c61fe121812de4a8",
+  "test_number_uses": 0,
+  "type": "fp"
+}

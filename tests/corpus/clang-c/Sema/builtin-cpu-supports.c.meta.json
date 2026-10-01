@@ -1,0 +1,82 @@
+{
+  "bytes": 2469,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "invalid cpu feature string"
+    },
+    {
+      "kind": "error",
+      "msg": "expression is not a string literal"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid cpu name for builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid cpu name for builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid cpu name for builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid cpu name for builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid cpu name for builtin"
+    },
+    {
+      "kind": "warning",
+      "msg": "invalid cpu feature string for builtin"
+    },
+    {
+      "kind": "warning",
+      "msg": "invalid cpu feature string for builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "builtin is not supported on this target"
+    },
+    {
+      "kind": "error",
+      "msg": "builtin is not supported on this target"
+    },
+    {
+      "kind": "warning",
+      "msg": "invalid cpu feature string for builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid cpu name for builtin"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid cpu name for builtin"
+    },
+    {
+      "kind": "warning",
+      "msg": "invalid cpu feature string for builtin"
+    }
+  ],
+  "has_main": true,
+  "header_lines": 10,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c --target linux_aarch64"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/builtin-cpu-supports.sft.c",
+  "remark": null,
+  "sha256": "a3619e4f4471f5af1d855d81c734f8970125b2e4148cc34b24c209b750e9a6c4",
+  "test_number_uses": 0,
+  "type": "fn"
+}

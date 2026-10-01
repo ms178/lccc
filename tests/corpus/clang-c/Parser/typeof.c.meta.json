@@ -1,0 +1,46 @@
+{
+  "bytes": 995,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "cannot combine with previous 'int' declaration specifier"
+    },
+    {
+      "kind": "error",
+      "msg": "'short typeof' is invalid"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot combine with previous 'int' declaration specifier"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ';' at end of declaration"
+    },
+    {
+      "kind": "error",
+      "msg": "array has incomplete element type 'void'"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ')'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/typeof.sft.c",
+  "remark": null,
+  "sha256": "061467d619a91ffa161f03341ac9282874b6746fed351ec8fa069c3e5cf38e5b",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,30 @@
+{
+  "bytes": 341,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'noduplicate' attribute only applies to functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'noduplicate' attribute takes no arguments"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-noduplicate.sft.c",
+  "remark": null,
+  "sha256": "fc85f907dc48509b21cc64e9def167479e512fe3687ce5f0bbb008f31130833f",
+  "test_number_uses": 0,
+  "type": "fn"
+}

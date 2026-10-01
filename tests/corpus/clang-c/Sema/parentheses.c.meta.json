@@ -1,0 +1,142 @@
+{
+  "bytes": 7317,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "assignment as a condition"
+    },
+    {
+      "kind": "note",
+      "msg": "place parentheses around the assignment to silence this warning"
+    },
+    {
+      "kind": "note",
+      "msg": "use '==' to turn this assignment into an equality comparison"
+    },
+    {
+      "kind": "warning",
+      "msg": "& has lower precedence than =="
+    },
+    {
+      "kind": "note",
+      "msg": "place parentheses around the '==' expression to silence this warning"
+    },
+    {
+      "kind": "note",
+      "msg": "place parentheses around the & expression to evaluate it first"
+    },
+    {
+      "kind": "warning",
+      "msg": "& has lower precedence than =="
+    },
+    {
+      "kind": "note",
+      "msg": "place parentheses around the '==' expression to silence this warning"
+    },
+    {
+      "kind": "note",
+      "msg": "place parentheses around the & expression to evaluate it first"
+    },
+    {
+      "kind": "warning",
+      "msg": "& has lower precedence than <"
+    },
+    {
+      "kind": "note",
+      "msg": "place parentheses around the '<' expression to silence this warning"
+    },
+    {
+      "kind": "note",
+      "msg": "place parentheses around the & expression to evaluate it first"
+    },
+    {
+      "kind": "warning",
+      "msg": "operator '?:' has lower precedence than '+'"
+    },
+    {
+      "kind": "note",
+      "msg": "place parentheses around the '+' expression to silence this warning"
+    },
+    {
+      "kind": "note",
+      "msg": "place parentheses around the '?:' expression to evaluate it first"
+    },
+    {
+      "kind": "warning",
+      "msg": "operator '?:' has lower precedence than '-'"
+    },
+    {
+      "kind": "note",
+      "msg": "place parentheses around the '-' expression to silence this warning"
+    },
+    {
+      "kind": "note",
+      "msg": "place parentheses around the '?:' expression to evaluate it first"
+    },
+    {
+      "kind": "warning",
+      "msg": "operator '?:' has lower precedence than '*'"
+    },
+    {
+      "kind": "note",
+      "msg": "place parentheses around the '*' expression to silence this warning"
+    },
+    {
+      "kind": "note",
+      "msg": "place parentheses around the '?:' expression to evaluate it first"
+    },
+    {
+      "kind": "warning",
+      "msg": "operator '?:' has lower precedence than '/'"
+    },
+    {
+      "kind": "note",
+      "msg": "place parentheses around the '/' expression to silence this warning"
+    },
+    {
+      "kind": "note",
+      "msg": "place parentheses around the '?:' expression to evaluate it first"
+    },
+    {
+      "kind": "warning",
+      "msg": "operator '?:' has lower precedence than '+'"
+    },
+    {
+      "kind": "warning",
+      "msg": "operator '?:' has lower precedence than '+'"
+    },
+    {
+      "kind": "warning",
+      "msg": "operator '?:' has lower precedence than '+'"
+    },
+    {
+      "kind": "warning",
+      "msg": "operator '?:' has lower precedence than '|'"
+    },
+    {
+      "kind": "warning",
+      "msg": "operator '?:' has lower precedence than '|'"
+    },
+    {
+      "kind": "warning",
+      "msg": "operator '?:' has lower precedence than '&'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/parentheses.sft.c",
+  "remark": null,
+  "sha256": "99f470341877d8e7a9a99b7a8ed636801095a233145a9a05e42a5465333910e3",
+  "test_number_uses": 0,
+  "type": "fp"
+}

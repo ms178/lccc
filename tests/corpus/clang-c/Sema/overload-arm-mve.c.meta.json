@@ -1,0 +1,54 @@
+{
+  "bytes": 5779,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "candidate function"
+    },
+    {
+      "kind": "note",
+      "msg": "candidate function"
+    },
+    {
+      "kind": "note",
+      "msg": "candidate function"
+    },
+    {
+      "kind": "note",
+      "msg": "candidate function"
+    },
+    {
+      "kind": "error",
+      "msg": "no matching function for call to 'overload'"
+    },
+    {
+      "kind": "error",
+      "msg": "'__clang_arm_mve_strict_polymorphism' attribute can only be applied to an MVE/NEON vector type"
+    },
+    {
+      "kind": "error",
+      "msg": "'__clang_arm_mve_strict_polymorphism' attribute can only be applied to an MVE/NEON vector type"
+    },
+    {
+      "kind": "error",
+      "msg": "'__clang_arm_mve_strict_polymorphism' attribute can only be applied to an MVE/NEON vector type"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DERROR_CHECK --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/overload-arm-mve.sft.c",
+  "remark": null,
+  "sha256": "cd09d2e1b1703103835f14a5fd31a05e37a02b6ddbfdaf7e2c20522a5c6e7ee8",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,86 @@
+{
+  "bytes": 3493,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "address argument to load or store exclusive builtin must be a pointer to 1,2 or 4 byte type"
+    },
+    {
+      "kind": "error",
+      "msg": "address argument to load or store exclusive builtin must be a pointer to 1,2 or 4 byte type"
+    },
+    {
+      "kind": "error",
+      "msg": "eight-byte load and store exclusive builtins are not available on this architecture"
+    },
+    {
+      "kind": "error",
+      "msg": "eight-byte load and store exclusive builtins are not available on this architecture"
+    },
+    {
+      "kind": "error",
+      "msg": "eight-byte load and store exclusive builtins are not available on this architecture"
+    },
+    {
+      "kind": "error",
+      "msg": "eight-byte load and store exclusive builtins are not available on this architecture"
+    },
+    {
+      "kind": "error",
+      "msg": "eight-byte load and store exclusive builtins are not available on this architecture"
+    },
+    {
+      "kind": "error",
+      "msg": "eight-byte load and store exclusive builtins are not available on this architecture"
+    },
+    {
+      "kind": "error",
+      "msg": "eight-byte load and store exclusive builtins are not available on this architecture"
+    },
+    {
+      "kind": "error",
+      "msg": "eight-byte load and store exclusive builtins are not available on this architecture"
+    },
+    {
+      "kind": "error",
+      "msg": "eight-byte load and store exclusive builtins are not available on this architecture"
+    },
+    {
+      "kind": "error",
+      "msg": "eight-byte load and store exclusive builtins are not available on this architecture"
+    },
+    {
+      "kind": "error",
+      "msg": "eight-byte load and store exclusive builtins are not available on this architecture"
+    },
+    {
+      "kind": "error",
+      "msg": "eight-byte load and store exclusive builtins are not available on this architecture"
+    },
+    {
+      "kind": "error",
+      "msg": "eight-byte load and store exclusive builtins are not available on this architecture"
+    },
+    {
+      "kind": "error",
+      "msg": "eight-byte load and store exclusive builtins are not available on this architecture"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 11,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/builtins-arm-exclusive-124.sft.c",
+  "remark": null,
+  "sha256": "32d9399568285852f72bee8cb61723045c9a31fc5ada585788beafe24cc05357",
+  "test_number_uses": 0,
+  "type": "fn"
+}

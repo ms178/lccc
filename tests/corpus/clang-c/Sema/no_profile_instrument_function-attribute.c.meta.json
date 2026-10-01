@@ -1,0 +1,34 @@
+{
+  "bytes": 787,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'no_profile_instrument_function' attribute only applies to functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'no_profile_instrument_function' attribute takes no arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'no_profile_instrument_function' attribute cannot be applied to a statement"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 3,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/no_profile_instrument_function-attribute.sft.c",
+  "remark": null,
+  "sha256": "56d6f7df0508f4019e973791081d62a99edfd0790f916c37ddae9969896e1542",
+  "test_number_uses": 0,
+  "type": "fn"
+}

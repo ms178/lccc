@@ -1,0 +1,26 @@
+{
+  "bytes": 298,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'riscv_rvv_vector_bits' attribute is not supported on targets missing 'zve32x'; specify an appropriate -march= or -mcpu="
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/riscv-vector-types-support.sft.c",
+  "remark": null,
+  "sha256": "b27606e6d45d6efdb13779455841ad65f3c93de99b065e0fbba999e3ec7fb1c5",
+  "test_number_uses": 0,
+  "type": "fn"
+}

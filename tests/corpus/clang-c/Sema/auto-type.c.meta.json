@@ -1,0 +1,67 @@
+{
+  "bytes": 4639,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'__auto_type' is a GNU extension"
+    },
+    {
+      "kind": "error",
+      "msg": "variable 'e' declared with deduced type '__auto_type' cannot appear in its own initializer"
+    },
+    {
+      "kind": "error",
+      "msg": "'__auto_type' not allowed in struct member"
+    },
+    {
+      "kind": "error",
+      "msg": "'__auto_type' deduced as 'int' in declaration of 'f' and deduced as 'double' in declaration of 'g'"
+    },
+    {
+      "kind": "error",
+      "msg": "'__auto_type' not allowed in function return type"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot pass bit-field as __auto_type initializer in C"
+    },
+    {
+      "kind": "error",
+      "msg": "'__auto_type' not allowed in K&R-style function parameter"
+    },
+    {
+      "kind": "error",
+      "msg": "'__auto_type' not allowed here"
+    },
+    {
+      "kind": "error",
+      "msg": "type specifier missing, defaults to 'int'"
+    },
+    {
+      "kind": "note",
+      "msg": "compatible type 'typeof (i)' (aka 'int') specified here"
+    },
+    {
+      "kind": "error",
+      "msg": "type 'typeof (a)' (aka 'int') in generic association compatible with previously specified type 'typeof (i)' (aka 'int')"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c11",
+    " --c11"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/auto-type.sft.c",
+  "remark": null,
+  "sha256": "fe1075420f150f973f86c4a8eef323e52f3c70aa36d5f3d2188ab7f054c00af0",
+  "test_number_uses": 0,
+  "type": "fn"
+}

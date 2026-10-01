@@ -1,0 +1,392 @@
+{
+  "bytes": 13321,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "non-local variable with sizeless type 'svint8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "non-local variable with sizeless type 'svint8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "non-local variable with sizeless type 'svint8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "non-local variable with sizeless type 'svint8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of 'sizeof' to sizeless type 'svint8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of 'sizeof' to sizeless type 'svint8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of 'alignof' to sizeless type 'svint8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of 'alignof' to sizeless type 'svint8_t'"
+    },
+    {
+      "kind": "warning",
+      "msg": "GNU extension"
+    },
+    {
+      "kind": "note",
+      "msg": "passing argument to parameter here"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid vector element type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid vector element type"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "unused"
+    },
+    {
+      "kind": "error",
+      "msg": "array has sizeless element type"
+    },
+    {
+      "kind": "error",
+      "msg": "non-local variable with sizeless type 'svint8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "'aligned' attribute cannot be applied to sizeless type 'svint8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "'aligned' attribute cannot be applied to sizeless type 'svint8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Alignas' attribute cannot be applied to sizeless type 'svint8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of '_Alignas' to sizeless type 'svint8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "static assertion expression is not an integral constant expression"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression result unused"
+    },
+    {
+      "kind": "warning",
+      "msg": "left operand of comma operator has no effect"
+    },
+    {
+      "kind": "warning",
+      "msg": "left operand of comma operator has no effect"
+    },
+    {
+      "kind": "error",
+      "msg": "expected expression"
+    },
+    {
+      "kind": "warning",
+      "msg": "excess elements in initializer for indivisible sizeless type 'svint8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible type 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible type 'svint16_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "initialization of non-aggregate type 'svint8_t' (aka '__SVInt8_t') with a designated initializer list"
+    },
+    {
+      "kind": "warning",
+      "msg": "too many braces around initializer"
+    },
+    {
+      "kind": "warning",
+      "msg": "too many braces around initializer"
+    },
+    {
+      "kind": "note",
+      "msg": "declared const here"
+    },
+    {
+      "kind": "warning",
+      "msg": "default initialization of an object of type 'const svint8_t' (aka 'const __SVInt8_t') leaves the object uninitialized"
+    },
+    {
+      "kind": "note",
+      "msg": "declared const here"
+    },
+    {
+      "kind": "warning",
+      "msg": "default initialization of an object of type 'const volatile svint8_t' (aka 'const volatile __SVInt8_t') leaves the object uninitialized"
+    },
+    {
+      "kind": "error",
+      "msg": "_Atomic cannot be applied to sizeless type 'svint8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "requires a pointer or reference"
+    },
+    {
+      "kind": "error",
+      "msg": "array has sizeless element type"
+    },
+    {
+      "kind": "error",
+      "msg": "array has sizeless element type"
+    },
+    {
+      "kind": "error",
+      "msg": "initializing '_Bool' with an expression of incompatible type 'svint8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "initializing 'int' with an expression of incompatible type 'svint8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'svint8_t' (aka '__SVInt8_t') from incompatible type 'svint16_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'svint8_t' (aka '__SVInt8_t') from incompatible type 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'int' from incompatible type 'svint8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "used type 'svint8_t' (aka '__SVInt8_t') where arithmetic or pointer type is required"
+    },
+    {
+      "kind": "error",
+      "msg": "used type 'svint8_t' (aka '__SVInt8_t') where arithmetic or pointer type is required"
+    },
+    {
+      "kind": "error",
+      "msg": "operand of type 'svint8_t' (aka '__SVInt8_t') where arithmetic or pointer type is required"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot assign to variable 'const_int8' with const-qualified type 'const svint8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot assign to variable 'const_volatile_int8' with const-qualified type 'const volatile svint8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "passing 'svint16_t' (aka '__SVInt16_t') to parameter of incompatible type 'svint8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'svint16_t' (aka '__SVInt16_t') from incompatible type 'svint8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "arithmetic on a pointer to sizeless type"
+    },
+    {
+      "kind": "error",
+      "msg": "read-only variable is not assignable"
+    },
+    {
+      "kind": "error",
+      "msg": "read-only variable is not assignable"
+    },
+    {
+      "kind": "error",
+      "msg": "subscript of pointer to sizeless type 'svint8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "subscript of pointer to sizeless type 'svint8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "subscript of pointer to sizeless type 'svint8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "no matching function"
+    },
+    {
+      "kind": "error",
+      "msg": "no matching function"
+    },
+    {
+      "kind": "error",
+      "msg": "arithmetic on a pointer to sizeless type"
+    },
+    {
+      "kind": "error",
+      "msg": "arithmetic on a pointer to sizeless type"
+    },
+    {
+      "kind": "error",
+      "msg": "arithmetic on a pointer to sizeless type"
+    },
+    {
+      "kind": "error",
+      "msg": "arithmetic on a pointer to sizeless type"
+    },
+    {
+      "kind": "error",
+      "msg": "arithmetic on a pointer to sizeless type"
+    },
+    {
+      "kind": "error",
+      "msg": "arithmetic on a pointer to sizeless type"
+    },
+    {
+      "kind": "error",
+      "msg": "arithmetic on a pointer to sizeless type"
+    },
+    {
+      "kind": "error",
+      "msg": "arithmetic on a pointer to sizeless type"
+    },
+    {
+      "kind": "error",
+      "msg": "arithmetic on a pointer to sizeless type"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot increment value of type 'svint8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot increment value of type 'svint8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot decrement value of type 'svint8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot decrement value of type 'svint8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid argument type 'svint8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "indirection requires pointer operand"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid type 'svint8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid type 'svint8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression"
+    },
+    {
+      "kind": "error",
+      "msg": "statement requires expression of scalar type"
+    },
+    {
+      "kind": "error",
+      "msg": "statement requires expression of scalar type"
+    },
+    {
+      "kind": "error",
+      "msg": "statement requires expression of scalar type"
+    },
+    {
+      "kind": "error",
+      "msg": "statement requires expression of integer type"
+    },
+    {
+      "kind": "error",
+      "msg": "field has sizeless type 'svint8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "field has sizeless type 'svint8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "field has sizeless type 'svint8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "field has sizeless type 'svint8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "field has sizeless type 'svint8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "field has sizeless type 'svint8_t'"
+    },
+    {
+      "kind": "error",
+      "msg": "type 'svint8_t' (aka '__SVInt8_t') in generic association compatible with previously specified type 'svint8_t'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c90",
+    " --c11",
+    " --c11 --strict_gnu"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/sizeless-1.sft.c",
+  "remark": null,
+  "sha256": "4c695f57ff47b2f6cbe522173afbd335fe60ad69d677f4672c6206df83d35832",
+  "test_number_uses": 0,
+  "type": "fn"
+}

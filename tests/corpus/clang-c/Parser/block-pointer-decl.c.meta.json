@@ -1,0 +1,21 @@
+{
+  "bytes": 539,
+  "cases": null,
+  "category": "Parser",
+  "expected": [],
+  "has_main": true,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/block-pointer-decl.sft.c",
+  "remark": null,
+  "sha256": "44fad34f27045d803fae9fde3eef92e572500bd07bd0beb92105323602937ae0",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,38 @@
+{
+  "bytes": 1421,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "static assertion failed"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression is not an integer constant expression; folding it to a constant is a GNU extension"
+    },
+    {
+      "kind": "error",
+      "msg": "static assertion expression is not an integral constant expression"
+    },
+    {
+      "kind": "error",
+      "msg": "static assertion expression is not an integral constant expression"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 17,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C2y/n3525.sft.c",
+  "remark": null,
+  "sha256": "4356a8c2f1ac0380c1a18aee1bfb0f227cd2c235b749234dc6a813b87fb328b6",
+  "test_number_uses": 0,
+  "type": "fn"
+}

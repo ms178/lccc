@@ -1,0 +1,25 @@
+{
+  "bytes": 3082,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 16,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c99",
+    " --c23",
+    " --c99",
+    " --c23",
+    " --c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/ext-pp-directive.sft.c",
+  "remark": null,
+  "sha256": "c0e35a959045ac363d92d7ba9ec1eaf89f0cd03d7e9baefcbf9956c9db22f1f9",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,21 @@
+{
+  "bytes": 184,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/disabled-cond-diags.sft.c",
+  "remark": null,
+  "sha256": "beb2688f4c2ebd8af1287e7fb58adf8c20fc0b89281ef58931b056f00933df89",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,146 @@
+{
+  "bytes": 3912,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "address of array 'b' will always evaluate to 'true'"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of array 'b' equal to a null pointer is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "address of array 'c.x' will always evaluate to 'true'"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of array 'c.x' equal to a null pointer is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "address of array 'str' will always evaluate to 'true'"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of array 'str' equal to a null pointer is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "address of array 'array' will always evaluate to 'true'"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of array 'array' not equal to a null pointer is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of array 'array' equal to a null pointer is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "address of 'pointer' will always evaluate to 'true'"
+    },
+    {
+      "kind": "warning",
+      "msg": "address of 'pointer' will always evaluate to 'true'"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of address of 'pointer' equal to a null pointer is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of address of 'pointer' not equal to a null pointer is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "address of array 'array' will always evaluate to 'true'"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of array 'array' not equal to a null pointer is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "address of array 'array' will always evaluate to 'true'"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of array 'array' equal to a null pointer is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "address of array 'array' will always evaluate to 'true'"
+    },
+    {
+      "kind": "warning",
+      "msg": "address of array 'array' will always evaluate to 'true'"
+    },
+    {
+      "kind": "warning",
+      "msg": "address of array 'array' will always evaluate to 'true'"
+    },
+    {
+      "kind": "warning",
+      "msg": "address of array 'array' will always evaluate to 'true'"
+    },
+    {
+      "kind": "warning",
+      "msg": "address of array 'array' will always evaluate to 'true'"
+    },
+    {
+      "kind": "warning",
+      "msg": "address of array 'array' will always evaluate to 'true'"
+    },
+    {
+      "kind": "warning",
+      "msg": "address of array 'array' will always evaluate to 'true'"
+    },
+    {
+      "kind": "warning",
+      "msg": "address of array 'array' will always evaluate to 'true'"
+    },
+    {
+      "kind": "warning",
+      "msg": "address of array"
+    },
+    {
+      "kind": "warning",
+      "msg": "address of array"
+    },
+    {
+      "kind": "warning",
+      "msg": "address of array"
+    },
+    {
+      "kind": "warning",
+      "msg": "address of array"
+    },
+    {
+      "kind": "warning",
+      "msg": "address of 'x'"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of address of 'a' equal to a null pointer is always false"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-tautological-compare.sft.c",
+  "remark": null,
+  "sha256": "798a2259b4f06178d743a59796cbc1cf8e4f4a916608ec32908af78ed6769b0d",
+  "test_number_uses": 0,
+  "type": "fp"
+}

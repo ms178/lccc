@@ -1,0 +1,21 @@
+{
+  "bytes": 255,
+  "cases": null,
+  "category": "Parser",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 3,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/promote_types_in_proto.sft.c",
+  "remark": null,
+  "sha256": "8da4d4d74c5b223c03c28b53c11c9a20b131fb488d26201fdf61439a1e50fa62",
+  "test_number_uses": 0,
+  "type": "fp"
+}

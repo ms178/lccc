@@ -1,0 +1,21 @@
+{
+  "bytes": 44264,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 51,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c --target linux_aarch64"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-arm-sve-vector-bits.sft.c",
+  "remark": null,
+  "sha256": "f4d402b758e8ba4cc7bbcc577021d7ab97b61b98a854c4ae10ea810ea392d0bb",
+  "test_number_uses": 0,
+  "type": "fn"
+}

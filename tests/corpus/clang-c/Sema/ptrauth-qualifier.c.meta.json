@@ -1,0 +1,183 @@
+{
+  "bytes": 9833,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "200 does not identify a valid pointer authentication key for the current target"
+    },
+    {
+      "kind": "error",
+      "msg": "'__ptrauth' qualifier only applies to pointer or pointer sized integer types; 'int' is invalid"
+    },
+    {
+      "kind": "error",
+      "msg": "'__ptrauth' qualifier only applies to pointer or pointer sized integer types; 'int' is invalid"
+    },
+    {
+      "kind": "error",
+      "msg": "expected identifier or '('"
+    },
+    {
+      "kind": "error",
+      "msg": "type 'int *__ptrauth(2,0,0)' is already '__ptrauth'-qualified"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid address discrimination flag '2'; '__ptrauth' requires '0' or '1'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid address discrimination flag '-1'; '__ptrauth' requires '0' or '1'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid extra discriminator flag '-1'; '__ptrauth' requires a value between '0' and '65535'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid extra discriminator flag '100000'; '__ptrauth' requires a value between '0' and '65535'"
+    },
+    {
+      "kind": "error",
+      "msg": "argument to '__ptrauth' must be an integer constant expression"
+    },
+    {
+      "kind": "error",
+      "msg": "argument to '__ptrauth' must be an integer constant expression"
+    },
+    {
+      "kind": "error",
+      "msg": "expression is not an integer constant expression"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration"
+    },
+    {
+      "kind": "error",
+      "msg": "redeclaration of 'redeclaration0' with a different type: '__ptrauth(2,0,0) intp' (aka 'int *__ptrauth(2,0,0)') vs 'intp' (aka 'int *')"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration"
+    },
+    {
+      "kind": "error",
+      "msg": "redeclaration of 'redeclaration1' with a different type: '__ptrauth(2,0,0) intp' (aka 'int *__ptrauth(2,0,0)') vs 'intp' (aka 'int *')"
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of 'redeclaration2' with a different type: 'intp' (aka 'int *') vs '__ptrauth(2,0,0) intp' (aka 'int *__ptrauth(2,0,0)')"
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of 'redeclaration3' with a different type: 'intp' (aka 'int *') vs '__ptrauth(2,0,0) intp' (aka 'int *__ptrauth(2,0,0)')"
+    },
+    {
+      "kind": "error",
+      "msg": "parameter type may not be qualified with '__ptrauth'; type is '__ptrauth(2,0,0) intp' (aka 'int *__ptrauth(2,0,0)')"
+    },
+    {
+      "kind": "error",
+      "msg": "return type may not be qualified with '__ptrauth'; type is '__ptrauth(2,0,0) intp' (aka 'int *__ptrauth(2,0,0)')"
+    },
+    {
+      "kind": "warning",
+      "msg": "association of type 'int *__ptrauth(2,0,0)' will never be selected"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot cast to '__ptrauth'-qualified type '__ptrauth(2,0,0) intp' (aka 'int *__ptrauth(2,0,0)')"
+    },
+    {
+      "kind": "error",
+      "msg": "initializing '__ptrauth(2,0,0) intp *' (aka 'int *__ptrauth(2,0,0) *') with an expression of type 'intp *' (aka 'int **') changes pointer authentication of pointee type"
+    },
+    {
+      "kind": "error",
+      "msg": "initializing 'intp *' (aka 'int **') with an expression of type '__ptrauth(2,0,0) intp *' (aka 'int *__ptrauth(2,0,0) *') changes pointer authentication of pointee type"
+    },
+    {
+      "kind": "error",
+      "msg": "'__ptrauth' qualification mismatch ('__ptrauth(2,0,0) intp *' (aka 'int *__ptrauth(2,0,0) *') and 'intp *' (aka 'int **'))"
+    },
+    {
+      "kind": "error",
+      "msg": "'__ptrauth' qualifier only applies to pointer or pointer sized integer types; 'int[10]' is invalid"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use type 'union U0' for function/method return since it is a union that is non-trivial to copy"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use type 'union U2' for function/method return since it is a union that is non-trivial to copy"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use type 'union U3' for function/method return since it is a union that is non-trivial to copy"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use type 'struct S4' for function/method return since it contains a union that is non-trivial to copy"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 32,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DIS_DARWIN --c23",
+    " --c23 --target linux_aarch64"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/ptrauth-qualifier.sft.c",
+  "remark": null,
+  "sha256": "3732344cda0d0d8a0ac14e5616c581dccfc2d5c8a39a7df9dcfadfbb8dad8b3f",
+  "test_number_uses": 0,
+  "type": "fn"
+}

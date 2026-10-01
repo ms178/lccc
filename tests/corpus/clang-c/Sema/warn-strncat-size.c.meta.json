@@ -1,0 +1,66 @@
+{
+  "bytes": 3718,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "size argument in 'strncat' call appears to be size of the source"
+    },
+    {
+      "kind": "warning",
+      "msg": "size argument in 'strncat' call appears to be size of the source"
+    },
+    {
+      "kind": "warning",
+      "msg": "the value of the size argument in 'strncat' is too large, might lead to a buffer overflow"
+    },
+    {
+      "kind": "warning",
+      "msg": "the value of the size argument in 'strncat' is too large, might lead to a buffer overflow"
+    },
+    {
+      "kind": "warning",
+      "msg": "size argument in 'strncat' call appears to be size of the source"
+    },
+    {
+      "kind": "warning",
+      "msg": "size argument in 'strncat' call appears to be size of the source"
+    },
+    {
+      "kind": "warning",
+      "msg": "size argument in 'strncat' call appears to be size of the source"
+    },
+    {
+      "kind": "warning",
+      "msg": "size argument in 'strncat' call appears to be size of the source"
+    },
+    {
+      "kind": "warning",
+      "msg": "the value of the size argument to 'strncat' is wrong"
+    },
+    {
+      "kind": "warning",
+      "msg": "size argument in 'strncat' call appears to be size of the source"
+    },
+    {
+      "kind": "warning",
+      "msg": "the value of the size argument to 'strncat' is wrong"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "%-DUSE_BUILTINS %-DUSE_BUILTINS --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-strncat-size.sft.c",
+  "remark": null,
+  "sha256": "91d912dfa7878da192a090f648613f36cf19f1425c13f277400b768512889a9b",
+  "test_number_uses": 0,
+  "type": "fp"
+}

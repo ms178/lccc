@@ -1,0 +1,30 @@
+{
+  "bytes": 525,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "multiple unsequenced modifications to 'g'"
+    },
+    {
+      "kind": "warning",
+      "msg": "multiple unsequenced modifications to 'g'"
+    }
+  ],
+  "has_main": true,
+  "header_lines": 8,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C11/n1282.sft.c",
+  "remark": null,
+  "sha256": "5fd2b9dc88850132ddaf5f314b89be5df8f08132b168ad7101e9c0a06c616b2b",
+  "test_number_uses": 0,
+  "type": "fp"
+}

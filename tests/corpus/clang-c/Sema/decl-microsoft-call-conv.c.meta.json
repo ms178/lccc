@@ -1,0 +1,42 @@
+{
+  "bytes": 1953,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "function with no prototype cannot use the fastcall calling convention"
+    },
+    {
+      "kind": "warning",
+      "msg": "function with no prototype cannot use the stdcall calling convention"
+    },
+    {
+      "kind": "error",
+      "msg": "function with no prototype cannot use the thiscall calling convention"
+    },
+    {
+      "kind": "error",
+      "msg": "function with no prototype cannot use the pascal calling convention"
+    },
+    {
+      "kind": "error",
+      "msg": "function with no prototype cannot use the vectorcall calling convention"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/decl-microsoft-call-conv.sft.c",
+  "remark": null,
+  "sha256": "2d715ab5b641ae36660f3c556ae6bfd6379a11234d243af1ec96df62890af6cc",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,154 @@
+{
+  "bytes": 4513,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": "#pragma entered here"
+    },
+    {
+      "kind": "error",
+      "msg": "'b' causes a section type conflict with 'a'"
+    },
+    {
+      "kind": "error",
+      "msg": "'d' causes a section type conflict with 'a'"
+    },
+    {
+      "kind": "error",
+      "msg": "\\u used with no following hex digits"
+    },
+    {
+      "kind": "warning",
+      "msg": "expected non-wide string literal in '#pragma data_seg'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": "declared here"
+    },
+    {
+      "kind": "note",
+      "msg": "#pragma entered here"
+    },
+    {
+      "kind": "error",
+      "msg": "'fn_bad_seg' causes a section type conflict with 'int_bad_seg'"
+    },
+    {
+      "kind": "warning",
+      "msg": "missing '(' after '#pragma bss_seg' - ignoring"
+    },
+    {
+      "kind": "warning",
+      "msg": "expected push, pop or a string literal for the section name in '#pragma bss_seg' - ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "expected push, pop or a string literal for the section name in '#pragma bss_seg' - ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "expected a stack label or a string literal for the section name in '#pragma bss_seg'"
+    },
+    {
+      "kind": "warning",
+      "msg": "missing '(' after '#pragma bss_seg' - ignoring"
+    },
+    {
+      "kind": "warning",
+      "msg": "expected a string literal for the section name in '#pragma bss_seg' - ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "missing ')' after '#pragma bss_seg' - ignoring"
+    },
+    {
+      "kind": "warning",
+      "msg": "missing ')' after '#pragma bss_seg' - ignoring"
+    },
+    {
+      "kind": "warning",
+      "msg": "missing '(' after '#pragma section' - ignoring"
+    },
+    {
+      "kind": "warning",
+      "msg": "expected a string literal for the section name in '#pragma section' - ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "expected a string literal for the section name in '#pragma section' - ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "missing ')' after '#pragma section' - ignoring"
+    },
+    {
+      "kind": "warning",
+      "msg": "missing ')' after '#pragma section' - ignoring"
+    },
+    {
+      "kind": "warning",
+      "msg": "expected action or ')' in '#pragma section' - ignored"
+    },
+    {
+      "kind": "error",
+      "msg": "this causes a section type conflict with a prior #pragma section"
+    },
+    {
+      "kind": "warning",
+      "msg": "unknown action 'bogus' for '#pragma section' - ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "known but unsupported action 'nopage' for '#pragma section' - ignored"
+    },
+    {
+      "kind": "error",
+      "msg": "this causes a section type conflict with a prior #pragma section"
+    },
+    {
+      "kind": "warning",
+      "msg": "expected action or ')' in '#pragma section' - ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "#pragma bss_seg(\".drectve\") has undefined behavior, use #pragma comment(linker, ...) instead"
+    },
+    {
+      "kind": "warning",
+      "msg": "#pragma code_seg(\".drectve\") has undefined behavior, use #pragma comment(linker, ...) instead"
+    },
+    {
+      "kind": "warning",
+      "msg": "#pragma const_seg(\".drectve\") has undefined behavior, use #pragma comment(linker, ...) instead"
+    },
+    {
+      "kind": "warning",
+      "msg": "#pragma data_seg(\".drectve\") has undefined behavior, use #pragma comment(linker, ...) instead"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--ms_extensions -w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/pragma-section.sft.c",
+  "remark": null,
+  "sha256": "46d04446646c76151ac3296e429712f2d815ec938ffcfedd3b17eb259f03d933",
+  "test_number_uses": 0,
+  "type": "fn"
+}

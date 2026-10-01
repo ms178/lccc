@@ -1,0 +1,50 @@
+{
+  "bytes": 1210,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'constructor' attribute only applies to functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'constructor' attribute takes no more than 1 argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'constructor' attribute requires an integer constant"
+    },
+    {
+      "kind": "error",
+      "msg": "integer constant expression evaluates to value 4294967296 that cannot be represented in a 32-bit unsigned integer type"
+    },
+    {
+      "kind": "warning",
+      "msg": "'destructor' attribute only applies to functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'destructor' attribute takes no more than 1 argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'destructor' attribute requires an integer constant"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/constructor-attribute.sft.c",
+  "remark": null,
+  "sha256": "6e13dea923008108126c454f67ba36699c0ee82f3434efb84521a0f552c08515",
+  "test_number_uses": 0,
+  "type": "fn"
+}

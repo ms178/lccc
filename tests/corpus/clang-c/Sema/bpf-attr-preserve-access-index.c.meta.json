@@ -1,0 +1,42 @@
+{
+  "bytes": 1372,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'preserve_access_index' attribute takes no arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'preserve_access_index' attribute only applies to structs, unions, and classes"
+    },
+    {
+      "kind": "error",
+      "msg": "'preserve_access_index' attribute only applies to structs, unions, and classes"
+    },
+    {
+      "kind": "error",
+      "msg": "'preserve_access_index' attribute only applies to structs, unions, and classes"
+    },
+    {
+      "kind": "error",
+      "msg": "'preserve_access_index' attribute only applies to structs, unions, and classes"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/bpf-attr-preserve-access-index.sft.c",
+  "remark": null,
+  "sha256": "4c7a3561381b14c5371018b1bb6204f6dacd596f2ffe842d6ad12c821a6de3ac",
+  "test_number_uses": 0,
+  "type": "fn"
+}

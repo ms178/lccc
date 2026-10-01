@@ -1,0 +1,21 @@
+{
+  "bytes": 19406,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 50,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/zvk-target-attributes.sft.c",
+  "remark": null,
+  "sha256": "08c81a840424a1119840ce4a3b720d4ed67143f8d820ffa7e643e67ed336ea15",
+  "test_number_uses": 0,
+  "type": "fp"
+}

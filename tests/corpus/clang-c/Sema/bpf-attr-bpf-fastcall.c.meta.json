@@ -1,0 +1,30 @@
+{
+  "bytes": 557,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'bpf_fastcall' attribute only applies to functions and function pointers"
+    },
+    {
+      "kind": "error",
+      "msg": "'bpf_fastcall' attribute takes no arguments"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/bpf-attr-bpf-fastcall.sft.c",
+  "remark": null,
+  "sha256": "5e15ee96eb38383294eadef2ba6bee56dcade358a0d261fea06d95c83e6eb6a6",
+  "test_number_uses": 0,
+  "type": "fn"
+}

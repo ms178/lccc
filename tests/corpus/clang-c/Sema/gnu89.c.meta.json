@@ -1,0 +1,26 @@
+{
+  "bytes": 255,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "return type of 'main' is not 'int'"
+    }
+  ],
+  "has_main": true,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    " --c89 --strict_gnu"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/gnu89.sft.c",
+  "remark": null,
+  "sha256": "bea9c020f9933c2786cd0e70b52f06692bf54ea9b64394796ce72b3da8a9c163",
+  "test_number_uses": 0,
+  "type": "fp"
+}

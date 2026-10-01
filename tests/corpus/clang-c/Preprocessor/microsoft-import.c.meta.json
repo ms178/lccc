@@ -1,0 +1,26 @@
+{
+  "bytes": 547,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 10,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--ms_compatibility --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/microsoft-import.sft.c",
+  "remark": null,
+  "sha256": "85f6a57059ed207afffb90dbea098e852d08df49326f1aeaa50b8ec0d5b52bec",
+  "test_number_uses": 0,
+  "type": "fn"
+}

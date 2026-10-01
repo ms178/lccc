@@ -1,0 +1,70 @@
+{
+  "bytes": 3245,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "use of bitwise '&' with boolean operands"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "use of bitwise '&' with boolean operands"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "use of bitwise '&' with boolean operands"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "use of bitwise '&' with boolean operands"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "use of bitwise '&' with boolean operands"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "use of bitwise '&' with boolean operands"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 12,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-bitwise-and-bool.sft.c",
+  "remark": null,
+  "sha256": "3e9628b10d9554a8e6c1425fc7b6f590c9f82fdf5f7f48249cfbb607779856b2",
+  "test_number_uses": 0,
+  "type": "fp"
+}

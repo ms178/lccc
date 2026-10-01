@@ -1,0 +1,30 @@
+{
+  "bytes": 335,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'lock'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'lock'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/PR28181.sft.c",
+  "remark": null,
+  "sha256": "0ce5610cd774dfe80b6cfc0af48212e226c64809833374871f9ac97b3efea297",
+  "test_number_uses": 0,
+  "type": "fn"
+}

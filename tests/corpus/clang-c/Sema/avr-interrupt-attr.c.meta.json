@@ -1,0 +1,28 @@
+{
+  "bytes": 392,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'interrupt' attribute only applies to functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'interrupt' attribute takes no arguments"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 3,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/avr-interrupt-attr.sft.c",
+  "remark": null,
+  "sha256": "26658ecade17d353368e11f63c3d97fd3d8cd870e723974c4fa7ebb2c58178cc",
+  "test_number_uses": 0,
+  "type": "fn"
+}

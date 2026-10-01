@@ -1,0 +1,31 @@
+{
+  "bytes": 1224,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "fields must have a constant size"
+    },
+    {
+      "kind": "error",
+      "msg": "negative size"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 9,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c17 --c17 --strict_gnu",
+    " --c17 --c17 --strict_gnu"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/rounding-math.sft.c",
+  "remark": null,
+  "sha256": "e550786150036459dfe60234b59596712d0dd24a52688047ae7f8b28f9b8b5a1",
+  "test_number_uses": 0,
+  "type": "fn"
+}

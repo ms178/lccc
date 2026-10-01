@@ -1,0 +1,42 @@
+{
+  "bytes": 969,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'tls_model' attribute only applies to thread-local variables"
+    },
+    {
+      "kind": "error",
+      "msg": "'tls_model' attribute only applies to thread-local variables"
+    },
+    {
+      "kind": "error",
+      "msg": "'tls_model' attribute takes one argument"
+    },
+    {
+      "kind": "error",
+      "msg": "expected string literal as argument of 'tls_model' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "tls_model must be \"global-dynamic\", \"local-dynamic\", \"initial-exec\" or \"local-exec\""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-tls_model.sft.c",
+  "remark": null,
+  "sha256": "d8c47855cdaa7167d2ce771de11c66c71918bfb51e38b3991eb3454605eaf665",
+  "test_number_uses": 0,
+  "type": "fn"
+}

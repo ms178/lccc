@@ -1,0 +1,150 @@
+{
+  "bytes": 3946,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "flexible array initialization is a GNU extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "flexible array initialization is a GNU extension"
+    },
+    {
+      "kind": "error",
+      "msg": "initialization of flexible array member is not allowed"
+    },
+    {
+      "kind": "warning",
+      "msg": "use of an empty initializer is a C23 extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "flexible array initialization is a GNU extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "zero size arrays are an extension"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "'z' may not be nested in a struct due to flexible array member"
+    },
+    {
+      "kind": "warning",
+      "msg": "flexible array initialization is a GNU extension"
+    },
+    {
+      "kind": "error",
+      "msg": "initialization of flexible array member is not allowed"
+    },
+    {
+      "kind": "warning",
+      "msg": "flexible array initialization is a GNU extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "use of an empty initializer is a C23 extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "zero size arrays are an extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "'struct foo' may not be used as an array element due to flexible array member"
+    },
+    {
+      "kind": "error",
+      "msg": "initialization of flexible array member is not allowed"
+    },
+    {
+      "kind": "warning",
+      "msg": "flexible array initialization is a GNU extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "use of an empty initializer is a C23 extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "zero size arrays are an extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "flexible array initialization is a GNU extension"
+    },
+    {
+      "kind": "error",
+      "msg": "initialization of flexible array member is not allowed"
+    },
+    {
+      "kind": "error",
+      "msg": "flexible array requires brace-enclosed initializer"
+    },
+    {
+      "kind": "note",
+      "msg": "initialized flexible array member 'points' is here"
+    },
+    {
+      "kind": "error",
+      "msg": "designator into flexible array member subobject"
+    },
+    {
+      "kind": "warning",
+      "msg": "'struct X' may not be used as an array element due to flexible array member"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "initialization of flexible array member is not allowed"
+    },
+    {
+      "kind": "error",
+      "msg": "initialization of flexible array member is not allowed"
+    },
+    {
+      "kind": "note",
+      "msg": "initialized flexible array member 'v' is here"
+    },
+    {
+      "kind": "error",
+      "msg": "initialization of flexible array member is not allowed"
+    },
+    {
+      "kind": "note",
+      "msg": "initialized flexible array member 'y' is here"
+    },
+    {
+      "kind": "error",
+      "msg": "initialization of flexible array member is not allowed"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 3,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/flexible-array-init.sft.c",
+  "remark": null,
+  "sha256": "fde8934e94d24e22f61ea05e5c73c98ac60423600c44bb0dda05d7a3d2af574e",
+  "test_number_uses": 0,
+  "type": "fn"
+}

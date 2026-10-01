@@ -1,0 +1,46 @@
+{
+  "bytes": 1152,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "'FUNC_LIKE3' macro redefined"
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "'FUNC_LIKE4' macro redefined"
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "'FUNC_LIKE5' macro redefined"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 20,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--ms_extensions -DMS_EXT --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/macro_misc.sft.c",
+  "remark": null,
+  "sha256": "9fcf012e65c7b394d1b779682ac7e27d56efcfd9f5e4fa9ab9e39208d2699b6f",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,50 @@
+{
+  "bytes": 2915,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "attribute takes one argument"
+    },
+    {
+      "kind": "error",
+      "msg": "attribute requires an integer constant"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid vector element type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid vector element type"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid vector element type"
+    },
+    {
+      "kind": "error",
+      "msg": "Neon vector size must be 64 or 128 bits"
+    },
+    {
+      "kind": "error",
+      "msg": "Neon vector size must be 64 or 128 bits"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 9,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DUSE_LONG -DUSE_LONG --c --target linux_aarch64"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/aarch64-neon-vector-types.sft.c",
+  "remark": null,
+  "sha256": "381e7ffdcff4826db52f5e2ae7cfba9e199591c81375436995b0fac117f9fad0",
+  "test_number_uses": 0,
+  "type": "fn"
+}

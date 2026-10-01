@@ -1,0 +1,30 @@
+{
+  "bytes": 459,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'xray_always_instrument' attribute only applies to functions and Objective-C methods"
+    },
+    {
+      "kind": "error",
+      "msg": "'xray_always_instrument' attribute takes no arguments"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 3,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c11"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/xray-always-instrument-attr.sft.c",
+  "remark": null,
+  "sha256": "295b8f14ae16157b25fc27ecd5b68d7d9cf2341a03d4f5b9a7e56ca287ac26d7",
+  "test_number_uses": 0,
+  "type": "fn"
+}

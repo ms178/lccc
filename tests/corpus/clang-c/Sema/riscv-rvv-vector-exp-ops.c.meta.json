@@ -1,0 +1,21 @@
+{
+  "bytes": 18780,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 52,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/riscv-rvv-vector-exp-ops.sft.c",
+  "remark": null,
+  "sha256": "dee770a67c65aa8b351cc5df5209e791436cfcb491f905ed4d4da2e4f52d7ddf",
+  "test_number_uses": 0,
+  "type": "fn"
+}

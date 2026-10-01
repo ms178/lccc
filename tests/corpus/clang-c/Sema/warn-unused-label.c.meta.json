@@ -1,0 +1,30 @@
+{
+  "bytes": 396,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "unused"
+    },
+    {
+      "kind": "warning",
+      "msg": "'noreturn' attribute only applies to functions"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-unused-label.sft.c",
+  "remark": null,
+  "sha256": "3ff03b390741c269812b88c3f9a0a82aa50f0d4292e6dc85ad4fb7b8e9a806b3",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,69 @@
+{
+  "bytes": 8871,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "initializing '_Atomic(const int *)' with an expression of type 'const volatile int *' discards qualifiers"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer types initializing '_Atomic(int *)' with an expression of type '_Atomic(int) *'"
+    },
+    {
+      "kind": "warning",
+      "msg": "initializing '_Atomic(const int *)' with an expression of type 'const volatile int *' discards qualifiers"
+    },
+    {
+      "kind": "warning",
+      "msg": "initializing '_Atomic(const void *)' with an expression of type 'const volatile int *' discards qualifiers"
+    },
+    {
+      "kind": "error",
+      "msg": "initializer element is not a compile-time constant"
+    },
+    {
+      "kind": "error",
+      "msg": "initializer element is not a compile-time constant"
+    },
+    {
+      "kind": "error",
+      "msg": "initializer element is not a compile-time constant"
+    },
+    {
+      "kind": "error",
+      "msg": "initializer element is not a compile-time constant"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer types initializing '_Atomic(int *)' with an expression of type '_Atomic(int) *'"
+    },
+    {
+      "kind": "error",
+      "msg": "initializer element is not a compile-time constant"
+    },
+    {
+      "kind": "error",
+      "msg": "used type 'struct T' where arithmetic or pointer type is required"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 12,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23",
+    " --c23",
+    " --c23",
+    " --c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/atomic-expr.sft.c",
+  "remark": null,
+  "sha256": "4d679fc1a3a651cc8c6a4f37cdee3f3aab3fb248602407baab28f43ce08eb0b3",
+  "test_number_uses": 0,
+  "type": "fn"
+}

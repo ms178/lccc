@@ -1,0 +1,23 @@
+{
+  "bytes": 808,
+  "cases": null,
+  "category": "C",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 19,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c99",
+    " --c89 --strict_gnu",
+    " --c89"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C99/float_h-characteristics.sft.c",
+  "remark": null,
+  "sha256": "09323da0a534deec1a6a190e595c240e1a5b054bbf3c1607664567d8199f521c",
+  "test_number_uses": 0,
+  "type": "fp"
+}

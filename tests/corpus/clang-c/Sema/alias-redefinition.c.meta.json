@@ -1,0 +1,74 @@
+{
+  "bytes": 1431,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "previous definition"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of 'fun1'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of 'fun2'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of 'fun3'"
+    },
+    {
+      "kind": "error",
+      "msg": "definition 'fun5' cannot also be an alias"
+    },
+    {
+      "kind": "error",
+      "msg": "definition 'var1' cannot also be an alias"
+    },
+    {
+      "kind": "error",
+      "msg": "definition 'var2' cannot also be an alias"
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of 'var3'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "error",
+      "msg": "alias definition of 'var4' after tentative definition"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/alias-redefinition.sft.c",
+  "remark": null,
+  "sha256": "8201d1a4ef78365e3b3930e625f3befc1d04f1bf90a765105f0c1a1bcf836c07",
+  "test_number_uses": 0,
+  "type": "fn"
+}

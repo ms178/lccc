@@ -1,0 +1,86 @@
+{
+  "bytes": 2726,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "load and store exclusive builtins are not available on this architecture"
+    },
+    {
+      "kind": "error",
+      "msg": "load and store exclusive builtins are not available on this architecture"
+    },
+    {
+      "kind": "error",
+      "msg": "load and store exclusive builtins are not available on this architecture"
+    },
+    {
+      "kind": "error",
+      "msg": "load and store exclusive builtins are not available on this architecture"
+    },
+    {
+      "kind": "error",
+      "msg": "load and store exclusive builtins are not available on this architecture"
+    },
+    {
+      "kind": "error",
+      "msg": "load and store exclusive builtins are not available on this architecture"
+    },
+    {
+      "kind": "error",
+      "msg": "load and store exclusive builtins are not available on this architecture"
+    },
+    {
+      "kind": "error",
+      "msg": "load and store exclusive builtins are not available on this architecture"
+    },
+    {
+      "kind": "error",
+      "msg": "load and store exclusive builtins are not available on this architecture"
+    },
+    {
+      "kind": "error",
+      "msg": "load and store exclusive builtins are not available on this architecture"
+    },
+    {
+      "kind": "error",
+      "msg": "load and store exclusive builtins are not available on this architecture"
+    },
+    {
+      "kind": "error",
+      "msg": "load and store exclusive builtins are not available on this architecture"
+    },
+    {
+      "kind": "error",
+      "msg": "load and store exclusive builtins are not available on this architecture"
+    },
+    {
+      "kind": "error",
+      "msg": "load and store exclusive builtins are not available on this architecture"
+    },
+    {
+      "kind": "error",
+      "msg": "load and store exclusive builtins are not available on this architecture"
+    },
+    {
+      "kind": "error",
+      "msg": "load and store exclusive builtins are not available on this architecture"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/builtins-arm-exclusive-none.sft.c",
+  "remark": null,
+  "sha256": "5a25b69a8a1c58295c2bc3c7066b92a85f632d0248648432671e47c6ab1cc853",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,162 @@
+{
+  "bytes": 6515,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "too many arguments to function call, expected 0, have 1"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to function call, expected 0, have 1"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to function call, expected 1, have 2"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call, expected 1, have 0"
+    },
+    {
+      "kind": "error",
+      "msg": "1st argument must be an externref"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call, expected 1, have 0"
+    },
+    {
+      "kind": "error",
+      "msg": "1st argument must be a WebAssembly table"
+    },
+    {
+      "kind": "error",
+      "msg": "1st argument must be a WebAssembly table"
+    },
+    {
+      "kind": "error",
+      "msg": "1st argument must be a WebAssembly table"
+    },
+    {
+      "kind": "error",
+      "msg": "1st argument must be a WebAssembly table"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to function call, expected 1, have 2"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call, expected 3, have 0"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to function call, expected 3, have 4"
+    },
+    {
+      "kind": "error",
+      "msg": "1st argument must be a WebAssembly table"
+    },
+    {
+      "kind": "error",
+      "msg": "2nd argument must match the element type of the WebAssembly table in the 1st argument"
+    },
+    {
+      "kind": "error",
+      "msg": "3rd argument must be an integer"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call, expected 4, have 0"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to function call, expected 4, have 5"
+    },
+    {
+      "kind": "error",
+      "msg": "1st argument must be a WebAssembly table"
+    },
+    {
+      "kind": "error",
+      "msg": "2nd argument must be an integer"
+    },
+    {
+      "kind": "error",
+      "msg": "3rd argument must match the element type of the WebAssembly table in the 1st argument"
+    },
+    {
+      "kind": "error",
+      "msg": "4th argument must be an integer"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call, expected 5, have 0"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to function call, expected 5, have 6"
+    },
+    {
+      "kind": "error",
+      "msg": "1st argument must be a WebAssembly table"
+    },
+    {
+      "kind": "error",
+      "msg": "2nd argument must be a WebAssembly table"
+    },
+    {
+      "kind": "error",
+      "msg": "3rd argument must be an integer"
+    },
+    {
+      "kind": "error",
+      "msg": "4th argument must be an integer"
+    },
+    {
+      "kind": "error",
+      "msg": "5th argument must be an integer"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call, expected 1, have 0"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to function call, expected 1, have 2"
+    },
+    {
+      "kind": "error",
+      "msg": "used type 'void *' where function pointer is required"
+    },
+    {
+      "kind": "error",
+      "msg": "used type 'int' where function pointer is required"
+    },
+    {
+      "kind": "error",
+      "msg": "not supported with the multivalue ABI for function pointers with a struct/union as parameter"
+    },
+    {
+      "kind": "error",
+      "msg": "not supported with the multivalue ABI for function pointers with a struct/union as return value"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DMULTIVALUE --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/builtins-wasm.sft.c",
+  "remark": null,
+  "sha256": "6bde557694fa503e6366099d9426c7d5769b5140ddade6cacec3cb09f91ae544",
+  "test_number_uses": 0,
+  "type": "fn"
+}

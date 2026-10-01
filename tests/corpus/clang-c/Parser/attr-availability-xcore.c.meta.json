@@ -1,0 +1,30 @@
+{
+  "bytes": 613,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "encoding prefix 'L' on an unevaluated string literal has no effect"
+    },
+    {
+      "kind": "warning",
+      "msg": "encoding prefix 'L' on an unevaluated string literal has no effect"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 10,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/attr-availability-xcore.sft.c",
+  "remark": null,
+  "sha256": "730ab964a10bfa188b09fd543e8e70bf3b1c014d3e2423cd2d9ee18b5198423d",
+  "test_number_uses": 0,
+  "type": "fp"
+}

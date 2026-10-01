@@ -1,0 +1,30 @@
+{
+  "bytes": 2244,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "static assertion failed due to requirement '__builtin_complex(0., 1.) * -0. == 1'"
+    },
+    {
+      "kind": "note",
+      "msg": "expression evaluates to '(-0 + -0i) == 1'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 11,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C2y/n3460.sft.c",
+  "remark": null,
+  "sha256": "d7c430a2b1d11ad2a58a2b59058ded4be6abee3b4b7dbab2255ecf184d9332f1",
+  "test_number_uses": 0,
+  "type": "fn"
+}

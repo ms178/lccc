@@ -1,0 +1,106 @@
+{
+  "bytes": 3156,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'fastcall' calling convention is not supported for this target"
+    },
+    {
+      "kind": "warning",
+      "msg": "'stdcall' calling convention is not supported for this target"
+    },
+    {
+      "kind": "error",
+      "msg": "'fastcall' attribute takes no arguments"
+    },
+    {
+      "kind": "warning",
+      "msg": "'fastcall' calling convention is not supported for this target"
+    },
+    {
+      "kind": "warning",
+      "msg": "'stdcall' calling convention is not supported for this target"
+    },
+    {
+      "kind": "warning",
+      "msg": "'thiscall' calling convention is not supported for this target"
+    },
+    {
+      "kind": "error",
+      "msg": "'cdecl' attribute takes no arguments"
+    },
+    {
+      "kind": "warning",
+      "msg": "'fastcall' calling convention is not supported for this target"
+    },
+    {
+      "kind": "warning",
+      "msg": "'stdcall' calling convention is not supported for this target"
+    },
+    {
+      "kind": "warning",
+      "msg": "'fastcall' calling convention is not supported for this target"
+    },
+    {
+      "kind": "error",
+      "msg": "'pcs' attribute takes one argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'pcs' attribute takes one argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'pcs' attribute requires a string"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid PCS type"
+    },
+    {
+      "kind": "error",
+      "msg": "expected string literal as argument of 'pcs' attribute"
+    },
+    {
+      "kind": "warning",
+      "msg": "'pcs' calling convention is not supported for this target"
+    },
+    {
+      "kind": "warning",
+      "msg": "'pcs' calling convention is not supported for this target"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid PCS type"
+    },
+    {
+      "kind": "warning",
+      "msg": "'stdcall' calling convention is not supported for this target"
+    },
+    {
+      "kind": "warning",
+      "msg": "'intel_ocl_bicc' calling convention is not supported for this target"
+    },
+    {
+      "kind": "warning",
+      "msg": "'stdcall' calling convention is not supported for this target"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/callingconv-iamcu.sft.c",
+  "remark": null,
+  "sha256": "0937896c910c4d90482287672613bdafc1e2a06c628aa76f64418c0cc8f4c26c",
+  "test_number_uses": 0,
+  "type": "fn"
+}

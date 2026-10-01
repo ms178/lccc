@@ -1,0 +1,21 @@
+{
+  "bytes": 52679,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 21,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/atomic-ops.sft.c",
+  "remark": null,
+  "sha256": "0c7138a642fa90e7491842bee6c585d066f1a292da476ad50e8f6967c9c44df5",
+  "test_number_uses": 0,
+  "type": "fn"
+}

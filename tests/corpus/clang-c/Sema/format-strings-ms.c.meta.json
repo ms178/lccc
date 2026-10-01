@@ -1,0 +1,154 @@
+{
+  "bytes": 5381,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'I' length modifier is not supported by ISO C"
+    },
+    {
+      "kind": "warning",
+      "msg": "'I32' length modifier is not supported by ISO C"
+    },
+    {
+      "kind": "warning",
+      "msg": "'I64' length modifier is not supported by ISO C"
+    },
+    {
+      "kind": "warning",
+      "msg": "'w' length modifier is not supported by ISO C"
+    },
+    {
+      "kind": "warning",
+      "msg": "'Z' conversion specifier is not supported by ISO C"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type '__int64' (aka 'long long') but the argument has type 'short'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type '__int32' (aka 'int') but the argument has type 'long long'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type '__int32' (aka 'int') but the argument has type 'long long'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'unsigned __int64' (aka 'unsigned long long') but the argument has type 'unsigned short'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'unsigned __int32' (aka 'unsigned int') but the argument has type 'unsigned long long'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'unsigned __int32' (aka 'unsigned int') but the argument has type 'unsigned long long'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'wint_t' (aka 'unsigned short') but the argument has type 'double'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'wchar_t' (aka 'unsigned short') but the argument has type 'double'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'wchar_t' (aka 'unsigned short') but the argument has type 'double'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'wchar_t *' (aka 'unsigned short *') but the argument has type 'double'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'wchar_t *' (aka 'unsigned short *') but the argument has type 'double'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'wchar_t *' (aka 'unsigned short *') but the argument has type 'double'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'wchar_t *' (aka 'unsigned short *') but the argument has type 'double *'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'wchar_t *' (aka 'unsigned short *') but the argument has type 'double *'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'wchar_t *' (aka 'unsigned short *') but the argument has type 'double *'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'wchar_t *' (aka 'unsigned short *') but the argument has type 'double *'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'wchar_t *' (aka 'unsigned short *') but the argument has type 'double *'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'wchar_t *' (aka 'unsigned short *') but the argument has type 'double *'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'int' but the argument has type 'double'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'int' but the argument has type 'double'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'char *' but the argument has type 'double'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'char *' but the argument has type 'double'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'char *' but the argument has type 'double *'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'char *' but the argument has type 'double *'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'char *' but the argument has type 'double *'"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'char *' but the argument has type 'double *'"
+    },
+    {
+      "kind": "warning",
+      "msg": "length modifier 'hh' results in undefined behavior or no effect with 'Z' conversion specifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "invalid conversion specifier 'Z'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--ms_compatibility -w --ms_compatibility -w -DNON_ISO_WARNING --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/format-strings-ms.sft.c",
+  "remark": null,
+  "sha256": "43818f370854be2695321acc27f9b611bcc9d3e0198b2bc5d3d837f9747c28ae",
+  "test_number_uses": 0,
+  "type": "fp"
+}

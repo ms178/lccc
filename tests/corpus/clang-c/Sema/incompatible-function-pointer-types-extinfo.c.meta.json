@@ -1,0 +1,76 @@
+{
+  "bytes": 3146,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "incompatible function pointer types"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible function pointer types"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible function pointer types"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible function pointer types"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible function pointer types"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible function pointer types"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible function pointer types"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible function pointer types"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible function pointer types"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible function pointer types"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible function pointer types"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible function pointer types"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible function pointer types"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 12,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c99",
+    " --c11",
+    " --c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/incompatible-function-pointer-types-extinfo.sft.c",
+  "remark": null,
+  "sha256": "f0315ad81e962e774fc39da6b871b6e0d1d7f5dbc43bef902b9b16e118d1e404",
+  "test_number_uses": 0,
+  "type": "fn"
+}

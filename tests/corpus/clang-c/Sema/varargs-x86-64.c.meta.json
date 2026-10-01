@@ -1,0 +1,94 @@
+{
+  "bytes": 3365,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "first argument to 'va_arg' is of type 'const __builtin_va_list' and not 'va_list'"
+    },
+    {
+      "kind": "error",
+      "msg": "'__builtin_ms_va_start' used in System V ABI function"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to function"
+    },
+    {
+      "kind": "error",
+      "msg": "'va_start' used in function with fixed args"
+    },
+    {
+      "kind": "warning",
+      "msg": "second argument to 'va_start' is not the last non-variadic parameter"
+    },
+    {
+      "kind": "warning",
+      "msg": "second argument to 'va_start' is not the last non-variadic parameter"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "passing an object that undergoes default argument promotion to 'va_start' has undefined behavior"
+    },
+    {
+      "kind": "warning",
+      "msg": "passing an object that undergoes default argument promotion to 'va_start' has undefined behavior"
+    },
+    {
+      "kind": "error",
+      "msg": "'va_start' used in function with fixed args"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function"
+    },
+    {
+      "kind": "error",
+      "msg": "expression is not assignable"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot take the address of an rvalue"
+    },
+    {
+      "kind": "error",
+      "msg": "second argument to 'va_arg' is of incomplete type 'void'"
+    },
+    {
+      "kind": "warning",
+      "msg": "second argument to 'va_arg' is of promotable type 'float'"
+    },
+    {
+      "kind": "warning",
+      "msg": "second argument to 'va_arg' is of promotable type 'short'"
+    },
+    {
+      "kind": "warning",
+      "msg": "second argument to 'va_arg' is of promotable type 'char'"
+    },
+    {
+      "kind": "error",
+      "msg": "'va_start' used in Win64 ABI function"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/varargs-x86-64.sft.c",
+  "remark": null,
+  "sha256": "5712c4caba4d730288bb4f036b872dfdf98893416870e5840baf74ad372c71dd",
+  "test_number_uses": 0,
+  "type": "fn"
+}

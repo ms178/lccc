@@ -1,0 +1,21 @@
+{
+  "bytes": 19441,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 53,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/rvv-required-features.sft.c",
+  "remark": null,
+  "sha256": "84e1ba112d75803a43306b2129747749f99f1a78234c8ae59c05c0046a41c39e",
+  "test_number_uses": 0,
+  "type": "fp"
+}

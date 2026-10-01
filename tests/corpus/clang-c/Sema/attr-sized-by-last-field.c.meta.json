@@ -1,0 +1,94 @@
+{
+  "bytes": 4198,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'bork'"
+    },
+    {
+      "kind": "note",
+      "msg": "'size' declared here"
+    },
+    {
+      "kind": "error",
+      "msg": "'sized_by' field 'size' isn't within the same struct as the annotated pointer"
+    },
+    {
+      "kind": "note",
+      "msg": "'size' declared here"
+    },
+    {
+      "kind": "error",
+      "msg": "'sized_by' field 'size' isn't within the same struct as the annotated pointer"
+    },
+    {
+      "kind": "note",
+      "msg": "'size' declared here"
+    },
+    {
+      "kind": "error",
+      "msg": "'sized_by' field 'size' isn't within the same struct as the annotated pointer"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'size'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'size'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'size'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'blork'"
+    },
+    {
+      "kind": "note",
+      "msg": "'global' declared here"
+    },
+    {
+      "kind": "error",
+      "msg": "field 'global' in 'sized_by' not inside structure"
+    },
+    {
+      "kind": "error",
+      "msg": "'sized_by' requires a non-boolean integer type argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'sized_by' requires a non-boolean integer type argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'sized_by' only applies to pointers; did you mean to use 'counted_by'?"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'crount'"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 9,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-sized-by-last-field.sft.c",
+  "remark": null,
+  "sha256": "7bf93cd9f17c0bf66c493e85eb4e47f9aad98505f7130232b6d5a9a6e54faf02",
+  "test_number_uses": 0,
+  "type": "fn"
+}

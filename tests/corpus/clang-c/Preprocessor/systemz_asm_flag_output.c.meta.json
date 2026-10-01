@@ -1,0 +1,21 @@
+{
+  "bytes": 271,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/systemz_asm_flag_output.sft.c",
+  "remark": null,
+  "sha256": "fdc4c8c5d15508c126ff4b010acff52aaea5649eaac6d4989c4ceb72ed335666",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,118 @@
+{
+  "bytes": 5060,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "misplaced attributes"
+    },
+    {
+      "kind": "error",
+      "msg": "expected identifier"
+    },
+    {
+      "kind": "error",
+      "msg": "expected identifier or '('"
+    },
+    {
+      "kind": "error",
+      "msg": "expected string literal as argument of 'deprecated' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ','"
+    },
+    {
+      "kind": "warning",
+      "msg": "unknown attribute 'foo' ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "an attribute list cannot appear here"
+    },
+    {
+      "kind": "error",
+      "msg": "an attribute list cannot appear here"
+    },
+    {
+      "kind": "error",
+      "msg": "an attribute list cannot appear here"
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration does not declare anything"
+    },
+    {
+      "kind": "error",
+      "msg": "misplaced attributes"
+    },
+    {
+      "kind": "error",
+      "msg": "an attribute list cannot appear here"
+    },
+    {
+      "kind": "error",
+      "msg": "misplaced attributes"
+    },
+    {
+      "kind": "error",
+      "msg": "an attribute list cannot appear here"
+    },
+    {
+      "kind": "warning",
+      "msg": "unknown attribute 'attr' ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "unknown attribute 'vendor::attr' ignored"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'xx'"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ','"
+    },
+    {
+      "kind": "warning",
+      "msg": "unknown attribute 'using' ignored"
+    },
+    {
+      "kind": "error",
+      "msg": "an attribute list cannot appear here"
+    },
+    {
+      "kind": "error",
+      "msg": "an attribute list cannot appear here"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ';' after top level declarator"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    " --c23 --strict_gnu"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/c2x-attributes.sft.c",
+  "remark": null,
+  "sha256": "e250139d3ca748c0e922633e2450c3113230ff67bbdfd02a2cef3cc97bc55a5c",
+  "test_number_uses": 0,
+  "type": "fn"
+}

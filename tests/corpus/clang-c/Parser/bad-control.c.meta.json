@@ -1,0 +1,42 @@
+{
+  "bytes": 717,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'break' statement not in loop or switch statement"
+    },
+    {
+      "kind": "error",
+      "msg": "'continue' statement not in loop statement"
+    },
+    {
+      "kind": "error",
+      "msg": "'break' statement not in loop or switch statement"
+    },
+    {
+      "kind": "error",
+      "msg": "'break' statement not in loop or switch statement"
+    },
+    {
+      "kind": "error",
+      "msg": "'continue' statement not in loop statement"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/bad-control.sft.c",
+  "remark": null,
+  "sha256": "5b508b218e1a06e09fbe49d214400ce77b96edf93024f3af2725823c727eec0d",
+  "test_number_uses": 0,
+  "type": "fn"
+}

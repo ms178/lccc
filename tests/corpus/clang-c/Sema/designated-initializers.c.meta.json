@@ -1,0 +1,242 @@
+{
+  "bytes": 9747,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "array designator range [8, 7] is empty"
+    },
+    {
+      "kind": "error",
+      "msg": "array designator value '-1' is negative"
+    },
+    {
+      "kind": "error",
+      "msg": "array designator index (10) exceeds array bounds (10)"
+    },
+    {
+      "kind": "warning",
+      "msg": "use of GNU 'missing =' extension in designator"
+    },
+    {
+      "kind": "error",
+      "msg": "array designator index (12) exceeds array bounds (10)"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "field designator 'a' does not refer to any field in type 'struct point'"
+    },
+    {
+      "kind": "error",
+      "msg": "array designator cannot initialize non-array type"
+    },
+    {
+      "kind": "error",
+      "msg": "field designator 'z' does not refer to any field in type 'struct point'"
+    },
+    {
+      "kind": "error",
+      "msg": "array designator index (10) exceeds array bounds (10)"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "field designator cannot initialize a non-struct, non-union type"
+    },
+    {
+      "kind": "error",
+      "msg": "initialization of non-aggregate type 'double' with a designated initializer list"
+    },
+    {
+      "kind": "warning",
+      "msg": "braces around scalar initializer"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "initializer partially overrides prior initialization of this subobject"
+    },
+    {
+      "kind": "note",
+      "msg": "previous initialization is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "initializer partially overrides prior initialization of this subobject"
+    },
+    {
+      "kind": "warning",
+      "msg": "initializer partially overrides prior initialization of this subobject"
+    },
+    {
+      "kind": "note",
+      "msg": "previous initialization is here"
+    },
+    {
+      "kind": "note",
+      "msg": "previous initialization is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "initializer overrides prior initialization of this subobject"
+    },
+    {
+      "kind": "warning",
+      "msg": "initializer overrides prior initialization of this subobject"
+    },
+    {
+      "kind": "warning",
+      "msg": "excess elements in union initializer"
+    },
+    {
+      "kind": "note",
+      "msg": "previous"
+    },
+    {
+      "kind": "warning",
+      "msg": "overrides"
+    },
+    {
+      "kind": "note",
+      "msg": "previous"
+    },
+    {
+      "kind": "warning",
+      "msg": "overrides"
+    },
+    {
+      "kind": "warning",
+      "msg": "overrides"
+    },
+    {
+      "kind": "warning",
+      "msg": "overrides"
+    },
+    {
+      "kind": "note",
+      "msg": "previous"
+    },
+    {
+      "kind": "warning",
+      "msg": "overrides"
+    },
+    {
+      "kind": "warning",
+      "msg": "overrides"
+    },
+    {
+      "kind": "warning",
+      "msg": "overrides"
+    },
+    {
+      "kind": "note",
+      "msg": "previous"
+    },
+    {
+      "kind": "warning",
+      "msg": "overrides"
+    },
+    {
+      "kind": "note",
+      "msg": "previous"
+    },
+    {
+      "kind": "warning",
+      "msg": "overrides"
+    },
+    {
+      "kind": "note",
+      "msg": "previous"
+    },
+    {
+      "kind": "warning",
+      "msg": "overrides"
+    },
+    {
+      "kind": "note",
+      "msg": "previous initialization is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "initializer overrides prior initialization of this subobject"
+    },
+    {
+      "kind": "error",
+      "msg": "field designator 'b' does not refer to any field"
+    },
+    {
+      "kind": "note",
+      "msg": "previous initialization is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "initializer partially overrides prior initialization of this subobject"
+    },
+    {
+      "kind": "note",
+      "msg": "previous initialization is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "initializer partially overrides prior initialization of this subobject"
+    },
+    {
+      "kind": "note",
+      "msg": "previous initialization is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "initializer partially overrides prior initialization of this subobject"
+    },
+    {
+      "kind": "error",
+      "msg": "field designator"
+    },
+    {
+      "kind": "note",
+      "msg": "previous initialization is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "initializer overrides prior initialization of this subobject"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer to integer conversion initializing 'const char' with an expression of type 'char[1]'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer to integer conversion initializing 'const char' with an expression of type 'char[1]'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/designated-initializers.sft.c",
+  "remark": null,
+  "sha256": "09bbf6688a28c2ad3a57a1f6aa124dbe51495b0a75e22429e4fe1fe66cda2283",
+  "test_number_uses": 0,
+  "type": "fn"
+}

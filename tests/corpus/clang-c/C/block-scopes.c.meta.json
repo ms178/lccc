@@ -1,0 +1,25 @@
+{
+  "bytes": 1285,
+  "cases": null,
+  "category": "C",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 20,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c89",
+    " --c99",
+    " --c11",
+    " --c17",
+    " --c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C99/block-scopes.sft.c",
+  "remark": null,
+  "sha256": "f53294c6815244412f0fcbd5d7c79bb3e2ebfa10b98b84683fe1301cbaf7571c",
+  "test_number_uses": 0,
+  "type": "fp"
+}

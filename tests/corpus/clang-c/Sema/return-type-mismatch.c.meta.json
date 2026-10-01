@@ -1,0 +1,21 @@
+{
+  "bytes": 975,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/return-type-mismatch.sft.c",
+  "remark": null,
+  "sha256": "1469f6a3a875ebd46c43501754f990ffa03d6a8ec51053bd6a0365b495de60e3",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,26 @@
+{
+  "bytes": 921,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DTEST1 -DTEST1 --c --target linux_aarch64"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/builtins-aarch64.sft.c",
+  "remark": null,
+  "sha256": "fe499a524cdf931751c7583e0f70cf888ea2b1a2e99630ac5a0c6b53603c06f9",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,46 @@
+{
+  "bytes": 1439,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "'frob' is deprecated"
+    },
+    {
+      "kind": "warning",
+      "msg": "'frob' is deprecated"
+    },
+    {
+      "kind": "warning",
+      "msg": "ignoring return value of function declared with 'nodiscard' attribute"
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "attribute declaration must precede definition"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-decl-after-definition-std.sft.c",
+  "remark": null,
+  "sha256": "bd3b50a95ba57c872706548357ecab436b12132f65b6090fb670031e9d5f1eb3",
+  "test_number_uses": 0,
+  "type": "fp"
+}

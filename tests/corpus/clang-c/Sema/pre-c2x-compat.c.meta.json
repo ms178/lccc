@@ -1,0 +1,30 @@
+{
+  "bytes": 339,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "digit separators are incompatible with C standards before C23"
+    },
+    {
+      "kind": "warning",
+      "msg": "unicode literals are incompatible with C standards before C23"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/pre-c2x-compat.sft.c",
+  "remark": null,
+  "sha256": "f9828ea3d56a2ea3aae84e54c5b20178ead69c7df537231e9d8e875c426a9642",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,162 @@
+{
+  "bytes": 14769,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "expression is not an integer constant expression; folding it to a constant is a GNU extension"
+    },
+    {
+      "kind": "note",
+      "msg": "previous initialization is here"
+    },
+    {
+      "kind": "note",
+      "msg": "previous initialization is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "initializer overrides prior initialization of this subobject"
+    },
+    {
+      "kind": "warning",
+      "msg": "initializer overrides prior initialization of this subobject"
+    },
+    {
+      "kind": "error",
+      "msg": "fail"
+    },
+    {
+      "kind": "note",
+      "msg": "variable 'v1' declared const here"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot assign to variable 'v1' with const-qualified type 'typeof (i)' (aka 'const int')"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression is not an integer constant expression; folding it to a constant is a GNU extension"
+    },
+    {
+      "kind": "error",
+      "msg": "expected expression"
+    },
+    {
+      "kind": "warning",
+      "msg": "'_Alignas' attribute ignored"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Alignas' attribute cannot be applied to a bit-field"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Alignas' attribute only applies to variables and fields"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Alignas' attribute cannot be applied to a variable with 'register' storage class"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Alignas' attribute only applies to variables and fields"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression is not an integer constant expression; folding it to a constant is a GNU extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression is not an integer constant expression; folding it to a constant is a GNU extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "shift count >= width of type"
+    },
+    {
+      "kind": "error",
+      "msg": "controlling expression type 'char *' not compatible with any generic association type"
+    },
+    {
+      "kind": "warning",
+      "msg": "due to lvalue conversion of the controlling expression, association of type 'char[4]' will never be selected because it is of array type"
+    },
+    {
+      "kind": "error",
+      "msg": "controlling expression type 'int' not compatible with any generic association type"
+    },
+    {
+      "kind": "warning",
+      "msg": "due to lvalue conversion of the controlling expression, association of type 'const int' will never be selected because it is qualified"
+    },
+    {
+      "kind": "error",
+      "msg": "controlling expression type 'int' not compatible with any generic association type"
+    },
+    {
+      "kind": "warning",
+      "msg": "due to lvalue conversion of the controlling expression, association of type 'const int' will never be selected because it is qualified"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression is not an integer constant expression; folding it to a constant is a GNU extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression is not an integer constant expression; folding it to a constant is a GNU extension"
+    },
+    {
+      "kind": "error",
+      "msg": "'aligned' attribute requires integer constant"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression is not an integer constant expression; folding it to a constant is a GNU extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression with side effects has no effect in an unevaluated context"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression is not an integer constant expression; folding it to a constant is a GNU extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression is not an integer constant expression; folding it to a constant is a GNU extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration does not declare anything"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ')'"
+    },
+    {
+      "kind": "note",
+      "msg": "to match this '('"
+    }
+  ],
+  "has_main": true,
+  "header_lines": 3,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c89",
+    " --c99",
+    " --c11",
+    " --c17",
+    " --c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/drs/dr4xx.sft.c",
+  "remark": null,
+  "sha256": "a2c23c750f96b84d7ebf37fd16ac4f68aa8744e9382fb52a341eef9fe5b921da",
+  "test_number_uses": 0,
+  "type": "fn"
+}

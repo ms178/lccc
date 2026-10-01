@@ -1,0 +1,98 @@
+{
+  "bytes": 3464,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "unknown attribute 'annotate_type' ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "unknown attribute 'annotate_type' ignored"
+    },
+    {
+      "kind": "error",
+      "msg": "'clang::annotate_type' attribute cannot be applied to a declaration"
+    },
+    {
+      "kind": "error",
+      "msg": "'clang::annotate_type' attribute cannot be applied to a declaration"
+    },
+    {
+      "kind": "error",
+      "msg": "'clang::annotate_type' attribute cannot be applied to a statement"
+    },
+    {
+      "kind": "error",
+      "msg": "expected string literal as argument of 'annotate_type' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "'clang::annotate_type' attribute takes at least 1 argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'clang::annotate_type' attribute takes at least 1 argument"
+    },
+    {
+      "kind": "error",
+      "msg": "expected string literal as argument of 'annotate_type' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "'clang::annotate_type' attribute requires parameter 1 to be a constant expression"
+    },
+    {
+      "kind": "error",
+      "msg": "'clang::annotate_type' attribute requires parameter 1 to be a constant expression"
+    },
+    {
+      "kind": "error",
+      "msg": "expected expression"
+    },
+    {
+      "kind": "error",
+      "msg": "'clang::annotate_type' attribute cannot be applied to a declaration"
+    },
+    {
+      "kind": "error",
+      "msg": "'clang::annotate_type' attribute cannot be applied to a declaration"
+    },
+    {
+      "kind": "error",
+      "msg": "'clang::annotate_type' attribute cannot be applied to a declaration"
+    },
+    {
+      "kind": "error",
+      "msg": "'clang::annotate_type' attribute cannot be applied to a declaration"
+    },
+    {
+      "kind": "error",
+      "msg": "'clang::annotate_type' attribute cannot be applied to a declaration"
+    },
+    {
+      "kind": "error",
+      "msg": "'clang::annotate_type' attribute cannot be applied to a declaration"
+    },
+    {
+      "kind": "error",
+      "msg": "an attribute list cannot appear here"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/annotate-type.sft.c",
+  "remark": null,
+  "sha256": "f2bf0de35420017420f8619bb828cbfe57feeacc43ca472bca9ec66e77a82ad5",
+  "test_number_uses": 0,
+  "type": "fn"
+}

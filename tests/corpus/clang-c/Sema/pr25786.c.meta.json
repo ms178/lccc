@@ -1,0 +1,34 @@
+{
+  "bytes": 633,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'stdcall' calling convention is not supported for this target"
+    },
+    {
+      "kind": "warning",
+      "msg": "'stdcall' calling convention is not supported for this target"
+    },
+    {
+      "kind": "no-diagnostics",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DTEST --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/pr25786.sft.c",
+  "remark": null,
+  "sha256": "6681f3497d8be92c8a33db725c0718567c290c2b53e2260b99d373d836a5b705",
+  "test_number_uses": 0,
+  "type": "fp"
+}

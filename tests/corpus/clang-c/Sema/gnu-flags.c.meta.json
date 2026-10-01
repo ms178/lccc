@@ -1,0 +1,90 @@
+{
+  "bytes": 5484,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 40,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DNONE -DALL -DALL -DNONE -DALIGNOF -DCOMPLEXINT -DOMITTEDOPERAND -DLABELVALUE -DSTATEMENTEXP -DSTATEMENTEXPMACRO -DCOMPOUNDLITERALINITIALIZER -DFLEXIBLEARRAYINITIALIZER -DREDECLAREDENUM -DUNIONCAST -DVARIABLESIZEDTYPENOTATEND -DFOLDINGCONSTANT -DEMPTYSTRUCT --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/gnu-flags.sft.c",
+  "remark": null,
+  "sha256": "b20dfa429f1656d1d9f797b10a68b4d589d832a1ca99c91d84bd63a39f854027",
+  "test_number_uses": 0,
+  "type": "fp"
+}

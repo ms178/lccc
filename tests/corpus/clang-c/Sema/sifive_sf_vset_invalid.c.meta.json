@@ -1,0 +1,21 @@
+{
+  "bytes": 19006,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 54,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/sifive_sf_vset_invalid.sft.c",
+  "remark": null,
+  "sha256": "8c66a8f8ecf283ae4ca4271ed0b707851ccb48d779b4a18c2ca7e52e192c44b3",
+  "test_number_uses": 0,
+  "type": "fn"
+}

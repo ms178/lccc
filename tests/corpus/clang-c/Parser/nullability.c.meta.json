@@ -1,0 +1,26 @@
+{
+  "bytes": 821,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "type nullability specifier '_Nonnull' is a Clang extension"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c99"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/nullability.sft.c",
+  "remark": null,
+  "sha256": "fb9bf455e1d6da8c49bc2b2a884b5e6ba5bc3d267cab15c7e3fdcb99644d7c88",
+  "test_number_uses": 0,
+  "type": "fp"
+}

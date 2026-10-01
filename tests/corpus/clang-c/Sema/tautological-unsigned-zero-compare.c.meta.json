@@ -1,0 +1,90 @@
+{
+  "bytes": 5859,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "comparison of unsigned expression < 0 is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of unsigned expression < 0 is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of unsigned expression >= 0 is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of 0 <= unsigned expression is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of 0 > unsigned expression is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of unsigned expression < 0 is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of unsigned expression >= 0 is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of 0 <= unsigned expression is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of 0 > unsigned expression is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of unsigned expression < 0 is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of unsigned expression >= 0 is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of 0 <= unsigned expression is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of 0 > unsigned expression is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of unsigned expression < 0 is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of unsigned expression >= 0 is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of 0 <= unsigned expression is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of 0 > unsigned expression is always false"
+    }
+  ],
+  "has_main": true,
+  "header_lines": 13,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/tautological-unsigned-zero-compare.sft.c",
+  "remark": null,
+  "sha256": "f7d32051270b6cf1098e1b022b1b90a0660bae55d6838ea24f944893b042ce6a",
+  "test_number_uses": 0,
+  "type": "fp"
+}

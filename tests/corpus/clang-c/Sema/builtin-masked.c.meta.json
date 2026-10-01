@@ -1,0 +1,226 @@
+{
+  "bytes": 9265,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call, expected 2, have 1"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to function call, expected at most 3, have 4"
+    },
+    {
+      "kind": "error",
+      "msg": "2nd argument must be a scalar pointer"
+    },
+    {
+      "kind": "error",
+      "msg": "3rd argument must be a 'int __attribute__((ext_vector_type(2)))' (vector of 2 'int' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call, expected 3, have 1"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to function call, expected 3, have 4"
+    },
+    {
+      "kind": "error",
+      "msg": "1st argument must be a vector of boolean types (was 'int')"
+    },
+    {
+      "kind": "error",
+      "msg": "2nd argument must be a vector"
+    },
+    {
+      "kind": "error",
+      "msg": "3rd argument must be a scalar pointer"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call, expected 2, have 1"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to function call, expected at most 3, have 4"
+    },
+    {
+      "kind": "error",
+      "msg": "2nd argument must be a scalar pointer"
+    },
+    {
+      "kind": "error",
+      "msg": "3rd argument must be a 'int __attribute__((ext_vector_type(2)))' (vector of 2 'int' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call, expected 3, have 1"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to function call, expected 3, have 4"
+    },
+    {
+      "kind": "error",
+      "msg": "1st argument must be a vector of boolean types (was 'int')"
+    },
+    {
+      "kind": "error",
+      "msg": "2nd argument must be a vector"
+    },
+    {
+      "kind": "error",
+      "msg": "3rd argument must be a scalar pointer"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call, expected 3, have 1"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to function call, expected at most 4, have 6"
+    },
+    {
+      "kind": "error",
+      "msg": "1st argument must be a vector of boolean types (was 'int *')"
+    },
+    {
+      "kind": "error",
+      "msg": "1st argument must be a vector of integer types (was 'int *')"
+    },
+    {
+      "kind": "error",
+      "msg": "all arguments to '__builtin_masked_gather' must have the same number of elements (was 'v2b'"
+    },
+    {
+      "kind": "error",
+      "msg": "4th argument must be a 'int __attribute__((ext_vector_type(8)))' (vector of 8 'int' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "3rd argument must be a scalar pointer"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call, expected 4, have 1"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to function call, expected 4, have 6"
+    },
+    {
+      "kind": "error",
+      "msg": "1st argument must be a vector of boolean types (was 'int *')"
+    },
+    {
+      "kind": "error",
+      "msg": "2nd argument must be a vector of integer types (was 'int *')"
+    },
+    {
+      "kind": "error",
+      "msg": "last two arguments to '__builtin_masked_scatter' must have the same type"
+    },
+    {
+      "kind": "error",
+      "msg": "4th argument must be a scalar pointer"
+    },
+    {
+      "kind": "error",
+      "msg": "4th argument must be a scalar pointer"
+    },
+    {
+      "kind": "error",
+      "msg": "sending 'volatile int *' to parameter of incompatible type 'int *': type mismatch at 2nd parameter ('volatile int *' vs 'int *')"
+    },
+    {
+      "kind": "error",
+      "msg": "sending 'volatile int *' to parameter of incompatible type 'int *': type mismatch at 2nd parameter ('volatile int *' vs 'int *')"
+    },
+    {
+      "kind": "error",
+      "msg": "sending 'const int *' to parameter of incompatible type 'int *': type mismatch at 2nd parameter ('const int *' vs 'int *')"
+    },
+    {
+      "kind": "error",
+      "msg": "sending 'const int *' to parameter of incompatible type 'int *': type mismatch at 2nd parameter ('const int *' vs 'int *')"
+    },
+    {
+      "kind": "error",
+      "msg": "sending 'const int *' to parameter of incompatible type 'int *': type mismatch at 2nd parameter ('const int *' vs 'int *')"
+    },
+    {
+      "kind": "error",
+      "msg": "sending 'volatile int *' to parameter of incompatible type 'int *': type mismatch at 2nd parameter ('volatile int *' vs 'int *')"
+    },
+    {
+      "kind": "error",
+      "msg": "sending 'volatile int *' to parameter of incompatible type 'int *': type mismatch at 2nd parameter ('volatile int *' vs 'int *')"
+    },
+    {
+      "kind": "error",
+      "msg": "sending 'volatile int *' to parameter of incompatible type 'int *': type mismatch at 2nd parameter ('volatile int *' vs 'int *')"
+    },
+    {
+      "kind": "error",
+      "msg": "sending 'volatile int *' to parameter of incompatible type 'int *': type mismatch at 2nd parameter ('volatile int *' vs 'int *')"
+    },
+    {
+      "kind": "error",
+      "msg": "sending 'volatile int *' to parameter of incompatible type 'int *': type mismatch at 2nd parameter ('volatile int *' vs 'int *')"
+    },
+    {
+      "kind": "error",
+      "msg": "sending 'volatile int *' to parameter of incompatible type 'int *': type mismatch at 2nd parameter ('volatile int *' vs 'int *')"
+    },
+    {
+      "kind": "error",
+      "msg": "sending '__attribute__((address_space(999))) int *' to parameter of incompatible type 'int *': type mismatch at 2nd parameter ('__attribute__((address_space(999))) int *' vs 'int *')"
+    },
+    {
+      "kind": "error",
+      "msg": "sending '__attribute__((address_space(999))) int *' to parameter of incompatible type 'int *': type mismatch at 2nd parameter ('__attribute__((address_space(999))) int *' vs 'int *')"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Atomic(int) *' to parameter of incompatible type 'int *': type mismatch at 2nd parameter ('_Atomic(int) *' vs 'int *')"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Atomic(int) *' to parameter of incompatible type 'int *': type mismatch at 2nd parameter ('_Atomic(int) *' vs 'int *')"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Atomic(int) *' to parameter of incompatible type 'int *': type mismatch at 2nd parameter ('_Atomic(int) *' vs 'int *')"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Atomic(int) *' to parameter of incompatible type 'int *': type mismatch at 2nd parameter ('_Atomic(int) *' vs 'int *')"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Atomic(int) *' to parameter of incompatible type 'int *': type mismatch at 2nd parameter ('_Atomic(int) *' vs 'int *')"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Atomic(int) *' to parameter of incompatible type 'int *': type mismatch at 2nd parameter ('_Atomic(int) *' vs 'int *')"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/builtin-masked.sft.c",
+  "remark": null,
+  "sha256": "563be872fd4b007f8cf6deb24cf199bb316a31764c9ad3487498416410ea379b",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,102 @@
+{
+  "bytes": 2579,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'intmax_t' (aka 'long long')"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'uintmax_t' (aka 'unsigned long long')"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'size_t' (aka 'unsigned long')"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'ptrdiff_t' (aka 'int')"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'wint_t' (aka 'int')"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'wchar_t *' (aka 'int *')"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'wchar_t *' (aka 'int *')"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'wchar_t' (aka 'int')"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'intmax_t *' (aka 'long long *')"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'uintmax_t *' (aka 'unsigned long long *')"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'size_t *' (aka 'unsigned long *')"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'ptrdiff_t *' (aka 'int *')"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'wchar_t *' (aka 'int *')"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'wchar_t *' (aka 'int *')"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'wchar_t *' (aka 'int *')"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'wchar_t *' (aka 'int *')"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'intmax_t' (aka 'long long') but the argument has type 'intmax_t' (aka 'void *')"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'uintmax_t' (aka 'unsigned long long') but the argument has type 'uintmax_t' (aka 'void *')"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'size_t' (aka 'unsigned long') but the argument has type 'size_t' (aka 'void *')"
+    },
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'ptrdiff_t' (aka 'int') but the argument has type 'ptrdiff_t' (aka 'void *')"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/format-strings-int-typedefs.sft.c",
+  "remark": null,
+  "sha256": "621c2ce03d692d50ca43795f737bfb6a3ce342e9ccccbf48b78adc04430f19ef",
+  "test_number_uses": 0,
+  "type": "fp"
+}

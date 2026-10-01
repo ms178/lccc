@@ -1,0 +1,79 @@
+{
+  "bytes": 6795,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "controlling expression type 'const int' not compatible with any generic association type"
+    },
+    {
+      "kind": "warning",
+      "msg": "due to lvalue conversion of the controlling expression, association of type 'const int' will never be selected because it is qualified"
+    },
+    {
+      "kind": "error",
+      "msg": "type 'void (int)' in generic association not an object type"
+    },
+    {
+      "kind": "note",
+      "msg": "compatible type 'const int' specified here"
+    },
+    {
+      "kind": "error",
+      "msg": "type 'const int' in generic association compatible with previously specified type 'const int'"
+    },
+    {
+      "kind": "note",
+      "msg": "compatible type 'CInt' (aka 'const int') specified here"
+    },
+    {
+      "kind": "error",
+      "msg": "type 'OtherCInt' (aka 'const int') in generic association compatible with previously specified type 'CInt' (aka 'const int')"
+    },
+    {
+      "kind": "note",
+      "msg": "compatible type 'int[12]' specified here"
+    },
+    {
+      "kind": "error",
+      "msg": "type 'int[12]' in generic association compatible with previously specified type 'int[12]'"
+    },
+    {
+      "kind": "note",
+      "msg": "compatible type 'int (int)' specified here"
+    },
+    {
+      "kind": "error",
+      "msg": "type 'int (int)' in generic association compatible with previously specified type 'int (int)'"
+    },
+    {
+      "kind": "error",
+      "msg": "controlling expression type 'double' not compatible with any generic association type"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "expected ','"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 9,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23",
+    " --c++17 --c++"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/generic-selection-type-extension.sft.c",
+  "remark": null,
+  "sha256": "d51409971e86d89f43ac6f600e1ee9c07b3d8a101290d7b95fdc0ffe04ca7103",
+  "test_number_uses": 0,
+  "type": "fn"
+}

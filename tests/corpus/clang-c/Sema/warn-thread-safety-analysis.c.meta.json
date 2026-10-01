@@ -1,0 +1,218 @@
+{
+  "bytes": 14275,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "calling function 'Foo_fun1' requires holding mutex 'mu2'"
+    },
+    {
+      "kind": "warning",
+      "msg": "calling function 'Foo_fun1' requires holding mutex 'mu1' exclusively"
+    },
+    {
+      "kind": "note",
+      "msg": "mutex acquired here"
+    },
+    {
+      "kind": "warning",
+      "msg": "acquiring mutex 'mu1' that is already held"
+    },
+    {
+      "kind": "warning",
+      "msg": "mutex 'mu1' must be acquired before 'mu2'"
+    },
+    {
+      "kind": "warning",
+      "msg": "cannot call function 'Foo_func3' while mutex 'mu1' is held"
+    },
+    {
+      "kind": "warning",
+      "msg": "calling function 'set_value' requires holding mutex 'foo_.mu_' exclusively"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "calling function 'get_value' requires holding mutex 'foo_.mu_'"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "writing variable 'a_' requires holding mutex 'foo_.mu_'"
+    },
+    {
+      "kind": "warning",
+      "msg": "writing variable 'a_' requires holding mutex 'foo_.mu_'"
+    },
+    {
+      "kind": "warning",
+      "msg": "reading variable 'a_' requires holding mutex 'foo_.mu_'"
+    },
+    {
+      "kind": "warning",
+      "msg": "reading variable 'a_' requires holding mutex 'foo_.mu_'"
+    },
+    {
+      "kind": "warning",
+      "msg": "writing the value pointed to by 'b_' requires holding mutex 'foo_.mu_' exclusively"
+    },
+    {
+      "kind": "warning",
+      "msg": "writing the value pointed to by 'b_' requires holding mutex 'foo_.mu_' exclusively"
+    },
+    {
+      "kind": "warning",
+      "msg": "reading the value pointed to by 'b_' requires holding mutex 'foo_.mu_'"
+    },
+    {
+      "kind": "warning",
+      "msg": "reading the value pointed to by 'b_' requires holding mutex 'foo_.mu_'"
+    },
+    {
+      "kind": "warning",
+      "msg": "writing variable 'c_' requires holding any mutex exclusively"
+    },
+    {
+      "kind": "warning",
+      "msg": "reading the value pointed to by 'd_' requires holding any mutex"
+    },
+    {
+      "kind": "note",
+      "msg": "mutex acquired here"
+    },
+    {
+      "kind": "warning",
+      "msg": "releasing mutex 'mu1' using shared access, expected exclusive access"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "releasing mutex 'mu1' that was not held"
+    },
+    {
+      "kind": "note",
+      "msg": "mutex acquired here"
+    },
+    {
+      "kind": "warning",
+      "msg": "releasing mutex 'mu1' using exclusive access, expected shared access"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "releasing mutex 'mu1' that was not held"
+    },
+    {
+      "kind": "warning",
+      "msg": "writing variable 'a_value' requires holding mutex 'mu_' exclusively"
+    },
+    {
+      "kind": "warning",
+      "msg": "writing the value pointed to by 'a_ptr' requires holding mutex 'bar.other_mu' exclusively"
+    },
+    {
+      "kind": "warning",
+      "msg": "mutex 'third_mu' must be acquired before 'other_mu'"
+    },
+    {
+      "kind": "warning",
+      "msg": "mutex 'mu_' must be acquired before 'other_mu'"
+    },
+    {
+      "kind": "warning",
+      "msg": "writing variable 'a_value_defined_before' requires holding mutex 'a_mutex_defined_late' exclusively"
+    },
+    {
+      "kind": "warning",
+      "msg": "calling function 'set_value' requires holding mutex 'foo_.mu_' exclusively"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "mutex 'a_mutex_defined_early' must be acquired before 'a_mutex_defined_late'"
+    },
+    {
+      "kind": "warning",
+      "msg": "mutex 'a_mutex_defined_very_late' must be acquired before 'a_mutex_defined_late'"
+    },
+    {
+      "kind": "warning",
+      "msg": "writing variable 'r_' requires holding mutex 'rmu' exclusively"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "'guarded_by' attribute takes one argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'pt_guarded_by' attribute takes one argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'guarded_by' attribute takes one argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'pt_guarded_by' attribute takes one argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'acquired_after' attribute takes at least 1 argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'acquired_before' attribute takes at least 1 argument"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'bad_expr'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'bad_expr'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'other_bad_expr'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'other_bad_expr'"
+    }
+  ],
+  "has_main": true,
+  "header_lines": 24,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DLATE_PARSING --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-thread-safety-analysis.sft.c",
+  "remark": null,
+  "sha256": "a1568f30e0245df39721d23b79d5a80a9ff47e860bcb99cd11119017b9e79ae1",
+  "test_number_uses": 0,
+  "type": "fn"
+}

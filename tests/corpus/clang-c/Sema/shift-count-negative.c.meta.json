@@ -1,0 +1,26 @@
+{
+  "bytes": 676,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/shift-count-negative.sft.c",
+  "remark": null,
+  "sha256": "feb8b11208b1b70708dcadb172bed167d53f29d476e18291b170455772d42126",
+  "test_number_uses": 0,
+  "type": "fp"
+}

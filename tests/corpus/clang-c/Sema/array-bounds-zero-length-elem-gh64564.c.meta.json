@@ -1,0 +1,30 @@
+{
+  "bytes": 386,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "tentative array definition assumed to have one element"
+    },
+    {
+      "kind": "warning",
+      "msg": "tentative array definition assumed to have one element"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/array-bounds-zero-length-elem-gh64564.sft.c",
+  "remark": null,
+  "sha256": "7827e172d17d308b95f0dbe1af9e30d22eb32c5a5cfce1e3b8e7d78d1fe4d5de",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,102 @@
+{
+  "bytes": 3013,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "does not directly precede switch label"
+    },
+    {
+      "kind": "warning",
+      "msg": "ISO C does not allow an attribute list to appear here"
+    },
+    {
+      "kind": "error",
+      "msg": "does not directly precede switch label"
+    },
+    {
+      "kind": "warning",
+      "msg": "ISO C does not allow an attribute list to appear here"
+    },
+    {
+      "kind": "error",
+      "msg": "does not directly precede switch label"
+    },
+    {
+      "kind": "warning",
+      "msg": "ISO C does not allow an attribute list to appear here"
+    },
+    {
+      "kind": "error",
+      "msg": "does not directly precede switch label"
+    },
+    {
+      "kind": "warning",
+      "msg": "ISO C does not allow an attribute list to appear here"
+    },
+    {
+      "kind": "error",
+      "msg": "does not directly precede switch label"
+    },
+    {
+      "kind": "warning",
+      "msg": "ISO C does not allow an attribute list to appear here"
+    },
+    {
+      "kind": "error",
+      "msg": "does not directly precede switch label"
+    },
+    {
+      "kind": "error",
+      "msg": "'fallthrough' attribute cannot be applied to a declaration"
+    },
+    {
+      "kind": "error",
+      "msg": "'fallthrough' attribute cannot be applied to types"
+    },
+    {
+      "kind": "error",
+      "msg": "'fallthrough' attribute cannot be applied to a declaration"
+    },
+    {
+      "kind": "error",
+      "msg": "'fallthrough' attribute cannot be applied to a declaration"
+    },
+    {
+      "kind": "error",
+      "msg": "'fallthrough' attribute cannot be applied to a declaration"
+    },
+    {
+      "kind": "error",
+      "msg": "'fallthrough' attribute cannot be applied to a declaration"
+    },
+    {
+      "kind": "error",
+      "msg": "'fallthrough' attribute cannot be applied to a declaration"
+    },
+    {
+      "kind": "error",
+      "msg": "'fallthrough' attribute only applies to empty statements"
+    },
+    {
+      "kind": "error",
+      "msg": "argument list"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/c2x-fallthrough.sft.c",
+  "remark": null,
+  "sha256": "a7ceb56f3975d292b129f3bdd9de786d816605036b3f2d1d12acdbcc06b2f815",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,142 @@
+{
+  "bytes": 31928,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "not a compile-time constant"
+    },
+    {
+      "kind": "error",
+      "msg": "not a compile-time constant"
+    },
+    {
+      "kind": "error",
+      "msg": "not a compile-time constant"
+    },
+    {
+      "kind": "error",
+      "msg": "not a compile-time constant"
+    },
+    {
+      "kind": "error",
+      "msg": "not a compile-time constant"
+    },
+    {
+      "kind": "error",
+      "msg": "not a compile-time constant"
+    },
+    {
+      "kind": "error",
+      "msg": "not a compile-time constant"
+    },
+    {
+      "kind": "error",
+      "msg": "variable length array declaration not allowed at file scope"
+    },
+    {
+      "kind": "error",
+      "msg": "variable length array declaration not allowed at file scope"
+    },
+    {
+      "kind": "error",
+      "msg": "not a compile-time constant"
+    },
+    {
+      "kind": "error",
+      "msg": "variable length array declaration not allowed at file scope"
+    },
+    {
+      "kind": "error",
+      "msg": "variable length array declaration not allowed at file scope"
+    },
+    {
+      "kind": "error",
+      "msg": "not a compile-time constant"
+    },
+    {
+      "kind": "error",
+      "msg": "not a compile-time constant"
+    },
+    {
+      "kind": "error",
+      "msg": "not a compile-time constant"
+    },
+    {
+      "kind": "error",
+      "msg": "not a compile-time constant"
+    },
+    {
+      "kind": "error",
+      "msg": "not a compile-time constant"
+    },
+    {
+      "kind": "error",
+      "msg": "not a compile-time constant"
+    },
+    {
+      "kind": "error",
+      "msg": "not a compile-time constant"
+    },
+    {
+      "kind": "error",
+      "msg": "not a compile-time constant"
+    },
+    {
+      "kind": "error",
+      "msg": "not a compile-time constant"
+    },
+    {
+      "kind": "error",
+      "msg": "not a compile-time constant"
+    },
+    {
+      "kind": "error",
+      "msg": "not a compile-time constant"
+    },
+    {
+      "kind": "error",
+      "msg": "1st argument must be a scalar integer type (was 'float')"
+    },
+    {
+      "kind": "error",
+      "msg": "1st argument must be a scalar integer type (was 'long double')"
+    },
+    {
+      "kind": "error",
+      "msg": "1st argument must be a scalar integer type (was 'char[6]')"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to function call, expected 1, have 2"
+    },
+    {
+      "kind": "error",
+      "msg": "1st argument must be a scalar integer type (was 'int *')"
+    },
+    {
+      "kind": "error",
+      "msg": "1st argument must be a scalar integer type (was 'int[4]')"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/constant-builtins-2.sft.c",
+  "remark": null,
+  "sha256": "ff3fe0823e0f95b1a206a021993772bdac02cde4c361d8576d1e87b0aec83469",
+  "test_number_uses": 0,
+  "type": "fn"
+}

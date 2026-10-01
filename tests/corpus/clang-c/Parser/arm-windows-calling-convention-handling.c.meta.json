@@ -1,0 +1,30 @@
+{
+  "bytes": 486,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "no-diagnostics",
+      "msg": ""
+    },
+    {
+      "kind": "no-diagnostics",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w --ms_compatibility -w --ms_compatibility --c --target linux_aarch64"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/arm-windows-calling-convention-handling.sft.c",
+  "remark": null,
+  "sha256": "554d8fe6320d22988be5f2d61f1e719e4f136b3ba4f30723b06b09edbd761ab3",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,26 @@
+{
+  "bytes": 186,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'x'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c11"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/namelookup-anonymous-struct.sft.c",
+  "remark": null,
+  "sha256": "0027d329513901c934d102fdab0da26740631a1af63ab5e473ba7f19a2026b5f",
+  "test_number_uses": 0,
+  "type": "fn"
+}

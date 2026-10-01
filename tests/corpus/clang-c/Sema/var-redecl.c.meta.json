@@ -1,0 +1,146 @@
+{
+  "bytes": 2934,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redeclaration of 'outer1' with a different type"
+    },
+    {
+      "kind": "error",
+      "msg": "redeclaration of 'outer2' with a different type"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of 'outer6' as different kind of symbol"
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of 'outer3' with a different type"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of 'outer4' with a different type"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of 'outer5' with a different type"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of 'outer8' as different kind of symbol"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of 'outer9' with a different type"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redeclaration of 'outer11' with a different type"
+    },
+    {
+      "kind": "error",
+      "msg": "redeclaration of 'outer12' with a different type"
+    },
+    {
+      "kind": "error",
+      "msg": "redeclaration of 'outer13' with a different type"
+    },
+    {
+      "kind": "note",
+      "msg": "'g18' declared here"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'g19'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer types"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "non-static declaration of 'a' follows static declaration"
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "error",
+      "msg": "extern declaration of 'x' follows non-extern declaration"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redeclaration of 'b' with a different type: 'int[4]' vs 'int[3]'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/var-redecl.sft.c",
+  "remark": null,
+  "sha256": "dcd2a8ff6a5e6aa492308ca062052763cacb0024b665019c178f903e6a4cacdb",
+  "test_number_uses": 0,
+  "type": "fn"
+}

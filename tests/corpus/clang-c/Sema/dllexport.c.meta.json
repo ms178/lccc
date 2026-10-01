@@ -1,0 +1,193 @@
+{
+  "bytes": 8875,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redeclaration of 'GlobalRedecl3' cannot add 'dllexport' attribute"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "redeclaration of 'GlobalRedecl4' should not add 'dllexport' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "'StaticGlobal' must have external linkage when declared 'dllexport'"
+    },
+    {
+      "kind": "error",
+      "msg": "'ThreadLocalGlobal' cannot be thread local when declared 'dllexport'"
+    },
+    {
+      "kind": "error",
+      "msg": "'LocalVarDecl' must have external linkage when declared 'dllexport'"
+    },
+    {
+      "kind": "error",
+      "msg": "'LocalVarDef' must have external linkage when declared 'dllexport'"
+    },
+    {
+      "kind": "error",
+      "msg": "'StaticLocalVar' must have external linkage when declared 'dllexport'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redeclaration of 'redecl4' cannot add 'dllexport' attribute"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redeclaration of 'redecl5' cannot add 'dllexport' attribute"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "redeclaration of 'redecl6' should not add 'dllexport' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "'staticFunc' must have external linkage when declared 'dllexport'"
+    },
+    {
+      "kind": "error",
+      "msg": "'staticLocal' must have external linkage when declared 'dllexport'"
+    },
+    {
+      "kind": "warning",
+      "msg": "'dllimport' attribute ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "'dllimport' attribute ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "'dllimport' attribute ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "'dllimport' attribute ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "'dllimport' attribute ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "'dllimport' attribute ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "'dllimport' attribute ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "'dllimport' attribute ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "'dllimport' attribute ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "'dllimport' attribute ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "'dllimport' attribute ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "'dllimport' attribute ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "'dllimport' attribute ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "'dllimport' attribute ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "'dllimport' attribute ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "'dllimport' attribute ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "'dllimport' attribute ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "'dllimport' attribute ignored"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 12,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w --ms_extensions --c99 -w --ms_extensions",
+    " --c11 --ms_extensions",
+    " --c11 --ms_extensions",
+    " --c99 -w --ms_extensions",
+    " --c99 -w --ms_extensions",
+    " --c11 --ms_extensions",
+    " --c99 --ms_extensions",
+    " --c11"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/dllexport.sft.c",
+  "remark": null,
+  "sha256": "7385fa479346bec6c7868f82ba835fc07710cd597692d71b664f94c9d541e025",
+  "test_number_uses": 0,
+  "type": "fn"
+}

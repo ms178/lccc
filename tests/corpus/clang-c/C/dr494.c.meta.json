@@ -1,0 +1,25 @@
+{
+  "bytes": 1127,
+  "cases": null,
+  "category": "C",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 3,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c89",
+    " --c99",
+    " --c11",
+    " --c17",
+    " --c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/drs/dr494.sft.c",
+  "remark": null,
+  "sha256": "aef73aa61a453aa7a53533fdd739f771f645a21a370e1066788ec49c19724e30",
+  "test_number_uses": 0,
+  "type": "fp"
+}

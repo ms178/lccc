@@ -1,0 +1,146 @@
+{
+  "bytes": 4139,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "mixing declarations and code"
+    },
+    {
+      "kind": "warning",
+      "msg": "mixing declarations and code"
+    },
+    {
+      "kind": "warning",
+      "msg": "mixing declarations and code"
+    },
+    {
+      "kind": "warning",
+      "msg": "extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable length array"
+    },
+    {
+      "kind": "warning",
+      "msg": "long long"
+    },
+    {
+      "kind": "error",
+      "msg": "expected identifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "omitting the parameter name in a function definition is a C23 extension"
+    },
+    {
+      "kind": "error",
+      "msg": "may not have 'void' type"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable length arrays are a C99 feature"
+    },
+    {
+      "kind": "warning",
+      "msg": "static array size is a C99 feature"
+    },
+    {
+      "kind": "warning",
+      "msg": "qualifier in array size is a C99 feature"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable length arrays are a C99 feature"
+    },
+    {
+      "kind": "warning",
+      "msg": "ISO C90 does not allow subscripting non-lvalue array"
+    },
+    {
+      "kind": "warning",
+      "msg": "ISO C90 does not allow subscripting non-lvalue array"
+    },
+    {
+      "kind": "warning",
+      "msg": "designated initializers are a C99 feature"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit declaration of function 'printg'"
+    },
+    {
+      "kind": "warning",
+      "msg": "flexible array members are a C99 feature"
+    },
+    {
+      "kind": "warning",
+      "msg": "duplicate 'const' declaration specifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "duplicate 'volatile' declaration specifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "duplicate 'volatile' declaration specifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "duplicate 'const' declaration specifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "duplicate 'const' declaration specifier"
+    },
+    {
+      "kind": "error",
+      "msg": "'main' must return 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "'main' must return 'int'"
+    },
+    {
+      "kind": "warning",
+      "msg": "'long long' is an extension when C99 mode is not enabled"
+    },
+    {
+      "kind": "warning",
+      "msg": "'long long' is an extension when C99 mode is not enabled"
+    },
+    {
+      "kind": "warning",
+      "msg": "'long long' is an extension when C99 mode is not enabled"
+    },
+    {
+      "kind": "warning",
+      "msg": "'long long' is an extension when C99 mode is not enabled"
+    },
+    {
+      "kind": "warning",
+      "msg": "initializer for aggregate is not a compile-time constant"
+    },
+    {
+      "kind": "warning",
+      "msg": "initializer for aggregate is not a compile-time constant"
+    }
+  ],
+  "has_main": true,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c89"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/c89.sft.c",
+  "remark": null,
+  "sha256": "5175a186fe4a67c7753be894c72c85dc170677f162cd8eb3f3900e6ec862c76e",
+  "test_number_uses": 0,
+  "type": "fn"
+}

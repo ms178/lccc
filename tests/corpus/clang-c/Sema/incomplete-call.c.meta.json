@@ -1,0 +1,42 @@
+{
+  "bytes": 529,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": "'a' declared here"
+    },
+    {
+      "kind": "error",
+      "msg": "calling 'a' with incomplete return type 'struct foo'"
+    },
+    {
+      "kind": "error",
+      "msg": "argument type 'struct foo' is incomplete"
+    },
+    {
+      "kind": "error",
+      "msg": "argument type 'struct foo' is incomplete"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/incomplete-call.sft.c",
+  "remark": null,
+  "sha256": "f856515102c229aaceed18409cb614b13902af0282776c48445a45e8b520de10",
+  "test_number_uses": 0,
+  "type": "fn"
+}

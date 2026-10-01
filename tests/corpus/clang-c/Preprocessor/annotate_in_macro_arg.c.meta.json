@@ -1,0 +1,30 @@
+{
+  "bytes": 266,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "unterminated function-like macro invocation"
+    },
+    {
+      "kind": "error",
+      "msg": "expected value in expression"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/annotate_in_macro_arg.sft.c",
+  "remark": null,
+  "sha256": "53e56bf66614df81bbd5f52cc4ca83c6be94b48944535115796e57edfb85fa2f",
+  "test_number_uses": 0,
+  "type": "fn"
+}

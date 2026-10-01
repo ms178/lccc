@@ -1,0 +1,21 @@
+{
+  "bytes": 1325,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--ms_extensions --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-print.sft.c",
+  "remark": null,
+  "sha256": "c05d0d86b5b8d33cb3799fd6da78230f99931246d84148ed0cb2783589e3c505",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,62 @@
+{
+  "bytes": 2480,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "use of '__int128' with '__vector bool' requires VSX support enabled (on POWER10 or later)"
+    },
+    {
+      "kind": "error",
+      "msg": "use of '__int128' with '__vector bool' requires VSX support enabled (on POWER10 or later)"
+    },
+    {
+      "kind": "error",
+      "msg": "use of '__int128' with '__vector bool' requires VSX support enabled (on POWER10 or later)"
+    },
+    {
+      "kind": "error",
+      "msg": "use of '__int128' with '__vector bool' requires VSX support enabled (on POWER10 or later)"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use 'unsigned' with '__vector bool'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use 'signed' with '__vector bool'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use 'unsigned' with '__vector bool'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use 'signed' with '__vector bool'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use 'signed' with '__vector bool'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use 'signed' with '__vector bool'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 13,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/altivec-bool-128.sft.c",
+  "remark": null,
+  "sha256": "c475eb6226c2abce5c648cb3b4d5516426a107f349dcb93ac69b829111bba600",
+  "test_number_uses": 0,
+  "type": "fn"
+}

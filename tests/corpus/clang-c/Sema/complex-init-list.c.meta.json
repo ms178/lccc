@@ -1,0 +1,94 @@
+{
+  "bytes": 3479,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "specifying real and imaginary components is an extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "complex integer"
+    },
+    {
+      "kind": "warning",
+      "msg": "specifying real and imaginary components is an extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "specifying real and imaginary components is an extension"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "imaginary constants"
+    },
+    {
+      "kind": "warning",
+      "msg": "specifying real and imaginary components is an extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "excess elements"
+    },
+    {
+      "kind": "warning",
+      "msg": "specifying real and imaginary components is an extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "excess elements in scalar initializer"
+    },
+    {
+      "kind": "warning",
+      "msg": "use of an empty initializer is a C23 extension"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "specifying real and imaginary components is an extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "specifying real and imaginary components is an extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "specifying real and imaginary components is an extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "excess elements in scalar initializer"
+    },
+    {
+      "kind": "warning",
+      "msg": "specifying real and imaginary components is an extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "excess elements in scalar initializer"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 21,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/complex-init-list.sft.c",
+  "remark": null,
+  "sha256": "c4cc3827118717aef2dd4a8ffc6617cb29a273ed9377279fa05f5163361d6a83",
+  "test_number_uses": 0,
+  "type": "fp"
+}

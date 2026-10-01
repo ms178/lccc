@@ -1,0 +1,21 @@
+{
+  "bytes": 267,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/pragma-align-mac68k-unsupported.sft.c",
+  "remark": null,
+  "sha256": "4d1ed5153f9ad386e66ba32519da3717b77fa8c9a41ce1380ff444d8981dd57c",
+  "test_number_uses": 0,
+  "type": "fn"
+}

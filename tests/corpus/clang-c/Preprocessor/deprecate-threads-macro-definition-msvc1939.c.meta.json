@@ -1,0 +1,27 @@
+{
+  "bytes": 1560,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 17,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w --c89 -w",
+    " --c99 -w",
+    " --c11 -w",
+    " --c89 -w",
+    " --c99 -w",
+    " --c11 -w",
+    " --c11"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/deprecate-threads-macro-definition-msvc1939.sft.c",
+  "remark": null,
+  "sha256": "2ecab91d3018e5f3c129aea81335363decab278d7b59bc067d7744891a0f0cfe",
+  "test_number_uses": 0,
+  "type": "fp"
+}

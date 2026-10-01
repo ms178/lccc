@@ -1,0 +1,21 @@
+{
+  "bytes": 339,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c --target linux_aarch64"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/builtin-clear_cache.sft.c",
+  "remark": null,
+  "sha256": "eade223f39e026e424d43e6cf1acaf6bf4833b00686bec6d4f934525cff9eff8",
+  "test_number_uses": 0,
+  "type": "fp"
+}

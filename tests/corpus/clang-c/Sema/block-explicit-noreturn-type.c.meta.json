@@ -1,0 +1,30 @@
+{
+  "bytes": 455,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "return type 'double' must match previous return type 'float' when block literal has"
+    },
+    {
+      "kind": "error",
+      "msg": "return type 'SHORT' (aka 'short') must match previous return type 'float' when"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/block-explicit-noreturn-type.sft.c",
+  "remark": null,
+  "sha256": "2b6f83b6352b05d41175c636f986a641aca28a7e773ec96bb0c7ad3be776952d",
+  "test_number_uses": 0,
+  "type": "fn"
+}

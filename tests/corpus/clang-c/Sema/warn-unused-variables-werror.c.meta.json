@@ -1,0 +1,30 @@
+{
+  "bytes": 191,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "unused"
+    },
+    {
+      "kind": "error",
+      "msg": "unused"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-unused-variables-werror.sft.c",
+  "remark": null,
+  "sha256": "495cd2933badb426c8ce349887ba03ef1f8233108ddbfe68a54cab2471d7430f",
+  "test_number_uses": 0,
+  "type": "fn"
+}

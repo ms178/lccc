@@ -1,0 +1,34 @@
+{
+  "bytes": 1884,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "comparison of distinct pointer types ('struct S2 *' and 'struct S2 *')"
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration of 'struct S4' will not be visible outside of this function"
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration of 'struct S5' will not be visible outside of this function"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/type-spec-struct-union.sft.c",
+  "remark": null,
+  "sha256": "e5811e2544317d2e4250a1e969f8c8d21b5a62a812cf8529e48f4a8e64720332",
+  "test_number_uses": 0,
+  "type": "fp"
+}

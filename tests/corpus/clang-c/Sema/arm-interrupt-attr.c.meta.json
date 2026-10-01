@@ -1,0 +1,42 @@
+{
+  "bytes": 1434,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "interrupt service routine with vfp enabled may clobber the interruptee's vfp state; consider using the `interrupt_save_fp` attribute to prevent this behavior"
+    },
+    {
+      "kind": "warning",
+      "msg": "'interrupt' attribute argument not supported: irq"
+    },
+    {
+      "kind": "error",
+      "msg": "'interrupt' attribute requires a string"
+    },
+    {
+      "kind": "error",
+      "msg": "'interrupt' attribute takes no more than 1 argument"
+    },
+    {
+      "kind": "error",
+      "msg": "interrupt service routine cannot be called directly"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/arm-interrupt-attr.sft.c",
+  "remark": null,
+  "sha256": "d48f93d7e6a51eb4daeed4bc96d62a5ef3e74d8420f74659398857f1ab1dd6a4",
+  "test_number_uses": 0,
+  "type": "fn"
+}

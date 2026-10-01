@@ -1,0 +1,34 @@
+{
+  "bytes": 748,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'v_195'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier 'v_231'"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/typo-correction-ambiguity.sft.c",
+  "remark": null,
+  "sha256": "322fd55d2eac2da618eb0b33e5d65c6c17845192ef827ec1cb608a09b42c7fe5",
+  "test_number_uses": 0,
+  "type": "fn"
+}

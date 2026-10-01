@@ -1,0 +1,21 @@
+{
+  "bytes": 601,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 11,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/arm-execute-only-tls.sft.c",
+  "remark": null,
+  "sha256": "6c844dfbba64f66c005d491f4f3eef19d02241c2ec3a08cfbeb9965cbf074247",
+  "test_number_uses": 0,
+  "type": "fp"
+}

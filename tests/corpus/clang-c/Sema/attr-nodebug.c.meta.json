@@ -1,0 +1,30 @@
+{
+  "bytes": 463,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'nodebug' attribute only applies to typedefs, functions, function pointers, Objective-C methods, and variables"
+    },
+    {
+      "kind": "error",
+      "msg": "'nodebug' attribute takes no arguments"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-nodebug.sft.c",
+  "remark": null,
+  "sha256": "347f4525e9aac24ac953a1e1ab4a66bf26cc50ed7984c89f439b1a2124ab0f21",
+  "test_number_uses": 0,
+  "type": "fn"
+}

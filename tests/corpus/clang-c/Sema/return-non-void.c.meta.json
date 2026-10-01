@@ -1,0 +1,22 @@
+{
+  "bytes": 360,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c99",
+    " --c90"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/return-non-void.sft.c",
+  "remark": null,
+  "sha256": "c3d140874f86dfda69ca8b625aac30cb520354644fe27ee361b5d6084a5ba50d",
+  "test_number_uses": 0,
+  "type": "fn"
+}

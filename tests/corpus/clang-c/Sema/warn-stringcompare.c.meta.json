@@ -1,0 +1,46 @@
+{
+  "bytes": 1973,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "result of comparison against a string literal is unspecified (use an explicit string comparison function instead)"
+    },
+    {
+      "kind": "warning",
+      "msg": "result of comparison against a string literal is unspecified (use an explicit string comparison function instead)"
+    },
+    {
+      "kind": "warning",
+      "msg": "result of comparison against a string literal is unspecified (use an explicit string comparison function instead)"
+    },
+    {
+      "kind": "warning",
+      "msg": "result of comparison against a string literal is unspecified (use an explicit string comparison function instead)"
+    },
+    {
+      "kind": "warning",
+      "msg": "result of comparison against a string literal is unspecified (use an explicit string comparison function instead)"
+    },
+    {
+      "kind": "warning",
+      "msg": "result of comparison against a string literal is unspecified (use an explicit string comparison function instead)"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 10,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-stringcompare.sft.c",
+  "remark": null,
+  "sha256": "84c195ffa0d9f1daf981754d0f5d6b2df54c5143d31704dcde2cb51c4c363117",
+  "test_number_uses": 0,
+  "type": "fn"
+}

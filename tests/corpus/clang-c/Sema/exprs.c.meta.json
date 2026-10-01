@@ -1,0 +1,318 @@
+{
+  "bytes": 11363,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "indirection of non-volatile null pointer will be deleted, not trap"
+    },
+    {
+      "kind": "warning",
+      "msg": "indirection of non-volatile null pointer will be deleted, not trap"
+    },
+    {
+      "kind": "warning",
+      "msg": "imaginary constants are a C2y extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "use of unary operator that may be intended as compound assignment (+=)"
+    },
+    {
+      "kind": "warning",
+      "msg": "use of unary operator that may be intended as compound assignment (-=)"
+    },
+    {
+      "kind": "error",
+      "msg": "assignment to cast is illegal, lvalue casts are not supported"
+    },
+    {
+      "kind": "error",
+      "msg": "assignment to cast is illegal, lvalue casts are not supported"
+    },
+    {
+      "kind": "error",
+      "msg": "called object type 'int' is not a function or function pointer"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression ('int *' and '_Complex float')"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of 'alignof' to bit-field"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of 'sizeof' to bit-field"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of 'typeof' to bit-field"
+    },
+    {
+      "kind": "error",
+      "msg": "fields must have a constant size"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression ('typeof (P)' (aka 'struct mystruct') and 'typeof (F)' (aka 'float'))"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison against a string literal is unspecified (use an explicit string comparison function instead)"
+    },
+    {
+      "kind": "error",
+      "msg": "blocks support disabled - compile with -fblocks"
+    },
+    {
+      "kind": "error",
+      "msg": "blocks support disabled - compile with -fblocks"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression ('test15_t' (aka 'unsigned long *') and 'test15_t')"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression"
+    },
+    {
+      "kind": "warning",
+      "msg": "division by zero is undefined"
+    },
+    {
+      "kind": "warning",
+      "msg": "remainder by zero is undefined"
+    },
+    {
+      "kind": "warning",
+      "msg": "division by zero is undefined"
+    },
+    {
+      "kind": "warning",
+      "msg": "remainder by zero is undefined"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": "'test18_b' declared here"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": "'test18_d' declared here"
+    },
+    {
+      "kind": "note",
+      "msg": "'test18_e' declared here"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to function call, expected single argument 'a', have 2"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call, single argument 'a' was not specified"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call, expected 1, have 0"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call, expected 2, have 1"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to function call, expected 2, have 3"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call, at least argument 'a' must be specified"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call, expected at least 2, have 0"
+    },
+    {
+      "kind": "error",
+      "msg": "too few arguments to function call, expected 2, have 1"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to function call, expected 2, have 3"
+    },
+    {
+      "kind": "warning",
+      "msg": "indirection of non-volatile null pointer"
+    },
+    {
+      "kind": "note",
+      "msg": "consider using __builtin_trap"
+    },
+    {
+      "kind": "warning",
+      "msg": "indirection of non-volatile null pointer"
+    },
+    {
+      "kind": "note",
+      "msg": "consider using __builtin_trap"
+    },
+    {
+      "kind": "warning",
+      "msg": "indirection of non-volatile null pointer"
+    },
+    {
+      "kind": "note",
+      "msg": "consider using __builtin_trap"
+    },
+    {
+      "kind": "warning",
+      "msg": "indirection of non-volatile null pointer"
+    },
+    {
+      "kind": "note",
+      "msg": "consider using __builtin_trap"
+    },
+    {
+      "kind": "warning",
+      "msg": "use of logical '&&' with constant operand"
+    },
+    {
+      "kind": "note",
+      "msg": "use '&' for a bitwise operation"
+    },
+    {
+      "kind": "note",
+      "msg": "remove constant to silence this warning"
+    },
+    {
+      "kind": "warning",
+      "msg": "use of logical '||' with constant operand"
+    },
+    {
+      "kind": "note",
+      "msg": "use '|' for a bitwise operation"
+    },
+    {
+      "kind": "warning",
+      "msg": "use of logical '||' with constant operand"
+    },
+    {
+      "kind": "note",
+      "msg": "use '|' for a bitwise operation"
+    },
+    {
+      "kind": "warning",
+      "msg": "use of logical '&&' with constant operand"
+    },
+    {
+      "kind": "note",
+      "msg": "use '&' for a bitwise operation"
+    },
+    {
+      "kind": "note",
+      "msg": "remove constant to silence this warning"
+    },
+    {
+      "kind": "warning",
+      "msg": "use of logical '&&' with constant operand"
+    },
+    {
+      "kind": "note",
+      "msg": "use '&' for a bitwise operation"
+    },
+    {
+      "kind": "note",
+      "msg": "remove constant to silence this warning"
+    },
+    {
+      "kind": "warning",
+      "msg": "use of logical '||' with constant operand"
+    },
+    {
+      "kind": "note",
+      "msg": "use '|' for a bitwise operation"
+    },
+    {
+      "kind": "warning",
+      "msg": "use of logical '||' with constant operand"
+    },
+    {
+      "kind": "note",
+      "msg": "use '|' for a bitwise operation"
+    },
+    {
+      "kind": "warning",
+      "msg": "use of logical '&&' with constant operand"
+    },
+    {
+      "kind": "note",
+      "msg": "use '&' for a bitwise operation"
+    },
+    {
+      "kind": "note",
+      "msg": "remove constant to silence this warning"
+    },
+    {
+      "kind": "warning",
+      "msg": "use of logical '&&' with constant operand"
+    },
+    {
+      "kind": "note",
+      "msg": "use '&' for a bitwise operation"
+    },
+    {
+      "kind": "note",
+      "msg": "remove constant to silence this warning"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "incomplete type 'struct Test21' where a complete type is required"
+    },
+    {
+      "kind": "error",
+      "msg": "incomplete type 'struct Test21' where a complete type is required"
+    },
+    {
+      "kind": "warning",
+      "msg": "address of function 'test22' will always evaluate to 'true'"
+    },
+    {
+      "kind": "note",
+      "msg": "prefix with the address-of operator to silence this warning"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/exprs.sft.c",
+  "remark": null,
+  "sha256": "beaac4faab2e572ae937f16bfb3a067c4314f76f16ff3c70bdcda51f91e3c418",
+  "test_number_uses": 0,
+  "type": "fn"
+}

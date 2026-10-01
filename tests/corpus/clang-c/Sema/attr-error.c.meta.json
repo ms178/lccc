@@ -1,0 +1,62 @@
+{
+  "bytes": 1615,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'error' attribute takes one argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'error' attribute only applies to functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'error' attribute cannot be applied to a statement"
+    },
+    {
+      "kind": "error",
+      "msg": "expected string literal as argument of 'error' attribute"
+    },
+    {
+      "kind": "error",
+      "msg": "'warning' and 'error' attributes are not compatible"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": "conflicting attribute is here"
+    },
+    {
+      "kind": "error",
+      "msg": "'error' and 'warning' attributes are not compatible"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "'error' attribute does not appear on the first declaration"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-error.sft.c",
+  "remark": null,
+  "sha256": "e04fdcd04715b1f4509c6bdd35d8a1e23c8e1462ea0563a90bedf45c4e209bd4",
+  "test_number_uses": 0,
+  "type": "fn"
+}

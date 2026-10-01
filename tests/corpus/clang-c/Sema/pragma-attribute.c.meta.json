@@ -1,0 +1,110 @@
+{
+  "bytes": 3678,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "when applied to this declaration"
+    },
+    {
+      "kind": "note",
+      "msg": "when applied to this declaration"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "'always_inline' attribute ignored"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "'always_inline' attribute ignored"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "'annotate' attribute takes at least 1 argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'annotate' attribute takes at least 1 argument"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "'#pragma clang attribute pop' with no matching '#pragma clang attribute push'"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": "when applied to this declaration"
+    },
+    {
+      "kind": "error",
+      "msg": "'annotate' attribute takes at least 1 argument"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "'#pragma clang attribute pop' with no matching '#pragma clang attribute push'"
+    },
+    {
+      "kind": "error",
+      "msg": "'#pragma clang attribute' attribute with no matching '#pragma clang attribute push"
+    },
+    {
+      "kind": "error",
+      "msg": "'#pragma clang attribute pop' with no matching '#pragma clang attribute push'"
+    },
+    {
+      "kind": "error",
+      "msg": "unterminated '#pragma clang attribute push' at end of file"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 13,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/pragma-attribute.sft.c",
+  "remark": null,
+  "sha256": "d72efaf7cf70fc03442709d945443e58d357360f7a95011088078020f93680e8",
+  "test_number_uses": 0,
+  "type": "fn"
+}

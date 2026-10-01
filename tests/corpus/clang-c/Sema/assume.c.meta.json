@@ -1,0 +1,54 @@
+{
+  "bytes": 1176,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'assume' attribute takes one argument"
+    },
+    {
+      "kind": "error",
+      "msg": "expected expression"
+    },
+    {
+      "kind": "error",
+      "msg": "'assume' attribute takes one argument"
+    },
+    {
+      "kind": "error",
+      "msg": "expected expression"
+    },
+    {
+      "kind": "warning",
+      "msg": "assumption is ignored because it contains (potential) side-effects"
+    },
+    {
+      "kind": "warning",
+      "msg": "assumption is ignored because it contains (potential) side-effects"
+    },
+    {
+      "kind": "error",
+      "msg": "'clang::assume' attribute cannot be applied to a declaration"
+    },
+    {
+      "kind": "error",
+      "msg": "'assume' attribute cannot be applied to a declaration"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/assume.sft.c",
+  "remark": null,
+  "sha256": "ef0198a13cec60aedb81919ed8d773c54db51e55c6694f27ebe1008d6ca0c482",
+  "test_number_uses": 0,
+  "type": "fn"
+}

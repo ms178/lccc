@@ -1,0 +1,170 @@
+{
+  "bytes": 4569,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "bitwise comparison always evaluates to false"
+    },
+    {
+      "kind": "warning",
+      "msg": "bitwise comparison always evaluates to false"
+    },
+    {
+      "kind": "warning",
+      "msg": "bitwise comparison always evaluates to false"
+    },
+    {
+      "kind": "warning",
+      "msg": "bitwise comparison always evaluates to false"
+    },
+    {
+      "kind": "warning",
+      "msg": "bitwise comparison always evaluates to true"
+    },
+    {
+      "kind": "warning",
+      "msg": "bitwise comparison always evaluates to true"
+    },
+    {
+      "kind": "warning",
+      "msg": "bitwise comparison always evaluates to true"
+    },
+    {
+      "kind": "warning",
+      "msg": "bitwise comparison always evaluates to true"
+    },
+    {
+      "kind": "warning",
+      "msg": "bitwise comparison always evaluates to false"
+    },
+    {
+      "kind": "warning",
+      "msg": "bitwise comparison always evaluates to true"
+    },
+    {
+      "kind": "warning",
+      "msg": "bitwise comparison always evaluates to true"
+    },
+    {
+      "kind": "warning",
+      "msg": "bitwise comparison always evaluates to false"
+    },
+    {
+      "kind": "warning",
+      "msg": "bitwise comparison always evaluates to true"
+    },
+    {
+      "kind": "warning",
+      "msg": "bitwise comparison always evaluates to true"
+    },
+    {
+      "kind": "warning",
+      "msg": "bitwise comparison always evaluates to false"
+    },
+    {
+      "kind": "warning",
+      "msg": "bitwise comparison always evaluates to false"
+    },
+    {
+      "kind": "warning",
+      "msg": "bitwise comparison always evaluates to false"
+    },
+    {
+      "kind": "warning",
+      "msg": "bitwise comparison always evaluates to false"
+    },
+    {
+      "kind": "warning",
+      "msg": "bitwise comparison always evaluates to false"
+    },
+    {
+      "kind": "warning",
+      "msg": "bitwise comparison always evaluates to false"
+    },
+    {
+      "kind": "warning",
+      "msg": "bitwise comparison always evaluates to false"
+    },
+    {
+      "kind": "warning",
+      "msg": "bitwise comparison always evaluates to false"
+    },
+    {
+      "kind": "warning",
+      "msg": "bitwise comparison always evaluates to true"
+    },
+    {
+      "kind": "warning",
+      "msg": "bitwise comparison always evaluates to true"
+    },
+    {
+      "kind": "warning",
+      "msg": "bitwise comparison always evaluates to true"
+    },
+    {
+      "kind": "warning",
+      "msg": "bitwise comparison always evaluates to false"
+    },
+    {
+      "kind": "warning",
+      "msg": "bitwise comparison always evaluates to false"
+    },
+    {
+      "kind": "warning",
+      "msg": "bitwise comparison always evaluates to false"
+    },
+    {
+      "kind": "warning",
+      "msg": "bitwise comparison always evaluates to true"
+    },
+    {
+      "kind": "warning",
+      "msg": "bitwise comparison always evaluates to true"
+    },
+    {
+      "kind": "warning",
+      "msg": "bitwise comparison always evaluates to false"
+    },
+    {
+      "kind": "warning",
+      "msg": "bitwise comparison always evaluates to true"
+    },
+    {
+      "kind": "warning",
+      "msg": "bitwise or with non-zero value always evaluates to true"
+    },
+    {
+      "kind": "warning",
+      "msg": "bitwise or with non-zero value always evaluates to true"
+    },
+    {
+      "kind": "warning",
+      "msg": "bitwise or with non-zero value always evaluates to true"
+    },
+    {
+      "kind": "warning",
+      "msg": "bitwise or with non-zero value always evaluates to true"
+    },
+    {
+      "kind": "warning",
+      "msg": "bitwise or with non-zero value always evaluates to true"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-bitwise-compare.sft.c",
+  "remark": null,
+  "sha256": "c19a2136d9bc60f674b9de18fc1dbeea26c02670a6b766680969be3d734a8528",
+  "test_number_uses": 0,
+  "type": "fp"
+}

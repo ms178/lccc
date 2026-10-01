@@ -1,0 +1,32 @@
+{
+  "bytes": 1273,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "restrict requires a pointer or reference ('t7' (aka 'int[2]') is invalid)"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23",
+    " --c17",
+    " --c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/pre-c2x-restrict-qualifier.sft.c",
+  "remark": null,
+  "sha256": "2f9d7ab0592c6c4dd44e539f9df738ecce44b265ad4d93b7a5a74968188c88cf",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,21 @@
+{
+  "bytes": 2719,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 16,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/ptrauth-intrinsics-macro.sft.c",
+  "remark": null,
+  "sha256": "8dc765a6e64e2bd227992f52c38f9698cda77701b98402e618b37441f51d53fc",
+  "test_number_uses": 0,
+  "type": "fp"
+}

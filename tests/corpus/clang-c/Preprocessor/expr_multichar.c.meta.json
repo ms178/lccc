@@ -1,0 +1,21 @@
+{
+  "bytes": 194,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/expr_multichar.sft.c",
+  "remark": null,
+  "sha256": "d66dd0e03462e67a1da22c3d22458e61564657ae0c8171115a7c80da835ab574",
+  "test_number_uses": 0,
+  "type": "fp"
+}

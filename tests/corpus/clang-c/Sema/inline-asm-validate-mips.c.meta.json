@@ -1,0 +1,21 @@
+{
+  "bytes": 345,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/inline-asm-validate-mips.sft.c",
+  "remark": null,
+  "sha256": "987d8784ed063b32e92ca8375ae950efa484990fa35150d773fdf5b8cc8b1a19",
+  "test_number_uses": 0,
+  "type": "fp"
+}

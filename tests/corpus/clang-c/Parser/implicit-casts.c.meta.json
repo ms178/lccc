@@ -1,0 +1,26 @@
+{
+  "bytes": 472,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "incompatible pointer to integer conversion assigning to 'int' from 'int (void)'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 3,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/implicit-casts.sft.c",
+  "remark": null,
+  "sha256": "28dd35e2e4c8c57c794932026751aa27c501877067fc8c7195e8fa4dd3400853",
+  "test_number_uses": 0,
+  "type": "fn"
+}

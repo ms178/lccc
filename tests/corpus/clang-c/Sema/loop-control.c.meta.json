@@ -1,0 +1,86 @@
+{
+  "bytes": 4573,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'continue' is bound to current loop, GCC binds it to the enclosing loop"
+    },
+    {
+      "kind": "warning",
+      "msg": "'break' is bound to current loop, GCC binds it to the enclosing loop"
+    },
+    {
+      "kind": "warning",
+      "msg": "'continue' is bound to current loop, GCC binds it to the enclosing loop"
+    },
+    {
+      "kind": "warning",
+      "msg": "'break' is bound to current loop, GCC binds it to the enclosing loop"
+    },
+    {
+      "kind": "warning",
+      "msg": "'break' is bound to current loop, GCC binds it to the enclosing loop"
+    },
+    {
+      "kind": "warning",
+      "msg": "'continue' is bound to current loop, GCC binds it to the enclosing loop"
+    },
+    {
+      "kind": "warning",
+      "msg": "'break' is bound to current loop, GCC binds it to the enclosing loop"
+    },
+    {
+      "kind": "warning",
+      "msg": "'continue' is bound to current loop, GCC binds it to the enclosing loop"
+    },
+    {
+      "kind": "warning",
+      "msg": "'break' is bound to loop, GCC binds it to switch"
+    },
+    {
+      "kind": "warning",
+      "msg": "'break' is bound to loop, GCC binds it to switch"
+    },
+    {
+      "kind": "warning",
+      "msg": "'break' is bound to loop, GCC binds it to switc"
+    },
+    {
+      "kind": "warning",
+      "msg": "'break' is bound to loop, GCC binds it to switch"
+    },
+    {
+      "kind": "warning",
+      "msg": "'continue' is bound to current loop, GCC binds it to the enclosing loop"
+    },
+    {
+      "kind": "warning",
+      "msg": "'break' is bound to loop, GCC binds it to switch"
+    },
+    {
+      "kind": "warning",
+      "msg": "'break' is bound to current loop, GCC binds it to the enclosing loop"
+    },
+    {
+      "kind": "warning",
+      "msg": "'break' is bound to current loop, GCC binds it to the enclosing loop"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/loop-control.sft.c",
+  "remark": null,
+  "sha256": "694672794e1db3ef55d8bbed0ef3da360362e722728ab42a6bd9a7ec5fe4e2cb",
+  "test_number_uses": 0,
+  "type": "fp"
+}

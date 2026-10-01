@@ -1,0 +1,21 @@
+{
+  "bytes": 372,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 13,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-documentation-crlf.sft.c",
+  "remark": null,
+  "sha256": "00dfede56ec9dd13ac95bbd52afdb83449a14dec0937ddd4048f3a99a7151ee1",
+  "test_number_uses": 0,
+  "type": "fp"
+}

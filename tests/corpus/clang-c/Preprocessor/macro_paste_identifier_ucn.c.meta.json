@@ -1,0 +1,21 @@
+{
+  "bytes": 310,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--ms_extensions --ms_extensions --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/macro_paste_identifier_ucn.sft.c",
+  "remark": null,
+  "sha256": "4573031ecd16dddf3109b44ce6a0a5b3953fd576ab35932de866e40766f65bc8",
+  "test_number_uses": 0,
+  "type": "fp"
+}

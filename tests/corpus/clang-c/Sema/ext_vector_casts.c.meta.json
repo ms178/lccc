@@ -1,0 +1,138 @@
+{
+  "bytes": 5825,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "cannot convert between vector values of different size"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between vector values of different size"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid conversion between vector type 'int4' (vector of 4 'int' values) and integer type 'int' of different size"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'int' from incompatible type 'int4' (vector of 4 'int' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid conversion between vector type 'int4' (vector of 4 'int' values) and scalar type 'int *'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid conversion between ext-vector type 'float4' (vector of 4 'float' values) and 'float2' (vector of 2 'float' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid operands to binary expression ('float4' (vector of 4 'float' values) and 'int')"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between vector values of different size ('int4' (vector of 4 'int' values) and 'float4' (vector of 4 'float' values))"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between vector and non-scalar values ('int4' (vector of 4 'int' values) and 'int *')"
+    },
+    {
+      "kind": "warning",
+      "msg": "inequality comparison result unused"
+    },
+    {
+      "kind": "note",
+      "msg": "use '|=' to turn this inequality comparison into an or-assignment"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid vector element type 'float2' (vector of 2 'float' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot increment value of type 'float2' (vector of 2 'float' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid type 'float2' (vector of 2 'float' values) to __real operator"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid conversion between ext-vector type 'float32x4_t' (vector of 4 'float' values) and 'C3DVector3' (vector of 3 'float' values)"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from 'int' to 'short8' (vector of 8 'short' values) changes value from 65536 to 0"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion loses integer precision"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between vector values of different size"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion loses integer precision"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot convert between vector values of different size"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion changes signedness"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion changes signedness"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion loses integer precision"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from 'long' to 'float2' (vector of 2 'float' values) may lose precision"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion loses floating-point precision"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from 'unsigned int' to 'float2' (vector of 2 'float' values) changes value from 4294967295 to 4294967296"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion loses floating-point precision"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from 'long' to 'double2' (vector of 2 'double' values) may lose precision"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from '__uint128_t' (aka 'unsigned __int128') to 'double2' (vector of 2 'double' values) may lose precision"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/ext_vector_casts.sft.c",
+  "remark": null,
+  "sha256": "d0bfe39be0abb1503981d8e58b94a70d3867b656c091dc4a928d705faab7931f",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,38 @@
+{
+  "bytes": 1143,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/arm-branch-protection-attr-warn.sft.c",
+  "remark": null,
+  "sha256": "18443bb8fb5b5c8e829474b462227e93006a3d1ddbd62d0f86cdc0f73633b75b",
+  "test_number_uses": 0,
+  "type": "fp"
+}

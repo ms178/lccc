@@ -1,0 +1,21 @@
+{
+  "bytes": 177,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--ms_extensions --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/macro-reserved-ms.sft.c",
+  "remark": null,
+  "sha256": "521d4bef14586f2a47afc4b802db2080566f8991ef8e2bdb0dabe8784850550d",
+  "test_number_uses": 0,
+  "type": "fp"
+}

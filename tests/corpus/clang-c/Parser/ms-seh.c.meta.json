@@ -1,0 +1,38 @@
+{
+  "bytes": 587,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "expected '{'"
+    },
+    {
+      "kind": "error",
+      "msg": "expected '__except' or '__finally' block"
+    },
+    {
+      "kind": "error",
+      "msg": "expected '{'"
+    },
+    {
+      "kind": "error",
+      "msg": "expected '{'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--ms_extensions --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/ms-seh.sft.c",
+  "remark": null,
+  "sha256": "3b524db5b43548a9fa5aeef75f0b1cb30096d76b82692febf87ddd1697b332f3",
+  "test_number_uses": 0,
+  "type": "fn"
+}

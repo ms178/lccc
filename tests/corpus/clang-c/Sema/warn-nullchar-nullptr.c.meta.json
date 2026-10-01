@@ -1,0 +1,62 @@
+{
+  "bytes": 1759,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "comparing a pointer to a null character constant; did you mean to compare to (void *)0?"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparing a pointer to a null character constant; did you mean to compare to (void *)0?"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparing a pointer to a null character constant; did you mean to compare to (void *)0?"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparing a pointer to a null character constant; did you mean to compare to (void *)0?"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparing a pointer to a null character constant; did you mean to compare to (void *)0?"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparing a pointer to a null character constant; did you mean to compare to (void *)0?"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "comparing a pointer to a null character constant; did you mean to compare to (void *)0?"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparing a pointer to a null character constant; did you mean to compare to NULL?"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparing a pointer to a null character constant; did you mean to compare to NULL?"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c11"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-nullchar-nullptr.sft.c",
+  "remark": null,
+  "sha256": "c9c306eedce0398f18e4a6bde0f71a412f806729fd372e1dafacac9ad87163f4",
+  "test_number_uses": 0,
+  "type": "fp"
+}

@@ -1,0 +1,46 @@
+{
+  "bytes": 1114,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "assigning to 'int4' (vector of 4 'int' values) from incompatible type 'float4' (vector of 4 'float' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'int4' (vector of 4 'int' values) from incompatible type 'float4' (vector of 4 'float' values)"
+    },
+    {
+      "kind": "note",
+      "msg": "variable 'r' declared const here"
+    },
+    {
+      "kind": "warning",
+      "msg": "default initialization of an object of type 'b' (aka 'const int[5]') leaves the object uninitialized"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot assign to variable 'r' with const-qualified type 'b' (aka 'const int[5]')"
+    },
+    {
+      "kind": "error",
+      "msg": "read-only variable is not assignable"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/typedef-retain.sft.c",
+  "remark": null,
+  "sha256": "b65d29badc4347fb1e16c2d2993b1f41cb3708edbe77ded794bd33f6f1bf3d7a",
+  "test_number_uses": 0,
+  "type": "fn"
+}

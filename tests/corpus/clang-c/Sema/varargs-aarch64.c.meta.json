@@ -1,0 +1,30 @@
+{
+  "bytes": 442,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'__builtin_ms_va_start' used in System V ABI function"
+    },
+    {
+      "kind": "error",
+      "msg": "'va_start' used in Win64 ABI function"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c --target linux_aarch64"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/varargs-aarch64.sft.c",
+  "remark": null,
+  "sha256": "5c8822cb35acb1837b406d626308a5ec2647f947995fc00e993a856087584263",
+  "test_number_uses": 0,
+  "type": "fn"
+}

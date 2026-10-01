@@ -1,0 +1,114 @@
+{
+  "bytes": 3321,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "vector component access exceeds type 'float2'"
+    },
+    {
+      "kind": "error",
+      "msg": "vector component access exceeds type 'float2'"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression result unused"
+    },
+    {
+      "kind": "error",
+      "msg": "illegal vector component name 'c'"
+    },
+    {
+      "kind": "error",
+      "msg": "illegal vector component name 'z'"
+    },
+    {
+      "kind": "error",
+      "msg": "vector is not assignable (contains duplicate components)"
+    },
+    {
+      "kind": "error",
+      "msg": "vector is not assignable (contains duplicate components)"
+    },
+    {
+      "kind": "error",
+      "msg": "vector is not assignable (contains duplicate components)"
+    },
+    {
+      "kind": "error",
+      "msg": "vector is not assignable (contains duplicate components)"
+    },
+    {
+      "kind": "error",
+      "msg": "vector component access exceeds type 'float2'"
+    },
+    {
+      "kind": "error",
+      "msg": "vector component access exceeds type 'float4'"
+    },
+    {
+      "kind": "error",
+      "msg": "vector component access exceeds type 'float2'"
+    },
+    {
+      "kind": "error",
+      "msg": "vector component access exceeds type 'float2'"
+    },
+    {
+      "kind": "warning",
+      "msg": "expression result unused"
+    },
+    {
+      "kind": "error",
+      "msg": "illegal vector component name 'z'"
+    },
+    {
+      "kind": "error",
+      "msg": "illegal vector component name 'c'"
+    },
+    {
+      "kind": "error",
+      "msg": "illegal vector component name 'r'"
+    },
+    {
+      "kind": "error",
+      "msg": "vector component access exceeds type 'float4'"
+    },
+    {
+      "kind": "error",
+      "msg": "vector is not assignable (contains duplicate components)"
+    },
+    {
+      "kind": "error",
+      "msg": "vector is not assignable (contains duplicate components)"
+    },
+    {
+      "kind": "error",
+      "msg": "vector is not assignable (contains duplicate components)"
+    },
+    {
+      "kind": "error",
+      "msg": "vector is not assignable (contains duplicate components)"
+    },
+    {
+      "kind": "error",
+      "msg": "vector component access exceeds type 'float2'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/ext_vector_components.sft.c",
+  "remark": null,
+  "sha256": "b5da72a9224708b1f55862c11693549d6d7d4689f0433181895504859bf1a477",
+  "test_number_uses": 0,
+  "type": "fn"
+}

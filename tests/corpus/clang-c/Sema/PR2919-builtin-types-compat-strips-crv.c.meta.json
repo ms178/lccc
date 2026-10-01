@@ -1,0 +1,21 @@
+{
+  "bytes": 290,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/PR2919-builtin-types-compat-strips-crv.sft.c",
+  "remark": null,
+  "sha256": "a023d2801d90ca0315a3d79c4353ae9a5c583249bd78fe40ca4260773a5fc797",
+  "test_number_uses": 0,
+  "type": "fp"
+}

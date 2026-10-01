@@ -1,0 +1,27 @@
+{
+  "bytes": 1074,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "no-diagnostics",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 3,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c99",
+    " --c89"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/C99/n835.sft.c",
+  "remark": null,
+  "sha256": "eace85959f5a7d9db143b4e5862f2dad38ffce209460f62e45a4ed3268b79c8c",
+  "test_number_uses": 0,
+  "type": "fp"
+}

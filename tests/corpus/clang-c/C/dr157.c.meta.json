@@ -1,0 +1,42 @@
+{
+  "bytes": 1756,
+  "cases": null,
+  "category": "C",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of 'Int' as different kind of symbol"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ';' at end of declaration"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ';' after top level declarator"
+    }
+  ],
+  "has_main": true,
+  "header_lines": 3,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c89",
+    " --c99",
+    " --c11",
+    " --c17",
+    " --c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/C/drs/dr157.sft.c",
+  "remark": null,
+  "sha256": "ad81d912f280dabbcbe325e4bff8c43a486e60890d98699d2f9ae1219bb9c457",
+  "test_number_uses": 0,
+  "type": "fn"
+}

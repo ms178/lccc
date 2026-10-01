@@ -1,0 +1,21 @@
+{
+  "bytes": 755,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/macro_disable.sft.c",
+  "remark": null,
+  "sha256": "f25ed0c5cf6c1ce529ee6adb3f74a4fe7a47bec9ee05337fc0d30bed7a445e23",
+  "test_number_uses": 0,
+  "type": "fp"
+}

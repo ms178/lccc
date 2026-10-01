@@ -1,0 +1,60 @@
+{
+  "bytes": 2102,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "requested alignment is not a power of 2"
+    },
+    {
+      "kind": "error",
+      "msg": "requested alignment is less than minimum"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Alignas' attribute cannot be applied to a bit-field"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Alignas' attribute only applies to variables and fields"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Alignas' attribute cannot be applied to a function parameter"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Alignas' attribute cannot be applied to a variable with 'register' storage class"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c11 -Dalignof=__alignof",
+    " --c11 -Dalignof=_Alignof -DUSING_C11_SYNTAX",
+    " --c23 -DUSING_C11_SYNTAX"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/alignas.sft.c",
+  "remark": null,
+  "sha256": "4eb94a85fa5c6eba0d0f05d46a7d0c38ed1fd2ac0c17cb2ce3dff30d9d1464be",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,54 @@
+{
+  "bytes": 1334,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "function 'a' has internal linkage but is not defined"
+    },
+    {
+      "kind": "error",
+      "msg": "function 'b' has internal linkage but is not defined"
+    },
+    {
+      "kind": "error",
+      "msg": "function 'c' has internal linkage but is not defined"
+    },
+    {
+      "kind": "error",
+      "msg": "function 'd' has internal linkage but is not defined"
+    },
+    {
+      "kind": "note",
+      "msg": "used here"
+    },
+    {
+      "kind": "note",
+      "msg": "used here"
+    },
+    {
+      "kind": "note",
+      "msg": "used here"
+    },
+    {
+      "kind": "note",
+      "msg": "used here"
+    }
+  ],
+  "has_main": true,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c11"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/undefined-internal-basic.sft.c",
+  "remark": null,
+  "sha256": "d411bbbc9a749263407b8050e29a412660b79ba3da77dc55cf53c0c296554e85",
+  "test_number_uses": 0,
+  "type": "fn"
+}

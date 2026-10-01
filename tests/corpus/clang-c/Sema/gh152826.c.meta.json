@@ -1,0 +1,21 @@
+{
+  "bytes": 383,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/gh152826.sft.c",
+  "remark": null,
+  "sha256": "62564110247fd53fa4b4d0250ff4e68670dd26aaecad45308532c19e2e111da7",
+  "test_number_uses": 0,
+  "type": "fp"
+}

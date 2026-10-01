@@ -1,0 +1,38 @@
+{
+  "bytes": 981,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "will never be executed"
+    },
+    {
+      "kind": "warning",
+      "msg": "will never be executed"
+    },
+    {
+      "kind": "warning",
+      "msg": "will never be executed"
+    },
+    {
+      "kind": "warning",
+      "msg": "never be executed"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w --ms_extensions --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-unreachable-ms.sft.c",
+  "remark": null,
+  "sha256": "846cecdbff36e0b172de096f4778ca01fc800f9ed9e3863698389287a7cbf9b3",
+  "test_number_uses": 0,
+  "type": "fp"
+}

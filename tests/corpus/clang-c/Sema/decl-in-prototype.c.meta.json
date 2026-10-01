@@ -1,0 +1,142 @@
+{
+  "bytes": 3601,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "will not be visible outside of this function"
+    },
+    {
+      "kind": "warning",
+      "msg": "will not be visible outside of this function"
+    },
+    {
+      "kind": "warning",
+      "msg": "will not be visible outside of this function"
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration of 'struct A' will not be visible outside of this function"
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration of 'struct aA' will not be visible"
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration of 'struct z' will not be visible outside of this function"
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration of 'enum e19018' will not be visible outside of this function"
+    },
+    {
+      "kind": "error",
+      "msg": "tentative definition has type 'enum e19018' that is never completed"
+    },
+    {
+      "kind": "note",
+      "msg": "forward declaration of 'enum e19018'"
+    },
+    {
+      "kind": "warning",
+      "msg": "will not be visible outside"
+    },
+    {
+      "kind": "warning",
+      "msg": "will not be visible"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable length array folded to constant array as an extension"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "'struct S' that is never completed"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "will not be visible"
+    },
+    {
+      "kind": "warning",
+      "msg": "will not be visible"
+    },
+    {
+      "kind": "warning",
+      "msg": "will not be visible"
+    },
+    {
+      "kind": "warning",
+      "msg": "will not be visible"
+    },
+    {
+      "kind": "warning",
+      "msg": "will not be visible"
+    },
+    {
+      "kind": "warning",
+      "msg": "expected ';' at end of declaration list"
+    },
+    {
+      "kind": "error",
+      "msg": "expected member name or ';'"
+    },
+    {
+      "kind": "warning",
+      "msg": "will not be visible"
+    },
+    {
+      "kind": "error",
+      "msg": "incomplete type"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c17"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/decl-in-prototype.sft.c",
+  "remark": null,
+  "sha256": "0cb016818264eef6ba85ecc85c72340272e8138011384fa6a11f1d11ae80b8bb",
+  "test_number_uses": 0,
+  "type": "fn"
+}

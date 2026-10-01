@@ -1,0 +1,58 @@
+{
+  "bytes": 1491,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'uninitialized' attribute takes no arguments"
+    },
+    {
+      "kind": "warning",
+      "msg": "'uninitialized' attribute only applies to local variables"
+    },
+    {
+      "kind": "warning",
+      "msg": "'uninitialized' attribute only applies to local variables"
+    },
+    {
+      "kind": "warning",
+      "msg": "'uninitialized' attribute only applies to local variables"
+    },
+    {
+      "kind": "warning",
+      "msg": "'uninitialized' attribute only applies to local variables"
+    },
+    {
+      "kind": "warning",
+      "msg": "'uninitialized' attribute only applies to local variables"
+    },
+    {
+      "kind": "warning",
+      "msg": "'uninitialized' attribute only applies to local variables"
+    },
+    {
+      "kind": "warning",
+      "msg": "'uninitialized' attribute only applies to local variables"
+    },
+    {
+      "kind": "warning",
+      "msg": "'uninitialized' attribute only applies to local variables"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-uninitialized.sft.c",
+  "remark": null,
+  "sha256": "ae3f967455db0978d3fc3a1e6d9b713af00ea50a35b9f57f7707f09cc85d9e2c",
+  "test_number_uses": 0,
+  "type": "fn"
+}

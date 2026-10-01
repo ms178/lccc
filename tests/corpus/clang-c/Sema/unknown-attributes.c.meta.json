@@ -1,0 +1,38 @@
+{
+  "bytes": 1057,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "unknown attribute 'gmu::deprected' ignored; did you mean 'gnu::deprecated'?"
+    },
+    {
+      "kind": "warning",
+      "msg": "unknown attribute 'gmu::deprecated' ignored; did you mean 'gnu::deprecated'?"
+    },
+    {
+      "kind": "warning",
+      "msg": "unknown attribute 'gnu::deprected' ignored; did you mean 'gnu::deprecated'?"
+    },
+    {
+      "kind": "warning",
+      "msg": "unknown attribute 'deprected' ignored; did you mean 'deprecated'?"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/unknown-attributes.sft.c",
+  "remark": null,
+  "sha256": "468c468ebbf541fcd6f871fb8f5450ca1ec41e57ac3dc4bde5b2a3d9bb891714",
+  "test_number_uses": 0,
+  "type": "fp"
+}

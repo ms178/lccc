@@ -1,0 +1,38 @@
+{
+  "bytes": 1336,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 13,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DNO_CALLER_SAVED_REGISTERS=1 -DGPRONLY=1 --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/x86-diag-excessive-regsave.sft.c",
+  "remark": null,
+  "sha256": "5e0e7b80702fc30c24f636e821f7bd7e96cf5e001fddf086382718c4438ad371",
+  "test_number_uses": 0,
+  "type": "fp"
+}

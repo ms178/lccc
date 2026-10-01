@@ -1,0 +1,126 @@
+{
+  "bytes": 5022,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "this declaration is not a prototype; add parameter declarations to make it one"
+    },
+    {
+      "kind": "warning",
+      "msg": "no previous prototype for function 'f'"
+    },
+    {
+      "kind": "warning",
+      "msg": "no previous prototype for function 'h'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "no previous prototype for function 'g3'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": "this declaration is not a prototype; add parameter declarations to make it one"
+    },
+    {
+      "kind": "warning",
+      "msg": "no previous prototype for function 'h2'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "no previous prototype for function 'h3'"
+    },
+    {
+      "kind": "note",
+      "msg": "this declaration is not a prototype; add 'void' to make it a prototype for a zero-parameter function"
+    },
+    {
+      "kind": "warning",
+      "msg": "no previous prototype for function 'not_a_prototype_test'"
+    },
+    {
+      "kind": "warning",
+      "msg": "no previous prototype for function 'get_const'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "no previous prototype for function 'get_struct'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "no previous prototype for function 'get_struct_2'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "no previous prototype for function 'get_struct_ptr'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "no previous prototype for function 'get_struct_3'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "no previous prototype for function 'get_struct_4'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "no previous prototype for function 'get_struct_nyi'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    }
+  ],
+  "has_main": true,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-missing-prototypes.sft.c",
+  "remark": null,
+  "sha256": "f9bf0c1b9baf458de38b89216c13dbb4e7bf7d2fe09d98b2cb45c4adcccc4387",
+  "test_number_uses": 0,
+  "type": "fp"
+}

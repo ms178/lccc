@@ -1,0 +1,91 @@
+{
+  "bytes": 2938,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 14,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c",
+    " --c++11 --c++ -DCXX11 -DCXX03 -DOBJC",
+    " --c11 -DC11",
+    " --c11 -DC11",
+    " --c11 --ms_extensions -DMS",
+    " --c23 -DC23",
+    " --c23 -DC23",
+    " --c23 -DC23",
+    " --c23 -DC23",
+    " --c23 --ms_extensions -DC23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/fixed-enum.sft.c",
+  "remark": null,
+  "sha256": "39d4ee45bf7ed5f9e21b457dbc8755f4b11bbe468dcbb936db10c100be6acf7c",
+  "test_number_uses": 0,
+  "type": "fn"
+}

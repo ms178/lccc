@@ -1,0 +1,26 @@
+{
+  "bytes": 395,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "non-void function does not return a value in all control paths"
+    }
+  ],
+  "has_main": true,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/freemain.sft.c",
+  "remark": null,
+  "sha256": "e07e043c9e2721c719c3103249790280e0f965eb1685fe5121c2b5f8c258ba8c",
+  "test_number_uses": 0,
+  "type": "fn"
+}

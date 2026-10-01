@@ -1,0 +1,62 @@
+{
+  "bytes": 2531,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "format specifies type 'long long' but the argument has type 'long'"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "invalid conversion specifier 'Z'"
+    },
+    {
+      "kind": "warning",
+      "msg": "length modifier 'L' results in undefined behavior or no effect with 'c' conversion specifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "length modifier 'L' results in undefined behavior or no effect with 's' conversion specifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "length modifier 'L' results in undefined behavior or no effect with 's' conversion specifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "length modifier 'L' results in undefined behavior or no effect with 's' conversion specifier"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 10,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DMS -w -DMS -DALLOWED -DALLOWED --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/format-strings-gnu.sft.c",
+  "remark": null,
+  "sha256": "dfec2964ab6a90507df3beb72181b16399c1848ae5549a7ed5bd729c20b59b50",
+  "test_number_uses": 0,
+  "type": "fp"
+}

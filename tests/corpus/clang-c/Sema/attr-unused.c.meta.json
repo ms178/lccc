@@ -1,0 +1,54 @@
+{
+  "bytes": 1257,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'unused' attribute takes no arguments"
+    },
+    {
+      "kind": "warning",
+      "msg": "unused variable"
+    },
+    {
+      "kind": "warning",
+      "msg": "unused variable"
+    },
+    {
+      "kind": "warning",
+      "msg": "'Int_unused' was marked unused but was used"
+    },
+    {
+      "kind": "warning",
+      "msg": "unused variable"
+    },
+    {
+      "kind": "warning",
+      "msg": "'Test0_unused' was marked unused but was used"
+    },
+    {
+      "kind": "warning",
+      "msg": "unused parameter 'x'"
+    },
+    {
+      "kind": "warning",
+      "msg": "'x' was marked unused but was used"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-unused.sft.c",
+  "remark": null,
+  "sha256": "8e622bd5794629769e9ae15b4208d58d1e2ceccbf2d6ac03abbdea3e00f029e6",
+  "test_number_uses": 0,
+  "type": "fn"
+}

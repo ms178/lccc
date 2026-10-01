@@ -1,0 +1,30 @@
+{
+  "bytes": 634,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "__builtin_btf_type_id argument 2 not a constant"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to function call, expected 2, have 3"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/builtin-bpf-btf-type-id.sft.c",
+  "remark": null,
+  "sha256": "9116b27b80763b1bab5758d965cbb29dcfdcd5d57dabae6cf3376675a3490741",
+  "test_number_uses": 0,
+  "type": "fn"
+}

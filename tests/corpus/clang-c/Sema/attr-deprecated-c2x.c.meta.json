@@ -1,0 +1,110 @@
+{
+  "bytes": 2401,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": "'g' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "'f' is deprecated"
+    },
+    {
+      "kind": "warning",
+      "msg": "'f' is deprecated"
+    },
+    {
+      "kind": "warning",
+      "msg": "'g' is deprecated"
+    },
+    {
+      "kind": "warning",
+      "msg": "'var' is deprecated"
+    },
+    {
+      "kind": "warning",
+      "msg": "'var' is deprecated"
+    },
+    {
+      "kind": "note",
+      "msg": "'old_fn' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "warning",
+      "msg": "'old_fn' is deprecated"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "'x' is deprecated"
+    },
+    {
+      "kind": "warning",
+      "msg": "'x' is deprecated"
+    },
+    {
+      "kind": "warning",
+      "msg": "'x' is deprecated"
+    },
+    {
+      "kind": "note",
+      "msg": "'foo_dep' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "warning",
+      "msg": "'foo_dep' is deprecated"
+    },
+    {
+      "kind": "note",
+      "msg": "'bar_dep' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "warning",
+      "msg": "unknown attribute 'invalid_attribute' ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "'bar_dep' is deprecated"
+    },
+    {
+      "kind": "note",
+      "msg": "'i' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "warning",
+      "msg": "'i' is deprecated: this is the message"
+    },
+    {
+      "kind": "error",
+      "msg": "'deprecated' attribute takes no more than 1 argument"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-deprecated-c2x.sft.c",
+  "remark": null,
+  "sha256": "6b3c325adfa6be86b4dde34809248c5c8b60288af4781cbe616d82612033aa9b",
+  "test_number_uses": 0,
+  "type": "fn"
+}

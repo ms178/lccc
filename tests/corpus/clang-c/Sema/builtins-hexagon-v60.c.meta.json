@@ -1,0 +1,34 @@
+{
+  "bytes": 983,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "no-diagnostics",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DTEST_V60 -DTEST_V62 -DTEST_V65 --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/builtins-hexagon-v60.sft.c",
+  "remark": null,
+  "sha256": "862851051cbd0f2dceadd9483f130a4bb30a7349ef5af5d79f5abb21d632e8a9",
+  "test_number_uses": 0,
+  "type": "fn"
+}

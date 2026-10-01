@@ -1,0 +1,459 @@
+{
+  "bytes": 18317,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'constexpr' can only be used in variable declarations"
+    },
+    {
+      "kind": "error",
+      "msg": "'constexpr' can only be used in variable declarations"
+    },
+    {
+      "kind": "error",
+      "msg": "struct cannot be marked constexpr"
+    },
+    {
+      "kind": "error",
+      "msg": "struct cannot be marked constexpr"
+    },
+    {
+      "kind": "error",
+      "msg": "union cannot be marked constexpr"
+    },
+    {
+      "kind": "error",
+      "msg": "union cannot be marked constexpr"
+    },
+    {
+      "kind": "error",
+      "msg": "enum cannot be marked constexpr"
+    },
+    {
+      "kind": "error",
+      "msg": "type name does not allow storage class"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "'constexpr' can only be used in variable declarations"
+    },
+    {
+      "kind": "error",
+      "msg": "expected expression"
+    },
+    {
+      "kind": "error",
+      "msg": "constexpr pointer initializer is not null"
+    },
+    {
+      "kind": "error",
+      "msg": "'auto' cannot be signed or unsigned"
+    },
+    {
+      "kind": "error",
+      "msg": "typedef cannot be constexpr"
+    },
+    {
+      "kind": "error",
+      "msg": "typedef cannot be constexpr"
+    },
+    {
+      "kind": "error",
+      "msg": "function parameter cannot be constexpr"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot combine with previous '_Thread_local' declaration specifier"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot combine with previous '_Thread_local' declaration specifier"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot combine with previous '_Thread_local' declaration specifier"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "cannot combine with previous '_Thread_local' declaration specifier"
+    },
+    {
+      "kind": "error",
+      "msg": "constexpr variable cannot have type 'const _Atomic(int)'"
+    },
+    {
+      "kind": "error",
+      "msg": "constexpr variable cannot have type 'const _Atomic(int)'"
+    },
+    {
+      "kind": "error",
+      "msg": "constexpr variable cannot have type 'const volatile int'"
+    },
+    {
+      "kind": "error",
+      "msg": "constexpr variable cannot have type 'int *const restrict'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot combine with previous 'extern' declaration specifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "'extern' variable has an initializer"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "constexpr variable cannot have type 'volatile int'"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "constexpr variable cannot have type 'const typeof (fp)' (aka 'int (*(*const)(int))[n]')"
+    },
+    {
+      "kind": "error",
+      "msg": "constexpr initializer evaluates to nan which is not exactly representable in type 'const float'"
+    },
+    {
+      "kind": "error",
+      "msg": "constexpr initializer evaluates to nan which is not exactly representable in type 'const float'"
+    },
+    {
+      "kind": "error",
+      "msg": "constexpr initializer evaluates to nan which is not exactly representable in type 'const double'"
+    },
+    {
+      "kind": "error",
+      "msg": "constexpr initializer evaluates to nan which is not exactly representable in type 'const double'"
+    },
+    {
+      "kind": "error",
+      "msg": "variable has incomplete type 'const struct S9'"
+    },
+    {
+      "kind": "note",
+      "msg": "forward declaration of 'struct S9'"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "expected '(' after 'if'"
+    },
+    {
+      "kind": "error",
+      "msg": "expected '(' after 'if'"
+    },
+    {
+      "kind": "error",
+      "msg": "constexpr variable 'num' must be initialized by a constant expression"
+    },
+    {
+      "kind": "error",
+      "msg": "constexpr variable 'i' must be initialized by a constant expression"
+    },
+    {
+      "kind": "note",
+      "msg": "declared here"
+    },
+    {
+      "kind": "error",
+      "msg": "static assertion expression is not an integral constant expression"
+    },
+    {
+      "kind": "note",
+      "msg": "initializer of 'i' is not a constant expression"
+    },
+    {
+      "kind": "error",
+      "msg": "constexpr variable 'd_const' must be initialized by a constant expression"
+    },
+    {
+      "kind": "error",
+      "msg": "constexpr variable 'ld_const' must be initialized by a constant expression"
+    },
+    {
+      "kind": "error",
+      "msg": "constexpr variable 'c' must be initialized by a constant expression"
+    },
+    {
+      "kind": "note",
+      "msg": "read of object outside its lifetime is not allowed in a constant expression"
+    },
+    {
+      "kind": "error",
+      "msg": "initializer element is not a compile-time constant"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23",
+    " --c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/constexpr.sft.c",
+  "remark": null,
+  "sha256": "262d9fe91f61b434c27a0e7599a694f2b380593f31a421f5408110e49dd08d1b",
+  "test_number_uses": 0,
+  "type": "fn"
+}

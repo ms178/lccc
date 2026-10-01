@@ -1,0 +1,134 @@
+{
+  "bytes": 3107,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "no member named 'f3'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot assign to variable 'xc' with const-qualified type 'const struct X'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot assign to variable 'xc' with const-qualified type 'const struct X'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot assign to variable 'xc' with const-qualified type 'const struct X'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration does not declare anything"
+    },
+    {
+      "kind": "error",
+      "msg": "member of anonymous union redeclares 'x'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "duplicate member 'z'"
+    },
+    {
+      "kind": "error",
+      "msg": "duplicate member 'zz'"
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration does not declare anything"
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration does not declare anything"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration does not declare anything"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "typedef requires a name"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "member of anonymous union redeclares 'f0'"
+    },
+    {
+      "kind": "warning",
+      "msg": "declaration does not declare anything"
+    },
+    {
+      "kind": "warning",
+      "msg": "expected ';' at end of declaration list"
+    },
+    {
+      "kind": "error",
+      "msg": "expected member name or ';' after declaration specifiers"
+    },
+    {
+      "kind": "error",
+      "msg": "initializing 'int' with an expression of incompatible type 'a_struct'"
+    },
+    {
+      "kind": "note",
+      "msg": "'A' has been explicitly marked deprecated here"
+    },
+    {
+      "kind": "warning",
+      "msg": "'A' is deprecated"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 3,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/anonymous-struct-union.sft.c",
+  "remark": null,
+  "sha256": "313b97b8b7b5123b12f02c202ac9701d4d247eabc4edd76b8256247118b44cf6",
+  "test_number_uses": 0,
+  "type": "fn"
+}

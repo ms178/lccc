@@ -1,0 +1,22 @@
+{
+  "bytes": 245,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c23",
+    " --c23"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/c2x.sft.c",
+  "remark": null,
+  "sha256": "4cb7dbd46c92803a34afcd252151673fe40e108a3c670aa560f9e85130d953ba",
+  "test_number_uses": 0,
+  "type": "fp"
+}

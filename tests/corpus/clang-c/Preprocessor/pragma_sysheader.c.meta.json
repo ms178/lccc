@@ -1,0 +1,24 @@
+{
+  "bytes": 460,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 22,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c99",
+    " --c99 -DGCC",
+    " --c99 -DCLANG",
+    " --c99 --ms_extensions -DMS"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/pragma_sysheader.sft.c",
+  "remark": null,
+  "sha256": "4ef457aedfbb0ec165d4b4ed95c9baf6d49bc3cec30ff3fda313c457bfe4bdea",
+  "test_number_uses": 0,
+  "type": "fp"
+}

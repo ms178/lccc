@@ -1,0 +1,78 @@
+{
+  "bytes": 1753,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'#pragma comment linker' ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "'#pragma comment linker' ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "'#pragma comment linker' ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "'#pragma comment user' ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "'#pragma comment user' ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "'#pragma comment user' ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "'#pragma comment compiler' ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "'#pragma comment compiler' ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "'#pragma comment compiler' ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "'#pragma comment exestr' ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "'#pragma comment exestr' ignored"
+    },
+    {
+      "kind": "warning",
+      "msg": "'#pragma comment exestr' ignored"
+    },
+    {
+      "kind": "error",
+      "msg": "unknown kind of pragma comment"
+    },
+    {
+      "kind": "error",
+      "msg": "unknown kind of pragma comment"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 11,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--ms_extensions --ms_extensions --ms_extensions --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/pragma-comment-elf.sft.c",
+  "remark": null,
+  "sha256": "6de48b8f9edbcaa9e4259178ce52b5e6867092ce6dd618f3c666902e7235ead7",
+  "test_number_uses": 0,
+  "type": "fn"
+}

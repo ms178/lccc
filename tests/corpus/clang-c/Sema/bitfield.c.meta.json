@@ -1,0 +1,90 @@
+{
+  "bytes": 3321,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "forward declaration of 'enum e0'"
+    },
+    {
+      "kind": "error",
+      "msg": "bit-field 'a' has negative width"
+    },
+    {
+      "kind": "error",
+      "msg": "width of bit-field 'b' (33 bits) exceeds the width of its type (32 bits)"
+    },
+    {
+      "kind": "error",
+      "msg": "integer constant expression must have integer type"
+    },
+    {
+      "kind": "error",
+      "msg": "bit-field 'e' has zero width"
+    },
+    {
+      "kind": "error",
+      "msg": "bit-field 'xx' has non-integral type"
+    },
+    {
+      "kind": "error",
+      "msg": "field has incomplete type 'enum e0'"
+    },
+    {
+      "kind": "error",
+      "msg": "width of anonymous bit-field (10 bits) exceeds the width of its type (8 bits)"
+    },
+    {
+      "kind": "error",
+      "msg": "anonymous bit-field has negative width (-2)"
+    },
+    {
+      "kind": "error",
+      "msg": "anonymous bit-field has non-integral type 'float'"
+    },
+    {
+      "kind": "error",
+      "msg": "width of anonymous bit-field (2 bits) exceeds the width of its type (1 bit)"
+    },
+    {
+      "kind": "error",
+      "msg": "width of bit-field 'h' (5 bits) exceeds the width of its type (1 bit)"
+    },
+    {
+      "kind": "error",
+      "msg": "anonymous bit-field has non-integral type 'double'"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of 'sizeof' to bit-field"
+    },
+    {
+      "kind": "error",
+      "msg": "invalid application of 'sizeof' to bit-field"
+    },
+    {
+      "kind": "error",
+      "msg": "type name requires a specifier or qualifier"
+    },
+    {
+      "kind": "error",
+      "msg": "call to undeclared function 'implicitly_declare_function'; ISO C99 and later do not support implicit function declarations"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c11"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/bitfield.sft.c",
+  "remark": null,
+  "sha256": "9bbdf56c07e570c9033c37856aebdb4d986a7ef812d1e3421179743461f73661",
+  "test_number_uses": 0,
+  "type": "fn"
+}

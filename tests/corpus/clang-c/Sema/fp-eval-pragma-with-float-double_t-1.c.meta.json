@@ -1,0 +1,38 @@
+{
+  "bytes": 4287,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 42,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DNOERROR -DNOERROR -DCPP -DNOERROR -DCPP -DNOERROR -DCPP -DCPP -DCPP -DCPP -DCPP -DCPP --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/fp-eval-pragma-with-float-double_t-1.sft.c",
+  "remark": null,
+  "sha256": "abe6745327754bdc47d68062af04f9c5588107d7e9786ba6430a60d845355297",
+  "test_number_uses": 0,
+  "type": "fn"
+}

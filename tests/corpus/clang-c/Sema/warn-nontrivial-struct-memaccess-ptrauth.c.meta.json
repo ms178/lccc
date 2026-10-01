@@ -1,0 +1,30 @@
+{
+  "bytes": 2702,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c --target linux_aarch64"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-nontrivial-struct-memaccess-ptrauth.sft.c",
+  "remark": null,
+  "sha256": "51ab5269f3a6e5ff6ca623983af47fa365971037bb434fed3292f082bee4ea0c",
+  "test_number_uses": 0,
+  "type": "fp"
+}

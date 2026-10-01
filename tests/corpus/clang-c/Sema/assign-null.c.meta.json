@@ -1,0 +1,21 @@
+{
+  "bytes": 2264,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 21,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/assign-null.sft.c",
+  "remark": null,
+  "sha256": "a2ed086ea16e37b3c7c2ef824b849a1c92330447972d5c08bebe0974dcce5a14",
+  "test_number_uses": 0,
+  "type": "fp"
+}

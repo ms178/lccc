@@ -1,0 +1,30 @@
+{
+  "bytes": 979,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 10,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c",
+    " --c++03 --c++",
+    " --c++03 --c++",
+    " --c++11 --c++",
+    " --c++11 --c++"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/shift-negative-value.sft.c",
+  "remark": null,
+  "sha256": "bae750d159161afbf1119b5863d22a28cdc1ba05acfd306d1c648a0c617ea425",
+  "test_number_uses": 0,
+  "type": "fp"
+}

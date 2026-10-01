@@ -1,0 +1,166 @@
+{
+  "bytes": 11639,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "cannot use 'long double' with '__vector'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use 'long double' with '__vector'"
+    },
+    {
+      "kind": "error",
+      "msg": "type specifier missing, defaults to 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "type specifier missing, defaults to 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of 'double' with '__vector' requires VSX support to be enabled (available on POWER7 or later)"
+    },
+    {
+      "kind": "error",
+      "msg": "use of 'double' with '__vector' requires VSX support to be enabled (available on POWER7 or later)"
+    },
+    {
+      "kind": "error",
+      "msg": "use of 'long long' with '__vector' requires VSX support (available on POWER7 or later) to be enabled"
+    },
+    {
+      "kind": "error",
+      "msg": "use of 'long long' with '__vector' requires VSX support (available on POWER7 or later) to be enabled"
+    },
+    {
+      "kind": "error",
+      "msg": "use of 'long long' with '__vector' requires VSX support (available on POWER7 or later) to be enabled"
+    },
+    {
+      "kind": "error",
+      "msg": "use of 'long long' with '__vector' requires VSX support (available on POWER7 or later) to be enabled"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use 'long double' with '__vector'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use 'long double' with '__vector'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use '_Complex' with '__vector'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use '_Complex' with '__vector'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use '_Complex' with '__vector'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use '_Complex' with '__vector'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use '_Complex' with '__vector'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use '_Complex' with '__vector'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use 'float' with '__vector bool'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use 'double' with '__vector bool'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use '__pixel' with '__vector bool'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use 'signed' with '__vector bool'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use 'unsigned' with '__vector bool'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use 'long' with '__vector bool'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use 'float' with '__vector bool'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use 'double' with '__vector bool'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use '__pixel' with '__vector bool'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use 'signed' with '__vector bool'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use 'unsigned' with '__vector bool'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot use 'long' with '__vector bool'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of 'long long' with '__vector' requires VSX support (available on POWER7 or later) to be enabled"
+    },
+    {
+      "kind": "error",
+      "msg": "use of 'long long' with '__vector' requires VSX support (available on POWER7 or later) to be enabled"
+    },
+    {
+      "kind": "error",
+      "msg": "use of 'long long' with '__vector' requires VSX support (available on POWER7 or later) to be enabled"
+    },
+    {
+      "kind": "error",
+      "msg": "requires a specifier or qualifier"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to '__attribute__((__vector_size__(2 * sizeof(unsigned int)))) unsigned int' (vector of 2 'unsigned int' values) from incompatible type '__attribute__((__vector_size__(4 * sizeof(unsigned int)))) unsigned int' (vector of 4 'unsigned int' values)"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to '__vector unsigned int' (vector of 4 'unsigned int' values) from incompatible type '__attribute__((__vector_size__(2 * sizeof(unsigned int)))) unsigned int' (vector of 2 'unsigned int' values)"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 7,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/altivec.sft.c",
+  "remark": null,
+  "sha256": "533634a07189e064c25e08530d3edba7d3118bd4ac2f75e08f9a576daf17ad69",
+  "test_number_uses": 0,
+  "type": "fn"
+}

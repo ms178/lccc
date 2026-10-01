@@ -1,0 +1,134 @@
+{
+  "bytes": 3660,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": "variable 'b' declared const here"
+    },
+    {
+      "kind": "note",
+      "msg": "variable 'b2' declared const here"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot assign to variable 'b' with const-qualified type 'const arr' (aka 'const int[10]')"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot assign to variable 'b2' with const-qualified type 'const int[10]'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "cannot assign to variable 'i1' with const-qualified data member 'a'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot assign to variable 'j1' with nested const-qualified data member 'a'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot assign to non-static data member 'i' with const-qualified data member 'a'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot assign to lvalue with nested const-qualified data member 'a'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot assign to non-static data member 'i' with const-qualified data member 'a'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot assign to variable 'i1' with const-qualified data member 'a'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot assign to variable 'j1' with nested const-qualified data member 'a'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot assign to non-static data member 'i' with const-qualified data member 'a'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot assign to lvalue with nested const-qualified data member 'a'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot assign to non-static data member 'i' with const-qualified data member 'a'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "field has incomplete type 'struct L'"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'struct L' from incompatible type 'int'"
+    },
+    {
+      "kind": "note",
+      "msg": "forward declaration of 'struct M1'"
+    },
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "error",
+      "msg": "field has incomplete type 'const struct M1'"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot assign to lvalue with nested const-qualified data member 'field'"
+    },
+    {
+      "kind": "note",
+      "msg": "forward declaration of 'struct N1'"
+    },
+    {
+      "kind": "error",
+      "msg": "field has incomplete type 'struct N1'"
+    },
+    {
+      "kind": "error",
+      "msg": "assigning to 'struct N1' from incompatible type 'int'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/assign.sft.c",
+  "remark": null,
+  "sha256": "08d7eb3b5db053544c46abbd9ae2b9d93d399cf8b1ab75905ef2166c3664e68a",
+  "test_number_uses": 0,
+  "type": "fn"
+}

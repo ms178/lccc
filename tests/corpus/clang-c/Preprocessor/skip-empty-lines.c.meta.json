@@ -1,0 +1,21 @@
+{
+  "bytes": 1371,
+  "cases": null,
+  "category": "Preprocessor",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 2,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-w -w -w -w -w -w --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Preprocessor/skip-empty-lines.sft.c",
+  "remark": null,
+  "sha256": "6e4c22891fa89c015a332c374c68792f6a9840b8d2ef5ffa2e86b052dace0e73",
+  "test_number_uses": 0,
+  "type": "fp"
+}

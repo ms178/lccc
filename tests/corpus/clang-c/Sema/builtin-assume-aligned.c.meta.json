@@ -1,0 +1,90 @@
+{
+  "bytes": 4413,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "requested alignment is not a power of 2"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer to integer conversion passing 'unsigned int *' to parameter of type"
+    },
+    {
+      "kind": "error",
+      "msg": "too many arguments to function call, expected at most 3, have 4"
+    },
+    {
+      "kind": "error",
+      "msg": "requested alignment is not a power of 2"
+    },
+    {
+      "kind": "error",
+      "msg": "must be a constant integer"
+    },
+    {
+      "kind": "warning",
+      "msg": "requested alignment must be 4294967296 bytes or smaller; maximum alignment assumed"
+    },
+    {
+      "kind": "warning",
+      "msg": "requested alignment must be 4294967296 bytes or smaller; maximum alignment assumed"
+    },
+    {
+      "kind": "error",
+      "msg": "argument to '__builtin_assume_aligned' must be a constant integer"
+    },
+    {
+      "kind": "error",
+      "msg": "non-pointer argument to '__builtin_assume_aligned' is not allowed"
+    },
+    {
+      "kind": "warning",
+      "msg": "'assume_aligned' attribute only applies to return values that are pointers"
+    },
+    {
+      "kind": "warning",
+      "msg": "'assume_aligned' attribute only applies to return values that are pointers"
+    },
+    {
+      "kind": "warning",
+      "msg": "requested alignment must be 4294967296 bytes or smaller; maximum alignment assumed"
+    },
+    {
+      "kind": "warning",
+      "msg": "'assume_aligned' attribute only applies to Objective-C methods and functions"
+    },
+    {
+      "kind": "error",
+      "msg": "requested alignment is not a power of 2"
+    },
+    {
+      "kind": "error",
+      "msg": "'assume_aligned' attribute takes at least 1 argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'assume_aligned' attribute takes at least 1 argument"
+    },
+    {
+      "kind": "error",
+      "msg": "'assume_aligned' attribute takes no more than 2 arguments"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 10,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "%-DSIZE_T_64 %-DSIZE_T_64 --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/builtin-assume-aligned.sft.c",
+  "remark": null,
+  "sha256": "800502fa85d59716f7722c07e6079e9ecad6fd178bd575b02969a3b38465951a",
+  "test_number_uses": 0,
+  "type": "fn"
+}

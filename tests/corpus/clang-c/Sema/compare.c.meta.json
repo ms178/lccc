@@ -1,0 +1,322 @@
+{
+  "bytes": 18135,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "comparison between pointer and integer ('char *' and 'int')"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of integers of different signs"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of integers of different signs"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of integers of different signs"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of integers of different signs"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of integers of different signs"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of integers of different signs"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of integers of different signs"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of integers of different signs"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of integers of different signs"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of integers of different signs"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of integers of different signs"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of integers of different signs"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of integers of different signs"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of integers of different signs"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of unsigned expression < 0 is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of unsigned expression < 0 is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of unsigned expression < 0 is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 'C' (65536) with expression of type 'unsigned short' is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 'C' (65536) with expression of type 'unsigned char' is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 'C' (65536) with expression of type 'unsigned short' is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 'C' (65536) with expression of type 'unsigned char' is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 'C' (65536) with expression of type 'short' is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 'C' (65536) with expression of type 'signed char' is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of integers of different signs"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 'C' (65536) with expression of type 'short' is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 'C' (65536) with expression of type 'signed char' is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of integers of different signs"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of integers of different signs"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 524288 with expression of type 'unsigned short' is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 524288 with expression of type 'unsigned char' is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 524288 with expression of type 'unsigned short' is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 524288 with expression of type 'unsigned char' is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 524288 with expression of type 'short' is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 524288 with expression of type 'signed char' is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of integers of different signs"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 524288 with expression of type 'short' is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of constant 524288 with expression of type 'signed char' is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of integers of different signs"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of integers of different signs"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of distinct pointer types"
+    },
+    {
+      "kind": "warning",
+      "msg": "ordered comparison between pointer and zero ('int *' and 'int') is an extension"
+    },
+    {
+      "kind": "warning",
+      "msg": "ordered comparison between pointer and integer ('int *' and 'int')"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of distinct pointer types"
+    },
+    {
+      "kind": "warning",
+      "msg": "ordered comparison of function pointers"
+    },
+    {
+      "kind": "warning",
+      "msg": "self-comparison always evaluates to false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of distinct pointer types"
+    },
+    {
+      "kind": "warning",
+      "msg": "equality comparison between function pointer and void pointer"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of integers of different signs"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of integers of different signs"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of integers of different signs"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of unsigned expression < 0 is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of 0 > unsigned expression is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of unsigned expression >= 0 is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of 0 <= unsigned expression is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of unsigned expression < 0 is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of unsigned expression < 0 is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of unsigned enum expression < 0 is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of unsigned enum expression >= 0 is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of 0 <= unsigned enum expression is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of 0 > unsigned enum expression is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of unsigned enum expression < 0 is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of unsigned enum expression >= 0 is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of 0 <= unsigned enum expression is always true"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of 0 > unsigned enum expression is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of integers of different signs: 'int' and 'unsigned int'"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of integers of different signs: 'int' and 'unsigned int'"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of integers of different signs"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of integers of different signs"
+    },
+    {
+      "kind": "warning",
+      "msg": "comparison of integers of different signs"
+    },
+    {
+      "kind": "warning",
+      "msg": "result of comparison of constant 2147483648 with expression of type 'int' is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "result of comparison of 5-bit signed value <= -17 is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "result of comparison of 17-bit signed value == 65536 is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "result of comparison of 17-bit signed value == 65536 is always false"
+    },
+    {
+      "kind": "warning",
+      "msg": "result of comparison of 16-bit signed value == 32768 is always false"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "-DTEST=1 -DTEST=2 --c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/compare.sft.c",
+  "remark": null,
+  "sha256": "6f6e4fc26326fd150fea0dd23f98d5ad3479297f4336c673b492504b150c03a6",
+  "test_number_uses": 0,
+  "type": "fp"
+}

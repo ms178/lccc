@@ -1,0 +1,30 @@
+{
+  "bytes": 390,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "invalid use of a cast in an inline asm context requiring an lvalue"
+    },
+    {
+      "kind": "warning",
+      "msg": "invalid use of a cast in an inline asm context requiring an lvalue"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/heinous-extensions-on.sft.c",
+  "remark": null,
+  "sha256": "c7f9429cf5bd6ba3c80908edbc372b0a689983c28a116255c9a5ee41d6f065de",
+  "test_number_uses": 0,
+  "type": "fp"
+}

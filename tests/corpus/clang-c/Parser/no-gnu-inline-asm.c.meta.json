@@ -1,0 +1,30 @@
+{
+  "bytes": 600,
+  "cases": null,
+  "category": "Parser",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "GNU-style inline assembly is disabled"
+    },
+    {
+      "kind": "error",
+      "msg": "GNU-style inline assembly is disabled"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 8,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Parser/no-gnu-inline-asm.sft.c",
+  "remark": null,
+  "sha256": "145a6ba49986895b654d63fdbc3e851b7e10efbd9577848a0fca6038f22bd90a",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,82 @@
+{
+  "bytes": 2071,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'common' and 'internal_linkage' attributes are not compatible"
+    },
+    {
+      "kind": "note",
+      "msg": "conflicting attribute is here"
+    },
+    {
+      "kind": "error",
+      "msg": "'internal_linkage' and 'common' attributes are not compatible"
+    },
+    {
+      "kind": "note",
+      "msg": "conflicting attribute is here"
+    },
+    {
+      "kind": "note",
+      "msg": "previous declaration is here"
+    },
+    {
+      "kind": "error",
+      "msg": "'internal_linkage' and 'common' attributes are not compatible"
+    },
+    {
+      "kind": "error",
+      "msg": "'internal_linkage' attribute does not appear on the first declaration"
+    },
+    {
+      "kind": "note",
+      "msg": "conflicting attribute is here"
+    },
+    {
+      "kind": "error",
+      "msg": "'common' and 'internal_linkage' attributes are not compatible"
+    },
+    {
+      "kind": "warning",
+      "msg": "'internal_linkage' attribute only applies to variables, functions, and classes"
+    },
+    {
+      "kind": "error",
+      "msg": "'internal_linkage' attribute takes no arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'common' and 'clang::internal_linkage' attributes are not compatible"
+    },
+    {
+      "kind": "note",
+      "msg": "conflicting attribute is here"
+    },
+    {
+      "kind": "error",
+      "msg": "'clang::internal_linkage' and 'common' attributes are not compatible"
+    },
+    {
+      "kind": "note",
+      "msg": "conflicting attribute is here"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/internal_linkage.sft.c",
+  "remark": null,
+  "sha256": "448a17c99e75f75c74460d40722353e2e82c356584ea57c57a3947d2c1ba9ecd",
+  "test_number_uses": 0,
+  "type": "fn"
+}

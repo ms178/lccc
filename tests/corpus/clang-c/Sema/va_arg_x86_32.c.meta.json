@@ -1,0 +1,30 @@
+{
+  "bytes": 306,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "expression is not assignable"
+    },
+    {
+      "kind": "error",
+      "msg": "first argument to 'va_arg' is of type 'void *'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/va_arg_x86_32.sft.c",
+  "remark": null,
+  "sha256": "208934c345a87f96e8648c3bd8e348f6727299b575c6943fd5e77f19816c3deb",
+  "test_number_uses": 0,
+  "type": "fn"
+}

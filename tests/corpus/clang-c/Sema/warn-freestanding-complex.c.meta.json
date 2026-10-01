@@ -1,0 +1,26 @@
+{
+  "bytes": 221,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "complex numbers are an extension in a freestanding C99 implementation"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-freestanding-complex.sft.c",
+  "remark": null,
+  "sha256": "8a08a3da6200b27ba4a52fc64158cb37ee2bb49687178b146c24626ac0d142e6",
+  "test_number_uses": 0,
+  "type": "fp"
+}

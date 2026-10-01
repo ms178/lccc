@@ -1,0 +1,26 @@
+{
+  "bytes": 1161,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "passing argument to parameter 'x' here"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 10,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/incompatible-function-pointer-types.sft.c",
+  "remark": null,
+  "sha256": "1062d7f3e9aa05e5b150c7c254e02fb3d6832dca95ca078913b77c8ba461fc76",
+  "test_number_uses": 0,
+  "type": "fp"
+}

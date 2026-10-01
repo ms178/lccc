@@ -1,0 +1,94 @@
+{
+  "bytes": 2757,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "self-comparison always evaluates to true"
+    },
+    {
+      "kind": "warning",
+      "msg": "self-comparison always evaluates to false"
+    },
+    {
+      "kind": "warning",
+      "msg": "self-comparison always evaluates to true"
+    },
+    {
+      "kind": "warning",
+      "msg": "self-comparison always evaluates to true"
+    },
+    {
+      "kind": "warning",
+      "msg": "self-comparison"
+    },
+    {
+      "kind": "warning",
+      "msg": "self-comparison"
+    },
+    {
+      "kind": "warning",
+      "msg": "self-comparison always evaluates to true"
+    },
+    {
+      "kind": "warning",
+      "msg": "self-comparison always evaluates to false"
+    },
+    {
+      "kind": "warning",
+      "msg": "self-comparison always evaluates to false"
+    },
+    {
+      "kind": "warning",
+      "msg": "self-comparison always evaluates to true"
+    },
+    {
+      "kind": "warning",
+      "msg": "self-comparison always evaluates to false"
+    },
+    {
+      "kind": "warning",
+      "msg": "self-comparison always evaluates to true"
+    },
+    {
+      "kind": "warning",
+      "msg": "array comparison always evaluates to false"
+    },
+    {
+      "kind": "warning",
+      "msg": "array comparison always evaluates to true"
+    },
+    {
+      "kind": "warning",
+      "msg": "array comparison always evaluates to a constant"
+    },
+    {
+      "kind": "warning",
+      "msg": "array comparison always evaluates to a constant"
+    },
+    {
+      "kind": "warning",
+      "msg": "array comparison always evaluates to a constant"
+    },
+    {
+      "kind": "warning",
+      "msg": "array comparison always evaluates to a constant"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/self-comparison.sft.c",
+  "remark": null,
+  "sha256": "0fbfe224c530b05b9ff95700cd72799fc4dfb6fbb0b8a330cda995ea97eb7a03",
+  "test_number_uses": 0,
+  "type": "fp"
+}

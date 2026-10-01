@@ -1,0 +1,38 @@
+{
+  "bytes": 1020,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "error",
+      "msg": "redefinition of 'f'"
+    },
+    {
+      "kind": "note",
+      "msg": "previous definition is here"
+    },
+    {
+      "kind": "error",
+      "msg": "conflicting types for 'h'"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 14,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    " --c89 --strict_gnu"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/inline-redef.sft.c",
+  "remark": null,
+  "sha256": "06d85ebb8e0e9330c6bfdd341800b8bb5f288a57a77ff05a3708534caa46dd0d",
+  "test_number_uses": 0,
+  "type": "fn"
+}

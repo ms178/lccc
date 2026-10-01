@@ -1,0 +1,186 @@
+{
+  "bytes": 4827,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "unsequenced modification and access to 'a'"
+    },
+    {
+      "kind": "warning",
+      "msg": "multiple unsequenced modifications to 'a'"
+    },
+    {
+      "kind": "warning",
+      "msg": "unsequenced modification and access to 'a'"
+    },
+    {
+      "kind": "warning",
+      "msg": "multiple unsequenced modifications to 'a'"
+    },
+    {
+      "kind": "warning",
+      "msg": "multiple unsequenced modifications"
+    },
+    {
+      "kind": "warning",
+      "msg": "multiple unsequenced modifications"
+    },
+    {
+      "kind": "warning",
+      "msg": "multiple unsequenced modifications"
+    },
+    {
+      "kind": "warning",
+      "msg": "multiple unsequenced modifications"
+    },
+    {
+      "kind": "warning",
+      "msg": "multiple unsequenced modifications"
+    },
+    {
+      "kind": "warning",
+      "msg": "multiple unsequenced modifications"
+    },
+    {
+      "kind": "warning",
+      "msg": "multiple unsequenced modifications"
+    },
+    {
+      "kind": "warning",
+      "msg": "unsequenced modification and access"
+    },
+    {
+      "kind": "warning",
+      "msg": "unsequenced modification and access"
+    },
+    {
+      "kind": "warning",
+      "msg": "multiple unsequenced modifications"
+    },
+    {
+      "kind": "warning",
+      "msg": "multiple unsequenced modifications"
+    },
+    {
+      "kind": "warning",
+      "msg": "multiple unsequenced modifications"
+    },
+    {
+      "kind": "warning",
+      "msg": "multiple unsequenced modifications"
+    },
+    {
+      "kind": "warning",
+      "msg": "multiple unsequenced modifications"
+    },
+    {
+      "kind": "warning",
+      "msg": "multiple unsequenced modifications"
+    },
+    {
+      "kind": "warning",
+      "msg": "multiple unsequenced modifications"
+    },
+    {
+      "kind": "warning",
+      "msg": "unsequenced modification and access"
+    },
+    {
+      "kind": "warning",
+      "msg": "multiple unsequenced modifications"
+    },
+    {
+      "kind": "warning",
+      "msg": "unsequenced modification and access"
+    },
+    {
+      "kind": "warning",
+      "msg": "unsequenced modification and access to 'a'"
+    },
+    {
+      "kind": "warning",
+      "msg": "unsequenced modification and access"
+    },
+    {
+      "kind": "warning",
+      "msg": "unsequenced modification and access to 'a'"
+    },
+    {
+      "kind": "warning",
+      "msg": "unsequenced modification and access"
+    },
+    {
+      "kind": "warning",
+      "msg": "unsequenced modification and access to 'a'"
+    },
+    {
+      "kind": "warning",
+      "msg": "unsequenced modification and access"
+    },
+    {
+      "kind": "warning",
+      "msg": "unsequenced modification and access to 'a'"
+    },
+    {
+      "kind": "warning",
+      "msg": "unsequenced modification and access"
+    },
+    {
+      "kind": "warning",
+      "msg": "unsequenced modification and access"
+    },
+    {
+      "kind": "warning",
+      "msg": "unsequenced modification and access to 'q'"
+    },
+    {
+      "kind": "warning",
+      "msg": "unsequenced modification and access to 'a'"
+    },
+    {
+      "kind": "warning",
+      "msg": "multiple unsequenced modifications to 'a'"
+    },
+    {
+      "kind": "warning",
+      "msg": "multiple unsequenced modifications"
+    },
+    {
+      "kind": "warning",
+      "msg": "multiple unsequenced modifications"
+    },
+    {
+      "kind": "warning",
+      "msg": "multiple unsequenced modifications"
+    },
+    {
+      "kind": "warning",
+      "msg": "multiple unsequenced modifications"
+    },
+    {
+      "kind": "warning",
+      "msg": "multiple unsequenced modifications"
+    },
+    {
+      "kind": "warning",
+      "msg": "extension"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c11"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/warn-unsequenced.sft.c",
+  "remark": null,
+  "sha256": "bebe4a2b54b5cc3ac4d90bbfc255d9f62f9235fb7e9ff27ee426ad0c0fb277c3",
+  "test_number_uses": 0,
+  "type": "fp"
+}

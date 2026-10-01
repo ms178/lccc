@@ -1,0 +1,34 @@
+{
+  "bytes": 217,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "to match this '{'"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared label"
+    },
+    {
+      "kind": "error",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/recover-goto.sft.c",
+  "remark": null,
+  "sha256": "f8480c9254da5138e5a3de82a7263f71ec7b11d53d904f6a48aad121545a5445",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,134 @@
+{
+  "bytes": 3335,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "initializing char array with wide string literal"
+    },
+    {
+      "kind": "error",
+      "msg": "initializing char array with wide string literal"
+    },
+    {
+      "kind": "error",
+      "msg": "initializing char array with wide string literal"
+    },
+    {
+      "kind": "error",
+      "msg": "initializing wide char array with non-wide string literal"
+    },
+    {
+      "kind": "error",
+      "msg": "initializing wide char array with non-wide string literal"
+    },
+    {
+      "kind": "error",
+      "msg": "initializing wide char array with incompatible wide string literal"
+    },
+    {
+      "kind": "error",
+      "msg": "initializing wide char array with incompatible wide string literal"
+    },
+    {
+      "kind": "error",
+      "msg": "initializing wide char array with non-wide string literal"
+    },
+    {
+      "kind": "error",
+      "msg": "initializing wide char array with non-wide string literal"
+    },
+    {
+      "kind": "error",
+      "msg": "initializing wide char array with incompatible wide string literal"
+    },
+    {
+      "kind": "error",
+      "msg": "initializing wide char array with incompatible wide string literal"
+    },
+    {
+      "kind": "error",
+      "msg": "initializing wide char array with non-wide string literal"
+    },
+    {
+      "kind": "error",
+      "msg": "initializing wide char array with non-wide string literal"
+    },
+    {
+      "kind": "error",
+      "msg": "initializing wide char array with incompatible wide string literal"
+    },
+    {
+      "kind": "error",
+      "msg": "initializing wide char array with incompatible wide string literal"
+    },
+    {
+      "kind": "error",
+      "msg": "initializing wide char array with non-wide string literal"
+    },
+    {
+      "kind": "error",
+      "msg": "initializing wide char array with non-wide string literal"
+    },
+    {
+      "kind": "error",
+      "msg": "initializing wide char array with incompatible wide string literal"
+    },
+    {
+      "kind": "error",
+      "msg": "initializing wide char array with incompatible wide string literal"
+    },
+    {
+      "kind": "error",
+      "msg": "array initializer must be an initializer list"
+    },
+    {
+      "kind": "error",
+      "msg": "array initializer must be an initializer list"
+    },
+    {
+      "kind": "error",
+      "msg": "array initializer must be an initializer list"
+    },
+    {
+      "kind": "error",
+      "msg": "array initializer must be an initializer list"
+    },
+    {
+      "kind": "error",
+      "msg": "array initializer must be an initializer list"
+    },
+    {
+      "kind": "error",
+      "msg": "array initializer must be an initializer list or string literal"
+    },
+    {
+      "kind": "error",
+      "msg": "array initializer must be an initializer list or wide string literal"
+    },
+    {
+      "kind": "error",
+      "msg": "array initializer must be an initializer list or wide string literal"
+    },
+    {
+      "kind": "error",
+      "msg": "array initializer must be an initializer list or wide string literal"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c11"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/string-init.sft.c",
+  "remark": null,
+  "sha256": "b7058d9a3a4360483690e19b424e8074f7243ef8f9dfa28149b58a43b2d45df5",
+  "test_number_uses": 0,
+  "type": "fn"
+}

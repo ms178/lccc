@@ -1,0 +1,82 @@
+{
+  "bytes": 2441,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "statement requires expression of integer type ('_Complex int' invalid)"
+    },
+    {
+      "kind": "error",
+      "msg": "integer constant expression must have integer type"
+    },
+    {
+      "kind": "error",
+      "msg": "integer constant expression must have integer type"
+    },
+    {
+      "kind": "error",
+      "msg": "integer constant expression must have integer type"
+    },
+    {
+      "kind": "error",
+      "msg": "integer constant expression must have integer type"
+    },
+    {
+      "kind": "warning",
+      "msg": "fold"
+    },
+    {
+      "kind": "warning",
+      "msg": "fold"
+    },
+    {
+      "kind": "warning",
+      "msg": "fold"
+    },
+    {
+      "kind": "warning",
+      "msg": "fold"
+    },
+    {
+      "kind": "warning",
+      "msg": "fold"
+    },
+    {
+      "kind": "warning",
+      "msg": "fold"
+    },
+    {
+      "kind": "warning",
+      "msg": "fold"
+    },
+    {
+      "kind": "warning",
+      "msg": "fold"
+    },
+    {
+      "kind": "warning",
+      "msg": "fold"
+    },
+    {
+      "kind": "warning",
+      "msg": "fold"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/complex-int.sft.c",
+  "remark": null,
+  "sha256": "cf2498c8ec51795c29235101aa0b3eda963ac364cb12891fa16a3baecb26ff72",
+  "test_number_uses": 0,
+  "type": "fn"
+}

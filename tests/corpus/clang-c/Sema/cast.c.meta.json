@@ -1,0 +1,78 @@
+{
+  "bytes": 5717,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "variable length array used"
+    },
+    {
+      "kind": "warning",
+      "msg": "variable length array folded to constant array as an extension"
+    },
+    {
+      "kind": "note",
+      "msg": "this conversion is not allowed in a constant expression"
+    },
+    {
+      "kind": "error",
+      "msg": "pointer cannot be cast to type"
+    },
+    {
+      "kind": "error",
+      "msg": "cannot be cast to a pointer type"
+    },
+    {
+      "kind": "warning",
+      "msg": "cast to 'VoidPtr' (aka 'void *') from smaller integer type 'Int' (aka 'int')"
+    },
+    {
+      "kind": "warning",
+      "msg": "cast to 'CharPtr' (aka 'char *') from smaller integer type 'Int' (aka 'int')"
+    },
+    {
+      "kind": "warning",
+      "msg": "cast to 'CharPtr' (aka 'char *') from smaller integer type 'Int' (aka 'int')"
+    },
+    {
+      "kind": "warning",
+      "msg": "cast to smaller integer type 'Int' (aka 'int') from 'VoidPtr' (aka 'void *')"
+    },
+    {
+      "kind": "warning",
+      "msg": "cast to smaller integer type 'Int' (aka 'int') from 'CharPtr' (aka 'char *')"
+    },
+    {
+      "kind": "warning",
+      "msg": "cast to smaller integer type 'Int' (aka 'int') from 'CharPtr' (aka 'char *')"
+    },
+    {
+      "kind": "warning",
+      "msg": "cast to smaller integer type 'X' from 'VoidPtr' (aka 'void *')"
+    },
+    {
+      "kind": "warning",
+      "msg": "cast to smaller integer type 'X' from 'CharPtr' (aka 'char *')"
+    },
+    {
+      "kind": "warning",
+      "msg": "cast to smaller integer type 'X' from 'CharPtr' (aka 'char *')"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/cast.sft.c",
+  "remark": null,
+  "sha256": "d4f9b72a0125c56391b6cedf9c156ce01f6ec8dcdff6df828cfba1d6705c67cc",
+  "test_number_uses": 0,
+  "type": "fn"
+}

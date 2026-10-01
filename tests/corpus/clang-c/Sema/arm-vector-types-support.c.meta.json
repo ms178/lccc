@@ -1,0 +1,34 @@
+{
+  "bytes": 1175,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "on M-profile architectures 'neon_vector_type' attribute is not supported on targets missing 'mve'; specify an appropriate -march= or -mcpu="
+    },
+    {
+      "kind": "error",
+      "msg": "on M-profile architectures 'neon_polyvector_type' attribute is not supported on targets missing 'mve'; specify an appropriate -march= or -mcpu="
+    },
+    {
+      "kind": "error",
+      "msg": "'arm_sve_vector_bits' attribute is not supported on targets missing 'sve'; specify an appropriate -march= or -mcpu="
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c --target linux_aarch64"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/arm-vector-types-support.sft.c",
+  "remark": null,
+  "sha256": "7d3423662c1d7443b25d99547803f7aa6dfb793a61006f762bf57acb83a15b91",
+  "test_number_uses": 0,
+  "type": "fn"
+}

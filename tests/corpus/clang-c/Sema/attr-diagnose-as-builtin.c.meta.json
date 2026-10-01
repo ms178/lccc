@@ -1,0 +1,98 @@
+{
+  "bytes": 6184,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "warning",
+      "msg": "'diagnose_as_builtin' attribute only applies to functions"
+    },
+    {
+      "kind": "warning",
+      "msg": "'memcpy' will always overflow; destination buffer has size 10, but size argument is 11"
+    },
+    {
+      "kind": "error",
+      "msg": "use of undeclared identifier '__function_that_doesnt_exist'"
+    },
+    {
+      "kind": "error",
+      "msg": "'diagnose_as_builtin' attribute requires parameter 1 to be a builtin function"
+    },
+    {
+      "kind": "error",
+      "msg": "'diagnose_as_builtin' attribute references function '__builtin_memcpy', which takes exactly 3 arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'diagnose_as_builtin' attribute references function '__builtin_memcpy', which takes exactly 3 arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'diagnose_as_builtin' attribute requires parameter 2 to be an integer constant"
+    },
+    {
+      "kind": "error",
+      "msg": "'diagnose_as_builtin' attribute requires parameter 1 to be a builtin function"
+    },
+    {
+      "kind": "error",
+      "msg": "'diagnose_as_builtin' attribute references parameter 3, but the function 'failure_parameter_index_bounds' has only 2 parameters"
+    },
+    {
+      "kind": "error",
+      "msg": "'diagnose_as_builtin' attribute parameter types do not match: parameter 1 of function 'failure_parameter_types' has type 'double', but parameter 1 of function '__builtin_memcpy' has type 'void *'"
+    },
+    {
+      "kind": "warning",
+      "msg": "'memcpy' will always overflow; destination buffer has size 9, but size argument is 10"
+    },
+    {
+      "kind": "warning",
+      "msg": "'memcpy' will always overflow; destination buffer has size 10, but size argument is 11"
+    },
+    {
+      "kind": "error",
+      "msg": "'diagnose_as_builtin' attribute parameter types do not match: parameter 2 of function 'failure_type' has type 'char', but parameter 2 of function '__builtin_memset' has type 'int'"
+    },
+    {
+      "kind": "warning",
+      "msg": "'sscanf' may overflow; destination buffer in argument 3 has size 10, but the corresponding specifier may require size 11"
+    },
+    {
+      "kind": "error",
+      "msg": "'diagnose_as_builtin' attribute requires parameter 1 to be a builtin function"
+    },
+    {
+      "kind": "error",
+      "msg": "'diagnose_as_builtin' attribute requires parameter 1 to be a builtin function"
+    },
+    {
+      "kind": "error",
+      "msg": "'diagnose_as_builtin' attribute requires parameter 1 to be a builtin function"
+    },
+    {
+      "kind": "error",
+      "msg": "'diagnose_as_builtin' attribute cannot be applied to non-static member functions"
+    },
+    {
+      "kind": "warning",
+      "msg": "'memcpy' will always overflow; destination buffer has size 10, but size argument is 11"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-diagnose-as-builtin.sft.c",
+  "remark": null,
+  "sha256": "2c8daad1c118ac4f6071c103a6facb52a6480172d685fc2e196bd600c7f46045",
+  "test_number_uses": 0,
+  "type": "fn"
+}

@@ -1,0 +1,21 @@
+{
+  "bytes": 3263,
+  "cases": null,
+  "category": "Sema",
+  "expected": [],
+  "has_main": false,
+  "header_lines": 4,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/libbuiltins-ctype-powerpc64.sft.c",
+  "remark": null,
+  "sha256": "44982021b193cda9cc9c2129a75dc85722af21f67840fdfef797f18bc17d30ef",
+  "test_number_uses": 0,
+  "type": "fp"
+}

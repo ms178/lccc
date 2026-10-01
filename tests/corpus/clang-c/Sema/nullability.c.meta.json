@@ -1,0 +1,250 @@
+{
+  "bytes": 13818,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": ""
+    },
+    {
+      "kind": "warning",
+      "msg": "duplicate nullability specifier '_Nonnull'"
+    },
+    {
+      "kind": "error",
+      "msg": "nullability specifier '_Nullable' conflicts with existing specifier '_Nonnull'"
+    },
+    {
+      "kind": "error",
+      "msg": "nullability specifier '_Nonnull' conflicts with existing specifier '_Null_unspecified'"
+    },
+    {
+      "kind": "error",
+      "msg": "nullability specifier '_Nullable' conflicts with existing specifier '_Nonnull'"
+    },
+    {
+      "kind": "error",
+      "msg": "nullability specifier '_Nullable' conflicts with existing specifier '_Nonnull'"
+    },
+    {
+      "kind": "error",
+      "msg": "nullability specifier '_Null_unspecified' conflicts with existing specifier '_Nonnull'"
+    },
+    {
+      "kind": "error",
+      "msg": "nullability specifier '_Nonnull' cannot be applied to non-pointer type 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "from 'function_pointer_type_3' (aka 'int * _Nonnull (*)(int, int)')"
+    },
+    {
+      "kind": "error",
+      "msg": "from incompatible type 'block_type_3' (aka 'int * _Nonnull (^)(int, int)')"
+    },
+    {
+      "kind": "error",
+      "msg": "from 'function_pointer_type_4' (aka 'int * _Nonnull (*)(int, int)')"
+    },
+    {
+      "kind": "error",
+      "msg": "from 'function_pointer_type_5' (aka 'void (*)(int * _Nonnull)')"
+    },
+    {
+      "kind": "error",
+      "msg": "from incompatible type 'block_type_4' (aka 'int_ptr  _Nonnull (^)(int, int)')"
+    },
+    {
+      "kind": "error",
+      "msg": "nullability specifier '_Nonnull' cannot be applied to non-pointer type 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer types initializing 'int * _Nonnull' with an expression of type 'float *'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer types initializing 'float *' with an expression of type 'int * _Nonnull'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer types initializing 'float **' with an expression of type 'int ** _Nonnull'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer types initializing 'float **' with an expression of type 'int * _Nullable * _Nonnull'"
+    },
+    {
+      "kind": "warning",
+      "msg": "null passed to a callee that requires a non-null argument"
+    },
+    {
+      "kind": "warning",
+      "msg": "null passed to a callee that requires a non-null argument"
+    },
+    {
+      "kind": "warning",
+      "msg": "null passed to a callee that requires a non-null argument"
+    },
+    {
+      "kind": "warning",
+      "msg": "null returned from function that requires a non-null return value"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from nullable pointer 'int * _Nullable' to non-nullable pointer type 'int * _Nonnull'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from nullable pointer 'int * _Nullable' to non-nullable pointer type 'int * _Nonnull'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from nullable pointer 'int * _Nullable' to non-nullable pointer type 'int * _Nullable _Nonnull'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from nullable pointer 'int * _Nullable' to non-nullable pointer type 'int * _Nonnull'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from nullable pointer 'int * _Nullable' to non-nullable pointer type 'int * _Nonnull'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from nullable pointer 'int * _Nullable' to non-nullable pointer type 'int * _Nonnull'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from nullable pointer 'int * _Nullable' to non-nullable pointer type 'int * _Nonnull'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from nullable pointer 'int * _Nullable' to non-nullable pointer type 'int * _Nonnull'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from nullable pointer 'int * _Nullable' to non-nullable pointer type 'int * _Nonnull'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from nullable pointer 'int * _Nullable' to non-nullable pointer type 'int * _Nonnull'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from nullable pointer 'int * _Nullable' to non-nullable pointer type 'int * _Nonnull'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from nullable pointer 'IntP _Nullable' (aka 'int *') to non-nullable pointer type 'int * _Nonnull'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from nullable pointer 'IntP _Nullable' (aka 'int *') to non-nullable pointer type 'int * _Nonnull'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from nullable pointer 'NullableIntP1' (aka 'int *') to non-nullable pointer type 'int * _Nonnull'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from nullable pointer 'int * _Nullable' to non-nullable pointer type 'int * _Nonnull'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from nullable pointer 'int * _Nullable' to non-nullable pointer type 'int * _Nonnull'"
+    },
+    {
+      "kind": "warning",
+      "msg": "implicit conversion from nullable pointer 'int * _Nullable' to non-nullable pointer type 'int * _Nonnull'"
+    },
+    {
+      "kind": "error",
+      "msg": "incompatible pointer to integer conversion initializing 'int' with an expression of type 'void (int * _Nonnull, void ** _Nullable, void *** _Nullable, void * _Null_unspecified * _Nonnull * _Nullable, int * _Nonnull, int * _Nonnull, int * _Nonnull, int * _Nonnull, int * _Nonnull, void ** _Nullable)'"
+    },
+    {
+      "kind": "error",
+      "msg": "nullability specifier '_Nullable' cannot be applied to non-pointer type 'int[3]'"
+    },
+    {
+      "kind": "error",
+      "msg": "nullability specifier '_Nonnull' cannot be applied to non-pointer type 'int[1]'"
+    },
+    {
+      "kind": "error",
+      "msg": "nullability specifier '_Nonnull' cannot be applied to non-pointer type 'int[1][2]'"
+    },
+    {
+      "kind": "error",
+      "msg": "nullability specifier '_Nonnull' cannot be applied to non-pointer type 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "nullability specifier '_Nonnull' cannot be applied to non-pointer type 'int'"
+    },
+    {
+      "kind": "error",
+      "msg": "nullability specifier '_Nonnull' cannot be applied to non-pointer type 'int[4]'"
+    },
+    {
+      "kind": "error",
+      "msg": "nullability specifier '_Nonnull' cannot be applied to non-pointer type 'INTS' (aka 'int[4]')"
+    },
+    {
+      "kind": "error",
+      "msg": "nullability specifier '_Nonnull' cannot be applied to non-pointer type 'INTS' (aka 'int[4]')"
+    },
+    {
+      "kind": "error",
+      "msg": "nullability specifier '_Nonnull' cannot be applied to non-pointer type 'INTS' (aka 'int[4]')"
+    },
+    {
+      "kind": "warning",
+      "msg": "null passed to a callee that requires a non-null argument"
+    },
+    {
+      "kind": "warning",
+      "msg": "null passed to a callee that requires a non-null argument"
+    },
+    {
+      "kind": "error",
+      "msg": "nullability specifier '_Nonnull' cannot be applied to non-pointer type 'int[2]'"
+    },
+    {
+      "kind": "error",
+      "msg": "nullability specifier '_Nonnull' cannot be applied to non-pointer type 'int[2]'"
+    },
+    {
+      "kind": "warning",
+      "msg": "null passed to a callee that requires a non-null argument"
+    },
+    {
+      "kind": "error",
+      "msg": "nullability specifier '_Nonnull' cannot be applied to non-pointer type 'INTS' (aka 'int[4]')"
+    },
+    {
+      "kind": "error",
+      "msg": "nullability specifier '_Nonnull' cannot be applied to non-pointer type 'INTS' (aka 'int[4]')"
+    },
+    {
+      "kind": "error",
+      "msg": "'_Nullable' attribute only applies to classes"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 9,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/nullability.sft.c",
+  "remark": null,
+  "sha256": "64257747ec4ff16a12e36253eecc00563a6c1a46abbc14d701052feceab3316d",
+  "test_number_uses": 0,
+  "type": "fn"
+}

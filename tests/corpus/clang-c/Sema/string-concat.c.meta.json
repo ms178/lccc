@@ -1,0 +1,94 @@
+{
+  "bytes": 6069,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "note",
+      "msg": "place parentheses around the string literal to silence warning"
+    },
+    {
+      "kind": "warning",
+      "msg": "suspicious concatenation of string literals in an array initialization; did you mean to separate the elements with a comma?"
+    },
+    {
+      "kind": "note",
+      "msg": "place parentheses around the string literal to silence warning"
+    },
+    {
+      "kind": "warning",
+      "msg": "suspicious concatenation of string literals in an array initialization; did you mean to separate the elements with a comma?"
+    },
+    {
+      "kind": "note",
+      "msg": "place parentheses around the string literal to silence warning"
+    },
+    {
+      "kind": "warning",
+      "msg": "suspicious concatenation of string literals in an array initialization; did you mean to separate the elements with a comma?"
+    },
+    {
+      "kind": "note",
+      "msg": "place parentheses around the string literal to silence warning"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": "place parentheses around the string literal to silence warning"
+    },
+    {
+      "kind": "warning",
+      "msg": "suspicious concatenation of string literals in an array initialization; did you mean to separate the elements with a comma?"
+    },
+    {
+      "kind": "note",
+      "msg": "place parentheses around the string literal to silence warning"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": "place parentheses around the string literal to silence warning"
+    },
+    {
+      "kind": "warning",
+      "msg": "suspicious concatenation of string literals in an array initialization; did you mean to separate the elements with a comma?"
+    },
+    {
+      "kind": "note",
+      "msg": "place parentheses around the string literal to silence warning"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    },
+    {
+      "kind": "note",
+      "msg": "place parentheses around the string literal to silence warning"
+    },
+    {
+      "kind": "warning",
+      "msg": ""
+    }
+  ],
+  "has_main": false,
+  "header_lines": 6,
+  "lccc_expect": "accept",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/string-concat.sft.c",
+  "remark": null,
+  "sha256": "7149e398fc328468473b64d10fa1687308447ab21206298357b5fbe2513da3b6",
+  "test_number_uses": 0,
+  "type": "fp"
+}

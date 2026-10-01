@@ -1,0 +1,70 @@
+{
+  "bytes": 1649,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "'long_call' attribute takes no arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'short_call' attribute takes no arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'far' attribute takes no arguments"
+    },
+    {
+      "kind": "error",
+      "msg": "'near' attribute takes no arguments"
+    },
+    {
+      "kind": "warning",
+      "msg": "attribute only applies to functions"
+    },
+    {
+      "kind": "warning",
+      "msg": "attribute only applies to functions"
+    },
+    {
+      "kind": "warning",
+      "msg": "attribute only applies to functions"
+    },
+    {
+      "kind": "warning",
+      "msg": "attribute only applies to functions"
+    },
+    {
+      "kind": "error",
+      "msg": "'near' and 'far' attributes are not compatible"
+    },
+    {
+      "kind": "note",
+      "msg": "conflicting attribute is here"
+    },
+    {
+      "kind": "error",
+      "msg": "'long_call' and 'short_call' attributes are not compatible"
+    },
+    {
+      "kind": "note",
+      "msg": "conflicting attribute is here"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 5,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/attr-long-call.sft.c",
+  "remark": null,
+  "sha256": "d8bae1bb62b5ac8af37cb3d05fb21817356fe42aa93832222fe728091c512dbf",
+  "test_number_uses": 0,
+  "type": "fn"
+}

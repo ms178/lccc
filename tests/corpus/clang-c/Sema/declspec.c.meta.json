@@ -1,0 +1,98 @@
+{
+  "bytes": 2249,
+  "cases": null,
+  "category": "Sema",
+  "expected": [
+    {
+      "kind": "error",
+      "msg": "cannot return array type"
+    },
+    {
+      "kind": "error",
+      "msg": "function definition declared 'typedef'"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ';' after struct"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ';' after struct"
+    },
+    {
+      "kind": "warning",
+      "msg": "typedef requires a name"
+    },
+    {
+      "kind": "warning",
+      "msg": "'const' qualifier on function type 'f' (aka 'int (void)') has no effect and is a Clang extension"
+    },
+    {
+      "kind": "error",
+      "msg": "restrict requires a pointer or reference ('f' (aka 'int (void)') is invalid)"
+    },
+    {
+      "kind": "error",
+      "msg": "pointer to function type 'f' (aka 'int (void)') may not be 'restrict' qualified"
+    },
+    {
+      "kind": "error",
+      "msg": "pointer to function type 'f' (aka 'int (void)') may not be 'restrict' qualified"
+    },
+    {
+      "kind": "error",
+      "msg": "restrict requires a pointer or reference"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ';' after struct"
+    },
+    {
+      "kind": "error",
+      "msg": "expected ';' after struct"
+    },
+    {
+      "kind": "warning",
+      "msg": "duplicate 'const' declaration specifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "duplicate 'volatile' declaration specifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "duplicate 'restrict' declaration specifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "duplicate 'extern' declaration specifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "duplicate 'register' declaration specifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "duplicate 'inline' declaration specifier"
+    },
+    {
+      "kind": "warning",
+      "msg": "duplicate '_Noreturn' declaration specifier"
+    }
+  ],
+  "has_main": false,
+  "header_lines": 3,
+  "lccc_expect": "reject",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "match_regex": null,
+  "options": [
+    "--c"
+  ],
+  "options_all": "",
+  "options_sep": ":",
+  "origin": "tests/tests/imported/clang/c/Sema/declspec.sft.c",
+  "remark": null,
+  "sha256": "d8a3ed7514808bea31d579f90a1451b95358e4f573badaa4f4b5974e61dc5052",
+  "test_number_uses": 0,
+  "type": "fn"
+}
