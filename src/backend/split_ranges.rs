@@ -182,164 +182,39 @@ pub(crate) fn terminator_uses_value(term: &Terminator, vid: u32) -> bool {
     });
     hit
 }
-
-fn rewrite_operand(op: &mut Operand, map: &FxHashMap<u32, u32>) {
-    if let Operand::Value(v) = op {
-        if let Some(&n) = map.get(&v.0) {
-            v.0 = n;
-        }
-    }
-}
-
-fn rewrite_value(v: &mut Value, map: &FxHashMap<u32, u32>) {
-    if let Some(&n) = map.get(&v.0) {
-        v.0 = n;
-    }
-}
-
-/// Rewrite every *use* of a mapped value. Destinations are left alone.
-/// Phi incoming is rewritten only when `rewrite_phi` is true — callers that
-/// just defined a replacement in *this* block must pass false (use-before-def).
-pub(crate) fn replace_values_in_inst(
+/// Rewrite every *use* of a mapped value, with phi-incoming suppression.
+///
+/// Phi incoming is rewritten only when `rewrite_phi` is true — callers that just
+/// defined a replacement in *this* block must pass false (use-before-def).
+///
+/// Everything else is the canonical walk.  The 130-line table this replaces
+/// duplicated `for_each_operand_mut` + `for_each_value_use_mut` by hand, so its
+/// coverage could drift from the canonical pair — and had: its `VaEnd` arm was
+/// grouped with the field-less variants, silently leaving a stale `va_list`
+/// pointer behind.  A phi arm is the *only* slot the generic walk cannot be told
+/// to skip, so a phi arm is the only thing this wrapper handles itself; the
+/// `IrInstruction` coverage the table claimed is now the canonical pair's, pinned
+/// by `ir::instruction::value_replacement_tests`.
+pub(crate) fn replace_values_in_inst_phi_aware(
     inst: &mut Instruction,
     map: &FxHashMap<u32, u32>,
     rewrite_phi: bool,
-) {
-    match inst {
-        Instruction::Alloca { .. }
-        | Instruction::PgoCounterInc { .. }
-        | Instruction::GlobalAddr { .. }
-        | Instruction::Fence { .. }
-        | Instruction::LabelAddr { .. }
-        | Instruction::GetReturnF64Second { .. }
-        | Instruction::GetReturnF32Second { .. }
-        | Instruction::GetReturnF128Second { .. }
-        | Instruction::GetStaticChain { .. }
-        | Instruction::StackSave { .. }
-        | Instruction::ParamRef { .. }
-        | Instruction::VaEnd { .. } => {}
-        // Nested-function support: operand rewrites.
-        Instruction::SetStaticChain { src } => rewrite_operand(src, map),
-        Instruction::InitTrampoline { buffer, chain, .. } => {
-            rewrite_value(buffer, map);
-            rewrite_operand(chain, map);
-        }
-        Instruction::NonlocalGotoSave { frame, .. } => rewrite_value(frame, map),
-        Instruction::NonlocalGoto { chain, .. } => rewrite_operand(chain, map),
-        Instruction::DynAlloca { size, .. } => rewrite_operand(size, map),
-        Instruction::Store { val, ptr, .. } => {
-            rewrite_operand(val, map);
-            rewrite_value(ptr, map);
-        }
-        Instruction::Load { ptr, .. } => rewrite_value(ptr, map),
-        Instruction::BinOp { lhs, rhs, .. } | Instruction::Cmp { lhs, rhs, .. } => {
-            rewrite_operand(lhs, map);
-            rewrite_operand(rhs, map);
-        }
-        Instruction::UnaryOp { src, .. }
-        | Instruction::Cast { src, .. }
-        | Instruction::Copy { src, .. } => rewrite_operand(src, map),
-        Instruction::Call { info, .. } => {
-            for a in &mut info.args {
-                rewrite_operand(a, map);
-            }
-        }
-        Instruction::CallIndirect { func_ptr, info } => {
-            rewrite_operand(func_ptr, map);
-            for a in &mut info.args {
-                rewrite_operand(a, map);
-            }
-        }
-        Instruction::GetElementPtr { base, offset, .. } => {
-            rewrite_value(base, map);
-            rewrite_operand(offset, map);
-        }
-        Instruction::Memcpy { dest, src, .. } => {
-            rewrite_value(dest, map);
-            rewrite_value(src, map);
-        }
-        Instruction::VaArg { va_list_ptr, .. } | Instruction::VaStart { va_list_ptr } => {
-            rewrite_value(va_list_ptr, map);
-        }
-        Instruction::VaCopy { dest_ptr, src_ptr } => {
-            rewrite_value(dest_ptr, map);
-            rewrite_value(src_ptr, map);
-        }
-        Instruction::VaArgStruct {
-            dest_ptr,
-            va_list_ptr,
-            ..
-        } => {
-            rewrite_value(dest_ptr, map);
-            rewrite_value(va_list_ptr, map);
-        }
-        Instruction::AtomicRmw { ptr, val, .. } | Instruction::AtomicStore { ptr, val, .. } => {
-            rewrite_operand(ptr, map);
-            rewrite_operand(val, map);
-        }
-        Instruction::AtomicInc { ptr, .. } | Instruction::AtomicLoad { ptr, .. } => {
-            rewrite_operand(ptr, map);
-        }
-        Instruction::AtomicCmpxchg {
-            ptr,
-            expected,
-            desired,
-            ..
-        } => {
-            rewrite_operand(ptr, map);
-            rewrite_operand(expected, map);
-            rewrite_operand(desired, map);
-        }
-        Instruction::Phi { incoming, .. } => {
-            if rewrite_phi {
-                for (op, _) in incoming {
-                    rewrite_operand(op, map);
-                }
-            }
-        }
-        Instruction::SetReturnF64Second { src }
-        | Instruction::SetReturnF32Second { src }
-        | Instruction::SetReturnF128Second { src } => rewrite_operand(src, map),
-        Instruction::InlineAsm {
-            inputs, outputs, ..
-        } => {
-            for (_, op, _) in inputs {
-                rewrite_operand(op, map);
-            }
-            for (_, v, _) in outputs {
-                rewrite_value(v, map);
-            }
-        }
-        Instruction::Intrinsic { args, dest_ptr, .. } => {
-            for a in args {
-                rewrite_operand(a, map);
-            }
-            if let Some(dp) = dest_ptr {
-                rewrite_value(dp, map);
-            }
-        }
-        Instruction::Select {
-            cond,
-            true_val,
-            false_val,
-            ..
-        } => {
-            rewrite_operand(cond, map);
-            rewrite_operand(true_val, map);
-            rewrite_operand(false_val, map);
-        }
-        Instruction::StackRestore { ptr } => rewrite_value(ptr, map),
+) -> usize {
+    if !rewrite_phi && matches!(inst, Instruction::Phi { .. }) {
+        return 0;
     }
+    crate::ir::instruction::replace_values_in_inst_map(inst, map)
 }
 
-pub(crate) fn replace_values_in_terminator(term: &mut Terminator, map: &FxHashMap<u32, u32>) {
-    match term {
-        Terminator::Return(Some(op)) => rewrite_operand(op, map),
-        Terminator::CondBranch { cond, .. } => rewrite_operand(cond, map),
-        Terminator::IndirectBranch { target, .. } => rewrite_operand(target, map),
-        Terminator::Switch { val, .. } => rewrite_operand(val, map),
-        _ => {}
-    }
+/// Terminator counterpart of [`replace_values_in_inst_phi_aware`]: no program
+/// has a phi in a terminator, so the phi flag cannot matter here — this is the
+/// canonical walk, kept under the `_phi_aware` name so the call sites read as
+/// one policy.
+pub(crate) fn replace_values_in_terminator_phi_aware(
+    term: &mut Terminator,
+    map: &FxHashMap<u32, u32>,
+) -> usize {
+    crate::ir::instruction::replace_values_in_terminator_map(term, map)
 }
 
 fn const_type(c: &IrConst) -> Option<IrType> {
@@ -739,9 +614,9 @@ pub fn split_loop_transparent_ranges(func: &mut IrFunction, max_splits: usize) -
                 for inst in &mut block.instructions {
                     // Never rewrite Phis: incoming is a pred-side use and
                     // `new_val` is defined *after* the phis in the exit block.
-                    replace_values_in_inst(inst, &map, false);
+                    replace_values_in_inst_phi_aware(inst, &map, false);
                 }
-                replace_values_in_terminator(&mut block.terminator, &map);
+                replace_values_in_terminator_phi_aware(&mut block.terminator, &map);
             }
             splits += 1;
         }
@@ -996,9 +871,9 @@ fn apply_local_call_split(func: &mut IrFunction, vid: u32, next_val: &mut u32) -
         // load sits at ci+2 after both inserts
         let first_after_load = (ci + 3).min(block.instructions.len());
         for inst in block.instructions[first_after_load..].iter_mut() {
-            replace_values_in_inst(inst, &map, false);
+            replace_values_in_inst_phi_aware(inst, &map, false);
         }
-        replace_values_in_terminator(&mut block.terminator, &map);
+        replace_values_in_terminator_phi_aware(&mut block.terminator, &map);
         wrapped += 1;
     }
 
@@ -1327,14 +1202,14 @@ mod tests {
         };
         let mut map = FxHashMap::default();
         map.insert(1, 99);
-        replace_values_in_inst(&mut inst, &map, false);
+        replace_values_in_inst_phi_aware(&mut inst, &map, false);
         match &inst {
             Instruction::Phi { incoming, .. } => {
                 assert!(matches!(incoming[0].0, Operand::Value(v) if v.0 == 1));
             }
             _ => panic!("phi vanished"),
         }
-        replace_values_in_inst(&mut inst, &map, true);
+        replace_values_in_inst_phi_aware(&mut inst, &map, true);
         match &inst {
             Instruction::Phi { incoming, .. } => {
                 assert!(matches!(incoming[0].0, Operand::Value(v) if v.0 == 99));
@@ -2083,7 +1958,7 @@ fn apply_block_splits(
         if !active.is_empty() {
             // `rewrite_phi = false`: a phi in THIS block reads on the
             // incoming edge, never at the top of the body.
-            replace_values_in_inst(&mut inst, &active, false);
+            replace_values_in_inst_phi_aware(&mut inst, &active, false);
         }
         out.push(inst);
     }
@@ -2109,7 +1984,7 @@ fn apply_block_splits(
     }
     func.blocks[bi].instructions = out;
     if !active.is_empty() {
-        replace_values_in_terminator(&mut func.blocks[bi].terminator, &active);
+        replace_values_in_terminator_phi_aware(&mut func.blocks[bi].terminator, &active);
     }
 
     // Successor phi operands coming from THIS block: the reload dominates
@@ -2324,5 +2199,117 @@ mod pressure_split_tests {
     fn tuning_knobs_are_clamped() {
         assert!((2..=64).contains(&pressure_budget()));
         assert!((1..=256).contains(&pressure_min_gap()));
+    }
+}
+
+#[cfg(test)]
+mod phi_aware_rewrite_tests {
+    use super::*;
+
+    fn map_from(pairs: &[(u32, u32)]) -> FxHashMap<u32, u32> {
+        pairs.iter().copied().collect()
+    }
+
+    /// The one slot the canonical walk cannot be asked to skip: `rewrite_phi =
+    /// false` must leave every phi arm alone, because the caller defined the
+    /// replacement earlier in this very block (use-before-def).
+    #[test]
+    fn phi_arms_are_suppressed_only_when_asked() {
+        let mut phi = Instruction::Phi {
+            dest: Value(1),
+            ty: IrType::I32,
+            incoming: vec![
+                (Operand::Value(Value(10)), BlockId(2)),
+                (Operand::Value(Value(11)), BlockId(3)),
+            ],
+        };
+        let map = map_from(&[(10, 20), (11, 21)]);
+
+        assert_eq!(
+            replace_values_in_inst_phi_aware(&mut phi, &map, false),
+            0,
+            "suppression is the whole point of the flag"
+        );
+        match &phi {
+            Instruction::Phi { incoming, .. } => {
+                assert_eq!(incoming[0].0, Operand::Value(Value(10)));
+                assert_eq!(incoming[1].0, Operand::Value(Value(11)));
+            }
+            other => panic!("expected a phi, got {other:?}"),
+        }
+
+        assert_eq!(
+            replace_values_in_inst_phi_aware(&mut phi, &map, true),
+            2,
+            "with the flag set the canonical walk visits both arms"
+        );
+        match &phi {
+            Instruction::Phi { incoming, .. } => {
+                assert_eq!(incoming[0].0, Operand::Value(Value(20)));
+                assert_eq!(incoming[1].0, Operand::Value(Value(21)));
+            }
+            other => panic!("expected a phi, got {other:?}"),
+        }
+    }
+
+    /// The `VaEnd` arm this table used to group with the field-less variants:
+    /// a mapped `va_list_ptr` must be rewritten.  This is the coverage the
+    /// delegation now inherits from `ir::instruction` instead of re-implementing
+    /// (and mis-implementing) here.
+    #[test]
+    fn bare_value_slots_are_rewritten_through_the_canonical_walk() {
+        let map = map_from(&[(7, 70), (9, 90)]);
+
+        let mut end = Instruction::VaEnd {
+            va_list_ptr: Value(7),
+        };
+        assert_eq!(replace_values_in_inst_phi_aware(&mut end, &map, false), 1);
+        assert!(matches!(end, Instruction::VaEnd { va_list_ptr } if va_list_ptr == Value(70)));
+
+        let mut load = Instruction::Load {
+            dest: Value(50),
+            ptr: Value(7),
+            ty: IrType::I32,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        };
+        assert_eq!(replace_values_in_inst_phi_aware(&mut load, &map, false), 1);
+        assert!(matches!(load, Instruction::Load { ptr, .. } if ptr == Value(70)));
+
+        let mut memcpy = Instruction::Memcpy {
+            dest: Value(7),
+            src: Value(9),
+            size: 8,
+        };
+        assert_eq!(
+            replace_values_in_inst_phi_aware(&mut memcpy, &map, false),
+            2
+        );
+        assert!(
+            matches!(memcpy, Instruction::Memcpy { dest, src, .. } if dest == Value(70) && src == Value(90))
+        );
+
+        let mut gep = Instruction::GetElementPtr {
+            dest: Value(60),
+            base: Value(9),
+            offset: Operand::Value(Value(7)),
+            ty: IrType::Ptr,
+        };
+        assert_eq!(replace_values_in_inst_phi_aware(&mut gep, &map, false), 2);
+    }
+
+    /// The terminator wrapper reaches every variant, `IndirectBranch`
+    /// included — the variant the `redundant_loads` hand-rolled match missed.
+    #[test]
+    fn terminators_including_indirect_branch_are_rewritten() {
+        let map = map_from(&[(3, 30)]);
+        let mut term = Terminator::IndirectBranch {
+            target: Operand::Value(Value(3)),
+            possible_targets: vec![BlockId(1)],
+        };
+        assert_eq!(replace_values_in_terminator_phi_aware(&mut term, &map), 1);
+        assert!(
+            matches!(term, Terminator::IndirectBranch { target, .. } if target == Operand::Value(Value(30)))
+        );
     }
 }

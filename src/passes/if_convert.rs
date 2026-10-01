@@ -406,11 +406,25 @@ fn sink_conditional_stores(func: &mut IrFunction) -> usize {
     }
     let label_to_idx = analysis::build_label_map(func);
     let (preds, _succs) = analysis::build_cfg(func, &label_to_idx);
+    let cfg = analysis::CfgAnalysis::build(func);
     let defs: FxHashMap<u32, Instruction> = func
         .blocks
         .iter()
         .flat_map(|b| b.instructions.iter())
         .filter_map(|i| i.dest().map(|d| (d.0, i.clone())))
+        .collect();
+    // Where each value is defined. The address-chain cloner needs this: a leaf
+    // it may not simply keep is one defined in an arm that merely *reaches* the
+    // merge (see the GlobalAddr note in `clone_addr_chain_into_merge`).
+    let def_block: FxHashMap<u32, usize> = func
+        .blocks
+        .iter()
+        .enumerate()
+        .flat_map(|(bi, b)| {
+            b.instructions
+                .iter()
+                .filter_map(move |i| i.dest().map(|d| (d.0, bi)))
+        })
         .collect();
     let mut copy_of = FxHashMap::default();
     for b in &func.blocks {
@@ -487,9 +501,15 @@ fn sink_conditional_stores(func: &mut IrFunction) -> usize {
         // nodes so every SSA def dominates M.  Chain leaves (parameters,
         // globals, IV phis, constants) dominate M by construction; a leaf
         // that is any other instruction makes the sink bail (fail closed).
-        let Some((gep_val, chain_insts)) =
-            clone_addr_chain_into_merge(&defs, &copy_of, cands[0].ptr, func)
-        else {
+        let Some((gep_val, chain_insts)) = clone_addr_chain_into_merge(
+            &defs,
+            &def_block,
+            &cfg,
+            merge_idx,
+            &copy_of,
+            cands[0].ptr,
+            func,
+        ) else {
             continue;
         };
 
@@ -556,6 +576,9 @@ fn sink_conditional_stores(func: &mut IrFunction) -> usize {
 /// bails when any link is outside that grammar.
 fn clone_addr_chain_into_merge(
     defs: &FxHashMap<u32, Instruction>,
+    def_block: &FxHashMap<u32, usize>,
+    cfg: &analysis::CfgAnalysis,
+    merge_idx: usize,
     copy_of: &FxHashMap<Value, Value>,
     ptr: Value,
     func: &mut IrFunction,
@@ -578,6 +601,9 @@ fn clone_addr_chain_into_merge(
     fn clone_operand(
         operand: &Operand,
         defs: &FxHashMap<u32, Instruction>,
+        def_block: &FxHashMap<u32, usize>,
+        cfg: &analysis::CfgAnalysis,
+        merge_idx: usize,
         copy_of: &FxHashMap<Value, Value>,
         memo: &mut FxHashMap<Value, Value>,
         emitted: &mut Vec<Instruction>,
@@ -586,14 +612,18 @@ fn clone_addr_chain_into_merge(
         match operand {
             Operand::Const(c) => Some(Operand::Const(*c)),
             Operand::Value(v) => Some(Operand::Value(clone_value(
-                *v, defs, copy_of, memo, emitted, next_val,
+                *v, defs, def_block, cfg, merge_idx, copy_of, memo, emitted, next_val,
             )?)),
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // one recursive cloner, threaded context
     fn clone_value(
         v: Value,
         defs: &FxHashMap<u32, Instruction>,
+        def_block: &FxHashMap<u32, usize>,
+        cfg: &analysis::CfgAnalysis,
+        merge_idx: usize,
         copy_of: &FxHashMap<Value, Value>,
         memo: &mut FxHashMap<Value, Value>,
         emitted: &mut Vec<Instruction>,
@@ -623,7 +653,9 @@ fn clone_addr_chain_into_merge(
         *next_val += 1;
         match def {
             Instruction::Copy { src, .. } => {
-                let ns = clone_operand(src, defs, copy_of, memo, emitted, next_val)?;
+                let ns = clone_operand(
+                    src, defs, def_block, cfg, merge_idx, copy_of, memo, emitted, next_val,
+                )?;
                 emitted.push(Instruction::Copy { dest: nv, src: ns });
             }
             Instruction::Cast {
@@ -632,7 +664,9 @@ fn clone_addr_chain_into_merge(
                 from_ty,
                 ..
             } => {
-                let ns = clone_operand(src, defs, copy_of, memo, emitted, next_val)?;
+                let ns = clone_operand(
+                    src, defs, def_block, cfg, merge_idx, copy_of, memo, emitted, next_val,
+                )?;
                 emitted.push(Instruction::Cast {
                     dest: nv,
                     src: ns,
@@ -647,8 +681,12 @@ fn clone_addr_chain_into_merge(
                 ty,
                 ..
             } => {
-                let nl = clone_operand(lhs, defs, copy_of, memo, emitted, next_val)?;
-                let nr = clone_operand(rhs, defs, copy_of, memo, emitted, next_val)?;
+                let nl = clone_operand(
+                    lhs, defs, def_block, cfg, merge_idx, copy_of, memo, emitted, next_val,
+                )?;
+                let nr = clone_operand(
+                    rhs, defs, def_block, cfg, merge_idx, copy_of, memo, emitted, next_val,
+                )?;
                 emitted.push(Instruction::BinOp {
                     dest: nv,
                     op: *op,
@@ -657,10 +695,59 @@ fn clone_addr_chain_into_merge(
                     ty: *ty,
                 });
             }
-            Instruction::Phi { .. }
-            | Instruction::GlobalAddr { .. }
-            | Instruction::ParamRef { .. } => {
-                // Dominating leaves: keep the original value.
+            Instruction::Phi { .. } => {
+                // A phi is a *dominating* leaf only when its block dominates the
+                // merge.  The old blanket "keep the original" was wrong for a
+                // switch-arm phi that merely reaches the merge: the sunk store
+                // then read a value the other arms never defined, which is
+                // exactly the def-dominates-use violation CCC_VERIFY_IR reports
+                // for `minmax_refused.c`.  No dominator proof here -> refuse.
+                let Some(&pb) = def_block.get(&resolved.0) else {
+                    return None;
+                };
+                if !analysis::dominates_idom(&cfg.idom, pb, merge_idx) {
+                    return None;
+                }
+                memo.insert(v, resolved);
+                return Some(resolved);
+            }
+            Instruction::GlobalAddr { name, .. } => {
+                // Reuse the original when it dominates the merge (the usual
+                // case: one `GlobalAddr` in the entry block serves every arm),
+                // and rematerialise when it does not — the address of a global
+                // is the same at every point, so a fresh definition in the merge
+                // is always available and always correct.  Reusing a
+                // non-dominating one is the `minmax_refused.c` violation: the
+                // switch arm's `GlobalAddr "a"` fed a store sunk into a
+                // 4-incoming join, so the other arms' paths read a value they
+                // never defined.
+                if def_block
+                    .get(&resolved.0)
+                    .is_some_and(|&gb| analysis::dominates_idom(&cfg.idom, gb, merge_idx))
+                {
+                    memo.insert(v, resolved);
+                    return Some(resolved);
+                }
+                emitted.push(Instruction::GlobalAddr {
+                    dest: nv,
+                    name: name.clone(),
+                });
+            }
+            Instruction::ParamRef { .. } => {
+                // Reuse only with a proof of dominance: canonical lowering puts
+                // `ParamRef` in the entry block, which dominates every merge, so
+                // the common case is unchanged.  It must NOT be rematerialised —
+                // the backend materialises a parameter from its ABI read, which
+                // only happens in the entry block.  Measured: cloning one into a
+                // merge dropped the second parameter's read and
+                // `bb_slp_nested_ifconv` stored through a garbage pointer (rc=139).
+                // Without the proof, refuse the sink.
+                let Some(&pb) = def_block.get(&resolved.0) else {
+                    return None;
+                };
+                if !analysis::dominates_idom(&cfg.idom, pb, merge_idx) {
+                    return None;
+                }
                 memo.insert(v, resolved);
                 return Some(resolved);
             }
@@ -680,10 +767,23 @@ fn clone_addr_chain_into_merge(
     else {
         return None;
     };
-    let nb = clone_value(*base, defs, copy_of, &mut memo, &mut emitted, &mut next_val)?;
+    let nb = clone_value(
+        *base,
+        defs,
+        def_block,
+        cfg,
+        merge_idx,
+        copy_of,
+        &mut memo,
+        &mut emitted,
+        &mut next_val,
+    )?;
     let noff = clone_operand(
         offset,
         defs,
+        def_block,
+        cfg,
+        merge_idx,
         copy_of,
         &mut memo,
         &mut emitted,
@@ -3963,5 +4063,108 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    /// The sunk store's address chain must be available AT THE MERGE.
+    ///
+    /// Canonical lowering emits a fresh `GlobalAddr` per source reference, so
+    /// each switch arm owns its own; the chain cloner used to treat a
+    /// `GlobalAddr` leaf as "dominating by construction" and kept the arm's
+    /// original.  With four arms reaching the join, the arm that owned it does
+    /// not dominate the merge, and the store this pass moved into the merge read
+    /// a value that only one path defined — the def-dominates-use violation
+    /// `CCC_VERIFY_IR` reports on `tests/regression/minmax_refused.c`.
+    /// Rematerialising the address (and a parameter) in the merge is the fix.
+    #[test]
+    fn sunk_store_address_is_available_at_the_merge() {
+        use crate::common::types::{AddressSpace, IrType};
+        use crate::ir::reexports::{BasicBlock, BlockId, IrFunction};
+
+        let mut func = IrFunction::new("sink".into(), IrType::Void, vec![], false);
+        func.next_label = 4; // fixture bookkeeping: labels 0..=3 are in use
+        func.next_value_id = 100;
+        let arm =
+            |label: u32, gid: u32, off_id: u32, sh_id: u32, gep_id: u32, val: i32| BasicBlock {
+                label: BlockId(label),
+                instructions: vec![
+                    Instruction::GlobalAddr {
+                        dest: Value(gid),
+                        name: "a".into(),
+                    },
+                    Instruction::Cast {
+                        dest: Value(off_id),
+                        src: Operand::Value(Value(9)),
+                        from_ty: IrType::I32,
+                        to_ty: IrType::I64,
+                    },
+                    Instruction::BinOp {
+                        dest: Value(sh_id),
+                        op: IrBinOp::Shl,
+                        lhs: Operand::Value(Value(off_id)),
+                        rhs: Operand::Const(IrConst::I64(2)),
+                        ty: IrType::I64,
+                    },
+                    Instruction::GetElementPtr {
+                        dest: Value(gep_id),
+                        base: Value(gid),
+                        offset: Operand::Value(Value(sh_id)),
+                        ty: IrType::I32,
+                    },
+                    Instruction::Store {
+                        val: Operand::Const(IrConst::I32(val)),
+                        ptr: Value(gep_id),
+                        ty: IrType::I32,
+                        seg_override: AddressSpace::Default,
+                        volatile: false,
+                    },
+                ],
+                terminator: Terminator::Branch(BlockId(3)),
+                source_spans: Vec::new(),
+            };
+
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::ParamRef {
+                    dest: Value(9),
+                    param_idx: 0,
+                    ty: IrType::I32,
+                },
+                Instruction::Cmp {
+                    dest: Value(10),
+                    op: IrCmpOp::Slt,
+                    lhs: Operand::Value(Value(9)),
+                    rhs: Operand::Const(IrConst::I32(4)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(10)),
+                true_label: BlockId(1),
+                false_label: BlockId(2),
+            },
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(arm(1, 20, 21, 22, 23, 1));
+        func.blocks.push(arm(2, 30, 31, 32, 33, 2));
+        func.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: vec![],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+
+        let sunk = sink_conditional_stores(&mut func);
+        assert!(
+            sunk > 0,
+            "the two identical arm stores must sink into the join"
+        );
+
+        let mut violations = Vec::new();
+        crate::passes::verify::verify_function(&func, "if_convert_sink_test", &mut violations);
+        assert!(
+            violations.is_empty(),
+            "sunk store left invalid IR: {violations:#?}"
+        );
     }
 }

@@ -641,27 +641,19 @@ fn reduce_loop(
                             rewritten += 1;
                         }
                     });
-                    match rinst {
-                        Instruction::Load { ptr, .. } => {
-                            if muls.contains(ptr) {
-                                *ptr = j_val;
-                                rewritten += 1;
-                            }
+                    // Bare-`Value` slots (Load/Store ptr, GEP base, Memcpy,
+                    // va_list, inline-asm outputs, intrinsic dest_ptr, ...): the
+                    // exhaustive walker, never a hand-rolled match.  The three-arm
+                    // version this replaces covered only Load/Store/GEP-base and
+                    // silently left every other shape reading the grouped multiply
+                    // — a missed rewrite, invisible to SSA validation because the
+                    // old value is still defined.
+                    rinst.for_each_value_use_mut(|v| {
+                        if v.0 != 0 && muls.contains(v) {
+                            *v = j_val;
+                            rewritten += 1;
                         }
-                        Instruction::Store { ptr, .. } => {
-                            if muls.contains(ptr) {
-                                *ptr = j_val;
-                                rewritten += 1;
-                            }
-                        }
-                        Instruction::GetElementPtr { base, .. } => {
-                            if muls.contains(base) {
-                                *base = j_val;
-                                rewritten += 1;
-                            }
-                        }
-                        _ => {}
-                    }
+                    });
                 }
                 block.terminator.for_each_operand_mut(|o| {
                     if matches!(o, Operand::Value(v) if v.0 != 0 && muls.contains(v)) {

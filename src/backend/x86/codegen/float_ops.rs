@@ -10,6 +10,30 @@ use crate::common::types::IrType;
 
 use crate::ir::reexports::{IrConst, IrUnaryOp, Operand, Value};
 
+/// Which bit-count instruction a `BitCountMnem` call site is emitting.
+///
+/// This is an enum, not a `&str`, on purpose: the false-dependency break below
+/// dispatches on it, and a string match with a `_ =>` arm silently gives any
+/// *new* mnemonic whatever the fallback row says.  With an enum the compiler
+/// rejects an unhandled case, and adding an instruction to the tree means
+/// choosing its dependency row explicitly.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BitCountMnem {
+    Popcnt,
+    Lzcnt,
+    Tzcnt,
+}
+
+impl BitCountMnem {
+    fn text(self) -> &'static str {
+        match self {
+            BitCountMnem::Popcnt => "popcnt",
+            BitCountMnem::Lzcnt => "lzcnt",
+            BitCountMnem::Tzcnt => "tzcnt",
+        }
+    }
+}
+
 impl X86Codegen {
     /// Load an F32/F64 operand into %xmm0, honoring a register-allocated XMM
 
@@ -1032,7 +1056,7 @@ impl X86Codegen {
         dest: &Value,
         src: &Operand,
         ty: IrType,
-        mnem: &str,
+        mnem: BitCountMnem,
     ) -> bool {
         let use_32bit = matches!(ty, IrType::I32 | IrType::U32);
         let suffix = if use_32bit { "l" } else { "q" };
@@ -1076,8 +1100,9 @@ impl X86Codegen {
         // the xor is a pure front-end/code-size cost.  GCC 16.2 still emits
         // it for tzcnt on Skylake, where uops.info measures no dependency.
         let needs_break = match mnem {
-            "popcnt" => self.tune.break_popcnt_dep(),
-            _ => self.tune.break_lzcnt_tzcnt_dep(),
+            BitCountMnem::Popcnt => self.tune.break_popcnt_dep(),
+            BitCountMnem::Lzcnt => self.tune.break_lzcnt_dep(),
+            BitCountMnem::Tzcnt => self.tune.break_tzcnt_dep(),
         };
         if needs_break && src_name != dst_name && src_name != dst32 {
             self.state
@@ -1085,7 +1110,10 @@ impl X86Codegen {
         }
         self.state.emit_fmt(format_args!(
             "    {}{} %{}, %{}",
-            mnem, suffix, src_name, dst_name
+            mnem.text(),
+            suffix,
+            src_name,
+            dst_name
         ));
         self.state.reg_cache.invalidate_acc();
         if dest_gpr.is_none() {
@@ -1210,9 +1238,13 @@ impl X86Codegen {
         if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128 | IrType::F128) {
             if matches!(ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64) {
                 let bitcount = match op {
-                    IrUnaryOp::Popcount if self.popcnt_enabled => Some("popcnt"),
-                    IrUnaryOp::Clz | IrUnaryOp::ClzNonZero if self.lzcnt_enabled => Some("lzcnt"),
-                    IrUnaryOp::Ctz | IrUnaryOp::CtzNonZero if self.lzcnt_enabled => Some("tzcnt"),
+                    IrUnaryOp::Popcount if self.popcnt_enabled => Some(BitCountMnem::Popcnt),
+                    IrUnaryOp::Clz | IrUnaryOp::ClzNonZero if self.lzcnt_enabled => {
+                        Some(BitCountMnem::Lzcnt)
+                    }
+                    IrUnaryOp::Ctz | IrUnaryOp::CtzNonZero if self.lzcnt_enabled => {
+                        Some(BitCountMnem::Tzcnt)
+                    }
                     _ => None,
                 };
                 if let Some(mnem) = bitcount {

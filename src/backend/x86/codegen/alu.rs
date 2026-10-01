@@ -670,6 +670,61 @@ impl X86Codegen {
         }
     }
 
+    /// Emit `%rdx:%rax / %rcx` (64-bit) with `%rax` = quotient, `%rdx` =
+    /// remainder, prefixed by the width bypass when the tuning row asks for it
+    /// ([`crate::backend::x86::cpu_model::X86Tune::bypass_div64`]).
+    ///
+    /// Bypass form (both operands provably < 2^32 at run time → 32-bit
+    /// divide, LLVM `idivq-to-divl`):
+    ///
+    /// ```text
+    ///     movq %rax, %rdx        # %rdx is dead until the divide defines it
+    ///     orq  %rcx, %rdx
+    ///     shrq $32,  %rdx        # ZF = (dividend | divisor) >> 32 == 0
+    ///     jnz  .slow
+    ///     divl %ecx              # %edx == 0 here; quotient/remainder
+    ///     jmp  .done             #   zero-extend into %rax/%rdx
+    /// .slow:
+    ///     xorl %edx,%edx | cqto  # unchanged 64-bit path
+    ///     divq | idivq %rcx
+    /// .done:
+    /// ```
+    ///
+    /// Signed division takes the fast path only for two non-negative
+    /// operands (a negative 64-bit value has bits 63..32 set), where the
+    /// unsigned 32-bit divide is exact; `INT64_MIN / -1` and divide-by-zero
+    /// behave exactly as before (slow path / `#DE` from `divl` with `%ecx == 0`).
+    /// Measured on `[uops.info]`: DIV r64 TP 21 vs DIV r32 TP 6 on SKL.
+    fn emit_div64(&mut self, signed: bool) {
+        let emit_full = |this: &mut Self| {
+            if signed {
+                this.state.emit("    cqto");
+                this.state.emit("    idivq %rcx");
+            } else {
+                this.state.emit("    xorl %edx, %edx");
+                this.state.emit("    divq %rcx");
+            }
+        };
+        if !crate::backend::x86::cpu_model::bypass_div64_enabled_for(
+            &self.tune,
+            crate::backend::x86::cpu_model::div64_bypass_killed(),
+        ) {
+            emit_full(self);
+            return;
+        }
+        let slow = self.state.fresh_label("div64_slow");
+        let done = self.state.fresh_label("div64_done");
+        self.state.emit("    movq %rax, %rdx");
+        self.state.emit("    orq %rcx, %rdx");
+        self.state.emit("    shrq $32, %rdx");
+        self.state.out.emit_jcc_label("    jnz", &slow);
+        self.state.emit("    divl %ecx");
+        self.state.out.emit_jmp_label(&done);
+        self.state.out.emit_named_label(&slow);
+        emit_full(self);
+        self.state.out.emit_named_label(&done);
+    }
+
     /// Emit one divide serving a same-block div/rem pair and store BOTH
     /// results. Returns false when the home combination is unstoreable
     /// (deadlock) — the caller falls back to standalone divisions for both
@@ -693,21 +748,14 @@ impl X86Codegen {
             self.operand_to_rax(lhs);
         }
         self.operand_to_rcx(rhs);
-        if signed {
-            if use_32bit {
-                self.state.emit("    cltd");
-                self.state.emit("    idivl %ecx");
-            } else {
-                self.state.emit("    cqto");
-                self.state.emit("    idivq %rcx");
-            }
+        if !use_32bit {
+            self.emit_div64(signed);
+        } else if signed {
+            self.state.emit("    cltd");
+            self.state.emit("    idivl %ecx");
         } else {
             self.state.emit("    xorl %edx, %edx");
-            if use_32bit {
-                self.state.emit("    divl %ecx");
-            } else {
-                self.state.emit("    divq %rcx");
-            }
+            self.state.emit("    divl %ecx");
         }
         self.state.reg_cache.invalidate_acc();
 
@@ -1659,16 +1707,15 @@ impl X86Codegen {
                     self.state.emit("    cltd");
                     self.state.emit("    idivl %ecx");
                 } else {
-                    self.state.emit("    cqto");
-                    self.state.emit("    idivq %rcx");
+                    self.emit_div64(true);
                 }
             }
             IrBinOp::UDiv => {
-                self.state.emit("    xorl %edx, %edx");
                 if use_32bit {
+                    self.state.emit("    xorl %edx, %edx");
                     self.state.emit("    divl %ecx");
                 } else {
-                    self.state.emit("    divq %rcx");
+                    self.emit_div64(false);
                 }
             }
             IrBinOp::SRem => {
@@ -1677,18 +1724,17 @@ impl X86Codegen {
                     self.state.emit("    idivl %ecx");
                     self.state.emit("    movl %edx, %eax");
                 } else {
-                    self.state.emit("    cqto");
-                    self.state.emit("    idivq %rcx");
+                    self.emit_div64(true);
                     self.state.emit("    movq %rdx, %rax");
                 }
             }
             IrBinOp::URem => {
-                self.state.emit("    xorl %edx, %edx");
                 if use_32bit {
+                    self.state.emit("    xorl %edx, %edx");
                     self.state.emit("    divl %ecx");
                     self.state.emit("    movl %edx, %eax");
                 } else {
-                    self.state.emit("    divq %rcx");
+                    self.emit_div64(false);
                     self.state.emit("    movq %rdx, %rax");
                 }
             }

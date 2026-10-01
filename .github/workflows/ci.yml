@@ -241,6 +241,17 @@ jobs:
       - name: Volatile spin-loop position gate
         run: bash tests/regression/check_volatile_spin_loop.sh
 
+      # The 64-bit division width bypass is a *tuning* decision, so it has two
+      # silent failure modes the C fixture cannot see: the guard missing on a row
+      # whose measured divider ratio says it is worth it (the fixture still
+      # passes — `divq` is just the old, slower path), and the guard present where
+      # it must not be (a row, or `CCC_NO_DIV64_BYPASS=1`, that must stay
+      # byte-identical to the pre-bypass compiler).  This gate asserts the emitted
+      # text for all three probes and executes the guarded form against GCC on
+      # both sides of the 2^32 boundary.
+      - name: 64-bit divide bypass assembly contract
+        run: bash tests/regression/check_div64_bypass_asm.sh
+
       # A volatile BITFIELD is a read-modify-write, sometimes straddling two
       # storage units, so none of the gates above can see it: they inspect
       # straight-line accesses.  Every access of every one of those RMWs used to

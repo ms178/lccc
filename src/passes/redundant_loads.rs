@@ -263,30 +263,18 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
     if !all_rewrites.is_empty() {
         for block in func.blocks.iter_mut() {
             for inst in block.instructions.iter_mut() {
-                super::tail_call_elim::replace_values_in_inst(inst, &all_rewrites);
+                crate::ir::instruction::replace_values_in_inst_map(inst, &all_rewrites);
             }
-            match &mut block.terminator {
-                Terminator::CondBranch { cond, .. } => {
-                    if let Operand::Value(v) = cond {
-                        if let Some(&to) = all_rewrites.get(&v.0) {
-                            *v = Value(to);
-                        }
-                    }
-                }
-                Terminator::Switch { val: discr, .. } => {
-                    if let Operand::Value(v) = discr {
-                        if let Some(&to) = all_rewrites.get(&v.0) {
-                            *v = Value(to);
-                        }
-                    }
-                }
-                Terminator::Return(Some(Operand::Value(v))) => {
-                    if let Some(&to) = all_rewrites.get(&v.0) {
-                        *v = Value(to);
-                    }
-                }
-                _ => {}
-            }
+            // Canonical terminator walk.  The hand-rolled match this replaces
+            // covered conditional branches, switches and returns but not
+            // `IndirectBranch`: a duplicate load whose result is a computed-goto
+            // target survived as a reference to a value this pass had just
+            // removed.  (Predates the consolidation, which is why it is fixed
+            // here rather than inherited.)
+            crate::ir::instruction::replace_values_in_terminator_map(
+                &mut block.terminator,
+                &all_rewrites,
+            );
         }
     }
 
@@ -371,5 +359,83 @@ mod tests {
             .filter(|i| matches!(i, crate::ir::reexports::Instruction::Load { .. }))
             .count();
         assert_eq!(loads, 2);
+    }
+
+    /// A duplicate load whose only consumer is an `IndirectBranch` target: the
+    /// terminator match this pass used to carry covered conditional branches,
+    /// switches and returns but not `IndirectBranch`, so the branch kept naming
+    /// the value the pass had just deleted.  The canonical terminator walk
+    /// covers every variant, which is why it is used instead of a match.
+    ///
+    /// Shape: [g = &t; a = load g; b = load g; indirect-branch b] — `b` is a
+    /// duplicate of `a` and must be removed *and* redirected.
+    #[test]
+    fn indirect_branch_target_is_redirected_when_its_load_is_merged() {
+        use crate::common::types::{AddressSpace, IrType};
+        use crate::ir::reexports::{BasicBlock, BlockId};
+
+        let mut func = IrFunction::new("tgt".into(), IrType::Void, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(0),
+                    name: "g".into(),
+                },
+                Instruction::Load {
+                    dest: Value(1),
+                    ptr: Value(0),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+                Instruction::Load {
+                    dest: Value(2),
+                    ptr: Value(0),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+            ],
+            terminator: Terminator::IndirectBranch {
+                target: Operand::Value(Value(2)),
+                possible_targets: vec![BlockId(2), BlockId(3)],
+            },
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: vec![],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+
+        let merged = run(&mut func);
+        assert!(merged > 0, "the duplicate load must be merged");
+
+        let live: std::collections::HashSet<u32> = func
+            .blocks
+            .iter()
+            .flat_map(|b| b.instructions.iter())
+            .filter_map(|i| i.dest())
+            .map(|d| d.0)
+            .collect();
+        let Terminator::IndirectBranch { target, .. } = &func.blocks[0].terminator else {
+            panic!("terminator changed shape");
+        };
+        let Operand::Value(t) = target else {
+            panic!("indirect branch target must stay a value");
+        };
+        assert!(
+            live.contains(&t.0),
+            "terminator target v{} names a value the pass removed (live defs: {live:?})",
+            t.0
+        );
     }
 }
