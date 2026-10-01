@@ -41,7 +41,12 @@ done
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/ref" "$WORK/cand"
-find "$ROOT" -name '*.c' | LC_ALL=C sort > "$WORK/list.txt"
+# The curated test corpus (tests/corpus/**) has its own runner
+# (run_clang_c_corpus.py) and a much larger surface; keep it out of this
+# small differential harness so the two do not pollute each other (PR #719
+# review finding F5).
+find "$ROOT" -path '*/tests/corpus' -prune -o -not -path '*/tests/corpus/*' \
+  -name '*.c' -print | LC_ALL=C sort > "$WORK/list.txt"
 N=$(wc -l < "$WORK/list.txt")
 [ "$N" -gt 0 ] || { echo "corpus is empty: $ROOT" >&2; exit 2; }
 

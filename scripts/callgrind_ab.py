@@ -22,6 +22,7 @@ script's own results (matmul 0.29x, double_reduction 0.29x) were recorded
 without the flag and overstated lccc by the width of the vector unit.
 """
 import functools
+import json
 import os
 import re
 import shlex
@@ -42,6 +43,23 @@ def gcc_include() -> str:
 
 
 INCLUDE = gcc_include()
+
+# ---------------------------------------------------------------------------
+# Fixed Callgrind/Cachegrind cache geometry — DO NOT autodiscover.
+#
+# Valgrind's cache simulation otherwise probes the host CPU, so the same
+# binary reports different I1/LL miss counts on every machine/restore.  We pin
+# a mainstream desktop geometry (32 KiB 8-way 64 B-line L1i/L1d, 32 MiB
+# 16-way LLC) so paired A/B ratios and absolute counts are comparable across
+# sessions and hosts.  Callgrind models I1, D1 and LL only (no L2) — that is a
+# tool limit, not an oversight.  Same doctrine as the EDG front end's
+# benchmark harness (edgcpp/compiler `dev_tools/bin/edg-bench`), which pins
+# this exact geometry for the same reason.  Overrides exist for deliberate
+# what-if runs but MUST be recorded in the artifact manifest if used.
+# ---------------------------------------------------------------------------
+CG_I1 = os.environ.get("LCCC_CG_I1", "32768,8,64")
+CG_D1 = os.environ.get("LCCC_CG_D1", "32768,8,64")
+CG_LL = os.environ.get("LCCC_CG_LL", "33554432,16,64")
 
 # Fast/medium corpus; heavy multi-second drivers are opt-in (they take
 # minutes each under ~30x Callgrind instrumentation).
@@ -74,6 +92,10 @@ def callgrind(binpath, outdir):
     p = subprocess.run(
         ["valgrind", "--tool=callgrind", "--cache-sim=yes",
          "--branch-sim=yes", "--quiet",
+         # FIXED cache geometry (see CG_* below): Valgrind otherwise
+         # autodiscovers the host caches and the simulated miss counts stop
+         # being comparable across hosts/restores.
+         f"--I1={CG_I1}", f"--D1={CG_D1}", f"--LL={CG_LL}",
          f"--callgrind-out-file={cg}", str(binpath)],
         capture_output=True, text=True, env=env, timeout=1200)
     if p.returncode != 0:
@@ -94,12 +116,35 @@ def parse_summary(cg: Path):
     return dict(zip(events, totals))
 
 
+def compiler_version(cmd: Path) -> str:
+    try:
+        return subprocess.run([str(cmd), "--version"], capture_output=True,
+                              text=True, timeout=30).stdout.splitlines()[0]
+    except (OSError, subprocess.SubprocessError, IndexError):
+        return "unknown"
+
+
 def main():
     mine, ref, opt = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
     benches = sys.argv[4:] or DEFAULT_FAST
     outroot = Path("/tmp/cg_" + re.sub(r"[^A-Za-z0-9]+", "_", opt.strip()).strip("_"))
     (outroot / "mine").mkdir(parents=True, exist_ok=True)
     (outroot / "ref").mkdir(parents=True, exist_ok=True)
+    # Record the pinned geometry up front: an A/B without its cache model is
+    # not reproducible evidence.  Overrides are visible, never silent.
+    env_overrides = {k: os.environ[k] for k in
+                     ("LCCC_CG_I1", "LCCC_CG_D1", "LCCC_CG_LL") if k in os.environ}
+    print(f"# callgrind geometry: I1={CG_I1} D1={CG_D1} LL={CG_LL}"
+          + (f"  [env overrides: {env_overrides}]" if env_overrides else ""))
+    manifest = {
+        "geometry": {"I1": CG_I1, "D1": CG_D1, "LL": CG_LL},
+        "geometry_env_overrides": env_overrides,
+        "opt": opt,
+        "mine": {"path": str(mine), "version": compiler_version(mine)},
+        "ref": {"path": str(ref), "version": compiler_version(ref)},
+        "tool": "valgrind callgrind --cache-sim=yes --branch-sim=yes",
+        "results": {},
+    }
     rows = []
     for b in benches:
         src = REPO / "tests/benchmark/programs" / f"{b}.c"
@@ -122,8 +167,10 @@ def main():
         if not m_ev or not r_ev:
             print(f"{b}: callgrind failed: {(e3 or e4)[:100]}"); continue
         rows.append((b, r_ev, m_ev))
-    print("\n| benchmark | Ir ref | Ir mine | Ir m/r | I1miss m/r | IL miss m/r | Bcmisp m/r | Bimisp m/r |")
-    print("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+        manifest["results"][b] = {"ref": r_ev, "mine": m_ev}
+    print("\n| benchmark | Ir ref | Ir mine | Ir m/r | I1miss m/r | D1miss m/r |"
+          " IL miss m/r | Bcmisp m/r | Bimisp m/r |")
+    print("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
     agg = {}
     for b, r, m in rows:
         def g(ev, *names):
@@ -133,16 +180,21 @@ def main():
             return 0
         irr, irm = g(r, "Ir"), g(m, "Ir")
         i1r, i1m = g(r, "I1mr"), g(m, "I1mr")
+        d1r, d1m = g(r, "D1mr"), g(m, "D1mr")
         llr, llm = g(r, "ILmr"), g(m, "ILmr")
         bmr, bmm = g(r, "Bcm"), g(m, "Bcm")
         bir, bim = g(r, "Bim"), g(m, "Bim")
         print(f"| {b} | {irr:,} | {irm:,} | {irm/irr:.5f} | "
-              f"{i1m}/{i1r} | {llm}/{llr} | {bmm}/{bmr} | {bim}/{bir} |")
+              f"{i1m}/{i1r} | {d1m}/{d1r} | {llm}/{llr} | {bmm}/{bmr} | {bim}/{bir} |")
         agg.setdefault("ir", []).append(irm / irr)
     import math
-    if agg["ir"]:
-        print(f"\ngeomean Ir mine/ref = "
-              f"{math.exp(sum(math.log(x) for x in agg['ir'])/len(agg['ir'])):.5f}")
+    if agg.get("ir"):
+        geo = math.exp(sum(math.log(x) for x in agg["ir"]) / len(agg["ir"]))
+        print(f"\ngeomean Ir mine/ref = {geo:.5f}")
+        manifest["geomean_ir_mine_over_ref"] = round(geo, 6)
+    (outroot / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"manifest -> {outroot / 'manifest.json'}")
 
 
 if __name__ == "__main__":
