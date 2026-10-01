@@ -328,16 +328,9 @@ impl super::InstructionEncoder {
         } else {
             gp_ext_bits(reg)
         };
-        let (b, b4) = mem
-            .base
-            .as_ref()
-            .map(|b| gp_ext_bits(&b.name))
-            .unwrap_or((false, false));
-        let (x, x4) = mem
-            .index
-            .as_ref()
-            .map(|i| gp_ext_bits(&i.name))
-            .unwrap_or((false, false));
+        // Bits from the FOLDED view, the same operand `encode_modrm_mem`
+        // encodes (see folded_addr_ext_bits).
+        let ((b, b4), (x, x4)) = folded_addr_ext_bits(mem);
         let (nd, vvvv) = match ndd {
             Some(n) => (true, Self::gp_id_or_err(n)?),
             None => (false, 0),
@@ -399,16 +392,9 @@ impl super::InstructionEncoder {
         } else {
             gp_ext_bits(reg)
         };
-        let (b, b4) = mem
-            .base
-            .as_ref()
-            .map(|b| gp_ext_bits(&b.name))
-            .unwrap_or((false, false));
-        let (x, x4) = mem
-            .index
-            .as_ref()
-            .map(|i| gp_ext_bits(&i.name))
-            .unwrap_or((false, false));
+        // Bits from the FOLDED view, the same operand `encode_modrm_mem`
+        // encodes (see folded_addr_ext_bits).
+        let ((b, b4), (x, x4)) = folded_addr_ext_bits(mem);
         self.emit_evex_apx(r, x, b, r4, x4, b4, w, 0, true, nf, pp);
         Ok(())
     }
@@ -461,16 +447,9 @@ impl super::InstructionEncoder {
         } else {
             gp_ext_bits(reg)
         };
-        let (b, b4) = mem
-            .base
-            .as_ref()
-            .map(|b| gp_ext_bits(&b.name))
-            .unwrap_or((false, false));
-        let (x, x4) = mem
-            .index
-            .as_ref()
-            .map(|i| gp_ext_bits(&i.name))
-            .unwrap_or((false, false));
+        // Bits from the FOLDED view, the same operand `encode_modrm_mem`
+        // encodes (see folded_addr_ext_bits).
+        let ((b, b4), (x, x4)) = folded_addr_ext_bits(mem);
         let id = Self::gp_id_or_err(vvvv)?;
         self.emit_evex_apx(
             r,
@@ -525,16 +504,9 @@ impl super::InstructionEncoder {
         } else {
             gp_ext_bits(reg)
         };
-        let (b, b4) = mem
-            .base
-            .as_ref()
-            .map(|b| gp_ext_bits(&b.name))
-            .unwrap_or((false, false));
-        let (x, x4) = mem
-            .index
-            .as_ref()
-            .map(|i| gp_ext_bits(&i.name))
-            .unwrap_or((false, false));
+        // Bits from the FOLDED view, the same operand `encode_modrm_mem`
+        // encodes (see folded_addr_ext_bits).
+        let ((b, b4), (x, x4)) = folded_addr_ext_bits(mem);
         let v = Self::gp_id_or_err(vvvv)?;
         self.emit_evex_apx_map(r, x, b, r4, x4, b4, w, v, false, nf, pp, mmm);
         Ok(())
@@ -573,16 +545,9 @@ impl super::InstructionEncoder {
         } else {
             gp_ext_bits(reg)
         };
-        let (b, b4) = mem
-            .base
-            .as_ref()
-            .map(|b| gp_ext_bits(&b.name))
-            .unwrap_or((false, false));
-        let (x, x4) = mem
-            .index
-            .as_ref()
-            .map(|i| gp_ext_bits(&i.name))
-            .unwrap_or((false, false));
+        // Bits from the FOLDED view, the same operand `encode_modrm_mem`
+        // encodes (see folded_addr_ext_bits).
+        let ((b, b4), (x, x4)) = folded_addr_ext_bits(mem);
         self.emit_evex_ccmp(r, x, b, r4, x4, b4, w, dfv, scc, pp);
         Ok(())
     }
@@ -606,25 +571,16 @@ impl super::InstructionEncoder {
         // `encode()` (one splice point covers legacy, VEX and EVEX
         // alike, in canonical [seg][67][66] order); this helper only
         // computes the REX bits.
-        // Fold BEFORE computing REX: if the index moves into the base slot the
-        // extension bit for r8-r15 must be REX.B, not REX.X.
-
         let w = size == 8;
         let (r, r4) = if reg.is_empty() {
             (false, false)
         } else {
             gp_ext_bits(reg)
         };
-        let (b, b4) = mem
-            .base
-            .as_ref()
-            .map(|b| gp_ext_bits(&b.name))
-            .unwrap_or((false, false));
-        let (x, x4) = mem
-            .index
-            .as_ref()
-            .map(|i| gp_ext_bits(&i.name))
-            .unwrap_or((false, false));
+        // Bits from the FOLDED view, the same operand `encode_modrm_mem`
+        // encodes (see folded_addr_ext_bits): an index that moves into the
+        // base slot carries its extension bit in REX.B, not REX.X.
+        let ((b, b4), (x, x4)) = folded_addr_ext_bits(mem);
         self.emit_rex_or_rex2(w, r, x, b, r4, x4, b4, is_rex_required_8bit(reg));
     }
 
@@ -846,6 +802,11 @@ impl super::InstructionEncoder {
     }
 
     fn encode_modrm_mem_body(&mut self, reg_field: u8, mem: &MemoryOperand) -> Result<(), String> {
+        // The same pure fold `emit_rex_rm` applied: the REX prefix was
+        // computed for the folded operand, so the ModR/M must encode it
+        // too (index->base moves the register's extension bit X->B).
+        let folded = fold_index_into_base(mem);
+        let mem = folded.as_ref().unwrap_or(mem);
         let base = mem.base.as_ref();
         let index = mem.index.as_ref();
 
@@ -1151,26 +1112,123 @@ impl super::InstructionEncoder {
 /// first needs a SIB byte and -- because SIB with no base only supports
 /// mod=00 + disp32 -- a full 4-byte displacement.  Moving the index into the
 /// base slot removes the SIB byte and lets the displacement shrink to disp8,
-/// turning 8 bytes into 4.  ICC performs this fold; GAS 2.47, clang 22.1,
-/// gcc 16.2 and icx 2024.0 all emit the longer form.
+/// turning 8 bytes into 4.
 ///
-/// Two register numbers can never be folded, because the base slot assigns
-/// them a meaning the index slot does not have:
-///   * reg 4 (%rsp/%r12) -- base==100 is the escape that selects a SIB byte,
-///     so folding produced `(%rsp,%r12,1)`.
-///   * reg 5 (%rbp/%r13) -- mod=00 with base==101 means "no base, disp32",
-///     so folding produced `(%rbp)`.
+/// Distilled from the remote-oracle encdiff run (gcc16.2/clang23.1/icx/icc
+/// over the whole corpus): ICC's encoder performs this fold; GAS 2.47,
+/// clang, gcc and icx all emit the longer SIB form.  lccc now folds too, so
+/// on this family it matches ICC and beats every other oracle by 3-5 bytes
+/// per row (88 rows on the modrm corpus alone, −277 bytes vs lccc's previous
+/// encodings).
+///
+/// Unlike the i686 twin (which excludes reg 4 and reg 5 for its SS/DS
+/// segment-default concern), the 64-bit encoder folds EVERY GPR index:
+/// segmentation is flat in 64-bit mode, and the ModR/M emitter already
+/// encodes every based form optimally, byte-probed:
+///   `mov (%r13),%rcx` -> `49 8b 4d 00` (mod=01 + disp8; mod=00 with
+///                         r/m=101 would mean no-base + disp32)
+///   `mov (%r12),%rcx` -> `49 8b 0c 24` (SIB with base only, mod=00)
+///   `mov -1(%r10),%rcx` -> `49 8b 4a ff` (direct r/m, mod=01)
+///
+/// The fold applies to ANY integer displacement (None included): an
+/// int8-range value lands in the mod=01 disp8 base form, a wider integer
+/// in the mod=10 base form -- both drop the SIB byte (and the index-only
+/// form's mandatory disp32).  Symbol displacements keep the GAS-parity SIB
+/// form: folding them is unevidenced and would change the relocation
+/// shape.
 ///
 /// Returning the rewritten operand (rather than mutating in place) lets the
-/// REX emitter and the ModR/M emitter share one decision: the extension bit
-/// for r8-r15 has to move from REX.X to REX.B along with the register, and
-/// having two code paths decide independently is what made an earlier version
-/// of this fold emit `rex.WX mov -0x1(%rdx)` for `mov -1(,%r10,1)`.
-/// True when a memory operand needs the 0x67 address-size override:
-/// any 32-bit component (base or index). Checked on the UNFOLDED operand
-/// by `encode()`'s pre-scan; the verdict agrees with the folded operand
-/// the helpers encode (folding moves index->base, preserving width).
-/// (`%eiz` is not a reg32 name, so it never triggers.)
+/// REX emitter and the ModR/M emitter share ONE decision: both call this
+/// pure function, so the extension bit for r8-r31 moves from REX.X to
+/// REX.B in lockstep with the register (an earlier x86-64 draft had two
+/// paths deciding independently and emitted `rex.WX mov -0x1(%rdx)` for
+/// `mov -1(,%r10,1)`).
+///
+/// Every prefix path that pairs with `encode_modrm_mem` shares that one
+/// decision: [`folded_addr_ext_bits`] is the single fold+extract helper
+/// behind `emit_rex_rm` and the five APX-EVEX memory helpers, and the
+/// VEX/XOP callers derive their (X, B) bits through
+/// [`mem_vex_xb_bits`].  AVX-512 `encode_evex_mem` intentionally does NOT
+/// fold -- no corpus row evidences the EVEX form yet, and it encodes the
+/// raw operand, so the `evex_addr_bits` prefix stays consistent with it.
+fn fold_index_into_base(mem: &MemoryOperand) -> Option<MemoryOperand> {
+    if mem.base.is_some() || mem.scale.unwrap_or(1) != 1 {
+        return None;
+    }
+    match &mem.displacement {
+        // Any INTEGER displacement: an int8 range folds to a disp8 base
+        // form (3-5 bytes saved); a wider integer folds to the mod=10
+        // base form, dropping just the SIB byte (1 byte saved on the
+        // direct-r/m and rbp/r13 classes; neutral on rsp/r12, whose base
+        // form needs a SIB anyway). Both are the same program: the index
+        // contributes *1 and moves into the base slot.
+        Displacement::None | Displacement::Integer(_) => {}
+        // Symbol displacements keep the GAS-parity SIB form: folding them
+        // is unevidenced and would change the relocation shape.
+        _ => return None,
+    }
+    // Any GPR index (the parser already rejects non-GPR names there); the
+    // index register's gp_id existence check keeps the fold honest if the
+    // grammar ever widens.
+    let index = mem.index.as_ref()?;
+    if gp_id(&index.name).is_none() {
+        return None;
+    }
+    Some(MemoryOperand {
+        base: mem.index.clone(),
+        index: None,
+        scale: None,
+        ..mem.clone()
+    })
+}
+
+/// `((B, B4), (X, X4))` extension bits of the FOLDED view of `mem`.
+///
+/// The ONE place the fold decision meets the extension-bit extraction:
+/// `emit_rex_rm` and the five APX-EVEX memory helpers all route through
+/// here, so every prefix that pairs with `encode_modrm_mem` derives its
+/// bits from the same folded operand the ModR/M encodes.  A future prefix
+/// emitter that wants ModR/M-consistent bits has one obvious function to
+/// call -- re-extracting from the raw operand is exactly the PR #711 F1
+/// defect class (VEX.X=0 on a SIB-less ModR/M the CPU decodes with the
+/// unextended base), and this helper exists so that path is no longer the
+/// copy-paste default.
+fn folded_addr_ext_bits(mem: &MemoryOperand) -> ((bool, bool), (bool, bool)) {
+    let folded = fold_index_into_base(mem);
+    let mem = folded.as_ref().unwrap_or(mem);
+    (
+        mem.base
+            .as_ref()
+            .map(|b| gp_ext_bits(&b.name))
+            .unwrap_or((false, false)),
+        mem.index
+            .as_ref()
+            .map(|i| gp_ext_bits(&i.name))
+            .unwrap_or((false, false)),
+    )
+}
+
+/// Post-fold `(X, B)` VEX/XOP extension bits for a memory operand.
+///
+/// `encode_modrm_mem` folds an index-only scale-1 address into the base
+/// slot; the register's extension bit then travels in the prefix B field,
+/// not X.  Every `emit_vex`/`emit_xop_prefix` caller paired with
+/// `encode_modrm_mem` must derive both bits from this same folded view:
+/// computing them from the raw operand emits `VEX.X=0` on a SIB-less
+/// ModR/M the CPU decodes with the unextended base -- e.g. `vmovups
+/// (,%r10,1),%xmm0` as `c4 a1 78 10 02`, which executes `vmovups
+/// (%rdx),%xmm0` (the PR #711 audit's P0 reproducer).  VEX/XOP carry only
+/// bit 3 of a register (no EGPR reach), hence `needs_vex_ext` rather than
+/// [`folded_addr_ext_bits`].
+pub(crate) fn mem_vex_xb_bits(mem: &MemoryOperand) -> (bool, bool) {
+    let folded = fold_index_into_base(mem);
+    let mem = folded.as_ref().unwrap_or(mem);
+    (
+        mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name)),
+        mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name)),
+    )
+}
+
 /// Reconstruct the `disp(base,index,scale)` text for the
 /// `` `...' is not a valid base/index expression `` diagnostic, GAS-style
 /// (no spaces: `(%bx,%si)`; displacement included: `8(%ax)`).
@@ -1388,6 +1446,11 @@ pub(crate) fn validate_mem_operand(mnemonic: &str, mem: &MemoryOperand) -> Resul
     Ok(())
 }
 
+/// True when a memory operand needs the 0x67 address-size override:
+/// any 32-bit component (base or index). Checked on the UNFOLDED operand
+/// by `encode()`'s pre-scan; the verdict agrees with the folded operand
+/// the helpers encode (folding moves index->base, preserving width).
+/// (`%eiz` is not a reg32 name, so it never triggers.)
 pub(crate) fn mem_needs_addr32(mem: &MemoryOperand) -> bool {
     mem.base.as_ref().is_some_and(|b| is_reg32(&b.name))
         || mem.index.as_ref().is_some_and(|i| is_reg32(&i.name))

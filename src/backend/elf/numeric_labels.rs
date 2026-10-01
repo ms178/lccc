@@ -261,6 +261,30 @@ pub fn resolve_numeric_name(
     current_idx: usize,
     defs: &FxHashMap<String, Vec<(usize, String)>>,
 ) -> Option<String> {
+    // A numeric reference may carry a source-level addend (`jmp 1f+300`,
+    // `ja 2b-0x70`): split it off, resolve the base reference, and splice
+    // it back. The combined spelling (`.Lnum_1_0+300`) then flows through
+    // every label-plus-constant consumer — relocation recording splits it
+    // at the choke point, jump-target parsing splits it for relaxation —
+    // exactly like a named label with an addend. Without the rewrite the
+    // raw `1f+300` escapes the whole resolution pipeline and becomes an
+    // external relocation against a symbol literally named `1f+300`
+    // (undefined at link time; GAS resolves the constant at assembly
+    // time). Non-numeric bases fall through to the exact-match path and
+    // return None, leaving named `foo+4` operands to their own paths.
+    // The recursion is depth-1 by construction: the splitter folds the
+    // WHOLE offset expression at the first separator (`1f+4+8` splits as
+    // base `1f` + offset 12 -- parse_integer_expr evaluates `4+8`), and
+    // the returned base is always a symbol-charset slice (no '+'/'-'),
+    // so the recursive call can never split again. A `.Lnum_1_0+4+8`
+    // spelling cannot arise (probed: `jmp 1f+4+8` assembles to the same
+    // bytes as GAS).
+    if let Some((base, addend)) =
+        crate::backend::x86::assembler::parser::split_relocation_symbol_addend(name)
+    {
+        return resolve_numeric_name(base, current_idx, defs)
+            .map(|resolved| format!("{resolved}{addend:+}"));
+    }
     let (num, is_forward) = parse_numeric_ref(name)?;
     let def_list = defs.get(num)?;
 
@@ -363,4 +387,66 @@ pub fn resolve_numeric_refs_in_expr(
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::fx_hash::FxHashMap;
+
+    fn defs() -> FxHashMap<String, Vec<(usize, String)>> {
+        let mut d: FxHashMap<String, Vec<(usize, String)>> = FxHashMap::default();
+        d.insert("1".to_string(), vec![(2, ".Lnum_1_0".to_string())]);
+        d.insert(
+            "7".to_string(),
+            vec![(1, ".Lnum_7_0".to_string()), (5, ".Lnum_7_1".to_string())],
+        );
+        d
+    }
+
+    #[test]
+    fn plain_references_resolve_unchanged() {
+        let d = defs();
+        // Forward: the next definition after the reference site.
+        assert_eq!(
+            resolve_numeric_name("1f", 0, &d),
+            Some(".Lnum_1_0".to_string())
+        );
+        // Backward: the most recent definition before the reference site.
+        assert_eq!(
+            resolve_numeric_name("7b", 6, &d),
+            Some(".Lnum_7_1".to_string())
+        );
+        assert_eq!(
+            resolve_numeric_name("7f", 0, &d),
+            Some(".Lnum_7_0".to_string())
+        );
+        assert_eq!(resolve_numeric_name("notnumeric", 0, &d), None);
+    }
+
+    #[test]
+    fn reference_with_addend_resolves_and_recombines() {
+        // `jmp 1f+300` must become `.Lnum_1_0+300` so the relocation choke
+        // point can split it into the base label plus a link-time addend.
+        // Before this rewrite the raw `1f+300` escaped as an external
+        // relocation against a symbol literally named `1f+300` (undefined
+        // at link time; GAS resolves the constant at assembly time).
+        let d = defs();
+        assert_eq!(
+            resolve_numeric_name("1f+300", 0, &d),
+            Some(".Lnum_1_0+300".to_string())
+        );
+        assert_eq!(
+            resolve_numeric_name("7b-0x70", 6, &d),
+            Some(".Lnum_7_1-112".to_string())
+        );
+        // Offset-first spellings keep their order.
+        assert_eq!(
+            resolve_numeric_name("4+1f", 0, &d),
+            Some(".Lnum_1_0+4".to_string())
+        );
+        // A named (non-numeric) base never resolves here — `foo+4` flows
+        // through the named-label paths unchanged.
+        assert_eq!(resolve_numeric_name("foo+4", 0, &d), None);
+    }
 }

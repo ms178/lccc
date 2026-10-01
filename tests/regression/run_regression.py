@@ -54,7 +54,16 @@ HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[1]
 DEFAULT_LCCC = REPO_ROOT / "target" / "fastbuild" / "lccc"
 DEFAULT_FLAGS = "-O2"
-TIMEOUT_S = 90  # per compile+run phase; PGO tests get 3 phases
+# Per compile+run phase; PGO tests get 3 phases.  The 90 s default is the
+# GitHub-runner budget.  A slower but legitimate host can exceed it on the
+# heaviest vectorizer rows without any code defect: on one 4 GiB sandbox
+# (2026-10-01, bisection recorded) `vectorize_int_reduction_homes.c -O2`
+# compiles in 112 s on PRISTINE upstream main (and byte-identically, 148 s
+# wall under suite contention, on the audited tree -- same 47528-byte
+# object), so the timeout there is a host-speed artifact, not a regression
+# signal.  LCCC_REGRESSION_TIMEOUT_S overrides the budget for exactly that
+# case; the compile still has to SUCCEED, only the wall-clock budget moves.
+TIMEOUT_S = int(os.environ.get("LCCC_REGRESSION_TIMEOUT_S", "90"))
 
 BOLD = "\033[1m"
 RED = "\033[31m"

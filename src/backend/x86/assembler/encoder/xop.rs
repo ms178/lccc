@@ -179,8 +179,7 @@ impl InstructionEncoder {
                 Ok(())
             }
             Operand::Memory(mem) => {
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 self.emit_xop_prefix(false, x, b_ext, vvvv, v_prime, 0, XOP_MAP_A);
                 self.bytes.push(0x12);
                 self.encode_modrm_mem(reg_field, mem)?;
@@ -290,8 +289,7 @@ impl InstructionEncoder {
                         let dst_num = xop_vec_id(dst_name)
                             .ok_or_else(|| format!("bad XOP register: {dst_name}"))?;
                         let r = needs_vex_ext(dst_name);
-                        let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                        let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                        let (x, b_ext) = mem_vex_xb_bits(mem);
                         self.emit_xop_prefix(r, x, b_ext, vvvv, v_prime, l, XOP_MAP_8);
                         self.bytes.push(opcode);
                         let rc = self.relocations.len();
@@ -329,8 +327,7 @@ impl InstructionEncoder {
                     .ok_or_else(|| format!("bad XOP register: {src2_name}"))?;
                 let dst_num =
                     xop_vec_id(dst_name).ok_or_else(|| format!("bad XOP register: {dst_name}"))?;
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 let r = needs_vex_ext(dst_name);
                 // GAS 2.47 quirk (byte-verified): the memory-first 4-op form
                 // always sets V'=1 regardless of the vvvv register id —
@@ -372,8 +369,7 @@ impl InstructionEncoder {
             (Operand::Memory(mem), Operand::Register(d)) => {
                 let dst_num =
                     xop_vec_id(&d.name).ok_or_else(|| format!("bad XOP register: {}", d.name))?;
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 let r = needs_vex_ext(&d.name);
                 self.emit_xop_prefix(r, x, b_ext, 0, false, 0, XOP_MAP_9);
                 self.bytes.push(opcode);
@@ -439,8 +435,7 @@ impl InstructionEncoder {
                 Ok(())
             }
             Operand::Memory(mem) => {
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 self.emit_xop_prefix(r, x, b_ext, 0, false, l, XOP_MAP_9);
                 self.bytes.push(opcode);
                 let rc = self.relocations.len();
@@ -491,8 +486,7 @@ impl InstructionEncoder {
                 Ok(())
             }
             Operand::Memory(mem) => {
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 self.emit_xop_prefix(r, x, b_ext, vvvv, v_prime, 0, XOP_MAP_9);
                 self.bytes.push(opcode);
                 let rc = self.relocations.len();
@@ -562,8 +556,7 @@ impl InstructionEncoder {
                 // `vprotb (%rax), %xmm2, %xmm3`). Like the vpcmov mem
                 // form, GAS always sets V'=1 here regardless of the id.
                 let (vvvv, _) = xop_vvvv(&src.name)?;
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 self.emit_xop_prefix(r, x, b_ext, vvvv, true, l, XOP_MAP_9);
                 self.bytes.push(opcode_reg);
                 let rc = self.relocations.len();
