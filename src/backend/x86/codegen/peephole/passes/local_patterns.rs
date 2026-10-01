@@ -15,7 +15,7 @@
 
 use super::super::types::*;
 use super::dead_writes::{frame_slot_stable_in_range, parse_frame_slot};
-use super::flag_peepholes::flags_dead_after;
+use super::flag_peepholes::{FlagsEffect, flags_dead_after, flags_effect};
 use super::fp_liveness::FpLiveness;
 use super::helpers::{
     get_dest_reg, has_implicit_reg_usage, implicit_read_reg_family, is_callee_saved_reg,
@@ -24,8 +24,8 @@ use super::helpers::{
 };
 use super::liveness::FileLiveness;
 use super::relay_and_lea::{
-    LazyDeadness, function_range, is_writable_family_gpr, plain_gp_operand, provably_dead_lv,
-    rbp_is_gpr_in_function, splice_lea_into_mem_operand, split_two_operands,
+    LazyDeadness, function_range, is_writable_family_gpr, line_refs_family, plain_gp_operand,
+    provably_dead_lv, rbp_is_gpr_in_function, splice_lea_into_mem_operand, split_two_operands,
 };
 
 #[cfg(test)]
@@ -11720,4 +11720,214 @@ mod broadcast_fold_tests {
             );
         }
     }
+}
+
+// ── Shift-into-addressing-mode folding ──────────────────────────────────────
+
+/// Fold an index's `shl` into the SIB scale of the address computation:
+///
+/// ```text
+///   shlq $3, %rax                 leaq (%r9, %rax, 8), %r9
+///   addq %rax, %r9          →     (then the existing LEA-splicing passes fold
+///                                  the result into the memory operand:
+///                                  `addq $1, (%r9,%rax,8)`)
+/// ```
+///
+/// `a[i]`, `p->arr[i]`, `table[idx]++` and every other scaled index lowers as
+/// an explicit shift on the IR side (the frontend scales by `sizeof`), and the
+/// x86 addressing mode can carry that scale for free.  Measured on
+/// tests/benchmark/programs/histogram.c (`bins[bytes[i]]++`), Callgrind at
+/// `-O2 -march=x86-64-v3`: this is worth two instructions per element on top of
+/// the RMW fold -- `shl` plus `add` become one `lea`, and the LEA-splicing pass
+/// then folds that `lea` into the memory operand, leaving GCC's exact
+/// `addq $1, (%r9,%rax,8)` shape.
+///
+/// The fold is legal only when:
+///
+/// * the add is 64-bit (`addq`).  A 32-bit `addl` zero-extends the upper half
+///   of its destination; `lea` never does, so the rewrite would change the
+///   upper 32 bits of the base register;
+/// * the shift is by 1, 2 or 3 bits -- the encodable SIB scales;
+/// * the shift's destination register is dead after the add.  The fold DELETES
+///   its definition, so the register reverts to holding the pre-shift value:
+///   any other reader would see a different number.  (`provably_dead_lv`'s
+///   whole-function uniqueness proof settles the common case where the shifted
+///   temporary is a one-use value);
+/// * the add's source is not its own destination (`addq %rax, %rax` doubles;
+///   `leaq (%rax,%rax,8)` multiplies by nine), and neither operand is
+///   `%rsp`/`%rbp`, which cannot be encoded in the SIB index field (only `%rbp`
+///   when it is also the base is unencodable; `%rsp` never is);
+/// * the flags are dead after the add.  `shl` and `add` both write flags;
+///   `lea` writes none, so a later `jcc`/`setcc`/`adc` would read stale ones.
+///
+/// `addq %R, %R` (a doubling, i.e. a shift by one) is folded as well: the same
+/// rewrite produces `leaq (%R, %R, 2), %R`.
+pub(super) fn fold_shift_into_sib(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut dead = LazyDeadness::new();
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() || infos[i].pinned {
+            i += 1;
+            continue;
+        }
+        let ti = infos[i].trimmed(store.get(i)).to_string();
+        // Form A: `shlq $K, %R` (K = 1..3, the encodable SIB scales).
+        // Form B: `addq %R, %R` -- a doubling, i.e. a shift by one.
+        let (shifted_reg, scale) = match parse_shift_imm(&ti) {
+            Some((k, reg)) if (1..=3).contains(&k) => (reg.to_string(), 1u32 << k),
+            _ => match parse_self_doubling(&ti) {
+                Some(reg) => (reg.to_string(), 2u32),
+                None => {
+                    i += 1;
+                    continue;
+                }
+            },
+        };
+        let shifted_fam = register_family_fast(&shifted_reg);
+        if shifted_fam == REG_NONE || shifted_fam > REG_GP_MAX {
+            i += 1;
+            continue;
+        }
+        // A SIB index field cannot name `%rsp` (that encoding means "no index"),
+        // and `%rbp` as an index forces an extra displacement byte; both are
+        // rejected so the produced instruction has exactly one encoding and the
+        // text round-trips through the assembler unchanged.
+        if shifted_reg == "%rsp" || shifted_reg == "%rbp" {
+            i += 1;
+            continue;
+        }
+
+        // Find the consumer: an `addq` naming the shifted register, within a
+        // bounded window and never across a barrier.
+        //
+        // The add is routinely NOT adjacent.  The backend materialises a
+        // rematerialised `GlobalAddr` as a `lea` right where its value is
+        // needed, so the measured shape is
+        //
+        //     shlq $3, %rax
+        //     leaq bins(%rip), %r9     <- GlobalAddr remat, in between
+        //     addq %rax, %r9
+        //
+        // Intervening lines are allowed only while they cannot observe the
+        // difference the fold makes:
+        //
+        // * none may MENTION the shifted register.  A reader would see the
+        //   unshifted value once the `shl` is deleted, and a writer would make
+        //   the `lea`'s scaled read consume the new value where the deleted
+        //   `add` consumed the shifted one;
+        // * none may READ the flags.  The deleted `shl` produced the flags a
+        //   reader would see; the `lea` replacing the add writes none.  A flag
+        //   WRITER is harmless -- the fold separately requires the flags to be
+        //   dead after the add.
+        const WINDOW: usize = 6;
+        let mut j = next_non_nop(infos, i + 1, len);
+        let mut steps = 0usize;
+        let mut add_rest: Option<String> = None;
+        while j < len && steps <= WINDOW && !infos[j].is_barrier() {
+            let t = infos[j].trimmed(store.get(j));
+            if let Some(rest) = t.strip_prefix("addq ") {
+                if rest.contains(&shifted_reg) {
+                    add_rest = Some(rest.to_string());
+                }
+                break;
+            }
+            if line_refs_family(t, shifted_fam) || matches!(flags_effect(t), FlagsEffect::Reads) {
+                break;
+            }
+            steps += 1;
+            j = next_non_nop(infos, j + 1, len);
+        }
+        let Some(rest) = add_rest else {
+            i += 1;
+            continue;
+        };
+        let Some((src, dst)) = split_two_operands(&rest) else {
+            i += 1;
+            continue;
+        };
+        // The source must be the shifted register itself; the destination is
+        // the base the scaled index is added into.
+        if src != shifted_reg || !dst.starts_with('%') || dst.contains('(') {
+            i += 1;
+            continue;
+        }
+        // `addq %rax, %rax` doubles -- that is the `parse_self_doubling` form
+        // and already carries its own scale.  For the `shl` form the base must
+        // be a different register, or the rewrite would compute
+        // `base + base*scale` instead of `base + shifted_source`.
+        if dst == shifted_reg && scale != 2 {
+            i += 1;
+            continue;
+        }
+        if dst == "%rsp" || dst == "%rbp" {
+            i += 1;
+            continue;
+        }
+        let dst_fam = register_family_fast(dst);
+        if dst_fam == REG_NONE || dst_fam > REG_GP_MAX {
+            i += 1;
+            continue;
+        }
+        if !all_editable(infos, &[i, j]) {
+            i += 1;
+            continue;
+        }
+        // The deleted definition must have no other reader: `%R` is about to
+        // go back to holding its pre-shift value.
+        if !dead.dead_after(store, infos, j, shifted_fam, &[i, j]) {
+            i += 1;
+            continue;
+        }
+        // `lea` writes no flags; `shl`+`add` did.
+        if !flags_dead_after(store, infos, j + 1) {
+            i += 1;
+            continue;
+        }
+        // Both operands keep their `%`: line classification, `reg_refs` and
+        // every liveness scan in this module find registers by their full
+        // spelling, and the assembler accepts bare names -- so emitting
+        // `(%r9, r11, 8)` would assemble to the right bytes while the peephole
+        // bookkeeping saw no read of %r11 at all.  That is not hypothetical:
+        // it made `eliminate_dead_pure_writes` delete the copy that fed the
+        // index (`movl %eax, %r11d`) and the kernel dereferenced `bins[i*8]`.
+        // The differential fixture pins the operand spellings for this reason.
+        let new_line = format!(
+            "    leaq (%{}, %{}, {}), {}",
+            &dst[1..],
+            &shifted_reg[1..],
+            scale,
+            dst
+        );
+        replace_line(store, &mut infos[j], j, new_line);
+        mark_nop(&mut infos[i]);
+        dead.invalidate(store, infos, j);
+        changed = true;
+        i = j + 1;
+    }
+    changed
+}
+
+/// `shlq $K, %R` / `shll $K, %R` / `salq $K, %R` -> `(K, "%R")`.  Only the
+/// immediate form, and only a plain register destination: `shl %cl, %rax` has
+/// a runtime count (no constant scale) and `shlq $3, (%rax)` is memory.
+fn parse_shift_imm(t: &str) -> Option<(u32, &str)> {
+    let (mnemonic, rest) = t.split_once(' ')?;
+    if !matches!(mnemonic, "shlq" | "shll" | "salq" | "sall") {
+        return None;
+    }
+    let (imm, dst) = split_two_operands(rest.trim_start())?;
+    let k: u32 = imm.strip_prefix('$')?.parse().ok()?;
+    if !dst.starts_with('%') || dst.contains('(') {
+        return None;
+    }
+    Some((k, dst))
+}
+
+/// `addq %R, %R` -> `"%R"` (a doubling, which is a shift by one).
+fn parse_self_doubling(t: &str) -> Option<&str> {
+    let rest = t.strip_prefix("addq ")?;
+    let (src, dst) = split_two_operands(rest)?;
+    (src == dst && dst.starts_with('%') && !dst.contains('(')).then_some(dst)
 }

@@ -1006,6 +1006,21 @@ fn canonical_cc(cc: &str) -> Option<&'static str> {
     })
 }
 
+/// Operands of a widening copy of an 8-bit register: `movzbl %bl, %ebx`,
+/// `movsbq %bl, %r11`, `movsbl %al, %eax`, ... .  Returns `(src, dst)`.
+fn widen_copy_operands(t: &str) -> Option<(&str, &str)> {
+    // Only the byte-source extensions: `movzwl`/`movswl` read 16 bits, which
+    // the `setcc` did not define (see the call site).
+    for pfx in ["movzbl ", "movzbq ", "movsbl ", "movsbq "] {
+        if let Some(args) = t.strip_prefix(pfx) {
+            if let Some((s, d)) = split_two_operands(args) {
+                return Some((s, d));
+            }
+        }
+    }
+    None
+}
+
 /// Split `cmovneq %r8, %rbx` into (`"ne"`, `"q"`, `"%r8"`, `"%rbx"`).
 fn parse_cmov(t: &str) -> Option<(&'static str, char, &str, &str)> {
     let rest = t.strip_prefix("cmov")?;
@@ -1042,9 +1057,16 @@ fn parse_cmov(t: &str) -> Option<(&'static str, char, &str, &str)> {
 /// * NOTHING between the `setCC` and the `cmov` writes or reads the flags
 ///   (readers would observe the comparison we are about to consume, writers
 ///   would destroy it), and there is no control-flow boundary;
-/// * the `test` is a self-test of the boolean, and the `cmov` condition is
-///   `ne` (boolean true) or `e` (boolean false), which maps to the original
-///   condition or its negation.
+/// * the `test` is a self-test of the boolean or of a WIDENING COPY of it.
+///   The IR's `Cast(bool -> i32)` lowers to a sign-extending copy into a fresh
+///   register (`movsbq %bl, %r11`), and the `test` then names that register
+///   instead of the boolean -- measured on the ASCII case-fold kernel, where
+///   insisting on the boolean's own register left `setbe; movzbl; movsbq;
+///   test; cmovne` (9 instructions per byte) in place.  Both copies are
+///   accepted; sign/zero extension of a 0/1 value is 0 iff the boolean is 0,
+///   so the `test` still means "the original condition holds";
+/// * the `cmov` condition is `ne` (boolean true) or `e` (boolean false), which
+///   maps to the original condition or its negation.
 pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut lv = FileLiveness::new(store, infos);
@@ -1083,21 +1105,40 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
         let mut k = i;
         let mut test_idx = None;
         let mut cmov_idx = None;
+        // The register family the `test` and the `cmov` are matched against:
+        // the boolean's own family, or the destination of a widening copy of
+        // it (`movsbq %bl, %r11` -- the shape the IR's `Cast(bool -> i32)`
+        // produces, which the "same family only" rule used to bail on).
+        let mut tested_fam = bool_fam;
         while let Some(n) = next_real(infos, k, len) {
             k = n;
             if infos[n].pinned || infos[n].is_barrier() {
                 break;
             }
             let tn = infos[n].trimmed(store.get(n));
-            // The widening move of the boolean is part of the idiom.
-            if test_idx.is_none()
-                && (tn.starts_with("movzbl ") || tn.starts_with("movzbq "))
-                && split_two_operands(&tn[7..]).is_some_and(|(s, d)| {
-                    register_family_fast(s) == bool_fam && register_family_fast(d) == bool_fam
-                })
-            {
-                owned.push(n);
-                continue;
+            // A widening copy of the boolean is part of the idiom, whether it
+            // lands back in the same family (`movzbl %bl, %ebx`) or in a fresh
+            // register (`movsbq %bl, %r11`).  The copy's source must be the
+            // boolean; the destination becomes the register the `test` names.
+            if test_idx.is_none() {
+                if let Some((src, dst)) = widen_copy_operands(&tn) {
+                    let sfam = register_family_fast(src);
+                    let dfam = register_family_fast(dst);
+                    // The copy must read the EXACT register the `setcc` wrote
+                    // (`%bl`, not merely its family): `setcc` defines the low
+                    // byte only, so a 16-bit read of the same family
+                    // (`movswl %bx, %eax`) would sign-extend whatever the high
+                    // byte happens to hold -- garbage the `setcc` never wrote
+                    // -- and the fused `cmov` would then follow the wrong
+                    // condition.  Family equality is what makes the accepted
+                    // 8-bit reads sound; text equality is what makes the wider
+                    // ones impossible.
+                    if sfam == bool_fam && src == breg && dfam != REG_NONE && dfam <= REG_GP_MAX {
+                        tested_fam = dfam;
+                        owned.push(n);
+                        continue;
+                    }
+                }
             }
             if test_idx.is_none() {
                 if let Some(args) = tn
@@ -1106,7 +1147,7 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
                     .or_else(|| tn.strip_prefix("testb "))
                 {
                     if let Some((a, b)) = split_two_operands(args) {
-                        if a == b && register_family_fast(a) == bool_fam {
+                        if a == b && register_family_fast(a) == tested_fam {
                             owned.push(n);
                             test_idx = Some(n);
                             continue;
@@ -1117,11 +1158,28 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
             if test_idx.is_some() {
                 if parse_cmov(tn).is_some() {
                     cmov_idx = Some(n);
+                    break;
                 }
-                break;
+                // Flag-neutral staging between the `test` and the `cmov` is
+                // part of the same idiom: the select lowering stages the
+                // false value into the destination (`movq %r9, %rbp`) and the
+                // allocator is free to place it after the test.  Such lines
+                // stay in the output; they only have to avoid the flags and
+                // the registers we are about to delete.
+                let tested_mask = 1u16 << tested_fam;
+                if infos[n].reg_refs & (bool_mask | tested_mask) != 0
+                    || flags_effect(tn) != FlagsEffect::Neutral
+                {
+                    break;
+                }
+                continue;
             }
-            // Any other line: it must neither touch the boolean nor the flags.
-            if infos[n].reg_refs & bool_mask != 0 || flags_effect(tn) != FlagsEffect::Neutral {
+            // Any other line: it must neither touch the boolean (or its
+            // widened copy) nor the flags.
+            let tested_mask = 1u16 << tested_fam;
+            if infos[n].reg_refs & (bool_mask | tested_mask) != 0
+                || flags_effect(tn) != FlagsEffect::Neutral
+            {
                 break;
             }
         }
@@ -1151,8 +1209,9 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
                 continue;
             }
         };
-        // The cmov must not read the boolean itself (it would lose its definition).
-        if infos[cmov_i].reg_refs & bool_mask != 0 {
+        // The cmov must not read the boolean or its widened copy (it would
+        // lose the definition we are deleting).
+        if infos[cmov_i].reg_refs & (bool_mask | (1u16 << tested_fam)) != 0 {
             i += 1;
             continue;
         }
@@ -1169,10 +1228,17 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
         // rewrites it before any read, or the whole function only mentions it
         // in the lines we are about to delete.
         owned.push(cmov_i);
-        let dead = matches!(lv.live_after(cmov_i, bool_fam), Some(false))
+        // Both registers die with the idiom: the boolean itself, and the
+        // widened copy the `test`/`cmov` were reading.  A widened copy that is
+        // live elsewhere keeps its definition (the transform is not
+        // applicable), and the boolean likewise.
+        let bool_dead = matches!(lv.live_after(cmov_i, bool_fam), Some(false))
             || dead_in_block_after(store, infos, cmov_i + 1, bool_fam)
             || family_private_to(store, infos, i, bool_fam, &owned);
-        if !dead {
+        let tested_dead = tested_fam == bool_fam
+            || matches!(lv.live_after(cmov_i, tested_fam), Some(false))
+            || dead_in_block_after(store, infos, cmov_i + 1, tested_fam);
+        if !bool_dead || !tested_dead {
             i += 1;
             continue;
         }

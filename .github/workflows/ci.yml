@@ -731,6 +731,19 @@ jobs:
           # it is not -- including the alias-guard fallback, where the mirror
           # is live.
           bash tests/regression/check_vec_dead_remainder.sh
+          # ZERO-REM-2 + chained exit phis: the hoisted FMA transform's A
+          # factor lives in a fixed register (%ymm1) with no SSA edge to its
+          # consumers, so every entry edge into a vectorized loop must
+          # re-establish it; a k-unrolled chain enters j-loop N+1 on a
+          # conditional arm of j-loop N's header.  Pins oracle parity, the
+          # one-broadcast-per-packed-loop ratio, and broadcast-or-refuse.
+          bash tests/regression/check_vec_chain_exit_phi.sh
+          # ZERO-ROT-AFFINE: loop_rotate's cloned exit compare folds its
+          # affine constant operand into the bound (signed only), giving a
+          # bare-IV compare the compare-branch fusion can fuse -- without the
+          # FileLiveness backward-edge fix the fusion refused the rotated
+          # setcc shape and the `leaq` temporary stayed per-iteration.
+          bash tests/regression/check_affine_exit_compare.sh
           # MINMAX-1: integer min/max reductions lower to packed vpmin/vpmax
           # on AVX2, and every shape the transform does not model (unsigned,
           # 16-bit, float, guarded, multi-accumulator) stays scalar AND stays
@@ -782,6 +795,12 @@ jobs:
           bash tests/regression/check_got64_old_spelling.sh
           bash tests/regression/check_tls_pie_preemptible.sh
           bash tests/regression/check_tls_model_selection.sh
+          # The peephole folds and the affine exit-compare fold: oracle parity
+          # at every opt level times every kill switch, plus the asm pins that
+          # say the fold actually fired (and stayed off when refused).
+          bash tests/regression/check_rmw_sib_folds.sh
+          bash tests/regression/check_select_from_compare.sh
+          bash tests/regression/check_affine_loop_fold.sh
           bash tests/regression/check_phi_acyclic_order.sh
           python3 scripts/check_doc_links.py
           bash tests/regression/check_ra_web_inloop_use.sh

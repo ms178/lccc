@@ -459,10 +459,81 @@ impl FileLiveness {
             for slot in &mut lv.func_of[i..end] {
                 *slot = Some((i as u32, end as u32));
             }
-            lv.analyse_function(store, infos, i, end);
+            lv.analyse_function(store, infos, i, end, None);
             i = end.max(i + 1);
         }
         lv
+    }
+
+    /// Live family set immediately after line `idx` in the program that
+    /// results from DELETING the definitions found on `lo..=hi` for the
+    /// families in `mask` (reads and writes both neutralised, see
+    /// `analyse_function`).  `None` when the enclosing function is not
+    /// analysable.
+    ///
+    /// This is the question `compare_branch`'s fusion gate actually means by
+    /// "the family is dead after the fused jump".  Plain [`live_after`] is a
+    /// whole-program property of the CURRENT text, and it counts reads made
+    /// by the boolean sequence itself -- the extension's narrow source read
+    /// and the test -- which this very fusion deletes.  Across a loop's back
+    /// edge that is not a local nuisance but a loop-carried bit: the rotated
+    /// loop
+    ///
+    /// ```text
+    /// .LBB4:
+    ///     movzbl (%rdi,%rdx), %eax
+    ///     addq %rax, %rsi
+    ///     addq $1, %rdx
+    ///     cmpq $2044, %rdx
+    ///     setl %r8b            ; <- dropped
+    ///     movzbl %r8b, %r8d    ; <- dropped (reads %r8b)
+    ///     testb %r8b, %r8b     ; <- dropped (reads %r8b)
+    ///     jne .LBB4            ; <- fused to `jl .LBB4`
+    /// .LBB5:
+    ///     movq %rsi, %rax
+    /// ```
+    ///
+    /// has `%r8` live at the `jne` only because the back edge re-enters the
+    /// header, which is above the sequence: the loop-carried bit exists
+    /// solely through the two reads that the fusion removes.  The exact
+    /// question ("is `%r8` observed after the fused jump on any path that
+    /// does not go through the sequence?") answers dead, and the fusion
+    /// fires.
+    ///
+    /// Soundness: `analyse_function` drops the span's writes too, so nothing
+    /// is assumed dead that a surviving path could still observe.  The
+    /// caller must have established that the span is straight-line,
+    /// unconditionally executed between the producer and the jump, and
+    /// contains every mention of the mask families that it deletes
+    /// (`compare_branch` re-verifies mentionedness of its transparent lines
+    /// against the final carrier mask; labels are never transparent there).
+    pub(super) fn live_after_dropping_region(
+        &self,
+        store: &LineStore,
+        infos: &[LineInfo],
+        idx: usize,
+        lo: usize,
+        hi: usize,
+        mask: u16,
+    ) -> Option<u16> {
+        if idx >= self.known.len() || lo > hi || hi >= self.known.len() {
+            return None;
+        }
+        let (start, end) = self.recorded_function(store, infos, idx)?;
+        // Clone-and-re-derive: the neutralised solution must not leak into
+        // the caller's (unmodified-program) solution, and every other field
+        // keeps the function/structural bookkeeping the caller inherited.
+        let mut probe = FileLiveness {
+            live_out: self.live_out.clone(),
+            live_in: self.live_in.clone(),
+            known: self.known.clone(),
+            structural: self.structural.clone(),
+            effect: self.effect.clone(),
+            func_of: self.func_of.clone(),
+            textual_ret: self.textual_ret.clone(),
+        };
+        probe.reanalyse_with(store, infos, start, end, Some((lo, hi, mask)));
+        probe.known[idx].then(|| probe.live_out[idx])
     }
 
     /// `Some(true)` when `fam` may be read after line `idx`, `Some(false)` when
@@ -516,6 +587,19 @@ impl FileLiveness {
 
     /// Forget and recompute the function `[start, end)`.
     fn reanalyse(&mut self, store: &LineStore, infos: &[LineInfo], start: usize, end: usize) {
+        self.reanalyse_with(store, infos, start, end, None);
+    }
+
+    /// [`FileLiveness::reanalyse`] with the optional `neutralise` override of
+    /// `analyse_function` (used by the region-dropping query).
+    fn reanalyse_with(
+        &mut self,
+        store: &LineStore,
+        infos: &[LineInfo],
+        start: usize,
+        end: usize,
+        neutralise: Option<(usize, usize, u16)>,
+    ) {
         for n in start..end {
             self.known[n] = false;
             self.live_out[n] = ALL;
@@ -524,7 +608,7 @@ impl FileLiveness {
             self.effect[n] = (0, 0);
         }
         self.textual_ret.remove(&start);
-        self.analyse_function(store, infos, start, end);
+        self.analyse_function(store, infos, start, end, neutralise);
     }
 
     /// The recorded `(start, end)` of the function containing `idx`, if its
@@ -865,6 +949,12 @@ impl FileLiveness {
         None
     }
 
+    /// `neutralise` (see [`FileLiveness::live_after_dropping_region`]): when
+    /// `Some((lo, hi, mask))`, the lines `lo..=hi` contribute NEITHER reads
+    /// nor writes for `mask`'s families -- the analysis then answers
+    /// liveness questions for the program that would exist if those
+    /// definitions had been deleted.  Everything else is unchanged; the
+    /// store/load, call and `ret` modelling never consults the mask.
     #[expect(clippy::needless_range_loop)]
     fn analyse_function(
         &mut self,
@@ -872,6 +962,7 @@ impl FileLiveness {
         infos: &[LineInfo],
         start: usize,
         end: usize,
+        neutralise: Option<(usize, usize, u16)>,
     ) {
         let rdx_marker = Self::ret_rdx_marker(store, infos, start, end);
         if rdx_marker.is_none() {
@@ -971,6 +1062,22 @@ impl FileLiveness {
             ) {
                 Some(v) => v,
                 None => return, // unanalysable control flow: leave `known` false
+            };
+            let eff = match neutralise {
+                // Deleted-definition semantics: the span is no longer an
+                // observation of these families, and no longer a
+                // definition either.  Both halves matter -- dropping the
+                // reads models "the sequence's own consumers are gone";
+                // dropping the writes is what keeps the answer SOUND
+                // across a back edge (with the write still counted, the
+                // region would keep killing the family on every
+                // iteration, and a genuine loop-carried observation
+                // below the region would be reported dead).
+                Some((lo, hi, mask)) if n >= lo && n <= hi => Effect {
+                    reads: eff.reads & !mask,
+                    writes: eff.writes & !mask,
+                },
+                _ => eff,
             };
             effects[rel] = Some(eff);
             succs[rel] = edges;

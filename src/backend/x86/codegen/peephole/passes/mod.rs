@@ -689,6 +689,22 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
                 changed |= c;
             }
         }
+        if !sk("shl_sib") {
+            // Index scaling: `shl $k,%idx; addq %idx,%base` -> a scaled SIB
+            // operand, which the LEA-splicing passes then fold into whatever
+            // consumes the address.  With `mem_rmw` this is what turns
+            // `table[idx]++` into one `addq $1,(base,idx,8)`.
+            let c = local_patterns::fold_shift_into_sib(&mut store, &mut infos);
+            trace("fold_shift_into_sib", pass_count, c, &store, &infos);
+            changed |= c;
+        }
+        if !sk("mem_rmw") {
+            // Memory read-modify-write: `mov MEM,%d; <inc %d>; mov %d,MEM`
+            // -> `add $imm,MEM`.  The `table[idx]++` shape.
+            let c = memory_fold::fold_memory_rmw(&mut store, &mut infos);
+            trace("fold_memory_rmw", pass_count, c, &store, &infos);
+            changed |= c;
+        }
         if !sk("fuse_movq_ext") {
             {
                 let c = local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos);

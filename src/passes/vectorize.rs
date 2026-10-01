@@ -16862,14 +16862,398 @@ fn verify_gep_pattern(block: &BasicBlock, gep_val: Value, iv: Value) -> Option<(
     }
 }
 
+/// Block labels of the loop being vectorized (`pattern.loop_blocks`), the
+/// membership test every chained-exit-phi question below is phrased in.
+fn fma_loop_labels(func: &IrFunction, pattern: &VectorizablePattern) -> FxHashSet<BlockId> {
+    pattern
+        .loop_blocks
+        .iter()
+        .map(|&idx| func.blocks[idx].label)
+        .collect()
+}
+
+/// Dests of every instruction inside the loop (`pattern.loop_blocks`).
+fn fma_loop_defined_values(func: &IrFunction, pattern: &VectorizablePattern) -> FxHashSet<u32> {
+    let mut defined = FxHashSet::default();
+    for &idx in &pattern.loop_blocks {
+        for inst in &func.blocks[idx].instructions {
+            if let Some(d) = inst.dest() {
+                defined.insert(d.0);
+            }
+        }
+    }
+    defined
+}
+
+/// Pre-mutation gate for the chained-loop shapes: every `Phi` in the loop's
+/// EXIT block must take, on each incoming edge that comes from one of the
+/// loop's own blocks, a value that is NOT defined inside the loop -- and at
+/// most one incoming edge per phi may come from the loop at all.
+///
+/// Why it exists.  When the k-loop is unrolled, the j-loops are chained: the
+/// exit block of j-loop N is the HEADER of j-loop N+1, and its IV phi carries
+/// the `j = 0` copy for the next loop from the edge that leaves j-loop N.
+/// Vectorizing j-loop N re-routes that edge through the remainder header
+/// (`insert_remainder_loop` relabels these incomings), so the operand that
+/// arrives on it must still be defined on the remainder path: an invariant or
+/// a constant.  A loop-defined operand would not dominate the remainder
+/// header, and the phi would be reading a value its new predecessor cannot
+/// produce.  The "at most one" half keeps the relabelling unambiguous: two
+/// collapsed edges would leave the phi with duplicate labels for the same
+/// predecessor, and phi elimination would keep only one of them.
+///
+/// Fail-closed: a refusal skips the FMA transform for this loop (the loop
+/// keeps its scalar form), never emits a wrong one.
+fn fma_exit_phis_loop_invariant(func: &IrFunction, pattern: &VectorizablePattern) -> bool {
+    let loop_labels = fma_loop_labels(func, pattern);
+    let defined = fma_loop_defined_values(func, pattern);
+    for inst in &func.blocks[pattern.exit_idx].instructions {
+        let Instruction::Phi { incoming, .. } = inst else {
+            continue;
+        };
+        let mut loop_edges = 0usize;
+        for (op, label) in incoming {
+            if !loop_labels.contains(label) {
+                continue;
+            }
+            loop_edges += 1;
+            if matches!(op, Operand::Value(v) if defined.contains(&v.0)) {
+                return false;
+            }
+        }
+        if loop_edges > 1 {
+            return false;
+        }
+    }
+    true
+}
+
+/// The loop's IV phi starts at a compile-time zero on every incoming edge
+/// that does not come from the loop itself.  Half of the exact-coverage
+/// proof: the packed loop covers `floor((limit - start) / W) * W` elements
+/// from `start`, and the remainder is dead only when `start == 0` and the
+/// limit is an exact multiple of `W`.
+fn fma_iv_starts_at_zero(func: &IrFunction, pattern: &VectorizablePattern) -> bool {
+    let loop_labels = fma_loop_labels(func, pattern);
+    let mut saw_entry = false;
+    let mut all_zero = true;
+    for inst in &func.blocks[pattern.header_idx].instructions {
+        let Instruction::Phi { dest, incoming, .. } = inst else {
+            continue;
+        };
+        if *dest != pattern.iv {
+            continue;
+        }
+        for (op, label) in incoming {
+            if loop_labels.contains(label) {
+                continue;
+            }
+            saw_entry = true;
+            if !matches!(op, Operand::Const(c) if c.to_i64() == Some(0)) {
+                all_zero = false;
+                break;
+            }
+        }
+    }
+    saw_entry && all_zero
+}
+
+/// No value defined inside the loop is used outside it -- instructions AND
+/// terminators, via `for_each_used_value`.
+///
+/// This is the licence for omitting the remainder entirely: the remainder
+/// body is the only place that would have re-materialised a loop-defined
+/// value on the exit path (through `plan_remainder_reference` /
+/// `materialize_remainder_reference`), so a genuinely closed loop is the only
+/// shape whose exit path is already complete without it.  Strictly stronger
+/// than `loop_escape_closed`, which keeps the IV exception the reduction path
+/// needs for `rewire_escaping_iv_uses`: the FMA transforms never rewire
+/// escaping IV uses.
+fn fma_loop_is_closed(func: &IrFunction, pattern: &VectorizablePattern) -> bool {
+    let defined = fma_loop_defined_values(func, pattern);
+    if defined.is_empty() {
+        return true;
+    }
+    for (bi, block) in func.blocks.iter().enumerate() {
+        if pattern.loop_blocks.contains(&bi) {
+            continue;
+        }
+        for inst in &block.instructions {
+            let mut escaped = false;
+            inst.for_each_used_value(|u| {
+                if defined.contains(&u) {
+                    escaped = true;
+                }
+            });
+            if escaped {
+                return false;
+            }
+        }
+        let mut escaped = false;
+        block.terminator.for_each_used_value(|u| {
+            if defined.contains(&u) {
+                escaped = true;
+            }
+        });
+        if escaped {
+            return false;
+        }
+    }
+    true
+}
+
+/// Entry edges of `pattern`'s loop that arrive from OUTSIDE the loop, as
+/// `(pred_idx, needs_split)` pairs.
+///
+/// `needs_split` is true when the predecessor reaches the header through one
+/// arm of a `CondBranch`, i.e. it also has a non-entry successor.  That is the
+/// chained shape the k-unroll produces: the exit block of `j`-loop N is the
+/// HEADER of `j`-loop N+1, and the next header is entered on the `false` edge
+/// of the previous loop's header.  The broadcast must not be appended to such
+/// a block -- it would then run once per iteration of the previous loop -- so
+/// `split_fma_entry_edge` carves the entry edge out into its own block.
+///
+/// `None` means "the entry edge cannot be isolated under one insertion
+/// point": no predecessor outside the loop at all (the header is the entry
+/// block, or the loop is endless), or an entry through a `Switch` case /
+/// `IndirectBranch`, whose edge is not a branch this pass can rewrite.
+/// Callers must then refuse the hoisted-FMA form; a loop that keeps its
+/// scalar body is slow, never wrong.
+///
+/// Why the entry edge matters at all: `BroadcastLoadF64` carries the A factor
+/// in %ymm1, a FIXED register with NO SSA edge to the FMA intrinsics that
+/// consume it (x86 `IntrinsicOp::BroadcastLoadF64` emits `vmovsd` +
+/// `vbroadcastsd %ymm1`; `FmaF64x4HoistedSIB` / `FmaF64x2Hoisted` read it;
+/// AArch64 keeps the same implicit carrier in v15).  A loop whose FMAs are
+/// emitted without re-establishing that register on the way in silently
+/// reuses whatever the previously vectorized loop left behind -- a wrong-A
+/// miscompile, not a missed optimization.
+fn fma_broadcast_entry_edges(
+    func: &IrFunction,
+    pattern: &VectorizablePattern,
+) -> Option<Vec<(usize, bool)>> {
+    header_entry_edges(func, &pattern.loop_blocks, pattern.header_idx)
+}
+
+/// Entry edges of the loop headed by `header_idx`, as `(pred_idx,
+/// needs_split)` pairs -- the general form of
+/// [`fma_broadcast_entry_edges`], usable by any transform that must
+/// re-establish something on EVERY way into a loop.
+///
+/// `needs_split` is true when the predecessor reaches the header through one
+/// arm of a `CondBranch`, i.e. it also has a non-entry successor.
+///
+/// `None` means "the entry cannot be isolated under one insertion point", and
+/// it is returned for EVERY such shape, not just the obvious ones:
+///
+/// * no predecessor outside the loop at all (the header is the entry block,
+///   or the loop is endless);
+/// * a `Switch` case or default reaching the header.  `split_fma_entry_edge`
+///   rewrites two-arm and one-arm branch terminators only, so a switch edge
+///   cannot be carved out: appending the broadcast to the switch block would
+///   run it on every arm, and skipping it would leave the carrier register
+///   stale on that path;
+/// * an `IndirectBranch` whose possible-target set contains the header -- same
+///   reason, plus the target set need not be exact.
+///
+/// Callers must treat `None` as "refuse the transform".  For the FMA carrier
+/// (see `fma_broadcast_entry_edges`) refusing costs the hoisted form and
+/// nothing else: a loop that keeps its scalar body is slow, never wrong.
+fn header_entry_edges(
+    func: &IrFunction,
+    loop_blocks: &FxHashSet<usize>,
+    header_idx: usize,
+) -> Option<Vec<(usize, bool)>> {
+    let header_label = func.blocks[header_idx].label;
+    let mut edges: Vec<(usize, bool)> = Vec::new();
+    for (idx, block) in func.blocks.iter().enumerate() {
+        if loop_blocks.contains(&idx) {
+            continue;
+        }
+        match &block.terminator {
+            Terminator::Branch(label) if *label == header_label => edges.push((idx, false)),
+            Terminator::CondBranch {
+                true_label,
+                false_label,
+                ..
+            } if *true_label == header_label || *false_label == header_label => {
+                edges.push((idx, true))
+            }
+            // A way into the header this pass cannot isolate.  Refuse the
+            // whole loop rather than the one edge: a partially re-established
+            // carrier is exactly the stale-%ymm1 miscompile the entry edges
+            // exist to prevent.  (`_ => {}` below is then genuinely only
+            // "this branch does not enter the header".)
+            Terminator::Switch { cases, default, .. } => {
+                if *default == header_label || cases.iter().any(|(_, l)| *l == header_label) {
+                    return None;
+                }
+            }
+            Terminator::IndirectBranch {
+                possible_targets, ..
+            } => {
+                if possible_targets.contains(&header_label) {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    (!edges.is_empty()).then_some(edges)
+}
+
+/// Split the entry edge `pred -> header` off into a fresh block and return its
+/// index.  The new block is `[rematerialised A chain]; BroadcastLoadF64;
+/// Branch(header)`, so the broadcast runs once per entry into the loop instead
+/// of once per iteration of `pred`.
+///
+/// The header's phis are relabelled from `pred`'s label onto the new block:
+/// the predecessor edge they describe is now the new block's, and a stale
+/// incoming label would make phi elimination drop the entry copy -- the same
+/// failure mode `insert_remainder_loop`'s exit-phi retarget guards against.
+fn split_fma_entry_edge(
+    func: &mut IrFunction,
+    pred_idx: usize,
+    header_idx: usize,
+    next_label: &mut u32,
+) -> usize {
+    let header_label = func.blocks[header_idx].label;
+    let pred_label = func.blocks[pred_idx].label;
+    // Never trust the cursor alone (see the "Defensive: never trust
+    // func.next_label" note in both transforms): allocating below an existing
+    // label duplicates it and corrupts the CFG.
+    let max_present_label = func.blocks.iter().map(|b| b.label.0).max().unwrap_or(0);
+    *next_label = (*next_label).max(max_present_label + 1);
+    let new_label = BlockId(*next_label);
+    *next_label += 1;
+    match &mut func.blocks[pred_idx].terminator {
+        Terminator::CondBranch {
+            true_label,
+            false_label,
+            ..
+        } => {
+            if *true_label == header_label {
+                *true_label = new_label;
+            }
+            if *false_label == header_label {
+                *false_label = new_label;
+            }
+        }
+        Terminator::Branch(label) => *label = new_label,
+        _ => {}
+    }
+    for inst in &mut func.blocks[header_idx].instructions {
+        if let Instruction::Phi { incoming, .. } = inst {
+            for (_, label) in incoming.iter_mut() {
+                if *label == pred_label {
+                    *label = new_label;
+                }
+            }
+        }
+    }
+    func.blocks.push(BasicBlock {
+        label: new_label,
+        instructions: Vec::new(),
+        terminator: Terminator::Branch(header_label),
+        source_spans: vec![],
+    });
+    func.blocks.len() - 1
+}
+
+/// Materialise the hoisted `BroadcastLoadF64` for `pattern` on EVERY entry
+/// edge of its loop (see `fma_broadcast_entry_edges`), splitting conditional
+/// entry edges as needed.  Returns `false` when no isolatable entry edge
+/// exists -- the entry gates refuse the transform in that case, so the caller
+/// treats `false` as "must not emit hoisted FMAs".
+///
+/// `pattern.a_ptr` may be defined INSIDE the loop (an in-loop GEP over outer
+/// IVs); naming it from the entry block would be a use-before-def the
+/// verifier rejects.  Rematerialise its pure chain above the broadcast: the
+/// entry gate proved a plan exists, and the steps between the gate and here
+/// only ADD pure nodes to that chain.
+fn hoist_fma_a_broadcast(
+    func: &mut IrFunction,
+    pattern: &VectorizablePattern,
+    entry_edges: &[(usize, bool)],
+    next_val_id: &mut u32,
+    next_label: &mut u32,
+    debug: bool,
+) {
+    for &(pred_idx, needs_split) in entry_edges {
+        let site = if needs_split {
+            split_fma_entry_edge(func, pred_idx, pattern.header_idx, next_label)
+        } else {
+            pred_idx
+        };
+        let bc_plan = plan_remainder_reference(func, pattern.a_ptr, &pattern.loop_blocks)
+            .expect("fma broadcast hoist lost its dominance plan");
+        let mut hoist_prefix = Vec::new();
+        let bc_ptr = materialize_remainder_reference(bc_plan, &mut hoist_prefix, next_val_id);
+        func.blocks[site].instructions.extend(hoist_prefix);
+        func.blocks[site].instructions.push(Instruction::Intrinsic {
+            dest: None,
+            op: IntrinsicOp::BroadcastLoadF64,
+            dest_ptr: None,
+            args: vec![Operand::Value(bc_ptr)],
+        });
+        if debug {
+            eprintln!(
+                "[VEC]   Hoisted BroadcastLoadF64 for A ptr Value({}) into entry block {} ({})",
+                bc_ptr.0,
+                site,
+                if needs_split {
+                    "split entry edge"
+                } else {
+                    "preheader"
+                }
+            );
+        }
+    }
+}
+
+/// ZERO-REM-2: the FMA scalar remainder is provably dead, so
+/// `insert_remainder_loop` omits it (and the four blocks that carry it).
+///
+/// The quad (16 doubles per iteration) packed loop covers
+/// `floor(N / 16) * 16` elements; when the trip count is a compile-time
+/// constant that the width divides exactly, the remainder would run zero
+/// iterations.  What the omission SAVES is not just the loop: the remainder
+/// costs the resume math, re-materialised stream bases, three live pointers,
+/// a scalar body that keeps the FMA unit's operands live across the packed
+/// loop, and the callee-saved pushes and stack spills that holding them
+/// costs.  Measured on the k-unrolled chain shapes, it is most of the
+/// function's frame.
+///
+/// The three conjuncts after the width/unit checks are the proof's other
+/// halves: `const_trip_covers_exactly` gives the element-count arithmetic
+/// (`limit` is an element count in the pattern -- the transform byte-morphs
+/// the IV afterwards), `fma_iv_starts_at_zero` fixes the start, and
+/// `fma_loop_is_closed` guarantees no exit path needed the remainder's
+/// re-materialisations.  `no_map_zero_rem()` (`CCC_NO_MAP_ZERO_REM=1`) is the
+/// kill switch, shared with the map vectorizer's ZERO-REM-1.
+fn fma_remainder_is_dead(
+    func: &IrFunction,
+    pattern: &VectorizablePattern,
+    vec_width: usize,
+) -> bool {
+    vec_width == 16
+        && !no_map_zero_rem()
+        && const_trip_covers_exactly(&pattern.limit, 0, 16, 8)
+        && fma_iv_starts_at_zero(func, pattern)
+        && fma_loop_is_closed(func, pattern)
+}
+
 /// Extract base pointers for C and B arrays from the pattern's GEP values.
 /// Returns (c_base, a_ptr, b_base) for use in remainder loop.
 /// Pre-mutation gate for the FMA transforms: every value their scalar
 /// remainder references (C base, B base, broadcast A pointer) must have a
-/// dominance-sound plan. See `plan_remainder_reference`.
+/// dominance-sound plan (see `plan_remainder_reference`), AND the loop's
+/// chained exit phis must be relabellable (see `fma_exit_phis_loop_invariant`,
+/// whose check is what makes `insert_remainder_loop`'s phi retarget sound).
 fn fma_remainder_references_sound(func: &IrFunction, pattern: &VectorizablePattern) -> bool {
     let (c_base, a_ptr, b_base) = extract_base_pointers(func, pattern);
-    plan_remainder_reference(func, c_base, &pattern.loop_blocks).is_some()
+    fma_exit_phis_loop_invariant(func, pattern)
+        && plan_remainder_reference(func, c_base, &pattern.loop_blocks).is_some()
         && plan_remainder_reference(func, a_ptr, &pattern.loop_blocks).is_some()
         && plan_remainder_reference(func, b_base, &pattern.loop_blocks).is_some()
 }
@@ -16920,6 +17304,18 @@ fn insert_remainder_loop(
     next_label: &mut u32,
 ) -> usize {
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
+
+    // ZERO-REM-2: constant trip count the packed loop covers exactly -- the
+    // scalar remainder cannot iterate, so omit it (and the four blocks that
+    // carry it).  Returning BEFORE any mutation is what keeps this sound:
+    // the vectorized header keeps its ORIGINAL exit edge, so the exit block
+    // phis of a chained loop stay valid without relabelling.
+    if fma_remainder_is_dead(func, pattern, vec_width) {
+        if debug {
+            eprintln!("[VEC] Remainder omitted: constant trip count divides {vec_width} exactly");
+        }
+        return 0;
+    }
 
     // Extract base pointers for arrays
     let (c_base, a_ptr, b_base) = extract_base_pointers(func, pattern);
@@ -17012,6 +17408,40 @@ fn insert_remainder_loop(
             );
         }
         *false_label = vec_exit_label;
+    }
+
+    // Step 1b: retarget the chained exit phis.  After a k-unroll the exit
+    // block of this j-loop is the HEADER of the next j-loop, whose IV phi
+    // carries the `j = 0` copy for the next loop on the edge that leaves this
+    // one.  That edge now comes from the remainder header (the header's own
+    // exit was just redirected to vec_exit), so every incoming label that
+    // used to name a block of THIS loop must be relabelled to the remainder
+    // header.  Without it the phi has no incoming for its actual predecessor
+    // and phi elimination drops the copy: the next j-loop starts from an
+    // uninitialised register (observed as a whole-row offset in the result).
+    // Soundness: `fma_exit_phis_loop_invariant` (pre-mutation, part of
+    // `fma_remainder_references_sound`) proved every such incoming operand is
+    // NOT loop-defined, so it is available on the remainder path, and that
+    // each phi has at most one such incoming.
+    {
+        let loop_labels = fma_loop_labels(func, pattern);
+        let mut retargeted = 0usize;
+        for inst in &mut func.blocks[pattern.exit_idx].instructions {
+            if let Instruction::Phi { incoming, .. } = inst {
+                for (_, label) in incoming.iter_mut() {
+                    if loop_labels.contains(label) {
+                        *label = remainder_header_label;
+                        retargeted += 1;
+                    }
+                }
+            }
+        }
+        if debug && retargeted > 0 {
+            eprintln!(
+                "[VEC]   Retargeted {} chained exit-phi incoming edge(s) to the remainder header",
+                retargeted
+            );
+        }
     }
 
     // Step 2: Create vec_exit block.
@@ -17219,23 +17649,22 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
 
     // DOMINANCE PRECONDITION -- before any IR is touched: the scalar
     // remainder must be able to reference every base with a dominating
-    // definition (see fma_remainder_references_sound).
+    // definition (see fma_remainder_references_sound), and the hoisted form's
+    // entry edge must be isolatable so the A broadcast can be re-established
+    // in the fixed %ymm1 carrier on every way into the loop (see
+    // fma_broadcast_entry_edges).
     if !fma_remainder_references_sound(func, pattern) {
         if debug {
             eprintln!("[VEC] remainder references not dominance-safe; skipping loop");
         }
         return 0;
     }
-
-    // DOMINANCE PRECONDITION -- before any IR is touched: the scalar
-    // remainder must be able to reference every base with a dominating
-    // definition (see fma_remainder_references_sound).
-    if !fma_remainder_references_sound(func, pattern) {
+    let Some(entry_edges) = fma_broadcast_entry_edges(func, pattern) else {
         if debug {
-            eprintln!("[VEC] remainder references not dominance-safe; skipping loop");
+            eprintln!("[VEC] no isolatable entry edge for the A broadcast; skipping loop");
         }
         return 0;
-    }
+    };
 
     // Keep track of the next available Value and BlockId
     let mut next_val_id = func.next_value_id;
@@ -17758,29 +18187,20 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
     // The `fma_remainder_references_sound` gate at function entry already
     // proved a plan exists (steps 1-2 only ADD pure nodes to the chain), so
     // `expect` documents an unreachable path rather than a real choice.
-    if let Some(preheader_idx) = func.blocks.iter().enumerate().find_map(|(idx, block)| {
-        if pattern.loop_blocks.contains(&idx) {
-            return None;
-        }
-        matches!(block.terminator, Terminator::Branch(label)
-            if label == func.blocks[pattern.header_idx].label)
-        .then_some(idx)
-    }) {
-        let bc_plan = plan_remainder_reference(func, pattern.a_ptr, &pattern.loop_blocks)
-            .expect("fma broadcast hoist lost its dominance plan");
-        let mut hoist_prefix = Vec::new();
-        let bc_ptr = materialize_remainder_reference(bc_plan, &mut hoist_prefix, &mut next_val_id);
-        func.blocks[preheader_idx].instructions.extend(hoist_prefix);
-        func.blocks[preheader_idx]
-            .instructions
-            .push(Instruction::Intrinsic {
-                dest: None,
-                op: IntrinsicOp::BroadcastLoadF64,
-                dest_ptr: None,
-                args: vec![Operand::Value(bc_ptr)],
-            });
-        changes += 1;
-    }
+    // Hand the ALREADY VALIDATED edges to the hoister: it takes them as a
+    // parameter, so the "no isolatable entry edge" case cannot be lost between
+    // the gate and the mutation (the previous signature re-derived them
+    // internally and every call site had to keep a second, textual copy of the
+    // refusal).
+    hoist_fma_a_broadcast(
+        func,
+        pattern,
+        &entry_edges,
+        &mut next_val_id,
+        &mut next_label,
+        debug,
+    );
+    changes += 1;
 
     // Step 3: Replace the body accumulation with a hoisted FmaF64x2.
     {
@@ -17849,23 +18269,22 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
 
     // DOMINANCE PRECONDITION -- before any IR is touched: the scalar
     // remainder must be able to reference every base with a dominating
-    // definition (see fma_remainder_references_sound).
+    // definition (see fma_remainder_references_sound), and the hoisted form's
+    // entry edge must be isolatable so the A broadcast can be re-established
+    // in the fixed %ymm1 carrier on every way into the loop (see
+    // fma_broadcast_entry_edges).
     if !fma_remainder_references_sound(func, pattern) {
         if debug {
             eprintln!("[VEC] remainder references not dominance-safe; skipping loop");
         }
         return 0;
     }
-
-    // DOMINANCE PRECONDITION -- before any IR is touched: the scalar
-    // remainder must be able to reference every base with a dominating
-    // definition (see fma_remainder_references_sound).
-    if !fma_remainder_references_sound(func, pattern) {
+    let Some(entry_edges) = fma_broadcast_entry_edges(func, pattern) else {
         if debug {
-            eprintln!("[VEC] remainder references not dominance-safe; skipping loop");
+            eprintln!("[VEC] no isolatable entry edge for the A broadcast; skipping loop");
         }
         return 0;
-    }
+    };
 
     // Keep track of the next available Value and BlockId
     let mut next_val_id = func.next_value_id;
@@ -18391,35 +18810,20 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
     // `pattern.a_ptr` may be defined INSIDE the loop (see the f64x2 hoist
     // above); rematerialize its pure chain above the broadcast. The entry
     // gate already proved a plan exists, so `expect` is unreachable.
-    if let Some(preheader_idx) = func.blocks.iter().enumerate().find_map(|(idx, block)| {
-        if pattern.loop_blocks.contains(&idx) {
-            return None;
-        }
-        matches!(block.terminator, Terminator::Branch(label)
-            if label == func.blocks[pattern.header_idx].label)
-        .then_some(idx)
-    }) {
-        let bc_plan = plan_remainder_reference(func, pattern.a_ptr, &pattern.loop_blocks)
-            .expect("fma broadcast hoist lost its dominance plan");
-        let mut hoist_prefix = Vec::new();
-        let bc_ptr = materialize_remainder_reference(bc_plan, &mut hoist_prefix, &mut next_val_id);
-        func.blocks[preheader_idx].instructions.extend(hoist_prefix);
-        func.blocks[preheader_idx]
-            .instructions
-            .push(Instruction::Intrinsic {
-                dest: None,
-                op: IntrinsicOp::BroadcastLoadF64,
-                dest_ptr: None,
-                args: vec![Operand::Value(bc_ptr)],
-            });
-        changes += 1;
-        if debug {
-            eprintln!(
-                "[VEC]   Hoisted BroadcastLoadF64 for A ptr Value({}) into preheader block {}",
-                bc_ptr.0, preheader_idx
-            );
-        }
-    }
+    // Hand the ALREADY VALIDATED edges to the hoister: it takes them as a
+    // parameter, so the "no isolatable entry edge" case cannot be lost between
+    // the gate and the mutation (the previous signature re-derived them
+    // internally and every call site had to keep a second, textual copy of the
+    // refusal).
+    hoist_fma_a_broadcast(
+        func,
+        pattern,
+        &entry_edges,
+        &mut next_val_id,
+        &mut next_label,
+        debug,
+    );
+    changes += 1;
 
     // Step 3: Replace the body with FOUR FmaF64x4HoistedSIB (SIB + hoisted broadcast).
     // This is the optimal form: SIB eliminates GEP leaq/movq overhead, hoisted
@@ -28087,5 +28491,144 @@ mod no_remainder_tests {
         // 268435455; 268435452 % 4 == 0 is the largest divisible trip).
         assert!(const_trip_covers_exactly(&c32(268435452), 0, 4, 8));
         assert!(!const_trip_covers_exactly(&c32(268435456), 0, 4, 8));
+    }
+}
+
+#[cfg(test)]
+mod entry_edge_tests {
+    use super::*;
+    use crate::common::types::IrType as Ty;
+    use crate::ir::reexports::{BasicBlock, BlockId, Terminator};
+
+    fn blk(label: u32, term: Terminator) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(label),
+            instructions: Vec::new(),
+            terminator: term,
+            source_spans: Vec::new(),
+        }
+    }
+
+    /// A function whose block 1 is the (empty) loop header and whose other
+    /// blocks are described by `others`.  The loop body is just the header.
+    fn f_with(others: Vec<BasicBlock>) -> IrFunction {
+        let mut f = IrFunction::new("edge".into(), Ty::I32, vec![], false);
+        f.blocks.push(blk(0, Terminator::Branch(BlockId(1))));
+        f.blocks.push(blk(1, Terminator::Branch(BlockId(9)))); // header, loop body = {1}
+        f.blocks.extend(others);
+        f
+    }
+
+    fn loop_blocks_of(_f: &IrFunction) -> FxHashSet<usize> {
+        let mut s = FxHashSet::default();
+        s.insert(1);
+        s
+    }
+
+    fn edges_of(f: &IrFunction) -> Option<Vec<(usize, bool)>> {
+        header_entry_edges(f, &loop_blocks_of(f), 1)
+    }
+
+    #[test]
+    fn plain_branch_entry_needs_no_split() {
+        // Block 0 branches into the header unconditionally: one edge, no split.
+        let f = f_with(vec![]);
+        assert_eq!(edges_of(&f), Some(vec![(0, false)]));
+    }
+
+    #[test]
+    fn conditional_entry_is_marked_for_splitting() {
+        // A diamond whose false arm enters the loop: the edge must be carved
+        // out, or the re-established carrier would run on the other arm too.
+        let f = f_with(vec![blk(
+            2,
+            Terminator::CondBranch {
+                cond: Operand::Const(IrConst::I32(1)),
+                true_label: BlockId(3),
+                false_label: BlockId(1),
+            },
+        )]);
+        assert_eq!(edges_of(&f), Some(vec![(0, false), (2, true)]));
+    }
+
+    #[test]
+    fn unrelated_switch_does_not_refuse() {
+        // A switch that never enters the header is just another block; it must
+        // not cost the loop its vectorisation.
+        let cases = vec![(0i64, BlockId(4)), (1, BlockId(5))];
+        let f = f_with(vec![blk(
+            2,
+            Terminator::Switch {
+                val: Operand::Const(IrConst::I32(0)),
+                cases,
+                default: BlockId(4),
+                ty: Ty::I32,
+            },
+        )]);
+        assert_eq!(edges_of(&f), Some(vec![(0, false)]));
+    }
+
+    #[test]
+    fn switch_case_into_the_header_refuses() {
+        let cases = vec![(0i64, BlockId(1)), (1, BlockId(5))];
+        let f = f_with(vec![blk(
+            2,
+            Terminator::Switch {
+                val: Operand::Const(IrConst::I32(0)),
+                cases,
+                default: BlockId(5),
+                ty: Ty::I32,
+            },
+        )]);
+        assert_eq!(edges_of(&f), None, "a switch-case entry cannot be isolated");
+    }
+
+    #[test]
+    fn switch_default_into_the_header_refuses() {
+        let cases = vec![(0i64, BlockId(3)), (1, BlockId(5))];
+        let f = f_with(vec![blk(
+            2,
+            Terminator::Switch {
+                val: Operand::Const(IrConst::I32(0)),
+                cases,
+                default: BlockId(1),
+                ty: Ty::I32,
+            },
+        )]);
+        assert_eq!(
+            edges_of(&f),
+            None,
+            "a switch-default entry cannot be isolated"
+        );
+    }
+
+    #[test]
+    fn indirect_branch_into_the_header_refuses() {
+        let f = f_with(vec![blk(
+            2,
+            Terminator::IndirectBranch {
+                target: Operand::Const(IrConst::I32(0)),
+                possible_targets: vec![BlockId(1), BlockId(3)],
+            },
+        )]);
+        assert_eq!(
+            edges_of(&f),
+            None,
+            "a computed-jump entry cannot be isolated"
+        );
+    }
+
+    #[test]
+    fn no_entry_edge_refuses() {
+        // Header is the entry block itself: there is no outside predecessor to
+        // establish the carrier in.  The loop set must contain the header for
+        // this to be that shape -- otherwise the header's own branch is an
+        // outside predecessor (a self-loop at block 0 is still a loop whose
+        // entry edge is block 0's branch).
+        let mut f = IrFunction::new("edge".into(), Ty::I32, vec![], false);
+        f.blocks.push(blk(0, Terminator::Branch(BlockId(0))));
+        let mut loop_blocks = FxHashSet::default();
+        loop_blocks.insert(0);
+        assert_eq!(header_entry_edges(&f, &loop_blocks, 0), None);
     }
 }

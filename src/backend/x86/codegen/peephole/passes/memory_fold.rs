@@ -23,7 +23,8 @@ use super::helpers::{
     implicit_read_reg_family, is_read_modify_write, is_rsp_shift_line, src_mentions_family,
     writes_family,
 };
-use super::liveness::call_window_verdict;
+use super::liveness::{FileLiveness, call_window_verdict};
+use super::relay_and_lea::{LazyDeadness, split_two_operands};
 
 /// True when a line transfers control or merges paths, so that textual line
 /// order can diverge from execution order.  A load-value reader textually
@@ -4330,4 +4331,409 @@ mod movslq_relay_call_tests {
         assert!(changed, "{out:?}");
         assert_eq!(out[0], "movslq %eax, %rdi");
     }
+}
+
+// ── Memory read-modify-write coalescing ─────────────────────────────────────
+
+/// Fold a load / increment / store-back of the SAME address into one
+/// read-modify-write ALU op:
+///
+/// ```text
+///   movq (%r9), %r13          movq (%r9), %rax
+///   leaq 1(%r13), %rax   →    addq $1, (%r9)
+///   movq %rax, (%r9)
+/// ```
+///
+/// Why it matters: `bins[bytes[i]]++` -- the histogram shape, and the same
+/// shape in any parser/compressor table update -- emitted six instructions per
+/// element (load, lea/add, store) where GCC emits one `addq $1,(mem)` on top of
+/// its load.  Measured on tests/benchmark/programs/histogram.c with Callgrind
+/// at `-O2 -march=x86-64-v3`: lccc 4,179,149 Ir against GCC's 1,667,758 before
+/// this fold.
+///
+/// Soundness (all of these are checked, in this order):
+///
+/// * the three lines are CONSECUTIVE real lines -- only nop padding may sit
+///   between them -- so nothing can write the address, change a register used
+///   in it, or consume the loaded value in between;
+/// * the load and the store name the SAME memory operand TEXT, so both address
+///   the same location;
+/// * the register the increment writes must not appear in the memory operand
+///   (if it did, the store's address would be computed from the incremented
+///   value while the fused RMW computes it from the old one -- different
+///   address);
+/// * the width suffixes agree (`movl`... with `addl`, `movb` with `addb`, and
+///   `leaq` only for 64-bit moves), and the increment is a constant: the fused
+///   instruction has no room for a register addend;
+/// * every register family the three lines define (the loaded register and the
+///   increment's destination) is dead after the store: the rewrite deletes
+///   their definitions, so a later reader would otherwise observe the old
+///   value;
+/// * the flags are dead after the store: the removed trio was flag-neutral and
+///   `add` writes flags, so a later flag reader would see different flags.
+pub(super) fn fold_memory_rmw(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    use super::flag_peepholes::flags_dead_after;
+    use super::relay_and_lea::line_refs_family;
+
+    let len = store.len();
+    let mut dead = LazyDeadness::new();
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() || infos[i].pinned {
+            i += 1;
+            continue;
+        }
+        let li = infos[i].trimmed(store.get(i)).to_string();
+        let Some((mem_width, reg_width, mem, loaded_reg)) = parse_load_mem_to_reg(&li) else {
+            i += 1;
+            continue;
+        };
+        let loaded_fam = register_family_fast(loaded_reg);
+        if loaded_fam == REG_NONE || loaded_fam > REG_GP_MAX {
+            i += 1;
+            continue;
+        }
+        // The increment sits on the next real line.
+        let j = next_non_nop(infos, i + 1, len);
+        if j >= len || infos[j].is_barrier() {
+            i += 1;
+            continue;
+        }
+        let lj = infos[j].trimmed(store.get(j)).to_string();
+        let Some((value_reg, imm_text)) = parse_const_increment(&lj, reg_width, loaded_reg) else {
+            i += 1;
+            continue;
+        };
+        let value_fam = register_family_fast(value_reg);
+        if value_fam == REG_NONE || value_fam > REG_GP_MAX {
+            i += 1;
+            continue;
+        }
+        // The store-back is the line after that, to the identical address.
+        let k = next_non_nop(infos, j + 1, len);
+        if k >= len || infos[k].is_barrier() {
+            i += 1;
+            continue;
+        }
+        // The store may be reached directly or through ONE narrow copy, which
+        // is what the backend emits for a byte/word counter:
+        //
+        //     movzbl (%rdx), %r8d      <- load
+        //     addl   $1, %r8d          <- increment
+        //     movzbl %r8b, %r9d        <- narrow copy of the low byte
+        //     movb   %r9b, (%rdx)      <- store
+        //
+        // The copy is accepted only in the exact spelling of the value family
+        // at the memory width (`%r8b` for family 8 at width B): a WIDER read of
+        // the family (`movzwl %r8w, %r9d`) would drag the freshly incremented
+        // high bits into a value the fused `addb` never computes.  The copy's
+        // destination carries its own deadness obligation, because the fold
+        // deletes its definition too.
+        let lk = infos[k].trimmed(store.get(k)).to_string();
+        let mut owned_vec: Vec<usize> = vec![i, j, k];
+        // Family whose low `mem_width` bits hold exactly the value the fused
+        // `add` computes.
+        let mut store_fam = value_fam;
+        let mut store_idx = k;
+        let direct = parse_store_reg_to_mem(&lk)
+            .map(|(_, reg, _)| register_family_fast(reg) == value_fam)
+            .unwrap_or(false);
+        if !direct {
+            let Some(copy_fam) = parse_narrow_copy(&lk, mem_width) else {
+                i += 1;
+                continue;
+            };
+            if copy_fam != value_fam {
+                i += 1;
+                continue;
+            }
+            let k2 = next_non_nop(infos, k + 1, len);
+            if k2 >= len || infos[k2].is_barrier() {
+                i += 1;
+                continue;
+            }
+            let lk2 = infos[k2].trimmed(store.get(k2)).to_string();
+            let Some((w2, reg2, _)) = parse_store_reg_to_mem(&lk2) else {
+                i += 1;
+                continue;
+            };
+            if w2 != mem_width {
+                i += 1;
+                continue;
+            }
+            store_fam = register_family_fast(reg2);
+            if store_fam == REG_NONE || store_fam > REG_GP_MAX {
+                i += 1;
+                continue;
+            }
+            store_idx = k2;
+            owned_vec.push(k2);
+        }
+        // The store must name the load's MEMORY operand and write the load's
+        // MEMORY width -- that is the width the fused `add` produces.  The
+        // store's own register spelling is compared by FAMILY, not text: a byte
+        // store of the widened temporary names `%r8b` where the increment wrote
+        // `%r8d`.
+        let store_line = infos[store_idx].trimmed(store.get(store_idx)).to_string();
+        let Some((store_width, _stored_reg, mem2)) = parse_store_reg_to_mem(&store_line) else {
+            i += 1;
+            continue;
+        };
+        if store_width != mem_width || mem2 != mem {
+            i += 1;
+            continue;
+        }
+        let k = store_idx;
+        let owned = owned_vec.as_slice();
+        // No register whose value the fold CHANGES may participate in the
+        // address text: the values diverge between the load line and the store
+        // line, so a text-equal operand would denote two different addresses.
+        //
+        // * The INCREMENTED one: the fused form computes the address from the
+        //   pre-increment value, while the original computed the store's
+        //   address from the incremented one (`movq (%r9),%r9; leaq 1(%r9),%rax;
+        //   movq %rax,(%r9)` stores to a different slot than it loaded from --
+        //   fusing it would silently pick the load's address).
+        // * The LOADED one: a load that overwrites its own address register
+        //   (`movq (%rax),%rax`) leaves the third line's `(%rax)` naming a
+        //   DIFFERENT address than the first line's.  Text equality of the two
+        //   operands is therefore not sufficient on its own.
+        // * The narrow-copy destination, when there is one.
+        if line_refs_family(mem, value_fam)
+            || line_refs_family(mem, loaded_fam)
+            || (store_fam != value_fam && line_refs_family(mem, store_fam))
+        {
+            i += 1;
+            continue;
+        }
+        if !all_editable(infos, owned) {
+            i += 1;
+            continue;
+        }
+        // Every definition the fold deletes must be dead afterwards.  The
+        // shared oracle is used rather than a hand-rolled disjunction:
+        // `provably_dead_lv` is the audited union of CFG liveness and the two
+        // syntactic proofs, and it covers the case this pass needs most -- the
+        // loaded value is a dead temporary, but the ALLOCATOR may hand the same
+        // family to an unrelated temporary in a later block, which flat
+        // liveness reports as live and a text scan cannot resolve.
+        if !dead.dead_after(store, infos, k, loaded_fam, owned)
+            || !dead.dead_after(store, infos, k, value_fam, owned)
+        {
+            i += 1;
+            continue;
+        }
+        if store_fam != value_fam && !dead.dead_after(store, infos, k, store_fam, owned) {
+            i += 1;
+            continue;
+        }
+        if !flags_dead_after(store, infos, k + 1) {
+            i += 1;
+            continue;
+        }
+        let suffix = mem_width.mnemonic_suffix();
+        let new_line = format!("    add{} ${}, {}", suffix, imm_text, mem);
+        replace_line(store, &mut infos[k], k, new_line);
+        mark_nop(&mut infos[i]);
+        mark_nop(&mut infos[j]);
+        dead.invalidate(store, infos, k);
+        changed = true;
+        i = k + 1;
+    }
+    changed
+}
+
+/// Move width of a plain `mov` and the ALU mnemonic suffix it pairs with.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum RmwWidth {
+    Q,
+    L,
+    W,
+    B,
+}
+
+impl RmwWidth {
+    fn from_mov(mnemonic: &str) -> Option<Self> {
+        Some(match mnemonic {
+            "movq" => Self::Q,
+            "movl" => Self::L,
+            "movw" => Self::W,
+            "movb" => Self::B,
+            _ => return None,
+        })
+    }
+
+    fn mnemonic_suffix(self) -> char {
+        match self {
+            Self::Q => 'q',
+            Self::L => 'l',
+            Self::W => 'w',
+            Self::B => 'b',
+        }
+    }
+}
+
+/// Widths of a load mnemonic: `(memory width, register width)`.
+///
+/// The widening forms are accepted because the fused `add` only has to
+/// reproduce the value's LOW `memory width` bits: the store truncates to
+/// exactly those, and `add{b,w,l} $imm,MEM` wraps modulo the same power of two.
+/// Sign- and zero-extension agree on the low bits, so `movsbl` and `movzbl`
+/// are interchangeable here -- including against the STORE width, which is what
+/// selects the fused mnemonic.
+fn load_widths(mnemonic: &str) -> Option<(RmwWidth, RmwWidth)> {
+    use RmwWidth::*;
+    Some(match mnemonic {
+        "movb" => (B, B),
+        "movw" => (W, W),
+        "movl" => (L, L),
+        "movq" => (Q, Q),
+        "movzbl" | "movsbl" => (B, L),
+        "movzbq" | "movsbq" => (B, Q),
+        "movzbw" | "movsbw" => (B, W),
+        "movzwl" | "movswl" => (W, L),
+        "movzwq" | "movswq" => (W, Q),
+        "movslq" => (L, Q),
+        _ => return None,
+    })
+}
+
+/// `movzbl (%r9), %eax` -> `(B, L, "(%r9)", "%eax")`.  Memory-only source,
+/// plain register destination: a register-to-register widening moves no memory
+/// and is not this fold's business.
+fn parse_load_mem_to_reg(t: &str) -> Option<(RmwWidth, RmwWidth, &str, &str)> {
+    let sp = t.find(' ')?;
+    let (mnemonic, rest) = t.split_at(sp);
+    let (mem_width, reg_width) = load_widths(mnemonic)?;
+    let (src, dst) = split_two_operands(rest.trim_start())?;
+    if !src.contains('(') || !dst.starts_with('%') || dst.contains('(') {
+        return None;
+    }
+    Some((mem_width, reg_width, src, dst))
+}
+
+/// `movq %rax, (%r9)` -> `(Q, "%rax", "(%r9)")`.
+fn parse_store_reg_to_mem(t: &str) -> Option<(RmwWidth, &str, &str)> {
+    let sp = t.find(' ')?;
+    let (mnemonic, rest) = t.split_at(sp);
+    let width = RmwWidth::from_mov(mnemonic)?;
+    let (src, dst) = split_two_operands(rest.trim_start())?;
+    if !src.starts_with('%') || src.contains('(') || !dst.contains('(') {
+        return None;
+    }
+    Some((width, src, dst))
+}
+
+/// A constant increment of `reg` on a line, in one of the two forms the
+/// backend emits:
+///
+/// * `add{width} $IMM, %reg` -- in place, and
+/// * `lea{l,q} IMM(%reg), %dst` -- the register-width LEA form (there is no
+///   8/16-bit LEA).
+///
+/// Returns `(value_reg, immediate_text)`; the text is the source's own
+/// spelling (`1`, `0x1`, `-4`), re-emitted with a `$`.
+fn parse_const_increment<'a>(
+    t: &'a str,
+    width: RmwWidth,
+    reg: &'a str,
+) -> Option<(&'a str, &'a str)> {
+    let sp = t.find(' ')?;
+    let (mnemonic, rest) = t.split_at(sp);
+    let rest = rest.trim_start();
+    let want = format!("add{}", width.mnemonic_suffix());
+    if mnemonic == want {
+        let (imm, dst) = split_two_operands(rest)?;
+        let imm = imm.strip_prefix('$')?;
+        if dst != reg {
+            return None;
+        }
+        if parse_plain_imm(imm).is_none() {
+            return None;
+        }
+        return Some((reg, imm));
+    }
+    let lea_want = match width {
+        RmwWidth::L => "leal",
+        RmwWidth::Q => "leaq",
+        _ => return None,
+    };
+    if mnemonic == lea_want {
+        let (src, dst) = split_two_operands(rest)?;
+        let open = src.find('(')?;
+        let imm = &src[..open];
+        let inner = src.get(open + 1..src.len().checked_sub(1)?)?;
+        // Base-register-only addressing: an index term would mean the
+        // "increment" is not a constant add of this register.
+        if inner != reg {
+            return None;
+        }
+        if imm.is_empty() || parse_plain_imm(imm).is_none() {
+            return None;
+        }
+        if !dst.starts_with('%') || dst.contains('(') {
+            return None;
+        }
+        return Some((dst, imm));
+    }
+    None
+}
+
+/// Decimal or `0x` integer literal with an optional sign, in `i32` range --
+/// the width an x86 ALU immediate can carry.
+fn parse_plain_imm(s: &str) -> Option<i64> {
+    let (neg, body) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s),
+    };
+    let value = if let Some(hex) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+        i64::from_str_radix(hex, 16).ok()?
+    } else {
+        body.parse::<i64>().ok()?
+    };
+    let value = if neg { -value } else { value };
+    (i32::try_from(value).is_ok()).then_some(value)
+}
+
+/// `movzbl %r8b, %r9d` -> `Some(8)` for a copy of family 8's byte.  Only the
+/// exact spelling of the family at `mem_width` is accepted (see the call site):
+/// a wider read would drag the incremented high bits into the value the fused
+/// read-modify-write never sees.
+fn parse_narrow_copy(t: &str, mem_width: RmwWidth) -> Option<RegId> {
+    let (mnemonic, rest) = t.split_once(' ')?;
+    let (mem_w, _dst_w) = {
+        let mut found = None;
+        for m in [
+            "movzbl", "movzbq", "movzbw", "movzwl", "movzwq", "movslq", "movsbl", "movsbq",
+            "movsbw", "movswl", "movswq",
+        ] {
+            if mnemonic == m {
+                found = load_widths(m);
+                break;
+            }
+        }
+        found?
+    };
+    if mem_w != mem_width {
+        return None;
+    }
+    let (src, dst) = split_two_operands(rest.trim_start())?;
+    let fam = register_family_fast(src);
+    if fam == REG_NONE || fam > REG_GP_MAX {
+        return None;
+    }
+    let row = match mem_width {
+        RmwWidth::B => 3,
+        RmwWidth::W => 2,
+        RmwWidth::L => 1,
+        RmwWidth::Q => 0,
+    };
+    if src != REG_NAMES[row][fam as usize] {
+        return None;
+    }
+    if !dst.starts_with('%') || dst.contains('(') {
+        return None;
+    }
+    Some(fam)
 }

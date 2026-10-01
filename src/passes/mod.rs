@@ -1231,6 +1231,13 @@ pub(crate) fn run_passes(
     vectorize::set_no_map_i64_unroll(no_map_i64_unroll);
     vectorize::set_no_map_zero_rem(no_map_zero_rem);
     vectorize::set_no_bytecmp_vec(no_bytecmp_vec);
+    // The affine exit-compare fold's knobs, same rule as the byte-compare arm:
+    // resolved here (the ratchet in check_env_test_hygiene.sh excludes this
+    // file) and handed to the pass, never read per loop.
+    loop_rotate::set_affine_fold_knobs(
+        std::env::var_os("CCC_NO_AFFINE_EXIT_FOLD").is_none(),
+        std::env::var_os("CCC_DEBUG_AFFINE_FOLD").is_some(),
+    );
     // Linux's `.code16gcc` setup image has a hard 32 KiB code+data+BSS limit
     // and only six generally usable GPRs.  On the real linux-cachymod setup
     // corpus these four transformations increase final machine-code size by
@@ -2060,6 +2067,29 @@ pub(crate) fn run_passes(
             let n = timed_pass!(
                 "loop_rotate",
                 run_on_visited(module, &dirty, &mut changed, loop_rotate::run_function)
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        // Phase 2b-affold: the affine exit-compare fold — iter 0, immediately
+        // AFTER rotation so a rotated latch's cloned compare is folded too, and
+        // after iv_widen so the phi it reasons about is pointer-width where
+        // that mattered.  Unlike rotation this is DEFAULT-ON at -O2+ and on the
+        // size pipelines: it needs no CFG surgery (it is a value equivalence)
+        // and it is the only way the fold reaches the inner loop of a nest,
+        // which is where every filter kernel's hot loop lives.  Kill switch
+        // `CCC_NO_AFFINE_EXIT_FOLD`; report `CCC_DEBUG_AFFINE_FOLD`.
+        if iter == 0 && (opt_level >= 2 || optimize_for_size) && !pass_disabled(&disabled, "affold")
+        {
+            let n = timed_pass!(
+                "affold",
+                run_on_visited(
+                    module,
+                    &dirty,
+                    &mut changed,
+                    loop_rotate::fold_affine_exit_compares
+                )
             );
             total_changes += n;
             total_changes_excl_dce += n;
