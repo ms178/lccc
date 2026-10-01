@@ -7,9 +7,11 @@ all three are losses on the machine.
 
 ## The shape that motivated the work
 
-`benchmark/programs/nbody.c`, built with `-O2 -march=x86-64-v3 -DSTEPS=2000`.
-The inner loop walks `bodies[j]` and `bodies[k]` where `bodies` is a static
-array and the byte offset is `index * 56`.  IVSR's derived-expression finder
+`tests/benchmark/programs/nbody.c`, built with `-O2 -march=x86-64-v3 -DSTEPS=2000`.
+The inner pair loop walks `bodies[i]` and `bodies[j]` (the two C-level loop
+variables of `advance`; the IR renumbers them after inlining, so the sections
+below name the C variables and quote IR block labels where it matters) where
+`bodies` is a static array and the byte offset is `index * 56`.  IVSR's derived-expression finder
 does locate those multiplies (`[IVSR]` reports `derived=1` for both loops), and
 yet the multiply survives into the emitted loop.
 
@@ -68,10 +70,32 @@ The pointer form is the right shape -- it is what GCC emits (`addq $56, %rax`
 with `disp(%rax)` accesses) -- and it does shrink the hot loop from 45 to 42
 instructions with the multiply gone entirely.  It loses anyway, because the seed
 for a nested loop's pointer is computed in the *enclosing* loop body: the
-k-loop's start address depends on `j`, so `(j+1) * 56 + bodies` is materialized
-once per j-iteration where the old code recomputed it inside the k-loop.  The
-k-loop saves 2 instructions per k-iteration, the j-loop body grows by 3 per
-j-iteration, and the measured total rises 1.9 %.
+inner loop's start address depends on `i`, so `(i+1) * 56 + bodies` is
+materialized once per `i`-iteration where the old code recomputed it inside the
+inner loop, and the new pointer is live across the whole nest.
+
+The cost decomposition is measured, not modelled, because the two obvious
+per-iteration guesses do not reconcile with the counters.  For
+`NBODIES = 5`, `STEPS = 2000` the inner pair loop runs
+`C(5,2) * 2000 = 20 000` iterations while the `i`-loop runs `5 * 2000 = 10 000`
+(8 000 of which enter the inner loop).  A "saves 2 per inner iteration, adds 3
+per outer iteration" reading would predict a *net win* of roughly 10 000-16 000
+instructions; the instruments measure the opposite sign, so that reading was
+wrong and is replaced here by the dump-attributed delta:
+
+| region (callgrind, `--dump-instr=yes`) | baseline | pointer form | delta |
+| --- | --- | --- | --- |
+| `main` (caller loops) | 1 100 994 | 1 108 990 | **+7 996** = +4 per step, −4 |
+| everything outside `main` (`advance`, the hot nest) | 151 508 | 163 508 | **+12 000** = +6 per step |
+| total | 1 252 502 | 1 272 498 | +19 996 (+1.60 %) |
+
+qemu agrees on sign and size (+21 995, +1.94 %).  So the regression is *not*
+mostly in the hot loop at all: two thirds of it is +6 instructions per step
+inside `advance`, i.e. work attached to entering and leaving the nest rather
+than to the 20 000 inner iterations that the transform was supposed to make
+cheaper.  That is the accurate statement of why the pointer form loses, and it
+is the one to trust; the earlier per-iteration sentence counted instructions in
+the wrong regions.
 
 ## Consequences for the pass
 

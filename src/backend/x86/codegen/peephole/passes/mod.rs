@@ -431,12 +431,27 @@ pub(crate) fn peephole_optimize_with_config(asm: String, ra_config: &RaConfig) -
 /// post-Phase-1 orphan sweeps: every global fold (copy propagation's consumer
 /// retargets, the relay/memory folds, stack-slot DSE, trampoline removal)
 /// orphans staging copies whose value became dead, and Phase 1's
-/// `eliminate_dead_pure_writes` never runs again afterwards.
+/// `eliminate_dead_pure_writes`/`eliminate_dead_flag_writes` never run again afterwards.
 /// `CCC_PEEPHOLE_SKIP=dead_pure_writes` disables every site (Phase 1 and
 /// these sweeps alike).
-fn retire_dead_pure_writes(store: &LineStore, infos: &mut [LineInfo]) -> bool {
+fn retire_dead_pure_writes(
+    store: &LineStore,
+    infos: &mut [LineInfo],
+    flag_writes_enabled: bool,
+) -> bool {
     let mut any = false;
-    while dead_writes::eliminate_dead_pure_writes(store, infos) {
+    loop {
+        // Joint fixpoint, not two independent ones: retiring a dead
+        // flag-writing arithmetic (`shlq $2, %r13`) is what makes the pure
+        // write that fed it (`movl %r10d, %r13d`) provably dead, so each pass
+        // exposes work for the other.  `flag_writes_enabled` comes from the
+        // once-parsed `CCC_PEEPHOLE_SKIP` set (`dead_flag_writes`), keeping the
+        // pass itself free of per-call environment reads.
+        let pure = dead_writes::eliminate_dead_pure_writes(store, infos);
+        let flagged = flag_writes_enabled && dead_writes::eliminate_dead_flag_writes(store, infos);
+        if !pure && !flagged {
+            break;
+        }
         any = true;
     }
     any
@@ -1150,6 +1165,13 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
                 changed |= c;
             }
         }
+        if !sk("dead_flag_writes") {
+            {
+                let c = dead_writes::eliminate_dead_flag_writes(&store, &mut infos);
+                trace("eliminate_dead_flag_writes", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
         if !sk("load_test_cmp") {
             {
                 let c = dead_writes::fold_load_test_into_cmp(&mut store, &mut infos);
@@ -1470,7 +1492,7 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
         // round — the comment at `copy_fold` promised this retirement and the
         // only instrument that can prove it (`FileLiveness`) sat in Phase 1.
         if !sk("dead_pure_writes") {
-            global_changed |= retire_dead_pure_writes(&store, &mut infos);
+            global_changed |= retire_dead_pure_writes(&store, &mut infos, !sk("dead_flag_writes"));
         }
         global_changed
     };
@@ -1597,7 +1619,7 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
             // writes; retiring them lets the next iteration see the cleaner
             // code (and the while-changed loop then converges).
             if !sk("dead_pure_writes") {
-                changed2 |= retire_dead_pure_writes(&store, &mut infos);
+                changed2 |= retire_dead_pure_writes(&store, &mut infos, !sk("dead_flag_writes"));
             }
             pass_count2 += 1;
         }
@@ -1664,7 +1686,7 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
             changed3 |= local_patterns::collapse_increment_chain(&mut store, &mut infos);
             // Orphan retirement inside the fixpoint (see phase 3).
             if !sk("dead_pure_writes") {
-                changed3 |= retire_dead_pure_writes(&store, &mut infos);
+                changed3 |= retire_dead_pure_writes(&store, &mut infos, !sk("dead_flag_writes"));
             }
             pass_count3 += 1;
         }
@@ -1741,7 +1763,7 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
     // the pipeline's terminal invariant: no provably-dead GP pure write
     // leaves the peephole.
     if !sk("dead_pure_writes") {
-        let _ = retire_dead_pure_writes(&store, &mut infos);
+        let _ = retire_dead_pure_writes(&store, &mut infos, !sk("dead_flag_writes"));
     }
 
     // Phase 9: Re-run the always-on text passes on the FINAL text. The early

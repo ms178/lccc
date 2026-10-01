@@ -362,7 +362,29 @@ fn cc_suffix(cc: CondCode) -> &'static str {
 }
 
 /// Emit a single allocated MachInst as AT&T assembly text.
+///
+/// Uses the active tuning row and the process-wide knobs; the
+/// (row, knob)-explicit form is [`emit_machinst_with_tune`].
 pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
+    emit_machinst_with_tune(
+        inst,
+        out,
+        &crate::backend::x86::cpu_model::active(),
+        crate::backend::x86::cpu_model::div64_bypass_killed(),
+    );
+}
+
+/// [`emit_machinst`] with the tuning row and the `CCC_NO_DIV64_BYPASS` kill
+/// switch passed in: the codegen decision is a function of its inputs, so it
+/// can be unit-tested on any row without mutating process-global state.
+pub fn emit_machinst_with_tune(
+    inst: &MachInst,
+    out: &mut AsmOutput,
+    tune: &crate::backend::x86::cpu_model::X86Tune,
+    div64_bypass_killed: bool,
+) {
+    let bypass_div64 =
+        crate::backend::x86::cpu_model::bypass_div64_enabled_for(tune, div64_bypass_killed);
     match inst {
         MachInst::Mov { src, dst, size } => {
             // Skip self-moves (same register or same stack slot)
@@ -881,7 +903,42 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
             let mnem = if *signed { "idiv" } else { "div" };
             let suffix = size.suffix();
             let div_str = fmt_operand(divisor, *size, out);
-            out.emit_fmt(format_args!("    {}{} {}", mnem, suffix, div_str));
+            if *size == OpSize::S64 && bypass_div64 {
+                // 64-bit divide width bypass (see `X86Tune::bypass_div64` and
+                // `alu.rs::emit_div64`).  The preceding `XorRdx`/`Cqto` set up
+                // %rdx for the full-width divide; the fast path may clobber it
+                // (the slow path redoes it), so the guard needs no free
+                // register beyond %rdx, which the divide defines anyway:
+                //     movq %rax,%rdx; orq <div>,%rdx; shrq $32,%rdx
+                //     jnz .Ldiv64_slow_n ; divl <div32> ; jmp .Ldiv64_done_n
+                //  slow: xorl %edx,%edx | cqto ; [i]divq <div>
+                //  done:
+                let div32 = fmt_operand(divisor, OpSize::S32, out);
+                // Named labels from the emitter's single allocator, the same
+                // mechanism `alu.rs` uses.  Numeric `1:`/`2:` labels happen to
+                // work while the sequence is contiguous, but any future
+                // text-level insertion between the branch and its target
+                // silently retargets it; a named label cannot be retargeted by
+                // accident.
+                let slow = out.fresh_label("div64_slow");
+                let done = out.fresh_label("div64_done");
+                out.emit("    movq %rax, %rdx");
+                out.emit_fmt(format_args!("    orq {}, %rdx", div_str));
+                out.emit("    shrq $32, %rdx");
+                out.emit_jcc_label("    jnz", &slow);
+                out.emit_fmt(format_args!("    divl {}", div32));
+                out.emit_jmp_label(&done);
+                out.emit_named_label(&slow);
+                out.emit(if *signed {
+                    "    cqto"
+                } else {
+                    "    xorl %edx, %edx"
+                });
+                out.emit_fmt(format_args!("    {}{} {}", mnem, suffix, div_str));
+                out.emit_named_label(&done);
+            } else {
+                out.emit_fmt(format_args!("    {}{} {}", mnem, suffix, div_str));
+            }
         }
 
         MachInst::Cmp { lhs, rhs, size } => {
@@ -1233,6 +1290,24 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
 
 /// Emit a sequence of allocated MachInsts as AT&T assembly.
 pub fn emit_machinsts(insts: &[MachInst], out: &mut AsmOutput) {
+    emit_machinsts_with_tune(
+        insts,
+        out,
+        &crate::backend::x86::cpu_model::active(),
+        crate::backend::x86::cpu_model::div64_bypass_killed(),
+    );
+}
+
+/// [`emit_machinsts`] with the tuning row and kill switch passed in (see
+/// [`emit_machinst_with_tune`]).
+pub fn emit_machinsts_with_tune(
+    insts: &[MachInst],
+    out: &mut AsmOutput,
+    tune: &crate::backend::x86::cpu_model::X86Tune,
+    div64_bypass_killed: bool,
+) {
+    let bypass_div64 =
+        crate::backend::x86::cpu_model::bypass_div64_enabled_for(tune, div64_bypass_killed);
     // Loop-header alignment is NOT done here. MachInst windows are
     // straight-line sequences flushed before calls and at block ends, and
     // `MachInst::Label` is never constructed by any lowering, so the
@@ -1259,7 +1334,24 @@ pub fn emit_machinsts(insts: &[MachInst], out: &mut AsmOutput) {
             i += 2;
             continue;
         }
-        emit_machinst(&insts[i], out);
+        // `xorl %edx,%edx` / `cqto` immediately before a width-bypassed 64-bit
+        // divide is dead: the guard overwrites %rdx and the slow path redoes
+        // the set-up itself (see the `MachInst::Div` arm).
+        if matches!(
+            insts[i],
+            MachInst::XorRdx | MachInst::Cqto { size: OpSize::S64 }
+        ) && matches!(
+            insts.get(i + 1),
+            Some(MachInst::Div {
+                size: OpSize::S64,
+                ..
+            })
+        ) && bypass_div64
+        {
+            i += 1;
+            continue;
+        }
+        emit_machinst_with_tune(&insts[i], out, tune, div64_bypass_killed);
         i += 1;
     }
 }

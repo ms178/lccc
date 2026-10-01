@@ -16,6 +16,7 @@
 //!   to a register the address depends on.
 
 use super::super::types::*;
+use super::flag_peepholes::flags_dead_after;
 use super::helpers::{HIGH_BYTE_NAMES, get_dest_reg, has_implicit_reg_usage, writes_family};
 use super::liveness::FileLiveness;
 use super::relay_and_lea::{
@@ -45,6 +46,146 @@ fn droppable_source(op: &str, src: &str) -> bool {
         return true;
     }
     is_register_operand(src) || src.starts_with('$')
+}
+
+// ── Dead flag-writing arithmetic ────────────────────────────────────────────
+
+/// Base mnemonics of GP integer operations whose only effects are the
+/// destination register and (for all but `not`) the flags: no memory operand,
+/// no implicit register.  The width suffix is stripped before the lookup, so
+/// `shlq`/`shll`/`addw` all resolve here.
+///
+/// This set is the exact complement of `PURE_WRITE_PREFIXES`: the pure-write
+/// pass cannot retire an instruction that writes flags, so a dead address
+/// computation left behind by a SIB fold survived forever and kept the write
+/// feeding it alive through the deadness proof.
+///
+/// Measured with `scripts/callgrind_ab.py` (-O2, fast corpus, identical stdout
+/// on every program): bitops -100,000,000 Ir (-3.39%, five dead instructions
+/// per iteration), zstd_count -1.86%, linux_find_bit -0.14%, nothing slower.
+///
+/// Coverage is bounded by `flags_dead_after`, whose scan stops at a label: in
+/// ring_fifo the dead `movl %r10d, %r13d; shlq $2, %r13` pair sits directly
+/// before `.LBB5`, the flags therefore cannot be proven dead, and the pair
+/// survives (Callgrind confirms ring_fifo is unchanged).  Recovering it needs
+/// a CFG-based flag liveness; the linear scan is sound, merely imprecise.
+const FLAG_WRITING_PURE_ARITH: &[&str] = &[
+    "shl", "shr", "sar", "sal", "rol", "ror", "shld", "shrd", "add", "sub", "and", "or", "xor",
+    "inc", "dec", "neg", "not", "imul", "bt", "bts", "btr", "btc", "bsf", "bsr", "popcnt", "lzcnt",
+    "tzcnt",
+];
+
+/// One-operand forms are accepted for exactly these base mnemonics.  Every
+/// other entry needs the explicit `SRC, DST` shape: `imul %rcx` is the
+/// implicit `%rdx:%rax` form (its "destination" is not `%rcx`), and
+/// `mul`/`div`/`idiv` are absent from the whitelist entirely for the same
+/// reason.
+const ONE_OPERAND_PURE_ARITH: &[&str] = &["inc", "dec", "neg", "not"];
+
+/// Base mnemonic of `t` (opcode with any `b`/`w`/`l`/`q` width suffix
+/// removed), or `None` when the first token is not one of the whitelisted base
+/// mnemonics.  The exact token is probed first so a name that merely ends in a
+/// width letter (`popcnt`, `bt`) is never truncated.
+fn pure_arith_base(t: &str) -> Option<&'static str> {
+    let op = t.split_whitespace().next()?;
+    if let Some(base) = FLAG_WRITING_PURE_ARITH.iter().find(|b| **b == op) {
+        return Some(base);
+    }
+    let last = op.as_bytes().last().copied()?;
+    if !matches!(last, b'b' | b'w' | b'l' | b'q') {
+        return None;
+    }
+    let stem = &op[..op.len() - 1];
+    FLAG_WRITING_PURE_ARITH
+        .iter()
+        .find(|b| **b == stem)
+        .copied()
+}
+
+/// Delete GP integer arithmetic whose destination register AND whose flags are
+/// provably dead.
+///
+/// Soundness rests on four independent guards, each reusing a proof already
+/// exercised by the neighbouring passes:
+/// 1. no **memory operand** (`(` anywhere in the text): deleting a load removes
+///    a fault the program may rely on, and a store is never a pure write;
+/// 2. no **implicit register** (`has_implicit_reg_usage`), which is what keeps
+///    the `%rdx:%rax` forms of `imul`/`mul` and every `div` out of reach;
+/// 3. the destination family is **provably dead** (`provably_dead_lv`: exact
+///    CFG liveness with the syntactic proof as fallback, the same predicate
+///    `eliminate_dead_pure_writes` trusts);
+/// 4. the **flags are dead after it** (`flags_dead_after`: no `setCC`, `cmov`,
+///    `adc`/`sbb`, `pushf` or conditional branch reads them before the next
+///    writer).
+///
+/// Retiring the arithmetic is what lets `eliminate_dead_pure_writes` collapse
+/// the chain that fed it (both verified by `CCC_PEEPHOLE_TRACE`: this pass
+/// removes the `shlq`, the next round removes the `movl`); the two run to a
+/// joint fixpoint in `retire_dead_pure_writes`.  `CCC_NO_DEAD_FLAG_WRITES=1` disables this pass
+/// alone for bisection; `CCC_PEEPHOLE_SKIP=dead_flag_writes` disables it with
+/// the rest of the pipeline.
+pub(super) fn eliminate_dead_flag_writes(store: &LineStore, infos: &mut [LineInfo]) -> bool {
+    if std::env::var_os("CCC_NO_DEAD_FLAG_WRITES").is_some() {
+        return false;
+    }
+    let len = store.len();
+    let mut lv = FileLiveness::new(store, infos);
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() || infos[i].is_barrier() || infos[i].pinned {
+            i += 1;
+            continue;
+        }
+        let t = infos[i].trimmed(store.get(i));
+        let Some(base) = pure_arith_base(t) else {
+            i += 1;
+            continue;
+        };
+        // Guard 1: no memory operand anywhere on the line.
+        if t.contains('(') {
+            i += 1;
+            continue;
+        }
+        // Guard 2: no implicit register (one-operand imul/mul, div, cdq, ...).
+        if has_implicit_reg_usage(t) {
+            i += 1;
+            continue;
+        }
+        let rest = t[base.len()..]
+            .trim_start_matches(|c: char| matches!(c, 'b' | 'w' | 'l' | 'q' | ' ' | '\t'));
+        let (_src, dst) = match split_two_operands(rest) {
+            Some((s, d)) => (s, d),
+            None if ONE_OPERAND_PURE_ARITH.contains(&base) => ("", rest.trim()),
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+        let Some(fam) = plain_gp_operand(dst) else {
+            i += 1;
+            continue;
+        };
+        if !is_relayable_family(fam) {
+            i += 1;
+            continue;
+        }
+        // Guard 3: the destination family dies here.
+        if !provably_dead_lv(&lv, store, infos, i, fam, &[i]) {
+            i += 1;
+            continue;
+        }
+        // Guard 4: the flags die here too.
+        if !flags_dead_after(store, infos, i + 1) {
+            i += 1;
+            continue;
+        }
+        mark_nop(&mut infos[i]);
+        lv.refresh_at(store, infos, i);
+        changed = true;
+        i += 1;
+    }
+    changed
 }
 
 /// Delete instructions that only write a register nobody reads afterwards.
@@ -1293,6 +1434,84 @@ pub(super) fn fold_accumulator_roundtrip(store: &mut LineStore, infos: &mut [Lin
 
 #[cfg(test)]
 mod tests {
+    // ── Dead flag-writing arithmetic ────────────────────────────────────────
+    //
+    // The chain below is the shape a SIB fold leaves behind in ring_fifo: the
+    // array access is absorbed into `(%rdi, %r10, 4)`, orphaning
+    // `shlq $2, %r13` and — through it — the `movl` that fed it.  Neither
+    // instruction may survive, and the flags written by the `shlq` must not be
+    // mistaken for live.
+
+    #[test]
+    fn dead_shift_and_feeding_move_are_retired() {
+        use super::super::super::peephole_optimize;
+        let out = peephole_optimize(
+            "f:\n.cfi_startproc\n    pushq %r13\n    xorl %r10d, %r10d\n.L1:\n    movl %r10d, %r13d\n    shlq $2, %r13\n    addl $1, %r10d\n    cmpl $10, %r10d\n    jne .L1\n    popq %r13\n    ret\n.cfi_endproc\n"
+                .to_string(),
+        );
+        assert!(
+            !out.contains("shlq"),
+            "dead flag-writing shift must go: {out}"
+        );
+        assert!(
+            !out.contains("movl %r10d, %r13d"),
+            "the move feeding the dead shift must go with it: {out}"
+        );
+        assert!(out.contains(".L1:"), "the loop label must survive: {out}");
+        assert!(
+            out.contains("jne .L1") && out.contains("ret"),
+            "the loop control flow must survive: {out}"
+        );
+    }
+
+    #[test]
+    fn dead_shift_with_caller_saved_destination_is_retired() {
+        use super::super::super::peephole_optimize;
+        let out = peephole_optimize(
+            "f:\n.cfi_startproc\n    xorl %r10d, %r10d\n.L1:\n    movl %r10d, %r9d\n    shlq $2, %r9\n    addl $1, %r10d\n    cmpl $10, %r10d\n    jne .L1\n    ret\n.cfi_endproc\n"
+                .to_string(),
+        );
+        assert!(!out.contains("shlq"), "dead shift must go: {out}");
+        assert!(!out.contains("r9"), "dead chain must go: {out}");
+    }
+
+    #[test]
+    fn live_flags_keep_the_arithmetic() {
+        use super::super::super::peephole_optimize;
+        // `jne` reads the flags the `shlq` produced: the shift must survive.
+        let out = peephole_optimize(
+            "f:\n.cfi_startproc\n.L1:\n    shlq $2, %r9\n    jne .L1\n    ret\n.cfi_endproc\n"
+                .to_string(),
+        );
+        assert!(out.contains("shlq"), "flags are read by the branch: {out}");
+    }
+
+    #[test]
+    fn memory_operand_is_never_deleted() {
+        use super::super::super::peephole_optimize;
+        // A load source can fault and must not be dropped, dead or not.
+        let out = peephole_optimize(
+            "f:\n.cfi_startproc\n    addl (%rax), %r9d\n    ret\n.cfi_endproc\n".to_string(),
+        );
+        assert!(
+            out.contains("addl (%rax), %r9d"),
+            "memory read must survive: {out}"
+        );
+    }
+
+    #[test]
+    fn implicit_register_form_is_never_deleted() {
+        use super::super::super::peephole_optimize;
+        // One-operand imul writes %rdx:%rax; its operand is not a destination.
+        let out = peephole_optimize(
+            "f:\n.cfi_startproc\n    imul %rcx\n    ret\n.cfi_endproc\n".to_string(),
+        );
+        assert!(
+            out.contains("imul %rcx"),
+            "implicit rdx:rax form must survive: {out}"
+        );
+    }
+
     use super::super::super::peephole_optimize;
     use super::*;
 
@@ -2034,6 +2253,9 @@ mod tests {
 
     #[test]
     fn accumulator_roundtrip_is_applied_in_place() {
+        // `cmpl`/`jne` + the closing `movq %r8, %rax` keep the folded
+        // accumulator live: `eliminate_dead_flag_writes` correctly deletes a
+        // fold whose result nothing reads, and this test is about the FOLD.
         let out = run(concat!(
             "foo:\n",
             ".cfi_startproc\n",
@@ -2042,7 +2264,10 @@ mod tests {
             "    xorq %r10, %rax\n",
             "    movq %rax, %r8\n",
             "    addl $1, %ebx\n",
-            "    jmp .LBB2\n",
+            "    cmpl $4, %ebx\n",
+            "    jne .LBB2\n",
+            "    movq %r8, %rax\n",
+            "    ret\n",
             ".cfi_endproc\n",
         ));
         assert!(out.contains("xorq %r10, %r8"), "{out}");
@@ -2789,15 +3014,17 @@ mod tests {
             // The relay feeds an NDD-middle read: `imull $26, %eax, %eax`
             // reads %eax as its MIDDLE (source) operand. Retargeting the
             // movslq to %r14 and deleting the relay leaves the imul reading
-            // a never-written register. The relay must survive.
+            // a never-written register. The relay must survive; `addq %rax,
+            // %r14` keeps the imul live so this is about the relay pass, not
+            // about dead-code elimination.
             let out = run(concat!(
                 "f:\n",
                 ".cfi_startproc\n",
                 "    movslq %edi, %rax\n",
                 "    movq %rax, %r14\n",
                 "    imull $26, %eax, %eax\n",
-                "    movq %r14, %rbx\n",
-                "    movq %rbx, %rax\n",
+                "    addq %rax, %r14\n",
+                "    movq %r14, %rax\n",
                 "    ret\n",
                 ".cfi_endproc\n",
             ));

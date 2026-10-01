@@ -233,6 +233,62 @@ pub fn compute_reverse_postorder(num_blocks: usize, succs: &FlatAdj) -> Vec<usiz
 /// O(P * D) per sweep, and a long compare-and-branch chain whose exits all
 /// meet at one label (gcc.c-torture/compile 20001226-1: 8192 branches, two
 /// joins of 4096 predecessors each) made every dominator build quadratic.
+/// Does block `a` dominate block `b`, walking the immediate-dominator chain?
+///
+/// The single monotone predicate every pass that rewrites *uses* needs: a value
+/// defined in `a` is available at `b` exactly when `a` dominates `b`.  A pass
+/// that redirects reads (and therefore moves values across blocks) must prove
+/// this or refuse — "it happens to work because the consumer is forgiving" is
+/// how `verify` check 8 came to exist.
+///
+/// Semantics match the IR verifier's dominance check:
+///
+/// * the entry block (index 0) dominates every *reachable* block, and
+/// * `idom[0] == 0`, so the walk terminates at the root.
+///
+/// Unreachable blocks have no dominator relationship other than the reflexive
+/// one, which is reported as `false` here — a caller that rewrites a use in an
+/// unreachable block is rewriting dead code either way, and refusing is the
+/// conservative answer.
+pub fn dominates_idom(idom: &[usize], a: usize, b: usize) -> bool {
+    if a >= idom.len() || b >= idom.len() {
+        return false;
+    }
+    if a == b {
+        return true;
+    }
+    if a == 0 {
+        // The entry dominates every block whose idom chain reaches it.
+        let mut cur = b;
+        for _ in 0..=idom.len() {
+            if cur == 0 {
+                return true;
+            }
+            let next = idom[cur];
+            if next == cur || next >= idom.len() {
+                return false;
+            }
+            cur = next;
+        }
+        return false;
+    }
+    let mut cur = b;
+    for _ in 0..=idom.len() {
+        if cur == 0 {
+            return false;
+        }
+        let next = idom[cur];
+        if next == cur || next >= idom.len() {
+            return false;
+        }
+        cur = next;
+        if cur == a {
+            return true;
+        }
+    }
+    false
+}
+
 /// Immediate dominators are unique, so the result is identical; the CHK
 /// version is kept as the test oracle.
 pub fn compute_dominators(num_blocks: usize, preds: &FlatAdj, succs: &FlatAdj) -> Vec<usize> {
@@ -565,5 +621,63 @@ mod dominator_tests {
             let (snca, chk) = both(&succs);
             assert_eq!(snca, chk, "succs = {succs:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod dominates_idom_tests {
+    use super::dominates_idom;
+
+    /// Diamond: 0 -> {1,2} -> 3.  Only 0 and 3's own chain dominate 3.
+    #[test]
+    fn diamond_dominance() {
+        // idom: 0->0 (root), 1->0, 2->0, 3->0
+        let idom = [0usize, 0, 0, 0];
+        assert!(dominates_idom(&idom, 0, 3));
+        assert!(dominates_idom(&idom, 3, 3));
+        assert!(
+            !dominates_idom(&idom, 1, 3),
+            "a sibling arm does not dominate the join"
+        );
+        assert!(
+            !dominates_idom(&idom, 3, 1),
+            "the join does not dominate an arm"
+        );
+        assert!(!dominates_idom(&idom, 2, 3));
+    }
+
+    /// Chain: 0 -> 1 -> 2 -> 3.  Every earlier block dominates every later one.
+    #[test]
+    fn chain_dominance() {
+        let idom = [0usize, 0, 1, 2];
+        assert!(dominates_idom(&idom, 1, 3));
+        assert!(dominates_idom(&idom, 2, 3));
+        assert!(!dominates_idom(&idom, 3, 2));
+        assert!(dominates_idom(&idom, 1, 1));
+    }
+
+    /// A self-loop header: 0 -> 1 -> 2 -> 1.  The header dominates its body.
+    #[test]
+    fn loop_header_dominates_body() {
+        // idom: 0->0, 1->0, 2->1
+        let idom = [0usize, 0, 1];
+        assert!(dominates_idom(&idom, 1, 2));
+        assert!(
+            !dominates_idom(&idom, 2, 1),
+            "the body does not dominate the header"
+        );
+    }
+
+    /// Out-of-range and malformed chains must answer `false`, never hang.
+    #[test]
+    fn refuses_rather_than_looping() {
+        assert!(!dominates_idom(&[], 0, 0), "empty table has no relations");
+        assert!(!dominates_idom(&[0], 0, 5), "out-of-range use block");
+        // A legitimate relation in a table whose root is odd: idom[2] == 1
+        // really does mean "1 dominates 2", so this must answer true.
+        assert!(dominates_idom(&[1, 1, 1], 1, 2));
+        // A self-referential idom entry is malformed; the walk must terminate
+        // and answer false rather than spin.
+        assert!(!dominates_idom(&[0, 0, 2], 1, 2));
     }
 }

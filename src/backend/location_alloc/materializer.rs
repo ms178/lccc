@@ -424,7 +424,7 @@ pub(super) fn materialize(
                 ev_idx += 1;
             }
             if !matches!(inst, Instruction::Phi { .. }) && !active.is_empty() {
-                replace_values_in_inst(&mut inst, &active, false);
+                replace_values_in_inst_phi_aware(&mut inst, &active, false);
             }
             out.push(inst);
             if spanful {
@@ -457,7 +457,7 @@ pub(super) fn materialize(
             func.blocks[bi].source_spans = out_spans;
         }
         if !active.is_empty() {
-            replace_values_in_terminator(&mut func.blocks[bi].terminator, &active);
+            replace_values_in_terminator_phi_aware(&mut func.blocks[bi].terminator, &active);
         }
     }
 

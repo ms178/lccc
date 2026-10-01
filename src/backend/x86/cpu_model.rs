@@ -122,10 +122,15 @@ pub enum X86Cpu {
     AlderLake,
     /// Raptor Lake (Raptor Cove P-core + Gracemont E-core).  Same core as
     /// Golden Cove; larger caches, more E-cores, higher clocks (see module
-    /// docs).  Meteor Lake's Redwood Cove shares the 2 MiB L2 and resolves
-    /// here as well (its only measured instruction-level delta is VMULP*
-    /// latency 3 instead of 4, `[uops.info]` MTL-P).
+    /// docs).
     RaptorLake,
+    /// Meteor Lake (Redwood Cove P-core + Crestmont E-core).  Not a spelling
+    /// of Raptor Lake: `[uops.info]` MTL-P differs from ADL-P/EMR on 198 of
+    /// the 3779 instruction pages both columns measure — for the model the
+    /// one that matters is the FP multiply (`VMULP{S,D}`/`MULS{S,D}` latency
+    /// 3 instead of 4).  Raptor Lake keeps 4: ADL-P and EMR (Golden Cove)
+    /// and therefore Raptor Cove agree on every scalar/256-bit timing.
+    MeteorLake,
     /// Sapphire/Emerald Rapids (Golden Cove server + AVX-512, 2 MiB L2).
     SapphireRapids,
     /// Arrow Lake / Lunar Lake (Lion Cove P-core + Skymont E-core).
@@ -253,9 +258,15 @@ pub struct X86Tune {
     /// POPCNT reads its destination: SNB, IVB, HSW, BDW, SKL, SKX, CLX.
     /// Fixed on ICL/TGL/RKL/ADL-P/ADL-E and on every Zen.
     pub popcnt_false_dep: bool,
-    /// LZCNT/TZCNT read their destination: SNB, IVB, HSW, BDW.  Fixed on
-    /// SKL and later (measured 0 on SKL/SKX/CLX/ICL/ADL) and on every Zen.
-    pub lzcnt_tzcnt_false_dep: bool,
+    /// LZCNT reads its destination: SNB, IVB, HSW, BDW.  Fixed on SKL and
+    /// later (op1→op1 measured 0 on SKL/SKX/CLX/ICL/ADL) and on every Zen.
+    pub lzcnt_false_dep: bool,
+    /// TZCNT reads its destination: SNB, IVB, HSW, BDW **and Zen 5**
+    /// (`[uops.info]` TZCNT_R64_R64 ZEN5 op1→op1 = 1, while LZCNT/POPCNT on
+    /// the same core measure 0).  A single shared bit cannot express this —
+    /// the very conflation this module's header criticises in GCC's
+    /// `X86_TUNE_AVOID_FALSE_DEP_FOR_BMI` — hence two fields.
+    pub tzcnt_false_dep: bool,
 
     // ------------------------------------------------------------------
     // Shifts by CL.  `[uops.info]` SHL_R64_CL port usage / rTP, re-read
@@ -309,8 +320,22 @@ pub struct X86Tune {
     pub div64_latency_min: u8,
     /// Worst-case dependent latency of DIV r64 (full 128-bit dividend).
     pub div64_latency: u8,
-    /// Reciprocal throughput of DIV r64 ×100.
+    /// Reciprocal throughput of DIV r64 ×100, **measured** (`TP_loop` of
+    /// DIV_R64).  Earlier revisions stored the `TP_ports` figure (computed
+    /// from port usage: 11/8/8.25/3.0) which understates the real divider
+    /// occupancy by 2–3×: measured SNB/IVB 22, HSW/BDW/SKL/SKX 21, ICL/ADL-P
+    /// 10, ARL-P 10.6, ADL-E 6, Zen+/Zen2 14, Zen3/4/5 7 `[uops.info]`.
     pub div64_rtp_x100: u16,
+    /// Best-case latency of DIV r32 `[uops.info]` (SNB/IVB 18, HSW/BDW 20,
+    /// SKL/SKX 23, ICL/ADL-P/MTL-P 10, ARL-P 11, ADL-E 11, Zen+/2 8, Zen3/4
+    /// 9, Zen5 10).
+    pub div32_latency_min: u8,
+    /// Worst-case latency of DIV r32 (SNB/IVB 26, HSW/BDW/SKL 28, ICL/ADL-P
+    /// 15, ARL-P 16, ADL-E 28, Zen+/2 25, Zen3/4 14, Zen5 13).
+    pub div32_latency: u8,
+    /// Measured reciprocal throughput of DIV r32 ×100 (SNB 11, IVB/HSW/BDW 9,
+    /// SKL/SKX/ICL/ADL-P/ARL-P/ADL-E/Zen3+ 6, Zen+/Zen2 14).
+    pub div32_rtp_x100: u16,
     /// `[uops.info]` PMULLD_XMM_XMM, re-read this session: SNB/IVB 1 µop
     /// lat 5 rTP 1; HSW/BDW 2*p0 lat 10 rTP 2; SKL..ADL-P 2*p01 lat 10
     /// rTP 1; ADL-E lat 4; ARL-P lat 5–6; Zen+/Zen2 lat 4 rTP 1; Zen3/4/5
@@ -464,15 +489,15 @@ pub enum MulStep {
 }
 
 /// `[uops.info]` ADL-E: LEA_B_I_D8 lat 2 rTP 1.0; SHL r,CL rTP 0.54; IMUL
-/// r64 lat 5; DIV r64 lat 12–43; VFMADD231PS ymm lat 6.  `[Agner]` L1D 3.
+/// r64 lat 5; DIV r64 lat 11–44, rTP 6.0; VFMADD231PS ymm lat 6.  `[Agner]` L1D 3.
 const GRACEMONT_ADL: ECoreTune = ECoreTune {
     name: "gracemont",
     lea3_latency: 2,
     lea3_rtp_x100: 100,
     shift_cl_uops: 1,
     imul64_latency: 5,
-    div64_latency: 43,
-    div64_rtp_x100: 1500,
+    div64_latency: 44,
+    div64_rtp_x100: 600,
     fma_latency: 6,
     load_latency: 3,
     cluster_l2_kib: 2048,
@@ -483,8 +508,18 @@ const GRACEMONT_RPL: ECoreTune = ECoreTune {
     ..GRACEMONT_ADL
 };
 
+/// `[uops.info]` MTL-E (Crestmont): LEA_B_I_D8 lat 2 rTP 1.0; SHL r,CL rTP
+/// 0.57 (1 µop); IMUL r64 lat 5; DIV r64 11–33, rTP 6.0 (Gracemont 11–44);
+/// VFMADD231PS ymm lat 6.  `[Intel ARK]` 2 MiB L2 per 4-core cluster.
+const CRESTMONT_MTL: ECoreTune = ECoreTune {
+    name: "crestmont",
+    div64_latency: 33,
+    cluster_l2_kib: 2048,
+    ..GRACEMONT_ADL
+};
+
 /// `[uops.info]` ARL-E (Skymont): LEA_B_I_D8 latency 2 rTP 0.29; SHL r,CL
-/// rTP 0.47; IMUL r64 lat 4; DIV r64 12–32; VFMADD231PS ymm 4; `[Intel
+/// rTP 0.47; IMUL r64 lat 4; DIV r64 11–33, rTP 5.5; VFMADD231PS ymm 4; `[Intel
 /// ARK]` 4 MiB per 4-core cluster.
 const SKYMONT_ARL: ECoreTune = ECoreTune {
     name: "skymont",
@@ -492,8 +527,8 @@ const SKYMONT_ARL: ECoreTune = ECoreTune {
     lea3_rtp_x100: 29,
     shift_cl_uops: 1,
     imul64_latency: 4,
-    div64_latency: 32,
-    div64_rtp_x100: 1200,
+    div64_latency: 33,
+    div64_rtp_x100: 550,
     fma_latency: 4,
     load_latency: 4,
     cluster_l2_kib: 4096,
@@ -554,7 +589,8 @@ impl X86Cpu {
             "skylake-avx512" | "cascadelake" | "cooperlake" | "cannonlake" => SkylakeAvx512,
             "icelake-client" | "icelake-server" | "tigerlake" | "rocketlake" => IceLake,
             "alderlake" => AlderLake,
-            "raptorlake" | "raptor-lake" | "meteorlake" => RaptorLake,
+            "raptorlake" | "raptor-lake" => RaptorLake,
+            "meteorlake" => MeteorLake,
             "gracemont" | "sierraforest" | "grandridge" | "clearwaterforest" | "alderlake-n" => {
                 Gracemont
             }
@@ -675,10 +711,11 @@ impl X86Cpu {
                 0x7D | 0x7E | 0x6A | 0x6C | 0x8C | 0x8D | 0xA7 => IceLake,
                 // ADL-S (0x97), ADL-P (0x9A).
                 0x97 | 0x9A => AlderLake,
-                // RPL-S (0xB7), RPL-P (0xBA), RPL-S refresh / RPL-HX (0xBF);
-                // MTL-M/P (0xAA), MTL-S (0xAC), ARL-U = MTL refresh (0xB5)
-                // share the 2 MiB-L2 Redwood/Raptor Cove class.
-                0xB7 | 0xBA | 0xBF | 0xAA | 0xAC | 0xB5 => RaptorLake,
+                // RPL-S (0xB7), RPL-P (0xBA), RPL-S refresh / RPL-HX (0xBF).
+                0xB7 | 0xBA | 0xBF => RaptorLake,
+                // MTL-M/P (0xAA), MTL-S (0xAC), ARL-U = MTL refresh (0xB5):
+                // Redwood Cove (3-cycle FP multiply) + Crestmont.
+                0xAA | 0xAC | 0xB5 => MeteorLake,
                 // ADL-N (0xBE), Sierra Forest (0xAF), Grand Ridge (0xB6),
                 // Clearwater Forest (0xDD): E-core only.
                 0xBE | 0xAF | 0xB6 | 0xDD => Gracemont,
@@ -719,7 +756,8 @@ impl X86Cpu {
                 uop_cache_uops: 1536,
                 jcc_erratum: false,
                 popcnt_false_dep: true,
-                lzcnt_tzcnt_false_dep: true,
+                lzcnt_false_dep: true,
+                tzcnt_false_dep: true,
                 shift_cl_uops: 3,
                 lea3_latency: 3,
                 lea3_rtp_x100: 100,
@@ -729,7 +767,10 @@ impl X86Cpu {
                 imul64_latency: 3,
                 div64_latency_min: 30,
                 div64_latency: 91,
-                div64_rtp_x100: 1100,
+                div64_rtp_x100: 2200,
+                div32_latency_min: 18,
+                div32_latency: 26,
+                div32_rtp_x100: 1100,
                 pmulld_uops: 1,
                 pmulld_latency: 5,
                 fma_latency: 0,
@@ -762,6 +803,8 @@ impl X86Cpu {
                 name: "ivybridge",
                 // [uops.info] SHL_R64_CL on IVB: 2*p05, rTP 1.0 (SNB: 3).
                 shift_cl_uops: 2,
+                // [uops.info] DIV_R32 IVB: TP_loop 9.0 (SNB 11.0).
+                div32_rtp_x100: 900,
                 ..snb_like(IvyBridge, "ivybridge", true)
             },
             Haswell => X86Tune {
@@ -771,15 +814,20 @@ impl X86Cpu {
                 lsd_uops: 56,
                 div64_latency_min: 31,
                 div64_latency: 94,
-                div64_rtp_x100: 800,
+                div64_rtp_x100: 2100,
+                div32_latency_min: 20,
+                div32_latency: 28,
+                div32_rtp_x100: 900,
                 pmulld_uops: 2,
                 pmulld_latency: 10,
                 fma_latency: 5,
                 fma_pipes: 2,
                 // [uops.info] HSW: VADDPS still p1 only (the two FMA units do
-                // not add until SKL); VPADDD ymm p015; two 256-bit load ports.
+                // not add until SKL); VPADDD ymm **p15** (p015 only from SKL
+                // on; audit finding of scripts/cpu_model_audit.py); two
+                // 256-bit load ports.
                 fadd_pipes: 1,
-                vec_int_alu_pipes: 3,
+                vec_int_alu_pipes: 2,
                 vec_load_port_bits: 256,
                 avx256_unaligned_split: false,
                 // [Intel ARK] i7-4790K: 32K/8w, 256K/8w, 8M/16w; [Agner] L2
@@ -801,10 +849,16 @@ impl X86Cpu {
                 cpu: Skylake,
                 name: "skylake",
                 mispredict_penalty: 16,
-                lzcnt_tzcnt_false_dep: false,
+                lzcnt_false_dep: false,
+                tzcnt_false_dep: false,
                 div64_latency_min: 35,
                 div64_latency: 90,
-                div64_rtp_x100: 825,
+                div64_rtp_x100: 2100,
+                div32_latency_min: 23,
+                div32_latency: 28,
+                div32_rtp_x100: 600,
+                // [uops.info] SKL: VPADDD ymm on p015 (HSW/BDW: p15).
+                vec_int_alu_pipes: 3,
                 fma_latency: 4,
                 fadd_latency: 4,
                 // [uops.info] SKL: VADDPS on p01 (both FMA units).
@@ -827,6 +881,8 @@ impl X86Cpu {
                 // [Intel ORM] SKX: 512-bit FMA on p0+p1 fused (+p5 on the
                 // 2-FMA SKUs); two 64-byte loads per cycle.
                 simd_datapath_bits: 512,
+                // [uops.info] SKX DIV_R64 5–89 (SKL 5–90).
+                div64_latency: 89,
                 vec_load_port_bits: 512,
                 ..Skylake.tune()
             },
@@ -845,7 +901,10 @@ impl X86Cpu {
                 lea3_rtp_x100: 25,
                 div64_latency_min: 14,
                 div64_latency: 18,
-                div64_rtp_x100: 300,
+                div64_rtp_x100: 1000,
+                div32_latency_min: 10,
+                div32_latency: 15,
+                div32_rtp_x100: 600,
                 fsrm: true,
                 rep_movsb_threshold: 2112,
                 rob_entries: 352,
@@ -891,6 +950,20 @@ impl X86Cpu {
                 ecore: Some(GRACEMONT_RPL),
                 ..AlderLake.tune()
             },
+            MeteorLake => X86Tune {
+                cpu: MeteorLake,
+                name: "meteorlake",
+                // [uops.info] MTL-P: VMULPS/VMULPD/MULSS/MULSD 3 cycles (ADL-P,
+                // EMR and therefore Raptor Cove: 4); every other modelled
+                // instruction is identical to ADL-P.
+                fmul_latency: 3,
+                // [Intel ARK] Core Ultra 7 155H/9 185H: 48K/12w, 2M/16w,
+                // 24M/12w; L3 sits behind the tile fabric (scale only, not
+                // re-measured); 4.8 GHz × ~100 ns (LPDDR5).
+                cache: cache(48, 12, 5, 2048, 16, 16, 24576, 12, 70, 480),
+                ecore: Some(CRESTMONT_MTL),
+                ..AlderLake.tune()
+            },
             SapphireRapids => X86Tune {
                 cpu: SapphireRapids,
                 name: "sapphirerapids",
@@ -912,6 +985,14 @@ impl X86Cpu {
                 // (µop count not published; kept at the GLC value).
                 div64_latency_min: 16,
                 div64_latency: 19,
+                div64_rtp_x100: 1060,
+                div32_latency_min: 11,
+                div32_latency: 16,
+                div32_rtp_x100: 600,
+                // [uops.info] ARL-P: IMUL_R64_R64 latency 4 (3 for the
+                // same-register form); PMULLD_XMM_XMM 3 µops, latency 5–6.
+                imul64_latency: 4,
+                pmulld_uops: 3,
                 pmulld_latency: 6,
                 fmul_latency: 3,
                 rob_entries: 576,
@@ -934,7 +1015,8 @@ impl X86Cpu {
                 uop_cache_uops: 0,
                 jcc_erratum: false,
                 popcnt_false_dep: false,
-                lzcnt_tzcnt_false_dep: false,
+                lzcnt_false_dep: false,
+                tzcnt_false_dep: false,
                 shift_cl_uops: 1,
                 lea3_latency: 2,
                 lea3_rtp_x100: 100,
@@ -943,9 +1025,13 @@ impl X86Cpu {
                 cmov_uops: 1,
                 cmov_latency: 2,
                 imul64_latency: 5,
-                div64_latency_min: 12,
-                div64_latency: 43,
-                div64_rtp_x100: 1500,
+                // [uops.info] ADL-E DIV_R64 11–44, TP_loop 6.0; DIV_R32 11–28.
+                div64_latency_min: 11,
+                div64_latency: 44,
+                div64_rtp_x100: 600,
+                div32_latency_min: 11,
+                div32_latency: 28,
+                div32_rtp_x100: 600,
                 pmulld_uops: 1,
                 pmulld_latency: 4,
                 fma_latency: 6,
@@ -980,7 +1066,8 @@ impl X86Cpu {
                 uop_cache_uops: 2048,
                 jcc_erratum: false,
                 popcnt_false_dep: false,
-                lzcnt_tzcnt_false_dep: false,
+                lzcnt_false_dep: false,
+                tzcnt_false_dep: false,
                 shift_cl_uops: 1,
                 lea3_latency: 2,
                 lea3_rtp_x100: 50,
@@ -991,6 +1078,10 @@ impl X86Cpu {
                 div64_latency_min: 8,
                 div64_latency: 41,
                 div64_rtp_x100: 1400,
+                // [uops.info] DIV_R32 Zen+/Zen2: 8–25, TP_loop 14.0.
+                div32_latency_min: 8,
+                div32_latency: 25,
+                div32_rtp_x100: 1400,
                 pmulld_uops: 1,
                 pmulld_latency: 4,
                 fma_latency: 5,
@@ -1037,7 +1128,11 @@ impl X86Cpu {
                 mispredict_penalty: 13,
                 lea3_uops: 2,
                 div64_latency_min: 9,
-                div64_latency: 18,
+                // [uops.info] Zen3/4 DIV_R64 9–19; DIV_R32 9–14, TP 6.0.
+                div64_latency: 19,
+                div32_latency_min: 9,
+                div32_latency: 14,
+                div32_rtp_x100: 600,
                 div64_rtp_x100: 700,
                 pmulld_latency: 3,
                 fma_latency: 4,
@@ -1060,6 +1155,9 @@ impl X86Cpu {
             },
             Znver5 => X86Tune {
                 cpu: Znver5,
+                // [uops.info] TZCNT_R64_R64 ZEN5: op1→op1 latency 1 (LZCNT and
+                // POPCNT: 0) — Zen 5 regressed the TZCNT output dependency.
+                tzcnt_false_dep: true,
                 name: "znver5",
                 dispatch_width: 8,
                 // [AMD SOG Zen5] full 512-bit FP datapath on the desktop/
@@ -1068,6 +1166,10 @@ impl X86Cpu {
                 vec_load_port_bits: 512,
                 mispredict_penalty: 14,
                 div64_latency_min: 10,
+                // [uops.info] Zen5 DIV_R64 10–18; DIV_R32 10–13.
+                div64_latency: 18,
+                div32_latency_min: 10,
+                div32_latency: 13,
                 // [uops.info] VADDPS ymm on Zen 5: latency 2.
                 fadd_latency: 2,
                 rob_entries: 448,
@@ -1094,7 +1196,8 @@ impl X86Cpu {
                 uop_cache_uops: 0,
                 jcc_erratum: false,
                 popcnt_false_dep: true,
-                lzcnt_tzcnt_false_dep: true,
+                lzcnt_false_dep: true,
+                tzcnt_false_dep: true,
                 shift_cl_uops: 3,
                 lea3_latency: 3,
                 lea3_rtp_x100: 100,
@@ -1105,6 +1208,11 @@ impl X86Cpu {
                 div64_latency_min: 35,
                 div64_latency: 94,
                 div64_rtp_x100: 1500,
+                // Envelope of the DIV r32 rows; chosen so `bypass_div64()`
+                // stays off (1500 < 2 × 900): an untuned build keeps `divq`.
+                div32_latency_min: 18,
+                div32_latency: 28,
+                div32_rtp_x100: 900,
                 pmulld_uops: 2,
                 pmulld_latency: 10,
                 fma_latency: 6,
@@ -1131,7 +1239,7 @@ impl X86Cpu {
     }
 
     /// Every row, for exhaustive tests and `LCCC_DUMP_TUNE=all`.
-    pub const ALL: [X86Cpu; 18] = [
+    pub const ALL: [X86Cpu; 19] = [
         X86Cpu::Generic,
         X86Cpu::SandyBridge,
         X86Cpu::IvyBridge,
@@ -1142,6 +1250,7 @@ impl X86Cpu {
         X86Cpu::IceLake,
         X86Cpu::AlderLake,
         X86Cpu::RaptorLake,
+        X86Cpu::MeteorLake,
         X86Cpu::SapphireRapids,
         X86Cpu::ArrowLake,
         X86Cpu::Gracemont,
@@ -1220,10 +1329,34 @@ impl X86Tune {
         self.popcnt_false_dep
     }
 
-    /// Emit `xor %d,%d` before `lzcnt`/`tzcnt %s,%d` (d ≠ s)?
+    /// Emit `xor %d,%d` before `lzcnt %s,%d` (d ≠ s)?
     #[inline]
-    pub fn break_lzcnt_tzcnt_dep(&self) -> bool {
-        self.lzcnt_tzcnt_false_dep
+    pub fn break_lzcnt_dep(&self) -> bool {
+        self.lzcnt_false_dep
+    }
+
+    /// Emit `xor %d,%d` before `tzcnt %s,%d` (d ≠ s)?  Differs from
+    /// [`Self::break_lzcnt_dep`] on Zen 5.
+    #[inline]
+    pub fn break_tzcnt_dep(&self) -> bool {
+        self.tzcnt_false_dep
+    }
+
+    /// Guard a 64-bit `div`/`idiv` with a run-time "both operands fit in 32
+    /// bits" test and take the 32-bit divide when they do (LLVM's
+    /// `TuningSlowDivide64` / `idivq-to-divl`)?
+    ///
+    /// Derived from **measured** divider occupancy, not lineage: the bypass
+    /// costs ≈ 3 µops (`mov`/`or`/`shr` + a predicted `jne`) and pays off
+    /// when the 64-bit divider is at least twice as expensive as the 32-bit
+    /// one.  `[uops.info]` DIV_R64 vs DIV_R32 TP_loop: SNB 22/11, IVB 22/9,
+    /// HSW/BDW 21/9, SKL/SKX 21/6 → on; ICL/ADL-P 10/6, Zen3+ 7/6, Gracemont
+    /// 6/6, Zen+/2 14/14 → off.  `Generic` (15/9) stays off so untuned
+    /// builds are unchanged.
+    #[inline]
+    pub fn bypass_div64(&self) -> bool {
+        u32::from(self.div64_rtp_x100) >= 2 * u32::from(self.div32_rtp_x100)
+            && self.div64_latency_min > self.div32_latency
     }
 
     /// Select `shlx/shrx/sarx` over `shl/shr/sar r, %cl` when BMI2 is
@@ -1658,10 +1791,8 @@ impl X86Tune {
         kv("uop_cache_uops", self.uop_cache_uops.to_string());
         kv("jcc_erratum", self.jcc_erratum.to_string());
         kv("popcnt_false_dep", self.popcnt_false_dep.to_string());
-        kv(
-            "lzcnt_tzcnt_false_dep",
-            self.lzcnt_tzcnt_false_dep.to_string(),
-        );
+        kv("lzcnt_false_dep", self.lzcnt_false_dep.to_string());
+        kv("tzcnt_false_dep", self.tzcnt_false_dep.to_string());
         kv("shift_cl_uops", self.shift_cl_uops.to_string());
         kv("fadd_pipes", self.fadd_pipes.to_string());
         kv("vec_int_alu_pipes", self.vec_int_alu_pipes.to_string());
@@ -1714,6 +1845,10 @@ impl X86Tune {
         kv("div64_latency_min", self.div64_latency_min.to_string());
         kv("div64_latency", self.div64_latency.to_string());
         kv("div64_rtp_x100", self.div64_rtp_x100.to_string());
+        kv("div32_latency_min", self.div32_latency_min.to_string());
+        kv("div32_latency", self.div32_latency.to_string());
+        kv("div32_rtp_x100", self.div32_rtp_x100.to_string());
+        kv("derived.bypass_div64", self.bypass_div64().to_string());
         kv("pmulld_uops", self.pmulld_uops.to_string());
         kv("pmulld_latency", self.pmulld_latency.to_string());
         kv("fma_latency", self.fma_latency.to_string());
@@ -1806,6 +1941,35 @@ impl X86Tune {
         kv("derived.on_core_bytes", self.on_core_bytes().to_string());
         s
     }
+}
+
+/// Pure core of the bypass decision: `tune.bypass_div64()` gated by the
+/// `CCC_NO_DIV64_BYPASS` kill switch.
+///
+/// The bypass is a **run-time speculation with no range analysis behind it** —
+/// the guard tests the operands at run time, not the IR — so it is emitted on
+/// *every* 64-bit divide on a bypass-enabled row.  When a divide is under
+/// investigation, the kill switch returns the plain `cqto`/`xorl %edx,%edx` +
+/// `[i]divq` sequence.  Emitters take the tune explicitly and call this, so the
+/// decision is a function of (row, knob) — no hidden global read, and testable
+/// without touching process state.
+#[inline]
+pub fn bypass_div64_enabled_for(tune: &X86Tune, kill_switch: bool) -> bool {
+    tune.bypass_div64() && !kill_switch
+}
+
+/// `CCC_NO_DIV64_BYPASS` as read once per call site (presence-only, like every
+/// other `CCC_NO_*` knob in this tree).
+#[inline]
+pub fn div64_bypass_killed() -> bool {
+    std::env::var_os("CCC_NO_DIV64_BYPASS").is_some()
+}
+
+/// The decision for the active tuning row; this is what the emitters that have
+/// no explicit tune call.
+#[inline]
+pub fn bypass_div64_enabled() -> bool {
+    bypass_div64_enabled_for(&active(), div64_bypass_killed())
 }
 
 impl Default for X86Tune {
@@ -1905,13 +2069,23 @@ mod tests {
                 cpu
             );
             assert_eq!(
-                t.lzcnt_tzcnt_false_dep,
+                t.lzcnt_false_dep,
                 lzcnt_dep.contains(&cpu),
                 "lzcnt {:?}",
                 cpu
             );
+            // [uops.info] TZCNT_R64_R64: same set plus Zen 5 (op1→op1 = 1).
+            assert_eq!(
+                t.tzcnt_false_dep,
+                lzcnt_dep.contains(&cpu) || cpu == Znver5,
+                "tzcnt {:?}",
+                cpu
+            );
         }
-        assert!(Skylake.tune().popcnt_false_dep && !Skylake.tune().lzcnt_tzcnt_false_dep);
+        assert!(Skylake.tune().popcnt_false_dep && !Skylake.tune().lzcnt_false_dep);
+        // The split is observable: only Zen 5 differs between the two.
+        assert!(!Znver5.tune().break_lzcnt_dep() && Znver5.tune().break_tzcnt_dep());
+        assert!(!Znver4.tune().break_tzcnt_dep());
     }
 
     #[test]
@@ -1970,16 +2144,19 @@ mod tests {
             assert_eq!(cpu.tune().cmov_latency, 1);
         }
         assert_eq!(Gracemont.tune().cmov_latency, 2);
-        // DIV r64: latency is a range, throughput from port usage.
+        // DIV r64: latency is a range; throughput is the *measured* loop
+        // figure (TP_loop), not the port-computed one.
         for cpu in X86Cpu::ALL {
             let t = cpu.tune();
             assert!(t.div64_latency_min <= t.div64_latency, "{:?}", cpu);
             assert!(t.div64_rtp_x100 >= 300, "{:?}", cpu);
         }
-        assert_eq!(SandyBridge.tune().div64_rtp_x100, 1100);
-        assert_eq!(Haswell.tune().div64_rtp_x100, 800);
-        assert_eq!(Skylake.tune().div64_rtp_x100, 825);
-        assert_eq!(IceLake.tune().div64_rtp_x100, 300);
+        assert_eq!(SandyBridge.tune().div64_rtp_x100, 2200);
+        assert_eq!(Haswell.tune().div64_rtp_x100, 2100);
+        assert_eq!(Skylake.tune().div64_rtp_x100, 2100);
+        assert_eq!(IceLake.tune().div64_rtp_x100, 1000);
+        assert_eq!(RaptorLake.tune().div64_rtp_x100, 1000);
+        assert_eq!(Gracemont.tune().div64_rtp_x100, 600);
         assert_eq!(RaptorLake.tune().div64_latency, 18);
         assert!(Skylake.tune().div64_latency > IceLake.tune().div64_latency);
         assert!(IceLake.tune().div64_latency_min > Znver3.tune().div64_latency_min);
@@ -2033,14 +2210,15 @@ mod tests {
         // Same core: every instruction-level number is identical.
         let same = |a: &X86Tune| {
             format!(
-                "{} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {:?}",
+                "{} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {:?}",
                 a.dispatch_width,
                 a.mispredict_penalty,
                 a.rob_entries,
                 a.lsd_uops,
                 a.uop_cache_uops,
                 a.popcnt_false_dep,
-                a.lzcnt_tzcnt_false_dep,
+                a.lzcnt_false_dep,
+                a.tzcnt_false_dep,
                 a.shift_cl_uops,
                 a.lea3_latency,
                 a.cmov_uops,
@@ -2088,7 +2266,8 @@ mod tests {
         assert_eq!(X86Cpu::from_name("sierraforest"), Some(X86Cpu::Gracemont));
         assert_eq!(X86Cpu::from_name("gracemont"), Some(X86Cpu::Gracemont));
         assert_eq!(X86Cpu::from_name("alderlake"), Some(X86Cpu::AlderLake));
-        assert_eq!(X86Cpu::from_name("meteorlake"), Some(X86Cpu::RaptorLake));
+        assert_eq!(X86Cpu::from_name("meteorlake"), Some(X86Cpu::MeteorLake));
+        assert_eq!(X86Cpu::from_name("raptorlake"), Some(X86Cpu::RaptorLake));
     }
 
     #[test]
@@ -2097,7 +2276,8 @@ mod tests {
         for cpu in X86Cpu::ALL {
             let t = cpu.tune();
             assert!(g.popcnt_false_dep >= t.popcnt_false_dep);
-            assert!(g.lzcnt_tzcnt_false_dep >= t.lzcnt_tzcnt_false_dep);
+            assert!(g.lzcnt_false_dep >= t.lzcnt_false_dep);
+            assert!(g.tzcnt_false_dep >= t.tzcnt_false_dep);
             assert!(g.rob_entries <= t.rob_entries, "{:?}", cpu);
             assert!(g.uop_cache_uops <= t.uop_cache_uops, "{:?}", cpu);
             assert!(g.dispatch_width <= t.dispatch_width, "{:?}", cpu);
@@ -2237,15 +2417,49 @@ mod tests {
         // Register constraint is reported.
         assert!(g.mul_const_plan(7).unwrap().needs_distinct_src);
         assert!(!g.mul_const_plan(15).unwrap().needs_distinct_src);
-        // Every P-core and Zen row agrees with Generic.
+        // Every P-core and Zen row agrees with Generic — except Arrow Lake,
+        // where the measured `IMUL_R64_R64` latency is 4 cycles (3 only for the
+        // same-register form; uops.info ARL-P `1->1 cyc=4 same_reg=3`), so
+        // `mul_const_op_budget()` (= imul64_latency - 1) admits a 3-step plan.
+        // Pinning the old 2 here is what turned the tuning refresh red: the
+        // budget is derived from the latency column, so a corrected IMUL
+        // latency MUST move it.
         for cpu in X86Cpu::ALL {
             let t = cpu.tune();
             if cpu == X86Cpu::Gracemont {
                 continue;
             }
-            assert_eq!(t.mul_const_op_budget(), 2, "{:?}", cpu);
+            let expected = if cpu == X86Cpu::ArrowLake { 3 } else { 2 };
+            assert_eq!(t.mul_const_op_budget(), expected, "{:?}", cpu);
             for k in [-100, -10, 6, 7, 10, 15, 17, 31, 100, 1000] {
-                assert_eq!(t.mul_const_plan(k), g.mul_const_plan(k), "{:?} k={k}", cpu);
+                // A row with the wider budget may only ever *add* plans: every
+                // k Generic already plans must plan identically (a divergence
+                // there is a regression in the shared search, not a budget
+                // effect), and only ArrowLake may add the extra step that its
+                // measured 4-cycle IMUL pays for.
+                match (t.mul_const_plan(k), g.mul_const_plan(k)) {
+                    (Some(plan), Some(base)) => assert_eq!(plan, base, "{:?} k={k}", cpu),
+                    (Some(plan), None) => assert_eq!(
+                        cpu,
+                        X86Cpu::ArrowLake,
+                        "only the ARL-P budget may add a plan: {:?} k={k} {:?}",
+                        cpu,
+                        plan
+                    ),
+                    (None, Some(base)) => {
+                        panic!("{:?} lost a plan Generic has: k={k} {:?}", cpu, base)
+                    }
+                    (None, None) => {}
+                }
+            }
+            if cpu == X86Cpu::ArrowLake {
+                // The budget must be *live*: -10 = 5x·2 then negate is 3 steps,
+                // which only this row may use (`Generic` returns none for it).
+                assert_eq!(
+                    t.mul_const_plan(-10).unwrap().steps(),
+                    [LeaMul(4), Shl(1), Neg]
+                );
+                assert_eq!(g.mul_const_plan(-10), None);
             }
         }
         // Gracemont (IMUL 5): up to 4 one-cycle steps beat the multiplier.
@@ -2272,6 +2486,51 @@ mod tests {
                     assert!(p.len() <= 4);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn div64_bypass_is_a_function_of_the_row_and_the_kill_switch() {
+        use super::{X86Cpu::*, bypass_div64_enabled_for};
+        let on = |cpu: X86Cpu| bypass_div64_enabled_for(&cpu.tune(), false);
+        // ON exactly where the measured divider ratio says so.  `[uops.info]`
+        // DIV r64/r32 TP_loop: SNB 22/11, IVB 22/9, HSW 21/9, BDW 21/9,
+        // SKL/SKX 21/6 — each ≥ 2x with a deeper 64-bit latency.
+        for cpu in [
+            SandyBridge,
+            IvyBridge,
+            Haswell,
+            Broadwell,
+            Skylake,
+            SkylakeAvx512,
+        ] {
+            assert!(on(cpu), "{:?} must bypass (measured ratio ≥ 2x)", cpu);
+            // The kill switch is authoritative on every row that bypasses.
+            assert!(
+                !bypass_div64_enabled_for(&cpu.tune(), true),
+                "{:?}: CCC_NO_DIV64_BYPASS must win",
+                cpu
+            );
+        }
+        // OFF everywhere the 32-bit and 64-bit dividers are close (ICL/ADL-P/
+        // ARL-P 10/6, Gracemont 6/6, Zen/Zen+/2 14/14) and for Generic, so an
+        // untuned build is byte-identical to the pre-bypass compiler.
+        for cpu in [
+            IceLake,
+            AlderLake,
+            RaptorLake,
+            MeteorLake,
+            ArrowLake,
+            SapphireRapids,
+            Gracemont,
+            Znver1,
+            Znver2,
+            Znver3,
+            Znver4,
+            Znver5,
+            Generic,
+        ] {
+            assert!(!on(cpu), "{:?} must not bypass", cpu);
         }
     }
 
@@ -2394,7 +2653,13 @@ mod tests {
         assert_eq!(intel(0xB7), RaptorLake); // Raptor Lake-S (i7-14700KF)
         assert_eq!(intel(0xBA), RaptorLake); // Raptor Lake-P
         assert_eq!(intel(0xBF), RaptorLake);
-        assert_eq!(intel(0xAA), RaptorLake); // Meteor Lake
+        // MTL-M/P (0xAA), MTL-L (0xAC) and ARL-U (0xB5) are Redwood Cove +
+        // Crestmont parts, not Raptor Lake — the refresh split them out, and
+        // this test must pin the split, not the lumped behaviour.
+        assert_eq!(intel(0xAA), MeteorLake); // Meteor Lake-M/P
+        assert_eq!(intel(0xAC), MeteorLake); // Meteor Lake-L
+        assert_eq!(intel(0xB5), MeteorLake); // Arrow Lake-U
+        assert_eq!(intel(0xB7), RaptorLake); // Raptor Lake-S stays Raptor Lake
         assert_eq!(intel(0xBE), Gracemont); // Alder Lake-N
         assert_eq!(intel(0xAF), Gracemont); // Sierra Forest
         assert_eq!(intel(0x8F), SapphireRapids);
@@ -2614,5 +2879,112 @@ mod tests {
         for cpu in X86Cpu::ALL {
             assert_eq!(keys(&cpu.tune().dump()), keys(&d), "{:?}", cpu);
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Session "cpu-model red-team" (scripts/cpu_model_audit.py findings).
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn meteorlake_is_redwood_cove_not_a_raptorlake_alias() {
+        use X86Cpu::*;
+        assert_eq!(X86Cpu::from_name("meteorlake"), Some(MeteorLake));
+        // CPUID signatures: MTL-M/P 0xAA, MTL-S 0xAC, ARL-U 0xB5.
+        for m in [0xAA, 0xAC, 0xB5] {
+            assert_eq!(
+                X86Cpu::from_signature(true, false, 6, m),
+                MeteorLake,
+                "{m:#x}"
+            );
+        }
+        for m in [0xB7, 0xBA, 0xBF] {
+            assert_eq!(
+                X86Cpu::from_signature(true, false, 6, m),
+                RaptorLake,
+                "{m:#x}"
+            );
+        }
+        let (mtl, rpl) = (MeteorLake.tune(), RaptorLake.tune());
+        // [uops.info] MTL-P: VMULPD 3 cycles; ADL-P/EMR (Raptor Cove): 4.
+        assert_eq!(mtl.fmul_latency, 3);
+        assert_eq!(rpl.fmul_latency, 4);
+        // The P-core is otherwise Golden Cove class.
+        assert_eq!(mtl.fma_latency, rpl.fma_latency);
+        assert_eq!(mtl.fadd_latency, rpl.fadd_latency);
+        assert_eq!(mtl.lea3_latency, rpl.lea3_latency);
+        assert_eq!(mtl.div64_latency, rpl.div64_latency);
+        assert_eq!(mtl.cache.l2.kib, 2048);
+        // Crestmont: DIV r64 11–33 (Gracemont 11–44), 2 MiB cluster L2.
+        let e = mtl.ecore.expect("hybrid");
+        assert_eq!(
+            (e.name, e.div64_latency, e.cluster_l2_kib),
+            ("crestmont", 33, 2048)
+        );
+        assert_eq!(e.lea3_latency, Gracemont.tune().lea3_latency);
+        assert_eq!(resolve(None, Some("meteorlake")).cpu, MeteorLake);
+    }
+
+    #[test]
+    fn div_throughput_is_measured_and_drives_the_width_bypass() {
+        use X86Cpu::*;
+        // [uops.info] TP_loop DIV_R64 / DIV_R32 (x100).
+        let measured: &[(X86Cpu, u16, u16)] = &[
+            (SandyBridge, 2200, 1100),
+            (IvyBridge, 2200, 900),
+            (Haswell, 2100, 900),
+            (Broadwell, 2100, 900),
+            (Skylake, 2100, 600),
+            (SkylakeAvx512, 2100, 600),
+            (IceLake, 1000, 600),
+            (AlderLake, 1000, 600),
+            (RaptorLake, 1000, 600),
+            (MeteorLake, 1000, 600),
+            (Gracemont, 600, 600),
+            (Znver2, 1400, 1400),
+            (Znver3, 700, 600),
+            (Znver4, 700, 600),
+            (Znver5, 700, 600),
+        ];
+        for &(cpu, d64, d32) in measured {
+            let t = cpu.tune();
+            assert_eq!((t.div64_rtp_x100, t.div32_rtp_x100), (d64, d32), "{cpu:?}");
+            assert!(t.div32_latency_min <= t.div32_latency, "{cpu:?}");
+            // 32-bit division is never slower than 64-bit on any core.
+            assert!(t.div32_latency <= t.div64_latency, "{cpu:?}");
+        }
+        // Bypass is on exactly where the 64-bit divider is ≥ 2× the 32-bit
+        // one (SNB..SKX); Raptor Lake, Zen, Gracemont and Generic stay off.
+        for cpu in X86Cpu::ALL {
+            let on = matches!(
+                cpu,
+                SandyBridge | IvyBridge | Haswell | Broadwell | Skylake | SkylakeAvx512
+            );
+            assert_eq!(cpu.tune().bypass_div64(), on, "{cpu:?}");
+        }
+        assert!(
+            !X86Tune::GENERIC.bypass_div64(),
+            "untuned builds must not change"
+        );
+    }
+
+    #[test]
+    fn haswell_broadwell_vector_int_alu_is_p15_and_skylake_widens_to_p015() {
+        use X86Cpu::*;
+        // [uops.info] VPADDD ymm: HSW/BDW 1*p15, SKL 1*p015.
+        assert_eq!(Haswell.tune().vec_int_alu_pipes, 2);
+        assert_eq!(Broadwell.tune().vec_int_alu_pipes, 2);
+        assert_eq!(Skylake.tune().vec_int_alu_pipes, 3);
+        assert_eq!(SkylakeAvx512.tune().vec_int_alu_pipes, 3);
+        assert_eq!(IceLake.tune().vec_int_alu_pipes, 3);
+    }
+
+    #[test]
+    fn arrowlake_row_follows_the_refreshed_uops_info_column() {
+        let t = X86Cpu::ArrowLake.tune();
+        // IMUL_R64_R64 ARL-P: 4 (3 for the same-register form).
+        assert_eq!(t.imul64_latency, 4);
+        assert_eq!(t.pmulld_uops, 3);
+        assert_eq!(t.div64_rtp_x100, 1060);
+        assert_eq!(t.ecore.unwrap().div64_latency, 33);
     }
 }

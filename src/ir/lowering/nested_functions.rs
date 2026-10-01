@@ -35,7 +35,10 @@ use crate::frontend::parser::ast::{
     BlockItem, CompoundStmt, Expr, ForInit, FunctionDef, Initializer, SizeofArg, Stmt,
     TypeSpecifier,
 };
-use crate::ir::reexports::{Instruction, IrConst, Operand, Terminator, Value};
+use crate::ir::reexports::{
+    Instruction, IrConst, Operand, Terminator, Value, replace_operand_value,
+    replace_terminator_value,
+};
 
 /// Result of the capture analysis over a nested-function subtree.
 #[derive(Default, Debug)]
@@ -555,42 +558,15 @@ impl Lowerer {
     fn rewrite_value_uses(&mut self, old: u32, new: Value) {
         // The current block being built buffers its instructions in `instrs`
         // (they move into `blocks` at the next terminator): rewrite BOTH.
+        // Canonical pair: operand slots and bare-Value slots in one place.
         for inst in self.func_mut().instrs.iter_mut() {
-            inst.for_each_value_use_mut(|v| {
-                if v.0 == old {
-                    *v = new;
-                }
-            });
-            inst.for_each_operand_mut(|op| {
-                if let Operand::Value(v) = op {
-                    if v.0 == old {
-                        *op = Operand::Value(new);
-                    }
-                }
-            });
+            replace_operand_value(inst, Value(old), Operand::Value(new));
         }
         for block in self.func_mut().blocks.iter_mut() {
             for inst in block.instructions.iter_mut() {
-                inst.for_each_value_use_mut(|v| {
-                    if v.0 == old {
-                        *v = new;
-                    }
-                });
-                inst.for_each_operand_mut(|op| {
-                    if let Operand::Value(v) = op {
-                        if v.0 == old {
-                            *op = Operand::Value(new);
-                        }
-                    }
-                });
+                replace_operand_value(inst, Value(old), Operand::Value(new));
             }
-            block.terminator.for_each_operand_mut(|op| {
-                if let Operand::Value(v) = op {
-                    if v.0 == old {
-                        *op = Operand::Value(new);
-                    }
-                }
-            });
+            replace_terminator_value(&mut block.terminator, Value(old), Operand::Value(new));
         }
     }
 

@@ -1105,6 +1105,12 @@ fn link_builtin_native(
 /// of going through `Display`/`write_fmt` machinery.
 pub struct AsmOutput {
     pub buf: String,
+    /// Monotonic label counter — the ONE label allocator for every emitter
+    /// path.  `CodegenState::fresh_label`/`next_label_id` and the const-pool
+    /// labels all delegate here, so a label can never be handed out twice, and
+    /// the MachInst emitter (which has no `CodegenState`) can name its own
+    /// guard/done labels instead of hand-writing `1:`/`2:`.
+    label_counter: u32,
     /// When true, stack slot references use RSP-relative addressing instead of RBP.
     /// Set when the frame pointer is omitted (-fomit-frame-pointer).
     pub use_rsp_addressing: bool,
@@ -1830,6 +1836,7 @@ impl AsmOutput {
         // Pre-allocate 256KB to avoid repeated reallocations during codegen.
         Self {
             buf: String::with_capacity(256 * 1024),
+            label_counter: 0,
             use_rsp_addressing: false,
             rsp_frame_size: 0,
             #[cfg(debug_assertions)]
@@ -2278,6 +2285,20 @@ impl AsmOutput {
         }
         self.buf.push('\n');
         self.debug_scan_tail();
+    }
+
+    /// Allocate the next label id.  Every label in the emitted text is named
+    /// from this counter, so two labels can never collide even when two
+    /// different emitter paths build a sequence for the same function.
+    pub fn next_label_id(&mut self) -> u32 {
+        let id = self.label_counter;
+        self.label_counter += 1;
+        id
+    }
+
+    /// Allocate a fresh named label: `.L{prefix}_{id}`.
+    pub fn fresh_label(&mut self, prefix: &str) -> String {
+        format!(".L{}_{}", prefix, self.next_label_id())
     }
 
     /// Emit a named label definition: `{label}:`

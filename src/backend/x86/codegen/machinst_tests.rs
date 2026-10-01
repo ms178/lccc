@@ -2013,6 +2013,100 @@ fn div_uses_rax_rdx_and_computes_quotient_when_executed() {
 }
 
 #[test]
+fn div64_width_bypass_is_emitted_only_where_the_tuning_row_asks_and_runs_correctly() {
+    // Three claims in one place, because they fail independently:
+    //   1. the guard is *emitted* on a bypass row and *not* elsewhere,
+    //   2. `CCC_NO_DIV64_BYPASS` (the `div64_bypass_killed` argument) returns
+    //      the plain sequence on a row that would otherwise bypass,
+    //   3. the emitted guard computes the right quotient for inputs on both
+    //      sides of the 32-bit boundary -- the fast path and the slow path.
+    // The decision is a function of (row, knob), so this test needs no
+    // process-global mutation and cannot race the other emission tests.
+    let skl = crate::backend::x86::cpu_model::X86Cpu::Skylake.tune();
+    let rpl = crate::backend::x86::cpu_model::X86Cpu::RaptorLake.tune();
+    let dst = PhysReg(11); // r10 holds the divisor
+    for signed in [false, true] {
+        let inst = MachInst::Div {
+            divisor: MachOperand::Reg(MachReg::Phys(dst)),
+            signed,
+            size: OpSize::S64,
+        };
+
+        let mut on = AsmOutput::new();
+        emit_machinst_with_tune(&inst, &mut on, &skl, false);
+        assert!(
+            on.buf.contains("shrq $32, %rdx"),
+            "signed={signed}: no width guard on a bypass row:\n{}",
+            on.buf
+        );
+        assert!(
+            on.buf.contains("divl"),
+            "signed={signed}: no 32-bit fast path"
+        );
+        assert!(
+            on.buf.contains(".Ldiv64_slow_") && on.buf.contains(".Ldiv64_done_"),
+            "signed={signed}: guard uses numeric labels, not the shared allocator:\n{}",
+            on.buf
+        );
+        assert!(
+            on.buf.contains(if signed { "idivq" } else { "divq" }),
+            "signed={signed}: the 64-bit slow path is gone:\n{}",
+            on.buf
+        );
+
+        // The knob and an off-row must agree exactly: both are "no bypass".
+        let mut killed = AsmOutput::new();
+        emit_machinst_with_tune(&inst, &mut killed, &skl, true);
+        let mut off_row = AsmOutput::new();
+        emit_machinst_with_tune(&inst, &mut off_row, &rpl, false);
+        assert_eq!(killed.buf, off_row.buf, "signed={signed}: knob != off-row");
+        assert!(
+            !killed.buf.contains("divl") && !killed.buf.contains("shrq $32"),
+            "signed={signed}: kill switch did not remove the guard:\n{}",
+            killed.buf
+        );
+
+        // Execute the guarded form: quotient for the fast path (both operands
+        // below 2^32), the slow path (either operand at or above it), and the
+        // boundary values themselves.
+        let body = format!(
+            "    movq %rdi, %rax\n{}{}    movq %rsi, %r10\n    movq %rdx, %rsi\n",
+            if signed {
+                "    cqto\n"
+            } else {
+                "    xorl %edx, %edx\n"
+            },
+            on.buf
+        );
+        let inputs: &[(i64, i64)] = &[
+            (0xFFFF_FFFF, 7),
+            (0x1_0000_0000, 3),
+            (7, 100),
+            (i64::MAX, 7),
+            (i64::MIN, 2),
+            (1, 1),
+            (0, 5),
+        ];
+        let Some(got) = run_emitted(&body, inputs) else {
+            eprintln!("SKIP: no assembler/linker; Div bypass execution cannot run");
+            continue;
+        };
+        for (i, (a, b)) in inputs.iter().enumerate() {
+            let want = if signed {
+                a.wrapping_div(*b)
+            } else {
+                (*a as u64).wrapping_div(*b as u64) as i64
+            };
+            assert_eq!(
+                got[i], want,
+                "signed={signed} {a}/{b}: bypass computed {} but must be {want}",
+                got[i]
+            );
+        }
+    }
+}
+
+#[test]
 fn cmov_selects_the_right_operand_when_executed() {
     // Flags are set by a cmp the probe controls: cmovl picks the smaller
     // input. An operand-order bug picks the larger one — both are valid

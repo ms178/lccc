@@ -328,7 +328,6 @@ pub struct CodegenState {
     /// instruction/label mapping at -O1 (see 20000822-1).
     pub trampoline_data_blocks: Vec<String>,
     /// Counter for generating unique labels (e.g., memcpy loops).
-    label_counter: u32,
     /// Whether any position-independent code generation is enabled. Backends
     /// that do not distinguish PIE from full PIC retain this conservative bit.
     pub pic_mode: bool,
@@ -711,7 +710,6 @@ impl CodegenState {
             dirty_upper_ymm: false,
             requires_executable_stack: false,
             trampoline_data_blocks: Vec::new(),
-            label_counter: 0,
             pic_mode: false,
             shared_lib: false,
             pie_mode: false,
@@ -782,9 +780,7 @@ impl CodegenState {
     }
 
     pub fn next_label_id(&mut self) -> u32 {
-        let id = self.label_counter;
-        self.label_counter += 1;
-        id
+        self.out.next_label_id()
     }
 
     /// Mark that a `.section` directive for a NON-TEXT section has just been
@@ -801,10 +797,10 @@ impl CodegenState {
         self.current_text_section.clear();
     }
 
-    /// Generate a fresh label with the given prefix.
+    /// Generate a fresh label with the given prefix.  Delegates to the single
+    /// allocator in [`AsmOutput`] so every emitter path shares one namespace.
     pub fn fresh_label(&mut self, prefix: &str) -> String {
-        let id = self.next_label_id();
-        format!(".L{}_{}", prefix, id)
+        self.out.fresh_label(prefix)
     }
 
     /// Central x87-pending flush gate. Any emitted line that could mutate
@@ -837,8 +833,7 @@ impl CodegenState {
         if let Some(label) = self.fp_const_pool.get(&bits) {
             return label.clone();
         }
-        let label = format!(".LCFP_{}", self.label_counter);
-        self.label_counter += 1;
+        let label = format!(".LCFP_{}", self.out.next_label_id());
         self.fp_const_pool.insert(bits, label.clone());
         label
     }
@@ -853,8 +848,7 @@ impl CodegenState {
         if let Some(label) = self.vec_const_pool.get(bytes) {
             return label.clone();
         }
-        let label = format!(".LCVEC_{}", self.label_counter);
-        self.label_counter += 1;
+        let label = format!(".LCVEC_{}", self.out.next_label_id());
         self.vec_const_pool.insert(bytes.to_vec(), label.clone());
         label
     }
