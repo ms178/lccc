@@ -1106,8 +1106,18 @@ pub(super) fn fold_load_test_into_cmp(store: &mut LineStore, infos: &mut [LineIn
         let width_matched =
             (*cmp_mnemonic == "cmpb" && width == 'b') || (*cmp_mnemonic == "cmpw" && width == 'w');
         let sf_provably_identical = width_matched || signed_64 || (signed_32 && !test_is_q);
+        // The precise query, not the coarse one: the coarse walk stops at ANY
+        // writer, so a `stc` (CF only) hides every consumer behind it -- and a
+        // `js` behind a `stc` observes exactly the SF this fold may change.
+        // ZF/CF/PF/OF are provably identical in this branch, so a writer that
+        // touches only those cannot expose the rewrite and is stepped over;
+        // `sahf` writes SF and still stops the walk.
         if !sf_provably_identical
-            && super::flag_peepholes::flags_reach_an_sf_consumer(store, infos, j + 1)
+            && super::flag_peepholes::flags_reach_an_sf_consumer_preserving_zf_cf_pf_of(
+                store,
+                infos,
+                j + 1,
+            )
         {
             i += 1;
             continue;
@@ -1121,7 +1131,9 @@ pub(super) fn fold_load_test_into_cmp(store: &mut LineStore, infos: &mut [LineIn
         // cannot read AF (there is no AF predicate), and the
         // NON_SF_FLAG_READERS whitelist reads CF/OF only, so `je`/`js`/
         // `cmovne`/`adc` never trigger this veto.
-        if super::flag_peepholes::flags_reach_a_whole_flags_reader(store, infos, j + 1) {
+        // Likewise precise: this fold changes ONLY AF, and the coarse query
+        // let a CF-only `stc` hide a `lahf` -- which reads AF -- behind it.
+        if super::flag_peepholes::flags_reach_a_whole_flags_reader_except_af(store, infos, j + 1) {
             i += 1;
             continue;
         }

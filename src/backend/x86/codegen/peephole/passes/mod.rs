@@ -38,6 +38,7 @@ mod identical_blocks;
 mod liveness;
 mod load_op_fuse;
 mod local_patterns;
+mod loop_iv_spill;
 mod loop_trampoline;
 mod memory_fold;
 mod narrow_copy_fold;
@@ -1598,8 +1599,31 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
         loop_trampoline::eliminate_loop_trampolines(&mut store, &mut infos)
     };
 
+    // Phase 4a: Coalesce a loop induction variable that the windowed allocator
+    // left in a stack slot, so the loop stops round-tripping the IV through
+    // memory once per iteration. Runs after trampoline elimination, which
+    // removes the phi-shuffle blocks that would otherwise hide the reload/store
+    // pair, and before the local cleanup below, which folds the store we sink
+    // into a memory operand where it can.
+    //
+    // Returns `true` when it rewrote the unit, because `insert_line` shifts
+    // every later index and the driver must not reuse its own.
+    //
+    // Deliberately NOT gated on `skip_phase4`. That flag disables the whole of
+    // phase 4 because the trampoline pass RENAMES registers, which is not
+    // MachInst-safe; this pass renames nothing — it moves one load to the loop's
+    // entry edge and one store to its exits, both within a single function, and
+    // its guards are stated over the current text rather than over a register
+    // assignment. Tying it to `skip_phase4` would have left it permanently off,
+    // since `skip_phase4` is unconditionally true outside MachInst mode.
+    let iv_spill_changed = if sk("loop_iv_spill") {
+        false
+    } else {
+        loop_iv_spill::promote_loop_iv_spill(&mut store, &mut infos)
+    };
+
     // Phase 4b: If trampoline elimination made changes, do another round of local cleanup.
-    if trampoline_changed && !skip_phase4 {
+    if (trampoline_changed || iv_spill_changed) && !skip_phase4 {
         let mut changed3 = true;
         let mut pass_count3 = 0;
         while changed3 && pass_count3 < MAX_POST_GLOBAL_ITERATIONS {

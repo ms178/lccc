@@ -59,6 +59,17 @@ pub(super) const F_ALL: u8 = F_ZF | F_CF | F_SF | F_OF | F_PF | F_AF;
 
 /// The flags a writer instruction can clobber, as a bitmask.
 ///
+/// ## SCOPE: the six ARITHMETIC flags only
+///
+/// DF is deliberately NOT modelled, and a caller must not read this function
+/// as covering it. `cld`/`std` set and clear DF, and `pushfq`/`lahf` read the
+/// flags word including bit 10, so a `pushfq` after a `cld` and after a `std`
+/// really do differ. Masking those two as 0 is sound **only** because every
+/// rewrite guarded by this module changes arithmetic flags alone. A rewrite
+/// that changed DF would need a seventh bit here, and getting that wrong is a
+/// silent miscompile rather than a lost fold -- which is why it is stated here
+/// rather than left to be inferred.
+///
 /// [`walk_flag_consumers`] used to treat every `FlagsEffect::Writes` as a
 /// total clobber.  That is sound but far too coarse for a rewrite that
 /// PROVES it preserves ZF and CF, because two very common flag setters write
@@ -85,6 +96,14 @@ pub(super) const F_ALL: u8 = F_ZF | F_CF | F_SF | F_OF | F_PF | F_AF;
 /// which do write OF and AF, and every unrecognised mnemonic -- returns
 /// [`F_ALL`], so no existing call can become less conservative than before.
 pub(super) fn flags_written_mask(t: &str) -> u8 {
+    // Trim FIRST. Every current caller passes an already-trimmed line, so this
+    // is a no-op today -- but the fail-closed `_` arm means an untrimmed
+    // argument returns F_ALL, and that failure is SILENT: a caller that
+    // passes a raw line would simply see its folds stop happening, with no
+    // diagnostic anywhere. Making the function accept what a reader expects
+    // it to accept costs one line and removes a whole class of quiet
+    // degradation.
+    let t = t.trim();
     let base = t.strip_prefix('v').unwrap_or(t);
     let mnem = base
         .split(|c: char| c == ' ' || c == '\t')
@@ -1678,6 +1697,28 @@ fn flags_are_block_local(
 /// (`b`/`ae`/`a`/`be`), the CF predicates, `o`/`no` and `p`/`np` do not.
 const SF_CCS: &[&str] = &["s", "ns", "l", "nl", "le", "nle", "g", "ng", "ge", "nge"];
 
+/// The EFLAGS bits a condition code actually selects on, per SDM Vol. 1
+/// Table 3-1 ("Contents of Flags Registers") plus the Jcc/SETcc/CMOVcc
+/// definitions.  An unrecognised code falls back to `F_ALL`, so no caller can
+/// read a narrowed "this code touches nothing" out of a typo.
+fn cc_reads(cc: &str) -> u8 {
+    match cc {
+        "e" | "z" | "ne" | "nz" => F_ZF,
+        "b" | "c" | "nae" => F_CF,
+        "nb" | "nc" | "ae" => F_CF,
+        "be" | "na" | "a" | "nbe" => F_ZF | F_CF,
+        "s" | "ns" => F_SF,
+        "l" | "nl" => F_SF | F_OF,
+        "le" | "nle" => F_SF | F_OF | F_ZF,
+        "g" | "ng" => F_SF | F_OF | F_ZF,
+        "ge" | "nge" => F_SF | F_OF | F_ZF,
+        "o" | "no" => F_OF,
+        // Unrecognised: fail closed.  Every bit is charged, so an unknown code
+        // can never be mistaken for one that touches nothing.
+        _ => F_ALL,
+    }
+}
+
 /// Condition codes that select on ZF and CF alone, with every other flag
 /// masked out: `e/z/ne/nz` (ZF), `b/c/nae` (CF), `nb/nc/ae` (!CF) and
 /// `be/na` (CF|ZF), `a/nbe` (!CF|!ZF).  The SF/OF group (`s`, `l`, `le`, `g`,
@@ -1826,10 +1867,32 @@ fn walk_flag_consumers(
         }
     };
 
+    // Per-path LIVE mask: the flags whose value still comes from the
+    // instruction whose consumers we are hunting.  It starts at F_ALL and is
+    // narrowed by every writer stepped over.
+    //
+    // This is strictly more information than the static `preserved`
+    // comparison, and the difference is exactly the unsound case: a PARTIAL
+    // writer must not END the walk.  `stc` writes CF only, so after it CF is
+    // dead but OF, SF, ZF, PF and AF are still whatever the producer left --
+    // a `jo` behind the `stc` observes the PRODUCER's OF, and a rewrite that
+    // changes OF must be vetoed by it.  The old rule stopped at the `stc` and
+    // never saw the `jo`, which is a live miscompile in the self-test fold
+    // (orig returned 1 and folded returned 0 at x = 0x7fffffff).
+    //
+    // `seen` stays a plain boolean even though liveness is per-path: a path
+    // that kills every flag BREAKS out of the walk instead of pushing its
+    // successor, so it can never mark a merge block seen.  Every path that
+    // does reach a merge still has at least one live flag, so the boolean memo
+    // is exact.  `a_full_writer_arm_does_not_suppress_the_live_arm_at_a_merge`
+    // and `the_dead_arm_expanded_first_does_not_hide_the_live_arm` both pass
+    // under a liveness-aware memo too, which is the evidence for that claim
+    // rather than an assumption about it.
     let mut seen = vec![false; fe - fs];
-    let mut work: Vec<usize> = vec![from];
-    while let Some(head) = work.pop() {
+    let mut work: Vec<(usize, u8)> = vec![(from, F_ALL)];
+    while let Some((head, live)) = work.pop() {
         let mut n = head;
+        let mut live = live;
         while n < fe {
             if seen[n - fs] {
                 break; // this suffix was already expanded, facts included
@@ -1871,7 +1934,7 @@ fn walk_flag_consumers(
                 // the target only.
                 LineKind::Jmp => {
                     if let Some(idx) = resolve(t, &mut facts) {
-                        work.push(idx);
+                        work.push((idx, live));
                     }
                     break;
                 }
@@ -1889,13 +1952,44 @@ fn walk_flag_consumers(
                 _ => {}
             }
             match flags_effect(t) {
-                // The flags die here on this path -- UNLESS this writer only
-                // clobbers flags the rewrite already proves it preserves.  A
-                // CF-only writer cannot reveal a ZF/CF-preserving rewrite, and
-                // stopping there would hide every consumer behind it.
+                // A writer only KILLS the flags it actually defines.  It does
+                // not end the walk, because everything it does not define is
+                // still live from the original producer and a consumer behind
+                // it can still observe it.
+                //
+                // This is the difference between a mask comparison and a
+                // liveness model.  The old test was
+                // `flags_written_mask(t) & !preserved != 0 -> break`, which
+                // conflates "this writer destroys what the rewrite preserves"
+                // with "this writer destroys something": a `stc` destroys CF
+                // only, so it ended the walk and hid every OF/SF/AF consumer
+                // standing behind it.  Narrowing instead of stopping reaches
+                // them, and the `live & reads` intersection below decides
+                // whether each can actually observe the rewrite.
+                //
+                // `cmc` is the instructive case: it COMPLEMENTS CF rather than
+                // defining it, so the value it leaves is a function of the
+                // incoming CF.  Killing CF there would claim a consumer of the
+                // OLD CF is safe, which is false, so CF stays live and any
+                // `jb` behind the `cmc` still vetoes.
                 FlagsEffect::Writes => {
-                    if flags_written_mask(t) & !preserved != 0 {
-                        break;
+                    match t.split_whitespace().next().unwrap_or("") {
+                        "cmc" => {
+                            // CF is a function of the old CF, not a constant.
+                            // Nothing is retired; keep walking with `live`.
+                        }
+                        _ => {
+                            live &= !flags_written_mask(t);
+                            if live == 0 {
+                                // Nothing the caller cares about survives, so
+                                // no consumer behind here can observe the
+                                // rewrite.  Stopping is not merely an
+                                // optimisation: continuing would charge
+                                // consumers of flags that are already dead,
+                                // vetoing rewrites that are provably safe.
+                                break;
+                            }
+                        }
                     }
                     n += 1;
                     continue;
@@ -1905,25 +1999,61 @@ fn walk_flag_consumers(
                     continue;
                 }
                 FlagsEffect::Reads => {
-                    facts.saw_consumer = true;
-                    // Condition-code consumers (`jcc`, `setcc`, `cmovcc`) name
-                    // exactly which flags they read; everything else is a
-                    // whole-flag or unknown reader and is charged with SF
-                    // unless `NON_SF_FLAG_READERS` vouches for it.
+                    // A consumer is charged for the intersection of three sets:
+                    //
+                    //   cc_reads(cc)  -- what this instruction selects on
+                    //   live          -- what is still the producer's value
+                    //   !preserved    -- what the rewrite may change
+                    //
+                    // All three are needed.  Without `live` a consumer of a
+                    // flag some earlier writer already retired vetoes a
+                    // rewrite that cannot reach it, so "just walk further"
+                    // would trade one bug for its mirror image.  Without
+                    // `!preserved` the walk charges consumers of flags the
+                    // rewrite leaves alone, which is the coarse
+                    // over-approximation `preserved` exists to remove.
+                    //
+                    // `saw_consumer` comes from LIVENESS rather than from
+                    // `observed`: a ZF-only `je` is still the one consumer the
+                    // ZF-only proofs need to see, even though nothing it reads
+                    // can have been changed.
                     let cc = condition_code_of(t);
                     match cc {
                         Some(cc) => {
-                            if !matches!(cc, "e" | "z" | "ne" | "nz") {
+                            // Condition-code consumers (`jcc`, `setcc`,
+                            // `cmovcc`) name exactly which flags they read;
+                            // everything else is a whole-flag or unknown
+                            // reader and is charged with SF unless
+                            // `NON_SF_FLAG_READERS` vouches for it.
+                            let reads = cc_reads(cc);
+                            if reads & live == 0 {
+                                n += 1;
+                                continue; // every flag it wants is already dead
+                            }
+                            facts.saw_consumer = true;
+                            let observed = reads & live & !preserved;
+                            if observed & !F_ZF != 0 {
                                 facts.saw_non_zf = true;
                             }
-                            if !ZF_CF_ONLY_CCS.contains(&cc) {
+                            if observed & !(F_ZF | F_CF) != 0 {
                                 facts.saw_outside_zf_cf = true;
                             }
-                            if SF_CCS.contains(&cc) {
+                            if observed & F_SF != 0 {
                                 facts.saw_sf_reader = true;
                             }
                         }
                         None => {
+                            if live == 0 {
+                                break;
+                            }
+                            facts.saw_consumer = true;
+                            // A whole-word or unknown reader observes
+                            // everything still live, so it is charged unless
+                            // the rewrite preserves all of it.
+                            if live & !preserved == 0 {
+                                n += 1;
+                                continue;
+                            }
                             facts.saw_non_zf = true;
                             facts.saw_outside_zf_cf = true;
                             if !NON_SF_FLAG_READERS.iter().any(|p| t.starts_with(p)) {
@@ -1938,7 +2068,7 @@ fn walk_flag_consumers(
                         || (t.starts_with('j') && !t.starts_with("jmp"))
                     {
                         if let Some(idx) = resolve(t, &mut facts) {
-                            work.push(idx);
+                            work.push((idx, live));
                         }
                     }
                     if reader_also_writes_flags(t) {
@@ -1981,7 +2111,12 @@ pub(super) fn flag_consumers_are_zf_only(
     infos: &[LineInfo],
     from: usize,
 ) -> bool {
-    let f = walk_flag_consumers(store, infos, from, 0);
+    // `preserved = F_ZF` is the whole proof this query stands on: the caller
+    // established that the two exchanged instructions agree on ZF and on
+    // nothing else.  Passing 0 would be equally conservative for a direct
+    // consumer and strictly more so behind a partial writer (it would charge a
+    // `jo` of a dead OF), which costs folds.
+    let f = walk_flag_consumers(store, infos, from, F_ZF);
     f.proved && f.saw_consumer && !f.saw_non_zf
 }
 
@@ -1994,7 +2129,7 @@ pub(super) fn flag_consumers_are_zf_cf_only(
     infos: &[LineInfo],
     from: usize,
 ) -> bool {
-    let f = walk_flag_consumers(store, infos, from, 0);
+    let f = walk_flag_consumers(store, infos, from, F_ZF | F_CF);
     f.proved && f.saw_consumer && !f.saw_outside_zf_cf
 }
 
@@ -2040,26 +2175,55 @@ pub(super) fn flags_reach_an_sf_consumer(
     !f.proved || f.saw_sf_reader
 }
 
-/// True when some consumer of the current flags reads the WHOLE EFLAGS word
-/// (or is opaque enough that it might): `lahf`, `pushf`, inline-asm blocks,
-/// unknown mnemonics.  This is the reader class that can observe **AF**;
-/// condition-code consumers cannot select AF and the
-/// [`NON_SF_FLAG_READERS`] whitelist (`adc`/`sbb`/`adox`/`rcl`/`rcr`/`cmc`/
-/// `salc`/`into`) reads CF/OF only.  Fails closed exactly like
-/// [`flags_reach_an_sf_consumer`]: an incomplete walk must not license an
-/// AF-divergent rewrite.
+/// [`flags_reach_a_whole_flags_reader`] for a rewrite that PROVES it changes
+/// only AF, which is the `cmp $0, mem` -> `test $0, mem` zero-compare fold.
 ///
-/// Used by `test`→`cmp` zero-compare folds: `cmp $0, mem` DEFINES AF (a
-/// subtraction from zero never borrows, so AF=0) while `test` leaves it
-/// carrying the previous writer's value -- the only flag the rewrite can
-/// change when SF/ZF/PF/CF/OF are provably identical.
-pub(super) fn flags_reach_a_whole_flags_reader(
+/// This is not a narrowing for its own sake. A walk that stops at ANY writer
+/// lets a writer that touches only preserved flags hide every consumer behind
+/// it, and a whole-word reader sitting behind one is missed:
+///
+/// ```asm
+///         cmpq  $0, (%rax)      ; -> testq $0, (%rax): AF diverges
+///         je    .Lkeep          ; ZF only: allowed
+///         jmp   .Lout           ; the walk's fall-through leaves here
+/// .Lkeep:
+///         stc                   ; writes CF, and ONLY CF  -> walk stops
+///         lahf                  ; reads SF ZF AF PF: MISSED by the coarse walk
+/// ```
+///
+/// `lahf` observes exactly the flag this fold changes, so the fold is licensed
+/// on a path where it is observable. `stc` writes none of AF, so the precise
+/// walk steps over it and reaches the `lahf`, which vetoes.
+///
+/// `sahf` is deliberately NOT stepped over: it writes AF, so it genuinely can
+/// mask an AF observation and the walk must stop there. `cld`/`std` write
+/// neither AF nor any EFLAGS arithmetic flag, so they are stepped over.
+pub(super) fn flags_reach_a_whole_flags_reader_except_af(
     store: &LineStore,
     infos: &[LineInfo],
     from: usize,
 ) -> bool {
-    let f = walk_flag_consumers(store, infos, from, 0);
+    let f = walk_flag_consumers(store, infos, from, F_ZF | F_CF | F_SF | F_OF | F_PF);
     !f.proved || f.saw_whole_reader
+}
+
+/// [`flags_reach_an_sf_consumer`] for a rewrite that PROVES ZF, CF, PF and OF
+/// unchanged, and that MAY change SF and AF.
+///
+/// Same reasoning as [`flags_reach_a_whole_flags_reader_except_af`], with the
+/// preserved set taken from what the caller actually proved.  Note the set is
+/// deliberately NOT the same one: the whole-word query guards the branch where
+/// AF is the only divergent flag, while this one guards the branch where SF
+/// provably is NOT identical, so SF and AF are both outside the set.  `sahf`
+/// writes SF and therefore still stops the walk; `stc` writes only CF and is
+/// stepped over, so a `js` behind it is finally reached.
+pub(super) fn flags_reach_an_sf_consumer_preserving_zf_cf_pf_of(
+    store: &LineStore,
+    infos: &[LineInfo],
+    from: usize,
+) -> bool {
+    let f = walk_flag_consumers(store, infos, from, F_ZF | F_CF | F_PF | F_OF);
+    !f.proved || f.saw_sf_reader
 }
 
 /// Whole-name occurrence test: `%r8` must not match inside `%r8d`.
@@ -2384,7 +2548,10 @@ fn strip_width_suffix<'a>(t: &'a str, base: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::super::super::peephole_optimize;
-    use super::{ConsumerFacts, FlagsEffect, flags_effect, walk_flag_consumers};
+    use super::{
+        ConsumerFacts, F_AF, F_ALL, F_CF, F_OF, F_PF, F_SF, F_ZF, FlagsEffect, flags_effect,
+        flags_written_mask, walk_flag_consumers,
+    };
     use crate::backend::x86::codegen::peephole::types::{LineInfo, LineStore, classify_line};
 
     fn run(asm: &str) -> String {
@@ -2481,6 +2648,280 @@ mod tests {
             ".cfi_endproc\n",
         ));
         assert!(out.contains("testq %rsi, %rsi"), "{out}");
+    }
+
+    /// RED-TEAM REGRESSION for a miscompile in the self-test fold.
+    ///
+    /// `eliminate_redundant_self_test` deletes `test %R,%R` after an arithmetic
+    /// producer, keeping it only when `flag_consumers_are_zf_only` proves every
+    /// consumer reads ZF alone.  That proof used to walk with `preserved = 0`,
+    /// so ANY writer stopped the walk -- and a PARTIAL writer such as `stc`
+    /// leaves OF, SF, ZF, PF and AF exactly as the producer left them.  A `jo`
+    /// behind the `stc` therefore observed the PRODUCER's OF without the walk
+    /// ever seeing it, and the fold fired:
+    ///
+    ///     addl $1, %eax      ; x = 0x7fffffff -> OF = 1
+    ///     testl %eax, %eax   ; deleted by the fold, and it would clear OF
+    ///     je .Lzero          ; ZF-only consumer, not taken
+    ///     stc                ; CF only -- the coarse walk stopped HERE
+    ///     jo .Lof            ; reads the producer's OF; must veto
+    ///
+    /// Executed as an A/B, orig returns 1 and folded returns 0 at
+    /// x = 0x7fffffff: a wrong answer from code that lowers the instruction
+    /// count, assembles, links and passes every shape-only gate.
+    #[test]
+    fn self_test_after_sub_is_kept_when_a_partial_writer_hides_an_of_reader() {
+        let out = self_test_case(concat!(
+            "    addl %edx, %esi\n",
+            "    testl %esi, %esi\n",
+            "    je .LBB4\n", // ZF-only consumer, NOT taken when %esi != 0
+            "    stc\n",      // CF-only writer: kills CF, leaves OF live
+            "    jo .Lof\n",  // must be reached and must veto
+            "    movl $1, %eax\n",
+            "    ret\n",
+            ".Lof:\n",
+            "    movl $0, %eax\n",
+            "    ret\n",
+        ));
+        assert!(
+            out.contains("testl %esi, %esi"),
+            "the redundant test must survive: the jo behind the stc reads the \
+             producer's OF, which the fold changes.\n{out}"
+        );
+    }
+
+    /// The complement, and the reason the fix is a liveness model rather than
+    /// "never step over a writer": a consumer of a flag the partial writer
+    /// ACTUALLY killed must NOT veto.  `stc` kills CF, so a `jb` behind it is
+    /// free and the fold must still fire.  A blanket "stop at any writer" rule
+    /// would pass the security tests above and silently lose this fold.
+    #[test]
+    fn self_test_after_add_is_still_folded_when_a_cf_only_writer_precedes_a_jb() {
+        let out = self_test_case(concat!(
+            "    addl %edx, %esi\n",
+            "    testl %esi, %esi\n",
+            "    je .LBB4\n",
+            "    stc\n",        // kills CF
+            "    jb .Lcarry\n", // reads CF only -> dead, must not veto
+            "    movl $1, %eax\n",
+            "    ret\n",
+            ".Lcarry:\n",
+            "    movl $2, %eax\n",
+            "    ret\n",
+        ));
+        assert!(
+            !out.contains("testl %esi, %esi"),
+            "jb reads only CF, which the stc already killed, so it cannot \
+             observe the fold and must not veto it.\n{out}"
+        );
+    }
+
+    /// A FULL writer really does kill everything, so consumers behind it are
+    /// unreachable and must not veto.  This is the other half of the liveness
+    /// argument and it is what keeps the walk from becoming merely more
+    /// conservative than the code it replaced.
+    #[test]
+    fn self_test_after_add_is_folded_when_a_full_writer_precedes_every_reader() {
+        let out = self_test_case(concat!(
+            "    addl %edx, %esi\n",
+            "    testl %esi, %esi\n",
+            "    je .LBB4\n",
+            "    addl $7, %ecx\n", // defines ALL six: nothing survives
+            "    jo .Lof\n",       // reads a DEAD OF -> must not veto
+            "    js .Ls\n",        // reads a DEAD SF -> must not veto
+            "    lahf\n",          // reads a DEAD word -> must not veto
+            "    movl $1, %eax\n",
+            "    ret\n",
+            ".Lof:\n",
+            "    movl $3, %eax\n",
+            "    ret\n",
+            ".Ls:\n",
+            "    movl $4, %eax\n",
+            "    ret\n",
+        ));
+        assert!(
+            !out.contains("testl %esi, %esi"),
+            "every flag is redefined by the addl before any reader, so no \
+             consumer behind it can observe the fold.\n{out}"
+        );
+    }
+
+    /// `cmc` is the case a mask-based liveness rule gets WRONG in the unsafe
+    /// direction.  `cmc` does not define CF, it COMPLEMENTS it, so the value
+    /// it leaves is a function of the incoming CF.  Retiring CF at a `cmc`
+    /// would claim a `jb` behind it reads a dead flag; it does not.
+    #[test]
+    fn self_test_after_add_is_kept_when_a_cmc_precedes_a_jb() {
+        let out = self_test_case(concat!(
+            "    addl %edx, %esi\n",
+            "    testl %esi, %esi\n",
+            "    je .LBB4\n",
+            "    cmc\n",        // complements CF: still a function of the producer
+            "    jb .Lcarry\n", // reads CF -> must veto
+            "    movl $1, %eax\n",
+            "    ret\n",
+            ".Lcarry:\n",
+            "    movl $2, %eax\n",
+            "    ret\n",
+        ));
+        assert!(
+            out.contains("testl %esi, %esi"),
+            "cmc complements rather than defines CF, so a jb behind it can \
+             still observe the producer's CF.\n{out}"
+        );
+    }
+
+    /// `sahf` writes SF/ZF/AF/PF/CF and leaves OF alone, so a `jo` behind it
+    /// reads the producer's OF and must veto.  This is the partial writer with
+    /// the OPPOSITE polarity to `stc`, and it catches an implementation that
+    /// only special-cases the CF-only case.
+    #[test]
+    fn self_test_after_add_is_kept_when_a_sahf_precedes_a_jo() {
+        let out = self_test_case(concat!(
+            "    addl %edx, %esi\n",
+            "    testl %esi, %esi\n",
+            "    je .LBB4\n",
+            "    sahf\n", // leaves OF live
+            "    jo .Lof\n",
+            "    movl $1, %eax\n",
+            "    ret\n",
+            ".Lof:\n",
+            "    movl $0, %eax\n",
+            "    ret\n",
+        ));
+        assert!(
+            out.contains("testl %esi, %esi"),
+            "sahf does not affect OF, so the jo behind it reads the producer's \
+             OF and must veto.\n{out}"
+        );
+    }
+
+    /// `lahf` is the AF observer: no condition code covers AF and
+    /// `NON_SF_FLAG_READERS` does not vouch for it, so a `lahf` behind a `stc`
+    /// must veto.  Same shape as the `jo` case with a whole-word reader, and
+    /// the reason unknown readers are charged at all.
+    #[test]
+    fn self_test_after_add_is_kept_when_a_lahf_precedes_nothing() {
+        let out = self_test_case(concat!(
+            "    addl %edx, %esi\n",
+            "    testl %esi, %esi\n",
+            "    je .LBB4\n",
+            "    stc\n",
+            "    lahf\n", // reads AF, which the stc does not define
+            "    movl $1, %eax\n",
+            "    ret\n",
+        ));
+        assert!(
+            out.contains("testl %esi, %esi"),
+            "lahf observes AF, and stc does not define AF.\n{out}"
+        );
+    }
+
+    /// A merge whose two arms kill DIFFERENT flag sets must not let the
+    /// narrower arm's expansion suppress the wider arm's consumers.
+    ///
+    /// `seen` stays a boolean even though liveness is per-path, and this is the
+    /// test that justifies it: the hazard would be an arm that kills every flag
+    /// marking the merge seen so the still-live arm is skipped.  It cannot
+    /// happen, because such an arm BREAKS out of the walk instead of pushing
+    /// its successor, so it never marks a merge.  Both this test and
+    /// `the_dead_arm_expanded_first_does_not_hide_the_live_arm` pass under a
+    /// liveness-aware memo as well, which is the evidence for the claim.
+    #[test]
+    fn a_full_writer_arm_does_not_suppress_the_live_arm_at_a_merge() {
+        let asm = concat!(
+            "    .text\n",
+            "    .globl f\n",
+            "    .type f, @function\n",
+            "f:\n",
+            "    .cfi_startproc\n",
+            "    cmpq $0, (%rdi)\n",
+            "    je .Llive\n",
+            "    addl $1, %eax\n", // full writer, live -> 0
+            "    jmp .Lmerge\n",
+            ".Llive:\n",
+            "    stc\n", // CF only: ZF stays live
+            ".Lmerge:\n",
+            "    jne .Lbad\n", // charged on the CF-only arm
+            "    ret\n",
+            ".Lbad:\n",
+            "    ret\n",
+            "    .cfi_endproc\n",
+        );
+        let store = LineStore::new(asm.to_string());
+        let infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let at = (0..store.len())
+            .find(|&i| infos[i].trimmed(store.get(i)).starts_with("cmpq"))
+            .expect("cmp not found");
+        let f = walk_flag_consumers(&store, &infos, at + 1, F_ZF);
+        assert!(
+            f.saw_consumer,
+            "the jne behind the merge is live on the CF-only arm and must be \
+             reported"
+        );
+    }
+
+    /// The same merge with the arms swapped, so the full writer is the one the
+    /// LIFO worklist expands first.  The result must not depend on traversal
+    /// order.
+    #[test]
+    fn the_dead_arm_expanded_first_does_not_hide_the_live_arm() {
+        let asm = concat!(
+            "    .text\n",
+            "    .globl f\n",
+            "    .type f, @function\n",
+            "f:\n",
+            "    .cfi_startproc\n",
+            "    cmpq $0, (%rdi)\n",
+            "    je .Llive\n", // pushed first  -> expanded LAST
+            "    stc\n",
+            "    jmp .Lmerge\n",
+            ".Llive:\n",
+            "    addl $1, %eax\n", // pushed second -> expanded FIRST
+            "    jmp .Lmerge\n",
+            ".Lmerge:\n",
+            "    jne .Lbad\n",
+            "    ret\n",
+            ".Lbad:\n",
+            "    ret\n",
+            "    .cfi_endproc\n",
+        );
+        let store = LineStore::new(asm.to_string());
+        let infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let at = (0..store.len())
+            .find(|&i| infos[i].trimmed(store.get(i)).starts_with("cmpq"))
+            .expect("cmp not found");
+        let f = walk_flag_consumers(&store, &infos, at + 1, F_ZF);
+        assert!(f.saw_consumer, "order must not change the facts");
+    }
+
+    /// `cc_reads` is pinned to the SDM so a typo in the table cannot silently
+    /// turn a sign test into a no-op.
+    #[test]
+    fn condition_code_flag_sets_match_the_sdm() {
+        use super::cc_reads;
+        use super::{F_AF as AF, F_CF as CF, F_OF as OF, F_PF as PF, F_SF as SF, F_ZF as ZF};
+        assert_eq!(cc_reads("e") | cc_reads("ne"), ZF, "e/ne are ZF-only");
+        assert_eq!(cc_reads("b"), CF, "b is CF-only");
+        assert_eq!(cc_reads("be"), ZF | CF, "be is ZF|CF");
+        assert_eq!(cc_reads("a"), ZF | CF, "a is ZF|CF");
+        assert_eq!(cc_reads("o"), OF, "o is OF-only");
+        assert_eq!(cc_reads("s"), SF, "s is SF-only");
+        assert_eq!(cc_reads("l"), SF | OF, "l is SF|OF");
+        assert_eq!(cc_reads("le"), SF | OF | ZF, "le is SF|OF|ZF");
+        // No condition code covers PF or AF, so nothing may claim to.
+        for cc in [
+            "e", "z", "ne", "nz", "b", "c", "nae", "nb", "nc", "ae", "be", "na", "a", "nbe", "s",
+            "ns", "l", "nl", "le", "nle", "g", "ng", "ge", "nge", "o", "no",
+        ] {
+            assert_eq!(cc_reads(cc) & PF, 0, "{cc} cannot select on PF");
+            assert_eq!(cc_reads(cc) & AF, 0, "{cc} cannot select on AF");
+        }
+        assert_eq!(cc_reads("zzz"), super::F_ALL, "unknown code fails closed");
     }
 
     #[test]
@@ -3530,6 +3971,144 @@ mod tests {
             .find(|&i| infos[i].trimmed(store.get(i)).contains(marker))
             .expect("marker line not found");
         walk_flag_consumers(&store, &infos, at + 1, 0)
+    }
+
+    /// The `cmp $0, mem` -> `test $0, mem` fold changes ONLY AF, so a writer
+    /// that cannot touch AF must not be able to hide an AF observer.
+    ///
+    /// This is a LATENT defect in shipped code, not in the new fold: before
+    /// `flags_written_mask` existed, the walk stopped at any writer, so `stc`
+    /// (CF only) ended it and the `lahf` behind it was never examined.  The
+    /// rewrite was then licensed on a path where `lahf` observes the one flag
+    /// it changes.  Every label here is REAL -- an unresolvable target would
+    /// set `proved = false` and veto for the wrong reason, which is how a
+    /// test of this shape passes vacuously.
+    /// The mask must be fail-closed for every writer the peephole can emit that
+    /// this function does NOT name.  `shld`/`shrd`/`bt*` are the dangerous
+    /// ones: they DO write OF and AF, so a narrow mask for them would be a
+    /// silent unsoundness rather than a missed fold.  This pins that they
+    /// stay F_ALL, and that `popfq` -- which replaces the whole word -- does
+    /// too.
+    #[test]
+    fn only_sdk_named_flag_setters_get_a_narrow_mask() {
+        for m in [
+            "shld",
+            "shldl",
+            "shldq",
+            "shrd",
+            "shrdl",
+            "shrdq",
+            "bts",
+            "btsq",
+            "bt",
+            "btr",
+            "btrq",
+            "btc",
+            "btcq",
+            "popf",
+            "popfq",
+            "addl",
+            "subq",
+            "cmpb",
+            "testl",
+            "imulq",
+            "",
+            "nop",
+            "movq",
+            "unknownmnemonic",
+        ] {
+            assert_eq!(
+                flags_written_mask(m),
+                F_ALL,
+                "{m:?} must stay fail-closed: an unstated writer must never get a narrow mask"
+            );
+        }
+        // The three narrow families, asserted against the SDM rather than
+        // against the implementation.
+        assert_eq!(flags_written_mask("stc"), F_CF, "stc defines CF alone");
+        assert_eq!(flags_written_mask("clc"), F_CF, "clc defines CF alone");
+        assert_eq!(flags_written_mask("cmc"), F_CF, "cmc complements CF alone");
+        assert_eq!(
+            flags_written_mask("sahf"),
+            F_SF | F_ZF | F_PF | F_AF | F_CF,
+            "sahf loads SF/ZF/AF/PF/CF from AH; SDM: OF is not affected"
+        );
+        assert_eq!(flags_written_mask("cld"), 0, "cld touches DF only");
+        assert_eq!(flags_written_mask("std"), 0, "std touches DF only");
+        // Operand and indentation forms must not defeat the matcher.
+        assert_eq!(flags_written_mask("    stc"), F_CF);
+        assert_eq!(flags_written_mask("stc   "), F_CF);
+    }
+
+    #[test]
+    fn a_cf_only_setter_does_not_hide_a_lahf_from_the_zero_compare_fold() {
+        let asm = "    .text\n    .globl f\n    .type f, @function\nf:\n    .cfi_startproc\n\
+                   \x20   movq 8(%rdi), %rax\n    cmpq $0, (%rax)\n    je .Lkeep\n    jmp .Lout\n\
+                   .Lkeep:\n    stc\n    lahf\n    ret\n.Lout:\n    ret\n    .cfi_endproc\n    .size f, .-f\n";
+        let store = LineStore::new(asm.to_string());
+        let infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let at = (0..store.len())
+            .find(|&i| infos[i].trimmed(store.get(i)).starts_with("cmpq"))
+            .expect("cmp not found");
+        // `stc` defines CF only, so AF -- the one flag this rewrite can change
+        // -- is still live behind it and the `lahf` must veto.  A walk that
+        // stopped at the `stc` reported "no whole reader" here, which is the
+        // miss this test exists to prevent.
+        assert!(
+            super::flags_reach_a_whole_flags_reader_except_af(&store, &infos, at + 1),
+            "the walk must step over the CF-only stc and reach the lahf behind it"
+        );
+    }
+
+    /// The complementary direction: when there is no AF observer at all, the
+    /// precise query must still say "no observer", so the fold is not lost.
+    /// A fix that only ever refuses is not a fix.
+    #[test]
+    fn a_cf_only_setter_does_not_veto_when_nothing_reads_af() {
+        let asm = "    .text\n    .globl f\n    .type f, @function\nf:\n    .cfi_startproc\n\
+                   \x20   movq 8(%rdi), %rax\n    cmpq $0, (%rax)\n    je .Lkeep\n    clc\n\
+                   .Lkeep:\n    jne .L16\n    ret\n.L16:\n    ret\n    .cfi_endproc\n    .size f, .-f\n";
+        let store = LineStore::new(asm.to_string());
+        let infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let at = (0..store.len())
+            .find(|&i| infos[i].trimmed(store.get(i)).starts_with("cmpq"))
+            .expect("cmp not found");
+        assert!(!super::flags_reach_a_whole_flags_reader_except_af(
+            &store,
+            &infos,
+            at + 1
+        ));
+    }
+
+    /// `sahf` writes AF, so it genuinely CAN mask an AF observation and the
+    /// walk must still stop at it.  If it were stepped over, a `lahf` behind
+    /// a `sahf` would be missed -- the same bug by a different route.
+    #[test]
+    fn sahf_still_terminates_the_walk_because_it_writes_af() {
+        let asm = "    .text\n    .globl f\n    .type f, @function\nf:\n    .cfi_startproc\n\
+                   \x20   movq 8(%rdi), %rax\n    cmpq $0, (%rax)\n    je .Lkeep\n    jmp .Lout\n\
+                   .Lkeep:\n    sahf\n    lahf\n    ret\n.Lout:\n    ret\n    .cfi_endproc\n    .size f, .-f\n";
+        let store = LineStore::new(asm.to_string());
+        let infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let at = (0..store.len())
+            .find(|&i| infos[i].trimmed(store.get(i)).starts_with("cmpq"))
+            .expect("cmp not found");
+        // The walk stops at sahf, so the lahf is unreachable and the answer
+        // is "no observer" -- which is exactly why the fail-closed `proved`
+        // flag matters: it must be reported as unproved, not as safe.
+        let f = walk_flag_consumers(
+            &store,
+            &infos,
+            at + 1,
+            super::F_ZF | super::F_CF | super::F_SF | super::F_OF | super::F_PF,
+        );
+        assert!(f.proved, "the sahf block is fully walked, so it is proved");
     }
 
     #[test]

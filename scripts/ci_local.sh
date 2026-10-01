@@ -589,11 +589,21 @@ gate "i686-tls-ie-relax" fast \
 gate "i686-narrow-cmp-flag-law" fast \
     bash tests/regression/check_narrow_cmp_flag_law.sh
 
-# Zero-extended compare fold (fuse_zero_ext_cmp). Its OWN skip name, so an A/B
-# against CCC_PEEPHOLE_SKIP=zero_ext_cmp measures this fold and not its
-# sibling fuse_load_into_alu -- they used to share `load_alu_fuse`, which made
-# the two inseparable. Measured worth: no runtime effect (see the gate header);
-# the gate exists because BOTH failure directions are silent.
+# Zero-extended compare fold (fuse_zero_ext_cmp).  Three reasons this needs its
+# own gate, and the third is the one that matters:
+#   1. it has its OWN skip key, so an A/B against
+#      CCC_PEEPHOLE_SKIP=zero_ext_cmp measures this fold and not its sibling
+#      fuse_load_into_alu -- they used to share `load_alu_fuse`, which made the
+#      two inseparable and corrupted a firing-program attribution (21 vs 18);
+#   2. the sibling check_narrow_cmp_flag_law.sh pins the sibling
+#      fold_narrow_load_imm_compare, which shares the flag law, so the LAW was
+#      covered and the SHAPE was not;
+#   3. the mirrored-operand arm once emitted the memory in the wrong AT&T slot,
+#      computing S-D where the source computed D-S.  For an unsigned consumer
+#      the subtraction direction IS CF, so `jb` became `ja`.  It passed the flag
+#      law, LOWERED the instruction count, assembled, linked and returned the
+#      wrong answer -- so the gate pins the shape and asserts the emitted
+#      spelling, and the emitted assembly is executed in the Rust unit test.
 gate "zero-ext-cmp-fold" fast \
     bash tests/regression/check_zero_ext_cmp_fold.sh
 
