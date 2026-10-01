@@ -729,6 +729,15 @@ jobs:
           python3 scripts/check_script_imports.py
           python3 scripts/test_ci_gate_parity.py
           python3 scripts/test_encdiff.py
+          # EDG transplant tooling contracts (PR #721 review P1-6): the
+          # miner self-tests, the mocked corpus-runner verdict contracts,
+          # and the corpus-exclusion path tests gate the TEST
+          # INFRASTRUCTURE itself — no compiler needed.  Mirrored in
+          # scripts/ci_local.sh (parity-checked).
+          python3 scripts/edg_changes_mine.py selftest
+          python3 scripts/edg_corpus_mine.py selftest
+          python3 -m unittest discover -s tests/corpus -p 'test_*.py'
+          python3 scripts/test_differential_corpus_paths.py
           bash tests/regression/check_loop_memset.sh
           bash tests/regression/check_bool_pair_tail_jmp.sh
           bash tests/regression/check_bool_pair_prune.sh

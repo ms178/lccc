@@ -27,7 +27,37 @@
 # 2 = bad usage or a compiler that will not run.
 set -uo pipefail
 
-usage() { echo "usage: $0 <reference-lccc> <candidate-lccc> [corpus-root]" >&2; exit 2; }
+usage() {
+  echo "usage: $0 <reference-lccc> <candidate-lccc> [corpus-root]" >&2
+  echo "       $0 --list [corpus-root]   (enumerate the selection, no compilers)" >&2
+  exit 2
+}
+
+# The curated test corpus (tests/corpus/**) has its own runner
+# (tests/corpus/run_clang_c_corpus.py) and a much larger surface; keep it out
+# of this small differential harness so the two do not pollute each other
+# (PR #719 review F5, PR #721 review P1-4).  The exclusion is computed from
+# REALPATHS so every equivalent spelling of the corpus root — `tests`,
+# `./tests`, `tests/`, absolute, trailing slash — selects identically, and a
+# root that IS the curated corpus selects nothing explicitly.
+REPO_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+CORPUS_PRUNE="$REPO_ROOT/tests/corpus"
+
+list_sources() { # <root>
+  local root_abs
+  root_abs=$(CDPATH= cd -- "$1" 2>/dev/null && pwd) || {
+    echo "no such corpus root: $1" >&2; return 2; }
+  find "$root_abs" \
+    \( -type d -path "$CORPUS_PRUNE" -prune \) -o \
+    \( -not -path "$CORPUS_PRUNE/*" -name '*.c' -type f -print \) \
+    | LC_ALL=C sort
+}
+
+if [ "${1:-}" = "--list" ]; then
+  list_sources "${2:-tests}"
+  exit $?
+fi
+
 [ $# -ge 2 ] || usage
 REF="$1"; CAND="$2"; ROOT="${3:-tests}"
 
@@ -36,14 +66,13 @@ for c in "$REF" "$CAND"; do
   "$c" --version >/dev/null 2>&1 || "$c" --help >/dev/null 2>&1 || {
     echo "compiler does not respond: $c" >&2; exit 2; }
 done
-[ -d "$ROOT" ] || { echo "no such corpus root: $ROOT" >&2; exit 2; }
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/ref" "$WORK/cand"
-find "$ROOT" -name '*.c' | LC_ALL=C sort > "$WORK/list.txt"
+list_sources "$ROOT" > "$WORK/list.txt" || exit 2
 N=$(wc -l < "$WORK/list.txt")
-[ "$N" -gt 0 ] || { echo "corpus is empty: $ROOT" >&2; exit 2; }
+[ "$N" -gt 0 ] || { echo "corpus is empty (or entirely curated-corpus): $ROOT" >&2; exit 2; }
 
 compile_all() { # <lccc> <outdir>
   local cc="$1" out="$2" f n
