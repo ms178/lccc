@@ -63,7 +63,6 @@ tests/regression/check_pfe_section.sh  # passes locally; not yet wired into ci_l
 tests/regression/check_ptr_to_float_cast.sh  # passes locally; not yet wired into ci_local.sh / a workflow
 tests/regression/check_ra_allocstats.sh  # passes locally; not yet wired into ci_local.sh / a workflow
 tests/regression/check_reduction_vecreg_codegen.sh  # passes locally; not yet wired into ci_local.sh / a workflow
-tests/regression/check_redundant_test_elimination.sh  # passes locally; not yet wired into ci_local.sh / a workflow
 tests/regression/check_reg_src_fold.sh  # passes locally; not yet wired into ci_local.sh / a workflow
 tests/regression/check_return_32bit_zeroext.sh  # passes locally; not yet wired into ci_local.sh / a workflow
 tests/regression/check_riscv_int_canon.sh  # passes locally; not yet wired into ci_local.sh / a workflow
