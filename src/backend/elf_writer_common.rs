@@ -226,6 +226,13 @@ pub struct JumpDetection {
     pub is_conditional: bool,
     /// Whether this is already in short form (e.g., jecxz, loop).
     pub already_short: bool,
+    /// Whether a dead 0x66 (the `data16` word in 64-bit mode) is spliced in
+    /// front of the opcode. In 64-bit mode the prefix is architecturally
+    /// dead on near branches, so the row underneath is chosen exactly as
+    /// for the un-prefixed branch (short when disp8-reachable, near
+    /// otherwise) and the splice byte rides along: every length and byte
+    /// offset the relaxer touches shifts by one.
+    pub prefix66: bool,
 }
 
 // ─── Internal types ───────────────────────────────────────────────────
@@ -341,6 +348,11 @@ struct JumpInfo {
     /// Whether this writer shortened the jump and can restore its long form.
     /// Short-only instructions remain false.
     can_grow: bool,
+    /// A dead 0x66 precedes the opcode (`data16` on a 64-bit near branch):
+    /// the short form is `66 eb/7x rel8` (3 bytes) and the near form is
+    /// `66 e9/0f 8x rel32` (6/7 bytes) — one byte and one displacement
+    /// position longer than the plain rows.
+    prefix66: bool,
 }
 
 /// Apply a source-level branch addend. Negative effective targets are
@@ -2224,6 +2236,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         is_conditional: jump_det.is_conditional,
                         relaxed: true,
                         can_grow: false,
+                        prefix66: jump_det.prefix66,
                     });
                 } else if instr_len > 2 {
                     // The architecture has already identified this as a near
@@ -2238,6 +2251,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         is_conditional: jump_det.is_conditional,
                         relaxed: false,
                         can_grow: false,
+                        prefix66: jump_det.prefix66,
                     });
                 }
             }
@@ -3611,12 +3625,15 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         continue;
                     };
                     // A forward target moves left with the jump's own shrink;
-                    // a backward target does not.
+                    // a backward target does not. The backward arm measures
+                    // from the SHORT form's end: 2 bytes, or 3 with a dead
+                    // 0x66 (`data16` in 64-bit mode) riding in front.
                     let old_len = jump.len as i64;
+                    let short_len = 2 + i64::from(jump.prefix66);
                     let short_disp = if (target_off as i64) > jump.offset as i64 {
                         target_off as i64 - (jump.offset as i64 + old_len)
                     } else {
-                        target_off as i64 - (jump.offset as i64 + 2)
+                        target_off as i64 - (jump.offset as i64 + short_len)
                     };
                     let fits_short = (-128..=127).contains(&short_disp);
                     if first_pass && !jump.relaxed {
@@ -3688,12 +3705,12 @@ impl<A: X86Arch> ElfWriterCore<A> {
             self.apply_jump_transitions_sequential(sec_idx, actions);
             return;
         }
-        let reloc_pos = |offset: usize, is_conditional: bool| {
+        let reloc_pos = |offset: usize, is_conditional: bool, prefix66: bool| {
             (if is_conditional {
                 offset + 2
             } else {
                 offset + 1
-            }) as u64
+            } + usize::from(prefix66)) as u64
         };
         let mut edits: Vec<(usize, bool)> = actions
             .iter()
@@ -3708,7 +3725,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             .filter(|&&(_, shrink)| shrink)
             .map(|&(j, _)| {
                 let jump = &self.sections[sec_idx].jumps[j];
-                reloc_pos(jump.offset, jump.is_conditional)
+                reloc_pos(jump.offset, jump.is_conditional, jump.prefix66)
             })
             .collect();
         if !dropped.is_empty() {
@@ -3728,25 +3745,34 @@ impl<A: X86Arch> ElfWriterCore<A> {
             let (offset, old_len) = (jump.offset, jump.len);
             data.extend_from_slice(&old[cursor..offset]);
             let new_len = if shrink {
-                // near jcc 0x0f 0x8x rel / jmp 0xe9 rel -> short 0x7x / 0xeb disp8
+                // near jcc 0x0f 0x8x rel / jmp 0xe9 rel -> short 0x7x / 0xeb disp8.
+                // With a dead 0x66 (`data16`, 64-bit) the prefix byte rides
+                // along and every source index shifts by one.
+                if jump.prefix66 {
+                    data.push(0x66);
+                }
                 if jump.is_conditional {
-                    data.push(0x70 + (old[offset + 1] - 0x80));
+                    data.push(0x70 + (old[offset + usize::from(jump.prefix66) + 1] - 0x80));
                 } else {
                     data.push(0xEB);
                 }
                 data.push(0);
-                2
+                2 + usize::from(jump.prefix66)
             } else {
                 // short 0x7x / 0xeb disp8 -> near 0x0f 0x8x / 0xe9 rel16/32;
                 // the unconditional form keeps its old second byte as the
                 // first displacement byte, as the in-place splice did.
                 let grow = jump.long_len - old_len;
+                if jump.prefix66 {
+                    data.push(0x66);
+                }
+                let op = usize::from(jump.prefix66);
                 if jump.is_conditional {
                     data.push(0x0f);
-                    data.push(0x80 + (old[offset] - 0x70));
+                    data.push(0x80 + (old[offset + op] - 0x70));
                 } else {
                     data.push(0xE9);
-                    data.push(old[offset + 1]);
+                    data.push(old[offset + op + 1]);
                 }
                 data.resize(data.len() + grow, 0);
                 jump.long_len
@@ -3776,14 +3802,14 @@ impl<A: X86Arch> ElfWriterCore<A> {
             if shrink {
                 jump.relaxed = true;
                 jump.can_grow = true;
-                jump.len = 2;
+                jump.len = 2 + usize::from(jump.prefix66);
                 continue;
             }
             jump.relaxed = false;
             jump.len = jump.long_len;
             let rel16 = jump.long_len == if jump.is_conditional { 4 } else { 3 };
             let reloc = ElfRelocation {
-                offset: reloc_pos(jump.offset, jump.is_conditional),
+                offset: reloc_pos(jump.offset, jump.is_conditional, jump.prefix66),
                 symbol: jump.target.clone(),
                 reloc_type: if rel16 {
                     A::reloc_pc16().expect("rel16 branch without architecture relocation")
@@ -3817,41 +3843,53 @@ impl<A: X86Arch> ElfWriterCore<A> {
         });
         for (j, shrink) in order {
             let jump = &self.sections[sec_idx].jumps[j];
-            let (offset, old_len, long_len, is_conditional) =
-                (jump.offset, jump.len, jump.long_len, jump.is_conditional);
+            let (offset, old_len, long_len, is_conditional, prefix66) = (
+                jump.offset,
+                jump.len,
+                jump.long_len,
+                jump.is_conditional,
+                jump.prefix66,
+            );
             let (target, target_addend) = (jump.target.clone(), jump.target_addend);
             let reloc_pos = (if is_conditional {
                 offset + 2
             } else {
                 offset + 1
-            }) as u64;
+            } + usize::from(prefix66)) as u64;
             let data = &mut self.sections[sec_idx].data;
+            let op = usize::from(prefix66);
             if shrink {
                 if is_conditional {
-                    data[offset] = 0x70 + (data[offset + 1] - 0x80);
+                    data[offset + op] = 0x70 + (data[offset + op + 1] - 0x80);
                 } else {
-                    data[offset] = 0xEB;
+                    data[offset + op] = 0xEB;
                 }
-                data[offset + 1] = 0;
-                data.drain(offset + 2..offset + old_len);
+                data[offset + op + 1] = 0;
+                data.drain(offset + op + 2..offset + old_len);
                 self.sections[sec_idx]
                     .relocations
                     .retain(|r| r.offset != reloc_pos);
-                self.shift_after(sec_idx, offset + 1, 2 - old_len as i64, None);
+                self.shift_after(sec_idx, offset + 1, 2 + op as i64 - old_len as i64, None);
                 let jump = &mut self.sections[sec_idx].jumps[j];
                 jump.relaxed = true;
                 jump.can_grow = true;
-                jump.len = 2;
+                jump.len = 2 + op;
             } else {
                 let grow = long_len - old_len;
                 if is_conditional {
-                    let cc = data[offset] - 0x70;
-                    data.splice(offset + 2..offset + 2, std::iter::repeat_n(0u8, grow));
-                    data[offset] = 0x0f;
-                    data[offset + 1] = 0x80 + cc;
+                    let cc = data[offset + op] - 0x70;
+                    data.splice(
+                        offset + op + 2..offset + op + 2,
+                        std::iter::repeat_n(0u8, grow),
+                    );
+                    data[offset + op] = 0x0f;
+                    data[offset + op + 1] = 0x80 + cc;
                 } else {
-                    data.splice(offset + 2..offset + 2, std::iter::repeat_n(0u8, grow));
-                    data[offset] = 0xE9;
+                    data.splice(
+                        offset + op + 2..offset + op + 2,
+                        std::iter::repeat_n(0u8, grow),
+                    );
+                    data[offset + op] = 0xE9;
                 }
                 self.shift_after(sec_idx, offset + 1, grow as i64, None);
                 let rel16 = long_len == if is_conditional { 4 } else { 3 };
@@ -4009,7 +4047,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     } else {
                         moved(&visited, &cumulative, label_off, label_seq) + jump.target_addend
                     };
-                    let disp = target - (here + 2);
+                    let disp = target - (here + 2 + i64::from(jump.prefix66));
                     if !(-128..=127).contains(&disp) {
                         let delta = (jump.long_len - jump.len) as i64;
                         stretch += delta;
@@ -4107,12 +4145,12 @@ impl<A: X86Arch> ElfWriterCore<A> {
             );
             // A leading 0x67 address-size override (the i686 `addr16`
             // word or a 16-bit counter spelling) sits between the jump
-            // opcode and its displacement byte.
+            // opcode and its displacement byte; so does a dead 0x66 (the
+            // 64-bit `data16` word) in front of `66 eb/7x rel8`.
             let disp_at = jump.offset as usize
-                + if self.sections[sec_idx].data.get(jump.offset as usize) == Some(&0x67) {
-                    2
-                } else {
-                    1
+                + match self.sections[sec_idx].data.get(jump.offset as usize) {
+                    Some(&0x66) | Some(&0x67) => 2,
+                    _ => 1,
                 };
             let Some(target_off) = target else {
                 // Unresolvable target (undefined/external). A short-only
@@ -4129,12 +4167,12 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 // into the next instruction.
                 // A leading 0x67 address-size override (the i686 `addr16`
                 // word or a 16-bit counter spelling) sits between the jump
-                // opcode and its displacement byte.
+                // opcode and its displacement byte; so does a dead 0x66 (the
+                // 64-bit `data16` word) in front of `66 eb/7x rel8`.
                 let disp_at = jump.offset as usize
-                    + if self.sections[sec_idx].data.get(jump.offset as usize) == Some(&0x67) {
-                        2
-                    } else {
-                        1
+                    + match self.sections[sec_idx].data.get(jump.offset as usize) {
+                        Some(&0x66) | Some(&0x67) => 2,
+                        _ => 1,
                     };
                 if !jump.can_grow
                     && !self.sections[sec_idx]
@@ -5612,6 +5650,121 @@ mod tests {
         assert_eq!(rel, [(1, 2), (6, 2), (11, 4), (16, 4)]);
     }
 
+    /// Byte-pin the far-local `data16` grow path (audit F1/T1).
+    ///
+    /// The 64-bit `data16` branch law (hardware-proven, SDM-backed) removed
+    /// the far-local `.space 200` rows from the byte-equality casefile --
+    /// GAS's bytes there are the truncated `66 e9/0f 8x rel16` form, which
+    /// mis-executes -- and nothing replaced the gate: the .insn corpus rows
+    /// return ORACLE-INVALID before any comparison (encdiff partitions the
+    /// invalid oracle bytes out by design), and the encoder unit tests pin
+    /// only the external forms. The grow path this test pins is therefore
+    /// the newest, riskiest code of that change with zero coverage:
+    ///
+    ///   * the speculative first pass shrinks every relaxable jump to
+    ///     `66 eb/7x rel8` even when it does not fit, then the growth pass
+    ///     must restore `66 e9/0f 8x rel32` through the prefix66 plumbing:
+    ///     `grow = long_len - old_len` (long_len INCLUDES the 0x66), the
+    ///     op-offset byte surgery at `offset + prefix66`, the +1/+2
+    ///     `reloc_pos` shift, and the PC32-with-addend--4 bookkeeping;
+    ///   * `data16 call` never registers (no short row) -- if the relaxer
+    ///     ever shrank it to `eb`, this test would catch the corruption;
+    ///   * an off-by-one anywhere in the length arithmetic lands as a wrong
+    ///     displacement value or a wrong instruction boundary, both of
+    ///     which the full-vector assert below rejects.
+    ///
+    /// Distances are derived, not asserted: the displacement must equal
+    /// target - end-of-instruction for the emitted layout, so an off-by-one
+    /// in `grow` fails here (jmp disp 463 = 469-6, jcc 306 = 469-163,
+    /// call 150 = 469-319).
+    #[test]
+    fn data16_far_local_grow_path_is_byte_pinned() {
+        let asm = relax_asm(&[
+            ("data16 jmp .Lfar\n", 150),
+            ("data16 je .Lfar2\n", 150),
+            ("data16 call .Lfar3\n", 150),
+            (".Lfar:\n.Lfar2:\n.Lfar3:\nret\n", 0),
+        ]);
+        let obj = assemble_object(&asm);
+        let text = section_bytes(&obj, ".text").expect(".text present");
+        let nops = |n: usize| vec![0x90u8; n];
+        let expected = [
+            // 66 e9 rel32: disp 463 = .Lfar(469) - end(6)
+            &[0x66u8, 0xe9, 0xcf, 0x01, 0x00, 0x00][..],
+            &nops(150)[..],
+            // 66 0f 84 rel32: disp 306 = .Lfar2(469) - end(163)
+            &[0x66, 0x0f, 0x84, 0x32, 0x01, 0x00, 0x00][..],
+            &nops(150)[..],
+            // 66 e8 rel32: disp 150 = .Lfar3(469) - end(319)
+            &[0x66, 0xe8, 0x96, 0x00, 0x00, 0x00][..],
+            &nops(150)[..],
+            &[0xc3][..],
+        ]
+        .concat();
+        assert_eq!(text.len(), 470);
+        assert_eq!(text, expected);
+        // Same-section local targets resolve in place: no relocation may
+        // survive in .rela.text. A leftover R_X86_64_PC16 would be the
+        // truncated-form bug; a leftover PC32/PLT32 the addend-fold class
+        // (the numeric-label addend bug shape). Neither may ever ship.
+        match section_bytes(&obj, ".rela.text") {
+            None => {}
+            Some(rel) => {
+                let leftovers = rel
+                    .chunks_exact(24)
+                    .map(|e| {
+                        (
+                            u64::from_le_bytes(e[0..8].try_into().unwrap()),
+                            u32::from_le_bytes(e[8..12].try_into().unwrap()),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                assert!(
+                    leftovers.is_empty(),
+                    "leftover .text relocations: {leftovers:?}"
+                );
+            }
+        }
+    }
+
+    /// The shrink direction of the same prefix66 plumbing, at writer level:
+    /// NEAR-local `data16` branches relax to `66 eb/7x rel8`, byte-identical
+    /// to GAS 2.47 (pinned casefile-level in prefix-words.casefile; this is
+    /// the writer-level twin, so both directions of the relaxer are gated
+    /// in one place). disp8 is measured from the SHORT form's end.
+    #[test]
+    fn data16_near_local_relaxes_to_gas_short_rows() {
+        let text = relax_case(&[
+            ("data16 jmp .Ln\n", 1),
+            ("data16 jne .Ln2\n", 1),
+            (".Ln:\n.Ln2:\nret\n", 0),
+        ]);
+        // jmp at 0: `66 eb 05` (disp8 5 = .Ln(8) - end(3));
+        // jne at 4: `66 75 01` (disp8 1 = .Ln2(8) - end(7)).
+        assert_eq!(
+            text,
+            [0x66u8, 0xeb, 0x05, 0x90, 0x66, 0x75, 0x01, 0x90, 0xc3]
+        );
+    }
+
+    /// Far-BACKWARD local `data16`: the short-form fit is measured from the
+    /// SHORT form's end (`offset + 2 + prefix66`), not the long form's --
+    /// the backward arm of the S04 branch-verdict fix. At -133 the branch
+    /// cannot fit disp8 and must settle long: `66 0f 85 rel32` with
+    /// disp32 = -137 = .Lb(0) - end(137).
+    #[test]
+    fn data16_far_backward_local_settles_long() {
+        let text = relax_case(&[(".Lb:\n", 130), ("data16 jne .Lb\n", 0), ("ret\n", 0)]);
+        let expected = [
+            &vec![0x90u8; 130][..],
+            &[0x66, 0x0f, 0x85, 0x77, 0xff, 0xff, 0xff][..],
+            &[0xc3][..],
+        ]
+        .concat();
+        assert_eq!(text.len(), 138);
+        assert_eq!(text, expected);
+    }
+
     /// Executable padding reproduces GNU as 2.47 byte for byte in every NOP
     /// table: each entry, the last all-NOP gap, the first jump-over, the
     /// rel32 jump-over (with the operand-size prefix in 16-bit code) and
@@ -5682,6 +5835,17 @@ mod tests {
             asm.push_str(&"nop\n".repeat(nops));
         }
         assemble_text(&asm)
+    }
+
+    /// The same assembly `relax_case` builds, as source text: for tests
+    /// that need the OBJECT (relocation checks), not just the .text bytes.
+    fn relax_asm(parts: &[(&str, usize)]) -> String {
+        let mut asm = String::from(".text\nf:\n");
+        for &(text, nops) in parts {
+            asm.push_str(text);
+            asm.push_str(&"nop\n".repeat(nops));
+        }
+        asm
     }
 
     /// Growth decisions follow GAS's in-order sweep: once the far `jmp`

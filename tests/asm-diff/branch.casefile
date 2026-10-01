@@ -16412,3 +16412,20 @@ cmovg 8(%rdi), %eax
 cmovg %r9d, %r9d
 cmovg 8(%rdi), %rbx
 cmovg %r14, %r14
+;;; numeric_addend_branches
+.text
+# A numeric reference with a source-level addend (`jmp 1f+300`) must
+# resolve to the numeric label's unique name with the addend spliced on
+# (`.Lnum_1_0+300`), which the relocation choke point then splits into
+# base + link-time addend and folds in place exactly like GAS (no
+# relocation, constant displacement). Before the fix the raw `1f+300`
+# escaped as an external relocation against a symbol literally named
+# `1f+300` — undefined at link time — with the architecture addend
+# (-4/-2) as the displacement.
+jmp 1f+300
+1: nop
+je 2f+300
+2: nop
+call 3f+300
+3: nop
+1: jmp 1b+300

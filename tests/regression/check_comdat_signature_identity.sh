@@ -21,6 +21,9 @@ GCC=${GCC_BIN:-gcc}
 tmp=${TMPDIR:-/tmp}/lccc-comdat-sig.$$
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp"
+# Shared host i386-execution probe (see i386_exec.sh for why a link probe
+# is not enough).
+source "$(dirname "$0")/i386_exec.sh"
 
 # `movl $N, %eax; ret` assembles identically for both targets.
 group() { # file section flags-with-group-args symbol value
@@ -50,9 +53,21 @@ int main(void)
 C
 
 for m in "" -m32; do
-    if [[ -n "$m" ]] && ! echo 'int main(void){return 0;}' | "$GCC" -m32 -x c - -o "$tmp/probe" 2>/dev/null; then
-        echo "SKIP -m32: no 32-bit toolchain"
-        continue
+    # The run leg below executes 32-bit binaries; a host can link -m32
+    # (sysroot or multilib) yet refuse to execute the result, so the
+    # probe must exercise execution itself (i386_exec.sh). The link-level
+    # fallback keeps validating the i686 linker's COMDAT rules — this
+    # leg is their only coverage, the i686 linker's dedup code is
+    # separate from the x86-64 one — on hosts that cannot run i386.
+    if [[ -n "$m" ]] && ! i386_exec_ok "$GCC" "$tmp"; then
+        # Can the host link -m32 at all? Same probe taxonomy as the run
+        # probe above (i386_exec.sh): this is exactly its link level.
+        if i386_link_ok "$GCC"; then
+            echo "note -m32: host cannot execute i386; link-level COMDAT rules still asserted"
+        else
+            echo "SKIP -m32: no 32-bit toolchain"
+            continue
+        fi
     fi
     tag=${m:-x86-64}
     objs=()
@@ -63,12 +78,47 @@ for m in "" -m32; do
     "$CCC" $m -O2 -c "$tmp/main.c" -o "$tmp/main$m.o"
     # Reference: GNU ld accepts the set and the program returns 0.
     "$GCC" $m "$tmp/main$m.o" "${objs[@]}" -o "$tmp/ref$m"
-    "$tmp/ref$m" || { echo "FAIL ($tag): GNU ld reference program failed" >&2; exit 1; }
     if ! "$CCC" $m "$tmp/main$m.o" "${objs[@]}" -o "$tmp/t$m" 2>"$tmp/err"; then
         echo "FAIL ($tag): lccc link failed:" >&2
         cat "$tmp/err" >&2
         exit 1
     fi
-    "$tmp/t$m" || { echo "FAIL ($tag): wrong COMDAT selection (exit $?)" >&2; exit 1; }
+    # Link-level COMDAT selection law (every host, both modes): the link
+    # itself already asserts the structural rules — a wrongly dropped
+    # group leaves its global UNDEFINED (unresolved symbol), and a
+    # duplicate-signature group that survived to symbol resolution is a
+    # duplicate-definition error. For x86-64 the selection is ALSO
+    # verified directly: all five globals defined exactly once, and the
+    # duplicate-signature rule's first-wins choice is visible in the
+    # linked code (fc's body must be the c1 copy: movl $3, not the c2
+    # copy's movl $30). The i686 lccc-ld output carries no section
+    # headers, so nm/objdump cannot read it — there the structural
+    # link-success assertion plus the runtime check below are the
+    # coverage.
+    if [[ -z "$m" ]]; then
+        for sym in fa fb fc fd1 fd2; do
+            nm -B "$tmp/t$m" | awk -v s="$sym" '$2 == "T" && $3 == s {n++} END {exit !(n == 1)}' || {
+                echo "FAIL ($tag): $sym not defined exactly once after COMDAT selection" >&2
+                exit 1
+            }
+        done
+        if ! objdump -d "$tmp/t$m" | awk '
+            /<fc>:/ {inf = 1; next}
+            inf && /mov/ {
+                if ($0 ~ /\$0x3,/)  {ok = 1}
+                if ($0 ~ /\$0x1e,/) {bad = 1}
+                inf = 0
+            }
+            END {exit !(ok && !bad)}'; then
+            echo "FAIL ($tag): duplicate-signature COMDAT kept the wrong body for fc" >&2
+            exit 1
+        fi
+    fi
+    # Runtime confirmation of the full value composition (54321) whenever
+    # the host can execute this mode.
+    if [[ -z "$m" ]] || i386_exec_ok "$GCC" "$tmp"; then
+        "$tmp/ref$m" || { echo "FAIL ($tag): GNU ld reference program failed" >&2; exit 1; }
+        "$tmp/t$m" || { echo "FAIL ($tag): wrong COMDAT selection (exit $?)" >&2; exit 1; }
+    fi
 done
 echo "PASS: COMDAT groups are identified by signature"

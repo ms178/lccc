@@ -10,6 +10,7 @@
 # also pins the NOTYPE-in-data COPY routing.
 set -euo pipefail
 CCC=${CCC:-target/fastbuild/lccc}
+GCC=${GCC_BIN:-gcc}
 LD=${LD:-$(dirname "$CCC")/lccc-ld}
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/lccc-copyalias.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
@@ -38,7 +39,105 @@ int main(void) {
 C
 # Little-endian: low 4 bytes 0x55667788, full 8 bytes 0x1122334455667788.
 expected="1432778632 1234605616436508552"
+
+# Host i386 capability probe: the shared i386_exec.sh taxonomy (this
+# gate used to carry a private third copy; the 3-level model lives in the
+# helper once, memoized per compiler). A host can refuse -m32 at the
+# LINK (no 32-bit CRT/libgcc anywhere gcc looks), at the EXEC (the link
+# succeeds through a sysroot, but there is no /lib/ld-linux.so.2 to exec,
+# or a seccomp policy SIGSYSes the ia32 syscall gateway — rc 159), or not
+# at all. Link success is therefore never evidence the run leg can work;
+# the runtime comparison below is gated on the exact capability it needs
+# (the twin logic is run_regression.py's unavailable_i386_interpreter and
+# SIGSYS skips, and check_i686_tls_ie_relax.sh). The link-level alias laws
+# are asserted on every host that can link.
+source "$(dirname "$0")/i386_exec.sh"
+i386_cap=$(i386_capability "$GCC")
+
+# Link-level COPY-alias law, asserted for every mode the host can link
+# (execution-independent). The two architectures bind the alias group
+# differently and the law is stated per mode:
+#   x86-64: lccc's codegen reaches DSO data directly (%rip), so every
+#     member of the alias group is copy-relocated into the executable.
+#     Two correct physical layouts exist — lccc-ld dedups the group into
+#     ONE shared slot (both definitions at one address, verified:
+#     0x4a10/0x4a10), while GNU ld emits adjacent per-symbol slots
+#     (verified: 0x4018+8 == 0x4020) — and the runtime check below passes
+#     under both. The implementation-independent laws are therefore:
+#       1. every member carries a COPY relocation;
+#       2. every member exports exactly its declared size (alias8=8,
+#          alias4=4) — an under-sized alias8 is the tail-under-copy bug
+#          (low 4 bytes read fine, high 4 stay zero) in the shared model,
+#          and a short copy in the split model;
+#       3. the [address, size) ranges never PARTIALLY overlap: either the
+#          anchors coincide (shared slot) or the ranges are disjoint
+#          (split slots). A partial overlap means one copy overwrites
+#          another's bytes and both read corrupt data.
+#   i686: lccc's i386 codegen reaches DSO data GOT-indirectly
+#     (R_386_GOT32 in the object), so the aliases are bound by GLOB_DAT
+#     GOT entries, not by copies; the link law is that every member of
+#     the group carries its GOT binding.
+# Hosts that cannot execute i386 keep the full runtime check for x86-64
+# and the link law for both modes.
+copy_alias_law() { # $1 = executable, $2 = mode label
+    local exe=$1 m=$2 relocs
+    # --use-dynamic: the i386 lccc-ld output carries no section headers,
+    # so a section-driven readelf shows nothing (same reason as
+    # check_linker_notype_code.sh).
+    relocs=$(readelf -rW --use-dynamic "$exe")
+    if [[ -z "$m" ]]; then
+        for a in alias8 alias4; do
+            awk -v sym="$a" '$3 ~ /COPY$/ && $5 == sym {found=1} END {exit !found}' \
+                <<<"$relocs" || {
+                echo "FAIL${m:+ ($m)}: no COPY relocation for $a" >&2
+                exit 1
+            }
+        done
+        # dyn-syms columns: Num: Value Size Type Bind Vis Ndx Name. Value is
+        # hex without 0x, Size decimal for these small values; bash base
+        # arithmetic (16#/10#) parses both without gawk-only strtonum.
+        local ad8 ad4 sz8 sz4 a8 a4
+        ad8=$(readelf --dyn-syms -W "$exe" | awk '$8 == "alias8" {print $2}' | head -1)
+        ad4=$(readelf --dyn-syms -W "$exe" | awk '$8 == "alias4" {print $2}' | head -1)
+        sz8=$(readelf --dyn-syms -W "$exe" | awk '$8 == "alias8" {print $3}' | head -1)
+        sz4=$(readelf --dyn-syms -W "$exe" | awk '$8 == "alias4" {print $3}' | head -1)
+        if [[ -z $ad8 || -z $ad4 ]]; then
+            echo "FAIL${m:+ ($m)}: alias definitions missing from .dynsym" >&2
+            exit 1
+        fi
+        sz8=$((10#$sz8)) sz4=$((10#$sz4)) a8=$((16#$ad8)) a4=$((16#$ad4))
+        if [[ $sz8 -ne 8 || $sz4 -ne 4 ]]; then
+            echo "FAIL${m:+ ($m)}: exported alias sizes wrong (alias8=$sz8 want 8, alias4=$sz4 want 4)" >&2
+            exit 1
+        fi
+        if [[ $a8 -ne $a4 \
+              && $((a8 + sz8)) -gt $a4 && $((a4 + sz4)) -gt $a8 ]]; then
+            printf 'FAIL%s: alias ranges partially overlap (alias8@0x%x+8, alias4@0x%x+4)\n' \
+                "${m:+ ($m)}" "$a8" "$a4" >&2
+            exit 1
+        fi
+    else
+        local a
+        for a in alias8 alias4; do
+            awk -v sym="$a" '$3 == "R_386_GLOB_DAT" && $5 == sym {found=1} END {exit !found}' \
+                <<<"$relocs" || {
+                echo "FAIL${m:+ ($m)}: no GLOB_DAT GOT binding for $a" >&2
+                exit 1
+            }
+        done
+    fi
+}
+
 for m in "" -m32; do
+    if [[ -n "$m" && "$i386_cap" == none ]]; then
+        echo "SKIP (-m32): host cannot link i386 at all"
+        # Machine-readable reduced-coverage marker (run_regression.py's
+        # SKIP-RUN vocabulary): a restricted host must stay visible as
+        # less coverage, never as a clean PASS.
+        echo "SKIP-RUN: copy-alias -m32: host cannot link i386 at all"
+        m32_mode_skipped=1
+        continue
+    fi
     # i686 lccc-ld is ET_EXEC-only: -pie output is not implemented there.
     pie=()
     if [[ "$m" == "-m32" ]]; then pie=(-no-pie); fi
@@ -46,10 +145,24 @@ for m in "" -m32; do
     "$CCC" $m -c "$tmp/use.c" -o "$tmp/use.o"
     # shellcheck disable=SC2086
     gcc $m "${pie[@]}" -B"$tmp/shim" "$tmp/use.o" -L"$tmp" -laliased -o "$tmp/use"
-    got=$(LD_LIBRARY_PATH="$tmp" "$tmp/use")
-    if [[ "$got" != "$expected" ]]; then
-        echo "FAIL${m:+ ($m)}: got '$got', expected '$expected'" >&2
-        exit 1
+    copy_alias_law "$tmp/use" "$m"
+    if [[ -z "$m" || "$i386_cap" == run ]]; then
+        got=$(LD_LIBRARY_PATH="$tmp" "$tmp/use")
+        if [[ "$got" != "$expected" ]]; then
+            echo "FAIL${m:+ ($m)}: got '$got', expected '$expected'" >&2
+            exit 1
+        fi
+    else
+        echo "SKIP${m:+ ($m)}: host cannot execute i386; link-level alias law still asserted"
+        echo "SKIP-RUN: copy-alias -m32: host cannot execute i386 (link-level law still asserted)"
+        m32_run_skipped=1
     fi
 done
-echo "PASS: copy-alias sizes (x86-64 + i386)"
+# The PASS line claims exactly what ran — never more (audit F5).
+if [[ "${m32_mode_skipped:-0}" == 1 ]]; then
+    echo "PASS: copy-alias sizes (x86-64 only; i386 unavailable on this host)"
+elif [[ "${m32_run_skipped:-0}" == 1 ]]; then
+    echo "PASS: copy-alias sizes (x86-64 + i386 link-level; i386 execution unavailable on this host)"
+else
+    echo "PASS: copy-alias sizes (x86-64 + i386)"
+fi
