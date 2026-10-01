@@ -584,6 +584,35 @@ fn vectorize_with_analysis_mode(
             total_changes += changes;
             continue;
         } else if !neon
+            && !late_minmax_only()
+            && x86_simd_available_pub()
+            && let Some(bcmp_pattern) = analyze_byte_compare_loop(func, cfg, loop_info, debug)
+        {
+            // Byte-compare loop (`while (p < end && *p == *q) { p++; q++; }`,
+            // the match-extension family): WIDTH-byte `vpcmpeqb`/`vpmovmskb`
+            // window phase with the ORIGINAL scalar loop kept as the
+            // fallback tail -- both the "not enough room" tail and the
+            // exact first-mismatch exit the phase hands back.  Picks 32B
+            // AVX2 / 16B SSE2 itself, so (unlike the byte-count and Adler
+            // arms) it deliberately does NOT exclude LCCC_FORCE_SSE2 and
+            // does not require AVX2.  The analysis is positional (a
+            // swapped bound, a foreign branch condition, mixed load
+            // signedness or anything else outside the grammar declines);
+            // the safety argument for both window loads, the exactness
+            // argument for the mismatch exit and the label-space edge
+            // invariant live in the section doc.
+            let n = transform_byte_compare_loop(func, &bcmp_pattern, debug);
+            if n > 0 {
+                if debug {
+                    eprintln!(
+                        "[VEC] Byte-compare loop matched! {} changes (loop {})",
+                        n, idx
+                    );
+                }
+                total_changes += n;
+                continue;
+            }
+        } else if !neon
             && !force_two_wide
             && !late_minmax_only()
             && std::env::var("LCCC_FORCE_SSE2").is_err()
@@ -9308,6 +9337,932 @@ fn emit_scalar_count_tree(
         }
         MapExpr::Sqrt(_) | MapExpr::MinMax { .. } => None,
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Byte-compare loop epic: two-stream lockstep byte scans
+// ═══════════════════════════════════════════════════════════════════════
+//
+//     while (p < end && *p == *q) { p++; q++; }
+//
+// i.e. "two pointers advancing in lockstep until the first byte that
+// differs (or the bound)".  This is the shape of match-extension loops --
+// LZ4's `LZ4_count` tail, ZSTD's `ZSTD_count` tail, zlib-ng's byte
+// fallbacks, and every hand-written memmem/strstr-style scan with a
+// second stream.
+//
+// The transform keeps the ORIGINAL scalar loop as the semantic fallback
+// and puts a WIDTH-byte window phase in front of it:
+//
+//     preheader -> vh : p + (WIDTH-1) < end ?        -> vq
+//     vq        : q window inside q's own page ?     -> vbody
+//     vbody     : mask = pmovmskb(pcmpeqb(load p, load q))
+//                 mask == all-ones ?                 -> vstep
+//                 else                               -> vx
+//     vx        : t = ctz(~mask); p += t; q += t     -> header (tail)
+//     vstep     : p += WIDTH; q += WIDTH             -> vh
+//     header    : the original scalar loop, unchanged, exit included.
+//
+// Two properties matter, and both are the difference between
+// "vectorized" and "correctly vectorized":
+//
+// EXACTNESS (why `vx` hands the header an exact pointer pair).
+//   `vpcmpeqb` + `vpmovmskb` yields one mask bit per byte, so the lowest
+//   set bit of the MISMATCH mask `~mask` is the index of the first
+//   differing byte in the window; `ctz` reduces that to one instruction.
+//   The phase therefore hands the header the loop's exact exit state
+//   (p+t, q+t): the header re-tests that one byte pair, fails, and exits
+//   with the pointer pair the scalar program would have produced.  An
+//   earlier revision handed back the WINDOW START instead and let the
+//   scalar loop re-scan up to WIDTH-1 bytes, which is most of the work
+//   for exactly the short matches that dominate real compressors.
+//
+// SAFETY (why neither window load can fault).
+//   * The p window is bounded by the loop's OWN bound: the room test is
+//     `p + (WIDTH-1) < end`, i.e. `p <= end - WIDTH`, so `[p, p+WIDTH)`
+//     lies inside `[p, end)`.  The test reuses the frontend's own
+//     comparison op (`Ult`/`Slt`) and operand order, because that op is
+//     what encodes the signedness of the bound arithmetic.
+//   * The q window has no bound to reuse - the source loop gives none -
+//     so it is guarded by the page-crossing rule that glibc's string
+//     routines and GCC's own inline `strlen`/`memchr` expansions are
+//     built on: the load is issued only when the whole window stays
+//     inside the 4 KiB page containing `q`.  Every path into the phase
+//     implies `p < end`, so the scalar loop reads `q[0]` and that page is
+//     mapped; a window inside it cannot fault, whatever the object's
+//     size.  The test is `q + (WIDTH-1) <= (q | 4095)` - one OR with the
+//     page mask, no subtraction - and it lowers to the same
+//     `cmp`+`jcc` shape as the room test.  Exact for 4 KiB mappings,
+//     conservative for larger pages, never unsafe.
+//     The deliberately accepted residue: the q window reads bytes of
+//     that page which the scalar program would not necessarily read.
+//     This is the same read-ahead contract GCC and Clang emit for these
+//     loops.  It cannot fault, but an object-granular instrument (ASan
+//     redzones) can flag it; `LCCC_NO_BYTECMP_VEC=1` disables the arm
+//     for such builds.
+//   * The loop is checked to contain no store and no call, so the phase
+//     can neither duplicate nor reorder an observable side effect, and
+//     the two phases cannot observe each other.
+//
+// MATCH STRICTNESS (positional, not relational).  An earlier revision
+// matched "a Cmp with the p phi on either side" plus "a CondBranch whose
+// edges leave the loop", which accepts `Cmp(Ult, end, p)` -- the
+// condition `end < p`, i.e. a different loop - and accepts a branch that
+// tests some other value.  The grammar is now:
+//
+//   header  : [Phi(p), Phi(q), Cmp(bound_op, p_phi, end)] and a
+//             CondBranch with `cond` == that Cmp's dest, `true` == the
+//             compare block, `false` == the exit block.
+//   compare : [Load, (Cast), Load, (Cast), Cmp(Eq, a, b)] where the two
+//             loads read EXACTLY the two phis, both loads have the SAME
+//             element type, both sides carry the SAME cast (a
+//             signed/unsigned mix compares two different extensions of
+//             the byte, which byte equality does not reproduce), and the
+//             CondBranch has `cond` == the Eq dest, `true` == the latch,
+//             `false` == the exit block.
+//   latch   : [Add(p, 1), Add(q, 1)] and Branch to the header.
+//
+// Every deviation declines.  Nothing is half-rewritten: ids and labels
+// are allocated before the first mutation and the transform has no
+// bail-out path.
+//
+// Kill switch: `LCCC_NO_BYTECMP_VEC=1`.  Resolved ONCE per translation
+// unit in `run_passes` into a thread-local (the same discipline as every
+// other vectorization policy bit), so the per-loop scan never reads the
+// process environment - `vec_interleave` and `vec_load_sink` were
+// migrated off per-call `env::var` for exactly this cost.
+// `LCCC_DEBUG_VECTORIZE=1` traces matches and declines.
+//
+// HARD-WON INVARIANTS (regression risk, do not "simplify"):
+//
+// 1. Terminator labels are `BlockId` values in LABEL space, and a block's
+//    numeric label need NOT equal its index in `func.blocks` (the
+//    frontend allocates labels in source order; later passes reorder the
+//    vector).  `loop_info.body` is an index set.  Every edge comparison
+//    in this section is therefore label-to-label; the index is recovered
+//    only for the exit block, once, by label lookup.  Comparing
+//    `label.0 as usize` against an index set silently declines on any
+//    reordered function.
+//
+// 2. The header phis are rewired PER PHI: `p_phi` receives the phase's
+//    `p` live-in, `q_phi` the phase's `q` live-in.  Feeding one value to
+//    both makes the scalar tail compare A against A (the tail's `q`
+//    register is initialized from `p`); the development driver caught
+//    that at 9600/9600 mismatches.
+//
+// 3. The phase's room test reuses the frontend's bound op and operand
+//    order.  Building it from the pattern instead of from the source
+//    comparison is how the swapped-condition hole got in.
+
+/// The matched shape, in the vocabulary of the analyzed function.
+#[derive(Debug)]
+struct ByteComparePattern {
+    /// Block indices (into `func.blocks`) that the transform rewrites.
+    header_idx: usize,
+    preheader_idx: usize,
+    /// Block labels (label space) for the terminator rewiring.
+    preheader_label: BlockId,
+    header_label: BlockId,
+    /// The two loop-carried pointer phis (same type, distinct values).
+    p_phi: Value,
+    q_phi: Value,
+    p_pre: Value,
+    q_pre: Value,
+    /// The loop-invariant bound value of the `p < end` test.
+    end_val: Value,
+    /// Types as found in the loop: the pointer type, the pointer-add type
+    /// (latch increments), and the bound-compare type.
+    ptr_ty: IrType,
+    add_ty: IrType,
+    bound_ty: IrType,
+    /// The comparison op of the original `p < end` Cmp (Ult or Slt). The
+    /// phase room-test MUST reuse it: the frontend's choice encodes the
+    /// signedness of the bound arithmetic, and swapping it here changes
+    /// behaviour at the signed/unsigned boundary.
+    bound_op: IrCmpOp,
+}
+
+thread_local! {
+    /// `LCCC_NO_BYTECMP_VEC`: see the section doc.  A `Cell`, not a
+    /// `LazyLock`, because `run_passes` re-resolves it per translation unit
+    /// (worker threads compile many TUs on one process).
+    static NO_BYTECMP_VEC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn set_no_bytecmp_vec(disabled: bool) {
+    NO_BYTECMP_VEC.with(|cell| cell.set(disabled));
+}
+
+fn no_bytecmp_vec() -> bool {
+    NO_BYTECMP_VEC.with(|cell| cell.get())
+}
+
+fn analyze_byte_compare_loop(
+    func: &IrFunction,
+    cfg: &CfgAnalysis,
+    loop_info: &loop_analysis::NaturalLoop,
+    debug: bool,
+) -> Option<ByteComparePattern> {
+    // Reports and returns in one step, and only formats under a debug trace:
+    // `format_args!` allocates nothing, so a non-debug run pays a branch and
+    // never a `String`.  (The decline diagnostics used to allocate on every
+    // declined loop, in the compiler itself.)
+    macro_rules! decline {
+        ($($arg:tt)*) => {{
+            if debug {
+                eprintln!("[BCMP] {}; declining", format_args!($($arg)*));
+            }
+            return None;
+        }};
+    }
+
+    if no_bytecmp_vec() {
+        return None;
+    }
+
+    let loop_blocks: FxHashSet<usize> = loop_info.body.iter().copied().collect();
+    let header_idx = loop_info.header;
+    if loop_blocks.len() != 3 {
+        decline!("loop has {} blocks, want exactly 3", loop_blocks.len());
+    }
+
+    let defined_in_loop = |v: Value| -> bool {
+        loop_blocks.iter().any(|&bi| {
+            func.blocks[bi]
+                .instructions
+                .iter()
+                .any(|i| i.dest() == Some(v))
+        })
+    };
+
+    // ---- header: [Phi(p), Phi(q), Cmp(p vs end)] + 2-way branch --------
+    let hblock = &func.blocks[header_idx];
+    if hblock.instructions.len() != 3 {
+        decline!(
+            "header has {} instructions, want [Phi, Phi, Cmp]",
+            hblock.instructions.len()
+        );
+    }
+    let (p_phi, p_ty) = match &hblock.instructions[0] {
+        Instruction::Phi { dest, ty, .. } if matches!(ty, IrType::Ptr | IrType::I64) => {
+            (*dest, *ty)
+        }
+        _ => decline!("header instr 0 is not a pointer phi"),
+    };
+    let (q_phi, q_ty) = match &hblock.instructions[1] {
+        Instruction::Phi { dest, ty, .. } if matches!(ty, IrType::Ptr | IrType::I64) => {
+            (*dest, *ty)
+        }
+        _ => decline!("header instr 1 is not a pointer phi"),
+    };
+    if p_phi == q_phi || p_ty != q_ty {
+        decline!("the two pointer phis must be distinct and same-typed");
+    }
+    // The bound test, positionally: `Cmp(op, p_phi, end)`.  The swapped
+    // operand form (`Cmp(Ult, end, p)`, the condition `end < p`) is a
+    // different loop and is declined rather than reinterpreted.
+    let (bound_op, bound_ty, end_val, header_cmp_dest) = match &hblock.instructions[2] {
+        Instruction::Cmp {
+            dest,
+            op,
+            lhs,
+            rhs,
+            ty,
+        } if matches!(op, IrCmpOp::Ult | IrCmpOp::Slt) => {
+            let (lhs_v, rhs_v) = match (lhs, rhs) {
+                (Operand::Value(l), Operand::Value(r)) => (*l, *r),
+                _ => decline!("header Cmp sides must be values"),
+            };
+            if lhs_v != p_phi {
+                decline!("header Cmp lhs is not the p phi (foreign/swapped condition)");
+            }
+            if defined_in_loop(rhs_v) {
+                decline!("bound (rhs of header Cmp) is loop-defined");
+            }
+            (*op, *ty, rhs_v, *dest)
+        }
+        _ => decline!("header instr 2 is not the bound Cmp (p < end)"),
+    };
+
+    // ---- block roles ----------------------------------------------------
+    // Latch: the non-header loop block that branches to the header.
+    // Compare: the remaining loop block.
+    let mut latch_idx = None;
+    for &bi in &loop_info.body {
+        if bi == header_idx {
+            continue;
+        }
+        if matches!(
+            &func.blocks[bi].terminator,
+            Terminator::Branch(l) if *l == func.blocks[header_idx].label
+        ) {
+            latch_idx = Some(bi);
+        }
+    }
+    let Some(latch_idx) = latch_idx else {
+        decline!("no latch block (Branch to header) found");
+    };
+    let compare_idx = *loop_blocks
+        .iter()
+        .find(|&&i| i != header_idx && i != latch_idx)
+        .expect("3 blocks: header, latch, compare");
+    if compare_idx == latch_idx {
+        decline!("latch and compare block coincide");
+    }
+
+    // Preheader: the first non-loop block that branches to the header.
+    let mut preheader_idx = None;
+    for (bi, b) in func.blocks.iter().enumerate() {
+        if loop_blocks.contains(&bi) {
+            continue;
+        }
+        if matches!(&b.terminator, Terminator::Branch(l) if *l == func.blocks[header_idx].label) {
+            preheader_idx = Some(bi);
+            break;
+        }
+    }
+    let Some(preheader_idx) = preheader_idx else {
+        decline!("no preheader (non-loop block branching to header) found");
+    };
+    let preheader_label = func.blocks[preheader_idx].label;
+    let header_label = func.blocks[header_idx].label;
+    let latch_label = func.blocks[latch_idx].label;
+    let compare_label = func.blocks[compare_idx].label;
+
+    // The header must have EXACTLY the preheader and the latch as
+    // predecessors.  The phi check below pins the same fact through the
+    // incoming lists; this is the independent CFG statement of it, so the
+    // transform cannot be built on a header whose third predecessor is
+    // covered by some other phi it never looked at.
+    {
+        let mut preds: Vec<usize> = cfg
+            .preds
+            .row(header_idx)
+            .iter()
+            .map(|&p| p as usize)
+            .collect();
+        preds.sort_unstable();
+        let mut want = [preheader_idx, latch_idx];
+        want.sort_unstable();
+        if preds != want {
+            decline!("header predecessors are not exactly {{preheader, latch}}");
+        }
+    }
+
+    // ---- phi incomings: (preheader, latch) for both phis, plain values -
+    let mut p_pre = None;
+    let mut q_pre = None;
+    for inst in &hblock.instructions {
+        if let Instruction::Phi { dest, incoming, .. } = inst {
+            if incoming.len() != 2 {
+                decline!("phi has {} incomings, want 2", incoming.len());
+            }
+            let plain = |v: &Operand| match v {
+                Operand::Value(x) => Some(*x),
+                _ => None,
+            };
+            let pre = incoming
+                .iter()
+                .find(|(_, l)| *l == preheader_label)
+                .and_then(|(val, _)| plain(val));
+            let back = incoming
+                .iter()
+                .find(|(_, l)| *l == latch_label)
+                .and_then(|(val, _)| plain(val));
+            if pre.is_none() || back.is_none() {
+                decline!("a header phi lacks a plain preheader/latch incoming");
+            }
+            if *dest == p_phi {
+                p_pre = pre;
+            } else if *dest == q_phi {
+                q_pre = pre;
+            }
+        }
+    }
+    let (p_pre, q_pre) = match (p_pre, q_pre) {
+        (Some(a), Some(b)) => (a, b),
+        _ => decline!("phi pre-incoming map incomplete"),
+    };
+    if defined_in_loop(p_pre) || defined_in_loop(q_pre) {
+        decline!("a preheader incoming is loop-defined");
+    }
+
+    // ---- header branch: cond == the bound Cmp, true -> compare ----------
+    // Polarity is part of the grammar: `true_label` is the loop-continue
+    // edge, `false_label` the exit, and the condition must be the Cmp this
+    // analysis read.  A branch on any other value describes a different
+    // loop, however similar the block count looks.
+    let exit_label = match &hblock.terminator {
+        Terminator::CondBranch {
+            cond,
+            true_label,
+            false_label,
+        } => {
+            if !matches!(cond, Operand::Value(v) if *v == header_cmp_dest) {
+                decline!("header branch condition is not the bound Cmp result");
+            }
+            if *true_label != compare_label {
+                decline!("header branch's true edge does not enter the compare block");
+            }
+            *false_label
+        }
+        _ => decline!("header terminator is not a conditional branch"),
+    };
+    if loop_blocks
+        .iter()
+        .any(|&i| func.blocks[i].label == exit_label)
+    {
+        decline!("header exit target is loop-internal");
+    }
+
+    // ---- compare block: [Load, (Cast), Load, (Cast), Cmp] + branch ------
+    let cblock = &func.blocks[compare_idx];
+    let mut loads: Vec<(Value, Value, IrType)> = Vec::new(); // (dest, ptr, ty)
+    let mut casts: Vec<(Value, Value, IrType, IrType)> = Vec::new(); // (dest, src, from, to)
+    let mut cmps: Vec<(Value, Operand, Operand)> = Vec::new();
+    for inst in &cblock.instructions {
+        match inst {
+            Instruction::Load {
+                dest,
+                ptr,
+                ty,
+                volatile,
+                seg_override,
+            } if !*volatile
+                && matches!(ty, IrType::U8 | IrType::I8)
+                && matches!(seg_override, AddressSpace::Default) =>
+            {
+                loads.push((*dest, *ptr, *ty));
+            }
+            Instruction::Cast {
+                dest,
+                src,
+                from_ty,
+                to_ty,
+            } => {
+                let Operand::Value(s) = src else {
+                    decline!("compare-block Cast source is not a value");
+                };
+                casts.push((*dest, *s, *from_ty, *to_ty));
+            }
+            Instruction::Cmp {
+                dest,
+                op: IrCmpOp::Eq,
+                lhs,
+                rhs,
+                ..
+            } => cmps.push((*dest, lhs.clone(), rhs.clone())),
+            // A Ne here is the polarity the vector mask is NOT: vpcmpeqb
+            // produces an equality mask, so a `!=` loop would need the
+            // complement, and the declined shape is the safe answer.
+            _ => decline!("compare block contains an unsupported instruction"),
+        }
+    }
+    if loads.len() != 2 || cmps.len() != 1 || casts.len() > 2 {
+        decline!(
+            "compare block wants 2 loads + 1 Eq, found {} loads, {} casts, {} cmps",
+            loads.len(),
+            casts.len(),
+            cmps.len()
+        );
+    }
+    // Both loads must read exactly the two phis.
+    let mut load_ptrs: Vec<u32> = loads.iter().map(|(_, p, _)| p.0).collect();
+    load_ptrs.sort_unstable();
+    let mut want = [p_phi.0, q_phi.0];
+    want.sort_unstable();
+    if load_ptrs != want.to_vec() {
+        decline!("the two loads do not read exactly the p and q phis");
+    }
+    // Both sides must be the same load type AND carry the same cast: a
+    // signed/unsigned mix sign-/zero-extends the same byte to two different
+    // values, which a raw byte comparison does not reproduce.
+    let cast_of = |v: Value| casts.iter().find(|(d, _, _, _)| *d == v);
+    if loads[0].2 != loads[1].2 {
+        decline!(
+            "the two loads have different element types ({:?} vs {:?})",
+            loads[0].2,
+            loads[1].2
+        );
+    }
+    let cast_treatment = |loads_entry: &(Value, Value, IrType)| {
+        cast_of(loads_entry.0).map(|(_, _, from, to)| (*from, *to))
+    };
+    let (cast_a, cast_b) = (cast_treatment(&loads[0]), cast_treatment(&loads[1]));
+    if cast_a != cast_b {
+        decline!("the two loads are cast differently (mixed signedness treatment)");
+    }
+    if let (Some((from, _)), Some(ty)) = (cast_a, Some(loads[0].2))
+        && from != ty
+    {
+        decline!("a compare-block cast does not extend its own load type");
+    }
+    // The Eq compares the two load results (through their optional casts).
+    let (eq_dest, clhs, crhs) = cmps.pop().expect("checked len 1");
+    let load_dests: Vec<Value> = loads.iter().map(|(d, _, _)| *d).collect();
+    let side_val = |op: &Operand| -> Option<Value> {
+        let v = match op {
+            Operand::Value(v) => *v,
+            _ => return None,
+        };
+        Some(cast_of(v).map(|(_, s, _, _)| *s).unwrap_or(v))
+    };
+    match (side_val(&clhs), side_val(&crhs)) {
+        (Some(a), Some(b)) => {
+            if !load_dests.contains(&a) || !load_dests.contains(&b) || a == b {
+                decline!("compare-block Eq does not compare the two loads");
+            }
+        }
+        _ => decline!("compare-block Eq operands are not values"),
+    }
+
+    // ---- compare-block branch: cond == the Eq, true -> latch ------------
+    match &cblock.terminator {
+        Terminator::CondBranch {
+            cond,
+            true_label,
+            false_label,
+        } => {
+            if !matches!(cond, Operand::Value(v) if *v == eq_dest) {
+                decline!("compare-block branch condition is not the byte Eq result");
+            }
+            if *true_label != latch_label {
+                decline!("compare-block branch's true edge does not enter the latch");
+            }
+            if *false_label != exit_label {
+                decline!("compare-block branch exits to a different block than the header");
+            }
+        }
+        _ => decline!("compare-block terminator is not a conditional branch"),
+    }
+
+    // ---- latch: exactly [Add(p,1), Add(q,1)], branch to header ----------
+    let lblock = &func.blocks[latch_idx];
+    if lblock.instructions.len() != 2 {
+        decline!(
+            "latch has {} instructions, want 2 adds",
+            lblock.instructions.len()
+        );
+    }
+    let mut adds: Vec<(Value, Value, IrType)> = Vec::new(); // (dest, lhs, ty)
+    for inst in &lblock.instructions {
+        match inst {
+            Instruction::BinOp {
+                dest,
+                op: IrBinOp::Add,
+                lhs,
+                rhs,
+                ty,
+            } => {
+                let one = match rhs {
+                    Operand::Const(c) => c.to_i64() == Some(1),
+                    _ => false,
+                };
+                if !one {
+                    decline!("latch add is not +1");
+                }
+                match lhs {
+                    Operand::Value(lv) => adds.push((*dest, *lv, *ty)),
+                    _ => decline!("latch add lhs is not a value"),
+                }
+            }
+            _ => decline!("latch instruction is not an add"),
+        }
+    }
+    let ordered_pq = adds[0].1 == p_phi && adds[1].1 == q_phi;
+    let ordered_qp = adds[0].1 == q_phi && adds[1].1 == p_phi;
+    if !ordered_pq && !ordered_qp {
+        decline!("latch adds do not cover exactly p and q");
+    }
+    if adds[0].2 != adds[1].2 {
+        decline!("latch adds have different types");
+    }
+    let add_ty = adds[0].2;
+    // The phase builds pointer arithmetic in `add_ty` with an I32/I64
+    // constant; any other type (a Ptr-typed add, a narrow integer) would
+    // make that constant's width wrong.  `bound_ty` must agree with it: the
+    // phase's new comparisons re-use `bound_ty` on operands produced by
+    // `add_ty` arithmetic, and a mixed-width pair would be a different
+    // comparison than the one the pattern was accepted under.
+    if !matches!(add_ty, IrType::I32 | IrType::U32 | IrType::I64) {
+        decline!("latch add type {:?} is not a 32/64-bit integer", add_ty);
+    }
+    if add_ty != bound_ty {
+        decline!(
+            "latch add type {:?} and bound Cmp type {:?} disagree",
+            add_ty,
+            bound_ty
+        );
+    }
+
+    // ---- no stores anywhere in the loop ---------------------------------
+    for &bi in &loop_blocks {
+        for inst in &func.blocks[bi].instructions {
+            if matches!(inst, Instruction::Store { .. }) {
+                decline!("store in loop");
+            }
+        }
+    }
+
+    Some(ByteComparePattern {
+        header_idx,
+        preheader_idx,
+        preheader_label,
+        header_label,
+        p_phi,
+        q_phi,
+        p_pre,
+        q_pre,
+        end_val,
+        ptr_ty: p_ty,
+        add_ty,
+        bound_ty,
+        bound_op,
+    })
+}
+
+fn transform_byte_compare_loop(
+    func: &mut IrFunction,
+    p: &ByteComparePattern,
+    debug: bool,
+) -> usize {
+    let avx2 = x86_avx2_available_pub();
+    let sse2 = x86_simd_available_pub();
+    let (width, load_op, cmp_op, msb_op, full_mask) = if avx2 {
+        // 32 lanes: `vpmovmskb` yields 32 bits, so "every byte equal" is
+        // the mask being all-ones.
+        (
+            32i64,
+            IntrinsicOp::VecLoadI8x32,
+            IntrinsicOp::VecCmpI8x32,
+            IntrinsicOp::Pmovmskb256,
+            -1i32,
+        )
+    } else if sse2 {
+        (
+            16i64,
+            IntrinsicOp::VecLoadI8x16,
+            IntrinsicOp::VecCmpI8x16,
+            IntrinsicOp::Pmovmskb128,
+            0xFFFFi32,
+        )
+    } else {
+        return 0;
+    };
+    let window_span = width - 1;
+
+    // ---- allocate everything up front (pre-mutation discipline) ---------
+    let mut nid = func.next_value_id;
+    let fresh = |n: &mut u32| {
+        let v = Value(*n);
+        *n += 1;
+        v
+    };
+    let new_label = |f: &mut IrFunction| {
+        let l = BlockId(f.next_label);
+        f.next_label += 1;
+        l
+    };
+    let vh_label = new_label(func);
+    let vq_label = new_label(func);
+    let vbody_label = new_label(func);
+    let vx_label = new_label(func);
+    let vstep_label = new_label(func);
+    let p_v = fresh(&mut nid);
+    let q_v = fresh(&mut nid);
+    let p_span = fresh(&mut nid);
+    let room = fresh(&mut nid);
+    let q_span = fresh(&mut nid);
+    let q_page_last = fresh(&mut nid);
+    let page_ok = fresh(&mut nid);
+    let vload_a = fresh(&mut nid);
+    let vload_b = fresh(&mut nid);
+    let veq = fresh(&mut nid);
+    let vmsk = fresh(&mut nid);
+    let vfull = fresh(&mut nid);
+    let vmismatch = fresh(&mut nid);
+    let vfirst = fresh(&mut nid);
+    let vfirst_ext = if p.add_ty == IrType::I32 || p.add_ty == IrType::U32 {
+        vfirst
+    } else {
+        fresh(&mut nid)
+    };
+    let p_exact = fresh(&mut nid);
+    let q_exact = fresh(&mut nid);
+    let p_step = fresh(&mut nid);
+    let q_step = fresh(&mut nid);
+    func.next_value_id = nid;
+
+    let w_const = match p.add_ty {
+        IrType::I32 | IrType::U32 => IrConst::I32(width as i32),
+        _ => IrConst::I64(width),
+    };
+    let span_const = match p.add_ty {
+        IrType::I32 | IrType::U32 => IrConst::I32(window_span as i32),
+        _ => IrConst::I64(window_span),
+    };
+    // 4095 = the last byte offset of a 4 KiB page; see SAFETY in the
+    // section doc.  Always expressible: `window_span <= 31 < 4095`.
+    let page_mask_const = match p.add_ty {
+        IrType::I32 | IrType::U32 => IrConst::I32(4095),
+        _ => IrConst::I64(4095),
+    };
+    let preheader_label = p.preheader_label;
+    let header_label = p.header_label;
+
+    // vh: the two phase phis plus the p-side room test.
+    let vh_insts = vec![
+        Instruction::Phi {
+            dest: p_v,
+            ty: p.ptr_ty,
+            incoming: vec![
+                (Operand::Value(p.p_pre), preheader_label),
+                (Operand::Value(p_step), vstep_label),
+            ],
+        },
+        Instruction::Phi {
+            dest: q_v,
+            ty: p.ptr_ty,
+            incoming: vec![
+                (Operand::Value(p.q_pre), preheader_label),
+                (Operand::Value(q_step), vstep_label),
+            ],
+        },
+        Instruction::BinOp {
+            dest: p_span,
+            op: IrBinOp::Add,
+            lhs: Operand::Value(p_v),
+            rhs: Operand::Const(span_const.clone()),
+            ty: p.add_ty,
+        },
+        Instruction::Cmp {
+            dest: room,
+            // Reuse the ORIGINAL bound op: its signedness is the
+            // frontend's for the bound arithmetic (see the section doc).
+            op: p.bound_op,
+            lhs: Operand::Value(p_span),
+            rhs: Operand::Value(p.end_val),
+            ty: p.bound_ty,
+        },
+    ];
+    // vq: the q-side page-crossing test (`q + (WIDTH-1) <= q | 4095`).
+    let vq_insts = vec![
+        Instruction::BinOp {
+            dest: q_span,
+            op: IrBinOp::Add,
+            lhs: Operand::Value(q_v),
+            rhs: Operand::Const(span_const),
+            ty: p.add_ty,
+        },
+        Instruction::BinOp {
+            dest: q_page_last,
+            op: IrBinOp::Or,
+            lhs: Operand::Value(q_v),
+            rhs: Operand::Const(page_mask_const),
+            ty: p.add_ty,
+        },
+        Instruction::Cmp {
+            dest: page_ok,
+            op: IrCmpOp::Ule,
+            lhs: Operand::Value(q_span),
+            rhs: Operand::Value(q_page_last),
+            ty: p.bound_ty,
+        },
+    ];
+    // vbody: both windows, the per-byte compare, the mask, the fullness test.
+    // `VecLoadI8xNN` takes (base, offset) with the offset a Const; the
+    // `VecCmpI8xNN` predicate immediate 0 is "eq".
+    let vbody_insts = vec![
+        Instruction::Intrinsic {
+            dest: Some(vload_a),
+            op: load_op,
+            dest_ptr: None,
+            args: vec![Operand::Value(p_v), Operand::Const(IrConst::I64(0))],
+        },
+        Instruction::Intrinsic {
+            dest: Some(vload_b),
+            op: load_op,
+            dest_ptr: None,
+            args: vec![Operand::Value(q_v), Operand::Const(IrConst::I64(0))],
+        },
+        Instruction::Intrinsic {
+            dest: Some(veq),
+            op: cmp_op,
+            dest_ptr: None,
+            args: vec![
+                Operand::Value(vload_a),
+                Operand::Value(vload_b),
+                Operand::Const(IrConst::I32(0)),
+            ],
+        },
+        Instruction::Intrinsic {
+            dest: Some(vmsk),
+            op: msb_op,
+            dest_ptr: None,
+            args: vec![Operand::Value(veq)],
+        },
+        Instruction::Cmp {
+            dest: vfull,
+            op: IrCmpOp::Eq,
+            lhs: Operand::Value(vmsk),
+            rhs: Operand::Const(IrConst::I32(full_mask)),
+            ty: IrType::I32,
+        },
+    ];
+    // vx: the exact first-mismatch exit.  `~mask` has its lowest set bit at
+    // the first differing lane, so `ctz` is the byte offset; the header
+    // receives (p+t, q+t) and exits on that byte pair without rescanning.
+    // `CtzNonZero` is sound because this block is only reachable when the
+    // fullness test failed, i.e. `~mask != 0`.
+    let mut vx_insts = vec![
+        Instruction::BinOp {
+            dest: vmismatch,
+            op: IrBinOp::Xor,
+            lhs: Operand::Value(vmsk),
+            rhs: Operand::Const(IrConst::I32(full_mask)),
+            ty: IrType::I32,
+        },
+        Instruction::UnaryOp {
+            dest: vfirst,
+            op: IrUnaryOp::CtzNonZero,
+            src: Operand::Value(vmismatch),
+            ty: IrType::I32,
+        },
+    ];
+    if vfirst_ext != vfirst {
+        vx_insts.push(Instruction::Cast {
+            dest: vfirst_ext,
+            src: Operand::Value(vfirst),
+            from_ty: IrType::I32,
+            to_ty: p.add_ty,
+        });
+    }
+    vx_insts.push(Instruction::BinOp {
+        dest: p_exact,
+        op: IrBinOp::Add,
+        lhs: Operand::Value(p_v),
+        rhs: Operand::Value(vfirst_ext),
+        ty: p.add_ty,
+    });
+    vx_insts.push(Instruction::BinOp {
+        dest: q_exact,
+        op: IrBinOp::Add,
+        lhs: Operand::Value(q_v),
+        rhs: Operand::Value(vfirst_ext),
+        ty: p.add_ty,
+    });
+    // vstep: advance both pointers by WIDTH, back to vh.
+    let vstep_insts = vec![
+        Instruction::BinOp {
+            dest: p_step,
+            op: IrBinOp::Add,
+            lhs: Operand::Value(p_v),
+            rhs: Operand::Const(w_const.clone()),
+            ty: p.add_ty,
+        },
+        Instruction::BinOp {
+            dest: q_step,
+            op: IrBinOp::Add,
+            lhs: Operand::Value(q_v),
+            rhs: Operand::Const(w_const),
+            ty: p.add_ty,
+        },
+    ];
+    let vh_term = Terminator::CondBranch {
+        cond: Operand::Value(room),
+        true_label: vq_label,
+        false_label: header_label,
+    };
+    let vq_term = Terminator::CondBranch {
+        cond: Operand::Value(page_ok),
+        true_label: vbody_label,
+        false_label: header_label,
+    };
+    let vbody_term = Terminator::CondBranch {
+        cond: Operand::Value(vfull),
+        true_label: vstep_label,
+        false_label: vx_label,
+    };
+    let vx_term = Terminator::Branch(header_label);
+    let vstep_term = Terminator::Branch(vh_label);
+
+    // ---- mutations (no bail-outs remain) --------------------------------
+    let mut changes = 0usize;
+    // 1. Preheader now enters the phase, not the loop.
+    match &mut func.blocks[p.preheader_idx].terminator {
+        Terminator::Branch(l) if *l == header_label => {
+            *l = vh_label;
+            changes += 1;
+        }
+        _ => {
+            // The analyzer guaranteed this shape; a mismatch would mean the
+            // CFG changed underneath the analysis. Do not half-apply.
+            if debug {
+                eprintln!("[BCMP] preheader terminator changed under the analysis; aborting");
+            }
+            return 0;
+        }
+    }
+    // 2. Header phis: retarget the preheader incoming to the phase live-in
+    //    and name EVERY phase edge that now reaches the header.  The phase
+    //    has two abort edges (`vh` on the room test, `vq` on the page test)
+    //    plus the exact-mismatch edge (`vx`); all three must be named, both
+    //    because PHI-ARITY requires every reachable predecessor to be
+    //    covered and because a missing entry leaves the header phi's home
+    //    unwritten on that edge -- which is a wrong ANSWER, not a missed
+    //    optimization (measured: the page-edge driver returned 1 for an
+    //    expected 3 before the `vq` entry existed; `CCC_VALIDATE_SSA=1`
+    //    reports it as a PHI-ARITY violation naming the missing label).
+    //    PER PHI: p_phi receives the phase's p, q_phi the phase's q.
+    for inst in &mut func.blocks[p.header_idx].instructions {
+        if let Instruction::Phi { dest, incoming, .. } = inst {
+            let (phase_val, exact_val) = if *dest == p.p_phi {
+                (p_v, p_exact)
+            } else if *dest == p.q_phi {
+                (q_v, q_exact)
+            } else {
+                continue;
+            };
+            let mut saw_pre = false;
+            for (val, lbl) in incoming.iter_mut() {
+                if *lbl == preheader_label {
+                    *val = Operand::Value(phase_val);
+                    *lbl = vh_label;
+                    saw_pre = true;
+                }
+            }
+            if saw_pre {
+                incoming.push((Operand::Value(phase_val), vq_label));
+                incoming.push((Operand::Value(exact_val), vx_label));
+                changes += 1;
+            }
+        }
+    }
+    // 3. Append the phase blocks.  Block ORDER is irrelevant (labels carry
+    //    the edges); appending keeps every pre-existing index valid.
+    let new_blocks = [
+        (vh_label, vh_insts, vh_term),
+        (vq_label, vq_insts, vq_term),
+        (vbody_label, vbody_insts, vbody_term),
+        (vx_label, vx_insts, vx_term),
+        (vstep_label, vstep_insts, vstep_term),
+    ];
+    for (label, instructions, terminator) in new_blocks {
+        changes += instructions.len();
+        func.blocks.push(BasicBlock {
+            label,
+            instructions,
+            terminator,
+            source_spans: vec![],
+        });
+    }
+    if debug {
+        eprintln!(
+            "[BCMP] byte-compare loop vectorized ({}-byte windows): {} changes",
+            width, changes
+        );
+    }
+    changes
 }
 
 // ═══════════════════════════════════════════════════════════════════════

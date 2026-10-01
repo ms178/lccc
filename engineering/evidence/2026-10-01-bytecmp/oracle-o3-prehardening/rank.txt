@@ -1,0 +1,18 @@
+
+target/scratch/oracle/bytecmp.c :: <all functions>
+compiler       insns  loads  stores  spills  branch   best-x  name
+--------------------------------------------------------------------------------------------
+lccc              92     18       0       0      24    1.59x  local LCCC
+gcc16.2          483    101      26      13     119    8.33x  x86-64 gcc 16.2
+clang             58     10       0       0      19    1.00x  x86-64 clang 23.1.0
+icc               59     16       0       0      17    1.02x  x86-64 icc 2021.10.0
+icx              148     25       0       0      44    2.55x  x86-64 icx (latest)
+
+TOTALS across 1 source(s) per compiler: instruction/load/store/spill/branch/vector sums, per-source bests
+compiler       insns  loads  stores  spills  branch vector  best
+------------------------------------------------------------------------
+clang             58     10       0       0      19      0     1
+icc               59     16       0       0      17      0     0
+lccc              92     18       0       0      24     10     0
+icx              148     25       0       0      44      0     0
+gcc16.2          483    101      26      13     119     71     0
