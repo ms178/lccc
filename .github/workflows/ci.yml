@@ -760,6 +760,7 @@ jobs:
           # backedges, composite loops never measured, step recovery through
           # index addressing.
           python3 scripts/test_hot_loop_metric.py
+          python3 scripts/test_vectorize_stress.py
           python3 scripts/test_godbolt_cache.py
           python3 scripts/test_glibc_check_triage.py
           python3 scripts/test_oracle_delta_gate.py

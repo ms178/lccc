@@ -455,6 +455,11 @@ gate "pipefail-sigpipe" fast \
 gate "hot-loop-metric" fast \
     python3 scripts/test_hot_loop_metric.py
 
+# The vectorizer stress oracle must itself be sound: operand-aware SIMD census
+# fixtures and a UBSan run of the signed accumulating reference kernels.
+gate "vectorize-stress-selftest" fast \
+    python3 scripts/test_vectorize_stress.py
+
 # Pure-logic gate: it exercises the oracle-verdict / oracle-agreement
 # classifier directly, so it needs neither a built linker nor a single
 # installed oracle linker.  That is the point -- the paths it pins (two
