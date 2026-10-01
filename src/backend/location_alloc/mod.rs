@@ -182,8 +182,8 @@ use std::sync::OnceLock;
 use super::liveness::LivenessResult;
 use super::split_ranges::{
     collect_value_types, first_non_phi, insert_entry_alloca, is_simple_gpr_type, next_value,
-    pressure_budget, pressure_min_gap, replace_values_in_inst, replace_values_in_terminator,
-    split_debug_enabled, terminator_uses_value,
+    pressure_budget, pressure_min_gap, replace_values_in_inst_phi_aware,
+    replace_values_in_terminator_phi_aware, split_debug_enabled, terminator_uses_value,
 };
 
 // Phase 1 lives in focused modules; the glob re-exports make the cross-cut

@@ -3375,6 +3375,10 @@ mod tests {
             "    movzbl (%rsi,%rbx), %eax\n",
             "    movl %eax, %r10d\n",
             "    addl %r10d, %r8d\n",
+            // The store keeps %r8d — and therefore the folded add — live:
+            // `eliminate_dead_flag_writes` retires a consumer whose result
+            // nothing observes, and this test is about the FOLD.
+            "    movl %r8d, (%rdx)\n",
             "    ret\n",
             ".cfi_endproc\n",
         ));
@@ -3400,6 +3404,11 @@ mod tests {
             "    movl %eax, %r10d\n",
             "    addl %r10d, %r8d\n",
             "    addl %r10d, %r9d\n",
+            // Both results must be observable for the relay invariant to be
+            // testable at all: a consumer whose result nothing reads is now
+            // (correctly) deleted.
+            "    movl %r8d, (%rdx)\n",
+            "    movl %r9d, (%rdx)\n",
             "    ret\n",
             ".cfi_endproc\n",
         ));
@@ -3444,6 +3453,9 @@ mod tests {
             "    movl %eax, %r10d\n",
             "    call bar\n",
             "    addl %r10d, %r8d\n",
+            // Keep the post-call consumer observable (its result is what the
+            // test contrasts with the dead staging copy).
+            "    movl %r8d, (%rdx)\n",
             "    ret\n",
             ".cfi_endproc\n",
         ));
@@ -3463,6 +3475,9 @@ mod tests {
             "    movl %eax, %ebx\n",
             "    call bar\n",
             "    addl %ebx, %r8d\n",
+            // The consumer's result must escape, or the dead-result rule
+            // removes the very instruction this test needs to observe.
+            "    movl %r8d, (%rdx)\n",
             "    ret\n",
             ".cfi_endproc\n",
         ));
@@ -3645,24 +3660,29 @@ mod tests {
     fn rmw_coalesce_refuses_movl_shlq32_before_push_barrier() {
         // Push/pop are barriers: unknown code past them could read CF, so
         // the fold needs a clobber BEFORE the barrier. None here: veto.
-        // (The `call` observes the stack and `%rbx` is live below, so no
-        // other pass deletes the pair; the audit runs in the width gate,
-        // before either deadness proof, so the refusal isolates the veto.)
+        // The pair is kept alive by the `orq %r12` below (so no deadness
+        // proof can retire it) and the audit runs in the width gate, before
+        // either deadness proof, so the refusal isolates the veto.
         let out = run(concat!(
             "foo:\n",
             ".cfi_startproc\n",
-            "    movl %r8d, %r10d\n",
-            "    shlq $32, %r10\n",
+            // %r12, not %r10: an unmarked `call` clobbers caller-saved
+            // registers, so a pair staged in %r10 is legitimately dead under
+            // the ABI (`eliminate_dead_flag_writes` deletes it) and the veto
+            // under test would be unobservable.  %r12 survives the call.
+            "    movl %r8d, %r12d\n",
+            "    shlq $32, %r12\n",
             "    pushq %rbx\n",
             "    call qux\n",
             "    popq %rbx\n",
             "    movl %ebx, %eax\n",
+            "    orq %r12, %rax\n",
             "    ret\n",
             ".cfi_endproc\n",
         ));
         assert!(out.contains("pushq %rbx"), "{out}");
-        assert!(out.contains("movl %r8d, %r10d"), "{out}");
-        assert!(out.contains("shlq $32, %r10"), "{out}");
+        assert!(out.contains("movl %r8d, %r12d"), "{out}");
+        assert!(out.contains("shlq $32, %r12"), "{out}");
     }
 
     #[test]
@@ -4204,7 +4224,10 @@ mod tests {
             "    incl %eax\n",
             "    orq %r10, %rdi\n",
             "    movq %rdi, (%rsi)\n",
-            "    movl $5, %eax\n",
+            // `movl %eax, (%rdx)` instead of `movl $5, %eax`: it observes the
+            // incremented %eax, so the CF-preserving `incl` cannot be retired
+            // as a dead write before the audit this test exercises.
+            "    movl %eax, (%rdx)\n",
             "    ret\n",
             ".cfi_endproc\n",
         ));

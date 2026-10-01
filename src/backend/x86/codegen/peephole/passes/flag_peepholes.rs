@@ -3845,8 +3845,18 @@ mod tests {
             1,
             "movq preserves flags and writes neither operand"
         );
-        // ...and the negative control still holds the fold off.
-        let kept = run(&two_cmp_case("addl %esi, %edi"));
+        // ...and the negative control still holds the fold off.  The tail
+        // stores %edi so the intervening `addl` cannot be retired as a dead
+        // write (`eliminate_dead_flag_writes`): what blocks the fold must be
+        // the flag write, not the removal of the line.
+        let kept = run(concat!(
+            "main:\n    .cfi_startproc\n    cmpb $-128, %rcx\n",
+            "    addl %esi, %edi\n",
+            "    cmpb $-128, %rcx\n",
+            "    cmovb %rsi, %rcx\n",
+            "    movl %edi, (%rdx)\n",
+            "    .cfi_endproc\n    ret\n",
+        ));
         assert_eq!(
             n_cmp(&kept),
             2,

@@ -70,12 +70,10 @@ use crate::common::types::IrType;
 use crate::ir::analysis::CfgAnalysis;
 use crate::ir::reexports::{
     BlockId, Instruction, IrBinOp, IrCmpOp, IrConst, IrFunction, Operand, Terminator, Value,
+    replace_operand_value, replace_terminator_value, replace_values_in_inst_map,
 };
 use crate::passes::loop_analysis::{NaturalLoop, find_natural_loops, merge_loops_by_header};
-use crate::passes::loop_unroll::{
-    rename_inst_dest, subst_value_in_terminator, subst_value_with_operand,
-};
-use crate::passes::tail_call_elim::replace_values_in_inst;
+use crate::passes::loop_unroll::rename_inst_dest;
 
 /// Per-function entry point for the dirty-tracking pipeline.
 pub(crate) fn run_function(func: &mut IrFunction) -> usize {
@@ -832,7 +830,7 @@ fn try_rotate_loop(
     for inst in latch_block.instructions.iter_mut().skip(n_new_phis) {
         for (&old_phi, &new_phi) in &new_loop_phis {
             let repl = Operand::Value(Value(new_phi));
-            subst_value_with_operand(inst, old_phi, &repl);
+            replace_operand_value(inst, Value(old_phi), repl.clone());
         }
     }
 
@@ -888,7 +886,7 @@ fn try_rotate_loop(
             for inst in latch_block.instructions.iter_mut() {
                 for (&old_phi, &new_phi) in &new_loop_phis {
                     let repl = Operand::Value(Value(old_phi));
-                    subst_value_with_operand(inst, new_phi, &repl);
+                    replace_operand_value(inst, Value(new_phi), repl.clone());
                 }
             }
             // Defensive: bump the watermark past the now-unused IDs so
@@ -995,7 +993,7 @@ fn try_rotate_loop(
                 for inst in latch_block.instructions.iter_mut() {
                     for (&old_phi, &new_phi) in &new_loop_phis {
                         let repl = Operand::Value(Value(old_phi));
-                        subst_value_with_operand(inst, new_phi, &repl);
+                        replace_operand_value(inst, Value(new_phi), repl.clone());
                     }
                 }
                 func.next_value_id = next_val;
@@ -1062,13 +1060,17 @@ fn try_rotate_loop(
                         for inst in block.instructions.iter_mut().skip(n_exit_phis) {
                             for (&old_phi, &new_phi) in &exit_merge_map {
                                 let repl = Operand::Value(Value(new_phi));
-                                subst_value_with_operand(inst, old_phi, &repl);
+                                replace_operand_value(inst, Value(old_phi), repl.clone());
                             }
                         }
                         // Also rewrite the exit block's terminator.
                         for (&old_phi, &new_phi) in &exit_merge_map {
                             let repl = Operand::Value(Value(new_phi));
-                            subst_value_in_terminator(&mut block.terminator, old_phi, &repl);
+                            replace_terminator_value(
+                                &mut block.terminator,
+                                Value(old_phi),
+                                repl.clone(),
+                            );
                         }
                     }
                     continue;
@@ -1076,12 +1078,12 @@ fn try_rotate_loop(
                 for inst in &mut block.instructions {
                     for (&old_phi, &new_phi) in &exit_merge_map {
                         let repl = Operand::Value(Value(new_phi));
-                        subst_value_with_operand(inst, old_phi, &repl);
+                        replace_operand_value(inst, Value(old_phi), repl.clone());
                     }
                 }
                 for (&old_phi, &new_phi) in &exit_merge_map {
                     let repl = Operand::Value(Value(new_phi));
-                    subst_value_in_terminator(&mut block.terminator, old_phi, &repl);
+                    replace_terminator_value(&mut block.terminator, Value(old_phi), repl.clone());
                 }
             }
         }
@@ -1110,13 +1112,13 @@ fn try_rotate_loop(
         // First: rewrite Value operands that are cloned-instruction dests →
         // their fresh IDs. This handles references BETWEEN cloned
         // instructions (e.g. `BinOp And(c1, c2)` where both c1 and c2 are
-        // cloned). `replace_values_in_inst` only touches operands, not dest.
-        replace_values_in_inst(&mut cloned, &clone_map);
+        // cloned). `replace_values_in_inst_map` only touches reads, not dest.
+        replace_values_in_inst_map(&mut cloned, &clone_map);
         // Second: rewrite phi references → latch-edge incoming operands.
         // Phi references are NOT in clone_map (phis are not cloned), so
-        // `replace_values_in_inst` left them untouched.
+        // `replace_values_in_inst_map` left them untouched.
         for (&phi_id, latch_op) in &phi_latch_val {
-            subst_value_with_operand(&mut cloned, phi_id, latch_op);
+            replace_operand_value(&mut cloned, Value(phi_id), (latch_op).clone());
         }
         // Third: rename the dest to the fresh ID.
         if new_dest_opt.is_some() {
@@ -1389,7 +1391,7 @@ fn canonicalise_affine_exit_cmps(cloned: &mut [Instruction]) -> usize {
 ///
 /// NOTE: Phi is deliberately EXCLUDED. Header phis are NOT cloned into
 /// the latch — they are REWRITTEN to their latch-edge incoming values
-/// (step 7's `subst_value_with_operand` via `phi_latch_val`). If a Phi
+/// (step 7's `replace_operand_value` via `phi_latch_val`). If a Phi
 /// were cloned, the cloned Cmp would reference the cloned Phi (a
 /// duplicate self-loop phi) instead of the post-increment `i_next`,
 /// producing an off-by-one (the test reads the phi's stale value).

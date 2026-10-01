@@ -100,6 +100,20 @@ use crate::ir::reexports::{BasicBlock, Instruction, IrFunction, IrModule, Operan
 /// a violation. After `eliminate_phis` the IR is *conventional* SSA — a phi
 /// home is legally assigned by one `Copy` per predecessor edge — so
 /// duplicates are tolerated iff every def of that id is a `Copy`.
+/// `CCC_DEBUG_VEC_AVAIL=1` enables the vector-availability divergence trace
+/// (`vectorize::rewrite_uses_where_available`): every use the oracle refuses is
+/// reported, and the count belongs in the measurement record.
+///
+/// Resolved ONCE per process.  The trace is consulted for every refused use, so
+/// a per-call `environ` scan there is exactly the cost the env-read ratchet in
+/// `tests/regression/check_env_test_hygiene.sh` exists to prevent; the accessor
+/// lives here, beside the other once-resolved pipeline configuration.
+pub(crate) fn debug_vec_avail() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("CCC_DEBUG_VEC_AVAIL").is_some());
+    *ENABLED
+}
+
 pub(crate) fn validate_unique_defs(module: &IrModule, tag: &str) {
     let strict = !tag.starts_with("backend:eliminate_phis")
         && !tag.starts_with("backend:post-phi")

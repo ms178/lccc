@@ -63,6 +63,7 @@
 use crate::common::types::IrType;
 use crate::ir::reexports::{
     Instruction, IrBinOp, IrCmpOp, IrConst, IrFunction, Operand, Terminator, Value,
+    replace_operand_value, replace_terminator_value,
 };
 
 /// A comparison, canonicalized to `value OP const` with an explicit role.
@@ -1105,36 +1106,16 @@ fn fold_phi_diamonds(
         }
         match replacement {
             DiamondReplacement::Value(replacement) => {
-                // Replace every use of phi_dest with the replacement.
+                // Replace every use of phi_dest with the replacement, through the
+                // canonical pair: operand slots AND the bare-Value slots (Store ptr,
+                // GEP base, ...), because the phi is deleted below and anything naming
+                // it here has to be redirected with it (the contract the long-form
+                // comment spelled out; the helper enforces it for every IR shape).
                 for block in &mut func.blocks {
                     for inst in &mut block.instructions {
-                        inst.for_each_operand_mut(|op: &mut Operand| {
-                            if let Operand::Value(v) = op {
-                                if v.0 == phi_dest.0 {
-                                    *op = replacement;
-                                }
-                            }
-                        });
-                        // Bare-Value positions (Store ptr, GEP base, ...) are
-                        // not Operands: the phi is deleted below, so any
-                        // naming it here must be rewritten too (same two-walk
-                        // contract as loop_memset; the replacement is always
-                        // a Value).
-                        if let Operand::Value(replacement_val) = replacement {
-                            inst.for_each_value_use_mut(|v: &mut Value| {
-                                if v.0 == phi_dest.0 {
-                                    *v = replacement_val;
-                                }
-                            });
-                        }
+                        replace_operand_value(inst, phi_dest, replacement.clone());
                     }
-                    block.terminator.for_each_operand_mut(|op: &mut Operand| {
-                        if let Operand::Value(v) = op {
-                            if v.0 == phi_dest.0 {
-                                *op = replacement;
-                            }
-                        }
-                    });
+                    replace_terminator_value(&mut block.terminator, phi_dest, replacement.clone());
                 }
                 // Drop the phi from Bmerge; collapse every other phi's
                 // duplicate Bcheck arm (proven equal above).

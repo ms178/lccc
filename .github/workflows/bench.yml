@@ -6,12 +6,23 @@ on:
   pull_request:
     branches: [main]
 
+# Supersede an in-flight benchmark when the same ref is pushed again: the run is
+# ~9 minutes of timed corpus, and a newer revision invalidates its numbers anyway.
+# Safe because nothing here publishes a result the repository consumes (the
+# artifacts are per-run).
+concurrency:
+  group: bench-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
 jobs:
   benchmark:
     name: LCCC vs GCC
+    # A hung compiler in the corpus step would otherwise burn the default six
+    # hours before failing; the timed corpus is ~9 minutes on a good day.
+    timeout-minutes: 45
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -63,6 +74,31 @@ jobs:
           echo "Running (includes fib(90) — impossible without rec2iter)..."
           /tmp/fib_rec2iter
 
+      # MS-01a codegen-quality gate. The runtime gate above can only catch
+      # what the timed benchmarks measure; this one pins static, noise-free
+      # codegen metrics (insns / stackmem / pushes / ymm / fma) for the six
+      # golden workloads against .github/scripts/ci-codegen-baseline.json
+      # with per-workload tolerance bands.
+      #
+      # MOVED EARLIER, NOT NEW: these two steps already existed in this
+      # workflow, but they ran *after* the timed corpus (~8.5 minutes of build
+      # plus two -O3 benchmark runs). A regression in the six golden workloads
+      # therefore only surfaced once the slow steps had burned their time, and
+      # any earlier failing step skipped them outright (there was no
+      # `if: always()`). Running the cheap, deterministic gate first means a
+      # static-codegen regression is reported in ~10 s, and `if: always()`
+      # keeps the corpus result and the artifact upload reachable even when an
+      # earlier step fails. Baseline refreshes go through --update-baseline in
+      # the PR that lands the improvement, per the gate's header contract.
+      - name: Gate self-test (stackmem accounting)
+        run: python3 .github/scripts/test_ci_codegen_gate.py
+
+      - name: Codegen quality gate (golden workloads)
+        run: |
+          set -o pipefail
+          python3 .github/scripts/ci-codegen-gate.py \
+            --lccc target/fastbuild/lccc 2>&1 | tee codegen-gate.txt
+
       - name: Run complete benchmark corpus
         run: |
           # GitHub's default Linux shell for `run:` steps is `bash -e`
@@ -88,24 +124,6 @@ jobs:
       - name: Post benchmark summary
         if: always()
         run: cat bench-summary.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
-
-      # MS-01a codegen-quality gate. The runtime gate above can only catch
-      # what the timed benchmarks measure; this one pins static, noise-free
-      # codegen metrics (insns / stackmem / pushes / ymm / fma) for the six
-      # golden workloads against .github/scripts/ci-codegen-baseline.json
-      # with per-workload tolerance bands. It was written for bench.yml but
-      # never wired (the v3 audit found it orphaned — the workflow only ran
-      # ci-bench.py); wiring it now closes the "runtime-only gate" hole the
-      # audit flagged. Baseline refreshes go through --update-baseline in
-      # the PR that lands the improvement, per the gate's header contract.
-      - name: Gate self-test (stackmem accounting)
-        run: python3 .github/scripts/test_ci_codegen_gate.py
-
-      - name: Codegen quality gate (golden workloads)
-        run: |
-          set -o pipefail
-          python3 .github/scripts/ci-codegen-gate.py \
-            --lccc target/fastbuild/lccc 2>&1 | tee codegen-gate.txt
 
       - name: Upload benchmark results
         if: always()

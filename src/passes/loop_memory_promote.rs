@@ -38,6 +38,7 @@ use crate::common::types::{AddressSpace, IrType};
 use crate::ir::analysis::CfgAnalysis;
 use crate::ir::reexports::{
     BasicBlock, Instruction, IrBinOp, IrConst, IrFunction, Operand, Terminator, Value,
+    replace_operand_value, replace_terminator_value,
 };
 use std::sync::OnceLock;
 
@@ -809,153 +810,22 @@ fn subst_operand(op: &Operand, from: u32, to: u32) -> Operand {
     }
 }
 
-fn rewrite_operand(op: &mut Operand, from: u32, to: u32) {
-    if let Operand::Value(v) = op {
-        if v.0 == from {
-            v.0 = to;
-        }
-    }
-}
-
-fn rewrite_value(v: &mut Value, from: u32, to: u32) {
-    if v.0 == from {
-        v.0 = to;
-    }
-}
-
+/// Rewrite every *read* of `from` in `inst` to `to`; destinations are untouched.
+///
+/// This was a 135-line hand-rolled table until it was replaced by the canonical
+/// two-walk helpers.  The table was exhaustive, but its
+/// `VaEnd { .. } => {}` arm sat in the group of field-less variants while
+/// `VaEnd` actually holds a bare `va_list_ptr: Value` — so a promoted slot whose
+/// value was redirected left one stale `va_end` pointer behind.  A table cannot
+/// be audited as easily as a visitor pair that the compiler checks exhaustively;
+/// the canonical form covers every slot the table covered plus the ones it forgot.
 fn rewrite_uses_in_inst(inst: &mut Instruction, from: u32, to: u32) {
-    match inst {
-        Instruction::Alloca { .. }
-        | Instruction::PgoCounterInc { .. }
-        | Instruction::GlobalAddr { .. }
-        | Instruction::Fence { .. }
-        | Instruction::LabelAddr { .. }
-        | Instruction::GetReturnF64Second { .. }
-        | Instruction::GetReturnF32Second { .. }
-        | Instruction::GetReturnF128Second { .. }
-        | Instruction::GetStaticChain { .. }
-        | Instruction::StackSave { .. }
-        | Instruction::ParamRef { .. }
-        | Instruction::VaEnd { .. } => {}
-        Instruction::SetStaticChain { src } => rewrite_operand(src, from, to),
-        Instruction::InitTrampoline { buffer, chain, .. } => {
-            rewrite_value(buffer, from, to);
-            rewrite_operand(chain, from, to);
-        }
-        Instruction::NonlocalGotoSave { frame, .. } => rewrite_value(frame, from, to),
-        Instruction::NonlocalGoto { chain, .. } => rewrite_operand(chain, from, to),
-        Instruction::DynAlloca { size, .. } => rewrite_operand(size, from, to),
-        Instruction::Store { val, ptr, .. } => {
-            rewrite_operand(val, from, to);
-            rewrite_value(ptr, from, to);
-        }
-        Instruction::Load { ptr, .. } => rewrite_value(ptr, from, to),
-        Instruction::BinOp { lhs, rhs, .. } | Instruction::Cmp { lhs, rhs, .. } => {
-            rewrite_operand(lhs, from, to);
-            rewrite_operand(rhs, from, to);
-        }
-        Instruction::UnaryOp { src, .. }
-        | Instruction::Cast { src, .. }
-        | Instruction::Copy { src, .. } => rewrite_operand(src, from, to),
-        Instruction::Call { info, .. } => {
-            for a in &mut info.args {
-                rewrite_operand(a, from, to);
-            }
-        }
-        Instruction::CallIndirect { func_ptr, info } => {
-            rewrite_operand(func_ptr, from, to);
-            for a in &mut info.args {
-                rewrite_operand(a, from, to);
-            }
-        }
-        Instruction::GetElementPtr { base, offset, .. } => {
-            rewrite_value(base, from, to);
-            rewrite_operand(offset, from, to);
-        }
-        Instruction::Memcpy { dest, src, .. } => {
-            rewrite_value(dest, from, to);
-            rewrite_value(src, from, to);
-        }
-        Instruction::VaArg { va_list_ptr, .. } | Instruction::VaStart { va_list_ptr } => {
-            rewrite_value(va_list_ptr, from, to);
-        }
-        Instruction::VaCopy { dest_ptr, src_ptr } => {
-            rewrite_value(dest_ptr, from, to);
-            rewrite_value(src_ptr, from, to);
-        }
-        Instruction::VaArgStruct {
-            dest_ptr,
-            va_list_ptr,
-            ..
-        } => {
-            rewrite_value(dest_ptr, from, to);
-            rewrite_value(va_list_ptr, from, to);
-        }
-        Instruction::AtomicRmw { ptr, val, .. } | Instruction::AtomicStore { ptr, val, .. } => {
-            rewrite_operand(ptr, from, to);
-            rewrite_operand(val, from, to);
-        }
-        Instruction::AtomicInc { ptr, .. } | Instruction::AtomicLoad { ptr, .. } => {
-            rewrite_operand(ptr, from, to);
-        }
-        Instruction::AtomicCmpxchg {
-            ptr,
-            expected,
-            desired,
-            ..
-        } => {
-            rewrite_operand(ptr, from, to);
-            rewrite_operand(expected, from, to);
-            rewrite_operand(desired, from, to);
-        }
-        Instruction::Phi { incoming, .. } => {
-            for (op, _) in incoming {
-                rewrite_operand(op, from, to);
-            }
-        }
-        Instruction::SetReturnF64Second { src }
-        | Instruction::SetReturnF32Second { src }
-        | Instruction::SetReturnF128Second { src } => rewrite_operand(src, from, to),
-        Instruction::InlineAsm {
-            inputs, outputs, ..
-        } => {
-            for (_, op, _) in inputs {
-                rewrite_operand(op, from, to);
-            }
-            for (_, v, _) in outputs {
-                rewrite_value(v, from, to);
-            }
-        }
-        Instruction::Intrinsic { args, dest_ptr, .. } => {
-            for a in args {
-                rewrite_operand(a, from, to);
-            }
-            if let Some(dp) = dest_ptr {
-                rewrite_value(dp, from, to);
-            }
-        }
-        Instruction::Select {
-            cond,
-            true_val,
-            false_val,
-            ..
-        } => {
-            rewrite_operand(cond, from, to);
-            rewrite_operand(true_val, from, to);
-            rewrite_operand(false_val, from, to);
-        }
-        Instruction::StackRestore { ptr } => rewrite_value(ptr, from, to),
-    }
+    replace_operand_value(inst, Value(from), Operand::Value(Value(to)));
 }
 
+/// Terminator half of [`rewrite_uses_in_inst`].
 fn rewrite_uses_in_terminator(term: &mut Terminator, from: u32, to: u32) {
-    match term {
-        Terminator::Return(Some(op)) => rewrite_operand(op, from, to),
-        Terminator::CondBranch { cond, .. } => rewrite_operand(cond, from, to),
-        Terminator::IndirectBranch { target, .. } => rewrite_operand(target, from, to),
-        Terminator::Switch { val, .. } => rewrite_operand(val, from, to),
-        _ => {}
-    }
+    replace_terminator_value(term, Value(from), Operand::Value(Value(to)));
 }
 
 /// Value that must be written on the unique exit so memory matches the

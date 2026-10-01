@@ -652,6 +652,14 @@ gate "i686-narrow-cmp-flag-law" fast \
 gate "zero-ext-cmp-fold" fast \
     bash tests/regression/check_zero_ext_cmp_fold.sh
 
+# The 64-bit division width bypass (`X86Tune::bypass_div64`): the guard must be
+# emitted on bypass rows only, `CCC_NO_DIV64_BYPASS=1` must restore the off-row
+# text exactly, and the guarded form must compute what GCC computes.  The corpus
+# fixture pins *results* on one row; this pins *which row* and *what text*, which
+# is where a tuning refresh can silently go wrong.
+gate "div64-bypass-asm" fast \
+    bash tests/regression/check_div64_bypass_asm.sh
+
 # Kbuild does not fingerprint compiler/linker executable contents.  Preserve
 # the contract that compiler changes clean all products while linker-only
 # changes retain target objects and purge only link outputs.

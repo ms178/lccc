@@ -83,7 +83,7 @@ use crate::ir::analysis::CfgAnalysis;
 use crate::ir::instruction::{BasicBlock, BlockId, Instruction, Operand, Terminator, Value};
 use crate::ir::intrinsics::IntrinsicOp;
 use crate::ir::ops::{IrBinOp, IrCmpOp, IrUnaryOp};
-use crate::ir::reexports::{IrConst, IrFunction};
+use crate::ir::reexports::{IrConst, IrFunction, replace_operand_value, replace_terminator_value};
 use crate::passes::loop_analysis;
 
 // Per-loop rejection reason for the "why was this not vectorized" diagnostic
@@ -3915,7 +3915,7 @@ fn deduplicate_vector_loads(func: &mut IrFunction, loop_blocks: &FxHashSet<usize
     // the earlier canonical load in the same block.
     for block in func.blocks.iter_mut() {
         for inst in &mut block.instructions {
-            crate::passes::tail_call_elim::replace_values_in_inst(inst, &replace);
+            crate::ir::instruction::replace_values_in_inst_map(inst, &replace);
         }
         match &mut block.terminator {
             Terminator::CondBranch { cond, .. } => {
@@ -4153,13 +4153,259 @@ fn rewrite_reduction_body(
     (init_zero_value, vec_sum_value, changes)
 }
 
+/// Where `v` is defined, as `(block index, instruction index)`.
+///
+/// `None` when no instruction defines it.  Callers that redirect *reads* to
+/// `v` treat `None` as "refuse": a rewrite target with no visible definition is
+/// never available, and refusing leaves valid IR behind.
+fn definition_site(func: &IrFunction, v: Value) -> Option<(usize, usize)> {
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            if inst.dest() == Some(v) {
+                return Some((bi, ii));
+            }
+        }
+    }
+    None
+}
+
+/// The value ids that (transitively) feed the definition of `value`.
+///
+/// A read of the old accumulator may be redirected to `replacement` only when
+/// the reading instruction's own result is NOT on this chain; otherwise the
+/// rewrite puts the replacement behind itself.  Both breaks observed in the
+/// A/B run are instances of that: the no-remainder path's `hadd(acc) -> sum`
+/// re-reading `sum`, and the remainder path's seed `hadd(acc) -> 29` re-reading
+/// the phi the seed initialises (`41`), which left the vector loop without a
+/// single outside reader and let it be eliminated.
+fn producer_cone(func: &IrFunction, value: Value) -> FxHashSet<u32> {
+    let mut def_of: FxHashMap<u32, (usize, usize)> = FxHashMap::default();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            if let Some(dest) = inst.dest() {
+                def_of.insert(dest.0, (bi, ii));
+            }
+        }
+    }
+    let mut cone: FxHashSet<u32> = FxHashSet::default();
+    let mut work = vec![value.0];
+    while let Some(v) = work.pop() {
+        if !cone.insert(v) {
+            continue;
+        }
+        if let Some(&(bi, ii)) = def_of.get(&v) {
+            for read in func.blocks[bi].instructions[ii].used_values() {
+                work.push(read);
+            }
+        }
+    }
+    cone
+}
+
+/// A use site the rewriters may redirect.
+///
+/// The distinction matters because "is `replacement` available here?" has a
+/// different answer at each kind of site — that is exactly the part the first
+/// version of this helper got wrong (it tested instruction order in the use's
+/// own block and then waived everything else).
+#[derive(Clone, Copy)]
+enum UseSite {
+    /// Ordinary operand at instruction index `n` of the use's block.
+    Inst(usize),
+    /// A terminator operand: available if the definition dominates the block
+    /// (any same-block definition precedes the terminator).
+    Terminator,
+    /// A phi incoming on the edge from predecessor block `p`: the value must be
+    /// available **at the end of `p`**, not at the phi's own block.
+    PhiArm(usize),
+}
+
+/// Availability oracle for one rewriter call, built once from the CURRENT CFG
+/// (the pass inserts its vec-exit / remainder blocks before rewriting, so any
+/// earlier snapshot would be stale).
+struct Availability {
+    def_site: FxHashMap<u32, (usize, usize)>,
+    idom: Vec<usize>,
+}
+
+impl Availability {
+    fn build(func: &IrFunction) -> Self {
+        let mut def_site: FxHashMap<u32, (usize, usize)> = FxHashMap::default();
+        for (bi, block) in func.blocks.iter().enumerate() {
+            for (ii, inst) in block.instructions.iter().enumerate() {
+                if let Some(dest) = inst.dest() {
+                    def_site.insert(dest.0, (bi, ii));
+                }
+            }
+        }
+        let idom = CfgAnalysis::build(func).idom;
+        Self { def_site, idom }
+    }
+
+    /// Is `v` defined on every path that reaches `site`?  Mirrors the IR
+    /// verifier's check 8 exactly, so any rewrite this oracle permits is
+    /// verifier-clean by construction.
+    fn available(&self, v: Value, block: usize, site: UseSite) -> bool {
+        let Some(&(db, di)) = self.def_site.get(&v.0) else {
+            return false; // no definition at all: never available
+        };
+        let use_block = match site {
+            UseSite::PhiArm(p) => p,
+            _ => block,
+        };
+        if !crate::ir::analysis::dominates_idom(&self.idom, db, use_block) {
+            return false;
+        }
+        match site {
+            UseSite::Inst(ui) if use_block == db => di < ui,
+            _ => true,
+        }
+    }
+
+    /// Divergence trace: `CCC_DEBUG_VEC_AVAIL=1` reports every use the oracle
+    /// refuses.  A non-empty report is not a bug — refusing leaves valid IR, the
+    /// reader just keeps the loop's own value — but it is a missed rewrite, so
+    /// the count belongs in the measurement record.
+    fn tracing() -> bool {
+        super::debug_vec_avail()
+    }
+}
+
+/// The one implementation behind both outside-the-loop rewriters.
+///
+/// An outside read is redirected only if the replacement definition dominates
+/// its use site.  Phi incoming values are read on predecessor edges, not in the
+/// phi's block.  A producer and its transitive input chain keep the original
+/// accumulator to avoid a self-cycle.  A zero-trip bypass is not an exemption:
+/// an exit reached around the replacement producer must retain its old read.
+///
+/// That exception is what the shape tables here got right by accident and what
+/// a tableau-free walk must state explicitly.  Two shapes break otherwise, and
+/// both were observed as wrong code in the A/B run:
+///
+/// * the defining instruction itself — the no-remainder path's
+///   `VecHorizontalAddI32x8(acc) -> sum` is at once the reader that reduces the
+///   accumulator and the producer of the replacement, so redirecting its own
+///   operand turns it into `hadd(sum) -> sum` (`double_reduction` lost its
+///   correlation body, printed 0 instead of 201415680 and read an
+///   uninitialised spill slot as a pointer), and
+/// * any instruction whose result feeds the replacement — the remainder path
+///   seeds its scalar accumulator phi with `hadd(acc) -> 29`, so redirecting the
+///   seed closes the cycle `29 -> phi(41) -> ... -> 29` from the other side
+///   (the vector loop then had no outside reader left and was eliminated:
+///   `vectorize_i32_sum` returned garbage for `n = 1`).
+///
+/// Upstream's table was saved by the omission of an `Intrinsic` arm — the same
+/// omission that left every `Intrinsic` reader *after* the reduction
+/// unredirected.
+fn rewrite_uses_where_available(
+    func: &mut IrFunction,
+    loop_blocks: &FxHashSet<usize>,
+    skip_labels: &FxHashSet<u32>,
+    old_id: u32,
+    replacement: Value,
+) -> usize {
+    let Some((def_block, def_idx)) = definition_site(func, replacement) else {
+        // The callers have already mutated the CFG.  Returning zero here would
+        // silently emit a vectorized loop with stale outside reads.  This is an
+        // internal invariant, not a recoverable late refusal: fail in release
+        // builds as well as debug builds rather than generate wrong code.
+        panic!(
+            "vectorize: replacement v{} has no definition in {} after CFG mutation",
+            replacement.0, func.name
+        );
+    };
+    let producers = producer_cone(func, replacement);
+    let availability = Availability::build(func);
+    let label_to_idx = crate::ir::analysis::build_label_map(func);
+    let trace = Availability::tracing();
+    let old = Value(old_id);
+    let mut updates = 0usize;
+    let mut refused = 0usize;
+    for (bi, block) in func.blocks.iter_mut().enumerate() {
+        if loop_blocks.contains(&bi) || skip_labels.contains(&block.label.0) {
+            continue;
+        }
+        for ii in 0..block.instructions.len() {
+            let is_phi = matches!(block.instructions[ii], Instruction::Phi { .. });
+            if is_phi {
+                // Phi in-coming values are uses **at the end of the incoming
+                // edge**, so availability is a property of the predecessor
+                // block, not of this one.  Rewriting an arm blindly (the first
+                // version did, via the generic walk) can name a value on a path
+                // that never defined it.
+                let mut rewrote = 0usize;
+                if let Instruction::Phi { incoming, .. } = &mut block.instructions[ii] {
+                    for (op, label) in incoming.iter_mut() {
+                        let Operand::Value(v) = op else { continue };
+                        if *v != old {
+                            continue;
+                        }
+                        let Some(&p) = label_to_idx.get(label) else {
+                            refused += 1;
+                            continue;
+                        };
+                        if availability.available(replacement, bi, UseSite::PhiArm(p)) {
+                            *op = Operand::Value(replacement);
+                            rewrote += 1;
+                        } else {
+                            refused += 1;
+                        }
+                    }
+                }
+                updates += rewrote;
+                continue;
+            }
+            if bi == def_block && ii <= def_idx {
+                continue; // the replacement does not exist yet at this point
+            }
+            if matches!(block.instructions[ii].dest(), Some(dest) if producers.contains(&dest.0)) {
+                continue; // this result feeds the replacement: reading it is a cycle
+            }
+            if !availability.available(replacement, bi, UseSite::Inst(ii)) {
+                if trace && block.instructions[ii].used_values().contains(&old_id) {
+                    refused += 1;
+                }
+                continue;
+            }
+            updates += replace_operand_value(
+                &mut block.instructions[ii],
+                old,
+                Operand::Value(replacement),
+            );
+        }
+        if availability.available(replacement, bi, UseSite::Terminator) {
+            updates +=
+                replace_terminator_value(&mut block.terminator, old, Operand::Value(replacement));
+        } else if trace && block.terminator.used_values().contains(&old_id) {
+            refused += 1;
+        }
+    }
+    if trace {
+        eprintln!(
+            "[VEC-AVAIL] fn={} redirected={} refused_unavailable={} (replacement v{})",
+            func.name, updates, refused, replacement.0
+        );
+    }
+    updates
+}
+
 /// Rewrite uses of the value `id` outside the given loop blocks AND
-/// outside the blocks whose labels are in `skip_labels`.  Unlike
+/// outside the blocks whose labels are in `skip_labels`, where `replacement`
+/// is available — see [`rewrite_uses_where_available`].  Unlike
 /// [`rewrite_accumulator_uses_outside_loop`] this covers EVERY
 /// instruction kind including `Intrinsic` consumers (a later packed op
 /// reading the value) — it exists for the counting epic's IV
 /// materialisation, where the new transform-owned blocks (which the
 /// label set excludes) deliberately keep reading the original phi.
+///
+/// The rewrite is the canonical two-walk pair, not a table of instruction
+/// shapes: the 120-line table this replaces listed
+/// `Copy`/`Store`/`BinOp`/`Cmp`/... and stopped there, so a use in a
+/// `GetElementPtr` base, a `Load` pointer, a `Memcpy`, a va-list or an intrinsic
+/// `dest_ptr` outside the loop kept naming the value the loop no longer defines
+/// (SSA-valid, silently wrong).  The returned count is the number of rewritten
+/// use sites, which the callers report as `updates`.
 fn rewrite_value_uses_outside(
     func: &mut IrFunction,
     loop_blocks: &FxHashSet<usize>,
@@ -4167,225 +4413,35 @@ fn rewrite_value_uses_outside(
     id: u32,
     replacement: Value,
 ) -> usize {
-    let mut updates = 0usize;
-    let replace_in_operand = |op: &mut Operand| -> bool {
-        if let Operand::Value(v) = op {
-            if v.0 == id {
-                *v = replacement;
-                return true;
-            }
-        }
-        false
-    };
-    for (bi, block) in func.blocks.iter_mut().enumerate() {
-        if loop_blocks.contains(&bi) || skip_labels.contains(&block.label.0) {
-            continue;
-        }
-        for inst in &mut block.instructions {
-            match inst {
-                Instruction::Copy { src, .. } => {
-                    if replace_in_operand(src) {
-                        updates += 1;
-                    }
-                }
-                Instruction::Store { val, .. } => {
-                    if replace_in_operand(val) {
-                        updates += 1;
-                    }
-                }
-                Instruction::BinOp { lhs, rhs, .. } => {
-                    if replace_in_operand(lhs) {
-                        updates += 1;
-                    }
-                    if replace_in_operand(rhs) {
-                        updates += 1;
-                    }
-                }
-                Instruction::Cmp { lhs, rhs, .. } => {
-                    if replace_in_operand(lhs) {
-                        updates += 1;
-                    }
-                    if replace_in_operand(rhs) {
-                        updates += 1;
-                    }
-                }
-                Instruction::UnaryOp { src, .. } | Instruction::Cast { src, .. } => {
-                    if replace_in_operand(src) {
-                        updates += 1;
-                    }
-                }
-                Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
-                    for a in &mut info.args {
-                        if replace_in_operand(a) {
-                            updates += 1;
-                        }
-                    }
-                }
-                Instruction::Intrinsic { args, .. } => {
-                    for a in args.iter_mut() {
-                        if replace_in_operand(a) {
-                            updates += 1;
-                        }
-                    }
-                }
-                Instruction::Phi { incoming, .. } => {
-                    for (op, _) in incoming {
-                        if replace_in_operand(op) {
-                            updates += 1;
-                        }
-                    }
-                }
-                Instruction::Select {
-                    cond,
-                    true_val,
-                    false_val,
-                    ..
-                } => {
-                    if replace_in_operand(cond) {
-                        updates += 1;
-                    }
-                    if replace_in_operand(true_val) {
-                        updates += 1;
-                    }
-                    if replace_in_operand(false_val) {
-                        updates += 1;
-                    }
-                }
-                _ => {}
-            }
-        }
-        match &mut block.terminator {
-            Terminator::Return(Some(op)) => {
-                if replace_in_operand(op) {
-                    updates += 1;
-                }
-            }
-            Terminator::CondBranch { cond, .. } => {
-                if replace_in_operand(cond) {
-                    updates += 1;
-                }
-            }
-            Terminator::Switch { val, .. } => {
-                if replace_in_operand(val) {
-                    updates += 1;
-                }
-            }
-            _ => {}
-        }
-    }
-    updates
+    rewrite_uses_where_available(func, loop_blocks, skip_labels, id, replacement)
 }
 
 /// Rewrite every use of `acc_id` OUTSIDE the reduction's loop blocks to
-/// `replacement` (the scalar remainder result).  The vector accumulator only
-/// lives inside the loop; every outside reader must see the reduced scalar.
-/// Returns the number of rewritten uses (diagnostic only).
+/// `replacement` (the horizontal reduction standing in for the accumulator).
+/// The vector accumulator only lives inside the loop; every outside reader that
+/// can see the replacement must see the reduced scalar.  Returns the number of
+/// rewritten uses (diagnostic only).
+///
+/// Same availability rule and same canonical slot walk as
+/// [`rewrite_value_uses_outside`]: the table it replaces enumerated shapes
+/// instead of slots, so behind the (accidentally safe) omission of the
+/// `Intrinsic` arm it also missed every bare-`Value` position — a `Load`
+/// pointer or `GetElementPtr` base outside the loop kept reading the
+/// accumulator — while an `Intrinsic` reader *after* the reduction was never
+/// redirected at all.
 fn rewrite_accumulator_uses_outside_loop(
     func: &mut IrFunction,
     loop_blocks: &FxHashSet<usize>,
     acc_id: u32,
     replacement: Value,
 ) -> usize {
-    let mut updates = 0usize;
-    let replace_in_operand = |op: &mut Operand| -> bool {
-        if let Operand::Value(v) = op {
-            if v.0 == acc_id {
-                *v = replacement;
-                return true;
-            }
-        }
-        false
-    };
-    for (bi, block) in func.blocks.iter_mut().enumerate() {
-        if loop_blocks.contains(&bi) {
-            continue; // the vector accumulator lives and is consumed here
-        }
-        for inst in &mut block.instructions {
-            match inst {
-                Instruction::Copy { src, .. } => {
-                    if replace_in_operand(src) {
-                        updates += 1;
-                    }
-                }
-                Instruction::Store { val, .. } => {
-                    if replace_in_operand(val) {
-                        updates += 1;
-                    }
-                }
-                Instruction::BinOp { lhs, rhs, .. } => {
-                    if replace_in_operand(lhs) {
-                        updates += 1;
-                    }
-                    if replace_in_operand(rhs) {
-                        updates += 1;
-                    }
-                }
-                Instruction::Cmp { lhs, rhs, .. } => {
-                    if replace_in_operand(lhs) {
-                        updates += 1;
-                    }
-                    if replace_in_operand(rhs) {
-                        updates += 1;
-                    }
-                }
-                Instruction::UnaryOp { src, .. } | Instruction::Cast { src, .. } => {
-                    if replace_in_operand(src) {
-                        updates += 1;
-                    }
-                }
-                Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
-                    for a in &mut info.args {
-                        if replace_in_operand(a) {
-                            updates += 1;
-                        }
-                    }
-                }
-                Instruction::Phi { incoming, .. } => {
-                    for (op, _) in incoming {
-                        if replace_in_operand(op) {
-                            updates += 1;
-                        }
-                    }
-                }
-                Instruction::Select {
-                    cond,
-                    true_val,
-                    false_val,
-                    ..
-                } => {
-                    if replace_in_operand(cond) {
-                        updates += 1;
-                    }
-                    if replace_in_operand(true_val) {
-                        updates += 1;
-                    }
-                    if replace_in_operand(false_val) {
-                        updates += 1;
-                    }
-                }
-                _ => {}
-            }
-        }
-        match &mut block.terminator {
-            Terminator::Return(Some(op)) => {
-                if replace_in_operand(op) {
-                    updates += 1;
-                }
-            }
-            Terminator::CondBranch { cond, .. } => {
-                if replace_in_operand(cond) {
-                    updates += 1;
-                }
-            }
-            Terminator::Switch { val, .. } => {
-                if replace_in_operand(val) {
-                    updates += 1;
-                }
-            }
-            _ => {}
-        }
-    }
-    updates
+    rewrite_uses_where_available(
+        func,
+        loop_blocks,
+        &FxHashSet::default(),
+        acc_id,
+        replacement,
+    )
 }
 
 /// Identity of a pointer's statically-known base object.
@@ -16004,16 +16060,7 @@ fn strict_cfg_dominates(cfg: &CfgAnalysis, dominator: usize, block: usize) -> bo
 }
 
 fn strict_value_def_block(func: &IrFunction, value: Value) -> Option<usize> {
-    func.blocks
-        .iter()
-        .enumerate()
-        .find_map(|(block_idx, block)| {
-            block
-                .instructions
-                .iter()
-                .any(|inst| inst.dest() == Some(value))
-                .then_some(block_idx)
-        })
+    definition_site(func, value).map(|(block_idx, _)| block_idx)
 }
 
 /// The vector prefix starts from the scalar loop's preheader, rather than its
@@ -20080,12 +20127,12 @@ fn rewire_escaping_iv_uses(
                 }
             });
             if hit {
-                rewrite_value_use(inst, iv, rem_iv);
+                replace_operand_value(inst, iv, Operand::Value(rem_iv));
                 rewrites += 1;
             }
         }
         if terminator_uses_value(&func.blocks[bi].terminator, iv) {
-            rewrite_terminator_use(&mut func.blocks[bi].terminator, iv, rem_iv);
+            replace_terminator_value(&mut func.blocks[bi].terminator, iv, Operand::Value(rem_iv));
             rewrites += 1;
         }
     }
@@ -20187,24 +20234,6 @@ fn loop_escape_closed(
     true
 }
 
-/// Replace every use of `old` in `inst` with `new`.
-fn rewrite_value_use(inst: &mut Instruction, old: Value, new: Value) {
-    inst.for_each_operand_mut(|op| {
-        if matches!(op, Operand::Value(v) if *v == old) {
-            *op = Operand::Value(new);
-        }
-    });
-    // Pointer-like fields holding a bare `Value` (Store/Load ptr, GEP base,
-    // Memcpy, va_list, ...) are not Operands; the exhaustive walker covers
-    // them all (a hand-rolled Load/GEP-only match left Store-ptr and other
-    // positions naming the pre-rewrite value).
-    inst.for_each_value_use_mut(|v| {
-        if *v == old {
-            *v = new;
-        }
-    });
-}
-
 fn terminator_uses_value(term: &Terminator, v: Value) -> bool {
     let is = |op: &Operand| matches!(op, Operand::Value(x) if *x == v);
     match term {
@@ -20213,21 +20242,6 @@ fn terminator_uses_value(term: &Terminator, v: Value) -> bool {
         Terminator::Switch { val, .. } => is(val),
         Terminator::IndirectBranch { target, .. } => is(target),
         _ => false,
-    }
-}
-
-fn rewrite_terminator_use(term: &mut Terminator, old: Value, new: Value) {
-    let fix = |op: &mut Operand| {
-        if matches!(op, Operand::Value(x) if *x == old) {
-            *op = Operand::Value(new);
-        }
-    };
-    match term {
-        Terminator::Return(Some(op)) => fix(op),
-        Terminator::CondBranch { cond, .. } => fix(cond),
-        Terminator::Switch { val, .. } => fix(val),
-        Terminator::IndirectBranch { target, .. } => fix(target),
-        _ => {}
     }
 }
 
@@ -29287,5 +29301,404 @@ mod entry_edge_tests {
         let mut loop_blocks = FxHashSet::default();
         loop_blocks.insert(0);
         assert_eq!(header_entry_edges(&f, &loop_blocks, 0), None);
+    }
+}
+
+#[cfg(test)]
+mod outside_rewrite_availability_tests {
+    use super::*;
+    use crate::ir::ops::IrBinOp;
+    use crate::ir::reexports::{IrConst, IrFunction};
+
+    fn block(label: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(label),
+            instructions,
+            terminator,
+            source_spans: vec![],
+        }
+    }
+
+    fn binop(dest: u32, lhs: Value, rhs: i32) -> Instruction {
+        Instruction::BinOp {
+            dest: Value(dest),
+            op: IrBinOp::Add,
+            lhs: Operand::Value(lhs),
+            rhs: Operand::Const(IrConst::I32(rhs)),
+            ty: IrType::I32,
+        }
+    }
+
+    /// The horizontal reduction that PRODUCES the replacement both reads the
+    /// accumulator it reduces and defines the value every outside reader is
+    /// redirected to.  Redirecting its own operand is a self-cycle
+    /// (`hadd(sum) -> sum`): the loop feeding it goes dead — `double_reduction`
+    /// lost its correlation body, printed 0 instead of 201415680 and read an
+    /// uninitialised spill slot as a pointer.  Two independent rules exclude it:
+    /// the defining instruction cannot read its own result, and a read of the
+    /// accumulator is never redirected where the replacement is unavailable.
+    /// (A genuinely bypass-reachable exit block — where the replacement is NOT
+    /// available — is covered by `a_bypass_reached_reader_keeps_the_accumulator`
+    /// below; this test's CFG is a straight line on purpose.)
+    #[test]
+    fn the_defining_instruction_keeps_reading_what_it_reduces() {
+        let mut func = IrFunction::new("t".to_string(), IrType::I32, vec![], false);
+        func.blocks
+            .push(block(0, vec![], Terminator::Branch(BlockId(1))));
+        func.blocks.push(block(
+            1,
+            vec![Instruction::Phi {
+                dest: Value(10),
+                ty: IrType::I32,
+                incoming: vec![
+                    (Operand::Const(IrConst::I32(0)), BlockId(0)),
+                    (Operand::Value(Value(11)), BlockId(2)),
+                ],
+            }],
+            Terminator::CondBranch {
+                cond: Operand::Const(IrConst::I32(1)),
+                true_label: BlockId(2),
+                false_label: BlockId(3),
+            },
+        ));
+        func.blocks.push(block(
+            2,
+            vec![binop(11, Value(10), 1)],
+            Terminator::Branch(BlockId(1)),
+        ));
+        func.blocks.push(block(
+            3,
+            vec![Instruction::Intrinsic {
+                dest: Some(Value(20)),
+                op: IntrinsicOp::VecHorizontalAddI32x8,
+                dest_ptr: None,
+                args: vec![Operand::Value(Value(10))],
+            }],
+            Terminator::Branch(BlockId(4)),
+        ));
+        func.blocks.push(block(
+            4,
+            vec![binop(21, Value(20), 0)],
+            Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+        ));
+        // Block 4 has only predecessor 3, which defines the replacement.
+        // The actual bypass counterexample is tested separately below.
+        func.blocks[4].instructions.push(Instruction::BinOp {
+            dest: Value(22),
+            op: IrBinOp::Add,
+            lhs: Operand::Value(Value(21)),
+            rhs: Operand::Value(Value(10)),
+            ty: IrType::I32,
+        });
+
+        let loop_blocks: FxHashSet<usize> = [1usize, 2usize].into_iter().collect();
+        let updates = rewrite_uses_where_available(
+            &mut func,
+            &loop_blocks,
+            &FxHashSet::default(),
+            10,
+            Value(20),
+        );
+
+        match &func.blocks[3].instructions[0] {
+            Instruction::Intrinsic { args, .. } => assert_eq!(
+                args,
+                &vec![Operand::Value(Value(10))],
+                "the reduction must keep reading the accumulator, not its own result"
+            ),
+            other => panic!("expected the horizontal reduce, got {other:?}"),
+        }
+        match &func.blocks[4].instructions[1] {
+            Instruction::BinOp { rhs, .. } => assert_eq!(
+                rhs,
+                &Operand::Value(Value(20)),
+                "an outside reader of the accumulator must take the replacement"
+            ),
+            other => panic!("expected a binop, got {other:?}"),
+        }
+        assert_eq!(updates, 1, "only the outside reader is an update");
+    }
+
+    /// A reader placed BEFORE the definition, in the defining block, cannot
+    /// name the replacement: it has not executed yet.
+    #[test]
+    fn reads_before_the_definition_in_its_own_block_are_left_alone() {
+        let mut func = IrFunction::new("t".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(block(
+            0,
+            vec![
+                binop(30, Value(50), 1),
+                Instruction::Intrinsic {
+                    dest: Some(Value(60)),
+                    op: IntrinsicOp::VecHorizontalAddI32x8,
+                    dest_ptr: None,
+                    args: vec![Operand::Value(Value(50))],
+                },
+                binop(31, Value(50), 2),
+            ],
+            Terminator::Return(Some(Operand::Value(Value(31)))),
+        ));
+
+        let updates = rewrite_uses_where_available(
+            &mut func,
+            &FxHashSet::default(),
+            &FxHashSet::default(),
+            50,
+            Value(60),
+        );
+
+        let lhs_of = |i: usize| match &func.blocks[0].instructions[i] {
+            Instruction::BinOp { lhs, .. } => *lhs,
+            other => panic!("expected a binop, got {other:?}"),
+        };
+        assert_eq!(
+            lhs_of(0),
+            Operand::Value(Value(50)),
+            "a use before the definition must keep the original"
+        );
+        assert_eq!(lhs_of(2), Operand::Value(Value(60)));
+        assert_eq!(updates, 1);
+    }
+
+    /// Bare-`Value` (non-`Operand`) slots outside the loop are rewritten too: a
+    /// `Store` pointer, a `Load` pointer or a `GetElementPtr` base naming the
+    /// accumulator used to keep the stale value, because the shape table
+    /// enumerated operand-bearing instruction kinds only.
+    #[test]
+    fn bare_value_slots_outside_the_loop_are_covered() {
+        let mut func = IrFunction::new("t".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(block(
+            0,
+            vec![
+                binop(80, Value(0), 0),
+                Instruction::Store {
+                    val: Operand::Const(IrConst::I32(1)),
+                    ptr: Value(70),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+                Instruction::Load {
+                    dest: Value(81),
+                    ptr: Value(70),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(82),
+                    base: Value(70),
+                    offset: Operand::Const(IrConst::I32(4)),
+                    ty: IrType::Ptr,
+                },
+            ],
+            Terminator::Return(Some(Operand::Value(Value(81)))),
+        ));
+
+        let updates = rewrite_uses_where_available(
+            &mut func,
+            &FxHashSet::default(),
+            &FxHashSet::default(),
+            70,
+            Value(80),
+        );
+        assert_eq!(updates, 3, "store ptr, load ptr and gep base are all reads");
+
+        assert!(matches!(
+            &func.blocks[0].instructions[1],
+            Instruction::Store { ptr, .. } if *ptr == Value(80)
+        ));
+        assert!(matches!(
+            &func.blocks[0].instructions[2],
+            Instruction::Load { ptr, .. } if *ptr == Value(80)
+        ));
+        assert!(matches!(
+            &func.blocks[0].instructions[3],
+            Instruction::GetElementPtr { base, .. } if *base == Value(80)
+        ));
+    }
+
+    /// The cross-block form of the same cycle.  The remainder path seeds its
+    /// scalar accumulator phi with the horizontal reduce, so the seed is on the
+    /// chain that produces the replacement and must keep reading the
+    /// accumulator — otherwise the vector loop has no outside reader left and
+    /// is eliminated (`vectorize_i32_sum` returned garbage for `n = 1`).
+    #[test]
+    fn the_chain_that_produces_the_replacement_keeps_reading_the_accumulator() {
+        let mut func = IrFunction::new("t".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(block(
+            0,
+            vec![Instruction::Intrinsic {
+                dest: Some(Value(60)),
+                op: IntrinsicOp::VecHorizontalAddI32x8,
+                dest_ptr: None,
+                args: vec![Operand::Value(Value(50))],
+            }],
+            Terminator::Branch(BlockId(1)),
+        ));
+        func.blocks.push(block(
+            1,
+            vec![Instruction::Phi {
+                dest: Value(70),
+                ty: IrType::I32,
+                incoming: vec![
+                    (Operand::Value(Value(60)), BlockId(0)),
+                    (Operand::Value(Value(71)), BlockId(2)),
+                ],
+            }],
+            Terminator::CondBranch {
+                cond: Operand::Const(IrConst::I32(1)),
+                true_label: BlockId(2),
+                false_label: BlockId(3),
+            },
+        ));
+        func.blocks.push(block(
+            2,
+            vec![binop(71, Value(70), 1)],
+            Terminator::Branch(BlockId(1)),
+        ));
+        func.blocks.push(block(
+            3,
+            vec![binop(80, Value(70), 0)],
+            Terminator::Return(Some(Operand::Value(Value(80)))),
+        ));
+        // An outside reader that is NOT on the producer chain.
+        func.blocks[3].instructions.push(Instruction::BinOp {
+            dest: Value(81),
+            op: IrBinOp::Add,
+            lhs: Operand::Value(Value(80)),
+            rhs: Operand::Value(Value(50)),
+            ty: IrType::I32,
+        });
+
+        let updates = rewrite_uses_where_available(
+            &mut func,
+            &FxHashSet::default(),
+            &FxHashSet::default(),
+            50,
+            Value(70),
+        );
+
+        match &func.blocks[0].instructions[0] {
+            Instruction::Intrinsic { args, .. } => assert_eq!(
+                args,
+                &vec![Operand::Value(Value(50))],
+                "the seed that produces the replacement keeps the accumulator"
+            ),
+            other => panic!("expected the horizontal reduce, got {other:?}"),
+        }
+        match &func.blocks[3].instructions[1] {
+            Instruction::BinOp { rhs, .. } => assert_eq!(
+                rhs,
+                &Operand::Value(Value(70)),
+                "an off-chain outside reader still takes the replacement"
+            ),
+            other => panic!("expected a binop, got {other:?}"),
+        }
+        assert_eq!(updates, 1);
+    }
+
+    /// A missing definition is an invariant failure even in release builds.
+    /// The caller has already changed the CFG, so silently returning zero is
+    /// not a valid rollback strategy.
+    #[test]
+    #[should_panic(expected = "has no definition")]
+    fn missing_replacement_fails_stop() {
+        let mut func = IrFunction::new("t".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(block(
+            0,
+            vec![binop(30, Value(10), 1)],
+            Terminator::Return(Some(Operand::Value(Value(30)))),
+        ));
+        rewrite_uses_where_available(
+            &mut func,
+            &FxHashSet::default(),
+            &FxHashSet::default(),
+            10,
+            Value(99),
+        );
+    }
+
+    /// The audit's counterexample, as a test: the exit block is also reached by a
+    /// path that never enters the reduction's producer block, so the replacement
+    /// is not available there and the accumulator read must survive.
+    ///
+    /// CFG:  0 -> 1(header, phi acc) -> {2(body) -> 4(exit), 3(vec-exit) -> 4},
+    ///       with 2 -> 4 as well, so `3` does not dominate `4`.
+    /// The phi dominates the exit (all paths run through 1), so the input IR is
+    /// valid; the *replacement* defined in 3 is not, which is precisely what the
+    /// oracle has to notice.
+    #[test]
+    fn a_bypass_reached_reader_keeps_the_accumulator() {
+        let mut func = IrFunction::new("t".to_string(), IrType::I32, vec![], false);
+        func.blocks
+            .push(block(0, vec![], Terminator::Branch(BlockId(1))));
+        func.blocks.push(block(
+            1,
+            vec![Instruction::Phi {
+                dest: Value(10),
+                ty: IrType::I32,
+                incoming: vec![
+                    (Operand::Const(IrConst::I32(0)), BlockId(0)),
+                    (Operand::Value(Value(11)), BlockId(2)),
+                ],
+            }],
+            Terminator::CondBranch {
+                cond: Operand::Const(IrConst::I32(1)),
+                true_label: BlockId(2),
+                false_label: BlockId(3),
+            },
+        ));
+        func.blocks.push(block(
+            2,
+            vec![binop(11, Value(10), 1)],
+            Terminator::Branch(BlockId(4)),
+        ));
+        func.blocks.push(block(
+            3,
+            vec![Instruction::Intrinsic {
+                dest: Some(Value(20)),
+                op: IntrinsicOp::VecHorizontalAddI32x8,
+                dest_ptr: None,
+                args: vec![Operand::Value(Value(10))],
+            }],
+            Terminator::Branch(BlockId(4)),
+        ));
+        func.blocks.push(block(
+            4,
+            vec![
+                binop(30, Value(20), 0), // reads the replacement
+                binop(31, Value(10), 1), // reads the accumulator (bypass path)
+            ],
+            Terminator::Return(Some(Operand::Value(Value(31)))),
+        ));
+
+        let loop_blocks: FxHashSet<usize> = [1usize].into_iter().collect();
+        let updates = rewrite_uses_where_available(
+            &mut func,
+            &loop_blocks,
+            &FxHashSet::default(),
+            10,
+            Value(20),
+        );
+
+        let lhs_of = |i: usize| match &func.blocks[4].instructions[i] {
+            Instruction::BinOp { lhs, .. } => *lhs,
+            other => panic!("expected a binop, got {other:?}"),
+        };
+        assert_eq!(
+            lhs_of(1),
+            Operand::Value(Value(10)),
+            "the bypass path never defines the replacement, so the accumulator read stays"
+        );
+        assert_eq!(
+            lhs_of(0),
+            Operand::Value(Value(20)),
+            "the replacement read is untouched"
+        );
+        assert_eq!(
+            updates, 0,
+            "no rewrite is provable in the bypass-reached block"
+        );
     }
 }

@@ -61,7 +61,8 @@ HEAVY = {"nbody", "mandelbrot", "hash_table", "strlen_bench", "fannkuch",
 
 
 def compile(lccc, opt, src, out):
-    r = subprocess.run([str(lccc), INCLUDE, *shlex.split(opt), "-o", str(out), str(src)],
+    opts = opt.split() if isinstance(opt, str) else list(opt)
+    r = subprocess.run([str(lccc), INCLUDE, *opts, "-o", str(out), str(src)],
                        capture_output=True, text=True)
     if r.returncode != 0:
         return r.stderr[-300:]
@@ -97,15 +98,23 @@ def parse_summary(cg: Path):
 def main():
     mine, ref, opt = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
     benches = sys.argv[4:] or DEFAULT_FAST
-    outroot = Path("/tmp/cg_" + re.sub(r"[^A-Za-z0-9]+", "_", opt.strip()).strip("_"))
-    (outroot / "mine").mkdir(parents=True, exist_ok=True)
-    (outroot / "ref").mkdir(parents=True, exist_ok=True)
+    tag = "_".join(tok.lstrip("-") for tok in opt.split())
+    outroot = Path(f"/tmp/cg_{tag}")
+    # NOTE: the two sides MUST live on equal-length paths.  Valgrind counts
+    # instructions executed inside ld.so/glibc startup, whose string loops are
+    # path-length dependent; a 1-character asymmetry between the two sides
+    # injects a deterministic +/-14 Ir artifact (measured, e.g. fib: path
+    # length 17 -> 118053 vs 14/15/16 -> 118067).  Hence "aa"/"bb", not
+    # "mine"/"ref".
+    mdir, rdir = outroot / "aa", outroot / "bb"
+    mdir.mkdir(parents=True, exist_ok=True)
+    rdir.mkdir(parents=True, exist_ok=True)
     rows = []
     for b in benches:
         src = REPO / "tests/benchmark/programs" / f"{b}.c"
         if not src.exists():
             print(f"{b}: missing source"); continue
-        m_bin, r_bin = outroot / "mine" / b, outroot / "ref" / b
+        m_bin, r_bin = mdir / b, rdir / b
         e1 = compile(mine, opt, src, m_bin)
         if e1:
             print(f"{b}: MINE compile failed: {e1.strip()[:120]}"); continue
@@ -117,8 +126,8 @@ def main():
         or_ = subprocess.run([r_bin], capture_output=True).stdout
         if om != or_:
             print(f"{b}: OUTPUT MISMATCH"); continue
-        m_ev, e3 = callgrind(m_bin, outroot / "mine")
-        r_ev, e4 = callgrind(r_bin, outroot / "ref")
+        m_ev, e3 = callgrind(m_bin, mdir)
+        r_ev, e4 = callgrind(r_bin, rdir)
         if not m_ev or not r_ev:
             print(f"{b}: callgrind failed: {(e3 or e4)[:100]}"); continue
         rows.append((b, r_ev, m_ev))
