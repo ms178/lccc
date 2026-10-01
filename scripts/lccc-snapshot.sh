@@ -419,6 +419,12 @@ printf '| %d | %s | `%s` | %s | %s |\n' \
   "$seq" "$stamp" "$tag" "$desc" "${files:-none}" >> "$ledger_tmp"
 printf '<!-- base=%s patch_sha256=%s tar_sha256=%s bundle_sha256=%s bundle_clone=%s verdict=%s ci_gate=%s tree=%s -->\n' \
   "$BASE" "$patch_sha" "$tar_sha" "$bundle_sha" "${bundle_clone:-unknown}" "$verdict" "$ci_gate" "$tree_now" >> "$ledger_tmp"
+# Same rule as atomic_write: mktemp's 0600 must not leak onto published
+# artifacts. The mode must be fixed on the TEMP file BEFORE the rename —
+# chmod after the mv publishes a 0600 ledger to every reader for the
+# window between the two, and a crash in that window strands it: the
+# rename is the atomic publish, so it must be the LAST step.
+chmod 644 "$ledger_tmp"
 sync -f "$ledger_tmp" 2>/dev/null || true
 mv -f "$ledger_tmp" "$LEDGER"
 

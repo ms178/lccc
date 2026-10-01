@@ -1,0 +1,35 @@
+# encdiff corpus: 32-bit data16 branch rows (i686).
+#
+# In 32-bit mode the 66 prefix IS honored on near branches: 66 e9/e8/
+# 0f 8x select real 16-bit displacement fields (EIP truncates to 16
+# bits, which no in-payload target can observe), and `data16 jmp/je`
+# with a short-reachable target is a genuine encoding CHOICE — GAS
+# relaxes to `66 eb/7x rel8` while lccc's fixed-rel16 policy keeps the
+# requested 16-bit field. encdiff classifies that divergence
+# DECLINED-DATA16 after round-trip verification proves both forms are
+# the same program; short-only rows (loop/jrcxz) keep the dead prefix
+# where GAS drops it with a warning.
+#
+# These rows cannot live in tests/asm-diff/i686/*.casefile: the
+# asm-diff contract is byte-equality, and the relaxation difference is
+# a documented policy. Run with:
+#   scripts/encdiff.py --lccc ./target/fastbuild/lccc-i686 --32 \
+#       --offline --file tests/encdiff-corpus/data16-branches-32.insn
+data16 jmp foo
+data16 je foo
+data16 jne foo
+data16 call foo
+data16 jmp 1f
+data16 je 1f
+data16 jne 1f
+data16 call 1f
+data16 jmp 1f+300
+data16 je 1f+300
+data16 jne 1f+300
+data16 call 1f+300
+data16 jmp 1b
+data16 je 1b
+data16 jne 1b
+data16 call 1b
+data16 loop 1f
+data16 jrcxz 1f

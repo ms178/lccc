@@ -13,6 +13,7 @@
 #   3. the no-unwind program runs correctly.
 set -euo pipefail
 CCC=${CCC:-./target/fastbuild/lccc}
+GCC=${GCC_BIN:-gcc}
 tmp=${TMPDIR:-/tmp}/lccc-nocfi-parity.$$
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp"
@@ -51,16 +52,26 @@ int main(void)
     return handcfi() == 7 ? 0 : 3;
 }
 C
-# Probe the 32-bit toolchain ONCE, before the loop, and only then decide which
-# modes to run.  The probe used to sit inside the loop guarding just the
-# link-and-run step, so on a host without multilib the `-m32 -S` compile still
-# ran, died on `bits/libc-header-start.h: No such file or directory`, and
-# `set -e` turned a missing OPTIONAL toolchain into a red gate.  The i686 half
-# of this check is real and must not be weakened -- it is skipped, loudly, only
-# when the host genuinely cannot compile 32-bit code, exactly as
-# check_eh_frame_unwind.sh does.
+# Host i386 capability probes, via the shared helper like the other run-leg
+# gates. Two earlier revisions got this wrong in opposite directions:
+# the first probed only whether lccc could LINK -m32 (a host with a 32-bit
+# sysroot links fine yet still refuses to execute the result — no
+# /lib/ld-linux.so.2, or a seccomp policy that SIGSYSes the ia32 gateway),
+# which made such hosts report a codegen failure that never happened; the
+# second probed with lccc ITSELF, so an lccc -m32 regression flipped this
+# leg to a silent SKIP — the skip decision must depend only on host
+# capability, never on the artifact under test. Both probes below therefore
+# go through the shared helper with the host gcc: the mode list from its
+# link level (a host without a 32-bit toolchain cannot even compile the
+# mode, so it is skipped loudly instead of dying red on a missing OPTIONAL
+# capability) and the run leg from its execution level — the memo means one
+# probe binary per gate run covers both. The lccc -m32 legs must FAIL on
+# an lccc regression and SKIP only on host incapability. The
+# assembly-parity and CFI-survival checks are compile-only and stay
+# unconditional for every mode that runs.
+source "$(dirname "$0")/i386_exec.sh"
 modes=("")
-if echo 'int main(void){return 0;}' | "$CCC" -m32 -x c - -o "$tmp/probe32" 2>/dev/null; then
+if i386_link_ok "$GCC"; then
     modes+=("-m32")
 else
     echo "SKIP -m32: no 32-bit toolchain" >&2
@@ -79,7 +90,11 @@ for m in "${modes[@]}"; do
         grep -n '\.cfi_' "$tmp/nocfi.s" >&2 || true
         exit 1
     fi
-    "$CCC" $m -O2 -fno-asynchronous-unwind-tables "$tmp/t.c" -o "$tmp/t"
-    "$tmp/t"
+    if [[ -z "$m" ]] || i386_exec_ok "$GCC" "$tmp"; then
+        "$CCC" $m -O2 -fno-asynchronous-unwind-tables "$tmp/t.c" -o "$tmp/t"
+        "$tmp/t"
+    else
+        echo "SKIP${m:+ ($m)}: host cannot execute i386; assembly parity and CFI survival still asserted"
+    fi
 done
 echo "PASS: no-unwind codegen parity"

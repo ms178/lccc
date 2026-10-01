@@ -10,6 +10,7 @@
 # only the link is lccc-ld's, via a gcc -B shim.
 set -euo pipefail
 CCC=${CCC:-target/fastbuild/lccc}
+GCC=${GCC_BIN:-gcc}
 LD=${LD:-$(dirname "$CCC")/lccc-ld}
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/lccc-notypecode.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
@@ -80,18 +81,20 @@ main:
 	.string "%d %d\n"
 S
 expected="42 7"
+# Host i386 capability, shared taxonomy (i386_exec.sh): run | link |
+# none. A host can link -m32 yet refuse to execute the result (no
+# /lib/ld-linux.so.2, or a seccomp policy that SIGSYSes the ia32
+# gateway). The PLT-routing relocation assertions below are
+# execution-independent and run on every host that can link, so a
+# sandboxed host still validates the S22 law.
+source "$(dirname "$0")/i386_exec.sh"
+i386_cap=$(i386_capability "$GCC")
 check_one() { # $1 = gcc -m flag or "", $2 = caller stem, $3 = extra link flags
     local m="$1" stem="$2" pie="$3"
     gcc $m -shared -fPIC -o "$tmp/libnfn.so" "$tmp/nfn.s"
     gcc $m -c "$tmp/$stem.s" -o "$tmp/$stem.o"
     # shellcheck disable=SC2086
     gcc $m $pie -B"$tmp/shim" "$tmp/$stem.o" -L"$tmp" -lnfn -o "$tmp/$stem"
-    local got
-    got=$(LD_LIBRARY_PATH="$tmp" "$tmp/$stem")
-    if [[ "$got" != "$expected" ]]; then
-        echo "FAIL${m:+ ($m)}: got '$got', expected '$expected'" >&2
-        exit 1
-    fi
     # Both callees PLT-routed (a JUMP_SLOT each), neither copied (a COPY
     # of code bytes into BSS would hand out an NX address). --use-dynamic:
     # the i386 output carries no section headers, so plain -r shows nothing.
@@ -103,10 +106,34 @@ check_one() { # $1 = gcc -m flag or "", $2 = caller stem, $3 = extra link flags
         grep -q "COPY.* $fn\( \|+\|$\)" <<<"$relocs" && {
             echo "FAIL${m:+ ($m)}: stray COPY for $fn" >&2; exit 1; }
     done
+    # Execution-dependent output comparison: only on hosts that can
+    # execute this mode (the PLT-routing law above already ran).
+    if [[ -z "$m" || "$i386_cap" == run ]]; then
+        local got
+        got=$(LD_LIBRARY_PATH="$tmp" "$tmp/$stem")
+        if [[ "$got" != "$expected" ]]; then
+            echo "FAIL${m:+ ($m)}: got '$got', expected '$expected'" >&2
+            exit 1
+        fi
+    else
+        echo "SKIP${m:+ ($m)}: host cannot execute i386; PLT-routing law still asserted"
+        # Machine-readable reduced-coverage marker (run_regression.py's
+        # SKIP-RUN vocabulary): a restricted host must stay visible as
+        # less coverage, never as a clean PASS.
+        echo "SKIP-RUN: notype-code${m:+ -m32}: host cannot execute i386"
+        [[ -n "$m" ]] && m32_run_skipped=1
+    fi
     return 0
 }
 check_one "" use64 ""
-check_one -m32 use32 -no-pie
+m32_mode_skipped=0
+if [[ "$i386_cap" != none ]]; then
+    check_one -m32 use32 -no-pie
+else
+    echo "SKIP (-m32): host cannot link i386 at all"
+    echo "SKIP-RUN: notype-code -m32: host cannot link i386 at all"
+    m32_mode_skipped=1
+fi
 # x86-64 only: untyped DATA via `@PLTOFF` is data, not code — an
 # executable copy-relocates it (its link-time address is the copy),
 # while a shared link refuses it (a variable has no PLT entry).
@@ -167,4 +194,11 @@ check_pltoff() {
     return 0
 }
 check_pltoff
-echo "PASS: notype-code PLT routing (x86-64 + i386) + notype-data PLTOFF (x86-64)"
+# The PASS line claims exactly what ran — never more (audit F5).
+if [[ "$m32_mode_skipped" == 1 ]]; then
+    echo "PASS: notype-code PLT routing (x86-64 only; i386 unavailable on this host) + notype-data PLTOFF (x86-64)"
+elif [[ "${m32_run_skipped:-0}" == 1 ]]; then
+    echo "PASS: notype-code PLT routing (x86-64 + i386 link-level; i386 execution unavailable on this host) + notype-data PLTOFF (x86-64)"
+else
+    echo "PASS: notype-code PLT routing (x86-64 + i386) + notype-data PLTOFF (x86-64)"
+fi

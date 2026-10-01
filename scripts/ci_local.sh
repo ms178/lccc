@@ -883,6 +883,14 @@ if [ -x target/fastbuild/lccc-ld ]; then
     # ci-gate-parity requires --strict, LCCC_REQUIRE_I386=1 and the relocs
     # tool on both sides, and no --filter/--tag).  --strict fails on SKIP.
     # Fixtures assemble with the pinned GNU as 2.47 (installed above).
+    # NOTE: this gate is deliberately NOT host-probe-gated.  A sandbox that
+    # cannot link or execute i386 fails here, and that failure is the
+    # honest report — the suite's own i386_userspace._probe() plus
+    # LCCC_REQUIRE_I386=1 implement a fail-closed multilib contract, and
+    # weakening it from ci_local would break the ci-gate-parity contract.
+    # Per-leg host-probing belongs to the gates that lack the machinery
+    # (see check_copy_alias_sizes.sh / check_linker_notype_code.sh /
+    # check_nocfi_peephole_parity.sh), not to this one.
     gate "kernel-relocs-tool" fast \
         bash tests/linker/setup_kernel_tools.sh --prefix "$HOME/.cache/lccc-kernel-tools"
     gate "linker-suite" fast env \
@@ -953,8 +961,50 @@ gate "codegen-quality-gate" fast \
 # configuration is how a red PR gets pushed.  A clippy run is ~90 s against
 # the two multi-minute oracles `--fast` exists to skip.
 gate "rustfmt" fast cargo fmt --all -- --check
-gate "clippy" fast \
-    cargo clippy --all-targets --profile fastbuild --locked -j "${CI_LOCAL_JOBS:-2}" -- -D warnings
+
+# Memory-constrained hosts OOM-kill the clippy gate the same way they kill
+# the cargo-test compile (see cargo_test_repeated): clippy-driver's metadata
+# compile of the monolithic lib-test target has the same resident peak as
+# rustc's, so on a < 6 GB host the OOM killer SIGKILLs it mid-gate and the
+# gate reports a LINT failure that never happened (verified 2026-09-30:
+# CI_LOCAL_JOBS=1 alone still SIGKILLs with the profile defaults; debug=0 +
+# incremental=0 + -j1 passes in 81 s with identical lint results).  CI_LOCAL_JOBS
+# stays the explicit parallelism knob; the heuristic only drops it to 1 on a
+# host where the compile itself needs the headroom, mirroring cargo-test.
+# Explicit CARGO_PROFILE_FASTBUILD_DEBUG / CARGO_INCREMENTAL values override
+# the heuristic exactly as documented for cargo_test_repeated.
+clippy_gate() {
+    local flags="" dbg incr jobs total_mb
+    [ -r target/lccc-rustflags ] && flags="$(cat target/lccc-rustflags)"
+    jobs="${CI_LOCAL_JOBS:-2}"
+    dbg="${CARGO_PROFILE_FASTBUILD_DEBUG:-}"
+    incr="${CARGO_INCREMENTAL:-}"
+    if [ -z "$dbg" ]; then
+        total_mb=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}')
+        if [ -n "$total_mb" ] && [ "$total_mb" -lt 6000 ]; then
+            dbg=0
+            jobs=1
+        fi
+    fi
+    if [ -z "$incr" ] && [ "${dbg:-}" = "0" ]; then
+        incr=0
+    fi
+    if [ -n "$dbg" ]; then
+        export CARGO_PROFILE_FASTBUILD_DEBUG="$dbg"
+    else
+        unset CARGO_PROFILE_FASTBUILD_DEBUG
+    fi
+    if [ -n "$incr" ]; then
+        export CARGO_INCREMENTAL="$incr"
+    else
+        unset CARGO_INCREMENTAL
+    fi
+    # RUSTFLAGS reuses the build gate's resolved flags (see cargo_test_repeated):
+    # without them clippy recompiles the whole crate under a different flag set.
+    RUSTFLAGS="$flags" cargo clippy --all-targets --profile fastbuild \
+        --locked -j "$jobs" -- -D warnings
+}
+gate "clippy" fast clippy_gate
 
 # ci.yml's closing step "Regression corpus (debug-assertions compiler)": the
 # corpus gates above run an assertion-free compiler, so no debug-only

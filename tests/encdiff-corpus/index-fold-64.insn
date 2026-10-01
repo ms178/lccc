@@ -1,0 +1,182 @@
+# encdiff corpus: 64-bit index-only scale-1 addresses folded to base form.
+#
+# The x86-64 encoder folds `(,%%reg,1)' with an int8-range displacement
+# into the plain based form: `-1(,%%rdi,1)' and `-1(%%rdi)' compute the
+# same effective address, but the first needs a SIB byte and -- because
+# SIB with no base only supports mod=00 + disp32 -- a full 4-byte
+# displacement. Moving the index into the base slot drops the SIB byte
+# and shrinks the displacement to disp8: 8 bytes become 3-5.
+#
+# Distilled from the remote-oracle encdiff run over the whole corpus
+# (gcc16.2/clang23.1/icx/icc): ICC's encoder performs this fold; GAS
+# 2.47, clang, gcc and icx all emit the longer SIB form. lccc now folds
+# too, so on this family it matches ICC and beats every other oracle by
+# 3-5 bytes per row.
+#
+# These rows cannot live in tests/asm-diff/*.casefile: the asm-diff
+# contract is byte-equality with GNU as, and GAS's bytes here are the
+# longer (valid, just not shortest) forms. Run with:
+#   scripts/encdiff.py --lccc ./target/fastbuild/lccc \
+#       --file tests/encdiff-corpus/index-fold-64.insn
+#
+# The fold is guarded to: scale==1, no base, integer displacement of
+# ANY width (int8 range -> disp8 base form, 3-5 bytes saved; wider
+# integers -> mod=10 base form, the SIB byte dropped -- ICC's exact
+# encodings, 28 more verified rows). Scale!=1 and symbol displacements
+# keep the GAS-parity SIB form; those rows stay in the casefiles.
+leaq (,%rcx,1), %rdx
+leal (,%rcx,1), %edx
+leaq 0(,%rcx,1), %rdx
+leal 0(,%rcx,1), %edx
+leaq 1(,%rcx,1), %rdx
+leal 1(,%rcx,1), %edx
+leaq 127(,%rcx,1), %rdx
+leal 127(,%rcx,1), %edx
+leaq -128(,%rcx,1), %rdx
+leal -128(,%rcx,1), %edx
+leaq (,%rbx,1), %rdx
+leal (,%rbx,1), %edx
+leaq 0(,%rbx,1), %rdx
+leal 0(,%rbx,1), %edx
+leaq 1(,%rbx,1), %rdx
+leal 1(,%rbx,1), %edx
+leaq 127(,%rbx,1), %rdx
+leal 127(,%rbx,1), %edx
+leaq -128(,%rbx,1), %rdx
+leal -128(,%rbx,1), %edx
+leaq (,%r12,1), %rdx
+leal (,%r12,1), %edx
+leaq 0(,%r12,1), %rdx
+leal 0(,%r12,1), %edx
+leaq 1(,%r12,1), %rdx
+leal 1(,%r12,1), %edx
+leaq 127(,%r12,1), %rdx
+leal 127(,%r12,1), %edx
+leaq -128(,%r12,1), %rdx
+leal -128(,%r12,1), %edx
+leaq (,%r13,1), %rdx
+leal (,%r13,1), %edx
+leaq 0(,%r13,1), %rdx
+leal 0(,%r13,1), %edx
+leaq 1(,%r13,1), %rdx
+leal 1(,%r13,1), %edx
+leaq 127(,%r13,1), %rdx
+leal 127(,%r13,1), %edx
+leaq -128(,%r13,1), %rdx
+leal -128(,%r13,1), %edx
+mov 0(,%rax,1), %rcx
+mov 4(,%rax,1), %rcx
+mov 127(,%rax,1), %rcx
+mov -1(,%rax,1), %rcx
+mov 0(,%rcx,1), %rcx
+mov 4(,%rcx,1), %rcx
+mov 127(,%rcx,1), %rcx
+mov -1(,%rcx,1), %rcx
+mov 0(,%rdx,1), %rcx
+mov 4(,%rdx,1), %rcx
+mov 127(,%rdx,1), %rcx
+mov -1(,%rdx,1), %rcx
+mov 0(,%rbx,1), %rcx
+mov 4(,%rbx,1), %rcx
+mov 127(,%rbx,1), %rcx
+mov -1(,%rbx,1), %rcx
+mov 0(,%rbp,1), %rcx
+mov 4(,%rbp,1), %rcx
+mov 127(,%rbp,1), %rcx
+mov -1(,%rbp,1), %rcx
+mov 0(,%rsi,1), %rcx
+mov 4(,%rsi,1), %rcx
+mov 127(,%rsi,1), %rcx
+mov -1(,%rsi,1), %rcx
+mov 0(,%rdi,1), %rcx
+mov 4(,%rdi,1), %rcx
+mov 127(,%rdi,1), %rcx
+mov -1(,%rdi,1), %rcx
+mov 0(,%r8,1), %rcx
+mov 4(,%r8,1), %rcx
+mov 127(,%r8,1), %rcx
+mov -1(,%r8,1), %rcx
+mov 0(,%r9,1), %rcx
+mov 4(,%r9,1), %rcx
+mov 127(,%r9,1), %rcx
+mov -1(,%r9,1), %rcx
+mov 0(,%r10,1), %rcx
+mov 4(,%r10,1), %rcx
+mov 127(,%r10,1), %rcx
+mov -1(,%r10,1), %rcx
+mov 0(,%r11,1), %rcx
+mov 4(,%r11,1), %rcx
+mov 127(,%r11,1), %rcx
+mov -1(,%r11,1), %rcx
+mov 0(,%r12,1), %rcx
+mov 4(,%r12,1), %rcx
+mov 127(,%r12,1), %rcx
+mov -1(,%r12,1), %rcx
+mov 0(,%r13,1), %rcx
+mov 4(,%r13,1), %rcx
+mov 127(,%r13,1), %rcx
+mov -1(,%r13,1), %rcx
+mov 0(,%r14,1), %rcx
+mov 4(,%r14,1), %rcx
+mov 127(,%r14,1), %rcx
+mov -1(,%r14,1), %rcx
+mov 0(,%r15,1), %rcx
+mov 4(,%r15,1), %rcx
+mov 127(,%r15,1), %rcx
+mov -1(,%r15,1), %rcx
+mov (,%r13,1), %rcx
+leaq -1(,%r15,1), %rdx
+leaq 128(,%rcx,1), %rdx
+leal 128(,%rcx,1), %edx
+leaq -129(,%rcx,1), %rdx
+leal -129(,%rcx,1), %edx
+leaq 65536(,%rcx,1), %rdx
+leal 65536(,%rcx,1), %edx
+leaq 128(,%rbx,1), %rdx
+leal 128(,%rbx,1), %edx
+leaq -129(,%rbx,1), %rdx
+leal -129(,%rbx,1), %edx
+leaq 65536(,%rbx,1), %rdx
+leal 65536(,%rbx,1), %edx
+leaq 128(,%r12,1), %rdx
+leal 128(,%r12,1), %edx
+leaq -129(,%r12,1), %rdx
+leal -129(,%r12,1), %edx
+leaq 65536(,%r12,1), %rdx
+leal 65536(,%r12,1), %edx
+leaq 128(,%r13,1), %rdx
+leal 128(,%r13,1), %edx
+leaq -129(,%r13,1), %rdx
+leal -129(,%r13,1), %edx
+leaq 65536(,%r13,1), %rdx
+leal 65536(,%r13,1), %edx
+mov 128(,%rax,1), %rcx
+mov 2147483647(,%rax,1), %rcx
+mov 128(,%rcx,1), %rcx
+mov 2147483647(,%rcx,1), %rcx
+mov 128(,%rdx,1), %rcx
+mov 2147483647(,%rdx,1), %rcx
+mov 128(,%rbx,1), %rcx
+mov 2147483647(,%rbx,1), %rcx
+mov 128(,%rbp,1), %rcx
+mov 2147483647(,%rbp,1), %rcx
+mov 128(,%rsi,1), %rcx
+mov 2147483647(,%rsi,1), %rcx
+mov 128(,%rdi,1), %rcx
+mov 2147483647(,%rdi,1), %rcx
+mov 128(,%r8,1), %rcx
+mov 2147483647(,%r8,1), %rcx
+mov 128(,%r9,1), %rcx
+mov 2147483647(,%r9,1), %rcx
+mov 128(,%r10,1), %rcx
+mov 2147483647(,%r10,1), %rcx
+mov 128(,%r11,1), %rcx
+mov 2147483647(,%r11,1), %rcx
+mov 128(,%r12,1), %rcx
+mov 2147483647(,%r12,1), %rcx
+mov 128(,%r13,1), %rcx
+mov 2147483647(,%r13,1), %rcx
+mov 128(,%r14,1), %rcx
+mov 2147483647(,%r14,1), %rcx
+mov 128(,%r15,1), %rcx
+mov 2147483647(,%r15,1), %rcx

@@ -1048,6 +1048,26 @@ impl super::InstructionEncoder {
 
     /// Add a relocation at the current output position.
     pub(super) fn add_relocation(&mut self, symbol: &str, reloc_type: u32, addend: i64) {
+        // Mirror the x86-64 relocation choke point: a branch target spelled
+        // `symbol+constant` (`jmp 1f+300`, `call foo+4`) must not become an
+        // external relocation against a symbol literally named `1f+300` —
+        // undefined at link time and silently wrong at the byte level
+        // (GAS resolves the constant at assembly time). Split the source
+        // constant into the addend here so every encoding arm benefits.
+        let (symbol, addend) = if let Some((base, extra)) =
+            crate::backend::x86::assembler::parser::split_relocation_symbol_addend(symbol)
+        {
+            // Parsed source constants and architecture-supplied addends are
+            // both i64. Overflow is not a legal ELF addend; retaining the
+            // unsplit spelling lets the normal undefined-symbol path
+            // diagnose it rather than wrapping to a different address.
+            match addend.checked_add(extra) {
+                Some(sum) => (base, sum),
+                None => (symbol, addend),
+            }
+        } else {
+            (symbol, addend)
+        };
         let relocation = i686_make_relocation(self.bytes.len(), symbol, reloc_type, addend, None);
         self.relocations.push(relocation);
     }
