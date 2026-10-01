@@ -3211,6 +3211,7 @@ mod tests {
     #[test]
     fn test_compare_branch_fusion_with_matched_store_load() {
         let asm = [
+            "    .cfi_startproc",
             "    cmpq %rcx, %rax",
             "    setl %al",
             "    movzbq %al, %rax",
@@ -3219,12 +3220,22 @@ mod tests {
             "    testq %rax, %rax",
             "    jne .LBB2",
             "    jmp .LBB4",
+            ".LBB2:",
+            "    movl $1, %eax",
+            "    ret",
+            ".LBB4:",
+            "    movl $2, %eax",
+            "    ret",
         ]
         .join("\n")
             + "\n";
         let result = peephole_optimize(asm);
         assert!(result.contains("cmpq %rcx, %rax"), "should keep the cmp");
-        assert!(result.contains("jl .LBB2"), "should fuse to jl: {}", result);
+        assert!(
+            has_fused_branch(&result, "jl .LBB2", "jge .LBB4"),
+            "should fuse to jl .LBB2 (or its mirror jge .LBB4): {}",
+            result
+        );
         assert!(!result.contains("setl"), "should eliminate setl");
     }
 
@@ -3259,39 +3270,78 @@ mod tests {
         assert!(result.contains("testq %rax, %rax"), "{result}");
     }
 
+    /// A fused `cmp`+`test`+`jcc` may be re-oriented by the later layout
+    /// passes: branching to the FALSE label with the inverted condition is the
+    /// same branch when the true block falls through (`jge .Lfalse` ==
+    /// `jl .Ltrue`).  Both orientations encode the same predicate, so accept
+    /// either -- but only the pair: an inverted condition on the WRONG label
+    /// still fails the test.
+    fn has_fused_branch(result: &str, want_true: &str, want_false: &str) -> bool {
+        result
+            .lines()
+            .any(|l| l.trim_start().starts_with(want_true))
+            || result
+                .lines()
+                .any(|l| l.trim_start().starts_with(want_false))
+    }
+
     #[test]
     fn test_compare_branch_fusion_short() {
+        // A real function frame: the fusion deletes the `test`, so the flags
+        // at the branch are the `cmp`'s only after the rewrite, and the guard
+        // must be able to PROVE nothing later reads them.  Both successors end
+        // in `ret`, so the flags are dead on both paths -- the shape real
+        // codegen produces.  (A bare fragment without `.cfi_startproc` cannot
+        // prove that and is refused by design.)
         let asm = [
+            "    .cfi_startproc",
             "    cmpq %rcx, %rax",
             "    setl %al",
             "    movzbq %al, %rax",
             "    testq %rax, %rax",
             "    jne .LBB2",
             "    jmp .LBB4",
+            ".LBB2:",
+            "    movl $1, %eax",
+            "    ret",
+            ".LBB4:",
+            "    movl $2, %eax",
+            "    ret",
         ]
         .join("\n")
             + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("jl .LBB2"), "should fuse to jl: {}", result);
+        assert!(
+            has_fused_branch(&result, "jl .LBB2", "jge .LBB4"),
+            "should fuse to jl .LBB2 (or its mirror jge .LBB4): {}",
+            result
+        );
         assert!(!result.contains("setl"), "should eliminate setl");
     }
 
     #[test]
     fn test_compare_branch_fusion_je() {
         let asm = [
+            "    .cfi_startproc",
             "    cmpq %rcx, %rax",
             "    setl %al",
             "    movzbq %al, %rax",
             "    testq %rax, %rax",
             "    je .Lfalse",
             "    jmp .Ltrue",
+            ".Lfalse:",
+            "    movl $1, %eax",
+            "    ret",
+            ".Ltrue:",
+            "    movl $2, %eax",
+            "    ret",
         ]
         .join("\n")
             + "\n";
         let result = peephole_optimize(asm);
         assert!(
-            result.contains("jge .Lfalse"),
-            "should fuse to jge: {}",
+            has_fused_branch(&result, "jge .Lfalse", "jl .Ltrue"),
+            "should fuse to jge .Lfalse (or its mirror jl .Ltrue): {}",
             result
         );
     }
@@ -3399,7 +3449,7 @@ mod tests {
             ("a", "ja"),
         ] {
             let asm = format!(
-                "    cmpq %rcx, %rax\n    set{} %al\n    movzbq %al, %rax\n    testq %rax, %rax\n    jne .LBB1\n",
+                "    .cfi_startproc\n    cmpq %rcx, %rax\n    set{} %al\n    movzbq %al, %rax\n    testq %rax, %rax\n    jne .LBB1\n    ret\n.LBB1:\n    ret\n",
                 cc
             );
             let result = peephole_optimize(asm);

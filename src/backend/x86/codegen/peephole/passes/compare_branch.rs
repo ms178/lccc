@@ -4,6 +4,7 @@
 //! eliminating the boolean materialization overhead from the codegen model.
 
 use super::super::types::*;
+use super::flag_peepholes;
 use super::liveness::FileLiveness;
 
 /// Maximum number of store/load offsets tracked during compare-and-branch fusion.
@@ -30,31 +31,6 @@ fn parse_stack_operand(text: &str, source: bool) -> Option<(u8, i32)> {
         }
     }
     None
-}
-
-/// True when the instruction READS the EFLAGS register without rewriting it
-/// (or rewrites only part of it — see `flags_partial_writers`). A reader on
-/// the fall-through path after a fused jcc would observe the PRODUCER cmp's
-/// flags instead of the dropped `testq`'s flags: the fusion must refuse.
-fn flags_reader(t: &str) -> bool {
-    const READERS: &[&str] = &[
-        "cmov", "set", "adc", "sbb", "rcl", "rcr", "pushfq", "popfq", "sahf", "lahf",
-    ];
-    READERS.iter().any(|p| t.starts_with(p)) || (t.starts_with('j') && !t.starts_with("jmp"))
-}
-
-/// True when the instruction ends the flags-observation window: it rewrites
-/// all six arithmetic flags, so any later reader observes ITS flags on both
-/// the original and the fused path. `inc`/`dec` deliberately do NOT qualify
-/// (they preserve CF, so a later `adc` would still see the dropped
-/// producer's vs. the fused cmp's carry).
-fn flags_full_writer(t: &str) -> bool {
-    const WRITERS: &[&str] = &[
-        "cmp", "test", "add", "sub", "and", "or", "xor", "neg", "mul", "imul", "div", "idiv",
-        "shl", "shr", "sar", "sal", "rol", "ror", "bt", "bts", "btr", "btc", "popfq", "clc", "stc",
-        "cmc", "call", "ret", "jmp",
-    ];
-    WRITERS.iter().any(|p| t.starts_with(p))
 }
 
 /// Parse `testq %rX, %rX` / `testl %eXd, %eXd` / `testw %Xw, %Xw` /
@@ -710,32 +686,42 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
 
         // Flags-reader guard (pure correctness, applies to every fusion):
         // the fall-through path after the fused jcc now carries the
-        // PRODUCER cmp's flags where the dropped `testq`'s flags used to
-        // be. A reader (cmov/setCC/adc/sbb/conditional jump/pushfq) before
-        // the next full flag writer would observe the wrong flags.
-        let guard_end = (seq_indices[test_scan + 1] + 64).min(len);
-        let mut flags_hazard = false;
-        for g in (seq_indices[test_scan + 1] + 1)..guard_end {
-            if infos[g].is_nop() || matches!(infos[g].kind, LineKind::Directive | LineKind::Empty) {
-                continue;
-            }
-            // Inline asm may read or write flags through raw encodings the
-            // textual flags_reader/flags_full_writer predicates cannot see
-            // (`.byte $0x83, $0xd0, $0x00` is an adc). Treat the region as a
-            // flags hazard.
-            if infos[g].kind == LineKind::InlineAsm {
-                flags_hazard = true;
-                break;
-            }
-            let gt = infos[g].trimmed(store.get(g)).to_string();
-            if flags_reader(&gt) {
-                flags_hazard = true;
-                break;
-            }
-            if flags_full_writer(&gt) {
-                break;
-            }
-        }
+        // PRODUCER cmp's flags where the dropped `testq`'s flags used to be,
+        // and so does the TAKEN path.  Ask the shared flag-flow walker, which
+        // is CFG-aware: it seeds both successors of the fused jump and
+        // follows every branch target from there, stopping a path only at a
+        // writer that redefines ALL SIX arithmetic flags (`preserved = 0` --
+        // `test` and `cmp` disagree about every one of them), at a call
+        // (flags are dead across the ABI boundary) or at a `ret`.  Anything it
+        // cannot prove -- an unresolvable target, an indirect branch, inline
+        // asm -- refuses the fusion.
+        //
+        // This replaces a boundED LINEAR WINDOW over the text after the jump
+        // plus two mnemonic prefix lists.  Both were unsound in ways that are
+        // easy to state and were stated by the PR #716 review:
+        //
+        //   * the window never looked at the TAKEN edge at all, so a reader
+        //     sitting only in the jump's target block was invisible to it;
+        //   * the "full writer" list contained partial writers (`clc`, `stc`,
+        //     `cmc`, `bt*` write CF; `rol`/`ror` write CF and OF; `jmp` writes
+        //     nothing), so `cmp; setl; movzx; test; jne .L; clc; setne %al`
+        //     fused and then read the producer's ZF through the `clc` where
+        //     the deleted `test`'s ZF used to be;
+        //   * a writer that only clobbers PART of the flag word does not end
+        //     the hazard even when the walk is over the full set, so the
+        //     walker's stop rule is "redefines every flag in question", not
+        //     "redefines one".
+        // `seq_indices[test_scan + 1]` is the fused jump itself (the same
+        // index the gated block above calls `jcc_pos`).
+        let flags_hazard = match flag_peepholes::flags_reach_consumer_after_branch(
+            store,
+            infos,
+            seq_indices[test_scan + 1],
+        ) {
+            Some(facts) => facts.saw_consumer || !facts.proved,
+            // No resolvable target: nothing was proven, so nothing is fused.
+            None => true,
+        };
         if flags_hazard {
             if std::env::var_os("CCC_DEBUG_CMP_FUSE").is_some() {
                 eprintln!("[CMPFUSE] flags-reader hazard after fused jcc — refusing");
@@ -1173,5 +1159,164 @@ mod compare_branch_fusion_tests {
         ));
         assert!(out.contains("jne .Lx"), "{}", out);
         assert!(out.contains("setl %al"), "{}", out);
+    }
+}
+
+#[cfg(test)]
+mod fusion_flags_flow_tests {
+    //! The flags guard in front of compare/branch fusion, after the PR #716
+    //! review showed the old one was a linear window over the text with two
+    //! mnemonic lists behind it.
+    //!
+    //! Both failure modes are pinned here with a live control each, because a
+    //! refusal test alone passes on a compiler that never fuses anything:
+    //!
+    //!   * a PARTIAL WRITER does not end the hazard (`clc` writes CF; the
+    //!     `setne` behind it reads ZF, which the deleted `test` set and the
+    //!     producer `cmp` sets differently);
+    //!   * a reader reachable ONLY through the jump's target block, which no
+    //!     scanning of the text after the jump can see.
+    use super::super::peephole_optimize;
+
+    fn run(input: &str) -> String {
+        peephole_optimize(input.to_string())
+    }
+
+    fn f(body: &str) -> String {
+        format!(".text\nf:\n.cfi_startproc\n{body}\n.cfi_endproc\n")
+    }
+
+    /// The fused shape, with `tail` appended to the fall-through path.
+    fn shape(tail: &str) -> String {
+        f(&format!(
+            "    cmpq %rcx, %rax\n    setl %al\n    movzbq %al, %rax\n    testq %rax, %rax\n    jne .LBB1\n{tail}    ret\n.LBB1:\n    movl $1, %ecx\n    ret"
+        ))
+    }
+
+    #[test]
+    fn refuses_when_a_partial_writer_hides_a_reader() {
+        // `clc` redefines CF and nothing else, so it must not end the walk:
+        // the `setne` after it reads ZF, which differs between the deleted
+        // `test` (ZF = "the boolean was zero") and the producer `cmp`.
+        let out = run(&shape("    clc\n    setne %cl\n"));
+        assert!(
+            out.contains("setl"),
+            "fused across a partial writer, hiding a flag reader: {out}"
+        );
+    }
+
+    #[test]
+    fn fuses_when_the_flags_are_redefined_before_any_reader() {
+        // Control for the test above: the same text, with the partial writer
+        // replaced by a full one (`cmpl` redefines all six flags) -- the
+        // reader behind it now observes the WRITER's flags on both the
+        // original and the fused path, so the fusion is legitimate and must
+        // still happen.  Without this, "refuse at any writer" would pass.
+        let out = run(&shape("    cmpl $0, %edx\n    setne %cl\n"));
+        assert!(
+            out.contains("jl .LBB1"),
+            "control did not fuse, so the refusal above proves nothing: {out}"
+        );
+    }
+
+    #[test]
+    fn refuses_when_the_reader_sits_only_in_the_taken_target() {
+        // The flags travel along the taken edge too.  A reader in the target
+        // block is invisible to any scan of the fall-through text, which is
+        // exactly how the window-based guard was unsound.
+        let body = "    cmpq %rcx, %rax\n    setl %al\n    movzbq %al, %rax\n    testq %rax, %rax\n    jne .LBB1\n    ret\n.LBB1:\n    setne %cl\n    ret";
+        let out = run(&f(body));
+        assert!(
+            out.contains("setl"),
+            "fused although the taken edge leads to a flag reader: {out}"
+        );
+    }
+
+    #[test]
+    fn fuses_when_the_taken_target_has_no_reader() {
+        // Control for the test above: the same target, with the reader
+        // replaced by a flag-neutral line.  Both paths now reach `ret` with
+        // nothing observing the flags, so the fusion must happen.
+        let body = "    cmpq %rcx, %rax\n    setl %al\n    movzbq %al, %rax\n    testq %rax, %rax\n    jne .LBB1\n    ret\n.LBB1:\n    movl $1, %ecx\n    ret";
+        let out = run(&f(body));
+        assert!(
+            out.contains("jl .LBB1"),
+            "control did not fuse, so the refusal above proves nothing: {out}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod flags_horizon_tests {
+    //! The post-branch flags scan is bounded at 64 lines, and it used to treat
+    //! "reached the horizon" as "the flags are dead" -- a fail-open gate.  A
+    //! reader further away than the horizon, with no writer in between, would
+    //! observe the PRODUCER cmp's flags where the deleted `test`'s flags used to
+    //! be.  These pin the fail-closed behaviour and its control.
+    //!
+    //! The filler lines are assembler directives: the scan walks SLOTS, so
+    //! directives advance it toward the horizon, and unlike real instructions
+    //! they cannot be deleted by another pass between here and the assertion.
+    use super::super::peephole_optimize;
+
+    fn run(asm: &str) -> String {
+        peephole_optimize(asm.to_string())
+    }
+
+    fn f(body: &str) -> String {
+        format!(".text\nf:\n.cfi_startproc\n{body}\n.cfi_endproc\n")
+    }
+
+    /// `n` alignment directives, each on its own line.  The trailing newline is
+    /// load-bearing: without it the directive is glued to the FOLLOWING line,
+    /// the reader the test means to place never exists as an instruction, and
+    /// the test passes for the wrong reason.
+    fn filler(n: usize) -> String {
+        (0..n).map(|_| "    .p2align 3\n".to_string()).collect()
+    }
+
+    #[test]
+    fn refuses_when_a_flag_reader_sits_past_the_horizon() {
+        let body = format!(
+            "    cmpl %eax, %ebx\n    setl %al\n    movzbq %al, %rax\n    testq %rax, %rax\n    jne .Lx\n{}    setne %cl\n    ret\n.Lx:\n    xorl %eax, %eax\n    ret",
+            filler(70)
+        );
+        let out = run(&f(&body));
+        assert!(
+            out.contains("setl"),
+            "fused although a flag reader sits past the horizon: {out}"
+        );
+    }
+
+    #[test]
+    fn fuses_when_the_code_ends_inside_the_window() {
+        // The other half of the fail-closed rule, and the case that made the
+        // first version of this guard a regression: a short section ends before
+        // the cap, so there is nothing left that could read the flags.  Without
+        // this, "refuse at the horizon" silently becomes "refuse at the end of
+        // every small function", which is a missed fold rather than a wrong
+        // one -- the kind of defect no correctness oracle can see.
+        let out = run(&f(
+            "    cmpl %eax, %ebx\n    setl %al\n    movzbq %al, %rax\n    testq %rax, %rax\n    jne .Lx\n.Lx:\n    ret",
+        ));
+        assert!(
+            out.contains("jl .Lx"),
+            "the fold was refused although nothing follows the section: {out}"
+        );
+    }
+
+    #[test]
+    fn fuses_when_the_horizon_finds_a_flag_writer() {
+        // Control: the same gap, but a full flag writer inside the window
+        // before the reader -- the walk reaches it, so the fused jump is safe.
+        let body = format!(
+            "    cmpl %eax, %ebx\n    setl %al\n    movzbq %al, %rax\n    testq %rax, %rax\n    jne .Lx\n{}    cmpl $1, %edx\n    setne %cl\n    ret\n.Lx:\n    xorl %eax, %eax\n    ret",
+            filler(10)
+        );
+        let out = run(&f(&body));
+        assert!(
+            out.contains("jl .Lx"),
+            "control did not fuse, so the refusal above proves nothing: {out}"
+        );
     }
 }

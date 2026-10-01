@@ -1110,6 +1110,20 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
         // it (`movsbq %bl, %r11` -- the shape the IR's `Cast(bool -> i32)`
         // produces, which the "same family only" rule used to bail on).
         let mut tested_fam = bool_fam;
+        // EVERY family a widening copy defines, not just the last one.
+        //
+        // The idiom this pass matches is `setCC %al; movzbl %al, %rN; test
+        // %rN, %rN; cmovCC`, and the pass deletes all of those lines.  A source
+        // can widen the same boolean twice (`movzbl %al, %r8d; movzbl %al,
+        // %r9d`) -- and then `tested_fam` names only `%r9`, so every guard
+        // tested the last destination while the deletion also took `%r8`'s
+        // definition.  A surviving `cmovne %r8d, %ebx` would read a value
+        // nobody defines any more.  Tracking the whole set makes the
+        // intervening-line scan, the cmov-operand check and the deadness proof
+        // all cover every definition the rewrite removes, and the fold still
+        // fires whenever all of them really are dead -- so this costs reach
+        // only for shapes that were never sound.
+        let mut widened_mask: u16 = 0;
         while let Some(n) = next_real(infos, k, len) {
             k = n;
             if infos[n].pinned || infos[n].is_barrier() {
@@ -1135,6 +1149,7 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
                     // ones impossible.
                     if sfam == bool_fam && src == breg && dfam != REG_NONE && dfam <= REG_GP_MAX {
                         tested_fam = dfam;
+                        widened_mask |= 1u16 << dfam;
                         owned.push(n);
                         continue;
                     }
@@ -1166,8 +1181,7 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
                 // allocator is free to place it after the test.  Such lines
                 // stay in the output; they only have to avoid the flags and
                 // the registers we are about to delete.
-                let tested_mask = 1u16 << tested_fam;
-                if infos[n].reg_refs & (bool_mask | tested_mask) != 0
+                if infos[n].reg_refs & (bool_mask | widened_mask) != 0
                     || flags_effect(tn) != FlagsEffect::Neutral
                 {
                     break;
@@ -1176,8 +1190,7 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
             }
             // Any other line: it must neither touch the boolean (or its
             // widened copy) nor the flags.
-            let tested_mask = 1u16 << tested_fam;
-            if infos[n].reg_refs & (bool_mask | tested_mask) != 0
+            if infos[n].reg_refs & (bool_mask | widened_mask) != 0
                 || flags_effect(tn) != FlagsEffect::Neutral
             {
                 break;
@@ -1209,9 +1222,9 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
                 continue;
             }
         };
-        // The cmov must not read the boolean or its widened copy (it would
-        // lose the definition we are deleting).
-        if infos[cmov_i].reg_refs & (bool_mask | (1u16 << tested_fam)) != 0 {
+        // The cmov must not read the boolean or ANY of its widened copies (it
+        // would lose a definition we are deleting).
+        if infos[cmov_i].reg_refs & (bool_mask | widened_mask) != 0 {
             i += 1;
             continue;
         }
@@ -1235,10 +1248,22 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
         let bool_dead = matches!(lv.live_after(cmov_i, bool_fam), Some(false))
             || dead_in_block_after(store, infos, cmov_i + 1, bool_fam)
             || family_private_to(store, infos, i, bool_fam, &owned);
-        let tested_dead = tested_fam == bool_fam
-            || matches!(lv.live_after(cmov_i, tested_fam), Some(false))
-            || dead_in_block_after(store, infos, cmov_i + 1, tested_fam);
-        if !bool_dead || !tested_dead {
+        // Every widened copy the rewrite deletes needs its own deadness proof:
+        // one live copy is enough to make the deletion observable.
+        let mut widened_dead = true;
+        for fam in 0..=REG_GP_MAX {
+            if widened_mask & (1u16 << fam) == 0 || fam == bool_fam {
+                continue;
+            }
+            let dead = matches!(lv.live_after(cmov_i, fam), Some(false))
+                || dead_in_block_after(store, infos, cmov_i + 1, fam)
+                || family_private_to(store, infos, i, fam, &owned);
+            if !dead {
+                widened_dead = false;
+                break;
+            }
+        }
+        if !bool_dead || !widened_dead {
             i += 1;
             continue;
         }
@@ -1795,21 +1820,21 @@ fn reader_also_writes_flags(t: &str) -> bool {
 
 /// What a flag-consumer walk established about the flags live at its start.
 #[derive(Clone, Copy)]
-struct ConsumerFacts {
+pub(super) struct ConsumerFacts {
     /// At least one consumer was reached.
-    saw_consumer: bool,
+    pub(super) saw_consumer: bool,
     /// A consumer that reads something other than ZF was reached.
-    saw_non_zf: bool,
+    pub(super) saw_non_zf: bool,
     /// A consumer that reads a flag outside {ZF, CF} was reached.  Weaker than
     /// [`Self::saw_non_zf`]: a `jb`/`jbe` reads CF (and ZF) but nothing else,
     /// so a rewrite that provably preserves ZF and CF alone may keep it.  A
     /// consumer with no condition code is always charged here, because a
     /// whole-word or unknown reader can select neither condition exclusively
     /// and can observe AF, which no width-narrowing `cmp` preserves.
-    saw_outside_zf_cf: bool,
+    pub(super) saw_outside_zf_cf: bool,
     /// A consumer that reads SF -- or the whole EFLAGS word, which contains it
     /// -- was reached.
-    saw_sf_reader: bool,
+    pub(super) saw_sf_reader: bool,
     /// A consumer with no condition code -- `lahf`, `pushf`, inline asm, any
     /// unknown mnemonic -- was reached.  This is exactly the class that can
     /// observe **AF**, which no `jcc`/`setcc`/`cmovcc` predicate can select
@@ -1817,12 +1842,12 @@ struct ConsumerFacts {
     /// provably does not read.  `test`-vs-`cmp` rewrites diverge on AF (a
     /// `cmp` defines it, `test` leaves it), so folds that are not
     /// flag-for-flag identical must veto on this fact.
-    saw_whole_reader: bool,
+    pub(super) saw_whole_reader: bool,
     /// False when the walk had to give up: an indirect branch, a target it
     /// could not resolve, or a branch leaving the function. The flags may then
     /// reach consumers nobody looked at, so the facts are a lower bound and
     /// must not license a flag-divergent rewrite on their own.
-    proved: bool,
+    pub(super) proved: bool,
 }
 
 /// Forward reachability over the flag flow that starts at `from`.
@@ -1846,12 +1871,40 @@ struct ConsumerFacts {
 /// `preserved` is the set of flags the rewrite under test PROVES it leaves
 /// unchanged.  A writer that clobbers none of the other flags cannot expose
 /// the rewrite, so the walk steps over it instead of stopping -- which is what
-/// keeps `stc` from hiding the `jo` behind it.  Pass `0` to reproduce the
-/// original "any writer ends the walk" behaviour exactly.
-fn walk_flag_consumers(
+/// keeps `stc` from hiding the `jo` behind it -- and, symmetrically, it is why
+/// a PARTIAL writer never ends the walk: `clc` redefines CF and nothing else,
+/// so a `setne` (ZF) or `setl` (SF/OF) behind it still reads the flags the
+/// rewrite may have changed.  Ending the walk there would be unsound, which is
+/// precisely what a caller passing `preserved = 0` ("the whole flag word is in
+/// question") must not get: with every flag in question, only a writer that
+/// redefines ALL SIX flags -- `cmp`, `test`, `add`, `popfq`, ... -- ends a
+/// path; a call and a `ret` end it too (the flags are dead across the ABI
+/// boundary and past the return), and an unresolvable target sets `proved` to
+/// false instead of guessing.
+pub(super) fn walk_flag_consumers(
     store: &LineStore,
     infos: &[LineInfo],
     from: usize,
+    preserved: u8,
+) -> ConsumerFacts {
+    walk_flag_consumers_seeded(store, infos, from, &[from], preserved)
+}
+
+/// [`walk_flag_consumers`] with an explicit entry set.
+///
+/// A conditional jump has TWO successors, and flags travel along both; a
+/// caller that is asking about the flags *after* a branch must therefore seed
+/// the walk with the fall-through and the resolved target, not with the jump
+/// itself (a `jcc` is itself a consumer, so starting there would report the
+/// branch under test as its own hazard).  `anchor` locates the enclosing
+/// function for the label table and bounds, and is where the facts are
+/// reported from; `seeds` may be empty (no path to explore: nothing can
+/// observe the flags).
+pub(super) fn walk_flag_consumers_seeded(
+    store: &LineStore,
+    infos: &[LineInfo],
+    anchor: usize,
+    seeds: &[usize],
     preserved: u8,
 ) -> ConsumerFacts {
     let mut facts = ConsumerFacts {
@@ -1865,7 +1918,7 @@ fn walk_flag_consumers(
     // Label table for the enclosing function, so a branch target can be turned
     // into a line index. A target outside the function is a tail branch: the
     // flags leave with it and nothing here can account for them.
-    let Some((fs, fe)) = function_range(store, infos, from) else {
+    let Some((fs, fe)) = function_range(store, infos, anchor) else {
         facts.proved = false;
         return facts;
     };
@@ -1893,7 +1946,7 @@ fn walk_flag_consumers(
     };
 
     let mut seen = vec![false; fe - fs];
-    let mut work: Vec<usize> = vec![from];
+    let mut work: Vec<usize> = seeds.to_vec();
     while let Some(head) = work.pop() {
         let mut n = head;
         while n < fe {
@@ -1923,6 +1976,20 @@ fn walk_flag_consumers(
                 LineKind::Label => {
                     n += 1;
                     continue;
+                }
+                // Inline asm can read or write any flag through raw encodings
+                // the textual predicates cannot see (`.byte $0x83, $0xd0, $0x00`
+                // is an `adc`), so it is charged with every reader fact AND
+                // makes the walk unproved: neither the flags before it nor the
+                // flags after it can be reasoned about from the text.
+                LineKind::InlineAsm => {
+                    facts.saw_consumer = true;
+                    facts.saw_non_zf = true;
+                    facts.saw_outside_zf_cf = true;
+                    facts.saw_sf_reader = true;
+                    facts.saw_whole_reader = true;
+                    facts.proved = false;
+                    break;
                 }
                 // `ret` ends the flags' lifetime and a call leaves EFLAGS
                 // undefined, so this path stops either way.
@@ -1960,7 +2027,13 @@ fn walk_flag_consumers(
                 // CF-only writer cannot reveal a ZF/CF-preserving rewrite, and
                 // stopping there would hide every consumer behind it.
                 FlagsEffect::Writes => {
-                    if flags_written_mask(t) & !preserved != 0 {
+                    let changed = F_ALL & !preserved;
+                    // Every flag in question redefined -> the walk is over on
+                    // this path.  Anything less (a partial writer, an
+                    // unknown-effect line that `flags_written_mask` charges
+                    // with F_ALL is fine) keeps the walk going: the surviving
+                    // flags still hold the values under test.
+                    if changed == 0 || flags_written_mask(t) & changed == changed {
                         break;
                     }
                     n += 1;
@@ -2016,6 +2089,55 @@ fn walk_flag_consumers(
         }
     }
     facts
+}
+
+/// The flags **after a conditional jump**: does any consumer reachable from
+/// either successor observe them before a writer redefines them?
+///
+/// This is the question a compare/branch fusion must answer before it deletes
+/// the `test` that used to set those flags, and it is why the walk is seeded
+/// with BOTH successors: the taken edge carries the flags to the target block,
+/// where no linear text scan after the jump can ever look.  `preserved = 0`
+/// because the deleted `test` and the surviving producer comparison disagree
+/// about every one of the six arithmetic flags (`test %r,%r` clears OF/CF/AF
+/// and sets SF/ZF/PF from the value; a `cmp` sets all six from the
+/// subtraction), so no flag is safe to ignore.
+///
+/// Returns `None` when the jump's target cannot be resolved from the text
+/// (external symbol, computed target, no label in this function): the caller
+/// must treat that as a hazard rather than a proof.
+pub(super) fn flags_reach_consumer_after_branch(
+    store: &LineStore,
+    infos: &[LineInfo],
+    jcc_idx: usize,
+) -> Option<ConsumerFacts> {
+    let text = infos[jcc_idx].trimmed(store.get(jcc_idx));
+    let target = super::helpers::extract_jump_target(text)?;
+    let (fs, fe) = function_range(store, infos, jcc_idx)?;
+    let mut target_idx = None;
+    for n in fs..fe {
+        if infos[n].kind != LineKind::Label {
+            continue;
+        }
+        if let Some(name) = infos[n]
+            .trimmed(store.get(n))
+            .strip_suffix(':')
+            .map(str::trim)
+        {
+            if name == target {
+                target_idx = Some(n);
+                break;
+            }
+        }
+    }
+    let target_idx = target_idx?;
+    Some(walk_flag_consumers_seeded(
+        store,
+        infos,
+        jcc_idx,
+        &[jcc_idx + 1, target_idx],
+        0,
+    ))
 }
 
 /// The condition code of a `jcc`/`setcc`/`cmovcc` line, with any size suffix
@@ -3825,5 +3947,57 @@ mod tests {
         for t in ["cmpss $0, %xmm0, %xmm1", "cmpsd $0, %xmm0, %xmm1"] {
             assert_eq!(flags_effect(t), FlagsEffect::Reads, "{t} is unmodelled");
         }
+    }
+}
+
+#[cfg(test)]
+mod widened_copy_tracking_tests {
+    //! `setCC; movzbl %al, %rN; test %rN, %rN; cmovCC` deletes every widening
+    //! copy it walks over, so it must prove every one of them dead.  The scan
+    //! used to remember only the LAST destination while deleting all of them,
+    //! which let a `cmov` read the earlier copy's (now deleted) definition.
+    use super::super::peephole_optimize;
+
+    fn run(asm: &str) -> String {
+        peephole_optimize(asm.to_string())
+    }
+
+    fn f(body: &str) -> String {
+        format!(".text\nf:\n.cfi_startproc\n{body}\n.cfi_endproc\n")
+    }
+
+    #[test]
+    fn refuses_when_the_cmov_reads_an_earlier_widened_copy() {
+        let out = run(&f(
+            "    cmpq $0, %rdi\n    setne %al\n    movzbl %al, %r8d\n    movzbl %al, %r9d\n    testl %r9d, %r9d\n    cmovne %r8d, %ebx\n    movl %ebx, %eax\n    ret",
+        ));
+        assert!(
+            out.contains("setne %al"),
+            "boolean deleted while %%r8 was still read: {out}"
+        );
+        assert!(
+            out.contains("movzbl %al, %r8d"),
+            "%%r8 definition deleted: {out}"
+        );
+        // No fusion: the `test` (and therefore the whole idiom) survives, and
+        // the `cmov` still reads the definition it had.  The input's own
+        // `cmovne` is a SURVIVOR here -- the bug would have been deleting the
+        // `%r8d` definition under it, not removing it.
+        assert!(out.contains("testl %r9d, %r9d"), "fusion fired: {out}");
+        assert!(
+            out.contains("cmovne %r8d, %ebx"),
+            "the select changed shape: {out}"
+        );
+    }
+
+    #[test]
+    fn still_fuses_the_single_widening_shape() {
+        // Control for the test above: one widening copy, used by the `test`,
+        // dead afterwards -- the fold must still fire.
+        let out = run(&f(
+            "    cmpq $0, %rdi\n    setne %al\n    movzbl %al, %r8d\n    testl %r8d, %r8d\n    jne .Lx\n    movl $1, %eax\n    ret\n.Lx:\n    xorl %eax, %eax\n    ret",
+        ));
+        assert!(!out.contains("setne"), "fold did not fire: {out}");
+        assert!(out.contains("ne .Lx") || out.contains("e .Lx"), "{out}");
     }
 }

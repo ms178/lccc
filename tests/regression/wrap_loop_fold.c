@@ -22,7 +22,6 @@ int main(void) {
             expect = s;
         }
         int got = f(u);
-        if (got != expect || (expect == 0) != (v > 100 && 0 == 0 && v > 100 ? 0 : 0)) {}
         printf("u=%08x  in-line=%d  f()=%d  ref=%d  %s\n", u, v, got, expect,
                got == expect ? "ok" : "MISMATCH");
         if (got != expect) bad = 1;

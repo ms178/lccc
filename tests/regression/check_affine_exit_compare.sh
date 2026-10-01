@@ -23,6 +23,11 @@
 #      stdout AND exit status with rotation on, with rotation off, and under
 #      the kill switch.
 #
+#   2b. THE KILL SWITCH REACHES THE CLONE.  With rotation ON and
+#      `CCC_NO_AFFINE_EXIT_FOLD=1`, the rotation path must report ZERO clone
+#      folds while still reporting rotation candidates (otherwise the assertion
+#      would hold for the wrong reason).
+#
 #   2. THE ROTATION CLONE IS STILL COUNTED.  Under `CCC_DEBUG_LOOP_ROTATE=1`
 #      the rotation path must report at least one `[ROT] affine exit-compare
 #      folds:` and none when rotation is off.  The fold is now ALSO a
@@ -99,6 +104,22 @@ folds_off=$(grep -cF "[ROT] affine exit-compare folds:" "$work/norot.dbg" || tru
 note "rotated: $folds rotation-clone fold report(s); unrotated: $folds_off"
 [[ $folds -gt 0 ]] || bad "no affine exit-compare fold fired inside rotation"
 [[ $folds_off -eq 0 ]] || bad "rotation reported a clone fold without running ($folds_off report(s))"
+
+# The kill switch must reach BOTH producers of the fold.  `CCC_NO_AFFINE_EXIT_FOLD`
+# exists so a misbehaving fold can be disabled without disabling rotation (an
+# older, separate transformation), and it used to gate only the standalone pass:
+# the rotation clone kept folding, which made the A/B that condemns the fold the
+# same A/B that hides it.  The count is the observable, so assert on it.
+CCC_LOOP_ROTATE=1 CCC_NO_AFFINE_EXIT_FOLD=1 CCC_DEBUG_LOOP_ROTATE=1 "$CCC" \
+    -O2 -march=x86-64-v3 -S "$corpus" -o "$work/rotkilled.s" 2> "$work/rotkilled.dbg" \
+    || bad "rotated kill-switch -S build failed"
+folds_killed=$(grep -cF "[ROT] affine exit-compare folds:" "$work/rotkilled.dbg" || true)
+note "rotated with CCC_NO_AFFINE_EXIT_FOLD=1: $folds_killed rotation-clone fold report(s)"
+[[ $folds_killed -eq 0 ]] \
+    || bad "CCC_NO_AFFINE_EXIT_FOLD left the rotation clone fold running ($folds_killed report(s))"
+# ... and rotation itself still ran, or the line above would be vacuous.
+grep -qF "[ROT] candidate:" "$work/rotkilled.dbg" \
+    || bad "rotation did not run under the fold kill switch (test would be vacuous)"
 
 # ---------------------------------------------------------------- contract 3
 note "contract 3: f_const is the folded loop rotated and unrotated"

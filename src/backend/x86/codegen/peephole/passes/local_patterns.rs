@@ -11833,7 +11833,25 @@ pub(super) fn fold_shift_into_sib(store: &mut LineStore, infos: &mut [LineInfo])
                 }
                 break;
             }
-            if line_refs_family(t, shifted_fam) || matches!(flags_effect(t), FlagsEffect::Reads) {
+            // The register test must see the instruction the CPU executes,
+            // not just the spelling: `cqto` and `idivq %r11` name their
+            // operands implicitly (`%rdx`, and the `%rax:%rdx`
+            // dividend/quotient pair), so a textual scan sails past them.
+            // `LineInfo::reg_refs` is the classified mask -- explicit
+            // spellings OR'd with `implicit_reg_refs` -- and is the oracle
+            // every other pass in this crate uses for "does this line touch
+            // that family".  The counterexample the textual test missed:
+            //
+            //     shlq $3, %rax
+            //     cqto                  <- implicit %rax read (sign-extends it)
+            //     idivq %r11            <- implicit %rax write (the quotient)
+            //     addq %rax, %r9
+            //
+            // deleting the `shl` and folding the add into
+            // `leaq (%r9,%rax,8), %r9` scales the QUOTIENT by eight.
+            if infos[j].reg_refs & (1u16 << shifted_fam) != 0
+                || matches!(flags_effect(t), FlagsEffect::Reads)
+            {
                 break;
             }
             steps += 1;
@@ -11930,4 +11948,116 @@ fn parse_self_doubling(t: &str) -> Option<&str> {
     let rest = t.strip_prefix("addq ")?;
     let (src, dst) = split_two_operands(rest)?;
     (src == dst && dst.starts_with('%') && !dst.contains('(')).then_some(dst)
+}
+
+#[cfg(test)]
+mod shift_into_sib_tests {
+    //! The shift->SIB fold's intervening-line contract, at the assembly level.
+    //!
+    //! The positive cases live in `tests/regression/check_rmw_sib_folds.sh`;
+    //! these pin the REFUSALS, because that is where the fold was wrong: the
+    //! intervening-line scan used a textual register test
+    //! (`line_refs_family`), which cannot see an instruction's implicit
+    //! operands.  `cqto` reads `%rax` implicitly (it sign-extends the dividend)
+    //! and `idivq` writes `%rax` implicitly (the quotient), so the scan stepped
+    //! over both -- and the fold then rewrote `addq %rax, %r9` into
+    //! `leaq (%r9,%rax,8), %r9`, scaling the QUOTIENT by eight where the source
+    //! added it once.
+    //!
+    //! `still_folds_across_a_harmless_line` is the CONTROL that keeps the
+    //! refusals non-vacuous: the same shape with a line that touches neither the
+    //! register nor the flags must still fold.  If it ever stops folding, the
+    //! refusal tests would be passing for some other reason and would no longer
+    //! prove anything about implicit operands.
+    use super::*;
+
+    /// A CFI-marked function around `body`.  `FileLiveness` -- which the fold's
+    /// deadness proof consults -- needs the `startproc`/`endproc` span to bound
+    /// the function, so a test that omits it passes vacuously.  Lines are joined
+    /// programmatically rather than embedded as one escaped literal: an escape
+    /// typo in a test input is indistinguishable from a fold that did not fire.
+    fn f(body: &[&str]) -> String {
+        let mut lines = vec![".text", "f:", ".cfi_startproc"];
+        lines.extend_from_slice(body);
+        lines.push(".cfi_endproc");
+        lines.join("\n")
+    }
+
+    fn run(lines: &[&str]) -> String {
+        let asm = f(lines);
+        let mut store = LineStore::new(asm);
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        fold_shift_into_sib(&mut store, &mut infos);
+        (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Whitespace-normalised view: the emitter writes `leaq (%r9, %rcx, 8), %r9`
+    /// with a space after every comma, and an assertion that hardcodes the
+    /// compact spelling fails on a rewrite that actually HAPPENED.
+    fn flat(s: &str) -> String {
+        s.replace(", ", ",")
+    }
+
+    #[test]
+    fn a_plain_shift_and_add_still_folds() {
+        let out = run(&["shlq $3, %rcx", "addq %rcx, %r9", "movq %r9, %rax", "ret"]);
+        assert!(flat(&out).contains("leaq (%r9,%rcx,8),%r9"), "{out}");
+        assert!(!out.contains("shlq"), "{out}");
+    }
+
+    #[test]
+    fn still_folds_across_a_harmless_line() {
+        // The GlobalAddr-remat shape the intervening window exists for.
+        let out = run(&[
+            "shlq $3, %rax",
+            "leaq bins(%rip), %r9",
+            "addq %rax, %r9",
+            "movq %r9, %rax",
+            "ret",
+        ]);
+        assert!(flat(&out).contains("leaq (%r9,%rax,8),%r9"), "{out}");
+        assert!(!out.contains("shlq"), "{out}");
+    }
+
+    #[test]
+    fn refuses_to_cross_a_cqto_implicit_read() {
+        let out = run(&[
+            "shlq $3, %rax",
+            "cqto",
+            "addq %rax, %r9",
+            "movq %r9, %rax",
+            "ret",
+        ]);
+        assert!(
+            out.contains("shlq $3, %rax"),
+            "shift deleted across cqto: {out}"
+        );
+        assert!(!flat(&out).contains("leaq (%r9,%rax,8)"), "{out}");
+    }
+
+    #[test]
+    fn refuses_to_cross_an_idivq_implicit_write() {
+        // The counterexample in full: the shift scales the dividend, `idivq`
+        // replaces `%rax` with the quotient, and the add consumes the quotient.
+        let out = run(&[
+            "shlq $3, %rax",
+            "cqto",
+            "idivq %r11",
+            "addq %rax, %r9",
+            "movq %r9, %rax",
+            "ret",
+        ]);
+        assert!(
+            out.contains("shlq $3, %rax"),
+            "shift deleted across cqto/idivq: {out}"
+        );
+        assert!(out.contains("idivq %r11"), "{out}");
+        assert!(!flat(&out).contains("leaq (%r9,%rax,8)"), "{out}");
+    }
 }
