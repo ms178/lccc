@@ -1,7 +1,27 @@
 # FOLLOWUP 2026-09-30 — the affine exit-compare win, and the exact blocker
 
-**Status:** diagnosed, prototyped, soundness-argued, **deliberately not landed**.
-**Priority:** high (systematic, per-iteration, every loop of one shape).
+**Status: LANDED 2026-10-01** (this session) — the fold, the fusion gate that
+unblocks it, and the FileLiveness backward-edge precision fix that made the
+fusion accept the rotated setcc shape.  Gate:
+`tests/regression/check_affine_exit_compare.sh`; evidence:
+`engineering/evidence/ZERO-ROT-AFFINE/fold-and-fusion.md`; the pass stays
+opt-in (`CCC_LOOP_ROTATE=1`), so default codegen is unchanged.
+**Priority:** was high (systematic, per-iteration, every loop of one shape).
+
+## What landed (2026-10-01)
+
+* `FileLiveness` answers "is the fused region dead?" *relative to the region*
+  (`neutralise: Option<(usize, usize, u16)>` +
+  `live_after_dropping_region`), with `refresh_span` /
+  `CCC_VERIFY_LIVENESS_SPAN=1` keeping the incremental answer pinned to the
+  full analysis.
+* `compare_branch`'s gate therefore accepts the rotated latch: fast path
+  `setcc_dead && relay_dead`, else region-dropped `live & mask == 0`.
+* `loop_rotate` step 7b `canonicalise_affine_exit_cmps` folds the CLONED
+  compare `icmp slt (add iv, C), N` → `icmp slt iv, (N - C)` (signed types
+  only, `checked_sub`, sole-use offset temporary, constant bound).  Measured:
+  `f_const` goes from the 5-instruction loop (`leaq 4(%rdx)` + `cmpq $2048`)
+  to `cmpq $2044, %rdx; jl`.
 
 ## The gap, in hard numbers
 

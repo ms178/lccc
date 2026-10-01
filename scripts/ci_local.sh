@@ -346,6 +346,23 @@ gate "call-secondary-cache" fast \
 gate "vec-dead-remainder" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_vec_dead_remainder.sh
 
+# ZERO-REM-2 + chained exit phis: the hoisted FMA transform carries the A
+# factor in a FIXED register (%ymm1), so it may only be emitted where the
+# broadcast is re-established on EVERY entry edge -- the k-unrolled chain
+# shapes enter j-loop N+1 on a conditional arm of j-loop N's header.  The
+# gate pins oracle parity, the one-broadcast-per-packed-loop object-code
+# ratio, and the broadcast-or-refuse invariant.
+gate "vec-chain-exit-phi" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_vec_chain_exit_phi.sh
+
+# ZERO-ROT-AFFINE: the rotated latch folds `add(iv, C) < N` into `iv < N - C`
+# (signed only) so the backend emits a bare-IV compare that the compare-branch
+# fusion can fuse on the back edge -- no per-iteration `leaq` temporary.  The
+# pass is opt-in; the gate drives it, pins the fold count, and pins the
+# objected-code shape of the 4-instruction loop it produces.
+gate "affine-exit-compare" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_affine_exit_compare.sh
+
 gate "minmax-reduction" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_minmax_reduction.sh
 
@@ -485,6 +502,15 @@ gate "got64-old-spelling" fast \
 
 gate "tls-pie-preemptible" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_tls_pie_preemptible.sh
+
+gate "rmw-sib-folds" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_rmw_sib_folds.sh
+
+gate "select-from-compare" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_select_from_compare.sh
+
+gate "affine-loop-fold" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_affine_loop_fold.sh
 
 gate "phi-acyclic-copy-order" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_phi_acyclic_order.sh

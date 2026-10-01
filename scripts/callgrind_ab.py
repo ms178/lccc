@@ -9,12 +9,22 @@ the frontend placement effects (loop/function alignment) that wall time
 only hints at.
 
 Usage:
-  scripts/callgrind_ab.py MINE_LCCC REF_LCCC OPT [bench...]
+  scripts/callgrind_ab.py MINE_LCCC REF_LCCC "OPT [OPT...]" [bench...]
 
-Writes /tmp/cg_<opt>/{mine,ref}/<bench>.* and prints a markdown table.
+Writes /tmp/cg_<opt-slug>/{mine,ref}/<bench>.* and prints a markdown table.
+
+ISA MATCHING IS THE CALLER'S JOB, and the script refuses to guess: lccc's
+default target enables AVX2 while gcc's defaults to baseline x86-64 (SSE2), so
+an A/B run as `lccc -O2` vs `gcc -O2` measures the ISA, not the compiler.  Pass
+the architecture in OPT (e.g. `-O2 -march=x86-64-v3`) and it is handed to BOTH
+compilers verbatim.  Why this is spelled out here: an earlier round of this
+script's own results (matmul 0.29x, double_reduction 0.29x) were recorded
+without the flag and overstated lccc by the width of the vector unit.
 """
 import functools
 import os
+import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -51,7 +61,7 @@ HEAVY = {"nbody", "mandelbrot", "hash_table", "strlen_bench", "fannkuch",
 
 
 def compile(lccc, opt, src, out):
-    r = subprocess.run([str(lccc), INCLUDE, opt, "-o", str(out), str(src)],
+    r = subprocess.run([str(lccc), INCLUDE, *shlex.split(opt), "-o", str(out), str(src)],
                        capture_output=True, text=True)
     if r.returncode != 0:
         return r.stderr[-300:]
@@ -87,7 +97,7 @@ def parse_summary(cg: Path):
 def main():
     mine, ref, opt = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
     benches = sys.argv[4:] or DEFAULT_FAST
-    outroot = Path(f"/tmp/cg_{opt.lstrip('-')}")
+    outroot = Path("/tmp/cg_" + re.sub(r"[^A-Za-z0-9]+", "_", opt.strip()).strip("_"))
     (outroot / "mine").mkdir(parents=True, exist_ok=True)
     (outroot / "ref").mkdir(parents=True, exist_ok=True)
     rows = []

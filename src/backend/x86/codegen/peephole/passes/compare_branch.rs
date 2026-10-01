@@ -659,13 +659,48 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
             let relay_dead = relay_fam
                 .map(|f| lv.live_after(jcc_pos, f) == Some(false))
                 .unwrap_or(true);
-            if !setcc_dead || !relay_dead {
+            // Fast path: the whole-program answer already proves deadness.
+            // Otherwise ask the question the gate means, not the one the
+            // current text answers: `live_after` counts the sequence's OWN
+            // reads (the relay's narrow source read, the self-test), which
+            // THIS fusion deletes -- and across a loop's back edge those
+            // reads make the family loop-carried, so a rotated loop's
+            // `cmpq; setl %r8b; movzbl %r8b, %r8d; testb; jne` refused the
+            // fusion that licenses the rotation (the documented
+            // FOLLOWUP-2026-09-30-affine-exit-compare blocker).  With the
+            // sequence's definitions dropped from the analysis
+            // (`live_after_dropping_region`), the answer is the one that
+            // matters: dead means no path from the fused jump can observe
+            // the boolean the deleted lines used to define.
+            let dead = if setcc_dead && relay_dead {
+                true
+            } else {
+                let mask = carrier_mask(setcc_fam, relay_fam);
+                lv.live_after_dropping_region(
+                    store,
+                    infos,
+                    jcc_pos,
+                    seq_indices[1],
+                    seq_indices[test_scan],
+                    mask,
+                )
+                .is_some_and(|live| live & mask == 0)
+            };
+            if !dead {
                 if std::env::var_os("CCC_DEBUG_CMP_FUSE").is_some() {
                     eprintln!(
-                        "[CMPFUSE] refusing non-legacy fusion (setcc_fam={} setcc_live_after={:?} relay_live_after={:?})",
+                        "[CMPFUSE] refusing non-legacy fusion (setcc_fam={} setcc_live_after={:?} relay_live_after={:?} region_dropped_live={:?})",
                         setcc_fam,
                         lv.live_after(jcc_pos, setcc_fam),
-                        relay_fam.map(|f| lv.live_after(jcc_pos, f))
+                        relay_fam.map(|f| lv.live_after(jcc_pos, f)),
+                        lv.live_after_dropping_region(
+                            store,
+                            infos,
+                            jcc_pos,
+                            seq_indices[1],
+                            seq_indices[test_scan],
+                            carrier_mask(setcc_fam, relay_fam),
+                        )
                     );
                 }
                 i += 1;
