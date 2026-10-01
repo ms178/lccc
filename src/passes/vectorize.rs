@@ -589,7 +589,7 @@ fn vectorize_with_analysis_mode(
             && let Some(bcmp_pattern) = analyze_byte_compare_loop(func, loop_info)
         {
             // Byte-compare loop (`while (p < end && *p == *q) { p++; q++; }`,
-            // the LZ4 extend family): WIDTH-byte `vpcmpeqb`/`vpmovmskb`
+            // the match-extension family): WIDTH-byte `vpcmpeqb`/`vpmovmskb`
             // window phase with the ORIGINAL scalar loop kept as the
             // fallback tail.  Picks 32B AVX2 / 16B SSE2 itself, so (unlike
             // the byte-count and Adler arms) it deliberately does NOT
@@ -9336,15 +9336,17 @@ fn emit_scalar_count_tree(
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Byte-compare loop epic: the LZ4 extend-loop family
+// Byte-compare loop epic: two-stream lockstep byte scans
 // ═══════════════════════════════════════════════════════════════════════
 //
 //     while (p < end && *p == *q) { p++; q++; }
 //
 // i.e. "two pointers advancing in lockstep until the first byte that
-// differs (or the bound)".  This is the shape of LZ4's extend-phase
-// comparison loops, and of any hand-written memmem/strstr-style byte
-// scan with a second stream.
+// differs (or the bound)".  This is the shape of match-extension loops
+// (the in-tree `lz4_match_extend` benchmark, `ZSTD_count`'s tail loop)
+// and of hand-written memmem/strstr-style byte scans with a second
+// stream.  Current upstream LZ4 uses word-wise loops instead and does
+// not contain this shape.
 //
 // GCC 16.2, Clang 23.1 and ICX (2026-09 oracle pins, -O2
 // -march=x86-64-v3) all vectorize this shape with a 32-byte AVX2 window
@@ -9365,10 +9367,15 @@ fn emit_scalar_count_tree(
 //     (room re-test, back to .Lloop)
 //
 // Exactness argument (why this is a legal rewrite):
-//   * The window is loaded only when p + WIDTH <= end (the room test
-//     uses the SAME op the frontend chose for `p < end`, so the bound
-//     arithmetic's signedness is preserved), so every load is within
-//     the declared object (no OOB read).
+//   * The p-side window is loaded only when p + WIDTH < end (strict; the
+//     room test uses the SAME op the frontend chose for `p < end`, so
+//     the bound arithmetic's signedness is preserved), so the p-side
+//     load stays below `end`.  NOTE: only the p stream is bounded this
+//     way.  The q-side window reads q[0..WIDTH) unconditionally, which
+//     is more than the scalar loop would read if p and q diverge early;
+//     it is in bounds only when q's object extends at least WIDTH
+//     bytes past q (e.g. q trails p inside the same buffer, as in
+//     match extension).
 //   * `vpcmpeqb` + `vpmovmskb` == full means every lane is equal, which
 //     is equivalent to all WIDTH scalar iterations taking the "equal"
 //     branch; the pointer advance by WIDTH then reproduces exactly the
@@ -9383,7 +9390,7 @@ fn emit_scalar_count_tree(
 //     cannot observe each other's effects and cannot interleave
 //     differently from the original.
 //
-// The transform keeps the original loop blocks intact and prepends three
+// The transform keeps the original loop blocks intact and adds three
 // new blocks (vh / vbody / vstep): the preheader now enters the phase;
 // the phase either advances WIDTH bytes per iteration or hands control
 // to the original header, whose phis gain the phase live-in as an
@@ -10021,9 +10028,8 @@ fn transform_byte_compare_loop(func: &mut IrFunction, p: &ByteComparePattern) ->
     // 2. Header phis: retarget the preheader incoming to the phase
     //    live-out (vh edge) and add the vbody edge.  PER-PHI: p_phi must
     //    receive p_v and q_phi must receive q_v — a single value for both
-    //    would make the scalar tail compare A against A (regression from
-    //    the first iteration of this transform: a 9600-case driver caught
-    //    it; the tail's q register was initialized from p).
+    //    would make the scalar tail compare A against A (the tail's q
+    //    register would be initialized from p).
     for inst in &mut func.blocks[p.header_idx].instructions {
         if let Instruction::Phi { dest, incoming, .. } = inst {
             let phase_val = if *dest == p.p_phi {

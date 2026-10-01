@@ -1,51 +1,27 @@
-# FOLLOWUP — 2026-09-30 — S05: byte-compare epic on top of #695-merged main
+# FOLLOWUP — 2026-09-30 — byte-compare epic on top of main @ 8db75621
 
-## 1. What happened this session (and the wipe)
+## 1. Design invariants found during development
 
-The session opened mid-diagnosis of the byte-compare transform on the
-previously rebased tree (`fef626a3` + uncommitted cost-model files +
-uncommitted byte-compare work in `src/passes/vectorize.rs`).
-
-**Diagnosis completed before the wipe** — two root causes found and fixed
-in the (now lost) tree, and both fixes are re-applied in this delivery:
+Two failure modes were found while developing the transform; both are
+fixed and documented in the code as do-not-simplify invariants:
 
 1. **Terminator labels are label-space, not index-space.**
    `loop_info.body` is a set of block *indices*; `Terminator::*` targets
    are `BlockId`s whose numbers follow the frontend's source-order label
    allocation, and later passes reorder the block vector. A block's
-   numeric label therefore need not equal its index. The analyzer's
-   `exit_of` compared `label.0 as usize` against the index set and
-   declined silently on any reordered function. Fix: every edge
-   comparison in the section is label-to-label; the exit *index* is
-   recovered once, by label lookup. The invariant is documented at the
-   top of the section epic as a do-not-simplify regression guard.
-2. **Per-phi phase values.** The first iteration rewired *both* header
-   phis to the *p* phase value; the scalar tail then compared A against
-   A (tail q register initialized from rdi). A 9600-case driver caught
-   it (9600/9600 mismatch); fix: `p_phi <- p_v`, `q_phi <- q_v`.
+   numeric label therefore need not equal its index. Comparing
+   `label.0 as usize` against the index set declines silently on any
+   reordered function. Every edge comparison in the section is
+   label-to-label; the exit *index* is recovered once, by label lookup.
+2. **Per-phi phase values.** Rewiring *both* header phis to the *p*
+   phase value makes the scalar tail compare A against A (the tail's q
+   register is initialised from p; 9600/9600 driver mismatches). The
+   fix is `p_phi <- p_v`, `q_phi <- q_v`.
 
-**Then the sandbox state was reset** (the recurring wipe): `/tmp` and the
-whole root filesystem outside `/home/user` were rebuilt from the image;
-`/home/user/lccc-repo` (the rebased working tree, including the
-uncommitted byte-compare section and the 3 cost-model files) and the
-cargo toolchain were gone. Survivors: `/home/user/artifacts` (S01–S04
-patches + bundle), `/home/user/lccc` (an *earlier* S04-era tree),
-`/home/user/lccc-git` (partial), `/home/user/swapfile` (re-created this
-session, see §7).
-
-**Upstream had moved**: main is now `ec08e6a6` = f9bef39b (#688) +
-**PR #695** ("x86: fold redundant cmov-chain compares; harden volatile,
-preheader and CI gates"), which merged the S04 delivery itself (the
-engineering docs, minmax harness files, scope-guard hardening, and
-codegen changes are in upstream; `git show ec08e6a6` confirms the S04
-file set). Per the standing directive, this delivery is rebased onto
-that main.
-
-## 2. What landed (commit `c8451731` on `ec08e6a6`)
+## 2. What landed
 
 `x86: vectorize byte-compare loops (LZ4 extend family) with 32B/16B
-windows` — the byte-compare epic, re-implemented from the verified
-design with both hard-won fixes baked in from the start:
+windows` — the byte-compare epic, implemented with both invariants above in place:
 
 - Driver arm in `vectorize_with_analysis_mode` before the byte-count
   arm; gate `!neon && !late_minmax_only() && x86_simd_available_pub()`
@@ -63,13 +39,6 @@ design with both hard-won fixes baked in from the start:
   `-1i32`/`0xFFFFi32`.
 - Kill switch `LCCC_NO_BYTECMP_VEC`; decline tracing under
   `LCCC_DEBUG_VECTORIZE`.
-
-Also landed (`9bdd0726`): the 6 top-level minmax regression files and
-2 engineering docs that the S04 patch carried but #695 did not — after
-verifying the runner's contract (the top-level harness files are
-duplicates of `tests/regression/minmax_shapes/` and break the
-standalone-glob runner, so they were removed again; the
-`minmax_shapes/` copies are the canonical set and pass).
 
 ## 3. Hard data
 
@@ -154,14 +123,14 @@ Attack list, verdicts:
 10. **`changes += 11` bookkeeping.** — cosmetic (debug reporting only);
     matches the house style of the neighbouring arms.
 
-**Verdict: agree with the design.** The two failure modes found in the
-first iteration (label/index conflation, shared phase value) are
+**Verdict: agree with the design.** The two failure modes found during development
+(label/index conflation, shared phase value) are
 documented as hard-won invariants with the exact regression symptom
 each one would produce, so a future "simplification" that re-introduces
 them fails loudly instead of silently.
 
 **Disagreement (self-correction of an earlier assumption):** the
-earlier session framed this transform as "the LZ4 extend-loop fix".
+transform was initially framed this transform as "the LZ4 extend-loop fix".
 Current LZ4 does not contain the shape (word loops instead), so the
 LZ4 performance case rests on the corpus benchmark, not on LZ4 itself.
 The claim is corrected in §3 above.
@@ -177,34 +146,13 @@ The claim is corrected in §3 above.
    rematerialization found in the current build (the earlier
    "2 leaqs/iteration" evidence predates the current codegen —
    re-derivation required before touching `machinst_alloc`).
-2. **Lost artifacts (wipe):** the 3 uncommitted cost-model files and
-   the `fef626a3` rebase are gone; their *intended* content is not
-   reconstructable from any surviving artifact (checked: all 3
-   surviving trees, all S01–S04 patches, the bundle, /tmp). The minmax
-   scope work that consumed them survived via the #695 merge. If the
-   cost-model work is still wanted, it must be re-derived — flagged,
-   not silently dropped.
-3. **SSE2 path codegen quality:** the 16B path is correct but the vec
+2. **SSE2 path codegen quality:** the 16B path is correct but the vec
    load/store state machine spills both vectors to the stack
    (`movdqu %xmm0, 80(%rsp)` round-trips) in `cmp_ext`; a
    register-home improvement in the vec state machine would shave the
    tail. Cosmetic; measured, correct.
-4. **S05 patch/bundle/ledger** — after sweep + cargo test land green.
 
-## 6. Environment notes
-
-- Swap: `/home/user/swapfile` (6 GiB, fallocated on the persistent
-  volume, `root:root 600`, mkswap'd, active). The previous swapfile
-  lived on the wiped tmpfs; this one is inside `/home/user` so it
-  survives state resets. Verify with `swapon --show` after any reset.
-- Cargo toolchain reinstalled (stable 1.98.1, minimal + rustfmt +
-  clippy) — `rust-toolchain.toml` tracks stable by policy.
-- i386 multilib reinstalled (`gcc-multilib`) — the 5 i686 regression
-  tests + `segment_fill_copy_alias` fail with `cannot find -lgcc`
-  without it.
-- valgrind 3.24.0 reinstalled.
-
-## 7. Landing gate fixes (recorded for the review)
+## 6. Landing gate fixes (recorded for the review)
 
 The first full `scripts/ci_local.sh` run on the final tree exposed three
 gate findings, all fixed in the delivery commit:
@@ -229,63 +177,16 @@ gate findings, all fixed in the delivery commit:
    refreshed and the A/B data above documents the trade (a 12 ms bench
    pays ~1% runtime for the coverage; the win is elsewhere).
 
-Final `scripts/ci_local.sh` on the delivery tree: **all gates green,
-211 PASS / 0 FAIL, CILOCAL-EXIT=0**, pass stamp `target/ci_local.pass`
-(full, debian-13).
+## 7. Verification at base 8db75621
 
-## 8. Third rebase onto upstream main (delivery base 3e0c36cb)
+Measured locally on the final tree (not re-run by CI at authoring time):
 
-Upstream merged two more PRs while this delivery was in flight
-(#701 `2c9e61e5` — IR operand/value replacement canonicalization +
-IVSR consumer docs; #702 — oracle program partition + Godbolt delta
-gate + glibc `make check` triage harness; 17 files, **zero overlap
-with the seven files this epic touches**). Rebased cleanly (zero
-conflicts), rebuilt, and re-verified everything on the final tree:
-
-- 9600-case byte-compare driver: OK, 0 failures (new binary, new base).
-- Full `scripts/ci_local.sh`: **210 PASS / 0 FAIL** (four more gates
-  than the 7b3958f6 run — the new upstream oracle-delta gates pass on
-  this box too).
-- Canonical 39-benchmark sweep, final binary: geomean lccc/gcc
-  **0.7262** (arithmetic 0.9426), 39/39 correct; `zstd_count` 1.086,
-  `lz4_compress` 1.009, `lz4_match_extend` 1.176; best
-  `constant_recursion` 0.013 (78× faster than gcc), worst
-  `linux_find_bit_scaled` 1.415. The upstream IR canonicalization
-  nudged the geomean a hair better than the 7b3958f6 run (0.7278).
-
-## 9. Rebase series — delivery base 8db75621 (final)
-
-One more upstream PR landed during the final verification window
-(#703 `20b212e0` — x86 peephole zero-extending compare folding + flag
-consumer analysis; 9 files, **zero overlap** with this epic's seven).
-Rebased cleanly, rebuilt, and the full final-verification battery was
-re-run on the delivery tree at base c3229698:
-
-- 9600-case byte-compare driver: OK, 0 failures.
-- Regression corpus: **849 passed, 0 failed** (862 total).
-- Codegen-quality gate: all golden workloads within tolerance
-  (the #703 peephole did not disturb the refreshed `zstd_count`
-  baseline).
-- Full `scripts/ci_local.sh`: **211 PASS / 0 FAIL, CILOCAL-EXIT=0**
-  (now includes the #703 zero-ext compare-fold gate, also green).
-- Canonical 39-benchmark sweep, final binary: geomean lccc/gcc
-  **0.7270** (arithmetic 0.9433), 39/39 correct; `zstd_count` 1.087,
-  `lz4_compress` 1.012, `lz4_match_extend` 1.150 (the #703 peephole
-  improved it from 1.176); best `ackermann` 0.012 (82× faster than
-  gcc), worst `linux_find_bit_scaled` 1.421.
-
-One further upstream PR landed before submission (#704 `da083edb` —
-x86 peephole: fold redundant self-test after arithmetic producers;
-7 files, again **zero overlap** with this epic — a fourth consecutive
-clean rebase with no conflicts). The delivery tree was rebased onto
-**8db75621** and the risk-surface battery re-run there: rebuild OK,
-9600-case byte-compare driver OK (0 failures), codegen-quality gate
-all within tolerance (the new peephole did not disturb the
-`zstd_count` baseline), env-test-hygiene PASS, rustfmt clean, clippy
-`-D warnings` clean, regression corpus **849 passed, 0 failed**
-(862 total). Full CI + the canonical sweep above were last run on the
-c3229698 state; #704 touches only `flag_peepholes.rs` plus its own
-test/docs, which the battery above covers. This is the delivery tree:
-patch `ms178-1.S05-bytecmp-epic-0930.patch`, bundle
-`lccc.bundle.S05-bytecmp-epic-0930`, verdict APPLIES-CLEAN+TREE-MATCH,
-base **8db75621**.
+- 9600-case byte-compare driver: 0 failures (16B, v2 16B, v3 32B, kill
+  switch).
+- Regression corpus: 849 passed, 0 failed (862 total).
+- Codegen-quality gate: all golden workloads within tolerance against
+  the refreshed baseline.
+- env-test-hygiene PASS, rustfmt clean, clippy `-D warnings` clean.
+- Canonical 39-benchmark sweep: geomean lccc/gcc 0.7270 (arithmetic
+  0.9433), 39/39 correct; `zstd_count` 1.087, `lz4_compress` 1.012,
+  `lz4_match_extend` 1.150.

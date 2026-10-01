@@ -35,7 +35,7 @@ Review adjudication: `engineering/PR678-REVIEW-2026-09-30.md`.
   six i686-multilib environmental failures (no i686 libc, no root on this
   box).
 - Full `ci_local.sh` re-run on the final tree: **in flight at handoff**
-  (log /tmp/ci_final.log). Expected: green except the environmental
+  Expected: green except the environmental
   classes below.
 - Oracle hard data: see PR678-REVIEW-2026-09-30.md §6.
 
@@ -49,8 +49,7 @@ Review adjudication: `engineering/PR678-REVIEW-2026-09-30.md`.
    dropped 8/7645 corpus-wide; the runtime question is whether the
    replay-removal moves those geomean factors. Use `scripts/bench_kernels.py
    --baseline <union-baselines.json> --save cmp-replay.json` with
-   `--lccc` pointed at the pre-wired vs wired binaries (A/B pair preserved
-   at /home/user/lccc-pre-wired + the delivered binary).
+   `--lccc` pointed at the pre-wired vs wired binaries.
 3. **Full green stamp on a properly provisioned box**: i686 multilib (6
    corpus tests) + GAS 2.47 oracle (asm-diff gates; the binutils build tree
    at ~/.cache/binutils-2.47-build-* exists and was being finished on this
