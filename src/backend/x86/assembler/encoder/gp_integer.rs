@@ -2717,22 +2717,28 @@ impl super::InstructionEncoder {
                 let sym = strip_plt_suffix(label);
                 if self.explicit_data16 && sym.len() != label.len() {
                     // GAS 2.47: `data16 jmp foo@PLT` — "4-byte relocation
-                    // cannot be applied to 2-byte field": the 16-bit
-                    // displacement field cannot carry a PLT32. Checked
-                    // before the opcode bytes so a rejected form leaves no
-                    // partial state in `self.bytes`.
+                    // cannot be applied to 2-byte field". The field is now
+                    // 4 bytes (the 66 is a dead prefix, see below), but the
+                    // combination stays rejected for GAS parity: inventing
+                    // an accept GAS refuses would diverge the accept set on
+                    // a spelling no real code uses. Checked before the
+                    // opcode bytes so a rejected form leaves no partial
+                    // state in `self.bytes`.
                     return Err("4-byte relocation cannot be applied to 2-byte field".to_string());
                 }
                 self.bytes.push(0xE9);
-                if self.explicit_data16 {
-                    // `data16 jmp foo` shrinks the displacement to rel16
-                    // with the 16-bit PC-relative class (GAS 2.47: 66 e9
-                    // 0000 + R_X86_64_PC16 -2). The 0x66 is inserted by
-                    // the central forced-data16 splice, not here.
-                    self.add_relocation(sym, R_X86_64_PC16, -2);
-                    self.bytes.extend_from_slice(&[0, 0]);
-                    return Ok(());
-                }
+                // `data16 jmp` does NOT shrink this field. In 64-bit mode
+                // the 66 prefix is architecturally dead on direct near
+                // branches (Intel SDM: the operand-size prefix has no
+                // effect on near branches in 64-bit mode; hardware-proven:
+                // the decoder consumes a FULL 4-byte displacement after
+                // `66 e9`, so a 2-byte field desynchronises the instruction
+                // stream and jumps through whatever follows). GAS 2.47
+                // emits the truncated `66 e9 rel16` here anyway — that is a
+                // GAS bug, not a row to copy. The central forced-data16
+                // splice still prepends the dead 0x66 (`66 e9 rel32` is the
+                // shortest VALID spelling of the request) and the relaxer
+                // may shrink near targets to `66 eb rel8` (GAS parity).
                 self.add_relocation(sym, R_X86_64_PLT32, -4);
                 self.bytes.extend_from_slice(&[0, 0, 0, 0]);
                 Ok(())
@@ -2775,19 +2781,19 @@ impl super::InstructionEncoder {
                 // Strip @PLT suffix and use PLT32 relocation (matches GCC behavior)
                 let sym = strip_plt_suffix(label);
                 if self.explicit_data16 && sym.len() != label.len() {
-                    // GAS 2.47: a 16-bit jcc field cannot carry a PLT32.
-                    // Checked before the opcode bytes so a rejected form
-                    // leaves no partial state in `self.bytes`.
+                    // GAS 2.47: a 16-bit jcc field cannot carry a PLT32 —
+                    // kept for parity even though the field is 4 bytes now
+                    // (see the jmp arm for the full rationale).
                     return Err("4-byte relocation cannot be applied to 2-byte field".to_string());
                 }
                 self.bytes.extend_from_slice(&[0x0F, 0x80 + cc]);
-                if self.explicit_data16 {
-                    // `data16 je foo` = 66 0f 84 0000 + R_X86_64_PC16 -2;
-                    // the 0x66 comes from the central data16 splice.
-                    self.add_relocation(sym, R_X86_64_PC16, -2);
-                    self.bytes.extend_from_slice(&[0, 0]);
-                    return Ok(());
-                }
+                // `data16 je` keeps the full rel32 field: the 66 prefix is
+                // dead on 64-bit near branches (see encode_jmp). GAS's
+                // `66 0f 84 rel16` mis-executes — the decoder reads 4
+                // displacement bytes, stealing two bytes from the next
+                // instruction. The spliced dead 0x66 plus `0f 8x rel32`
+                // is the shortest VALID form; the relaxer shrinks near
+                // targets to `66 7x rel8` (GAS parity).
                 self.add_relocation(sym, R_X86_64_PLT32, -4);
                 self.bytes.extend_from_slice(&[0, 0, 0, 0]);
                 Ok(())
@@ -2806,19 +2812,19 @@ impl super::InstructionEncoder {
                 // Use PLT32 for external function calls (linker will resolve)
                 let sym = strip_plt_suffix(label);
                 if self.explicit_data16 && sym.len() != label.len() {
-                    // GAS 2.47: a 16-bit call field cannot carry a PLT32.
-                    // Checked before the opcode byte so a rejected form
-                    // leaves no partial state in `self.bytes`.
+                    // GAS 2.47: a 16-bit call field cannot carry a PLT32 —
+                    // kept for parity even though the field is 4 bytes now
+                    // (see encode_jmp for the full rationale).
                     return Err("4-byte relocation cannot be applied to 2-byte field".to_string());
                 }
                 self.bytes.push(0xE8);
-                if self.explicit_data16 {
-                    // `data16 call foo` = 66 e8 0000 + R_X86_64_PC16 -2;
-                    // the 0x66 comes from the central data16 splice.
-                    self.add_relocation(sym, R_X86_64_PC16, -2);
-                    self.bytes.extend_from_slice(&[0, 0]);
-                    return Ok(());
-                }
+                // `data16 call` keeps the full rel32 field: the 66 prefix
+                // is dead on 64-bit near branches (see encode_jmp). A
+                // `66 e8 rel16` pushes an 8-byte return address while
+                // reading a 4-byte displacement — GAS's truncated form
+                // both desynchronises the stream and computes a wild
+                // target. `66 e8 rel32` (spliced dead prefix) is the
+                // shortest VALID form; there is no short call row.
                 self.add_relocation(sym, R_X86_64_PLT32, -4);
                 self.bytes.extend_from_slice(&[0, 0, 0, 0]);
                 Ok(())

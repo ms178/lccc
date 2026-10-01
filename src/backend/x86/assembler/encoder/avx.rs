@@ -2722,8 +2722,7 @@ impl super::InstructionEncoder {
             (Operand::Memory(mem), Operand::Register(dst)) if is_xmm_or_ymm(&dst.name) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 let r = needs_vex_ext(&dst.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 self.emit_vex(r, x, b_ext, 1, 0, 0, l, pp);
                 self.bytes.push(load_op);
                 self.encode_modrm_mem(dst_num, mem)
@@ -2732,8 +2731,7 @@ impl super::InstructionEncoder {
             (Operand::Register(src), Operand::Memory(mem)) if is_xmm_or_ymm(&src.name) => {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let r = needs_vex_ext(&src.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 self.emit_vex(r, x, b_ext, 1, 0, 0, l, pp);
                 self.bytes.push(store_op);
                 self.encode_modrm_mem(src_num, mem)
@@ -2760,8 +2758,7 @@ impl super::InstructionEncoder {
             (Operand::Register(src), Operand::Memory(mem)) if is_xmm_or_ymm(&src.name) => {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let r = needs_vex_ext(&src.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 self.emit_vex(r, x, b_ext, 1, 0, 0, l, pp);
                 self.bytes.push(opcode);
                 self.encode_modrm_mem(src_num, mem)
@@ -2829,8 +2826,7 @@ impl super::InstructionEncoder {
             (Operand::Memory(mem), Operand::Register(dst)) if is_xmm_or_ymm(&dst.name) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 let r = needs_vex_ext(&dst.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 self.emit_vex(r, x, b_ext, 1, 0, 0, l, pp);
                 self.bytes.push(load_op);
                 self.encode_modrm_mem(dst_num, mem)
@@ -2838,8 +2834,7 @@ impl super::InstructionEncoder {
             (Operand::Register(src), Operand::Memory(mem)) if is_xmm_or_ymm(&src.name) => {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let r = needs_vex_ext(&src.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 self.emit_vex(r, x, b_ext, 1, 0, 0, l, pp);
                 self.bytes.push(store_op);
                 self.encode_modrm_mem(src_num, mem)
@@ -2922,8 +2917,7 @@ impl super::InstructionEncoder {
                 let vvvv_num = reg_num(&vvvv.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 let r = needs_vex_ext(&dst.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv.name) { 8 } else { 0 });
                 self.emit_vex(r, x, b_ext, 1, 0, vvvv_enc, l, pp);
                 self.bytes.push(opcode);
@@ -2968,8 +2962,7 @@ impl super::InstructionEncoder {
                 let vvvv_num = reg_num(&vvvv.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 let r = needs_vex_ext(&dst.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv.name) { 8 } else { 0 });
                 self.emit_vex(r, x, b_ext, 2, 0, vvvv_enc, l, pp);
                 self.bytes.push(opcode);
@@ -3016,8 +3009,7 @@ impl super::InstructionEncoder {
                 let vvvv_num = reg_num(&vvvv.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 let r = needs_vex_ext(&dst.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv.name) { 8 } else { 0 });
                 self.emit_vex(r, x, b_ext, 2, 0, vvvv_enc, l, pp);
                 self.bytes.push(opcode);
@@ -3069,8 +3061,7 @@ impl super::InstructionEncoder {
                 let src1_num = reg_num(&src1.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 let r = needs_vex_ext(&dst.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 let vvvv_enc = src1_num | (if needs_vex_ext(&src1.name) { 8 } else { 0 });
                 self.emit_vex(r, x, b_ext, 3, w, vvvv_enc, l, pp);
                 self.bytes.push(opcode);
@@ -3124,8 +3115,7 @@ impl super::InstructionEncoder {
             (Operand::Memory(mem), Operand::Register(dst)) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 let r = needs_vex_ext(&dst.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 self.emit_vex(r, x, b_ext, 3, 0, 0, l, pp);
                 self.bytes.push(opcode);
                 let rc = self.relocations.len();
@@ -3169,8 +3159,7 @@ impl super::InstructionEncoder {
                 let vvvv_num = reg_num(&vvvv.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 let r = needs_vex_ext(&dst.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv.name) { 8 } else { 0 });
                 self.emit_vex(r, x, b_ext, 2, 1, vvvv_enc, l, pp); // W=1 for F64
                 self.bytes.push(opcode);
@@ -3221,8 +3210,7 @@ impl super::InstructionEncoder {
                 let vvvv_num = reg_num(&vvvv.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 let r = needs_vex_ext(&dst.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv.name) { 8 } else { 0 });
                 self.emit_vex(r, x, b_ext, 2, 1, vvvv_enc, l, pp); // W=1 for F64
                 self.bytes.push(opcode);
@@ -3313,8 +3301,7 @@ impl super::InstructionEncoder {
                 let vvvv_num = reg_num(&vvvv.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 let r = needs_vex_ext(&dst.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv.name) { 8 } else { 0 });
                 self.emit_vex(r, x, b_ext, 1, 0, vvvv_enc, l, pp);
                 self.bytes.push(opcode);
@@ -3367,8 +3354,7 @@ impl super::InstructionEncoder {
             (Operand::Memory(mem), Operand::Register(dst)) if is_xmm_or_ymm(&dst.name) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 let r = needs_vex_ext(&dst.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 self.emit_vex(r, x, b_ext, 2, 0, 0, l, pp);
                 self.bytes.push(opcode);
                 self.encode_modrm_mem(dst_num, mem)
@@ -3420,8 +3406,7 @@ impl super::InstructionEncoder {
             (Operand::Memory(mem), Operand::Register(dst)) if is_xmm_or_ymm(&dst.name) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 let r = needs_vex_ext(&dst.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 self.emit_vex(r, x, b_ext, map, 0, 0, l, pp);
                 self.bytes.push(opcode);
                 self.encode_modrm_mem(dst_num, mem)
@@ -3951,8 +3936,7 @@ impl super::InstructionEncoder {
                 let vvvv_num = reg_num(&vvvv.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 let r = needs_vex_ext(&dst.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv.name) { 8 } else { 0 });
                 self.emit_vex(r, x, b_ext, 1, 0, vvvv_enc, l, pp);
                 self.bytes.push(opcode);
@@ -4027,8 +4011,7 @@ impl super::InstructionEncoder {
                 let vvvv_num = reg_num(&vvvv.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 let r = needs_vex_ext(&dst.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv.name) { 8 } else { 0 });
                 self.emit_vex(r, x, b_ext, 1, 0, vvvv_enc, l, pp);
                 self.bytes.push(opcode);
@@ -4056,8 +4039,7 @@ impl super::InstructionEncoder {
                     (Operand::Memory(mem), Operand::Register(dst)) if is_xmm_or_ymm(&dst.name) => {
                         let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                         let r = needs_vex_ext(&dst.name);
-                        let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                        let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                        let (x, b_ext) = mem_vex_xb_bits(mem);
                         self.emit_vex(r, x, b_ext, 1, 0, 0, 0, pp); // vvvv=0, L=0
                         self.bytes.push(load_op);
                         self.encode_modrm_mem(dst_num, mem)
@@ -4065,8 +4047,7 @@ impl super::InstructionEncoder {
                     (Operand::Register(src), Operand::Memory(mem)) if is_xmm_or_ymm(&src.name) => {
                         let src_num = reg_num(&src.name).ok_or("bad register")?;
                         let r = needs_vex_ext(&src.name);
-                        let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                        let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                        let (x, b_ext) = mem_vex_xb_bits(mem);
                         self.emit_vex(r, x, b_ext, 1, 0, 0, 0, pp); // vvvv=0, L=0
                         self.bytes.push(store_op);
                         self.encode_modrm_mem(src_num, mem)
@@ -4193,8 +4174,7 @@ impl super::InstructionEncoder {
             ) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 let r = needs_vex_ext(&dst.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 self.emit_vex(r, x, b_ext, 3, 0, 0, l, pp);
                 self.bytes.push(opcode);
                 let rc = self.relocations.len();
@@ -4426,8 +4406,7 @@ impl super::InstructionEncoder {
                 let vvvv_num = reg_num(&vvvv.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 let r = needs_vex_ext(&dst.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv.name) { 8 } else { 0 });
                 self.emit_vex(r, x, b_ext, 1, 0, vvvv_enc, l, pp);
                 self.bytes.push(0xC2);
@@ -4493,8 +4472,7 @@ impl super::InstructionEncoder {
                 let vvvv_num = reg_num(&vvvv.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 let r = needs_vex_ext(&dst.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv.name) { 8 } else { 0 });
                 self.emit_vex(r, x, b_ext, 3, 0, vvvv_enc, l, pp);
                 self.bytes.push(opcode);
@@ -4586,8 +4564,7 @@ impl super::InstructionEncoder {
                 // (reg_num is the low 3 bits; the extension bit is 8).
                 let slotless = reg_num(&src1.name).ok_or("bad register")?
                     | (if needs_vex_ext(&src1.name) { 8 } else { 0 });
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 self.emit_vex(r, x, b_ext, 3, 0, vvvv_enc, l, 1);
                 self.bytes.push(opcode);
                 let rc = self.relocations.len();
@@ -4599,8 +4576,7 @@ impl super::InstructionEncoder {
             (Operand::Memory(mem), Operand::Register(src2)) => {
                 let slotless = reg_num(&src2.name).ok_or("bad register")?
                     | (if needs_vex_ext(&src2.name) { 8 } else { 0 });
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 // W = 1: memory in the FIRST source position (GAS 2.47).
                 self.emit_vex(r, x, b_ext, 3, 1, vvvv_enc, l, 1);
                 self.bytes.push(opcode);
@@ -5043,8 +5019,7 @@ impl super::InstructionEncoder {
             }
             Operand::Memory(mem) => {
                 let r = needs_vex_ext(&src.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 self.emit_vex(r, x, b_ext, 3, 0, 0, l, 1);
                 self.bytes.push(0x1D);
                 let rc = self.relocations.len();
@@ -5258,8 +5233,7 @@ impl super::InstructionEncoder {
             (Operand::Memory(mem), Operand::Register(dst)) if is_xmm_or_ymm(&dst.name) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 let r = needs_vex_ext(&dst.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 // VEX.256.66.0F38 opcode /r
                 self.emit_vex(r, x, b_ext, 2, 0, 0, l, 1);
                 self.bytes.extend_from_slice(opcode);
@@ -5354,8 +5328,7 @@ impl super::InstructionEncoder {
             ) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 let r = needs_vex_ext(&dst.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 self.emit_vex(r, x, b_ext, 1, 0, 0, l, pp);
                 self.bytes.push(opcode);
                 let rc = self.relocations.len();
@@ -5434,8 +5407,7 @@ impl super::InstructionEncoder {
             (Operand::Memory(mem), Operand::Register(dst)) if is_xmm_or_ymm(&dst.name) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 let r = needs_vex_ext(&dst.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 self.emit_vex(r, x, b_ext, 1, 0, 0, 0, 1);
                 self.bytes.push(0x6E);
                 self.encode_modrm_mem(dst_num, mem)
@@ -5444,8 +5416,7 @@ impl super::InstructionEncoder {
             (Operand::Register(src), Operand::Memory(mem)) if is_xmm_or_ymm(&src.name) => {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let r = needs_vex_ext(&src.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 self.emit_vex(r, x, b_ext, 1, 0, 0, 0, 1);
                 self.bytes.push(0x7E);
                 self.encode_modrm_mem(src_num, mem)
@@ -5543,8 +5514,7 @@ impl super::InstructionEncoder {
             (Operand::Memory(mem), Operand::Register(dst)) if is_xmm_or_ymm(&dst.name) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 let r = needs_vex_ext(&dst.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 self.emit_vex(r, x, b_ext, 1, 0, 0, 0, 2);
                 self.bytes.push(0x7E);
                 self.encode_modrm_mem(dst_num, mem)
@@ -5553,8 +5523,7 @@ impl super::InstructionEncoder {
             (Operand::Register(src), Operand::Memory(mem)) if is_xmm_or_ymm(&src.name) => {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let r = needs_vex_ext(&src.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 self.emit_vex(r, x, b_ext, 1, 0, 0, 0, 1);
                 self.bytes.push(0xD6);
                 self.encode_modrm_mem(src_num, mem)
@@ -5638,8 +5607,7 @@ impl super::InstructionEncoder {
                         0
                     };
                     let r = needs_vex_ext(&dst.name);
-                    let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                    let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                    let (x, b_ext) = mem_vex_xb_bits(mem);
                     let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv.name) { 8 } else { 0 });
                     self.emit_vex(r, x, b_ext, 1, 0, vvvv_enc, l, pp);
                     self.bytes.push(reg_op);
@@ -5851,8 +5819,7 @@ impl super::InstructionEncoder {
             ) => {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let r = needs_vex_ext(&src.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 self.emit_vex(r, x, b_ext, 3, 0, 0, 1, pp);
                 self.bytes.push(opcode);
                 let rc = self.relocations.len();
@@ -5902,8 +5869,7 @@ impl super::InstructionEncoder {
             ) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 let r = needs_vex_ext(&dst.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 self.emit_vex(r, x, b_ext, 3, 1, 0, l, pp);
                 self.bytes.push(opcode);
                 let rc = self.relocations.len();
@@ -5970,8 +5936,7 @@ impl super::InstructionEncoder {
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 let mask_num = reg_num(&mask.name).ok_or("bad register")?;
                 let r = needs_vex_ext(&dst.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv.name) { 8 } else { 0 });
                 self.emit_vex(r, x, b_ext, 3, 0, vvvv_enc, l, pp);
                 self.bytes.push(opcode);
@@ -6027,8 +5992,7 @@ impl super::InstructionEncoder {
                 let vvvv_num = reg_num(&vvvv.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 let r = needs_vex_ext(&dst.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv.name) { 8 } else { 0 });
                 self.emit_vex(r, x, b_ext, 3, 0, vvvv_enc, 0, pp);
                 self.bytes.push(opcode);
@@ -6084,8 +6048,7 @@ impl super::InstructionEncoder {
                 let vvvv_num = reg_num(&vvvv.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 let r = needs_vex_ext(&dst.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv.name) { 8 } else { 0 });
                 self.emit_vex(r, x, b_ext, 1, 0, vvvv_enc, 0, pp);
                 self.bytes.push(opcode);
@@ -6141,8 +6104,7 @@ impl super::InstructionEncoder {
                 let vvvv_num = reg_num(&vvvv.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 let r = needs_vex_ext(&dst.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv.name) { 8 } else { 0 });
                 self.emit_vex(r, x, b_ext, 3, 1, vvvv_enc, 0, pp);
                 self.bytes.push(opcode);
@@ -6188,8 +6150,7 @@ impl super::InstructionEncoder {
             ) => {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let r = needs_vex_ext(&src.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 self.emit_vex(r, x, b_ext, 3, 0, 0, 0, 1);
                 self.bytes.push(0x15);
                 let rc = self.relocations.len();
@@ -6237,8 +6198,7 @@ impl super::InstructionEncoder {
             ) => {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let r = needs_vex_ext(&src.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 self.emit_vex(r, x, b_ext, 3, 0, 0, 0, pp);
                 self.bytes.push(opcode);
                 let rc = self.relocations.len();
@@ -6360,8 +6320,7 @@ impl super::InstructionEncoder {
             (Operand::Memory(mem), Operand::Register(dst)) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
                 let r = needs_vex_ext(&dst.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 self.emit_vex(r, x, b_ext, 2, w, vvvv_enc, 0, pp);
                 self.bytes.push(opcode);
                 self.encode_modrm_mem(dst_num, mem)
@@ -6403,8 +6362,7 @@ impl super::InstructionEncoder {
                 Ok(())
             }
             Operand::Memory(mem) => {
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 self.emit_vex(r, x, b_ext, 1, w, 0, 0, pp);
                 self.bytes.push(opcode);
                 self.encode_modrm_mem(dst_num, mem)
@@ -6452,8 +6410,7 @@ impl super::InstructionEncoder {
                 Ok(())
             }
             Operand::Memory(mem) => {
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 self.emit_vex(r, x, b_ext, 1, w, vvvv, 0, pp);
                 self.bytes.push(opcode);
                 self.encode_modrm_mem(dst_num, mem)
@@ -6489,8 +6446,7 @@ impl super::InstructionEncoder {
             (Operand::Memory(mem), Operand::Register(dst)) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 let r = needs_vex_ext(&dst.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 self.emit_vex(r, x, b_ext, 2, w, vvvv, l, 1);
                 self.bytes.push(load_op);
                 self.encode_modrm_mem(dst_num, mem)
@@ -6498,8 +6454,7 @@ impl super::InstructionEncoder {
             (Operand::Register(src), Operand::Memory(mem)) => {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let r = needs_vex_ext(&src.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 self.emit_vex(r, x, b_ext, 2, w, vvvv, l, 1);
                 self.bytes.push(store_op);
                 self.encode_modrm_mem(src_num, mem)
@@ -6573,8 +6528,7 @@ impl super::InstructionEncoder {
                 || mem.index.as_ref().is_some_and(|i| is_ymm(&i.name)),
         );
         let r = needs_vex_ext(&dst.name);
-        let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-        let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+        let (x, b_ext) = mem_vex_xb_bits(mem);
 
         self.emit_vex(r, x, b_ext, 2, w, vvvv, l, 1);
         self.bytes.push(opcode);
@@ -6738,8 +6692,7 @@ impl super::InstructionEncoder {
                 Ok(())
             }
             Operand::Memory(mem) => {
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 self.emit_vex(false, x, b_ext, 2, w, vvvv, 0, 0);
                 self.bytes.push(0xF3);
                 self.encode_modrm_mem(ext, mem)
@@ -6813,8 +6766,7 @@ impl super::InstructionEncoder {
             (Operand::Memory(mem), Operand::Register(dst)) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 let r = needs_vex_ext(&dst.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 self.emit_vex(r, x, b_ext, 2, w, vvvv_enc, 0, 0);
                 self.bytes.push(0xF2);
                 self.encode_modrm_mem(dst_num, mem)
@@ -6882,8 +6834,7 @@ impl super::InstructionEncoder {
             (Operand::Memory(mem), Operand::Register(dst)) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
                 let r = needs_vex_ext(&dst.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 self.emit_vex(r, x, b_ext, 3, w, 0, 0, 3);
                 self.bytes.push(0xF0);
                 let rc = self.relocations.len();
@@ -6925,8 +6876,7 @@ impl super::InstructionEncoder {
                 let vvvv_num = reg_num(&vvvv.name).ok_or("bad vvvv register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
                 let r = needs_vex_ext(&dst.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv.name) { 8 } else { 0 });
                 self.emit_vex(r, x, b_ext, 1, 0, vvvv_enc, l, pp);
                 self.bytes.push(opcode);
@@ -6962,8 +6912,7 @@ impl super::InstructionEncoder {
                         self.bytes.push(self.modrm(3, src_num, dst_num));
                     }
                     Operand::Memory(mem) => {
-                        let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                        let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                        let (x, b_ext) = mem_vex_xb_bits(mem);
                         self.emit_vex(r, x, b_ext, 3, 0, 0, 0, pp);
                         self.bytes.push(opcode);
                         self.encode_modrm_mem(src_num, mem)?;

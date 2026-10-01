@@ -6,6 +6,8 @@
 mod apx;
 mod avx;
 mod core;
+
+pub(crate) use self::core::mem_vex_xb_bits;
 mod gp_integer;
 mod promoted;
 mod registers;
@@ -167,12 +169,20 @@ pub struct InstructionEncoder {
     /// Memory forms ignore it (the direction is fixed by which side is
     /// memory), and every non-direction instruction ignores it too.
     s_flip: bool,
-    /// The `data16` prefix word (x86-64): besides the central 0x66 splice
-    /// it shrinks direct branch displacements to rel16 with the 16-bit
-    /// PC-relative relocation class (GAS 2.47: `data16 jmp foo` = 66 e9
-    /// 0000 + R_X86_64_PC16, `data16 je foo` = 66 0f 84 0000 + PC16,
-    /// `data16 call foo` = 66 e8 0000 + PC16; with @PLT GAS rejects with
-    /// "4-byte relocation cannot be applied to 2-byte field").
+    /// The `data16` prefix word (x86-64): the central 0x66 splice prepends
+    /// the prefix byte to the encoded body. On direct near branches the
+    /// byte is architecturally DEAD in 64-bit mode (Intel SDM: the
+    /// operand-size prefix has no effect on near branches in 64-bit mode;
+    /// hardware-proven: `66 e9`/`66 e8`/`66 0f 8x` still consume a full
+    /// 4-byte displacement), so the branch encoders keep the normal rel32
+    /// rows and only the splice carries the request (`data16 jmp foo` =
+    /// 66 e9 00000000 + R_X86_64_PLT32). GAS 2.47 truncates the field to
+    /// rel16 instead — a GAS bug that desynchronises the decoder stream —
+    /// and `foo@PLT` is rejected under either scheme ("4-byte relocation
+    /// cannot be applied to 2-byte field", kept for accept-set parity).
+    /// In 32-bit mode (i686 encoder) the same prefix IS honored: 66
+    /// selects the 16-bit field there, and that encoder has its own
+    /// rel16 arms.
     explicit_data16: bool,
     /// APX `{evex}`: force the map-4 EVEX encoding of a legacy insn.
     apx_evex: bool,
@@ -1570,9 +1580,19 @@ impl InstructionEncoder {
         // no table entry has no broadcast form at all. Before that
         // check, `vaddpd (%rcx){1to4}, %zmm30, %zmm31` silently encoded
         // as `{1to8}` — a false accept of an instruction GAS rejects.
+        // Byte 1 low nibble is B4 (APX EGPR base, NOT inverted) ++ mmm:
+        // the map is exactly the low 3 bits. A `& 0xF` here folds B4 into
+        // the map key, so every `{1toN}` broadcast whose memory base is
+        // r16-r31 missed the packed-broadcast element table and was
+        // rejected as `unsupported broadcast` even though the emitted
+        // encoding was correct (`vaddps 508(%r16){1to16}, %zmm5, %zmm6` =
+        // `62 f9 54 58 58 70 7f`). The scalar branch masked `& 7` at its
+        // call site; extracting the pure map here fixes both branches and
+        // keeps the EGPR index path (X4 lives in byte 2, outside the pp
+        // mask) untouched.
         let (b_map, b_pp, b_w, b_op, vl_bytes) = if bytes.len() >= pi + 5 {
             (
-                bytes[pi + 1] & 0xF,
+                bytes[pi + 1] & 0x7,
                 bytes[pi + 2] & 3,
                 (bytes[pi + 2] >> 7) & 1,
                 bytes[pi + 4],
@@ -1581,7 +1601,7 @@ impl InstructionEncoder {
         } else {
             (0u8, 0u8, 0u8, 0u8, 0u32)
         };
-        let scalar_class = Self::evex_scalar_bcst_class(b_map & 7, b_pp, b_w, b_op);
+        let scalar_class = Self::evex_scalar_bcst_class(b_map, b_pp, b_w, b_op);
         let packed_elem = Self::evex_packed_bcst_elem(b_map, b_pp, b_w, b_op);
         for op in ops {
             let (_, _, bcst, _) = op_decor(op);
@@ -1797,6 +1817,27 @@ impl InstructionEncoder {
             // VCVTNE2PS2BF16 uses F2/72 (different PP despite adjacent maps).
             "vdpbf16ps" => r(self.encode_evex_binary(ops, 2, 2, 0, 0x52)),
             "vcvtne2ps2bf16" => r(self.encode_evex_binary(ops, 2, 3, 0, 0x72)),
+            // AVX10.2 SM4 (EVEX.128/256/512.{F3,F2}.0F38.W0 DA): the EVEX
+            // rows are part of the AVX10.2 conformance set (the older
+            // "VEX.128/256 only" note in the SDM predates AVX10.2), and
+            // GAS 2.47 encodes them — zmm (`vsm4key4 %zmm1,%zmm2,%zmm3` =
+            // `62 f2 6e 48 da d9`), EGPR bases and xmm16+ spellings all
+            // need them. No decorator is defined for these rows; GAS
+            // rejects each with its own message (byte-probed):
+            //   `{k}`/`{z}`     -> `unsupported masking for `vsm4key4''
+            //   `{1toN}`        -> `unsupported broadcast for `vsm4key4''
+            //   `{sae}`/`{r*-sae}` -> `unsupported static rounding/sae for
+            //                          `vsm4rnds4'' (evex_sae_class has no
+            //                          DA row, so apply_evex_sae rejects).
+            // Width mismatches keep `register type mismatch` from the
+            // shared packed gate. Low-register xmm/ymm spellings never
+            // reach this arm: without zmm/EGPR/high-vector operands the
+            // dispatcher prefers the shorter VEX.128/256 rows in the main
+            // table (GAS emits VEX there too).
+            "vsm4key4" => r(Self::evex_forbid_mask_bcst(mnemonic, ops)
+                .and_then(|_| self.encode_evex_binary(ops, 2, 2, 0, 0xDA))),
+            "vsm4rnds4" => r(Self::evex_forbid_mask_bcst(mnemonic, ops)
+                .and_then(|_| self.encode_evex_binary(ops, 2, 3, 0, 0xDA))),
             // permutes (EVEX.NDS.66.0F38)
             "vpermd" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x36)),
             "vpermps" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x16)),
@@ -3168,8 +3209,7 @@ impl InstructionEncoder {
             // k -> mem (91): ModRM.reg = k (src), r/m = mem (dst)
             (Operand::Register(src), Operand::Memory(mem)) if is_kreg(&src.name) => {
                 let src_num = reg_num(&src.name).ok_or("bad k register")?;
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 self.emit_vex(false, x, b_ext, 1, w_k, 0, 0, pp_k);
                 self.bytes.push(0x91);
                 self.encode_modrm_mem(src_num, mem)
@@ -3177,8 +3217,7 @@ impl InstructionEncoder {
             // mem -> k (90): ModRM.reg = k (dst), r/m = mem (src)
             (Operand::Memory(mem), Operand::Register(dst)) if is_kreg(&dst.name) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad k register")?;
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let (x, b_ext) = mem_vex_xb_bits(mem);
                 self.emit_vex(false, x, b_ext, 1, w_k, 0, 0, pp_k);
                 self.bytes.push(0x90);
                 self.encode_modrm_mem(dst_num, mem)
@@ -5861,8 +5900,7 @@ impl InstructionEncoder {
                         let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                         let l = if is_ymm(&dst.name) { 1 } else { 0 };
                         let r = needs_vex_ext(&dst.name);
-                        let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                        let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                        let (x, b_ext) = mem_vex_xb_bits(mem);
                         self.emit_vex(r, x, b_ext, 2, 0, 0, l, 1);
                         self.bytes.push(0x17);
                         self.encode_modrm_mem(dst_num, mem)
@@ -5900,8 +5938,7 @@ impl InstructionEncoder {
                     ) => {
                         let src_num = reg_num(&src.name).ok_or("bad register")?;
                         let r = needs_vex_ext(&src.name);
-                        let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                        let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                        let (x, b_ext) = mem_vex_xb_bits(mem);
                         self.emit_vex(r, x, b_ext, 3, 1, 0, 0, 1);
                         self.bytes.push(0x16);
                         let rc = self.relocations.len();
@@ -7232,6 +7269,91 @@ mod encoding_opt_tests {
     }
 
     #[test]
+    fn evex_egpr_base_broadcast_map_key() {
+        // S02 red-team regression: the central broadcast-count check read
+        // EVEX byte 1 with & 0xF, folding the APX B4 bit (EGPR base,
+        // NOT inverted) into the map key — every {1toN} load with an
+        // r16-r31 base was rejected as `unsupported broadcast' even
+        // though the emitted encoding was correct. Byte 1 low nibble is
+        // B4 ++ mmm; the map is exactly & 0x7. Byte-probed against
+        // GAS 2.47 (map 0F rows here; 0F38/0F3A rows in the casefile
+        // corpus — evex-redteam-s02.casefile).
+        assert_eq!(
+            hex("vaddps 508(%r16){1to16}, %zmm5, %zmm6"),
+            "62 f9 54 58 58 70 7f"
+        );
+        assert_eq!(
+            hex("vaddps (%r16){1to8}, %ymm5, %ymm6"),
+            "62 f9 54 38 58 30"
+        );
+        // EGPR INDEX (X4 in byte 2, outside the pp mask) worked before
+        // and must keep working. The index lives in SIB.index = 000 with
+        // X4 (byte 2 bit 2, inverted: 0 = +16) selecting r16; the 508
+        // displacement compresses to disp8 0x7f (N=4), so the full
+        // encoding is 8 bytes: 62 f1 50 58 | 58 74 80 | 7f — modrm 74 is
+        // mod=01 (SIB + disp8), SIB 80 = scale 4 / index 000 / base rax.
+        // Byte-probed against GAS 2.47, which emits the identical octet.
+        assert_eq!(
+            hex("vaddps 508(%rax,%r16,4){1to16}, %zmm5, %zmm6"),
+            "62 f1 50 58 58 74 80 7f"
+        );
+    }
+
+    #[test]
+    fn evex_sm4_avx10_conformance() {
+        // AVX10.2 adds EVEX.128/256/512 rows for VSM4KEY4/VSM4RNDS4
+        // (no masking, no broadcast; low-register xmm/ymm spellings keep
+        // the shorter VEX.128/256 rows). Byte-probed against GAS 2.47:
+        // zmm key = 62 f2 6e 48 da d9, EGPR base sets B4 (bit 3 of
+        // byte 1, not inverted), xmm20+ needs R'/V'.
+        assert_eq!(hex("vsm4key4 %zmm1, %zmm2, %zmm3"), "62 f2 6e 48 da d9");
+        assert_eq!(hex("vsm4rnds4 %zmm1, %zmm2, %zmm3"), "62 f2 6f 48 da d9");
+        assert_eq!(hex("vsm4key4 (%r16), %xmm5, %xmm6"), "62 fa 56 08 da 30");
+        assert_eq!(hex("vsm4rnds4 %xmm20, %xmm5, %xmm6"), "62 b2 57 08 da f4");
+        // VEX preference for low-register spellings (GAS emits VEX there).
+        assert_eq!(hex("vsm4key4 %xmm4, %xmm5, %xmm6"), "c4 e2 52 da f4");
+        assert_eq!(hex("vsm4rnds4 %ymm4, %ymm5, %ymm6"), "c4 e2 57 da f4");
+    }
+
+    #[test]
+    fn data16_branch_dead_prefix_64bit() {
+        // In 64-bit mode the 0x66 the central splice prepends to a direct
+        // near branch is architecturally DEAD (Intel SDM: operand-size
+        // prefixes have no effect on near branches in 64-bit mode) — the
+        // decoder consumes the FULL 4-byte displacement after 66 e9/e8/
+        // 0f 8x regardless. Hardware-verified on a Xeon: a 2-byte rel16
+        // field makes the decoder read two bytes past the instruction and
+        // jump through whatever follows (SIGSEGV probes in the S03
+        // session log). GAS 2.47 emits those truncated rows with
+        // R_X86_64_PC16; lccc keeps the normal rel32 row and carries the
+        // prefix as a dead byte — the shortest VALID encoding:
+        //   data16 jmp  = 66 e9 rel32 + PLT32   (GAS: 66 e9 rel16 + PC16)
+        //   data16 jcc  = 66 0f 8x rel32 + PLT32 (GAS: 66 0f 8x rel16 + PC16)
+        //   data16 call = 66 e8 rel32 + PLT32   (GAS: 66 e8 rel16 + PC16)
+        // Near-local targets relax to `66 eb/7x rel8` (byte-identical to
+        // GAS — pinned in prefix-words.casefile, writer level).
+        let (h, r) = hex_relocs("data16 jmp foo");
+        assert_eq!(h, "66 e9 00 00 00 00");
+        assert_eq!(r, vec![R_X86_64_PLT32]);
+        let (h, r) = hex_relocs("data16 je foo");
+        assert_eq!(h, "66 0f 84 00 00 00 00");
+        assert_eq!(r, vec![R_X86_64_PLT32]);
+        let (h, r) = hex_relocs("data16 call foo");
+        assert_eq!(h, "66 e8 00 00 00 00");
+        assert_eq!(r, vec![R_X86_64_PLT32]);
+        // Un-prefixed branches must be untouched by the change.
+        assert_eq!(hex("jmp foo"), "e9 00 00 00 00");
+        assert_eq!(hex("je foo"), "0f 84 00 00 00 00");
+        assert_eq!(hex("call foo"), "e8 00 00 00 00");
+        // The @PLT spellings stay rejected for GAS accept-set parity
+        // ("4-byte relocation cannot be applied to 2-byte field" is
+        // GAS's own diagnostic for the combination).
+        assert!(fails("data16 jmp foo@PLT"));
+        assert!(fails("data16 je foo@PLT"));
+        assert!(fails("data16 call foo@PLT"));
+    }
+
+    #[test]
     fn evex_vfpclass_packed_scalar_and_bf16() {
         // GAS 2.47 byte probes: packed opcode 66, scalar opcode 67,
         // map=3; W/pp select PS/PD/PH/BF16 or SS/SD/SH. VFPCLASS has no
@@ -7974,5 +8096,152 @@ mod x87_pop_tests {
             "operand type mismatch for `fdivrp'"
         );
         assert_eq!(hex("fmulp %st(4), %st"), "de cc");
+    }
+}
+
+/// Byte-pins for the index-only scale-1 -> base fold (x86-64), distilled
+/// from the remote-oracle encdiff run: ICC's encoder folds these; GAS 2.47,
+/// clang, gcc and icx all emit the longer SIB form. lccc now matches ICC and
+/// beats the other four by 3-5 bytes per row (102 rows on the migrated
+/// index-fold-64.insn corpus, -419 bytes vs GAS; lccc ties ICC at 387).
+/// The fold is guarded to scale==1, no base, INTEGER displacement (any
+/// width: the disp8 range folds to the mod=01 base form, wider integers to
+/// mod=10); every guard edge is pinned below, and the extension-bit
+/// invariant (the register moves X->X4 into B->B4 with the slot) is pinned
+/// per prefix family. All expected bytes were probed against the built
+/// encoder, not derived.
+#[cfg(test)]
+mod index_fold_tests {
+    use super::apx_tests::{fails, hex, hex_relocs};
+
+    #[test]
+    fn fold_matches_icc_and_beats_the_sib_oracles() {
+        // Every GPR class folds; the based forms are the ones the ModR/M
+        // emitter already emits for explicit based operands (byte-probed):
+        assert_eq!(hex("mov (,%rbx,1), %rcx"), "48 8b 0b"); // 3B (GAS: 8)
+        assert_eq!(hex("mov 0(,%rax,1), %rcx"), "48 8b 08");
+        assert_eq!(hex("leaq (,%rbx,1), %rdx"), "48 8d 13");
+        assert_eq!(hex("mov -1(,%r10,1), %rcx"), "49 8b 4a ff"); // reg 2 class
+        // reg 5 class folds through mod=01 + disp8 (mod=00 r/m=101 is
+        // no-base + disp32, so [rbp]/[r13] always needs the disp8 slot):
+        assert_eq!(hex("mov (,%rbp,1), %rcx"), "48 8b 4d 00");
+        assert_eq!(hex("mov (,%r13,1), %rcx"), "49 8b 4d 00");
+        // reg 4 class folds through the SIB-base form:
+        assert_eq!(hex("mov -1(,%r12,1), %rcx"), "49 8b 4c 24 ff");
+        // EGPR: the extension bit moves X -> B with the register (REX2).
+        assert_eq!(hex("mov (,%r16,1), %rcx"), "d5 18 8b 08");
+        // The int8 boundaries fold; the 0x67 pre-scan verdict is unchanged
+        // (a 32-bit component either way), so `leal` folds with the
+        // address-size override:
+        assert_eq!(hex("mov -128(,%rbx,1), %rcx"), "48 8b 4b 80");
+        assert_eq!(hex("leal (,%ecx,1), %edx"), "67 8d 11");
+    }
+
+    #[test]
+    fn fold_guards_keep_the_gas_parity_form() {
+        // Scale != 1: the index is real, the fold would change the address.
+        assert_eq!(hex("mov (,%rbx,2), %rcx"), "48 8b 0c 5d 00 00 00 00");
+        // Wider integers still fold -- to the mod=10 base form (no SIB
+        // byte; ICC's exact encodings, byte-probed). 7B where the SIB
+        // index form is 8B; neutral (8B) on the rsp/r12 class whose base
+        // form needs a SIB anyway:
+        assert_eq!(hex("mov 128(,%rbx,1), %rcx"), "48 8b 8b 80 00 00 00");
+        assert_eq!(hex("mov 1000(,%rbx,1), %rcx"), "48 8b 8b e8 03 00 00");
+        assert_eq!(hex("mov 65536(,%rcx,1), %rdx"), "48 8b 91 00 00 01 00");
+        assert_eq!(hex("mov 128(,%r10,1), %rcx"), "49 8b 8a 80 00 00 00");
+        assert_eq!(hex("mov -129(,%rbx,1), %rcx"), "48 8b 8b 7f ff ff ff");
+        assert_eq!(hex("mov 128(,%r12,1), %rcx"), "49 8b 8c 24 80 00 00 00");
+        // Symbol displacements keep the SIB + reloc shape (folding them is
+        // unevidenced and would change the relocation class).
+        let (h, r) = hex_relocs("mov sym(,%rbx,1), %rcx");
+        assert_eq!(h, "48 8b 0c 1d 00 00 00 00");
+        assert_eq!(r.len(), 1); // the SIB-form relocation, R_X86_64_32S
+        // Explicitly based operands are untouched by the fold machinery:
+        assert_eq!(hex("mov 4(%rbx), %rcx"), "48 8b 4b 04");
+    }
+
+    #[test]
+    fn fold_moves_the_extension_bit_into_the_prefix_b_field() {
+        // The fold moves an r8-r31 index into the base slot, so its
+        // extension bit must travel X -> B in EVERY prefix family paired
+        // with encode_modrm_mem. These are the PR #711 audit's P0
+        // reproducers: with the bits taken from the raw operand the
+        // VEX/XOP prefix carried X=0/B=1 while the folded ModR/M encoded
+        // the base, and these rows executed as (%rdx)/(%rcx)/(%rax).
+        // All bytes objdump-verified post-fix, GAS SIB form cross-checked.
+        // VEX load / load+disp8 / 3-op family:
+        assert_eq!(hex("vmovups (,%r10,1), %xmm0"), "c4 c1 78 10 02");
+        assert_eq!(hex("vmovups -4(,%r8,1), %xmm1"), "c4 c1 78 10 48 fc");
+        assert_eq!(hex("vaddps -4(,%r8,1), %ymm1, %ymm2"), "c4 c1 74 58 50 fc");
+        // BMI (VEX map-2 memory source):
+        assert_eq!(hex("andnq (,%r9,1), %rax, %rcx"), "c4 c2 f8 f2 09");
+        // XOP memory operand:
+        assert_eq!(
+            hex("vpcmov %xmm1, (,%r10,1), %xmm2, %xmm3"),
+            "8f c8 68 a2 1a 10"
+        );
+        // k-register moves, both directions:
+        assert_eq!(hex("kmovq (,%r10,1), %k1"), "c4 c1 f8 90 0a");
+        assert_eq!(hex("kmovq %k1, (,%r11,1)"), "c4 c1 f8 91 0b");
+        // VEX mem-only (vldmxcsr/vstmxcsr; the r12 class takes the
+        // SIB-base form for its folded base):
+        assert_eq!(hex("vldmxcsr (,%r10,1)"), "c4 c1 78 ae 12");
+        assert_eq!(hex("vstmxcsr (,%r12,1)"), "c4 c1 78 ae 1c 24");
+        // Wide-integer fold through the same invariant (mod=10 base form):
+        assert_eq!(
+            hex("vmovups 128(,%r10,1), %ymm0"),
+            "c4 c1 7c 10 82 80 00 00 00"
+        );
+    }
+
+    #[test]
+    fn fold_moves_the_extension_bit_in_apx_evex_prefixes() {
+        // APX NDD: the index's extension bit must move with the register
+        // into the base slot (r8-r15 -> EVEX.B inverted, r16-r31 -> the
+        // EGPR B4 bit), matching what the five APX-EVEX memory helpers now
+        // fold before extracting (b, b4)/(x, x4):
+        assert_eq!(hex("addq (,%r10,1), %rax, %rcx"), "62 d4 f4 18 03 02");
+        assert_eq!(hex("addq (,%r16,1), %rax, %rcx"), "62 fc f4 18 03 00");
+        // CCMP memory form:
+        assert_eq!(hex("ccmpneq (,%r10,1), %rax"), "62 d4 84 05 3b 02");
+    }
+
+    #[test]
+    fn fold_keeps_avx512_evex_on_the_gas_sib_form() {
+        // encode_evex_mem intentionally does NOT fold (no corpus row
+        // evidences the EVEX form yet; see fold_index_into_base): prefix
+        // and ModR/M both encode the raw operand, so the SIB+disp32 row
+        // stays GAS-parity -- folded-prefix/raw-ModR/M would be the same
+        // silent-wrong-register class this module pins against.
+        assert_eq!(
+            hex("{evex} vmovq (,%r10,1), %xmm0"),
+            "62 b1 fd 08 6e 04 15 00 00 00 00"
+        );
+    }
+
+    #[test]
+    fn fold_preserves_the_gas_source_view_segment_verdict() {
+        // GAS decides ds/ss elision on the SOURCE operand: no base -> %ds
+        // default, so an explicit ds is dropped and ss is kept (probed:
+        // `mov %ds:(,%rbp,1),%eax` -> 8b 04 2d .., `mov %ss:(,%rbp,1),%eax`
+        // -> 36 8b 04 2d ..). The pre-fold scan in encode() does the same;
+        // the fold must not re-decide elision on the folded view --
+        // 0(%rbp) is ss-default, and re-deciding there would keep ds and
+        // drop ss, the exact opposite of GAS's bytes (in 64-bit flat mode
+        // both segments are base-0, so this is byte-parity, not
+        // wrong-code).
+        assert_eq!(hex("movl %ds:(,%rbp,1), %eax"), "8b 45 00");
+        assert_eq!(hex("movl %ss:(,%rbp,1), %eax"), "36 8b 45 00");
+    }
+
+    #[test]
+    fn fold_never_fires_for_vsib_vector_index() {
+        // VSIB gathers take vector indices: the gp_id guard keeps them on
+        // the SIB path (byte-parity with GAS, pinned in avx.casefile).
+        // Bytes probed, not derived.
+        assert_eq!(
+            hex("vgatherdpd %ymm5, 0x298(,%xmm4,1), %ymm6"),
+            "c4 e2 d5 92 34 25 98 02 00 00"
+        );
     }
 }

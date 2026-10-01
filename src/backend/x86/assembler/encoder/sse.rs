@@ -1008,8 +1008,7 @@ impl super::InstructionEncoder {
         }
         match &ops[0] {
             Operand::Memory(mem) => {
-                let x_bit = mem.index.as_ref().is_some_and(|i| needs_rex_ext(&i.name));
-                let b_bit = mem.base.as_ref().is_some_and(|b| needs_rex_ext(&b.name));
+                let (x_bit, b_bit) = mem_vex_xb_bits(mem);
                 self.emit_vex(false, x_bit, b_bit, 1, 0, 0, 0, 0);
                 // VEX.128.0F implies map 0F: emit only the final opcode byte.
                 self.bytes.push(opcode[opcode.len() - 1]);

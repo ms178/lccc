@@ -50,6 +50,7 @@ impl X86Arch for I686Arch {
                         Some(JumpDetection {
                             is_conditional: true,
                             already_short: true,
+                            prefix66: false,
                         })
                     } else {
                         let expected_len = if is_conditional { 6 } else { 5 };
@@ -57,6 +58,7 @@ impl X86Arch for I686Arch {
                             Some(JumpDetection {
                                 is_conditional,
                                 already_short: false,
+                                prefix66: false,
                             })
                         } else {
                             None
@@ -242,6 +244,7 @@ impl X86Arch for I686Arch {
                         Some(JumpDetection {
                             is_conditional,
                             already_short: false,
+                            prefix66: false,
                         })
                     } else {
                         None
@@ -324,6 +327,7 @@ fn code16_encode_inner(
                     Some(JumpDetection {
                         is_conditional,
                         already_short: false,
+                        prefix66: false,
                     })
                 } else {
                     None
