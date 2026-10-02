@@ -43,7 +43,8 @@ class EncDiffSemanticTests(unittest.TestCase):
         with mock.patch.object(encdiff, "decodes_same", return_value=True) as check:
             encdiff.classify(candidate)
         self.assertEqual(candidate.verdict, "BEATS")
-        check.assert_called_once_with(encdiff._OBJDUMP, b"L", b"GAS", bits32=False)
+        check.assert_called_once_with(encdiff._OBJDUMP, b"L", b"GAS", bits32=False,
+                                      seg_dead64=False)
 
     def test_disagreeing_shortest_forms_are_all_roundtrip_checked(self):
         candidate = row_with(b"L", gas=b"GA", icx=b"IC")
@@ -360,44 +361,116 @@ class OracleCommutativeAndSelectorViewTests(unittest.TestCase):
         self.assertEqual(encdiff._canon_insn("xchg %al,%bl"),
                          encdiff._canon_insn("xchg %bl,%al"))
 
-    def test_canon_strips_dead_segment_overrides_in_64bit_only(self):
+    def test_canon_dead_segment_law_is_fold_row_scoped(self):
         # 64-bit mode ignores ES/DS/SS overrides on data accesses, so an
-        # encoding that dropped the dead byte must compare equal to one
-        # that kept it (`ds mov 0x4(%rax),%rax` == `mov 0x4(%rax),%rax`).
-        self.assertEqual(
+        # encoding that dropped the dead byte is the same PROGRAM as one
+        # that kept it — but the unification is OPT-IN (seg_dead64), set
+        # per row for exactly the index-fold family whose folded view can
+        # legitimately differ from GAS's raw bytes (see _ROW_SEG_FOLD).
+        # Every other comparison keeps full prefix discrimination: a
+        # wrongly-dropped or swapped dead byte on a non-fold row must
+        # compare UNEQUAL and fail the gate, not be laundered equal.
+        self.assertNotEqual(
             encdiff._canon_insn("ds mov 0x4(%rax),%rax"),
             encdiff._canon_insn("mov 0x4(%rax),%rax"))
-        self.assertEqual(
+        self.assertNotEqual(
             encdiff._canon_insn("ss mov 0x0(%rbp),%eax"),
             encdiff._canon_insn("mov 0x0(%rbp),%eax"))
-        self.assertEqual(
+        self.assertNotEqual(
             encdiff._canon_insn("es mov (%r10),%xmm0"),
             encdiff._canon_insn("mov (%r10),%xmm0"))
-        # The spellings that must NOT unify are spelled differently by
-        # objdump, so the regex cannot touch them: NOTRACK (semantic
-        # under CET), branch hints, FS/GS (rendered inline), and every
-        # CS row (0x2e is the hint partner on branches; leave it alone).
+        # Opted in (the fold rows), the dead token is stripped so lccc's
+        # shorter folded form compares equal to GAS's SIB form:
+        self.assertEqual(
+            encdiff._canon_insn("ds mov 0x4(%rax),%rax", seg_dead64=True),
+            encdiff._canon_insn("mov 0x4(%rax),%rax", seg_dead64=True))
+        self.assertEqual(
+            encdiff._canon_insn("ss mov 0x0(%rbp),%eax", seg_dead64=True),
+            encdiff._canon_insn("mov 0x0(%rbp),%eax", seg_dead64=True))
+        self.assertEqual(
+            encdiff._canon_insn("es mov (%r10),%xmm0", seg_dead64=True),
+            encdiff._canon_insn("mov (%r10),%xmm0", seg_dead64=True))
+        # The spellings that must NOT unify — even opted in — are spelled
+        # differently by objdump, so the regex cannot touch them: NOTRACK
+        # (semantic under CET), branch hints, FS/GS (rendered inline), and
+        # every CS row (0x2e is the hint partner on branches).
         self.assertNotEqual(
-            encdiff._canon_insn("notrack jmp *%rax"),
-            encdiff._canon_insn("jmp *%rax"))
+            encdiff._canon_insn("notrack jmp *%rax", seg_dead64=True),
+            encdiff._canon_insn("jmp *%rax", seg_dead64=True))
         self.assertNotEqual(
-            encdiff._canon_insn("cs mov 0x4(%rax),%rax"),
-            encdiff._canon_insn("mov 0x4(%rax),%rax"))
+            encdiff._canon_insn("cs mov 0x4(%rax),%rax", seg_dead64=True),
+            encdiff._canon_insn("mov 0x4(%rax),%rax", seg_dead64=True))
         self.assertNotEqual(
-            encdiff._canon_insn("mov %fs:0x4(%rax),%rax"),
-            encdiff._canon_insn("mov 0x4(%rax),%rax"))
+            encdiff._canon_insn("mov %fs:0x4(%rax),%rax", seg_dead64=True),
+            encdiff._canon_insn("mov 0x4(%rax),%rax", seg_dead64=True))
         self.assertNotEqual(
-            encdiff._canon_insn("mov %gs:0x4(%rax),%rax"),
-            encdiff._canon_insn("mov 0x4(%rax),%rax"))
+            encdiff._canon_insn("mov %gs:0x4(%rax),%rax", seg_dead64=True),
+            encdiff._canon_insn("mov 0x4(%rax),%rax", seg_dead64=True))
         # Segment operands inside the operand text are not leading tokens:
         self.assertNotEqual(
             encdiff._canon_insn("mov %ds,%eax"),
             encdiff._canon_insn("mov %eax,%eax"))
-        # 32-bit mode strips nothing: every override selects a real
-        # descriptor there.
+        # 32-bit mode strips nothing — even opted in: every override
+        # selects a real descriptor there.
         self.assertNotEqual(
-            encdiff._canon_insn("ds mov 0x4(%eax),%eax", bits32=True),
-            encdiff._canon_insn("mov 0x4(%eax),%eax", bits32=True))
+            encdiff._canon_insn("ds mov 0x4(%eax),%eax", bits32=True,
+                                seg_dead64=True),
+            encdiff._canon_insn("mov 0x4(%eax),%eax", bits32=True,
+                                seg_dead64=True))
+
+    def test_row_seg_fold_matches_exactly_the_view_flip_rows(self):
+        # The flip set is {rbp, ebp}: an index-only scale-1 operand under
+        # a segment override whose fold moves the register into the base
+        # slot and changes the default-segment class. Everything else —
+        # explicit bases, scale != 1, symbol displacements, other index
+        # registers (rax/r10 fold but keep the DS default; rsp/esp cannot
+        # be an index; r12/r13 fold to non-SS-default names) — decides
+        # identically on both views and must NOT opt in.
+        def row(s: str) -> bool:
+            return encdiff._ROW_SEG_FOLD.search(s) is not None
+        self.assertTrue(row("mov %ss:4(,%rbp,1), %rax"))
+        self.assertTrue(row("mov %ds:4(,%rbp,1), %rax"))
+        self.assertTrue(row("movl %es:(,%ebp,1), %eax"))
+        self.assertTrue(row("mov %ss:(,%rbp,1), %rax"))   # no displacement
+        self.assertTrue(row("mov %ds:0x10(,%rbp,1), %rax"))
+        self.assertFalse(row("mov %ss:4(%rbp), %rax"))    # explicit base
+        self.assertFalse(row("mov %ss:4(,%rbp,2), %rax"))  # scale != 1
+        self.assertFalse(row("mov %ds:sym(,%rbp,1), %rax"))  # symbols never fold
+        self.assertFalse(row("mov %ss:4(,%rax,1), %rax"))  # rax: no flip
+        self.assertFalse(row("mov %ss:4(,%r10,1), %rax"))  # r10: no flip
+        self.assertFalse(row("mov %ss:4(,%r13,1), %rax"))  # r13 folds to a
+        #                       non-SS-default name (GAS 2.47 elision is
+        #                       name-based rbp/ebp/rsp/esp — byte-probed)
+        self.assertFalse(row("mov 4(,%rbp,1), %rax"))     # no segment override
+
+    def test_fold_row_threads_the_dead_segment_law_into_the_roundtrip(self):
+        # classify() derives the opt-in from the ROW SOURCE and hands it to
+        # the round-trip comparison: the flip rows get the unification, a
+        # plain fold row does not, and a non-fold row never does.
+        flip = row_as("mov %ds:4(,%rbp,1), %rax", b"L", gas=b"GAS")
+        with mock.patch.object(encdiff, "decodes_same", return_value=True) as check:
+            encdiff.classify(flip)
+        self.assertEqual(flip.verdict, "BEATS")
+        check.assert_called_once_with(encdiff._OBJDUMP, b"L", b"GAS", bits32=False,
+                                      seg_dead64=True)
+        plain = row_as("mov 4(,%rax,1), %rcx", b"L", gas=b"GAS")
+        with mock.patch.object(encdiff, "decodes_same", return_value=True) as check:
+            encdiff.classify(plain)
+        check.assert_called_once_with(encdiff._OBJDUMP, b"L", b"GAS", bits32=False,
+                                      seg_dead64=False)
+
+    def test_dead_segment_bytes_compare_unequal_outside_the_fold_rows(self):
+        # End to end through decodes_same (the gate's actual comparison):
+        # two encodings of one instruction differing only by the dead DS
+        # byte are NOT the same comparison unit outside the fold rows —
+        # the corpus gate fails on such a divergence — and compare equal
+        # exactly when the fold-row law is opted in.
+        withds = bytes.fromhex("3e488b4504")   # ds mov 0x4(%rbp),%rax
+        without = bytes.fromhex("488b4504")    # mov 0x4(%rbp),%rax
+        self.assertFalse(encdiff.decodes_same(
+            encdiff._OBJDUMP, without, withds))
+        self.assertTrue(encdiff.decodes_same(
+            encdiff._OBJDUMP, without, withds, seg_dead64=True))
 
     def test_canon_insn_sorts_test_operands(self):
         self.assertEqual(

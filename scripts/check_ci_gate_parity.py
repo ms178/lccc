@@ -230,13 +230,25 @@ def direct_asmdiff_commands(script: str) -> list[list[str]]:
     Consume `\\` continuation lines from that invocation, not the enclosing
     ci_local `gate ... \\` line.
     """
+    return direct_diff_commands(script, "scripts/asmdiff.py")
+
+
+def direct_diff_commands(script: str, program: str) -> list[list[str]]:
+    """Args of every directly executed `python3 <program> ...` command.
+
+    The asmdiff and encdiff parity checks share this parser: `\\`
+    continuations are joined (so a gate-prefixed invocation still yields
+    its argument list from the `python3` line down), prose/comments/
+    `echo`-prefixed lines never qualify, and the returned lists start at
+    the first argument after the program path.
+    """
     lines = script.splitlines()
     commands = []
     i = 0
     while i < len(lines):
         line = lines[i].strip()
         i += 1
-        if not line.startswith("python3 scripts/asmdiff.py "):
+        if not line.startswith(f"python3 {program} "):
             continue
         while line.endswith("\\") and i < len(lines):
             line = line[:-1] + " " + lines[i].strip()
@@ -245,7 +257,7 @@ def direct_asmdiff_commands(script: str) -> list[list[str]]:
             tokens = shlex.split(line, comments=True)
         except ValueError:
             continue
-        if tokens[:2] == ["python3", "scripts/asmdiff.py"]:
+        if tokens[:2] == ["python3", program]:
             commands.append(tokens[2:])
     return commands
 
@@ -291,6 +303,57 @@ def check_asmdiff_gate_parity(local_text: str, hosted: str) -> int:
             missing.append(f"{where}: install GNU as 2.47 x86-64 oracle")
     if missing:
         print("missing mode/corpus-specific assembly gates:", file=sys.stderr)
+        for item in missing:
+            print(f"  {item}", file=sys.stderr)
+        return 1
+    return 0
+
+
+# The encdiff corpus gate contract: the exact invocation both mirrors must
+# run. The corpus set is an INVARIANT, not a default — a third corpus file
+# is a real coverage change that must update this contract consciously
+# (same discipline as the pinned-oracle count in the parity tests).
+ENCDIFF_CORPUS_FILES = (
+    "tests/encdiff-corpus/index-fold-64.insn",
+    "tests/encdiff-corpus/data16-branches-64.insn",
+)
+
+
+def check_encdiff_gate_parity(local_text: str, hosted: str) -> int:
+    """Require the IDENTICAL encdiff corpus invocation on both mirrors.
+
+    The encdiff-corpus gate is byte-truth-dependent exactly like the
+    asm-diff gates (GAS 2.47 pinned oracle; --offline so the verdicts are
+    network-independent; the 64-bit law corpora, not their 32-bit
+    sibling). Path-level mirroring only proves the script path appears
+    somewhere on the other side: a hosted-only edit — depinned --as,
+    dropped --offline, a swapped corpus file, the wrong compiler mode,
+    or removing the step while ci_local keeps its copy — passed every
+    other check in this module (the S16 audit response). This checker
+    closes that: both sides must run the same offline, quiet, pinned,
+    x86-64 invocation over the full corpus set, and the local side must
+    register it as the fast `encdiff-corpus` gate.
+    """
+    missing = []
+    for where, text in (("local", local_text), ("hosted", hosted)):
+        commands = direct_diff_commands(text, "scripts/encdiff.py")
+        if not any(
+            "--offline" in cmd
+            and "--quiet" in cmd
+            and asm_option(cmd, "--lccc") == "target/fastbuild/lccc-x86"
+            and "gas-2.47-x86_64-linux-gnu/bin/as" in (asm_option(cmd, "--as") or "")
+            and set(ENCDIFF_CORPUS_FILES) == {t for t in cmd if t.endswith(".insn")}
+            for cmd in commands
+        ):
+            missing.append(
+                f"{where}: encdiff-corpus gate "
+                "(--offline --quiet, lccc-x86, pinned GNU as 2.47, "
+                "both 64-bit law corpora)"
+            )
+    if 'gate "encdiff-corpus" fast' not in local_text:
+        missing.append('local: fast gate registration for "encdiff-corpus"')
+    if missing:
+        print("encdiff corpus gate parity:", file=sys.stderr)
         for item in missing:
             print(f"  {item}", file=sys.stderr)
         return 1
@@ -537,14 +600,16 @@ def main() -> int:
         return 1
     if check_asmdiff_gate_parity(local_text, hosted) != 0:
         return 1
+    if check_encdiff_gate_parity(local_text, hosted) != 0:
+        return 1
     if check_hosted_steps_mirrored(local_text, hosted) != 0:
         return 1
     if check_linker_suite_parity(local_text, hosted) != 0:
         return 1
     print(
         f"CI/local standalone gate parity: PASS ({len(local_paths)} commands, "
-        "2 mode/corpus-specific asm-diff gates, strict full linker suite, "
-        "hosted steps mirrored)"
+        "2 mode/corpus-specific asm-diff gates, encdiff corpus gate, "
+        "strict full linker suite, hosted steps mirrored)"
     )
     return 0
 
