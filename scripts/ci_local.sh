@@ -555,6 +555,19 @@ gate "ci-asm-diff-parity-self-test" fast \
 gate "encdiff-semantic-validation" fast \
     python3 scripts/test_encdiff.py
 
+# EDG transplant tooling contracts (PR #721 review P1-6): the miner
+# self-tests, the mocked corpus-runner verdict contracts, and the corpus
+# exclusion path tests run without any compiler — they gate the TEST
+# INFRASTRUCTURE itself, which generic import checks cannot.
+gate "edg-changes-miner-selftest" fast \
+    python3 scripts/edg_changes_mine.py selftest
+gate "edg-corpus-miner-selftest" fast \
+    python3 scripts/edg_corpus_mine.py selftest
+gate "corpus-runner-contracts" fast \
+    python3 -m unittest discover -s tests/corpus -p 'test_*.py'
+gate "differential-corpus-paths" fast \
+    python3 scripts/test_differential_corpus_paths.py
+
 gate "ra-web-inloop-use" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_ra_web_inloop_use.sh
 

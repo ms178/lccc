@@ -173,10 +173,22 @@ snapshot_guard_staged_diff() {
     bad=1
   fi
   if [[ -n $modes ]]; then
-    echo "snapshot guard: staged diff changes file modes:" >&2
-    printf '%s\n' "$modes" | head -5 >&2
-    echo "    ($(printf '%s\n' "$modes" | wc -l) in total)" >&2
-    bad=1
+    if [[ ${LCCC_SNAPSHOT_ALLOW_MODES:-0} == 1 ]]; then
+      # Deliberate mode fixes (e.g. making documented entry points
+      # executable) are legitimate patch CONTENT.  They must be requested
+      # explicitly and stay visible in the snapshot log; an accidental
+      # wipe-induced mode change has no reason to set this flag.
+      echo "snapshot guard: staged diff changes file modes (ALLOWED by" >&2
+      echo "  LCCC_SNAPSHOT_ALLOW_MODES=1 — deliberate mode fixes):" >&2
+      printf '%s\n' "$modes" >&2
+    else
+      echo "snapshot guard: staged diff changes file modes:" >&2
+      printf '%s\n' "$modes" | head -5 >&2
+      echo "    ($(printf '%s\n' "$modes" | wc -l) in total)" >&2
+      echo "  If these are DELIBERATE mode fixes (e.g. chmod +x on documented" >&2
+      echo "  entry points), re-run with LCCC_SNAPSHOT_ALLOW_MODES=1." >&2
+      bad=1
+    fi
   fi
   if ((bad)); then
     cat >&2 <<'MSG'

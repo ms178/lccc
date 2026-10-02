@@ -77,6 +77,26 @@ unless their own header states otherwise.  Keep third-party benchmark sources
 as test/measurement material; do not link them into the compiler/runtime or
 claim the project-default license covers their upstream-derived portions.
 
+### Third-Party-Derived Test Corpus
+
+**Licensed under**: the upstream license named per subtree; attribution SPDX
+headers are preserved in every copied file.
+
+| Material | Upstream | Applicable upstream license | Redistribution |
+|---|---|---|---|
+| `tests/corpus/clang-c/**` | `edgcpp/compiler` `tests/tests/imported/clang/c` | Apache-2.0 WITH LLVM exception | full sources, adapted |
+| `tests/corpus/gnu-torture-manifest.jsonl` | `edgcpp/compiler` `tests/tests/imported/gnu/c` (GCC c-torture lineage) | GPL-3.0-or-later | **names + directive facts only**; no source text |
+
+The Apache-2.0 WITH LLVM exception text is retained at
+[`third_party_licenses/EDG-Clang-Apache-2.0-LLVM.txt`](./third_party_licenses/EDG-Clang-Apache-2.0-LLVM.txt);
+the per-file mapping is
+[`tests/corpus/clang-c/LICENSE-NOTICE.txt`](./tests/corpus/clang-c/LICENSE-NOTICE.txt).
+The GPL-3.0 GNU testsuite material is never copied: the manifest records
+testcase names and `.sft` directive *values* (uncopyrightable facts) so a
+locally obtained upstream checkout can supply the originals at run time.
+Curation (which tests were copied, how metadata is keyed) is an LCCC
+contribution under the project default.
+
 ### Hybrid Files (CCC Base + LCCC Improvements)
 **Licensed under**: Both CC0 + your chosen license
 
