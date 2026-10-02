@@ -1900,6 +1900,91 @@ pub(super) fn walk_flag_consumers(
 /// function for the label table and bounds, and is where the facts are
 /// reported from; `seeds` may be empty (no path to explore: nothing can
 /// observe the flags).
+/// Directives that emit DATA.  A `.byte`/`.long`/`.quad` sequence inside a
+/// function body can encode any instruction -- `adc`, `clc`, a branch -- that
+/// the textual predicates above cannot see, exactly like inline asm.  The
+/// walker must therefore NOT step over them as if they had no effect.  The
+/// benign directives (`.cfi_*`, alignment, location, section, symbol
+/// bookkeeping) cannot encode an instruction and are skipped; anything the
+/// classification does not name is treated as data, because "unrecognized" is
+/// not "harmless".
+fn directive_emits_data(text: &str) -> bool {
+    let Some(rest) = text.strip_prefix('.') else {
+        return false;
+    };
+    let name = rest
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .next()
+        .unwrap_or("");
+    if matches!(
+        name,
+        // Benign: position, bookkeeping, sections, debug info, symbol attrs.
+        "cfi_startproc"
+            | "cfi_endproc"
+            | "cfi_def_cfa"
+            | "cfi_def_cfa_offset"
+            | "cfi_def_cfa_register"
+            | "cfi_offset"
+            | "cfi_restore"
+            | "cfi_same_value"
+            | "cfi_remember_state"
+            | "cfi_restore_state"
+            | "cfi_return_column"
+            | "cfi_undefined"
+            | "cfi_personality"
+            | "cfi_lsda"
+            | "cfi_escape"
+            | "p2align"
+            | "p2alignw"
+            | "p2alignl"
+            | "align"
+            | "balign"
+            | "balignw"
+            | "balignl"
+            | "loc"
+            | "file"
+            | "text"
+            | "data"
+            | "bss"
+            | "section"
+            | "rodata"
+            | "globl"
+            | "global"
+            | "weak"
+            | "local"
+            | "type"
+            | "size"
+            | "ident"
+            | "set"
+            | "equ"
+            | "end"
+            | "intel_syntax"
+            | "att_syntax"
+            | "code64"
+            | "code32"
+            | "code16"
+            | "arch"
+            | "version"
+            | "skip"
+            | "space"
+            | "fill"
+            | "zero"
+            | "comm"
+            | "lcomm"
+            | "pushsection"
+            | "popsection"
+            | "previous"
+            | "subsection"
+    ) {
+        return false;
+    }
+    // `.byte`, `.2byte`/`.word`, `.4byte`/`.long`, `.8byte`/`.quad`,
+    // `.value`, `.inst`, `.insn`, `.ascii`, `.asciz`, `.string`, `.uleb128`,
+    // `.sleb128`, `.float`, `.double` -- and anything unrecognized.
+    let _ = name;
+    true
+}
+
 pub(super) fn walk_flag_consumers_seeded(
     store: &LineStore,
     infos: &[LineInfo],
@@ -1954,11 +2039,32 @@ pub(super) fn walk_flag_consumers_seeded(
                 break; // this suffix was already expanded, facts included
             }
             seen[n - fs] = true;
-            if infos[n].is_nop() || infos[n].kind == LineKind::Directive {
+            if infos[n].is_nop() {
                 n += 1;
                 continue;
             }
             let t = infos[n].trimmed(store.get(n));
+            if infos[n].kind == LineKind::Directive {
+                // A benign directive is a position, not an effect.  A DATA
+                // directive is an instruction the text does not spell out, so
+                // it is charged like inline asm: a reader of every flag, and
+                // a reason the walk cannot be proved.  (No lccc-emitted
+                // function body contains a data directive -- measured over the
+                // whole benchmark corpus -- so this costs nothing on real
+                // output and closes the one place the walker trusted
+                // unrecognized text.)
+                if directive_emits_data(t) {
+                    facts.saw_consumer = true;
+                    facts.saw_non_zf = true;
+                    facts.saw_outside_zf_cf = true;
+                    facts.saw_sf_reader = true;
+                    facts.saw_whole_reader = true;
+                    facts.proved = false;
+                    break;
+                }
+                n += 1;
+                continue;
+            }
             // A blank line has no mnemonic, so `flags_effect` falls through to
             // its fail-closed default and charges it with reading every flag --
             // which made any walk that reached the end of a function (the

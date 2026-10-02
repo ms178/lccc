@@ -1220,6 +1220,30 @@ mod fusion_flags_flow_tests {
     }
 
     #[test]
+    fn refuses_across_a_data_directive_that_can_encode_an_instruction() {
+        // `.byte`/`.long` inside a body can be any instruction -- `adc`, `clc`,
+        // a branch -- so it must not be stepped over as if it had no effect.
+        // Unrecognized text is not harmless text.
+        let out = run(&shape("    .byte 0x83, 0xd0, 0x00\n"));
+        assert!(
+            out.contains("setl"),
+            "fused across a data directive that can encode a flag writer: {out}"
+        );
+    }
+
+    #[test]
+    fn fuses_across_benign_directives() {
+        // Control for the test above: the same position carrying directives
+        // that CANNOT encode an instruction (alignment, frame info, location).
+        // Refusing these would cost every real function its fold.
+        let out = run(&shape("    .p2align 3\n    .cfi_def_cfa_offset 16\n"));
+        assert!(
+            out.contains("jl .LBB1"),
+            "control did not fuse, so the refusal above proves nothing: {out}"
+        );
+    }
+
+    #[test]
     fn refuses_when_the_reader_sits_only_in_the_taken_target() {
         // The flags travel along the taken edge too.  A reader in the target
         // block is invisible to any scan of the fall-through text, which is
