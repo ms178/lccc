@@ -6,7 +6,7 @@
 # of /home/user itself).  This script re-establishes the invariants every LCCC
 # session depends on:
 #
-#   1. A 6 GiB swap file on the largest writable filesystem   (hard requirement:
+#   1. A configurable (default 4 GiB) swap file on the largest writable filesystem   (hard requirement:
 #      the sandbox has ~1.9 GiB RAM; linking/optimising lccc OOMs without it).
 #   2. VM tuning appropriate for a swap-backed, memory-starved build box.
 #   3. The current stable Rust toolchain selected by rust-toolchain.toml,
@@ -19,14 +19,14 @@
 #
 # Safe to run repeatedly; every step is a no-op when already satisfied.
 #
-# Usage:  ./lccc-bootstrap.sh [--no-clone]
+# Usage:  ./lccc-bootstrap.sh [--no-clone | --source-only]
 # ============================================================================
 set -euo pipefail
 
 WS=${LCCC_WS:-/home/user}
-REPO=${LCCC_REPO:-$WS/lccc}
+REPO=${LCCC_REPO:-/opt/lccc-work/lccc}
 ART=${LCCC_ARTIFACTS:-$WS/artifacts}
-SWAP_SIZE=${LCCC_SWAP_SIZE:-6G}
+SWAP_SIZE=${LCCC_SWAP_SIZE:-4G}
 UPSTREAM=${LCCC_UPSTREAM:-https://github.com/ms178/lccc}
 
 log() { printf '\033[1;36m[bootstrap]\033[0m %s\n' "$*"; }
@@ -34,7 +34,7 @@ warn() { printf '\033[1;33m[bootstrap]\033[0m %s\n' "$*" >&2; }
 
 # ---------------------------------------------------------------- 1. swap ----
 setup_swap() {
-  if /sbin/swapon --show 2>/dev/null | grep -q swapfile; then
+  if [[ $(awk 'NR>1 {n++} END {print n+0}' /proc/swaps) -gt 0 ]]; then
     log "swap already active: $(/sbin/swapon --show --bytes --noheadings | tr -s ' ')"
     return 0
   fi
@@ -52,7 +52,7 @@ setup_swap() {
   log "creating $SWAP_SIZE swap in $dir (free: $((bestfree/1024/1024/1024)) GiB)"
   sudo -n mkdir -p "$dir"
   sudo -n fallocate -l "$SWAP_SIZE" "$dir/swapfile" 2>/dev/null ||
-    sudo -n dd if=/dev/zero of="$dir/swapfile" bs=1M count=6144 status=none
+    sudo -n dd if=/dev/zero of="$dir/swapfile" bs=1M count="$(( ($(numfmt --from=iec "$SWAP_SIZE")+1048575)/1048576 ))" status=none
   sudo -n chmod 600 "$dir/swapfile"
   sudo -n /sbin/mkswap "$dir/swapfile" >/dev/null
   sudo -n /sbin/swapon "$dir/swapfile"
@@ -73,9 +73,13 @@ setup_repo() {
   [[ ${1:-} == --no-clone ]] && return 0
   mkdir -p "$ART"
   if [[ ! -d $REPO/.git ]]; then
-    if [[ -f $ART/lccc.bundle ]]; then
-      log "restoring worktree from artifact bundle (offline-safe)"
-      git clone -q "$ART/lccc.bundle" "$REPO" && return 0
+    if [[ -f $ART/SESSION_BUNDLE.json || -f $ART/SOURCE_ARCHIVE.json || -f $ART/lccc.bundle ]]; then
+      local recover_args=(--repo "$REPO" --artifacts "$ART" --upstream "$UPSTREAM")
+      [[ ${LCCC_RECOVERY_OFFLINE:-0} == 1 ]] && recover_args+=(--offline)
+      [[ -d $REPO ]] && recover_args+=(--preserve-worktree)
+      log "restoring compact session snapshot (no compiler build)"
+      python3 "$script_dir/lccc_recover.py" "${recover_args[@]}" || return 1
+      return 0
     fi
     log "cloning $UPSTREAM"
     git clone -q --depth 50 "$UPSTREAM" "$REPO"
@@ -156,6 +160,11 @@ setup_rust() {
   log "rust ready: $("$bin/rustc" --version)"
 }
 
+if [[ ${1:-} == --source-only ]]; then
+  setup_repo
+  log "source recovery only; swap/toolchain/packages/compiler builds were not requested"
+  exit 0
+fi
 setup_swap
 tune_vm
 # Clone/update the worktree before resolving rust-toolchain.toml. This lets a

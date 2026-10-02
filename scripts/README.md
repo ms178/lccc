@@ -2,6 +2,13 @@
 
 Developer and research tooling. None of these are needed to build LCCC.
 
+Compiler-free corpus audit entrypoint: `bash scripts/ci_corpus_tools.sh` (not
+`ci_local.sh --fast`). It is a tooling/contract gate, not compiler CI or runtime
+performance validation. Compact recovery: `python3 scripts/lccc_recover.py
+--repo /opt/lccc-work/lccc --offline --require-exact-history`; the published
+standalone `LCCC-RECOVER.py` survives a worktree reset. See the
+[audit and recovery instructions](../engineering/PR724-AUDIT-2026-10-02.md).
+
 | Script | Purpose |
 |---|---|
 | `rust_toolchain.sh` | Shared selector: resolves the current channel from `rust-toolchain.toml` (currently stable Rust 1.98.1), while honoring an explicit bisection/reproduction override. Its behavior is covered by `tests/regression/check_rust_toolchain_selector.sh`. |

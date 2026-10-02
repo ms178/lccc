@@ -562,6 +562,17 @@ pub fn archive_member_data(data: &[u8], offset: usize, size: usize) -> Option<&[
 
 // ── Linker script parsing (GROUP / INPUT) ────────────────────────────────────
 
+/// How deeply a linker script may nest other linker scripts.
+///
+/// GNU ld has no fixed limit, but a cycle (`INPUT ( self.so )` where
+/// `self.so` is the script itself) must end in a diagnostic instead of
+/// exhausting the stack, and every backend that resolves script inputs
+/// recursively needs the same bound so the three linkers cannot disagree
+/// about which input they accept.  Real toolchains nest one level at most
+/// (`libc.so` / `libgcc_s.so` name ELF objects directly), so this bound only
+/// ever rejects pathological input.
+pub const MAX_LINKER_SCRIPT_DEPTH: usize = 8;
+
 /// An entry found in a GNU linker script directive (`GROUP` or `INPUT`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkerScriptEntry {

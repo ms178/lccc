@@ -1,0 +1,44 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// Origin: edgcpp/compiler tests/tests/imported/clang/c (Apache-2.0 WITH
+// LLVM-exception).  Adapted into LCCC by scripts/edg_corpus_mine.py.
+//type: fp
+//options:  --ms_extensions -DMS_EXT --c
+// RUN: %clang_cc1 %s -Eonly -verify
+
+// This should not be rejected.
+#ifdef defined
+#elifdef defined
+#endif
+// expected-warning@-2 {{use of a '#elifdef' directive is a C23 extension}}
+
+
+
+// PR3764
+
+// This should not produce a redefinition warning.
+#define FUNC_LIKE(a) (a)
+#define FUNC_LIKE(a)(a)
+
+// This either.
+#define FUNC_LIKE2(a)\
+(a)
+#define FUNC_LIKE2(a) (a)
+
+// This should.
+#define FUNC_LIKE3(a) ( a)  // expected-note {{previous definition is here}}
+#define FUNC_LIKE3(a) (a) // expected-warning {{'FUNC_LIKE3' macro redefined}}
+
+// RUN: %clang_cc1 -fms-extensions -DMS_EXT %s -Eonly -verify
+#ifndef MS_EXT
+// This should under C99.
+#define FUNC_LIKE4(a,b) (a+b)  // expected-note {{previous definition is here}}
+#define FUNC_LIKE4(x,y) (x+y) // expected-warning {{'FUNC_LIKE4' macro redefined}}
+#else
+// This shouldn't under MS extensions.
+#define FUNC_LIKE4(a,b) (a+b)
+#define FUNC_LIKE4(x,y) (x+y)
+
+// This should.
+#define FUNC_LIKE5(a,b) (a+b) // expected-note {{previous definition is here}}
+#define FUNC_LIKE5(x,y) (y+x) // expected-warning {{'FUNC_LIKE5' macro redefined}}
+#endif

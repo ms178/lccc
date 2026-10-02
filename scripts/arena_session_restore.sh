@@ -14,7 +14,7 @@
 # re-resolves the channel rather than trusting them. This script restores every
 # piece idempotently so a new session is one command from productive work.
 #
-# Usage: scripts/arena_session_restore.sh [--with-kernel]
+# Usage: scripts/arena_session_restore.sh [--with-kernel | --source-only]
 # ============================================================================
 set -uo pipefail
 
@@ -23,8 +23,19 @@ cd "$repo_root"
 
 log() { printf '[restore] %s\n' "$*"; }
 
+if [[ ${1:-} == --source-only ]]; then
+    if [[ ! -d .git ]]; then
+        recover_args=(--repo "$repo_root" --artifacts "${LCCC_ARTIFACTS:-/home/user/artifacts}" --preserve-worktree)
+        [[ ${LCCC_RECOVERY_OFFLINE:-0} == 1 ]] && recover_args+=(--offline)
+        python3 "$repo_root/scripts/lccc_recover.py" "${recover_args[@]}" || exit 1
+    fi
+    log 'source-only recovery; no swap/toolchain/packages/compiler queries/builds'
+    exit 0
+fi
+
+
 # ---- 1. swap (compiler/linker peaks exceed the 1.9 GB RAM) ------------------
-if ! grep -q '^/swapfile' /proc/swaps 2>/dev/null; then
+if [[ $(awk 'NR>1 {n++} END {print n+0}' /proc/swaps) -eq 0 ]]; then
     log 'creating 8G /swapfile'
     sudo fallocate -l 8G /swapfile 2>/dev/null \
         || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192 status=none
@@ -114,57 +125,12 @@ log "m32 C++ oracle: $(printf '#include <stdexcept>\nint main(){return 0;}\n' | 
 # Recovery keeps the restored worktree byte-for-byte and rebuilds only the index,
 # so uncommitted work reappears as ordinary modifications.
 #
-# First choice is the session's own artifacts/lccc.bundle: transplanting its
-# .git preserves the work branch, the snapshot commits AND the base commit the
-# snapshot script diffs against. (An older revision of this script avoided the
-# bundle because `git fetch` from it can fail on thin packs; `git clone` from
-# it does not -- verified 2026-09-14 after a full .git loss, where the bundle
-# restored ms178-1-work with all commits and the base ref intact.)
-#
-# Fallback is a fresh upstream clone plus a MIXED reset (index rebuilt from
-# HEAD, worktree untouched). NEVER `git checkout -- .` / `git reset --hard`
-# here -- either one destroys the uncommitted work this script exists to
-# protect. Note the fallback does NOT preserve the session branch or the
-# snapshot base commit: the next snapshot must then be inspected by hand.
+# Recover through the compact-bundle/source-recipe consumer shared with
+# bootstrap. --preserve-worktree installs .git only, never resets source bytes.
 if [[ ! -d .git ]]; then
-    log 'RECOVERY: .git is missing entirely (not just .git/config)'
-    tmp_git="$(mktemp -d)/lccc"
-    # Primary: the durable bundle the snapshot script publishes (path
-    # agreement, audit F8).  Fallback: a bundle left in the bulk zone by an
-    # older snapshot revision — better than nothing when it survived.
-    if [[ ! -f /home/user/artifacts/lccc.bundle && -f /home/user/target/artifacts/lccc.bundle ]]; then
-        log 'using bulk-zone bundle (legacy snapshot layout)'
-        mkdir -p /home/user/artifacts
-        cp /home/user/target/artifacts/lccc.bundle /home/user/artifacts/lccc.bundle
-    fi
-    bundle_err=""
-    if [[ -f /home/user/artifacts/lccc.bundle ]] \
-        && bundle_err=$(git -c init.defaultBranch=main clone -q /home/user/artifacts/lccc.bundle "$tmp_git" 2>&1); then
-        mv "$tmp_git/.git" ./.git
-        git remote set-url origin https://github.com/ms178/lccc.git 2>/dev/null || true
-        log "recovered from bundle: branch=$(git branch --show-current 2>/dev/null || echo detached) HEAD=$(git rev-parse --short HEAD)"
-        log "recovered: $(git status --porcelain | wc -l) worktree changes preserved as modifications"
-    else
-        if [[ -n $bundle_err ]]; then
-            # A broken bundle must never fail silently: the quiet fallback
-            # hid an incomplete S03 bundle for two sessions (shallow-clone
-            # prerequisites, which `git bundle verify` does not catch).
-            # Surface the error line, not the hint noise above it.
-            log "bundle clone failed: $(printf '%s\n' "$bundle_err" | grep -m1 -E '^(error|fatal):' || printf '%s\n' "$bundle_err" | tail -1)"
-        fi
-        upstream_err=""
-        if upstream_err=$(git -c init.defaultBranch=main clone --depth 200 -q https://github.com/ms178/lccc.git "$tmp_git" 2>&1); then
-            mv "$tmp_git/.git" ./.git
-            # MIXED reset: rebuilds the index from HEAD and leaves the worktree
-            # alone (see NEVER above).
-            git reset -q
-            log "recovered from upstream: HEAD=$(git rev-parse --short HEAD) ($(git rev-list --count HEAD ^origin/main 2>/dev/null || echo 0) local commits)"
-            log "recovered: $(git status --porcelain | wc -l) worktree changes preserved as modifications"
-        else
-            log "RECOVERY FAILED: bundle and upstream clone both failed ($(printf '%s\n' "$upstream_err" | grep -m1 -E '^(error|fatal):' || echo 'see log')); worktree is intact but git is unavailable"
-        fi
-    fi
-    rm -rf "$(dirname "$tmp_git")" 2>/dev/null || true
+    recover_args=(--repo "$repo_root" --artifacts "${LCCC_ARTIFACTS:-/home/user/artifacts}" --preserve-worktree)
+    [[ ${LCCC_RECOVERY_OFFLINE:-0} == 1 ]] && recover_args+=(--offline)
+    python3 "$repo_root/scripts/lccc_recover.py" "${recover_args[@]}" || exit 1
 fi
 if ! git remote get-url origin >/dev/null 2>&1; then
     log 're-adding origin remote (snapshot drops .git/config)'
@@ -172,25 +138,12 @@ if ! git remote get-url origin >/dev/null 2>&1; then
 fi
 git config user.name  'LCCC Agent' 2>/dev/null || true
 git config user.email 'agent@lccc.local' 2>/dev/null || true
-# Restore worktree files the snapshot evicted (10k-file cap) WITHOUT touching
-# modified files: only paths git reports as DELETED are checked out, so
-# uncommitted content edits are never at risk (an absent file has no edits to
-# lose -- observed 2026-09-14: 1334 tracked files missing after a restore,
-# leaving the tree unbuildable until they were checked back out).
-#
-# A deliberately `rm`'d file looks identical to an evicted one, so the restore
-# only fires in bulk: more than 50 deletions is never a deliberate uncommitted
-# edit, it is snapshot eviction. At or below the threshold the deletions are
-# listed for the agent to judge instead.
-n_deleted=$(git diff --name-only --diff-filter=D -z 2>/dev/null | tr -cd '\0' | wc -c)
-if [[ "$n_deleted" -gt 50 ]]; then
-    n_restored=0
-    while IFS= read -r -d '' f; do
-        git checkout -q -- "$f" 2>/dev/null && n_restored=$((n_restored+1))
-    done < <(git diff --name-only --diff-filter=D -z)
-    log "evicted files restored: $n_restored (of $n_deleted deleted)"
+# Missing paths are not guessed to be eviction from a deletion-count threshold.
+# Deliberate deletions and dropped files are indistinguishable; require opt-in.
+if [[ ${LCCC_RESTORE_MISSING:-0} == 1 ]]; then
+    while IFS= read -r -d '' f; do git checkout -q -- "$f" || exit 1; done < <(git diff --name-only --diff-filter=D -z)
 else
-    log "deleted-but-tracked files left alone: $n_deleted (below bulk threshold)"
+    log 'missing tracked files left unchanged (LCCC_RESTORE_MISSING=1 opts in)'
 fi
 # Restore +x on tracked files recorded as executable.  NEVER `git checkout -- .`:
 # that would discard uncommitted content edits.
@@ -212,7 +165,9 @@ if [[ ${1:-} == --with-kernel ]]; then
 fi
 
 # ---- 6. compiler binaries -----------------------------------------------------
-if [[ ! -x target/fastbuild/lccc ]]; then
+if [[ ${LCCC_ALLOW_COMPILER_BUILD:-0} != 1 ]]; then
+    log 'compiler build skipped; explicit LCCC_ALLOW_COMPILER_BUILD=1 required'
+elif [[ ! -x target/fastbuild/lccc ]]; then
     log 'building lccc (fastbuild)'
     export PATH="$CARGO_HOME/bin:$PATH"
     ./scripts/build_lccc_fast.sh >/dev/null 2>&1 \

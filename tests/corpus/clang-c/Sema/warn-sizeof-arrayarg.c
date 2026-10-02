@@ -1,0 +1,31 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// Origin: edgcpp/compiler tests/tests/imported/clang/c (Apache-2.0 WITH
+// LLVM-exception).  Adapted into LCCC by scripts/edg_corpus_mine.py.
+//type: fp
+//options:  --c
+// RUN: %clang_cc1 -fsyntax-only -verify %s
+
+typedef int Arr[10];
+
+typedef int trungl_int;
+
+void f(int a[10], Arr arr) { // expected-note 4 {{declared here}}
+
+  /* Should warn. */
+  (void)sizeof(a);  // \
+      // expected-warning{{sizeof on array function parameter will return size of 'int *' instead of 'int[10]'}}
+  (void)sizeof((((a))));  // \
+      // expected-warning{{sizeof on array function parameter will return size of 'int *' instead of 'int[10]'}}
+  (void)sizeof a;  // \
+      // expected-warning{{sizeof on array function parameter will return size of 'int *' instead of 'int[10]'}}
+  (void)sizeof arr;  // \
+      // expected-warning{{sizeof on array function parameter will return size of 'int *' instead of 'Arr' (aka 'int[10]')}}
+
+  /* Shouldn't warn. */
+  int b[10];
+  (void)sizeof b;
+  Arr brr;
+  (void)sizeof brr;
+  (void)sizeof(Arr);
+  (void)sizeof(int);
+}

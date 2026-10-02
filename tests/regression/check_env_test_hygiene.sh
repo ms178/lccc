@@ -94,9 +94,19 @@ else
     printf 'ok   pass-pipeline environment reads: %s (budget %s)\n' "$count" "$ENV_READ_BUDGET"
 fi
 
-# 4. no deferred-work markers
-hits=$(grep -rnI -e "$MARKER" src tests scripts 2>/dev/null || true)
-report "no deferred-work markers in src/, tests/ or scripts/" "$hits"
+# 4. no deferred-work markers — in this tree's own work.  A marker is a claim
+#    that someone will come back; this tree's answer is to do the work, or to
+#    write down why it is not needed.  Verbatim third-party fixtures under
+#    tests/corpus/clang-c/ are upstream content kept byte-faithful on purpose
+#    (attribution + `--emit-sidecars`-free provenance in
+#    tests/corpus/clang-c/LICENSE-NOTICE.txt); their internal comments are the
+#    upstream author's prose under test, not this tree's deferred work.  The
+#    exclusion is exactly that one import tree: every marker elsewhere in
+#    src/, tests/, scripts/ — including the rest of tests/corpus/ (runner,
+#    manifests, docs we author) — still fails the gate.
+hits=$(grep -rnI -e "$MARKER" src tests scripts 2>/dev/null |
+    grep -v '^tests/corpus/clang-c/' || true)
+report "no deferred-work markers in src/, tests/ or scripts/ (verbatim imports excepted)" "$hits"
 
 if (( fail != 0 )); then
     echo "check_env_test_hygiene: FAILED" >&2

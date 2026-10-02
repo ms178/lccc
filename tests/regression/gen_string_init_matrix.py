@@ -9,8 +9,9 @@ designators and designator continuations, struct and union members,
 arrays of structs with and without element braces, pointer-carrying
 structs (relocation path), nested designator chains and flexible array
 members, in block-scope, static and global storage.  Each object is hashed
-bytewise after a stack-dirtying call, so both stale padding and misplaced
-elements show up in the gcc-vs-lccc comparison of run_regression_suite.sh.
+after a stack-dirtying call, so misplaced elements and missing required
+zero-fill show up. Union checks hash the active member only: bytes outside
+that member are unspecified and cannot be a cross-compiler oracle.
 
 Usage: gen_string_init_matrix.py [OUTPUT]   (default: next to this script)
 Regenerate and commit the output whenever the matrix changes.
@@ -59,7 +60,12 @@ for T, P, _, W in kinds:
             v = "v"
             pre = "static " if storage == "static" else ""
             bodies.append(fn)
-            out.append(f"__attribute__((noinline)) static void {fn}(void) {{ {pre}{d % v} mix(\"{fn}\", &{v}, sizeof {v}); }}")
+            # The active union member is completely checked, including all
+            # required zero-initialized elements. Inactive tail/padding bytes
+            # are not C value semantics; GCC 16 may legally leave them dirty.
+            pointer = f"{v}.s" if "_union" in name else f"&{v}"
+            size = f"sizeof {v}.s" if "_union" in name else f"sizeof {v}"
+            out.append(f"__attribute__((noinline)) static void {fn}(void) {{ {pre}{d % v} mix(\"{fn}\", {pointer}, {size}); }}")
     # compound literals (block scope)
     cls = [
         (f"{n}_cl_unsized", f"const {T} *p = ({T}[]){{ {lit('a' + big)} }}; mix(\"%s\", p, sizeof(({T}[]){{ {lit('a' + big)} }}));"),

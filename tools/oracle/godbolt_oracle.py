@@ -231,7 +231,7 @@ def _ce_call(cid: str, source: str, flags: str, execute: bool, timeout: int) -> 
         # the syntax has to be the local assembler's, or every oracle is
         # skipped with an "operand size mismatch" that is really just
         # "you handed me the wrong dialect".
-        "filters": {"intel": {"intel": False, "demangle": True, "directives": True}},
+        "filters": {"intel": False, "demangle": True, "directives": False},
         "tools": [{"id": "execute", "args": flags.split()}] if execute else [],
         "executeParameters": {"args": [], "stdin": ""},
     }
@@ -453,10 +453,29 @@ def remote(cid: str, source: str, flags: str, execute: bool, timeout: int) -> di
             rec["reason"] = "CE compiled but did not execute"
             rec["ok"] = False
             return finish(True)     # CE's refusal is a property of the program
-        br = x.get("buildResult") or {}
-        rec["stdout"] = _join(x.get("stdout") or br.get("stdout"), "\n")
-        er = x.get("execResult") or {}
-        rec["exit"] = er.get("code") if "code" in er else br.get("code")
+        build = x.get("buildResult") or {}
+        execution = x.get("execResult")
+        # CE's CURRENT flattened execution response stores the PROGRAM code
+        # at the top level. buildResult.code is the compiler's success, never
+        # the program exit: using it launders an abort/nonzero result into 0.
+        if execution is not None:
+            if not isinstance(execution, dict):
+                rec['ok'] = False; rec['reason'] = 'malformed execution result'
+                return finish(False)
+            exit_code = execution.get('code')
+            output = execution.get('stdout', x.get('stdout'))
+        else:
+            exit_code = x.get('code')
+            output = x.get('stdout')
+        if type(exit_code) is not int or type(build.get('code')) is not int or build['code'] != 0:
+            rec['ok'] = False; rec['reason'] = 'execution/build exit evidence missing or invalid'
+            return finish(False)
+        if x.get('timedOut') or x.get('truncated') or execution and (execution.get('timedOut') or execution.get('truncated')):
+            rec['ok'] = False; rec['reason'] = 'execution resource evidence incomplete'
+            return finish(False)
+        rec['stdout'] = _join(output, '\n')
+        rec['exit'] = exit_code
+
     return finish(True)
 
 

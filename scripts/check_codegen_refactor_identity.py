@@ -48,6 +48,8 @@ import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+sys.path.insert(0,str(Path(__file__).resolve().parent))
+from corpus_selection import source_paths
 from typing import Any
 
 
@@ -156,6 +158,12 @@ def run_compiler(
     return proc.returncode, proc.stderr[-2000:]
 
 
+def source_items(corpora):
+    physical=set()
+    for corpus in corpora:physical.update(source_paths(corpus))
+    return list(enumerate(sorted(physical,key=lambda p:os.fsencode(str(p)))))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--before", type=Path, required=True, help="baseline LCCC executable")
@@ -191,9 +199,9 @@ def main() -> int:
     for corpus in corpora:
         if not corpus.is_dir():
             parser.error(f"--corpus is not a directory: {corpus}")
-    sources: list[tuple[Path, Path]] = []
-    for corpus in corpora:
-        sources.extend((corpus, source) for source in sorted(corpus.rglob("*.c")))
+    if any(c==Path(__file__).resolve().parents[1]/'tests' for c in corpora):
+        parser.error('choose explicit regression/benchmark roots, never broad tests/')
+    sources=source_items(corpora)
     if not sources:
         parser.error("no C sources found")
 
@@ -214,11 +222,11 @@ def main() -> int:
     env.update(requested_env)
     began = time.monotonic()
 
-    def compare(item: tuple[Path, Path]) -> Result:
-        corpus, source = item
-        # A corpus directory name scopes the path when multiple corpora have
-        # equally named files (common for small extracted kernels).
-        rel = Path(corpus.name) / source.relative_to(corpus)
+    def compare(item: tuple[int, Path]) -> Result:
+        source_index,source = item
+        # Unique physical-source index handles equal stems, equally named
+        # roots, overlapping roots and file symlinks outside an explicit root.
+        rel=Path(f'source_{source_index:06d}')/source.name
         flags = flags_for(source, args.default_flags, profile_dir)
         before = output / "before" / rel.with_suffix(".s")
         after = output / "after" / rel.with_suffix(".s")

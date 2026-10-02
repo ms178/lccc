@@ -40,8 +40,8 @@ __attribute__((noinline)) static void t_char_arr_of_struct_auto(void) { struct {
 __attribute__((noinline)) static void t_char_arr_of_struct_static(void) { static struct { char s[4]; int k; } v[2] = { { "ab", 1 }, { "c", 2 } }; mix("t_char_arr_of_struct_static", &v, sizeof v); }
 __attribute__((noinline)) static void t_char_arr_of_struct_flat_auto(void) { struct { char s[4]; int k; } v[2] = { "ab", 1, "c", 2 }; mix("t_char_arr_of_struct_flat_auto", &v, sizeof v); }
 __attribute__((noinline)) static void t_char_arr_of_struct_flat_static(void) { static struct { char s[4]; int k; } v[2] = { "ab", 1, "c", 2 }; mix("t_char_arr_of_struct_flat_static", &v, sizeof v); }
-__attribute__((noinline)) static void t_char_union_auto(void) { union { char s[8]; long long x; } v = { "ab" }; mix("t_char_union_auto", &v, sizeof v); }
-__attribute__((noinline)) static void t_char_union_static(void) { static union { char s[8]; long long x; } v = { "ab" }; mix("t_char_union_static", &v, sizeof v); }
+__attribute__((noinline)) static void t_char_union_auto(void) { union { char s[8]; long long x; } v = { "ab" }; mix("t_char_union_auto", v.s, sizeof v.s); }
+__attribute__((noinline)) static void t_char_union_static(void) { static union { char s[8]; long long x; } v = { "ab" }; mix("t_char_union_static", v.s, sizeof v.s); }
 __attribute__((noinline)) static void t_char_2d_override_auto(void) { char v[2][4] = { [0] = "abc", [0] = "x", [1] = { 1, 2, 3 }, [1] = "y" }; mix("t_char_2d_override_auto", &v, sizeof v); }
 __attribute__((noinline)) static void t_char_2d_override_static(void) { static char v[2][4] = { [0] = "abc", [0] = "x", [1] = { 1, 2, 3 }, [1] = "y" }; mix("t_char_2d_override_static", &v, sizeof v); }
 __attribute__((noinline)) static void t_char_2d_excess_auto(void) { char v[2][3] = { "ab", "c", "d" }; mix("t_char_2d_excess_auto", &v, sizeof v); }
@@ -56,8 +56,8 @@ __attribute__((noinline)) static void t_char_member_desig_elem_auto(void) { stru
 __attribute__((noinline)) static void t_char_member_desig_elem_static(void) { static struct { int g; char a[2][4]; int k; } v = { .a[1][2] = 65, 66, 67, .g = 4 }; mix("t_char_member_desig_elem_static", &v, sizeof v); }
 __attribute__((noinline)) static void t_char_member_2d_desig_rows_auto(void) { struct { char a[3][3]; int k; } v = { { [2] = "p", [0] = { 1 } }, 8 }; mix("t_char_member_2d_desig_rows_auto", &v, sizeof v); }
 __attribute__((noinline)) static void t_char_member_2d_desig_rows_static(void) { static struct { char a[3][3]; int k; } v = { { [2] = "p", [0] = { 1 } }, 8 }; mix("t_char_member_2d_desig_rows_static", &v, sizeof v); }
-__attribute__((noinline)) static void t_char_union_2d_auto(void) { union { char s[2][3]; long long x[2]; } v = { "a", "bc" }; mix("t_char_union_2d_auto", &v, sizeof v); }
-__attribute__((noinline)) static void t_char_union_2d_static(void) { static union { char s[2][3]; long long x[2]; } v = { "a", "bc" }; mix("t_char_union_2d_static", &v, sizeof v); }
+__attribute__((noinline)) static void t_char_union_2d_auto(void) { union { char s[2][3]; long long x[2]; } v = { "a", "bc" }; mix("t_char_union_2d_auto", v.s, sizeof v.s); }
+__attribute__((noinline)) static void t_char_union_2d_static(void) { static union { char s[2][3]; long long x[2]; } v = { "a", "bc" }; mix("t_char_union_2d_static", v.s, sizeof v.s); }
 __attribute__((noinline)) static void t_char_cl_unsized(void) { const char *p = (char[]){ "a\xe9" }; mix("t_char_cl_unsized", p, sizeof((char[]){ "a\xe9" })); }
 __attribute__((noinline)) static void t_char_cl_sized(void) { const char *p = (char[5]){ "ab" }; mix("t_char_cl_sized", p, 5 * sizeof(char)); }
 __attribute__((noinline)) static void t_char_cl_2d(void) { const char (*p)[3] = (char[2][3]){ "ab", "c" }; mix("t_char_cl_2d", p, 6 * sizeof(char)); }
@@ -120,8 +120,8 @@ __attribute__((noinline)) static void t_char16_arr_of_struct_auto(void) { struct
 __attribute__((noinline)) static void t_char16_arr_of_struct_static(void) { static struct { char16_t s[4]; int k; } v[2] = { { u"ab", 1 }, { u"c", 2 } }; mix("t_char16_arr_of_struct_static", &v, sizeof v); }
 __attribute__((noinline)) static void t_char16_arr_of_struct_flat_auto(void) { struct { char16_t s[4]; int k; } v[2] = { u"ab", 1, u"c", 2 }; mix("t_char16_arr_of_struct_flat_auto", &v, sizeof v); }
 __attribute__((noinline)) static void t_char16_arr_of_struct_flat_static(void) { static struct { char16_t s[4]; int k; } v[2] = { u"ab", 1, u"c", 2 }; mix("t_char16_arr_of_struct_flat_static", &v, sizeof v); }
-__attribute__((noinline)) static void t_char16_union_auto(void) { union { char16_t s[8]; long long x; } v = { u"ab" }; mix("t_char16_union_auto", &v, sizeof v); }
-__attribute__((noinline)) static void t_char16_union_static(void) { static union { char16_t s[8]; long long x; } v = { u"ab" }; mix("t_char16_union_static", &v, sizeof v); }
+__attribute__((noinline)) static void t_char16_union_auto(void) { union { char16_t s[8]; long long x; } v = { u"ab" }; mix("t_char16_union_auto", v.s, sizeof v.s); }
+__attribute__((noinline)) static void t_char16_union_static(void) { static union { char16_t s[8]; long long x; } v = { u"ab" }; mix("t_char16_union_static", v.s, sizeof v.s); }
 __attribute__((noinline)) static void t_char16_2d_override_auto(void) { char16_t v[2][4] = { [0] = u"abc", [0] = u"x", [1] = { 1, 2, 3 }, [1] = u"y" }; mix("t_char16_2d_override_auto", &v, sizeof v); }
 __attribute__((noinline)) static void t_char16_2d_override_static(void) { static char16_t v[2][4] = { [0] = u"abc", [0] = u"x", [1] = { 1, 2, 3 }, [1] = u"y" }; mix("t_char16_2d_override_static", &v, sizeof v); }
 __attribute__((noinline)) static void t_char16_2d_excess_auto(void) { char16_t v[2][3] = { u"ab", u"c", u"d" }; mix("t_char16_2d_excess_auto", &v, sizeof v); }
@@ -136,8 +136,8 @@ __attribute__((noinline)) static void t_char16_member_desig_elem_auto(void) { st
 __attribute__((noinline)) static void t_char16_member_desig_elem_static(void) { static struct { int g; char16_t a[2][4]; int k; } v = { .a[1][2] = 65, 66, 67, .g = 4 }; mix("t_char16_member_desig_elem_static", &v, sizeof v); }
 __attribute__((noinline)) static void t_char16_member_2d_desig_rows_auto(void) { struct { char16_t a[3][3]; int k; } v = { { [2] = u"p", [0] = { 1 } }, 8 }; mix("t_char16_member_2d_desig_rows_auto", &v, sizeof v); }
 __attribute__((noinline)) static void t_char16_member_2d_desig_rows_static(void) { static struct { char16_t a[3][3]; int k; } v = { { [2] = u"p", [0] = { 1 } }, 8 }; mix("t_char16_member_2d_desig_rows_static", &v, sizeof v); }
-__attribute__((noinline)) static void t_char16_union_2d_auto(void) { union { char16_t s[2][3]; long long x[2]; } v = { u"a", u"bc" }; mix("t_char16_union_2d_auto", &v, sizeof v); }
-__attribute__((noinline)) static void t_char16_union_2d_static(void) { static union { char16_t s[2][3]; long long x[2]; } v = { u"a", u"bc" }; mix("t_char16_union_2d_static", &v, sizeof v); }
+__attribute__((noinline)) static void t_char16_union_2d_auto(void) { union { char16_t s[2][3]; long long x[2]; } v = { u"a", u"bc" }; mix("t_char16_union_2d_auto", v.s, sizeof v.s); }
+__attribute__((noinline)) static void t_char16_union_2d_static(void) { static union { char16_t s[2][3]; long long x[2]; } v = { u"a", u"bc" }; mix("t_char16_union_2d_static", v.s, sizeof v.s); }
 __attribute__((noinline)) static void t_char16_cl_unsized(void) { const char16_t *p = (char16_t[]){ u"a\U0001F600" }; mix("t_char16_cl_unsized", p, sizeof((char16_t[]){ u"a\U0001F600" })); }
 __attribute__((noinline)) static void t_char16_cl_sized(void) { const char16_t *p = (char16_t[5]){ u"ab" }; mix("t_char16_cl_sized", p, 5 * sizeof(char16_t)); }
 __attribute__((noinline)) static void t_char16_cl_2d(void) { const char16_t (*p)[3] = (char16_t[2][3]){ u"ab", u"c" }; mix("t_char16_cl_2d", p, 6 * sizeof(char16_t)); }
@@ -200,8 +200,8 @@ __attribute__((noinline)) static void t_wchar_arr_of_struct_auto(void) { struct 
 __attribute__((noinline)) static void t_wchar_arr_of_struct_static(void) { static struct { wchar_t s[4]; int k; } v[2] = { { L"ab", 1 }, { L"c", 2 } }; mix("t_wchar_arr_of_struct_static", &v, sizeof v); }
 __attribute__((noinline)) static void t_wchar_arr_of_struct_flat_auto(void) { struct { wchar_t s[4]; int k; } v[2] = { L"ab", 1, L"c", 2 }; mix("t_wchar_arr_of_struct_flat_auto", &v, sizeof v); }
 __attribute__((noinline)) static void t_wchar_arr_of_struct_flat_static(void) { static struct { wchar_t s[4]; int k; } v[2] = { L"ab", 1, L"c", 2 }; mix("t_wchar_arr_of_struct_flat_static", &v, sizeof v); }
-__attribute__((noinline)) static void t_wchar_union_auto(void) { union { wchar_t s[8]; long long x; } v = { L"ab" }; mix("t_wchar_union_auto", &v, sizeof v); }
-__attribute__((noinline)) static void t_wchar_union_static(void) { static union { wchar_t s[8]; long long x; } v = { L"ab" }; mix("t_wchar_union_static", &v, sizeof v); }
+__attribute__((noinline)) static void t_wchar_union_auto(void) { union { wchar_t s[8]; long long x; } v = { L"ab" }; mix("t_wchar_union_auto", v.s, sizeof v.s); }
+__attribute__((noinline)) static void t_wchar_union_static(void) { static union { wchar_t s[8]; long long x; } v = { L"ab" }; mix("t_wchar_union_static", v.s, sizeof v.s); }
 __attribute__((noinline)) static void t_wchar_2d_override_auto(void) { wchar_t v[2][4] = { [0] = L"abc", [0] = L"x", [1] = { 1, 2, 3 }, [1] = L"y" }; mix("t_wchar_2d_override_auto", &v, sizeof v); }
 __attribute__((noinline)) static void t_wchar_2d_override_static(void) { static wchar_t v[2][4] = { [0] = L"abc", [0] = L"x", [1] = { 1, 2, 3 }, [1] = L"y" }; mix("t_wchar_2d_override_static", &v, sizeof v); }
 __attribute__((noinline)) static void t_wchar_2d_excess_auto(void) { wchar_t v[2][3] = { L"ab", L"c", L"d" }; mix("t_wchar_2d_excess_auto", &v, sizeof v); }
@@ -216,8 +216,8 @@ __attribute__((noinline)) static void t_wchar_member_desig_elem_auto(void) { str
 __attribute__((noinline)) static void t_wchar_member_desig_elem_static(void) { static struct { int g; wchar_t a[2][4]; int k; } v = { .a[1][2] = 65, 66, 67, .g = 4 }; mix("t_wchar_member_desig_elem_static", &v, sizeof v); }
 __attribute__((noinline)) static void t_wchar_member_2d_desig_rows_auto(void) { struct { wchar_t a[3][3]; int k; } v = { { [2] = L"p", [0] = { 1 } }, 8 }; mix("t_wchar_member_2d_desig_rows_auto", &v, sizeof v); }
 __attribute__((noinline)) static void t_wchar_member_2d_desig_rows_static(void) { static struct { wchar_t a[3][3]; int k; } v = { { [2] = L"p", [0] = { 1 } }, 8 }; mix("t_wchar_member_2d_desig_rows_static", &v, sizeof v); }
-__attribute__((noinline)) static void t_wchar_union_2d_auto(void) { union { wchar_t s[2][3]; long long x[2]; } v = { L"a", L"bc" }; mix("t_wchar_union_2d_auto", &v, sizeof v); }
-__attribute__((noinline)) static void t_wchar_union_2d_static(void) { static union { wchar_t s[2][3]; long long x[2]; } v = { L"a", L"bc" }; mix("t_wchar_union_2d_static", &v, sizeof v); }
+__attribute__((noinline)) static void t_wchar_union_2d_auto(void) { union { wchar_t s[2][3]; long long x[2]; } v = { L"a", L"bc" }; mix("t_wchar_union_2d_auto", v.s, sizeof v.s); }
+__attribute__((noinline)) static void t_wchar_union_2d_static(void) { static union { wchar_t s[2][3]; long long x[2]; } v = { L"a", L"bc" }; mix("t_wchar_union_2d_static", v.s, sizeof v.s); }
 __attribute__((noinline)) static void t_wchar_cl_unsized(void) { const wchar_t *p = (wchar_t[]){ L"a\U0001F600" }; mix("t_wchar_cl_unsized", p, sizeof((wchar_t[]){ L"a\U0001F600" })); }
 __attribute__((noinline)) static void t_wchar_cl_sized(void) { const wchar_t *p = (wchar_t[5]){ L"ab" }; mix("t_wchar_cl_sized", p, 5 * sizeof(wchar_t)); }
 __attribute__((noinline)) static void t_wchar_cl_2d(void) { const wchar_t (*p)[3] = (wchar_t[2][3]){ L"ab", L"c" }; mix("t_wchar_cl_2d", p, 6 * sizeof(wchar_t)); }
@@ -280,8 +280,8 @@ __attribute__((noinline)) static void t_char32_arr_of_struct_auto(void) { struct
 __attribute__((noinline)) static void t_char32_arr_of_struct_static(void) { static struct { char32_t s[4]; int k; } v[2] = { { U"ab", 1 }, { U"c", 2 } }; mix("t_char32_arr_of_struct_static", &v, sizeof v); }
 __attribute__((noinline)) static void t_char32_arr_of_struct_flat_auto(void) { struct { char32_t s[4]; int k; } v[2] = { U"ab", 1, U"c", 2 }; mix("t_char32_arr_of_struct_flat_auto", &v, sizeof v); }
 __attribute__((noinline)) static void t_char32_arr_of_struct_flat_static(void) { static struct { char32_t s[4]; int k; } v[2] = { U"ab", 1, U"c", 2 }; mix("t_char32_arr_of_struct_flat_static", &v, sizeof v); }
-__attribute__((noinline)) static void t_char32_union_auto(void) { union { char32_t s[8]; long long x; } v = { U"ab" }; mix("t_char32_union_auto", &v, sizeof v); }
-__attribute__((noinline)) static void t_char32_union_static(void) { static union { char32_t s[8]; long long x; } v = { U"ab" }; mix("t_char32_union_static", &v, sizeof v); }
+__attribute__((noinline)) static void t_char32_union_auto(void) { union { char32_t s[8]; long long x; } v = { U"ab" }; mix("t_char32_union_auto", v.s, sizeof v.s); }
+__attribute__((noinline)) static void t_char32_union_static(void) { static union { char32_t s[8]; long long x; } v = { U"ab" }; mix("t_char32_union_static", v.s, sizeof v.s); }
 __attribute__((noinline)) static void t_char32_2d_override_auto(void) { char32_t v[2][4] = { [0] = U"abc", [0] = U"x", [1] = { 1, 2, 3 }, [1] = U"y" }; mix("t_char32_2d_override_auto", &v, sizeof v); }
 __attribute__((noinline)) static void t_char32_2d_override_static(void) { static char32_t v[2][4] = { [0] = U"abc", [0] = U"x", [1] = { 1, 2, 3 }, [1] = U"y" }; mix("t_char32_2d_override_static", &v, sizeof v); }
 __attribute__((noinline)) static void t_char32_2d_excess_auto(void) { char32_t v[2][3] = { U"ab", U"c", U"d" }; mix("t_char32_2d_excess_auto", &v, sizeof v); }
@@ -296,8 +296,8 @@ __attribute__((noinline)) static void t_char32_member_desig_elem_auto(void) { st
 __attribute__((noinline)) static void t_char32_member_desig_elem_static(void) { static struct { int g; char32_t a[2][4]; int k; } v = { .a[1][2] = 65, 66, 67, .g = 4 }; mix("t_char32_member_desig_elem_static", &v, sizeof v); }
 __attribute__((noinline)) static void t_char32_member_2d_desig_rows_auto(void) { struct { char32_t a[3][3]; int k; } v = { { [2] = U"p", [0] = { 1 } }, 8 }; mix("t_char32_member_2d_desig_rows_auto", &v, sizeof v); }
 __attribute__((noinline)) static void t_char32_member_2d_desig_rows_static(void) { static struct { char32_t a[3][3]; int k; } v = { { [2] = U"p", [0] = { 1 } }, 8 }; mix("t_char32_member_2d_desig_rows_static", &v, sizeof v); }
-__attribute__((noinline)) static void t_char32_union_2d_auto(void) { union { char32_t s[2][3]; long long x[2]; } v = { U"a", U"bc" }; mix("t_char32_union_2d_auto", &v, sizeof v); }
-__attribute__((noinline)) static void t_char32_union_2d_static(void) { static union { char32_t s[2][3]; long long x[2]; } v = { U"a", U"bc" }; mix("t_char32_union_2d_static", &v, sizeof v); }
+__attribute__((noinline)) static void t_char32_union_2d_auto(void) { union { char32_t s[2][3]; long long x[2]; } v = { U"a", U"bc" }; mix("t_char32_union_2d_auto", v.s, sizeof v.s); }
+__attribute__((noinline)) static void t_char32_union_2d_static(void) { static union { char32_t s[2][3]; long long x[2]; } v = { U"a", U"bc" }; mix("t_char32_union_2d_static", v.s, sizeof v.s); }
 __attribute__((noinline)) static void t_char32_cl_unsized(void) { const char32_t *p = (char32_t[]){ U"a\U0001F600" }; mix("t_char32_cl_unsized", p, sizeof((char32_t[]){ U"a\U0001F600" })); }
 __attribute__((noinline)) static void t_char32_cl_sized(void) { const char32_t *p = (char32_t[5]){ U"ab" }; mix("t_char32_cl_sized", p, 5 * sizeof(char32_t)); }
 __attribute__((noinline)) static void t_char32_cl_2d(void) { const char32_t (*p)[3] = (char32_t[2][3]){ U"ab", U"c" }; mix("t_char32_cl_2d", p, 6 * sizeof(char32_t)); }

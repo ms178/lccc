@@ -61,43 +61,48 @@ impl Lexer {
     }
 
     fn next_token(&mut self) -> Token {
-        self.skip_whitespace_and_comments();
+        loop {
+            self.skip_whitespace_and_comments();
 
-        if self.pos >= self.input.len() {
-            return Token::new(
-                TokenKind::Eof,
-                Span::new(self.pos as u32, self.pos as u32, self.file_id),
-            );
+            if self.pos >= self.input.len() {
+                return Token::new(
+                    TokenKind::Eof,
+                    Span::new(self.pos as u32, self.pos as u32, self.file_id),
+                );
+            }
+
+            let start = self.pos;
+            let ch = self.input[self.pos];
+
+            // Number literals
+            if ch.is_ascii_digit()
+                || (ch == b'.' && self.peek_next().is_some_and(|c| c.is_ascii_digit()))
+            {
+                return self.lex_number(start);
+            }
+
+            // String literals
+            if ch == b'"' {
+                return self.lex_string(start);
+            }
+
+            // Character literals
+            if ch == b'\'' {
+                return self.lex_char(start);
+            }
+
+            // Identifiers and keywords
+            // GCC extension: '$' is allowed in identifiers (-fdollars-in-identifiers, on by default)
+            if ch == b'_' || ch == b'$' || ch.is_ascii_alphabetic() {
+                return self.lex_identifier(start);
+            }
+
+            // Punctuation and operators
+            if let Some(token) = self.lex_punctuation(start) {
+                return token;
+            }
+            // The offending scalar was consumed; recover without recursion.
         }
-
-        let start = self.pos;
-        let ch = self.input[self.pos];
-
-        // Number literals
-        if ch.is_ascii_digit()
-            || (ch == b'.' && self.peek_next().is_some_and(|c| c.is_ascii_digit()))
-        {
-            return self.lex_number(start);
-        }
-
-        // String literals
-        if ch == b'"' {
-            return self.lex_string(start);
-        }
-
-        // Character literals
-        if ch == b'\'' {
-            return self.lex_char(start);
-        }
-
-        // Identifiers and keywords
-        // GCC extension: '$' is allowed in identifiers (-fdollars-in-identifiers, on by default)
-        if ch == b'_' || ch == b'$' || ch.is_ascii_alphabetic() {
-            return self.lex_identifier(start);
-        }
-
-        // Punctuation and operators
-        self.lex_punctuation(start)
     }
 
     fn skip_whitespace_and_comments(&mut self) {
@@ -1335,7 +1340,7 @@ impl Lexer {
         }
     }
 
-    fn lex_punctuation(&mut self, start: usize) -> Token {
+    fn lex_punctuation(&mut self, start: usize) -> Option<Token> {
         let ch = self.input[self.pos];
         self.pos += 1;
 
@@ -1538,9 +1543,11 @@ impl Lexer {
                 // Non-ASCII or unknown character: skip any remaining bytes of
                 // a multi-byte UTF-8 sequence (including PUA-encoded bytes from
                 // non-UTF-8 source files) and continue tokenizing.
-                let bad_start = self.pos;
-                let bad = self.input[self.pos];
-                self.pos += 1;
+                // The leading byte was consumed before this match. Reading
+                // self.input[self.pos] instead skips its successor and reads
+                // past EOF for a final unknown byte.
+                let bad_start = start;
+                let bad = ch;
                 while self.pos < self.input.len() && (self.input[self.pos] & 0xC0) == 0x80 {
                     self.pos += 1;
                 }
@@ -1549,11 +1556,14 @@ impl Lexer {
                     bad_start,
                     self.pos,
                 );
-                return self.next_token();
+                return None;
             }
         };
 
-        Token::new(kind, Span::new(start as u32, self.pos as u32, self.file_id))
+        Some(Token::new(
+            kind,
+            Span::new(start as u32, self.pos as u32, self.file_id),
+        ))
     }
 }
 
@@ -1563,5 +1573,49 @@ fn hex_digit_val(c: u8) -> u8 {
         b'a'..=b'f' => c - b'a' + 10,
         b'A'..=b'F' => c - b'A' + 10,
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    #[test]
+    fn unknown_byte_at_eof_has_exact_byte_and_span() {
+        let mut lexer = Lexer::new("@", 3);
+        let tokens = lexer.tokenize();
+        assert_eq!(tokens.len(), 1);
+        assert!(tokens[0].is_eof());
+        assert_eq!(lexer.diagnostics.len(), 1);
+        assert!(lexer.diagnostics[0].0.contains("0x40"));
+        assert_eq!(lexer.diagnostics[0].1, Span::new(0, 1, 3));
+    }
+
+    #[test]
+    fn unknown_byte_does_not_consume_following_punctuation() {
+        let mut lexer = Lexer::new("@;", 0);
+        let tokens = lexer.tokenize();
+        assert_eq!(tokens[0].kind, TokenKind::Semicolon);
+        assert_eq!(tokens[0].span, Span::new(1, 2, 0));
+        assert_eq!(lexer.diagnostics[0].1, Span::new(0, 1, 0));
+    }
+
+    #[test]
+    fn unicode_recovery_preserves_complete_scalar_span() {
+        let mut lexer = Lexer::new("€;", 0);
+        let tokens = lexer.tokenize();
+        assert_eq!(tokens[0].kind, TokenKind::Semicolon);
+        assert_eq!(tokens[0].span, Span::new(3, 4, 0));
+        assert_eq!(lexer.diagnostics.len(), 1);
+        assert_eq!(lexer.diagnostics[0].1, Span::new(0, 3, 0));
+    }
+
+    #[test]
+    fn long_unknown_run_uses_bounded_call_stack() {
+        let mut lexer = Lexer::new(&"@".repeat(100_000), 0);
+        let tokens = lexer.tokenize();
+        assert_eq!(tokens.len(), 1);
+        assert!(tokens[0].is_eof());
+        assert_eq!(lexer.diagnostics.len(), 100_000);
     }
 }

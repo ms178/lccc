@@ -67,6 +67,58 @@ pub fn resolve_lib_positional(name: &str, paths: &[String], static_only: bool) -
     })
 }
 
+/// Resolve a file named inside a linker script (`GROUP` / `INPUT`).
+///
+/// GNU ld semantics: an absolute name is looked up under `LCCC_SYSROOT`
+/// first (a script inside the sysroot has its absolute names prefixed), then
+/// exactly as written; a relative name is tried next to the script, then
+/// against the working directory, then in the library search path.
+///
+/// `is_file`, not `exists`: a *directory* carrying the entry's name is not an
+/// input, and `open()` on one succeeds on Linux — the caller would map it and
+/// report a bogus ELF parse error instead of `cannot find …`.
+pub fn resolve_script_path(
+    named: &str,
+    script_dir: Option<&str>,
+    lib_paths: &[String],
+) -> Option<String> {
+    if named.starts_with('/') {
+        let prefixed = crate::backend::common::with_sysroot_prefix(named);
+        if prefixed != named && Path::new(&prefixed).is_file() {
+            return Some(prefixed);
+        }
+        return Path::new(named).is_file().then(|| named.to_string());
+    }
+    // Written as early returns rather than an iterator chain on purpose:
+    // `std::iter::once(named.to_string())` evaluates its argument eagerly, so
+    // the chain form allocated the working-directory candidate on every call
+    // even when the script-directory candidate had already matched.  Each
+    // branch below allocates only the string it actually needs.
+    if let Some(dir) = script_dir {
+        let next_to_script = format!("{dir}/{named}");
+        if Path::new(&next_to_script).is_file() {
+            return Some(next_to_script);
+        }
+    }
+    if Path::new(named).is_file() {
+        return Some(named.to_string());
+    }
+    lib_paths
+        .iter()
+        .map(|dir| format!("{dir}/{named}"))
+        .find(|candidate| Path::new(candidate).is_file())
+}
+
+/// How GNU ld spells an unresolved linker-script input in its diagnostic:
+/// the path as written, or `-lNAME` for a library reference.
+pub fn script_input_spelling(input: &crate::backend::elf::LinkerScriptInput) -> String {
+    use crate::backend::elf::LinkerScriptEntry;
+    match &input.entry {
+        LinkerScriptEntry::Path(p) => p.clone(),
+        LinkerScriptEntry::Lib(name) => format!("-l{name}"),
+    }
+}
+
 /// The input list of a relocatable (`-r`) or script-driven (`-T`) link:
 /// the positional `files` with every `-lNAME` of the command line expanded,
 /// in place, into the file it names.
@@ -135,7 +187,132 @@ pub fn expand_file_mode_libs(
 
 #[cfg(test)]
 mod tests {
-    use super::{expand_file_mode_libs, resolve_lib_positional};
+    use super::{
+        expand_file_mode_libs, resolve_lib, resolve_lib_positional, resolve_script_path,
+        script_input_spelling,
+    };
+    use crate::backend::elf::{LinkerScriptEntry, LinkerScriptInput};
+
+    fn temp_root(tag: &str) -> std::path::PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("lccc_script_path_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn script_path_prefers_script_dir_then_search_path() {
+        let root = temp_root("order");
+        let script_dir = root.join("scriptdir");
+        let lib_dir = root.join("libdir");
+        std::fs::create_dir_all(&script_dir).unwrap();
+        std::fs::create_dir_all(&lib_dir).unwrap();
+        std::fs::write(lib_dir.join("libm.so"), b"").unwrap();
+        let libs = vec![lib_dir.display().to_string()];
+        let script_dir_string = script_dir.display().to_string();
+        let dir = Some(script_dir_string.as_str());
+
+        // Only in the library search path.
+        assert_eq!(
+            resolve_script_path("libm.so", dir, &libs),
+            Some(format!("{}/libm.so", lib_dir.display()))
+        );
+        // Next to the script wins over the search path (GNU ld order).
+        std::fs::write(script_dir.join("libm.so"), b"").unwrap();
+        assert_eq!(
+            resolve_script_path("libm.so", dir, &libs),
+            Some(format!("{}/libm.so", script_dir.display()))
+        );
+        // Nothing anywhere: None, so the caller reports the operand by name.
+        assert_eq!(resolve_script_path("libnope.so", dir, &libs), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn script_path_rejects_directory_and_missing_absolute_names() {
+        let root = temp_root("kinds");
+        // A directory carrying the entry's name is not an input: `exists()`
+        // said yes and the loader then mapped a directory.
+        std::fs::create_dir_all(root.join("libdir.so")).unwrap();
+        let libs: Vec<String> = Vec::new();
+        assert_eq!(
+            resolve_script_path(
+                "libdir.so",
+                Some(root.display().to_string().as_str()),
+                &libs
+            ),
+            None,
+            "a directory must not resolve as a linker-script input"
+        );
+        let missing = format!("{}/definitely-absent.so", root.display());
+        assert_eq!(resolve_script_path(&missing, None, &libs), None);
+        let file = root.join("present.so");
+        std::fs::write(&file, b"").unwrap();
+        assert_eq!(
+            resolve_script_path(&file.display().to_string(), None, &libs),
+            Some(file.display().to_string())
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn script_path_prefixes_absolute_names_with_the_sysroot() {
+        use crate::test_support::EnvGuard;
+        let root = temp_root("sysroot");
+        let rootfs = root.join("rootfs");
+        std::fs::create_dir_all(rootfs.join("usr/lib")).unwrap();
+        std::fs::write(rootfs.join("usr/lib/libc.so.6"), b"").unwrap();
+        let libs: Vec<String> = Vec::new();
+        let _guard = EnvGuard::set("LCCC_SYSROOT", &rootfs.display().to_string());
+        assert_eq!(
+            resolve_script_path("/usr/lib/libc.so.6", None, &libs),
+            Some(format!("{}/usr/lib/libc.so.6", rootfs.display())),
+            "an absolute script name resolves under the sysroot first"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The preference the AArch64 script loader now derives from the link
+    /// mode: GNU ld takes `libNAME.so` first and only prefers `libNAME.a`
+    /// when the link is static.
+    #[test]
+    fn resolve_lib_prefers_shared_unless_the_link_is_static() {
+        let root = temp_root("prefer");
+        std::fs::write(root.join("libfoo.so"), b"").unwrap();
+        std::fs::write(root.join("libfoo.a"), b"").unwrap();
+        let libs = vec![root.display().to_string()];
+        assert_eq!(
+            resolve_lib("foo", &libs, false),
+            Some(format!("{}/libfoo.so", root.display())),
+            "a dynamic link takes the shared object"
+        );
+        assert_eq!(
+            resolve_lib("foo", &libs, true),
+            Some(format!("{}/libfoo.a", root.display())),
+            "a static link takes the archive"
+        );
+        assert_eq!(
+            resolve_lib(":libfoo.a", &libs, false),
+            Some(format!("{}/libfoo.a", root.display())),
+            "-l:FILE names an exact file in either mode"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn script_input_spelling_matches_the_gnu_ld_operand() {
+        let path = LinkerScriptInput {
+            entry: LinkerScriptEntry::Path("/lib/libc.so.6".into()),
+            as_needed: false,
+        };
+        let lib = LinkerScriptInput {
+            entry: LinkerScriptEntry::Lib("gcc_s".into()),
+            as_needed: true,
+        };
+        assert_eq!(script_input_spelling(&path), "/lib/libc.so.6");
+        assert_eq!(script_input_spelling(&lib), "-lgcc_s");
+    }
 
     #[test]
     fn static_only_never_picks_a_shared_object() {
