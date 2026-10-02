@@ -1148,10 +1148,14 @@ impl super::InstructionEncoder {
 /// decision: [`folded_addr_ext_bits`] is the single fold+extract helper
 /// behind `emit_rex_rm` and the five APX-EVEX memory helpers, and the
 /// VEX/XOP callers derive their (X, B) bits through
-/// [`mem_vex_xb_bits`].  AVX-512 `encode_evex_mem` intentionally does NOT
-/// fold -- no corpus row evidences the EVEX form yet, and it encodes the
-/// raw operand, so the `evex_addr_bits` prefix stays consistent with it.
-fn fold_index_into_base(mem: &MemoryOperand) -> Option<MemoryOperand> {
+/// [`mem_vex_xb_bits`].  The AVX-512 EVEX path folds too, since the
+/// S15 red-team run produced the missing evidence: classic ICC folds
+/// the whole AVX-512 load family (`vmovdqu8 (,%r10,1),%xmm0` ->
+/// `62 d1 7f 08 6f 02`, the same X->B bit movement in the EVEX P0
+/// byte, 6 bytes vs every other oracle's 11), so the fold is now
+/// applied in `encode_evex_mem` and its `evex_addr_bits` prefix
+/// helper derives from the same folded view.
+pub(crate) fn fold_index_into_base(mem: &MemoryOperand) -> Option<MemoryOperand> {
     if mem.base.is_some() || mem.scale.unwrap_or(1) != 1 {
         return None;
     }
@@ -1227,6 +1231,30 @@ pub(crate) fn mem_vex_xb_bits(mem: &MemoryOperand) -> (bool, bool) {
         mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name)),
         mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name)),
     )
+}
+
+/// The base register of the FOLDED view: the register `encode_modrm_mem`
+/// will actually encode in the base slot -- the index, when the fold fires,
+/// else the operand's own base.
+///
+/// The default-SEGMENT class follows this view, for the same reason the
+/// REX/VEX/EVEX extension bits do: the fold moves a register into the base
+/// slot, and `%rbp` in the base slot makes `%ss` the default segment.  An
+/// index-only `ss:4(,%rbp,1)` therefore folds to the same instruction as
+/// `ss:4(%rbp)` and must elide its no-op `ss` the same way, while
+/// `ds:4(,%rbp,1)` must KEEP the `ds` byte -- dropping it would leave the
+/// SS default where every other spelling of the same operand carries an
+/// explicit override.  Deciding on the raw operand (`base: None`) made the
+/// two spellings encode differently, the one F1-law violation that survived
+/// the PR #711 fix sweep (segment prefixes are architecturally dead in
+/// 64-bit flat mode, so this is a byte-waste/consistency defect, not a
+/// miscompile).
+pub(crate) fn folded_base(mem: &MemoryOperand) -> Option<&Register> {
+    if mem.base.is_none() && fold_index_into_base(mem).is_some() {
+        mem.index.as_ref()
+    } else {
+        mem.base.as_ref()
+    }
 }
 
 /// Reconstruct the `disp(base,index,scale)` text for the

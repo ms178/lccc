@@ -180,3 +180,44 @@ mov 128(,%r14,1), %rcx
 mov 2147483647(,%r14,1), %rcx
 mov 128(,%r15,1), %rcx
 mov 2147483647(,%r15,1), %rcx
+
+# Segment overrides + the fold: the default-segment class follows the
+# FOLDED view (folded_base), so both spellings of one operand encode
+# identically. `ss:4(,%%rbp,1)' elides the no-op 0x36 exactly like
+# `ss:4(%%rbp)'; `ds:4(,%%rbp,1)' keeps the 0x3e exactly like
+# `ds:4(%%rbp)' (an rbp base makes SS the default, so the DS override is
+# meaningful text even though 64-bit flat mode ignores the byte).
+# `ds:' on a non-SS-default fold stays dropped (`ds:4(,%%rax,1)' ->
+# `48 8b 40 04', the 4-byte base form). The 0x36-keep rows for r10
+# pin the never-a-default class (index->base=r10, DS default, ss kept).
+mov %ss:4(,%rbp,1), %rax
+mov %ss:4(%rbp), %rax
+mov %ds:4(,%rbp,1), %rax
+mov %ds:4(%rbp), %rax
+mov %ds:4(,%rax,1), %rax
+mov %ds:4(%rax), %rax
+mov %ss:4(,%rax,1), %rax
+mov %fs:4(,%r10,1), %rax
+mov %gs:8(,%r11,1), %rax
+mov %ss:8(,%r10,1), %rax
+
+# AVX-512 EVEX family (encode_evex_mem + evex_addr_bits fold since the
+# S15 red-team): classic ICC folds this family too -- `vmovdqu8
+# (,%r10,1),%xmm0' -> `62 d1 7f 08 6f 02' (X->B moved in the EVEX P0
+# byte), 6 bytes vs the 11-byte SIB+disp32 every other oracle emits.
+# Displacements follow the FVM (N=16) law exactly like GAS's base form:
+# non-multiples stay mod=10+disp32, multiples compress to disp8*N, and
+# the fold twin encodes byte-identically to the base form. The {evex}
+# promoted row rides the same path.
+vmovdqu8 (,%r10,1), %xmm0
+vmovdqu16 (,%r10,1), %xmm0
+vmovdqu32 (,%r10,1), %xmm0
+vmovdqu64 (,%r10,1), %xmm0
+vmovdqu8 -1(,%r10,1), %xmm0
+vmovdqu8 -16(,%r10,1), %xmm0
+vmovdqu8 -16(%r10), %xmm0
+vmovdqu8 (,%r13,1), %xmm0
+vmovdqu8 (,%r12,1), %xmm0
+vmovdqu64 64(,%r11,1), %xmm0
+{evex} vmovq (,%r10,1), %xmm0
+vmovdqu8 16(,%r13,1), %xmm0

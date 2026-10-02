@@ -644,6 +644,25 @@ gate "i686-tls-ie-relax" fast \
 gate "i686-narrow-cmp-flag-law" fast \
     bash tests/regression/check_narrow_cmp_flag_law.sh
 
+# The encdiff corpus (index-fold-64: the S13/S15 index-fold families incl.
+# segment+fold and the AVX-512 EVEX fold; data16-branches-64: the 64-bit
+# data16-branch law) is the SEMANTIC record of every deliberate divergence
+# from GAS -- BEATS rows where lccc is provably shorter, DECLINED rows with
+# their policy notes. Until now NO gate ran it: only the 8 Rust byte-pins
+# protected the fold in CI, and a regression in any of the other ~170 rows
+# (or a wrong-vs-GAS encoding introduced by a future prefix emitter) would
+# have shipped silently. Offline (local GAS 2.47 only) so the gate is
+# network-independent; the remote-oracle enrichments stay in the slow lane.
+# encdiff exits 1 on WRONG-BYTES/UNVERIFIED-*/REJECTS-VALID/LONGER — the
+# exact classes this corpus exists to catch (ORACLE-INVALID rows -- GAS
+# emitting the truncated data16 forms -- are partitioned, not failures).
+gate "encdiff-corpus" fast \
+    python3 scripts/encdiff.py --offline --quiet \
+        --lccc target/fastbuild/lccc-x86 \
+        --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" \
+        --file tests/encdiff-corpus/index-fold-64.insn \
+        --file tests/encdiff-corpus/data16-branches-64.insn
+
 # Zero-extended compare fold (fuse_zero_ext_cmp). Its OWN skip name, so an A/B
 # against CCC_PEEPHOLE_SKIP=zero_ext_cmp measures this fold and not its
 # sibling fuse_load_into_alu -- they used to share `load_alu_fuse`, which made

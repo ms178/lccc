@@ -589,6 +589,21 @@ _SEL_STORE = re.compile(r"^(sldt|str)\s+%(\w+)$")
 # never equivalence partners.
 _DEAD66_BRANCH = re.compile(r"^data16\s+(j[a-z]+|loop[a-z]*)\b")
 _BRANCH_W32 = re.compile(r"^jmpw\b")
+# 64-bit mode ignores the ES/DS/SS segment overrides on data accesses
+# (Intel SDM Vol. 2, effect of segment-override prefixes in 64-bit mode:
+# only FS and GS are honored; CS/DS/ES/SS are fixed at base 0). objdump
+# renders the dead byte as a leading `ds `/`es `/`ss ` mnemonic token, so
+# encodings differing only by it decode to the same instruction and must
+# compare equal. The spellings that must NOT unify are spelled differently
+# by objdump and therefore cannot match this regex: FS/GS render inline
+# (`mov %fs:0x4(%rax),%rax`), NOTRACK renders as its own mnemonic
+# (`notrack jmp *%rax`, byte 3e on an indirect branch — semantically real
+# under CET), and branch hints render as `,pt`/`,pn` suffixes (`je,pt`).
+# CS (0x2e) is left alone too: on indirect branches it is the
+# historically-defined hint partner, and there is no reason to unify a
+# byte any oracle chose to emit. 32-bit mode strips nothing: every
+# override selects a real descriptor there.
+_SEG_DEAD64 = re.compile(r"^(?:ds|es|ss)\s+(?=[a-z])")
 # Direct branch to an absolute target: rewritten with BOTH comparison
 # invariants (see _branch_marker).
 _BRANCH_TARGET = re.compile(
@@ -741,6 +756,11 @@ def _canon_insn(insn: str, bits32: bool = False) -> str:
     insn = _DEAD66_BRANCH.sub(r"\1", insn)
     if bits32:
         insn = _BRANCH_W32.sub("jmp", insn)
+    else:
+        # ES/DS/SS overrides are architecturally dead on 64-bit data
+        # accesses; encodings differing only by the byte must compare
+        # equal (see the _SEG_DEAD64 law comment).
+        insn = _SEG_DEAD64.sub("", insn)
     insn = _SCALE1.sub(r"(%\1)", insn)
     insn = _ZERODISP.sub("(", insn)
     insn = re.sub(r"\s+", " ", insn)
@@ -1155,7 +1175,8 @@ def main() -> int:
     ap.add_argument("--objcopy", default=os.environ.get("LCCC_OBJCOPY", "objcopy"))
     ap.add_argument("--insn", action="append", default=[],
                     help="one instruction (repeatable)")
-    ap.add_argument("--file", help="file with one instruction per line")
+    ap.add_argument("--file", action="append", default=[], metavar="FILE",
+                    help="file with one instruction per line (repeatable)")
     ap.add_argument("--casefiles", nargs="*", default=[],
                     help="asm-diff casefiles to harvest positive instructions from (reject groups skipped)")
     ap.add_argument("--compiler", action="append", default=[],
@@ -1176,7 +1197,8 @@ def main() -> int:
 
     insns: list[str] = list(args.insn)
     if args.file:
-        insns += [l.strip() for l in Path(args.file).read_text().splitlines()
+        for one in args.file:
+            insns += [l.strip() for l in Path(one).read_text().splitlines()
                   if l.strip() and not l.strip().startswith("#")]
     if args.casefiles:
         insns += read_casefiles(args.casefiles)
