@@ -86,9 +86,10 @@ jobs:
       # therefore only surfaced once the slow steps had burned their time, and
       # any earlier failing step skipped them outright (there was no
       # `if: always()`). Running the cheap, deterministic gate first means a
-      # static-codegen regression is reported in ~10 s, and `if: always()`
-      # keeps the corpus result and the artifact upload reachable even when an
-      # earlier step fails. Baseline refreshes go through --update-baseline in
+      # static-codegen regression is reported before the timed corpus.  The
+      # corpus itself still uses the default success condition: if the gate
+      # fails, it will be skipped.  Only the later summary/artifact steps use
+      # `if: always()`; they cannot rescue a skipped corpus. Baseline refreshes go through --update-baseline in
       # the PR that lands the improvement, per the gate's header contract.
       - name: Gate self-test (stackmem accounting)
         run: python3 .github/scripts/test_ci_codegen_gate.py

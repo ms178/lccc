@@ -4329,6 +4329,14 @@ fn rewrite_uses_where_available(
         for ii in 0..block.instructions.len() {
             let is_phi = matches!(block.instructions[ii], Instruction::Phi { .. });
             if is_phi {
+                // The phi's *result* may feed replacement.  Its arms must then
+                // keep the original values even when replacement dominates the
+                // incoming edge: redirecting one closes a producer cycle.  The
+                // ordinary instruction guard below does not cover phi arms.
+                if matches!(block.instructions[ii].dest(), Some(dest) if producers.contains(&dest.0))
+                {
+                    continue;
+                }
                 // Phi in-coming values are uses **at the end of the incoming
                 // edge**, so availability is a property of the predecessor
                 // block, not of this one.  Rewriting an arm blindly (the first
@@ -29700,5 +29708,61 @@ mod outside_rewrite_availability_tests {
             updates, 0,
             "no rewrite is provable in the bypass-reached block"
         );
+    }
+    /// On the loop backedge, v20 is available, but replacing v10 in v41's
+    /// incoming arm would form v41 -> v20 -> v41.  Dominance is not enough.
+    #[test]
+    fn producer_phi_backedge_is_not_rewritten_into_a_cycle() {
+        let mut func = IrFunction::new("t".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(block(
+            0,
+            vec![Instruction::BinOp {
+                dest: Value(10),
+                op: IrBinOp::Add,
+                lhs: Operand::Const(IrConst::I32(1)),
+                rhs: Operand::Const(IrConst::I32(2)),
+                ty: IrType::I32,
+            }],
+            Terminator::Branch(BlockId(1)),
+        ));
+        func.blocks.push(block(
+            1,
+            vec![Instruction::Phi {
+                dest: Value(41),
+                ty: IrType::I32,
+                incoming: vec![
+                    (Operand::Value(Value(10)), BlockId(0)),
+                    (Operand::Value(Value(10)), BlockId(2)),
+                ],
+            }],
+            Terminator::Branch(BlockId(2)),
+        ));
+        func.blocks.push(block(
+            2,
+            vec![binop(20, Value(41), 1)],
+            Terminator::CondBranch {
+                cond: Operand::Const(IrConst::I32(1)),
+                true_label: BlockId(1),
+                false_label: BlockId(3),
+            },
+        ));
+        func.blocks.push(block(
+            3,
+            vec![binop(30, Value(10), 1)],
+            Terminator::Return(Some(Operand::Value(Value(30)))),
+        ));
+        let updates = rewrite_uses_where_available(
+            &mut func,
+            &FxHashSet::default(),
+            &FxHashSet::default(),
+            10,
+            Value(20),
+        );
+        let Instruction::Phi { incoming, .. } = &func.blocks[1].instructions[0] else {
+            panic!("expected phi")
+        };
+        assert_eq!(incoming[0].0, Operand::Value(Value(10)));
+        assert_eq!(incoming[1].0, Operand::Value(Value(10)));
+        assert_eq!(updates, 1, "only the exit reader is redirected");
     }
 }

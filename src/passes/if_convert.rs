@@ -4074,7 +4074,9 @@ mod tests {
     /// not dominate the merge, and the store this pass moved into the merge read
     /// a value that only one path defined — the def-dominates-use violation
     /// `CCC_VERIFY_IR` reports on `tests/regression/minmax_refused.c`.
-    /// Rematerialising the address (and a parameter) in the merge is the fix.
+    /// Rematerialising the address in the merge is the fix.  A `ParamRef`
+    /// must instead reuse its entry-block definition when that dominates the
+    /// merge; it cannot be rematerialised outside the ABI-read entry block.
     #[test]
     fn sunk_store_address_is_available_at_the_merge() {
         use crate::common::types::{AddressSpace, IrType};
