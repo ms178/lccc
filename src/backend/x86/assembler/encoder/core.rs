@@ -1157,7 +1157,8 @@ impl super::InstructionEncoder {
 /// helper derives from the same folded view.  EGPR indexes (r16-r31)
 /// are in scope as well -- `gp_id` accepts them, the extension bit
 /// moves X4->B4 with the slot, and the fold output is byte-identical
-/// to the base-form spelling (GAS 2.47-probed; pinned in
+/// to the base-form spelling; the EGPR corpus rows run against the
+/// pinned as+objdump 2.47 pair in the encdiff-corpus gate (pinned in
 /// index_fold_tests::fold_moves_the_egpr_index_through_avx512_evex).
 pub(crate) fn fold_index_into_base(mem: &MemoryOperand) -> Option<MemoryOperand> {
     if !folds_index_into_base(mem) {

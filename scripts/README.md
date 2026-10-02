@@ -153,6 +153,12 @@ export LCCC_OBJCOPY=/path/to/objcopy
 export LCCC_OBJDUMP=/path/to/objdump   # used to verify shorter encodings
 ```
 
+`encdiff.py` accepts each of these as a CLI flag too (`--as`, `--objcopy`,
+`--objdump`); the corpus gates use the flags so the parity checker sees the
+pinned paths (as + objdump come from one binutils 2.47 build via
+`scripts/ensure_gas_247.sh` — the disassembler decides the BEATS/ok
+verdicts, so it is as much an oracle as the assembler).
+
 `encdiff.py` additionally needs outbound network access for the remote
 oracles. Run it with `--offline` to restrict it to the local assembler; that
 is what CI uses when it has no network. Remote answers are cached under

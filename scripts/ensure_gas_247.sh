@@ -1,14 +1,21 @@
 #!/usr/bin/env bash
-# ensure_gas_247.sh — (re)provision GNU as 2.47 for a cross target after a
-# harness wipe.
+# ensure_gas_247.sh — (re)provision the pinned binutils 2.47 oracle pair
+# (GNU as + objdump) for a cross target after a harness wipe.
 #
 # The differential execution suites hard-gate on GNU as 2.47
-# (latest-toolchains-only policy). Distro binutils is older, and the
-# locally built assembler lives under the snapshot-excluded .cache/ tree,
-# so it never survives a workspace restore. This script rebuilds it
-# idempotently from the upstream tarball; only the assembler is configured
-# and built (no ld/gold/gdb/sim), which keeps the build at a few minutes
-# on the 2-vCPU sandbox.
+# (latest-toolchains-only policy), and the encdiff corpus gate additionally
+# pins the DISASSEMBLER: objdump decides BEATS/ok verdicts through
+# decodes_same, so the runner image's objdump is as much an oracle as its
+# `as' — whatever binutils the host ships is not a verdict authority. Both
+# binaries come from the same 2.47 build, land under the same prefix, and
+# are required TOGETHER: an as-only cache (a provision interrupted after
+# the gas cp) must not short-circuit the gate into running with an
+# unpinned objdump. Distro binutils is older, and the locally built tools
+# live under the snapshot-excluded .cache/ tree, so they never survive a
+# workspace restore. This script rebuilds them idempotently from the
+# upstream tarball; only the binutils tools needed are configured and
+# built (no ld/gold/gdb/sim), which keeps the build at a few minutes on
+# the 2-vCPU sandbox.
 #
 # ftp.gnu.org is NOT universally reachable from the sandbox (connection
 # blackholed), so the tarball fetch walks a mirror chain and takes the
@@ -17,16 +24,21 @@
 # the tarball across wipes; the install prefix is arg 2.
 #
 # Usage: scripts/ensure_gas_247.sh [target-triple] [install-prefix]
-#   target-triple defaults to riscv64-linux-gnu. The assembler is installed
-#   as <prefix>/bin/as and its version is printed on success.
+#   target-triple defaults to riscv64-linux-gnu. The tools are installed
+#   as <prefix>/bin/as and <prefix>/bin/objdump, and their versions are
+#   printed on success.
 set -euo pipefail
 
 target=${1:-riscv64-linux-gnu}
 prefix=${2:-${HOME}/.cache/gas-2.47-${target}}
 as="$prefix/bin/as"
+od="$prefix/bin/objdump"
 
-if [[ -x "$as" ]]; then
+# BOTH binaries or a full rebuild: a cache carrying only one of the pair
+# is an interrupted provision, not a working oracle.
+if [[ -x "$as" && -x "$od" ]]; then
     "$as" --version | head -1
+    "$od" --version | head -1
     exit 0
 fi
 
@@ -81,4 +93,6 @@ cd "$build"
 make -j2 >make.log 2>&1
 mkdir -p "$prefix/bin"
 cp gas/as-new "$as"
+cp binutils/objdump "$od"
 "$as" --version | head -1
+"$od" --version | head -1

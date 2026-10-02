@@ -312,11 +312,17 @@ def check_asmdiff_gate_parity(local_text: str, hosted: str) -> int:
 # The encdiff corpus gate contract: the exact invocation both mirrors must
 # run. The corpus set is an INVARIANT, not a default — a third corpus file
 # is a real coverage change that must update this contract consciously
-# (same discipline as the pinned-oracle count in the parity tests).
+# (same discipline as the pinned-oracle count in the parity tests). So are
+# the two S18 pins: the 2.47 objdump (the disassembler decides BEATS/ok
+# verdicts — an unpinned objdump is an unpinned oracle, whatever binutils
+# the runner image ships) and the checked-in verdict histogram (the
+# aggregate record: BEATS -> ok-best drift, new rows, deleted rows and
+# brand-new verdict classes all fail until the baseline is re-recorded).
 ENCDIFF_CORPUS_FILES = (
     "tests/encdiff-corpus/index-fold-64.insn",
     "tests/encdiff-corpus/data16-branches-64.insn",
 )
+ENCDIFF_HISTOGRAM = "tests/encdiff-corpus/expected-verdicts.txt"
 
 
 def check_encdiff_gate_parity(local_text: str, hosted: str) -> int:
@@ -329,10 +335,14 @@ def check_encdiff_gate_parity(local_text: str, hosted: str) -> int:
     somewhere on the other side: a hosted-only edit — depinned --as,
     dropped --offline, a swapped corpus file, the wrong compiler mode,
     or removing the step while ci_local keeps its copy — passed every
-    other check in this module (the S16 audit response). This checker
-    closes that: both sides must run the same offline, quiet, pinned,
-    x86-64 invocation over the full corpus set, and the local side must
-    register it as the fast `encdiff-corpus` gate.
+    other check in this module (the S16 audit response). The S18 audit
+    response extends the contract to the verdict chain: --objdump must
+    be the same pinned 2.47 build as `as` (the disassembler decides the
+    BEATS/ok verdicts), and --expect-histogram must name the one
+    checked-in baseline. This checker closes all of it: both sides must
+    run the same offline, quiet, pinned, x86-64 invocation over the full
+    corpus set with the baseline check, and the local side must register
+    it as the fast `encdiff-corpus` gate.
     """
     missing = []
     for where, text in (("local", local_text), ("hosted", hosted)):
@@ -342,12 +352,15 @@ def check_encdiff_gate_parity(local_text: str, hosted: str) -> int:
             and "--quiet" in cmd
             and asm_option(cmd, "--lccc") == "target/fastbuild/lccc-x86"
             and "gas-2.47-x86_64-linux-gnu/bin/as" in (asm_option(cmd, "--as") or "")
+            and "gas-2.47-x86_64-linux-gnu/bin/objdump" in (asm_option(cmd, "--objdump") or "")
+            and asm_option(cmd, "--expect-histogram") == ENCDIFF_HISTOGRAM
             and set(ENCDIFF_CORPUS_FILES) == {t for t in cmd if t.endswith(".insn")}
             for cmd in commands
         ):
             missing.append(
                 f"{where}: encdiff-corpus gate "
                 "(--offline --quiet, lccc-x86, pinned GNU as 2.47, "
+                "pinned 2.47 objdump, verdict histogram baseline, "
                 "both 64-bit law corpora)"
             )
     if 'gate "encdiff-corpus" fast' not in local_text:

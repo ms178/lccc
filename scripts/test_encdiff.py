@@ -472,6 +472,75 @@ class OracleCommutativeAndSelectorViewTests(unittest.TestCase):
         self.assertTrue(encdiff.decodes_same(
             encdiff._OBJDUMP, without, withds, seg_dead64=True))
 
+    def test_fold_row_law_ignores_trailing_comments(self):
+        # The opt-in is decided on the COMMENT-STRIPPED source (S18 audit
+        # D3): corpus rows may carry trailing `#' comments, and a comment
+        # quoting a flip-shaped operand — exactly the documentation style
+        # this corpus uses — must not opt its row into the dead-segment
+        # strip. Before the fix, a non-flip row with such a comment had a
+        # dropped-prefix regression laundered into a pass (proven with the
+        # shipped predicate: the regex matched the comment text, and
+        # decodes_same(seg_dead64=True) returned True for wrong bytes).
+        adversarial = ("mov %ss:4(%rax), %rax"
+                       "  # unlike %ds:4(,%rbp,1), this row keeps its prefix")
+        # Non-vacuous both ways: the regex DOES match the raw line...
+        self.assertIsNotNone(encdiff._ROW_SEG_FOLD.search(adversarial))
+        # ...the comment IS legal assembler input (the row itself is a
+        # normal, non-flip instruction)...
+        clean = "mov %ss:4(%rax), %rax"
+        self.assertIsNone(encdiff._ROW_SEG_FOLD.search(clean))
+        # ...and classify derives the opt-in from the stripped source, so
+        # the adversarial row threads seg_dead64=False exactly like the
+        # clean one. A dropped 0x36 on this row compares UNEQUAL and fails
+        # the gate (asserted end-to-end below).
+        for insn in (adversarial, clean):
+            row = row_as(insn, b"L", gas=b"GAS")
+            with mock.patch.object(encdiff, "decodes_same",
+                                   return_value=True) as check:
+                encdiff.classify(row)
+            check.assert_called_once_with(encdiff._OBJDUMP, b"L", b"GAS",
+                                          bits32=False, seg_dead64=False)
+        withss = bytes.fromhex("36488b4004")   # ss kept (correct for this row)
+        dropped = bytes.fromhex("488b4004")    # regression: prefix dropped
+        self.assertFalse(encdiff.decodes_same(
+            encdiff._OBJDUMP, dropped, withss))
+        # And the real flip row still opts in (the law is not over-fixed):
+        flip = row_as("mov %ds:4(,%rbp,1), %rax", b"L", gas=b"GAS")
+        with mock.patch.object(encdiff, "decodes_same",
+                               return_value=True) as check:
+            encdiff.classify(flip)
+        check.assert_called_once_with(encdiff._OBJDUMP, b"L", b"GAS",
+                                      bits32=False, seg_dead64=True)
+
+    def test_verdict_histogram_counts_and_zero_projection_compare(self):
+        # The aggregate baseline check: counts only, compared through the
+        # NONZERO projection on both sides (a class recorded at 0 is
+        # documentation — the actual dict has no key for it, and raw dict
+        # equality would flag every zero row as drift). Drift, a new
+        # nonzero class, and a class missing from the baseline all fail.
+        rows = [row_as("a", b"L", gas=b"S"), row_as("b", b"LS", gas=b"S"),
+                row_as("c", b"L", gas=b"G")]
+        for r, verdict in zip(rows, ("BEATS", "LONGER", "BEATS")):
+            r.verdict = verdict
+        self.assertEqual(encdiff.verdict_histogram(rows),
+                         {"BEATS": 2, "LONGER": 1})
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td) / "hist.txt"
+            base.write_text("# comment line\n"
+                            "BEATS 2\nLONGER 1\nok 0\n")
+            self.assertTrue(encdiff.check_verdict_histogram(rows, base))
+            # Count drift fails:
+            rows[0].verdict = "ok-best"
+            self.assertFalse(encdiff.check_verdict_histogram(rows, base))
+            rows[0].verdict = "BEATS"
+            # A class appearing from zero fails:
+            rows[0].verdict = "ok"
+            self.assertFalse(encdiff.check_verdict_histogram(rows, base))
+            rows[0].verdict = "BEATS"
+            # An unparseable baseline fails loudly (not as a silent pass):
+            base.write_text("BEATS two\n")
+            self.assertFalse(encdiff.check_verdict_histogram(rows, base))
+
     def test_canon_insn_sorts_test_operands(self):
         self.assertEqual(
             encdiff._canon_insn("test %bpl,%al"),
