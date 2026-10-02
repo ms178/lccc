@@ -8310,6 +8310,19 @@ mod index_fold_tests {
         assert_eq!(hex("mov %fs:4(%r10), %rax"), "64 49 8b 42 04");
         assert_eq!(hex("mov %gs:8(,%r11,1), %rax"), "65 49 8b 43 08");
         assert_eq!(hex("mov %gs:8(%r11), %rax"), "65 49 8b 43 08");
+        // The ebp half of the flip set (S18 audit D7 — until now the law
+        // claimed {rbp, ebp} but only rbp was pinned, in either mode): a
+        // 32-bit index in 64-bit mode rides the 0x67 addr32 form, the fold
+        // moves ebp into the base slot, and the class flips DS -> SS —
+        // `ss:4(,%ebp,1)' elides the 0x36 exactly like `ss:4(%ebp)' while
+        // GAS's raw SIB view keeps it, `ds:4(,%ebp,1)' keeps the 0x3e
+        // exactly like `ds:4(%ebp)' while GAS's raw view elides it. The
+        // corpus twins of these four rows are the flip-law rows of
+        // index-fold-64.insn (BEATS over GAS's 9-10-byte SIB forms).
+        assert_eq!(hex("mov %ss:4(,%ebp,1), %rax"), "67 48 8b 45 04");
+        assert_eq!(hex("mov %ss:4(%ebp), %rax"), "67 48 8b 45 04");
+        assert_eq!(hex("mov %ds:4(,%ebp,1), %rax"), "3e 67 48 8b 45 04");
+        assert_eq!(hex("mov %ds:4(%ebp), %rax"), "3e 67 48 8b 45 04");
     }
 
     #[test]
@@ -8317,17 +8330,22 @@ mod index_fold_tests {
         // The APX x AVX-512 combination (S16 audit F3): `gp_id` accepts
         // r16-r31, so the fold fires for EGPR indexes through
         // `encode_evex_mem`/`evex_addr_bits` -- an unpinned behaviour
-        // expansion until these pins. The evidence basis differs from the
-        // classic rows: classic ICC (the folding oracle) predates APX, so
-        // there is no oracle that both knows EGPR and folds. The fold is
-        // justified instead by (a) the same effective-address equivalence
-        // -- the index contributes *1 and moves into the base slot -- and
-        // (b) byte-identity with the BASE-FORM spelling: GAS 2.47 accepts
-        // `vmovdqu8 (%r16),%xmm0' and every fold row below encodes exactly
-        // like its base twin (probed, both encoders). The extension bits
-        // move X4 -> B4 with the slot: byte1 bit3 (B4) SET for an r16+
-        // base, byte2 bit2 (X4, inverted) back to 1 with no index left --
-        // the EGPR twin of the classic X -> B law pinned above.
+        // expansion until these pins. The evidence basis (recorded here
+        // honestly, and widened in S18 from one-time probes to a CI
+        // oracle record): classic ICC (the folding oracle) predates APX,
+        // so no oracle both knows EGPR and folds. The justification is
+        // (a) the same effective-address equivalence -- the index
+        // contributes *1 and moves into the base slot -- plus (b)
+        // byte-identity with the BASE-FORM spelling that GAS 2.47 itself
+        // accepts and emits, and since S18 (c) the corpus rows themselves:
+        // `vmovdqu8 (,%r16,1), %xmm0' and its siblings run against the
+        // pinned as+objdump 2.47 pair in the encdiff-corpus gate on every
+        // push, landing BEATS over GAS's 11-byte SIB+disp32 form with
+        // round-trip verification -- the evidence is oracle-recorded, not
+        // merely probed. The extension bits move X4 -> B4 with the slot:
+        // byte1 bit3 (B4) SET for an r16+ base, byte2 bit2 (X4, inverted)
+        // back to 1 with no index left -- the EGPR twin of the classic
+        // X -> B law pinned above.
         assert_eq!(hex("vmovdqu8 (,%r16,1), %xmm0"), "62 f9 7f 08 6f 00");
         assert_eq!(hex("vmovdqu8 (%r16), %xmm0"), "62 f9 7f 08 6f 00");
         // r20: low3=100, the rsp-class -- the folded base takes the

@@ -1,0 +1,30 @@
+# encdiff corpus verdict histogram — the aggregate coverage record of the
+# two 64-bit law corpora (index-fold-64 + data16-branches-64), as run by
+# the encdiff-corpus gate against the pinned binutils 2.47 pair
+# (as + objdump). Counts only, never bytes: this file records what the
+# corpus IS (which verdicts, how many rows), so that
+#   - a verdict DRIFT (a row silently slipping BEATS -> ok-best) cannot
+#     hide behind the gate's per-row exit contract,
+#   - a new row, a deleted row, or a brand-new verdict class forces a
+#     conscious baseline update in the same commit,
+# while a BEATS row staying BEATS through better bytes needs no update.
+# Update this file in the same commit that changes the corpus (or the
+# encoder in a way that shifts verdicts); the gate fails otherwise.
+#
+# Every verdict class is listed explicitly — zeros included — so a class
+# appearing from zero is also a baseline change.
+WRONG-BYTES 0
+UNVERIFIED-BEATS 0
+UNVERIFIED-BYTES 0
+REJECTS-VALID 0
+LONGER 0
+BEATS 174
+DISAGREE 0
+ok-best 0
+ok 21
+DECLINED-FP 0
+DECLINED-WRONG 0
+DECLINED-DATA16 0
+ORACLE-INVALID 10
+NO-ORACLE 0
+both-reject 0

@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import redirect_stderr
 from io import StringIO
 from pathlib import Path
+import re
 import tempfile
 import unittest
 
@@ -83,32 +84,62 @@ class AsmDiffParityTest(unittest.TestCase):
                 self.assert_rejected(self.hosted.replace(self.i686, replacement, 1))
 
     def test_local_gates_require_the_pinned_oracle_and_installer(self) -> None:
-        pinned = "--as \"$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as\""
+        pinned = '--as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"'
+        objdump_pin = '--objdump "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump"'
         # Three local gates pin the 2.47 oracle: x86-asm-diff, i686-asm-diff
-        # and (since S15) the offline encdiff-corpus gate. The count is an
-        # INVARIANT: a fourth gate would have to justify its oracle pin to
-        # this test, and a dropped pin anywhere trips the mutation loop or
-        # the standalone-command parity below.
+        # and (since S15) the offline encdiff-corpus gate; the encdiff gate
+        # additionally pins the 2.47 DISASSEMBLER (since S18 — objdump
+        # decides the BEATS/ok verdicts, so an unpinned objdump is an
+        # unpinned oracle). Both counts are INVARIANTS: a new gate would
+        # have to justify its pins to this test, and a dropped pin anywhere
+        # trips the mutation loop below.
         self.assertEqual(self.local.count(pinned), 3)
+        self.assertEqual(self.local.count(objdump_pin), 1)
         # EVERY pin occurrence is behaviorally mutation-checked (the S16
-        # audit response closed the range(2) hole): depinning occurrence i
-        # must be rejected by the parity checker that owns its gate. The
-        # owner is identified by the differential program the occurrence's
-        # command runs — the LAST `*.py` script named before the pin — so
-        # the two asm-diff occurrences assert against
-        # check_asmdiff_gate_parity and the encdiff occurrence against
-        # check_encdiff_gate_parity.
+        # audit response closed the range(2) hole; the S18 response made
+        # the dispatch token-based — the bare-substring rfind also matched
+        # `test_encdiff.py` and only worked because the asmdiff command
+        # line happened to sit closer). The owner of occurrence i is the
+        # differential program of the command the pin belongs to: the LAST
+        # `python3 scripts/<prog>.py` token before the pin, asserted to be
+        # one of the two differential drivers (test_* gates never own an
+        # --as pin).
         parts = self.local.split(pinned)
         self.assertEqual(len(parts) - 1, 3)
         for i in range(3):
             with self.subTest(occurrence=i):
-                owner_is_encdiff = (parts[i].rfind("encdiff.py")
-                                    > parts[i].rfind("asmdiff.py"))
-                checker = (parity.check_encdiff_gate_parity if owner_is_encdiff
+                programs = re.findall(
+                    r"python3\s+(scripts/(?:enc|asm)diff\.py)", parts[i])
+                self.assertTrue(programs, "no differential command before pin")
+                owner = programs[-1]
+                checker = (parity.check_encdiff_gate_parity
+                           if owner == "scripts/encdiff.py"
                            else parity.check_asmdiff_gate_parity)
                 local = pinned.join(parts[: i + 1]) + "--as as" + pinned.join(parts[i + 1 :])
                 with redirect_stderr(StringIO()):
+                    # The owning checker rejects the depinned gate ...
                     self.assertEqual(checker(local, self.hosted), 1)
+                    # ... and the NON-owning checker accepts it — proving the
+                    # dispatch is load-bearing: each mutation is caught by
+                    # exactly its owner, so routing an occurrence to the
+                    # wrong checker would let a depinned gate pass. (If a
+                    # future checker learns to parse both programs, this
+                    # assertion turns the overlap into a conscious update.)
+                    other = (parity.check_asmdiff_gate_parity
+                             if owner == "scripts/encdiff.py"
+                             else parity.check_encdiff_gate_parity)
+                    self.assertEqual(other(local, self.hosted), 0)
+        # The un-mutated tree passes BOTH checkers (non-vacuity of the
+        # 0-legs above: the non-owning checker is not simply always-1).
+        with redirect_stderr(StringIO()):
+            self.assertEqual(parity.check_asmdiff_gate_parity(self.local, self.hosted), 0)
+            self.assertEqual(parity.check_encdiff_gate_parity(self.local, self.hosted), 0)
+        # The objdump pin is mutation-checked through the same encdiff
+        # checker (a depinned disassembler must fail its gate).
+        with redirect_stderr(StringIO()):
+            self.assertEqual(parity.check_encdiff_gate_parity(
+                self.local.replace(objdump_pin, "--objdump objdump", 1),
+                self.hosted), 1)
         needle = "bash scripts/ensure_gas_247.sh x86_64-linux-gnu"
         with redirect_stderr(StringIO()):
             self.assertEqual(parity.check_asmdiff_gate_parity(
@@ -118,6 +149,10 @@ class AsmDiffParityTest(unittest.TestCase):
         # The offline encdiff corpus is byte-truth-dependent the same way
         # the asm-diff corpora are (GAS 2.44 emits different data16-branch
         # bytes; the corpus verdicts would shift under an unpinned oracle).
+        # VERDICT-truth-dependent too: objdump decides BEATS/ok through
+        # decodes_same, so the disassembler is pinned to the same 2.47
+        # build, and the verdict histogram baseline is part of the gate
+        # (aggregate drift cannot hide behind the per-row exit contract).
         # This is the LOCAL block-level pin (exact text as ci_local spells
         # it); the behavioral both-sides contract is
         # test_hosted_encdiff_command_must_match_the_local_gate_exactly.
@@ -126,6 +161,8 @@ class AsmDiffParityTest(unittest.TestCase):
             "    python3 scripts/encdiff.py --offline --quiet \\\n"
             "        --lccc target/fastbuild/lccc-x86 \\\n"
             '        --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" \\\n'
+            '        --objdump "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump" \\\n'
+            "        --expect-histogram tests/encdiff-corpus/expected-verdicts.txt \\\n"
             "        --file tests/encdiff-corpus/index-fold-64.insn \\\n"
             "        --file tests/encdiff-corpus/data16-branches-64.insn"
         )
@@ -135,6 +172,10 @@ class AsmDiffParityTest(unittest.TestCase):
             block.replace(
                 '--as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" ',
                 "--as as "),
+            block.replace(
+                '--objdump "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump"',
+                "--objdump objdump"),
+            block.replace("--expect-histogram tests/encdiff-corpus/expected-verdicts.txt ", ""),
             # Not a suffix-drop (a prefix of the real block is always a
             # substring); wiring the WRONG corpus is the detectable wrong
             # thing: the 64-bit law corpus, not its 32-bit sibling.
@@ -157,12 +198,13 @@ class AsmDiffParityTest(unittest.TestCase):
 
     def test_hosted_encdiff_command_must_match_the_local_gate_exactly(self) -> None:
         # Both-sides behavioral parity for the encdiff corpus gate (the
-        # S16 audit response). Path-level mirroring only proves the script
-        # path appears on both sides; a HOSTED-ONLY edit — depinned --as,
-        # dropped --offline, the wrong compiler, a swapped corpus — passed
-        # every pre-existing check (the local block pin never looked at
-        # the workflow). check_encdiff_gate_parity must accept the real
-        # mirrors and reject each hosted mutation.
+        # S16 audit response; extended in S18 to the verdict chain). Path-
+        # level mirroring only proves the script path appears on both
+        # sides; a HOSTED-ONLY edit — depinned --as or --objdump, dropped
+        # --offline or --expect-histogram, the wrong compiler, a swapped
+        # corpus — passed every pre-existing check (the local block pin
+        # never looked at the workflow). check_encdiff_gate_parity must
+        # accept the real mirrors and reject each hosted mutation.
         self.assertEqual(
             parity.check_encdiff_gate_parity(self.local, self.hosted), 0)
         block = self._encdiff_block(self.hosted)
@@ -170,6 +212,17 @@ class AsmDiffParityTest(unittest.TestCase):
             block.replace(
                 '--as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"',
                 "--as as"),
+            block.replace(
+                '--objdump "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump"',
+                "--objdump objdump"),
+            # The objdump flag dropped entirely: the gate falls back to the
+            # runner image's objdump — the unpinned-oracle class the pin
+            # exists to prevent. (Flag-to-newline, indentation-free, so the
+            # mutation is workflow- and ci_local-layout-agnostic.)
+            block.replace(
+                '--objdump "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump" \\\n', ""),
+            block.replace("--expect-histogram tests/encdiff-corpus/expected-verdicts.txt", ""),
+            block.replace("expected-verdicts.txt", "some-other-baseline.txt"),
             block.replace("--offline ", ""),
             block.replace("--quiet ", ""),
             block.replace("--lccc target/fastbuild/lccc-x86",
@@ -188,16 +241,21 @@ class AsmDiffParityTest(unittest.TestCase):
                     self.assertEqual(parity.check_encdiff_gate_parity(
                         self.local,
                         self.hosted.replace(block, mutation, 1)), 1)
-        # A local depinning must be rejected too (the occurrence loop in
+        # Local-side mutations must be rejected too (the occurrence loop in
         # test_local_gates_require_the_pinned_oracle_and_installer covers
-        # it via the same checker; this asserts the hosted side alone
-        # cannot satisfy the contract).
+        # the --as/--objdump pins via the same checker; this asserts the
+        # hosted side alone cannot satisfy a locally-mutated contract).
         local_block = self._encdiff_block(self.local)
-        with redirect_stderr(StringIO()):
-            self.assertEqual(parity.check_encdiff_gate_parity(
-                self.local.replace(local_block, local_block.replace(
-                    '--as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"',
-                    "--as as"), 1), self.hosted), 1)
+        for needle, replacement in (
+            ('--as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"', "--as as"),
+            ('--objdump "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump"', "--objdump objdump"),
+            ("--expect-histogram tests/encdiff-corpus/expected-verdicts.txt", ""),
+        ):
+            with self.subTest(local_pin=needle[:40]):
+                with redirect_stderr(StringIO()):
+                    self.assertEqual(parity.check_encdiff_gate_parity(
+                        self.local.replace(local_block, local_block.replace(
+                            needle, replacement), 1), self.hosted), 1)
 
 
 class FuzzDiscoveryParityTest(unittest.TestCase):

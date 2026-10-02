@@ -876,8 +876,9 @@ impl super::InstructionEncoder {
     /// into the base slot (ICC-verified on the AVX-512 load family), so
     /// its X/X4 bit moves to B/B4 exactly like the VEX family's
     /// `mem_vex_xb_bits`. EGPR indexes (r16-r31) ride the same fold —
-    /// X4 moves to B4 (byte-identical to the base-form spelling, probed
-    /// vs GAS 2.47; pinned in index_fold_tests::
+    /// X4 moves to B4, byte-identical to the base-form spelling; the
+    /// corpus rows run against the pinned as+objdump 2.47 pair in the
+    /// encdiff-corpus gate (pinned in index_fold_tests::
     /// fold_moves_the_egpr_index_through_avx512_evex). VSIB operands
     /// never fold (the index is a vector register, so
     /// `fold_index_into_base` declines).

@@ -235,3 +235,36 @@ vmovdqu8 (,%r12,1), %xmm0
 vmovdqu64 64(,%r11,1), %xmm0
 {evex} vmovq (,%r10,1), %xmm0
 vmovdqu8 16(,%r13,1), %xmm0
+
+# APX x AVX-512 EVEX (the S18 oracle record): `gp_id' accepts r16-r31, so
+# the fold fires for EGPR indexes exactly like the classic rows -- the
+# extension bit moves X4 -> B4 with the slot -- and the fold output is
+# byte-identical to the base-form spelling that GAS 2.47 itself accepts
+# and emits. These rows ARE the CI oracle record for that law (until S18
+# the pins were lccc==lccc twins plus one-time manual probes; the gate
+# now runs every row against the pinned as+objdump 2.47 pair): each fold
+# row lands BEATS over GAS's 11-byte SIB+disp32 form with round-trip
+# verification, the base twin is ok. A UNVERIFIED-BYTES verdict here
+# means the ORACLE PAIR must be fixed, never the row deleted (the gate
+# exits 1 on UNVERIFIED-* by design).
+vmovdqu8 (,%r16,1), %xmm0
+vmovdqu8 (%r16), %xmm0
+vmovdqu8 (,%r20,1), %xmm0
+vmovdqu8 (,%r24,1), %xmm0
+vmovdqu64 (,%r18,1), %xmm0
+vmovdqu8 -16(,%r16,1), %xmm0
+{evex} vmovq (,%r16,1), %xmm0
+
+# The ebp half of the {rbp, ebp} flip set (S18): a 32-bit index in 64-bit
+# mode rides the 0x67 addr32 form; the fold moves ebp into the base slot,
+# flips the default segment DS -> SS, and the dead-byte law
+# (_ROW_SEG_FOLD) unifies lccc's folded view with GAS's raw view on
+# exactly these rows -- `ss:4(,%%ebp,1)' elides the 0x36 like `ss:4(%%ebp)'
+# (6 bytes, both views agree SS is default post-fold), while GAS's own
+# SIB form KEEPS it (raw view: no base, DS default, ss meaningful); the
+# ds twins mirror it with the 0x3e. The Rust twins of all four rows:
+# index_fold_tests::fold_decides_segment_elision_on_the_folded_view.
+mov %ss:4(,%ebp,1), %rax
+mov %ss:4(%ebp), %rax
+mov %ds:4(,%ebp,1), %rax
+mov %ds:4(%ebp), %rax

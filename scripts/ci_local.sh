@@ -645,21 +645,29 @@ gate "i686-narrow-cmp-flag-law" fast \
     bash tests/regression/check_narrow_cmp_flag_law.sh
 
 # The encdiff corpus (index-fold-64: the S13/S15 index-fold families incl.
-# segment+fold and the AVX-512 EVEX fold; data16-branches-64: the 64-bit
-# data16-branch law) is the SEMANTIC record of every deliberate divergence
-# from GAS -- BEATS rows where lccc is provably shorter, DECLINED rows with
-# their policy notes. Until now NO gate ran it: only the 8 Rust byte-pins
-# protected the fold in CI, and a regression in any of the other ~170 rows
-# (or a wrong-vs-GAS encoding introduced by a future prefix emitter) would
-# have shipped silently. Offline (local GAS 2.47 only) so the gate is
-# network-independent; the remote-oracle enrichments stay in the slow lane.
-# encdiff exits 1 on WRONG-BYTES/UNVERIFIED-*/REJECTS-VALID/LONGER — the
-# exact classes this corpus exists to catch (ORACLE-INVALID rows -- GAS
-# emitting the truncated data16 forms -- are partitioned, not failures).
+# segment+fold and the APX x AVX-512 EVEX oracle record; data16-branches-64:
+# the 64-bit data16-branch law) is the SEMANTIC record of every deliberate
+# divergence from GAS -- BEATS rows where lccc is provably shorter, DECLINED
+# rows with their policy notes. Until S15 NO gate ran it; until S18 the
+# DISASSEMBLER that decides those verdicts was whatever objdump the host
+# image shipped (only `as' was pinned) and the aggregate verdict counts
+# were unchecked (a BEATS -> ok-best drift could hide forever). Both pins
+# and the baseline are now part of the contract:
+#   --as/--objdump  the 2.47 oracle PAIR from one build (the gate's bytes
+#                   AND verdicts come from pinned tools),
+#   --expect-histogram  the checked-in verdict-count baseline — any count
+#                   change (drift, a new row, a deleted row) fails the
+#                   gate until the baseline is consciously re-recorded.
+# encdiff exits 1 on WRONG-BYTES/UNVERIFIED-*/REJECTS-VALID/LONGER and on a
+# histogram mismatch — the exact classes this corpus exists to catch
+# (ORACLE-INVALID rows -- GAS emitting the truncated data16 forms -- are
+# partitioned, not failures).
 gate "encdiff-corpus" fast \
     python3 scripts/encdiff.py --offline --quiet \
         --lccc target/fastbuild/lccc-x86 \
         --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" \
+        --objdump "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump" \
+        --expect-histogram tests/encdiff-corpus/expected-verdicts.txt \
         --file tests/encdiff-corpus/index-fold-64.insn \
         --file tests/encdiff-corpus/data16-branches-64.insn
 

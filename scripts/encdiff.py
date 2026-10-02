@@ -941,8 +941,14 @@ def classify(row: Row, bits32: bool = False) -> None:
     # The dead-ES/DS/SS unification is row-scoped (see _SEG_DEAD64): only
     # the segment+index-fold rows — the family whose folded view can
     # legitimately differ from GAS's raw bytes by one dead byte — opt in;
-    # every other row keeps full prefix discrimination.
-    seg_fold = _ROW_SEG_FOLD.search(row.insn) is not None
+    # every other row keeps full prefix discrimination. The opt-in is
+    # decided on the COMMENT-STRIPPED source, exactly like _canon_insn:
+    # corpus rows may carry trailing `#' comments, and a comment quoting a
+    # flip-shaped operand (`... # unlike %ds:4(,%rbp,1), this row ...')
+    # must not opt its row into the strip — that would launder a
+    # dead-prefix regression on a non-flip row into a pass (the S18
+    # audit's D3, proven with the shipped predicate before the fix).
+    seg_fold = _ROW_SEG_FOLD.search(row.insn.split("#")[0]) is not None
     ok_oracles = {k: v for k, v in row.oracles.items() if v.ok and v.data is not None}
 
     if not ok_oracles:
@@ -1217,12 +1223,76 @@ def read_casefiles(paths: list[str]) -> list[str]:
     return out
 
 
+def verdict_histogram(rows: list["Row"]) -> dict[str, int]:
+    """Per-verdict row counts of a finished run (the aggregate record)."""
+    counts: dict[str, int] = {}
+    for r in rows:
+        counts[r.verdict] = counts.get(r.verdict, 0) + 1
+    return counts
+
+
+def check_verdict_histogram(rows: list["Row"], path: Path) -> bool:
+    """Fail unless the run's per-verdict counts equal the recorded baseline.
+
+    The corpus gate's exit contract catches WRONG-BYTES/UNVERIFIED-*/
+    REJECTS-VALID/LONGER — the per-row defects. It is deliberately blind
+    to verdict DRIFT: a row silently slipping BEATS -> ok-best (a lost
+    5-byte win, say) keeps the gate green forever. The checked-in
+    histogram makes the aggregate a contract: any count change — drift,
+    a new row, a deleted row, a whole new verdict class appearing —
+    fails the gate until the baseline is consciously re-recorded (the
+    same discipline as the pinned-oracle count in the parity tests).
+    Counts only, never bytes: the baseline records what the corpus IS,
+    not a byte-for-byte snapshot that would churn on every encoder
+    improvement (BEATS staying BEATS through better bytes is fine).
+    """
+    expected: dict[str, int] = {}
+    for line in path.read_text().splitlines():
+        line = line.split("#")[0].strip()
+        if not line:
+            continue
+        name, _, count = line.rpartition(" ")
+        try:
+            expected[name] = int(count)
+        except ValueError:
+            print(f"histogram baseline {path}: unparseable line {line!r}",
+                  file=sys.stderr)
+            return False
+    actual = verdict_histogram(rows)
+    # Compare through the nonzero projection on BOTH sides: a verdict class
+    # recorded at 0 is documentation (the class is pinned absent) — the
+    # actual dict simply has no key for it, and raw dict equality would
+    # flag every zero row as drift. Anything APPEARING from zero, any count
+    # change, and any class missing from the baseline still mismatches.
+    if {k: v for k, v in expected.items() if v} == \
+       {k: v for k, v in actual.items() if v}:
+        return True
+    print("verdict histogram drifted from the recorded baseline:", file=sys.stderr)
+    for name in sorted(set(expected) | set(actual)):
+        e, a = expected.get(name, 0), actual.get(name, 0)
+        marker = "  " if e == a else "->"
+        print(f"  {marker} {name:<18} {e:>4} {a:>4}", file=sys.stderr)
+    print("  update the baseline in the same commit that changed the corpus"
+          " (the histogram is the aggregate coverage record, not a"
+          " snapshot of bytes)", file=sys.stderr)
+    return False
+
+
 def main() -> int:
+    global _OBJDUMP
     ap = argparse.ArgumentParser(
         description="LCCC vs GAS/Clang/ICX/GCC encoding differential.")
     ap.add_argument("--lccc", default=os.environ.get("LCCC", "./target/release/lccc"))
     ap.add_argument("--as", dest="gas", default=os.environ.get("LCCC_GAS", "as"))
     ap.add_argument("--objcopy", default=os.environ.get("LCCC_OBJCOPY", "objcopy"))
+    # The disassembler decides BEATS/ok verdicts through decodes_same: it is
+    # as much an oracle as `as`, and the corpus gates pin it (the runner
+    # image's objdump is whatever binutils it ships — the exact unpinned-
+    # tool class the 2.47 `as' pin exists to prevent).
+    ap.add_argument("--objdump", default=os.environ.get("LCCC_OBJDUMP", "objdump"))
+    ap.add_argument("--expect-histogram", default=None, metavar="FILE", type=Path,
+                    help="fail unless the per-verdict row counts equal this"
+                         " recorded baseline (counts only, no bytes)")
     ap.add_argument("--insn", action="append", default=[],
                     help="one instruction (repeatable)")
     ap.add_argument("--file", action="append", default=[], metavar="FILE",
@@ -1244,6 +1314,7 @@ def main() -> int:
     ap.add_argument("--json", type=Path,
                     help="write a per-instruction scoreboard (bytes vs every oracle)")
     args = ap.parse_args()
+    _OBJDUMP = args.objdump
 
     insns: list[str] = list(args.insn)
     if args.file:
@@ -1405,7 +1476,12 @@ def main() -> int:
     bad = sum(counts.get(k, 0) for k in (
         "WRONG-BYTES", "UNVERIFIED-BEATS", "UNVERIFIED-BYTES",
         "REJECTS-VALID", "LONGER"))
-    return 1 if bad else 0
+    if bad:
+        return 1
+    if args.expect_histogram is not None:
+        if not check_verdict_histogram(rows, args.expect_histogram):
+            return 1
+    return 0
 
 
 if __name__ == "__main__":
