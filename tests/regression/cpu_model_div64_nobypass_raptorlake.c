@@ -1,11 +1,11 @@
 /* CPU tuning model — 64-bit division width bypass (`X86Tune::bypass_div64`).
  *
- * On Sandy Bridge..Skylake-X the measured DIV r64 throughput is 21-22 cycles
- * vs 6-11 for DIV r32 (uops.info DIV_R64/DIV_R32 TP_loop), so with
- * -mtune=skylake lccc guards every 64-bit div/idiv with a run-time
- * "(dividend | divisor) >> 32 == 0" test and takes `divl` when it holds.
+ * On Raptor Lake the div64 width bypass must be DISABLED: its tuning row
+ * does not satisfy the bypass predicate.  This fixture drives div/rem
+ * correctness without relying on a fast-path guard that must not exist.
+ * The companion assembly gate checks the no-bypass code shape.
  *
- * This test drives every edge of that guard — upper halves zero / non-zero in
+ * This test drives division edge cases — upper halves zero / non-zero in
  * either operand, the 2^32 boundary, all sign combinations, div/rem pairs,
  * and a pseudo-random sweep — and checks each result against an independent
  * reference computed with __int128 (which never reaches the bypassed code).

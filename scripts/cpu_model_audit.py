@@ -3,8 +3,8 @@
 
 The tuning model (`src/backend/x86/cpu_model.rs`) stores *numbers* with a
 provenance tag.  Comments rot; numbers can be re-derived.  This script makes
-the claim "every `[uops.info]` field equals the published measurement"
-executable:
+the claim "every `[uops.info]` field matches its published measurement
+within the field-specific rule declared in CHECKS" executable:
 
   1. for each model row it runs `lccc -mtune=<row> -S` with `LCCC_DUMP_TUNE=1`
      and parses the `key=value` dump;
@@ -25,9 +25,14 @@ and an accidental drift is not.  Run it after *every* edit of a row:
 Exit status: 0 = all fields verified or allow-listed, 1 = mismatch,
 2 = infrastructure error (binary / data missing).
 
-Tolerances: latencies and µop counts compare exactly; reciprocal throughput
-compares within 25 % (uops.info publishes `TP_ports` computed from port usage
-for most pages, `TP_loop` otherwise; the model keeps ×100 integers).
+Tolerances: non-division latencies and µop counts compare exactly.  The
+four dividend-dependent division latency extrema use `near` (within 15 %) to
+account for measurement/input-dependent ranges; they are NOT exact checks.
+Reciprocal throughput compares within 25 % (uops.info publishes `TP_ports`
+computed from port usage for most pages, `TP_loop` otherwise; the model keeps
+×100 integers).  This is an interactive maintainer audit, not a hermetic CI
+gate: first use fetches ~140 MB XML unless a local `--xml` cache is supplied.
+Do not add an implicit network dependency to CI or call a near match exact.
 """
 from __future__ import annotations
 

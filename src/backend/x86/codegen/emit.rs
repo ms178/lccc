@@ -8304,7 +8304,12 @@ impl ArchCodegen for X86Codegen {
             return;
         }
 
-        super::machinst_emit::emit_machinsts(&final_insts, &mut self.state.out);
+        super::machinst_emit::emit_machinsts_with_tune(
+            &final_insts,
+            &mut self.state.out,
+            &self.tune,
+            crate::backend::x86::cpu_model::div64_bypass_killed(),
+        );
 
         // Register-cache coherence (SOUNDNESS): the window's instructions
         // may write %rax/%rcx (pre-colored div staging, Phys destinations)
