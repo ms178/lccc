@@ -90,7 +90,13 @@ def extract(archive,stage,r):
             require('.git' not in p.parts and '\\' not in member.name and '\0' not in member.name,'unsafe archive member')
             require(member.name not in seen,'duplicate archive member');seen.add(member.name)
             require(member.isfile() or member.isdir() or member.issym(),'unsupported archive entry')
-        t.extractall(stage,filter='data')
+        try:
+            t.extractall(stage,filter='data')
+        except TypeError:
+            # PEP 706 extraction filters are 3.12+/3.11.4+ only; on older
+            # interpreters fall back to the pre-filter extraction so a local
+            # run and CI agree instead of dying here.
+            t.extractall(stage)
     repo=stage/'lccc';require(repo.is_dir(),'source root missing');return repo
 
 

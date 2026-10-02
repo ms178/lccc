@@ -200,7 +200,11 @@ def main(argv=None):
     # Preserve the original third positional quoted option-string, including
     # a single '-O2' (argparse would mistake that positional for an option).
     if len(argv)>=3 and argv[2]!='--opt' and not argv[2].startswith('--opt='):argv=argv[:2]+['--opt='+argv[2]]+argv[3:]
-    args=ap.parse_args(argv);benches=args.bench or DEFAULT_FAST+(sorted(HEAVY) if args.heavy else [])
+    # `bench` is a `nargs='*'` positional and optionals follow it, so
+    # `parse_args` closes the positional group at the first option and then
+    # rejects later names ("unrecognized arguments"); interspersed dispatch
+    # is the argparse entry point for exactly this shape.
+    args=ap.parse_intermixed_args(argv);benches=args.bench or DEFAULT_FAST+(sorted(HEAVY) if args.heavy else [])
     if len(set(benches))!=len(benches) or any(not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]*',b) for b in benches):
         ap.error('duplicate/unsafe benchmark name')
     # A unique common prefix avoids stale/concurrent default outputs. Explicit
