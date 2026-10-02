@@ -190,6 +190,20 @@ mov 2147483647(,%r15,1), %rcx
 # `ds:' on a non-SS-default fold stays dropped (`ds:4(,%%rax,1)' ->
 # `48 8b 40 04', the 4-byte base form). The 0x36-keep rows for r10
 # pin the never-a-default class (index->base=r10, DS default, ss kept).
+#
+# WHAT THIS GATE VERIFIES per row: the fold itself (ModRM/SIB/disp) and
+# the length verdict, on every row; the dead-prefix BYTE (0x26/0x2e/
+# 0x36/0x3e) wherever the row is not an rbp/ebp-index fold — the
+# explicit-base twins (`ss:4(%%rbp)', `ds:4(%%rbp)', `ds:4(%%rax)'), the
+# non-flip folds (`ds:4(,%%rax,1)', `ss:4(,%%rax,1)', the r10 rows) and
+# the inline-rendered %%fs/%%gs rows all compare their prefix byte and
+# fail the gate if lccc drops or swaps it. The two rbp-index flip rows
+# (`ss:4(,%%rbp,1)', `ds:4(,%%rbp,1)') CANNOT be byte-checked here:
+# their folded bytes legitimately differ from GAS's SIB bytes by exactly
+# the dead byte, so encdiff's dead-segment law (_ROW_SEG_FOLD) unifies
+# them on those rows only — their prefix bytes are pinned byte-exactly
+# in Rust instead: encoder mod.rs
+# index_fold_tests::fold_decides_segment_elision_on_the_folded_view.
 mov %ss:4(,%rbp,1), %rax
 mov %ss:4(%rbp), %rax
 mov %ds:4(,%rbp,1), %rax

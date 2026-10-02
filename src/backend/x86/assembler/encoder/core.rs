@@ -1154,10 +1154,37 @@ impl super::InstructionEncoder {
 /// `62 d1 7f 08 6f 02`, the same X->B bit movement in the EVEX P0
 /// byte, 6 bytes vs every other oracle's 11), so the fold is now
 /// applied in `encode_evex_mem` and its `evex_addr_bits` prefix
-/// helper derives from the same folded view.
+/// helper derives from the same folded view.  EGPR indexes (r16-r31)
+/// are in scope as well -- `gp_id` accepts them, the extension bit
+/// moves X4->B4 with the slot, and the fold output is byte-identical
+/// to the base-form spelling (GAS 2.47-probed; pinned in
+/// index_fold_tests::fold_moves_the_egpr_index_through_avx512_evex).
 pub(crate) fn fold_index_into_base(mem: &MemoryOperand) -> Option<MemoryOperand> {
-    if mem.base.is_some() || mem.scale.unwrap_or(1) != 1 {
+    if !folds_index_into_base(mem) {
         return None;
+    }
+    // `folds_index_into_base` proved the index exists and is a GPR; the
+    // unwrap is that check's payload, not an assumption.
+    let index = mem.index.as_ref().expect("predicate proved the index");
+    Some(MemoryOperand {
+        base: Some(index.clone()),
+        index: None,
+        scale: None,
+        ..mem.clone()
+    })
+}
+
+/// Whether [`fold_index_into_base`] would rewrite `mem`: the pure
+/// predicate behind the fold decision.
+///
+/// Callers that only need the yes/no answer (the segment-elision class in
+/// [`folded_base`], the AVX-512 `evex_addr_bits` view question) must use
+/// this and not construct the rewritten operand just to drop it — the
+/// fold builds a full `MemoryOperand` clone, predicate-only callers owe
+/// the operand nothing.
+pub(crate) fn folds_index_into_base(mem: &MemoryOperand) -> bool {
+    if mem.base.is_some() || mem.scale.unwrap_or(1) != 1 {
+        return false;
     }
     match &mem.displacement {
         // Any INTEGER displacement: an int8 range folds to a disp8 base
@@ -1169,21 +1196,14 @@ pub(crate) fn fold_index_into_base(mem: &MemoryOperand) -> Option<MemoryOperand>
         Displacement::None | Displacement::Integer(_) => {}
         // Symbol displacements keep the GAS-parity SIB form: folding them
         // is unevidenced and would change the relocation shape.
-        _ => return None,
+        _ => return false,
     }
     // Any GPR index (the parser already rejects non-GPR names there); the
     // index register's gp_id existence check keeps the fold honest if the
     // grammar ever widens.
-    let index = mem.index.as_ref()?;
-    if gp_id(&index.name).is_none() {
-        return None;
-    }
-    Some(MemoryOperand {
-        base: mem.index.clone(),
-        index: None,
-        scale: None,
-        ..mem.clone()
-    })
+    mem.index
+        .as_ref()
+        .is_some_and(|index| gp_id(&index.name).is_some())
 }
 
 /// `((B, B4), (X, X4))` extension bits of the FOLDED view of `mem`.
@@ -1250,7 +1270,7 @@ pub(crate) fn mem_vex_xb_bits(mem: &MemoryOperand) -> (bool, bool) {
 /// 64-bit flat mode, so this is a byte-waste/consistency defect, not a
 /// miscompile).
 pub(crate) fn folded_base(mem: &MemoryOperand) -> Option<&Register> {
-    if mem.base.is_none() && fold_index_into_base(mem).is_some() {
+    if folds_index_into_base(mem) {
         mem.index.as_ref()
     } else {
         mem.base.as_ref()

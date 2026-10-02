@@ -90,18 +90,25 @@ class AsmDiffParityTest(unittest.TestCase):
         # this test, and a dropped pin anywhere trips the mutation loop or
         # the standalone-command parity below.
         self.assertEqual(self.local.count(pinned), 3)
-        # The asmdiff-specific parity check only parses `asmdiff.py`
-        # invocations, so the mutation loop targets the two asm-diff
-        # occurrences (file order: x86-64 first, i686 second). The encdiff
-        # gate's pin is guarded by the standalone-command parity instead:
-        # hosted CI must run the identical `encdiff.py ... --as <pinned>`
-        # command, so a local depinning breaks that equality.
-        for i in range(2):
+        # EVERY pin occurrence is behaviorally mutation-checked (the S16
+        # audit response closed the range(2) hole): depinning occurrence i
+        # must be rejected by the parity checker that owns its gate. The
+        # owner is identified by the differential program the occurrence's
+        # command runs — the LAST `*.py` script named before the pin — so
+        # the two asm-diff occurrences assert against
+        # check_asmdiff_gate_parity and the encdiff occurrence against
+        # check_encdiff_gate_parity.
+        parts = self.local.split(pinned)
+        self.assertEqual(len(parts) - 1, 3)
+        for i in range(3):
             with self.subTest(occurrence=i):
-                parts = self.local.split(pinned)
+                owner_is_encdiff = (parts[i].rfind("encdiff.py")
+                                    > parts[i].rfind("asmdiff.py"))
+                checker = (parity.check_encdiff_gate_parity if owner_is_encdiff
+                           else parity.check_asmdiff_gate_parity)
                 local = pinned.join(parts[: i + 1]) + "--as as" + pinned.join(parts[i + 1 :])
                 with redirect_stderr(StringIO()):
-                    self.assertEqual(parity.check_asmdiff_gate_parity(local, self.hosted), 1)
+                    self.assertEqual(checker(local, self.hosted), 1)
         needle = "bash scripts/ensure_gas_247.sh x86_64-linux-gnu"
         with redirect_stderr(StringIO()):
             self.assertEqual(parity.check_asmdiff_gate_parity(
@@ -111,9 +118,9 @@ class AsmDiffParityTest(unittest.TestCase):
         # The offline encdiff corpus is byte-truth-dependent the same way
         # the asm-diff corpora are (GAS 2.44 emits different data16-branch
         # bytes; the corpus verdicts would shift under an unpinned oracle).
-        # Path-level parity only proves hosted CI runs scripts/encdiff.py
-        # somewhere; the ORACLE PIN needs its own invariant, so the gate
-        # block is matched as a unit, exactly as ci_local.sh spells it.
+        # This is the LOCAL block-level pin (exact text as ci_local spells
+        # it); the behavioral both-sides contract is
+        # test_hosted_encdiff_command_must_match_the_local_gate_exactly.
         block = (
             'gate "encdiff-corpus" fast \\\n'
             "    python3 scripts/encdiff.py --offline --quiet \\\n"
@@ -135,6 +142,62 @@ class AsmDiffParityTest(unittest.TestCase):
         ):
             with self.subTest(mutation=mutation[:60]):
                 self.assertNotIn(mutation, self.local)
+
+    @staticmethod
+    def _encdiff_block(text: str) -> str:
+        """The hosted encdiff command block, continuations included."""
+        lines = text.splitlines(keepends=True)
+        for i, line in enumerate(lines):
+            if line.strip().startswith("python3 scripts/encdiff.py"):
+                j = i
+                while lines[j].rstrip("\n").endswith("\\"):
+                    j += 1
+                return "".join(lines[i : j + 1])
+        raise AssertionError("no encdiff command in text")
+
+    def test_hosted_encdiff_command_must_match_the_local_gate_exactly(self) -> None:
+        # Both-sides behavioral parity for the encdiff corpus gate (the
+        # S16 audit response). Path-level mirroring only proves the script
+        # path appears on both sides; a HOSTED-ONLY edit — depinned --as,
+        # dropped --offline, the wrong compiler, a swapped corpus — passed
+        # every pre-existing check (the local block pin never looked at
+        # the workflow). check_encdiff_gate_parity must accept the real
+        # mirrors and reject each hosted mutation.
+        self.assertEqual(
+            parity.check_encdiff_gate_parity(self.local, self.hosted), 0)
+        block = self._encdiff_block(self.hosted)
+        mutations = (
+            block.replace(
+                '--as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"',
+                "--as as"),
+            block.replace("--offline ", ""),
+            block.replace("--quiet ", ""),
+            block.replace("--lccc target/fastbuild/lccc-x86",
+                          "--lccc target/fastbuild/lccc-i686"),
+            block.replace("index-fold-64.insn", "index-fold-32.insn"),
+            block.replace("data16-branches-64.insn", "data16-branches-32.insn"),
+            # The whole step removed: scripts/encdiff.py still runs in
+            # ci_local, so path parity stays green — only this checker
+            # notices the hosted corpus verification is gone.
+            "# encdiff corpus step removed",
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation[:60]):
+                self.assertNotEqual(mutation, block)
+                with redirect_stderr(StringIO()):
+                    self.assertEqual(parity.check_encdiff_gate_parity(
+                        self.local,
+                        self.hosted.replace(block, mutation, 1)), 1)
+        # A local depinning must be rejected too (the occurrence loop in
+        # test_local_gates_require_the_pinned_oracle_and_installer covers
+        # it via the same checker; this asserts the hosted side alone
+        # cannot satisfy the contract).
+        local_block = self._encdiff_block(self.local)
+        with redirect_stderr(StringIO()):
+            self.assertEqual(parity.check_encdiff_gate_parity(
+                self.local.replace(local_block, local_block.replace(
+                    '--as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"',
+                    "--as as"), 1), self.hosted), 1)
 
 
 class FuzzDiscoveryParityTest(unittest.TestCase):

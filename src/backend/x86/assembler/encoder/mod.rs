@@ -8280,6 +8280,73 @@ mod index_fold_tests {
         assert_eq!(hex("movl %ss:0(%rax), %eax"), "36 8b 00");
         assert_eq!(hex("movl %ss:(,%eax,1), %eax"), "36 67 8b 00");
         assert_eq!(hex("movl %ss:0(%eax), %eax"), "36 67 8b 00");
+        // The 64-bit twins of the encdiff corpus segment rows (REX.W; the
+        // corpus's exact displacements). On the two rbp-index flip rows
+        // (`ss:4(,%rbp,1)', `ds:4(,%rbp,1)') these pins are the ONLY
+        // byte-level guard: the corpus gate cannot see the dead prefix
+        // byte there by construction — its canonicaliser must unify
+        // lccc's folded view with GAS's raw view on exactly those rows
+        // (encdiff `_ROW_SEG_FOLD`), so the prefix byte's truth lives
+        // here. The base-form twins (`ss:4(%rbp)', `ds:4(%rbp)',
+        // `ds:4(%rax)', `ss:8(%r10)', the fs/gs rows) are additionally
+        // byte-identical to GAS 2.47's own encodings of the same source
+        // (probed; see the engineering record).
+        assert_eq!(hex("mov %ss:4(,%rbp,1), %rax"), "48 8b 45 04");
+        assert_eq!(hex("mov %ss:4(%rbp), %rax"), "48 8b 45 04");
+        assert_eq!(hex("mov %ds:4(,%rbp,1), %rax"), "3e 48 8b 45 04");
+        assert_eq!(hex("mov %ds:4(%rbp), %rax"), "3e 48 8b 45 04");
+        assert_eq!(hex("mov %ds:4(,%rax,1), %rax"), "48 8b 40 04");
+        assert_eq!(hex("mov %ds:4(%rax), %rax"), "48 8b 40 04");
+        // ss on a DS-default base stays KEPT in both views (never a
+        // default segment), fold or not:
+        assert_eq!(hex("mov %ss:4(,%rax,1), %rax"), "36 48 8b 40 04");
+        assert_eq!(hex("mov %ss:4(%rax), %rax"), "36 48 8b 40 04");
+        // The never-a-default class through an extended base (r10/r11):
+        // DS default, so an explicit ss/fs/gs is kept, with the fold
+        // moving REX.X -> REX.B exactly like the non-segment rows:
+        assert_eq!(hex("mov %ss:8(,%r10,1), %rax"), "36 49 8b 42 08");
+        assert_eq!(hex("mov %ss:8(%r10), %rax"), "36 49 8b 42 08");
+        assert_eq!(hex("mov %fs:4(,%r10,1), %rax"), "64 49 8b 42 04");
+        assert_eq!(hex("mov %fs:4(%r10), %rax"), "64 49 8b 42 04");
+        assert_eq!(hex("mov %gs:8(,%r11,1), %rax"), "65 49 8b 43 08");
+        assert_eq!(hex("mov %gs:8(%r11), %rax"), "65 49 8b 43 08");
+    }
+
+    #[test]
+    fn fold_moves_the_egpr_index_through_avx512_evex() {
+        // The APX x AVX-512 combination (S16 audit F3): `gp_id` accepts
+        // r16-r31, so the fold fires for EGPR indexes through
+        // `encode_evex_mem`/`evex_addr_bits` -- an unpinned behaviour
+        // expansion until these pins. The evidence basis differs from the
+        // classic rows: classic ICC (the folding oracle) predates APX, so
+        // there is no oracle that both knows EGPR and folds. The fold is
+        // justified instead by (a) the same effective-address equivalence
+        // -- the index contributes *1 and moves into the base slot -- and
+        // (b) byte-identity with the BASE-FORM spelling: GAS 2.47 accepts
+        // `vmovdqu8 (%r16),%xmm0' and every fold row below encodes exactly
+        // like its base twin (probed, both encoders). The extension bits
+        // move X4 -> B4 with the slot: byte1 bit3 (B4) SET for an r16+
+        // base, byte2 bit2 (X4, inverted) back to 1 with no index left --
+        // the EGPR twin of the classic X -> B law pinned above.
+        assert_eq!(hex("vmovdqu8 (,%r16,1), %xmm0"), "62 f9 7f 08 6f 00");
+        assert_eq!(hex("vmovdqu8 (%r16), %xmm0"), "62 f9 7f 08 6f 00");
+        // r20: low3=100, the rsp-class -- the folded base takes the
+        // SIB-base form exactly like the classic r12 fold:
+        assert_eq!(hex("vmovdqu8 (,%r20,1), %xmm0"), "62 f9 7f 08 6f 04 24");
+        assert_eq!(hex("vmovdqu8 (%r20), %xmm0"), "62 f9 7f 08 6f 04 24");
+        // r24 = 16+8: BOTH the classic B bit (reg bit 3) and the EGPR B4
+        // bit are set in byte1 -- 0xd9, not 0xf9:
+        assert_eq!(hex("vmovdqu8 (,%r24,1), %xmm0"), "62 d9 7f 08 6f 00");
+        assert_eq!(hex("vmovdqu8 (%r24), %xmm0"), "62 d9 7f 08 6f 00");
+        // Displacements ride the FVM (N=16) law through the fold exactly
+        // like the base form: multiples compress to disp8*N, so -16/16
+        // are disp8 rows (0xff/0x01):
+        assert_eq!(hex("vmovdqu8 -16(,%r16,1), %xmm0"), "62 f9 7f 08 6f 40 ff");
+        assert_eq!(hex("vmovdqu8 16(,%r16,1), %xmm0"), "62 f9 7f 08 6f 40 01");
+        // A W=1 row (vmovdqu64) and the {evex}-promoted scalar row ride
+        // the same path:
+        assert_eq!(hex("vmovdqu64 (,%r18,1), %xmm0"), "62 f9 fe 08 6f 02");
+        assert_eq!(hex("{evex} vmovq (,%r16,1), %xmm0"), "62 f9 fd 08 6e 00");
     }
 
     #[test]

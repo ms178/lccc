@@ -875,8 +875,12 @@ impl super::InstructionEncoder {
     /// `encode_evex_mem` encodes: an index-only scale-1 address folds
     /// into the base slot (ICC-verified on the AVX-512 load family), so
     /// its X/X4 bit moves to B/B4 exactly like the VEX family's
-    /// `mem_vex_xb_bits`. VSIB operands never fold (the index is a
-    /// vector register, so `fold_index_into_base` declines).
+    /// `mem_vex_xb_bits`. EGPR indexes (r16-r31) ride the same fold —
+    /// X4 moves to B4 (byte-identical to the base-form spelling, probed
+    /// vs GAS 2.47; pinned in index_fold_tests::
+    /// fold_moves_the_egpr_index_through_avx512_evex). VSIB operands
+    /// never fold (the index is a vector register, so
+    /// `fold_index_into_base` declines).
     fn evex_addr_bits(mem: &MemoryOperand) -> (bool, bool, bool, bool) {
         let folded = fold_index_into_base(mem);
         let mem = folded.as_ref().unwrap_or(mem);

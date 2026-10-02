@@ -593,9 +593,9 @@ _BRANCH_W32 = re.compile(r"^jmpw\b")
 # (Intel SDM Vol. 2, effect of segment-override prefixes in 64-bit mode:
 # only FS and GS are honored; CS/DS/ES/SS are fixed at base 0). objdump
 # renders the dead byte as a leading `ds `/`es `/`ss ` mnemonic token, so
-# encodings differing only by it decode to the same instruction and must
-# compare equal. The spellings that must NOT unify are spelled differently
-# by objdump and therefore cannot match this regex: FS/GS render inline
+# encodings differing only by it decode to the same instruction. The
+# spellings that must NOT unify are spelled differently by objdump and
+# therefore cannot match this regex: FS/GS render inline
 # (`mov %fs:0x4(%rax),%rax`), NOTRACK renders as its own mnemonic
 # (`notrack jmp *%rax`, byte 3e on an indirect branch — semantically real
 # under CET), and branch hints render as `,pt`/`,pn` suffixes (`je,pt`).
@@ -603,7 +603,34 @@ _BRANCH_W32 = re.compile(r"^jmpw\b")
 # historically-defined hint partner, and there is no reason to unify a
 # byte any oracle chose to emit. 32-bit mode strips nothing: every
 # override selects a real descriptor there.
+#
+# The law is NOT applied unconditionally (the S16 audit response): a
+# corpus whose only dead-segment divergence is the index-fold family was
+# no reason to blind every other 64-bit comparison — the token would be
+# invisible to ANY corpus, ad-hoc --insn run or future casefile, and a
+# wrongly-dropped/kept byte there would pass silently. Instead the strip
+# is scoped by _ROW_SEG_FOLD (below) to exactly the rows where lccc's
+# FOLDED view of the operand can disagree with GAS's raw view: the
+# index-only scale-1 fold moving rbp/ebp into the base slot flips the
+# default-segment class (DS -> SS; the elision match in the encoder is
+# name-based rbp/ebp/rsp/esp — rsp/esp cannot be an index, and r12/r13
+# fold to non-matching names, so the flip set is exactly {rbp, ebp}).
+# Everywhere else both encoders decide identically, the strip would be a
+# no-op for CORRECT bytes — and the only thing it could ever hide is a
+# regression, so it is not applied. The prefix byte on the two flip rows
+# is byte-pinned in Rust instead (encoder mod.rs
+# index_fold_tests::fold_decides_segment_elision_on_the_folded_view).
 _SEG_DEAD64 = re.compile(r"^(?:ds|es|ss)\s+(?=[a-z])")
+# A row whose SOURCE asks for a segment override on the index-only
+# scale-1 operand that folds rbp/ebp into the base slot: the one family
+# where the encoder's folded-view segment decision can diverge from
+# GAS's raw-view bytes (see the _SEG_DEAD64 law comment). Displacements:
+# integer or none — symbol displacements never fold (the encoder guard),
+# so those rows keep full discrimination too.
+_ROW_SEG_FOLD = re.compile(
+    r"%(?:cs|ds|es|fs|gs|ss)\s*:\s*"
+    r"(?:[-+]?(?:0[xX][0-9a-fA-F]+|\d+))?"
+    r"\(\s*,\s*%(?:r|e)bp\s*,\s*1\s*\)")
 # Direct branch to an absolute target: rewritten with BOTH comparison
 # invariants (see _branch_marker).
 _BRANCH_TARGET = re.compile(
@@ -739,8 +766,15 @@ def _stream_equal(a: str, b: str) -> bool:
     return True
 
 
-def _canon_insn(insn: str, bits32: bool = False) -> str:
-    """Canonicalise disassembly spellings that differ only by encoding choice."""
+def _canon_insn(insn: str, bits32: bool = False, seg_dead64: bool = False) -> str:
+    """Canonicalise disassembly spellings that differ only by encoding choice.
+
+    `seg_dead64` opts the comparison into the dead-ES/DS/SS unification
+    (_SEG_DEAD64): it is set per ROW (see classify) for exactly the
+    index-fold rows whose folded view can legitimately differ from GAS's
+    bytes by a dead segment byte. The default keeps every other 64-bit
+    comparison fully discriminating on the prefix byte.
+    """
     insn = insn.split("#")[0].strip().lower()
     # Objdump marks an EVEX-only mnemonic's legal VEX row with a GNU pseudo
     # prefix (`{vex} vpdpbusds`). It describes the selected encoding, not a
@@ -756,10 +790,12 @@ def _canon_insn(insn: str, bits32: bool = False) -> str:
     insn = _DEAD66_BRANCH.sub(r"\1", insn)
     if bits32:
         insn = _BRANCH_W32.sub("jmp", insn)
-    else:
+    elif seg_dead64:
         # ES/DS/SS overrides are architecturally dead on 64-bit data
-        # accesses; encodings differing only by the byte must compare
-        # equal (see the _SEG_DEAD64 law comment).
+        # accesses; on the index-fold rows (seg_dead64) encodings differing
+        # only by the byte must compare equal — lccc's folded form drops
+        # the no-op override where GAS's SIB form keeps the meaningful one
+        # (see the _SEG_DEAD64 law comment).
         insn = _SEG_DEAD64.sub("", insn)
     insn = _SCALE1.sub(r"(%\1)", insn)
     insn = _ZERODISP.sub("(", insn)
@@ -813,7 +849,7 @@ def _canon_insn(insn: str, bits32: bool = False) -> str:
 
 
 def decodes_same(objdump: str, a: bytes, b: bytes,
-                 bits32: bool = False) -> bool | None:
+                 bits32: bool = False, seg_dead64: bool = False) -> bool | None:
     """Compare disassembly, returning None when it cannot be verified.
 
     False means both byte strings decoded successfully but to different
@@ -840,7 +876,7 @@ def decodes_same(objdump: str, a: bytes, b: bytes,
                 r"^\s+([0-9a-f]+):\s+((?:[0-9a-f]{2} )+)\s*\t(.*)$", line)
             if not m:
                 continue
-            insn = _canon_insn(m.group(3), bits32=bits32)
+            insn = _canon_insn(m.group(3), bits32=bits32, seg_dead64=seg_dead64)
             # Branch targets: rewrite with both comparison invariants so
             # a short and a near encoding of the same branch compare
             # equal exactly when they transfer to the same place (see
@@ -864,7 +900,7 @@ def decodes_same(objdump: str, a: bytes, b: bytes,
 
 
 def _roundtrip_same_as(row: Row, references: list[bytes],
-                       bits32: bool = False) -> bool | None:
+                       bits32: bool = False, seg_dead64: bool = False) -> bool | None:
     """Require the candidate to decode like every distinct reference form.
 
     `None` is fail-closed: without a usable disassembly there is no semantic
@@ -872,7 +908,8 @@ def _roundtrip_same_as(row: Row, references: list[bytes],
     """
     if not row.lccc.ok or row.lccc.data is None or not references:
         return None
-    results = [decodes_same(_OBJDUMP, row.lccc.data, ref, bits32=bits32)
+    results = [decodes_same(_OBJDUMP, row.lccc.data, ref, bits32=bits32,
+                            seg_dead64=seg_dead64)
                for ref in sorted(set(references))]
     if any(result is False for result in results):
         return False
@@ -882,9 +919,10 @@ def _roundtrip_same_as(row: Row, references: list[bytes],
 
 
 def _classify_roundtrip(row: Row, references: list[bytes], success: str,
-                        bits32: bool = False) -> None:
+                        bits32: bool = False, seg_dead64: bool = False) -> None:
     """Assign a byte-different verdict only after semantic round-trip proof."""
-    same = _roundtrip_same_as(row, references, bits32=bits32)
+    same = _roundtrip_same_as(row, references, bits32=bits32,
+                              seg_dead64=seg_dead64)
     if same is True:
         row.verdict = success
         row.note = (row.note + " | " if row.note else "") + \
@@ -900,6 +938,11 @@ def _classify_roundtrip(row: Row, references: list[bytes], success: str,
 
 
 def classify(row: Row, bits32: bool = False) -> None:
+    # The dead-ES/DS/SS unification is row-scoped (see _SEG_DEAD64): only
+    # the segment+index-fold rows — the family whose folded view can
+    # legitimately differ from GAS's raw bytes by one dead byte — opt in;
+    # every other row keeps full prefix discrimination.
+    seg_fold = _ROW_SEG_FOLD.search(row.insn) is not None
     ok_oracles = {k: v for k, v in row.oracles.items() if v.ok and v.data is not None}
 
     if not ok_oracles:
@@ -984,9 +1027,11 @@ def classify(row: Row, bits32: bool = False) -> None:
         row.note = "oracles differ: " + ", ".join(
             f"{k}={len(v.data)}B" for k, v in sorted(ok_oracles.items()))
         if n < best:
-            _classify_roundtrip(row, best_bytes, "BEATS", bits32=bits32)
+            _classify_roundtrip(row, best_bytes, "BEATS", bits32=bits32,
+                                seg_dead64=seg_fold)
         elif n == best:
-            _classify_roundtrip(row, best_bytes, "ok-best", bits32=bits32)
+            _classify_roundtrip(row, best_bytes, "ok-best", bits32=bits32,
+                                seg_dead64=seg_fold)
         elif is_wrong_shorter(row.insn):
             row.verdict = "DECLINED-WRONG"
             row.note += (f" | {best}B form from {','.join(best_who)} is not"
@@ -998,7 +1043,8 @@ def classify(row: Row, bits32: bool = False) -> None:
                          " NaN payload")
         else:
             row.note += f" | shortest is {best}B from {','.join(best_who)}"
-            _classify_roundtrip(row, best_bytes, "LONGER", bits32=bits32)
+            _classify_roundtrip(row, best_bytes, "LONGER", bits32=bits32,
+                                seg_dead64=seg_fold)
         return
 
     ref = next(iter(bytesets))
@@ -1010,7 +1056,8 @@ def classify(row: Row, bits32: bool = False) -> None:
         # honest after the round-trip proves the two forms are the same
         # program: an UNVERIFIED decline would mask a real mis-encoding
         # forever, so verification failure escalates instead.
-        same = _roundtrip_same_as(row, [ref], bits32=bits32)
+        same = _roundtrip_same_as(row, [ref], bits32=bits32,
+                                  seg_dead64=seg_fold)
         if same is True:
             row.verdict = "DECLINED-DATA16"
             if _DATA16_LOOP.match(row.insn):
@@ -1047,16 +1094,19 @@ def classify(row: Row, bits32: bool = False) -> None:
         row.note = (row.note + " | " if row.note else "") + (
             f"oracles agree on {len(ref)}B"
             f" ({','.join(sorted(ok_oracles))})")
-        _classify_roundtrip(row, [ref], "BEATS", bits32=bits32)
+        _classify_roundtrip(row, [ref], "BEATS", bits32=bits32,
+                            seg_dead64=seg_fold)
     elif n > len(ref):
         row.note = (row.note + " | " if row.note else "") + (
             f"oracles agree on {len(ref)}B"
             f" ({','.join(sorted(ok_oracles))})")
-        _classify_roundtrip(row, [ref], "LONGER", bits32=bits32)
+        _classify_roundtrip(row, [ref], "LONGER", bits32=bits32,
+                            seg_dead64=seg_fold)
     else:
         row.note = (row.note + " | " if row.note else "") + (
             f"same length, different bytes (oracle {ref.hex()})")
-        _classify_roundtrip(row, [ref], "ok", bits32=bits32)
+        _classify_roundtrip(row, [ref], "ok", bits32=bits32,
+                            seg_dead64=seg_fold)
 
 
 # Cases where a shorter encoding EXISTS but is deliberately not taken.
