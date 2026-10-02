@@ -59,7 +59,19 @@ fi
 
 src="$cache/binutils-$ver"
 build="$src-build-${target//-/_}"
-[[ -d $src ]] || tar -xJf "$tarball" -C "$cache"
+# A bare -d test is not enough: an interrupted extraction (harness wipe mid
+# tar, full disk, ...) leaves a tree that passes -d but has no configure,
+# which would wedge the gate until manual cleanup. Reuse the cached tree only
+# when its configure script is intact; otherwise re-extract atomically
+# (extract to a scratch dir, then rename into place) so no partially
+# extracted tree is ever visible to the build.
+if [[ ! -f "$src/configure" ]]; then
+    rm -rf "$src" "$src.extracting"
+    mkdir -p "$src.extracting"
+    tar -xJf "$tarball" -C "$src.extracting"
+    mv "$src.extracting/binutils-$ver" "$src"
+    rm -rf "$src.extracting"
+fi
 rm -rf "$build"
 mkdir -p "$build"
 cd "$build"

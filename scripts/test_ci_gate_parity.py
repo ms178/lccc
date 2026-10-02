@@ -84,7 +84,18 @@ class AsmDiffParityTest(unittest.TestCase):
 
     def test_local_gates_require_the_pinned_oracle_and_installer(self) -> None:
         pinned = "--as \"$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as\""
-        self.assertEqual(self.local.count(pinned), 2)
+        # Three local gates pin the 2.47 oracle: x86-asm-diff, i686-asm-diff
+        # and (since S15) the offline encdiff-corpus gate. The count is an
+        # INVARIANT: a fourth gate would have to justify its oracle pin to
+        # this test, and a dropped pin anywhere trips the mutation loop or
+        # the standalone-command parity below.
+        self.assertEqual(self.local.count(pinned), 3)
+        # The asmdiff-specific parity check only parses `asmdiff.py`
+        # invocations, so the mutation loop targets the two asm-diff
+        # occurrences (file order: x86-64 first, i686 second). The encdiff
+        # gate's pin is guarded by the standalone-command parity instead:
+        # hosted CI must run the identical `encdiff.py ... --as <pinned>`
+        # command, so a local depinning breaks that equality.
         for i in range(2):
             with self.subTest(occurrence=i):
                 parts = self.local.split(pinned)
@@ -95,6 +106,35 @@ class AsmDiffParityTest(unittest.TestCase):
         with redirect_stderr(StringIO()):
             self.assertEqual(parity.check_asmdiff_gate_parity(
                 self.local.replace(needle, "echo installer removed", 1), self.hosted), 1)
+
+    def test_encdiff_corpus_gate_pins_the_2_47_oracle(self) -> None:
+        # The offline encdiff corpus is byte-truth-dependent the same way
+        # the asm-diff corpora are (GAS 2.44 emits different data16-branch
+        # bytes; the corpus verdicts would shift under an unpinned oracle).
+        # Path-level parity only proves hosted CI runs scripts/encdiff.py
+        # somewhere; the ORACLE PIN needs its own invariant, so the gate
+        # block is matched as a unit, exactly as ci_local.sh spells it.
+        block = (
+            'gate "encdiff-corpus" fast \\\n'
+            "    python3 scripts/encdiff.py --offline --quiet \\\n"
+            "        --lccc target/fastbuild/lccc-x86 \\\n"
+            '        --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" \\\n'
+            "        --file tests/encdiff-corpus/index-fold-64.insn \\\n"
+            "        --file tests/encdiff-corpus/data16-branches-64.insn"
+        )
+        self.assertIn(block, self.local)
+        for mutation in (
+            block.replace("--offline ", ""),
+            block.replace(
+                '--as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" ',
+                "--as as "),
+            # Not a suffix-drop (a prefix of the real block is always a
+            # substring); wiring the WRONG corpus is the detectable wrong
+            # thing: the 64-bit law corpus, not its 32-bit sibling.
+            block.replace("data16-branches-64", "data16-branches-32"),
+        ):
+            with self.subTest(mutation=mutation[:60]):
+                self.assertNotIn(mutation, self.local)
 
 
 class FuzzDiscoveryParityTest(unittest.TestCase):

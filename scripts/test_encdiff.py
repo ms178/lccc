@@ -360,6 +360,45 @@ class OracleCommutativeAndSelectorViewTests(unittest.TestCase):
         self.assertEqual(encdiff._canon_insn("xchg %al,%bl"),
                          encdiff._canon_insn("xchg %bl,%al"))
 
+    def test_canon_strips_dead_segment_overrides_in_64bit_only(self):
+        # 64-bit mode ignores ES/DS/SS overrides on data accesses, so an
+        # encoding that dropped the dead byte must compare equal to one
+        # that kept it (`ds mov 0x4(%rax),%rax` == `mov 0x4(%rax),%rax`).
+        self.assertEqual(
+            encdiff._canon_insn("ds mov 0x4(%rax),%rax"),
+            encdiff._canon_insn("mov 0x4(%rax),%rax"))
+        self.assertEqual(
+            encdiff._canon_insn("ss mov 0x0(%rbp),%eax"),
+            encdiff._canon_insn("mov 0x0(%rbp),%eax"))
+        self.assertEqual(
+            encdiff._canon_insn("es mov (%r10),%xmm0"),
+            encdiff._canon_insn("mov (%r10),%xmm0"))
+        # The spellings that must NOT unify are spelled differently by
+        # objdump, so the regex cannot touch them: NOTRACK (semantic
+        # under CET), branch hints, FS/GS (rendered inline), and every
+        # CS row (0x2e is the hint partner on branches; leave it alone).
+        self.assertNotEqual(
+            encdiff._canon_insn("notrack jmp *%rax"),
+            encdiff._canon_insn("jmp *%rax"))
+        self.assertNotEqual(
+            encdiff._canon_insn("cs mov 0x4(%rax),%rax"),
+            encdiff._canon_insn("mov 0x4(%rax),%rax"))
+        self.assertNotEqual(
+            encdiff._canon_insn("mov %fs:0x4(%rax),%rax"),
+            encdiff._canon_insn("mov 0x4(%rax),%rax"))
+        self.assertNotEqual(
+            encdiff._canon_insn("mov %gs:0x4(%rax),%rax"),
+            encdiff._canon_insn("mov 0x4(%rax),%rax"))
+        # Segment operands inside the operand text are not leading tokens:
+        self.assertNotEqual(
+            encdiff._canon_insn("mov %ds,%eax"),
+            encdiff._canon_insn("mov %eax,%eax"))
+        # 32-bit mode strips nothing: every override selects a real
+        # descriptor there.
+        self.assertNotEqual(
+            encdiff._canon_insn("ds mov 0x4(%eax),%eax", bits32=True),
+            encdiff._canon_insn("mov 0x4(%eax),%eax", bits32=True))
+
     def test_canon_insn_sorts_test_operands(self):
         self.assertEqual(
             encdiff._canon_insn("test %bpl,%al"),

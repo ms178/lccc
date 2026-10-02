@@ -63,7 +63,32 @@ DEFAULT_FLAGS = "-O2"
 # object), so the timeout there is a host-speed artifact, not a regression
 # signal.  LCCC_REGRESSION_TIMEOUT_S overrides the budget for exactly that
 # case; the compile still has to SUCCEED, only the wall-clock budget moves.
-TIMEOUT_S = int(os.environ.get("LCCC_REGRESSION_TIMEOUT_S", "90"))
+
+
+def _timeout_s() -> int:
+    """The per-phase wall-clock budget, from LCCC_REGRESSION_TIMEOUT_S.
+
+    Fail CLOSED with the offending value in the message: an empty or
+    non-numeric setting is a CI misconfiguration (the `export VAR=` with
+    nothing after it, or a stray unit suffix), and the alternative --
+    ValueError traceback at import time -- costs a debugging round to even
+    find which knob broke. A budget below 1 s is the same class: it can
+    only ever produce TimeoutExpired on every row.
+    """
+    raw = os.environ.get("LCCC_REGRESSION_TIMEOUT_S", "90")
+    try:
+        budget = int(raw)
+    except ValueError:
+        raise SystemExit(
+            f"LCCC_REGRESSION_TIMEOUT_S must be an integer number of "
+            f"seconds, got {raw!r}") from None
+    if budget < 1:
+        raise SystemExit(
+            f"LCCC_REGRESSION_TIMEOUT_S must be >= 1 second, got {budget}")
+    return budget
+
+
+TIMEOUT_S = _timeout_s()
 
 BOLD = "\033[1m"
 RED = "\033[31m"

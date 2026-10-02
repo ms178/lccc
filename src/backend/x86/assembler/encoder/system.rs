@@ -396,7 +396,7 @@ impl super::InstructionEncoder {
     }
 
     /// Encode XSAVE-family: opcode /ext with optional forced REX.W (64-bit forms).
-    /// GNU as encodings (verified against binutils 2.44):
+    /// GNU as encodings (verified against GNU as 2.47, re-probed S15):
     ///   xsave m       0F AE /4      xsave64 m     REX.W 0F AE /4
     ///   xrstor m      0F AE /5      xrstor64 m    REX.W 0F AE /5
     ///   xsaveopt m    0F AE /6      xsaveopt64 m  REX.W 0F AE /6

@@ -1097,6 +1097,17 @@ impl super::InstructionEncoder {
         mem: &MemoryOperand,
         scale_n: u32,
     ) -> Result<(), String> {
+        // The same index-only scale-1 fold as `encode_modrm_mem`, with the
+        // same evidence class: classic ICC folds the whole AVX-512 load
+        // family (`vmovdqu8 (,%r10,1),%xmm0` -> `62 d1 7f 08 6f 02`, 6
+        // bytes vs the 11-byte SIB+disp32 form every other oracle emits),
+        // moving the extension bit X->B in the EVEX P0 byte. `evex_addr_bits`
+        // derives its prefix bits from this same folded view, and the
+        // disp8*N compression below then applies to the folded base form
+        // (a folded `-N` displacement compresses to disp8 = -N/N, which is
+        // how lccc beats even ICC's own mod=10+disp32 fold).
+        let folded = fold_index_into_base(mem);
+        let mem = folded.as_ref().unwrap_or(mem);
         // RIP-relative: same ModRM (mod=00 rm=101 + disp32) as the legacy
         // encoder, including `sym@GOTPCREL` / `@GOTTPOFF` / `@TLSDESC`.
         // `gotpcrel_x_type` then classifies AVX-512 EVEX as plain

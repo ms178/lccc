@@ -870,7 +870,16 @@ impl super::InstructionEncoder {
     /// APX EGPR addressing on AVX-512 EVEX (GAS 2.47):
     /// P0 bit3 = B4 of the GP base (not inverted); P1 bit2 = !X4 of the index.
     /// Classic EVEX required those bits 0 and 1 respectively (X4=B4=0).
+    ///
+    /// The bits come from the FOLDED view, the same operand
+    /// `encode_evex_mem` encodes: an index-only scale-1 address folds
+    /// into the base slot (ICC-verified on the AVX-512 load family), so
+    /// its X/X4 bit moves to B/B4 exactly like the VEX family's
+    /// `mem_vex_xb_bits`. VSIB operands never fold (the index is a
+    /// vector register, so `fold_index_into_base` declines).
     fn evex_addr_bits(mem: &MemoryOperand) -> (bool, bool, bool, bool) {
+        let folded = fold_index_into_base(mem);
+        let mem = folded.as_ref().unwrap_or(mem);
         let b_id = mem.base.as_ref().and_then(|b| gp_id(&b.name));
         let x_id = mem.index.as_ref().and_then(|i| gp_id(&i.name));
         let b3 = match b_id {

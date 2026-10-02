@@ -7,7 +7,7 @@ mod apx;
 mod avx;
 mod core;
 
-pub(crate) use self::core::mem_vex_xb_bits;
+pub(crate) use self::core::{fold_index_into_base, folded_base, mem_vex_xb_bits};
 mod gp_integer;
 mod promoted;
 mod registers;
@@ -1165,7 +1165,7 @@ impl InstructionEncoder {
         // choke point every instruction passes through. ────────────────────
         //
         // GAS places the segment override as the OUTERMOST legacy prefix
-        // (verified against GNU as 2.44 byte-for-byte across the whole
+        // (verified against GNU as 2.47 byte-for-byte across the whole
         // memory-operand instruction matrix: `65 66 0f 6e 00` movd,
         // `65 f2 0f 58 08` addsd, `65 f0 48 ff 00` lock incq, `65 c5 fd 6f
         // 00` vmovdqa, `65 67 41 8b 40 40` addr32+REX — the override always
@@ -1202,8 +1202,15 @@ impl InstructionEncoder {
                         // when the base register is rbp/ebp/rsp/esp (mod != 00
                         // or SIB base), %ds otherwise (`ss:(%rbp)` -> no 0x36,
                         // `ds:(%rsp)` -> 0x3e KEPT, `ds:(%rax)` -> dropped,
-                        // `ss:(%rax)` -> 0x36 kept — all byte-probed).
-                        let base_is_ss_default = mem.base.as_ref().is_some_and(|b| {
+                        // `ss:(%rax)` -> 0x36 kept — all byte-probed). The
+                        // class is decided on the FOLDED view (see
+                        // [`folded_base`]): an index that folds into the base
+                        // slot changes the default segment exactly like a
+                        // literal base register, so `ss:4(,%rbp,1)` elides
+                        // its no-op override and `ds:4(,%rbp,1)` keeps the
+                        // 0x3e — matching what this emitter does for the
+                        // same operand written as `4(%rbp)`.
+                        let base_is_ss_default = folded_base(mem).is_some_and(|b| {
                             matches!(
                                 b.name.to_ascii_lowercase().as_str(),
                                 "rbp" | "ebp" | "rsp" | "esp"
@@ -4083,7 +4090,8 @@ impl InstructionEncoder {
                     Err("incsspd requires a 32-bit register operand".to_string())
                 }
             }
-            // CET shadow-stack family (encodings verified against GNU binutils 2.44)
+            // CET shadow-stack family (encodings verified against GNU as
+            // 2.47 — re-probed with the 2.47 oracle, S15)
             "rstorssp" => self.encode_rstorssp(ops),
             "clrssbsy" => self.encode_clrssbsy(ops),
             "saveprevssp" => {
@@ -5341,8 +5349,9 @@ impl InstructionEncoder {
             "vpmadd52luq" => self.encode_avx_3op_38_pp_w1(ops, 0xB4, 1),
             "vpmadd52huq" => self.encode_avx_3op_38_pp_w1(ops, 0xB5, 1),
             // GFNI: binutils/GCC emit the legacy SSE forms for 128-bit
-            // (66 0F38/0F3A); VEX forms exist in the ISA but binutils 2.44
-            // neither assembles nor disassembles them. Match GNU as exactly.
+            // (66 0F38/0F3A; byte-verified against GAS 2.47, S15 re-probe);
+            // VEX forms exist in the ISA but binutils 2.44 neither
+            // assembled nor disassembled them. Match GNU as exactly.
             "gf2p8mulb" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0xCF]),
             "gf2p8affineqb" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0xCE]),
             "gf2p8affineinvqb" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0xCF]),
@@ -6375,7 +6384,8 @@ impl InstructionEncoder {
             "fxrstor" => self.encode_mem_only(ops, &[0x0F, 0xAE], 1), // 0F AE /1
             "fxsaveq" | "fxsave64" => self.encode_fxsaveq(ops),      // REX.W + 0F AE /0
             "fxrstorq" | "fxrstor64" => self.encode_fxrstorq(ops),   // REX.W + 0F AE /1
-            // XSAVE family (encodings verified against GNU as 2.44)
+            // XSAVE family (encodings verified against GNU as 2.47;
+            // the /5-vs-/3 xsaves/xrstors note below rides the same probe)
             "xsave" => self.encode_xsave_family(ops, &[0x0F, 0xAE], 4, false),
             "xsave64" => self.encode_xsave_family(ops, &[0x0F, 0xAE], 4, true),
             "xrstor" => self.encode_xsave_family(ops, &[0x0F, 0xAE], 5, false),
@@ -6385,7 +6395,7 @@ impl InstructionEncoder {
             "xsavec" => self.encode_xsave_family(ops, &[0x0F, 0xC7], 4, false),
             "xsavec64" => self.encode_xsave_family(ops, &[0x0F, 0xC7], 4, true),
             // Note: binutils encodes xsaves with ModRM /5 and xrstors with
-            // /3 (empirically verified against GNU as 2.44) — byte-identical.
+            // /3 (verified against GNU as 2.47) — byte-identical.
             "xsaves" => self.encode_xsave_family(ops, &[0x0F, 0xC7], 5, false),
             "xsaves64" => self.encode_xsave_family(ops, &[0x0F, 0xC7], 5, true),
             "xrstors" => self.encode_xsave_family(ops, &[0x0F, 0xC7], 3, false),
@@ -7243,7 +7253,8 @@ mod encoding_opt_tests {
 
     #[test]
     fn evex_dest_modrm_reg_and_tuple_disp8() {
-        // GAS 2.44: dest lives in ModRM.reg, not hard-wired 0.
+        // GAS 2.47 (and 2.44 before it): dest lives in ModRM.reg, not
+        // hard-wired 0.
         assert_eq!(hex("vpshufd $1, %zmm2, %zmm3"), "62 f1 7d 48 70 da 01");
         assert_eq!(
             hex("vpternlogd $0xaa, %zmm2, %zmm1, %zmm3"),
@@ -8207,31 +8218,68 @@ mod index_fold_tests {
     }
 
     #[test]
-    fn fold_keeps_avx512_evex_on_the_gas_sib_form() {
-        // encode_evex_mem intentionally does NOT fold (no corpus row
-        // evidences the EVEX form yet; see fold_index_into_base): prefix
-        // and ModR/M both encode the raw operand, so the SIB+disp32 row
-        // stays GAS-parity -- folded-prefix/raw-ModR/M would be the same
-        // silent-wrong-register class this module pins against.
+    fn fold_moves_the_extension_bit_in_avx512_evex_prefixes() {
+        // The AVX-512 EVEX path folds too (S15 red-team evidence: classic
+        // ICC folds the whole AVX-512 load family -- `vmovdqu8
+        // (,%r10,1),%xmm0` -> `62 d1 7f 08 6f 02`, X->B moved in the EVEX
+        // P0 byte, 6 bytes vs the 11-byte SIB+disp32 every other oracle
+        // emits). The prefix (`evex_addr_bits`) and the ModR/M
+        // (`encode_evex_mem`) share the one folded view. Bytes probed,
+        // not derived. The displacement rows are FVM (N=16): a
+        // non-multiple stays mod=10+disp32 (byte-identical to ICC's fold
+        // and to GAS's own base form), a multiple compresses to
+        // disp8*N -- the fold twin encodes EXACTLY like the base form.
+        assert_eq!(hex("{evex} vmovq (,%r10,1), %xmm0"), "62 d1 fd 08 6e 02");
+        assert_eq!(hex("vmovdqu8 (,%r10,1), %xmm0"), "62 d1 7f 08 6f 02");
         assert_eq!(
-            hex("{evex} vmovq (,%r10,1), %xmm0"),
-            "62 b1 fd 08 6e 04 15 00 00 00 00"
+            hex("vmovdqu8 -1(,%r10,1), %xmm0"),
+            "62 d1 7f 08 6f 82 ff ff ff ff"
+        );
+        assert_eq!(hex("vmovdqu8 -16(,%r10,1), %xmm0"), "62 d1 7f 08 6f 42 ff");
+        assert_eq!(hex("vmovdqu8 -16(%r10), %xmm0"), "62 d1 7f 08 6f 42 ff");
+        assert_eq!(hex("vmovdqu8 16(,%r13,1), %xmm0"), "62 d1 7f 08 6f 45 01");
+        // VSIB gathers never fold (vector index): SIB+disp32, GAS-parity.
+        assert_eq!(
+            hex("vgatherdpd %ymm5, 0x298(,%xmm4,1), %ymm6"),
+            "c4 e2 d5 92 34 25 98 02 00 00"
         );
     }
 
     #[test]
-    fn fold_preserves_the_gas_source_view_segment_verdict() {
-        // GAS decides ds/ss elision on the SOURCE operand: no base -> %ds
-        // default, so an explicit ds is dropped and ss is kept (probed:
-        // `mov %ds:(,%rbp,1),%eax` -> 8b 04 2d .., `mov %ss:(,%rbp,1),%eax`
-        // -> 36 8b 04 2d ..). The pre-fold scan in encode() does the same;
-        // the fold must not re-decide elision on the folded view --
-        // 0(%rbp) is ss-default, and re-deciding there would keep ds and
-        // drop ss, the exact opposite of GAS's bytes (in 64-bit flat mode
-        // both segments are base-0, so this is byte-parity, not
-        // wrong-code).
-        assert_eq!(hex("movl %ds:(,%rbp,1), %eax"), "8b 45 00");
-        assert_eq!(hex("movl %ss:(,%rbp,1), %eax"), "36 8b 45 00");
+    fn fold_decides_segment_elision_on_the_folded_view() {
+        // The default-SEGMENT class follows the FOLDED view (folded_base):
+        // the fold moves the index into the base slot, and %rbp in the
+        // base slot makes %ss the default -- so both spellings of one
+        // operand must elide/keep overrides identically:
+        //   `ss:(,%rbp,1)` elides 0x36 exactly like `ss:(%rbp)`,
+        //   `ds:(,%rbp,1)` keeps 0x3e exactly like `ds:(%rbp)` (an rbp
+        //   base makes SS default, so the DS override is architecturally
+        //   meaningful text even though 64-bit flat mode ignores the byte).
+        // The earlier law -- decide on the RAW operand because "GAS decides
+        // on the source" -- produced `ds:(,%rbp,1)` -> `8b 45 00` (override
+        // silently swapped to the SS default) next to `ds:(%rbp)` ->
+        // `3e 8b 45 00`: one operand, two encodings, and the executed
+        // segment no longer the one the source named. GAS itself cannot
+        // fold (its bytes are the SIB form), so byte-parity-with-GAS is
+        // unreachable on this family; parity with the equivalent base-form
+        // encoding is the invariant that survives (probed: GAS
+        // `mov %ds:(,%rbp,1),%eax` -> 8b 04 2d .. and
+        // `mov %ss:(,%rbp,1),%eax` -> 36 8b 04 2d .., the raw-view pair).
+        assert_eq!(hex("movl %ss:(,%rbp,1), %eax"), "8b 45 00");
+        assert_eq!(hex("movl %ss:0(%rbp), %eax"), "8b 45 00");
+        assert_eq!(hex("movl %ds:(,%rbp,1), %eax"), "3e 8b 45 00");
+        assert_eq!(hex("movl %ds:0(%rbp), %eax"), "3e 8b 45 00");
+        // A fold whose base stays DS-default keeps eliding `ds` and keeps
+        // an explicit `ss` -- both views agree there, and the bytes match
+        // the base-form twins (including the 0x67 pair: a 32-bit GPR in
+        // the base slot switches to 32-bit addressing, where (%eax) is
+        // the mod=00 direct form):
+        assert_eq!(hex("movl %ds:(,%rax,1), %eax"), "8b 00");
+        assert_eq!(hex("movl %ds:0(%rax), %eax"), "8b 00");
+        assert_eq!(hex("movl %ss:(,%rax,1), %eax"), "36 8b 00");
+        assert_eq!(hex("movl %ss:0(%rax), %eax"), "36 8b 00");
+        assert_eq!(hex("movl %ss:(,%eax,1), %eax"), "36 67 8b 00");
+        assert_eq!(hex("movl %ss:0(%eax), %eax"), "36 67 8b 00");
     }
 
     #[test]

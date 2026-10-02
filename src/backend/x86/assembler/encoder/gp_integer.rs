@@ -3059,7 +3059,7 @@ impl super::InstructionEncoder {
         }
     }
     // ---- CET shadow-stack family (Intel CET / SHSTK) ----
-    // Encodings verified against GNU binutils 2.44 (AT&T syntax):
+    // Encodings verified against GNU as 2.47 (AT&T syntax; re-probed S15):
     //   rstorssp m64      F3 0F 01 /5
     //   saveprevssp       F3 0F 01 EA        (fixed, no ModRM)
     //   setssbsy          F3 0F 01 E8        (fixed, no ModRM)
