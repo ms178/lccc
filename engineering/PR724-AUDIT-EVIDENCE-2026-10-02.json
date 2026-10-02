@@ -1,0 +1,125 @@
+{
+  "base": "dd263fe2a4d01a3527e2ceffb5680d730e143bf2",
+  "branch": "arena/01a0fbbb-lccc",
+  "changes": {
+    "bracketed": 7415,
+    "full_pinned_regeneration_identical_now": true,
+    "original_artifacts_regenerated_byte_identical_before_provenance_updates": true,
+    "parsed": 13562,
+    "raw_bytes": 7416817,
+    "raw_lines": 202940,
+    "raw_sha256": "2a106769af424f409410988ffe58e03f2853b9fe8bcbadab10ee4bbf9457ae5d",
+    "selected": 1567,
+    "unbracketed": 6147
+  },
+  "current": {
+    "copied": 1434,
+    "cpp_executed": 0,
+    "eligible_invocations": 102,
+    "executed_invocations": 0,
+    "filecheck_sources": 214,
+    "files": 1529,
+    "gnu_executed": 0,
+    "gnu_inventory": 18188,
+    "gnu_manifest_sha256": "e446652d34c0591397f0fa9b6b57d7c835dfa739382e52e529c8d68a6a8c98fc",
+    "header_indicator_records_all": 148,
+    "header_indicator_records_copied": 53,
+    "index_bytes": 9009749,
+    "index_sha256": "a487b25eea090f2d879de8b6f9df469a234e9d23b55338ac3bbbfa4d7426c9e5",
+    "languages": {
+      "c": 4797,
+      "c++": 279,
+      "unsupported": 54
+    },
+    "models": {
+      "clang-run": 4982,
+      "edg-options": 148
+    },
+    "phases": {
+      "codegen": 33,
+      "execute": 4,
+      "filecheck": 2612,
+      "frontend": 2398,
+      "link": 1,
+      "preprocess": 82
+    },
+    "planned_invocations": 5130,
+    "schema": "lccc-c-corpus-v2",
+    "skipped": 95
+  },
+  "date": "2026-10-02",
+  "fixture_proof": {
+    "all_bytes_equal_original_pr": true,
+    "body_vs_upstream_git_blobs": 1433,
+    "count": 1434,
+    "known_lossy_exception": "C/C23/n2927.sft.c; upstream invalid UTF-8 byte 0x92, importer replacement decoding; fixture preserved and execution unsupported",
+    "sorted_path_sha256_digest": "e8c6f459b274b1de67fc2802cdcc50d66ab52b0e923079003310b59f5b0aac3c"
+  },
+  "isolation": {
+    "corpus_sample_paths": 0,
+    "every_15th_sample": 64,
+    "first_party_sources": 950,
+    "sample_categories": {
+      "benchmark": 6,
+      "other": 2,
+      "regression": 56
+    }
+  },
+  "original": {
+    "copied": 1434,
+    "definition": "located means indexed line is not null; prefix mismatch counts nonempty legacy per-set prefix arrays with a different EDG option-set cardinality",
+    "filecheck_sources": 222,
+    "files": 1529,
+    "index_bytes": 8981513,
+    "infinity_tokens": 5,
+    "located_expectations": 15202,
+    "prefix_set_cardinality_mismatches": 541,
+    "skipped": 95
+  },
+  "original_pr_head": "0ed28f6de8ae0abb35ddbba735cc3feef617e043",
+  "scope": "compiler-free PR724 audit; no compiler builds, compiler queries, compiler corpus execution or performance measurements",
+  "validation": {
+    "changes_miner_assertions": 23,
+    "ci_parity_mutation_tests": 21,
+    "compiler_ci": "UNGATED",
+    "corpus_miner_selftests": 5,
+    "corpus_unittests": 232,
+    "differential_path_tests": 5,
+    "mirrored_ci_commands": 130,
+    "no_src_or_cargo_changes": true,
+    "offline_exact_history_production_proven": true,
+    "script_import_helpers": 124,
+    "workflow_shell_files": 2
+  },
+  "whitespace": {
+    "current": {
+      "copied": 707,
+      "exit_code": 2,
+      "nonfixture": [
+        [
+          "third_party_licenses/EDG-Clang-Apache-2.0-LLVM.txt",
+          "297",
+          "new blank line at EOF."
+        ]
+      ],
+      "total": 708
+    },
+    "original": {
+      "copied": 707,
+      "exit_code": 2,
+      "nonfixture": [
+        [
+          "docs/edg_changes_c_extract.md",
+          "33102",
+          "new blank line at EOF."
+        ],
+        [
+          "third_party_licenses/EDG-Clang-Apache-2.0-LLVM.txt",
+          "297",
+          "new blank line at EOF."
+        ]
+      ],
+      "total": 709
+    }
+  }
+}

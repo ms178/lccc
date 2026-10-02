@@ -1,0 +1,11 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// Origin: edgcpp/compiler tests/tests/imported/clang/c (Apache-2.0 WITH
+// LLVM-exception).  Adapted into LCCC by scripts/edg_corpus_mine.py.
+//type: fp
+//options:  --c
+// RUN: %clang_cc1 -fsyntax-only -verify -triple x86_64-linux %s
+
+#define EVAL_EXPR(testno, expr) int test##testno = sizeof(struct{char qq[expr];});
+
+EVAL_EXPR(1, ((char*)-1LL) + 1 == 0 ? 1 : -1) // expected-warning {{folded}}
+EVAL_EXPR(2, ((char*)-1LL) + 1 < (char*) -1 ? 1 : -1) // expected-warning {{folded}}

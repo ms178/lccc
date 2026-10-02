@@ -23,6 +23,7 @@ import os
 import re
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -86,6 +87,41 @@ class TestExecuteResult(unittest.TestCase):
         self.assertEqual(G._join(None, "\n"), "")
         self.assertEqual(G._join([], "\n"), "")
         self.assertEqual(G._join("already joined", "\n"), "already joined")
+
+
+class TestExecutionProtocol(unittest.TestCase):
+    def remote(self, response):
+        with mock.patch.object(G, 'USE_CACHE', False), mock.patch.object(G, '_ce_call',
+                side_effect=[{'code': 0, 'asm': [{'text': '\tret'}]}, response]):
+            return G.remote('cg162', 'int main(void){return 7;}', '-O2', True, 5)
+
+    def test_flattened_nonzero_exit_not_build_success(self):
+        result = self.remote({'didExecute': True, 'code': 7, 'buildResult': {'code': 0},
+                              'stdout': [{'text': 'program'}]})
+        self.assertTrue(result['ok']); self.assertEqual(result['exit'], 7)
+        self.assertEqual(result['stdout'], 'program')
+
+    def test_nested_nonzero_exit_and_empty_output_not_build_output(self):
+        result = self.remote({'didExecute': True, 'code': 0, 'buildResult': {'code': 0, 'stdout': [{'text': 'compiler banner'}]},
+                              'stdout': [], 'execResult': {'code': -6, 'stdout': []}})
+        self.assertTrue(result['ok']); self.assertEqual(result['exit'], -6)
+        self.assertEqual(result['stdout'], '')
+
+    def test_missing_boolean_or_resource_exit_evidence_is_not_green(self):
+        for response in ({'didExecute': True, 'buildResult': {'code': 0}},
+                         {'didExecute': True, 'code': False, 'buildResult': {'code': 0}},
+                         {'didExecute': True, 'code': 0, 'buildResult': {'code': 0}, 'timedOut': True}):
+            self.assertFalse(self.remote(response)['ok'])
+
+    def test_att_filter_shape_is_boolean_not_nested_dictionary(self):
+        with mock.patch.object(G, '_post', return_value={}) as post:
+            G._ce_call('cg162', 'int f(void){return 1;}', '-O2', False, 5)
+        options = post.call_args.args[1]['options']
+        self.assertIs(options['filters']['intel'], False)
+        self.assertIs(options['filters']['directives'], False)
+
+    def test_old_cache_namespace_is_not_reused(self):
+        self.assertNotEqual(GC.NS_ORACLE, 'oracle-v1')
 
 
 class TestOracleTable(unittest.TestCase):

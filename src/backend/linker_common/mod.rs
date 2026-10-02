@@ -145,7 +145,10 @@ pub use archive::{
 };
 
 // resolve_lib.rs
-pub use resolve_lib::{expand_file_mode_libs, resolve_lib, resolve_lib_positional};
+pub use resolve_lib::{
+    expand_file_mode_libs, resolve_lib, resolve_lib_positional, resolve_script_path,
+    script_input_spelling,
+};
 
 // write.rs
 pub use write::{align_up_64, pad_to, write_elf64_phdr, write_elf64_phdr_at, write_elf64_shdr};

@@ -31,11 +31,19 @@
 # Usage: tests/regression/check_peephole_whitespace.sh [--phase N]
 #   CCC=... path to the lccc binary (default target/fastbuild/lccc)
 #   PROFILE / JOBS  cargo profile and -j (default fastbuild / 2)
-#   CORPUS_EVERY=15 take every Nth tests/**/*.c for phase 3 (default 15)
+#   CORPUS_EVERY=15 sample the first-party C selection after corpus exclusion
+#   --list [root]  print that exact sample without running compilers
 set -uo pipefail
 
-repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+repo_root=$(CDPATH= cd -P -- "$(dirname -- "$(readlink -f -- "$0")")/../.." && pwd -P)
 cd "$repo_root"
+
+# Compiler-free enumeration is the EXACT phase-3 selection, not a test-only
+# replica. It runs before toolchain discovery and before any cargo command.
+if [[ ${1:-} == --list ]]; then
+    exec python3 scripts/corpus_selection.py "${2:-$repo_root/tests}" \
+      --every "${CORPUS_EVERY:-15}"
+fi
 
 # Prefer the persisted rustup installation: the phases drive `cargo test`
 # directly, and a bare environment (cron, CI shards, fresh shells) does not
@@ -136,13 +144,21 @@ if want_phase 3 "$ONLY_PHASE" || want_phase 4 "$ONLY_PHASE"; then
         bad "$CCC is missing or not executable: phases 3 and 4 would be vacuous"
     else
         corpus_dir=$(mktemp -d)
-        mapfile -t sources < <(find tests -name '*.c' -type f 2>/dev/null |
-            LC_ALL=C sort | awk -v n="$CORPUS_EVERY" 'NR % n == 1')
+        if ! python3 scripts/corpus_selection.py "$repo_root/tests" \
+            --every "$CORPUS_EVERY" > "$corpus_dir/sources.list"; then
+            bad "phase-3 source enumeration failed"
+            sources=()
+        else
+            mapfile -t sources < "$corpus_dir/sources.list"
+        fi
         note "== phase 3: generating assembly from ${#sources[@]} C sources with $CCC"
         generated=0
         compiled_out=0
-        for src in "${sources[@]}"; do
-            stem=$(basename "$src" .c)
+        for source_index in "${!sources[@]}"; do
+            src=${sources[source_index]}
+            # Source identity is the position in a unique, stable sorted list;
+            # equal basenames cannot overwrite another source's assembly.
+            stem="source${source_index}_$(basename "$src" .c)"
             for opt in -O0 -O1 -O2 -O3; do
                 dest="$corpus_dir/${stem}${opt}.s"
                 if timeout 120 "$CCC" $opt -S "$src" -o "$dest" >/dev/null 2>&1 &&

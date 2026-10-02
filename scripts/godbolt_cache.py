@@ -103,7 +103,7 @@ CACHE = Path(os.environ.get(
 # key space in one explicit step instead of leaving it to be mistaken for a
 # current result. Bump these again on any future change to a key's meaning.
 NS_ASM = "att-v3"          # AT&T-syntax assembly, text, one file per tuple
-NS_ORACLE = "oracle-v1"    # execution-oracle records, JSON
+NS_ORACLE = "oracle-v2"    # execution-oracle records, JSON
 NS_ENCDIFF = "encdiff-v2"  # raw CE /compile replies incl. binary opcodes, JSON
 
 

@@ -72,10 +72,9 @@ impl DynlibSym {
 /// Shared-library exports by name (the first library defining a name wins).
 pub(super) type DynlibSyms = FxHashMap<String, DynlibSym>;
 
-/// Linker scripts may include other linker scripts; GNU ld has no fixed
-/// limit, but a cycle must not hang the link.  Real toolchains nest at most
-/// one level (libc.so and libgcc_s.so name ELF objects directly).
-const MAX_SCRIPT_DEPTH: usize = 8;
+/// Linker scripts may include other linker scripts; the shared bound lives
+/// next to the script parser so every backend rejects the same nesting.
+const MAX_SCRIPT_DEPTH: usize = crate::backend::elf::MAX_LINKER_SCRIPT_DEPTH;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum LinkItemKind {

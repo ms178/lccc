@@ -935,15 +935,19 @@ impl Driver {
             let mut parser = Parser::new(tokens);
             parser.set_diagnostics(diagnostics);
             let ast = parser.parse();
-            if parser.error_count > 0 {
+            let diagnostics = parser.take_diagnostics();
+            // Lexer diagnostics were seeded into this engine before parsing.
+            // Count the complete frontend evidence, not only parser errors;
+            // never run sema on a translation unit already rejected by lexing.
+            if diagnostics.has_errors() {
                 return Err(format!(
-                    "{}: {} parse error(s)",
-                    input_file, parser.error_count
+                    "{}: {} frontend error(s)",
+                    input_file,
+                    diagnostics.error_count()
                 ));
             }
 
             // Semantic analysis.
-            let diagnostics = parser.take_diagnostics();
             let mut sema = SemanticAnalyzer::new();
             sema.set_diagnostics(diagnostics);
             if let Err(error_count) = sema.analyze(&ast) {

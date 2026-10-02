@@ -223,6 +223,18 @@ pub fn link_builtin(
     let mut needed_sonames: Vec<String> = Vec::new();
     let lib_path_strings: Vec<String> = lib_paths.iter().map(|s| s.to_string()).collect();
 
+    // Parse the user command line *before* loading any input.  A linker
+    // script passed as an input resolves its own `-l` references against the
+    // `-L` search path, so that path has to exist by the time the first input
+    // is read; parsing later left early inputs (CRT objects, user objects and
+    // scripts) searching only the driver's default directories.
+    let parsed_args = linker_common::parse_linker_args(user_args);
+
+    // `-L` directories first, in command-line order, then the defaults -- the
+    // order GNU ld searches in.
+    let mut all_lib_paths: Vec<String> = parsed_args.extra_lib_paths.clone();
+    all_lib_paths.extend(lib_path_strings.iter().cloned());
+
     // Load CRT objects before user objects
     for path in crt_objects_before {
         if Path::new(path).exists() {
@@ -231,7 +243,7 @@ pub fn link_builtin(
                 &mut objects,
                 &mut globals,
                 &mut needed_sonames,
-                &lib_path_strings,
+                &all_lib_paths,
                 false,
             )?;
         }
@@ -244,14 +256,12 @@ pub fn link_builtin(
             &mut objects,
             &mut globals,
             &mut needed_sonames,
-            &lib_path_strings,
+            &all_lib_paths,
             false,
         )?;
     }
 
     phase!("load-inputs");
-    // Parse user args using shared infrastructure
-    let parsed_args = linker_common::parse_linker_args(user_args);
     // Before the field moves below partially move `parsed_args`.
     let requested_dyn_flags = parsed_args.requested_dyn_flags();
     // `-z ibt=func` & co: accepted, ignored, and warned about — verbatim
@@ -273,7 +283,6 @@ pub fn link_builtin(
     // parsed args, and an invalid `-z x86-64-*` level should fail the link
     // before any real work happens anyway.
     let cet_flags = parsed_args.property_link_flags()?;
-    let extra_lib_paths = parsed_args.extra_lib_paths;
     let libs_to_load = parsed_args.libs_to_load;
     // Whether each `-l` in `libs_to_load` was written under `-Bstatic` (or
     // `-static`): its search then accepts only `libNAME.a`.  args.rs records
@@ -408,7 +417,7 @@ pub fn link_builtin(
                     &mut objects,
                     &mut globals,
                     &mut needed_sonames,
-                    &lib_path_strings,
+                    &all_lib_paths,
                     true,
                     as_needed_for(path),
                 )?;
@@ -420,14 +429,11 @@ pub fn link_builtin(
                 &mut objects,
                 &mut globals,
                 &mut needed_sonames,
-                &lib_path_strings,
+                &all_lib_paths,
                 false,
             )?;
         }
     }
-
-    let mut all_lib_paths: Vec<String> = extra_lib_paths;
-    all_lib_paths.extend(lib_path_strings.iter().cloned());
 
     // Load CRT objects after
     for path in crt_objects_after {

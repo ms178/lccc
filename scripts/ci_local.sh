@@ -254,10 +254,8 @@ DBGASSERT_CONFIG=(--config 'profile.fastbuild.debug-assertions=true'
     --config 'profile.fastbuild.incremental=false'
     --config 'profile.fastbuild.debug=0')
 cargo_test_dbgassert() {
-    local flags="" jobs=2 total_mb
+    local flags="" jobs="${CI_LOCAL_JOBS:-2}"
     [ -r target/lccc-rustflags ] && flags="$(cat target/lccc-rustflags)"
-    total_mb=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}')
-    [ -n "$total_mb" ] && [ "$total_mb" -lt 6000 ] && jobs=1
     CARGO_INCREMENTAL=0 RUSTFLAGS="$flags" cargo test --profile fastbuild \
         --all-targets --locked -j "$jobs" "${DBGASSERT_CONFIG[@]}"
 }
@@ -554,6 +552,25 @@ gate "ci-asm-diff-parity-self-test" fast \
 
 gate "encdiff-semantic-validation" fast \
     python3 scripts/test_encdiff.py
+
+# EDG/corpus compiler-free tooling contracts: the miner
+# self-tests, the mocked corpus-runner verdict contracts, and the corpus
+# exclusion path tests run without any compiler — they gate the TEST
+# INFRASTRUCTURE itself, which generic import checks cannot.
+gate "edg-changes-miner-selftest" fast \
+    python3 scripts/edg_changes_mine.py selftest
+gate "edg-corpus-miner-selftest" fast \
+    python3 scripts/edg_corpus_mine.py selftest
+gate "corpus-index-integrity" fast \
+    python3 scripts/edg_corpus_mine.py verify-index
+gate "edg-changes-artifact-integrity" fast \
+    python3 scripts/edg_changes_mine.py verify-artifacts
+gate "corpus-runner-contracts" fast \
+    python3 -m unittest discover -s tests/corpus -p 'test_*.py'
+gate "frontend-diagnostic-recovery" fast \
+    bash tests/regression/check_frontend_diagnostic_recovery.sh
+gate "differential-corpus-paths" fast \
+    python3 scripts/test_differential_corpus_paths.py
 
 gate "ra-web-inloop-use" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_ra_web_inloop_use.sh

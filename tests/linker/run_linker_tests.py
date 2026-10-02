@@ -2575,6 +2575,128 @@ def _as_needed_positional_test(args, oracles):
         shutil.rmtree(td, ignore_errors=True)
 
 
+def _script_as_needed_input_test(args, oracles):
+    """A linker script whose inputs are AS_NEEDED must still be an input.
+
+    The defect: script parsing went through the *filtered* accessor, which
+    drops everything inside `AS_NEEDED ( ... )`.  A script whose body is only
+    as-needed inputs — the shape distro `libgcc_s_asneeded.so` and `libc.so`
+    use — then parsed to "no inputs at all", and the loader rejected the file
+    as `not a valid ELF object or archive` instead of loading it.  Four
+    subcases, each against GNU ld on the same files:
+
+      all_as_needed   INPUT ( AS_NEEDED ( libfoo.so ) ) — referenced symbol:
+                      the DSO must be loaded and named in DT_NEEDED
+      unreferenced    same script, symbol not referenced: GNU drops the
+                      DT_NEEDED entry, and so must we
+      dash_l          GROUP ( AS_NEEDED ( -lfoo ) ) — the -l search path
+      missing         a script naming a file that does not exist must name
+                      the operand and the script, not silently drop it
+      cycle           a script that names itself must end in a bounded
+                      diagnostic, not stack exhaustion or a hang
+    """
+    name = "script_as_needed_input"
+    td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
+    try:
+        with open(os.path.join(td, "foo.c"), "w") as f:
+            f.write("int foo_value(void){ return 41; }\n")
+        r = sh([CC, "-shared", "-fPIC", "-O1", "-Wl,-soname,libfoo.so",
+                "foo.c", "-o", "libfoo.so"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "SKIP", r.stderr.decode()[:150])
+
+        # Uses the library -> the as-needed DSO is needed.
+        with open(os.path.join(td, "uses.c"), "w") as f:
+            f.write("extern int foo_value(void);\n"
+                    "int main(void){ return foo_value() == 41 ? 0 : 1; }\n")
+        # Does not use it -> GNU ld drops the DT_NEEDED entry.
+        with open(os.path.join(td, "plain.c"), "w") as f:
+            f.write("int main(void){ return 0; }\n")
+        for src, obj in (("uses.c", "uses.o"), ("plain.c", "plain.o")):
+            r = sh([CC, "-c", "-O1", "-fno-pic", src, "-o", obj], cwd=td)
+            if r.returncode != 0:
+                return Result(name, "SKIP", r.stderr.decode()[:150])
+
+        with open(os.path.join(td, "asneeded.so"), "w") as f:
+            f.write("/* GNU ld script */\nINPUT ( AS_NEEDED ( libfoo.so ) )\n")
+        with open(os.path.join(td, "asneeded_l.so"), "w") as f:
+            f.write("/* GNU ld script */\nGROUP ( AS_NEEDED ( -lfoo ) )\n")
+        with open(os.path.join(td, "missing.so"), "w") as f:
+            f.write("/* GNU ld script */\nINPUT ( libdefinitelyabsent.so )\n")
+        with open(os.path.join(td, "loop.so"), "w") as f:
+            f.write("/* GNU ld script */\nINPUT ( loop.so )\n")
+
+        lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+
+        def needed(linker, script, obj, out):
+            r = sh([linker, "-L" + td, "-dynamic-linker",
+                    "/lib64/ld-linux-x86-64.so.2", "-pie", obj, script,
+                    "-o", out], cwd=td, timeout=60)
+            if r.returncode != 0:
+                return None
+            d = sh(["readelf", "-dW", out], cwd=td).stdout.decode()
+            return sorted(re.findall(r"NEEDED\)\s+Shared library: \[([^\]]+)\]", d))
+
+        # 1+2: all-as-needed script, referenced and unreferenced.
+        for label, obj in (("all_as_needed", "uses.o"), ("unreferenced", "plain.o")):
+            got = needed(lccc_ld, "asneeded.so", obj, f"o.{label}")
+            want = needed("ld", "asneeded.so", obj, f"b.{label}")
+            if want is None:
+                continue
+            if got is None:
+                return Result(name, "FAIL",
+                              f"{label}: lccc-ld rejected an all-AS_NEEDED "
+                              f"linker script")
+            if got != want:
+                return Result(name, "FAIL",
+                              f"{label}: DT_NEEDED {got} != GNU ld {want}")
+
+        # 3: the -l form inside AS_NEEDED.
+        got = needed(lccc_ld, "asneeded_l.so", "uses.o", "o.dash_l")
+        want = needed("ld", "asneeded_l.so", "uses.o", "b.dash_l")
+        if want is not None:
+            if got is None:
+                return Result(name, "FAIL",
+                              "dash_l: lccc-ld rejected GROUP ( AS_NEEDED ( -lfoo ) )")
+            if got != want:
+                return Result(name, "FAIL",
+                              f"dash_l: DT_NEEDED {got} != GNU ld {want}")
+
+        # 4: a missing input is reported, not dropped.
+        r = sh([lccc_ld, "-L" + td, "plain.o", "missing.so", "-o", "o.missing"],
+               cwd=td, timeout=60)
+        if r.returncode == 0:
+            return Result(name, "FAIL",
+                          "missing: a script naming an absent file linked "
+                          "instead of reporting it")
+        err = r.stderr.decode()
+        if "libdefinitelyabsent.so" not in err or "missing.so" not in err:
+            return Result(name, "FAIL",
+                          f"missing: diagnostic names neither operand nor "
+                          f"script: {err[:200]!r}")
+
+        # 5: a self-referencing script terminates with a bounded diagnostic.
+        r = sh([lccc_ld, "-L" + td, "plain.o", "loop.so", "-o", "o.loop"],
+               cwd=td, timeout=60)
+        if r.returncode == 0:
+            return Result(name, "FAIL", "cycle: self-referencing script linked")
+        if r.returncode < 0:
+            return Result(name, "FAIL",
+                          f"cycle: killed by signal {-r.returncode} "
+                          f"(stack exhaustion?) instead of a diagnostic")
+        if "nested more than" not in r.stderr.decode():
+            return Result(name, "FAIL",
+                          f"cycle: no nesting diagnostic: "
+                          f"{r.stderr.decode()[:200]!r}")
+        return Result(name, "PASS")
+    except subprocess.TimeoutExpired:
+        return Result(name, "FAIL", "cycle: link did not terminate")
+    except Exception as e:
+        return Result(name, "FAIL", f"harness exception: {e!r}")
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
 def _print_map_test(args, oracles):
     """--print-map and -M must write a map to stdout, not silently do nothing.
 
@@ -10801,6 +10923,7 @@ def _registry(args, oracles):
         one("script_tls_gd_ld_relaxation", _script_tls_gd_ld_test, "script"),
         one("script_overlay_shared_vma", _script_overlay_test, "script"),
         one("as_needed_positional_dt_needed", _as_needed_positional_test, "driver"),
+        one("script_as_needed_input", _script_as_needed_input_test, "script", "driver"),
         one("bstatic_positional_search", _bstatic_positional_test, "driver"),
         one("print_map_to_stdout", _print_map_test, "map"),
         one("version_script_multiple_nodes", _multi_version_node_test, "exports"),

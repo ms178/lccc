@@ -110,3 +110,8 @@ tool-results/
 
 # A/B compiler binaries and scratch build outputs (large, machine-specific)
 work/
+
+# Generated corpus/document publication locks are synchronization state, not source.
+/docs/.edg-changes.lock
+/tests/corpus/clang-c/.index.lock
+/tests/corpus/.corpus-publish.lock
