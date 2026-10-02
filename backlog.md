@@ -925,6 +925,40 @@ per block: the moves are spread across cold blocks, and the hot inner loop
 runs **faster** than GCC (0.930x). Recorded so the next engineer does not
 spend a day on it: it is a size defect on a kernel that already wins.
 
+### EDG-TRANSPLANT · **NEW 2026-10-01** — mined the open-sourced EDG front end
+
+Register + evidence: [`docs/EDG_TRANSPLANT_ANALYSIS.md`](docs/EDG_TRANSPLANT_ANALYSIS.md)
+(14 items E1–E14, subsystem-by-subsystem, licensing adjudicated). Session
+narrative + mid-session harness-wipe doctrine:
+[`engineering/FOLLOWUP-2026-10-01-edg-transplant.md`](engineering/FOLLOWUP-2026-10-01-edg-transplant.md).
+
+Closed already: **E1** corpus miner (`scripts/edg_corpus_mine.py` selftest
+18/18 + `tests/corpus/`: 1 434 Apache Clang-C tests mined with SPDX
+attribution and `corpus-index.json` metadata (expectations, per-invocation
+`option_sets`, flag translation), runner
+`tests/corpus/run_clang_c_corpus.py`, 18 188 GPL-safe GNU test names
+manifested), **E2** (pinned Callgrind geometry in `scripts/callgrind_ab.py`
+with `manifest.json` evidence — no-PMU measurements now host-reproducible),
+**E7 accelerated** (`scripts/edg_changes_mine.py` dual-era parser: 13 562
+`Changes` entries losslessly parsed, 1 567 C-relevant extracted to
+`docs/edg_changes_c_extract.md` (918 KB) + full index — remaining work is
+curation into regression tests).  All three were re-opened and perfected
+against the PR #719 and #721 review audits (see
+[`docs/REVIEW_719_ADJUDICATION.md`](docs/REVIEW_719_ADJUDICATION.md) and
+[`docs/REVIEW_721_ADJUDICATION.md`](docs/REVIEW_721_ADJUDICATION.md)).
+
+Open, priority order (each needs a reproducer/measurement to move):
+**E1 remainder** corpus-vs-LCCC triage (runner exists; collect failures);
+**E7 remainder** curation;
+**E5** work-stack const-eval + step budget (`crash_synth_*` class);
+**E3** builtin-signature scrape+generate pipeline (kernel/glibc/expat
+fidelity); **E6** bit-field ABI differential corpus; **E4** diagnostic
+catalog+tags; **E8** macro expansion diagnostic notes; **E9**
+initializer/VLA corpus; **E13** expect recording + flake sonar; **E10** IR
+dump/diff; **E11** lccc daemon; **E12** shareable-const interning. T3
+(do-not-do, recorded in the analysis): template machinery/IFC, tree-IL
+transplant, committing generated giant headers.
+
 ## Closed this cycle (do not re-open without new evidence)
 <!-- durable here for grep-ability; narrative in engineering/journal/2026-09-W2.md and 2026-09-W3.md -->
 

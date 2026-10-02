@@ -13,6 +13,8 @@ reported as target-performance evidence.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import sys
 import concurrent.futures
 import dataclasses
 import json
@@ -23,6 +25,8 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
+sys.path.insert(0,str(Path(__file__).resolve().parent))
+from corpus_selection import source_paths
 from typing import Sequence
 
 
@@ -122,7 +126,7 @@ def compile_reference(
 
 def test_one(source: Path, tools: Toolchain, work_root: Path) -> Result:
     started = time.monotonic()
-    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(source.relative_to(tools.corpus_root)))
+    safe = source_key(source)
     work = work_root / safe
     work.mkdir(parents=True, exist_ok=True)
     assembly = work / "lccc.s"
@@ -197,8 +201,13 @@ def test_one(source: Path, tools: Toolchain, work_root: Path) -> Result:
         return Result(str(source), "HARNESS-ERROR", "spawn", time.monotonic() - started, str(error))
 
 
+def source_key(source: Path) -> str:
+    readable=re.sub(r'[^A-Za-z0-9_.-]+','_',source.stem)[:80]
+    return readable+'-'+hashlib.sha256(os.fsencode(source.resolve())).hexdigest()
+
+
 def discover(root: Path, recursive: bool) -> list[Path]:
-    iterator = root.rglob("*.c") if recursive else root.glob("*.c")
+    iterator = source_paths(root, recursive=recursive)
     return sorted(path.resolve() for path in iterator if path.is_file())
 
 

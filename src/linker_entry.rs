@@ -24,8 +24,9 @@ pub fn load_inputs_x86(
     inputs: &[(String, bool)],
     objects: &mut Vec<Elf64Object>,
     undefined: &[String],
+    lib_paths: &[String],
 ) -> Result<(), String> {
-    crate::backend::x86::linker::load_inputs_for_ld(inputs, objects, undefined)
+    crate::backend::x86::linker::load_inputs_for_ld(inputs, objects, undefined, lib_paths)
 }
 
 /// Input list of a `-r` or `-T` link with every `-lNAME` expanded in place;

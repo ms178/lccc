@@ -3,6 +3,7 @@
 //! Handles loading of object files (.o), archives (.a), shared libraries (.so),
 //! and linker scripts. Delegates to `linker_common` for ELF parsing.
 
+use crate::backend::elf::{LinkerScriptInput, MAX_LINKER_SCRIPT_DEPTH};
 use crate::common::fx_hash::FxHashMap;
 use std::path::Path;
 
@@ -42,6 +43,57 @@ pub(super) fn load_file_as_needed(
     lib_paths: &[String],
     whole_archive: bool,
     as_needed: bool,
+) -> Result<(), String> {
+    load_file_depth(
+        path,
+        objects,
+        globals,
+        needed_sonames,
+        lib_paths,
+        whole_archive,
+        as_needed,
+        0,
+    )
+}
+
+/// Resolve the file a script entry names, or explain which one is missing.
+///
+/// Dropping an unresolvable entry silently — as the previous shape did with
+/// `Path::exists` guards — turns a missing library into later undefined
+/// symbols with no mention of the script that named it.  GNU ld reports the
+/// operand, so this does too.
+fn resolve_script_input(
+    input: &LinkerScriptInput,
+    script_path: &str,
+    script_dir: Option<&str>,
+    lib_paths: &[String],
+) -> Result<String, String> {
+    let resolved = match &input.entry {
+        LinkerScriptEntry::Path(p) => linker_common::resolve_script_path(p, script_dir, lib_paths),
+        LinkerScriptEntry::Lib(name) => linker_common::resolve_lib(name, lib_paths, false),
+    };
+    resolved.ok_or_else(|| {
+        format!(
+            "cannot find {} (referenced from linker script {})",
+            linker_common::script_input_spelling(input),
+            script_path
+        )
+    })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one loader state tuple threaded through script recursion"
+)]
+fn load_file_depth(
+    path: &str,
+    objects: &mut linker_common::ObjectSet,
+    globals: &mut FxHashMap<String, GlobalSymbol>,
+    needed_sonames: &mut Vec<String>,
+    lib_paths: &[String],
+    whole_archive: bool,
+    as_needed: bool,
+    depth: usize,
 ) -> Result<(), String> {
     if std::env::var("LINKER_DEBUG").is_ok() {
         eprintln!("load_file: {}", path);
@@ -89,57 +141,41 @@ pub(super) fn load_file_as_needed(
         );
     }
 
-    // Not ELF? Try linker script (handles GROUP and INPUT directives)
+    // Not ELF? Try linker script (handles GROUP and INPUT directives).
+    //
+    // `parse_linker_script_inputs`, not `parse_linker_script_entries`: a
+    // script whose *whole* body is `AS_NEEDED ( ... )` — the shape distro
+    // `libgcc_s_asneeded.so` and `libc.so` use — has no non-as-needed entry
+    // at all, so the filtered accessor reports "no entries" and the file
+    // would be misdiagnosed as `not a valid ELF object or archive`.  The
+    // as-needed flag has to travel with the entry instead: it becomes
+    // `DT_NEEDED` state for a shared object, and is meaningless for a static
+    // input, exactly as GNU ld applies it.
     if data.len() >= 4 && data[0..4] != ELF_MAGIC {
         if let Ok(text) = std::str::from_utf8(data) {
-            if let Some(entries) = parse_linker_script_entries(text) {
+            if let Some(inputs) = parse_linker_script_inputs(text) {
+                if depth >= MAX_LINKER_SCRIPT_DEPTH {
+                    return Err(format!(
+                        "{}: linker scripts nested more than {} deep",
+                        path, MAX_LINKER_SCRIPT_DEPTH
+                    ));
+                }
                 let script_dir = Path::new(path)
                     .parent()
-                    .map(|p| p.to_string_lossy().to_string());
-                for entry in &entries {
-                    match entry {
-                        LinkerScriptEntry::Path(lib_path) => {
-                            if Path::new(lib_path).exists() {
-                                load_file_as_needed(
-                                    lib_path,
-                                    objects,
-                                    globals,
-                                    needed_sonames,
-                                    lib_paths,
-                                    whole_archive,
-                                    as_needed,
-                                )?;
-                            } else if let Some(ref dir) = script_dir {
-                                let resolved = format!("{}/{}", dir, lib_path);
-                                if Path::new(&resolved).exists() {
-                                    load_file_as_needed(
-                                        &resolved,
-                                        objects,
-                                        globals,
-                                        needed_sonames,
-                                        lib_paths,
-                                        whole_archive,
-                                        as_needed,
-                                    )?;
-                                }
-                            }
-                        }
-                        LinkerScriptEntry::Lib(lib_name) => {
-                            if let Some(resolved_path) =
-                                linker_common::resolve_lib(lib_name, lib_paths, false)
-                            {
-                                load_file_as_needed(
-                                    &resolved_path,
-                                    objects,
-                                    globals,
-                                    needed_sonames,
-                                    lib_paths,
-                                    whole_archive,
-                                    as_needed,
-                                )?;
-                            }
-                        }
-                    }
+                    .map(|p| p.to_string_lossy().into_owned());
+                for input in &inputs {
+                    let resolved =
+                        resolve_script_input(input, path, script_dir.as_deref(), lib_paths)?;
+                    load_file_depth(
+                        &resolved,
+                        objects,
+                        globals,
+                        needed_sonames,
+                        lib_paths,
+                        whole_archive,
+                        as_needed || input.as_needed,
+                        depth + 1,
+                    )?;
                 }
                 return Ok(());
             }

@@ -53,6 +53,7 @@ pub fn load_inputs_for_ld(
     inputs: &[(String, bool)],
     out: &mut Vec<crate::backend::linker_common::Elf64Object>,
     undefined: &[String],
+    lib_paths: &[String],
 ) -> Result<(), String> {
     // COMDAT claims are only consulted while symbols are registered (see
     // `ObjectSet`), so they live for the duration of loading; the callers'
@@ -60,7 +61,7 @@ pub fn load_inputs_for_ld(
     // `out` are registered as claims first, exactly as if pushed.
     let mut objects: crate::backend::linker_common::ObjectSet =
         std::mem::take(out).into_iter().collect();
-    let result = load_inputs_into(inputs, &mut objects, undefined);
+    let result = load_inputs_into(inputs, &mut objects, undefined, lib_paths);
     *out = objects.into_vec();
     result
 }
@@ -69,6 +70,7 @@ fn load_inputs_into(
     inputs: &[(String, bool)],
     objects: &mut crate::backend::linker_common::ObjectSet,
     undefined: &[String],
+    lib_paths: &[String],
 ) -> Result<(), String> {
     let mut globals: crate::common::fx_hash::FxHashMap<String, types::GlobalSymbol> =
         crate::common::fx_hash::FxHashMap::default();
@@ -93,7 +95,6 @@ fn load_inputs_into(
         );
     }
     let mut needed_sonames: Vec<String> = Vec::new();
-    let lib_paths: Vec<String> = Vec::new();
     let mut fully_loaded: crate::common::fx_hash::FxHashSet<String> =
         crate::common::fx_hash::FxHashSet::default();
     let mut changed = true;
@@ -126,7 +127,7 @@ fn load_inputs_into(
                 objects,
                 &mut globals,
                 &mut needed_sonames,
-                &lib_paths,
+                lib_paths,
                 *wa,
             )?;
             if !is_selective_archive {

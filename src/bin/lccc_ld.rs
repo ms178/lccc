@@ -876,8 +876,12 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         let ordered = ordered_args(&passthrough, &positional_files);
         let inputs = lccc::linker_entry::expand_file_mode_libs(&ordered, &inputs, &[], "-r")?;
+        // A positional input can itself be a linker script, and a script
+        // resolves its own `-l` against the `-L` path -- so the loader needs
+        // that path even though every command-line `-l` is already expanded.
+        let lib_dirs = lccc::backend::linker_common::parse_linker_args(&ordered).extra_lib_paths;
         let mut objects = Vec::new();
-        lccc::linker_entry::load_inputs_x86(&inputs, &mut objects, &undefined_symbols)?;
+        lccc::linker_entry::load_inputs_x86(&inputs, &mut objects, &undefined_symbols, &lib_dirs)?;
         return lccc::linker_entry::link_relocatable_x86(&objects, &output);
     }
 
@@ -911,11 +915,21 @@ fn run(args: &[String]) -> Result<(), String> {
         let search_dirs = lccc::linker_entry::script_search_dirs(&script_src)?;
         let inputs =
             lccc::linker_entry::expand_file_mode_libs(&ordered, &inputs, &search_dirs, "-T")?;
+        // Same order the `-l` expansion above uses: `-L` directories first,
+        // then the script's own `SEARCH_DIR`s.
+        let mut lib_dirs =
+            lccc::backend::linker_common::parse_linker_args(&ordered).extra_lib_paths;
+        lib_dirs.extend(search_dirs.iter().cloned());
         let mut objects = if elf_i386 {
             lccc::linker_entry::load_inputs_i386_script(&inputs, &undefined_symbols)?
         } else {
             let mut objects = Vec::new();
-            lccc::linker_entry::load_inputs_x86(&inputs, &mut objects, &undefined_symbols)?;
+            lccc::linker_entry::load_inputs_x86(
+                &inputs,
+                &mut objects,
+                &undefined_symbols,
+                &lib_dirs,
+            )?;
             objects
         };
         // Everything appended from here on is linker-synthesized and must
