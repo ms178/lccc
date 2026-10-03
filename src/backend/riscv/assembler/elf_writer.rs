@@ -1409,6 +1409,33 @@ impl ElfWriter {
             let ref_offset = reloc.pcrel_hi_offset.unwrap_or(reloc.offset);
             let pc_offset = (target_offset as i64) - (ref_offset as i64) + reloc.addend;
 
+            // GAS parity: validate the PC-relative offset against the
+            // encoding's range before patching it in.
+            //
+            // Each immediate below is split across the instruction's fields
+            // with plain shifts and masks, so an offset that does not fit
+            // silently WRAPS and the branch lands somewhere else entirely.
+            // Because the relocation is resolved right here, neither a
+            // diagnostic nor an external relocation survives to reveal it.
+            // (Upstream fork issue #121; same defect as the AArch64 writer.)
+            let (lo, hi) = match reloc.reloc_type {
+                // R_RISCV_BRANCH: B-type, 13-bit signed (bit 0 implicit)
+                16 => (-(1i64 << 12), (1i64 << 12)),
+                // R_RISCV_JAL: J-type, 21-bit signed (bit 0 implicit)
+                17 => (-(1i64 << 20), (1i64 << 20)),
+                // R_RISCV_CALL_PLT / R_RISCV_PCREL_HI20: 32-bit via AUIPC+JALR
+                19 | 23 => (-(1i64 << 31), (1i64 << 31)),
+                _ => (i64::MIN, i64::MAX),
+            };
+            if !(lo..hi).contains(&pc_offset) {
+                return Err(format!(
+                    "branch out of range: `{}` at offset {:#x} needs a PC-relative \
+                     offset of {:#x}, which is not encodable in relocation type {} \
+                     (allowed {:#x}..{:#x}); it would silently branch to the wrong address",
+                    reloc.symbol, reloc.offset, pc_offset, reloc.reloc_type, lo, hi
+                ));
+            }
+
             if let Some(section) = self.base.sections.get_mut(&reloc.section) {
                 let instr_offset = reloc.offset as usize;
 

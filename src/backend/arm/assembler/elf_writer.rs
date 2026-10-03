@@ -992,6 +992,56 @@ impl ElfWriter {
 
             let pc_offset = (target_offset as i64) - (reloc.offset as i64) + reloc.addend;
 
+            // GAS parity: an out-of-range PC-relative offset is a hard error.
+            //
+            // Every immediate field below is patched with a plain mask/shift,
+            // so without this check a branch that cannot be encoded silently
+            // WRAPS and jumps to an unrelated address. That is worse than a
+            // normal miscompile: the relocation is *resolved* here, so no
+            // diagnostic is emitted and no external relocation is left behind
+            // for the linker to catch -- the corrupted branch is invisible in
+            // the object file. (Upstream fork issue #121.)
+            //
+            // ADRP (275) is encoded as a page difference rather than a byte
+            // offset, so it gets its own operand.
+            let checked = if reloc.reloc_type == 275 {
+                let pc_page = (reloc.offset as i64) & !0xFFF;
+                let target_page = (target_offset as i64) & !0xFFF;
+                target_page - pc_page
+            } else {
+                pc_offset
+            };
+            let (lo, hi) = match reloc.reloc_type {
+                // R_AARCH64_JUMP26 / R_AARCH64_CALL26: imm26 << 2
+                282 | 283 => (-(1i64 << 27), (1i64 << 27)),
+                // R_AARCH64_CONDBR19 / R_AARCH64_LD_PREL_LO19: imm19 << 2
+                280 | 273 => (-(1i64 << 20), (1i64 << 20)),
+                // R_AARCH64_TSTBR14: imm14 << 2
+                279 => (-(1i64 << 15), (1i64 << 15)),
+                // R_AARCH64_ADR_PREL_LO21: 21-bit signed byte offset
+                274 => (-(1i64 << 20), (1i64 << 20)),
+                // R_AARCH64_ADR_PREL_PG_HI21: 21-bit signed *page* offset
+                275 => (-(1i64 << 32), (1i64 << 32)),
+                _ => (i64::MIN, i64::MAX),
+            };
+            if !(lo..hi).contains(&checked) {
+                return Err(format!(
+                    "branch out of range: `{}` at offset {:#x} needs a PC-relative \
+                     offset of {:#x}, which is not encodable in relocation type {} \
+                     (allowed {:#x}..{:#x}); it would silently branch to the wrong address",
+                    reloc.symbol, reloc.offset, checked, reloc.reloc_type, lo, hi
+                ));
+            }
+            // AArch64 instructions are 4-byte aligned, so every PC-relative
+            // branch displacement must be a multiple of 4.
+            if matches!(reloc.reloc_type, 282 | 283 | 280 | 279 | 273) && (pc_offset & 3) != 0 {
+                return Err(format!(
+                    "misaligned branch target: `{}` needs a PC-relative offset of \
+                     {:#x}, which is not a multiple of 4",
+                    reloc.symbol, pc_offset
+                ));
+            }
+
             if let Some(section) = self.base.sections.get_mut(&reloc.section) {
                 let instr_offset = reloc.offset as usize;
                 if instr_offset + 4 > section.data.len() {
@@ -1283,5 +1333,100 @@ mod movw_tests {
         // movn has no MOVW forms.
         let movn = assemble_to_writer(".text\nmovn x3, :abs_g0:v\n");
         assert!(movn.is_err(), "movn must reject :abs_g*: modifiers");
+    }
+}
+
+// =============================================================================
+// Branch-displacement range validation (upstream fork issue #121)
+// =============================================================================
+#[cfg(test)]
+mod branch_range_tests {
+    use super::super::parser::parse_asm;
+    use super::*;
+
+    fn assemble(asm: &str) -> Result<ElfWriter, String> {
+        let statements = parse_asm(asm)?;
+        let mut writer = ElfWriter::new();
+        writer.process_statements(&statements)?;
+        Ok(writer)
+    }
+
+    /// A conditional branch (`b.eq`) encodes a 19-bit displacement: +-1 MiB.
+    /// Pushing the target 2 MiB away used to wrap silently into the immediate
+    /// field and branch to an unrelated address, with no diagnostic and no
+    /// external relocation left behind to reveal it.
+    #[test]
+    fn out_of_range_cond_branch_is_diagnosed_not_wrapped() {
+        let err = match assemble(
+            ".text\n\
+             b.eq .Lfar\n\
+             .org 0x200000\n\
+             .Lfar:\n\
+             nop\n",
+        ) {
+            Ok(_) => panic!("an unencodable +-1 MiB displacement must be diagnosed"),
+            // `ElfWriter` is not `Debug`, so `expect_err` is unavailable here.
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("branch out of range"),
+            "expected a range diagnostic, got: {err}"
+        );
+    }
+
+    /// `tbz` is tighter still: a 14-bit displacement, +-32 KiB.
+    #[test]
+    fn out_of_range_tbz_is_diagnosed_not_wrapped() {
+        let err = match assemble(
+            ".text\n\
+             tbz x0, #3, .Lfar\n\
+             .org 0x10000\n\
+             .Lfar:\n\
+             nop\n",
+        ) {
+            Ok(_) => panic!("an unencodable +-32 KiB displacement must be diagnosed"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("branch out of range"),
+            "expected a range diagnostic, got: {err}"
+        );
+    }
+
+    /// The check must not fire on ordinary code: short forward and backward
+    /// branches are the common case and must keep resolving inline.
+    #[test]
+    fn in_range_branches_still_resolve_inline() {
+        let w = assemble(
+            ".text\n\
+             b.eq .Lfwd\n\
+             nop\n\
+             .Lfwd:\n\
+             nop\n\
+             tbz x0, #0, .Lfwd2\n\
+             nop\n\
+             .Lfwd2:\n\
+             nop\n",
+        )
+        .expect("short branches must assemble");
+        assert!(
+            w.base.sections[".text"].relocs.is_empty(),
+            "a resolved local branch leaves no relocation behind"
+        );
+    }
+
+    /// A backward branch resolves to a negative displacement; the range check
+    /// must be signed, not a magnitude test.
+    #[test]
+    fn backward_branch_resolves_with_negative_displacement() {
+        let w = assemble(
+            ".text\n\
+             .Ltop:\n\
+             nop\n\
+             nop\n\
+             b.eq .Ltop\n",
+        )
+        .expect("a short backward branch must assemble");
+        assert!(w.base.sections[".text"].relocs.is_empty());
     }
 }

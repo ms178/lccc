@@ -163,7 +163,22 @@ pub fn parse_reg_num(name: &str) -> Option<u32> {
             let prefix = name.chars().next()?;
             match prefix {
                 'x' | 'w' | 'd' | 's' | 'q' | 'v' | 'h' | 'b' => {
-                    let num: u32 = name[1..].parse().ok()?;
+                    // `str::parse::<u32>` is far more permissive than the
+                    // AArch64 register grammar: it accepts a leading `+` and
+                    // arbitrary leading zeros, so "x+5", "x007" and "w+31"
+                    // all used to resolve to a real register instead of being
+                    // rejected. Accept only bare decimal digits, and only in
+                    // canonical (no leading zero) form -- matching GAS, which
+                    // rejects "x007" as an unknown symbol.
+                    // (Upstream fork issues #118 and #207.)
+                    let digits = &name[1..];
+                    if digits.is_empty()
+                        || !digits.bytes().all(|b| b.is_ascii_digit())
+                        || (digits.len() > 1 && digits.starts_with('0'))
+                    {
+                        return None;
+                    }
+                    let num: u32 = digits.parse().ok()?;
                     if num <= 31 { Some(num) } else { None }
                 }
                 _ => None,
@@ -1211,4 +1226,72 @@ fn get_symbol(operands: &[Operand], idx: usize) -> Result<(String, i64), String>
 
 fn sf_bit(is_64: bool) -> u32 {
     if is_64 { 1 } else { 0 }
+}
+
+// =============================================================================
+// Register-name parsing (upstream fork issues #118 and #207)
+// =============================================================================
+#[cfg(test)]
+mod parse_reg_num_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_canonical_aarch64_register_spellings() {
+        for (name, want) in [
+            ("x0", 0),
+            ("x30", 30),
+            ("w0", 0),
+            ("w30", 30),
+            ("d31", 31),
+            ("s31", 31),
+            ("v15", 15),
+            ("h7", 7),
+            ("b3", 3),
+            ("q12", 12),
+            ("sp", 31),
+            ("wsp", 31),
+            ("xzr", 31),
+            ("wzr", 31),
+            ("lr", 30),
+            ("X9", 9), // case-insensitive
+            ("W9", 9),
+        ] {
+            assert_eq!(
+                parse_reg_num(name),
+                Some(want),
+                "parse_reg_num({name:?}) should be Some({want})"
+            );
+        }
+    }
+
+    /// `str::parse::<u32>` accepts a leading `+` and leading zeros; the
+    /// AArch64 register grammar does not. These used to resolve to a real
+    /// register instead of being rejected.
+    #[test]
+    fn rejects_malformed_register_spellings() {
+        for name in [
+            "x+5", "x+0", "w+31", "x007", "w007", "x00", "x05", "d007", "x", "w", "x32", "w32",
+            "x99", "x-1", "y5", "5", "", "x 5", "x5x", "x1_0",
+        ] {
+            assert_eq!(
+                parse_reg_num(name),
+                None,
+                "parse_reg_num({name:?}) should be None"
+            );
+        }
+    }
+
+    /// Leading zeros are the subtle one: "x007" looks harmless but GAS treats
+    /// it as an unknown symbol, and silently accepting it here would let a
+    /// typo assemble into a branch to the wrong register.
+    #[test]
+    fn rejects_leading_zero_register_numbers() {
+        // Single "0" is canonical.
+        assert_eq!(parse_reg_num("x0"), Some(0));
+        // Anything with a leading zero and more digits is not.
+        assert_eq!(parse_reg_num("x00"), None);
+        assert_eq!(parse_reg_num("x01"), None);
+        assert_eq!(parse_reg_num("x007"), None);
+        assert_eq!(parse_reg_num("x030"), None);
+    }
 }

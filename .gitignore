@@ -1,5 +1,12 @@
 # Rust build artifacts
+# `/target/` only matches a DIRECTORY. On hosts with a small root disk the
+# build directory is moved outside the tree and bridged back with a symlink
+# (`ln -s /path/to/target target`) so scripts that hardcode `target/...` keep
+# working -- and a symlink is a FILE, so `/target/` does not cover it. Without
+# the bare pattern below, `git add -A` commits the symlink and bakes a
+# machine-specific path into the repository.
 /target/
+/target
 
 # Literal @PROFDIR@ dir dropped by PGO tests run outside the x86 driver
 # (once polluted a format-patch with .gcda binary blobs)
