@@ -19,7 +19,13 @@
 #
 # ftp.gnu.org is NOT universally reachable from the sandbox (connection
 # blackholed), so the tarball fetch walks a mirror chain and takes the
-# first one that answers. The download cache and build tree are
+# first one that answers. Whatever the source — a fresh download OR a
+# tarball pre-placed through the GAS_DL_DIR cache — the bytes must hash to
+# the pinned SHA-256 below (cross-verified between ftp.gnu.org's mirror
+# chain: kernel.org and uwaterloo serve identical bytes; GNU release
+# tarballs are immutable). A mirror compromise, a truncated fetch and a
+# doctored pre-placed tarball are the same defect: a binutils that is not
+# the one the pins promise. The download cache and build tree are
 # parametrised (GAS_DL_DIR / GAS_CACHE) so a persistent workspace can keep
 # the tarball across wipes; the install prefix is arg 2.
 #
@@ -105,6 +111,26 @@ validate_pair() {
         return 1
     }
     _canary || return 1
+}
+
+# ─── Supply-chain pin: the tarball's bytes ────────────────────────────────
+# Checked on EVERY trust path — freshly fetched from any mirror AND
+# already present in the download cache (GAS_DL_DIR is exactly the channel
+# through which a pre-placed tarball would otherwise skip verification).
+# sha256sum output is one <hash>  <file> line; the comparison is on the
+# whole 64-hex-digit token, never a substring of it.
+GAS_TARBALL_SHA256=154ab23b60070e8f27013c22977f1129425d67d1e8acd6e13010e617811e4cff
+
+_sha256_is() {  # _sha256_is <file> <expected-hex>: whole-digest equality
+    [[ -f "$1" ]] || return 1
+    local got
+    got=$(sha256sum "$1" 2>/dev/null) || return 1
+    got=${got%% *}
+    [[ "$got" == "$2" ]]
+}
+
+_tarball_matches_pin() {  # <tarball>: the pinned binutils-2.47 bytes?
+    _sha256_is "$1" "$GAS_TARBALL_SHA256"
 }
 
 # ─── Self-test: the validation matrix, against fake tool pairs ────────────
@@ -244,6 +270,32 @@ EOF
     mkver "$as" "$V47"; mkver "$od" "$O47"
     check "non-x86 target: version-only validation" 0
 
+    # The supply-chain comparator, on real digests of a real file: the
+    # whole token decides (prefix/substring lookalikes of the hash itself
+    # are the same defect class as the version-token lookalikes above).
+    printf 'binutils tarball bytes\n' >"$tmp/fake.tarball"
+    local sum
+    sum=$(sha256sum "$tmp/fake.tarball")
+    sum=${sum%% *}
+    if _sha256_is "$tmp/fake.tarball" "$sum"; then
+        printf '  ok   %-44s -> %s\n' "sha256 pin: matching digest" ACCEPT
+    else
+        printf '  FAIL %-44s -> wanted ACCEPT: digest comparator\n' "sha256 pin: matching digest"
+        ok=1
+    fi
+    if _sha256_is "$tmp/fake.tarball" "${sum%??}ff"; then
+        printf '  FAIL %-44s -> wanted REJECT: lookalike digest\n' "sha256 pin: 62-of-64-hex lookalike"
+        ok=1
+    else
+        printf '  ok   %-44s -> %s\n' "sha256 pin: 62-of-64-hex lookalike" REJECT
+    fi
+    if _sha256_is "$tmp/absent.tarball" "$sum"; then
+        printf '  FAIL %-44s -> wanted REJECT: missing file\n' "sha256 pin: missing tarball"
+        ok=1
+    else
+        printf '  ok   %-44s -> %s\n' "sha256 pin: missing tarball" REJECT
+    fi
+
     if [[ $ok == 0 ]]; then
         echo "ensure_gas_247 self-test: every case lands on its verdict"
     else
@@ -303,6 +355,19 @@ if [[ ! -f "$tarball" ]]; then
         rm -f "$tarball.part"
     done
     [[ -n "$fetched" ]] || { echo "FATAL: no mirror reachable for binutils-$ver" >&2; exit 1; }
+fi
+
+# The supply-chain pin, on every trust path: a freshly fetched tarball, a
+# cached one, or one pre-placed through GAS_DL_DIR must ALL hash to the
+# pinned digest before a single byte of it is extracted. A mismatch is
+# fatal, and the bad copy is deleted so the next run re-fetches instead of
+# wedging on the same poisoned cache.
+if ! _tarball_matches_pin "$tarball"; then
+    rm -f "$tarball" "$tarball.part"
+    echo "FATAL: $tarball is not the pinned binutils-$ver tarball (sha256 " \
+         "$GAS_TARBALL_SHA256) — removed; a mirror or the GAS_DL_DIR cache " \
+         "served bytes we did not order" >&2
+    exit 1
 fi
 
 src="$cache/binutils-$ver"

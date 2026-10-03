@@ -13,6 +13,7 @@ objdump output.
 """
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -108,6 +109,47 @@ def _patch_run(table: dict[tuple[str, str], object]):
 
 OBJDUMP = "/pinned/gas-2.47-x86_64-linux-gnu/bin/objdump"
 A, B = Path("/fake/a.o"), Path("/fake/b.o")
+
+
+# ── The real-toolchain leg's tool resolution ───────────────────────────────
+# The leg exists to anchor the parser to the listing grammar the PINNED
+# oracle prints — a distro objdump is a different grammar authority, which
+# is exactly the unpinned-oracle class the differential gates refuse. The
+# tools therefore come from EXPLICIT test channels (ASMDIFF_TEST_AS /
+# ASMDIFF_TEST_OBJDUMP, set by both CI mirrors to the provisioned 2.47
+# pair), never from ambient PATH, unless a human runs the suite bare.
+#
+# LCCC_REQUIRE_PINNED_ORACLE=1 (set by both CI mirrors) turns a missing
+# pin into a FAILURE: in CI a silently-skipped leg is a silently-untested
+# parser — the same defect as an unwired suite, one level down. Bare local
+# runs keep the old skip so the suite stays runnable on any box.
+def _resolve_leg_tools() -> tuple[str | None, str | None, str]:
+    """(as, objdump, problem) for the real-toolchain leg."""
+    require = os.environ.get("LCCC_REQUIRE_PINNED_ORACLE") == "1"
+    as_path = os.environ.get("ASMDIFF_TEST_AS") or ""
+    od_path = os.environ.get("ASMDIFF_TEST_OBJDUMP") or ""
+    if require:
+        for role, path in (("as", as_path), ("objdump", od_path)):
+            if not path:
+                return None, None, (
+                    f"LCCC_REQUIRE_PINNED_ORACLE=1 but ASMDIFF_TEST_{role.upper()} "
+                    "is unset — the leg must run against the pinned 2.47 pair, "
+                    "not skip")
+            if not (Path(path).is_file() and os.access(path, os.X_OK)):
+                return None, None, (
+                    f"LCCC_REQUIRE_PINNED_ORACLE=1 but {path!r} is not an "
+                    "executable file — provision the pinned pair first "
+                    "(bash scripts/ensure_gas_247.sh x86_64-linux-gnu)")
+        return as_path, od_path, ""
+    # Bare human run: explicit channels still win, PATH is the fallback.
+    if as_path and od_path:
+        return as_path, od_path, ""
+    found_as = shutil.which("as")
+    found_od = shutil.which("objdump")
+    if found_as and found_od:
+        return found_as, found_od, ""
+    return None, None, "needs GNU as and objdump on PATH (or ASMDIFF_TEST_AS/" \
+        "ASMDIFF_TEST_OBJDUMP; CI sets LCCC_REQUIRE_PINNED_ORACLE=1 to refuse the skip)"
 
 
 class ParseDisasmTests(unittest.TestCase):
@@ -261,10 +303,24 @@ class SemanticallyEqualTests(unittest.TestCase):
         self.assertFalse(result)
 
 
-@unittest.skipUnless(shutil.which("as") and shutil.which("objdump"),
-                     "needs GNU as and objdump on PATH")
 class RealToolchainTests(unittest.TestCase):
-    """Anchor the parser to a genuine objdump: real bytes, real listings."""
+    """Anchor the parser to a genuine objdump: real bytes, real listings.
+
+    The tools are resolved once per class: the explicit ASMDIFF_TEST_*
+    channels (both CI mirrors pass the provisioned 2.47 pair through them),
+    PATH only as a bare-run fallback. Under LCCC_REQUIRE_PINNED_ORACLE=1
+    a missing or non-executable pin is an ERROR, not a skip: CI must never
+    report this leg green because it quietly ran nothing.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        # `as` is a Python keyword, so the assembler lands on cls.as_tool.
+        cls.as_tool, cls.objdump, problem = _resolve_leg_tools()
+        if problem:
+            if os.environ.get("LCCC_REQUIRE_PINNED_ORACLE") == "1":
+                raise AssertionError(problem)
+            raise unittest.SkipTest(problem)
 
     def setUp(self) -> None:
         # One directory per test: the assembled objects must outlive the
@@ -278,23 +334,23 @@ class RealToolchainTests(unittest.TestCase):
         src = Path(self._td.name) / f"p{self._n}.s"
         out = Path(self._td.name) / f"p{self._n}.o"
         src.write_text(".text\n" + asm + "\n")
-        subprocess.run(["as", "-o", str(out), str(src)], check=True)
+        subprocess.run([self.as_tool, "-o", str(out), str(src)], check=True)
         return out
 
     def test_scale1_sib_fold_is_equality(self) -> None:
         a = self._obj("mov -0x1(,%rdi,1), %rax")
         b = self._obj("mov -0x1(%rdi), %rax")
-        self.assertTrue(asmdiff.semantically_equal(a, b, "objdump"))
+        self.assertTrue(asmdiff.semantically_equal(a, b, self.objdump))
 
     def test_one_byte_vs_two_byte_bad_real(self) -> None:
         a = self._obj(".byte 0x06\nxor %eax, %eax")
         b = self._obj(".byte 0x0f, 0x04\nxor %eax, %eax")
-        self.assertFalse(asmdiff.semantically_equal(a, b, "objdump"))
+        self.assertFalse(asmdiff.semantically_equal(a, b, self.objdump))
 
     def test_undecodable_prefix_refuses_real(self) -> None:
         a = self._obj(".byte 0x0f, 0x04\nxor %eax, %eax")
         b = self._obj("xor %eax, %eax")
-        self.assertFalse(asmdiff.semantically_equal(a, b, "objdump"))
+        self.assertFalse(asmdiff.semantically_equal(a, b, self.objdump))
 
 
 if __name__ == "__main__":
