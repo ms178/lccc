@@ -317,6 +317,24 @@ gate "comdat-signature-identity" fast \
 gate "loop-memset-decisions" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_loop_memset.sh
 
+# A13/A14: a pass may synthesise a libcall only when the TU does not define
+# that symbol, and the backend may expand a constant-size memcpy/memset call
+# only while the callee still is the builtin.  Covers the refusals, the
+# positive controls (the optimisations must not be lost), the
+# -fno-builtin/-ffreestanding/-fno-builtin-<fn> contracts, the ungated
+# __*_chk rows and three runtime programs.
+gate "libcall-synthesis-no-selfcall" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_libcall_synthesis_no_selfcall.sh
+
+# The inliner's __builtin_va_arg_pack_len() sentinel rewrite matched in the
+# wrong value space and left a live call to the undefined
+# __lccc_va_arg_pack_len for every call site whose clone was offset (gzip
+# 1.14's gnulib open-safer.c under glibc fortify failed to link).  The gate
+# asserts no sentinel survives at -O0/-O1/-O2/-O3, runs the wrapper semantics
+# (one/two/zero forwarded arguments) and takes gcc as the reference.
+gate "va-arg-pack-len-folds" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_va_arg_pack_len_folds.sh
+
 gate "bool-pair-tail-jmp-contract" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_bool_pair_tail_jmp.sh
 

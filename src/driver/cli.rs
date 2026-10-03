@@ -6,9 +6,38 @@
 //! like `--dumpmachine` and `--version`.
 //!
 //! Design: The parser is a simple `while` loop with a flat `match` on each
-//! argument. No external parser library is used. Unknown flags are silently
-//! ignored (matching GCC's behavior for unrecognized `-f` and `-m` flags),
-//! which is critical for build system compatibility.
+//! argument. No external parser library is used.
+//!
+//! # Unknown-option policy
+//!
+//! GCC is *not* permissive here: `gcc -fbogus`, `gcc -Wbogus`, `gcc --bogus`
+//! and `gcc -std=bogus99` all print
+//! `error: unrecognized command-line option '-X'` and exit 1 (verified against
+//! GCC 14/16). LCCC therefore cannot honestly claim "GCC compatibility" by
+//! swallowing options it does not implement, and doing so is actively
+//! dangerous: a build that asks for `-fno-strict-aliasing`,
+//! `-fno-delete-null-pointer-checks` or `-fno-stack-protector` must never
+//! silently receive a binary optimised under the assumption it asked to
+//! disable. That is the same failure mode the `-fstack-protector` arm below
+//! already refuses.
+//!
+//! The policy is tiered so that speculative feature probes (autoconf, Meson,
+//! Kconfig `cc-option`) keep working -- those *depend* on being able to try a
+//! flag and continue -- while no request can disappear without a trace:
+//!
+//! | input | behaviour |
+//! |---|---|
+//! | `-std=<unrecognized>` | **hard error** (a wrong dialect silently mis-parses headers) |
+//! | unimplemented *contract* flag (`-fstack-protector*`, `-ftrapv`, `-fsanitize=`) | **hard error** + remediation hint |
+//! | any other unrecognized option | **warning, once per distinct spelling**, naming the option |
+//! | as above, with `LCCC_STRICT_OPTIONS=1` | **hard error** (CI, corpus capability establishment) |
+//!
+//! The warning is emitted with no `-W` opt-in because a silently dropped flag
+//! is a silent bug report; it never changes the exit status on its own, so
+//! existing builds keep working until they read their own stderr.
+//!
+//! Escalation is spelled with the `LCCC_STRICT_` prefix already established by
+//! `LCCC_STRICT_MFLAGS` below.
 
 use super::pipeline::{CliDefine, CompileMode, Driver};
 use crate::backend::Target;
@@ -1055,6 +1084,11 @@ impl Driver {
     /// Parse the main argument list (everything after argv[0]).
     fn parse_main_args(&mut self, args: &[String]) -> Result<(), String> {
         let mut explicit_language: Option<String> = None;
+        // Distinct unrecognized spellings already diagnosed, so a flag passed
+        // to every translation unit of a build reports once (see the
+        // unknown-option arm). Also the `LCCC_STRICT_OPTIONS` escalation point.
+        let mut unknown_options: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         let mut i = 0;
         while i < args.len() {
             // x86 ISA flags are routed through the shared applicator FIRST:
@@ -1380,6 +1414,47 @@ impl Driver {
                 }
                 arg if arg == "-finstrument-functions-exclude-file-list" => {}
                 arg if arg == "-finstrument-functions-exclude-function-list" => {}
+                // `-ffreestanding` (C11 4p6): the program may execute in a
+                // freestanding environment, so `__STDC_HOSTED__` is 0. Linux's
+                // arch/x86/boot and most firmware pass this; before this arm
+                // existed the flag was dropped by the blanket `-f` swallow and
+                // the macro stayed 1, silently selecting hosted header paths.
+                //
+                // `-fhosted` is the documented negation and must restore 1
+                // (GCC accepts both, last one wins).
+
+                // ---- A13/A14: which library calls an optimisation may create --------------
+                // A pass may replace user code with a call to a standard library function
+                // (`loop_idiom` -> memcpy/memmove, `loop_memset` -> memset, `fortify_fold` ->
+                // puts/fwrite/...) and the backend may expand a constant-size memcpy/memset
+                // call inline.  Both are only sound while the callee really is the library
+                // function: a translation unit that defines `memcpy` (glibc's own string
+                // routines do) makes the synthesised call resolve into a definition the
+                // compiled code is part of -- unbounded self-recursion, or a silently ignored
+                // user definition.  These four arms record the CLI half of the policy; the
+                // passes consult it together with the TU's own definitions
+                // (`passes::libcall::LibcallAllowance`) and the backend consults the same
+                // object (`backend::libcall_policy`).
+                //
+                // Semantics follow GCC 16.2 (verified on the pinned oracles, both Godbolt and
+                // local): `-ffreestanding` implies `-fno-builtin`; `-fbuiltin`/`-fhosted`
+                // clear the *blanket* withdrawal (last one wins); a per-name
+                // `-fno-builtin-<fn>` is sticky (GCC keeps it even after a later `-fbuiltin`)
+                // and is never cleared by the blanket arms.
+                "-ffreestanding" => {
+                    self.freestanding = true;
+                    self.builtin_policy.withdraw_all();
+                }
+                "-fhosted" => {
+                    self.freestanding = false;
+                    self.builtin_policy.restore_all();
+                }
+                "-fbuiltin" => self.builtin_policy.restore_all(),
+                arg if arg == "-fno-builtin" => self.builtin_policy.withdraw_all(),
+                arg if arg.starts_with("-fno-builtin-") => {
+                    self.builtin_policy
+                        .withdraw_one(&arg["-fno-builtin-".len()..]);
+                }
                 arg if arg.starts_with("-std=") => {
                     let std_value = &arg[5..];
                     // GNU dialects: gnu89, gnu99, gnu11, gnu17, gnu23, etc.
@@ -1403,7 +1478,28 @@ impl Driver {
                     // one-argument form `va_start(ap)` expanded to
                     // `__builtin_va_start(ap,)` and failed to parse
                     // (gcc.c-torture/execute/pr117432.c).
-                    self.stdc_version = std_version_macro(std_value);
+                    //
+                    // An unrecognized dialect is a HARD ERROR, matching GCC
+                    // (`error: unrecognized command-line option
+                    // '-std=bogus99'; did you mean '-std=gnu99'?`). This arm
+                    // used to leave `stdc_version` untouched, so an unknown or
+                    // misspelled dialect was accepted and the compiler
+                    // silently compiled as gnu17 -- wrong __STDC_VERSION__ and
+                    // wrong feature set, with no diagnostic anywhere. A build
+                    // must never believe it selected a dialect it did not.
+                    let version = std_version_macro(std_value);
+                    if version.is_none() {
+                        return Err(match closest_std_dialect(std_value) {
+                            Some(s) => format!(
+                                "unrecognized command-line option '-std={}'; did you mean '-std={}'?",
+                                std_value, s
+                            ),
+                            None => {
+                                format!("unrecognized command-line option '-std={}'", std_value)
+                            }
+                        });
+                    }
+                    self.stdc_version = version;
                 }
 
                 // Machine/target flags
@@ -2080,7 +2176,16 @@ impl Driver {
                         arg
                     ));
                 }
-                arg if arg.starts_with("-f") => {}
+                // NOTE: there used to be a blanket `arg if arg.starts_with("-f") => {}`
+                // here. It made every unimplemented `-f` option -- including
+                // `-ftrapv` and `-fsanitize=*`, whose explicit refusal arms
+                // sit BELOW it and were therefore unreachable dead code --
+                // disappear without a diagnostic. Anything not matched by a
+                // specific arm above now falls through to the unknown-option
+                // arm at the end of this match, which applies the documented
+                // tier policy (warning by default, `LCCC_STRICT_OPTIONS=1`
+                // fatal). Do not reintroduce it; add a specific, commented
+                // no-op arm for a flag LCCC deliberately treats as inert.
 
                 // Linker flags
                 "-static" => self.static_link = true,
@@ -2204,10 +2309,58 @@ impl Driver {
                     ));
                 }
 
-                // Unknown flags
+                // Instrumentation and trap requests whose *absence* is
+                // invisible in the produced binary.
+                //
+                // Same failure mode as `-fstack-protector` above, and the same
+                // answer: refuse loudly instead of handing back a binary the
+                // caller believes is instrumented. `-ftrapv` promises a
+                // run-time trap on signed overflow; LCCC emits no such check,
+                // so accepting it would silently give a *different execution*
+                // than requested. `-fsanitize=*` promises a checked build; an
+                // unchecked binary that the caller will not re-verify in the
+                // field is the exact hazard this arm exists to prevent.
+                //
+                // `-fno-trapv` / `-fsanitize-recover=*` style *disable*
+                // requests stay accepted (see the `-mno-` arm) because a
+                // compiler that never emits the instrumentation already
+                // complies with a request to leave it out.
+                arg if arg == "-ftrapv" => {
+                    return Err("-ftrapv: LCCC does not emit signed-overflow traps; \
+                         build without it, or use -fwrapv to state the \
+                         wrapping contract explicitly"
+                        .to_string());
+                }
+                arg if arg == "-fsanitize" || arg.starts_with("-fsanitize=") => {
+                    return Err(format!(
+                        "{}: LCCC does not implement sanitizer instrumentation; \
+                         a build must not be labelled sanitized when it is not",
+                        arg
+                    ));
+                }
+
+                // Unknown flags -- LCCC's standing doctrine is that no request
+                // may be discarded silently (see the module header and the
+                // `-fstack-protector` arm). This arm is the generic case.
+                //
+                // Why a warning and not GCC's error: build systems probe with
+                // speculative flags (`cc-option`, `meson.get_compiler().
+                // has_argument`, Kconfig) and *rely* on the compiler exiting
+                // successfully. Making the generic case fatal would abort the
+                // Linux kernel build at the first Kconfig probe. A visible,
+                // specific diagnostic plus `LCCC_STRICT_OPTIONS=1` gives CI and
+                // the corpus harness the fatal behaviour without regressing
+                // those probes.
+                //
+                // Reported once per distinct spelling: a build that passes the
+                // same unimplemented flag to 4 000 translation units must
+                // produce one line, not 4 000.
                 arg if arg.starts_with('-') => {
-                    if self.verbose {
-                        eprintln!("warning: unknown flag: {}", arg);
+                    if unknown_options.insert(arg.to_string()) {
+                        // The policy lives in a pure function so it is testable
+                        // without mutating process-global environment state
+                        // (which would race under the parallel test harness).
+                        unknown_option(arg, std::env::var_os("LCCC_STRICT_OPTIONS").is_some())?;
                     }
                 }
 
@@ -2278,6 +2431,140 @@ impl Driver {
         self.include_paths.push(path.to_string());
     }
 }
+
+/// Decide what to do about one unrecognized command-line option.
+///
+/// `strict` is `LCCC_STRICT_OPTIONS` being set. Returns `Err` for the fatal
+/// case, otherwise emits the once-per-run warning and returns `Ok(())`.
+///
+/// Kept free of global state (no `env::var`, no I/O beyond the deliberate
+/// diagnostic) so the policy can be pinned by tests and reviewed as one unit;
+/// the caller owns the de-duplication.
+pub fn unknown_option(arg: &str, strict: bool) -> Result<(), String> {
+    if strict {
+        return Err(format!(
+            "unrecognized command-line option '{}'; LCCC_STRICT_OPTIONS is set",
+            arg
+        ));
+    }
+    eprintln!(
+        "warning: unrecognized command-line option '{}' \
+         (LCCC has no implementation for it and will not act on it); \
+         set LCCC_STRICT_OPTIONS=1 to make this an error",
+        arg
+    );
+    Ok(())
+}
+
+/// Every C dialect spelling LCCC recognises, in `-std=` wire form.
+///
+/// Used for the "did you mean" suggestion on an unrecognized `-std=` value and
+/// by tests that pin the accepted set. Kept in one place so a newly taught
+/// dialect cannot be added to [`std_version_macro`] without the suggestion
+/// machinery seeing it.
+pub const STD_DIALECTS: &[&str] = &[
+    "c89",
+    "c90",
+    "c99",
+    "c9x",
+    "c11",
+    "c1x",
+    "c17",
+    "c18",
+    "c23",
+    "c2x",
+    "c2y",
+    "gnu89",
+    "gnu90",
+    "gnu99",
+    "gnu9x",
+    "gnu11",
+    "gnu1x",
+    "gnu17",
+    "gnu18",
+    "gnu23",
+    "gnu2x",
+    "gnu2y",
+    "iso9899:1990",
+    "iso9899:199409",
+    "iso9899:1999",
+    "iso9899:199x",
+    "iso9899:2011",
+    "iso9899:2017",
+    "iso9899:2018",
+];
+
+/// Levenshtein edit distance between two ASCII strings.
+///
+/// Two-row dynamic program: `O(min(a,b))` space, `O(a*b)` time. The tables are
+/// a few dozen bytes (see [`STD_DIALECTS`]) so the quadratic term is
+/// irrelevant next to process startup, and `-std=` is parsed once per
+/// invocation.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.is_empty() {
+        return b.len();
+    }
+    if b.is_empty() {
+        return a.len();
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, &ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// Closest recognised `-std=` dialect to `std_value`, for a GCC-style
+/// "did you mean" hint. `None` when nothing is close enough to be useful.
+///
+/// GCC suggests by edit distance over its dialect table; the same oracle is
+/// used here so `-std=c17x`, `-std=gnu1z` and `-std=c++11` produce a pointer
+/// instead of a bare rejection. Candidates are restricted to dialects sharing
+/// the first character so `-std=z89` is not "corrected" to `-std=c89`, and a
+/// hit further than [`STD_SUGGEST_MAX_DISTANCE`] away is suppressed rather
+/// than guessed at -- a confidently wrong suggestion is worse than none.
+pub fn closest_std_dialect(std_value: &str) -> Option<&'static str> {
+    let first = std_value.as_bytes().first().copied()?;
+    STD_DIALECTS
+        .iter()
+        .copied()
+        .filter(|d| d.as_bytes().first().copied() == Some(first))
+        .map(|d| {
+            (
+                edit_distance(d, std_value),
+                std::cmp::Reverse(common_prefix_len(d, std_value)),
+                d,
+            )
+        })
+        // Ties break on the LONGEST shared prefix: a typed extra/missing
+        // character (`-std=c17x` for `c17`) keeps the prefix intact, while a
+        // shorter unrelated alias (`c1x`) does not. `min_by_key` then keeps the
+        // first of any remaining tie, i.e. `STD_DIALECTS` order -- stable.
+        .filter(|(dist, _, _)| *dist <= STD_SUGGEST_MAX_DISTANCE)
+        .min_by_key(|(dist, prefix, _)| (*dist, *prefix))
+        .map(|(_, _, d)| d)
+}
+
+/// Number of leading bytes `a` and `b` agree on.
+fn common_prefix_len(a: &str, b: &str) -> usize {
+    a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count()
+}
+
+/// Largest edit distance still worth suggesting.
+///
+/// A fixed budget is used rather than a length-relative one: the dialect
+/// lexicon is dense enough (`c99`/`c9x`, `c17`/`c18`, `gnu2x`/`gnu2y`) that a
+/// ratio-based budget would happily "correct" a genuine dialect into a
+/// near-miss neighbour. Four edits covers every realistic transposition or
+/// truncated-word typo while leaving unrelated spellings alone.
+const STD_SUGGEST_MAX_DISTANCE: usize = 4;
 
 /// `__STDC_VERSION__` value for a `-std=` dialect name, mirroring GCC.
 ///
@@ -3154,5 +3441,180 @@ mod cli_tests {
         assert!(d.parse_cli_args(&args).is_ok());
         assert!(d.resolved_bmi1(), "integer BMI survives the xmm denial");
         assert!(d.resolved_bmi2());
+    }
+
+    // ---- unknown-option policy (module header) --------------------------
+    //
+    // GCC exits 1 with `error: unrecognized command-line option '-X'` for
+    // every one of these. LCCC keeps a non-fatal default so autoconf/Meson/
+    // Kconfig speculative probes still work, but the option must never vanish
+    // without a trace, and LCCC_STRICT_OPTIONS must be able to make it fatal.
+
+    #[test]
+    fn unknown_option_is_warned_but_not_fatal_by_default() {
+        assert!(super::unknown_option("-fno-strict-aliasing", false).is_ok());
+        assert!(super::unknown_option("-fno-delete-null-pointer-checks", false).is_ok());
+        assert!(super::unknown_option("--totally-bogus", false).is_ok());
+    }
+
+    #[test]
+    fn unknown_option_is_fatal_under_strict_options() {
+        let err = super::unknown_option("-fno-strict-aliasing", true)
+            .expect_err("strict mode must reject an unimplemented option");
+        assert!(err.contains("-fno-strict-aliasing"), "{err}");
+        assert!(err.contains("LCCC_STRICT_OPTIONS"), "{err}");
+    }
+
+    // ---- -std= dialect contract -----------------------------------------
+
+    /// Every dialect the suggestion table advertises must actually be accepted;
+    /// otherwise the "did you mean" hint points at another rejection.
+    #[test]
+    fn every_advertised_std_dialect_is_accepted() {
+        for d in super::STD_DIALECTS {
+            let flag = format!("-std={d}");
+            assert!(try_flag(&flag).is_ok(), "{flag} must be accepted");
+        }
+    }
+
+    #[test]
+    fn unknown_std_dialect_is_a_hard_error_with_suggestion() {
+        let err = try_flag("-std=bogus99").expect_err("-std=bogus99 must be rejected");
+        assert!(
+            err.contains("unrecognized command-line option '-std=bogus99'"),
+            "{err}"
+        );
+
+        // A suggestion must always be a dialect LCCC actually accepts:
+        // pointing at another rejection would be worse than staying silent.
+        for bad in [
+            "-std=c17x",
+            "-std=gnu1z",
+            "-std=c1l",
+            "-std=c11z",
+            "-std=gnu99y",
+        ] {
+            let err = try_flag(bad).expect_err(bad);
+            let suggested = err
+                .split("did you mean '-std=")
+                .nth(1)
+                .and_then(|s| s.split('\'').next());
+            assert!(
+                suggested.is_some(),
+                "{bad} was rejected without a 'did you mean' hint: {err}"
+            );
+            let suggested = suggested.unwrap();
+            assert!(
+                super::STD_DIALECTS.contains(&suggested),
+                "{bad} suggested unaccepted dialect {suggested}"
+            );
+            assert!(
+                try_flag(&format!("-std={suggested}")).is_ok(),
+                "{bad} suggested {suggested}, which is not accepted"
+            );
+        }
+
+        // The two cases where a transposition/insertion typo has a unique,
+        // obviously-intended target are pinned so a regression in the
+        // tie-break is caught rather than merely reproducing itself.
+        for (bad, want) in [("-std=c17x", "c17"), ("-std=c1l", "c11")] {
+            let err = try_flag(bad).expect_err(bad);
+            assert!(
+                err.contains(&format!("did you mean '-std={want}'")),
+                "{bad} should have suggested {want}, got: {err}"
+            );
+        }
+    }
+
+    /// A `-std=` value that is not close to anything must still be rejected,
+    /// just without a possibly-misleading pointer.
+    ///
+    /// Deliberate divergence from GCC, recorded here so it is a decision and
+    /// not an accident: GCC 14/16 answers `-std=bogus99` with
+    /// `did you mean '-std=gnu99'?`, i.e. it leaves the `c`/`gnu`/`iso9899:`
+    /// family the user was clearly typing in. LCCC suppresses the hint when no
+    /// same-family dialect is within [`STD_SUGGEST_MAX_DISTANCE`]; a wrong-but-
+    /// confident suggestion is worse than a clean rejection. The rejection
+    /// itself -- the part that matters for correctness -- matches GCC exactly.
+    #[test]
+    fn distant_std_dialect_is_rejected_without_a_guess() {
+        let err = try_flag("-std=qwertyuiop").expect_err("-std=qwertyuiop must be rejected");
+        assert!(
+            err.contains("unrecognized command-line option '-std=qwertyuiop'"),
+            "{err}"
+        );
+        assert!(
+            !err.contains("did you mean"),
+            "no near neighbour exists: {err}"
+        );
+    }
+
+    /// The suggestion must not fire when nothing is remotely close, and must
+    /// never cross the c/gnu/iso prefix boundary.
+    #[test]
+    fn std_suggestion_is_conservative() {
+        assert_eq!(super::closest_std_dialect("zzzzzzzzzz"), None);
+        assert_eq!(super::closest_std_dialect(""), None);
+        for probe in ["c17x", "gnu1z", "c99", "gnu23", "iso9899:2017"] {
+            if let Some(s) = super::closest_std_dialect(probe) {
+                assert_eq!(
+                    s.as_bytes().first(),
+                    probe.as_bytes().first(),
+                    "{probe} -> {s} crossed the dialect prefix"
+                );
+            }
+        }
+    }
+
+    // ---- contract flags that must never be silently dropped -------------
+
+    /// `-fstack-protector*` is the established precedent; these two requests
+    /// have the same invisible-absence failure mode and must be refused too.
+    #[test]
+    fn instrumentation_requests_are_refused_not_ignored() {
+        for f in [
+            "-ftrapv",
+            "-fsanitize=address",
+            "-fsanitize=undefined",
+            "-fsanitize",
+        ] {
+            assert!(
+                try_flag(f).is_err(),
+                "{f} must be refused, not silently ignored"
+            );
+        }
+        // The matching *disable* requests stay accepted: a compiler that never
+        // emits the instrumentation already complies.
+        for f in ["-fno-trapv", "-fsanitize-recover=all"] {
+            assert!(try_flag(f).is_ok(), "{f} must be accepted");
+        }
+    }
+
+    // ---- -ffreestanding (C11 4p6) ----------------------------------------
+
+    /// Both spellings must be accepted, and `-fhosted` must undo
+    /// `-ffreestanding` (GCC applies them last-wins), rather than the pair
+    /// being an unknown-option diagnostic.
+    #[test]
+    fn freestanding_and_hosted_are_accepted() {
+        for f in ["-ffreestanding", "-fhosted"] {
+            assert!(try_flag(f).is_ok(), "{f} must be accepted");
+        }
+    }
+
+    #[test]
+    fn edit_distance_matches_known_values() {
+        assert_eq!(super::edit_distance("", ""), 0);
+        assert_eq!(super::edit_distance("c17", "c17"), 0);
+        assert_eq!(super::edit_distance("c17x", "c17"), 1);
+        assert_eq!(super::edit_distance("", "abc"), 3);
+        assert_eq!(super::edit_distance("abc", ""), 3);
+        assert_eq!(super::edit_distance("kitten", "sitting"), 3);
+        // "gnu17" vs "gnu23": the two trailing digits both differ.
+        assert_eq!(super::edit_distance("gnu17", "gnu23"), 2);
+        assert_eq!(super::common_prefix_len("c17x", "c17"), 3);
+        assert_eq!(super::common_prefix_len("c17x", "c1x"), 2);
+        assert_eq!(super::common_prefix_len("abc", "abd"), 2);
+        assert_eq!(super::common_prefix_len("", "abc"), 0);
     }
 }

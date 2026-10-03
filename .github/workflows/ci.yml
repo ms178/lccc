@@ -792,6 +792,19 @@ jobs:
           python3 scripts/check_deep_nesting_robustness.py
           python3 scripts/test_differential_corpus_paths.py
           bash tests/regression/check_loop_memset.sh
+          # A13/A14: a pass may synthesise a libcall only when this TU does
+          # not define that symbol (per symbol, so an asm label, an alias or
+          # a static definition counts), and a constant-size memcpy/memset
+          # call may be expanded only while the callee still is the builtin.
+          # Refusals, positive controls, the -fno-builtin/-ffreestanding
+          # contract, the ungated __*_chk rows and three runtime programs.
+          bash tests/regression/check_libcall_synthesis_no_selfcall.sh
+          # The inliner's __builtin_va_arg_pack_len() sentinel rewrite matched
+          # in the wrong value space, leaving a live call to the undefined
+          # __lccc_va_arg_pack_len whenever the cloned caller was offset (gzip
+          # 1.14's gnulib open-safer.c under glibc fortify failed to link).
+          # No sentinel at -O0..-O3, wrapper semantics, gcc as the reference.
+          bash tests/regression/check_va_arg_pack_len_folds.sh
           bash tests/regression/check_bool_pair_tail_jmp.sh
           bash tests/regression/check_bool_pair_prune.sh
           bash tests/regression/check_demorgan_branch_split.sh
