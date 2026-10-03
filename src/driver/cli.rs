@@ -31,10 +31,10 @@
 //! | `-std=<unrecognized>` | **hard error** with a suggestion (a wrong dialect silently mis-parses headers) |
 //! | `-std=<known>`, `-ansi` | implemented: `-ansi` is `-std=c90` (measured on GCC: no `__STDC_VERSION__`, `__STRICT_ANSI__` defined) |
 //! | *contract* flags — `-fstack-protector*`, `-ftrapv`, `-fsanitize=` | **hard error** + remediation hint (upstream's original rule) |
-//! | data-model / ABI requests — `-fshort-enums`, `-fshort-wchar`, `-fpack-struct[=n]`, `-funsigned-char` | **hard error**, because ignoring one silently returns objects whose layout or `char` signedness disagrees with the libraries they link against. `-fsigned-char` is *not* here: it names the x86-64 SysV default LCCC already emits |
+//! | unsupported data-model / ABI requests — `-fshort-enums`, `-fshort-wchar`, `-fpack-struct[=n]` | **hard error**, because ignoring one silently returns objects whose layout disagrees with the libraries they link against. `-funsigned-char` and `-fsigned-char` are implemented and select the target's plain-`char` signedness |
 //! | `-g<selector>` that GNU rejects (`-g4`, `-ggdb9`, `-gdwarf-9`, `-gz=bogus`, `-gno-bogus`, `-gbogus`) | **hard error** — the selector grammar is closed and was measured exhaustively, so a name outside it is a typo, not a newer GNU (GCC 14.2/16.2, Clang 23.1 and ICX all reject these) |
 //! | *off-requests* — `-Wno-<unknown>`, `-gno-<feature>` | **accepted silently**: the thing asked to be switched off does not exist here, so the requested state is already the state (all four reference compilers accept `-Wno-<unknown>`, measured) |
-//! | everything else unimplemented — `-f*`, `-m*`, `--*`, `-W<name>`, `-Werror=<name>`, `--param`, GNU-accepted `-g` selectors, presentation namespaces (`-fdiagnostics-*`, `-fmessage-length=`, `-fmax-errors=`, `-f*prefix-map=`, `-fverbose-asm`) | **warning naming the option**, once per compilation; `LCCC_STRICT_OPTIONS=1` makes it fatal |
+//! | everything else unimplemented — `-f*`, `-m*`, `--*`, `-W<name>`, `-Werror=<name>`, `--param`, GNU-accepted but unimplemented `-g` selectors, presentation namespaces (`-fdiagnostics-*`, `-fmessage-length=`, `-fmax-errors=`, `-f*prefix-map=`, `-fverbose-asm`) | **warning naming the option**, once per compilation; `LCCC_STRICT_OPTIONS=1` makes it fatal |
 //!
 //! The last row is the one that needs defending, and the defence is the
 //! measurement, not taste.  LCCC implements six warning names out of the 409
@@ -1103,15 +1103,27 @@ impl Driver {
 
     /// Parse the main argument list (everything after argv[0]).
     fn parse_main_args(&mut self, args: &[String]) -> Result<(), String> {
+        // Read once: every accepted-but-unimplemented spelling on this command
+        // line must see the same process policy.
+        let strict_options = std::env::var_os("LCCC_STRICT_OPTIONS").is_some();
+        self.parse_main_args_with_policy(args, strict_options)
+    }
+
+    /// The parser core with strictness injected so policy tests do not mutate
+    /// process-global environment state while Rust's test workers run in
+    /// parallel.
+    fn parse_main_args_with_policy(
+        &mut self,
+        args: &[String],
+        strict_options: bool,
+    ) -> Result<(), String> {
         let mut explicit_language: Option<String> = None;
+        // GCC applies -gtoggle after all other debug options and only once,
+        // regardless of its command-line position or repetition.
+        let mut debug_info_toggle = false;
         // Distinct unrecognized spellings already diagnosed, so a flag passed
         // to every translation unit of a build reports once (see the
-        // unknown-option arm). Also the `LCCC_STRICT_OPTIONS` escalation point.
-        // `LCCC_STRICT_OPTIONS` escalates every accepted-but-unimplemented
-        // spelling to an error.  Read once: the policy is per process, and a
-        // build that cannot see one value for the whole command line is worse
-        // than either answer.
-        let strict_options = std::env::var_os("LCCC_STRICT_OPTIONS").is_some();
+        // unknown-option arm).
         let mut unknown_options: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         let mut i = 0;
@@ -1204,31 +1216,28 @@ impl Driver {
                 //     that switch a debug FEATURE off; they must never turn
                 //     debug info ON for a TU compiled without -g.
                 //   -gsplit-dwarf: split DWARF (.dwo side files) is not
-                //     implemented — warn and continue with non-split debug
-                //     info rather than silently ignoring the request.
-                //   -gz / -gz=<type>: compressed debug sections are not
-                //     implemented — warn; the flag only selects compression,
-                //     so it changes nothing about whether debug info is built.
-                // Unknown `-g*` selectors keep the historical blanket-enable:
-                // a future spelling must not silently turn debug OFF.
+                //     implemented — diagnose it through the tolerated-option
+                //     policy. Like GCC, this modifier does not enable `-g` by
+                //     itself; if `-g` is also present, emit ordinary DWARF.
+                //   -gz / -gz=<type>: compression is not implemented. Valid
+                //     compression requests are diagnosed (and fatal in strict
+                //     probe mode); `-gz=none` is already satisfied because
+                //     LCCC emits uncompressed sections. These modifiers never
+                //     enable debug info on their own.
+                // Unknown `-g*` selectors are hard errors unless GNU accepts
+                // them, in which case the tolerated-option policy applies.
                 "-g0" | "-ggdb0" => self.debug_info = false,
                 "-g" | "-ggdb" => self.debug_info = true,
-                "-gsplit-dwarf" => {
-                    self.debug_info = true;
-                    eprintln!(
-                        "lccc: warning: -gsplit-dwarf is not supported; \
-                         emitting non-split debug info"
-                    );
-                }
-                "-gz" => eprintln!(
-                    "lccc: warning: compressed debug sections (-gz) are not \
-                     supported; emitting uncompressed debug info"
-                ),
-                arg if arg.starts_with("-gz=") => eprintln!(
-                    "lccc: warning: compressed debug sections ({}) are not \
-                     supported; emitting uncompressed debug info",
-                    arg
-                ),
+                "-gsplit-dwarf" => unknown_option_tolerated(arg, strict_options)?,
+                "-gz" => unknown_option_tolerated(arg, strict_options)?,
+                arg if arg.starts_with("-gz=") => {
+                    if !gnu_debug_selector_known(&arg[2..]) {
+                        return Err(format!("unrecognized command-line option '{}'", arg));
+                    }
+                    if &arg[4..] != "none" {
+                        unknown_option_tolerated(arg, strict_options)?;
+                    }
+                },
                 // A `-gno-<feature>` modifier asks for a feature to be OFF.
                 // LCCC implements none of the features these modifiers name,
                 // so the requested state is the actual state: the request is
@@ -1263,21 +1272,24 @@ impl Driver {
                     }
                     self.debug_info = true
                 }
-                // Any other `-g<selector>`.  Two outcomes, both measured:
-                //
-                //  * GNU accepts the selector (a format/modifier spelling LCCC
-                //    has no implementation for) -> keep the historical
-                //    semantic, a selector must never silently turn debug OFF,
-                //    and diagnose that nothing acts on it.
-                //  * GNU rejects it (`-gbogus`, `-gdwarf-9`, `-glto`) -> error,
-                //    matching GCC 14.2/16.2 and Clang 23.1/ICX; the old blanket
-                //    accepted all of these and made the capability probe
-                //    report them as implemented.
+                // `-gtoggle` is the one order-independent debug modifier:
+                // GCC applies it after all other debug flags, once even if
+                // repeated. Defer the toggle until the loop has parsed them.
+                "-gtoggle" => debug_info_toggle = true,
+                // Any other `-g<selector>`. GNU-accepted selectors are
+                // diagnosed when LCCC lacks the requested detail, but only
+                // format selectors request debug output on their own; options
+                // such as -gcolumn-info and -grecord-gcc-switches modify an
+                // already-enabled debug stream. GNU-rejected names remain hard
+                // errors, so probes cannot read typos as support.
                 arg if arg.starts_with("-g") => {
-                    if !gnu_debug_selector_known(&arg[2..]) {
+                    let selector = &arg[2..];
+                    if !gnu_debug_selector_known(selector) {
                         unknown_option(arg, strict_options)?;
                     }
-                    self.debug_info = true;
+                    if gnu_debug_selector_requests_output(selector) {
+                        self.debug_info = true;
+                    }
                     unknown_option_tolerated(arg, strict_options)?;
                 }
 
@@ -2214,10 +2226,12 @@ impl Driver {
                 }
                 arg if arg.starts_with("-fdiagnostics-color=") => {
                     let value = &arg["-fdiagnostics-color=".len()..];
-                    if let Some(mode) = ColorMode::from_flag(value) {
-                        self.color_mode = mode;
-                    }
-                    // Unknown values silently ignored (matching GCC)
+                    self.color_mode = ColorMode::from_flag(value).ok_or_else(|| {
+                        format!(
+                            "unrecognized argument '{}' to '-fdiagnostics-color=' option",
+                            value
+                        )
+                    })?;
                 }
                 // Function-entry mcount instrumentation: `-pg` is the trigger
                 // that activates emission (see McountInstrumentation). The
@@ -2244,18 +2258,16 @@ impl Driver {
                         a
                     ));
                 }
-                // Data-model and ABI requests.  A *suppression* request can be
-                // satisfied by not doing the thing; these cannot: they ask for
-                // a different `char` signedness, enum width, wchar_t width or
-                // struct packing, so ignoring one silently produces objects
-                // whose layout disagrees with the libraries they are linked
-                // against.  `-fsigned-char` is not here: it names the x86-64
-                // SysV default, which is what LCCC already emits.
-                a @ ("-fshort-enums" | "-fshort-wchar" | "-fpack-struct" | "-funsigned-char") => {
+                // Unsupported data-model and ABI requests. A *suppression*
+                // request can be satisfied by not doing the thing; enum width,
+                // wchar_t width, and struct packing cannot, so ignoring one
+                // silently produces incompatible object layouts. Plain-char
+                // signedness is handled above because LCCC implements both
+                // `-funsigned-char` and `-fsigned-char`.
+                a @ ("-fshort-enums" | "-fshort-wchar" | "-fpack-struct") => {
                     return Err(format!(
                         "{}: LCCC does not implement this data-model request, and \
-                         ignoring it would silently produce objects whose layout or \
-                         char signedness disagrees with the code it links against",
+                         ignoring it would silently produce objects with an incompatible layout",
                         a
                     ));
                 }
@@ -2393,12 +2405,31 @@ impl Driver {
                 // probe must be able to see that lccc has no implementation
                 // for the name).
                 "--param" => {
-                    // Skip the next argument (the parameter value)
+                    // Keep the value attached to the option (and reject a
+                    // missing/malformed operand) even though the parameter
+                    // table itself is intentionally not implemented.
                     i += 1;
-                    unknown_option_tolerated("--param", strict_options)?;
+                    if i >= args.len() {
+                        return Err("--param requires an argument of the form <name>=<value>".to_string());
+                    }
+                    let value = args[i].as_str();
+                    if !valid_gcc_param(value) {
+                        return Err(format!(
+                            "invalid argument '{}' to '--param'; expected <name>=<value>",
+                            value
+                        ));
+                    }
+                    unknown_option_tolerated(&format!("--param {}", value), strict_options)?;
                 }
                 arg if arg.starts_with("--param=") => {
                     // Single-argument form: --param=ssp-buffer-size=4
+                    let value = &arg["--param=".len()..];
+                    if !valid_gcc_param(value) {
+                        return Err(format!(
+                            "invalid argument '{}' to '--param'; expected <name>=<value>",
+                            value
+                        ));
+                    }
                     unknown_option_tolerated(arg, strict_options)?;
                 }
 
@@ -2513,6 +2544,9 @@ impl Driver {
             i += 1;
         }
 
+        if debug_info_toggle {
+            self.debug_info = !self.debug_info;
+        }
         Ok(())
     }
 
@@ -2605,6 +2639,18 @@ impl Driver {
     pub fn add_include_path(&mut self, path: &str) {
         self.include_paths.push(path.to_string());
     }
+}
+
+/// Does a GCC `--param` operand have the required `name=value` shape?
+///
+/// Parameter names and their value domains are implementation-specific and
+/// remain subject to the tolerated-option policy; this only rejects malformed
+/// command-line syntax such as a missing operand, empty name, or empty value.
+fn valid_gcc_param(value: &str) -> bool {
+    let Some((name, value)) = value.split_once('=') else {
+        return false;
+    };
+    !name.is_empty() && !name.chars().any(char::is_whitespace) && !value.is_empty()
 }
 
 /// Decide what to do about one unrecognized command-line option.
@@ -2705,6 +2751,32 @@ fn gnu_debug_selector_known(selector: &str) -> bool {
     )
 }
 
+/// Does this accepted GNU selector request a debug stream by itself?
+///
+/// Format selectors such as `-gdwarf-5` do; modifiers such as `-gcolumn-info`,
+/// `-gpubnames`, `-gdwarf64`, and `-gsplit-dwarf` only affect a stream enabled
+/// separately by `-g`. `-gtoggle` is handled separately because GCC applies it
+/// after parsing all debug options.
+fn gnu_debug_selector_requests_output(selector: &str) -> bool {
+    if selector.starts_with("dwarf-") {
+        return true;
+    }
+    matches!(
+        selector,
+        "dwarf"
+            | "stabs"
+            | "stabs+"
+            | "xcoff"
+            | "xcoff+"
+            | "coff"
+            | "coff1"
+            | "coff2"
+            | "coff3"
+            | "vms"
+            | "codeview"
+    )
+}
+
 /// Is `modifier` (the text after `-gno-`) a debug feature GNU lets a build
 /// switch off?
 ///
@@ -2761,8 +2833,7 @@ pub fn unknown_option_tolerated(arg: &str, strict: bool) -> Result<(), String> {
     }
     eprintln!(
         "warning: unrecognized command-line option '{}' is tolerated but not \
-         implemented by LCCC (nothing will act on it); set LCCC_STRICT_OPTIONS=1 \
-         to make this an error",
+         fully implemented by LCCC; set LCCC_STRICT_OPTIONS=1 to make this an error",
         arg
     );
     Ok(())
@@ -2935,6 +3006,17 @@ mod cli_tests {
         // args[0] is argv[0] (used for target detection from the binary name).
         let args = vec!["ccc".to_string(), flag.to_string(), "x.c".to_string()];
         d.parse_cli_args(&args).map(|_| ())
+    }
+
+    /// Parse one driver option with an explicit strictness value, avoiding
+    /// process-environment mutation in the parallel unit-test harness.
+    fn try_flag_with_strict(flag: &str, strict: bool) -> Result<(), String> {
+        let mut d = Driver::new();
+        let args = [flag, "x.c"]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect::<Vec<_>>();
+        d.parse_main_args_with_policy(&args, strict)
     }
 
     /// `-mno-<feature>` must be ACCEPTED for any ISA extension LCCC never
@@ -3812,7 +3894,7 @@ mod cli_tests {
 
     #[test]
     fn tolerated_class_warns_by_default_and_fails_under_strict() {
-        for arg in ["-Wno-bogus", "--param=ssp-buffer-size=4", "-gdwarf-9"] {
+        for arg in ["-Wbogus", "--param=ssp-buffer-size=4", "-gcolumn-info"] {
             assert!(
                 super::unknown_option_tolerated(arg, false).is_ok(),
                 "{arg}: the GNU-tolerated class must not break a build"
@@ -3820,6 +3902,31 @@ mod cli_tests {
             let err = super::unknown_option_tolerated(arg, true)
                 .expect_err("strict mode must escalate the tolerated class");
             assert!(err.contains(arg), "{err}");
+        }
+    }
+
+    #[test]
+    fn tolerated_cli_options_follow_the_injected_strict_policy() {
+        for arg in [
+            "-gsplit-dwarf",
+            "-gz",
+            "-gz=zlib",
+            "-gcolumn-info",
+            "--param=ssp-buffer-size=4",
+            "-fno-strict-aliasing",
+        ] {
+            assert!(try_flag_with_strict(arg, false).is_ok(), "{arg}");
+            let err = try_flag_with_strict(arg, true)
+                .expect_err("strict mode must reject accepted-but-unimplemented options");
+            assert!(err.contains(arg), "{err}");
+        }
+        assert!(
+            try_flag_with_strict("-gz=none", true).is_ok(),
+            "no compression is already the emitted behavior"
+        );
+        for arg in ["-gz=bogus", "-fdiagnostics-color=bogus"] {
+            assert!(try_flag_with_strict(arg, false).is_err(), "{arg}");
+            assert!(try_flag_with_strict(arg, true).is_err(), "{arg}");
         }
     }
 
@@ -3871,7 +3978,8 @@ mod cli_tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        d.parse_cli_args(&args).expect("known negative warning flags");
+        d.parse_cli_args(&args)
+            .expect("known negative warning flags");
         assert!(!d.warning_config.werror_all, "-Wno-error clears -Werror");
         assert!(
             !d.warning_config
@@ -3941,7 +4049,6 @@ mod cli_tests {
             "-fstack-protector-strong",
             "-ftrapv",
             "-fsanitize=address",
-            "-funsigned-char",
             "-fshort-enums",
             "-fshort-wchar",
             "-fpack-struct",
@@ -3950,15 +4057,20 @@ mod cli_tests {
         ] {
             assert!(try_flag(arg).is_err(), "{arg} must be refused");
         }
-        // ...while the *suppression* spellings of the same families are fine:
-        // LCCC already does not do what they ask to switch off.
-        for arg in [
-            "-fno-stack-protector",
-            "-fno-builtin-memcpy",
-            "-fsigned-char",
-        ] {
+        // ...while a suppression request can be satisfied by not doing the
+        // thing in the first place.
+        for arg in ["-fno-stack-protector", "-fno-builtin-memcpy"] {
             assert!(try_flag(arg).is_ok(), "{arg}");
         }
+    }
+
+    #[test]
+    fn plain_char_signedness_flags_are_implemented() {
+        // Unlike enum packing, wchar width, and packed structs, these have an
+        // explicit type-system implementation and must not hit the rejection
+        // arm for unsupported ABI requests.
+        assert!(try_flag("-funsigned-char").is_ok());
+        assert!(try_flag("-fsigned-char").is_ok());
     }
 
     /// `-ansi` is `-std=c90`, not an ignorable spelling: a dialect request
@@ -4082,6 +4194,46 @@ mod cli_tests {
         }
     }
 
+    #[test]
+    fn invalid_diagnostic_color_value_is_rejected() {
+        assert!(try_flag("-fdiagnostics-color=bogus").is_err());
+        for arg in [
+            "-fdiagnostics-color=auto",
+            "-fdiagnostics-color=always",
+            "-fdiagnostics-color=never",
+        ] {
+            assert!(try_flag(arg).is_ok(), "{arg}");
+        }
+    }
+
+    #[test]
+    fn param_requires_a_well_formed_operand() {
+        for arg in [
+            "--param",
+            "--param=",
+            "--param=ssp-buffer-size",
+            "--param=ssp-buffer-size=",
+        ] {
+            assert!(try_flag(arg).is_err(), "{arg} must be rejected");
+        }
+        assert!(try_flag("--param=ssp-buffer-size=4").is_ok());
+
+        let mut missing_value = Driver::new();
+        let args = ["ccc", "--param"]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect::<Vec<_>>();
+        assert!(missing_value.parse_cli_args(&args).is_err());
+
+        let mut d = Driver::new();
+        let args = ["ccc", "--param", "ssp-buffer-size=4", "x.c"]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect::<Vec<_>>();
+        d.parse_cli_args(&args).expect("--param <name>=<value>");
+        assert_eq!(d.input_files, vec!["x.c".to_string()]);
+    }
+
     /// Spellings whose implementation lives in another layer must be
     /// *recognised* here.
     ///
@@ -4147,14 +4299,14 @@ mod cli_tests {
             "-gcodeview",
             "-gbtf",
             "-gctf",
-            "-gz=none",
+            "-gsplit-dwarf",
+            "-gz",
             "-gz=zlib",
             "-gz=zstd",
             "-grecord-gcc-switches",
             "-gcolumn-info",
             "-gvariable-location-views",
             "-gvariable-location-views=incompat5",
-            "-gtoggle",
             "-gno-record-gcc-switches",
             "-gno-column-info",
             "-gno-pubnames",
@@ -4166,6 +4318,9 @@ mod cli_tests {
                 "{arg}: strict mode must not report it as implemented"
             );
         }
+        // `none` matches LCCC's uncompressed output exactly, so it is
+        // already implemented rather than merely tolerated.
+        assert!(try_flag("-gz=none").is_ok());
         for arg in [
             "-g4",
             "-g9",
@@ -4194,6 +4349,61 @@ mod cli_tests {
             d.parse_cli_args(&args).expect(arg);
             assert!(!d.debug_info, "{arg} must turn debug info off");
         }
+    }
+
+    #[test]
+    fn debug_modifiers_do_not_enable_debug_info_by_themselves() {
+        for arg in [
+            "-gsplit-dwarf",
+            "-gz",
+            "-gz=none",
+            "-gz=zlib",
+            "-gcolumn-info",
+            "-grecord-gcc-switches",
+            "-gdwarf32",
+            "-gdwarf64",
+            "-gvariable-location-views",
+            "-gpubnames",
+            "-gbtf",
+            "-gctf",
+        ] {
+            let mut d = Driver::new();
+            let args = vec!["ccc".to_string(), arg.to_string(), "x.c".to_string()];
+            d.parse_cli_args(&args).expect(arg);
+            assert!(!d.debug_info, "{arg} modifies debug output; it does not enable -g");
+        }
+
+        for arg in ["-gdwarf-5", "-gstabs", "-gcodeview"] {
+            let mut d = Driver::new();
+            let args = vec!["ccc".to_string(), arg.to_string(), "x.c".to_string()];
+            d.parse_cli_args(&args).expect(arg);
+            assert!(d.debug_info, "{arg} selects a debug format");
+        }
+
+        let mut d = Driver::new();
+        let args = ["ccc", "-g", "-gsplit-dwarf", "x.c"]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect::<Vec<_>>();
+        d.parse_cli_args(&args).expect("-g -gsplit-dwarf");
+        assert!(d.debug_info, "the separate -g still enables debug info");
+    }
+
+    #[test]
+    fn gtoggle_is_applied_after_other_debug_options_and_only_once() {
+        for (args, expected) in [
+            (&["ccc", "-gtoggle", "x.c"][..], true),
+            (&["ccc", "-g", "-gtoggle", "x.c"][..], false),
+            (&["ccc", "-gtoggle", "-g", "x.c"][..], false),
+            (&["ccc", "-g0", "-gtoggle", "x.c"][..], true),
+            (&["ccc", "-gtoggle", "-gtoggle", "x.c"][..], true),
+        ] {
+            let mut d = Driver::new();
+            let args = args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+            d.parse_cli_args(&args).expect("-gtoggle");
+            assert_eq!(d.debug_info, expected, "args: {args:?}");
+        }
+        assert!(try_flag_with_strict("-gtoggle", true).is_ok());
     }
 
     /// A hardening request lccc cannot honour is diagnosed where it enters

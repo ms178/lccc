@@ -117,10 +117,11 @@ GCC 16.2 / Clang 23.1 / ICC 2021.10 / ICX:
 |---|---|---|---|---|---|
 | `-std=<unknown>` | exit 1 | exit 1 | varies | exit 1 | exit 1 |
 | `-fstack-protector*`, `-ftrapv`, `-fsanitize=` | accepted | accepted | accepted | accepted | exit 1 (contract: LCCC would not harden) |
-| `-funsigned-char`, `-fshort-enums`, `-fshort-wchar`, `-fpack-struct*` | accepted | accepted | accepted | accepted | exit 1 (contract: ignoring silently changes the data model) |
+| `-funsigned-char`, `-fsigned-char` | accepted | accepted | accepted | accepted | accepted and implemented (selects plain-`char` signedness) |
+| `-fshort-enums`, `-fshort-wchar`, `-fpack-struct*` | accepted | accepted | accepted | accepted | exit 1 (contract: ignoring silently changes the data model) |
 | `-g4`, `-ggdb9`, `-gdwarf-9`, `-gz=bogus`, `-gno-bogus`, `-gbogus` | exit 1 | exit 1 | accepted | exit 1 | exit 1 |
 | `-Wno-<unknown>`, `-gno-<feature>` | accepted | accepted | accepted | accepted | accepted silently (satisfied off-request) |
-| `--<unknown>`, `-f<unknown>`, `-m<unknown>`, `-W<unknown>`, `-Werror=<unknown>`, `--param`, GNU-accepted `-g` selectors, presentation namespaces | exit 1 for `--`/`-f`/`--param`/`-W`, accepted elsewhere | accepted | accepted | accepted | accepted + diagnosed; `LCCC_STRICT_OPTIONS=1` → exit 1 |
+| `--<unknown>`, `-f<unknown>`, `-m<unknown>`, `-W<unknown>`, `-Werror=<unknown>`, `--param`, GNU-accepted but unimplemented `-g` selectors, presentation namespaces | exit 1 for `--`/`-f`/`--param`/`-W`, accepted elsewhere | accepted | accepted | accepted | accepted + diagnosed; `LCCC_STRICT_OPTIONS=1` → exit 1 |
 
 A build system decides whether a flag exists from the **exit status**
 (`cc-option`, Meson `has_argument`, Kconfig), so succeeding on a flag lccc
@@ -129,11 +130,12 @@ and for a hardening or optimisation flag that is a silent misbuild.
 
 LCCC fails closed wherever ignoring a request would change what the program
 *means*: the hardening contract flags (`-fstack-protector*`, `-ftrapv`,
-`-fsanitize=`), the data-model flags (`-funsigned-char`, `-fshort-enums`,
-`-fshort-wchar`, `-fpack-struct*` — ignoring one silently returns objects
-whose layout or `char` signedness disagrees with the libraries they link
-against), a dialect it cannot parse (`-std=<unknown>`), and the debug selectors
-GNU itself rejects (that grammar is closed and was measured exhaustively).
+`-fsanitize=`), unsupported data-model flags (`-fshort-enums`, `-fshort-wchar`,
+`-fpack-struct*` — ignoring one silently returns objects whose layout disagrees
+with the libraries they link against), a dialect it cannot parse
+(`-std=<unknown>`), and the debug selectors GNU itself rejects (that grammar
+is closed and was measured exhaustively). Plain-`char` signedness is
+implemented and is therefore not in the refusal set.
 
 Everything else the driver has no arm for is **diagnosed, not fatal**, and the
 reason is a measurement rather than taste: of the 93 flag spellings the Linux
