@@ -3,6 +3,7 @@
 import base64
 import hashlib
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -13,6 +14,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
 
 REPO=Path(__file__).resolve().parents[2]
 spec=importlib.util.spec_from_file_location('recover_contract',REPO/'scripts/lccc_recover.py')
@@ -112,5 +114,92 @@ class RecoveryContract(unittest.TestCase):
         p=subprocess.run(['bash',str(dest/'scripts/arena_session_restore.sh'),'--source-only'],env=env,capture_output=True,text=True,timeout=30)
         self.assertEqual(p.returncode,0,p.stderr);self.assertEqual((dest/'a.txt').read_text(),'valuable work');self.assertEqual(git(dest,'rev-parse','HEAD'),self.head)
         self.assertIn('no swap/toolchain/packages/compiler queries/builds',p.stdout)
+
+class ExtractSafetyTests(unittest.TestCase):
+    """`extract` refuses an escaping link on EVERY interpreter, not just 3.12+.
+
+    The member loop validates member NAMES and never the symlink TARGET, so the
+    only thing that ever stopped `lccc/evil -> ../../../../etc/passwd` was
+    tarfile's PEP 706 data filter -- 3.12+/3.11.4+, against the Python 3.9+
+    floor docs/getting-started.md declares.  A portability fallback that drops
+    the filter must not drop the guarantee with it, so the loop now rejects the
+    escaping target itself and these pin both paths.
+    """
+
+    def setUp(self):
+        self._td=tempfile.TemporaryDirectory();self.addCleanup(self._td.cleanup)
+
+    def archive(self,extra):
+        buf=io.BytesIO()
+        with tarfile.open(fileobj=buf,mode='w:gz') as t:
+            root=tarfile.TarInfo('lccc');root.type=tarfile.DIRTYPE;root.mode=0o775;t.addfile(root)
+            for member in extra:t.addfile(member)
+        data=buf.getvalue()
+        path=Path(self._td.name)/'src.tar.gz';path.write_bytes(data)
+        return path,hashlib.sha256(data).hexdigest()
+
+    def sym(self,name,target):
+        member=tarfile.TarInfo(name);member.type=tarfile.SYMTYPE;member.linkname=target;member.mode=0o775
+        return member
+
+    def test_escaping_symlink_refused_with_the_data_filter(self):
+        path,digest=self.archive([self.sym('lccc/evil','../../../../etc/passwd')])
+        with tempfile.TemporaryDirectory() as stage:
+            with self.assertRaises(ValueError) as caught:
+                recovery.extract(path,Path(stage),{'archive_sha256':digest})
+        self.assertIn('escaping archive link target',str(caught.exception))
+
+    def test_escaping_symlink_refused_without_the_data_filter(self):
+        # A pre-3.12 interpreter: extractall accepts no `filter` keyword, so the
+        # TypeError fallback runs -- the loop must still be what refuses it.
+        path,digest=self.archive([self.sym('lccc/evil','../../../../etc/passwd')])
+        real=tarfile.TarFile.extractall
+        def legacy(self,dest,**kw):
+            kw.pop('filter',None);return real(self,dest,**kw)
+        with tempfile.TemporaryDirectory() as stage:
+            with mock.patch.object(tarfile.TarFile,'extractall',legacy):
+                with self.assertRaises(ValueError) as caught:
+                    recovery.extract(path,Path(stage),{'archive_sha256':digest})
+        self.assertIn('escaping archive link target',str(caught.exception))
+
+    def test_special_mode_bits_refused(self):
+        member=tarfile.TarInfo('lccc/x');member.type=tarfile.REGTYPE;member.size=0;member.mode=0o4755
+        path,digest=self.archive([member])
+        with tempfile.TemporaryDirectory() as stage:
+            with self.assertRaises(ValueError) as caught:
+                recovery.extract(path,Path(stage),{'archive_sha256':digest})
+        self.assertIn('setuid/setgid/sticky',str(caught.exception))
+
+    def test_in_tree_relative_symlink_still_extracted(self):
+        # The rule is strict about escaping targets, not about links as such.
+        path,digest=self.archive([self.sym('lccc/link','README.md')])
+        with tempfile.TemporaryDirectory() as stage:
+            repo=recovery.extract(path,Path(stage),{'archive_sha256':digest})
+            self.assertTrue((repo/'link').is_symlink())
+
+    def test_filter_support_is_probed_from_the_signature(self):
+        supported = 'filter' in inspect.signature(tarfile.TarFile.extractall).parameters
+        self.assertEqual(recovery.extractall_takes_filter(), supported)
+        def legacy(self,path='.',members=None,*,numeric_owner=False):pass
+        with mock.patch.object(tarfile.TarFile,'extractall',legacy):
+            self.assertFalse(recovery.extractall_takes_filter())
+
+    def test_an_unrelated_typeerror_is_not_swallowed_into_an_unfiltered_retry(self):
+        # The exact failure mode the probe replaces.  `except TypeError` around
+        # the filtered call catches an error raised from INSIDE it and silently
+        # retries without the filter, extracting content the filter refused.
+        # The stub keeps `filter` in its signature so the probe still reports
+        # support -- patching it away would test the fallback instead.
+        path,digest=self.archive([self.sym('lccc/link','README.md')])
+        real=tarfile.TarFile.extractall
+        def filtered_call_fails(self,dest,members=None,*,filter=None,numeric_owner=False):
+            if filter is not None:raise TypeError('unrelated internal failure')
+            return real(self,dest,members=members,numeric_owner=numeric_owner)
+        with tempfile.TemporaryDirectory() as stage:
+            with mock.patch.object(tarfile.TarFile,'extractall',filtered_call_fails):
+                with self.assertRaises(TypeError) as caught:
+                    recovery.extract(path,Path(stage),{'archive_sha256':digest})
+        self.assertIn('unrelated internal failure',str(caught.exception))
+
 
 if __name__=='__main__':unittest.main()

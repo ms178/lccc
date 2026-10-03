@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -24,7 +25,7 @@ import tempfile
 import time
 import urllib.request
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 VERSION = "1.14"
 ARCHIVE_URL = "https://ftp.gnu.org/pub/gnu/gzip/gzip-1.14.tar.xz"
@@ -60,6 +61,70 @@ def run(command: list[str], *, cwd: Path | None = None,
 def compiler_version(path: str) -> str:
     result = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=20)
     return next((line for line in (result.stdout + result.stderr).splitlines() if line.strip()), "unknown")
+
+
+
+def extractall_takes_filter() -> bool:
+    """True when tarfile's extractall accepts PEP 706's ``filter=`` keyword."""
+    try:
+        return "filter" in inspect.signature(tarfile.TarFile.extractall).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def extract_untrusted(tf: tarfile.TarFile, dest: Path) -> None:
+    """Extract a downloaded third-party tarball without trusting its members.
+
+    ``filter="data"`` needs CPython 3.12+/3.11.4+ while docs/getting-started.md
+    declares Python 3.9+ as the floor, so passing it unconditionally kills this
+    workload with a TypeError on 3.9-3.11.3.  Falling back to a bare
+    ``extractall()`` is not the fix either: the data filter is what refuses
+    members escaping ``dest``, and this archive is fetched over the network, so
+    an escaping symlink is precisely what has to stay blocked.  The rules are
+    therefore applied by hand first, and the filter stays on as defence in depth
+    wherever the interpreter has it.  ``filter=`` support is probed from the
+    signature rather than by catching TypeError, which would also swallow one
+    raised from inside extraction and then continue unfiltered.
+
+    Mirrors scripts/lccc_recover.py instead of sharing it: nothing under
+    tests/workloads/ imports from scripts/, and check_script_imports.py resolves
+    imports against real modules, so a shared helper would mean sys.path surgery
+    in a benchmark runner.  Both copies are pinned by tests.
+
+    Stricter than the data filter, which permits a ``..`` that resolves back
+    inside the destination.  Measured, that costs nothing here: the pinned
+    gzip-1.14.tar.xz (sha256 01a7b881...0ac6, re-verified against ftp.gnu.org)
+    carries 525 members, zero symlink/hardlink members and zero
+    setuid/setgid/sticky modes, every one under gzip-1.14/.
+    """
+    for m in tf.getmembers():
+        name = PurePosixPath(m.name)
+        if name.is_absolute() or ".." in name.parts or not name.parts:
+            raise ValueError(f"refusing archive member {m.name!r}: escapes the destination")
+        if "\0" in m.name:
+            raise ValueError(f"refusing archive member {m.name!r}: NUL byte in name")
+        # Entry TYPE, not just name and mode.  Measured: tarfile's data filter
+        # rejects FIFO/char/block members with SpecialFileError, but an
+        # unfiltered extractall happily creates the FIFO -- so without this the
+        # pre-PEP-706 fallback would accept what the filter refuses.  Hardlinks
+        # are rejected too, which is stricter than the filter and costs nothing
+        # (the pinned archive has no link members at all).  Matches the
+        # equivalent require() in scripts/lccc_recover.py.
+        if not (m.isfile() or m.isdir() or m.issym()):
+            raise ValueError(f"refusing archive member {m.name!r}: unsupported entry type "
+                             f"(only regular files, directories and symlinks are allowed)")
+        if m.issym():
+            link = PurePosixPath(m.linkname)
+            if link.is_absolute() or ".." in link.parts:
+                raise ValueError(f"refusing archive member {m.name!r}: link target "
+                                 f"{m.linkname!r} escapes the destination")
+        if m.mode & 0o7000:
+            raise ValueError(f"refusing archive member {m.name!r}: "
+                             f"setuid/setgid/sticky mode {oct(m.mode)}")
+    if extractall_takes_filter():
+        tf.extractall(dest, filter="data")
+    else:
+        tf.extractall(dest)
 
 
 def get_archive(value: str | None, cache: Path) -> Path:
@@ -338,7 +403,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="lccc-gzip-1.14.") as td:
         root = Path(td)
         with tarfile.open(archive) as tf:
-            tf.extractall(root, filter="data")
+            extract_untrusted(tf, root)
         source = root / f"gzip-{VERSION}"
         source_input = root / "source-corpus.bin"
         mixed_input = root / "mixed-corpus.bin"

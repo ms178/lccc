@@ -192,6 +192,11 @@ def _measure(args,benches,outroot,manifest,cache):
     return 2 if not rows else 1 if failures else 0
 
 
+# Every long option `main`'s parser defines, so the option-string rewrite below
+# never swallows one of the script's own flags into `--opt=`.
+_OWN_OPTIONS=frozenset(('--opt','--out-root','--gcc-include-command','--heavy','--help'))
+
+
 def main(argv=None):
     argv=list(sys.argv[1:] if argv is None else argv)
     ap=argparse.ArgumentParser(description=__doc__.splitlines()[0]);ap.add_argument('mine');ap.add_argument('ref')
@@ -199,11 +204,21 @@ def main(argv=None):
     ap.add_argument('--out-root',type=Path);ap.add_argument('--gcc-include-command',default='gcc')
     # Preserve the original third positional quoted option-string, including
     # a single '-O2' (argparse would mistake that positional for an option).
-    if len(argv)>=3 and argv[2]!='--opt' and not argv[2].startswith('--opt='):argv=argv[:2]+['--opt='+argv[2]]+argv[3:]
-    # `bench` is a `nargs='*'` positional and optionals follow it, so
-    # `parse_args` closes the positional group at the first option and then
-    # rejects later names ("unrecognized arguments"); interspersed dispatch
-    # is the argparse entry point for exactly this shape.
+    # Anything spelling one of this parser's own long options is left alone:
+    # rewriting `mine ref --out-root X` into `--opt=--out-root` would hide the
+    # missing required `--opt` behind a bogus value instead of reporting it.
+    if len(argv)>=3 and argv[2].split('=',1)[0] not in _OWN_OPTIONS:argv=argv[:2]+['--opt='+argv[2]]+argv[3:]
+    # parse_INTERMIXED_args, not parse_args.  The rewrite above puts an optional
+    # in front of the `bench` positional, and plain parse_args consumes
+    # positionals in the contiguous groups the optionals split them into -- a
+    # group that `nargs='*'` is satisfied by with NOTHING in it.  CPython 3.12.3,
+    # which is what Ubuntu 24.04 ships and therefore what hosted CI runs, binds
+    # `bench` to empty and then rejects every bench name as `unrecognized
+    # arguments: fib`; later 3.12 patches and 3.13 group them correctly.  That
+    # is the whole of PR #730's red "Verify remaining fast local contracts"
+    # step: green on every developer host here (3.12.15, 3.13.14), 4 errors on
+    # the runner.  parse_intermixed_args is the stdlib answer to exactly this,
+    # and unlike hand-rolled argv reordering it keeps a bare `--` meaningful.
     args=ap.parse_intermixed_args(argv);benches=args.bench or DEFAULT_FAST+(sorted(HEAVY) if args.heavy else [])
     if len(set(benches))!=len(benches) or any(not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]*',b) for b in benches):
         ap.error('duplicate/unsafe benchmark name')

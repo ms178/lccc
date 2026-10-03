@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import inspect
 import json
 import os
 from pathlib import Path,PurePosixPath
@@ -40,6 +41,23 @@ def sha(path):
 
 def require(ok,msg):
     if not ok:raise ValueError(msg)
+
+
+def extractall_takes_filter():
+    """True when tarfile's extractall accepts PEP 706's filter= keyword.
+
+    filter= landed in 3.12 and 3.11.4, but docs/getting-started.md declares
+    Python 3.9+ as the floor, so it cannot be passed unconditionally.  Probe
+    the signature instead of catching TypeError around the call: a bare
+    `except TypeError` also swallows one raised from INSIDE extraction and
+    then silently continues unfiltered, which is a worse outcome than the
+    crash it was hiding.  Verified True on 3.12.3/3.12.15/3.13.14 and False
+    for a simulated legacy signature.
+    """
+    try:
+        return 'filter' in inspect.signature(tarfile.TarFile.extractall).parameters
+    except (TypeError,ValueError):
+        return False
 
 
 def read_json(path):
@@ -90,12 +108,28 @@ def extract(archive,stage,r):
             require('.git' not in p.parts and '\\' not in member.name and '\0' not in member.name,'unsafe archive member')
             require(member.name not in seen,'duplicate archive member');seen.add(member.name)
             require(member.isfile() or member.isdir() or member.issym(),'unsupported archive entry')
-        try:
+            # Everything above validates the member NAME and never the symlink
+            # TARGET, so on its own this loop accepts `lccc/evil ->
+            # ../../../../etc/passwd`: verified -- the loop returns no verdict
+            # for that member and only tarfile's data filter refuses it
+            # (LinkOutsideDestinationError), while an unfiltered extractall
+            # happily creates the escaping link.  The guarantee therefore cannot
+            # rest on `filter='data'`, which is 3.12+/3.11.4+ against the
+            # Python 3.9+ floor docs/getting-started.md declares.  Reject the
+            # escaping target and the special mode bits here instead, so an old
+            # interpreter loses redundancy rather than protection.  Stricter
+            # than the data filter (which permits a `..` that resolves back
+            # inside), which costs nothing: the snapshot archive this restores
+            # carries 5620 members, zero links and zero special-bit modes.
+            if member.issym():
+                link=PurePosixPath(member.linkname)
+                require(not link.is_absolute() and '..' not in link.parts,'escaping archive link target')
+            require(not member.mode & 0o7000,'setuid/setgid/sticky archive member')
+        # PEP 706 data filter where the interpreter provides it; the loop above
+        # is the version-independent guarantee this falls back on.
+        if extractall_takes_filter():
             t.extractall(stage,filter='data')
-        except TypeError:
-            # PEP 706 extraction filters are 3.12+/3.11.4+ only; on older
-            # interpreters fall back to the pre-filter extraction so a local
-            # run and CI agree instead of dying here.
+        else:
             t.extractall(stage)
     repo=stage/'lccc';require(repo.is_dir(),'source root missing');return repo
 
