@@ -482,6 +482,11 @@ class Row:
 # spelling GAS itself emits).
 _BYTE_PIN = re.compile(r"#\s*byte-exact\s+((?:[0-9a-f]{2})+)\s*$",
                      re.IGNORECASE)
+# ANY pin-shaped tag, in any near-miss spelling (byte exact / byte_exact
+# / ByteExact / byteexact): used to COUNT tag occurrences over the whole
+# comment before any grammar is applied, so a second tag — conflicting,
+# identical, or malformed — can never hide behind a later valid one.
+_PIN_LIKE = re.compile(r"#\s*byte[\s_-]*exact\b", re.IGNORECASE)
 
 
 def split_byte_pin(text: str) -> tuple[str, bytes | None]:
@@ -495,19 +500,35 @@ def split_byte_pin(text: str) -> tuple[str, bytes | None]:
     are matched case-insensitively — `# BYTE-EXACT <hex>' is the same pin
     as `# byte-exact <hex>' — so no near-miss spelling of the TAG can
     fall through as prose either.
+
+    EXACTLY ONE pin-shaped tag may appear in the line. The whole comment
+    is scanned for tag-shaped occurrences first, so an earlier tag can
+    never be shadowed by a later valid one (`# byte-exact 90
+    # byte-exact 91' used to pin 91 with the conflicting 90 silently
+    ignored — the enforced pin differed from what a reader would
+    reasonably take from the row), and repeated identical tags are an
+    error too: the deduplicated row carries one contract, and it must be
+    unambiguous — never decided by corpus ordering or a regex's
+    leftmost-match-with-end-anchor.
     """
+    pin_like = list(_PIN_LIKE.finditer(text))
+    if not pin_like:
+        return text, None
+    if len(pin_like) > 1:
+        raise ValueError(
+            f"multiple byte-exact annotations: {text.strip()!r} "
+            f"({len(pin_like)} tag-shaped occurrences) — exactly one pin "
+            "per row, so the enforced contract is never ambiguous")
     m = _BYTE_PIN.search(text)
     if m:
         return text[:m.start()].rstrip(), bytes.fromhex(m.group(1))
-    # Liberal in what it flags: any comment that LOOKS like a pin
-    # annotation in any near-miss spelling (byte exact / byte_exact /
-    # ByteExact / byte-exact with junk hex) is an error, not prose — a
-    # typo'd pin must never silently weaken the row back to verdict-only.
-    if re.search(r"#\s*byte[\s_-]*exact\b", text, re.IGNORECASE):
-        raise ValueError(
-            f"malformed byte-exact annotation: {text.strip()!r} "
-            "(expected `# byte-exact <hex bytes>', two hex digits per byte)")
-    return text, None
+    # Liberal in what it flags: the one tag-shaped occurrence does not
+    # match the strict grammar (byte exact / byte_exact / ByteExact /
+    # byte-exact with junk hex) — an error, not prose, for the same
+    # reason: a typo'd pin must never silently weaken the row.
+    raise ValueError(
+        f"malformed byte-exact annotation: {text.strip()!r} "
+        "(expected `# byte-exact <hex bytes>', two hex digits per byte)")
 
 
 def harvest_byte_pins(insns: list[str]) -> tuple[list[str], dict[str, bytes]]:
@@ -937,7 +958,24 @@ def decodes_same(objdump: str, a: bytes, b: bytes,
     False means both byte strings decoded successfully but to different
     instruction text. None is deliberately distinct: a missing/old objdump,
     a failed invocation, empty bytes, or undecodable data must not be treated
-    as proof that a shorter encoding is correct (or as proof that it is wrong).
+    as proof that a shorter encoding is correct (or as proof that it is
+    wrong).
+
+    The listing parser is fail-closed over the full objdump grammar, the
+    same state machine asmdiff uses (see asmdiff._parse_disasm): anchor
+    lines are `ADDR:\\t<byte column padded to a fixed width>\\t<insn>',
+    and continuation lines (address + remaining bytes, no instruction
+    column) are admitted only when the previous line FILLED the byte
+    column (objdump wraps only on overflow), their address is the RUNNING
+    address, and the accumulated instruction stays within 15 bytes — the
+    byte-accounting invariant that also holds between consecutive
+    anchors. Any other line shape, an orphan fragment, a `...` gap, or an
+    inconsistent byte-column width makes the whole stream None: silently
+    skipping unknown lines would let two streams that differ only in
+    skipped bytes compare equal. A wrapped instruction's TRUE byte length
+    (anchor plus continuations, taken from the verified address chain)
+    feeds the branch-marker arithmetic, so a branch wider than the column
+    is target-compared with its real end address, not the column width.
     """
     def dis(data: bytes) -> str | None:
         if not data:
@@ -952,24 +990,84 @@ def decodes_same(objdump: str, a: bytes, b: bytes,
                 capture_output=True, text=True, timeout=120)
         if r.returncode != 0:
             return None
-        out = []
+        out: list[str] = []
+        width: int | None = None       # byte-column capacity (3 chars/byte)
+        prev_addr: int | None = None   # address-chain state, reset at labels
+        prev_bytes = 0
+        prev_full = False
+        insn_bytes = 0
+        pending: tuple[str, int] | None = None  # (canonical insn, addr)
+
+        def emit(insn: str, addr: int, end_addr: int) -> None:
+            # end_addr - addr is the TRUE instruction length: the anchor's
+            # bytes plus every continuation's, taken from the verified
+            # address chain (the old code passed only the anchor-line byte
+            # count, which is wrong for any wrapped branch).
+            out.append(_branch_marker(insn, addr, end_addr - addr))
+
         for line in r.stdout.splitlines():
-            m = re.match(
-                r"^\s+([0-9a-f]+):\s+((?:[0-9a-f]{2} )+)\s*\t(.*)$", line)
-            if not m:
+            stripped = line.strip()
+            if not stripped:
                 continue
-            insn = _canon_insn(m.group(3), bits32=bits32, seg_dead64=seg_dead64)
-            # Branch targets: rewrite with both comparison invariants so
-            # a short and a near encoding of the same branch compare
-            # equal exactly when they transfer to the same place (see
-            # _branch_marker / _stream_equal).
-            insn = _branch_marker(
-                insn, int(m.group(1), 16), len(m.group(2).split()))
+            if " file format " in stripped:
+                continue
+            if stripped.startswith("Disassembly of section "):
+                prev_addr = None
+                continue
+            if re.match(r"^[0-9a-f]{8,16} <[^>]*>:$", stripped):
+                prev_addr = None
+                continue
+            if stripped == "...":
+                return None          # undecoded gap: not evidence
+            m = re.match(r"^\s*([0-9a-f]+):\t(.*)$", line)
+            if m is None:
+                return None          # unknown line shape: never a silent skip
+            addr = int(m.group(1), 16)
+            bytes_col, sep, insn_text = m.group(2).partition("\t")
+            tokens = bytes_col.split()
+            if not tokens or any(
+                    not re.fullmatch(r"[0-9a-f]{2}", t) for t in tokens):
+                return None
+            nbytes = len(tokens)
+            if not sep:
+                # Continuation candidate: full predecessor, running
+                # address, in-range accumulated size.
+                if prev_addr is None or not prev_full:
+                    return None
+                if addr != prev_addr + prev_bytes:
+                    return None
+                insn_bytes += nbytes
+                if insn_bytes > 15:
+                    return None
+                prev_addr, prev_bytes = addr, nbytes
+                prev_full = 3 * nbytes == (width or -1)
+                continue
+            if prev_addr is not None and addr != prev_addr + prev_bytes:
+                return None          # address-chain break
+            if width is None:
+                width = len(bytes_col)
+                if width % 3:
+                    return None      # 3 chars per byte, by construction
+            elif len(bytes_col) != width:
+                return None          # inconsistent column: not objdump
+            insn = _canon_insn(insn_text, bits32=bits32, seg_dead64=seg_dead64)
             # Objdump renders undecodable bytes as `.byte` (and some versions
             # use `(bad)`). Two undecodable streams are not equivalent code.
             if not insn or insn == "(bad)" or insn.startswith(".byte"):
                 return None
-            out.append(insn)
+            # Branch targets: rewrite with both comparison invariants so
+            # a short and a near encoding of the same branch compare
+            # equal exactly when they transfer to the same place (see
+            # _branch_marker / _stream_equal). Deferred to instruction
+            # completion so the length is the TRUE one.
+            if pending is not None:
+                emit(*pending, addr)
+            pending = (insn, addr)
+            prev_addr, prev_bytes = addr, nbytes
+            prev_full = 3 * nbytes == width
+            insn_bytes = nbytes
+        if pending is not None and prev_addr is not None:
+            emit(*pending, prev_addr + prev_bytes)
         return "\n".join(out) if out else None
 
     try:
@@ -1386,7 +1484,13 @@ def check_verdict_histogram(rows: list["Row"], path: Path) -> bool:
                       "line — the digest is one line, not a "
                       "last-write-wins field", file=sys.stderr)
                 return False
-            digest = m.group(1)
+            # hashlib's hexdigest() is lowercase; an uppercase spelling of
+            # the SAME digest parsed fine (the grammar is
+            # case-insensitive) but could then never compare equal — a
+            # correct baseline that reports drift forever. Normalise to
+            # lowercase at the parse boundary so case is spelling, not
+            # semantics.
+            digest = m.group(1).lower()
             continue
         line = line.split("#")[0].strip()
         if not line:

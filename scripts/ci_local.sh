@@ -545,6 +545,10 @@ gate "phi-acyclic-copy-order" fast \
 gate "doc-link-integrity" fast \
     python3 scripts/check_doc_links.py
 
+# Needs PyYAML (python3-yaml on Debian/Ubuntu). This gate is the FIRST
+# local consumer: on a box without it the checker fails cleanly (no
+# traceback) with a message naming the package and the install path, so
+# the failure is actionable without a separate preflight.
 gate "ci-gate-parity" fast \
     python3 scripts/check_ci_gate_parity.py
 gate "ci-asm-diff-parity-self-test" fast \

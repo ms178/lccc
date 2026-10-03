@@ -730,6 +730,15 @@ jobs:
             --file tests/encdiff-corpus/index-fold-64.insn \
             --file tests/encdiff-corpus/data16-branches-64.insn
 
+      # The gate-parity checker and the workflow-shell checker parse this
+      # very file (and every other workflow) through PyYAML. The runner
+      # images ship it, but that is an image property, not a declared
+      # dependency of a REQUIRED gate — a future image change (or a
+      # self-hosted runner) must not turn the parity gate into a
+      # ModuleNotFoundError. Declared here, at the point of first use.
+      - name: Install checker dependency (PyYAML)
+        run: sudo apt-get install -y --no-install-recommends python3-yaml
+
       # Keep every standalone gate from ci_local.sh represented in hosted CI.
       # Group the compact contracts to avoid YAML drift and setup overhead;
       # the expensive codegen-quality gate remains in bench.yml.

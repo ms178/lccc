@@ -381,18 +381,57 @@ def _canon_commutative(insn: str) -> str:
     return insn
 
 
+# objdump renders the raw-byte column at a FIXED width per listing — on
+# x86 (both 64- and 32-bit output, binutils 2.44/2.47 verified) seven
+# bytes, i.e. three characters per byte ("XX " each) = 21 columns,
+# space-padded whenever an instruction is shorter — and wraps
+# instructions wider than the column onto continuation lines that carry
+# the RUNNING address (previous address + previous bytes) and the
+# remaining bytes but no instruction column. Both properties make
+# continuation lines mechanically checkable, which is what the stateful
+# parser below does; the width is never hardcoded but inferred from the
+# first anchor line and required to be consistent across the listing.
+_MAX_X86_INSN_BYTES = 15    # the architectural maximum instruction length
+_INSN_LINE = re.compile(r"^\s*([0-9a-f]+):\t(.*)$")
+_LABEL_LINE = re.compile(r"^[0-9a-f]{8,16} <[^>]*>:$")
+
+
+def _byte_tokens(field: str) -> list[str] | None:
+    """The two-hex-digit byte tokens of a byte column, or None if malformed."""
+    tokens = field.split()
+    if not tokens or any(not re.fullmatch(r"[0-9a-f]{2}", t) for t in tokens):
+        return None
+    return tokens
+
+
 def _parse_disasm(text: str) -> list[str] | None:
     """Parse one `objdump -d` listing into its normalised instructions.
 
     Fail-closed: the return value is the normalised instruction sequence,
     or None whenever the listing is not admissible semantic evidence —
     an undecodable instruction, a `...` gap (bytes present that the
-    decoder declined to decode), an unrecognised line shape, or an
-    empty instruction stream. Undecodable renderings are not semantic
+    decoder declined to decode), an unrecognised line shape, an
+    unanchored or inconsistent byte-continuation fragment, or an empty
+    instruction stream. Undecodable renderings are not semantic
     evidence: objdump DOES print the raw bytes before `(bad)', but the
     byte column is dropped here, so two different garbage streams can
     render to the same instruction text — a `BETTER' verdict must never
     stand on that, in either direction.
+
+    Continuation lines (address + bytes, no instruction column — objdump
+    emits them when an instruction is wider than the byte column) are
+    admitted ONLY under the full state machine real objdump implies: the
+    immediately preceding line must have filled the byte column
+    completely (objdump wraps only when the column overflows), the
+    fragment's address must be the running address (previous address +
+    previous bytes) — the byte-accounting invariant that also holds
+    between consecutive anchors within one symbol block — and the
+    accumulated instruction must stay within the 15-byte architectural
+    maximum. A byte-only line that fails any of these is not formatting
+    but an ORPHAN fragment: it is never skipped, because two listings
+    that differ only in orphan bytes would then compare equal and a
+    size-only `BETTER' could stand on streams the parser never proved
+    identical (the exact false pass this state machine closes).
 
     Two encodings are equivalent when they decode to the same instruction
     with the same effective address. The two spellings that differ purely
@@ -404,6 +443,11 @@ def _parse_disasm(text: str) -> list[str] | None:
     `{nf}` is NOT stripped: it changes flags semantics.
     """
     out: list[str] = []
+    width: int | None = None   # byte-column capacity in characters (3/byte)
+    prev_addr: int | None = None    # address-chain state; reset at labels
+    prev_bytes = 0
+    prev_full = False           # a continuation is legal only after a FULL line
+    insn_bytes = 0              # accumulated bytes of the instruction in flight
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped:
@@ -411,35 +455,49 @@ def _parse_disasm(text: str) -> list[str] | None:
         if " file format " in stripped:
             continue                     # "<file>: file format <fmt>" header
         if stripped.startswith("Disassembly of section "):
+            prev_addr = None             # new section: the chain restarts
             continue
-        if re.match(r"^[0-9a-f]{8,16} <[^>]*>:$", stripped):
-            continue                     # symbol label: ADDR <name>:
+        if _LABEL_LINE.match(stripped):
+            prev_addr = None             # symbol label: ADDR <name>:
+            continue
         if stripped == "...":
             # A gap marker: bytes exist here that the decoder declined to
             # decode. That is undecidable content, not noise — the two
             # objects' undecoded tails could differ behind identical
             # decoded prefixes.
             return None
-        m = re.match(r"^[0-9a-f]+:\t(.+)$", stripped)
+        m = _INSN_LINE.match(line)
         if m is None:
             return None                  # unknown line shape: parse failure
-        bytes_col, sep, insn = m.group(1).partition("\t")
-        raw = bytes_col.split()
-        if not raw:
+        addr = int(m.group(1), 16)
+        bytes_col, sep, insn = m.group(2).partition("\t")
+        tokens = _byte_tokens(bytes_col)
+        if tokens is None:
             return None
-        if any(len(b) != 2 or not re.fullmatch(r"[0-9a-f]{2}", b) for b in raw):
-            return None
+        nbytes = len(tokens)
         if not sep:
-            # A byte-continuation fragment: objdump splits a byte column
-            # wider than its line across continuation lines that carry an
-            # address and the remaining bytes but no instruction column —
-            # the instruction is anchored on the line that has the column.
-            # The fragment is formatting, not a separate instruction, and
-            # the bytes it shows are already accounted for in the anchor's
-            # instruction text, so it is skipped — never confused with a
-            # parse failure, which is reserved for shapes objdump never
-            # emits.
-            continue
+            # Continuation candidate: needs a full predecessor, the
+            # running address, and an in-range accumulated instruction.
+            if prev_addr is None or not prev_full:
+                return None              # orphan fragment (or one that
+                                       # follows a non-overflowed column)
+            if addr != prev_addr + prev_bytes:
+                return None              # not the running address
+            insn_bytes += nbytes
+            if insn_bytes > _MAX_X86_INSN_BYTES:
+                return None
+            prev_addr, prev_bytes = addr, nbytes
+            prev_full = 3 * nbytes == (width or -1)
+            continue                     # the anchor line owns the record
+        # Anchor line: padded byte column, then the instruction column.
+        if prev_addr is not None and addr != prev_addr + prev_bytes:
+            return None                  # address-chain break within a block
+        if width is None:
+            width = len(bytes_col)
+            if width % 3:
+                return None              # the column is 3 chars per byte
+        elif len(bytes_col) != width:
+            return None                  # inconsistent column: not objdump
         insn = insn.strip()
         if not insn:
             return None
@@ -458,6 +516,9 @@ def _parse_disasm(text: str) -> list[str] | None:
         if not insn:
             return None
         out.append(insn)
+        prev_addr, prev_bytes = addr, nbytes
+        prev_full = 3 * nbytes == width
+        insn_bytes = nbytes
     return out or None
 
 
