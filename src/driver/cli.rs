@@ -6,9 +6,58 @@
 //! like `--dumpmachine` and `--version`.
 //!
 //! Design: The parser is a simple `while` loop with a flat `match` on each
-//! argument. No external parser library is used. Unknown flags are silently
-//! ignored (matching GCC's behavior for unrecognized `-f` and `-m` flags),
-//! which is critical for build system compatibility.
+//! argument. No external parser library is used.
+//!
+//! # Unknown-option policy
+//!
+//! Two facts pull in opposite directions, and the policy is where they meet.
+//!
+//! * Garbage must not read as support.  Feature probes (`cc-option`, Meson
+//!   `has_argument`, Kconfig) decide by **exit status**, so a flag LCCC does
+//!   not implement must not succeed: that turns "does the compiler support
+//!   this?" into a false yes, and the build then proceeds under assumptions
+//!   the compiler never agreed to.
+//! * Real builds must keep building.  Measured against a prebuilt driver, 16
+//!   of the 93 flag spellings that the Linux kernel, glibc, zlib-ng, gzip and
+//!   expat build systems pass *unconditionally* had no arm here
+//!   (`-fno-strict-aliasing`, `-fwrapv`, `-fno-strict-overflow`, `-fno-plt`,
+//!   `-flto`, `-funroll-loops`, `-Og`, `-ansi`, `-fno-ident`, `-fuse-ld=*`,
+//!   `-fvar-tracking-assignments`, …).  Refusing those breaks real builds.
+//!
+//! So the policy is **tiered by consequence**, and every tier is measured:
+//!
+//! | input | behaviour |
+//! |---|---|
+//! | `-std=<unrecognized>` | **hard error** with a suggestion (a wrong dialect silently mis-parses headers) |
+//! | `-std=<known>`, `-ansi` | implemented: `-ansi` is `-std=c90` (measured on GCC: no `__STDC_VERSION__`, `__STRICT_ANSI__` defined) |
+//! | *contract* flags — `-fstack-protector*`, `-ftrapv`, `-fsanitize=` | **hard error** + remediation hint (upstream's original rule) |
+//! | data-model / ABI requests — `-fshort-enums`, `-fshort-wchar`, `-fpack-struct[=n]`, `-funsigned-char` | **hard error**, because ignoring one silently returns objects whose layout or `char` signedness disagrees with the libraries they link against. `-fsigned-char` is *not* here: it names the x86-64 SysV default LCCC already emits |
+//! | `-g<selector>` that GNU rejects (`-g4`, `-ggdb9`, `-gdwarf-9`, `-gz=bogus`, `-gno-bogus`, `-gbogus`) | **hard error** — the selector grammar is closed and was measured exhaustively, so a name outside it is a typo, not a newer GNU (GCC 14.2/16.2, Clang 23.1 and ICX all reject these) |
+//! | *off-requests* — `-Wno-<unknown>`, `-gno-<feature>` | **accepted silently**: the thing asked to be switched off does not exist here, so the requested state is already the state (all four reference compilers accept `-Wno-<unknown>`, measured) |
+//! | everything else unimplemented — `-f*`, `-m*`, `--*`, `-W<name>`, `-Werror=<name>`, `--param`, GNU-accepted `-g` selectors, presentation namespaces (`-fdiagnostics-*`, `-fmessage-length=`, `-fmax-errors=`, `-f*prefix-map=`, `-fverbose-asm`) | **warning naming the option**, once per compilation; `LCCC_STRICT_OPTIONS=1` makes it fatal |
+//!
+//! The last row is the one that needs defending, and the defence is the
+//! measurement, not taste.  LCCC implements six warning names out of the 409
+//! GNU exposes (`gcc -Q --help=warnings`, measured) and has no parameter,
+//! debug-selector, optimisation or long-option table at all, so for those
+//! namespaces it cannot tell a typo from a spelling a newer GNU added.  The
+//! consequence of ignoring a request in this row is an optimisation, warning,
+//! reporting or debug-info preference *not being applied* — visible in the
+//! diagnostic — rather than a program that means something different, which is
+//! why the meaning-changing requests above are refused instead.  Strict mode
+//! exists precisely because a capability probe cannot live with that judgement
+//! call: under `LCCC_STRICT_OPTIONS=1` every tolerated request fails, so the
+//! exit status means "implemented", and that is the mode
+//! `scripts/lccc_capability_probe.py` runs in.
+//!
+//! Escalation is spelled with the `LCCC_STRICT_` prefix already established by
+//! `LCCC_STRICT_MFLAGS` below.
+//!
+//! Two spellings with an implementation in another layer are recognised here
+//! so they cannot reach the fallback at all: `--sysroot[=]`/`-isysroot[=]`
+//! (resolved by the link layer and the include search) and the GNU link-file
+//! switches `-nostartfiles`/`-nodefaultlibs` (resolved by `backend::common`
+//! from the raw command line, like `-nostdlib`).
 
 use super::pipeline::{CliDefine, CompileMode, Driver};
 use crate::backend::Target;
@@ -1055,6 +1104,16 @@ impl Driver {
     /// Parse the main argument list (everything after argv[0]).
     fn parse_main_args(&mut self, args: &[String]) -> Result<(), String> {
         let mut explicit_language: Option<String> = None;
+        // Distinct unrecognized spellings already diagnosed, so a flag passed
+        // to every translation unit of a build reports once (see the
+        // unknown-option arm). Also the `LCCC_STRICT_OPTIONS` escalation point.
+        // `LCCC_STRICT_OPTIONS` escalates every accepted-but-unimplemented
+        // spelling to an error.  Read once: the policy is per process, and a
+        // build that cannot see one value for the whole command line is worse
+        // than either answer.
+        let strict_options = std::env::var_os("LCCC_STRICT_OPTIONS").is_some();
+        let mut unknown_options: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         let mut i = 0;
         while i < args.len() {
             // x86 ISA flags are routed through the shared applicator FIRST:
@@ -1170,21 +1229,57 @@ impl Driver {
                      supported; emitting uncompressed debug info",
                     arg
                 ),
-                arg if arg.starts_with("-gno-") => {}
-                arg if arg.starts_with("-gdwarf-") => self.debug_info = true,
+                // A `-gno-<feature>` modifier asks for a feature to be OFF.
+                // LCCC implements none of the features these modifiers name,
+                // so the requested state is the actual state: the request is
+                // satisfied by construction and no diagnostic is owed.  An
+                // unknown modifier is a GNU error, though (`-gno-bogus` exits
+                // 1 on GCC 14.2 and 16.2, measured), and accepting it here was
+                // the other half of the old `-g*` blanket.
+                arg if arg.starts_with("-gno-") => {
+                    if !gnu_debug_feature_off_known(&arg[5..]) {
+                        unknown_option(arg, strict_options)?;
+                    }
+                }
                 arg if arg.len() > 5
                     && arg.starts_with("-ggdb")
                     && arg[5..].bytes().all(|b| b.is_ascii_digit()) =>
                 {
+                    // GCC accepts -ggdb1..-ggdb3; -ggdb4 and above are errors
+                    // (measured on 14.2, and 16.2 rejects -ggdb9).
+                    if !matches!(&arg[5..], "1" | "2" | "3") {
+                        unknown_option(arg, strict_options)?;
+                    }
                     self.debug_info = true
                 }
                 arg if arg.len() > 2
                     && arg.starts_with("-g")
                     && arg[2..].bytes().all(|b| b.is_ascii_digit()) =>
                 {
+                    // GCC accepts -g1..-g3 (-g4 is an error, measured); -g0 is
+                    // handled above as an explicit OFF.
+                    if !matches!(&arg[2..], "1" | "2" | "3") {
+                        unknown_option(arg, strict_options)?;
+                    }
                     self.debug_info = true
                 }
-                arg if arg.starts_with("-g") => self.debug_info = true,
+                // Any other `-g<selector>`.  Two outcomes, both measured:
+                //
+                //  * GNU accepts the selector (a format/modifier spelling LCCC
+                //    has no implementation for) -> keep the historical
+                //    semantic, a selector must never silently turn debug OFF,
+                //    and diagnose that nothing acts on it.
+                //  * GNU rejects it (`-gbogus`, `-gdwarf-9`, `-glto`) -> error,
+                //    matching GCC 14.2/16.2 and Clang 23.1/ICX; the old blanket
+                //    accepted all of these and made the capability probe
+                //    report them as implemented.
+                arg if arg.starts_with("-g") => {
+                    if !gnu_debug_selector_known(&arg[2..]) {
+                        unknown_option(arg, strict_options)?;
+                    }
+                    self.debug_info = true;
+                    unknown_option_tolerated(arg, strict_options)?;
+                }
 
                 // Verbose/diagnostic flags
                 "-v" | "--verbose" => self.verbose = true,
@@ -1259,11 +1354,47 @@ impl Driver {
                     }
                 }
 
-                // Warning flags
+                // Warning flags.
+                //
+                // `process_flag` reports whether it recognised the name; an
+                // unknown one must not vanish.  The measured contract
+                // (GCC 14.2 in-tree plus the pinned oracles
+                // GCC 16.2 / Clang 23.1 / ICC 2021.10 / ICX):
+                //
+                //   -W<name>          gcc: rc 1   clang/icc/icx: accept
+                //   -Werror=<name>    gcc: rc 1   clang/icc/icx: accept
+                //   -Wno-error=<name> gcc: rc 1   clang/icc/icx: accept
+                //   -Wno-<name>       all four: accept, silently
+                //
+                // LCCC implements SIX warning names; GNU exposes 409
+                // (`gcc -Q --help=warnings | grep -c '^  -W'`, measured).  A
+                // driver with six names of a 409-name namespace cannot decide
+                // whether a name it does not implement is a typo or a warning
+                // added by a newer GNU -- so it must not guess in the
+                // direction that stops a build that GNU builds, and it must
+                // not guess "supported" either.  Both are avoided by
+                // diagnosing the name (which a `-Wno-` request does not need:
+                // LCCC emits no such warning, so "off" is already the state)
+                // and making it fatal under `LCCC_STRICT_OPTIONS=1`, which is
+                // what the capability probe exports.  The consequence of
+                // tolerating a name is a missing diagnostic, never different
+                // code -- which is why this namespace, unlike `-f`/`--`/`-g`,
+                // is not fail-closed by default.
                 arg if arg.starts_with("-W") => {
                     let flag = &arg[2..];
+                    // A plain `-Wno-<name>` request for an unknown warning
+                    // is honoured by construction (there is no such warning,
+                    // so "off" is already the state) and gets no diagnostic.
+                    // `-Wno-error=<name>` is different: it changes error
+                    // promotion for a named warning, so an unknown name is
+                    // diagnosed like every other unimplemented warning.
                     if !flag.is_empty() {
-                        self.warning_config.process_flag(flag);
+                        let recognized = self.warning_config.process_flag(flag);
+                        let unknown_off_request =
+                            flag.starts_with("no-") && !flag.starts_with("no-error=");
+                        if !recognized && !unknown_off_request {
+                            unknown_option_tolerated(arg, strict_options)?;
+                        }
                     }
                 }
 
@@ -1271,12 +1402,27 @@ impl Driver {
                 "-D" => {
                     i += 1;
                     if i < args.len() {
-                        self.add_define(&args[i]);
+                        self.add_define(&args[i], strict_options)?;
                     } else {
                         return Err("-D requires an argument".to_string());
                     }
                 }
-                arg if arg.starts_with("-D") => self.add_define(&arg[2..]),
+                arg if arg.starts_with("-D") => self.add_define(&arg[2..], strict_options)?,
+
+                // `--sysroot=<dir>` / `-isysroot <dir>`: implemented by the
+                // link layer (`backend::common` resolves the CRT objects, the
+                // default library search and `-print-libgcc-file-name` against
+                // it) and by the preprocessor's system include search.  The
+                // operand must be consumed here so it is not mistaken for an
+                // input file; `raw_args` carries the spelling to the layers
+                // that act on it.
+                arg if arg.starts_with("--sysroot=") || arg.starts_with("-isysroot=") => {}
+                "--sysroot" | "-isysroot" => {
+                    i += 1;
+                    if i >= args.len() {
+                        return Err(format!("{} requires a directory argument", args[i - 1]));
+                    }
+                }
 
                 // Force-include files
                 "-include" => {
@@ -1380,31 +1526,56 @@ impl Driver {
                 }
                 arg if arg == "-finstrument-functions-exclude-file-list" => {}
                 arg if arg == "-finstrument-functions-exclude-function-list" => {}
-                arg if arg.starts_with("-std=") => {
-                    let std_value = &arg[5..];
-                    // GNU dialects: gnu89, gnu99, gnu11, gnu17, gnu23, etc.
-                    // Strict ISO: c89, c99, c11, c17, c23, iso9899:*, etc.
-                    self.gnu_extensions = std_value.starts_with("gnu");
-                    // gnu89 and c89 use GNU inline semantics by default;
-                    // gnu99+ and c99+ use C99 inline semantics.
-                    // Note: an EXPLICIT -fgnu89-inline / -fno-gnu89-inline overrides
-                    // any -std= (matching GCC: -std= only sets the default model).
-                    if self.gnu89_inline_explicit.is_none() {
-                        self.gnu89_inline = matches!(
-                            std_value,
-                            "gnu89" | "c89" | "gnu90" | "c90" | "iso9899:1990" | "iso9899:199409"
-                        );
-                    }
-                    // `__STDC_VERSION__` must track the selected dialect.
-                    // Leaving it pinned at the C17 default made every
-                    // C23-conditional header take its pre-C23 branch even
-                    // under `-std=c23`: GCC's own <stdarg.h> then kept the
-                    // two-parameter `va_start(v, l)` definition, so the C23
-                    // one-argument form `va_start(ap)` expanded to
-                    // `__builtin_va_start(ap,)` and failed to parse
-                    // (gcc.c-torture/execute/pr117432.c).
-                    self.stdc_version = std_version_macro(std_value);
+                // `-ffreestanding` (C11 4p6): the program may execute in a
+                // freestanding environment, so `__STDC_HOSTED__` is 0. Linux's
+                // arch/x86/boot and most firmware pass this; before this arm
+                // existed the flag was dropped by the blanket `-f` swallow and
+                // the macro stayed 1, silently selecting hosted header paths.
+                //
+                // `-fhosted` is the documented negation and must restore 1
+                // (GCC accepts both, last one wins).
+
+                // ---- A13/A14: which library calls an optimisation may create --------------
+                // A pass may replace user code with a call to a standard library function
+                // (`loop_idiom` -> memcpy/memmove, `loop_memset` -> memset, `fortify_fold` ->
+                // puts/fwrite/...) and the backend may expand a constant-size memcpy/memset
+                // call inline.  Both are only sound while the callee really is the library
+                // function: a translation unit that defines `memcpy` (glibc's own string
+                // routines do) makes the synthesised call resolve into a definition the
+                // compiled code is part of -- unbounded self-recursion, or a silently ignored
+                // user definition.  These four arms record the CLI half of the policy; the
+                // passes consult it together with the TU's own definitions
+                // (`passes::libcall::LibcallAllowance`) and the backend consults the same
+                // object (`backend::libcall_policy`).
+                //
+                // Semantics follow GCC 16.2 (verified on the pinned oracles, both Godbolt and
+                // local): `-ffreestanding` implies `-fno-builtin`; `-fbuiltin`/`-fhosted`
+                // clear the *blanket* withdrawal (last one wins); a per-name
+                // `-fno-builtin-<fn>` is sticky (GCC keeps it even after a later `-fbuiltin`)
+                // and is never cleared by the blanket arms.
+                "-ffreestanding" => {
+                    self.freestanding = true;
+                    self.builtin_policy.withdraw_all();
                 }
+                "-fhosted" => {
+                    self.freestanding = false;
+                    self.builtin_policy.restore_all();
+                }
+                "-fbuiltin" => self.builtin_policy.restore_all(),
+                arg if arg == "-fno-builtin" => self.builtin_policy.withdraw_all(),
+                arg if arg.starts_with("-fno-builtin-") => {
+                    self.builtin_policy
+                        .withdraw_one(&arg["-fno-builtin-".len()..]);
+                }
+                // `-ansi` is `-std=c90` in GCC's driver (measured: `gcc
+                // -ansi -dM -E` reports `__STDC_VERSION__` absent, exactly
+                // like `-std=c90`, and defines `__STRICT_ANSI__`).  Ignoring
+                // it would compile C90 sources as C17, which is the one thing
+                // the dialect policy never does silently.
+                // NOTE: these arms must not `return` — the parse loop still
+                // has the input files and every other option to walk.
+                "-ansi" => self.apply_std_dialect("c90")?,
+                arg if arg.starts_with("-std=") => self.apply_std_dialect(&arg[5..])?,
 
                 // Machine/target flags
                 "-mfunction-return=thunk-extern" => self.function_return_thunk = true,
@@ -2073,6 +2244,28 @@ impl Driver {
                         a
                     ));
                 }
+                // Data-model and ABI requests.  A *suppression* request can be
+                // satisfied by not doing the thing; these cannot: they ask for
+                // a different `char` signedness, enum width, wchar_t width or
+                // struct packing, so ignoring one silently produces objects
+                // whose layout disagrees with the libraries they are linked
+                // against.  `-fsigned-char` is not here: it names the x86-64
+                // SysV default, which is what LCCC already emits.
+                a @ ("-fshort-enums" | "-fshort-wchar" | "-fpack-struct" | "-funsigned-char") => {
+                    return Err(format!(
+                        "{}: LCCC does not implement this data-model request, and \
+                         ignoring it would silently produce objects whose layout or \
+                         char signedness disagrees with the code it links against",
+                        a
+                    ));
+                }
+                arg if arg.starts_with("-fpack-struct=") => {
+                    return Err(format!(
+                        "{}: LCCC does not implement packed struct layouts; define the \
+                         struct with __attribute__((packed)) instead",
+                        arg
+                    ));
+                }
                 arg if arg.starts_with("-mstack-protector-guard") => {
                     return Err(format!(
                         "{}: LCCC does not implement stack-protector canaries; \
@@ -2080,7 +2273,16 @@ impl Driver {
                         arg
                     ));
                 }
-                arg if arg.starts_with("-f") => {}
+                // NOTE: there used to be a blanket `arg if arg.starts_with("-f") => {}`
+                // here. It made every unimplemented `-f` option -- including
+                // `-ftrapv` and `-fsanitize=*`, whose explicit refusal arms
+                // sit BELOW it and were therefore unreachable dead code --
+                // disappear without a diagnostic. Anything not matched by a
+                // specific arm above now falls through to the unknown-option
+                // arm at the end of this match, which applies the documented
+                // tier policy (warning by default, `LCCC_STRICT_OPTIONS=1`
+                // fatal). Do not reintroduce it; add a specific, commented
+                // no-op arm for a flag LCCC deliberately treats as inert.
 
                 // Linker flags
                 "-static" => self.static_link = true,
@@ -2096,9 +2298,22 @@ impl Driver {
                 "-no-pie" | "--no-pie" | "--no-pic-executable" => {
                     self.linker_ordered_items.push("-no-pie".to_string());
                 }
+                // The three GNU link-file switches are recognised here and
+                // *acted on* in `backend::common`, which resolves them from
+                // `raw_args` exactly as it already does for `-nostdlib`.
+                // Recognising them is the point: the link layer reads the raw
+                // command line, so an arm-less spelling used to reach the
+                // unknown-option fallback — harmless while that was a warning,
+                // a broken cross build now that it is an error, even though
+                // the implementation was there all along.
+                //
+                // Semantics, measured on GCC 14.2 and honoured as measured:
+                //   -nostartfiles  -> no crt1/crti/crtbegin/crtend/crtn, libc kept
+                //   -nodefaultlibs -> crt files kept, libc/libm dropped, libgcc kept
+                //   -nostdlib      -> crt files and all default libraries dropped
                 "-nostdlib" => self.nostdlib = true,
                 "-nostdinc" => self.nostdinc = true,
-                "-nodefaultlibs" => {}
+                "-nostartfiles" | "-nodefaultlibs" => {}
 
                 // Language selection
                 "-x" => {
@@ -2170,13 +2385,21 @@ impl Driver {
 
                 // GCC --param flag: --param <name>=<value> or --param=<name>=<value>
                 // Used by nix CC wrapper for hardening flags like ssp-buffer-size=4
+                // GCC's parameter table is implementation-private and every
+                // spelling a real build passes is a request to tune an
+                // internal heuristic, not a semantic contract; lccc has no
+                // table to check against, so the value is tolerated — but
+                // not silently (gcc 16.2 errors on `--param bogus=1`, and a
+                // probe must be able to see that lccc has no implementation
+                // for the name).
                 "--param" => {
                     // Skip the next argument (the parameter value)
                     i += 1;
+                    unknown_option_tolerated("--param", strict_options)?;
                 }
                 arg if arg.starts_with("--param=") => {
                     // Single-argument form: --param=ssp-buffer-size=4
-                    // Silently ignore
+                    unknown_option_tolerated(arg, strict_options)?;
                 }
 
                 // Stdin input
@@ -2204,10 +2427,72 @@ impl Driver {
                     ));
                 }
 
-                // Unknown flags
+                // Instrumentation and trap requests whose *absence* is
+                // invisible in the produced binary.
+                //
+                // Same failure mode as `-fstack-protector` above, and the same
+                // answer: refuse loudly instead of handing back a binary the
+                // caller believes is instrumented. `-ftrapv` promises a
+                // run-time trap on signed overflow; LCCC emits no such check,
+                // so accepting it would silently give a *different execution*
+                // than requested. `-fsanitize=*` promises a checked build; an
+                // unchecked binary that the caller will not re-verify in the
+                // field is the exact hazard this arm exists to prevent.
+                //
+                // `-fno-trapv` / `-fsanitize-recover=*` style *disable*
+                // requests stay accepted (see the `-mno-` arm) because a
+                // compiler that never emits the instrumentation already
+                // complies with a request to leave it out.
+                arg if arg == "-ftrapv" => {
+                    return Err("-ftrapv: LCCC does not emit signed-overflow traps; \
+                         build without it, or use -fwrapv to state the \
+                         wrapping contract explicitly"
+                        .to_string());
+                }
+                arg if arg == "-fsanitize" || arg.starts_with("-fsanitize=") => {
+                    return Err(format!(
+                        "{}: LCCC does not implement sanitizer instrumentation; \
+                         a build must not be labelled sanitized when it is not",
+                        arg
+                    ));
+                }
+
+                // Unknown flags -- LCCC's standing doctrine is that no request
+                // may be discarded silently (see the module header and the
+                // `-fstack-protector` arm). This arm is the generic case.
+                //
+                // Why a warning and not GCC's error: build systems probe with
+                // speculative flags (`cc-option`, `meson.get_compiler().
+                // has_argument`, Kconfig) and *rely* on the compiler exiting
+                // successfully. Making the generic case fatal would abort the
+                // Linux kernel build at the first Kconfig probe. A visible,
+                // specific diagnostic plus `LCCC_STRICT_OPTIONS=1` gives CI and
+                // the corpus harness the fatal behaviour without regressing
+                // those probes.
+                //
+                // Reported once per distinct spelling: a build that passes the
+                // same unimplemented flag to 4 000 translation units must
+                // produce one line, not 4 000.
                 arg if arg.starts_with('-') => {
-                    if self.verbose {
-                        eprintln!("warning: unknown flag: {}", arg);
+                    if unknown_options.insert(arg.to_string()) {
+                        // The policy lives in a pure function so it is testable
+                        // without mutating process-global environment state
+                        // (which would race under the parallel test harness).
+                        //
+                        // Tolerated with a diagnostic, not fatal: measured, 16
+                        // of 93 flag spellings that the kernel, glibc, zlib-ng,
+                        // gzip and expat build systems pass unconditionally
+                        // have no arm here (`-fno-strict-aliasing`, `-fwrapv`,
+                        // `-fno-strict-overflow`, `-fno-plt`, `-flto`,
+                        // `-funroll-loops`, `-Og`, `-ansi`, `-fno-ident`, ...).
+                        // Failing the build on those would break real builds
+                        // while the request itself is an optimisation,
+                        // reporting or debug-info preference -- the classes
+                        // whose being ignored cannot change the generated
+                        // program's *meaning*.  The requests that would change
+                        // it are refused above (stack protector, data model,
+                        // ABI) and the dialect request is implemented.
+                        unknown_option_tolerated(arg, strict_options)?;
                     }
                 }
 
@@ -2259,18 +2544,61 @@ impl Driver {
     }
 
     /// Add a -D define from command line.
-    pub fn add_define(&mut self, arg: &str) {
-        if let Some(eq_pos) = arg.find('=') {
-            self.defines.push(CliDefine {
-                name: arg[..eq_pos].to_string(),
-                value: arg[eq_pos + 1..].to_string(),
-            });
-        } else {
-            self.defines.push(CliDefine {
-                name: arg.to_string(),
-                value: "1".to_string(),
+    pub fn add_define(&mut self, arg: &str, strict: bool) -> Result<(), String> {
+        let (name, value) = match arg.find('=') {
+            Some(eq_pos) => (&arg[..eq_pos], arg[eq_pos + 1..].to_string()),
+            None => (arg, "1".to_string()),
+        };
+        // `_FORTIFY_SOURCE` is accepted but neutralised (the driver undefines
+        // it unconditionally; glibc's fortify wrappers are not modelled).  A
+        // hardening request that cannot be honoured must not disappear
+        // silently, so it goes through the same visible-tolerance policy as
+        // the other accepted-but-unimplemented spellings.
+        if name == "_FORTIFY_SOURCE" {
+            fortify_source_unsupported(strict)?;
+        }
+        self.defines.push(CliDefine {
+            name: name.to_string(),
+            value,
+        });
+        Ok(())
+    }
+
+    /// Apply a `-std=<dialect>` selection (`-ansi` is `-std=c90`, see below).
+    ///
+    /// The one request class that cannot be satisfied by ignoring it: a dialect
+    /// selects what the source is allowed to mean, so compiling C90 source as
+    /// C17 accepts `//` comments, declarations after statements and `inline`
+    /// that C90 rejects — the silent mis-parse the dialect policy refuses
+    /// everywhere else.  An unknown name is therefore an error with a
+    /// suggestion, and every known name sets the macros the dialect implies.
+    fn apply_std_dialect(&mut self, std_value: &str) -> Result<(), String> {
+        // GNU dialects: gnu89, gnu99, gnu11, gnu17, gnu23, etc.
+        // Strict ISO: c89, c99, c11, c17, c23, iso9899:*, etc.
+        self.gnu_extensions = std_value.starts_with("gnu");
+        if self.gnu89_inline_explicit.is_none() {
+            self.gnu89_inline = matches!(
+                std_value,
+                "gnu89" | "c89" | "gnu90" | "c90" | "iso9899:1990" | "iso9899:199409"
+            );
+        }
+        self.finish_std_dialect(std_value)
+    }
+
+    /// Set `__STDC_VERSION__` for a dialect name, refusing an unknown one.
+    fn finish_std_dialect(&mut self, std_value: &str) -> Result<(), String> {
+        let version = std_version_macro(std_value);
+        if version.is_none() {
+            return Err(match closest_std_dialect(std_value) {
+                Some(s) => format!(
+                    "unrecognized command-line option '-std={}'; did you mean '-std={}'?",
+                    std_value, s
+                ),
+                None => format!("unrecognized command-line option '-std={}'", std_value),
             });
         }
+        self.stdc_version = version;
+        Ok(())
     }
 
     /// Add a -I include path from command line.
@@ -2278,6 +2606,301 @@ impl Driver {
         self.include_paths.push(path.to_string());
     }
 }
+
+/// Decide what to do about one unrecognized command-line option.
+///
+/// **Fatal by default, matching GCC** (`gcc -fbogus`, `gcc -Wbogus`,
+/// `gcc -gbogus` and `gcc --param bogus=1` all exit 1 with
+/// `error: unrecognized command-line option`; measured on GCC 14.2 in this
+/// tree and GCC 16.2 / clang 23.1 / icc 2021.10 / icx on the pinned oracles).
+///
+/// Why not the old warn-and-continue default: a build system decides whether
+/// a flag exists by *the exit status* (`cc-option`, Meson `has_argument`,
+/// Kconfig).  Succeeding on a flag lccc does not implement turns "does the
+/// compiler support this?" into a false yes, and the build then proceeds
+/// under assumptions the compiler never agreed to — for hardening or
+/// optimisation flags that is a silent misbuild, which is exactly what this
+/// module's doctrine forbids.
+///
+/// `strict` is `LCCC_STRICT_OPTIONS` being set; it is accepted so the error
+/// text can say why the failure happened in strict mode.  Kept free of
+/// global state (no `env::var`, no I/O beyond the deliberate diagnostic) so
+/// the policy can be pinned by tests and reviewed as one unit.
+pub fn unknown_option(arg: &str, strict: bool) -> Result<(), String> {
+    if strict {
+        return Err(format!(
+            "unrecognized command-line option '{}'; LCCC_STRICT_OPTIONS is set",
+            arg
+        ));
+    }
+    Err(format!(
+        "unrecognized command-line option '{}' (LCCC has no implementation for it; \
+         refusing to let a feature probe read this as support)",
+        arg
+    ))
+}
+
+/// Is `selector` (the text after `-g`) a debug selector GNU accepts?
+///
+/// Measured, not guessed: `gcc -Q --help=common` for the name set, plus one
+/// compile per spelling to pin the accepted/rejected boundary on GCC 14.2 in
+/// this tree and GCC 16.2 on the pinned oracle.  Accepted: `dwarf`,
+/// `dwarf-2..dwarf-5` (`-gdwarf-1`, `-gdwarf-6` and `-gdwarf-9` are errors on
+/// both), `dwarf32`/`dwarf64`, the format selectors (`stabs`, `stabs+`,
+/// `xcoff`, `xcoff+`, `coff1..3`, `vms`, `codeview`, `btf`, `ctf`), the
+/// content modifiers (`column-info`, `record-gcc-switches`, `pubnames`,
+/// `gnu-pubnames`, `statement-frontiers`, `variable-location-views`,
+/// `internal-reset-location-views`, `describe-dies`, `strict-dwarf`,
+/// `as-loc-support`, `gas-locview-support`, `inline-points`, `toggle`) and
+/// `z` / `z=<none|zlib|zlib-gnu|zlib-gabi|zstd>` (`-gz=bogus` is an error).
+/// Rejected, and therefore errors here: `g4`, `ggdb9`, `gdwarf-9`, `glto`,
+/// `gbogus`.
+///
+/// LCCC honours the selectors it implements in the literal arms above; every
+/// selector this function accepts but does not implement is diagnosed once
+/// per compilation and fatal under `LCCC_STRICT_OPTIONS=1`.
+fn gnu_debug_selector_known(selector: &str) -> bool {
+    if let Some(n) = selector.strip_prefix("dwarf-") {
+        // 5 is the newest version GCC 14.2 and 16.2 emit.
+        return matches!(n, "2" | "3" | "4" | "5");
+    }
+    if let Some(method) = selector.strip_prefix("z=") {
+        return matches!(method, "none" | "zlib" | "zlib-gnu" | "zlib-gabi" | "zstd");
+    }
+    if let Some(views) = selector.strip_prefix("variable-location-views=") {
+        return views == "incompat5";
+    }
+    matches!(
+        selector,
+        "dwarf"
+            | "dwarf32"
+            | "dwarf64"
+            | "strict-dwarf"
+            | "split-dwarf"
+            | "z"
+            | "record-gcc-switches"
+            | "column-info"
+            | "stabs"
+            | "stabs+"
+            | "xcoff"
+            | "xcoff+"
+            | "coff"
+            | "coff1"
+            | "coff2"
+            | "coff3"
+            | "vms"
+            | "pubnames"
+            | "gnu-pubnames"
+            | "statement-frontiers"
+            | "variable-location-views"
+            | "internal-reset-location-views"
+            | "describe-dies"
+            | "codeview"
+            | "btf"
+            | "ctf"
+            | "as-loc-support"
+            | "gas-locview-support"
+            | "inline-points"
+            | "toggle"
+    )
+}
+
+/// Is `modifier` (the text after `-gno-`) a debug feature GNU lets a build
+/// switch off?
+///
+/// Such a request is satisfied by construction here: LCCC implements none of
+/// these features, so "off" is the actual state.  An unknown modifier is a GNU
+/// error (`-gno-bogus` exits 1 on GCC 14.2 and 16.2, measured), which is why
+/// this is a closed list rather than the blanket accept it used to be.
+fn gnu_debug_feature_off_known(modifier: &str) -> bool {
+    matches!(
+        modifier,
+        "record-gcc-switches"
+            | "column-info"
+            | "pubnames"
+            | "statement-frontiers"
+            | "variable-location-views"
+            | "internal-reset-location-views"
+            | "describe-dies"
+            | "strict-dwarf"
+            | "inline-points"
+    )
+}
+
+/// The deliberately *tolerated* class of unrecognized spelling.
+///
+/// Two measured GNU behaviours are worth keeping, because rejection would
+/// break real builds without protecting anything:
+///
+/// * `-Wno-<name>`: all four reference compilers accept an unknown one
+///   silently (build systems disable warnings that may not exist).
+/// * `--param <name>=<v>` / `-g<selector>`: the request tunes an internal
+///   heuristic (or selects a debug-info flavour) whose meaning lccc does not
+///   implement; the program is still correct in either case, and gcc's own
+///   parameter/debug-selector tables are not a contract lccc can check
+///   against.  GCC *does* validate them (`--param bogus=1`, `-gbogus`,
+///   `-gdwarf-9` all exit 1 on GCC 14.2, measured), so this is a deliberate,
+///   diagnosed divergence in the permissive direction -- the diagnostic is
+///   what keeps it from being a silent one.
+///
+/// * unknown `-W<name>` / `-Werror=<name>` and the benign presentation
+///   presentation namespaces, and anything else the driver has no arm for:
+///   LCCC has no table to validate against, and the measurement above shows
+///   the spellings real builds pass are overwhelmingly optimisation,
+///   reporting and debug-info preferences -- see the module header.
+///
+/// These are *tolerated*, not *supported*: the diagnostic names them, and
+/// `LCCC_STRICT_OPTIONS=1` makes them fatal so a capability probe can
+/// establish the difference from exit status alone.
+pub fn unknown_option_tolerated(arg: &str, strict: bool) -> Result<(), String> {
+    if strict {
+        return Err(format!(
+            "unrecognized command-line option '{}'; LCCC_STRICT_OPTIONS is set",
+            arg
+        ));
+    }
+    eprintln!(
+        "warning: unrecognized command-line option '{}' is tolerated but not \
+         implemented by LCCC (nothing will act on it); set LCCC_STRICT_OPTIONS=1 \
+         to make this an error",
+        arg
+    );
+    Ok(())
+}
+
+/// `-D_FORTIFY_SOURCE=2`-style hardening request: accepted, diagnosed,
+/// never honoured (yet).
+///
+/// The macro is undefined for every translation unit by the driver, because
+/// glibc's `_FORTIFY_SOURCE` headers expand to `extern __inline __attribute__
+/// ((__always_inline__))` wrappers built on `__builtin_va_arg_pack()` and
+/// `__builtin_object_size()`.  Modelling that surface is a separate work
+/// item; until it is verified end to end, a build that asks for a fortified
+/// libc must be told it is not getting one instead of finding out from a
+/// security review.  Tolerated by default for source compatibility, fatal
+/// under `LCCC_STRICT_OPTIONS=1`.
+pub fn fortify_source_unsupported(strict: bool) -> Result<(), String> {
+    let msg = "_FORTIFY_SOURCE is not implemented by LCCC; the macro is undefined for \
+               this translation unit, so library calls are NOT fortified";
+    if strict {
+        return Err(format!("{}; LCCC_STRICT_OPTIONS is set", msg));
+    }
+    eprintln!(
+        "lccc: warning: {} (set LCCC_STRICT_OPTIONS=1 to make this an error)",
+        msg
+    );
+    Ok(())
+}
+
+/// Every C dialect spelling LCCC recognises, in `-std=` wire form.
+///
+/// Used for the "did you mean" suggestion on an unrecognized `-std=` value and
+/// by tests that pin the accepted set. Kept in one place so a newly taught
+/// dialect cannot be added to [`std_version_macro`] without the suggestion
+/// machinery seeing it.
+pub const STD_DIALECTS: &[&str] = &[
+    "c89",
+    "c90",
+    "c99",
+    "c9x",
+    "c11",
+    "c1x",
+    "c17",
+    "c18",
+    "c23",
+    "c2x",
+    "c2y",
+    "gnu89",
+    "gnu90",
+    "gnu99",
+    "gnu9x",
+    "gnu11",
+    "gnu1x",
+    "gnu17",
+    "gnu18",
+    "gnu23",
+    "gnu2x",
+    "gnu2y",
+    "iso9899:1990",
+    "iso9899:199409",
+    "iso9899:1999",
+    "iso9899:199x",
+    "iso9899:2011",
+    "iso9899:2017",
+    "iso9899:2018",
+];
+
+/// Levenshtein edit distance between two ASCII strings.
+///
+/// Two-row dynamic program: `O(min(a,b))` space, `O(a*b)` time. The tables are
+/// a few dozen bytes (see [`STD_DIALECTS`]) so the quadratic term is
+/// irrelevant next to process startup, and `-std=` is parsed once per
+/// invocation.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.is_empty() {
+        return b.len();
+    }
+    if b.is_empty() {
+        return a.len();
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, &ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// Closest recognised `-std=` dialect to `std_value`, for a GCC-style
+/// "did you mean" hint. `None` when nothing is close enough to be useful.
+///
+/// GCC suggests by edit distance over its dialect table; the same oracle is
+/// used here so `-std=c17x`, `-std=gnu1z` and `-std=c++11` produce a pointer
+/// instead of a bare rejection. Candidates are restricted to dialects sharing
+/// the first character so `-std=z89` is not "corrected" to `-std=c89`, and a
+/// hit further than [`STD_SUGGEST_MAX_DISTANCE`] away is suppressed rather
+/// than guessed at -- a confidently wrong suggestion is worse than none.
+pub fn closest_std_dialect(std_value: &str) -> Option<&'static str> {
+    let first = std_value.as_bytes().first().copied()?;
+    STD_DIALECTS
+        .iter()
+        .copied()
+        .filter(|d| d.as_bytes().first().copied() == Some(first))
+        .map(|d| {
+            (
+                edit_distance(d, std_value),
+                std::cmp::Reverse(common_prefix_len(d, std_value)),
+                d,
+            )
+        })
+        // Ties break on the LONGEST shared prefix: a typed extra/missing
+        // character (`-std=c17x` for `c17`) keeps the prefix intact, while a
+        // shorter unrelated alias (`c1x`) does not. `min_by_key` then keeps the
+        // first of any remaining tie, i.e. `STD_DIALECTS` order -- stable.
+        .filter(|(dist, _, _)| *dist <= STD_SUGGEST_MAX_DISTANCE)
+        .min_by_key(|(dist, prefix, _)| (*dist, *prefix))
+        .map(|(_, _, d)| d)
+}
+
+/// Number of leading bytes `a` and `b` agree on.
+fn common_prefix_len(a: &str, b: &str) -> usize {
+    a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count()
+}
+
+/// Largest edit distance still worth suggesting.
+///
+/// A fixed budget is used rather than a length-relative one: the dialect
+/// lexicon is dense enough (`c99`/`c9x`, `c17`/`c18`, `gnu2x`/`gnu2y`) that a
+/// ratio-based budget would happily "correct" a genuine dialect into a
+/// near-miss neighbour. Four edits covers every realistic transposition or
+/// truncated-word typo while leaving unrelated spellings alone.
+const STD_SUGGEST_MAX_DISTANCE: usize = 4;
 
 /// `__STDC_VERSION__` value for a `-std=` dialect name, mirroring GCC.
 ///
@@ -3154,5 +3777,592 @@ mod cli_tests {
         assert!(d.parse_cli_args(&args).is_ok());
         assert!(d.resolved_bmi1(), "integer BMI survives the xmm denial");
         assert!(d.resolved_bmi2());
+    }
+
+    // ---- unknown-option policy (module header) --------------------------
+    //
+    // The contract is measured, not assumed: gcc 14.2 (in this tree) and
+    // gcc 16.2 / clang 23.1 / icc 2021.10 / icx (pinned oracles) all fail on
+    // `-Wbogus`, `-fno-bogus`, `-gbogus` and `--param bogus=1`, while all
+    // four accept `-Wno-bogus` silently.  LCCC matches the compatibility
+    // target (GCC): unknown is fatal; the `-Wno-` carve-out is tolerated by
+    // default and fatal under LCCC_STRICT_OPTIONS, so a capability probe can
+    // still separate "implemented" from "tolerated".
+
+    #[test]
+    fn unknown_option_is_fatal_by_default() {
+        for arg in ["-fno-strict-aliasing", "--totally-bogus", "-Wbogus"] {
+            let err = super::unknown_option(arg, false)
+                .expect_err("an unimplemented option must not let a probe read success");
+            assert!(err.contains(arg), "{err}");
+            assert!(
+                err.contains("no implementation"),
+                "the diagnostic must say the option is unimplemented: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_option_is_fatal_under_strict_options() {
+        let err = super::unknown_option("-fno-strict-aliasing", true)
+            .expect_err("strict mode must reject an unimplemented option");
+        assert!(err.contains("-fno-strict-aliasing"), "{err}");
+        assert!(err.contains("LCCC_STRICT_OPTIONS"), "{err}");
+    }
+
+    #[test]
+    fn tolerated_class_warns_by_default_and_fails_under_strict() {
+        for arg in ["-Wno-bogus", "--param=ssp-buffer-size=4", "-gdwarf-9"] {
+            assert!(
+                super::unknown_option_tolerated(arg, false).is_ok(),
+                "{arg}: the GNU-tolerated class must not break a build"
+            );
+            let err = super::unknown_option_tolerated(arg, true)
+                .expect_err("strict mode must escalate the tolerated class");
+            assert!(err.contains(arg), "{err}");
+        }
+    }
+
+    /// The `-W` arm must reach the policy: an unknown warning name is
+    /// diagnosed, and fatal under strict options (the pre-fix code discarded
+    /// `WarningConfig::process_flag`'s `false`, so the name vanished — and the
+    /// capability probe read the silence as support).
+    #[test]
+    fn unknown_warning_option_is_diagnosed_and_strict_fatal() {
+        // Default policy: a build that passes a name LCCC has no table for
+        // (409 GNU names against the six implemented here) must still build.
+        for arg in [
+            "-Wbogus",
+            "-Werror=bogus",
+            "-Wno-error=bogus",
+            "-Wsign-compare",
+        ] {
+            assert!(try_flag(arg).is_ok(), "{arg}");
+            let err = super::unknown_option_tolerated(arg, true)
+                .expect_err("strict mode must not report an unknown name as implemented");
+            assert!(err.contains(arg), "{err}");
+        }
+        // Plain `-Wno-<unknown>` is honoured by construction (nothing to
+        // switch off), so it needs no diagnostic; the known -Wno-error form
+        // is processed, while an unknown -Wno-error=<name> is tolerated with
+        // the normal unimplemented-option diagnostic.
+        for arg in ["-Wno-bogus", "-Wno-unused-variable"] {
+            assert!(try_flag(arg).is_ok(), "{arg}");
+        }
+        for arg in ["-Wno-error", "-Wno-error=unused-variable"] {
+            assert!(try_flag(arg).is_ok(), "{arg}");
+        }
+        // A *known* warning option is untouched by the change.
+        for arg in [
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-Wreturn-type",
+            "-Wno-return-type",
+        ] {
+            assert!(try_flag(arg).is_ok(), "{arg}");
+        }
+    }
+
+    #[test]
+    fn known_negative_warning_flags_still_take_effect() {
+        let mut d = Driver::new();
+        let args: Vec<String> = ["ccc", "-Werror", "-Wno-error", "-Wno-return-type", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        d.parse_cli_args(&args).expect("known negative warning flags");
+        assert!(!d.warning_config.werror_all, "-Wno-error clears -Werror");
+        assert!(
+            !d.warning_config
+                .is_enabled(crate::common::error::WarningKind::ReturnType),
+            "-Wno-return-type disables the implemented warning"
+        );
+    }
+
+    /// The open `-f`/`-m`/`--` namespace: tolerated with a diagnostic, fatal
+    /// under strict options.
+    ///
+    /// The list is not hypothetical. A binary audit of the 93 spellings in
+    /// `common_build_system_flags_are_recognised` against a prebuilt driver
+    /// found 16 with no arm — the ones below — and every one of them is passed
+    /// *unconditionally* by the kernel, glibc, zlib-ng, gzip or expat build
+    /// systems. Failing the build on them would break real builds while
+    /// protecting nothing: they are optimisation, reporting and debug-info
+    /// preferences. The requests whose being ignored would change the
+    /// program's meaning are refused by their own arms instead, which is what
+    /// the next test pins.
+    #[test]
+    fn unimplemented_optimisation_flags_are_diagnosed_not_fatal() {
+        for arg in [
+            "-fno-strict-aliasing",
+            "-fstrict-aliasing",
+            "-fwrapv",
+            "-fno-strict-overflow",
+            "-fno-plt",
+            "-fno-semantic-interposition",
+            "-fno-math-errno",
+            "-fmerge-all-constants",
+            "-fno-ident",
+            "-fshort-enums", // contract tier, checked below
+            "-fno-var-tracking",
+            "-fvar-tracking-assignments",
+            "-funroll-loops",
+            "-ftree-vectorize",
+            "-fno-tree-vectorize",
+            "-fno-stack-clash-protection",
+            "-fuse-ld=bfd",
+            "-flto",
+            "-Og",
+            "-fdiagnostics-color=always",
+            "-fmax-errors=5",
+        ] {
+            if arg == "-fshort-enums" {
+                continue; // its own contract arm, asserted in the next test
+            }
+            assert!(try_flag(arg).is_ok(), "{arg} must not fail a build");
+            assert!(
+                super::unknown_option_tolerated(arg, true).is_err(),
+                "{arg}: strict mode must not report it as implemented"
+            );
+        }
+        // A spelling no compiler knows is diagnosed the same way; strict mode is
+        // what turns it into the refusal a capability probe needs.
+        assert!(try_flag("--totally-bogus").is_ok());
+        assert!(super::unknown_option_tolerated("--totally-bogus", true).is_err());
+    }
+
+    /// The requests that cannot be satisfied by ignoring them are refused, not
+    /// diagnosed: stack protector (already), the data model, and the dialect.
+    #[test]
+    fn meaning_changing_requests_are_refused_not_ignored() {
+        for arg in [
+            "-fstack-protector",
+            "-fstack-protector-strong",
+            "-ftrapv",
+            "-fsanitize=address",
+            "-funsigned-char",
+            "-fshort-enums",
+            "-fshort-wchar",
+            "-fpack-struct",
+            "-fpack-struct=1",
+            "-std=obscure-dialect",
+        ] {
+            assert!(try_flag(arg).is_err(), "{arg} must be refused");
+        }
+        // ...while the *suppression* spellings of the same families are fine:
+        // LCCC already does not do what they ask to switch off.
+        for arg in [
+            "-fno-stack-protector",
+            "-fno-builtin-memcpy",
+            "-fsigned-char",
+        ] {
+            assert!(try_flag(arg).is_ok(), "{arg}");
+        }
+    }
+
+    /// `-ansi` is `-std=c90`, not an ignorable spelling: a dialect request
+    /// changes what the source is allowed to mean.
+    #[test]
+    fn ansi_selects_the_c90_dialect() {
+        let mut d = Driver::new();
+        let args = vec!["ccc".to_string(), "-ansi".to_string(), "x.c".to_string()];
+        d.parse_cli_args(&args).expect("-ansi");
+        assert!(!d.gnu_extensions, "-ansi is strict ISO, not a GNU dialect");
+        assert_eq!(d.stdc_version, super::std_version_macro("c90"));
+        // ...and the rest of the command line still parses (the arm must not
+        // return early).
+        assert_eq!(d.input_files, vec!["x.c".to_string()]);
+    }
+
+    /// No flag a real build system passes unconditionally may *fail* the
+    /// driver.
+    ///
+    /// A regression pin for the whole tier policy, and the reason it exists is
+    /// measured: an audit of 93 spellings taken from the Linux kernel, glibc,
+    /// zlib-ng, gzip, expat and the distro CFLAGS conventions, run against a
+    /// prebuilt driver, found 16 with no arm (`-fno-strict-aliasing`,
+    /// `-fwrapv`, `-fno-strict-overflow`, `-fno-plt`, `-flto`,
+    /// `-funroll-loops`, `-Og`, `-ansi`, `-fno-ident`, `-fuse-ld=*`,
+    /// `-fvar-tracking-assignments`, …) plus two, `--sysroot=` and
+    /// `-nostartfiles`, whose implementation lives in another layer.  Every one
+    /// of them is now implemented, diagnosed or refused only when ignoring it
+    /// would change the program; none may abort a build.  A list, not a
+    /// principle, because the failure mode is "a real-world spelling nobody
+    /// thought of": extend it when a build reports one.
+    #[test]
+    fn common_build_system_flags_are_recognised() {
+        const FLAGS: &[&str] = &[
+            // language/dialect
+            "-std=gnu11",
+            "-std=c17",
+            "-ansi",
+            // optimisation and codegen
+            "-O2",
+            "-O3",
+            "-Os",
+            "-Oz",
+            "-Og",
+            "-fPIC",
+            "-fpic",
+            "-fPIE",
+            "-fpie",
+            "-fno-pic",
+            "-fno-PIE",
+            "-fno-strict-aliasing",
+            "-fstrict-aliasing",
+            "-fomit-frame-pointer",
+            "-fno-omit-frame-pointer",
+            "-ffreestanding",
+            "-fhosted",
+            "-fno-builtin",
+            "-fno-builtin-memcpy",
+            "-fwrapv",
+            "-fno-strict-overflow",
+            "-fno-common",
+            "-fsigned-char",
+            "-fno-asynchronous-unwind-tables",
+            "-fno-unwind-tables",
+            "-fasynchronous-unwind-tables",
+            "-fno-ident",
+            "-fmerge-all-constants",
+            "-fno-math-errno",
+            "-ffp-contract=off",
+            "-fgnu89-inline",
+            "-fno-plt",
+            "-fno-semantic-interposition",
+            "-fno-var-tracking",
+            "-fvar-tracking-assignments",
+            "-falign-loops=32",
+            "-falign-functions=16",
+            "-funroll-loops",
+            "-ftree-vectorize",
+            "-fno-tree-vectorize",
+            "-fuse-ld=bfd",
+            "-fuse-ld=lld",
+            "-flto",
+            "-flto=auto",
+            "-march=native",
+            "-mtune=generic",
+            "-msse4.2",
+            "-mavx2",
+            "-mno-red-zone",
+            "-m64",
+            "-m32",
+            "-fno-stack-clash-protection",
+            // linking / driver
+            "-pipe",
+            "-pthread",
+            "-nostdlib",
+            "-nostdinc",
+            "-nostartfiles",
+            "-nodefaultlibs",
+            "--sysroot=/opt/sysroot",
+            "-isysroot=/opt/sysroot",
+            "-shared",
+            "-static",
+            "-rdynamic",
+            "-no-pie",
+            "-L/usr/local/lib",
+            "-lm",
+            "-lz",
+            "-Wl,-z,now",
+            "-Wl,--as-needed",
+            // diagnostics
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-Wno-unused-parameter",
+            "-Wno-sign-compare",
+            "-fdiagnostics-color=always",
+            "-fmax-errors=5",
+        ];
+        for arg in FLAGS {
+            assert!(try_flag(arg).is_ok(), "{arg} must not fail a build");
+        }
+    }
+
+    /// Spellings whose implementation lives in another layer must be
+    /// *recognised* here.
+    ///
+    /// `--sysroot=`, `-isysroot`, `-nostartfiles` and `-nodefaultlibs` are
+    /// resolved from the raw command line by the link layer (and by the
+    /// include search), so they never needed a CLI arm while the fallback only
+    /// warned — and an arm-less spelling is a broken build (a cross build for
+    /// `--sysroot=`, a freestanding link for `-nostartfiles`) as soon as the
+    /// link layer cannot see it for the operand it consumed.
+    #[test]
+    fn options_implemented_in_other_layers_are_recognised() {
+        for arg in [
+            "--sysroot=/opt/sysroot",
+            "-isysroot=/opt/sysroot",
+            "-nostartfiles",
+            "-nodefaultlibs",
+            "-nostdlib",
+            "-nostdinc",
+        ] {
+            assert!(try_flag(arg).is_ok(), "{arg} must be recognised");
+        }
+        // The space-separated forms consume their operand: it must not be
+        // mistaken for an input file (which the driver would try to compile).
+        let mut d = Driver::new();
+        let args = vec![
+            "ccc".to_string(),
+            "--sysroot".to_string(),
+            "/opt/sysroot".to_string(),
+            "x.c".to_string(),
+        ];
+        d.parse_cli_args(&args).expect("--sysroot <dir>");
+        assert_eq!(d.input_files, vec!["x.c".to_string()]);
+        // ...and a missing operand is an error, not a silently empty sysroot.
+        let mut d = Driver::new();
+        let args = vec!["ccc".to_string(), "-isysroot".to_string()];
+        assert!(d.parse_cli_args(&args).is_err());
+    }
+
+    /// The `-g` family, pinned against the measured GNU boundary.
+    ///
+    /// The old `-g*` blanket accepted every one of these silently, so
+    /// `-gbogus`/`-gdwarf-9`/`-g4` were reported as implemented features by a
+    /// capability probe and the request "select a debug format" produced a
+    /// silent lie.  What GNU accepts is tied out in both directions: honoured
+    /// selectors build quietly, GNU-accepted-but-unimplemented ones are
+    /// diagnosed (and fatal under strict), and GNU-rejected ones fail.
+    #[test]
+    fn debug_selector_boundary_matches_gnu() {
+        for arg in ["-g", "-g1", "-g2", "-g3", "-g0", "-ggdb", "-ggdb3"] {
+            assert!(try_flag(arg).is_ok(), "{arg} must be honoured");
+        }
+        for arg in [
+            "-gdwarf",
+            "-gdwarf-2",
+            "-gdwarf-4",
+            "-gdwarf-5",
+            "-gdwarf32",
+            "-gdwarf64",
+            "-gstabs",
+            "-gxcoff+",
+            "-gcoff3",
+            "-gvms",
+            "-gcodeview",
+            "-gbtf",
+            "-gctf",
+            "-gz=none",
+            "-gz=zlib",
+            "-gz=zstd",
+            "-grecord-gcc-switches",
+            "-gcolumn-info",
+            "-gvariable-location-views",
+            "-gvariable-location-views=incompat5",
+            "-gtoggle",
+            "-gno-record-gcc-switches",
+            "-gno-column-info",
+            "-gno-pubnames",
+            "-gno-strict-dwarf",
+        ] {
+            assert!(try_flag(arg).is_ok(), "{arg} must be tolerated");
+            assert!(
+                super::unknown_option_tolerated(arg, true).is_err(),
+                "{arg}: strict mode must not report it as implemented"
+            );
+        }
+        for arg in [
+            "-g4",
+            "-g9",
+            "-ggdb4",
+            "-ggdb9",
+            "-gdwarf-1",
+            "-gdwarf-6",
+            "-gdwarf-9",
+            "-gz=bogus",
+            "-gno-bogus",
+            "-glto",
+            "-gbogus",
+            "-gnorecord-gcc-switches",
+        ] {
+            let err = try_flag(arg).expect_err(arg);
+            assert!(err.contains(arg), "{err}");
+        }
+    }
+
+    /// `-g0`/`-ggdb0` keep their GCC meaning: an explicit OFF.
+    #[test]
+    fn debug_off_selectors_disable_debug_info() {
+        for arg in ["-g0", "-ggdb0"] {
+            let mut d = Driver::new();
+            let args = vec!["ccc".to_string(), arg.to_string(), "x.c".to_string()];
+            d.parse_cli_args(&args).expect(arg);
+            assert!(!d.debug_info, "{arg} must turn debug info off");
+        }
+    }
+
+    /// A hardening request lccc cannot honour is diagnosed where it enters
+    /// the driver, not silently dropped by the preprocessor setup.
+    #[test]
+    fn fortify_source_request_is_diagnosed() {
+        // Accepted (source compatibility) but never silent: the diagnostic
+        // comes from `fortify_source_unsupported`.
+        assert!(try_flag("-D_FORTIFY_SOURCE=2").is_ok());
+        // Strict mode must not let a probe conclude the surface exists.
+        let err = super::fortify_source_unsupported(true)
+            .expect_err("strict mode must reject a hardening request it cannot honour");
+        assert!(err.contains("_FORTIFY_SOURCE"), "{err}");
+        assert!(err.contains("LCCC_STRICT_OPTIONS"), "{err}");
+        // The neutralisation is unconditional, so it fires with or without a
+        // value and for the `-D`/`-D ` spellings alike.
+        assert!(try_flag("-D_FORTIFY_SOURCE").is_ok());
+    }
+
+    // ---- -std= dialect contract -----------------------------------------
+
+    /// Every dialect the suggestion table advertises must actually be accepted;
+    /// otherwise the "did you mean" hint points at another rejection.
+    #[test]
+    fn every_advertised_std_dialect_is_accepted() {
+        for d in super::STD_DIALECTS {
+            let flag = format!("-std={d}");
+            assert!(try_flag(&flag).is_ok(), "{flag} must be accepted");
+        }
+    }
+
+    #[test]
+    fn unknown_std_dialect_is_a_hard_error_with_suggestion() {
+        let err = try_flag("-std=bogus99").expect_err("-std=bogus99 must be rejected");
+        assert!(
+            err.contains("unrecognized command-line option '-std=bogus99'"),
+            "{err}"
+        );
+
+        // A suggestion must always be a dialect LCCC actually accepts:
+        // pointing at another rejection would be worse than staying silent.
+        for bad in [
+            "-std=c17x",
+            "-std=gnu1z",
+            "-std=c1l",
+            "-std=c11z",
+            "-std=gnu99y",
+        ] {
+            let err = try_flag(bad).expect_err(bad);
+            let suggested = err
+                .split("did you mean '-std=")
+                .nth(1)
+                .and_then(|s| s.split('\'').next());
+            assert!(
+                suggested.is_some(),
+                "{bad} was rejected without a 'did you mean' hint: {err}"
+            );
+            let suggested = suggested.unwrap();
+            assert!(
+                super::STD_DIALECTS.contains(&suggested),
+                "{bad} suggested unaccepted dialect {suggested}"
+            );
+            assert!(
+                try_flag(&format!("-std={suggested}")).is_ok(),
+                "{bad} suggested {suggested}, which is not accepted"
+            );
+        }
+
+        // The two cases where a transposition/insertion typo has a unique,
+        // obviously-intended target are pinned so a regression in the
+        // tie-break is caught rather than merely reproducing itself.
+        for (bad, want) in [("-std=c17x", "c17"), ("-std=c1l", "c11")] {
+            let err = try_flag(bad).expect_err(bad);
+            assert!(
+                err.contains(&format!("did you mean '-std={want}'")),
+                "{bad} should have suggested {want}, got: {err}"
+            );
+        }
+    }
+
+    /// A `-std=` value that is not close to anything must still be rejected,
+    /// just without a possibly-misleading pointer.
+    ///
+    /// Deliberate divergence from GCC, recorded here so it is a decision and
+    /// not an accident: GCC 14/16 answers `-std=bogus99` with
+    /// `did you mean '-std=gnu99'?`, i.e. it leaves the `c`/`gnu`/`iso9899:`
+    /// family the user was clearly typing in. LCCC suppresses the hint when no
+    /// same-family dialect is within [`STD_SUGGEST_MAX_DISTANCE`]; a wrong-but-
+    /// confident suggestion is worse than a clean rejection. The rejection
+    /// itself -- the part that matters for correctness -- matches GCC exactly.
+    #[test]
+    fn distant_std_dialect_is_rejected_without_a_guess() {
+        let err = try_flag("-std=qwertyuiop").expect_err("-std=qwertyuiop must be rejected");
+        assert!(
+            err.contains("unrecognized command-line option '-std=qwertyuiop'"),
+            "{err}"
+        );
+        assert!(
+            !err.contains("did you mean"),
+            "no near neighbour exists: {err}"
+        );
+    }
+
+    /// The suggestion must not fire when nothing is remotely close, and must
+    /// never cross the c/gnu/iso prefix boundary.
+    #[test]
+    fn std_suggestion_is_conservative() {
+        assert_eq!(super::closest_std_dialect("zzzzzzzzzz"), None);
+        assert_eq!(super::closest_std_dialect(""), None);
+        for probe in ["c17x", "gnu1z", "c99", "gnu23", "iso9899:2017"] {
+            if let Some(s) = super::closest_std_dialect(probe) {
+                assert_eq!(
+                    s.as_bytes().first(),
+                    probe.as_bytes().first(),
+                    "{probe} -> {s} crossed the dialect prefix"
+                );
+            }
+        }
+    }
+
+    // ---- contract flags that must never be silently dropped -------------
+
+    /// `-fstack-protector*` is the established precedent; these two requests
+    /// have the same invisible-absence failure mode and must be refused too.
+    #[test]
+    fn instrumentation_requests_are_refused_not_ignored() {
+        for f in [
+            "-ftrapv",
+            "-fsanitize=address",
+            "-fsanitize=undefined",
+            "-fsanitize",
+        ] {
+            assert!(
+                try_flag(f).is_err(),
+                "{f} must be refused, not silently ignored"
+            );
+        }
+        // The matching *disable* requests stay accepted: a compiler that never
+        // emits the instrumentation already complies.
+        for f in ["-fno-trapv", "-fsanitize-recover=all"] {
+            assert!(try_flag(f).is_ok(), "{f} must be accepted");
+        }
+    }
+
+    // ---- -ffreestanding (C11 4p6) ----------------------------------------
+
+    /// Both spellings must be accepted, and `-fhosted` must undo
+    /// `-ffreestanding` (GCC applies them last-wins), rather than the pair
+    /// being an unknown-option diagnostic.
+    #[test]
+    fn freestanding_and_hosted_are_accepted() {
+        for f in ["-ffreestanding", "-fhosted"] {
+            assert!(try_flag(f).is_ok(), "{f} must be accepted");
+        }
+    }
+
+    #[test]
+    fn edit_distance_matches_known_values() {
+        assert_eq!(super::edit_distance("", ""), 0);
+        assert_eq!(super::edit_distance("c17", "c17"), 0);
+        assert_eq!(super::edit_distance("c17x", "c17"), 1);
+        assert_eq!(super::edit_distance("", "abc"), 3);
+        assert_eq!(super::edit_distance("abc", ""), 3);
+        assert_eq!(super::edit_distance("kitten", "sitting"), 3);
+        // "gnu17" vs "gnu23": the two trailing digits both differ.
+        assert_eq!(super::edit_distance("gnu17", "gnu23"), 2);
+        assert_eq!(super::common_prefix_len("c17x", "c17"), 3);
+        assert_eq!(super::common_prefix_len("c17x", "c1x"), 2);
+        assert_eq!(super::common_prefix_len("abc", "abd"), 2);
+        assert_eq!(super::common_prefix_len("", "abc"), 0);
     }
 }

@@ -16,6 +16,7 @@ pub(crate) mod cfi_synth; // Unwind info derived from final x86/i686 code
 pub(crate) mod f128_softfloat; // Shared F128 soft-float orchestration (ARM + RISC-V)
 pub(crate) mod generation; // Module/function/instruction dispatch
 pub(crate) mod inline_asm; // InlineAsmEmitter trait and shared framework
+pub(crate) mod libcall_policy; // A13/A14: TU definitions vs the builtin contract
 pub(crate) mod stack_layout; // Stack layout: slot assignment, alloca coalescing, regalloc helpers
 pub(crate) mod state; // CodegenState, StackSlot, SlotAddr
 pub(crate) mod traits; // ArchCodegen trait with default implementations

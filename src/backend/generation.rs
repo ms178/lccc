@@ -3502,6 +3502,12 @@ fn pre_size_output_buffer(cg: &mut dyn ArchCodegen, module: &IrModule) {
 }
 
 fn collect_symbol_sets(cg: &mut dyn ArchCodegen, module: &IrModule) {
+    // A14b: publish this module's defined symbols for the const-size
+    // expansion gate.  Same collector as the pass-side rule, so the two
+    // halves of A14 cannot disagree about what this TU defines.
+    crate::backend::libcall_policy::set_module_state(crate::common::builtin::symbol_inventory(
+        module,
+    ));
     let state = cg.state();
     state
         .extern_function_symbols
@@ -3935,7 +3941,10 @@ pub(crate) fn inline_memcpy_len(func: &str, args: &[Operand], is_variadic: bool)
         _ => return None,
     };
     match func {
-        "memcpy" => Some(n as usize),
+        // A14a/b: expand only while the callee still is the builtin.
+        "memcpy" if crate::backend::libcall_policy::may_assume_builtin("memcpy") => {
+            Some(n as usize)
+        }
         "__memcpy_chk" => {
             if args.len() < 4 {
                 return None;
@@ -3969,7 +3978,10 @@ pub(crate) fn inline_memset_const_len(
         _ => return None,
     };
     match func {
-        "memset" => Some(n as usize),
+        // A14a/b: expand only while the callee still is the builtin.
+        "memset" if crate::backend::libcall_policy::may_assume_builtin("memset") => {
+            Some(n as usize)
+        }
         "__memset_chk" => {
             if args.len() < 4 {
                 return None;
@@ -6777,6 +6789,7 @@ mod indexed_gep_machinst_gate_tests {
 #[cfg(test)]
 mod remat_call_arg_tests {
     use super::*;
+    use crate::common::builtin::BuiltinPolicy;
     use crate::ir::reexports::CallInfo;
 
     fn function_with_global_addr_call(
@@ -6821,6 +6834,28 @@ mod remat_call_arg_tests {
         map
     }
 
+    /// Run `f` in the world a real compilation is in: the driver published
+    /// the builtin policy and the module published exactly these `defined`
+    /// symbols (`libcall_policy::published_policy_for_test`).
+    ///
+    /// The remat set is built from the same predicate that decides the
+    /// const-size inline expansion, and that predicate fails closed before
+    /// publication — without the window a test would observe "no module has
+    /// been compiled yet" rather than the engine's behaviour, and the
+    /// no-definition window is the shape of a translation unit that only
+    /// *uses* the builtin.
+    fn with_module_definitions<T>(defined: &[&str], f: impl FnOnce() -> T) -> T {
+        let inventory = crate::common::builtin::SymbolInventory {
+            defined: defined.iter().map(|name| name.to_string()).collect(),
+            ..crate::common::builtin::SymbolInventory::default()
+        };
+        let _window = crate::backend::libcall_policy::published_policy_for_test(
+            BuiltinPolicy::default(),
+            inventory,
+        );
+        f()
+    }
+
     #[test]
     fn call_arg_use_is_rematerializable() {
         // glibc_memcmp's glibc_left: a bare GlobalAddr passed as a call
@@ -6846,8 +6881,36 @@ mod remat_call_arg_tests {
             false,
             false,
         );
-        let set = build_rematerializable_global_addr_set_for(&func, &global_addr_map());
+        let set = with_module_definitions(&[], || {
+            build_rematerializable_global_addr_set_for(&func, &global_addr_map())
+        });
         assert!(!set.contains(&0));
+    }
+
+    #[test]
+    fn module_defined_memcpy_keeps_the_root_homed() {
+        // The other half of the exclusion above.  A module that *defines*
+        // `memcpy` makes the const-size call a real call again (A14: the
+        // callee is no longer the library's), so it travels the
+        // remat-capable call emitter and the root must stay in the set —
+        // the exclusion tracks the expansion decision, not the call shape.
+        let func = function_with_global_addr_call(
+            vec![
+                Operand::Value(Value(0)),
+                Operand::Value(Value(1)),
+                Operand::Const(IrConst::I64(8)),
+            ],
+            "memcpy",
+            false,
+            false,
+        );
+        let set = with_module_definitions(&["memcpy"], || {
+            build_rematerializable_global_addr_set_for(&func, &global_addr_map())
+        });
+        assert!(
+            set.contains(&0),
+            "a TU-defined memcpy is not inline-expanded: the root must be rematerializable"
+        );
     }
 
     #[test]
@@ -6855,15 +6918,34 @@ mod remat_call_arg_tests {
         // The set must agree EXACTLY with the x86 inline-memset predicate:
         // excluded iff the backend would inline-expand (which bypasses the
         // remat-capable call emitter). The policy itself is CPU-row
-        // dependent, so the test pins the wiring, not the row.
+        // dependent, so the test pins the wiring, not the row — and it
+        // pins it in every world the predicate distinguishes: the library
+        // builtin, a module that defines `memset`, and a CLI withdrawal.
         let args = vec![
             Operand::Value(Value(0)),
             Operand::Const(IrConst::I32(0)),
             Operand::Const(IrConst::I64(16)),
         ];
         let func = function_with_global_addr_call(args.clone(), "memset", false, false);
+        for defined in [&[][..], &["memset"][..]] {
+            let (set, inlined) = with_module_definitions(defined, || {
+                (
+                    build_rematerializable_global_addr_set_for(&func, &global_addr_map()),
+                    x86_inline_memset_len("memset", &args, false).is_some(),
+                )
+            });
+            assert_eq!(set.contains(&0), !inlined, "defined={defined:?}");
+        }
+
+        let mut withdrawn = BuiltinPolicy::default();
+        withdrawn.withdraw_one("memset");
+        let _window = crate::backend::libcall_policy::published_policy_for_test(
+            withdrawn,
+            crate::common::builtin::SymbolInventory::default(),
+        );
         let set = build_rematerializable_global_addr_set_for(&func, &global_addr_map());
         let inlined = x86_inline_memset_len("memset", &args, false).is_some();
+        assert!(!inlined, "a withdrawn memset must not be expanded");
         assert_eq!(set.contains(&0), !inlined);
     }
 

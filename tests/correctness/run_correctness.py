@@ -451,6 +451,34 @@ int main(void) {
 }
 ''', [], None),
 
+    # C11 6.3.2.1p4: a *function designator* in a value context converts to a
+    # pointer to the function, exactly like an array decay.  The comma operator
+    # is a value context, so `(0, f)` is a function pointer and every context
+    # below must treat it as one -- the sema-side type must agree with what
+    # codegen materialises (the address), or the two disagree about what the
+    # expression is.  Differential against the reference compiler.
+    ("comma_operator_designator_decay", r'''
+#include <stdio.h>
+static int inc(int x) { return x + 1; }
+static int arr[4];
+static int (*plain(void))(int) { return inc; }
+int main(void) {
+    int (*fp)(int) = (0, inc);
+    printf("%d\n", fp(41));
+    printf("%d\n", (0, inc)(1));
+    int (*same)(int) = (0, plain());
+    printf("%d\n", same(2) == fp(2));
+    /* the decayed pointer survives a comparison and a cast */
+    printf("%d\n", (0, inc) == inc);
+    printf("%d\n", ((int (*)(int))(0, inc))(3));
+    int (*ap)[4] = (0, &arr);
+    (*ap)[2] = 7;
+    printf("%d %d\n", arr[2], (0, arr) == arr);
+    printf("%zu %zu %zu\n", sizeof(arr), sizeof((0, arr)), sizeof(ap));
+    return 0;
+}
+''', [], None),
+
     ("comma_operator", r'''
 #include <stdio.h>
 int main(void) {
