@@ -12,6 +12,15 @@ use crate::frontend::lexer::token::TokenKind;
 impl Parser {
     pub(super) fn parse_compound_stmt(&mut self) -> CompoundStmt {
         let open_brace = self.peek_span();
+        // Block-budget frame: nested `{ { ... } }` recurse one frame per
+        // brace level; on exhaustion consume NOTHING and hand back an
+        // empty block so the caller's progress guarantee unwinds safely.
+        if !self.enter_block_frame(open_brace) {
+            return CompoundStmt {
+                items: Vec::new(),
+                local_labels: Vec::new(),
+            };
+        }
         self.expect(&TokenKind::LBrace);
         let mut items = Vec::with_capacity(16);
         let mut local_labels = Vec::with_capacity(8);
@@ -45,75 +54,116 @@ impl Parser {
             self.expect_after(&TokenKind::Semicolon, "after __label__ declaration");
         }
 
-        while !matches!(self.peek(), TokenKind::RBrace | TokenKind::Eof) {
-            self.skip_gcc_extensions();
-            // Handle #pragma pack directives within function bodies
-            while self.handle_pragma_pack_token() {
-                self.consume_if(&TokenKind::Semicolon);
-            }
-            // Handle #pragma GCC visibility push/pop within function bodies
-            while self.handle_pragma_visibility_token() {
-                self.consume_if(&TokenKind::Semicolon);
-            }
-            if matches!(self.peek(), TokenKind::RBrace | TokenKind::Eof) {
+        'body: while !matches!(self.peek(), TokenKind::RBrace | TokenKind::Eof) {
+            // E5 termination guarantee: once the expression frame budget is
+            // exhausted the guarded expression entry points return
+            // placeholders WITHOUT consuming tokens. Without this check a
+            // statement that fails to parse an expression would spin this
+            // loop forever on the same token (hostile input like
+            // `({ ({ ... ({ ) ... }) }) })` beyond the budget). The budget
+            // diagnostic was already emitted; unwind silently like the
+            // top-level loop does.
+            if self.nesting_budget_diagnosed {
                 break;
             }
-            // Handle __label__ declarations that appear after __extension__
-            if matches!(self.peek(), TokenKind::GnuLabel) {
-                self.advance();
-                loop {
-                    if let TokenKind::Identifier(name) = self.peek() {
-                        local_labels.push(name.clone());
-                        self.advance();
-                    }
-                    if !self.consume_if(&TokenKind::Comma) {
-                        break;
-                    }
+            let pos_before = self.pos;
+            // Single-tail iteration: every path exits through the labelled
+            // block so the progress guarantee below ENFORCES consumption on
+            // all of them (`break 'item` replaces what used to be
+            // `continue`, which silently skipped the check).
+            'item: {
+                self.skip_gcc_extensions();
+                // Handle #pragma pack directives within function bodies
+                while self.handle_pragma_pack_token() {
+                    self.consume_if(&TokenKind::Semicolon);
                 }
-                self.expect_after(&TokenKind::Semicolon, "after __label__ declaration");
-                continue;
+                // Handle #pragma GCC visibility push/pop within function bodies
+                while self.handle_pragma_visibility_token() {
+                    self.consume_if(&TokenKind::Semicolon);
+                }
+                if matches!(self.peek(), TokenKind::RBrace | TokenKind::Eof) {
+                    break 'body;
+                }
+                // Handle __label__ declarations that appear after __extension__
+                if matches!(self.peek(), TokenKind::GnuLabel) {
+                    self.advance();
+                    loop {
+                        if let TokenKind::Identifier(name) = self.peek() {
+                            local_labels.push(name.clone());
+                            self.advance();
+                        }
+                        if !self.consume_if(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                    self.expect_after(&TokenKind::Semicolon, "after __label__ declaration");
+                    break 'item;
+                }
+                if matches!(self.peek(), TokenKind::StaticAssert) {
+                    self.parse_static_assert();
+                } else if self.is_type_specifier() && !self.is_typedef_label() {
+                    // GNU C nested function definition? (`int f(int *p) { ... }`
+                    // at block scope). Try to parse one; on mismatch the parser
+                    // state is restored and the item falls through to a normal
+                    // local declaration.
+                    if let Some(nf) = self.try_parse_nested_function_def() {
+                        items.push(BlockItem::NestedFunction(nf));
+                        break 'item;
+                    }
+                    if let Some(decl) = self.parse_local_declaration() {
+                        items.push(BlockItem::Declaration(decl));
+                    }
+                } else if self.looks_like_implicit_int_nested_function() {
+                    // C89 implicit-int nested function (`retframe_block() { ... }`
+                    // or K&R `f(a) int a; { ... }` at block scope): an identifier
+                    // directly followed by a parameter list and a body cannot be
+                    // an expression statement (that would require a ';').
+                    if let Some(nf) = self.try_parse_nested_function_def() {
+                        items.push(BlockItem::NestedFunction(nf));
+                        break 'item;
+                    }
+                    let stmt = self.parse_stmt();
+                    items.push(BlockItem::Statement(stmt));
+                } else {
+                    let stmt = self.parse_stmt();
+                    items.push(BlockItem::Statement(stmt));
+                }
             }
-            if matches!(self.peek(), TokenKind::StaticAssert) {
-                self.parse_static_assert();
-            } else if self.is_type_specifier() && !self.is_typedef_label() {
-                // GNU C nested function definition? (`int f(int *p) { ... }`
-                // at block scope). Try to parse one; on mismatch the parser
-                // state is restored and the item falls through to a normal
-                // local declaration.
-                if let Some(nf) = self.try_parse_nested_function_def() {
-                    items.push(BlockItem::NestedFunction(nf));
-                    continue;
-                }
-                if let Some(decl) = self.parse_local_declaration() {
-                    items.push(BlockItem::Declaration(decl));
-                }
-            } else if self.looks_like_implicit_int_nested_function() {
-                // C89 implicit-int nested function (`retframe_block() { ... }`
-                // or K&R `f(a) int a; { ... }` at block scope): an identifier
-                // directly followed by a parameter list and a body cannot be
-                // an expression statement (that would require a ';').
-                if let Some(nf) = self.try_parse_nested_function_def() {
-                    items.push(BlockItem::NestedFunction(nf));
-                    continue;
-                }
-                let stmt = self.parse_stmt();
-                items.push(BlockItem::Statement(stmt));
-            } else {
-                let stmt = self.parse_stmt();
-                items.push(BlockItem::Statement(stmt));
+            // Universal progress guarantee, ENFORCED: no statement parse
+            // may return having consumed nothing, or this loop would retry
+            // the same token forever (defense in depth on top of the
+            // budget check). Runs on every path, including the labelled
+            // early exits above.
+            if self.pos == pos_before {
+                self.advance();
             }
         }
 
         self.expect_closing(&TokenKind::RBrace, open_brace);
         self.shadowed_typedefs = saved_shadowed;
         self.attrs.restore_flags(saved_attr_flags);
+        self.exit_parser_frame();
         CompoundStmt {
             items,
             local_labels,
         }
     }
 
+    /// Statement-budget wrapper: statement nesting (compound bodies, if /
+    /// loop / case bodies, statement expressions) recurses through this
+    /// dispatcher one frame per level. On exhaustion return an empty
+    /// statement WITHOUT consuming tokens so every caller's progress
+    /// guarantee unwinds safely.
     pub(super) fn parse_stmt(&mut self) -> Stmt {
+        if !self.enter_stmt_frame(self.peek_span()) {
+            return Stmt::Expr(None);
+        }
+        let stmt = self.parse_stmt_inner();
+        self.exit_parser_frame();
+        stmt
+    }
+
+    fn parse_stmt_inner(&mut self) -> Stmt {
         // C23 / GNU extension: declarations are allowed in statement position.
         // This handles declarations after labels (e.g., `label: int x = 5;`),
         // after case/default, and other contexts where parse_stmt() is called.

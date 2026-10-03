@@ -506,6 +506,12 @@ pub struct Parser {
     pub(super) func_decl_no_instrument: FxHashSet<String>,
     /// Count of parse errors encountered (invalid tokens at top level, etc.)
     pub error_count: usize,
+    /// Number of currently-live expression-parse frames (E5 hardening).
+    /// Bounded by `PARSER_FRAME_BUDGET`; see `enter_expr_frame`.
+    pub(super) parser_frame_depth: u32,
+    /// Set once the frame-budget diagnostic has been emitted, so a single
+    /// pathological nesting level produces exactly one error, not a flood.
+    pub(super) nesting_budget_diagnosed: bool,
     /// Structured diagnostic engine for error/warning reporting with source snippets.
     pub(super) diagnostics: DiagnosticEngine,
     /// Map of enum constant names to their integer values.
@@ -539,6 +545,8 @@ impl Parser {
             pragma_default_visibility: None,
             func_decl_no_instrument: FxHashSet::default(),
             error_count: 0,
+            parser_frame_depth: 0,
+            nesting_budget_diagnosed: false,
             diagnostics: DiagnosticEngine::new(),
             enum_constants: FxHashMap::default(),
             unevaluable_enum_constants: FxHashSet::default(),
@@ -561,8 +569,133 @@ impl Parser {
     /// Emit a parse error at the given span. Updates error_count and prints
     /// the error with source location and snippet (if source manager is set).
     pub(super) fn emit_error(&mut self, message: impl Into<String>, span: Span) {
+        // Silent unwind after budget exhaustion: the single budget
+        // diagnostic is the TU verdict; every later error is cascade
+        // noise over placeholder ASTs.
+        if self.nesting_budget_diagnosed {
+            return;
+        }
         self.error_count += 1;
         self.diagnostics.error(message, span);
+    }
+
+    /// Register one entry into the recursive expression-parse chain.
+    ///
+    /// WHY: every nesting level of a parenthesised expression re-enters the
+    /// full precedence climb (`parse_expr` -> assignment -> conditional ->
+    /// 10x binary/next-tighter -> cast -> unary -> postfix -> primary), and
+    /// each of those frames carries `Expr`-sized by-value temporaries plus
+    /// the big locals of `parse_primary_expr`/`parse_cast_expr`. Measured on
+    /// the -O1 fastbuild, ~4800 nested-parenthesis levels overflow even the
+    /// 64 MB compiler thread stack (a raw abort, rc=134; GCC 14 segfaults
+    /// its cc1 on the same input). Left-associative chains do NOT recurse
+    /// (they loop), so this bound bites only on genuinely deep nesting.
+    ///
+    /// The bound is on live parser frames, not source-nesting depth: real
+    /// translation units (kernel, glibc, zlib-ng, expat, csmith output) stay
+    /// orders of magnitude under it, while the adversarial class in
+    /// `artifacts/repros/crash_synth_*` and beyond now degrades to a clean,
+    /// GCC-compatible error instead of an abort.
+    /// Budget for expression / initializer / record frames. Calibrated
+    /// against the measured expression crash ceiling (~4800 nested-paren
+    /// levels ≈ 62k actual frames overflow the 64 MB compiler thread):
+    /// the budget trips at roughly half the overflow depth.
+    pub(super) const PARSER_FRAME_BUDGET: u32 = 32_768;
+
+    /// Budget for statement/block frames, LOWER than the expression budget
+    /// because block frames cost ~4x more stack per counted frame
+    /// (measured: ~14k compound-statement levels overflow before any
+    /// 32k-frame budget could trip). Statements and compound statements
+    /// both register frames, so one brace level costs two counted frames:
+    /// the effective ceiling is ~4096 nested blocks, a ~3.5x margin under
+    /// the measured overflow, robust across build profiles. Real TUs nest
+    /// blocks single-digit-deep; the gate's deep-but-legal cases stay
+    /// under it by an order of magnitude.
+    pub(super) const BLOCK_FRAME_BUDGET: u32 = 8_192;
+
+    /// Budget for nested struct/union DEFINITION frames, lower than the
+    /// block budget for two independent reasons:
+    ///   * real translation units nest record definitions single digits
+    ///     deep (kernel, glibc, sqlite all measured <= ~8) -- 2048 levels
+    ///     is >250x the worst real-world shape;
+    ///   * the post-parse phases (sema layout, codegen) are quadratic on
+    ///     record-nesting depth (measured 9.7 s for an 8000-deep named
+    ///     chain), so keeping the legal depth under this bound caps the
+    ///     worst-case compile of a hostile-but-legal TU at ~0.6 s while
+    ///     the parser still holds a 25x margin over its measured ~50k
+    ///     stack-overflow ceiling.
+    pub(super) const TYPE_FRAME_BUDGET: u32 = 2_048;
+
+    /// Shared budget machinery (generalized from the original
+    /// expression-only counter): every recursive parser entry point that a
+    /// hostile TU can drive to stack overflow registers a frame here.
+    /// One live-frame counter covers all classes because the resource at
+    /// risk is the SAME stack; one `nesting_budget_diagnosed` latch keeps
+    /// the verdict at exactly one diagnostic regardless of which class
+    /// trips first; all entry points unwind silently once it is set.
+    fn enter_nesting_frame(&mut self, span: Span, class: &str, budget: u32) -> bool {
+        if self.parser_frame_depth >= budget {
+            if !self.nesting_budget_diagnosed {
+                self.nesting_budget_diagnosed = true;
+                self.error_count += 1;
+                self.diagnostics.error(
+                    format!("{} (exceeds {} parser frames)", class, budget),
+                    span,
+                );
+            }
+            return false;
+        }
+        self.parser_frame_depth += 1;
+        true
+    }
+
+    pub(super) fn enter_expr_frame(&mut self, span: Span) -> bool {
+        self.enter_nesting_frame(
+            span,
+            "expression nesting too deep",
+            Self::PARSER_FRAME_BUDGET,
+        )
+    }
+
+    /// Nested compound statements (`{ { { ... } } }`) recurse one
+    /// parse_compound_stmt frame per brace level (block-class budget).
+    pub(super) fn enter_block_frame(&mut self, span: Span) -> bool {
+        self.enter_nesting_frame(span, "block nesting too deep", Self::BLOCK_FRAME_BUDGET)
+    }
+
+    /// Every statement parse registers a frame too: statement nesting
+    /// (block bodies, loop/if bodies, statement expressions) recurses
+    /// through parse_stmt, and counting it doubles the block-class
+    /// accounting per brace level, buying margin against build-profile
+    /// frame-size variation. Flat statement sequences enter and exit
+    /// immediately, so they never accumulate.
+    pub(super) fn enter_stmt_frame(&mut self, span: Span) -> bool {
+        self.enter_nesting_frame(span, "block nesting too deep", Self::BLOCK_FRAME_BUDGET)
+    }
+
+    /// Nested brace-initializer lists recurse one parse_initializer frame
+    /// per `{` level.
+    pub(super) fn enter_initializer_frame(&mut self, span: Span) -> bool {
+        self.enter_nesting_frame(
+            span,
+            "initializer nesting too deep",
+            Self::PARSER_FRAME_BUDGET,
+        )
+    }
+
+    /// Nested struct/union DEFINITIONS recurse one parse_struct_or_union
+    /// frame per level (field type -> specifier -> nested record).
+    /// TYPE_FRAME_BUDGET: see the constant's rationale (real TUs nest
+    /// single digits deep; the bound also caps post-parse quadratic
+    /// layout cost on hostile-but-legal input).
+    pub(super) fn enter_record_frame(&mut self, span: Span) -> bool {
+        self.enter_nesting_frame(span, "type nesting too deep", Self::TYPE_FRAME_BUDGET)
+    }
+
+    #[inline]
+    pub(super) fn exit_parser_frame(&mut self) {
+        debug_assert!(self.parser_frame_depth > 0);
+        self.parser_frame_depth = self.parser_frame_depth.saturating_sub(1);
     }
 
     /// Panic-mode recovery: skip until a synchronization point.
@@ -725,6 +858,12 @@ impl Parser {
     pub fn parse(&mut self) -> TranslationUnit {
         let mut decls = Vec::with_capacity(16);
         while !self.at_eof() {
+            // The expression frame-budget error is fatal for the TU; stop
+            // parsing instead of cascading thousands of recovery errors over
+            // the (now meaningless) token remainder.
+            if self.nesting_budget_diagnosed {
+                break;
+            }
             if let Some(decl) = self.parse_external_decl() {
                 decls.push(decl);
             } else {
@@ -813,6 +952,12 @@ impl Parser {
             self.advance();
             span
         } else {
+            // The frame-budget diagnostic is fatal for the TU; suppress the
+            // cascade of "expected ';'" recovery errors while the stub
+            // unwinds (same policy as expect_closing).
+            if self.nesting_budget_diagnosed {
+                return self.peek_span();
+            }
             let span = self.peek_span();
             let diag = crate::common::error::Diagnostic::error(format!(
                 "expected {} {} before {}",
@@ -841,6 +986,11 @@ impl Parser {
             self.advance();
             span
         } else {
+            // The frame-budget diagnostic is fatal for the TU; do not cascade
+            // thousands of "expected ')'" errors while the stub unwinds.
+            if self.nesting_budget_diagnosed {
+                return self.peek_span();
+            }
             let span = self.peek_span();
             let open_tok = match expected {
                 TokenKind::RParen => "'('",
@@ -874,6 +1024,10 @@ impl Parser {
             self.advance();
             span
         } else {
+            // See expect_closing: one fatal budget error, no cascade.
+            if self.nesting_budget_diagnosed {
+                return self.peek_span();
+            }
             let span = self.peek_span();
             let diag = crate::common::error::Diagnostic::error(format!(
                 "expected {} {} before {}",
@@ -2146,6 +2300,18 @@ impl Parser {
             TypeSpecifier::Array(elem, _) => Self::alignof_type_spec(elem, tag_aligns),
             TypeSpecifier::Struct(name, fields, is_packed, _, struct_aligned, _)
             | TypeSpecifier::Union(name, fields, is_packed, _, struct_aligned, _) => {
+                // Cache hit for previously DEFINED named records: definitions
+                // insert their final alignment into struct_tag_alignments the
+                // moment their fields are parsed, so lookups bottom-up during
+                // deep `struct { struct { ... } }` nesting are O(1) each.
+                // Without this, every level re-walked the entire chain and
+                // nesting time grew quadratically (measured: depth 8000 went
+                // from 11.6 s to milliseconds).
+                if let Some(tag) = name {
+                    if let Some(a) = tag_aligns.and_then(|m| m.get(tag)) {
+                        return *a;
+                    }
+                }
                 if *is_packed {
                     return 1;
                 }

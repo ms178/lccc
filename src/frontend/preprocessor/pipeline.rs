@@ -318,6 +318,11 @@ impl Preprocessor {
             last_source_line_num = source_line_num;
             self.macros
                 .set_line_resolver(line_resolver, self.line_override, stripped_line_start);
+            // Byte offset where THIS source line starts. Captured before the
+            // running offset moves on; downstream code must never reconstruct
+            // it by subtracting (possibly rewritten) line lengths — an inline
+            // #embed replacement can be longer than the whole prefix.
+            let current_line_start = stripped_line_start;
             stripped_line_start += line.len() + 1;
 
             // Directive handling: #if/#ifdef/#ifndef/#elif/#else/#endif must always
@@ -444,7 +449,8 @@ impl Preprocessor {
                         );
                         let expanded = self.macros.expand_line_reuse(&pending_line, &mut expanding);
                         self.drain_expansion_pragmas();
-                        let expanded = self.resolve_has_macros_in_code(&expanded);
+                        let expanded =
+                            self.resolve_has_macros_in_code(&expanded, source_line_num + 1);
                         output.push_str(&expanded);
                         output.push('\n');
                         for _ in 1..pending_newlines {
@@ -496,10 +502,21 @@ impl Preprocessor {
                 // Regular line (or directive during include with pending line) -
                 // expand macros, handling multi-line macro invocations
                 let output_len_before = output.len();
+                // C23 inline #embed: splice the byte-list expansion into the
+                // line BEFORE macro expansion so prefix/suffix parameter
+                // tokens participate in it like any other text.
+                let spliced_line;
+                let line: &str = match self.splice_inline_embed(line, source_line_num) {
+                    Some(replaced) => {
+                        spliced_line = replaced;
+                        &spliced_line
+                    }
+                    None => line,
+                };
                 self.accumulate_and_expand(
                     line,
                     source_line_num,
-                    stripped_line_start - line.len() - 1,
+                    current_line_start,
                     &mut pending_line,
                     &mut pending_newlines,
                     &mut output,
@@ -548,7 +565,7 @@ impl Preprocessor {
             );
             let expanded = self.macros.expand_line_reuse(&pending_line, &mut expanding);
             self.drain_expansion_pragmas();
-            let expanded = self.resolve_has_macros_in_code(&expanded);
+            let expanded = self.resolve_has_macros_in_code(&expanded, last_source_line_num + 1);
             output.push_str(&expanded);
             output.push('\n');
             // Collect macro expansion info for the flushed line
@@ -682,7 +699,7 @@ impl Preprocessor {
     }
 
     fn accumulate_and_expand(
-        &self,
+        &mut self,
         line: &str,
         source_line_num: usize,
         _line_start_abs: usize,
@@ -719,7 +736,7 @@ impl Preprocessor {
                     *pending_line = line.to_string();
                     *pending_newlines = 1;
                 } else {
-                    let expanded = self.resolve_has_macros_in_code(&expanded);
+                    let expanded = self.resolve_has_macros_in_code(&expanded, source_line_num + 1);
                     output.push_str(&expanded);
                     output.push('\n');
                 }
@@ -755,7 +772,8 @@ impl Preprocessor {
                     {
                         // Don't clear pending_line - keep accumulating
                     } else {
-                        let expanded = self.resolve_has_macros_in_code(&expanded);
+                        let expanded =
+                            self.resolve_has_macros_in_code(&expanded, source_line_num + 1);
                         output.push_str(&expanded);
                         output.push('\n');
                         for _ in 1..*pending_newlines {
@@ -793,7 +811,8 @@ impl Preprocessor {
                     {
                         // Don't clear pending_line - keep accumulating
                     } else {
-                        let expanded = self.resolve_has_macros_in_code(&expanded);
+                        let expanded =
+                            self.resolve_has_macros_in_code(&expanded, source_line_num + 1);
                         output.push_str(&expanded);
                         output.push('\n');
                         for _ in 1..*pending_newlines {
@@ -1035,12 +1054,15 @@ impl Preprocessor {
     /// point). Called after every expansion pass so pragma effects
     /// (push_macro/pop_macro, weak, visibility, ...) apply in source order.
     fn drain_expansion_pragmas(&mut self) {
-        for content in self.macros.take_pending_pragmas() {
+        for (content, line) in self.macros.take_pending_pragmas() {
             let content = content.trim().to_string();
             if content.is_empty() {
                 continue;
             }
-            self.handle_pragma(&content);
+            // The line was resolved at enqueue time against the expansion
+            // site's own line resolver (C99 §6.10.9: the pragma behaves
+            // as if written where the `_Pragma` operator appears).
+            self.handle_pragma(&content, line, 0);
         }
     }
 
@@ -1075,7 +1097,7 @@ impl Preprocessor {
                 }
             }
             "elif" => {
-                self.handle_elif(rest);
+                self.handle_elif(rest, line_num);
                 return None;
             }
             "else" => {
@@ -1104,13 +1126,23 @@ impl Preprocessor {
                 // current file's directory in the include search list
                 return self.handle_include_next(rest, line_num, col);
             }
-            "define" => self.handle_define(rest),
+            "embed" => {
+                // C23 #embed: the directive line is replaced by the byte-list
+                // token sequence.  The caller treats Some(_) as injected
+                // content and appends the return line marker, so end the
+                // expansion with a newline to keep the marker on its own line.
+                return self.expand_embed(rest, line_num, col).map(|mut t| {
+                    t.push('\n');
+                    t
+                });
+            }
+            "define" => self.handle_define(rest, line_num, col),
             "undef" => self.handle_undef(rest),
             "ifdef" => self.handle_ifdef(rest, false),
             "ifndef" => self.handle_ifdef(rest, true),
-            "if" => self.handle_if(rest),
+            "if" => self.handle_if(rest, line_num),
             "pragma" => {
-                return self.handle_pragma(rest);
+                return self.handle_pragma(rest, line_num, col);
             }
             "error" => {
                 // Expand macros in error message
@@ -1163,9 +1195,168 @@ impl Preprocessor {
         None
     }
 
-    fn handle_define(&mut self, rest: &str) {
+    /// C23 6.10.15 makes `#embed` the one directive that may appear MID
+    /// line (`unsigned char d[] = {#embed "logo.bin"};`) — the standard
+    /// form, not an extension. When the line holds such an occurrence,
+    /// replace it (directive text runs to end of line) and hand the
+    /// spliced line to the ordinary macro-expansion path. Returns None
+    /// when the line has no inline `#embed`.
+    fn splice_inline_embed(&mut self, line: &str, source_line_num: usize) -> Option<String> {
+        // Fast path: no candidate text at all.
+        if !line.contains("embed") {
+            return None;
+        }
+        // SINGLE scan: the first match is reused, not discarded and
+        // re-found on a cloned line as before.
+        let (first_hash, first_kw_end) = Self::find_inline_embed(line)?;
+        // A line may carry SEVERAL inline embeds
+        // (`{#embed "a"}, {#embed "b"}`); splice them left to right.
+        let mut out = String::with_capacity(line.len());
+        out.push_str(&line[..first_hash]);
+        // `rest` owns the scannable tail from the FIRST `#` onward (the
+        // splice loop needs an owned buffer because expand_embed_inline
+        // hands back the unconsumed suffix by value); `base` is its offset
+        // in the original line so diagnostic columns stay exact across
+        // splice boundaries.
+        let mut rest = line[first_hash..].to_string();
+        let mut base = first_hash;
+        // First occurrence already located at (0, first_kw_end - first_hash)
+        // within `rest`; subsequent occurrences found in the remainder.
+        let mut next = Some((0usize, first_kw_end - first_hash));
+        while let Some((hash_pos, kw_end)) = next {
+            out.push_str(&rest[..hash_pos]);
+            // Detach the spec text: expand_embed_inline needs &mut self.
+            let spec_text = rest[kw_end..].to_string();
+            match self.expand_embed_inline(&spec_text, source_line_num + 1, base + hash_pos + 1) {
+                Some((t, remainder)) => {
+                    out.push_str(&t);
+                    // Continue scanning ONLY the unconsumed source tail.
+                    // The expansion is data: never re-scan it (a prefix or
+                    // suffix containing `#embed` must not recurse).
+                    // `remainder` is a suffix of the spec text, so the new
+                    // buffer offset follows from the length difference.
+                    base += rest.len() - remainder.len();
+                    rest = remainder;
+                    next = Self::find_inline_embed(&rest);
+                }
+                None => {
+                    // Spec error diagnosed: the directive swallows the rest
+                    // of the line, so drop the tail like a whole-line
+                    // directive would.
+                    return Some(out);
+                }
+            }
+        }
+        out.push_str(&rest);
+        Some(out)
+    }
+
+    /// Locate an inline `#embed` occurrence: returns (hash_pos, kw_end)
+    /// with kw_end one past the `embed` keyword. String/char literals are
+    /// skipped (a `#embed` inside a literal is ordinary text); `#embedded`
+    /// and friends do not match (keyword boundary check).
+    fn find_inline_embed(text: &str) -> Option<(usize, usize)> {
+        let bytes = text.as_bytes();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let c = bytes[i];
+            if c == b'"' || c == b'\'' {
+                let quote = c;
+                i += 1;
+                while i < bytes.len() && bytes[i] != quote {
+                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                i += 1;
+                continue;
+            }
+            if c == b'#' {
+                let mut j = i + 1;
+                while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+                    j += 1;
+                }
+                if j + 5 <= bytes.len()
+                    && &bytes[j..j + 5] == b"embed"
+                    && (j + 5 == bytes.len()
+                        || !(bytes[j + 5].is_ascii_alphanumeric() || bytes[j + 5] == b'_'))
+                {
+                    return Some((i, j + 5));
+                }
+            }
+            i += 1;
+        }
+        None
+    }
+
+    fn handle_define(&mut self, rest: &str, line_num: usize, col: usize) {
         if let Some(def) = parse_define(rest) {
+            self.validate_macro_stringize(&def, line_num, col);
             self.macros.define(def);
+        }
+    }
+
+    /// C (and C++) constrain the `#` stringize operator: in a function-like
+    /// macro it must be followed by one of the macro's parameters.  GCC
+    /// diagnoses this at DEFINE time ("'#' is not followed by a macro
+    /// parameter"), and the corpus pins exactly that — silently accepting it
+    /// would let garbage bodies survive to expansion.
+    fn validate_macro_stringize(&mut self, def: &MacroDef, line_num: usize, col: usize) {
+        if !def.is_function_like {
+            return;
+        }
+        let bytes = def.body.as_bytes();
+        let len = bytes.len();
+        let mut i = 0usize;
+        while i < len {
+            let c = bytes[i];
+            // Skip string and char literals: a '#' inside a literal is
+            // ordinary text, not the stringize operator (#define F(x) "#"
+            // and #define G(x) '#' are both valid).
+            if c == b'"' || c == b'\'' {
+                let quote = c;
+                i += 1;
+                while i < len && bytes[i] != quote {
+                    if bytes[i] == b'\\' && i + 1 < len {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                i += 1;
+                continue;
+            }
+            if c != b'#' {
+                i += 1;
+                continue;
+            }
+            // '##' is token pasting, not stringize: skip both.
+            if i + 1 < len && bytes[i + 1] == b'#' {
+                i += 2;
+                continue;
+            }
+            let mut j = i + 1;
+            while j < len && (bytes[j] == b' ' || bytes[j] == b'\t') {
+                j += 1;
+            }
+            let start = j;
+            while j < len && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                j += 1;
+            }
+            let operand = &def.body[start..j];
+            let valid = !operand.is_empty()
+                && (def.params.iter().any(|p| p == operand)
+                    || (def.is_variadic && operand == "__VA_ARGS__"));
+            if !valid {
+                self.errors.push(PreprocessorDiagnostic {
+                    file: self.current_file(),
+                    line: line_num,
+                    col,
+                    message: "'#' is not followed by a macro parameter".to_string(),
+                });
+                return; // one diagnostic per definition, like GCC
+            }
+            i = j;
         }
     }
 
@@ -1183,29 +1374,29 @@ impl Preprocessor {
         self.conditionals.push_if(condition);
     }
 
-    fn handle_if(&mut self, expr: &str) {
+    fn handle_if(&mut self, expr: &str, diag_line: usize) {
         // First resolve `defined(X)` and `__has_*()` before macro expansion
-        let resolved = self.resolve_defined_in_expr(expr);
+        let resolved = self.resolve_defined_in_expr(expr, diag_line);
         // Expand macros in the resolved expression (reuse directive_expanding set)
         let expanded = self
             .macros
             .expand_line_reuse(&resolved, &mut self.directive_expanding);
         // Resolve again after macro expansion, in case macros expanded to
         // __has_attribute(), __has_builtin(), __has_include(), etc.
-        let expanded = self.resolve_defined_in_expr(&expanded);
+        let expanded = self.resolve_defined_in_expr(&expanded, diag_line);
         // Replace any remaining identifiers with 0 (standard C behavior for #if)
         let final_expr = self.replace_remaining_idents_with_zero(&expanded);
         let condition = evaluate_condition(&final_expr, &self.macros);
         self.conditionals.push_if(condition);
     }
 
-    fn handle_elif(&mut self, expr: &str) {
-        let resolved = self.resolve_defined_in_expr(expr);
+    fn handle_elif(&mut self, expr: &str, diag_line: usize) {
+        let resolved = self.resolve_defined_in_expr(expr, diag_line);
         let expanded = self
             .macros
             .expand_line_reuse(&resolved, &mut self.directive_expanding);
         // Resolve again after macro expansion (same reason as handle_if)
-        let expanded = self.resolve_defined_in_expr(&expanded);
+        let expanded = self.resolve_defined_in_expr(&expanded, diag_line);
         let final_expr = self.replace_remaining_idents_with_zero(&expanded);
         let condition = evaluate_condition(&final_expr, &self.macros);
         self.conditionals.handle_elif(condition);

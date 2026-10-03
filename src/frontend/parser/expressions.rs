@@ -159,6 +159,17 @@ impl Parser {
     /// Parse a left-associative binary expression at the given precedence level.
     /// This is the shared core that replaces 10 nearly-identical parsing functions.
     fn parse_binary_expr(&mut self, level: PrecedenceLevel) -> Expr {
+        let span = self.peek_span();
+        if !self.enter_expr_frame(span) {
+            return Expr::IntLiteral(0, span);
+        }
+        let r = self.parse_binary_expr_inner(level);
+        self.exit_parser_frame();
+        r
+    }
+
+    #[inline(always)]
+    fn parse_binary_expr_inner(&mut self, level: PrecedenceLevel) -> Expr {
         let mut lhs = self.parse_next_tighter(level);
         while let Some(op) = self.token_to_binop(self.peek(), level) {
             let span = self.peek_span();
@@ -171,6 +182,17 @@ impl Parser {
 
     /// Parse the next tighter precedence level.
     fn parse_next_tighter(&mut self, level: PrecedenceLevel) -> Expr {
+        let span = self.peek_span();
+        if !self.enter_expr_frame(span) {
+            return Expr::IntLiteral(0, span);
+        }
+        let r = self.parse_next_tighter_inner(level);
+        self.exit_parser_frame();
+        r
+    }
+
+    #[inline(always)]
+    fn parse_next_tighter_inner(&mut self, level: PrecedenceLevel) -> Expr {
         match level {
             PrecedenceLevel::LogicalOr => self.parse_binary_expr(PrecedenceLevel::LogicalAnd),
             PrecedenceLevel::LogicalAnd => self.parse_binary_expr(PrecedenceLevel::BitwiseOr),
@@ -188,6 +210,17 @@ impl Parser {
     /// Parse a cast expression: (type-name)expr, compound literal (type-name){...},
     /// or fall through to unary expression.
     pub(super) fn parse_cast_expr(&mut self) -> Expr {
+        let span = self.peek_span();
+        if !self.enter_expr_frame(span) {
+            return Expr::IntLiteral(0, span);
+        }
+        let r = self.parse_cast_expr_inner();
+        self.exit_parser_frame();
+        r
+    }
+
+    #[inline(always)]
+    fn parse_cast_expr_inner(&mut self) -> Expr {
         if matches!(self.peek(), TokenKind::LParen) {
             let save = self.pos;
             let save_typedef = self.attrs.parsing_typedef();
@@ -238,6 +271,17 @@ impl Parser {
     }
 
     fn parse_unary_expr(&mut self) -> Expr {
+        let span = self.peek_span();
+        if !self.enter_expr_frame(span) {
+            return Expr::IntLiteral(0, span);
+        }
+        let r = self.parse_unary_expr_inner();
+        self.exit_parser_frame();
+        r
+    }
+
+    #[inline(always)]
+    fn parse_unary_expr_inner(&mut self) -> Expr {
         match self.peek() {
             TokenKind::AmpAmp => {
                 // GCC extension: &&label (address of label, for computed goto)
@@ -401,8 +445,14 @@ impl Parser {
     }
 
     fn parse_postfix_expr(&mut self) -> Expr {
+        let span = self.peek_span();
+        if !self.enter_expr_frame(span) {
+            return Expr::IntLiteral(0, span);
+        }
         let expr = self.parse_primary_expr();
-        self.parse_postfix_ops(expr)
+        let r = self.parse_postfix_ops(expr);
+        self.exit_parser_frame();
+        r
     }
 
     /// Parse postfix operators ([], ., ->, ++, --, function call) applied to an initial expression.
@@ -472,6 +522,17 @@ impl Parser {
     }
 
     fn parse_primary_expr(&mut self) -> Expr {
+        let span = self.peek_span();
+        if !self.enter_expr_frame(span) {
+            return Expr::IntLiteral(0, span);
+        }
+        let r = self.parse_primary_expr_inner();
+        self.exit_parser_frame();
+        r
+    }
+
+    #[inline(always)]
+    fn parse_primary_expr_inner(&mut self) -> Expr {
         match self.peek() {
             TokenKind::IntLiteral(val) => {
                 let val = *val;
