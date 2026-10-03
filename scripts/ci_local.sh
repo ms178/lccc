@@ -489,6 +489,14 @@ gate "linker-oracle-verdict" fast \
 gate "regression-corpus-link" fast \
     python3 tests/regression/run_regression.py --lccc "$LCCC" -j 2 --compile-only
 
+# A nested same-tag record definition must not alias the outer one. The
+# regression corpus cannot see this class: it compares runtime output against
+# GCC, and GCC refuses to build the offending program at all, so the oracle
+# here is accept/reject. TAG-ID-1 -- it shipped as a miscompile (44 where the
+# answer is 300) with every corpus and unit test green.
+gate "record-tag-identity" fast \
+    env CCC="$LCCC" bash tests/regression/check_record_tag_identity.sh
+
 gate "copy-alias-sizes" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_copy_alias_sizes.sh
 
@@ -950,6 +958,13 @@ gate "env-test-hygiene" fast \
 # assembly: the committed corpus, ~150k operand spellings, freshly generated
 # output at four -O levels, and the assembler path, where a padded .s must
 # produce byte-identical object code.
+# The gate's own argument parsing regressed once already: `--phase 1` stored the
+# literal flag, selected nothing, ran no phase and still printed PASS.  That
+# failure mode is invisible to the invariance gate below, which is `slow` and
+# therefore absent from --fast, so the parser gets its own compiler-free gate
+# that runs everywhere.
+gate "peephole-whitespace-arg-selftest" fast \
+    bash tests/regression/check_peephole_whitespace.sh --selftest
 gate "peephole-whitespace-invariance" slow \
     env CCC=target/fastbuild/lccc bash tests/regression/check_peephole_whitespace.sh
 

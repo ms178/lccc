@@ -1363,14 +1363,14 @@ fn ctype_from_type_spec(spec: &TypeSpecifier, types: &TypeContext) -> CType {
         }
         TypeSpecifier::Struct(tag, ..) => {
             if let Some(tag) = tag {
-                CType::Struct(format!("struct.{}", tag).into())
+                CType::Struct(types.resolve_record_key(&format!("struct.{}", tag)).into())
             } else {
                 CType::Int // anonymous struct without context
             }
         }
         TypeSpecifier::Union(tag, ..) => {
             if let Some(tag) = tag {
-                CType::Union(format!("union.{}", tag).into())
+                CType::Union(types.resolve_record_key(&format!("union.{}", tag)).into())
             } else {
                 CType::Int // anonymous union without context
             }

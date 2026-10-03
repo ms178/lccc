@@ -177,6 +177,13 @@ jobs:
       - name: Loop-alignment contract gate (emitted assembly)
         run: python3 scripts/check_loop_alignment.py --lccc target/fastbuild/lccc
 
+      # Nested same-tag record identity, differential against the host GCC.
+      # The runtime corpus cannot cover this: GCC rejects the offending program
+      # so there is no output to compare. TAG-ID-1 shipped as a miscompile with
+      # every corpus and unit test green, which is why it gets its own oracle.
+      - name: Record tag identity gate (nested same-tag structs)
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_record_tag_identity.sh
+
       # The result artifact is retained already, but GitHub's public job view
       # hides raw logs/artifacts from anonymous triage. Turn each result into a
       # normal check annotation so the failing test and phase stay visible.
@@ -876,6 +883,11 @@ jobs:
           bash tests/regression/check_boot_size_measurement.sh
           bash tests/regression/check_env_test_hygiene.sh
           bash tests/regression/check_peephole_whitespace.sh
+          # The wrapper's argument parsing is exercised separately: it once
+          # stored the literal `--phase` flag, selected nothing, ran no phase
+          # and still printed PASS.  The invariance gate above cannot see that,
+          # so the parser gets its own compiler-free case table.
+          bash tests/regression/check_peephole_whitespace.sh --selftest
           bash tests/regression/check_peephole_trace_bisect.sh
           # The trace-bisect tool is also exercised directly, so a broken
           # operand parser fails CI even if the wrapper gate is skipped.

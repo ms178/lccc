@@ -2056,8 +2056,63 @@ impl SemanticAnalyzer {
         for (arg, (param_ty, _)) in args.iter().zip(params) {
             if let Some(arg_ty) = checker.infer_expr_ctype(arg) {
                 self.check_pointer_float_conversion(&arg_ty, param_ty, arg.span());
+                self.check_record_argument_compatibility(&arg_ty, param_ty, name, arg.span());
             }
         }
+    }
+
+    /// A by-value record argument must have a compatible record type.
+    ///
+    /// C 6.5.2.2p1 makes passing an incompatible struct or union a constraint
+    /// violation, but this call path only ever checked arity and pointer/float
+    /// mixing -- so a `struct S { int c; }` value passed where
+    /// `struct S { char c; }` was expected compiled silently and truncated at
+    /// runtime (`f(s)` returned 44 for `s.c == 300`, in
+    /// tests/bugs/nested_tag_struct_identity.c) while GCC 16.2 rejects it.
+    ///
+    /// Anonymous records are exempt exactly as in `check_assignment_
+    /// compatibility`, and so is a `transparent_union` parameter, which accepts
+    /// its members by ABI design.
+    fn check_record_argument_compatibility(
+        &self,
+        from: &CType,
+        to: &CType,
+        name: &str,
+        span: Span,
+    ) {
+        let (a, b) = match (from, to) {
+            (CType::Struct(a), CType::Struct(b)) | (CType::Union(a), CType::Union(b)) => (a, b),
+            _ => return,
+        };
+        if a == b || a.starts_with("__anon_") || b.starts_with("__anon_") {
+            return;
+        }
+        if matches!(to, CType::Union(_))
+            && self
+                .result
+                .type_context
+                .borrow_struct_layouts()
+                .get(&**b)
+                .is_some_and(|layout| layout.is_transparent_union)
+        {
+            return;
+        }
+        // Two records with the same tag but different definitions print
+        // identically, so say what actually distinguishes them rather than
+        // emitting "have 'struct S' but expected 'struct S'".
+        let (from_text, to_text) = (from.to_string(), to.to_string());
+        let message = if from_text == to_text {
+            format!(
+                "incompatible type for argument to '{}': '{}' here is a different type from the '{}' of the parameter, despite the shared tag",
+                name, from_text, to_text
+            )
+        } else {
+            format!(
+                "incompatible type for argument to '{}': have '{}' but expected '{}'",
+                name, from_text, to_text
+            )
+        };
+        self.diagnostics.borrow_mut().error(message, span);
     }
 
     fn check_assignment_compatibility(
@@ -2465,6 +2520,28 @@ impl SemanticAnalyzer {
 /// - struct/union: converts fields and computes layout
 /// - enum: returns CType::Enum with name info (preserves enum identity)
 /// - typeof: returns CType::Int (sema doesn't have full expr type resolution yet)
+/// Whether two record layouts have *corresponding* members: the N3037
+/// (C23 6.2.9) relation, reduced to what a computed layout can express.
+///
+/// Same record kind, same member count, and per member the same name, offset,
+/// type, and bit-field width and bit offset. Size and alignment follow from
+/// those, but are compared too so that any unexplained difference also counts
+/// as non-corresponding -- erring toward two distinct types, which is the safe
+/// direction.
+fn record_layouts_correspond(a: &StructLayout, b: &StructLayout) -> bool {
+    a.is_union == b.is_union
+        && a.size == b.size
+        && a.align == b.align
+        && a.fields.len() == b.fields.len()
+        && a.fields.iter().zip(&b.fields).all(|(x, y)| {
+            x.name == y.name
+                && x.offset == y.offset
+                && x.ty == y.ty
+                && x.bit_offset == y.bit_offset
+                && x.bit_width == y.bit_width
+        })
+}
+
 impl type_builder::TypeConvertContext for SemanticAnalyzer {
     fn resolve_typedef(&self, name: &str) -> CType {
         if let Some(resolved) = self.result.type_context.typedefs.get(name) {
@@ -2490,20 +2567,17 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
             .map(|f| self.convert_struct_fields(f))
             .unwrap_or_default();
         let max_field_align = if is_packed { Some(1) } else { pragma_pack };
-        let key = if let Some(tag) = name {
+        let base_key = if let Some(tag) = name {
             format!("{}.{}", prefix, tag)
         } else {
             let id = self.result.type_context.next_anon_struct_id();
             format!("__anon_struct_{}", id)
         };
-        // Track whether this struct/union has been defined (has a body in the
-        // AST, e.g. `struct X { ... }` or `struct X {}`), as opposed to just
-        // forward-declared (`struct X;`). This distinction is needed for the
-        // incomplete type check in analyze_declaration.
-        if fields.is_some() {
-            self.defined_structs.borrow_mut().insert(key.clone());
-        }
-        if !struct_fields.is_empty() {
+        // The layout is computed BEFORE the key is settled, because deciding
+        // whether this definition shadows a different one needs the members.
+        let defined_layout: Option<StructLayout> = if struct_fields.is_empty() {
+            None
+        } else {
             let mut layout = if is_union {
                 StructLayout::for_union_with_packing(
                     &struct_fields,
@@ -2526,6 +2600,73 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
                     layout.size = (layout.size + mask) & !mask;
                 }
             }
+            Some(layout)
+        };
+        // C 6.7.2.3: a record definition in an inner scope declares a NEW type,
+        // incompatible with any outer type of the same tag. lccc keyed records
+        // by tag alone, so an inner `struct S { int c; }` and an outer
+        // `struct S { char c; }` were the SAME CType -- no compatibility check
+        // could ever fire, and passing one where the other was expected was
+        // silent: `f(s)` returned 44 for `s.c == 300` (tests/bugs/
+        // nested_tag_struct_identity.c) where GCC 16.2 rejects the program.
+        // A shadowing definition therefore gets its own key. Members that
+        // correspond (the N3037 / C23 6.2.9 case) keep the shared key so valid
+        // C23 still compiles, and two layout-identical definitions cannot
+        // miscompile whichever way they are keyed.
+        let key = match (&defined_layout, name) {
+            (Some(new_layout), Some(_)) => {
+                // Compare against the currently visible definition, which may
+                // itself be a shadowing variant in an enclosing block. Using
+                // only `base_key` would misclassify a nested redefinition that
+                // corresponds to the visible inner record but not the file-
+                // scope record (or vice versa).
+                let visible_key = self.result.type_context.resolve_record_key(&base_key);
+                let shadows_different = self
+                    .result
+                    .type_context
+                    .borrow_struct_layouts()
+                    .get(visible_key.as_ref())
+                    // An empty layout is a forward declaration, which this
+                    // definition completes rather than shadows.
+                    .is_some_and(|prev| {
+                        !prev.fields.is_empty() && !record_layouts_correspond(prev, new_layout)
+                    });
+                if shadows_different {
+                    let id = self.result.type_context.next_struct_variant_id();
+                    let variant = format!("{}#{}", base_key, id);
+                    // While this scope lives, the tag denotes the variant, so
+                    // every tag->CType site resolves to the inner type.
+                    self.result
+                        .type_context
+                        .set_record_alias_from_ref(&base_key, &variant);
+                    variant
+                } else {
+                    visible_key.into_owned()
+                }
+            }
+            // A tag-only reference inside the shadowing scope must resolve to
+            // the currently active variant too; it has no member list from
+            // which to recover the key. Without this, `struct S b;` after an
+            // inner `struct S { ... }` silently falls back to the outer layout.
+            (None, Some(_)) => self
+                .result
+                .type_context
+                .resolve_record_key(&base_key)
+                .into_owned(),
+            _ => base_key.clone(),
+        };
+        // Track whether this struct/union has been defined (has a body in the
+        // AST, e.g. `struct X { ... }` or `struct X {}`), as opposed to just
+        // forward-declared (`struct X;`). This distinction is needed for the
+        // incomplete type check in analyze_declaration.
+        if fields.is_some() {
+            let mut defined = self.defined_structs.borrow_mut();
+            defined.insert(key.clone());
+            if key != base_key {
+                defined.insert(base_key.clone());
+            }
+        }
+        if let Some(layout) = defined_layout {
             self.result
                 .type_context
                 .insert_struct_layout_scoped_from_ref(&key, layout);
