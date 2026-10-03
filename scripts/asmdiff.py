@@ -46,6 +46,15 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CORPUS = REPO_ROOT / "tests" / "asm-diff"
 
+# The disassembler is half the oracle pair. `allow_better` groups accept a
+# byte difference only when the two objects still disassemble identically,
+# so whatever objdump this resolves to ARBITRATES those verdicts — an
+# unpinned objdump is whatever binutils the host image ships (the exact
+# unpinned-tool class the 2.47 `as' pin exists to prevent). Mirrors encdiff:
+# a module global, set once in main() from --objdump / LCCC_OBJDUMP; the
+# corpus gates pass the pinned 2.47 path so the parity checker sees it.
+_OBJDUMP = os.environ.get("LCCC_OBJDUMP", "objdump")
+
 
 # ─── Minimal ELF64 reader (no third-party dependency) ─────────────────────
 
@@ -279,6 +288,10 @@ def hexdiff(a: bytes, b: bytes, limit: int = 8) -> str:
 
 _SCALE1 = re.compile(r"\(,%([a-z0-9]+),1\)")
 _ZERODISP = re.compile(r"(?<![0-9a-fx])0x0\(")
+# An objdump line whose instruction column is undecodable: `(bad)' for an
+# invalid encoding (printed WITHOUT the bytes), or a `.byte' fallback.
+_UNDISASM = re.compile(r"^\s+[0-9a-f]+:\s+(?:[0-9a-f]{2} )+\s*\t"
+                       r"(?:\(bad\)|\.byte)\b", re.MULTILINE)
 
 
 # VEX 3-operand instructions whose two SOURCE operands may be exchanged with
@@ -411,6 +424,17 @@ def semantically_equal(a_obj: Path, b_obj: Path, objdump: str) -> bool:
                             capture_output=True, text=True, timeout=120).stdout
     except (OSError, subprocess.SubprocessError):
         return False
+    # Undecodable renderings are not semantic evidence. objdump prints
+    # `(bad)` for an invalid encoding WITHOUT printing the bytes, so two
+    # DIFFERENT garbage streams can render to identical text — a `BETTER'
+    # verdict must never stand on that (the same fail-closed discipline
+    # as encdiff's decodes_same, which refuses undecodable streams).
+    # This path only runs when the objects' bytes differ, so a shared
+    # `.byte' region prints its actual values and can never be the equal
+    # text two different streams collapse to; rejecting it outright is
+    # the conservative direction either way.
+    if _UNDISASM.search(ta) or _UNDISASM.search(tb):
+        return False
     return _norm_disasm(ta) == _norm_disasm(tb)
 
 
@@ -530,12 +554,12 @@ def run_case(c: Case, lccc: str, gas: str, wd: str, verbose: bool,
     if errs and c.allow_better:
         # Accept the difference only if every byte-level complaint is LCCC
         # being smaller, and the two objects still decode identically.
-        objdump = os.environ.get("LCCC_OBJDUMP") or (
-            shutil.which("objdump") or "objdump")
+        # The disassembler is the pinned-pair global, never a PATH lookup:
+        # it decides BETTER verdicts, so it is as much an oracle as `as'.
         size_l = len(read_elf(lo).content.get(".text", b""))
         size_g = len(read_elf(go).content.get(".text", b""))
         only_size = all("bytes differ" in e for e in errs)
-        if only_size and size_l < size_g and semantically_equal(lo, go, objdump):
+        if only_size and size_l < size_g and semantically_equal(lo, go, _OBJDUMP):
             return (c.name, True, f"BETTER: {size_l}B vs gas {size_g}B, "
                                   f"same disassembly")
     if errs:
@@ -549,6 +573,10 @@ def main() -> int:
     ap.add_argument("cases", nargs="*", type=Path)
     ap.add_argument("--lccc", default=str(REPO_ROOT / "target" / "release" / "lccc"))
     ap.add_argument("--as", dest="gas", default=os.environ.get("LCCC_GAS", "as"))
+    ap.add_argument("--objdump", default=os.environ.get("LCCC_OBJDUMP", "objdump"),
+                    help="disassembler that arbitrates allow_better verdicts "
+                         "(pin it with `as': an unpinned objdump is an "
+                         "unpinned oracle, whatever the host image ships)")
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 2)
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("--max-report", type=int, default=30)
@@ -557,8 +585,15 @@ def main() -> int:
                          "tests/asm-diff/i686/")
     args = ap.parse_args()
 
+    global _OBJDUMP
+    _OBJDUMP = args.objdump
     if not (shutil.which(args.gas) or Path(args.gas).exists()):
         print(f"error: assembler oracle {args.gas!r} not found", file=sys.stderr)
+        return 2
+    if not (shutil.which(args.objdump) or Path(args.objdump).exists()):
+        print(f"error: disassembler oracle {args.objdump!r} not found "
+              "(it decides allow_better verdicts; provision the 2.47 pair "
+              "with scripts/ensure_gas_247.sh)", file=sys.stderr)
         return 2
     if not Path(args.lccc).exists():
         print(f"error: lccc not built at {args.lccc!r}", file=sys.stderr)

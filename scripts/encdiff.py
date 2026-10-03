@@ -461,6 +461,49 @@ class Row:
     oracles: dict[str, Encoding] = field(default_factory=dict)
     verdict: str = ""
     note: str = ""
+    # The row's byte-exact pin, from a `# byte-exact <hex>' annotation
+    # (see split_byte_pin): the strongest row contract, checked BEFORE
+    # any law, canonicaliser or round-trip. None on unpinned rows.
+    byte_pin: bytes | None = None
+
+
+# A corpus row may pin its LCCC bytes byte-exactly:
+#     mov %ds:4(,%ebp,1), %rax   # byte-exact 3e67488b4504
+# The annotation is stripped from the instruction before assembly and
+# enforced in classify() ahead of every other rule, so no downstream
+# machinery — not the dead-segment strip, not a same-rendering oracle,
+# not any future unification law — can launder a pinned byte difference
+# into a verdict. It exists for rows whose bytes ARE the claim but whose
+# verdict-level comparison cannot see them: the flip rows (the folded
+# view legitimately differs from GAS's raw bytes by the dead prefix, so
+# the gate's canonicaliser must unify exactly there — the prefix byte's
+# truth would otherwise live only in the Rust unit tests) and the APX
+# folds (whose correctness argument is byte-identity with the base-form
+# spelling GAS itself emits).
+_BYTE_PIN = re.compile(r"#\s*byte-exact\s+((?:[0-9a-f]{2})+)\s*$")
+
+
+def split_byte_pin(text: str) -> tuple[str, bytes | None]:
+    """Split one instruction line into (instruction, pinned LCCC bytes).
+
+    A line without the annotation returns (text, None) unchanged. A line
+    carrying a MALFORMED annotation (anything byte-exact-shaped that does
+    not match the strict `hex bytes to end of line' grammar) is an error,
+    not a silently-ignored comment: a typo'd pin must never quietly weaken
+    the row's contract back to verdict-only.
+    """
+    m = _BYTE_PIN.search(text)
+    if m:
+        return text[:m.start()].rstrip(), bytes.fromhex(m.group(1))
+    # Liberal in what it flags: any comment that LOOKS like a pin
+    # annotation in any near-miss spelling (byte exact / byte_exact /
+    # byte-exact with junk hex) is an error, not prose — a typo'd pin
+    # must never silently weaken the row back to verdict-only.
+    if re.search(r"#\s*byte[\s_-]*exact\b", text):
+        raise ValueError(
+            f"malformed byte-exact annotation: {text.strip()!r} "
+            "(expected `# byte-exact <hex bytes>', two hex digits per byte)")
+    return text, None
 
 
 def _norm_disasm(s: str) -> str:
@@ -938,6 +981,26 @@ def _classify_roundtrip(row: Row, references: list[bytes], success: str,
 
 
 def classify(row: Row, bits32: bool = False) -> None:
+    # A byte-exact pin is the STRONGEST row contract, so it is checked
+    # FIRST — before the dead-segment law, before any partitioning or
+    # round-trip, before a verdict of any kind: nothing downstream (not
+    # the _ROW_SEG_FOLD strip, not a same-rendering oracle) can launder
+    # a pinned byte difference into a pass. This is what makes the flip
+    # rows' segment byte a CI record: the dead-segment canon deliberately
+    # tolerates any ES/DS/SS choice on opted-in rows (both views are the
+    # same 64-bit flat-mode program), so the prefix byte's truth on those
+    # rows cannot be a verdict — it is the pin (previously a Rust-unit-
+    # test-only fact; PR #731 audit M2 demonstrated a dropped 0x3e on
+    # the ds flip row classifying BEATS through the strip).
+    if row.byte_pin is not None:
+        got = row.lccc.data if (row.lccc.ok and row.lccc.data is not None) else None
+        if got != row.byte_pin:
+            row.verdict = "WRONG-BYTES"
+            row.note = ("byte-exact pin violated: pinned "
+                        + row.byte_pin.hex() + ", lccc "
+                        + (got.hex() if got is not None
+                           else "did not assemble the row"))
+            return
     # The dead-ES/DS/SS unification is row-scoped (see _SEG_DEAD64): only
     # the segment+index-fold rows — the family whose folded view can
     # legitimately differ from GAS's raw bytes by one dead byte — opt in;
@@ -1231,23 +1294,54 @@ def verdict_histogram(rows: list["Row"]) -> dict[str, int]:
     return counts
 
 
+def rows_digest(rows: list["Row"]) -> str:
+    """A content digest of the row SET — identity, not verdicts.
+
+    sha256 over the sorted comment-stripped row texts, each carrying its
+    byte-exact pin when present. The histogram pins aggregate COUNTS; a
+    compensating delete+add of same-verdict rows nets to zero and is
+    invisible to it. This digest pins row identity: any row-set change —
+    and any weakening of a row's byte-exact pin — is a baseline change
+    that must be consciously re-recorded (PR #731 audit L1).
+    """
+    identities = sorted(
+        r.insn.split("#")[0].strip()
+        + ("" if r.byte_pin is None else f" @byte-exact={r.byte_pin.hex()}")
+        for r in rows)
+    return hashlib.sha256("\n".join(identities).encode()).hexdigest()
+
+
 def check_verdict_histogram(rows: list["Row"], path: Path) -> bool:
     """Fail unless the run's per-verdict counts equal the recorded baseline.
 
-    The corpus gate's exit contract catches WRONG-BYTES/UNVERIFIED-*/
-    REJECTS-VALID/LONGER — the per-row defects. It is deliberately blind
-    to verdict DRIFT: a row silently slipping BEATS -> ok-best (a lost
-    5-byte win, say) keeps the gate green forever. The checked-in
-    histogram makes the aggregate a contract: any count change — drift,
-    a new row, a deleted row, a whole new verdict class appearing —
-    fails the gate until the baseline is consciously re-recorded (the
-    same discipline as the pinned-oracle count in the parity tests).
     Counts only, never bytes: the baseline records what the corpus IS,
     not a byte-for-byte snapshot that would churn on every encoder
-    improvement (BEATS staying BEATS through better bytes is fine).
+    improvement (BEATS staying BEATS through better bytes is fine). Row
+    IDENTITY is pinned separately, by the `# rows-sha256:' digest line
+    the baseline must carry: counts alone are a NET contract — a
+    compensating delete+add of same-verdict rows nets to zero — so the
+    digest closes that blind spot without churning on verdict-preserving
+    byte improvements either (it covers the row set and the pins, not
+    the verdicts).
     """
+    try:
+        text = path.read_text()
+    except OSError as exc:
+        # A missing/unreadable baseline is not drift, and "update the
+        # baseline" would be misleading advice: there is nothing to
+        # update. Say what actually happened (PR #731 audit L4).
+        print(f"verdict histogram baseline {path}: unreadable ({exc}). "
+              "A missing baseline is not drift — create it from the "
+              "gate's own output in the same commit as the corpus change.",
+              file=sys.stderr)
+        return False
     expected: dict[str, int] = {}
-    for line in path.read_text().splitlines():
+    digest: str | None = None
+    for line in text.splitlines():
+        m = re.match(r"^#\s*rows-sha256:\s*([0-9a-f]{64})\s*$", line.strip())
+        if m:
+            digest = m.group(1)
+            continue
         line = line.split("#")[0].strip()
         if not line:
             continue
@@ -1258,20 +1352,41 @@ def check_verdict_histogram(rows: list["Row"], path: Path) -> bool:
             print(f"histogram baseline {path}: unparseable line {line!r}",
                   file=sys.stderr)
             return False
+    if not expected:
+        print(f"histogram baseline {path}: no verdict counts parsed — an "
+              "empty baseline is not a contract. Record every verdict "
+              "class (zeros included) plus the rows-sha256 digest, as the "
+              "gate's own output spells them. Current digest: "
+              f"{rows_digest(rows)}", file=sys.stderr)
+        return False
+    if digest is None:
+        print(f"histogram baseline {path}: missing the `# rows-sha256:' "
+              "digest line. Counts alone are a NET contract — a "
+              "compensating delete+add of same-verdict rows nets to zero "
+              "— so the baseline must also pin row identity. Add this "
+              f"line: # rows-sha256: {rows_digest(rows)}", file=sys.stderr)
+        return False
     actual = verdict_histogram(rows)
+    actual_digest = rows_digest(rows)
     # Compare through the nonzero projection on BOTH sides: a verdict class
     # recorded at 0 is documentation (the class is pinned absent) — the
     # actual dict simply has no key for it, and raw dict equality would
     # flag every zero row as drift. Anything APPEARING from zero, any count
     # change, and any class missing from the baseline still mismatches.
-    if {k: v for k, v in expected.items() if v} == \
-       {k: v for k, v in actual.items() if v}:
+    counts_match = {k: v for k, v in expected.items() if v} == \
+        {k: v for k, v in actual.items() if v}
+    if counts_match and digest == actual_digest:
         return True
     print("verdict histogram drifted from the recorded baseline:", file=sys.stderr)
     for name in sorted(set(expected) | set(actual)):
         e, a = expected.get(name, 0), actual.get(name, 0)
         marker = "  " if e == a else "->"
         print(f"  {marker} {name:<18} {e:>4} {a:>4}", file=sys.stderr)
+    if digest != actual_digest:
+        print(f"  -> rows-sha256       recorded {digest}",
+              file=sys.stderr)
+        print(f"     rows-sha256       actual   {actual_digest}",
+              file=sys.stderr)
     print("  update the baseline in the same commit that changed the corpus"
           " (the histogram is the aggregate coverage record, not a"
           " snapshot of bytes)", file=sys.stderr)
@@ -1330,6 +1445,23 @@ def main() -> int:
         ap.error("i686 casefiles require --32 (otherwise LCCC/GAS and remote "
                  "oracles use x86-64 mode)")
 
+    # Byte-exact annotations are row contracts, not assembler input:
+    # strip them from every source line (--insn, --file and casefile
+    # harvest alike) before dedup, keeping the pinned bytes per stripped
+    # text. A malformed annotation is a hard error — a typo'd pin must
+    # never silently weaken a row back to verdict-only.
+    byte_pins: dict[str, bytes] = {}
+    stripped: list[str] = []
+    try:
+        for one in insns:
+            text, pin = split_byte_pin(one)
+            if pin is not None:
+                byte_pins[text] = pin
+            stripped.append(text)
+    except ValueError as exc:
+        ap.error(str(exc))
+    insns = stripped
+
     seen: set[str] = set()
     uniq = [i for i in insns if not (i in seen or seen.add(i))]
 
@@ -1367,7 +1499,7 @@ def main() -> int:
                                                  f"oracle failed: {e}")] * len(uniq)
 
         for k, insn in enumerate(uniq):
-            row = Row(insn, locals_lccc[k])
+            row = Row(insn, locals_lccc[k], byte_pin=byte_pins.get(insn))
             row.oracles["gas"] = locals_gas[k]
             for name, encs in remote.items():
                 if k < len(encs):

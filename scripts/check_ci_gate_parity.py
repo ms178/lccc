@@ -290,11 +290,15 @@ def check_asmdiff_gate_parity(local_text: str, hosted: str) -> int:
                 and asm_option(cmd, "--lccc") == compiler
                 and set(casefiles) == {t for t in cmd if t.endswith(".casefile")}
                 # Every byte-exact differential, in both modes and on both
-                # sides, uses the pinned GAS 2.47 oracle: an unpinned `as`
-                # is whatever release the host image ships (the i686 gate
-                # once failed only because the runner's 2.42 lays out NOP
-                # fills differently from 2.47).
+                # sides, uses the pinned GAS 2.47 oracle PAIR: an unpinned
+                # `as` is whatever release the host image ships (the i686
+                # gate once failed only because the runner's 2.42 lays out
+                # NOP fills differently from 2.47), and an unpinned objdump
+                # is an unpinned VERDICT authority -- the betterok groups
+                # accept a smaller encoding only when the disassembler
+                # proves the two objects decode identically.
                 and "gas-2.47-x86_64-linux-gnu/bin/as" in (asm_option(cmd, "--as") or "")
+                and "gas-2.47-x86_64-linux-gnu/bin/objdump" in (asm_option(cmd, "--objdump") or "")
                 for cmd in commands
             ):
                 missing.append(f"{where}: {gate} (mode/corpus/compiler/jobs/oracle)")

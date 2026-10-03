@@ -34,9 +34,19 @@ prefix=${2:-${HOME}/.cache/gas-2.47-${target}}
 as="$prefix/bin/as"
 od="$prefix/bin/objdump"
 
-# BOTH binaries or a full rebuild: a cache carrying only one of the pair
-# is an interrupted provision, not a working oracle.
-if [[ -x "$as" && -x "$od" ]]; then
+# BOTH binaries, at the PINNED VERSION, or a full rebuild. Two guards,
+# two failure modes: a cache carrying only one of the pair is an
+# interrupted provision, and a pair under the 2.47-NAMED prefix that is
+# not 2.47 is a lie — the prefix name is not the version. A stale pair
+# (say a distro 2.46 copied in, or a prefix reused by a newer provision)
+# would short-circuit the gate into arbitrating every differential
+# against the wrong oracle release, so the fast path re-derives what it
+# is about to trust: --version's first line of BOTH binaries must say
+# 2.47. Anything else falls through to the rebuild, which reinstalls
+# from one source tree and re-prints both versions on success.
+if [[ -x "$as" && -x "$od" ]] \
+   && "$as" --version 2>/dev/null | head -1 | grep -q '2\.47' \
+   && "$od" --version 2>/dev/null | head -1 | grep -q '2\.47'; then
     "$as" --version | head -1
     "$od" --version | head -1
     exit 0

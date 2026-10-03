@@ -637,11 +637,13 @@ gate "inline-asm-utf8" fast \
     python3 scripts/check_inline_asm_utf8.py --lccc "$LCCC" --expect preserved \
         --json target/inline-asm-utf8.json
 
-# Byte-exact assembler differentials have ONE oracle: GNU as 2.47, exactly as
-# hosted CI. Distro assemblers are not interchangeable -- GAS 2.44 orders the
-# i386 lea-NOP remainder after the long NOP, 2.47 before it -- so an unpinned
-# oracle makes these gates depend on the host image. Provisioned (idempotent,
-# cached under ~/.cache) by the same script hosted CI runs.
+# Byte-exact assembler differentials have ONE oracle: the GNU as + objdump
+# 2.47 PAIR, exactly as hosted CI. Distro binutils are not interchangeable
+# -- GAS 2.44 orders the i386 lea-NOP remainder after the long NOP, 2.47
+# before it -- and the betterok groups accept a smaller encoding only when
+# the pinned objdump proves the disassembly identical, so an unpinned
+# DISASSEMBLER is an unpinned verdict authority too. Provisioned
+# (idempotent, cached under ~/.cache) by the same script hosted CI runs.
 gate "asm-diff-oracle-gas-2.47" fast \
     bash scripts/ensure_gas_247.sh x86_64-linux-gnu
 
@@ -650,10 +652,12 @@ gate "asm-diff-oracle-gas-2.47" fast \
 # single follow-up file let new corpora (pc8, EVEX AVX512, XOP) land ungated.
 gate "x86-asm-diff" fast \
     python3 scripts/asmdiff.py --jobs 2 --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" \
+        --objdump "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump" \
         --lccc target/fastbuild/lccc-x86
 
 gate "i686-asm-diff" fast \
     python3 scripts/asmdiff.py --32 --jobs 2 --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" \
+        --objdump "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump" \
         --lccc target/fastbuild/lccc-i686
 gate "i686-tls-ie-relax" fast \
     bash tests/regression/check_i686_tls_ie_relax.sh
@@ -674,7 +678,10 @@ gate "i686-narrow-cmp-flag-law" fast \
 #                   AND verdicts come from pinned tools),
 #   --expect-histogram  the checked-in verdict-count baseline — any count
 #                   change (drift, a new row, a deleted row) fails the
-#                   gate until the baseline is consciously re-recorded.
+#                   gate until the baseline is consciously re-recorded,
+#                   and its rows-sha256 digest pins row IDENTITY too (a
+#                   compensating delete+add of same-verdict rows nets to
+#                   zero in the counts; the digest still fails it).
 # encdiff exits 1 on WRONG-BYTES/UNVERIFIED-*/REJECTS-VALID/LONGER and on a
 # histogram mismatch — the exact classes this corpus exists to catch
 # (ORACLE-INVALID rows -- GAS emitting the truncated data16 forms -- are

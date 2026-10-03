@@ -8282,15 +8282,21 @@ mod index_fold_tests {
         assert_eq!(hex("movl %ss:0(%eax), %eax"), "36 67 8b 00");
         // The 64-bit twins of the encdiff corpus segment rows (REX.W; the
         // corpus's exact displacements). On the two rbp-index flip rows
-        // (`ss:4(,%rbp,1)', `ds:4(,%rbp,1)') these pins are the ONLY
-        // byte-level guard: the corpus gate cannot see the dead prefix
-        // byte there by construction — its canonicaliser must unify
-        // lccc's folded view with GAS's raw view on exactly those rows
-        // (encdiff `_ROW_SEG_FOLD`), so the prefix byte's truth lives
-        // here. The base-form twins (`ss:4(%rbp)', `ds:4(%rbp)',
-        // `ds:4(%rax)', `ss:8(%r10)', the fs/gs rows) are additionally
-        // byte-identical to GAS 2.47's own encodings of the same source
-        // (probed; see the engineering record).
+        // (`ss:4(,%rbp,1)', `ds:4(,%rbp,1)') these pins were historically
+        // the only byte-level guard: the corpus gate cannot see the dead
+        // prefix byte there through a VERDICT — its canonicaliser must
+        // unify lccc's folded view with GAS's raw view on exactly those
+        // rows (encdiff `_ROW_SEG_FOLD`), because both views are the same
+        // 64-bit flat-mode program. Since the PR #731 audit the corpus
+        // flip rows carry `# byte-exact <hex>` annotations checked before
+        // any law or round-trip, so these Rust pins and the corpus gate
+        // are two INDEPENDENT byte-level guards of one law (the corpus
+        // ones run against the pinned as+objdump 2.47 pair in CI; these
+        // run without any oracle at all). The base-form twins
+        // (`ss:4(%rbp)', `ds:4(%rbp)', `ds:4(%rax)', `ss:8(%r10)', the
+        // fs/gs rows) are additionally byte-identical to GAS 2.47's own
+        // encodings of the same source (probed; see the engineering
+        // record).
         assert_eq!(hex("mov %ss:4(,%rbp,1), %rax"), "48 8b 45 04");
         assert_eq!(hex("mov %ss:4(%rbp), %rax"), "48 8b 45 04");
         assert_eq!(hex("mov %ds:4(,%rbp,1), %rax"), "3e 48 8b 45 04");
@@ -8318,7 +8324,10 @@ mod index_fold_tests {
         // GAS's raw SIB view keeps it, `ds:4(,%ebp,1)' keeps the 0x3e
         // exactly like `ds:4(%ebp)' while GAS's raw view elides it. The
         // corpus twins of these four rows are the flip-law rows of
-        // index-fold-64.insn (BEATS over GAS's 9-10-byte SIB forms).
+        // index-fold-64.insn: their BEATS verdicts prove the addressing
+        // fold and the disp economy against GAS's 9-10-byte SIB forms,
+        // and their `# byte-exact' annotations prove the segment byte
+        // itself (the verdict cannot — see the PR #731 audit M2).
         assert_eq!(hex("mov %ss:4(,%ebp,1), %rax"), "67 48 8b 45 04");
         assert_eq!(hex("mov %ss:4(%ebp), %rax"), "67 48 8b 45 04");
         assert_eq!(hex("mov %ds:4(,%ebp,1), %rax"), "3e 67 48 8b 45 04");
@@ -8332,17 +8341,25 @@ mod index_fold_tests {
         // `encode_evex_mem`/`evex_addr_bits` -- an unpinned behaviour
         // expansion until these pins. The evidence basis (recorded here
         // honestly, and widened in S18 from one-time probes to a CI
-        // oracle record): classic ICC (the folding oracle) predates APX,
-        // so no oracle both knows EGPR and folds. The justification is
-        // (a) the same effective-address equivalence -- the index
-        // contributes *1 and moves into the base slot -- plus (b)
-        // byte-identity with the BASE-FORM spelling that GAS 2.47 itself
-        // accepts and emits, and since S18 (c) the corpus rows themselves:
-        // `vmovdqu8 (,%r16,1), %xmm0' and its siblings run against the
-        // pinned as+objdump 2.47 pair in the encdiff-corpus gate on every
+        // oracle record, then completed by the PR #731 follow-up):
+        // classic ICC (the folding oracle) predates APX, so no oracle
+        // both knows EGPR and folds. The justification is (a) the same
+        // effective-address equivalence -- the index contributes *1 and
+        // moves into the base slot -- plus (b) byte-identity with the
+        // BASE-FORM spelling that GAS 2.47 itself accepts and emits,
+        // and since S18 (c) the corpus rows themselves: `vmovdqu8
+        // (,%r16,1), %xmm0' and its siblings run against the pinned
+        // as+objdump 2.47 pair in the encdiff-corpus gate on every
         // push, landing BEATS over GAS's 11-byte SIB+disp32 form with
         // round-trip verification -- the evidence is oracle-recorded, not
-        // merely probed. The extension bits move X4 -> B4 with the slot:
+        // merely probed. Since the PR #731 follow-up ALL TEN pins below
+        // have corpus twins carrying `# byte-exact' annotations with
+        // these exact bytes, so step (b) -- the byte-identity argument
+        // itself -- is part of the CI record too (7 of 10 before; the
+        // (%r20)/(%r24) SIB-escape base twins and the positive
+        // compressed-disp8 `16(,%%r16,1)' sign case were the gaps), and
+        // test_encdiff.py enforces the 10/10 coverage as a contract.
+        // The extension bits move X4 -> B4 with the slot:
         // byte1 bit3 (B4) SET for an r16+ base, byte2 bit2 (X4, inverted)
         // back to 1 with no index left -- the EGPR twin of the classic
         // X -> B law pinned above.

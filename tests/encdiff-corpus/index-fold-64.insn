@@ -197,16 +197,25 @@ mov 2147483647(,%r15,1), %rcx
 # explicit-base twins (`ss:4(%%rbp)', `ds:4(%%rbp)', `ds:4(%%rax)'), the
 # non-flip folds (`ds:4(,%%rax,1)', `ss:4(,%%rax,1)', the r10 rows) and
 # the inline-rendered %%fs/%%gs rows all compare their prefix byte and
-# fail the gate if lccc drops or swaps it. The two rbp-index flip rows
-# (`ss:4(,%%rbp,1)', `ds:4(,%%rbp,1)') CANNOT be byte-checked here:
-# their folded bytes legitimately differ from GAS's SIB bytes by exactly
-# the dead byte, so encdiff's dead-segment law (_ROW_SEG_FOLD) unifies
-# them on those rows only — their prefix bytes are pinned byte-exactly
-# in Rust instead: encoder mod.rs
-# index_fold_tests::fold_decides_segment_elision_on_the_folded_view.
-mov %ss:4(,%rbp,1), %rax
+# fail the gate if lccc drops or swaps it. The four rbp/ebp-index FLIP
+# rows (`ss:4(,%%rbp,1)', `ds:4(,%%rbp,1)', `ss:4(,%%ebp,1)',
+# `ds:4(,%%ebp,1)') prove their ADDRESSING-FOLD equivalence and their
+# disp economy as verdicts (BEATS over GAS's raw SIB view, round-trip
+# verified) but their verdict comparison CANNOT see the dead prefix
+# byte: the folded view legitimately differs from GAS's raw bytes by
+# exactly that byte, so encdiff's dead-segment law (_ROW_SEG_FOLD)
+# deliberately tolerates any ES/DS/SS choice on exactly those rows.
+# Since the PR #731 audit (M2 — a dropped 0x3e on the ds flip row still
+# classified BEATS through the strip) the prefix byte on ALL FOUR flip
+# rows (both halves of the {rbp, ebp} set) is pinned in THIS file via
+# `# byte-exact <hex>' annotations, checked before any law or
+# round-trip; the Rust twins in encoder mod.rs
+# index_fold_tests::fold_decides_segment_elision_on_the_folded_view
+# remain the unit-level record of the same bytes (two independent
+# guards, one law).
+mov %ss:4(,%rbp,1), %rax # byte-exact 488b4504
 mov %ss:4(%rbp), %rax
-mov %ds:4(,%rbp,1), %rax
+mov %ds:4(,%rbp,1), %rax # byte-exact 3e488b4504
 mov %ds:4(%rbp), %rax
 mov %ds:4(,%rax,1), %rax
 mov %ds:4(%rax), %rax
@@ -236,35 +245,67 @@ vmovdqu64 64(,%r11,1), %xmm0
 {evex} vmovq (,%r10,1), %xmm0
 vmovdqu8 16(,%r13,1), %xmm0
 
-# APX x AVX-512 EVEX (the S18 oracle record): `gp_id' accepts r16-r31, so
-# the fold fires for EGPR indexes exactly like the classic rows -- the
-# extension bit moves X4 -> B4 with the slot -- and the fold output is
-# byte-identical to the base-form spelling that GAS 2.47 itself accepts
-# and emits. These rows ARE the CI oracle record for that law (until S18
-# the pins were lccc==lccc twins plus one-time manual probes; the gate
-# now runs every row against the pinned as+objdump 2.47 pair): each fold
-# row lands BEATS over GAS's 11-byte SIB+disp32 form with round-trip
-# verification, the base twin is ok. A UNVERIFIED-BYTES verdict here
-# means the ORACLE PAIR must be fixed, never the row deleted (the gate
-# exits 1 on UNVERIFIED-* by design).
-vmovdqu8 (,%r16,1), %xmm0
-vmovdqu8 (%r16), %xmm0
-vmovdqu8 (,%r20,1), %xmm0
-vmovdqu8 (,%r24,1), %xmm0
-vmovdqu64 (,%r18,1), %xmm0
-vmovdqu8 -16(,%r16,1), %xmm0
-{evex} vmovq (,%r16,1), %xmm0
+# APX x AVX-512 EVEX (the S18 oracle record, completed by the PR #731
+# audit follow-up): `gp_id' accepts r16-r31, so the fold fires for EGPR
+# indexes exactly like the classic rows -- the extension bit moves X4 ->
+# B4 with the slot -- and the fold output is byte-identical to the
+# base-form spelling that GAS 2.47 itself accepts and emits. Until S18
+# the pins were lccc==lccc twins plus one-time manual probes; until this
+# follow-up only 7 of the 10 encoder pins had corpus rows. Now ALL TEN
+# mod.rs pins (fold_moves_the_egpr_index_through_avx512_evex) are
+# corpus-recorded, and the coverage is a CONTRACT: test_encdiff.py
+# refuses a new pin without its corpus row and refuses drift between the
+# two records.
+#
+# What each row proves: the BEATS verdicts prove the addressing-fold
+# equivalence (round-trip against GAS's 11-byte SIB+disp32 raw view) and
+# the compressed-disp8 economy; the `# byte-exact' annotations prove the
+# BYTES — the fold's output must be exactly the base-form spelling
+# (byte-identity is this law's correctness argument, and the verdict
+# comparison alone cannot see WHICH legal EVEX encoding was chosen). The
+# base twins are additionally byte-identical to GAS (ok), pinning the
+# same bytes a second way. The (%r20)/(%r24) rows pin the SIB-escape
+# base forms (low3=100: modrm 04 + SIB 24 for r20; the r24 twin rides
+# B4 into byte1 instead); `16(,%%r16,1)' pins the POSITIVE compressed
+# disp8 sign (40 01 = +16xN) next to the shipped -16 (40 ff). A
+# UNVERIFIED-BYTES verdict here means the ORACLE PAIR must be fixed,
+# never the row deleted (the gate exits 1 on UNVERIFIED-* by design).
+vmovdqu8 (,%r16,1), %xmm0 # byte-exact 62f97f086f00
+vmovdqu8 (%r16), %xmm0 # byte-exact 62f97f086f00
+vmovdqu8 (,%r20,1), %xmm0 # byte-exact 62f97f086f0424
+vmovdqu8 (%r20), %xmm0 # byte-exact 62f97f086f0424
+vmovdqu8 (,%r24,1), %xmm0 # byte-exact 62d97f086f00
+vmovdqu8 (%r24), %xmm0 # byte-exact 62d97f086f00
+vmovdqu64 (,%r18,1), %xmm0 # byte-exact 62f9fe086f02
+vmovdqu8 -16(,%r16,1), %xmm0 # byte-exact 62f97f086f40ff
+vmovdqu8 16(,%r16,1), %xmm0 # byte-exact 62f97f086f4001
+{evex} vmovq (,%r16,1), %xmm0 # byte-exact 62f9fd086e00
 
 # The ebp half of the {rbp, ebp} flip set (S18): a 32-bit index in 64-bit
 # mode rides the 0x67 addr32 form; the fold moves ebp into the base slot,
 # flips the default segment DS -> SS, and the dead-byte law
 # (_ROW_SEG_FOLD) unifies lccc's folded view with GAS's raw view on
 # exactly these rows -- `ss:4(,%%ebp,1)' elides the 0x36 like `ss:4(%%ebp)'
-# (6 bytes, both views agree SS is default post-fold), while GAS's own
-# SIB form KEEPS it (raw view: no base, DS default, ss meaningful); the
-# ds twins mirror it with the 0x3e. The Rust twins of all four rows:
+# (5 bytes, both views agree SS is default post-fold) while GAS's own
+# SIB form KEEPS it (raw view: no base, DS default, ss meaningful,
+# `36 67 48 8b 04 2d 04 00 00 00', 10 bytes); the ds twins mirror it
+# with the 0x3e (fold KEEPS it, 6 bytes -- post-fold SS is default so
+# the DS override stays meaningful text -- while GAS's raw view ELIDES
+# it, 9 bytes: no base, DS already default).
+#
+# WHAT THESE FOUR ROWS PROVE, precisely: the BEATS verdicts prove the
+# addressing-fold equivalence (lccc's folded base view round-trips
+# against GAS's raw SIB view) and the disp8/disp32 economy; the segment
+# BYTE is proven by the `# byte-exact' annotations, not by the verdict
+# -- the dead-segment canon deliberately tolerates any ES/DS/SS choice
+# on exactly these rows (both views are the same 64-bit flat-mode
+# program), so the verdict CANNOT see a dropped or swapped prefix
+# (PR #731 audit M2: a 3e-less ds fold still classified BEATS). The
+# annotations are checked before any law or round-trip, so the corpus
+# gate itself goes WRONG-BYTES on a segment-byte regression. The Rust
+# twins of all four rows remain the unit-level record:
 # index_fold_tests::fold_decides_segment_elision_on_the_folded_view.
-mov %ss:4(,%ebp,1), %rax
-mov %ss:4(%ebp), %rax
-mov %ds:4(,%ebp,1), %rax
-mov %ds:4(%ebp), %rax
+mov %ss:4(,%ebp,1), %rax # byte-exact 67488b4504
+mov %ss:4(%ebp), %rax # byte-exact 67488b4504
+mov %ds:4(,%ebp,1), %rax # byte-exact 3e67488b4504
+mov %ds:4(%ebp), %rax # byte-exact 3e67488b4504
