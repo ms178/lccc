@@ -225,6 +225,41 @@ are not CI reds, which is why they are a list rather than a gate.
 
 ## P0 — largest measured gaps
 
+### TAG-ID-1 · **FIXED 2026-10-03** — nested same-tag structs no longer alias; the miscompile is gone
+
+`f(s)` for the reproducer below is now a hard error matching GCC 16.2, and no
+binary is produced. Pinned by
+[`tests/regression/check_record_tag_identity.sh`](tests/regression/check_record_tag_identity.sh),
+a 15-row differential against the host GCC, wired into `ci_local.sh --fast` and
+hosted CI (gate-parity green at 133 commands). Disabling the new check fails
+10 of the 15 rows, so the gate is not decorative.
+
+Three defects, not one:
+1. `resolve_struct_or_union` keyed records by tag alone, so an inner
+   `struct S { int c; }` and an outer `struct S { char c; }` were the same
+   `CType`. Now a shadowing definition with non-corresponding members gets
+   `struct.S#N`; corresponding members (N3037) keep the shared key so valid C23
+   still compiles.
+2. Every tag→`CType` site rebuilt the key from the raw source tag, so the
+   distinct key never reached the type checker. A scoped `record_alias` map in
+   `TypeContext` (unwound by `pop_scope`) now resolves them in
+   `sema/type_checker.rs` and `sema/const_eval.rs`.
+3. `check_call_arguments` compared **only** arity and pointer/float mixing — it
+   never compared record types at all. `check_record_argument_compatibility`
+   now does, exempting anonymous records and `transparent_union` parameters.
+   This third gap is why the first two fixes alone changed nothing, and it is
+   the one worth remembering: a type-identity fix is inert if no comparison
+   consumes the identity.
+
+Residual, asserted rather than hidden: `pos_n3037` under `-std=c17` is accepted
+by lccc and rejected by GCC. Corresponding members share a key, which is what
+C23 requires and is too permissive pre-C23; it cannot miscompile because
+corresponding members means identical layouts. Closing it needs `-std` threaded
+into sema (which has no notion of it today) plus a mode-gated N3037 relation —
+making keys always distinct without that relation would reject valid C23.
+
+Original report:
+
 ### TAG-ID-1 · **NEW 2026-10-02** — nested same-tag structs share one type identity (miscompile)
 
 A correctness defect, ranked above the codegen gaps below because it silently

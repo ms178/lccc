@@ -1481,6 +1481,26 @@ pub fn align_up(offset: usize, align: usize) -> usize {
     }
 }
 
+impl CType {
+    /// The user-visible tag of a record type key.
+    ///
+    /// Strips the internal `struct.`/`union.` prefix and the `#N` suffix that
+    /// marks a shadowing definition (C 6.7.2.3: an inner-scope `struct S` is a
+    /// distinct type from an outer `struct S`, so the two need distinct keys
+    /// while still printing identically). A C identifier cannot contain `#`, so
+    /// cutting there is unambiguous.
+    pub fn record_display_tag(key: &str) -> &str {
+        let without_prefix = key
+            .strip_prefix("union.")
+            .or_else(|| key.strip_prefix("struct."))
+            .unwrap_or(key);
+        match without_prefix.find('#') {
+            Some(i) => &without_prefix[..i],
+            None => without_prefix,
+        }
+    }
+}
+
 impl std::fmt::Display for CType {
     /// Format a CType as its C-language type name (e.g., `int`, `unsigned long`,
     /// `char *`, `void (*)(int, double)`). Used in compiler diagnostics to show
@@ -1562,8 +1582,7 @@ impl std::fmt::Display for CType {
                 write!(f, ")")
             }
             CType::Struct(name) => {
-                // Strip the "struct." prefix if present for cleaner display
-                let display_name = name.strip_prefix("struct.").unwrap_or(name);
+                let display_name = CType::record_display_tag(name);
                 if display_name.starts_with("__anon_struct_") {
                     write!(f, "struct <anonymous>")
                 } else {
@@ -1571,11 +1590,7 @@ impl std::fmt::Display for CType {
                 }
             }
             CType::Union(name) => {
-                // Strip the "union." or "struct." prefix if present
-                let display_name = name
-                    .strip_prefix("union.")
-                    .or_else(|| name.strip_prefix("struct."))
-                    .unwrap_or(name);
+                let display_name = CType::record_display_tag(name);
                 if display_name.starts_with("__anon_struct_") {
                     write!(f, "union <anonymous>")
                 } else {

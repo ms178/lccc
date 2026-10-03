@@ -489,6 +489,14 @@ gate "linker-oracle-verdict" fast \
 gate "regression-corpus-link" fast \
     python3 tests/regression/run_regression.py --lccc "$LCCC" -j 2 --compile-only
 
+# A nested same-tag record definition must not alias the outer one. The
+# regression corpus cannot see this class: it compares runtime output against
+# GCC, and GCC refuses to build the offending program at all, so the oracle
+# here is accept/reject. TAG-ID-1 -- it shipped as a miscompile (44 where the
+# answer is 300) with every corpus and unit test green.
+gate "record-tag-identity" fast \
+    env CCC="$LCCC" bash tests/regression/check_record_tag_identity.sh
+
 gate "copy-alias-sizes" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_copy_alias_sizes.sh
 

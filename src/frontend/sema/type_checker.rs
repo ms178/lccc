@@ -702,7 +702,11 @@ impl<'a> ExprTypeChecker<'a> {
                 reverse_sso,
             ) => {
                 if let Some(tag) = tag {
-                    CType::Struct(format!("struct.{}", tag).into())
+                    CType::Struct(
+                        self.types
+                            .resolve_record_key(&format!("struct.{}", tag))
+                            .into(),
+                    )
                 } else if let Some(fs) = fields {
                     // Without a tag name but with fields, register the anonymous
                     // struct layout so member access resolution works correctly
@@ -730,7 +734,11 @@ impl<'a> ExprTypeChecker<'a> {
                 reverse_sso,
             ) => {
                 if let Some(tag) = tag {
-                    CType::Union(format!("union.{}", tag).into())
+                    CType::Union(
+                        self.types
+                            .resolve_record_key(&format!("union.{}", tag))
+                            .into(),
+                    )
                 } else if let Some(fs) = fields {
                     // Same as struct: register anonymous union layout for member access
                     self.resolve_anon_struct_or_union(

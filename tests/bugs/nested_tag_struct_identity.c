@@ -1,6 +1,36 @@
 /* BUG: nested same-tag struct definitions share one type identity -> miscompile
  *
- * Status: OPEN (frontend/sema). Filed from the EDG Changes-distillation
+ * Status: FIXED (this tree). Now pinned by
+ * tests/regression/check_record_tag_identity.sh, a differential gate against
+ * the host GCC run from both ci_local.sh --fast and hosted CI.
+ *
+ * The fix, in three parts:
+ *   1. src/frontend/sema/analysis.rs resolve_struct_or_union() mints a distinct
+ *      key ("struct.S#1") for a definition that shadows a visible one with
+ *      NON-corresponding members, so the two are no longer the same CType.
+ *      Members that correspond (N3037 / C23 6.2.9) keep the shared key, so
+ *      valid C23 still compiles.
+ *   2. src/frontend/sema/type_context.rs keeps a scoped record_alias map
+ *      (base key -> key currently denoting the tag, unwound by pop_scope), and
+ *      every tag->CType site resolves through it: sema/type_checker.rs and
+ *      sema/const_eval.rs. Without this the variable was still typed as the
+ *      outer record and the distinct key never reached the checker.
+ *   3. check_call_arguments() previously compared ONLY arity and
+ *      pointer/float mixing -- it never compared record types at all, so even
+ *      distinct keys could not diagnose anything. check_record_argument_
+ *      compatibility() now does, exempting anonymous records and
+ *      transparent_union parameters.
+ *
+ * Residual, asserted by the gate so it cannot widen silently: pos_n3037 under
+ * -std=c17 is accepted by lccc and rejected by GCC. Two definitions with
+ * corresponding members share a key, which is what C23 wants and is too
+ * permissive pre-C23. It cannot miscompile -- corresponding members means
+ * identical layouts -- and closing it needs the C standard threaded into sema,
+ * which currently has no notion of -std.
+ *
+ * Original report follows.
+ *
+ * Originally filed from the EDG Changes-distillation
  * campaign, entry "C23: New tag compatibility rules" (N3037), the highest
  * scored C-relevant entry in docs/edg_changes_c_extract.md (*C-score +10*).
  *

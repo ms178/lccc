@@ -177,6 +177,13 @@ jobs:
       - name: Loop-alignment contract gate (emitted assembly)
         run: python3 scripts/check_loop_alignment.py --lccc target/fastbuild/lccc
 
+      # Nested same-tag record identity, differential against the host GCC.
+      # The runtime corpus cannot cover this: GCC rejects the offending program
+      # so there is no output to compare. TAG-ID-1 shipped as a miscompile with
+      # every corpus and unit test green, which is why it gets its own oracle.
+      - name: Record tag identity gate (nested same-tag structs)
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_record_tag_identity.sh
+
       # The result artifact is retained already, but GitHub's public job view
       # hides raw logs/artifacts from anonymous triage. Turn each result into a
       # normal check annotation so the failing test and phase stay visible.

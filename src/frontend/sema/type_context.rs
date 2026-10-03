@@ -88,6 +88,10 @@ pub struct TypeScopeFrame {
     /// Keys that were overwritten in `struct_layouts`: (key, previous_value).
     /// Uses Rc<StructLayout> so saving/restoring is a cheap refcount bump.
     pub struct_layouts_shadowed: Vec<(String, RcLayout)>,
+    /// Base record keys whose alias was newly inserted into `record_alias`.
+    pub record_alias_added: Vec<String>,
+    /// Base record keys whose alias was overwritten: (base, previous alias).
+    pub record_alias_shadowed: Vec<(String, String)>,
     /// Keys newly inserted into `ctype_cache`.
     pub ctype_cache_added: Vec<String>,
     /// Keys that were overwritten in `ctype_cache`: (key, previous_value).
@@ -108,6 +112,8 @@ impl TypeScopeFrame {
             enums_added: Vec::new(),
             struct_layouts_added: Vec::new(),
             struct_layouts_shadowed: Vec::new(),
+            record_alias_added: Vec::new(),
+            record_alias_shadowed: Vec::new(),
             ctype_cache_added: Vec::new(),
             ctype_cache_shadowed: Vec::new(),
             typedefs_added: Vec::new(),
@@ -132,6 +138,12 @@ pub struct TypeContext {
     /// that take &self (via the TypeConvertContext trait) may need to insert
     /// forward-declaration layouts when encountering struct/union types.
     pub struct_layouts: RefCell<FxHashMap<String, RcLayout>>,
+    /// Base record key -> the key currently denoting that tag.
+    ///
+    /// Only non-identity while an inner-scope definition shadows an outer one
+    /// (C 6.7.2.3): `struct.S` then denotes `struct.S#1` until the scope pops.
+    /// Scoped like `struct_layouts` so shadowing unwinds with the scope.
+    pub record_alias: RefCell<FxHashMap<String, String>>,
     /// Enum constant values
     pub enum_constants: FxHashMap<String, i64>,
     /// Typedef mappings (name -> resolved CType)
@@ -167,6 +179,8 @@ pub struct TypeContext {
     /// Counter for anonymous struct/union CType keys generated from &self contexts.
     /// Uses Cell for interior mutability since type_spec_to_ctype takes &self.
     anon_ctype_counter: std::cell::Cell<u32>,
+    /// Counter for shadowing record definitions; see `next_struct_variant_id`.
+    struct_variant_counter: std::cell::Cell<u32>,
 }
 
 // We cannot directly implement `StructLayoutProvider` for `TypeContext` because
@@ -179,6 +193,7 @@ impl TypeContext {
     pub fn new() -> Self {
         let mut tc = Self {
             struct_layouts: RefCell::new(FxHashMap::default()),
+            record_alias: RefCell::new(FxHashMap::default()),
             enum_constants: FxHashMap::default(),
             typedefs: FxHashMap::default(),
             typedef_alignments: FxHashMap::default(),
@@ -191,6 +206,7 @@ impl TypeContext {
             ctype_cache: RefCell::new(FxHashMap::default()),
             scope_stack: RefCell::new(Vec::new()),
             anon_ctype_counter: std::cell::Cell::new(0),
+            struct_variant_counter: std::cell::Cell::new(0),
         };
         tc.seed_builtin_typedefs();
         tc
@@ -406,6 +422,54 @@ impl TypeContext {
         id
     }
 
+    /// Next id for a *shadowing* record definition: a `struct S { ... }` inside
+    /// an inner scope when a different `struct S` is already visible.
+    ///
+    /// C 6.7.2.3 makes that a NEW type, incompatible with the outer one, so it
+    /// cannot share the outer one's type key. The id is used as a `#N` suffix
+    /// on the base key (`struct.S#1`); `CType::struct_display_tag` strips it for
+    /// diagnostics so users still see `struct S`.
+    pub fn next_struct_variant_id(&self) -> u32 {
+        let id = self.struct_variant_counter.get();
+        self.struct_variant_counter.set(id + 1);
+        id
+    }
+
+    /// Record that `base` is currently denoted by `active`, scoped so the
+    /// mapping disappears when the shadowing scope pops.
+    pub fn set_record_alias_from_ref(&self, base: &str, active: &str) {
+        let mut alias = self.record_alias.borrow_mut();
+        let mut stack = self.scope_stack.borrow_mut();
+        if let Some(frame) = stack.last_mut() {
+            match alias.get(base).cloned() {
+                Some(prev) => frame.record_alias_shadowed.push((base.to_string(), prev)),
+                None => frame.record_alias_added.push(base.to_string()),
+            }
+        }
+        alias.insert(base.to_string(), active.to_string());
+    }
+
+    /// The key that currently denotes record tag key `base`: the shadowing
+    /// variant while one is live, otherwise `base` itself.
+    ///
+    /// Every place that turns a source-level tag into a record `CType` must go
+    /// through this, or an inner-scope `struct S` value gets typed as the outer
+    /// `struct S` and the two become indistinguishable to the type checker.
+    ///
+    /// Returns a borrow, not an owned copy: the overwhelmingly common case is
+    /// "no shadowing in effect", and record type resolution happens for every
+    /// elaborated type in the translation unit, so cloning here would be a
+    /// pure waste.
+    pub fn resolve_record_key<'a>(&self, base: &'a str) -> std::borrow::Cow<'a, str> {
+        // Copy out under the guard: a Cow::Borrowed tied to the Ref guard would
+        // not outlive it. The common path still allocates nothing.
+        let active = self.record_alias.borrow().get(base).cloned();
+        match active {
+            Some(active) => std::borrow::Cow::Owned(active),
+            None => std::borrow::Cow::Borrowed(base),
+        }
+    }
+
     /// Insert a struct layout from a &self context (interior mutability via RefCell).
     pub fn insert_struct_layout_from_ref(&self, key: &str, layout: StructLayout) {
         self.struct_layouts
@@ -443,6 +507,15 @@ impl TypeContext {
             let layouts = self.struct_layouts.get_mut();
             for key in frame.struct_layouts_added {
                 layouts.remove(&key);
+            }
+            {
+                let mut alias = self.record_alias.borrow_mut();
+                for key in frame.record_alias_added {
+                    alias.remove(&key);
+                }
+                for (key, val) in frame.record_alias_shadowed {
+                    alias.insert(key, val);
+                }
             }
             for (key, val) in frame.struct_layouts_shadowed {
                 // Don't restore an empty forward-declaration layout over a full
