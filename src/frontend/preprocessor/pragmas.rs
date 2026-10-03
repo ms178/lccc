@@ -36,7 +36,12 @@ impl Preprocessor {
         }
     }
 
-    pub(super) fn handle_pragma(&mut self, rest: &str) -> Option<String> {
+    pub(super) fn handle_pragma(
+        &mut self,
+        rest: &str,
+        line_num: usize,
+        col: usize,
+    ) -> Option<String> {
         let rest = rest.trim();
         if rest == "once" {
             // Mark the current file as "include once".  Track both canonical
@@ -90,10 +95,97 @@ impl Preprocessor {
                 }
                 return self.handle_pragma_gcc_visibility(vis_content.trim());
             }
+            if let Some(dep_content) = gcc_content.strip_prefix("dependency") {
+                self.handle_pragma_gcc_dependency(dep_content.trim(), line_num, col);
+                return None;
+            }
         }
 
         // Other pragmas (GCC, diagnostic, etc.) are silently ignored
         None
+    }
+
+    /// Handle `#pragma GCC dependency FILENAME [MESSAGE]` (GCC extension).
+    ///
+    /// GCC semantics, which Clang's corpus pins: the filename is NOT
+    /// macro-expanded (a bare macro name is an error) and must be a
+    /// complete `"..."` or `<...>` token; the file is searched like a
+    /// quoted/chevron include and a missing file is a hard error. When the
+    /// dependency exists but is NEWER than the current source file, GCC
+    /// warns (regeneration needed), appending any trailing message text.
+    /// The dependency is checked only, never inserted.
+    fn handle_pragma_gcc_dependency(&mut self, content: &str, line_num: usize, col: usize) {
+        let (filename, is_system, rest_after) = if let Some(r) = content.strip_prefix('"') {
+            match r.find('"') {
+                Some(end) => (r[..end].to_string(), false, &r[end + 1..]),
+                None => {
+                    self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                        file: self.current_file(),
+                        line: line_num,
+                        col,
+                        message: "expected \"FILENAME\" or <FILENAME>".to_string(),
+                    });
+                    return;
+                }
+            }
+        } else if let Some(r) = content.strip_prefix('<') {
+            match r.find('>') {
+                Some(end) => (r[..end].to_string(), true, &r[end + 1..]),
+                None => {
+                    self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                        file: self.current_file(),
+                        line: line_num,
+                        col,
+                        message: "expected \"FILENAME\" or <FILENAME>".to_string(),
+                    });
+                    return;
+                }
+            }
+        } else {
+            self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                file: self.current_file(),
+                line: line_num,
+                col,
+                message: "expected \"FILENAME\" or <FILENAME>".to_string(),
+            });
+            return;
+        };
+        let Some(resolved) = self.resolve_include_path(&filename, is_system) else {
+            self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                file: self.current_file(),
+                line: line_num,
+                col,
+                message: format!("'{}' file not found", filename),
+            });
+            return;
+        };
+        // Staleness check: warn when the dependency is newer than the
+        // current source (its generated content may be out of date). Any
+        // trailing text after the filename is GCC's optional message.
+        let message = rest_after.trim();
+        let dep_newer = match (
+            std::fs::metadata(&resolved).and_then(|m| m.modified()),
+            std::fs::metadata(self.current_file()).and_then(|m| m.modified()),
+        ) {
+            (Ok(dep), Ok(cur)) => dep > cur,
+            _ => false,
+        };
+        if dep_newer {
+            let text = if message.is_empty() {
+                format!("\"{}\" is newer than the current file", filename)
+            } else {
+                format!(
+                    "\"{}\" is newer than the current file: {}",
+                    filename, message
+                )
+            };
+            self.warnings.push(super::pipeline::PreprocessorDiagnostic {
+                file: self.current_file(),
+                line: line_num,
+                col,
+                message: text,
+            });
+        }
     }
 
     /// Handle #pragma GCC visibility push(hidden|default|protected|internal) / pop.

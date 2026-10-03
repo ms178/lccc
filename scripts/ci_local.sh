@@ -585,6 +585,13 @@ gate "corpus-runner-contracts" fast \
     python3 -m unittest discover -s tests/corpus -p 'test_*.py'
 gate "frontend-diagnostic-recovery" fast \
     bash tests/regression/check_frontend_diagnostic_recovery.sh
+# E5 (EDG register): adversarially nested expressions used to overflow the
+# 64 MB compiler thread and abort (rc=134; GCC 14 segfaults its cc1 on the
+# same input). The parser now runs a frame budget and degrades to one clean
+# bounded error; this gate pins crash-class rejection, deep-but-legal
+# acceptance, and in-budget semantic correctness.
+gate "deep-nesting-robustness" fast \
+    python3 scripts/check_deep_nesting_robustness.py --lccc "$LCCC"
 gate "differential-corpus-paths" fast \
     python3 scripts/test_differential_corpus_paths.py
 

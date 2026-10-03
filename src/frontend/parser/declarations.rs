@@ -980,6 +980,13 @@ impl Parser {
     pub(super) fn parse_initializer(&mut self) -> Initializer {
         if matches!(self.peek(), TokenKind::LBrace) {
             let open = self.peek_span();
+            // Initializer-budget frame: nested `{ { ... } }` initializer
+            // lists recurse one frame per brace level; on exhaustion
+            // consume nothing and return an empty list placeholder (the
+            // budget diagnostic is already the TU verdict).
+            if !self.enter_initializer_frame(open) {
+                return Initializer::List(Vec::new());
+            }
             self.advance();
             let mut items = Vec::with_capacity(8);
             while !matches!(self.peek(), TokenKind::RBrace | TokenKind::Eof) {
@@ -1039,6 +1046,7 @@ impl Parser {
                 Some(&self.enum_constants)
             };
             let items = Self::expand_range_designators(items, enums);
+            self.exit_parser_frame();
             Initializer::List(items)
         } else {
             Initializer::Expr(self.parse_assignment_expr())

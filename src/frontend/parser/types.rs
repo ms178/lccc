@@ -691,6 +691,14 @@ impl Parser {
 
     /// Parse a struct or union definition/reference.
     fn parse_struct_or_union(&mut self, is_struct: bool) -> TypeSpecifier {
+        // Type-budget frame: nested struct/union DEFINITIONS recurse one
+        // frame per level (`struct { struct { ... int x; } s; }`); on
+        // exhaustion return a placeholder WITHOUT consuming tokens -- the
+        // budget diagnostic is already the TU verdict and the callers'
+        // progress guarantees unwind the rest.
+        if !self.enter_record_frame(self.peek_span()) {
+            return TypeSpecifier::Int;
+        }
         let (mut is_packed, mut struct_aligned, _, _, mut sso) = self.parse_gcc_attributes();
         let name = if let TokenKind::Identifier(n) = self.peek() {
             let n = n.clone();
@@ -776,11 +784,16 @@ impl Parser {
         match &ts {
             TypeSpecifier::Struct(Some(tag), Some(_), ..)
             | TypeSpecifier::Union(Some(tag), Some(_), ..) => {
-                let align = Self::alignof_type_spec(&ts, None);
+                // Pass the tag-alignment map so nested NAMED records already
+                // defined (parsed inside-out) resolve in O(1) instead of
+                // re-walking the whole chain at every level. This is what
+                // keeps deep struct nesting linear instead of quadratic.
+                let align = Self::alignof_type_spec(&ts, Some(&self.struct_tag_alignments));
                 self.struct_tag_alignments.insert(tag.clone(), align);
             }
             _ => {}
         }
+        self.exit_parser_frame();
         ts
     }
 
@@ -917,6 +930,14 @@ impl Parser {
         let open = self.peek_span();
         self.expect_context(&TokenKind::LBrace, "for struct/union body");
         while !matches!(self.peek(), TokenKind::RBrace | TokenKind::Eof) {
+            // Budget termination guarantee: once the nesting budget is
+            // exhausted, every level unwinds immediately instead of
+            // grinding through the remaining tokens (the budget
+            // diagnostic is the TU verdict).
+            if self.nesting_budget_diagnosed {
+                break;
+            }
+            let pos_before = self.pos;
             self.skip_gcc_extensions();
             // Per-field reset: an `address_space(__seg_gs)` attribute parsed
             // for one field must not leak into the next (fields without a
@@ -950,6 +971,12 @@ impl Parser {
                 self.expect_after(&TokenKind::Semicolon, "after struct field declaration");
             } else {
                 self.advance(); // skip unknown
+            }
+            // Universal progress guarantee: a field parse that consumed
+            // nothing (e.g. a budget-exhausted placeholder type) must not
+            // be retried on the same token.
+            if self.pos == pos_before {
+                self.advance();
             }
         }
         self.expect_closing(&TokenKind::RBrace, open);

@@ -199,3 +199,290 @@ The register in `docs/EDG_TRANSPLANT_ANALYSIS.md` §6 is authoritative.
   (0 unique entry loss vs 7 416 header lines); SPDX/GPL scan clean;
   Callgrind pinned-geometry smoke test green; corpus integrity asserts
   green. **CI not run (user exemption).**
+
+---
+
+# Session 2026-10-03 — E1 corpus-driven hardening, #embed, Review-AI audit response
+
+Snapshots: S02 (E5 budget), S03 (embed + pragma deps), S04 (audit hardening).
+
+## 1. E1 corpus results (clang-c, outcome-only, c-driver-contract +
+clang-default-c-dialect capabilities)
+
+| Slice        | executed | PASS | FAIL | notes |
+|--------------|----------|------|------|-------|
+| Preprocessor | 26       | 24   | 2    | was 16/10 pre-session |
+| Sema         | 193      | 124  | 68   | baseline; 64 = "expected reject, observed ACCEPT" (missing semantics diagnostics), 4 over-rejects, 1 runner ERROR |
+
+Residual Preprocessor FAILs (documented in tests/bugs/backlog.md):
+`pragma_assume_nonnull` (needs `_Nonnull` keyword + -Wnonnull warning),
+`pushable-diagnostics` (needs diagnostic-state machine + unused-comparison
+warning). Both multi-subsystem; deferred for corpus breadth.
+
+## 2. Features landed (corpus-pinned, EDG-derived)
+
+- **C23 `#embed` / `__has_embed` / `__STDC_EMBED_*`** — full parameter
+  grammar: `limit` accepts C integer pp-numbers (hex/octal/binary/char
+  literals incl. escapes), `prefix/suffix/if_empty`, `clang::offset(N)`;
+  duplicate-param detection; literal-aware paren balance; strict trailing
+  validation in whole-line forms; mid-line (standard) form preserves
+  trailing tokens (`{#embed "f"};`). `__has_embed` probes silently yield
+  NOT_FOUND for unsupported/vendor parameters (feature-detection channel)
+  and diagnose true syntax errors. 8/9 corpus embed tests pass;
+  `embed_constexpr` needs an aux data file the corpus does not ship.
+- **`__has_warning`** — truthful verdicts against lccc's actual
+  WarningKind registry (no blanket 1s); full Clang contract diagnostics
+  (missing paren, zero args, non-string argument, non-`-W` option name,
+  unterminated literal).
+- **`#pragma GCC dependency`** — existence check, mtime staleness warning
+  with optional trailing message, delimiter validation, no macro expansion
+  of the filename (GCC contract; corpus pins both error shapes).
+- **`_Pragma` created by expansion** — rescan pass handles operators that
+  only come into existence through macro expansion (`DO_PRAGMA (...)`
+  kernel pattern) without resurrecting blue-painted macros.
+- **Stringize validation** — literal-aware: `#define F(x) "#"` and
+  `'#'` bodies are valid; `#z` with non-parameter z still diagnosed.
+
+## 3. Review-AI audit response (PR #734) — all 9 finding groups resolved
+
+- **High-1 parser termination (CONFIRMED LIVE, fixed):** `({ ... })` chains
+  beyond the frame budget hung forever (compound-statement loop retrying a
+  non-consuming placeholder). Fix: budget-exhaustion bail in the compound
+  loop + universal progress guarantee + silent unwind (expect_after /
+  emit_error suppress cascade once the budget diagnostic fired). Gate now
+  pins `stmtexpr_11000`.
+- **High-2 embed offset underflow (fixed):** `current_line_start` captured
+  before the running offset advances; no reconstruction from rewritten
+  line lengths.
+- **High-3 stringize literals (fixed):** scanner skips string/char
+  literals (audit's exact examples probed pre/post).
+- **High-4 gate fail-closed (fixed):** requires rc==1 exactly, exactly
+  one budget diagnostic, explicit signal/negative-rc rejection, timeout
+  rejection; acceptance logic extracted into `evaluate_budget_run` with
+  10 mocked unit cases in `--selftest`.
+- **High-5 unary fixture (fixed):** whitespace-separated negations
+  (`- - - 1`), maximal-munch-safe, odd/even invariants asserted.
+- **Med-6 embed grammar (fixed):** see §2.
+- **Med-7 __has_warning truthfulness (fixed):** see §2.
+- **Med-8 GCC dependency completeness (fixed):** see §2.
+- **High-9 diagnostic windowing coordinates (fixed):** byte-column from
+  resolve_span converted to char indices before windowing/caret/squiggle
+  math; UTF-8 caret alignment verified; no panics possible (no byte
+  slicing).
+- **DISAGREED (documented):** inline/mid-line `#embed` IS the C23
+  6.10.15 standard form, not an extension (comment now cites the clause);
+  the gate already rejected signal exits via negative-rc fall-through,
+  but is now explicit anyway.
+
+## 4. E7 curation (docs/edg_changes_c_extract.md -> tests/regression)
+
+Nine differential regression tests committed (all pass lccc vs GCC where
+GCC is a valid oracle): `edg_c23_empty_initializer`,
+`edg_gnu_null_constexpr`, `edg_dr423_const_return_qualifier`,
+`edg_anon_member_designated_init`, `edg_c23_compatible_tag_redefinition`
+(-std=c2x), `edg_typeof_statement_expr_cast`, `edg_inline_embed_tokens`
+(lccc-only), `edg_stringize_in_literals`, `edg_has_warning_registry`
+(lccc-only; GCC lacks __has_warning).
+
+## 5. E6 first pin + open bugs
+
+`tests/bugs/bitfield_generic_effective_type.c` — GCC's _Generic selects
+the EFFECTIVE bit-field type (`unsigned u:8` -> unsigned char); lccc uses
+the declared type. First pinned divergence for the E6 differential corpus.
+`tests/bugs/compound_literal_alignas.c` — _Alignas on compound literals
+loses its alignment in emission (DR444 syntax accepted, placement not).
+
+## 6. Verification at S04
+
+ci_local.sh --fast **150/150 green** (first fully green run); cargo test
+4011/0; deep-nesting gate 7/7 incl. stmtexpr termination; Preprocessor
+corpus 24/26; clippy + rustfmt clean; Sema baseline 124/193 recorded for
+the next session's triage (report: work/corpus_sema.json equivalent at
+/home/user/work/corpus_sema.json).
+
+## 7. Next-session starting points
+
+1. Sema triage: 64 "expected reject, observed ACCEPT" = missing semantic
+   diagnostics (group by error class); 4 over-rejects:
+   c2x-bool/c2x-nodiscard (C23 keywords `bool`/`true`/`false` +
+   `[[nodiscard]]` prefix attrs), overloaded-func-transparent-union,
+   undefined-internal-typeof-c23. C23 bool keywords are the highest
+   leverage (kernel/glibc -std=c23 readiness).
+2. E6 bit-field differential corpus build-out from the pinned divergence.
+3. E3 builtin signature scrape (kernel/glibc/zlib-ng/expat zero unresolved).
+
+---
+
+# Session 2026-10-03 (cont.) — rebase + full red-team audit of the patch
+
+Snapshots S06–S08. Base moved: be8b8569 (PR #731) -> **27cffb8 (PR #732)**;
+patch replays cleanly (zero shared files with #732).
+
+## Rebase facts
+
+- PR #732 touched only tooling/tests (callgrind_ab, lccc_recover, workload
+  extraction safety, peephole whitespace gate, gzip run.py) — zero overlap
+  with the session patch; `git apply` clean, no conflicts.
+- Post-wipe environment restored: rustup/rustc 1.99.0 reinstalled
+  (.cargo/.rustup are snapshot-excluded), swap re-enabled via
+  scripts/ensure_swap.sh, and the wiped i686 multilib stack
+  (gcc-multilib, g++-multilib, libc6-dev-i386) reinstalled — proven
+  environmental by host GCC failing `gcc -m32` identically before the fix.
+
+## Red-team findings (audited line-by-line) and fixes
+
+| ID | Severity | Defect | Fix |
+|----|----------|--------|-----|
+| R1 | bug | `probe_embed` reported directories as Found (metadata succeeds; the #embed read then fails) — inconsistent `__has_embed` verdicts | require `file_type().is_file()` |
+| R2 | bug | only the FIRST inline `#embed` per line was spliced; a second occurrence survived as raw text | splice loop scans the unconsumed remainder left-to-right; expansion text is never re-scanned (no recursion via prefix/suffix containing `#embed`) |
+| R3 | perf | per-byte `b.to_string()` = 1 heap allocation per embedded byte | `push_u8_decimal`: branch-on-digit-count fixed divisors, zero allocations |
+| R4 | perf | whole-file `fs::read` even with `limit(N)` | `read_embed_bounded`: prefix read capped at offset+limit; short-read/EINTR-tolerant loop; 50 MB + limit(16) measured **4 ms** (vs 41.7 s full expansion of the same file) |
+| R5 | debt | resolve/read/diagnose block duplicated across expand forms | extracted `read_embed_resource` |
+| R6 | dead | leftover `let _ = bytes;` | removed |
+| R7 | bug | **double offset**: bounded read seeked by `offset` while `expand_embed_bytes` sliced by `offset` again → truncated output (caught by the multi-embed differential) | single arithmetic owner: I/O reads the offset+limit prefix, slicing stays in `expand_embed_bytes` |
+| R8 | msg | `clang::offset` failures said "invalid embed limit" | `InvalidLimit(param, value)` → "invalid embed parameter 'clang::offset' value ''" |
+| R9 | diag | windowing caret/squiggle now fully char-based with byte→char conversion at one point (verified on multibyte windowed snippets) | (from the prior round; re-verified) |
+
+## Verification evidence (no guesswork)
+
+- **Byte oracle**: 256-byte fixture (all byte values) embedded via
+  `#embed`; FNV-1a `0x4242dc5249c33625` / size 256 identical for
+  lccc-#embed and a GCC-compiled reference array — baked as the constant
+  in `tests/regression/edg_embed_byte_oracle.c` (+ .bin fixture, sha256
+  40aff2e9…).
+- **i686 architecture**: the same oracle compiles and passes with
+  `-m32` (frontend is target-independent; verified anyway).
+- **Grammar battery** (`edg_embed_grammar_battery.c`): two embeds on one
+  line, offset+limit, hex limit, prefix/suffix, if_empty past EOF.
+- **Unit tests**: `embed_unit_tests` (4) — radices/suffixes, malformed
+  rejection incl. u64 overflow boundary, char-literal escapes, bounded
+  read contract. Total suite 4015/0.
+- **Fuzz sweeps, zero panics/hangs**: 27 embed edge cases
+  (unterminated params, overflow limits, nested-paren prefix, vendor
+  params, chevron/quote truncation), 17 `__has_warning` forms
+  (concatenated literals -> 1, -Wno- mapping, macro-arg non-expansion,
+  unterminated strings), 22 garbage-token recovery contexts (progress
+  guarantee without budget exhaustion).
+- **Verdict checks**: `__has_warning("-W" "return-type")` = 1,
+  `-Wno-return-type` = 1, `-Wextra` = 1; unknown flags = 0.
+- **CI**: `ci_local.sh --fast` 150/150 green on the rebased base;
+  linker suite 302/302 (after multilib restore); deep-nesting gate 7/7;
+  clippy 0 warnings; rustfmt clean; Preprocessor corpus 24/26
+  (unchanged); Sema corpus 124/193 identical to pre-red-team baseline
+  (no semantic drift).
+
+## Performance notes (14700KF-relevant)
+
+- Hot embed path is branch-light integer formatting into a pre-sized
+  String (no allocations per byte, one reserve of take*5 + affixes).
+- I/O bounded by offset+limit; the only remaining O(file) cost is an
+  UNBOUNDED embed of a huge file, which is inherent (the byte list
+  itself is the output). Preprocessing a 50 MB resource stays bounded
+  (limit(16) on 50 MB: ~9 ms); the downstream cost is the giant
+  initializer it emits (see backlog B5) and on this 2 GB harness a
+  full 50 MB embed exceeds the memory cgroup (SIGKILL) — measured
+  identical on S08, i.e. not a regression.
+- Compound-loop termination guard costs one pos compare per statement —
+  below measurement noise on real TUs.
+
+# Session 2026-10-03 (cont. 2) — PR #739 Review-AI audit remediation
+
+The Review AI audited PR #739 (11 findings, "request changes", self-scored
+6.5/10) with the explicit caveat that it CANNOT execute code. Every finding
+was therefore verified with reproducers against the built compiler before
+fixing; this ledger records the verdicts and the measured evidence.
+
+## Finding-by-finding verdicts (all verified empirically)
+
+| # | Audit claim | Verdict | Evidence / action |
+|---|-------------|---------|-------------------|
+| F1 | `#embed` limit/offset can size an allocation to u64::MAX -> ICE/abort | **AGREE** | `read_embed_bounded` allocated `vec![0u8; offset+limit]` unclamped; `limit(18446744073709551615)` parsed fine. Fixed: clamp to `f.metadata().len()` BEFORE allocating + `usize::try_from` reject. Gate pins 3 adversarial inputs (u64::MAX limit, 1 TiB limit, u64::MAX offset+limit(1)); all compile clean in ~ms. |
+| F2 | queued `_Pragma` diagnostics report line 0 | **AGREE** | Drain passed `(0,0)`. Fixed: queue now carries `(content, 1-based line)` resolved at enqueue through the current line resolver (`#line`-aware). Repro: macro-expanded `_Pragma("GCC dependency ...")` reports the macro-use line; `#line 9` override honored. Corpus `_Pragma-dependency.c` d0001 (line 17) and `_Pragma-dependency2.c` d0000 (line 9) now PASS in diagnostics mode. |
+| F3 | `__has_warning("foo")` (non-`-W` name) rejects the TU | **AGREE** | Severity split: well-formed call with non-flag argument is now a WARNING via a new `warn!` path; missing-paren/zero-args/non-string/unterminated stay errors per Clang. Corpus `invalid-__has_warning2.c` flipped FAIL->PASS. |
+| F4 | stale blanket-policy doc contradicts the registry | **AGREE** | Doc block deleted; `is_recognized_warning_flag` now documented as the registry predicate; contract block re-validated line-by-line against the code. |
+| F5 | budget only covers expressions; other recursion classes crash | **AGREE — and worse than claimed** | Measured stack-overflow aborts (rc=134) on VALID C: 200k nested blocks, 200k brace-initializer levels, 50k nested struct definitions (named AND anonymous), plus 20k-level stmt chains. Budget generalized to four frame classes with class-specific diagnostics (see below). |
+| F6 | diagnostic cap is error-only | **AGREE** | `MAX_RENDERED_WARNINGS = 200` added (rendering cap; counting continues past it, so `-Werror` and summaries stay exact). 200 vs Clang's 20 justified in-code: corpus pins exact warning output and real TUs must not be truncated at 20; the cap still bounds pathological floods. |
+| F7 | compound-loop `continue`s skip the progress check | **AGREE** | Restructured to a labelled `'item` block; every path (incl. the former `continue` exits) now flows through the single tail progress check; outer loop labelled `'body` for the labeled break. |
+| F8 | `resolve_has_macros_in_code` gets 0-based lines | **AGREE** | 5 call sites now pass `source_line_num + 1` (matching the `process_directive` convention); contract documented on the function. Repro: code-line `__has_warning("foo")` warning now reports the correct 1-based line. |
+| F9 | splice re-scans and clones | **AGREE (minor)** | Single-scan rewrite: first `find_inline_embed` result reused, head cloned only from the first `#` onward, remainder offsets derived from the suffix-slice guarantee of `parse_embed_params`. |
+| F10 | `push(c as char)` byte->char assumption | **AGREE, deferred** | Correct that ~20 pragma-de-escape sites assume 1 byte = 1 char; today inputs are pre-validated to the source charset and the sites are hot. Tracked below as a backlog item; no behavioral bug demonstrated. |
+| F11 | stray `e.txt`, stale FOLLOWUP base-ref line | **AGREE** | Both removed. |
+
+## F5 deep-dive: generalized parser frame budgets
+
+The audit's preferred option was implemented: one shared live-frame counter
+(`parser_frame_depth`, renamed from the expression-only counter) with
+class-specific budgets and diagnostics:
+
+| Class | Entry points counted | Budget | Measured ceiling |
+|-------|----------------------|--------|------------------|
+| expressions | `enter_expr_frame` sites | 32 768 | ~4 800 paren levels overflow |
+| statements/blocks | `parse_stmt` + `parse_compound_stmt` | 8 192 | ~14–16k block levels overflow |
+| brace initializers | `parse_initializer` | 32 768 | (same order as expressions) |
+| record definitions | `parse_struct_or_union` | 2 048 | ~50k levels overflow; post-parse phases are quadratic in record depth, so the lower bound also caps hostile-but-legal compile time (~0.6 s worst case) |
+
+Supporting hardening discovered while testing the budget itself:
+- **Termination guarantees**: struct-field loop gained the same
+  diagnosed-break + progress-guard pair the block loop has; without it the
+  post-budget unwind of deep record chains spun forever (rc=124) — found
+  by repro, fixed, and now pinned by the gate.
+- **alignof memoization**: `alignof_type_spec` now resolves previously
+  defined named records through `struct_tag_alignments` instead of
+  re-walking the chain; deep NAMED struct parsing drops from quadratic
+  (depth 8000: 11.6 s) to linear.
+- Known remaining algorithmic gap (backlog): sema/codegen layout cost is
+  quadratic in ANONYMOUS record-nesting depth (parser itself is linear
+  there; budget fires before sema runs, so crash-class inputs never hit
+  it). Real TUs nest single digits deep.
+- Gate (`scripts/check_deep_nesting_robustness.py`) extended: embed
+  adversarial class (3 cases, host-width-aware evaluator) + block /
+  initializer / record crash classes (4 cases) + stmtexpr re-pinned to the
+  block budget (statement expressions parse as compound statements).
+  Full gate: 14/14 PASS.
+
+## Corpus numbers, diagnostics mode (the honest bar)
+
+Preprocessor slice, `run_clang_c_corpus.py --mode diagnostics`
+(c-driver-contract + clang-default-cialect):
+
+| State | PASS | FAIL |
+|-------|------|------|
+| Before this session (S08) | 15/26 | 11 |
+| After fixes | **18/26** | 8 |
+
+Fixed: `_Pragma-dependency` (F2), `_Pragma-dependency2` (F2),
+`invalid-__has_warning2` (F3). ZERO regressions (fail-set is a strict
+subset; verified by rebuilding the pre-fix tree and diffing the reports).
+Note: the audit's claimed "true figure 22/26" was an overestimate — the
+measured pre-fix baseline was 15/26.
+
+Remaining 8 FAILs are pre-existing diagnostic-feature gaps (each verified
+against the pre-fix binary): `_Pragma.c` (malformed `_Pragma` error text +
+unknown-pragma warnings), `extension-warning.c`, `macro-reserved.c`,
+`pushable-diagnostics.c`, `suggest-typoed-directive.c` (x2) — all
+`-pedantic`/suggestion warnings lccc does not implement yet — plus
+`invalid-__has_warning1.c` (EOF-truncated call message text) and
+`pragma_assume_nonnull.c`. These belong to the E1 diagnostics backlog.
+
+## Backlog (from this session)
+
+- **B1 (audit F10)**: audit the byte->char decode sites for the
+  1-byte-1-char assumption — measured: 5 literal `push(c as char)`
+  (2x expr_eval.rs, 3x macro_defs.rs) plus 35 sibling byte-push sites
+  in the preprocessor; move to `Vec<u8>` or UTF-8-aware decoding if
+  non-ASCII source charsets are admitted.
+- **B2**: memoize sema/codegen struct layout for anonymous record chains
+  (quadratic today; bounded by TYPE_FRAME_BUDGET=2048 => ~0.6 s worst
+  legal case).
+- **B3**: implement the 8 pre-existing Preprocessor diagnostics gaps
+  listed above (E1 scope).
+- **B4**: C23 `bool`/`true`/`false` keyword gap under `-std=c2x`
+  (`TokenKind::from_keyword` needs a dialect parameter).
+- **B5**: giant initializer lists go super-linear past ~500k elements
+  (measured, PRE-EXISTING at S08, embed NOT involved: plain
+  `unsigned char a[] = {0,1,...}`: 480k elems = 1.6 s, 960k elems =
+  21 s on both trees). Suspected sema initializer-eval threshold;
+  huge `#embed` expansions surface it because they emit one
+  million-element initializer. Full 50 MB embed additionally exceeds
+  the 2 GB harness cgroup (SIGKILL) — bounded on real hosts by RAM,
+  same complexity class as any implementation of the directive.
