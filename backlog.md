@@ -225,6 +225,59 @@ are not CI reds, which is why they are a list rather than a gate.
 
 ## P0 — largest measured gaps
 
+### TAG-ID-1 · **NEW 2026-10-02** — nested same-tag structs share one type identity (miscompile)
+
+A correctness defect, ranked above the codegen gaps below because it silently
+produces a wrong answer rather than a slow one. Reproducer and full evidence:
+[`tests/bugs/nested_tag_struct_identity.c`](tests/bugs/nested_tag_struct_identity.c).
+
+```c
+struct S { char c; };
+unsigned f(struct S p) { return (unsigned)(unsigned char)p.c; }
+int main(void) { struct S { int c; } s = { 300 }; printf("%u\n", f(s)); }
+```
+
+lccc prints **44**; the correct answer is **300**. GCC 16.2 rejects the program
+outright (`incompatible type for argument 1 of 'f'`). 300 is 0x12C and the
+callee reads only the low byte.
+
+Cause: struct/union types are keyed by tag alone
+(`CType::Struct("struct.S")`) while struct *layouts* are scope-aware
+(`TypeScopeFrame::struct_layouts_shadowed` restores them on `pop_scope`), so an
+inner-scope definition of a tag silently rebinds the layout that the outer
+declaration refers to and the two are indistinguishable downstream.
+
+Differential vs GCC 16.2 — lccc accepts every row GCC rejects:
+
+| case | gcc | lccc |
+|---|---|---|
+| member type differs | REJECT | accept |
+| member name differs | REJECT | accept |
+| member count differs | REJECT | accept |
+| bit-field width differs | REJECT | accept |
+| bit-field signedness differs | REJECT | accept |
+
+And the defect is broader than C23: on the *valid* N3037 case GCC rejects under
+`-std=c11` and `-std=c17` (6.7.2.3 makes an inner-scope definition a new,
+incompatible type) and accepts under `-std=c23`; lccc accepts in all three, so
+it is only accidentally right in C23 when the members happen to correspond.
+
+Not a one-line fix, and that is why it is P0 rather than a patch: the tag-keyed
+form is assumed across layers. `src/ir/lowering/` rebuilds keys by hand from the
+AST tag (`format!("struct.{}", tag)` in `expr_access.rs`, `stmt.rs`,
+`structs.rs`, `const_eval.rs`), `TypeSpecifier` carries the raw tag while
+`CType` carries the prefixed key, and there are three `resolve_struct_or_union`
+implementations behind the `TypeBuilder` trait. The plan in the reproducer is:
+a per-definition key stack in `TypeContext` with one resolver used by every
+lookup site; a distinct key only when a definition shadows a visible one, so
+6.7.2.3p2 (same tag at file scope = same type) is preserved; then the N3037
+compatibility relation for C23 only; then each matrix row pinned as a
+`tests/regression/` case with GCC's verdict as the expectation.
+
+Found by the EDG `src/Changes` distillation (E7): the top-scored C-relevant
+entry in `docs/edg_changes_c_extract.md` is "C23: New tag compatibility rules"
+(N3037, *C-score +10*), which is what made the differential worth running.
+
 ### IVOPTS-1 · **NEW 2026-09-30** — index-form addressing is never strength-reduced
 
 The largest single measured codegen defect, and the one that explains most of

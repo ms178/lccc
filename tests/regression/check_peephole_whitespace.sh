@@ -57,7 +57,24 @@ CCC=${CCC:-target/fastbuild/lccc}
 PROFILE=${PROFILE:-fastbuild}
 JOBS=${JOBS:-2}
 CORPUS_EVERY=${CORPUS_EVERY:-15}
-ONLY_PHASE=${1:-}
+# `ONLY_PHASE` is the phase NUMBER, never the literal `--phase`: it used to be
+# `${1:-}`, so the documented `--phase 1` stored the flag itself, `want_phase`
+# matched nothing, every phase was skipped -- and the gate still printed PASS
+# for all four of them.  A selector that silently selects nothing is worse than
+# no selector, so the argument is parsed and validated here instead.
+ONLY_PHASE=''
+case "${1:-}" in
+    '') ;;
+    --phase)
+        ONLY_PHASE=${2:-}
+        [[ -n "$ONLY_PHASE" ]] || { echo "usage: $0 [--phase {1|2|3|4}]" >&2; exit 2; } ;;
+    --phase=*) ONLY_PHASE=${1#--phase=} ;;
+    *) echo "usage: $0 [--phase {1|2|3|4}]" >&2; exit 2 ;;
+esac
+case "$ONLY_PHASE" in
+    '' | 1 | 2 | 3 | 4) ;;
+    *) echo "usage: $0 [--phase {1|2|3|4}]" >&2; exit 2 ;;
+esac
 
 fail=0
 declare -a RESULTS=()
@@ -68,7 +85,7 @@ bad()  { printf 'FAIL %s\n' "$*" >&2; RESULTS+=("FAIL $*"); fail=1; }
 # A phase runs unless --phase N selected a different one.  `$1` is the phase
 # number; the second argument is always `$ONLY_PHASE` at the call site, which is
 # empty when every phase was requested.
-want_phase() { [[ -z "${2:-}" || "${2#--phase }" == "$1" ]] && return 0; return 1; }
+want_phase() { [[ -z "${2:-}" || "${2:-}" == "$1" ]] && return 0; return 1; }
 
 cargo_test() { # cargo_test <filter> [extra cargo-test args...]
     local filter=$1; shift
@@ -256,9 +273,19 @@ fi
 [[ -n "$corpus_dir" ]] && rm -rf "$corpus_dir"
 
 note ""
+# Nothing ran is a failure, not a pass: an empty RESULTS means the phase
+# selector matched no phase, and the old banner then claimed all four.
+if (( ${#RESULTS[@]} == 0 )); then
+    echo "check_peephole_whitespace: FAILED (no phase ran; selector matched nothing)" >&2
+    exit 1
+fi
 for line in "${RESULTS[@]}"; do printf '%s\n' "$line"; done
 if (( fail != 0 )); then
     echo "check_peephole_whitespace: FAILED" >&2
     exit 1
 fi
-echo "check_peephole_whitespace: PASS (in-tree corpus, operand totality, generated corpus, assembler path)"
+# The banner must describe what was actually verified, so a single-phase run
+# cannot read as a four-phase pass.
+summary='in-tree corpus, operand totality, generated corpus, assembler path'
+[[ -n "$ONLY_PHASE" ]] && summary="phase $ONLY_PHASE only"
+echo "check_peephole_whitespace: PASS ($summary)"
