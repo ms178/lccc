@@ -103,15 +103,54 @@ def sourced_libraries() -> set[str]:
 
 
 
-def run_script_bodies(path: Path) -> str:
-    """All `run:` script text of one workflow, comment-stripped.
+# A step `if:` condition that still runs the step on the ordinary
+# (green-path) PR run. Anything else — `failure()`, `runner.os == ...`,
+# an expression gate — means the step does not execute on the path the
+# parity contract is about, so its body is not coverage.
+_ACTIVE_IF = {"always()", "${{ always() }}", "success()", "${{ success() }}"}
 
-    Handles the single-line (`run: make check`) and block scalar
-    (`run: |`/`run: >`) forms through the YAML parser, so quoting,
-    folding, and comment placement cannot fake an execution. Shell
-    comment lines and trailing comments inside the script body are
-    removed before matching: a gate commented out of its own run block
-    executes nothing and must fail parity.
+
+def _env_names(env) -> set[str]:
+    """LCCC*-tool override names declared by one `env:` mapping."""
+    names: set[str] = set()
+    if isinstance(env, dict):
+        names |= {str(k) for k in env}
+    elif isinstance(env, list):
+        for item in env:
+            if isinstance(item, dict):
+                names |= {str(k) for k in item}
+    # Exactly the argparse-default override channels of the differential
+    # tools under contract (asmdiff/encdiff: LCCC, LCCC_GAS, LCCC_OBJCOPY,
+    # LCCC_OBJDUMP). Other LCCC_* variables (e.g. LCCC_RELOCS_TOOL for the
+    # linker suite, which passes it on the command line by contract) are
+    # not hidden channels for THESE programs.
+    return {n for n in names if n in
+            {"LCCC", "LCCC_GAS", "LCCC_OBJCOPY", "LCCC_OBJDUMP"}}
+
+
+def _strip_run_comments(run: str) -> str:
+    """One `run:` body, comment-stripped, as joined text lines."""
+    pieces: list[str] = []
+    for line in run.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            continue
+        # Cut a trailing comment; `#` can never be part of a matched
+        # path (not in the command charset).
+        cut = re.search(r"\s#", line)
+        pieces.append(line[: cut.start()] if cut else line)
+    return "\n".join(pieces)
+
+
+def workflow_run_steps(path: Path):
+    """Yield (active, soft, lccc_env, body) for every `run:` step.
+
+    `active` is False when a step-level `if:` keeps the step off the
+    green-path run (its body executes nothing on the PR path this
+    checker reasons about); `soft` is True under `continue-on-error`
+    (the step runs, but its failure cannot fail the build — a gate
+    there is not a gate); `lccc_env` is the set of hidden LCCC* tool
+    overrides the step inherits (step `env:` merged over job `env:`).
     """
     try:
         import yaml
@@ -125,35 +164,52 @@ def run_script_bodies(path: Path) -> str:
 
     doc = yaml.safe_load(path.read_text())
     if not isinstance(doc, dict):
-        return ""
-    pieces: list[str] = []
+        return
     jobs = doc.get("jobs") or {}
-    if isinstance(jobs, dict):
-        for job in jobs.values():
-            if not isinstance(job, dict):
-                continue
-            # `steps` is the normal location; composite action files would
-            # use `runs.steps`, accepted for future-proofing.
-            containers = []
-            if isinstance(job.get("steps"), list):
-                containers.append(job["steps"])
-            runs = job.get("runs") or {}
-            if isinstance(runs, dict) and isinstance(runs.get("steps"), list):
-                containers.append(runs["steps"])
-            for steps in containers:
-                for step in steps:
-                    if isinstance(step, dict) and isinstance(step.get("run"), str):
-                        for line in step["run"].splitlines():
-                            stripped = line.lstrip()
-                            if stripped.startswith("#"):
-                                continue
-                            # Cut a trailing comment; `#` can never be part
-                            # of a matched path (not in the command charset).
-                            cut = re.search(r"\s#", line)
-                            pieces.append(line[: cut.start()] if cut else line)
-    # `uses:` composite actions are out of scope: this repository's workflows
-    # inline every gate command.
-    return "\n".join(pieces)
+    if not isinstance(jobs, dict):
+        return
+    for job in jobs.values():
+        if not isinstance(job, dict):
+            continue
+        # `steps` is the normal location; composite action files would
+        # use `runs.steps`, accepted for future-proofing.
+        containers = []
+        if isinstance(job.get("steps"), list):
+            containers.append(job["steps"])
+        runs = job.get("runs") or {}
+        if isinstance(runs, dict) and isinstance(runs.get("steps"), list):
+            containers.append(runs["steps"])
+        job_env = _env_names(job.get("env"))
+        for steps in containers:
+            for step in steps:
+                if isinstance(step, dict) and isinstance(step.get("run"), str):
+                    cond = step.get("if")
+                    active = cond is None or str(cond).strip() in _ACTIVE_IF
+                    soft = bool(step.get("continue-on-error"))
+                    env = job_env | _env_names(step.get("env"))
+                    yield active, soft, env, _strip_run_comments(step["run"])
+
+
+def run_script_bodies(path: Path) -> str:
+    """All ACTIVE `run:` script text of one workflow, comment-stripped.
+
+    Handles the single-line (`run: make check`) and block scalar
+    (`run: |`/`run: >`) forms through the YAML parser, so quoting,
+    folding, and comment placement cannot fake an execution. Shell
+    comment lines and trailing comments inside the script body are
+    removed before matching: a gate commented out of its own run block
+    executes nothing and must fail parity.
+
+    Execution semantics go one level deeper: a step whose `if:` keeps it
+    off the green-path run (anything but always()/success()) does not
+    execute on the PR path, so its body is not coverage and is excluded
+    here — a workflow that referenced a gate only from a conditional
+    step used to pass parity while silently losing coverage.
+    """
+    return "\n".join(
+        body for active, _soft, _env, body in workflow_run_steps(path)
+        if active
+    )
 
 
 def allowlist_entries() -> set[str]:
@@ -221,54 +277,109 @@ def check_orphaned_gates(local_text: str, hosted: str) -> int:
     return 0
 
 
+def _logical_command_lines(script: str) -> list[list[str]]:
+    """Every logical line of a shell script as a shlex token list.
+
+    `\\` continuations are joined first (a wrapped invocation is ONE
+    command), comments are shlex-stripped, and lines that do not tokenize
+    are dropped — the same conventions the mirrors' own parsers use.
+    """
+    tokens_per_line: list[list[str]] = []
+    lines = script.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        i += 1
+        while line.rstrip().endswith("\\") and i < len(lines):
+            line = line.rstrip()[:-1] + " " + lines[i]
+            i += 1
+        if not line.strip():
+            continue
+        try:
+            tokens = shlex.split(line, comments=True)
+        except ValueError:
+            continue
+        if tokens:
+            tokens_per_line.append(tokens)
+    return tokens_per_line
+
+
+def program_args(tokens: list[str], program: str) -> list[str] | None:
+    """Args after `program` when it stands in COMMAND position, else None.
+
+    Command position: after a `gate NAME fast` wrapper, `env`, and
+    VAR=value assignments, optionally behind the python3/bash/sh
+    interpreter — exactly the prefixes the mirrors' orchestration uses.
+    Anything else (echo, false, `&&`, `if`, prose) is NOT a command
+    position: a decoy line that merely CONTAINS the program never
+    satisfies a contract. This closes the whole decoy class at once —
+    `echo bash scripts/ensure_gas_247.sh x86_64-linux-gnu' provisioned
+    nothing but passed a token-pair scan, and a `python3 ...' line that
+    was the ARGUMENT of an echo passed a starts-with scan.
+    """
+    if program not in tokens:
+        return None
+    head = tokens[: tokens.index(program)]
+    if head[:1] == ["gate"]:
+        head = head[3:]  # gate NAME fast|slow
+    if head[:1] == ["env"]:
+        head = head[1:]
+    if head and head[-1] in ("python3", "bash", "sh"):
+        head = head[:-1]
+    if not all(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", t) for t in head):
+        return None
+    return tokens[tokens.index(program) + 1 :]
+
+
 def direct_asmdiff_commands(script: str) -> list[list[str]]:
     """Parse directly executed asm-diff commands, preserving mode and corpus.
 
     Path-only parity conflates x86-64 and i686 invocations of asmdiff.py.
-    Only a real `python3 scripts/asmdiff.py ...` shell line qualifies: prose,
-    comments, and `echo python3 ...` are not executable differential gates.
-    Consume `\\` continuation lines from that invocation, not the enclosing
-    ci_local `gate ... \\` line.
+    Only a real command-position `python3 scripts/asmdiff.py ...`
+    qualifies: prose, comments, `echo python3 ...', and python3 lines
+    that are arguments of another command are not executable
+    differential gates.
     """
     return direct_diff_commands(script, "scripts/asmdiff.py")
 
 
 def direct_diff_commands(script: str, program: str) -> list[list[str]]:
-    """Args of every directly executed `python3 <program> ...` command.
+    """Args of every command-position `python3 <program> ...` invocation.
 
     The asmdiff and encdiff parity checks share this parser: `\\`
-    continuations are joined (so a gate-prefixed invocation still yields
-    its argument list from the `python3` line down), prose/comments/
-    `echo`-prefixed lines never qualify, and the returned lists start at
-    the first argument after the program path.
+    continuations are joined into one logical line (so a gate-prefixed
+    invocation yields its argument list with the wrapper resolved away),
+    and command position is decided by `program_args` — a `python3 ...'
+    that sits inside an echo, behind `false &&', or in prose never
+    qualifies.
     """
-    lines = script.splitlines()
     commands = []
-    i = 0
-    while i < len(lines):
-        line = lines[i].strip()
-        i += 1
-        if not line.startswith(f"python3 {program} "):
-            continue
-        while line.endswith("\\") and i < len(lines):
-            line = line[:-1] + " " + lines[i].strip()
-            i += 1
-        try:
-            tokens = shlex.split(line, comments=True)
-        except ValueError:
-            continue
-        if tokens[:2] == ["python3", program]:
-            commands.append(tokens[2:])
+    for tokens in _logical_command_lines(script):
+        args = program_args(tokens, program)
+        if args is not None:
+            commands.append(args)
     return commands
 
 
 def asm_option(tokens: list[str], name: str) -> str | None:
+    """The value of `name` when the option appears EXACTLY once, else None.
+
+    argparse's plain `store' action is LAST-occurrence-wins, so a command
+    with two `--objdump's runs with the second value while a
+    first-occurrence reader sees the first — the exact duplicate-override
+    false pass. The contract layer therefore never reads single options
+    out of a command; this helper (used for diagnostics only) refuses to
+    guess when an option is repeated or dangling.
+    """
+    values: list[str] = []
     for i, token in enumerate(tokens):
-        if token == name and i + 1 < len(tokens):
-            return tokens[i + 1]
-        if token.startswith(name + "="):
-            return token[len(name) + 1 :]
-    return None
+        if token == name:
+            if i + 1 >= len(tokens):
+                return None
+            values.append(tokens[i + 1])
+        elif token.startswith(name + "="):
+            values.append(token[len(name) + 1 :])
+    return values[0] if len(values) == 1 else None
 
 
 # The pinned-oracle PAIR contract, as EXACT tokens: the mirrors must
@@ -284,71 +395,129 @@ PINNED_OBJDUMP = "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump"
 def ensure_gas_invoked(script: str) -> bool:
     """True iff the script runs the exact provisioning command.
 
-    `bash scripts/ensure_gas_247.sh x86_64-linux-gnu' as a full token
-    list — the continuation walk joins gate-wrapper lines first, so a
-    wrapped invocation is one logical line. A substring match accepted
-    lookalikes (`x86_64-linux-gnu-malicious', extra arguments); token
-    equality pins the target and the absence of extra arguments.
+    `bash scripts/ensure_gas_247.sh x86_64-linux-gnu' in COMMAND position
+    (gate/env/VAR= wrappers and the interpreter resolved away), with the
+    target as the one and only argument. The old any-position token scan
+    accepted `echo bash scripts/ensure_gas_247.sh x86_64-linux-gnu' and
+    `false && bash ...' — lines that provision nothing — and a substring
+    scan before that accepted lookalikes outright. Command position plus
+    exact args closes the whole decoy class: a mutated target, extra
+    arguments, and the wrong target all fail, and so does any spelling
+    where the installer is not the command being run.
     """
-    lines = script.splitlines()
-    i = 0
-    while i < len(lines):
-        line = lines[i].strip()
-        i += 1
-        while line.endswith("\\") and i < len(lines):
-            line = line[:-1] + " " + lines[i].strip()
-            i += 1
-        if not line:
-            continue
-        try:
-            tokens = shlex.split(line, comments=True)
-        except ValueError:
-            continue
-        for start in range(len(tokens) - 1):
-            if tokens[start:start + 2] == ["bash", "scripts/ensure_gas_247.sh"]:
-                if tokens[start + 2:] == ["x86_64-linux-gnu"]:
-                    return True
+    for tokens in _logical_command_lines(script):
+        args = program_args(tokens, "scripts/ensure_gas_247.sh")
+        if args == ["x86_64-linux-gnu"]:
+            return True
     return False
 
 
+def _contract_status(cmd: list[str], option_spec: dict[str, list[str]],
+                     rest_spec: list[str]) -> tuple[bool, list[str]]:
+    """(matches, human diff) of one command against the token contract.
+
+    The contract has two layers, because argparse semantics have two
+    layers:
+
+    - OPTION/VALUE PAIRS: every option the contract names must appear
+      with exactly its expected values (`--as' once with the pinned
+      path; `--file' twice with the two corpora — append options carry
+      a value LIST, compared as multisets). A duplicate value-taking
+      option (argparse `store' runs the LAST occurrence while a
+      first-occurrence reader validated the first), an injected value,
+      and a value SWAPPED between two pinned options (same flat token
+      bag, different pairing: `--objdump <as-path> --as <objdump-path>')
+      all fail HERE.
+    - REST TOKENS: everything else — flags (`--32', `--offline') and
+      positionals — as an exact multiset. An unregistered option
+      (`--objcopy /evil'), an extra corpus, a dropped flag: all fail
+      here. The 64-bit encdiff contract's rest is exactly
+      [--offline, --quiet], so `--32' in it is a hard mismatch.
+    """
+    actual: dict[str, list[str]] = {}
+    rest: Counter = Counter()
+    i = 0
+    while i < len(cmd):
+        tok = cmd[i]
+        name, eq, inline = tok.partition("=")
+        if not tok.startswith("--"):
+            rest[tok] += 1
+            i += 1
+            continue
+        if name not in option_spec or (not eq and (
+                i + 1 >= len(cmd) or cmd[i + 1].startswith("--"))):
+            # Not a contract option (injected flags/tools land here), or
+            # a contract option in a shape the contract does not spell
+            # (dangling, or its value looks like a flag).
+            rest[tok] += 1
+            i += 1
+            continue
+        value = inline if eq else cmd[i + 1]
+        i += 1 if eq else 2
+        actual.setdefault(name, []).append(value)
+    diff: list[str] = []
+    for name in sorted(option_spec):
+        want, got = Counter(option_spec[name]), Counter(actual.get(name, []))
+        if want != got:
+            for tok in sorted((want - got).elements()):
+                diff.append(f"missing {name} {tok!r}")
+            for tok in sorted((got - want).elements()):
+                diff.append(f"unexpected {name} {tok!r}")
+    want_rest, got_rest = Counter(rest_spec), rest
+    if want_rest != got_rest:
+        for tok in sorted((want_rest - got_rest).elements()):
+            diff.append(f"missing {tok!r}")
+        for tok in sorted((got_rest - want_rest).elements()):
+            diff.append(f"unexpected {tok!r}")
+    return (not diff), diff
+
+
 def check_asmdiff_gate_parity(local_text: str, hosted: str) -> int:
-    """Require the *specific mode, compiler and corpus*, not just the path."""
+    """Require the *specific mode, compiler, corpus and oracle PAIR*.
+
+    Each asm-diff gate's invocation is pinned as an exact pair/rest
+    contract (see _contract_status): `--jobs 2', the pinned `as' AND
+    `objdump' of the 2.47 pair (each exactly once, each with its own
+    pinned value), the mode compiler, `--32' present exactly for i686
+    — and NOTHING else: no pinned casefile subset (asmdiff.py defaults
+    to every tests/asm-diff/*.casefile, so new corpora cannot land
+    ungated) and no option or flag the contract does not name.
+    """
     specs = (
-        # No .casefile operands: asmdiff.py defaults to the whole corpus
-        # (every tests/asm-diff/*.casefile), so new corpora cannot land
-        # ungated the way a pinned follow-up file allowed.
-        ("x86-asm-diff", False, "target/fastbuild/lccc-x86", ()),
-        ("i686-asm-diff", True, "target/fastbuild/lccc-i686", ()),
+        ("x86-asm-diff",
+         {"--jobs": ["2"], "--as": [PINNED_AS],
+          "--objdump": [PINNED_OBJDUMP],
+          "--lccc": ["target/fastbuild/lccc-x86"]},
+         []),
+        ("i686-asm-diff",
+         {"--jobs": ["2"], "--as": [PINNED_AS],
+          "--objdump": [PINNED_OBJDUMP],
+          "--lccc": ["target/fastbuild/lccc-i686"]},
+         ["--32"]),
     )
     missing = []
     for where, text in (("local", local_text), ("hosted", hosted)):
         commands = direct_asmdiff_commands(text)
-        for gate, mode32, compiler, casefiles in specs:
-            if not any(
-                ("--32" in cmd) == mode32
-                and asm_option(cmd, "--jobs") == "2"
-                and asm_option(cmd, "--lccc") == compiler
-                and set(casefiles) == {t for t in cmd if t.endswith(".casefile")}
-                # Every byte-exact differential, in both modes and on both
-                # sides, uses the pinned GAS 2.47 oracle PAIR: an unpinned
-                # `as` is whatever release the host image ships (the i686
-                # gate once failed only because the runner's 2.42 lays out
-                # NOP fills differently from 2.47), and an unpinned objdump
-                # is an unpinned VERDICT authority -- the betterok groups
-                # accept a smaller encoding only when the disassembler
-                # proves the two objects decode identically. The pins are
-                # EXACT token equality: a lookalike path is an unpinned
-                # oracle, exactly like no path at all.
-                and asm_option(cmd, "--as") == PINNED_AS
-                and asm_option(cmd, "--objdump") == PINNED_OBJDUMP
-                for cmd in commands
-            ):
-                missing.append(f"{where}: {gate} (mode/corpus/compiler/jobs/oracle)")
+        for gate, option_spec, rest_spec in specs:
+            best: list[str] | None = None
+            for cmd in commands:
+                ok, diff = _contract_status(cmd, option_spec, rest_spec)
+                if ok:
+                    best = []
+                    break
+                if ("--as" in cmd or "--objdump" in cmd or "--lccc" in cmd
+                        or "--32" in cmd):
+                    best = diff
+            if best is None:
+                best = ["no asm-diff invocation of this gate found"]
+            if best:
+                missing.append(f"{where}: {gate} (exact token contract; "
+                               + "; ".join(best) + ")")
     for where, text in (("local", local_text), ("hosted", hosted)):
         if not ensure_gas_invoked(text):
             missing.append(f"{where}: provision the pinned 2.47 oracle pair "
-                           "(exact command: bash scripts/ensure_gas_247.sh "
-                           "x86_64-linux-gnu)")
+                           "(exact command, in command position: "
+                           "bash scripts/ensure_gas_247.sh x86_64-linux-gnu)")
     if missing:
         print("missing mode/corpus-specific assembly gates:", file=sys.stderr)
         for item in missing:
@@ -379,37 +548,45 @@ def check_encdiff_gate_parity(local_text: str, hosted: str) -> int:
     The encdiff-corpus gate is byte-truth-dependent exactly like the
     asm-diff gates (GAS 2.47 pinned oracle; --offline so the verdicts are
     network-independent; the 64-bit law corpora, not their 32-bit
-    sibling). Path-level mirroring only proves the script path appears
-    somewhere on the other side: a hosted-only edit — depinned --as,
-    dropped --offline, a swapped corpus file, the wrong compiler mode,
-    or removing the step while ci_local keeps its copy — passed every
-    other check in this module. The contract extends beyond the
-    assembler to the verdict chain: --objdump must
-    be the same pinned 2.47 build as `as` (the disassembler decides the
-    BEATS/ok verdicts), and --expect-histogram must name the one
-    checked-in baseline. This checker closes all of it: both sides must
-    run the same offline, quiet, pinned, x86-64 invocation over the full
-    corpus set with the baseline check, and the local side must register
-    it as the fast `encdiff-corpus` gate.
+    sibling). The invocation is pinned as an exact pair/rest contract
+    (see _contract_status): the pinned oracle PAIR (each half exactly
+    once with its own value — a swap of the two paths is a mismatch,
+    not a spelling), the one checked-in verdict baseline, both 64-bit
+    law corpora through `--file' (an append option: twice, with exactly
+    those two values), and NOTHING else — a duplicate option override,
+    an injected `--32' (argparse would run the 32-bit corpus while the
+    checker validated the 64-bit one), an unregistered extra tool, or a
+    duplicated `--file' all fail here. Path-level mirroring only proves
+    the script path appears somewhere on the other side: a hosted-only
+    edit — depinned --as, dropped --offline, a swapped corpus file, the
+    wrong compiler mode, or removing the step while ci_local keeps its
+    copy — passed every other check in this module before these
+    contracts existed.
     """
+    option_spec = {
+        "--lccc": ["target/fastbuild/lccc-x86"],
+        "--as": [PINNED_AS],
+        "--objdump": [PINNED_OBJDUMP],
+        "--expect-histogram": [ENCDIFF_HISTOGRAM],
+        "--file": list(ENCDIFF_CORPUS_FILES),
+    }
+    rest_spec = ["--offline", "--quiet"]
     missing = []
     for where, text in (("local", local_text), ("hosted", hosted)):
         commands = direct_diff_commands(text, "scripts/encdiff.py")
-        if not any(
-            "--offline" in cmd
-            and "--quiet" in cmd
-            and asm_option(cmd, "--lccc") == "target/fastbuild/lccc-x86"
-            and asm_option(cmd, "--as") == PINNED_AS
-            and asm_option(cmd, "--objdump") == PINNED_OBJDUMP
-            and asm_option(cmd, "--expect-histogram") == ENCDIFF_HISTOGRAM
-            and set(ENCDIFF_CORPUS_FILES) == {t for t in cmd if t.endswith(".insn")}
-            for cmd in commands
-        ):
+        best: list[str] | None = None
+        for cmd in commands:
+            ok, diff = _contract_status(cmd, option_spec, rest_spec)
+            if ok:
+                best = []
+                break
+            best = diff if best is None else best
+        if best is None:
+            best = ["no encdiff.py invocation found"]
+        if best:
             missing.append(
                 f"{where}: encdiff-corpus gate "
-                "(--offline --quiet, lccc-x86, pinned GNU as 2.47, "
-                "pinned 2.47 objdump, verdict histogram baseline, "
-                "both 64-bit law corpora)"
+                "(exact token contract; " + "; ".join(best) + ")"
             )
     if 'gate "encdiff-corpus" fast' not in local_text:
         missing.append('local: fast gate registration for "encdiff-corpus"')
@@ -502,6 +679,119 @@ def check_linker_suite_parity(local_text: str, hosted: str) -> int:
 HOSTED_ONLY = ROOT / "scripts" / "ci_hosted_only.txt"
 CARGO_SUBCOMMAND = re.compile(r"\bcargo\s+(?:\+\S+\s+)?([a-z][a-z-]*)")
 CARGO_CONFIG = re.compile(r"""--config[\s=]+(['"]?)([A-Za-z0-9_.-]+=[^'"\s]+)\1""")
+
+
+# The programs whose INVOCATION is under exact contract elsewhere in this
+# module (differential gates, the pinned-oracle provisioner, and their
+# compiler-free contract suites). check_step_guards holds every one of
+# them to the workflow-level execution semantics: active, not
+# continue-on-error, and free of hidden LCCC* tool overrides.
+GUARDED_PROGRAMS = (
+    "scripts/asmdiff.py",
+    "scripts/encdiff.py",
+    "scripts/ensure_gas_247.sh",
+    "scripts/test_asmdiff.py",
+)
+
+
+def check_step_guards(paths) -> int:
+    """Gate commands must be real, failing, unperturbed workflow steps.
+
+    Three ways a workflow can display a gate while not running it as a
+    gate, none visible to any text-level parity check:
+
+    - an `if:` that keeps the step off the green-path run (the gate
+      'exists' but executes on no PR path — run_script_bodies already
+      excludes these bodies from parity; this reports them by name);
+    - `continue-on-error: true` (the step runs, but its failure cannot
+      fail the build — a gate whose red is invisible is not a gate);
+    - a step/job `env:` setting LCCC, LCCC_GAS, LCCC_OBJCOPY or
+      LCCC_OBJDUMP (the argparse-default override channels of the
+      differential tools: a hidden env can swap the tool a command
+      line's pins never chose).
+    """
+    problems: list[str] = []
+    for path in paths:
+        for active, soft, env, body in workflow_run_steps(path):
+            tokens = _logical_command_lines(body)
+            guarded = sorted({
+                program for program in GUARDED_PROGRAMS
+                if any(program_args(t, program) is not None for t in tokens)
+            })
+            if not guarded:
+                continue
+            label = ", ".join(guarded)
+            if not active:
+                problems.append(
+                    f"{path.name}: {label} sits in a step whose `if:` keeps "
+                    "it off the green-path run — a gate that does not "
+                    "execute on the PR path is not coverage")
+            if soft:
+                problems.append(
+                    f"{path.name}: {label} runs under continue-on-error — "
+                    "a gate whose failure cannot fail the build is not a "
+                    "gate")
+            if env:
+                problems.append(
+                    f"{path.name}: {label} runs with hidden tool-override "
+                    f"env {sorted(env)} — the tools under contract come "
+                    "from the pinned command line, never an environment "
+                    "default")
+    if problems:
+        print("gate steps violate execution semantics:", file=sys.stderr)
+        for item in problems:
+            print(f"  {item}", file=sys.stderr)
+        return 1
+    return 0
+
+
+# The compiler-free contract suites of the differential infrastructure:
+# asmdiff's parser/oracle unit tests (mocked failure modes + a real
+# toolchain leg) and the binutils provisioner's validation matrix. Both
+# run without a compiler and without network, exactly like
+# test_encdiff.py / test_ci_gate_parity.py, whose registrations set the
+# precedent: a suite nothing executes is a contract nothing enforces.
+CONTRACT_SUITES = (
+    ("scripts/test_asmdiff.py", []),
+    ("scripts/ensure_gas_247.sh", ["--self-test"]),
+)
+CONTRACT_SUITE_GATES = (
+    "asmdiff-semantic-validation",
+    "gas-oracle-pair-self-test",
+)
+
+
+def check_test_suite_registration(local_text: str, hosted: str) -> int:
+    """Both mirrors must RUN the differential contract suites.
+
+    The real differential gates are integration checks; they do not
+    replace the synthetic parser/validator regressions (the failure
+    modes they pin — mocked failed disassemblers, orphan listings, fake
+    tool pairs — are exactly the ones an end-to-end green run cannot
+    exhibit). The audit class: test_asmdiff.py and the provisioner's
+    --self-test shipped unwired — 19 + 12 pinned contract cases that no
+    CI path executed.
+    """
+    missing = []
+    for where, text in (("local", local_text), ("hosted", hosted)):
+        for program, args in CONTRACT_SUITES:
+            if not any(
+                program_args(tokens, program) == args
+                for tokens in _logical_command_lines(text)
+            ):
+                missing.append(
+                    f"{where}: {' '.join([program, *args])} "
+                    "(compiler-free contract suite)")
+    for gate in CONTRACT_SUITE_GATES:
+        if f'gate "{gate}" fast' not in local_text:
+            missing.append(f'local: fast gate registration for "{gate}"')
+    if missing:
+        print("differential contract suites are not wired into both mirrors:",
+              file=sys.stderr)
+        for item in missing:
+            print(f"  {item}", file=sys.stderr)
+        return 1
+    return 0
 
 
 def check_hosted_steps_mirrored(local_text: str, hosted: str) -> int:
@@ -644,8 +934,9 @@ def main() -> int:
     if check_gate_name_uniqueness(local_text) != 0:
         return 1
     local_paths = set(COMMAND.findall(local_text)) - sourced_libraries()
+    workflows = sorted(WORKFLOWS.glob("*.yml"))
     bodies = []
-    for path in sorted(WORKFLOWS.glob("*.yml")):
+    for path in workflows:
         bodies.append(run_script_bodies(path))
     hosted = "\n".join(bodies)
     missing = sorted(path for path in local_paths if path not in hosted)
@@ -663,6 +954,10 @@ def main() -> int:
         return 1
     if check_encdiff_gate_parity(local_text, hosted) != 0:
         return 1
+    if check_test_suite_registration(local_text, hosted) != 0:
+        return 1
+    if check_step_guards(workflows) != 0:
+        return 1
     if check_hosted_steps_mirrored(local_text, hosted) != 0:
         return 1
     if check_linker_suite_parity(local_text, hosted) != 0:
@@ -670,6 +965,7 @@ def main() -> int:
     print(
         f"CI/local standalone gate parity: PASS ({len(local_paths)} commands, "
         "2 mode/corpus-specific asm-diff gates, encdiff corpus gate, "
+        "contract suites wired, step semantics guarded, "
         "strict full linker suite, hosted steps mirrored)"
     )
     return 0
