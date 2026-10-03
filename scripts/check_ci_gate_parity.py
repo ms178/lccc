@@ -271,6 +271,46 @@ def asm_option(tokens: list[str], name: str) -> str | None:
     return None
 
 
+# The pinned-oracle PAIR contract, as EXACT tokens: the mirrors must
+# spell the pin paths verbatim (shlex-quoted in the scripts; the token
+# the parser sees is the unquoted value). Substring containment accepted
+# lookalikes — .../bin/objdump-untrusted, /untrusted/$HOME/.../bin/objdump,
+# .../bin/objdumps — which is precisely the unpinned-oracle class the pin
+# exists to prevent, so the check is equality, not containment.
+PINNED_AS = "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"
+PINNED_OBJDUMP = "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump"
+
+
+def ensure_gas_invoked(script: str) -> bool:
+    """True iff the script runs the exact provisioning command.
+
+    `bash scripts/ensure_gas_247.sh x86_64-linux-gnu' as a full token
+    list — the continuation walk joins gate-wrapper lines first, so a
+    wrapped invocation is one logical line. A substring match accepted
+    lookalikes (`x86_64-linux-gnu-malicious', extra arguments); token
+    equality pins the target and the absence of extra arguments.
+    """
+    lines = script.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        i += 1
+        while line.endswith("\\") and i < len(lines):
+            line = line[:-1] + " " + lines[i].strip()
+            i += 1
+        if not line:
+            continue
+        try:
+            tokens = shlex.split(line, comments=True)
+        except ValueError:
+            continue
+        for start in range(len(tokens) - 1):
+            if tokens[start:start + 2] == ["bash", "scripts/ensure_gas_247.sh"]:
+                if tokens[start + 2:] == ["x86_64-linux-gnu"]:
+                    return True
+    return False
+
+
 def check_asmdiff_gate_parity(local_text: str, hosted: str) -> int:
     """Require the *specific mode, compiler and corpus*, not just the path."""
     specs = (
@@ -290,17 +330,25 @@ def check_asmdiff_gate_parity(local_text: str, hosted: str) -> int:
                 and asm_option(cmd, "--lccc") == compiler
                 and set(casefiles) == {t for t in cmd if t.endswith(".casefile")}
                 # Every byte-exact differential, in both modes and on both
-                # sides, uses the pinned GAS 2.47 oracle: an unpinned `as`
-                # is whatever release the host image ships (the i686 gate
-                # once failed only because the runner's 2.42 lays out NOP
-                # fills differently from 2.47).
-                and "gas-2.47-x86_64-linux-gnu/bin/as" in (asm_option(cmd, "--as") or "")
+                # sides, uses the pinned GAS 2.47 oracle PAIR: an unpinned
+                # `as` is whatever release the host image ships (the i686
+                # gate once failed only because the runner's 2.42 lays out
+                # NOP fills differently from 2.47), and an unpinned objdump
+                # is an unpinned VERDICT authority -- the betterok groups
+                # accept a smaller encoding only when the disassembler
+                # proves the two objects decode identically. The pins are
+                # EXACT token equality: a lookalike path is an unpinned
+                # oracle, exactly like no path at all.
+                and asm_option(cmd, "--as") == PINNED_AS
+                and asm_option(cmd, "--objdump") == PINNED_OBJDUMP
                 for cmd in commands
             ):
                 missing.append(f"{where}: {gate} (mode/corpus/compiler/jobs/oracle)")
     for where, text in (("local", local_text), ("hosted", hosted)):
-        if "bash scripts/ensure_gas_247.sh x86_64-linux-gnu" not in text:
-            missing.append(f"{where}: install GNU as 2.47 x86-64 oracle")
+        if not ensure_gas_invoked(text):
+            missing.append(f"{where}: provision the pinned 2.47 oracle pair "
+                           "(exact command: bash scripts/ensure_gas_247.sh "
+                           "x86_64-linux-gnu)")
     if missing:
         print("missing mode/corpus-specific assembly gates:", file=sys.stderr)
         for item in missing:
@@ -312,8 +360,8 @@ def check_asmdiff_gate_parity(local_text: str, hosted: str) -> int:
 # The encdiff corpus gate contract: the exact invocation both mirrors must
 # run. The corpus set is an INVARIANT, not a default — a third corpus file
 # is a real coverage change that must update this contract consciously
-# (same discipline as the pinned-oracle count in the parity tests). So are
-# the two S18 pins: the 2.47 objdump (the disassembler decides BEATS/ok
+# (same discipline as the pinned-oracle count in the parity tests). So
+# are the two pins beyond the assembler: the 2.47 objdump (the disassembler decides BEATS/ok
 # verdicts — an unpinned objdump is an unpinned oracle, whatever binutils
 # the runner image ships) and the checked-in verdict histogram (the
 # aggregate record: BEATS -> ok-best drift, new rows, deleted rows and
@@ -335,8 +383,8 @@ def check_encdiff_gate_parity(local_text: str, hosted: str) -> int:
     somewhere on the other side: a hosted-only edit — depinned --as,
     dropped --offline, a swapped corpus file, the wrong compiler mode,
     or removing the step while ci_local keeps its copy — passed every
-    other check in this module (the S16 audit response). The S18 audit
-    response extends the contract to the verdict chain: --objdump must
+    other check in this module. The contract extends beyond the
+    assembler to the verdict chain: --objdump must
     be the same pinned 2.47 build as `as` (the disassembler decides the
     BEATS/ok verdicts), and --expect-histogram must name the one
     checked-in baseline. This checker closes all of it: both sides must
@@ -351,8 +399,8 @@ def check_encdiff_gate_parity(local_text: str, hosted: str) -> int:
             "--offline" in cmd
             and "--quiet" in cmd
             and asm_option(cmd, "--lccc") == "target/fastbuild/lccc-x86"
-            and "gas-2.47-x86_64-linux-gnu/bin/as" in (asm_option(cmd, "--as") or "")
-            and "gas-2.47-x86_64-linux-gnu/bin/objdump" in (asm_option(cmd, "--objdump") or "")
+            and asm_option(cmd, "--as") == PINNED_AS
+            and asm_option(cmd, "--objdump") == PINNED_OBJDUMP
             and asm_option(cmd, "--expect-histogram") == ENCDIFF_HISTOGRAM
             and set(ENCDIFF_CORPUS_FILES) == {t for t in cmd if t.endswith(".insn")}
             for cmd in commands
