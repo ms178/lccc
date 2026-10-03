@@ -748,14 +748,23 @@ jobs:
           # tool that cannot run cannot ship unnoticed.
           python3 scripts/check_script_imports.py
           python3 scripts/test_ci_gate_parity.py
-          python3 scripts/test_encdiff.py
+          ENCDIFF_TEST_OBJDUMP="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump" \
+          LCCC_REQUIRE_PINNED_ORACLE=1 \
+            python3 scripts/test_encdiff.py
           # The differential oracle's own contract suites, compiler-free
-          # like the encdiff one: asmdiff's parser/oracle unit tests
+          # like the encdiff one but anchored to the REAL pinned pair
+          # (provisioned above): asmdiff's parser/oracle unit tests
           # (mocked failure modes plus a real-toolchain leg) and the
           # binutils provisioner's 2.47 validation matrix (fake tool
-          # pairs). Mirrored in scripts/ci_local.sh (parity-checked:
-          # check_test_suite_registration).
-          python3 scripts/test_asmdiff.py
+          # pairs). The pinned-tool env channels and the require-mode
+          # flag are part of the registered invocation contract
+          # (check_invocation_contracts): a leg that would silently skip,
+          # or run against the runner's distro binutils, is a contract
+          # violation — never a local convenience.
+          ASMDIFF_TEST_AS="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" \
+          ASMDIFF_TEST_OBJDUMP="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump" \
+          LCCC_REQUIRE_PINNED_ORACLE=1 \
+            python3 scripts/test_asmdiff.py
           bash scripts/ensure_gas_247.sh --self-test
           # EDG/corpus compiler-free tooling contracts: the
           # miner self-tests, the mocked corpus-runner verdict contracts,
