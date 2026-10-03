@@ -49,6 +49,32 @@ Execution channels that hide the program inside other tokens — command
 substitution, python -c payloads, encoded strings — are beyond static text
 parity and belong to review of the gate files themselves; the checker pins
 the grammar the mirrors actually use.
+
+Module map (one file BY DESIGN — the whole trust model must be readable
+top-to-bottom in one pass, the repo's scripts/ convention is flat single
+files, and the import-audit gates keep cross-module imports a review
+event; the section banners below are the module boundaries):
+
+  sourcing model        sourced_libraries()            what is a library
+  shell line model      _canonical, _Cmd,
+                        _logical_command_lines,
+                        _cut_shell_comment             one logical command
+  command position      _reduce_head, _find_invocation the wrapper grammar
+  contract registry     InvocationContract,
+                        INVOCATION_CONTRACTS,
+                        GUARDED_PROGRAMS,
+                        PROGRAM_ENV_CHANNELS           what must run, how
+  workflow model        _RunStep, workflow_run_steps,
+                        run_script_bodies,
+                        _load_workflow + _UniqueKeyLoader
+  substring layers      check_orphaned_gates,
+                        check_hosted_steps_mirrored,
+                        check_fuzz_test_gate_parity    coarse presence
+  contract layer        check_invocation_contracts     the universal rule
+  execution semantics   check_step_guards              active/soft/env
+  local registrations   gate_registrations,
+                        check_gate_name_uniqueness     gate NAME fast|slow
+  aggregation           main()                         all checks, one run
 """
 from __future__ import annotations
 
@@ -604,6 +630,19 @@ _ACTIVE_IF = {"always()", "${{ always() }}", "success()", "${{ success() }}"}
 # release hook, or no `on:` at all — which GitHub refuses to run) never
 # executes on the push/pull_request path, so its steps are not coverage
 # regardless of what they contain.
+#
+# POLICY, not GitHub truth: `pull_request_target` (secrets-bearing, runs
+# from the BASE ref — a gate there never sees the patch under review) and
+# `merge_group` (runs only when branch protection queues a merge, which
+# this repository's protection does not require) are deliberately NOT
+# coverage events here. Counting them would be the false-green direction
+# in both cases: a gate whose only copy lives in a merge_group workflow
+# does not run on any push/pull_request path where review happens, and a
+# pull_request_target copy arbitrates a different tree than the one the
+# contracts pin. If branch protection ever starts requiring checks in
+# merge queues, ADD the event here consciously and re-run the whole
+# mutation suite — the hosted legs would then need merge-queue coverage
+# too, which is a contract change, not a spelling change.
 _PR_PATH_EVENTS = frozenset({"push", "pull_request"})
 
 
@@ -642,6 +681,38 @@ def _env_names(env) -> set[str]:
     return names
 
 
+def _cut_shell_comment(line: str) -> str:
+    """One shell line with its trailing comment removed, QUOTE-AWARE.
+
+    A `#` only starts a comment at a word boundary (POSIX: the # must
+    begin a token), never inside single or double quotes, and a backslash
+    inside double quotes escapes the next character (inside single quotes
+    a backslash is literal). The pre-hardening `re.search(r"\\s#", line)`
+    cut at the first ` # ` REGARDLESS of quoting, so a contracted
+    invocation carrying a double-quoted argument like "x # y" was
+    truncated to an unbalanced-quote line that shlex refuses — and the
+    refusal silently DROPPED the invocation from the universal contract
+    check (the exact escape hatch this checker exists to keep shut).
+    """
+    quote: str | None = None
+    i = 0
+    n = len(line)
+    while i < n:
+        ch = line[i]
+        if quote is not None:
+            if ch == "\\" and quote == '"' and i + 1 < n:
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch == "#" and (i == 0 or line[i - 1] in " \t"):
+            return line[:i].rstrip()
+        i += 1
+    return line
+
+
 def _strip_run_comments(run: str) -> str:
     """One `run:` body, comment-stripped, as joined text lines."""
     pieces: list[str] = []
@@ -649,10 +720,7 @@ def _strip_run_comments(run: str) -> str:
         stripped = line.lstrip()
         if stripped.startswith("#"):
             continue
-        # Cut a trailing comment; `#` can never be part of a matched
-        # path (not in the command charset).
-        cut = re.search(r"\s#", line)
-        pieces.append(line[: cut.start()] if cut else line)
+        pieces.append(_cut_shell_comment(line))
     return "\n".join(pieces)
 
 
@@ -679,16 +747,32 @@ def _unique_keys(loader, node, deep=False):
     return mapping
 
 
+class _MissingDependency(Exception):
+    """A third-party module this checker refuses to run without.
+
+    Rendered as a clean, single-message failure — never a traceback —
+    because the message is the actionable part (which package, how to
+    install it on the system python the mirrors use), and because a
+    stack dump buries it.
+    """
+
+
 def _load_workflow(path: Path) -> dict:
     try:
         import yaml
     except ImportError:
-        print(
-            "error: PyYAML is required to verify gate parity with execution "
-            "semantics (python3 -m pip install pyyaml)",
-            file=sys.stderr,
-        )
-        raise
+        # PyYAML is load-bearing for a REQUIRED gate on both mirrors.
+        # It ships with GitHub's runner images, but that is an image
+        # property, not a declared dependency — make the absence loud,
+        # clean and actionable instead of a ModuleNotFoundError traceback.
+        # (pip into a PEP-668 externally-managed system python is the
+        # wrong advice on Debian/Ubuntu runners — apt or a venv is right.)
+        raise _MissingDependency(
+            "PyYAML is required to verify gate parity with execution "
+            "semantics. Install it for the python3 the mirrors run "
+            "(Debian/Ubuntu: sudo apt-get install -y python3-yaml; "
+            "elsewhere: python3 -m pip install pyyaml inside a venv). "
+            "Hosted CI installs it explicitly before this gate.")
 
     class _UniqueKeyLoader(yaml.SafeLoader):
         # A subclass, so the refusing constructor is THIS checker's, never
@@ -706,8 +790,36 @@ def _load_workflow(path: Path) -> dict:
     return doc if isinstance(doc, dict) else {}
 
 
+@dataclass(frozen=True)
+class _RunStep:
+    """One hosted `run:` step, with everything a diagnostic needs.
+
+    A diagnostic that says `hosted line 742` points into a synthetic
+    concatenation of every workflow's bodies — nobody can open that file.
+    Every hosted violation now carries the workflow file, the job id and
+    the step name (GitHub's own addressing: click the job, read the step
+    log header), plus the line WITHIN that step's body where the offending
+    command sits, which a search for the step name reaches immediately.
+    """
+
+    path: Path
+    job: str
+    step: str
+    active: bool
+    soft: bool
+    env_names: frozenset[str]
+    body: str
+    why: str
+
+    def where(self, lineno: int | None = None) -> str:
+        loc = f"{self.path.name} job={self.job} step=\"{self.step}\""
+        if lineno is not None:
+            loc += f" body-line {lineno}"
+        return loc
+
+
 def workflow_run_steps(path: Path):
-    """Yield (active, soft, env_names, body, why) for every `run:` step.
+    """Yield one _RunStep record for every `run:` step.
 
     `active` is False when the WORKFLOW's `on:` triggers never run it on
     the push/pull_request path, or a step- OR JOB-level `if:` keeps the
@@ -724,7 +836,7 @@ def workflow_run_steps(path: Path):
     if not isinstance(jobs, dict):
         return
     wf_env = _env_names(doc.get("env"))
-    for job in jobs.values():
+    for job_id, job in jobs.items():
         if not isinstance(job, dict):
             continue
         # `steps` is the normal location; composite action files would
@@ -740,7 +852,7 @@ def workflow_run_steps(path: Path):
         job_active = job_cond is None or str(job_cond).strip() in _ACTIVE_IF
         job_soft = bool(job.get("continue-on-error"))
         for steps in containers:
-            for step in steps:
+            for index, step in enumerate(steps):
                 if isinstance(step, dict) and isinstance(step.get("run"), str):
                     cond = step.get("if")
                     active = cond is None or str(cond).strip() in _ACTIVE_IF
@@ -759,9 +871,18 @@ def workflow_run_steps(path: Path):
                         why = "job-level continue-on-error swallows its red"
                     elif soft:
                         why = "continue-on-error swallows its red"
-                    yield (active and job_active and on_pr_path), \
-                        (soft or job_soft), env, \
-                        _strip_run_comments(step["run"]), why
+                    step_name = step.get("name") or step.get("id") \
+                        or f"#{index}"
+                    yield _RunStep(
+                        path=path,
+                        job=str(job_id),
+                        step=str(step_name),
+                        active=active and job_active and on_pr_path,
+                        soft=soft or job_soft,
+                        env_names=frozenset(env),
+                        body=_strip_run_comments(step["run"]),
+                        why=why,
+                    )
 
 
 def run_script_bodies(path: Path) -> str:
@@ -784,8 +905,7 @@ def run_script_bodies(path: Path) -> str:
     duplicate-key-refusing loader rejects.
     """
     return "\n".join(
-        body for active, _soft, _env, body, _why in workflow_run_steps(path)
-        if active
+        step.body for step in workflow_run_steps(path) if step.active
     )
 
 
@@ -931,7 +1051,7 @@ def _contract_diff(env: list[str], args: list[str],
                                    contract.rest_spec)
 
 
-def check_invocation_contracts(local_text: str, hosted: str) -> int:
+def check_invocation_contracts(local_text: str, hosted) -> int:
     """UNIVERSAL invocation parity: every invocation matches a contract.
 
     For each side (ci_local.sh, hosted run bodies), every command-position
@@ -947,13 +1067,35 @@ def check_invocation_contracts(local_text: str, hosted: str) -> int:
     nothing satisfies is a gate that no longer exists — and the local
     gate registrations (parsed from comment-stripped `gate NAME fast'
     lines) must carry each contract's name and speed class.
+
+    `hosted` is either the joined run-body text (synthetic blobs: the
+    mutation tests) or the _RunStep records of the real tree. With
+    records, the hosted side is checked STEP BY STEP — every `run:` block
+    is its own shell, so a trailing line-continuation at the end of one
+    step can never swallow the first line of the next (the joined-text
+    form over-joined exactly there), and every diagnostic carries the
+    workflow file, job id, step name and body line instead of a line
+    number into a synthetic concatenation of all workflows.
     """
     problems: list[str] = []
     # Keyed by contract index: InvocationContract carries a dict (the
     # option spec) and is deliberately not hashable.
     matched = {(i, side): 0 for i, c in enumerate(INVOCATION_CONTRACTS)
                for side in ("local", "hosted") if side in c.sides}
-    for side, text in (("local", local_text), ("hosted", hosted)):
+    units: list[tuple[str, str, object]] = [("local", "scripts/ci_local.sh",
+                                             local_text)]
+    if isinstance(hosted, str):
+        units.append(("hosted", "hosted run bodies", hosted))
+    else:
+        units.extend(("hosted", step, step.body) for step in hosted)
+
+    def _location(side: str, unit: object, cmd: _Cmd) -> str:
+        if isinstance(unit, _RunStep):
+            return f"{side} {unit.where(cmd.lineno)}"
+        where = unit if side == "hosted" else "scripts/ci_local.sh"
+        return f"{side} {where} line {cmd.lineno}"
+
+    for side, unit, text in units:
         for cmd in _logical_command_lines(text):
             for program in GUARDED_PROGRAMS:
                 found = _find_invocation(cmd, program)
@@ -961,16 +1103,16 @@ def check_invocation_contracts(local_text: str, hosted: str) -> int:
                     continue
                 if found == "mention":
                     problems.append(
-                        f"{side} line {cmd.lineno}: {program} appears outside "
-                        "the command-position grammar — if the line runs it, "
-                        "spell it as one command and register it; if it is "
-                        "prose, it does not belong in a run body: "
+                        f"{_location(side, unit, cmd)}: {program} appears "
+                        "outside the command-position grammar — if the line "
+                        "runs it, spell it as one command and register it; "
+                        "if it is prose, it does not belong in a run body: "
                         f"{cmd.display()}")
                     continue
                 quote = found[2].quote_problem()
                 if quote is not None:
                     problems.append(
-                        f"{side} line {cmd.lineno}: {program} cannot be "
+                        f"{_location(side, unit, cmd)}: {program} cannot be "
                         f"verified ({quote}) — if the line runs it, spell it "
                         "as one command and register it; if it is prose, it "
                         f"does not belong in a run body: {cmd.display()}")
@@ -990,7 +1132,7 @@ def check_invocation_contracts(local_text: str, hosted: str) -> int:
                 if best is not None:
                     _i, contract, diff = best
                     problems.append(
-                        f"{side} line {cmd.lineno}: {program} invocation "
+                        f"{_location(side, unit, cmd)}: {program} invocation "
                         f"matches no registered contract (nearest: "
                         f"{contract.name}) — " + "; ".join(diff) +
                         f" | invocation: {cmd.display()}")
@@ -1143,8 +1285,8 @@ def check_step_guards(paths) -> int:
             problems.append(f"workflow not parseable under the no-duplicate-"
                             f"keys contract: {e}")
             continue
-        for active, soft, env_names, body, why in steps:
-            cmds = _logical_command_lines(body)
+        for step in steps:
+            cmds = _logical_command_lines(step.body)
             present: list[str] = []
             mentions: list[str] = []
             for program in GUARDED_PROGRAMS:
@@ -1162,27 +1304,27 @@ def check_step_guards(paths) -> int:
             if not present and not mentions:
                 continue
             label = ", ".join(sorted(set(present) | set(mentions)))
-            if not active:
+            if not step.active:
                 problems.append(
-                    f"{path.name}: {label} sits in a step kept off the "
-                    f"green-path run ({why}) — a gate that does not execute "
-                    "on the PR path is not coverage")
-            if soft:
+                    f"{step.where()}: {label} sits in a step kept off the "
+                    f"green-path run ({step.why}) — a gate that does not "
+                    "execute on the PR path is not coverage")
+            if step.soft:
                 problems.append(
-                    f"{path.name}: {label} runs under continue-on-error "
-                    f"({why}) — a gate whose failure cannot fail the build "
-                    "is not a gate")
+                    f"{step.where()}: {label} runs under continue-on-error "
+                    f"({step.why}) — a gate whose failure cannot fail the "
+                    "build is not a gate")
             for program in sorted(set(present)):
                 hit = sorted(PROGRAM_ENV_CHANNELS.get(program, frozenset())
-                             & env_names)
+                             & step.env_names)
                 if hit:
                     problems.append(
-                        f"{path.name}: {program} runs with hidden env "
+                        f"{step.where()}: {program} runs with hidden env "
                         f"{hit} — a channel that can override what the "
                         "invocation's own pins chose")
             for program in sorted(set(mentions) - set(present)):
                 problems.append(
-                    f"{path.name}: {program} is mentioned in a run body "
+                    f"{step.where()}: {program} is mentioned in a run body "
                     "outside the command-position grammar — spell it as one "
                     "command or remove the mention")
     if problems:
@@ -1212,13 +1354,14 @@ def check_hosted_steps_mirrored(local_text: str, hosted: str) -> int:
     shrink -- an entry that ci_local now mirrors must be deleted.
     """
     # Execution semantics on the local side too: a ci_local comment that
-    # names a script or a build mode runs nothing.
+    # names a script or a build mode runs nothing. Same quote-aware
+    # cutting as the hosted side (a " # " inside a quoted argument is
+    # data, not a comment).
     kept = []
     for line in local_text.splitlines():
         if line.lstrip().startswith("#"):
             continue
-        cut = re.search(r"\s#", line)
-        kept.append(line[: cut.start()] if cut else line)
+        kept.append(_cut_shell_comment(line))
     local_text = "\n".join(kept)
     allow = set()
     if HOSTED_ONLY.exists():
@@ -1292,11 +1435,21 @@ def main() -> int:
     local_paths = set(COMMAND.findall(local_text)) - sourced_libraries()
     workflows = sorted(WORKFLOWS.glob("*.yml"))
     try:
-        bodies = [run_script_bodies(path) for path in workflows]
+        # One walk, both consumers: the structured records drive the
+        # invocation-contract check (per-step bodies, real diagnostics);
+        # the substring layers (presence, orphans, hosted-mirrored, fuzz
+        # discovery) take the joined active text, as before.
+        records = {path: list(workflow_run_steps(path))
+                   for path in workflows}
     except _WorkflowError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
-    hosted = "\n".join(bodies)
+    except _MissingDependency as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    active_steps = [step for steps in records.values() for step in steps
+                    if step.active]
+    hosted = "\n".join(step.body for step in active_steps)
     missing = sorted(path for path in local_paths if path not in hosted)
     if missing:
         print("hosted CI is missing standalone ci_local gates:", file=sys.stderr)
@@ -1306,7 +1459,8 @@ def main() -> int:
     checks = (
         ("orphaned gate scripts", check_orphaned_gates(local_text, hosted)),
         ("fuzz harness discovery", check_fuzz_test_gate_parity(local_text, hosted)),
-        ("invocation contracts", check_invocation_contracts(local_text, hosted)),
+        ("invocation contracts",
+         check_invocation_contracts(local_text, active_steps)),
         ("workflow step guards", check_step_guards(workflows)),
         ("hosted steps mirrored", check_hosted_steps_mirrored(local_text, hosted)),
     )

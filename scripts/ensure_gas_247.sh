@@ -49,7 +49,13 @@ set -euo pipefail
 # whitespace-delimited field a GNU tool prints), matched anchored against
 # the pin, and required to be the SAME token from both halves of the
 # pair: two different builds both calling themselves 2.47 is not "one
-# 2.47 build", which is what the pair contract promises. A functional
+# 2.47 build", which is what the pair contract promises. The grammar
+# accepts dated snapshot tokens (2.47.20260726) BY DESIGN: the pinned
+# RELEASE tarball's own build stamps a dated snapshot token into
+# --version, so requiring the bare "2.47" would reject the genuine
+# product of the pinned bytes. The grammar's job is lookalike and
+# pair-mismatch rejection, not snapshot discrimination — the byte-level
+# binding is the provenance marker's job (layer 3 below). A functional
 # canary then proves the pair actually assembles and disassembles in both
 # modes the gates run — a version string is not a tool. Non-x86 targets
 # have no shared canary source and validate version-only.
@@ -131,6 +137,76 @@ _sha256_is() {  # _sha256_is <file> <expected-hex>: whole-digest equality
 
 _tarball_matches_pin() {  # <tarball>: the pinned binutils-2.47 bytes?
     _sha256_is "$1" "$GAS_TARBALL_SHA256"
+}
+
+# ─── Provenance: tie the installed pair to the pinned tarball's bytes ────
+# Layer 3 of the pair validation. Layers 1+2 alone (anchored version
+# token + functional canary) accepted ANY pair under the prefix that
+# self-reported a 2.47.* token — a stale pair from an older pin, a pair
+# installed by a different tool, a partially-overwritten prefix: all of
+# them bypassed the tarball pin entirely, which is exactly the gap
+# between "the tarball BYTES are pinned" and "the installed PAIR came
+# from those bytes". The marker written after every verified-tarball
+# build closes it:
+#
+#   target=<the configured triple>        must equal this invocation's
+#   tarball_version=2.47                  the pin, for the record
+#   tarball_sha256=<GAS_TARBALL_SHA256>   must equal the CURRENT pin — a
+#                                          pin rotation retires every
+#                                          existing cache automatically
+#   as_sha256/objdump_sha256=<digests>    must equal the CURRENT bytes of
+#                                          <prefix>/bin/{as,objdump} — a
+#                                          swapped, tampered, truncated or
+#                                          partially-overwritten pair is
+#                                          rejected even when it still
+#                                          self-reports 2.47.* and passes
+#                                          the canary
+#
+# The key set is exact (no unknown keys, no duplicates): a marker from a
+# different tool — or a hand-edited one — fails the parse and the pair
+# rebuilds from the verified tarball. Honest boundary, same as the
+# tarball pin: a local attacker who can write the binaries can rewrite
+# the marker too; the runner filesystem is the trusted side, the network
+# and the caches are not. What the marker DOES close is every accidental
+# and environmental drift case that previously rode the fast path on a
+# self-reported version string alone.
+PROVENANCE_KEYS=(target tarball_version tarball_sha256 as_sha256 objdump_sha256)
+
+_pair_provenance_ok() {  # requires $as/$od/$provenance/$target set
+    [[ -f "$provenance" ]] || return 1
+    local line key value
+    local -A seen=()
+    # `read` returns 1 at EOF even when it DID deliver a final line
+    # without a trailing newline; the `|| [[ -n $line ]]` guard processes
+    # that last partial line instead of silently dropping it (a marker
+    # whose last key was dropped would parse as a missing-key marker).
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -n "$line" ]] || continue
+        [[ "$line" == *"="* ]] || return 1
+        key=${line%%=*}
+        value=${line#*=}
+        [[ -z "${seen[$key]+x}" ]] || return 1   # duplicate key
+        seen[$key]=$value
+    done < "$provenance"
+    [[ ${#seen[@]} -eq ${#PROVENANCE_KEYS[@]} ]] || return 1
+    local k
+    for k in "${PROVENANCE_KEYS[@]}"; do
+        [[ -n "${seen[$k]+x}" ]] || return 1
+    done
+    [[ "${seen[target]}" == "$target" ]] || return 1
+    [[ "${seen[tarball_sha256]}" == "$GAS_TARBALL_SHA256" ]] || return 1
+    _sha256_is "$as" "${seen[as_sha256]}" || return 1
+    _sha256_is "$od" "${seen[objdump_sha256]}" || return 1
+}
+
+_write_provenance() {  # after a verified-tarball build passed validation
+    local as_sum od_sum
+    as_sum=$(sha256sum "$as") && as_sum=${as_sum%% *}
+    od_sum=$(sha256sum "$od") && od_sum=${od_sum%% *}
+    printf 'target=%s\ntarball_version=%s\ntarball_sha256=%s\nas_sha256=%s\nobjdump_sha256=%s\n' \
+        "$target" "$ver" "$GAS_TARBALL_SHA256" "$as_sum" "$od_sum" \
+        > "$provenance.tmp"
+    mv -f "$provenance.tmp" "$provenance"
 }
 
 # ─── Self-test: the validation matrix, against fake tool pairs ────────────
@@ -274,16 +350,27 @@ EOF
     # whole token decides (prefix/substring lookalikes of the hash itself
     # are the same defect class as the version-token lookalikes above).
     printf 'binutils tarball bytes\n' >"$tmp/fake.tarball"
-    local sum
+    local sum lookalike
     sum=$(sha256sum "$tmp/fake.tarball")
     sum=${sum%% *}
+    # A 62-of-64-hex lookalike, constructed so it is GUARANTEED different
+    # from the real digest whatever the content hashes to: flipping the
+    # first two hex digits to a value they provably do not have (a
+    # `${sum%??}ff` splice can reproduce the original verbatim when the
+    # digest happens to end in "ff" — a lookalike case that is secretly
+    # the exact digest is a vacuous test, the defect class this matrix
+    # exists to hunt).
+    case ${sum:0:2} in
+        00) lookalike="11${sum:2}" ;;
+        *)  lookalike="00${sum:2}" ;;
+    esac
     if _sha256_is "$tmp/fake.tarball" "$sum"; then
         printf '  ok   %-44s -> %s\n' "sha256 pin: matching digest" ACCEPT
     else
         printf '  FAIL %-44s -> wanted ACCEPT: digest comparator\n' "sha256 pin: matching digest"
         ok=1
     fi
-    if _sha256_is "$tmp/fake.tarball" "${sum%??}ff"; then
+    if _sha256_is "$tmp/fake.tarball" "$lookalike"; then
         printf '  FAIL %-44s -> wanted REJECT: lookalike digest\n' "sha256 pin: 62-of-64-hex lookalike"
         ok=1
     else
@@ -295,6 +382,78 @@ EOF
     else
         printf '  ok   %-44s -> %s\n' "sha256 pin: missing tarball" REJECT
     fi
+
+    # The provenance layer, against a fake installed pair and fabricated
+    # markers — every drift case the fast path must refuse (a pair that
+    # still passes layers 1+2: it self-reports 2.47 and decodes the
+    # canary, but is NOT the pair the pinned tarball produced).
+    local marker sum_as sum_od
+    marker="$tmp/provenance"
+    provenance="$marker"
+    ver=2.47
+    target=x86_64-linux-gnu
+    as="$tmp/gas-prov"; od="$tmp/od-prov"
+    mkok "$as" "$V47"; mkok "$od" "$O47"
+    sum_as=$(sha256sum "$as"); sum_as=${sum_as%% *}
+    sum_od=$(sha256sum "$od"); sum_od=${sum_od%% *}
+    prov_case() {  # prov_case <label> <want> <marker-text>
+        local label=$1 want=$2 got
+        printf '%s' "$3" >"$marker"
+        if _pair_provenance_ok >/dev/null 2>&1; then got=0; else got=1; fi
+        if [[ $got == "$want" ]]; then
+            printf '  ok   %-44s -> %s\n' "$label" \
+                "$([[ $want == 0 ]] && echo ACCEPT || echo REJECT)"
+        else
+            printf '  FAIL %-44s -> wanted %s, got %s\n' "$label" \
+                "$([[ $want == 0 ]] && echo ACCEPT || echo REJECT)" \
+                "$([[ $got == 0 ]] && echo ACCEPT || echo REJECT)"
+            ok=1
+        fi
+    }
+    local good_marker no_objdump_marker rot_pin
+    good_marker=$(printf 'target=%s\ntarball_version=%s\ntarball_sha256=%s\nas_sha256=%s\nobjdump_sha256=%s\n' \
+        "$target" "$ver" "$GAS_TARBALL_SHA256" "$sum_as" "$sum_od")
+    no_objdump_marker=$(printf 'target=%s\ntarball_version=%s\ntarball_sha256=%s\nas_sha256=%s\n' \
+        "$target" "$ver" "$GAS_TARBALL_SHA256" "$sum_as")
+    # A rotated pin, guaranteed different from the current one (same
+    # first-two-hex-digit flip as the lookalike digest above — a splice
+    # off the tail can reproduce the original when the pin ends in the
+    # spliced characters, which the current pin's "...e4cff" tail does).
+    case ${GAS_TARBALL_SHA256:0:2} in
+        00) rot_pin="11${GAS_TARBALL_SHA256:2}" ;;
+        *)  rot_pin="00${GAS_TARBALL_SHA256:2}" ;;
+    esac
+    prov_case "provenance: marker of these exact bytes" 0 "$good_marker"
+    # A pair installed before the marker existed (the current real-world
+    # cache): no marker at all — the fast path must rebuild, not trust the
+    # bare version+canary layers.
+    rm -f "$marker"
+    if _pair_provenance_ok >/dev/null 2>&1; then
+        printf '  FAIL %-44s -> wanted REJECT: no marker file\n' "provenance: marker missing (pre-marker pair)"
+        ok=1
+    else
+        printf '  ok   %-44s -> %s\n' "provenance: marker missing (pre-marker pair)" REJECT
+    fi
+    prov_case "provenance: empty marker file" 1 ""
+    prov_case "provenance: wrong target (prefix reuse)" 1 \
+        "${good_marker/x86_64-linux-gnu/riscv64-linux-gnu}"
+    prov_case "provenance: wrong tarball pin (rotated pin)" 1 \
+        "${good_marker/$GAS_TARBALL_SHA256/$rot_pin}"
+    prov_case "provenance: as bytes drifted (swapped pair)" 1 \
+        "${good_marker/$sum_as/$sum_od}"
+    prov_case "provenance: objdump bytes drifted (tamper)" 1 \
+        "${good_marker/$sum_od/$sum_as}"
+    prov_case "provenance: missing key" 1 "$no_objdump_marker"
+    prov_case "provenance: unknown extra key" 1 \
+        "$good_marker
+extra=1
+"
+    prov_case "provenance: duplicate key" 1 \
+        "$good_marker
+target=other-target
+"
+    prov_case "provenance: not key=value at all" 1 "garbage"
+    rm -f "$marker"
 
     if [[ $ok == 0 ]]; then
         echo "ensure_gas_247 self-test: every case lands on its verdict"
@@ -313,18 +472,22 @@ target=${1:-riscv64-linux-gnu}
 prefix=${2:-${HOME}/.cache/gas-2.47-${target}}
 as="$prefix/bin/as"
 od="$prefix/bin/objdump"
+provenance="$prefix/.lccc-binutils-provenance"
 
 # BOTH binaries, validated as a PAIR (pinned token, one build, functional
-# canary), or a full rebuild. Two guards, two failure modes: a cache
-# carrying only one of the pair is an interrupted provision, and a pair
-# under the 2.47-NAMED prefix that does not validate is a lie — the
-# prefix name is not the version. A stale pair (a distro 2.46 copied in,
-# a prefix reused by a newer provision) would short-circuit the gate into
-# arbitrating every differential against the wrong oracle release, so the
-# fast path re-derives what it is about to trust. Anything else falls
-# through to the rebuild, which reinstalls from one source tree and must
-# itself pass the same validation before it is trusted.
-if [[ -x "$as" && -x "$od" ]] && validate_pair; then
+# canary) AND provably the product of the PINNED TARBALL's bytes (the
+# provenance marker: recorded tarball digest equal to the current pin and
+# recorded binary digests equal to the installed bytes), or a full
+# rebuild. Three guards, three failure modes: a cache carrying only one
+# of the pair is an interrupted provision; a pair under the 2.47-NAMED
+# prefix that does not validate is a lie — the prefix name is not the
+# version; and a pair whose provenance marker is missing, stale (a pin
+# rotation) or describes different bytes (a swap, a tamper, a partial
+# overwrite) never rode the pinned tarball at all — it rebuilds. Anything
+# else falls through to the rebuild, which reinstalls from one verified
+# source tree, must itself pass the same validation, and writes a fresh
+# marker.
+if [[ -x "$as" && -x "$od" ]] && validate_pair && _pair_provenance_ok; then
     "$as" --version | sed -n '1,1p'
     "$od" --version | sed -n '1,1p'
     exit 0
@@ -399,5 +562,10 @@ cp binutils/objdump "$od"
 # fast path applies — an install that cannot justify itself is a failure,
 # not a print-and-hope.
 validate_pair || { echo "FATAL: the freshly installed pair fails validation" >&2; exit 1; }
+# The marker is part of the install, not an afterthought: without it the
+# NEXT run cannot prove this pair came from the pinned tarball and will
+# rebuild it. Written atomically (temp + rename) so an interrupted write
+# can never leave a half-marker that parses.
+_write_provenance
 "$as" --version | sed -n '1,1p'
 "$od" --version | sed -n '1,1p'

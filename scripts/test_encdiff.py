@@ -19,8 +19,7 @@ sys.path.insert(0, str(ROOT))
 
 from scripts import encdiff, insndiff  # noqa: E402
 
-
-# ── The real-objdump leg's tool resolution ─────────────────────────────────
+# ── The real-objdump leg's tool resolution ──────────────────────────────────────────────────────────
 # The round-trip verdicts (ok-best / BEATS with "round-trip verified") are
 # decided by encdiff._OBJDUMP — which defaults to the LCCC_OBJDUMP env or
 # bare "objdump", i.e. whatever distro binary happens to be on PATH. The
@@ -29,7 +28,9 @@ from scripts import encdiff, insndiff  # noqa: E402
 # test channel (ENCDIFF_TEST_OBJDUMP, set by both CI mirrors to the
 # provisioned pair), PATH only as a bare-run fallback. Under
 # LCCC_REQUIRE_PINNED_ORACLE=1 a missing pin is an ERROR, not a skip — a
-# silently-skipped round-trip test is a silently-untested verdict path.
+# silently-skipped round-trip test is a silently-untested verdict path —
+# and a set-but-invalid channel never falls back to PATH either (the
+# all-or-nothing rule test_asmdiff's resolver documents).
 def _leg_objdump() -> str:
     require = os.environ.get("LCCC_REQUIRE_PINNED_ORACLE") == "1"
     pinned = os.environ.get("ENCDIFF_TEST_OBJDUMP") or ""
@@ -41,7 +42,17 @@ def _leg_objdump() -> str:
                 "pinned pair first (bash scripts/ensure_gas_247.sh "
                 "x86_64-linux-gnu)")
         return pinned
-    if pinned and Path(pinned).is_file() and os.access(pinned, os.X_OK):
+    if pinned:
+        # An EXPLICIT channel is never completed from PATH: a set-but-
+        # invalid ENCDIFF_TEST_OBJDUMP is a wiring error, and quietly
+        # arbitrating the round-trip verdicts against a distro objdump
+        # would paper over exactly the misconfiguration the channel
+        # exists to make visible.
+        if not (Path(pinned).is_file() and os.access(pinned, os.X_OK)):
+            raise unittest.SkipTest(
+                f"ENCDIFF_TEST_OBJDUMP={pinned!r} is not an executable "
+                "file — an explicit channel is never completed from "
+                "PATH; fix the path (or unset it for a bare PATH run)")
         return pinned
     found = shutil.which("objdump")
     if found:
@@ -49,6 +60,63 @@ def _leg_objdump() -> str:
     raise unittest.SkipTest(
         "objdump unavailable (set ENCDIFF_TEST_OBJDUMP to the pinned pair; "
         "CI sets LCCC_REQUIRE_PINNED_ORACLE=1 to refuse the skip)")
+
+
+class LegObjdumpResolverTests(unittest.TestCase):
+    """The explicit objdump channel never falls back to PATH when broken.
+
+    A set-but-invalid ENCDIFF_TEST_OBJDUMP is a wiring error; the
+    pre-hardening resolver quietly arbitrated the round-trip verdicts
+    against whatever distro objdump was on PATH — exactly the
+    unpinned-oracle defect the channel exists to prevent. Require mode
+    stays an error, bare mode stays runnable (skip with the reason, never
+    a silent fallback).
+    """
+
+    # A real executable INDEPENDENT of the ambient channels: capturing
+    # os.environ here would poison the "valid channel" cell the moment a
+    # human runs the suite with a broken ENCDIFF_TEST_OBJDUMP exported —
+    # the resolver checks existence+executability, not identity, and the
+    # Python interpreter is an executable every run of this suite has.
+    GOOD = sys.executable
+
+    def _env(self, **extra):
+        base = {k: v for k, v in os.environ.items()
+                if k not in ("ENCDIFF_TEST_OBJDUMP",
+                             "LCCC_REQUIRE_PINNED_ORACLE")}
+        base.update(extra)
+        return mock.patch.dict(os.environ, base, clear=True)
+
+    def test_invalid_explicit_channel_skips_never_falls_back(self) -> None:
+        with self._env(ENCDIFF_TEST_OBJDUMP="/nonexistent/objdump"):
+            with self.assertRaises(unittest.SkipTest) as ctx:
+                _leg_objdump()
+        self.assertIn("is not an executable file", str(ctx.exception))
+        self.assertIn("never completed from PATH", str(ctx.exception))
+
+    def test_valid_explicit_channel_wins_in_both_modes(self) -> None:
+        for extra in ({}, {"LCCC_REQUIRE_PINNED_ORACLE": "1"}):
+            with self.subTest(mode=extra or "bare"):
+                with self._env(ENCDIFF_TEST_OBJDUMP=self.GOOD, **extra):
+                    self.assertEqual(_leg_objdump(), self.GOOD)
+
+    def test_require_mode_rejects_invalid_or_missing_pin(self) -> None:
+        for pinned in ("/nonexistent/objdump", ""):
+            with self.subTest(pinned=pinned or "<unset>"):
+                with self._env(LCCC_REQUIRE_PINNED_ORACLE="1",
+                               **({"ENCDIFF_TEST_OBJDUMP": pinned}
+                                  if pinned else {})):
+                    with self.assertRaises(AssertionError):
+                        _leg_objdump()
+
+    def test_bare_mode_without_channel_uses_path_or_skips(self) -> None:
+        with self._env():
+            try:
+                got = _leg_objdump()
+            except unittest.SkipTest as exc:
+                self.assertIn("objdump unavailable", str(exc))
+            else:
+                self.assertTrue(Path(got).is_file())
 
 
 def encoded(data: bytes) -> encdiff.Encoding:
@@ -68,9 +136,19 @@ def row_as(insn: str, lccc: bytes, **oracles: bytes) -> encdiff.Row:
 
 
 def objdump_result(byte_column: str, instruction: str, returncode: int = 0):
-    line = f"   0:\t{byte_column:<20}\t{instruction}\n"
+    # The REAL pinned-2.47 byte column: 21 characters wide (three per
+    # byte, space-padded — see asmdiff's parser notes). The canned shape
+    # must match it, because the parser validates column consistency.
+    line = f"   0:\t{byte_column:<21}\t{instruction}\n"
     return subprocess.CompletedProcess(
         args=["objdump"], returncode=returncode, stdout=line, stderr="")
+
+
+def objdump_listing(*lines: str, returncode: int = 0):
+    """A canned multi-line objdump stdout, verbatim."""
+    return subprocess.CompletedProcess(
+        args=["objdump"], returncode=returncode,
+        stdout="".join(line + "\n" for line in lines), stderr="")
 
 
 class EncDiffSemanticTests(unittest.TestCase):
@@ -152,6 +230,73 @@ class EncDiffSemanticTests(unittest.TestCase):
             self.assertIs(encdiff.decodes_same("missing-objdump", b"\x90", b"\x90"), None)
 
         self.assertIs(encdiff.decodes_same("objdump", b"", b""), None)
+
+    def test_disassembler_admits_real_continuations_and_refuses_orphans(self):
+        # The pinned 2.47 wraps instructions wider than the 7-byte column
+        # onto continuation lines (running address, no instruction
+        # column). A real 12-byte wrap is semantic evidence and compares
+        # equal to itself; every malformed fragment class is None — the
+        # old parser silently SKIPPED non-matching lines, so two streams
+        # differing only in skipped bytes could compare equal.
+        wrap = objdump_listing(
+            "   0:\t48 81 84 cb 88 77 66 \taddq   $0x11223344,0x55667788(%rbx,%rcx,8)",
+            "   7:\t55 44 33 22 11 ",
+            "   c:\t90                   \tnop")
+        with mock.patch.object(encdiff.subprocess, "run",
+                               side_effect=[wrap, wrap]):
+            self.assertIs(encdiff.decodes_same(
+                "objdump", b"\x48\x81", b"\x48\x81"), True)
+        # THE orphan shapes — each must refuse the whole stream:
+        orphan = objdump_listing(
+            "   0:\t90                   \tnop",
+            "   1:\tff ")                     # column was not full: no wrap
+        with mock.patch.object(encdiff.subprocess, "run",
+                               side_effect=[orphan, orphan]):
+            self.assertIs(encdiff.decodes_same(
+                "objdump", b"\x90", b"\x90"), None)
+        for bad in (
+            # an unknown line shape is never a silent skip:
+            objdump_listing("   0:\t90                   \tnop",
+                            "garbage"),
+            # a `...` gap of undecoded bytes is not evidence:
+            objdump_listing("   0:\t90                   \tnop",
+                            "\t..."),
+            # an anchor byte column inconsistent with the listing width:
+            objdump_listing("   0:\t90                   \tnop",
+                            "   1:\t31 c0             \txor    %eax,%eax"),
+            # an address-chain break between anchors:
+            objdump_listing("   0:\t31 c0                \txor    %eax,%eax",
+                            "   3:\t90                   \tnop"),
+            # a continuation after a non-full continuation:
+            objdump_listing(
+                "   0:\t48 81 84 cb 88 77 66 \taddq   $0x11223344,0x55667788(%rbx,%rcx,8)",
+                "   7:\t55 ",
+                "   8:\t44 "),
+        ):
+            with self.subTest(bad=bad.stdout.splitlines()[-1]):
+                with mock.patch.object(encdiff.subprocess, "run",
+                                       side_effect=[bad, bad]):
+                    self.assertIs(encdiff.decodes_same(
+                        "objdump", b"\x90", b"\x90"), None)
+
+    def test_wrapped_branch_target_uses_the_true_instruction_length(self):
+        # A branch wider than the byte column wraps; its target marker
+        # must use the TRUE length (anchor + continuations), not the
+        # anchor-line byte count. Two encodings of the same transfer —
+        # one wrapped 8-byte near jmp (7+1) and one short — compare
+        # equal exactly when they transfer to the same place.
+        wrapped_near = objdump_listing(
+            "   0:\t2e 3e 26 36 2e 3e e9 \tjmp    0x6",
+            "   7:\t00 ")
+        short = objdump_listing("   0:\t74 02                \tje     0x2")
+        # (Same-transfer check is exercised through real rows elsewhere;
+        # here the pin is that the wrapped listing itself is admissible
+        # evidence — the old parser skipped its continuation line and
+        # computed the end address from 7 anchor bytes only.)
+        with mock.patch.object(encdiff.subprocess, "run",
+                               side_effect=[wrapped_near, wrapped_near]):
+            self.assertIs(encdiff.decodes_same(
+                "objdump", b"\x2e", b"\x2e"), True)
 
     def test_i686_roundtrip_classification_uses_32bit_disassembly(self):
         candidate = row_with(b"L", gas=b"GAS", clang=b"GAS")
@@ -603,6 +748,14 @@ class OracleCommutativeAndSelectorViewTests(unittest.TestCase):
             # alone are a NET contract.
             baseline("# comment line\n" + classes({"BEATS": 2, "LONGER": 1}))
             self.assertFalse(encdiff.check_verdict_histogram(rows, base))
+            # The digest grammar is case-insensitive, and an UPPERCASE
+            # spelling of the SAME digest is accepted (normalised at the
+            # parse boundary): before, it parsed fine and then compared
+            # verbatim against hashlib's lowercase hexdigest — a correct
+            # baseline that reported drift forever.
+            baseline("# ROWS-SHA256: " + encdiff.rows_digest(rows).upper()
+                     + "\n" + classes({"BEATS": 2, "LONGER": 1}))
+            self.assertTrue(encdiff.check_verdict_histogram(rows, base))
 
     def test_rows_digest_pins_row_identity_not_verdicts(self):
         # The L1 blind spot, closed: two row sets with IDENTICAL verdict
@@ -797,6 +950,41 @@ class ByteExactPinTests(unittest.TestCase):
             with self.subTest(bad=bad):
                 with self.assertRaises(ValueError):
                     encdiff.split_byte_pin(bad)
+
+    def test_exactly_one_pin_shaped_tag_per_line(self):
+        # The audit regression: a `$`-anchored regex found the LAST valid
+        # tag, so a conflicting earlier pin was silently ignored (and a
+        # malformed one too). The whole comment is scanned for tag-shaped
+        # occurrences first: exactly one, then strict grammar.
+        for bad in (
+            # two valid pins, conflicting values (was: accepted, pin=91):
+            "mov %eax, %ebx # byte-exact 90 # byte-exact 91",
+            # two valid pins, IDENTICAL values (ambiguity is the error,
+            # not the value):
+            "mov %eax, %ebx # byte-exact 90 # byte-exact 90",
+            # malformed first, valid second (was: accepted, pin=91):
+            "mov %eax, %ebx # byte exact 90 # byte-exact 91",
+            # valid first, malformed second (the shadowed case):
+            "mov %eax, %ebx # byte-exact 91 # byte exact 90",
+            # near-miss spellings are tag-shaped too, in any case:
+            "mov %eax, %ebx # BYTE_EXACT 90 # byte-exact 91",
+            "mov %eax, %ebx # byteexact 90 # byte-exact 91",
+        ):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError) as raised:
+                    encdiff.split_byte_pin(bad)
+                self.assertIn("byte-exact", str(raised.exception))
+        # A single tag in ANY case spelling is the same pin:
+        insn, pin = encdiff.split_byte_pin(
+            "mov %eax, %ebx # BYTE-EXACT 89d8")
+        self.assertEqual((insn, pin), ("mov %eax, %ebx", b"\x89\xd8"))
+        # A prose mention that is not tag-shaped (prose between the `#'
+        # and the word) stays a comment, not an error:
+        insn, pin = encdiff.split_byte_pin(
+            "mov %eax, %ebx # this row stays byte-exact by policy")
+        self.assertEqual(insn,
+                         "mov %eax, %ebx # this row stays byte-exact by policy")
+        self.assertIsNone(pin)
 
     def test_dropped_ds_prefix_on_the_ds_flip_row_is_not_a_beat(self):
         # THE adversarial row of the pin mechanism, end to end

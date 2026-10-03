@@ -30,6 +30,15 @@ The map:
   per-program env channels (W3)                       -> .test_hidden_channels...
   duplicate-key refusing loader (W9)                  -> .test_duplicate_keys...
   aggregated main (all checks run)                    -> .test_main_reports_all
+  quote-aware comment cutting (a quoted `#` is        -> QuoteAwareCommentStrippingTest
+    data; the regex cut truncated such lines,
+    shlex refused them, and the invocation
+    escaped the universal contracts)
+  structured hosted diagnostics + per-step bodies    -> StructuredHostedDiagnosticsTest
+    (workflow/job/step address instead of a
+    synthetic line number; a step-boundary
+    continuation used to swallow the next
+    step's first line in the joined form)
 """
 from __future__ import annotations
 
@@ -667,6 +676,179 @@ class StepSemanticsGuardTest(unittest.TestCase):
                     "    steps:\n      - name: g\n"
                     f"        if: failure()\n        run: {interp} {program}\n")
                 self.assertEqual(parity.check_step_guards([self.wf]), 1)
+
+
+class QuoteAwareCommentStrippingTest(unittest.TestCase):
+    """A `#` inside a quoted argument is data, not a comment.
+
+    The pre-hardening `re.search(r"\\s#", line)` cut in
+    _strip_run_comments truncated any hosted line carrying a double-quoted
+    ` # ` — the truncated remnant had an unbalanced quote, shlex refused
+    it, and _logical_command_lines DROPPED it: a contracted invocation
+    with a quoted-# argument silently escaped the universal contract
+    check entirely. The quote-aware _cut_shell_comment keeps the line
+    intact, so the invocation reaches the contract layer and a weakened
+    one FAILS there instead of vanishing.
+    """
+
+    def setUp(self) -> None:
+        import yaml  # noqa: F401  (the checker requires it anyway)
+        self._dir = tempfile.TemporaryDirectory()
+        self.wf = Path(self._dir.name) / "ci.yml"
+        self.addCleanup(self._dir.cleanup)
+
+    def _workflow(self, *run_lines: str) -> Path:
+        # A block scalar's content must be indented deeper than `run:`.
+        body = "\n".join("          " + line for line in run_lines)
+        self.wf.write_text(
+            "name: CI\n"
+            "on: [push, pull_request]\n"
+            "jobs:\n"
+            "  test:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - name: gate step\n"
+            f"        run: |\n{body}\n")
+        return self.wf
+
+    def test_quoted_hash_argument_survives_stripping(self) -> None:
+        line = ('python3 scripts/asmdiff.py --jobs 2 --as p --objdump q '
+                '--lccc target/fastbuild/lccc-x86 --note "gas # 2.47"')
+        self.assertEqual(parity._cut_shell_comment(line), line)
+        # A trailing REAL comment is still cut, quote-aware:
+        self.assertEqual(
+            parity._cut_shell_comment('echo "a # b"  # real comment'),
+            'echo "a # b"')
+        # ...including single-quoted data and a backslash-escaped quote:
+        self.assertEqual(
+            parity._cut_shell_comment("echo 'x # y' # tail"),
+            "echo 'x # y'")
+        self.assertEqual(
+            parity._cut_shell_comment('echo "a \\"# b"'),
+            'echo "a \\"# b"')
+
+    def test_weakened_invocation_with_quoted_hash_is_checked_not_dropped(self) -> None:
+        # THE escape-hatch repro: a second, WEAKENED invocation of a
+        # contracted program whose extra argument carries a quoted ` # `.
+        # Pre-fix it vanished from the contract layer (truncated →
+        # untokenizable → dropped) and the conforming invocation beside it
+        # kept the contract green. Post-fix it is checked — and fails.
+        path = self._workflow(
+            "python3 scripts/asmdiff.py --jobs 2 --as p --objdump q \\",
+            "  --lccc target/fastbuild/lccc-x86",
+            'python3 scripts/asmdiff.py --jobs 2 --as p --objdump q '
+            '--lccc target/fastbuild/lccc-x86 --note "pin # 2"')
+        steps = [s for s in parity.workflow_run_steps(path) if s.active]
+        bodies = "\n".join(s.body for s in steps)
+        # The weakened line survived comment-stripping intact:
+        self.assertIn('--note "pin # 2"', bodies)
+        err = StringIO()
+        with redirect_stderr(err):
+            rc = parity.check_invocation_contracts(
+                parity.LOCAL.read_text(), steps)
+        self.assertEqual(rc, 1)
+        out = err.getvalue()
+        # And the contract layer SAW it (a no-contract-match diagnostic
+        # naming the extra token — not silence):
+        self.assertIn("--note", out)
+
+    def test_step_body_comment_line_does_not_satisfy_anything(self) -> None:
+        # The fix must not overcorrect: a fully commented-out gate line
+        # still strips (executes nothing, satisfies nothing).
+        path = self._workflow(
+            "# python3 scripts/asmdiff.py --jobs 2 --as p --objdump q \\",
+            "#  --lccc target/fastbuild/lccc-x86",
+            "true")
+        steps = [s for s in parity.workflow_run_steps(path) if s.active]
+        self.assertEqual(
+            [cmd.display() for cmd in parity._logical_command_lines(
+                "\n".join(s.body for s in steps))],
+            ["true"])
+
+
+class StructuredHostedDiagnosticsTest(unittest.TestCase):
+    """Hosted violations must carry their real address, not a line number
+    into a synthetic concatenation of every workflow's bodies.
+
+    `hosted line 742` points into no file anyone can open; every hosted
+    diagnostic now names the workflow file, the job id and the step
+    (GitHub's own addressing), plus the line within that step's body.
+    The records interface also fixes a real over-join: the joined-text
+    form let a trailing line-continuation at the END of one `run:` block
+    swallow the first line of the NEXT block, though separate steps are
+    separate shells.
+    """
+
+    CONFORMING = ("python3 scripts/asmdiff.py --jobs 2 --as p --objdump q "
+                  "--lccc target/fastbuild/lccc-x86")
+
+    def setUp(self) -> None:
+        import yaml  # noqa: F401  (the checker requires it anyway)
+        self._dir = tempfile.TemporaryDirectory()
+        self.wf = Path(self._dir.name) / "ci.yml"
+        self.addCleanup(self._dir.cleanup)
+
+    def _workflow(self, step_bodies: list[tuple[str, str]]) -> Path:
+        steps = []
+        for name, body in step_bodies:
+            steps.append(f"      - name: {name}\n        run: |\n")
+            for line in body.splitlines():
+                steps.append(f"          {line}\n")
+        self.wf.write_text(
+            "name: CI\n"
+            "on: [push, pull_request]\n"
+            "jobs:\n"
+            "  test:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n" + "".join(steps))
+        return self.wf
+
+    def test_violation_names_workflow_job_and_step(self) -> None:
+        path = self._workflow([
+            ("good gate", self.CONFORMING),
+            ("sabotaged gate",
+             "python3 scripts/asmdiff.py --jobs 2 --as p --objdump q "
+             "--lccc /evil/lccc"),
+        ])
+        steps = [s for s in parity.workflow_run_steps(path) if s.active]
+        err = StringIO()
+        with redirect_stderr(err):
+            rc = parity.check_invocation_contracts(
+                parity.LOCAL.read_text(), steps)
+        self.assertEqual(rc, 1)
+        out = err.getvalue()
+        self.assertIn('ci.yml job=test step="sabotaged gate"', out)
+        self.assertIn("body-line 1", out)
+
+    def test_step_boundary_continuation_does_not_swallow_next_step(self) -> None:
+        # Step A ends with a dangling continuation; step B is a clean
+        # contracted invocation. In the joined-text form A's backslash
+        # joined B's first line into an `echo ...` mention — the contract
+        # lost its match. Per-step bodies are separate shells: B's
+        # invocation must stand on its own.
+        path = self._workflow([
+            ("trailing", "echo hello \\"),
+            ("good gate", self.CONFORMING),
+        ])
+        steps = list(parity.workflow_run_steps(path))
+        trailing = next(s for s in steps if s.step == "trailing")
+        gate = next(s for s in steps if s.step == "good gate")
+        # The invocation resolves in command position inside its own step:
+        found = parity._find_invocation(
+            parity._logical_command_lines(gate.body)[0],
+            "scripts/asmdiff.py")
+        self.assertIsInstance(found, tuple)
+        # And the trailing backslash did not reach across the boundary:
+        cmds_a = parity._logical_command_lines(trailing.body)
+        self.assertTrue(all("asmdiff" not in c.display() for c in cmds_a))
+
+    def test_str_interface_still_accepted_for_synthetic_blobs(self) -> None:
+        # The mutation tests drive the checker with plain strings; that
+        # interface is load-bearing and must keep working.
+        local = parity.LOCAL.read_text()
+        with redirect_stderr(StringIO()):
+            rc_str = parity.check_invocation_contracts(local, self.CONFORMING)
+        self.assertEqual(rc_str, 1)  # (one step satisfies nothing else)
 
 
 class WorkflowTriggerSemanticsTest(unittest.TestCase):
