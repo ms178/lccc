@@ -553,6 +553,22 @@ gate "ci-asm-diff-parity-self-test" fast \
 gate "encdiff-semantic-validation" fast \
     python3 scripts/test_encdiff.py
 
+# The differential oracle's OWN contract suites, compiler-free exactly
+# like the encdiff one above: asmdiff's parser/oracle unit tests (the
+# mocked failure modes — failed disassembler, empty listing, undecodable
+# bytes, orphan fragments — plus a real-toolchain leg) and the binutils
+# provisioner's 2.47 validation matrix (fake tool pairs: correct,
+# wrong-version, substring lookalikes, mismatched tokens, functionally
+# broken). The integration gates prove the tools work on today's corpus;
+# these prove the verdict machinery refuses the inputs an end-to-end
+# green run can never exhibit. Both are parity-required
+# (check_test_suite_registration).
+gate "asmdiff-semantic-validation" fast \
+    python3 scripts/test_asmdiff.py
+
+gate "gas-oracle-pair-self-test" fast \
+    bash scripts/ensure_gas_247.sh --self-test
+
 # EDG/corpus compiler-free tooling contracts: the miner
 # self-tests, the mocked corpus-runner verdict contracts, and the corpus
 # exclusion path tests run without any compiler — they gate the TEST
