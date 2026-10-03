@@ -114,7 +114,7 @@ impl Preprocessor {
     /// `__has_include` are NOT handled here: `defined` is only an operator
     /// inside #if/#elif (a code-line `defined` is an ordinary identifier),
     /// and __has_include's argument grammar (<...>) is directive-only.
-    pub(super) fn resolve_has_macros_in_code(&self, line: &str) -> String {
+    pub(super) fn resolve_has_macros_in_code(&mut self, line: &str, diag_line: usize) -> String {
         // Fast path: the overwhelming majority of lines have no __has_ token.
         if !line.contains("__has_") {
             return line.to_string();
@@ -164,6 +164,10 @@ impl Preprocessor {
                         self.skip_paren_arg_bytes(bytes, &mut i);
                         result.push('0');
                     }
+                    "__has_warning" => {
+                        let val = self.resolve_has_warning_call_bytes(bytes, &mut i, diag_line);
+                        result.push_str(val);
+                    }
                     _ => result.push_str(ident),
                 }
                 continue;
@@ -172,6 +176,59 @@ impl Preprocessor {
             i += 1;
         }
         result
+    }
+
+    /// Clang's `__has_warning("-Wflag")` operator. Policy: a well-formed
+    /// string-literal argument yields 1 (lccc accepts the guarded warning
+    /// workaround), anything else 0, and the empty call yields the Clang
+    /// diagnostic the corpus pins: `too few arguments`.
+    fn resolve_has_warning_call_bytes(
+        &mut self,
+        bytes: &[u8],
+        i: &mut usize,
+        diag_line: usize,
+    ) -> &'static str {
+        let len = bytes.len();
+        while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
+            *i += 1;
+        }
+        if *i >= len || bytes[*i] != b'(' {
+            return "0";
+        }
+        *i += 1;
+        while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
+            *i += 1;
+        }
+        if *i < len && bytes[*i] == b')' {
+            *i += 1;
+            self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                file: self.current_file(),
+                line: diag_line,
+                col: 0,
+                message: "too few arguments to function call, expected 1, have 0".to_string(),
+            });
+            return "0";
+        }
+        // Consume the argument (a string literal in well-formed use) and the
+        // closing paren; the verdict is 1 for a well-formed call.
+        let mut well_formed = false;
+        if *i < len && bytes[*i] == b'"' {
+            *i += 1;
+            while *i < len && bytes[*i] != b'"' {
+                *i += 1;
+            }
+            if *i < len {
+                *i += 1;
+                well_formed = true;
+            }
+        }
+        while *i < len && bytes[*i] != b')' {
+            *i += 1;
+        }
+        if *i < len {
+            *i += 1;
+        }
+        if well_formed { "1" } else { "0" }
     }
 
     pub(super) fn resolve_defined_in_expr(&mut self, expr: &str) -> String {
@@ -234,6 +291,12 @@ impl Preprocessor {
                     result.push_str(val);
                 } else if ident == "__has_include_next" {
                     let val = self.resolve_has_include_call_bytes(bytes, &mut i, true);
+                    result.push_str(val);
+                } else if ident == "__has_embed" {
+                    let val = self.resolve_has_embed_call_bytes(bytes, &mut i);
+                    result.push_str(&val);
+                } else if ident == "__has_warning" {
+                    let val = self.resolve_has_warning_call_bytes(bytes, &mut i, 0);
                     result.push_str(val);
                 } else {
                     result.push_str(ident);
@@ -387,6 +450,39 @@ impl Preprocessor {
         };
 
         if found { "1" } else { "0" }
+    }
+
+    /// C23 `__has_embed(...)`: parse the balanced parenthesized argument
+    /// (filename spec + optional embed parameters) and probe the resource.
+    /// Yields the numeric `__STDC_EMBED_*` value: 0 not found / unsupported
+    /// parameter, 1 found and non-empty, 2 found but empty.
+    fn resolve_has_embed_call_bytes(&mut self, bytes: &[u8], i: &mut usize) -> String {
+        let len = bytes.len();
+        while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
+            *i += 1;
+        }
+        if *i >= len || bytes[*i] != b'(' {
+            // Malformed operand; the #if evaluator treats it as absent.
+            return "0".to_string();
+        }
+        *i += 1; // skip '('
+        let start = *i;
+        let mut depth = 1usize;
+        while *i < len && depth > 0 {
+            match bytes[*i] {
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                _ => {}
+            }
+            if depth > 0 {
+                *i += 1;
+            }
+        }
+        let inner = bytes_to_str(bytes, start, *i);
+        if *i < len {
+            *i += 1; // skip ')'
+        }
+        (self.probe_embed(inner) as i64).to_string()
     }
 
     /// Skip a parenthesized argument (byte-oriented).

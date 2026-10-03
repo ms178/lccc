@@ -193,6 +193,8 @@ impl MacroTable {
             || name == "__has_extension"
             || name == "__has_include"
             || name == "__has_include_next"
+            || name == "__has_embed"
+            || name == "__has_warning"
     }
 
     /// Iterate over all macro definitions.
@@ -301,22 +303,80 @@ impl MacroTable {
         // - 0x01 (BLUE_PAINT_MARKER): prevents re-expansion per C11 §6.10.3.4
         // - 0x02/0x03 (PASTE_PROTECT_START/END): should already be consumed by
         //   substitute_params, but strip defensively in case any leak through.
-        if result
-            .as_bytes()
-            .iter()
-            .any(|&b| b == BLUE_PAINT_MARKER || b == PASTE_PROTECT_START || b == PASTE_PROTECT_END)
-        {
-            result.replace(
-                [
-                    BLUE_PAINT_MARKER as char,
-                    PASTE_PROTECT_START as char,
-                    PASTE_PROTECT_END as char,
-                ],
-                "",
-            )
-        } else {
-            result
+        let result =
+            if result.as_bytes().iter().any(|&b| {
+                b == BLUE_PAINT_MARKER || b == PASTE_PROTECT_START || b == PASTE_PROTECT_END
+            }) {
+                result.replace(
+                    [
+                        BLUE_PAINT_MARKER as char,
+                        PASTE_PROTECT_START as char,
+                        PASTE_PROTECT_END as char,
+                    ],
+                    "",
+                )
+            } else {
+                result
+            };
+        self.rescan_pragma_operators(result, expanding)
+    }
+
+    /// C99 §6.10.9 corner case: a `_Pragma` operator can come into existence
+    /// only THROUGH expansion — `#define DO_PRAGMA _Pragma` followed by
+    /// `DO_PRAGMA ("GCC dependency \"x\"")`. The first-pass handler saw the
+    /// body `_Pragma` without its argument (the parens live in the outer
+    /// text) and had to leave it alone. After the full line is expanded the
+    /// operator and its argument sit adjacent, so rescan for `_Pragma`
+    /// identifiers and run them through the same handler, which queues the
+    /// pragma for the pipeline and removes the operator from the stream.
+    /// Other macros are NOT re-expanded here: a second `expand_text` pass
+    /// would resurrect blue-painted self-references.
+    fn rescan_pragma_operators(&self, text: String, expanding: &mut FxHashSet<String>) -> String {
+        if !text.contains("_Pragma") {
+            return text;
         }
+        let bytes = text.as_bytes();
+        let len = bytes.len();
+        let mut out = String::with_capacity(text.len());
+        let mut i = 0usize;
+        while i < len {
+            let c = bytes[i];
+            if c == b'"' || c == b'\'' {
+                // Copy string/char literals verbatim: `_Pragma` inside a
+                // literal is ordinary text.
+                let quote = c;
+                let start = i;
+                i += 1;
+                while i < len && bytes[i] != quote {
+                    if bytes[i] == b'\\' && i + 1 < len {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                if i < len {
+                    i += 1;
+                }
+                out.push_str(&text[start..i]);
+                continue;
+            }
+            if is_ident_start_byte(c) {
+                let start = i;
+                i += 1;
+                while i < len && is_ident_cont_byte(bytes[i]) {
+                    i += 1;
+                }
+                let ident = bytes_to_str(bytes, start, i);
+                if ident == "_Pragma" {
+                    i = self.handle_pragma_operator(bytes, i, ident, &mut out, expanding);
+                } else {
+                    out.push_str(ident);
+                }
+                continue;
+            }
+            out.push(c as char);
+            i += 1;
+        }
+        out
     }
 
     /// Append `expanded` text to `result`, inserting spaces as needed to prevent

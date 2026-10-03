@@ -36,7 +36,12 @@ impl Preprocessor {
         }
     }
 
-    pub(super) fn handle_pragma(&mut self, rest: &str) -> Option<String> {
+    pub(super) fn handle_pragma(
+        &mut self,
+        rest: &str,
+        line_num: usize,
+        col: usize,
+    ) -> Option<String> {
         let rest = rest.trim();
         if rest == "once" {
             // Mark the current file as "include once".  Track both canonical
@@ -90,10 +95,47 @@ impl Preprocessor {
                 }
                 return self.handle_pragma_gcc_visibility(vis_content.trim());
             }
+            if let Some(dep_content) = gcc_content.strip_prefix("dependency") {
+                self.handle_pragma_gcc_dependency(dep_content.trim(), line_num, col);
+                return None;
+            }
         }
 
         // Other pragmas (GCC, diagnostic, etc.) are silently ignored
         None
+    }
+
+    /// Handle `#pragma GCC dependency FILENAME` (GCC extension).
+    ///
+    /// GCC semantics: the filename is NOT macro-expanded (a bare macro name
+    /// is an error), the file is searched like a quoted/chevron include, and
+    /// a missing file is a hard error. The content is only checked, not
+    /// inserted. Clang matches this contract and the corpus pins both error
+    /// shapes.
+    fn handle_pragma_gcc_dependency(&mut self, content: &str, line_num: usize, col: usize) {
+        let (filename, is_system) = if let Some(rest) = content.strip_prefix('"') {
+            let end = rest.find('"').unwrap_or(rest.len());
+            (rest[..end].to_string(), false)
+        } else if let Some(rest) = content.strip_prefix('<') {
+            let end = rest.find('>').unwrap_or(rest.len());
+            (rest[..end].to_string(), true)
+        } else {
+            self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                file: self.current_file(),
+                line: line_num,
+                col,
+                message: "expected \"FILENAME\" or <FILENAME>".to_string(),
+            });
+            return;
+        };
+        if self.resolve_include_path(&filename, is_system).is_none() {
+            self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                file: self.current_file(),
+                line: line_num,
+                col,
+                message: format!("'{}' file not found", filename),
+            });
+        }
     }
 
     /// Handle #pragma GCC visibility push(hidden|default|protected|internal) / pop.

@@ -42,6 +42,13 @@ impl Preprocessor {
             ("__STDC__", "1"),
             ("__STDC_VERSION__", "201710L"), // C17
             ("__STDC_HOSTED__", "1"),
+            // C23 #embed result constants (N3018). Defined unconditionally,
+            // matching lccc's permissive-extension dialect policy (#embed is
+            // accepted in every -std= mode, like GNU default modes accept
+            // newer-dialect features as extensions).
+            ("__STDC_EMBED_NOT_FOUND__", "0"),
+            ("__STDC_EMBED_FOUND__", "1"),
+            ("__STDC_EMBED_EMPTY__", "2"),
             // Platform
             ("__linux__", "1"),
             ("__linux", "1"),

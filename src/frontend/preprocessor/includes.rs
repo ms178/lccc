@@ -10,6 +10,41 @@ use super::pipeline::Preprocessor;
 /// Prevents infinite inclusion loops in files without `#pragma once`.
 const MAX_INCLUDE_DEPTH: usize = 200;
 
+/// C23 `__has_embed` result, matching the `__STDC_EMBED_*` macro values.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum EmbedResult {
+    /// `__STDC_EMBED_NOT_FOUND__`
+    NotFound = 0,
+    /// `__STDC_EMBED_FOUND__`
+    Found = 1,
+    /// `__STDC_EMBED_EMPTY__`
+    Empty = 2,
+}
+
+/// Parsed C23 `#embed` parameter sequence.
+#[derive(Default)]
+pub(super) struct EmbedParams {
+    pub limit: Option<usize>,
+    pub prefix: Option<String>,
+    pub suffix: Option<String>,
+    pub if_empty: Option<String>,
+    /// Clang vendor extension `clang::offset(N)`: skip the first N bytes of
+    /// the resource before `limit` applies. Recognized because the corpus is
+    /// Clang-derived and the feature-detection tests probe it.
+    pub offset: Option<usize>,
+}
+
+/// Failure classes of `#embed`/`__has_embed` argument parsing. `#embed`
+/// diagnoses all of them; `__has_embed` only diagnoses the syntax errors
+/// (an UNKNOWN parameter is the standard feature-detection channel and must
+/// stay silent, yielding `__STDC_EMBED_NOT_FOUND__`).
+enum EmbedSpecError {
+    NoFilename,
+    UnknownParam(String),
+    UnterminatedParam(String),
+    InvalidLimit(String),
+}
+
 /// Compiler-reserved x86 intrinsic headers supplied with LCCC.  They need to
 /// win over a user-supplied GCC builtin include directory: modern GCC's
 /// `immintrin.h` unconditionally pulls AVX-512/_Float16 declarations that the
@@ -634,6 +669,273 @@ impl Preprocessor {
         } else {
             // Fall back to regular include if include_next can't find it
             self.handle_include(path, line_num, col)
+        }
+    }
+
+    // ====================================================================
+    // C23 #embed / __has_embed (N3018) — binary resource inclusion.
+    //
+    // `#embed "file" [params]` is replaced by a comma-separated list of
+    // integer byte values; `__has_embed(...)` probes the same search and
+    // yields __STDC_EMBED_NOT_FOUND__/__STDC_EMBED_FOUND__/
+    // __STDC_EMBED_EMPTY__ (0/1/2).  The resource search reuses the
+    // #include machinery: quoted names search the including file's
+    // directory first, chevron names only the include paths — exactly the
+    // contract the corpus tests exercise.
+    // ====================================================================
+
+    /// Parse the `<filename> [param(args)...]` tail shared by `#embed` and
+    /// `__has_embed`. C23 forms (3)/(5): if the filename is not directly
+    /// `"..."`/`<...>`, the tail undergoes macro replacement first
+    /// (`#embed __FILE__ limit(2)`), then matching is retried.
+    fn parse_embed_spec(
+        &mut self,
+        text: &str,
+    ) -> Result<(String, bool, EmbedParams), EmbedSpecError> {
+        // Match a string/chevron filename at the start of `s`.
+        fn take_filename(s: &str) -> Option<(String, bool, usize)> {
+            if let Some(rest) = s.strip_prefix('"') {
+                let end = rest.find('"')?;
+                Some((rest[..end].to_string(), false, end + 2))
+            } else if let Some(rest) = s.strip_prefix('<') {
+                let end = rest.find('>')?;
+                Some((rest[..end].to_string(), true, end + 2))
+            } else {
+                None
+            }
+        }
+
+        let trimmed = text.trim_start();
+        let (filename, is_system, after, source) = match take_filename(trimmed) {
+            Some((f, sys, consumed)) => (f, sys, consumed, None),
+            None => {
+                let expanded = self.macros.expand_line(text);
+                let trimmed = expanded.trim_start();
+                match take_filename(trimmed) {
+                    Some((f, sys, consumed)) => (f, sys, consumed, Some(trimmed.to_string())),
+                    None => return Err(EmbedSpecError::NoFilename),
+                }
+            }
+        };
+        let rest = match &source {
+            Some(expanded) => &expanded[after..],
+            None => &trimmed[after..],
+        };
+        let params = self.parse_embed_params(rest)?;
+        Ok((filename, is_system, params))
+    }
+
+    /// Parse the parameter sequence: `name(tokens)...` pairs with balanced
+    /// parentheses. Failures are returned, not diagnosed: `#embed` turns
+    /// every variant into an error, while `__has_embed` must silently yield
+    /// __STDC_EMBED_NOT_FOUND__ for UNSUPPORTED parameters (that is how
+    //  vendor extensions are feature-detected), only diagnosing true
+    /// syntax errors.
+    fn parse_embed_params(&mut self, mut rest: &str) -> Result<EmbedParams, EmbedSpecError> {
+        let mut params = EmbedParams::default();
+        loop {
+            rest = rest.trim_start();
+            if rest.is_empty() {
+                return Ok(params);
+            }
+            // Parameter name: identifier, optionally vendor-qualified a::b.
+            let name_len = {
+                let mut n = 0;
+                let b = rest.as_bytes();
+                while n < b.len() && (b[n].is_ascii_alphanumeric() || b[n] == b'_') {
+                    n += 1;
+                }
+                if n < b.len() && b[n] == b':' && n + 1 < b.len() && b[n + 1] == b':' {
+                    n += 2;
+                    while n < b.len() && (b[n].is_ascii_alphanumeric() || b[n] == b'_') {
+                        n += 1;
+                    }
+                }
+                n
+            };
+            if name_len == 0 {
+                // Trailing garbage after the parameter sequence: stop
+                // parsing rather than looping forever.
+                return Ok(params);
+            }
+            let name = &rest[..name_len];
+            rest = rest[name_len..].trim_start();
+            // Balanced-paren argument, if present.
+            let mut args = String::new();
+            if let Some(stripped) = rest.strip_prefix('(') {
+                let b = stripped.as_bytes();
+                let mut depth = 1usize;
+                let mut end = None;
+                for (i, &c) in b.iter().enumerate() {
+                    match c {
+                        b'(' => depth += 1,
+                        b')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = Some(i);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                match end {
+                    Some(i) => {
+                        args = stripped[..i].to_string();
+                        rest = &stripped[i + 1..];
+                    }
+                    None => {
+                        return Err(EmbedSpecError::UnterminatedParam(name.to_string()));
+                    }
+                }
+            }
+            match name {
+                "limit" => match args.trim().parse::<usize>() {
+                    Ok(v) => params.limit = Some(v),
+                    Err(_) => return Err(EmbedSpecError::InvalidLimit(args.trim().to_string())),
+                },
+                "prefix" => params.prefix = Some(args),
+                "suffix" => params.suffix = Some(args),
+                "if_empty" => params.if_empty = Some(args),
+                "clang::offset" => match args.trim().parse::<usize>() {
+                    Ok(v) => params.offset = Some(v),
+                    Err(_) => return Err(EmbedSpecError::InvalidLimit(args.trim().to_string())),
+                },
+                _ => return Err(EmbedSpecError::UnknownParam(name.to_string())),
+            }
+        }
+    }
+
+    fn embed_diagnose_spec_error(&mut self, e: &EmbedSpecError, line_num: usize, col: usize) {
+        let message = match e {
+            EmbedSpecError::NoFilename => "expected \"FILENAME\" or <FILENAME>".to_string(),
+            EmbedSpecError::UnknownParam(n) => {
+                format!("unknown embed preprocessor parameter '{}'", n)
+            }
+            EmbedSpecError::UnterminatedParam(n) => {
+                format!("unterminated embed parameter '{}' argument", n)
+            }
+            EmbedSpecError::InvalidLimit(v) => format!("invalid embed limit '{}'", v),
+        };
+        self.errors.push(super::pipeline::PreprocessorDiagnostic {
+            file: self.current_file(),
+            line: line_num,
+            col,
+            message,
+        });
+    }
+
+    /// C23 `#embed`: expand to the comma-separated byte list (with
+    /// prefix/suffix/if_empty applied). Returns the replacement text, or
+    /// None after queueing a diagnostic.
+    pub(super) fn expand_embed(
+        &mut self,
+        rest: &str,
+        line_num: usize,
+        col: usize,
+    ) -> Option<String> {
+        let spec = match self.parse_embed_spec(rest) {
+            Ok(s) => s,
+            Err(e) => {
+                self.embed_diagnose_spec_error(&e, line_num, col);
+                return None;
+            }
+        };
+        let (filename, is_system, params) = spec;
+        if filename.is_empty() {
+            self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                file: self.current_file(),
+                line: line_num,
+                col,
+                message: "empty filename".to_string(),
+            });
+            return None;
+        }
+        let resolved = self.resolve_and_record_include_path(&filename, is_system);
+        let Some(resolved) = resolved else {
+            self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                file: self.current_file(),
+                line: line_num,
+                col,
+                message: format!("'{}' file not found", filename),
+            });
+            return None;
+        };
+        let bytes = match std::fs::read(&resolved) {
+            Ok(b) => b,
+            Err(_) => {
+                self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                    file: self.current_file(),
+                    line: line_num,
+                    col,
+                    message: format!("'{}' file not found", filename),
+                });
+                return None;
+            }
+        };
+        // clang::offset(N) skips the first N bytes; limit bounds the count
+        // of what remains.
+        let skip = params.offset.unwrap_or(0).min(bytes.len());
+        let remaining = &bytes[skip..];
+        let take = match params.limit {
+            Some(n) if n < remaining.len() => n,
+            _ => remaining.len(),
+        };
+        if take == 0 {
+            // Empty resource (or limit(0)): the if_empty token sequence,
+            // which may itself be empty.
+            return Some(params.if_empty.unwrap_or_default());
+        }
+        let mut out = String::new();
+        if let Some(p) = &params.prefix {
+            out.push_str(p);
+        }
+        let mut first = true;
+        for &b in &remaining[..take] {
+            if !first {
+                out.push_str(", ");
+            }
+            first = false;
+            out.push_str(&b.to_string());
+        }
+        if let Some(s) = &params.suffix {
+            out.push_str(s);
+        }
+        Some(out)
+    }
+
+    /// C23 `__has_embed`: probe without emitting tokens. Unsupported
+    /// parameters yield NOT_FOUND silently (feature detection); genuine
+    /// syntax errors diagnose and also yield NOT_FOUND.
+    pub(super) fn probe_embed(&mut self, rest: &str) -> EmbedResult {
+        let spec = match self.parse_embed_spec(rest) {
+            Ok(s) => s,
+            Err(EmbedSpecError::UnknownParam(_)) => return EmbedResult::NotFound,
+            Err(e) => {
+                self.embed_diagnose_spec_error(&e, 0, 0);
+                return EmbedResult::NotFound;
+            }
+        };
+        let (filename, is_system, params) = spec;
+        if filename.is_empty() {
+            self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                file: self.current_file(),
+                line: 0,
+                col: 0,
+                message: "empty filename".to_string(),
+            });
+            return EmbedResult::NotFound;
+        }
+        let Some(resolved) = self.resolve_include_path(&filename, is_system) else {
+            return EmbedResult::NotFound;
+        };
+        if params.limit == Some(0) {
+            return EmbedResult::Empty;
+        }
+        match std::fs::metadata(&resolved) {
+            Ok(md) if md.len() <= params.offset.unwrap_or(0) as u64 => EmbedResult::Empty,
+            Ok(_) => EmbedResult::Found,
+            Err(_) => EmbedResult::NotFound,
         }
     }
 

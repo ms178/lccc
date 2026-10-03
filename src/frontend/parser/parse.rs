@@ -506,6 +506,12 @@ pub struct Parser {
     pub(super) func_decl_no_instrument: FxHashSet<String>,
     /// Count of parse errors encountered (invalid tokens at top level, etc.)
     pub error_count: usize,
+    /// Number of currently-live expression-parse frames (E5 hardening).
+    /// Bounded by `EXPR_FRAME_BUDGET`; see `enter_expr_frame`.
+    pub(super) expr_frame_depth: u32,
+    /// Set once the frame-budget diagnostic has been emitted, so a single
+    /// pathological nesting level produces exactly one error, not a flood.
+    pub(super) expr_frame_diagnosed: bool,
     /// Structured diagnostic engine for error/warning reporting with source snippets.
     pub(super) diagnostics: DiagnosticEngine,
     /// Map of enum constant names to their integer values.
@@ -539,6 +545,8 @@ impl Parser {
             pragma_default_visibility: None,
             func_decl_no_instrument: FxHashSet::default(),
             error_count: 0,
+            expr_frame_depth: 0,
+            expr_frame_diagnosed: false,
             diagnostics: DiagnosticEngine::new(),
             enum_constants: FxHashMap::default(),
             unevaluable_enum_constants: FxHashSet::default(),
@@ -563,6 +571,50 @@ impl Parser {
     pub(super) fn emit_error(&mut self, message: impl Into<String>, span: Span) {
         self.error_count += 1;
         self.diagnostics.error(message, span);
+    }
+
+    /// Register one entry into the recursive expression-parse chain.
+    ///
+    /// WHY: every nesting level of a parenthesised expression re-enters the
+    /// full precedence climb (`parse_expr` -> assignment -> conditional ->
+    /// 10x binary/next-tighter -> cast -> unary -> postfix -> primary), and
+    /// each of those frames carries `Expr`-sized by-value temporaries plus
+    /// the big locals of `parse_primary_expr`/`parse_cast_expr`. Measured on
+    /// the -O1 fastbuild, ~4800 nested-parenthesis levels overflow even the
+    /// 64 MB compiler thread stack (a raw abort, rc=134; GCC 14 segfaults
+    /// its cc1 on the same input). Left-associative chains do NOT recurse
+    /// (they loop), so this bound bites only on genuinely deep nesting.
+    ///
+    /// The bound is on live parser frames, not source-nesting depth: real
+    /// translation units (kernel, glibc, zlib-ng, expat, csmith output) stay
+    /// orders of magnitude under it, while the adversarial class in
+    /// `artifacts/repros/crash_synth_*` and beyond now degrades to a clean,
+    /// GCC-compatible error instead of an abort.
+    pub(super) const EXPR_FRAME_BUDGET: u32 = 32_768;
+
+    pub(super) fn enter_expr_frame(&mut self, span: Span) -> bool {
+        if self.expr_frame_depth >= Self::EXPR_FRAME_BUDGET {
+            if !self.expr_frame_diagnosed {
+                self.expr_frame_diagnosed = true;
+                self.error_count += 1;
+                self.diagnostics.error(
+                    format!(
+                        "expression nesting too deep (exceeds {} parser frames)",
+                        Self::EXPR_FRAME_BUDGET
+                    ),
+                    span,
+                );
+            }
+            return false;
+        }
+        self.expr_frame_depth += 1;
+        true
+    }
+
+    #[inline]
+    pub(super) fn exit_expr_frame(&mut self) {
+        debug_assert!(self.expr_frame_depth > 0);
+        self.expr_frame_depth = self.expr_frame_depth.saturating_sub(1);
     }
 
     /// Panic-mode recovery: skip until a synchronization point.
@@ -725,6 +777,12 @@ impl Parser {
     pub fn parse(&mut self) -> TranslationUnit {
         let mut decls = Vec::with_capacity(16);
         while !self.at_eof() {
+            // The expression frame-budget error is fatal for the TU; stop
+            // parsing instead of cascading thousands of recovery errors over
+            // the (now meaningless) token remainder.
+            if self.expr_frame_diagnosed {
+                break;
+            }
             if let Some(decl) = self.parse_external_decl() {
                 decls.push(decl);
             } else {
@@ -841,6 +899,11 @@ impl Parser {
             self.advance();
             span
         } else {
+            // The frame-budget diagnostic is fatal for the TU; do not cascade
+            // thousands of "expected ')'" errors while the stub unwinds.
+            if self.expr_frame_diagnosed {
+                return self.peek_span();
+            }
             let span = self.peek_span();
             let open_tok = match expected {
                 TokenKind::RParen => "'('",
@@ -874,6 +937,10 @@ impl Parser {
             self.advance();
             span
         } else {
+            // See expect_closing: one fatal budget error, no cascade.
+            if self.expr_frame_diagnosed {
+                return self.peek_span();
+            }
             let span = self.peek_span();
             let diag = crate::common::error::Diagnostic::error(format!(
                 "expected {} {} before {}",

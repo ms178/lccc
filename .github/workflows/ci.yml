@@ -758,6 +758,10 @@ jobs:
           python3 scripts/edg_changes_mine.py verify-artifacts
           python3 -m unittest discover -s tests/corpus -p 'test_*.py'
           bash tests/regression/check_frontend_diagnostic_recovery.sh
+          # E5 (EDG register): deep-nesting crash class -> clean bounded
+          # error; deep-but-legal inputs keep compiling; in-budget nesting
+          # evaluates correctly end to end.
+          python3 scripts/check_deep_nesting_robustness.py
           python3 scripts/test_differential_corpus_paths.py
           bash tests/regression/check_loop_memset.sh
           bash tests/regression/check_bool_pair_tail_jmp.sh

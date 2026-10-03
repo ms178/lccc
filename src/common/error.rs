@@ -461,6 +461,19 @@ pub struct DiagnosticEngine {
     /// Used to avoid repeating the same chain for consecutive errors in the
     /// same included file (matching GCC behavior).
     last_include_trace_file: Option<String>,
+    /// Set once the rendered-error limit note has been emitted (see
+    /// `render_error`); the count keeps growing afterwards, rendering stops.
+    error_limit_noted: bool,
+}
+
+impl DiagnosticEngine {
+    /// Clang-style cap on rendered errors per engine. One malformed input can
+    /// trigger tens of thousands of cascading recovery errors; rendering every
+    /// one of them (each with source snippets) blows up output and memory and
+    /// buries the root cause. Errors keep COUNTING past the cap, so the
+    /// translation unit is rejected exactly as before — only the printing
+    /// stops (with a single "too many errors" note).
+    pub const MAX_RENDERED_ERRORS: usize = 200;
 }
 
 impl DiagnosticEngine {
@@ -474,7 +487,23 @@ impl DiagnosticEngine {
             source_manager: None,
             use_color: ColorMode::Auto.use_color(),
             last_include_trace_file: None,
+            error_limit_noted: false,
         }
+    }
+
+    /// Render an error-severity diagnostic subject to `MAX_RENDERED_ERRORS`.
+    fn render_error(&mut self, diag: &Diagnostic) {
+        if self.error_count < Self::MAX_RENDERED_ERRORS {
+            self.render_diagnostic(diag);
+        } else if !self.error_limit_noted {
+            self.error_limit_noted = true;
+            let note = Diagnostic::error(format!(
+                "too many errors emitted; stopping diagnostic emission (limit {})",
+                Self::MAX_RENDERED_ERRORS
+            ));
+            self.render_diagnostic(&note);
+        }
+        self.error_count += 1;
     }
 
     /// Set the warning configuration (parsed from CLI flags).
@@ -526,8 +555,7 @@ impl DiagnosticEngine {
                             fix_hint: diag.fix_hint.clone(),
                             explicit_location: diag.explicit_location.clone(),
                         };
-                        self.render_diagnostic(&promoted);
-                        self.error_count += 1;
+                        self.render_error(&promoted);
                         return;
                     }
 
@@ -555,8 +583,7 @@ impl DiagnosticEngine {
                             fix_hint: diag.fix_hint.clone(),
                             explicit_location: diag.explicit_location.clone(),
                         };
-                        self.render_diagnostic(&promoted);
-                        self.error_count += 1;
+                        self.render_error(&promoted);
                     } else {
                         self.render_diagnostic(diag);
                         self.warning_count += 1;
@@ -564,8 +591,7 @@ impl DiagnosticEngine {
                 }
             }
             Severity::Error => {
-                self.render_diagnostic(diag);
-                self.error_count += 1;
+                self.render_error(diag);
             }
             Severity::Note => {
                 self.render_diagnostic(diag);
@@ -871,13 +897,44 @@ impl DiagnosticEngine {
         let loc = sm.resolve_span(span);
         let col = loc.column as usize;
 
+        // Window overly long lines around the caret (generated/minified code
+        // can put 10k+ characters on one line; dumping it buries the caret
+        // and floods logs — the frame-budget reproducers hit exactly this).
+        const SNIPPET_WINDOW: usize = 160;
+        let n_chars = source_line.chars().count();
+        let (shown, caret_pad, truncated_left): (String, usize, bool) = if n_chars <= SNIPPET_WINDOW
+        {
+            (source_line.clone(), col, false)
+        } else {
+            let half = SNIPPET_WINDOW / 2;
+            let start = col
+                .saturating_sub(half)
+                .min(n_chars.saturating_sub(SNIPPET_WINDOW));
+            let end = (start + SNIPPET_WINDOW).min(n_chars);
+            let window: String = source_line.chars().skip(start).take(end - start).collect();
+            // Caret alignment: 1 leading space + 3 for the "..." prefix +
+            // 0-based offset of the caret inside the window (columns are
+            // 1-based, hence col-1).
+            let pad = col.saturating_sub(start) + if start > 0 { 3 } else { 0 };
+            let shown = format!(
+                "{}{}{}",
+                if start > 0 { "..." } else { "" },
+                window,
+                if end < n_chars { "..." } else { "" }
+            );
+            (shown, pad, start > 0)
+        };
+        let _ = truncated_left;
+
         // Print the source line with indentation
-        eprintln!(" {}", source_line);
+        eprintln!(" {}", shown);
 
         // Build the caret line: spaces up to the column, then ^ with tildes
-        if col > 0 {
-            let padding = " ".repeat(col);
+        if caret_pad > 0 {
+            let padding = " ".repeat(caret_pad);
             let span_len = (span.end.saturating_sub(span.start)) as usize;
+            // Never draw the squiggle past the rendered window.
+            let span_len = span_len.min(shown.len().saturating_sub(caret_pad));
             let underline = if span_len > 1 {
                 format!("^{}", "~".repeat(span_len - 1))
             } else {
