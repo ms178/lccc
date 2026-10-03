@@ -85,6 +85,26 @@ pub fn f64_to_f128_bytes(val: f64) -> [u8; 16] {
         }
     }
 
+    // Subnormal f64 (exp11 == 0 with a non-zero mantissa) has NO implicit
+    // integer bit, so it cannot fall into the normal path below: that path
+    // would re-bias the exponent as if the value were ~2^-1023 and fabricate
+    // a leading 1, mis-scoping the result by up to 2^52. Handle it first.
+    //
+    // `common::long_double::f64_normalize_significand` is the single, tested
+    // implementation of that renormalization; it returns the 53-bit
+    // significand with its leading bit at position 52 plus the matching
+    // unbiased exponent, so the layout arithmetic below is unchanged.
+    if exp11 == 0 {
+        let (neg, significand53, e) = crate::common::long_double::f64_normalize_significand(val);
+        let exp15 = (e + 16383) as u16;
+        // `significand53` has its leading bit at position 52, so `<< 60` puts
+        // it at 112 — which is the *lowest exponent bit*, not a mantissa bit.
+        // Mask it off: bit 112 is the f128 integer bit and is not stored.
+        let mantissa112: u128 = ((significand53 as u128) << 60) & ((1u128 << 112) - 1);
+        let sign_bit: u128 = if neg { 1u128 << 127 } else { 0 };
+        return (sign_bit | ((exp15 as u128) << 112) | mantissa112).to_le_bytes();
+    }
+
     // Normal number
     // f64 exponent bias is 1023, f128 exponent bias is 16383
     let exp15 = (exp11 - 1023 + 16383) as u16;
@@ -138,6 +158,22 @@ pub fn f64_to_x87_bytes(val: f64) -> [u8; 10] {
             bytes[9] = 0x7F | ((sign as u8) << 7);
             return bytes;
         }
+    }
+
+    // Subnormal f64 (exp11 == 0 with a non-zero mantissa) has NO implicit
+    // integer bit. The normal path below would fabricate one (`1 << 63`) and
+    // re-bias the exponent as if the value were ~2^-1023 instead of ~2^-1074,
+    // mis-scoping the result by up to 2^52. Handle it first via the shared,
+    // tested renormalization helper.
+    if exp11 == 0 {
+        let (neg, significand53, e) = crate::common::long_double::f64_normalize_significand(val);
+        let exp15 = (e + 16383) as u16;
+        let mantissa64 = significand53 << 11; // 63 - 52 = 11
+        let mut bytes = [0u8; 10];
+        bytes[..8].copy_from_slice(&mantissa64.to_le_bytes());
+        bytes[8] = (exp15 & 0xFF) as u8;
+        bytes[9] = ((exp15 >> 8) as u8) | ((neg as u8) << 7);
+        return bytes;
     }
 
     // Normal number

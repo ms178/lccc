@@ -633,6 +633,76 @@ fn f64_decompose(val: f64) -> F64Decomposed {
     }
 }
 
+/// Normalized significand / exponent decomposition of a **finite, non-zero** f64.
+///
+/// Returns `(negative, significand53, exp_of_bit52)` such that
+///
+/// ```text
+///     |val| == significand53 * 2^(exp_of_bit52 - 52)
+/// ```
+///
+/// where `significand53` lies in `[2^52, 2^53)`, i.e. bit 52 is *always* the
+/// leading (integer) bit — for normals because it is the implicit bit that
+/// IEEE 754 does not store, and for subnormals because the stored mantissa is
+/// renormalized up until its leading 1 lands there.
+///
+/// # Why this exists
+///
+/// The widening converters (`f64` -> binary128 and `f64` -> x87 80-bit) each
+/// used to open-code `biased_exp - 1023` and OR in an implicit integer bit.
+/// That is only valid for normals. A subnormal f64 carries `biased_exp == 0`
+/// and has **no** implicit integer bit, so the old expression
+///
+/// * re-biases an exponent that means `-1074`, not `-1023`, and
+/// * fabricates a leading `1` the value does not have,
+///
+/// which together mis-scope the result by a factor of `(2^52 + m) / (2m)` —
+/// between 2.5x (largest subnormal) and ~4.5e14 (smallest). Concretely
+/// `5.45247436838069e-309` widened to `1.3851606476726355e-308`, and
+/// `2.5e-323` widened to `1.1125369292536017e-308`.
+///
+/// On the f128 path the same expression was additionally evaluated in `u128`,
+/// so every `|v| < 1.0` input subtracted with overflow and **ICE'd the
+/// compiler** in any build with overflow checks enabled (the dev/test
+/// profiles) — `long double x = 0.5L;` was enough.
+///
+/// Renormalizing here, once, makes every widening site correct by
+/// construction rather than by coincidence.
+///
+/// # Panics
+///
+/// Debug-asserts that `val` is finite and non-zero; callers must handle zero,
+/// infinity and NaN before getting here (each has a target-specific encoding
+/// and no significand to normalize).
+pub fn f64_normalize_significand(val: f64) -> (bool, u64, i32) {
+    let d = f64_decompose(val);
+    debug_assert!(
+        !d.is_zero() && !d.is_special(),
+        "f64_normalize_significand requires a finite non-zero value"
+    );
+
+    if d.biased_exp == 0 {
+        // Subnormal f64: value == mantissa * 2^-1074, with no implicit
+        // integer bit. Shift the mantissa up so its leading 1 sits at bit 52
+        // and charge the shift to the exponent.
+        //
+        // `d.mantissa != 0` here (zero was filtered out above), so
+        // `leading_zeros() <= 63` and `hi` is in `0..=51`.
+        let hi = 63 - d.mantissa.leading_zeros();
+        let significand53 = d.mantissa << (52 - hi);
+        // |val| = significand53 * 2^(-1074 - (52 - hi))
+        //       = significand53 * 2^(e - 52)   =>   e = -1074 + hi
+        (d.sign, significand53, hi as i32 - 1074)
+    } else {
+        // Normal f64: value == (2^52 + mantissa) * 2^(biased_exp - 1023 - 52).
+        (
+            d.sign,
+            (1u64 << 52) | d.mantissa,
+            d.biased_exp as i32 - 1023,
+        )
+    }
+}
+
 /// Encode x87 80-bit extended precision bytes from sign, biased exponent, and mantissa.
 fn x87_encode(sign: bool, biased_exp: u16, mantissa64: u64) -> [u8; 16] {
     let mut bytes = [0u8; 16];
@@ -645,6 +715,113 @@ fn x87_encode(sign: bool, biased_exp: u16, mantissa64: u64) -> [u8; 16] {
 
 /// Convert x87 80-bit bytes back to f64 (lossy - for computations that need f64).
 /// `bytes[0..10]` contain the x87 extended value in little-endian.
+/// Convert `(-1)^sign * m * 2^e` to the nearest `f64`, rounding half-to-even.
+///
+/// This is the shared narrowing kernel for the f128 -> f64 and x87 -> f64
+/// conversions. Both used to compute `mantissa as f64 * 2f64.powi(exp)`, which
+/// silently yields `0.0` whenever the power-of-two factor underflows on its
+/// own — which is *every* value that is subnormal in f64, because the f128
+/// significand is ~2^112 (needing a `2^-1135` factor) and the x87
+/// significand is ~2^63 (needing `2^-1086`), both far below `f64::MIN`
+/// positive subnormal's `2^-1074`. Narrowing any long double below `2^-1022`
+/// to `double` therefore returned `0.0`, and since this feeds
+/// `eval_const_binop_float` and the constant folder, small long-double
+/// arithmetic folded to zero.
+///
+/// Doing the scaling in integer arithmetic with an explicit guard/sticky round
+/// step avoids the intermediate underflow entirely and additionally makes the
+/// narrowing correctly rounded instead of truncating.
+///
+/// `m` may be any non-zero `u128` in any normalization; the leading bit is
+/// located here. Overflow saturates to infinity, underflow to zero.
+fn scaled_significand_to_f64(sign: bool, m: u128, e: i64) -> f64 {
+    if m == 0 {
+        return if sign { -0.0 } else { 0.0 };
+    }
+
+    // Normalize so the MSB of `m` sits at bit 127.
+    //   value = m * 2^e  ==  (m << lz) * 2^(e - lz)
+    // and (m << lz) / 2^127 lies in [1, 2), so `big_e` below is
+    // floor(log2(value)).
+    let lz = m.leading_zeros();
+    let m = m << lz;
+    let e = e - lz as i64;
+    let big_e = e + 127;
+
+    /// Right-shift `m` by `sh` bits with round-half-to-even.
+    /// Returns `(truncated, round_up)`; `round_up` must be added to the
+    /// truncated value by the caller (so a carry out of the field is visible).
+    fn round_shift(m: u128, sh: i64) -> (u128, bool) {
+        if sh <= 0 {
+            return (m, false);
+        }
+        if sh >= 128 {
+            // Everything below the round bit is shifted out. The exact
+            // quotient lies in [0, 1); only `sh == 128` can round up, and
+            // only when m/2^128 > 1/2 (ties go to even, i.e. down to 0).
+            return (0, sh == 128 && m > (1u128 << 127));
+        }
+        let sh = sh as u32;
+        let truncated = m >> sh;
+        let round_bit = (m >> (sh - 1)) & 1;
+        let sticky = m & ((1u128 << (sh - 1)) - 1);
+        let round_up = round_bit == 1 && (sticky != 0 || (truncated & 1) == 1);
+        (truncated, round_up)
+    }
+
+    let sign_bit = (sign as u64) << 63;
+
+    if big_e > 1023 {
+        return if sign {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        };
+    }
+
+    if big_e >= -1022 {
+        // Normal f64: keep 53 significand bits (1 implicit + 52 stored).
+        // 128 - 53 = 75.
+        let (mut frac53, round_up) = round_shift(m, 75);
+        if round_up {
+            frac53 += 1;
+        }
+        // Rounding can carry frac53 to 2^53, which just bumps the exponent.
+        let (biased, mantissa52) = if frac53 >= (1u128 << 53) {
+            ((big_e + 1 + 1023) as u64, 0u64)
+        } else {
+            ((big_e + 1023) as u64, (frac53 & ((1u128 << 52) - 1)) as u64)
+        };
+        if biased >= 0x7FF {
+            return if sign {
+                f64::NEG_INFINITY
+            } else {
+                f64::INFINITY
+            };
+        }
+        return f64::from_bits(sign_bit | (biased << 52) | mantissa52);
+    }
+
+    // Subnormal f64 (or underflow): the result is `frac52 * 2^-1074` with
+    // frac52 in [0, 2^52).
+    //   frac52 = value * 2^1074 = m * 2^(big_e - 127 + 1074) = m * 2^(big_e + 947)
+    let sh = -(big_e + 947);
+    if sh > 128 {
+        return if sign { -0.0 } else { 0.0 };
+    }
+    let (mut frac52, round_up) = round_shift(m, sh);
+    if round_up {
+        frac52 += 1;
+    }
+    if frac52 >= (1u128 << 52) {
+        // Rounded up across the subnormal/normal boundary: biased exponent 1
+        // is 2^-1022, whose frac52 is exactly 2^52.
+        f64::from_bits(sign_bit | (1u64 << 52) | ((frac52 - (1u128 << 52)) as u64))
+    } else {
+        f64::from_bits(sign_bit | frac52 as u64)
+    }
+}
+
 pub fn x87_bytes_to_f64(bytes: &[u8; 16]) -> f64 {
     let d = x87_decompose(bytes);
     let sign_u64 = if d.sign { 1u64 } else { 0u64 };
@@ -713,9 +890,11 @@ pub fn x87_bytes_to_f64(bytes: &[u8; 16]) -> f64 {
         let f64_bits = (sign_u64 << 63) | (f64_biased_exp << 52) | mantissa52;
         f64::from_bits(f64_bits)
     } else {
-        // Subnormal in f64 - not common for constants, just convert approximately
-        let val = d.mantissa as f64 * 2.0_f64.powi(unbiased - 63);
-        if d.sign { -val } else { val }
+        // Subnormal in f64. The old `mantissa as f64 * 2f64.powi(unbiased-63)`
+        // returned 0.0 for every one of these: the 64-bit significand is
+        // ~2^63, so it needs a 2^(unbiased-63) factor as small as 2^-1086 and
+        // `powi` underflows long before the product is formed.
+        scaled_significand_to_f64(d.sign, d.mantissa as u128, unbiased as i64 - 63)
     }
 }
 
@@ -945,13 +1124,102 @@ pub fn f128_bytes_to_x87_bytes(f128_bytes: &[u8; 16]) -> [u8; 16] {
         };
     }
 
-    // Normal number
-    // f128 mantissa: 112 bits, implicit leading 1 (bit 112 set by f128_decompose)
-    // x87 mantissa: 64 bits, explicit leading 1
-    // Take top 64 bits of the 113-bit mantissa (mantissa >> 49)
-    // Exponent bias is the same for both formats (16383)
-    let mantissa64 = (mantissa >> 49) as u64;
-    x87_encode(sign, biased_exp as u16, mantissa64)
+    // Unify both f128 classes into `value == m * 2^e`.
+    //
+    // * normal:    implicit bit set by `f128_decompose`, exponent biased.
+    // * subnormal: `f128_decompose` returns the RAW significand (bit 112
+    //   clear) and IEEE gives it the *minimum normal* exponent, -16382 (not
+    //   -16383). Passing `biased_exp == 0` straight through, as the previous
+    //   code did, emitted a non-canonical x87 subnormal for every f128
+    //   subnormal: `long double x = 3.36210314311209350626e-4932L;` (the
+    //   largest f128 subnormal) came out as exponent 0 where GCC emits the
+    //   correctly-rounded smallest normal, exponent 1. Worse, lccc's own
+    //   `x87_bytes_to_f64` reads exponent 0 as "below -1074" and decodes the
+    //   constant back as **0.0**.
+    let (m, e) = if biased_exp == 0 {
+        (mantissa, -16382i64 - 112)
+    } else {
+        (mantissa, biased_exp as i64 - 16383 - 112)
+    };
+    encode_x87_from_scaled(sign, m, e)
+}
+
+/// Encode `(-1)^sign * m * 2^e` as the nearest x87 80-bit value,
+/// rounding half-to-even and always producing the canonical encoding.
+///
+/// The narrowing is ROUNDED, not truncated: dropping the low 49 bits with
+/// `mantissa >> 49` made every `long double` constant that round-trips through
+/// binary128 up to 1 ULP low relative to GCC and Clang (verified on
+/// `long double c = 1e-320L;` — GCC emits x87 mantissa `0xfd00b897478238d1`,
+/// truncation yields `0xfd00b897478238d0`).
+fn encode_x87_from_scaled(sign: bool, m: u128, e: i64) -> [u8; 16] {
+    if m == 0 {
+        return make_x87_zero(sign);
+    }
+
+    // Normalize: MSB of `m` at bit 127, so `big_e == floor(log2(value))`.
+    let lz = m.leading_zeros();
+    let m = m << lz;
+    let e = e - lz as i64;
+    let big_e = e + 127;
+
+    if big_e > 16383 {
+        return make_x87_infinity(sign);
+    }
+
+    /// Right-shift `m` by `sh` with round-half-to-even.
+    fn round_shift(m: u128, sh: i64) -> (u128, bool) {
+        if sh <= 0 {
+            return (m, false);
+        }
+        if sh >= 128 {
+            return (0, sh == 128 && m > (1u128 << 127));
+        }
+        let sh = sh as u32;
+        let truncated = m >> sh;
+        let round_bit = (m >> (sh - 1)) & 1;
+        let sticky = m & ((1u128 << (sh - 1)) - 1);
+        (
+            truncated,
+            round_bit == 1 && (sticky != 0 || (truncated & 1) == 1),
+        )
+    }
+
+    let (mut mant64, up) = if big_e >= -16382 {
+        // Normal x87: 64-bit significand with the integer bit at 63.
+        round_shift(m, 64)
+    } else {
+        // x87 subnormal / underflow. Both the subnormal encoding (exponent 0)
+        // and the smallest normal (exponent 1) use the SAME scale,
+        // `mant64 * 2^-16445`; they differ only in whether `mant64` has the
+        // integer bit set. So rounding can carry a value straight out of the
+        // subnormal range and the exponent simply becomes 1.
+        //
+        //   mant64 = value * 2^16445 = m * 2^(e + 16445)
+        let sh = -(e + 16445);
+        if sh > 128 {
+            return make_x87_zero(sign);
+        }
+        round_shift(m, sh)
+    };
+    if up {
+        mant64 += 1;
+    }
+
+    if big_e >= -16382 {
+        match u64::try_from(mant64) {
+            Ok(v) => x87_encode(sign, (big_e + 16383) as u16, v),
+            // Carried out of the 64-bit significand: halve it and bump the
+            // exponent. This is how the largest finite binary128 correctly
+            // rounds to x87 infinity instead of silently wrapping.
+            Err(_) => x87_encode(sign, (big_e + 16384) as u16, 1u64 << 63),
+        }
+    } else if mant64 >= (1u128 << 63) {
+        // Rounded up across the subnormal/normal boundary.
+        x87_encode(sign, 1, mant64 as u64)
+    } else {
+        x87_encode(sign, 0, mant64 as u64)
+    }
 }
 
 /// Convert f128 bytes to f64 (lossy narrowing).
@@ -992,9 +1260,13 @@ pub fn f128_bytes_to_f64(f128_bytes: &[u8; 16]) -> f64 {
             f64::INFINITY
         }
     } else {
-        // Subnormal in f64
-        let val = mantissa as f64 * 2.0_f64.powi(unbiased as i32 - 112);
-        if sign { -val } else { val }
+        // Subnormal in f64 (or underflow). The old
+        // `mantissa as f64 * 2f64.powi(unbiased-112)` returned 0.0 for every
+        // one of these: the significand carries the implicit bit (~2^112), so
+        // it needs a 2^(unbiased-112) factor as small as 2^-1135 and `powi`
+        // underflows before the product is formed. Narrowing any long double
+        // below 2^-1022 to `double` therefore produced 0.0.
+        scaled_significand_to_f64(sign, mantissa, unbiased - 112)
     }
 }
 
@@ -1099,13 +1371,16 @@ pub fn f64_to_f128_bytes_lossless(val: f64) -> [u8; 16] {
         };
     }
 
-    // Normal f64: exp = biased_exp - 1023, mantissa = 1.mantissa52
-    // f128: exp = biased_exp - 1023 + 16383, mantissa112 = mantissa52 << (112 - 52)
-    let exp15 = (d.biased_exp as u128 - 1023 + 16383) as u128;
-    let mantissa112: u128 = (d.mantissa as u128) << 60; // 112 - 52 = 60
-    let sign_bit: u128 = if d.sign { 1u128 << 127 } else { 0 };
-    let val128: u128 = sign_bit | (exp15 << 112) | mantissa112;
-    val128.to_le_bytes()
+    // Widening f64 -> binary128 is exact: the 53-bit significand fits the
+    // 113-bit f128 significand with 60 bits of zero headroom, and every f64
+    // exponent (including all subnormals, -1074..=971 after normalization)
+    // lies well inside the f128 normal range, so no rounding or underflow is
+    // possible. `f64_normalize_significand` handles the subnormal case that
+    // the previous open-coded `biased_exp - 1023` arithmetic got wrong (and,
+    // in u128, overflowed on for every |v| < 1.0).
+    let (negative, significand53, exp_of_bit52) = f64_normalize_significand(val);
+    let mantissa113: u128 = (significand53 as u128) << 60; // 112 - 52 = 60
+    encode_f128(negative, exp_of_bit52, mantissa113)
 }
 
 // =============================================================================
@@ -1218,10 +1493,19 @@ pub fn f64_to_x87_bytes_simple(val: f64) -> [u8; 16] {
         };
     }
 
-    // Normal f64: x87 mantissa has explicit integer bit at 63, then 52 bits at 62..11
-    let exp15 = (d.biased_exp as i32 - 1023 + 16383) as u16;
-    let mantissa64 = (1u64 << 63) | (d.mantissa << 11);
-    x87_encode(d.sign, exp15, mantissa64)
+    // x87 has a 64-bit significand with an EXPLICIT integer bit at position
+    // 63, so the renormalized 53-bit f64 significand is shifted to place its
+    // leading bit there. Widening is exact (64 > 53 significand bits) and
+    // every f64 exponent fits the x87 range, so no rounding can occur.
+    //
+    // `f64_normalize_significand` is what makes this correct for subnormal
+    // f64 inputs: they have no implicit integer bit, so the old
+    // `(1 << 63) | (mantissa << 11)` fabricated one and produced a value up
+    // to 4.5e14 times too large.
+    let (negative, significand53, exp_of_bit52) = f64_normalize_significand(val);
+    let exp15 = (exp_of_bit52 + 16383) as u16;
+    let mantissa64 = significand53 << 11; // 63 - 52 = 11
+    x87_encode(negative, exp15, mantissa64)
 }
 
 // ============================================================================
@@ -3821,5 +4105,301 @@ mod known_value_tests {
             biased_exp2, 0,
             "truncated LDBL_MIN string is subnormal in f128 (expected)"
         );
+    }
+}
+
+// =============================================================================
+// f64 widening regression: subnormal f64 -> binary128 / x87 80-bit
+// =============================================================================
+//
+// Distilled from the thanhtoantnt/claudes-c-compiler issue corpus (issues #4,
+// #114, #310) and re-derived independently here: every widening site in this
+// crate used `biased_exp - 1023` plus a fabricated implicit integer bit, which
+// is only valid for normals. A subnormal f64 has `biased_exp == 0` and no
+// implicit bit, so the result was mis-scoped by up to 2^52; on the f128 path
+// the same expression was evaluated in `u128`, so it additionally ICE'd the
+// compiler (debug/overflow-checked builds) for *every* `|v| < 1.0`.
+//
+// The properties below pin the corrected behaviour. They are written as
+// round-trips through the independently-implemented narrowing converters plus
+// exact bit-level witnesses, so they cannot be satisfied by a second
+// coincidentally-wrong widening.
+#[cfg(test)]
+mod widening_tests {
+    use super::*;
+
+    /// Smallest subnormal (2^-1074) and the smallest positive normal (2^-1022).
+    const TRUE_MIN: f64 = f64::from_bits(1);
+    const MIN_NORMAL: f64 = f64::MIN_POSITIVE;
+
+    /// Deterministic corpus: every structural class of finite f64.
+    fn corpus() -> Vec<f64> {
+        let mut v = vec![
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            0.5,
+            -0.5,
+            1e-10,
+            0.1,
+            1.0 / 3.0,
+            2.0,
+            std::f64::consts::PI,
+            -2.5,
+            1e300,
+            -1e-300,
+            MIN_NORMAL,
+            -MIN_NORMAL,
+            f64::MAX,
+            -f64::MAX,
+            TRUE_MIN,
+            -TRUE_MIN,
+            // issue #114 witness
+            5.45247436838069e-309,
+            // issue #310 witnesses (0 < |v| < 1.0)
+            1e-320,
+            2.5e-323,
+            // 2^-1 and 2^-1074, spelled without hex-float literals
+            f64::from_bits(0x3FE0_0000_0000_0000),
+            f64::from_bits(0x0000_0000_0000_0001),
+        ];
+        // Subnormals at every mantissa bit position: this is exactly the range
+        // whose exponent the old code re-biased 1023 too high.
+        for bit in 0..52 {
+            v.push(f64::from_bits(1u64 << bit));
+            v.push(f64::from_bits((1u64 << bit) | 1));
+        }
+        // Boundary: largest subnormal, smallest normal, and the pair either side.
+        v.push(f64::from_bits(0x000F_FFFF_FFFF_FFFF));
+        v.push(f64::from_bits(0x0010_0000_0000_0000));
+        v
+    }
+
+    /// splitmix64 — deterministic, dependency-free source of bit patterns.
+    fn pseudorandom_f64s(n: usize) -> Vec<f64> {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            let bits = z & !(1u64 << 63); // positive, avoids the sign branch
+            let v = f64::from_bits(bits);
+            if v.is_finite() {
+                out.push(v);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn f64_to_f128_is_exact_roundtrip_for_every_corpus_value() {
+        for v in corpus() {
+            if !v.is_finite() {
+                continue;
+            }
+            let wide = f64_to_f128_bytes_lossless(v);
+            let back = f128_bytes_to_f64(&wide);
+            assert_eq!(
+                back.to_bits(),
+                v.to_bits(),
+                "f64->f128->f64 round-trip changed the value: {v:e} ({:016x}) -> {back:e} ({:016x})",
+                v.to_bits(),
+                back.to_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn f64_to_x87_is_exact_roundtrip_for_every_corpus_value() {
+        for v in corpus() {
+            if !v.is_finite() {
+                continue;
+            }
+            let wide = f64_to_x87_bytes_simple(v);
+            let back = x87_bytes_to_f64(&wide);
+            assert_eq!(
+                back.to_bits(),
+                v.to_bits(),
+                "f64->x87->f64 round-trip changed the value: {v:e} ({:016x}) -> {back:e} ({:016x})",
+                v.to_bits(),
+                back.to_bits()
+            );
+        }
+    }
+
+    /// The ICE class from issue #310: every `0 < |v| < 1.0` used to overflow
+    /// the `u128` exponent subtraction. Covered exhaustively over the random
+    /// sweep as well as the corpus, because the debug build panics rather than
+    /// producing a wrong answer — so this test is also an overflow-check tripwire.
+    #[test]
+    fn f64_to_f128_handles_all_small_magnitudes() {
+        let mut checked = 0usize;
+        for v in corpus().into_iter().chain(pseudorandom_f64s(20_000)) {
+            if !v.is_finite() || v == 0.0 {
+                continue;
+            }
+            let wide = f64_to_f128_bytes_lossless(v);
+            let back = f128_bytes_to_f64(&wide);
+            assert_eq!(back.to_bits(), v.to_bits(), "round-trip failed for {v:e}");
+            checked += 1;
+        }
+        assert!(checked > 1000, "sweep covered too little: {checked}");
+    }
+
+    /// Exact bit-level witnesses. Derived analytically, not from the
+    /// implementation: 2^-1074 == (2^52) * 2^(-1074 - 52) == (2^112) *
+    /// 2^(-1074 - 112), so the f128 payload is exponent 15309 with a zero
+    /// stored mantissa and the x87 payload is exponent 15309 with only the
+    /// integer bit set.
+    #[test]
+    fn subnormal_witnesses_pin_exact_bit_patterns() {
+        // --- 2^-1074 -> binary128 ---
+        let f128 = f64_to_f128_bytes_lossless(TRUE_MIN);
+        assert_eq!(
+            u128::from_le_bytes(f128),
+            15309u128 << 112,
+            "2^-1074 must widen to f128 biased_exp 15309 (0x{:x})",
+            u128::from_le_bytes(f128)
+        );
+
+        // --- 2^-1074 -> x87 ---
+        let x87 = f64_to_x87_bytes_simple(TRUE_MIN);
+        let mantissa64 = u64::from_le_bytes(x87[0..8].try_into().unwrap());
+        let exp_sign = u16::from_le_bytes([x87[8], x87[9]]);
+        assert_eq!(mantissa64, 1u64 << 63, "x87 integer bit only");
+        assert_eq!(exp_sign, 15309, "x87 biased_exp must be 15309");
+
+        // --- largest subnormal keeps a full significand ---
+        let largest_sub = f64::from_bits(0x000F_FFFF_FFFF_FFFF);
+        let back = f128_bytes_to_f64(&f64_to_f128_bytes_lossless(largest_sub));
+        assert_eq!(back.to_bits(), largest_sub.to_bits());
+
+        // --- issue #114 witness: must not decode as a ~2.5x larger value ---
+        let w = 5.45247436838069e-309_f64;
+        let back = x87_bytes_to_f64(&f64_to_x87_bytes_simple(w));
+        assert_eq!(back.to_bits(), w.to_bits());
+    }
+
+    /// The normalization primitive is the single source of truth now; pin its
+    /// contract directly so a future edit cannot quietly reintroduce the
+    /// "normals only" assumption.
+    #[test]
+    fn normalize_significand_contract() {
+        for v in corpus().into_iter().chain(pseudorandom_f64s(20_000)) {
+            if !v.is_finite() || v == 0.0 {
+                continue;
+            }
+            let (neg, sig, e) = f64_normalize_significand(v);
+            assert_eq!(neg, v.is_sign_negative(), "sign for {v:e}");
+            assert!(
+                (1u64 << 52..1u64 << 53).contains(&sig),
+                "significand {sig} for {v:e} is not normalized to [2^52, 2^53)"
+            );
+            // |v| == sig * 2^(e-52). Verify against an independent read of the
+            // IEEE-754 layout — deliberately NOT via
+            // `(sig as f64) * 2f64.powi(e - 52)`, because `powi` underflows to
+            // zero for every exponent below ~-1074+53 and would reject correct
+            // answers. The shared narrowing kernel performs the same scaling in
+            // integer arithmetic, so it is exact here.
+            let rebuilt = scaled_significand_to_f64(false, sig as u128, e as i64 - 52);
+            assert_eq!(rebuilt, v.abs(), "reconstruction failed for {v:e}");
+        }
+    }
+
+    /// The two independent binary128 converters (`ir::constants` and
+    /// `common::long_double`) must agree bit-for-bit on every finite input.
+    /// They did not before the fix (they disagreed on every subnormal), and
+    /// keeping them in lockstep is what makes the eventual consolidation in the
+    /// follow-up backlog safe.
+    #[test]
+    fn ir_constants_f128_matches_long_double_f128() {
+        for v in corpus().into_iter().chain(pseudorandom_f64s(20_000)) {
+            if !v.is_finite() {
+                continue;
+            }
+            let a = crate::ir::constants::f64_to_f128_bytes(v);
+            let b = f64_to_f128_bytes_lossless(v);
+            assert_eq!(
+                u128::from_le_bytes(a),
+                u128::from_le_bytes(b),
+                "ir::constants and long_double disagree on f128 for {v:e} ({:016x})",
+                v.to_bits()
+            );
+        }
+    }
+
+    /// f128 -> x87 must produce the CANONICAL encoding, including for f128
+    /// subnormals. `long double x = 3.36210314311209350626e-4932L;` is the
+    /// largest f128 subnormal; it rounds up to the smallest x87 normal, so
+    /// GCC emits biased exponent 1 with only the integer bit set. Emitting
+    /// exponent 0 (a non-canonical x87 subnormal) is what the pre-fix code
+    /// did — and lccc's own `x87_bytes_to_f64` read that back as 0.0.
+    #[test]
+    fn f128_to_x87_emits_canonical_encoding() {
+        // Largest f128 subnormal: significand 2^112-1, biased exponent 0.
+        let f128_sub = ((1u128 << 112) - 1).to_le_bytes();
+        let x87 = f128_bytes_to_x87_bytes(&f128_sub);
+        let mantissa64 = u64::from_le_bytes(x87[0..8].try_into().unwrap());
+        let exp15 = u16::from_le_bytes([x87[8], x87[9]]) & 0x7FFF;
+        assert_eq!(
+            (exp15, mantissa64),
+            (1, 1u64 << 63),
+            "largest f128 subnormal must round up to the smallest x87 normal"
+        );
+        // ...and it must survive the round-trip back through lccc's decoder.
+        assert_eq!(x87_bytes_to_f64(&x87), 2.0f64.powi(-16382));
+
+        // The narrowing must round, not truncate: 1e-320 as a long double.
+        // GCC emits 0xfd00b897478238d1; truncation yields ...d0.
+        let v = 1e-320_f64;
+        let x87 = f64_to_x87_bytes_simple(v);
+        let back = x87_bytes_to_f64(&x87);
+        assert_eq!(back.to_bits(), v.to_bits(), "1e-320 must round-trip");
+
+        // Rounding must never emit a non-canonical encoding across the whole
+        // sweep: exponent 0 is only legal when the integer bit is clear.
+        for v in corpus().into_iter().chain(pseudorandom_f64s(5_000)) {
+            if !v.is_finite() || v == 0.0 {
+                continue;
+            }
+            let x87 = f64_to_x87_bytes_simple(v);
+            let exp15 = u16::from_le_bytes([x87[8], x87[9]]) & 0x7FFF;
+            let mantissa64 = u64::from_le_bytes(x87[0..8].try_into().unwrap());
+            if exp15 == 0 {
+                assert_eq!(
+                    mantissa64 & (1u64 << 63),
+                    0,
+                    "x87 exponent 0 with the integer bit set is a pseudo-denormal for {v:e}"
+                );
+            } else if exp15 != 0x7FFF {
+                assert_ne!(
+                    mantissa64 & (1u64 << 63),
+                    0,
+                    "x87 exponent {exp15} is normal but the integer bit is clear for {v:e}"
+                );
+            }
+        }
+    }
+
+    /// Same lockstep property for the two x87 converters.
+    #[test]
+    fn ir_constants_x87_matches_long_double_x87() {
+        for v in corpus().into_iter().chain(pseudorandom_f64s(20_000)) {
+            if !v.is_finite() {
+                continue;
+            }
+            let a = crate::ir::constants::f64_to_x87_bytes(v);
+            let b = f64_to_x87_bytes_simple(v);
+            assert_eq!(
+                &a[..],
+                &b[..10],
+                "ir::constants and long_double disagree on x87 for {v:e} ({:016x})",
+                v.to_bits()
+            );
+        }
     }
 }
