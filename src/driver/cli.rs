@@ -1228,8 +1228,8 @@ impl Driver {
                 // them, in which case the tolerated-option policy applies.
                 "-g0" | "-ggdb0" => self.debug_info = false,
                 "-g" | "-ggdb" => self.debug_info = true,
-                "-gsplit-dwarf" => unknown_option_tolerated(arg, strict_options)?,
-                "-gz" => unknown_option_tolerated(arg, strict_options)?,
+                arg @ "-gsplit-dwarf" => unknown_option_tolerated(arg, strict_options)?,
+                arg @ "-gz" => unknown_option_tolerated(arg, strict_options)?,
                 arg if arg.starts_with("-gz=") => {
                     if !gnu_debug_selector_known(&arg[2..]) {
                         return Err(format!("unrecognized command-line option '{}'", arg));
@@ -1237,7 +1237,7 @@ impl Driver {
                     if &arg[4..] != "none" {
                         unknown_option_tolerated(arg, strict_options)?;
                     }
-                },
+                }
                 // A `-gno-<feature>` modifier asks for a feature to be OFF.
                 // LCCC implements none of the features these modifiers name,
                 // so the requested state is the actual state: the request is
@@ -2410,7 +2410,9 @@ impl Driver {
                     // table itself is intentionally not implemented.
                     i += 1;
                     if i >= args.len() {
-                        return Err("--param requires an argument of the form <name>=<value>".to_string());
+                        return Err(
+                            "--param requires an argument of the form <name>=<value>".to_string()
+                        );
                     }
                     let value = args[i].as_str();
                     if !valid_gcc_param(value) {
@@ -4370,7 +4372,10 @@ mod cli_tests {
             let mut d = Driver::new();
             let args = vec!["ccc".to_string(), arg.to_string(), "x.c".to_string()];
             d.parse_cli_args(&args).expect(arg);
-            assert!(!d.debug_info, "{arg} modifies debug output; it does not enable -g");
+            assert!(
+                !d.debug_info,
+                "{arg} modifies debug output; it does not enable -g"
+            );
         }
 
         for arg in ["-gdwarf-5", "-gstabs", "-gcodeview"] {
