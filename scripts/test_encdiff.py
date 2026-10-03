@@ -2,7 +2,9 @@
 """Unit tests for encoding-diff semantics and casefile input handling."""
 from __future__ import annotations
 
+import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -16,6 +18,37 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from scripts import encdiff, insndiff  # noqa: E402
+
+
+# ── The real-objdump leg's tool resolution ─────────────────────────────────
+# The round-trip verdicts (ok-best / BEATS with "round-trip verified") are
+# decided by encdiff._OBJDUMP — which defaults to the LCCC_OBJDUMP env or
+# bare "objdump", i.e. whatever distro binary happens to be on PATH. The
+# listing grammar the corpus round-trips against is the PINNED 2.47 pair's,
+# so the leg resolves its objdump the way test_asmdiff does: an explicit
+# test channel (ENCDIFF_TEST_OBJDUMP, set by both CI mirrors to the
+# provisioned pair), PATH only as a bare-run fallback. Under
+# LCCC_REQUIRE_PINNED_ORACLE=1 a missing pin is an ERROR, not a skip — a
+# silently-skipped round-trip test is a silently-untested verdict path.
+def _leg_objdump() -> str:
+    require = os.environ.get("LCCC_REQUIRE_PINNED_ORACLE") == "1"
+    pinned = os.environ.get("ENCDIFF_TEST_OBJDUMP") or ""
+    if require:
+        if not (Path(pinned).is_file() and os.access(pinned, os.X_OK)):
+            raise AssertionError(
+                "LCCC_REQUIRE_PINNED_ORACLE=1 but ENCDIFF_TEST_OBJDUMP="
+                f"{pinned!r} is not an executable file — provision the "
+                "pinned pair first (bash scripts/ensure_gas_247.sh "
+                "x86_64-linux-gnu)")
+        return pinned
+    if pinned and Path(pinned).is_file() and os.access(pinned, os.X_OK):
+        return pinned
+    found = shutil.which("objdump")
+    if found:
+        return found
+    raise unittest.SkipTest(
+        "objdump unavailable (set ENCDIFF_TEST_OBJDUMP to the pinned pair; "
+        "CI sets LCCC_REQUIRE_PINNED_ORACLE=1 to refuse the skip)")
 
 
 def encoded(data: bytes) -> encdiff.Encoding:
@@ -695,40 +728,37 @@ class OracleCommutativeAndSelectorViewTests(unittest.TestCase):
         # The byteregs shape: same length, different bytes; with the
         # commutative canonicalisation the round-trip must verify the row
         # as ok-best instead of WRONG-BYTES.
-        import shutil
-        if shutil.which("objdump") is None:  # pragma: no cover
-            self.skipTest("objdump unavailable")
+        od = _leg_objdump()
         row = row_as("testb %bpl, %al", b"\x40\x84\xe8",
                      gas=b"\x40\x84\xe8", clang=b"\x40\x84\xe8",
                      gcc=b"\x40\x84\xe8", icc=b"\x40\x84\xc5",
                      icx=b"\x40\x84\xe8")
-        encdiff.classify(row)
+        with mock.patch.object(encdiff, "_OBJDUMP", od):
+            encdiff.classify(row)
         self.assertEqual(row.verdict, "ok-best")
         self.assertIn("round-trip verified", row.note)
 
     def test_clang_w_row_selector_move_verifies_ok_best(self):
         # The apx shape: same length (4B), one REX2 bit apart; with the
         # selector-view canonicalisation the round-trip must verify.
-        import shutil
-        if shutil.which("objdump") is None:  # pragma: no cover
-            self.skipTest("objdump unavailable")
+        od = _leg_objdump()
         row = row_as("movq %fs, %r16", b"\xd5\x10\x8c\xe0",
                      gas=b"\xd5\x10\x8c\xe0", clang=b"\xd5\x18\x8c\xe0",
                      gcc=b"\xd5\x10\x8c\xe0", icc=b"\xd5\x10\x8c\xe0",
                      icx=b"\xd5\x18\x8c\xe0")
-        encdiff.classify(row)
+        with mock.patch.object(encdiff, "_OBJDUMP", od):
+            encdiff.classify(row)
         self.assertEqual(row.verdict, "ok-best")
         self.assertIn("round-trip verified", row.note)
 
     def test_genuinely_different_selector_move_stays_wrong(self):
         # A control: different target register is a real difference — the
         # rule must not launder it.
-        import shutil
-        if shutil.which("objdump") is None:  # pragma: no cover
-            self.skipTest("objdump unavailable")
+        od = _leg_objdump()
         row = row_as("movq %fs, %r16", b"\xd5\x10\x8c\xe0",
                      gas=b"\xd5\x10\x8c\xe0", clang=b"\xd5\x10\x8c\xe1")
-        encdiff.classify(row)
+        with mock.patch.object(encdiff, "_OBJDUMP", od):
+            encdiff.classify(row)
         self.assertEqual(row.verdict, "WRONG-BYTES")
 
 
@@ -1122,16 +1152,15 @@ class SextImm32PartitionTests(unittest.TestCase):
         # The misc shape: lccc's 6B no-W form is shorter than the valid
         # 10B movabs oracles; ICC's 7B miscompile is excluded, and the
         # row verifies as BEATS with the exclusion noted.
-        import shutil
-        if shutil.which("objdump") is None:  # pragma: no cover
-            self.skipTest("objdump unavailable")
+        od = _leg_objdump()
         row = row_as("movq $2147483648, %r15", b"\x41\xbf\x00\x00\x00\x80",
                      gas=b"\x49\xbf\x00\x00\x00\x80\x00\x00\x00\x00",
                      clang=b"\x49\xbf\x00\x00\x00\x80\x00\x00\x00\x00",
                      gcc=b"\x49\xbf\x00\x00\x00\x80\x00\x00\x00\x00",
                      icc=b"\x49\xc7\xc7\x00\x00\x00\x80",
                      icx=b"\x49\xbf\x00\x00\x00\x80\x00\x00\x00\x00")
-        encdiff.classify(row)
+        with mock.patch.object(encdiff, "_OBJDUMP", od):
+            encdiff.classify(row)
         self.assertEqual(row.verdict, "BEATS")
         self.assertIn("sign-extension miscompile (icc)", row.note)
         self.assertIn("round-trip verified", row.note)

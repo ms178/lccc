@@ -550,21 +550,14 @@ gate "ci-gate-parity" fast \
 gate "ci-asm-diff-parity-self-test" fast \
     python3 scripts/test_ci_gate_parity.py
 
-gate "encdiff-semantic-validation" fast \
-    python3 scripts/test_encdiff.py
-
-# The differential oracle's OWN contract suites, compiler-free exactly
-# like the encdiff one above: asmdiff's parser/oracle unit tests (the
-# mocked failure modes — failed disassembler, empty listing, undecodable
-# bytes, orphan fragments — plus a real-toolchain leg) and the binutils
-# provisioner's 2.47 validation matrix (fake tool pairs: correct,
-# wrong-version, substring lookalikes, mismatched tokens, functionally
-# broken). The integration gates prove the tools work on today's corpus;
-# these prove the verdict machinery refuses the inputs an end-to-end
-# green run can never exhibit. Both are parity-required
-# (check_test_suite_registration).
-gate "asmdiff-semantic-validation" fast \
-    python3 scripts/test_asmdiff.py
+# The encdiff semantic-validation and asmdiff semantic-validation suites
+# run AFTER the oracle provisioning below: their real-toolchain legs
+# exercise the provisioned 2.47 pair (ASMDIFF_TEST_* / ENCDIFF_TEST_OBJDUMP
+# channels) under LCCC_REQUIRE_PINNED_ORACLE=1, which makes a missing pin a
+# hard failure instead of a silent skip — the ordering cannot rot, because
+# running before provisioning now fails the gate itself. The invocation
+# shapes (including these env channels) are pinned by
+# check_invocation_contracts.
 
 gate "gas-oracle-pair-self-test" fast \
     bash scripts/ensure_gas_247.sh --self-test
@@ -659,9 +652,32 @@ gate "inline-asm-utf8" fast \
 # before it -- and the betterok groups accept a smaller encoding only when
 # the pinned objdump proves the disassembly identical, so an unpinned
 # DISASSEMBLER is an unpinned verdict authority too. Provisioned
-# (idempotent, cached under ~/.cache) by the same script hosted CI runs.
+# (idempotent, cached under ~/.cache; the tarball is sha256-pinned) by the
+# same script hosted CI runs.
 gate "asm-diff-oracle-gas-2.47" fast \
     bash scripts/ensure_gas_247.sh x86_64-linux-gnu
+
+# The differential oracle's OWN contract suites, compiler-free exactly
+# like the gates above but anchored to the REAL pinned pair: asmdiff's
+# parser/oracle unit tests (the mocked failure modes — failed disassembler,
+# empty listing, undecodable bytes, orphan fragments — plus the
+# real-toolchain leg against the provisioned 2.47 pair) and encdiff's
+# round-trip verdict tests. The integration gates prove the tools work on
+# today's corpus; these prove the verdict machinery refuses the inputs an
+# end-to-end green run can never exhibit. The pinned-tool env channels and
+# LCCC_REQUIRE_PINNED_ORACLE=1 are part of the registered invocation
+# contract: a leg that would silently skip or run against the runner's
+# distro binutils is a contract violation, not a local convenience.
+gate "encdiff-semantic-validation" fast \
+    env ENCDIFF_TEST_OBJDUMP="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump" \
+        LCCC_REQUIRE_PINNED_ORACLE=1 \
+    python3 scripts/test_encdiff.py
+
+gate "asmdiff-semantic-validation" fast \
+    env ASMDIFF_TEST_AS="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" \
+        ASMDIFF_TEST_OBJDUMP="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump" \
+        LCCC_REQUIRE_PINNED_ORACLE=1 \
+    python3 scripts/test_asmdiff.py
 
 # Whole-corpus x86-64 assembly differential (every tests/asm-diff/*.casefile,
 # a one-instruction reject is never hidden by another reject): pinning a
