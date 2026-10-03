@@ -8,20 +8,25 @@
 #   - a new row, a deleted row, or a brand-new verdict class forces a
 #     conscious baseline update in the same commit,
 # while a BEATS row staying BEATS through better bytes needs no update.
+# Counts alone are a NET contract — a compensating delete+add of
+# same-verdict rows nets to zero — so the rows-sha256 digest below pins
+# row IDENTITY (and every row's byte-exact pin) as well: any row-set
+# change is a baseline change.
 # Update this file in the same commit that changes the corpus (or the
 # encoder in a way that shifts verdicts); the gate fails otherwise.
 #
 # Every verdict class is listed explicitly — zeros included — so a class
 # appearing from zero is also a baseline change.
+# rows-sha256: dfb579812e4003cf55d621448af58d9459cce14cf0edf2d94eeb566e6428404d
 WRONG-BYTES 0
 UNVERIFIED-BEATS 0
 UNVERIFIED-BYTES 0
 REJECTS-VALID 0
 LONGER 0
-BEATS 174
+BEATS 175
 DISAGREE 0
 ok-best 0
-ok 21
+ok 23
 DECLINED-FP 0
 DECLINED-WRONG 0
 DECLINED-DATA16 0

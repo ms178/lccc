@@ -46,6 +46,15 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CORPUS = REPO_ROOT / "tests" / "asm-diff"
 
+# The disassembler is half the oracle pair. `allow_better` groups accept a
+# byte difference only when the two objects still disassemble identically,
+# so whatever objdump runs here ARBITRATES those verdicts — an unpinned
+# objdump is whatever binutils the host image ships (the exact
+# unpinned-tool class the 2.47 `as' pin exists to prevent). It is threaded
+# explicitly: main() resolves it once from --objdump / LCCC_OBJDUMP and
+# passes it through run_case; the corpus gates pin the 2.47 pair on the
+# command line so the parity checker sees it.
+
 
 # ─── Minimal ELF64 reader (no third-party dependency) ─────────────────────
 
@@ -372,24 +381,72 @@ def _canon_commutative(insn: str) -> str:
     return insn
 
 
-def _norm_disasm(text: str) -> str:
-    """Normalise a disassembly listing for semantic comparison.
+def _parse_disasm(text: str) -> list[str] | None:
+    """Parse one `objdump -d` listing into its normalised instructions.
 
-    Two encodings are equivalent when they decode to the same instruction with
-    the same effective address. The two spellings that differ purely by
-    encoding choice are a redundant scale-1 index (`-0x1(,%rdi,1)` is the same
-    address as `-0x1(%rdi)`) and an explicit zero displacement. objdump's
-    `{vex}`/`{evex}` annotations likewise describe only which legal encoding
-    was chosen (LCCC prefers the shorter VEX form for VNNI memory sources
-    where GAS defaults to EVEX), so they are stripped too. `{nf}` is NOT
-    stripped: it changes flags semantics.
+    Fail-closed: the return value is the normalised instruction sequence,
+    or None whenever the listing is not admissible semantic evidence —
+    an undecodable instruction, a `...` gap (bytes present that the
+    decoder declined to decode), an unrecognised line shape, or an
+    empty instruction stream. Undecodable renderings are not semantic
+    evidence: objdump DOES print the raw bytes before `(bad)', but the
+    byte column is dropped here, so two different garbage streams can
+    render to the same instruction text — a `BETTER' verdict must never
+    stand on that, in either direction.
+
+    Two encodings are equivalent when they decode to the same instruction
+    with the same effective address. The two spellings that differ purely
+    by encoding choice are a redundant scale-1 index (`-0x1(,%rdi,1)` is
+    the same address as `-0x1(%rdi)`) and an explicit zero displacement.
+    objdump's `{vex}`/`{evex}` annotations likewise describe only which
+    legal encoding was chosen (LCCC prefers the shorter VEX form for VNNI
+    memory sources where GAS defaults to EVEX), so they are stripped too.
+    `{nf}` is NOT stripped: it changes flags semantics.
     """
-    out = []
+    out: list[str] = []
     for line in text.splitlines():
-        m = re.match(r"^\s+[0-9a-f]+:\s+((?:[0-9a-f]{2} )+)\s*\t(.*)$", line)
-        if not m:
+        stripped = line.strip()
+        if not stripped:
             continue
-        insn = m.group(2).strip()
+        if " file format " in stripped:
+            continue                     # "<file>: file format <fmt>" header
+        if stripped.startswith("Disassembly of section "):
+            continue
+        if re.match(r"^[0-9a-f]{8,16} <[^>]*>:$", stripped):
+            continue                     # symbol label: ADDR <name>:
+        if stripped == "...":
+            # A gap marker: bytes exist here that the decoder declined to
+            # decode. That is undecidable content, not noise — the two
+            # objects' undecoded tails could differ behind identical
+            # decoded prefixes.
+            return None
+        m = re.match(r"^[0-9a-f]+:\t(.+)$", stripped)
+        if m is None:
+            return None                  # unknown line shape: parse failure
+        bytes_col, sep, insn = m.group(1).partition("\t")
+        raw = bytes_col.split()
+        if not raw:
+            return None
+        if any(len(b) != 2 or not re.fullmatch(r"[0-9a-f]{2}", b) for b in raw):
+            return None
+        if not sep:
+            # A byte-continuation fragment: objdump splits a byte column
+            # wider than its line across continuation lines that carry an
+            # address and the remaining bytes but no instruction column —
+            # the instruction is anchored on the line that has the column.
+            # The fragment is formatting, not a separate instruction, and
+            # the bytes it shows are already accounted for in the anchor's
+            # instruction text, so it is skipped — never confused with a
+            # parse failure, which is reserved for shapes objdump never
+            # emits.
+            continue
+        insn = insn.strip()
+        if not insn:
+            return None
+        if insn.startswith("(") or insn.startswith(".byte"):
+            # `(bad)' — and any future parenthesised synthetic — and the
+            # `.byte' fallback are objdump's undecodable renderings.
+            return None
         insn = re.sub(r"^\{(?:vex|evex)\} ", "", insn)
         insn = _SCALE1.sub(r"(%\1)", insn)
         insn = _ZERODISP.sub("(", insn)
@@ -398,20 +455,44 @@ def _norm_disasm(text: str) -> str:
         insn = _canon_mov_imm(insn)
         # Drop the trailing branch-target comment objdump appends.
         insn = insn.split("#")[0].strip()
+        if not insn:
+            return None
         out.append(insn)
-    return "\n".join(out)
+    return out or None
+
+
+def _disasm_stream(obj: Path, objdump: str) -> str | None:
+    """The normalised instruction stream of one object — or None.
+
+    None is the fail-closed verdict: the disassembler was missing,
+    failed, timed out, exited nonzero, or produced an inadmissible
+    listing. A failed run prints nothing, and two failures must never
+    compare equal — that is the fail-open hole this exists to close.
+    """
+    try:
+        proc = subprocess.run([objdump, "-d", str(obj)],
+                               capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    insns = _parse_disasm(proc.stdout)
+    return None if insns is None else "\n".join(insns)
 
 
 def semantically_equal(a_obj: Path, b_obj: Path, objdump: str) -> bool:
-    """True when two objects disassemble to the same instruction sequence."""
-    try:
-        ta = subprocess.run([objdump, "-d", str(a_obj)],
-                            capture_output=True, text=True, timeout=120).stdout
-        tb = subprocess.run([objdump, "-d", str(b_obj)],
-                            capture_output=True, text=True, timeout=120).stdout
-    except (OSError, subprocess.SubprocessError):
+    """True when two objects disassemble to the same instruction sequence.
+
+    Both disassemblies must be admissible evidence: a stream that failed
+    to decode — in part or whole — is not semantic evidence, so it never
+    compares equal, not to the other object and not to another failed
+    stream.
+    """
+    sa = _disasm_stream(a_obj, objdump)
+    if sa is None:
         return False
-    return _norm_disasm(ta) == _norm_disasm(tb)
+    sb = _disasm_stream(b_obj, objdump)
+    return sb is not None and sa == sb
 
 
 def compare(lo: ElfImage, go: ElfImage, *, check_symbols: bool) -> list[str]:
@@ -494,7 +575,7 @@ def load_cases(path: Path) -> list[Case]:
     return cases
 
 
-def run_case(c: Case, lccc: str, gas: str, wd: str, verbose: bool,
+def run_case(c: Case, lccc: str, gas: str, objdump: str, wd: str, verbose: bool,
              bits32: bool = False):
     tag = re.sub(r"[^A-Za-z0-9_.-]", "_", c.name)
     src = Path(wd) / f"{tag}.s"
@@ -530,8 +611,9 @@ def run_case(c: Case, lccc: str, gas: str, wd: str, verbose: bool,
     if errs and c.allow_better:
         # Accept the difference only if every byte-level complaint is LCCC
         # being smaller, and the two objects still decode identically.
-        objdump = os.environ.get("LCCC_OBJDUMP") or (
-            shutil.which("objdump") or "objdump")
+        # The disassembler is the caller's pinned oracle, never a PATH
+        # lookup: it decides BETTER verdicts, so it is as much an oracle
+        # as `as'.
         size_l = len(read_elf(lo).content.get(".text", b""))
         size_g = len(read_elf(go).content.get(".text", b""))
         only_size = all("bytes differ" in e for e in errs)
@@ -549,6 +631,10 @@ def main() -> int:
     ap.add_argument("cases", nargs="*", type=Path)
     ap.add_argument("--lccc", default=str(REPO_ROOT / "target" / "release" / "lccc"))
     ap.add_argument("--as", dest="gas", default=os.environ.get("LCCC_GAS", "as"))
+    ap.add_argument("--objdump", default=os.environ.get("LCCC_OBJDUMP", "objdump"),
+                    help="disassembler that arbitrates allow_better verdicts "
+                         "(pin it with `as': an unpinned objdump is an "
+                         "unpinned oracle, whatever the host image ships)")
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 2)
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("--max-report", type=int, default=30)
@@ -559,6 +645,11 @@ def main() -> int:
 
     if not (shutil.which(args.gas) or Path(args.gas).exists()):
         print(f"error: assembler oracle {args.gas!r} not found", file=sys.stderr)
+        return 2
+    if not (shutil.which(args.objdump) or Path(args.objdump).exists()):
+        print(f"error: disassembler oracle {args.objdump!r} not found "
+              "(it decides allow_better verdicts; provision the 2.47 pair "
+              "with scripts/ensure_gas_247.sh)", file=sys.stderr)
         return 2
     if not Path(args.lccc).exists():
         print(f"error: lccc not built at {args.lccc!r}", file=sys.stderr)
@@ -591,8 +682,8 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="asmdiff-") as wd:
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as ex:
             for fut in concurrent.futures.as_completed(
-                    [ex.submit(run_case, c, args.lccc, args.gas, wd, args.verbose,
-                               args.bits32)
+                    [ex.submit(run_case, c, args.lccc, args.gas, args.objdump,
+                               wd, args.verbose, args.bits32)
                      for c in cases]):
                 name, ok, msg = fut.result()
                 if ok:
@@ -605,16 +696,20 @@ def main() -> int:
     if len(failures) > args.max_report:
         print(f"... and {len(failures) - args.max_report} more")
 
-    # Name the oracle's RELEASE, not just its path: byte-exact layout cases
-    # (NOP tables, relaxation order) legitimately differ between GAS
-    # releases, and a failure log must say which one it was checked against.
-    try:
-        version = subprocess.run([args.gas, "--version"], capture_output=True,
-                                 text=True, check=False).stdout.splitlines()[0]
-    except (OSError, IndexError):
-        version = "unknown version"
+    # Name both oracles' RELEASE, not just their paths: byte-exact layout
+    # cases (NOP tables, relaxation order) legitimately differ between GAS
+    # releases, the betterok verdicts are arbitrated by the disassembler,
+    # and a failure log must say which PAIR it was checked against.
+    def oracle_version(tool: str) -> str:
+        try:
+            return subprocess.run([tool, "--version"], capture_output=True,
+                                   text=True, check=False,
+                                   timeout=30).stdout.splitlines()[0]
+        except (OSError, IndexError, subprocess.SubprocessError):
+            return "unknown version"
     print(f"=== asm-diff: {passed} passed, {len(failures)} failed "
-          f"({len(cases)} cases, oracle={args.gas}: {version}) ===")
+          f"({len(cases)} cases, as={args.gas}: {oracle_version(args.gas)}; "
+          f"objdump={args.objdump}: {oracle_version(args.objdump)}) ===")
     return 1 if failures else 0
 
 

@@ -32,7 +32,7 @@
 #   ./scripts/ci_local.sh --only NAME  # a single gate, substring match
 #
 # A --fast pass is NOT CI-equivalent: GitHub runs all three slow gates on every
-# PR.  PR #638 (S24) went red on check_peephole_whitespace.sh after a green
+# PR.  PR #638 went red on check_peephole_whitespace.sh after a green
 # --fast run, because the snapshot gate accepted a fast stamp.  lccc-snapshot.sh
 # therefore demands mode=full; obtain it with a full run or with --fast then
 # --slow on the unchanged tree.
@@ -72,8 +72,8 @@ done
 LCCC=target/fastbuild/lccc
 # Pass stamp: the content address of the tree this run tested, written only
 # when every gate is green AND the tree did not change during the run.
-# lccc-snapshot.sh refuses to publish a tree without a matching stamp (S20
-# shipped a red hosted CI because this script was skipped). Removed up front:
+# lccc-snapshot.sh refuses to publish a tree without a matching stamp — a
+# past revision shipped a red hosted CI because this script was skipped. Removed up front:
 # a run that does not finish green leaves no proof behind.
 STAMP=target/ci_local.pass
 mkdir -p target
@@ -637,11 +637,13 @@ gate "inline-asm-utf8" fast \
     python3 scripts/check_inline_asm_utf8.py --lccc "$LCCC" --expect preserved \
         --json target/inline-asm-utf8.json
 
-# Byte-exact assembler differentials have ONE oracle: GNU as 2.47, exactly as
-# hosted CI. Distro assemblers are not interchangeable -- GAS 2.44 orders the
-# i386 lea-NOP remainder after the long NOP, 2.47 before it -- so an unpinned
-# oracle makes these gates depend on the host image. Provisioned (idempotent,
-# cached under ~/.cache) by the same script hosted CI runs.
+# Byte-exact assembler differentials have ONE oracle: the GNU as + objdump
+# 2.47 PAIR, exactly as hosted CI. Distro binutils are not interchangeable
+# -- GAS 2.44 orders the i386 lea-NOP remainder after the long NOP, 2.47
+# before it -- and the betterok groups accept a smaller encoding only when
+# the pinned objdump proves the disassembly identical, so an unpinned
+# DISASSEMBLER is an unpinned verdict authority too. Provisioned
+# (idempotent, cached under ~/.cache) by the same script hosted CI runs.
 gate "asm-diff-oracle-gas-2.47" fast \
     bash scripts/ensure_gas_247.sh x86_64-linux-gnu
 
@@ -650,10 +652,12 @@ gate "asm-diff-oracle-gas-2.47" fast \
 # single follow-up file let new corpora (pc8, EVEX AVX512, XOP) land ungated.
 gate "x86-asm-diff" fast \
     python3 scripts/asmdiff.py --jobs 2 --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" \
+        --objdump "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump" \
         --lccc target/fastbuild/lccc-x86
 
 gate "i686-asm-diff" fast \
     python3 scripts/asmdiff.py --32 --jobs 2 --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" \
+        --objdump "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump" \
         --lccc target/fastbuild/lccc-i686
 gate "i686-tls-ie-relax" fast \
     bash tests/regression/check_i686_tls_ie_relax.sh
@@ -661,20 +665,23 @@ gate "i686-tls-ie-relax" fast \
 gate "i686-narrow-cmp-flag-law" fast \
     bash tests/regression/check_narrow_cmp_flag_law.sh
 
-# The encdiff corpus (index-fold-64: the S13/S15 index-fold families incl.
+# The encdiff corpus (index-fold-64: the index-fold families incl.
 # segment+fold and the APX x AVX-512 EVEX oracle record; data16-branches-64:
 # the 64-bit data16-branch law) is the SEMANTIC record of every deliberate
 # divergence from GAS -- BEATS rows where lccc is provably shorter, DECLINED
-# rows with their policy notes. Until S15 NO gate ran it; until S18 the
-# DISASSEMBLER that decides those verdicts was whatever objdump the host
-# image shipped (only `as' was pinned) and the aggregate verdict counts
-# were unchecked (a BEATS -> ok-best drift could hide forever). Both pins
+# rows with their policy notes. Historically NO gate ran it at all; even
+# once gated, the DISASSEMBLER that decides those verdicts was whatever
+# objdump the host image shipped (only `as' was pinned) and the aggregate
+# verdict counts were unchecked (a BEATS -> ok-best drift could hide forever). Both pins
 # and the baseline are now part of the contract:
 #   --as/--objdump  the 2.47 oracle PAIR from one build (the gate's bytes
 #                   AND verdicts come from pinned tools),
 #   --expect-histogram  the checked-in verdict-count baseline — any count
 #                   change (drift, a new row, a deleted row) fails the
-#                   gate until the baseline is consciously re-recorded.
+#                   gate until the baseline is consciously re-recorded,
+#                   and its rows-sha256 digest pins row IDENTITY too (a
+#                   compensating delete+add of same-verdict rows nets to
+#                   zero in the counts; the digest still fails it).
 # encdiff exits 1 on WRONG-BYTES/UNVERIFIED-*/REJECTS-VALID/LONGER and on a
 # histogram mismatch — the exact classes this corpus exists to catch
 # (ORACLE-INVALID rows -- GAS emitting the truncated data16 forms -- are
@@ -979,7 +986,7 @@ gate "cross-backend-atomics" fast \
 gate "indexed-fold-scratch-index" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_indexed_fold_scratch_index.sh
 
-# _Decimal64 indexed fold (S15): the x86-64 indexed path must accept D64 on
+# _Decimal64 indexed fold: the x86-64 indexed path must accept D64 on
 # the load half, the store half, and the decider. Structural SIB-movsd
 # assertions plus an integer-checksum gcc differential (mirrors the ci.yml
 # step of the same script; ci-gate-parity fails if the two drift apart).

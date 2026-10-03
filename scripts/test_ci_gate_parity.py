@@ -64,22 +64,84 @@ class AsmDiffParityTest(unittest.TestCase):
             self.x64 + " tests/asm-diff/other.casefile",
             self.x64.replace("python3 scripts/asmdiff.py", "echo python3 scripts/asmdiff.py", 1),
             self.x64.replace("--as \"$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as\"", "--as as", 1),
+            # A depinned DISASSEMBLER must fail too: the betterok groups'
+            # smaller-encoding verdicts are arbitrated by objdump, so a
+            # PATH-resolved objdump is an unpinned verdict authority —
+            # 25 betterok groups across 7 casefiles once rode on the
+            # runner image's binutils for their BETTER verdicts.
+            self.x64.replace("--objdump \"$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump\"", "--objdump objdump", 1),
+            self.x64.replace(" --objdump \"$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump\"", "", 1),
         )
         for replacement in replacements:
             with self.subTest(replacement=replacement):
                 self.assertNotEqual(replacement, self.x64)
                 self.assert_rejected(self.hosted.replace(self.x64, replacement, 1))
 
+    def test_lookalike_pin_paths_are_rejected(self) -> None:
+        # Token equality, not substring containment: each lookalike below
+        # CONTAINS the pinned path as a substring, so the old containment
+        # check accepted it on both mirrors — the exact unpinned-oracle
+        # class the pin exists to prevent. Prefixed, suffixed and sibling
+        # spellings, for BOTH halves of the pair, on BOTH differential
+        # gates, with the lookalike on both mirrors at once.
+        as_pin = '--as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"'
+        od_pin = '--objdump "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump"'
+        self.assertIn(as_pin, self.x64)
+        self.assertIn(od_pin, self.x64)
+        for label, old, new in (
+            ("as suffixed", as_pin,
+             as_pin.replace('bin/as"', 'bin/as-untrusted"')),
+            ("as prefixed", as_pin,
+             as_pin.replace('"$HOME', '"/untrusted/$HOME')),
+            ("as sibling", as_pin,
+             as_pin.replace('bin/as"', 'bin/ass"')),
+            ("objdump suffixed", od_pin,
+             od_pin.replace('bin/objdump"', 'bin/objdump-untrusted"')),
+            ("objdump prefixed", od_pin,
+             od_pin.replace('"$HOME', '"/untrusted/$HOME')),
+            ("objdump sibling", od_pin,
+             od_pin.replace('bin/objdump"', 'bin/objdumps"')),
+        ):
+            with self.subTest(pin=label):
+                mutated = self.x64.replace(old, new, 1)
+                self.assertNotEqual(mutated, self.x64)
+                self.assert_rejected(self.hosted.replace(self.x64, mutated, 1))
+                # The encdiff gate, lookalike on BOTH mirrors — the
+                # containment check would have passed this.
+                with redirect_stderr(StringIO()):
+                    self.assertEqual(
+                        parity.check_encdiff_gate_parity(
+                            self.local.replace(old, new),
+                            self.hosted.replace(old, new)),
+                        1)
+
     def test_installer_is_not_optional_when_hosted_oracle_is_pinned(self) -> None:
         needle = "bash scripts/ensure_gas_247.sh x86_64-linux-gnu"
         self.assertIn(needle, self.hosted)
         self.assert_rejected(self.hosted.replace(needle, "echo installer removed", 1))
+        # Lookalike invocations satisfy the old substring check; token
+        # equality must reject them — a mutated target, extra arguments,
+        # and the wrong target alike.
+        for mutant in (
+            "bash scripts/ensure_gas_247.sh x86_64-linux-gnu-malicious",
+            "bash scripts/ensure_gas_247.sh x86_64-linux-gnu /untrusted/prefix",
+            "bash scripts/ensure_gas_247.sh riscv64-linux-gnu",
+        ):
+            with self.subTest(installer=mutant):
+                self.assert_rejected(self.hosted.replace(needle, mutant, 1))
 
     def test_i686_gate_requires_the_pinned_oracle(self) -> None:
         pinned = "--as \"$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as\" "
+        objdump_pinned = "--objdump \"$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump\""
         self.assertIn(pinned, self.i686)
+        self.assertIn(objdump_pinned, self.i686)
         for replacement in (self.i686.replace(pinned, "", 1),
-                            self.i686.replace(pinned, "--as as ", 1)):
+                            self.i686.replace(pinned, "--as as ", 1),
+                            self.i686.replace(pinned, "--as \"/untrusted/$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as\" ", 1),
+                            self.i686.replace(pinned, "--as \"$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as-untrusted\" ", 1),
+                            self.i686.replace(objdump_pinned, "--objdump objdump", 1),
+                            self.i686.replace(objdump_pinned, "--objdump \"$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump-untrusted\"", 1),
+                            self.i686.replace(f" {objdump_pinned}", "", 1)):
             with self.subTest(replacement=replacement):
                 self.assert_rejected(self.hosted.replace(self.i686, replacement, 1))
 
@@ -87,19 +149,20 @@ class AsmDiffParityTest(unittest.TestCase):
         pinned = '--as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"'
         objdump_pin = '--objdump "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump"'
         # Three local gates pin the 2.47 oracle: x86-asm-diff, i686-asm-diff
-        # and (since S15) the offline encdiff-corpus gate; the encdiff gate
-        # additionally pins the 2.47 DISASSEMBLER (since S18 — objdump
-        # decides the BEATS/ok verdicts, so an unpinned objdump is an
-        # unpinned oracle). Both counts are INVARIANTS: a new gate would
-        # have to justify its pins to this test, and a dropped pin anywhere
-        # trips the mutation loop below.
+        # and the offline encdiff-corpus gate. ALL THREE pin the 2.47
+        # DISASSEMBLER too, not just encdiff:
+        # asmdiff's betterok groups accept a smaller encoding only when
+        # objdump proves the disassembly identical, so an unpinned objdump
+        # is an unpinned VERDICT authority there exactly as in encdiff.
+        # Both counts are INVARIANTS: a new gate would have to justify its
+        # pins to this test, and a dropped pin anywhere trips the mutation
+        # loops below.
         self.assertEqual(self.local.count(pinned), 3)
-        self.assertEqual(self.local.count(objdump_pin), 1)
-        # EVERY pin occurrence is behaviorally mutation-checked (the S16
-        # audit response closed the range(2) hole; the S18 response made
-        # the dispatch token-based — the bare-substring rfind also matched
-        # `test_encdiff.py` and only worked because the asmdiff command
-        # line happened to sit closer). The owner of occurrence i is the
+        self.assertEqual(self.local.count(objdump_pin), 3)
+        # EVERY pin occurrence is behaviorally mutation-checked. The
+        # dispatch is token-based because a bare-substring rfind also
+        # matched `test_encdiff.py` and only worked because the asmdiff
+        # command line happened to sit closer. The owner of occurrence i is the
         # differential program of the command the pin belongs to: the LAST
         # `python3 scripts/<prog>.py` token before the pin, asserted to be
         # one of the two differential drivers (test_* gates never own an
@@ -134,12 +197,30 @@ class AsmDiffParityTest(unittest.TestCase):
         with redirect_stderr(StringIO()):
             self.assertEqual(parity.check_asmdiff_gate_parity(self.local, self.hosted), 0)
             self.assertEqual(parity.check_encdiff_gate_parity(self.local, self.hosted), 0)
-        # The objdump pin is mutation-checked through the same encdiff
-        # checker (a depinned disassembler must fail its gate).
-        with redirect_stderr(StringIO()):
-            self.assertEqual(parity.check_encdiff_gate_parity(
-                self.local.replace(objdump_pin, "--objdump objdump", 1),
-                self.hosted), 1)
+        # EVERY objdump pin occurrence is mutation-checked through the same
+        # token-based owner dispatch (all three gates: the two
+        # asmdiff gates joined encdiff — their betterok verdicts are arbitrated
+        # by the disassembler, so a depinned objdump must fail exactly its
+        # owning gate's checker and no other).
+        od_parts = self.local.split(objdump_pin)
+        self.assertEqual(len(od_parts) - 1, 3)
+        for i in range(3):
+            with self.subTest(objdump_occurrence=i):
+                programs = re.findall(
+                    r"python3\s+(scripts/(?:enc|asm)diff\.py)", od_parts[i])
+                self.assertTrue(programs, "no differential command before pin")
+                owner = programs[-1]
+                checker = (parity.check_encdiff_gate_parity
+                           if owner == "scripts/encdiff.py"
+                           else parity.check_asmdiff_gate_parity)
+                local = objdump_pin.join(od_parts[: i + 1]) + \
+                    "--objdump objdump" + objdump_pin.join(od_parts[i + 1:])
+                with redirect_stderr(StringIO()):
+                    self.assertEqual(checker(local, self.hosted), 1)
+                    other = (parity.check_asmdiff_gate_parity
+                             if owner == "scripts/encdiff.py"
+                             else parity.check_encdiff_gate_parity)
+                    self.assertEqual(other(local, self.hosted), 0)
         needle = "bash scripts/ensure_gas_247.sh x86_64-linux-gnu"
         with redirect_stderr(StringIO()):
             self.assertEqual(parity.check_asmdiff_gate_parity(
@@ -197,8 +278,8 @@ class AsmDiffParityTest(unittest.TestCase):
         raise AssertionError("no encdiff command in text")
 
     def test_hosted_encdiff_command_must_match_the_local_gate_exactly(self) -> None:
-        # Both-sides behavioral parity for the encdiff corpus gate (the
-        # S16 audit response; extended in S18 to the verdict chain). Path-
+        # Both-sides behavioral parity for the encdiff corpus gate, covering
+        # the full verdict chain. Path-
         # level mirroring only proves the script path appears on both
         # sides; a HOSTED-ONLY edit — depinned --as or --objdump, dropped
         # --offline or --expect-histogram, the wrong compiler, a swapped

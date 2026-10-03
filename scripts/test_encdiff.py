@@ -2,10 +2,13 @@
 """Unit tests for encoding-diff semantics and casefile input handling."""
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
+from io import StringIO
 from pathlib import Path
 from unittest import mock
 
@@ -473,8 +476,8 @@ class OracleCommutativeAndSelectorViewTests(unittest.TestCase):
             encdiff._OBJDUMP, without, withds, seg_dead64=True))
 
     def test_fold_row_law_ignores_trailing_comments(self):
-        # The opt-in is decided on the COMMENT-STRIPPED source (S18 audit
-        # D3): corpus rows may carry trailing `#' comments, and a comment
+        # The opt-in is decided on the COMMENT-STRIPPED source: corpus
+        # rows may carry trailing `#' comments, and a comment
         # quoting a flip-shaped operand — exactly the documentation style
         # this corpus uses — must not opt its row into the dead-segment
         # strip. Before the fix, a non-flip row with such a comment had a
@@ -513,11 +516,14 @@ class OracleCommutativeAndSelectorViewTests(unittest.TestCase):
                                       bits32=False, seg_dead64=True)
 
     def test_verdict_histogram_counts_and_zero_projection_compare(self):
-        # The aggregate baseline check: counts only, compared through the
-        # NONZERO projection on both sides (a class recorded at 0 is
-        # documentation — the actual dict has no key for it, and raw dict
-        # equality would flag every zero row as drift). Drift, a new
-        # nonzero class, and a class missing from the baseline all fail.
+        # The aggregate baseline check: counts AND the rows-sha256 row
+        # identity digest, compared through the NONZERO projection on
+        # both sides (a class recorded at 0 is documentation — the actual
+        # dict has no key for it, and raw dict equality would flag every
+        # zero row as drift). Drift, a new nonzero class, and a class
+        # missing from the baseline all fail. The parse is strict: every
+        # verdict class exactly once, nonnegative integer counts, exactly
+        # one digest line.
         rows = [row_as("a", b"L", gas=b"S"), row_as("b", b"LS", gas=b"S"),
                 row_as("c", b"L", gas=b"G")]
         for r, verdict in zip(rows, ("BEATS", "LONGER", "BEATS")):
@@ -526,8 +532,20 @@ class OracleCommutativeAndSelectorViewTests(unittest.TestCase):
                          {"BEATS": 2, "LONGER": 1})
         with tempfile.TemporaryDirectory() as td:
             base = Path(td) / "hist.txt"
-            base.write_text("# comment line\n"
-                            "BEATS 2\nLONGER 1\nok 0\n")
+
+            def baseline(text: str) -> None:
+                base.write_text(text)
+
+            def classes(overrides: dict[str, int]) -> str:
+                # every verdict class exactly once, zeros included
+                return "\n".join(
+                    f"{cls} {overrides.get(cls, 0)}"
+                    for cls in encdiff.SEVERITY) + "\n"
+
+            good = ("# comment line\n"
+                    f"# rows-sha256: {encdiff.rows_digest(rows)}\n"
+                    + classes({"BEATS": 2, "LONGER": 1}))
+            baseline(good)
             self.assertTrue(encdiff.check_verdict_histogram(rows, base))
             # Count drift fails:
             rows[0].verdict = "ok-best"
@@ -538,8 +556,72 @@ class OracleCommutativeAndSelectorViewTests(unittest.TestCase):
             self.assertFalse(encdiff.check_verdict_histogram(rows, base))
             rows[0].verdict = "BEATS"
             # An unparseable baseline fails loudly (not as a silent pass):
-            base.write_text("BEATS two\n")
+            baseline("BEATS two\n")
             self.assertFalse(encdiff.check_verdict_histogram(rows, base))
+            # A MISSING baseline fails cleanly with accurate advice (a
+            # missing file is not drift — no traceback, and no misleading
+            # "update the baseline" hint):
+            self.assertFalse(
+                encdiff.check_verdict_histogram(rows, Path(td) / "nope.txt"))
+            # An EMPTY baseline is not a contract:
+            baseline("# only comments\n")
+            self.assertFalse(encdiff.check_verdict_histogram(rows, base))
+            # A baseline without the rows-sha256 digest line fails: counts
+            # alone are a NET contract.
+            baseline("# comment line\n" + classes({"BEATS": 2, "LONGER": 1}))
+            self.assertFalse(encdiff.check_verdict_histogram(rows, base))
+
+    def test_rows_digest_pins_row_identity_not_verdicts(self):
+        # The L1 blind spot, closed: two row sets with IDENTICAL verdict
+        # counts but different row texts (a compensating delete+add) have
+        # different digests, so the gate fails where the counts-only
+        # contract passed. Verdict-only changes leave the digest alone
+        # (BEATS staying BEATS through better bytes needs no re-record).
+        left = [row_as("mov %rax, %rbx", b"L", gas=b"S"),
+                row_as("mov %rcx, %rdx", b"L", gas=b"S")]
+        right = [row_as("mov %rax, %rbx", b"L", gas=b"S"),
+                 row_as("mov %rsi, %rdi", b"L", gas=b"S")]  # swapped row
+        for r in left + right:
+            r.verdict = "BEATS"
+        self.assertEqual(encdiff.verdict_histogram(left),
+                         encdiff.verdict_histogram(right))
+        self.assertNotEqual(encdiff.rows_digest(left),
+                            encdiff.rows_digest(right))
+        # A verdict flip on identical rows keeps the digest:
+        left[0].verdict = "ok-best"
+        self.assertEqual(encdiff.rows_digest(left),
+                         encdiff.rows_digest([*left[:1],
+                                              row_as("mov %rcx, %rdx", b"L", gas=b"S")]))
+        # And a byte-exact pin is part of the row's identity: weakening a
+        # pin changes the digest even though the instruction text (and
+        # every count) is unchanged.
+        pinned = encdiff.Row("mov %ds:4(,%ebp,1), %rax", encoded(b"L"),
+                             byte_pin=bytes.fromhex("3e67488b4504"))
+        weakened = encdiff.Row("mov %ds:4(,%ebp,1), %rax", encoded(b"L"),
+                               byte_pin=bytes.fromhex("67488b4504"))
+        self.assertNotEqual(encdiff.rows_digest([pinned]),
+                            encdiff.rows_digest([weakened]))
+
+    def test_rows_digest_detects_a_compensating_swap_end_to_end(self):
+        # End to end through check_verdict_histogram: same counts, one
+        # row swapped for another of the same verdict — the counts-only
+        # comparison is blind to exactly this; the digest fails it.
+        rows = [row_as("mov %r8, %r9", b"L", gas=b"S"),
+                row_as("mov %r10, %r11", b"L", gas=b"S")]
+        for r in rows:
+            r.verdict = "BEATS"
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td) / "hist.txt"
+            base.write_text(
+                "# rows-sha256: " + encdiff.rows_digest(rows) + "\n"
+                + "\n".join(f"{c} {2 if c == 'BEATS' else 0}"
+                            for c in encdiff.SEVERITY) + "\n")
+            self.assertTrue(encdiff.check_verdict_histogram(rows, base))
+            swapped = [rows[0], row_as("mov %r12, %r13", b"L", gas=b"S")]
+            swapped[1].verdict = "BEATS"
+            self.assertEqual(encdiff.verdict_histogram(swapped),
+                             encdiff.verdict_histogram(rows))
+            self.assertFalse(encdiff.check_verdict_histogram(swapped, base))
 
     def test_canon_insn_sorts_test_operands(self):
         self.assertEqual(
@@ -650,6 +732,278 @@ class OracleCommutativeAndSelectorViewTests(unittest.TestCase):
         self.assertEqual(row.verdict, "WRONG-BYTES")
 
 
+class ByteExactPinTests(unittest.TestCase):
+    """The `# byte-exact <hex>' row annotation.
+
+    The dead-segment canon deliberately tolerates any ES/DS/SS choice on
+    the flip rows — both views are the same 64-bit flat-mode program —
+    so the flip rows' VERDICT cannot see the segment byte: before the
+    pins, a dropped 0x3e on the ds fold row classified BEATS straight
+    through the strip (reproduced here with real GAS bytes). The pin is
+    checked before any law, canonicaliser or round-trip, which makes the
+    corpus rows themselves the CI record of the prefix policy.
+    """
+
+    def test_split_byte_pin_parses_strips_and_rejects_malformed(self):
+        text = "mov %ds:4(,%ebp,1), %rax   # byte-exact 3e67488b4504"
+        insn, pin = encdiff.split_byte_pin(text)
+        self.assertEqual(insn, "mov %ds:4(,%ebp,1), %rax")
+        self.assertEqual(pin, bytes.fromhex("3e67488b4504"))
+        # No annotation: the line passes through unchanged.
+        self.assertEqual(encdiff.split_byte_pin("mov %eax, %ebx"),
+                         ("mov %eax, %ebx", None))
+        # A prose comment is not an annotation (it stays part of the
+        # instruction text, exactly as before the mechanism existed)...
+        insn, pin = encdiff.split_byte_pin("mov %eax, %ebx # a comment")
+        self.assertEqual(insn, "mov %eax, %ebx # a comment")
+        self.assertIsNone(pin)
+        # ...but anything byte-exact-SHAPED that fails the strict grammar
+        # is a hard error: a typo'd pin must never silently weaken the
+        # row's contract back to verdict-only.
+        for bad in ("mov %eax, %ebx # byte-exact 3e6",   # odd hex
+                    "mov %eax, %ebx # byte-exact xyz",   # not hex
+                    "mov %eax, %ebx # byte-exact",       # empty
+                    "mov %eax, %ebx # byte exact 3e"):   # wrong spelling
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    encdiff.split_byte_pin(bad)
+
+    def test_dropped_ds_prefix_on_the_ds_flip_row_is_not_a_beat(self):
+        # THE adversarial row of the pin mechanism, end to end
+        # through the shipped classify with REAL GAS 2.47 reference
+        # bytes: lccc regresses and drops the 0x3e the pin demands
+        # (emitting the 5-byte fold without the override). Without the
+        # pin this row classifies BEATS with "round-trip verified" —
+        # the dead-segment strip launders the missing byte — and the
+        # corpus gate stays green on a segment-byte regression.
+        gas_raw = bytes.fromhex("67488b042d04000000")    # GAS raw SIB view
+        for lccc_bytes, expect in (
+            (bytes.fromhex("3e67488b4504"), "BEATS"),       # correct: kept
+            (bytes.fromhex("67488b4504"), "WRONG-BYTES"),   # regress: dropped
+        ):
+            with self.subTest(lccc=lccc_bytes.hex()):
+                row = encdiff.Row(
+                    "mov %ds:4(,%ebp,1), %rax", encoded(lccc_bytes),
+                    {"gas": encoded(gas_raw)},
+                    byte_pin=bytes.fromhex("3e67488b4504"))
+                encdiff.classify(row)
+                self.assertEqual(row.verdict, expect)
+                if expect == "WRONG-BYTES":
+                    self.assertIn("byte-exact pin violated", row.note)
+                    self.assertIn("pinned 3e67488b4504", row.note)
+
+    def test_pin_fires_before_any_canonisation_or_roundtrip(self):
+        # The pin check precedes the dead-segment law and the round-trip
+        # entirely: even an oracle that would verify ANYTHING cannot be
+        # consulted for a pinned byte difference, and a row lccc refuses
+        # to assemble fails its pin too (the pin's contract includes
+        # assembling to exactly these bytes).
+        row = encdiff.Row(
+            "mov %ds:4(,%ebp,1), %rax", encoded(b"\x90"),
+            {"gas": encoded(bytes.fromhex("67488b042d04000000"))},
+            byte_pin=bytes.fromhex("3e67488b4504"))
+        with mock.patch.object(encdiff, "decodes_same") as check:
+            encdiff.classify(row)
+        check.assert_not_called()
+        self.assertEqual(row.verdict, "WRONG-BYTES")
+        rejected = encdiff.Row(
+            "mov %ds:4(,%ebp,1), %rax", encdiff.Encoding(False, None, "boom"),
+            {"gas": encoded(bytes.fromhex("67488b042d04000000"))},
+            byte_pin=bytes.fromhex("3e67488b4504"))
+        encdiff.classify(rejected)
+        self.assertEqual(rejected.verdict, "WRONG-BYTES")
+        self.assertIn("did not assemble", rejected.note)
+
+    def test_corpus_flip_annotations_match_the_encoder_pins(self):
+        # The corpus annotations and the Rust unit pins are two
+        # independent guards of one law; this test refuses to let them
+        # drift apart. The complete flip set {rbp, ebp} x {ss, ds} must
+        # be annotated in the corpus, and every corpus annotation whose
+        # instruction the encoder also pins must carry the SAME bytes.
+        mod = (ROOT / "src/backend/x86/assembler/encoder/mod.rs").read_text()
+        start = mod.index("fn fold_decides_segment_elision_on_the_folded_view()")
+        end = mod.find("\n    #[test]", start)
+        body = mod[start:end]
+        rust_pins = {
+            insn: bytes.fromhex(hexs.replace(" ", ""))
+            for insn, hexs in re.findall(
+                r'assert_eq!\(hex\("([^"]+)"\), "((?:[0-9a-f]{2} ?)+)"\)',
+                body)
+        }
+        corpus = (ROOT / "tests/encdiff-corpus/index-fold-64.insn").read_text()
+        corpus_pins = {
+            insn: bytes.fromhex(hexs)
+            for insn, hexs in re.findall(
+                r"^(.*?)\s*#\s*byte-exact\s+([0-9a-f]+)\s*$", corpus,
+                re.M | re.IGNORECASE)
+        }
+        # The complete flip set is annotated (both halves, both segments).
+        for flip in ("mov %ss:4(,%rbp,1), %rax", "mov %ds:4(,%rbp,1), %rax",
+                     "mov %ss:4(,%ebp,1), %rax", "mov %ds:4(,%ebp,1), %rax"):
+            self.assertIn(flip, corpus_pins,
+                          "flip row lost its byte-exact annotation")
+            self.assertEqual(corpus_pins[flip], rust_pins[flip])
+        # And no corpus annotation anywhere contradicts an encoder pin.
+        for insn, pin in corpus_pins.items():
+            if insn in rust_pins:
+                self.assertEqual(pin, rust_pins[insn],
+                                 f"corpus pin drifts from the Rust pin for {insn!r}")
+
+    def test_every_egpr_pin_is_corpus_recorded(self):
+        # Historically only 7 of the 10 EGPR fold pins had corpus rows;
+        # the (%r20)/(%r24) SIB-escape base twins and the positive
+        # compressed-disp8 sign case did not. Now the coverage is a
+        # CONTRACT: every pin in fold_moves_the_egpr_index_through_
+        # avx512_evex must appear in the corpus with a byte-exact
+        # annotation carrying the SAME bytes, and the count must be
+        # exactly the pin count — a new pin without its corpus row (or a
+        # deleted corpus row) fails here, not at the next audit.
+        mod = (ROOT / "src/backend/x86/assembler/encoder/mod.rs").read_text()
+        start = mod.index("fn fold_moves_the_egpr_index_through_avx512_evex()")
+        end = mod.find("\n    #[test]", start)
+        body = mod[start:end]
+        rust_pins = {
+            insn: bytes.fromhex(hexs.replace(" ", ""))
+            for insn, hexs in re.findall(
+                r'assert_eq!\(hex\("([^"]+)"\), "((?:[0-9a-f]{2} ?)+)"\)',
+                body)
+        }
+        corpus = (ROOT / "tests/encdiff-corpus/index-fold-64.insn").read_text()
+        corpus_pins = {
+            insn: bytes.fromhex(hexs)
+            for insn, hexs in re.findall(
+                r"^(.*?)\s*#\s*byte-exact\s+([0-9a-f]+)\s*$", corpus,
+                re.M | re.IGNORECASE)
+        }
+        self.assertEqual(len(rust_pins), 10,
+                         "the EGPR pin count changed: update this contract "
+                         "and the corpus together, in one commit")
+        for insn, pin in rust_pins.items():
+            with self.subTest(insn=insn):
+                self.assertIn(insn, corpus_pins,
+                              "EGPR pin has no corpus row with a byte-exact "
+                              "annotation")
+                self.assertEqual(corpus_pins[insn], pin)
+
+
+class BytePinPolicyTests(unittest.TestCase):
+    """harvest_byte_pins: a pin contract is unambiguous by construction."""
+
+    def test_same_pin_repeated_is_idempotent(self) -> None:
+        lines = ["mov %eax, %ebx # byte-exact 90",
+                 "mov %eax, %ebx # byte-exact 90",
+                 "mov %ecx, %edx"]
+        stripped, pins = encdiff.harvest_byte_pins(lines)
+        self.assertEqual(stripped, ["mov %eax, %ebx", "mov %eax, %ebx",
+                                    "mov %ecx, %edx"])
+        self.assertEqual(pins, {"mov %eax, %ebx": bytes.fromhex("90")})
+
+    def test_conflicting_duplicate_pins_are_an_error(self) -> None:
+        # Corpus ordering must not decide the contract: a dict's
+        # last-write-wins would silently keep whichever pin came last.
+        with self.assertRaisesRegex(ValueError, "conflicting bytes"):
+            encdiff.harvest_byte_pins([
+                "mov %eax, %ebx # byte-exact 90",
+                "mov %eax, %ebx # byte-exact 91"])
+
+    def test_pinned_and_unpinned_occurrences_are_an_error(self) -> None:
+        # The same text appearing both pinned and unpinned would let the
+        # deduplicated row inherit a pin by accident (or lose one).
+        with self.assertRaisesRegex(ValueError, "both pinned and unpinned"):
+            encdiff.harvest_byte_pins([
+                "mov %eax, %ebx # byte-exact 90",
+                "mov %eax, %ebx"])
+
+    def test_case_insensitive_tag_and_hex(self) -> None:
+        # `# BYTE-EXACT <hex>' and uppercase hex digits are the same pin
+        # as their lowercase spelling — no near-miss spelling of the TAG
+        # can fall through as prose.
+        stripped, pins = encdiff.harvest_byte_pins(
+            ["mov %eax, %ebx # BYTE-EXACT 3E67488B4504"])
+        self.assertEqual(stripped, ["mov %eax, %ebx"])
+        self.assertEqual(pins, {"mov %eax, %ebx":
+                                bytes.fromhex("3e67488b4504")})
+        with self.assertRaisesRegex(ValueError, "malformed byte-exact"):
+            encdiff.split_byte_pin("mov %eax, %ebx # Byte_Exact 3e6")
+
+
+class StrictBaselineParseTests(unittest.TestCase):
+    """check_verdict_histogram: malformed baselines are errors.
+
+    Duplicates, unknown or misspelled classes, negative counts and
+    missing classes must never be silently overwritten or silently
+    dropped data.
+    """
+
+    def _rows(self):
+        rows = [row_as("a", b"L", gas=b"S"), row_as("b", b"L", gas=b"S")]
+        for r in rows:
+            r.verdict = "BEATS"
+        return rows
+
+    def _lines(self, **overrides: int) -> str:
+        return "\n".join(
+            f"{cls} {overrides.get(cls, 0)}"
+            for cls in encdiff.SEVERITY) + "\n"
+
+    def _check(self, text: str) -> bool:
+        rows = self._rows()
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td) / "hist.txt"
+            base.write_text(text)
+            with redirect_stderr(StringIO()):
+                return encdiff.check_verdict_histogram(rows, base)
+
+    def test_well_formed_baseline_passes(self) -> None:
+        good = ("# rows-sha256: "
+                + encdiff.rows_digest(self._rows()) + "\n"
+                + self._lines(BEATS=2))
+        self.assertTrue(self._check(good))
+
+    def test_duplicate_digest_line(self) -> None:
+        good = ("# rows-sha256: "
+                + encdiff.rows_digest(self._rows()) + "\n")
+        self.assertFalse(self._check(good + "# rows-sha256: " + "0" * 64 + "\n"
+                                     + self._lines(BEATS=2)))
+
+    def test_duplicate_verdict_class(self) -> None:
+        text = ("# rows-sha256: "
+                + encdiff.rows_digest(self._rows()) + "\n"
+                + self._lines(BEATS=2) + "BEATS 2\n")
+        self.assertFalse(self._check(text))
+
+    def test_negative_count(self) -> None:
+        text = ("# rows-sha256: "
+                + encdiff.rows_digest(self._rows()) + "\n"
+                + self._lines(BEATS=2).replace("BEATS 2", "BEATS -3"))
+        self.assertFalse(self._check(text))
+
+    def test_unknown_class_nonzero(self) -> None:
+        # A misspelled class with a nonzero count was already caught by
+        # the count comparison; it is a parse error instead now.
+        text = ("# rows-sha256: "
+                + encdiff.rows_digest(self._rows()) + "\n"
+                + self._lines(BEATS=2).replace("BEATS 2", "BEATSS 5"))
+        self.assertFalse(self._check(text))
+
+    def test_misspelled_zero_class(self) -> None:
+        # THE invisible case: a misspelled zero-count class was discarded
+        # by the nonzero projection and could never fail.
+        text = ("# rows-sha256: "
+                + encdiff.rows_digest(self._rows()) + "\n"
+                + self._lines(BEATS=2).replace("ok 0", "okk 0"))
+        self.assertFalse(self._check(text))
+
+    def test_missing_class(self) -> None:
+        # Every class is listed exactly once, zeros included — a class
+        # absent from the baseline is a malformed baseline now (before,
+        # absence compared equal through the nonzero projection).
+        text = ("# rows-sha256: "
+                + encdiff.rows_digest(self._rows()) + "\n"
+                + self._lines(BEATS=2).replace("ok 0\n", ""))
+        self.assertFalse(self._check(text))
+
+
 class Data16DeclineVerificationTests(unittest.TestCase):
     """P1 regression: DECLINED-DATA16 is only claimable after the
     round-trip proves the relaxed oracle form is the same program."""
@@ -692,8 +1046,8 @@ class Data16DeclineVerificationTests(unittest.TestCase):
         self.assertIn("same program", row.note)
         # The decline is NOT a rubber stamp: if the LCCC bytes are
         # anything other than the verified same-program form -- here
-        # three NOPs -- the row is WRONG-BYTES, never DECLINED (the
-        # PR #711 audit's fail-open finding).
+        # three NOPs -- the row is WRONG-BYTES, never DECLINED — the
+        # fail-open hole this test pins shut.
         row = row_as("data16 loop 1f", b"\x90\x90\x90", gas=b"\xe2\x00")
         with mock.patch.object(encdiff, "decodes_same", return_value=False):
             encdiff.classify(row, bits32=True)

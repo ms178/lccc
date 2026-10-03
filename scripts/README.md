@@ -20,7 +20,7 @@ standalone `LCCC-RECOVER.py` survives a worktree reset. See the
 | `build_kernel_boot.sh` | Build all x86 real-mode setup objects with LCCC (`-ffunction-sections`), link with `lccc-ld --gc-sections`, preserve non-relocation boot payloads through a build-local `KEEP` script, enforce the authentic 32 KiB ASSERTs, and require flat-image byte identity with available BFD/LLD oracles. |
 | `elf_sections.sh` | Shared ELF section helper: `lccc_elf_code_bytes` sums every `SHF_EXECINSTR` section of an object. Sourced by the size harnesses, because summing sections named `.text*` reports `header.o` and `bioscall.o` as 0 bytes (their code is in `.bstext`/`.entrytext`/`.inittext`) and understates `tty.o`'s gap against GCC from +184 to +57. |
 | `realmode_corpus.sh` | Compare LCCC/GCC executable (`SHF_EXECINSTR`) bytes per `arch/x86/boot` C file under the real `-m16 -Os` flags. |
-| `asmdiff.py` | Whole-object differential against GNU as: section bytes, relocations, and symbols. See `tests/asm-diff/README.md`. |
+| `asmdiff.py` | Whole-object differential against GNU as: section bytes, relocations, and symbols. See `tests/asm-diff/README.md`. Takes the oracle pair as flags (`--as`, `--objdump`): the `betterok` groups accept a smaller encoding only when the pinned disassembler proves both objects decode identically, so both gates run it against the 2.47 pair. |
 | `insndiff.py` | Per-instruction encoding differential against GNU as. Reduces an encoding bug to a single mnemonic in one step; supports `--sweep` over register/immediate matrices. A shorter-than-GAS encoding is reported as `BETTER` only after the tool disassembles both forms and confirms they decode identically. |
 | `encdiff.py` | Multi-assembler encoding differential: LCCC against GNU as **and** the Clang, GCC, ICC and ICX integrated assemblers over the Compiler Explorer API. Supports x86-64 and i686 (`--32`, local `lccc-i686`/GAS `--32`, remote compiler `-m32`). A shorter result is a `BEATS` only after objdump round-trips it against every distinct shortest oracle encoding in the selected mode; missing/undecodable disassembly is reported as unverified and fails the gate. Casefile harvesting skips `reject` groups. |
 | `gen_encoding_sweep.py` | Generate instructions that have MORE THAN ONE legal encoding (accumulator short forms, imm8 sign-extension, redundant REX, VEX2-vs-VEX3, scale-1 index folds, ...). These are the only places an encoding can be improved, and most are invisible to a structural-coverage corpus. |
@@ -157,7 +157,44 @@ export LCCC_OBJDUMP=/path/to/objdump   # used to verify shorter encodings
 `--objdump`); the corpus gates use the flags so the parity checker sees the
 pinned paths (as + objdump come from one binutils 2.47 build via
 `scripts/ensure_gas_247.sh` — the disassembler decides the BEATS/ok
-verdicts, so it is as much an oracle as the assembler).
+verdicts, so it is as much an oracle as the assembler). The same discipline
+applies to the whole-object differential: `asmdiff.py` takes `--objdump`
+as well, its `betterok` groups accept a smaller encoding only when the
+disassembler proves the two objects decode identically, and both asm-diff
+gates (x86-64 and i686) pin the full 2.47 pair — an unpinned objdump is an
+unpinned verdict authority, whatever binutils the host image ships.
+
+## The corpus-gate contracts (encdiff)
+
+The `encdiff-corpus` gate runs `encdiff.py` offline, against the pinned
+as + objdump 2.47 pair, over the two 64-bit law corpora
+(`tests/encdiff-corpus/index-fold-64.insn` and
+`data16-branches-64.insn`), with two checked-in contracts:
+
+- **`--expect-histogram tests/encdiff-corpus/expected-verdicts.txt`** —
+  the per-verdict row-count baseline. Counts only, never bytes: a BEATS
+  row staying BEATS through better bytes needs no update, but any count
+  change — a verdict drifting (BEATS → ok-best), a new row, a deleted
+  row, a class appearing from zero — fails the gate until the baseline
+  is consciously re-recorded **in the same commit that changed the
+  corpus**. Zero-count classes are documentation (the class is pinned
+  absent) and compare through the nonzero projection on both sides. The
+  baseline also carries a `# rows-sha256:` digest over the
+  comment-stripped, sorted row texts (with each row's byte-exact pin):
+  counts alone are a NET contract — a compensating delete+add of
+  same-verdict rows nets to zero — so the digest pins row identity, and
+  any row-set or pin change is a baseline change too.
+- **`# byte-exact <hex>` row annotations** — the strongest per-row
+  contract. The annotation pins the row's LCCC bytes exactly and is
+  checked BEFORE any law, canonicaliser or round-trip, so nothing
+  downstream (not the dead-segment unification, not a same-rendering
+  oracle) can launder a pinned byte difference into a verdict. It exists
+  for rows whose bytes are the claim but whose verdict comparison cannot
+  see them: the segment+fold flip rows (where the folded view
+  legitimately differs from GAS's raw view by the dead prefix byte) and
+  the APX x AVX-512 folds (whose correctness argument is byte-identity
+  with the base-form spelling). A malformed annotation is a hard error,
+  never a silently-ignored comment.
 
 `encdiff.py` additionally needs outbound network access for the remote
 oracles. Run it with `--offline` to restrict it to the local assembler; that

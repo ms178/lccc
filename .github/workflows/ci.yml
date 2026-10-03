@@ -699,16 +699,18 @@ jobs:
         run: bash scripts/ensure_gas_247.sh x86_64-linux-gnu
 
       - name: Verify x86-64 assembly differential vs GNU as 2.47
-        run: python3 scripts/asmdiff.py --jobs 2 --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" --lccc target/fastbuild/lccc-x86
+        run: python3 scripts/asmdiff.py --jobs 2 --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" --objdump "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump" --lccc target/fastbuild/lccc-x86
 
       # Whole-object ELF32 differential corpus, including relocation/addend
       # ownership for bare memory operands and relaxation-patched loop/jecxz.
-      # Pinned to the same GNU as 2.47 oracle as the x86-64 differential: the
-      # byte-exact layout cases (NOP tables, relaxation order) differ between
-      # GAS releases -- 2.44 places the lea-NOP remainder after the long NOP,
-      # 2.47 before it -- so the runner image's assembler is not an oracle.
+      # Pinned to the same GNU as + objdump 2.47 PAIR as the x86-64
+      # differential: the byte-exact layout cases (NOP tables, relaxation
+      # order) differ between GAS releases -- 2.44 places the lea-NOP
+      # remainder after the long NOP, 2.47 before it -- and the betterok
+      # groups' smaller-encoding verdicts are arbitrated by the pinned
+      # objdump, so neither half of the pair may come from the runner image.
       - name: Verify i686 assembly differential vs GNU as 2.47
-        run: python3 scripts/asmdiff.py --32 --jobs 2 --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" --lccc target/fastbuild/lccc-i686
+        run: python3 scripts/asmdiff.py --32 --jobs 2 --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" --objdump "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump" --lccc target/fastbuild/lccc-i686
 
       # The encdiff corpus is the semantic record of every deliberate
       # divergence from GAS (index-fold families incl. the AVX-512 EVEX
@@ -886,10 +888,10 @@ jobs:
           # decider must accept %rdx/%r11-homed SIB operands (S13
           # sqlite_varint golden-gate regression pin).
           bash tests/regression/check_indexed_fold_scratch_index.sh
-          # _Decimal64 indexed fold (S15): SIB-movsd load+store assertions
+          # _Decimal64 indexed fold: SIB-movsd load+store assertions
           # plus an integer-checksum gcc differential.
           bash tests/regression/check_decimal64_indexed_fold.sh
-          # _Decimal32 AArch64 width (S19): w-view indexed + plain traffic
+          # _Decimal32 AArch64 width: w-view indexed + plain traffic
           # assertions plus encodability teeth (no bare mov past imm16).
           bash tests/regression/check_decimal32_indexed_fold_arm.sh
           # FMA-negation peel deletion invariant, re-derived over the enumerated

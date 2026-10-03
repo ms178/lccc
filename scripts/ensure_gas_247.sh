@@ -26,19 +26,255 @@
 # Usage: scripts/ensure_gas_247.sh [target-triple] [install-prefix]
 #   target-triple defaults to riscv64-linux-gnu. The tools are installed
 #   as <prefix>/bin/as and <prefix>/bin/objdump, and their versions are
-#   printed on success.
+#   printed on success — after the freshly installed pair has passed the
+#   same validation the cache fast path applies.
+#
+# scripts/ensure_gas_247.sh --self-test
+#   runs the validation matrix against fake tool pairs (correct 2.47,
+#   wrong 2.46, substring lookalikes, mismatched tokens, unreadable
+#   --version, version-correct-but-functionally-broken) and exits 0 only
+#   if every case lands on the verdict it must.
 set -euo pipefail
+
+# ─── Pair validation ───────────────────────────────────────────────────────
+# The version contract is an ANCHORED token, not a substring: grepping
+# for "2.47" accepts 2.470, 12.47 and wrapper-2.47-malicious alike. The
+# token is extracted from --version's first line (always the last
+# whitespace-delimited field a GNU tool prints), matched anchored against
+# the pin, and required to be the SAME token from both halves of the
+# pair: two different builds both calling themselves 2.47 is not "one
+# 2.47 build", which is what the pair contract promises. A functional
+# canary then proves the pair actually assembles and disassembles in both
+# modes the gates run — a version string is not a tool. Non-x86 targets
+# have no shared canary source and validate version-only.
+
+_version_token() {  # <tool>: the version token of --version's first line
+    local line
+    line=$("$1" --version 2>/dev/null | sed -n '1,1p') || return 1
+    [[ -n "$line" ]] || return 1
+    printf '%s\n' "$line" | awk '{print $NF}'
+}
+
+_canary() {  # functional target verification; x86-family targets only
+    case "$target" in
+        x86_64-*|i686-*|i386-*) ;;
+        *) return 0 ;;
+    esac
+    local tmp tag listing ok=0
+    tmp=$(mktemp -d)
+    printf '.text\nmov %%eax,%%ebx\n' >"$tmp/canary.s"
+    for tag in 64 32; do
+        if ! "$as" "--$tag" -o "$tmp/canary$tag.o" "$tmp/canary.s" \
+                2>/dev/null; then
+            echo "validate: canary: $as failed to assemble 'mov %eax,%ebx' in --$tag mode" >&2
+            ok=1
+            break
+        fi
+        listing=$("$od" -d "$tmp/canary$tag.o" 2>/dev/null) || {
+            echo "validate: canary: $od failed to disassemble the --$tag object" >&2
+            ok=1
+            break
+        }
+        if ! grep -Eq 'mov[[:space:]]+%eax,%ebx' <<<"$listing"; then
+            echo "validate: canary: $od did not decode the --$tag canary back to 'mov %eax,%ebx'" >&2
+            ok=1
+            break
+        fi
+    done
+    rm -rf "$tmp"
+    return "$ok"
+}
+
+validate_pair() {
+    local pin_re='^2\.47(\.[0-9]+)*$'
+    local tok_as tok_od
+    tok_as=$(_version_token "$as") \
+        || { echo "validate: $as --version is unreadable" >&2; return 1; }
+    tok_od=$(_version_token "$od") \
+        || { echo "validate: $od --version is unreadable" >&2; return 1; }
+    [[ "$tok_as" =~ $pin_re ]] || {
+        echo "validate: $as reports version '$tok_as' — not the pinned 2.47 (the token is matched against an anchored pattern: 2.470, 12.47, 2.46 and lookalikes are rejected)" >&2
+        return 1
+    }
+    [[ "$tok_od" =~ $pin_re ]] || {
+        echo "validate: $od reports version '$tok_od' — not the pinned 2.47 (anchored token)" >&2
+        return 1
+    }
+    [[ "$tok_as" == "$tok_od" ]] || {
+        echo "validate: pair mismatch — as says '$tok_as', objdump says '$tok_od'; both version tokens must be identical" >&2
+        return 1
+    }
+    _canary || return 1
+}
+
+# ─── Self-test: the validation matrix, against fake tool pairs ────────────
+# Every case the validators can be fed, each pinned to the verdict it must
+# land on. The fakes are functional for the canary layer wherever the case
+# is meant to reject at the VERSION layer (and vice versa), so each layer
+# is proven to reject on its own, independently.
+self_test() {
+    local tmp ok=0
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' RETURN
+
+    local V47="GNU assembler (GNU Binutils) 2.47"
+    local O47="GNU objdump (GNU Binutils) 2.47"
+
+    mkver() {  # mkver <path> <version-line>: prints the version, succeeds otherwise
+        cat >"$1" <<EOF
+#!/bin/sh
+case "\$1" in --version) printf '%s\n' "$2"; exit 0;; esac
+exit 0
+EOF
+        chmod +x "$1"
+    }
+    mkok() {  # mkok <path> <version-line>: as above, and -d decodes the canary
+        cat >"$1" <<EOF
+#!/bin/sh
+case "\$1" in --version) printf '%s\n' "$2"; exit 0;; esac
+printf '%s\n' '   0: 89 d8                  mov    %eax,%ebx'
+exit 0
+EOF
+        chmod +x "$1"
+    }
+    mkbad() {  # mkbad <path> <version-line>: as above, but -d decodes something else
+        cat >"$1" <<EOF
+#!/bin/sh
+case "\$1" in --version) printf '%s\n' "$2"; exit 0;; esac
+printf '%s\n' '   0: 0f 1f 40 00             nopl   0x0(%rax,%rax,1)'
+exit 0
+EOF
+        chmod +x "$1"
+    }
+    mkfail() {  # mkfail <path>: --version exits 1
+        cat >"$1" <<'EOF'
+#!/bin/sh
+case "$1" in --version) exit 1;; esac
+exit 0
+EOF
+        chmod +x "$1"
+    }
+    mkempty() {  # mkempty <path>: --version prints nothing
+        cat >"$1" <<'EOF'
+#!/bin/sh
+case "$1" in --version) :;; esac
+exit 0
+EOF
+        chmod +x "$1"
+    }
+    mkref() {  # mkref <path>: --version fine, refuses everything else
+        cat >"$1" <<'EOF'
+#!/bin/sh
+case "$1" in --version) printf '%s\n' "GNU assembler (GNU Binutils) 2.47"; exit 0;; esac
+exit 1
+EOF
+        chmod +x "$1"
+    }
+
+    check() {  # check <label> <want: 0=accept, 1=reject>
+        local label=$1 want=$2 got
+        if validate_pair >/dev/null 2>"$tmp/err"; then got=0; else got=1; fi
+        if [[ $got == "$want" ]]; then
+            printf '  ok   %-44s -> %s\n' "$label" \
+                "$([[ $want == 0 ]] && echo ACCEPT || echo REJECT)"
+        else
+            printf '  FAIL %-44s -> wanted %s, got %s: %s\n' "$label" \
+                "$([[ $want == 0 ]] && echo ACCEPT || echo REJECT)" \
+                "$([[ $got == 0 ]] && echo ACCEPT || echo REJECT)" \
+                "$(sed -n '1,1p' "$tmp/err")"
+            ok=1
+        fi
+    }
+
+    target=x86_64-linux-gnu
+
+    as="$tmp/gas-247";  od="$tmp/od-247"
+    mkok "$as" "$V47"; mkok "$od" "$O47"
+    check "correct 2.47 pair (functional canary)" 0
+
+    as="$tmp/gas-246"; od="$tmp/od-246"
+    mkok "$as" "GNU assembler (GNU Binutils) 2.46"
+    mkok "$od" "GNU objdump (GNU Binutils) 2.46"
+    check "2.46 pair under the 2.47-named prefix" 1
+
+    as="$tmp/gas-2470"; od="$tmp/od-2470"
+    mkok "$as" "GNU assembler (GNU Binutils) 2.470"
+    mkok "$od" "GNU objdump (GNU Binutils) 2.470"
+    check "substring lookalike 2.470" 1
+
+    as="$tmp/gas-1247"; od="$tmp/od-1247"
+    mkok "$as" "GNU assembler (GNU Binutils) 12.47"
+    mkok "$od" "GNU objdump (GNU Binutils) 12.47"
+    check "substring lookalike 12.47" 1
+
+    as="$tmp/gas-wrap"; od="$tmp/od-wrap"
+    mkok "$as" "GNU assembler (GNU Binutils) wrapper-2.47-malicious"
+    mkok "$od" "GNU objdump (GNU Binutils) wrapper-2.47-malicious"
+    check "substring lookalike wrapper-2.47-malicious" 1
+
+    as="$tmp/gas-247"; od="$tmp/od-247d"
+    mkok "$as" "$V47"
+    mkok "$od" "GNU objdump (GNU Binutils) 2.47.20260726"
+    check "mismatched tokens (2.47 vs 2.47.20260726)" 1
+
+    as="$tmp/gas-snap"; od="$tmp/od-snap"
+    mkok "$as" "GNU assembler (GNU Binutils) 2.47.20260726"
+    mkok "$od" "GNU objdump (GNU Binutils) 2.47.20260726"
+    check "dated snapshot 2.47.20260726, both halves" 0
+
+    as="$tmp/gas-fail"; od="$tmp/od-fail"
+    mkfail "$as"; mkfail "$od"
+    check "failing --version" 1
+
+    as="$tmp/gas-empty"; od="$tmp/od-empty"
+    mkempty "$as"; mkempty "$od"
+    check "empty --version line" 1
+
+    as="$tmp/gas-247"; od="$tmp/od-broken"
+    mkok "$as" "$V47"
+    mkbad "$od" "$O47"
+    check "version-correct, canary-broken pair" 1
+
+    as="$tmp/gas-ref"; od="$tmp/od-247"
+    mkref "$as"; mkok "$od" "$O47"
+    check "version-correct, as refuses to assemble" 1
+
+    target=riscv64-linux-gnu
+    as="$tmp/gas-rv"; od="$tmp/od-rv"
+    mkver "$as" "$V47"; mkver "$od" "$O47"
+    check "non-x86 target: version-only validation" 0
+
+    if [[ $ok == 0 ]]; then
+        echo "ensure_gas_247 self-test: every case lands on its verdict"
+    else
+        echo "ensure_gas_247 self-test: FAILURES above" >&2
+    fi
+    return "$ok"
+}
+
+if [[ ${1:-} == --self-test ]]; then
+    self_test
+    exit $?
+fi
 
 target=${1:-riscv64-linux-gnu}
 prefix=${2:-${HOME}/.cache/gas-2.47-${target}}
 as="$prefix/bin/as"
 od="$prefix/bin/objdump"
 
-# BOTH binaries or a full rebuild: a cache carrying only one of the pair
-# is an interrupted provision, not a working oracle.
-if [[ -x "$as" && -x "$od" ]]; then
-    "$as" --version | head -1
-    "$od" --version | head -1
+# BOTH binaries, validated as a PAIR (pinned token, one build, functional
+# canary), or a full rebuild. Two guards, two failure modes: a cache
+# carrying only one of the pair is an interrupted provision, and a pair
+# under the 2.47-NAMED prefix that does not validate is a lie — the
+# prefix name is not the version. A stale pair (a distro 2.46 copied in,
+# a prefix reused by a newer provision) would short-circuit the gate into
+# arbitrating every differential against the wrong oracle release, so the
+# fast path re-derives what it is about to trust. Anything else falls
+# through to the rebuild, which reinstalls from one source tree and must
+# itself pass the same validation before it is trusted.
+if [[ -x "$as" && -x "$od" ]] && validate_pair; then
+    "$as" --version | sed -n '1,1p'
+    "$od" --version | sed -n '1,1p'
     exit 0
 fi
 
@@ -94,5 +330,9 @@ make -j2 >make.log 2>&1
 mkdir -p "$prefix/bin"
 cp gas/as-new "$as"
 cp binutils/objdump "$od"
-"$as" --version | head -1
-"$od" --version | head -1
+# The freshly installed pair must pass the SAME validation the cache
+# fast path applies — an install that cannot justify itself is a failure,
+# not a print-and-hope.
+validate_pair || { echo "FATAL: the freshly installed pair fails validation" >&2; exit 1; }
+"$as" --version | sed -n '1,1p'
+"$od" --version | sed -n '1,1p'
