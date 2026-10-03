@@ -46,6 +46,18 @@ impl Parser {
         }
 
         while !matches!(self.peek(), TokenKind::RBrace | TokenKind::Eof) {
+            // E5 termination guarantee: once the expression frame budget is
+            // exhausted the guarded expression entry points return
+            // placeholders WITHOUT consuming tokens. Without this check a
+            // statement that fails to parse an expression would spin this
+            // loop forever on the same token (hostile input like
+            // `({ ({ ... ({ ) ... }) }) })` beyond the budget). The budget
+            // diagnostic was already emitted; unwind silently like the
+            // top-level loop does.
+            if self.expr_frame_diagnosed {
+                break;
+            }
+            let pos_before = self.pos;
             self.skip_gcc_extensions();
             // Handle #pragma pack directives within function bodies
             while self.handle_pragma_pack_token() {
@@ -101,6 +113,12 @@ impl Parser {
             } else {
                 let stmt = self.parse_stmt();
                 items.push(BlockItem::Statement(stmt));
+            }
+            // Universal progress guarantee: no statement parse may return
+            // having consumed nothing, or this loop would retry the same
+            // token forever (defense in depth on top of the budget check).
+            if self.pos == pos_before {
+                self.advance();
             }
         }
 

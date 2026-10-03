@@ -114,7 +114,7 @@ impl Preprocessor {
     /// `__has_include` are NOT handled here: `defined` is only an operator
     /// inside #if/#elif (a code-line `defined` is an ordinary identifier),
     /// and __has_include's argument grammar (<...>) is directive-only.
-    pub(super) fn resolve_has_macros_in_code(&self, line: &str) -> String {
+    pub(super) fn resolve_has_macros_in_code(&mut self, line: &str, diag_line: usize) -> String {
         // Fast path: the overwhelming majority of lines have no __has_ token.
         if !line.contains("__has_") {
             return line.to_string();
@@ -164,6 +164,10 @@ impl Preprocessor {
                         self.skip_paren_arg_bytes(bytes, &mut i);
                         result.push('0');
                     }
+                    "__has_warning" => {
+                        let val = self.resolve_has_warning_call_bytes(bytes, &mut i, diag_line);
+                        result.push_str(&val);
+                    }
                     _ => result.push_str(ident),
                 }
                 continue;
@@ -174,7 +178,156 @@ impl Preprocessor {
         result
     }
 
-    pub(super) fn resolve_defined_in_expr(&mut self, expr: &str) -> String {
+    /// Clang's `__has_warning("-Wflag")` operator. Policy: a well-formed
+    /// string-literal argument yields 1 (lccc accepts the guarded warning
+    /// workaround), anything else 0, and the empty call yields the Clang
+    /// diagnostic the corpus pins: `too few arguments`.
+    /// Is the argument of `__has_warning` a warning flag THIS compiler
+    /// recognizes? Queries the same registry the CLI -W parsing uses, so the
+    /// probe can never advertise support lccc does not have: unknown names
+    /// (including every flag lccc has not implemented) yield 0, which sends
+    /// ported sources down their compatibility fallback instead of into an
+    /// unsupported code path.
+    fn is_recognized_warning_flag(flag: &str) -> bool {
+        let Some(rest) = flag.strip_prefix("-W") else {
+            return false;
+        };
+        // -Wno-<name> asks about the same warning as -W<name>.
+        let rest = rest.strip_prefix("no-").unwrap_or(rest);
+        // Warning groups accepted by WarningConfig::process_flag.
+        if matches!(rest, "all" | "extra" | "error") {
+            return true;
+        }
+        crate::common::error::WarningKind::from_flag_name(rest).is_some()
+    }
+
+    /// Clang's `__has_warning("-Wflag")` operator (full contract, Clang
+    /// Preprocessor/__has_warning semantics):
+    ///   * missing '('           -> error, yields 0
+    ///   * zero arguments        -> error (too few arguments), yields 0
+    ///   * non-string argument   -> error, yields 0
+    ///   * not "-W..."           -> warning (__has_warning expected option
+    ///                              name), yields 0
+    ///   * unknown -W flag       -> silently yields 0
+    ///   * recognized flag       -> yields 1
+    /// The verdict consults `is_recognized_warning_flag`, never a blanket
+    /// truth value. Adjacent string literals are concatenated; escapes are
+    /// honoured; the closing ')' is required.
+    fn resolve_has_warning_call_bytes(
+        &mut self,
+        bytes: &[u8],
+        i: &mut usize,
+        diag_line: usize,
+    ) -> String {
+        macro_rules! diag {
+            ($msg:expr) => {
+                self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                    file: self.current_file(),
+                    line: diag_line,
+                    col: 0,
+                    message: $msg.to_string(),
+                })
+            };
+        }
+        let len = bytes.len();
+        while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
+            *i += 1;
+        }
+        if *i >= len || bytes[*i] != b'(' {
+            diag!("missing '(' after '__has_warning'".to_string());
+            return "0".to_string();
+        }
+        *i += 1;
+        while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
+            *i += 1;
+        }
+        if *i < len && bytes[*i] == b')' {
+            *i += 1;
+            diag!("too few arguments to function call, expected 1, have 0".to_string());
+            return "0".to_string();
+        }
+        if *i >= len || bytes[*i] != b'"' {
+            diag!("expected string literal in '__has_warning'".to_string());
+            while *i < len && bytes[*i] != b')' {
+                *i += 1;
+            }
+            if *i < len {
+                *i += 1;
+            } else {
+                diag!("missing ')' after '__has_warning'".to_string());
+            }
+            return "0".to_string();
+        }
+        // Concatenated string literals, escape-aware.
+        let mut arg = String::new();
+        let mut terminated = true;
+        while *i < len && bytes[*i] == b'"' {
+            *i += 1;
+            let mut closed = false;
+            while *i < len {
+                let c = bytes[*i];
+                if c == b'\\' && *i + 1 < len {
+                    arg.push(c as char);
+                    arg.push(bytes[*i + 1] as char);
+                    *i += 2;
+                    continue;
+                }
+                if c == b'"' {
+                    closed = true;
+                    *i += 1;
+                    break;
+                }
+                arg.push(c as char);
+                *i += 1;
+            }
+            if !closed {
+                terminated = false;
+                break;
+            }
+            while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
+                *i += 1;
+            }
+        }
+        if !terminated {
+            diag!("unterminated string literal in '__has_warning'".to_string());
+            while *i < len && bytes[*i] != b')' {
+                *i += 1;
+            }
+            if *i < len {
+                *i += 1;
+            }
+            return "0".to_string();
+        }
+        // Anything but ')' after the literal is malformed.
+        let mut junk = false;
+        while *i < len && bytes[*i] != b')' {
+            if bytes[*i] != b' ' && bytes[*i] != b'\t' {
+                junk = true;
+            }
+            *i += 1;
+        }
+        if *i < len {
+            *i += 1;
+        } else {
+            diag!("missing ')' after '__has_warning'".to_string());
+            return "0".to_string();
+        }
+        if junk {
+            // Malformed tail: treat as not-a-warning without advertising.
+            return "0".to_string();
+        }
+        if !arg.starts_with("-W") {
+            diag!("__has_warning expected option name".to_string());
+            return "0".to_string();
+        }
+        if Self::is_recognized_warning_flag(&arg) {
+            "1".to_string()
+        } else {
+            "0".to_string()
+        }
+    }
+
+    pub(super) fn resolve_defined_in_expr(&mut self, expr: &str, diag_line: usize) -> String {
         let mut result = String::with_capacity(64);
         let bytes = expr.as_bytes();
         let len = bytes.len();
@@ -235,6 +388,12 @@ impl Preprocessor {
                 } else if ident == "__has_include_next" {
                     let val = self.resolve_has_include_call_bytes(bytes, &mut i, true);
                     result.push_str(val);
+                } else if ident == "__has_embed" {
+                    let val = self.resolve_has_embed_call_bytes(bytes, &mut i, diag_line);
+                    result.push_str(&val);
+                } else if ident == "__has_warning" {
+                    let val = self.resolve_has_warning_call_bytes(bytes, &mut i, diag_line);
+                    result.push_str(&val);
                 } else {
                     result.push_str(ident);
                 }
@@ -387,6 +546,58 @@ impl Preprocessor {
         };
 
         if found { "1" } else { "0" }
+    }
+
+    /// C23 `__has_embed(...)`: parse the balanced parenthesized argument
+    /// (filename spec + optional embed parameters) and probe the resource.
+    /// Yields the numeric `__STDC_EMBED_*` value: 0 not found / unsupported
+    /// parameter, 1 found and non-empty, 2 found but empty.
+    fn resolve_has_embed_call_bytes(
+        &mut self,
+        bytes: &[u8],
+        i: &mut usize,
+        diag_line: usize,
+    ) -> String {
+        let len = bytes.len();
+        while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
+            *i += 1;
+        }
+        if *i >= len || bytes[*i] != b'(' {
+            // Malformed operand; the #if evaluator treats it as absent.
+            return "0".to_string();
+        }
+        *i += 1; // skip '('
+        let start = *i;
+        let mut depth = 1usize;
+        // Literal-aware balance scan: parens inside string/char literals
+        // do not terminate the operand.
+        while *i < len && depth > 0 {
+            let c = bytes[*i];
+            if c == b'"' || c == b'\'' {
+                let quote = c;
+                *i += 1;
+                while *i < len && bytes[*i] != quote {
+                    if bytes[*i] == b'\\' && *i + 1 < len {
+                        *i += 1;
+                    }
+                    *i += 1;
+                }
+            } else {
+                match c {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+            }
+            if depth > 0 {
+                *i += 1;
+            }
+        }
+        let inner = bytes_to_str(bytes, start, *i);
+        if *i < len {
+            *i += 1; // skip ')'
+        }
+        (self.probe_embed(inner, diag_line) as i64).to_string()
     }
 
     /// Skip a parenthesized argument (byte-oriented).

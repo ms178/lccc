@@ -10,6 +10,185 @@ use super::pipeline::Preprocessor;
 /// Prevents infinite inclusion loops in files without `#pragma once`.
 const MAX_INCLUDE_DEPTH: usize = 200;
 
+/// C23 `__has_embed` result, matching the `__STDC_EMBED_*` macro values.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum EmbedResult {
+    /// `__STDC_EMBED_NOT_FOUND__`
+    NotFound = 0,
+    /// `__STDC_EMBED_FOUND__`
+    Found = 1,
+    /// `__STDC_EMBED_EMPTY__`
+    Empty = 2,
+}
+
+/// Parsed C23 `#embed` parameter sequence.
+#[derive(Default)]
+pub(super) struct EmbedParams {
+    pub limit: Option<usize>,
+    pub prefix: Option<String>,
+    pub suffix: Option<String>,
+    pub if_empty: Option<String>,
+    /// Clang vendor extension `clang::offset(N)`: skip the first N bytes of
+    /// the resource before `limit` applies. Recognized because the corpus is
+    /// Clang-derived and the feature-detection tests probe it.
+    pub offset: Option<usize>,
+}
+
+/// Failure classes of `#embed`/`__has_embed` argument parsing. `#embed`
+/// diagnoses all of them; `__has_embed` only diagnoses the syntax errors
+/// (an UNKNOWN parameter is the standard feature-detection channel and must
+/// stay silent, yielding `__STDC_EMBED_NOT_FOUND__`).
+enum EmbedSpecError {
+    NoFilename,
+    UnknownParam(String),
+    UnterminatedParam(String),
+    InvalidLimit(String, String),
+    /// A parameter appeared twice (C23 6.10.15: each embed-param may
+    /// appear at most once).
+    DuplicateParam(String),
+    /// Non-parameter garbage after the parameter list.
+    TrailingGarbage(String),
+}
+
+/// Push a byte as decimal ASCII without allocations or divisions by
+/// variable denominators: branch on digit count, then fixed 10/100 steps.
+/// Hot path of `#embed` expansion (runs once per embedded byte).
+#[inline]
+fn push_u8_decimal(out: &mut String, b: u8) {
+    if b >= 100 {
+        out.push(char::from(b'0' + b / 100));
+        out.push(char::from(b'0' + (b / 10) % 10));
+        out.push(char::from(b'0' + b % 10));
+    } else if b >= 10 {
+        out.push(char::from(b'0' + b / 10));
+        out.push(char::from(b'0' + b % 10));
+    } else {
+        out.push(char::from(b'0' + b));
+    }
+}
+
+/// Read only the prefix of `path` that `#embed` can possibly emit:
+/// `offset + limit` bytes when a limit is present (the expansion skips
+/// `offset` and takes at most `limit`), the whole file otherwise. This is
+/// the bounded-I/O contract of the directive — embedding a 16-byte header
+/// of a multi-megabyte blob must not slurp the blob — while leaving the
+/// offset/limit slicing to `expand_embed_bytes` (exactly one owner of that
+/// arithmetic; a second offset here double-skipped and truncated output).
+/// The read loop tolerates short reads and EINTR per POSIX.
+fn read_embed_bounded(
+    path: &std::path::Path,
+    offset: usize,
+    limit: Option<usize>,
+) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let Some(n) = limit.map(|l| offset.saturating_add(l)) else {
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf)?;
+        return Ok(buf);
+    };
+    let mut buf = vec![0u8; n];
+    let mut filled = 0usize;
+    while filled < n {
+        match f.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(k) => filled += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    buf.truncate(filled);
+    Ok(buf)
+}
+
+/// Parse a C integer preprocessing number or character literal as used in
+/// `limit`/`clang::offset` embed parameters: decimal, 0x/0X hex, 0b/0B
+/// binary, 0-prefixed octal, optional u/U/l/L suffixes, or a char literal
+/// (simple and hex/octal escapes). Rejects any trailing garbage so
+/// `limit(12abc)` or `limit(1 + 2)` are invalid, matching Clang's
+/// single-pp-number contract (the spec requires a preprocessing number,
+/// not an arbitrary constant expression).
+fn parse_embed_int(text: &str) -> Option<u64> {
+    let s = text.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if s.starts_with('\'') {
+        let inner = s.strip_suffix('\'')?.strip_prefix('\'')?;
+        let b = inner.as_bytes();
+        if b.is_empty() {
+            return None;
+        }
+        if b[0] != b'\\' {
+            // Single unescaped character.
+            return if b.len() == 1 {
+                Some(b[0] as u64)
+            } else {
+                None
+            };
+        }
+        if b.len() < 2 {
+            return None;
+        }
+        if b[1] == b'x' || b[1] == b'X' {
+            let hex = std::str::from_utf8(&b[2..]).ok()?;
+            if hex.is_empty() {
+                return None;
+            }
+            return u64::from_str_radix(hex, 16).ok();
+        }
+        if b[1].is_ascii_digit() {
+            // Octal escape: \0, \07, \077, ...
+            let oct = std::str::from_utf8(&b[1..]).ok()?;
+            if !oct.bytes().all(|c| (b'0'..=b'7').contains(&c)) {
+                return None;
+            }
+            return u64::from_str_radix(oct, 8).ok();
+        }
+        let simple: Option<u64> = match b[1] {
+            b'n' => Some(0x0a),
+            b't' => Some(0x09),
+            b'r' => Some(0x0d),
+            b'a' => Some(0x07),
+            b'b' => Some(0x08),
+            b'f' => Some(0x0c),
+            b'v' => Some(0x0b),
+            b'\'' => Some(0x27),
+            b'"' => Some(0x22),
+            b'\\' => Some(0x5c),
+            b'?' => Some(0x3f),
+            _ => None,
+        };
+        if let Some(v) = simple {
+            return if b.len() == 2 { Some(v) } else { None };
+        }
+        return None;
+    }
+    let (digits, radix) = if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        (h, 16)
+    } else if let Some(bn) = s.strip_prefix("0b").or_else(|| s.strip_prefix("0B")) {
+        (bn, 2)
+    } else if s.len() > 1 && s.starts_with('0') && s.bytes().all(|c| c.is_ascii_digit()) {
+        (s, 8)
+    } else {
+        (s, 10)
+    };
+    let mut digits = digits;
+    // Strip integer suffixes (u/U/l/L in any order, at most one of each
+    // width class is valid C, but be permissive: any trailing ulUL run).
+    while digits
+        .bytes()
+        .last()
+        .is_some_and(|c| matches!(c, b'u' | b'U' | b'l' | b'L'))
+    {
+        digits = &digits[..digits.len() - 1];
+    }
+    if digits.is_empty() {
+        return None;
+    }
+    u64::from_str_radix(digits, radix).ok()
+}
+
 /// Compiler-reserved x86 intrinsic headers supplied with LCCC.  They need to
 /// win over a user-supplied GCC builtin include directory: modern GCC's
 /// `immintrin.h` unconditionally pulls AVX-512/_Float16 declarations that the
@@ -637,6 +816,410 @@ impl Preprocessor {
         }
     }
 
+    // ====================================================================
+    // C23 #embed / __has_embed (N3018) — binary resource inclusion.
+    //
+    // `#embed "file" [params]` is replaced by a comma-separated list of
+    // integer byte values; `__has_embed(...)` probes the same search and
+    // yields __STDC_EMBED_NOT_FOUND__/__STDC_EMBED_FOUND__/
+    // __STDC_EMBED_EMPTY__ (0/1/2).  The resource search reuses the
+    // #include machinery: quoted names search the including file's
+    // directory first, chevron names only the include paths — exactly the
+    // contract the corpus tests exercise.
+    // ====================================================================
+
+    /// Parse the `<filename> [param(args)...]` tail shared by `#embed` and
+    /// `__has_embed`. C23 forms (3)/(5): if the filename is not directly
+    /// `"..."`/`<...>`, the tail undergoes macro replacement first
+    /// (`#embed __FILE__ limit(2)`), then matching is retried.
+    fn parse_embed_spec(
+        &mut self,
+        text: &str,
+    ) -> Result<(String, bool, EmbedParams, String), EmbedSpecError> {
+        // Match a string/chevron filename at the start of `s`.
+        fn take_filename(s: &str) -> Option<(String, bool, usize)> {
+            if let Some(rest) = s.strip_prefix('"') {
+                let end = rest.find('"')?;
+                Some((rest[..end].to_string(), false, end + 2))
+            } else if let Some(rest) = s.strip_prefix('<') {
+                let end = rest.find('>')?;
+                Some((rest[..end].to_string(), true, end + 2))
+            } else {
+                None
+            }
+        }
+
+        let trimmed = text.trim_start();
+        let (filename, is_system, after, source) = match take_filename(trimmed) {
+            Some((f, sys, consumed)) => (f, sys, consumed, None),
+            None => {
+                let expanded = self.macros.expand_line(text);
+                let trimmed = expanded.trim_start();
+                match take_filename(trimmed) {
+                    Some((f, sys, consumed)) => (f, sys, consumed, Some(trimmed.to_string())),
+                    None => return Err(EmbedSpecError::NoFilename),
+                }
+            }
+        };
+        let rest = match &source {
+            Some(expanded) => &expanded[after..],
+            None => &trimmed[after..],
+        };
+        let (params, remainder) = self.parse_embed_params(rest)?;
+        Ok((filename, is_system, params, remainder.to_string()))
+    }
+
+    /// Parse the parameter sequence: `name(tokens)...` pairs with balanced
+    /// parentheses. Failures are returned, not diagnosed: `#embed` turns
+    /// every variant into an error, while `__has_embed` must silently yield
+    /// __STDC_EMBED_NOT_FOUND__ for UNSUPPORTED parameters (that is how
+    //  vendor extensions are feature-detected), only diagnosing true
+    /// syntax errors.
+    /// Returns the parsed parameters plus the UNCONSUMED remainder of the
+    /// input: C23 inline `#embed` may be followed by ordinary tokens on the
+    /// same line (`{#embed "f"};`), so only the callers that own the whole
+    /// line (the directive form, `__has_embed`) may treat leftover text as
+    /// an error.
+    fn parse_embed_params<'a>(
+        &mut self,
+        mut rest: &'a str,
+    ) -> Result<(EmbedParams, &'a str), EmbedSpecError> {
+        let mut params = EmbedParams::default();
+        let mut seen = std::collections::BTreeSet::<&'static str>::new();
+        loop {
+            rest = rest.trim_start();
+            // Commas between parameters are optional (Clang accepts both
+            // `limit(1), prefix(x)` and whitespace separation).
+            while let Some(r) = rest.strip_prefix(',') {
+                rest = r.trim_start();
+            }
+            if rest.is_empty() {
+                return Ok((params, rest));
+            }
+            // Parameter name: identifier, optionally vendor-qualified a::b.
+            let name_len = {
+                let mut n = 0;
+                let b = rest.as_bytes();
+                while n < b.len() && (b[n].is_ascii_alphanumeric() || b[n] == b'_') {
+                    n += 1;
+                }
+                if n < b.len() && b[n] == b':' && n + 1 < b.len() && b[n + 1] == b':' {
+                    n += 2;
+                    while n < b.len() && (b[n].is_ascii_alphanumeric() || b[n] == b'_') {
+                        n += 1;
+                    }
+                }
+                n
+            };
+            if name_len == 0 {
+                // Not a parameter: hand the leftover text back to the
+                // caller (inline tokens for the splice form, garbage for
+                // the whole-line forms).
+                return Ok((params, rest));
+            }
+            let name = &rest[..name_len];
+            rest = rest[name_len..].trim_start();
+            // Balanced-paren argument, if present. The balance scan is
+            // literal-aware: parens inside string/char literals do not
+            // count (suffix(, -1) style arguments aside, a vendor param
+            // like x(")") must not close early).
+            let mut args = String::new();
+            if let Some(stripped) = rest.strip_prefix('(') {
+                let b = stripped.as_bytes();
+                let mut depth = 1usize;
+                let mut end = None;
+                let mut i = 0usize;
+                while i < b.len() {
+                    let c = b[i];
+                    if c == b'"' || c == b'\'' {
+                        let quote = c;
+                        i += 1;
+                        while i < b.len() && b[i] != quote {
+                            if b[i] == b'\\' && i + 1 < b.len() {
+                                i += 1;
+                            }
+                            i += 1;
+                        }
+                    } else {
+                        match c {
+                            b'(' => depth += 1,
+                            b')' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    end = Some(i);
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    i += 1;
+                }
+                match end {
+                    Some(i) => {
+                        args = stripped[..i].to_string();
+                        rest = &stripped[i + 1..];
+                    }
+                    None => {
+                        return Err(EmbedSpecError::UnterminatedParam(name.to_string()));
+                    }
+                }
+            }
+            // Duplicate detection (each embed-param at most once).
+            let canon: &'static str = match name {
+                "limit" => "limit",
+                "prefix" => "prefix",
+                "suffix" => "suffix",
+                "if_empty" => "if_empty",
+                "clang::offset" => "clang::offset",
+                _ => {
+                    return Err(EmbedSpecError::UnknownParam(name.to_string()));
+                }
+            };
+            if !seen.insert(canon) {
+                return Err(EmbedSpecError::DuplicateParam(canon.to_string()));
+            }
+            match canon {
+                "limit" => match parse_embed_int(&args) {
+                    Some(v) => {
+                        params.limit = Some(usize::try_from(v).unwrap_or(usize::MAX));
+                    }
+                    None => {
+                        return Err(EmbedSpecError::InvalidLimit(
+                            "limit".to_string(),
+                            args.trim().to_string(),
+                        ));
+                    }
+                },
+                "prefix" => params.prefix = Some(args),
+                "suffix" => params.suffix = Some(args),
+                "if_empty" => params.if_empty = Some(args),
+                _ => match parse_embed_int(&args) {
+                    // clang::offset
+                    Some(v) => {
+                        params.offset = Some(usize::try_from(v).unwrap_or(usize::MAX));
+                    }
+                    None => {
+                        return Err(EmbedSpecError::InvalidLimit(
+                            "clang::offset".to_string(),
+                            args.trim().to_string(),
+                        ));
+                    }
+                },
+            }
+        }
+    }
+
+    fn embed_diagnose_spec_error(&mut self, e: &EmbedSpecError, line_num: usize, col: usize) {
+        let message = match e {
+            EmbedSpecError::NoFilename => "expected \"FILENAME\" or <FILENAME>".to_string(),
+            EmbedSpecError::UnknownParam(n) => {
+                format!("unknown embed preprocessor parameter '{}'", n)
+            }
+            EmbedSpecError::UnterminatedParam(n) => {
+                format!("unterminated embed parameter '{}' argument", n)
+            }
+            EmbedSpecError::InvalidLimit(n, v) => {
+                format!("invalid embed parameter '{}' value '{}'", n, v)
+            }
+            EmbedSpecError::DuplicateParam(n) => format!("duplicate embed parameter '{}'", n),
+            EmbedSpecError::TrailingGarbage(g) => {
+                format!("unexpected token '{}' after embed parameters", g)
+            }
+        };
+        self.errors.push(super::pipeline::PreprocessorDiagnostic {
+            file: self.current_file(),
+            line: line_num,
+            col,
+            message,
+        });
+    }
+
+    /// C23 `#embed`: expand to the comma-separated byte list (with
+    /// prefix/suffix/if_empty applied). Returns the replacement text, or
+    /// None after queueing a diagnostic.
+    pub(super) fn expand_embed(
+        &mut self,
+        rest: &str,
+        line_num: usize,
+        col: usize,
+    ) -> Option<String> {
+        let spec = match self.parse_embed_spec(rest) {
+            Ok(s) => s,
+            Err(e) => {
+                self.embed_diagnose_spec_error(&e, line_num, col);
+                return None;
+            }
+        };
+        let (filename, is_system, params, remainder) = spec;
+        // Whole-line form: the directive owns the rest of the line, so
+        // anything that is not embed syntax is malformed input.
+        let leftover = remainder.trim();
+        if !leftover.is_empty() {
+            self.embed_diagnose_spec_error(
+                &EmbedSpecError::TrailingGarbage(leftover.chars().take(16).collect()),
+                line_num,
+                col,
+            );
+            return None;
+        }
+        let bytes = self.read_embed_resource(&filename, is_system, &params, line_num, col)?;
+        self.expand_embed_bytes(&bytes, params)
+    }
+
+    /// Inline (mid-line) `#embed` as spliced by the pipeline: the same
+    /// expansion as the directive form, but unconsumed trailing text is
+    /// handed back instead of diagnosed, because it is ordinary code.
+    pub(super) fn expand_embed_inline(
+        &mut self,
+        rest: &str,
+        line_num: usize,
+        col: usize,
+    ) -> Option<(String, String)> {
+        let spec = match self.parse_embed_spec(rest) {
+            Ok(s) => s,
+            Err(e) => {
+                self.embed_diagnose_spec_error(&e, line_num, col);
+                return None;
+            }
+        };
+        let (filename, is_system, params, remainder) = spec;
+        let bytes = self.read_embed_resource(&filename, is_system, &params, line_num, col)?;
+        let text = self.expand_embed_bytes(&bytes, params)?;
+        Some((text, remainder))
+    }
+
+    /// Resolve and read an `#embed` resource, bounded by the parameters:
+    /// with `limit(N)` only the needed prefix is read from disk (large
+    /// binary resources must not pay O(file) I/O for a small slice); with
+    /// `clang::offset(K)` the read starts at K. Missing or unreadable
+    /// resources diagnose `'FILE' file not found` and yield None.
+    fn read_embed_resource(
+        &mut self,
+        filename: &str,
+        is_system: bool,
+        params: &EmbedParams,
+        line_num: usize,
+        col: usize,
+    ) -> Option<Vec<u8>> {
+        if filename.is_empty() {
+            self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                file: self.current_file(),
+                line: line_num,
+                col,
+                message: "empty filename".to_string(),
+            });
+            return None;
+        }
+        let Some(resolved) = self.resolve_and_record_include_path(filename, is_system) else {
+            self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                file: self.current_file(),
+                line: line_num,
+                col,
+                message: format!("'{}' file not found", filename),
+            });
+            return None;
+        };
+        match read_embed_bounded(&resolved, params.offset.unwrap_or(0), params.limit) {
+            Ok(b) => Some(b),
+            Err(_) => {
+                self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                    file: self.current_file(),
+                    line: line_num,
+                    col,
+                    message: format!("'{}' file not found", filename),
+                });
+                None
+            }
+        }
+    }
+
+    /// Shared byte-list builder: clang::offset(N) skips the first N bytes;
+    /// limit bounds the count of what remains; prefix/suffix/if_empty
+    /// applied per C23 6.10.15.
+    fn expand_embed_bytes(&self, bytes: &[u8], params: EmbedParams) -> Option<String> {
+        // clang::offset(N) skips the first N bytes; limit bounds the count
+        // of what remains.
+        let skip = params.offset.unwrap_or(0).min(bytes.len());
+        let remaining = &bytes[skip..];
+        let take = match params.limit {
+            Some(n) if n < remaining.len() => n,
+            _ => remaining.len(),
+        };
+        if take == 0 {
+            // Empty resource (or limit(0)): the if_empty token sequence,
+            // which may itself be empty.
+            return Some(params.if_empty.unwrap_or_default());
+        }
+        let prefix_len = params.prefix.as_deref().map_or(0, str::len);
+        let suffix_len = params.suffix.as_deref().map_or(0, str::len);
+        // Upper bound: 3 digits + ", " per byte.
+        let mut out = String::with_capacity(prefix_len + suffix_len + take * 5);
+        if let Some(p) = &params.prefix {
+            out.push_str(p);
+        }
+        let mut first = true;
+        for &b in &remaining[..take] {
+            if !first {
+                out.push_str(", ");
+            }
+            first = false;
+            push_u8_decimal(&mut out, b);
+        }
+        if let Some(sfx) = &params.suffix {
+            out.push_str(sfx);
+        }
+        Some(out)
+    }
+
+    /// C23 `__has_embed`: probe without emitting tokens. Unsupported
+    /// parameters yield NOT_FOUND silently (feature detection); genuine
+    /// syntax errors diagnose and also yield NOT_FOUND.
+    pub(super) fn probe_embed(&mut self, rest: &str, diag_line: usize) -> EmbedResult {
+        let spec = match self.parse_embed_spec(rest) {
+            Ok(s) => s,
+            // Unsupported/vendor parameters and non-parameter garbage are
+            // the feature-detection channel of __has_embed: silently
+            // NOT_FOUND (C23 6.10.15). Malformed syntax diagnoses.
+            Err(EmbedSpecError::UnknownParam(_))
+            | Err(EmbedSpecError::DuplicateParam(_))
+            | Err(EmbedSpecError::TrailingGarbage(_)) => return EmbedResult::NotFound,
+            Err(e) => {
+                self.embed_diagnose_spec_error(&e, diag_line, 0);
+                return EmbedResult::NotFound;
+            }
+        };
+        let (filename, is_system, params, remainder) = spec;
+        if !remainder.trim().is_empty() {
+            // Unparseable tail: feature-detection channel stays silent.
+            return EmbedResult::NotFound;
+        }
+        if filename.is_empty() {
+            self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                file: self.current_file(),
+                line: diag_line,
+                col: 0,
+                message: "empty filename".to_string(),
+            });
+            return EmbedResult::NotFound;
+        }
+        let Some(resolved) = self.resolve_include_path(&filename, is_system) else {
+            return EmbedResult::NotFound;
+        };
+        if params.limit == Some(0) {
+            return EmbedResult::Empty;
+        }
+        match std::fs::metadata(&resolved) {
+            // Directories are not embeddable resources: only regular files
+            // report Found/Empty (consistent with the #embed read path,
+            // where reading a directory fails).
+            Ok(md) if !md.file_type().is_file() => EmbedResult::NotFound,
+            Ok(md) if md.len() <= params.offset.unwrap_or(0) as u64 => EmbedResult::Empty,
+            Ok(_) => EmbedResult::Found,
+            Err(_) => EmbedResult::NotFound,
+        }
+    }
+
     /// Resolve an include path using #include_next semantics: search from the
     /// next include path after the one containing the current file.
     /// `current_file` is the full path to the file containing the #include_next.
@@ -1060,5 +1643,76 @@ mod intrinsic_include_tests {
         );
 
         std::fs::remove_dir_all(fake_dir).expect("remove fake include directory");
+    }
+}
+
+#[cfg(test)]
+mod embed_unit_tests {
+    use super::{parse_embed_int, read_embed_bounded};
+
+    #[test]
+    fn embed_int_radices_and_suffixes() {
+        assert_eq!(parse_embed_int("0"), Some(0));
+        assert_eq!(parse_embed_int("255"), Some(255));
+        assert_eq!(parse_embed_int("0x10"), Some(16));
+        assert_eq!(parse_embed_int("0XFF"), Some(255));
+        assert_eq!(parse_embed_int("0b101"), Some(5));
+        assert_eq!(parse_embed_int("010"), Some(8));
+        assert_eq!(parse_embed_int("12u"), Some(12));
+        assert_eq!(parse_embed_int("12UL"), Some(12));
+        assert_eq!(parse_embed_int(" 12 \t"), Some(12));
+        assert_eq!(parse_embed_int("u64"), None); // not a pp-number
+    }
+
+    #[test]
+    fn embed_int_rejects_malformed() {
+        assert_eq!(parse_embed_int(""), None);
+        assert_eq!(parse_embed_int("1 + 2"), None); // not a single pp-number
+        assert_eq!(parse_embed_int("0x"), None);
+        assert_eq!(parse_embed_int("-1"), None); // limit is non-negative
+        assert_eq!(parse_embed_int("09"), None); // invalid octal digit
+        assert_eq!(parse_embed_int("12abc"), None);
+        assert_eq!(parse_embed_int("18446744073709551616"), None); // u64 overflow
+        assert_eq!(parse_embed_int("18446744073709551615"), Some(u64::MAX));
+    }
+
+    #[test]
+    fn embed_int_char_literals() {
+        assert_eq!(parse_embed_int("'A'"), Some(65));
+        assert_eq!(parse_embed_int("'*'"), Some(42));
+        assert_eq!(parse_embed_int("'\\n'"), Some(10));
+        assert_eq!(parse_embed_int("'\\''"), Some(0x27));
+        assert_eq!(parse_embed_int("'\\\\'"), Some(0x5c));
+        assert_eq!(parse_embed_int("'\\x41'"), Some(65));
+        assert_eq!(parse_embed_int("'\\101'"), Some(65));
+        assert_eq!(parse_embed_int("'\\0'"), Some(0));
+        assert_eq!(parse_embed_int("''"), None);
+        assert_eq!(parse_embed_int("'ab'"), None); // multichar not a pp-number
+        assert_eq!(parse_embed_int("'"), None);
+    }
+
+    #[test]
+    fn embed_bounded_read_slices() {
+        let dir = std::env::temp_dir().join(format!("lccc_embed_ut_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("resource.bin");
+        let data: Vec<u8> = (0..=255u8).cycle().take(10_000).collect();
+        std::fs::write(&path, &data).unwrap();
+
+        // Unbounded: whole file.
+        assert_eq!(read_embed_bounded(&path, 0, None).unwrap().len(), 10_000);
+        // Prefix slice: limit bounds the read.
+        assert_eq!(read_embed_bounded(&path, 0, Some(4)).unwrap(), data[..4]);
+        // Offset + limit: reads exactly the offset+limit prefix; the
+        // offset slice itself is owned by expand_embed_bytes.
+        assert_eq!(
+            read_embed_bounded(&path, 250, Some(16)).unwrap(),
+            data[..266]
+        );
+        // Offset+limit beyond EOF truncates to what exists.
+        assert_eq!(read_embed_bounded(&path, 9_998, Some(16)).unwrap(), data);
+        // Missing file is an error.
+        assert!(read_embed_bounded(&dir.join("nope.bin"), 0, Some(1)).is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -461,6 +461,19 @@ pub struct DiagnosticEngine {
     /// Used to avoid repeating the same chain for consecutive errors in the
     /// same included file (matching GCC behavior).
     last_include_trace_file: Option<String>,
+    /// Set once the rendered-error limit note has been emitted (see
+    /// `render_error`); the count keeps growing afterwards, rendering stops.
+    error_limit_noted: bool,
+}
+
+impl DiagnosticEngine {
+    /// Clang-style cap on rendered errors per engine. One malformed input can
+    /// trigger tens of thousands of cascading recovery errors; rendering every
+    /// one of them (each with source snippets) blows up output and memory and
+    /// buries the root cause. Errors keep COUNTING past the cap, so the
+    /// translation unit is rejected exactly as before — only the printing
+    /// stops (with a single "too many errors" note).
+    pub const MAX_RENDERED_ERRORS: usize = 200;
 }
 
 impl DiagnosticEngine {
@@ -474,7 +487,23 @@ impl DiagnosticEngine {
             source_manager: None,
             use_color: ColorMode::Auto.use_color(),
             last_include_trace_file: None,
+            error_limit_noted: false,
         }
+    }
+
+    /// Render an error-severity diagnostic subject to `MAX_RENDERED_ERRORS`.
+    fn render_error(&mut self, diag: &Diagnostic) {
+        if self.error_count < Self::MAX_RENDERED_ERRORS {
+            self.render_diagnostic(diag);
+        } else if !self.error_limit_noted {
+            self.error_limit_noted = true;
+            let note = Diagnostic::error(format!(
+                "too many errors emitted; stopping diagnostic emission (limit {})",
+                Self::MAX_RENDERED_ERRORS
+            ));
+            self.render_diagnostic(&note);
+        }
+        self.error_count += 1;
     }
 
     /// Set the warning configuration (parsed from CLI flags).
@@ -526,8 +555,7 @@ impl DiagnosticEngine {
                             fix_hint: diag.fix_hint.clone(),
                             explicit_location: diag.explicit_location.clone(),
                         };
-                        self.render_diagnostic(&promoted);
-                        self.error_count += 1;
+                        self.render_error(&promoted);
                         return;
                     }
 
@@ -555,8 +583,7 @@ impl DiagnosticEngine {
                             fix_hint: diag.fix_hint.clone(),
                             explicit_location: diag.explicit_location.clone(),
                         };
-                        self.render_diagnostic(&promoted);
-                        self.error_count += 1;
+                        self.render_error(&promoted);
                     } else {
                         self.render_diagnostic(diag);
                         self.warning_count += 1;
@@ -564,8 +591,7 @@ impl DiagnosticEngine {
                 }
             }
             Severity::Error => {
-                self.render_diagnostic(diag);
-                self.error_count += 1;
+                self.render_error(diag);
             }
             Severity::Note => {
                 self.render_diagnostic(diag);
@@ -867,17 +893,71 @@ impl DiagnosticEngine {
             return;
         }
 
-        // Resolve the column for caret positioning
+        // Resolve the column for caret positioning.
+        //
+        // Coordinate systems (kept strictly separate):
+        //   * `col` from resolve_span is a 1-based BYTE offset;
+        //   * the snippet window and caret padding are CHAR-based, since
+        //     the rendered line is a char sequence;
+        //   * tabs render as single columns here (the renderer does not
+        //     expand them), so display column == char index + 1.
         let loc = sm.resolve_span(span);
         let col = loc.column as usize;
+        let line_bytes = source_line.as_bytes();
+        let col_byte0 = col.saturating_sub(1).min(line_bytes.len());
+        // Chars preceding the caret = non-continuation bytes preceding it.
+        let col_char0 = line_bytes[..col_byte0]
+            .iter()
+            .filter(|&&b| (b & 0xC0) != 0x80)
+            .count();
+
+        // Window overly long lines around the caret (generated/minified code
+        // can put 10k+ characters on one line; dumping it buries the caret
+        // and floods logs — the frame-budget reproducers hit exactly this).
+        const SNIPPET_WINDOW: usize = 160;
+        let n_chars = source_line.chars().count();
+        let (shown, caret_pad): (String, usize) = if n_chars <= SNIPPET_WINDOW {
+            (source_line.clone(), col_char0 + 1)
+        } else {
+            let half = SNIPPET_WINDOW / 2;
+            let start = col_char0
+                .saturating_sub(half)
+                .min(n_chars.saturating_sub(SNIPPET_WINDOW));
+            let end = (start + SNIPPET_WINDOW).min(n_chars);
+            let window: String = source_line.chars().skip(start).take(end - start).collect();
+            // Caret alignment: 1 leading space + 3 for the "..." prefix +
+            // 0-based char offset of the caret inside the window (+1 for
+            // the 1-based column).
+            let pad = (col_char0 - start) + 1 + if start > 0 { 3 } else { 0 };
+            let shown = format!(
+                "{}{}{}",
+                if start > 0 { "..." } else { "" },
+                window,
+                if end < n_chars { "..." } else { "" }
+            );
+            (shown, pad)
+        };
 
         // Print the source line with indentation
-        eprintln!(" {}", source_line);
+        eprintln!(" {}", shown);
 
         // Build the caret line: spaces up to the column, then ^ with tildes
-        if col > 0 {
-            let padding = " ".repeat(col);
-            let span_len = (span.end.saturating_sub(span.start)) as usize;
+        if caret_pad > 0 {
+            let padding = " ".repeat(caret_pad);
+            // Span length in CHARS (the squiggle is drawn over the
+            // char-based window): count non-continuation bytes of the line
+            // covered by [span.start, span.end).
+            let line_start_byte = (span.start as usize).saturating_sub(col_byte0);
+            let span_end_in_line = (span.end as usize).saturating_sub(line_start_byte);
+            let lo = col_byte0.min(line_bytes.len());
+            let hi = span_end_in_line.min(line_bytes.len()).max(lo);
+            let span_len = line_bytes[lo..hi]
+                .iter()
+                .filter(|&&b| (b & 0xC0) != 0x80)
+                .count()
+                .max(usize::from(span_end_in_line > lo));
+            // Never draw the squiggle past the rendered window.
+            let span_len = span_len.min(shown.chars().count().saturating_sub(caret_pad));
             let underline = if span_len > 1 {
                 format!("^{}", "~".repeat(span_len - 1))
             } else {

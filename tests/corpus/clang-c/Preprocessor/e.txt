@@ -1,0 +1,2 @@
+/home/user/lccc/tests/corpus/clang-c/Preprocessor/embed_file_not_found_chevron.c:8:2: error: 'nfejfNejAKFe' file not found
+ccc: error: 1 preprocessor error(s) in embed_file_not_found_chevron.c
