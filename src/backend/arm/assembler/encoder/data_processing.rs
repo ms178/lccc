@@ -163,12 +163,35 @@ pub(crate) fn encode_mov(operands: &[Operand]) -> Result<EncodeResult, String> {
     if let (Some(Operand::Reg(rd_name)), Some(Operand::Reg(rm_name))) =
         (operands.first(), operands.get(1))
     {
+        // Both operands must be general-purpose. `parse_reg_num` resolves
+        // `d0` and `lr` to bare numbers, so without this class check
+        // `mov d0, x1`, `mov x0, d1` and `mov d0, lr` all reached the GP
+        // encoding and assembled as `orr`/`add` -- GNU as rejects all three.
+        for (i, n) in [(0usize, rd_name), (1, rm_name)] {
+            if !is_gp_reg(n) {
+                return Err(format!(
+                    "mov: operand {i} `{n}` is not a general-purpose register \
+                     (expected x0-x30, w0-w30, lr, xzr or wzr)"
+                ));
+            }
+        }
+        // `lr` is x30, so a 32-bit destination cannot take it (`mov w0, lr`
+        // is rejected by GNU as on width grounds).
+        if is_64bit_reg(rd_name) != is_64bit_reg(rm_name) {
+            return Err(format!(
+                "mov: `{rd_name}` and `{rm_name}` are different widths; \
+                 a register move needs both operands the same size"
+            ));
+        }
         let rd = parse_reg_num(rd_name).ok_or("invalid rd")?;
         let rm = parse_reg_num(rm_name).ok_or("invalid rm")?;
         let is_64 = is_64bit_reg(rd_name);
 
-        // Check for MOV to/from SP: uses ADD Xd, Xn, #0
-        if rd_name.to_lowercase() == "sp" || rm_name.to_lowercase() == "sp" {
+        // Check for MOV to/from SP: uses ADD Xd, Xn, #0. Both the 64-bit
+        // `sp` and the 32-bit `wsp` spelling take this form (GNU as:
+        // `mov w0, wsp` -> 0x110003e0, an ADD, not an ORR).
+        let is_sp = |n: &str| n.eq_ignore_ascii_case("sp") || n.eq_ignore_ascii_case("wsp");
+        if is_sp(rd_name) || is_sp(rm_name) {
             let sf = sf_bit(is_64);
             // ADD Xd, Xn, #0: sf 0 0 10001 00 imm12=0 Rn Rd
             let word = ((sf << 31) | (0b10001 << 24)) | (rm << 5) | rd;
@@ -393,6 +416,20 @@ pub(crate) fn encode_add_sub(
     is_sub: bool,
     set_flags: bool,
 ) -> Result<EncodeResult, String> {
+    // ADD/SUB are general-purpose: `add x0, x1, h2` has no encoding and GNU as
+    // rejects it, but the permissive operand readers resolve `h2` to 2 and
+    // assemble it as `add x0, x1, x2`. SP stays legal (add sp, sp, #16).
+    let mn = if is_sub { "sub" } else { "add" };
+    for i in 0..3 {
+        if let Some(Operand::Reg(reg)) = operands.get(i) {
+            if !is_gp_reg(reg) {
+                return Err(format!(
+                    "{mn}: operand {i} `{reg}` is not a general-purpose register \
+                     (expected x0-x30, w0-w30, lr, sp or xzr)"
+                ));
+            }
+        }
+    }
     if operands.len() < 3 {
         return Err(format!(
             "add/sub requires 3 operands, got {}",
@@ -606,6 +643,39 @@ pub(crate) fn encode_logical(operands: &[Operand], opc: u32) -> Result<EncodeRes
         return encode_neon_logical(operands, opc);
     }
 
+    // SP is legal ONLY as the destination of the non-flags immediate forms
+    // (ARM ARM "Logical (immediate)": AND/ORR/EOR Rd may be SP; ANDS and both
+    // register forms take no SP anywhere). Verified against GNU as, which
+    // assembles `and sp, x1, #15` and rejects `and x0, sp, #15` and
+    // `and sp, x1, x2`.
+    let sp_ok_in_rd = matches!(operands.get(2), Some(Operand::Imm(_))) && opc != 0b11;
+    let rd_sp = sp_ok_in_rd
+        && matches!(
+            operands.first(),
+            Some(Operand::Reg(n))
+                if n.eq_ignore_ascii_case("sp") || n.eq_ignore_ascii_case("wsp")
+        );
+    // Every operand must be a general-purpose register: `parse_reg_num`
+    // resolves `d2` to a bare number, so `and x0, x1, d2` used to assemble as
+    // a real instruction that GNU as rejects.
+    for i in 0..3 {
+        if let Some(Operand::Reg(n)) = operands.get(i) {
+            let is_sp = n.eq_ignore_ascii_case("sp") || n.eq_ignore_ascii_case("wsp");
+            if is_sp && !(i == 0 && rd_sp) {
+                return Err(format!(
+                    "logical op: operand {i}: sp/wsp is not valid here; \
+                     SP is only allowed as the destination of the \
+                     non-flags-setting immediate form"
+                ));
+            }
+            if !is_sp && !is_gp_reg(n) {
+                return Err(format!(
+                    "logical op: operand {i} `{n}` is not a general-purpose \
+                     register (expected x0-x30, w0-w30, lr, xzr or wzr)"
+                ));
+            }
+        }
+    }
     let (rd, is_64) = get_reg(operands, 0)?;
     let (rn, _) = get_reg(operands, 1)?;
     let sf = sf_bit(is_64);
@@ -1079,15 +1149,22 @@ pub(crate) fn encode_shift(operands: &[Operand], shift_type: u32) -> Result<Enco
 
 pub(crate) fn encode_sxtw(operands: &[Operand]) -> Result<EncodeResult, String> {
     // SXTW Xd, Wn -> SBFM Xd, Xn, #0, #31
-    let (rd, _) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
+    let (rd, _, rn) = get_gp_reg_pair(operands, "sxtw")?;
     let word = ((1u32 << 31) | (0b100110 << 23) | (1 << 22)) | (31 << 10) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
 }
 
 pub(crate) fn encode_sxth(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
+    let (rd, is_64, rn) = get_gp_reg_pair(operands, "sxth")?;
+    // The extend aliases take a 32-bit *source*: `SXTB <Xd>, <Wn>`. GNU as rejects `sxtb x0, x1` and accepts `sxtb x0, w1`.
+    if let Some(Operand::Reg(src)) = operands.get(1) {
+        if is_64bit_reg(src) && !(src.eq_ignore_ascii_case("sp") || src.eq_ignore_ascii_case("lr"))
+        {
+            return Err(format!(
+                "sxth: source register `{src}` must be the 32-bit (w) form"
+            ));
+        }
+    }
     let sf = sf_bit(is_64);
     let n = if is_64 { 1u32 } else { 0 };
     let word = ((sf << 31) | (0b100110 << 23) | (n << 22)) | (15 << 10) | (rn << 5) | rd;
@@ -1095,8 +1172,15 @@ pub(crate) fn encode_sxth(operands: &[Operand]) -> Result<EncodeResult, String> 
 }
 
 pub(crate) fn encode_sxtb(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
+    let (rd, is_64, rn) = get_gp_reg_pair(operands, "sxtb")?;
+    // The extend aliases take a 32-bit *source*: `SXTB <Xd>, <Wn>`. GNU as rejects `sxtb x0, x1` and accepts `sxtb x0, w1`.
+    if let Some(Operand::Reg(src)) = operands.get(1) {
+        if is_64bit_reg(src) && !matches!(src.to_lowercase().as_str(), "sp" | "lr") {
+            return Err(format!(
+                "sxtb: source register `{src}` must be the 32-bit (w) form"
+            ));
+        }
+    }
     let sf = sf_bit(is_64);
     let n = if is_64 { 1u32 } else { 0 };
     let word = ((sf << 31) | (0b100110 << 23) | (n << 22)) | (7 << 10) | (rn << 5) | rd;
@@ -1106,16 +1190,22 @@ pub(crate) fn encode_sxtb(operands: &[Operand]) -> Result<EncodeResult, String> 
 pub(crate) fn encode_uxtw(operands: &[Operand]) -> Result<EncodeResult, String> {
     // UXTW is MOV Wd, Wn (the upper 32 bits are zeroed)
     // Or: UBFM Xd, Xn, #0, #31
-    let (rd, _) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
+    let (rd, _, rn) = get_gp_reg_pair(operands, "uxtw")?;
     // Use 32-bit ORR (MOV alias)
     let word = (0b001010100 << 23) | (rn << 16) | (0b11111 << 5) | rd;
     Ok(EncodeResult::Word(word))
 }
 
 pub(crate) fn encode_uxth(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
+    let (rd, is_64, rn) = get_gp_reg_pair(operands, "uxth")?;
+    // The extend aliases take a 32-bit *source*: `SXTB <Xd>, <Wn>`. GNU as rejects `sxtb x0, x1` and accepts `sxtb x0, w1`.
+    if let Some(Operand::Reg(src)) = operands.get(1) {
+        if is_64bit_reg(src) && !matches!(src.to_lowercase().as_str(), "sp" | "lr") {
+            return Err(format!(
+                "uxth: source register `{src}` must be the 32-bit (w) form"
+            ));
+        }
+    }
     let sf = sf_bit(is_64);
     let n = if is_64 { 1u32 } else { 0 };
     let word =
@@ -1124,8 +1214,15 @@ pub(crate) fn encode_uxth(operands: &[Operand]) -> Result<EncodeResult, String> 
 }
 
 pub(crate) fn encode_uxtb(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
+    let (rd, is_64, rn) = get_gp_reg_pair(operands, "uxtb")?;
+    // The extend aliases take a 32-bit *source*: `SXTB <Xd>, <Wn>`. GNU as rejects `sxtb x0, x1` and accepts `sxtb x0, w1`.
+    if let Some(Operand::Reg(src)) = operands.get(1) {
+        if is_64bit_reg(src) && !matches!(src.to_lowercase().as_str(), "sp" | "lr") {
+            return Err(format!(
+                "uxtb: source register `{src}` must be the 32-bit (w) form"
+            ));
+        }
+    }
     let sf = sf_bit(is_64);
     let n = if is_64 { 1u32 } else { 0 };
     let word =

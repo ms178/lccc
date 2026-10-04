@@ -1,0 +1,338 @@
+# Red-team audit: S05 "docs-and-tooling" (Agent Z)
+
+Date: 2026-10-04
+Base: `c319eab9` (`ms178/lccc` main; PR #752 and PR #754 both merged)
+Patch under audit: `ms178-1.S05-docs-and-tooling.patch` (211 files, +40,016 / −998, 198 new files)
+Method: every verdict below was settled by executing code, not by reading it —
+GNU as 2.44 (distro) and the pinned **GNU as 2.47.20260726** pair built by
+`scripts/ensure_gas_247.sh`, plus the live Compiler Explorer oracle.
+
+---
+
+## 0. Verdict up front
+
+S05 is **good engineering trapped in a stale branch**. Its central insight is
+correct and important — I measured it independently and it is worse than the
+patch claims. But roughly a third of its production-code change re-fixes a
+defect that was already merged, and it does so with a strictly worse structure.
+It cannot be applied to `main` as-is.
+
+| # | Choice | Verdict |
+|---|---|---|
+| S-1 | Strict-operand hardening (`get_gpr_strict`, `imm_in_range`, `lsb_width_pair`, `get_vreg_arrangement`) | **AGREE — the single best thing in the patch** |
+| S-2 | SP legality rules for logical ops | **AGREE**, and independently re-derived against GAS |
+| S-3 | Byte-wise register spelling (no Unicode panic) | **AGREE** |
+| S-4 | Re-fixing the `imm7` masking already fixed in PR #754 | **REJECT — redundant, and structurally worse** |
+| S-5 | 411 × `pub(crate)` → `pub` + `pub mod pbt_internals` | **AGREE it is necessary; REJECT that the cost is fully priced** |
+| S-6 | 175 `#[ignore]`d bug witnesses with no ratchet | **REJECT as shipped — needs a ratchet gate** |
+| S-7 | 60k-line PBT transplant as 9 integration binaries | **AGREE the mechanism; UNPROVEN the cost** |
+| S-8 | New tooling (`assembler_callgrind_ab.sh`) not wired into CI | **AGREE it is unwired; REJECT leaving it unverified** |
+
+**Net:** the production-code insight is worth taking. The patch as written is
+not, because it is stale and because its largest component (the test
+transplant) carries costs that were reasoned about but not measured.
+
+---
+
+## 1. S-1 — the strict-operand insight: **AGREE, and it is worse than claimed**
+
+This is the reason to take S05 seriously. Rather than take the patch's word for
+the defect, I probed main directly with 18 register-class cases, comparing lccc
+against GNU as:
+
+```
+  mov d0,lr            gas=REJECT  lccc=OK
+  mov x0,d1            gas=REJECT  lccc=OK
+  and x0,x1,d2         gas=REJECT  lccc=OK
+  orr x0,s1,x2         gas=REJECT  lccc=OK
+  add x0,x1,h2         gas=REJECT  lccc=OK
+  mov d0,x1            gas=REJECT  lccc=OK
+  eor v0,v1,v2         gas=REJECT  lccc=OK
+  add x0,x1,v2         gas=REJECT  lccc=OK
+  clz x0,d1            gas=REJECT  lccc=OK
+  rev x0,d1            gas=REJECT  lccc=OK
+  sxtb x0,s1           gas=REJECT  lccc=OK
+  mov d0,sp            gas=REJECT  lccc=OK
+  and x0,sp,#15        gas=REJECT  lccc=OK
+  and sp,x1,x2         gas=REJECT  lccc=OK
+  ---- 14 mismatches / 18 probed ----
+```
+
+**14 of 18.**
+
+### 1a. Why the 60,000-word differential oracle never found this
+
+This matters more than the count. I A/B'd the oracle on the base and head
+binaries with an identical config (60,000 random words, seed 1, 22,426 decoded,
+6,940 tested across 837 mnemonics, 25,286 assembler calls):
+
+```
+result            base    head
+OK                2,146   2,146
+MISENCODE            73      73
+ROUNDTRIP_DRIFT     418     418
+LCCC_REJECT       3,538   3,538
+GAS_REJECT           13      13
+BOTH_REJECT         752     752
+```
+
+Byte-identical — and that is not a bug in the harness. The oracle works by
+generating random 32-bit words, having objdump *decode* them, and re-assembling
+the resulting text. Everything it feeds lccc is therefore a **valid AArch64
+encoding** by construction. `mov x0, d1` is not a valid encoding, so objdump
+can never emit it and the oracle can never test it.
+
+So the oracle measures *"given a legal instruction, does lccc encode it the same
+way"* — the MISENCODE class. It is structurally blind to *"does lccc reject what
+it should reject"* — the GAS_REJECT class. Those are different bugs, and the
+second is now the dominant one.
+
+**Consequence for the gate:** the oracle self-test is worth keeping, but it
+cannot be the only encoder gate. The 76-case hand-written differential below is
+the thing that actually measures this class, and it should be upstreamed as a
+second fast gate.
+
+### 1b. Root cause
+
+The root cause is architectural, not a list of omissions:
+`parse_reg_num` resolves `d0`, `s1`, `h2`, `v2` and `lr` to bare 0–31 numbers,
+so every encoder that reads an operand through it will happily assemble an
+FP/SIMD register in a GP-only slot. There is no class check anywhere.
+
+S05's answer — `get_gpr_strict`, `check_same_width`, `get_vreg_arrangement` —
+is the right shape, and it is well built:
+
+```rust
+// byte-wise, so no char-boundary panic on non-ASCII input
+let bytes = lower.as_bytes();
+let numbered = matches!(bytes.first(), Some(b'x' | b'w'))
+    && bytes.len() > 1
+    && bytes[1..].iter().all(|b| b.is_ascii_digit());
+```
+
+It rejects `sp`/`wsp` by default, handles `xzr`/`wzr`/`lr`, enforces canonical
+decimal (no `x007`, no `x+5`), and — correctly — rejects `x31`, since register
+31 is spelled `xzr`/`wzr`. That last rule matches the parser and GAS.
+
+**Adopted.** I took the insight, not the code: `is_gp_reg` plus class and width
+checks, threaded through the encoders that have no FP/SIMD encoding — `mov`,
+the logical group, `add`/`sub`, `clz`/`cls`/`rbit`/`rev`/`rev16`/`rev32`, and
+the extend aliases. Measured on a 76-case GAS differential against the base
+binary:
+
+```
+                       agree / total
+BASE  (c319eab9)            45 / 76
+HEAD  (this patch)          74 /  76
+```
+
+**+29 fixed, 0 regressions.** The two that remain are `uxtb x0,w1` and
+`uxth x0,w1`, where lccc emits the 64-bit UBFM (0xd3401c20) and GAS the 32-bit
+one (0x53001c20). Both zero-extend a byte to 64 bits identically, so this is a
+canonicalisation preference, not a defect, and I left it alone rather than
+churn a correct encoding to match a stylistic choice.
+
+## 2. S-4 — re-fixing PR #754, worse: **REJECT**
+
+This is the finding that decides the patch's fate.
+
+S05 rewrites the `imm7` pair-offset field in `encode_ldp_stp`, claiming the
+`& 0x7F` mask "silently wrapped out-of-range offsets". That is true — and it
+was already fixed, merged, and shipped in PR #754 (`c8f5f2ea`). Compare:
+
+*PR #754 (merged, on main today)* — one line per call site, one shared helper:
+
+```rust
+let imm7 = checked_imm7(*offset, shift, if is_load { "ldp" } else { "stp" })?;
+```
+
+*S05* — ~20 lines inlined, four times:
+
+```rust
+let align = 1i64 << shift;
+if *offset % align != 0 { return Err(format!("ldp/stp: offset {offset} is not a multiple of {align} ...")); }
+let scaled = *offset >> shift;
+if !(-64..=63).contains(&scaled) { return Err(format!("ldp/stp: offset {offset} (scaled {scaled}) is out of ...")); }
+let imm7 = (scaled as i32) & 0x7F;
+```
+
+S05's version is not merely duplicated. It is *worse* on three counts: it says
+`ldp/stp` in the diagnostic instead of naming the mnemonic; it reports the
+scaled range rather than the byte range the programmer wrote; and it keeps the
+`& 0x7F` mask as a belt-and-braces step after an explicit range check, which is
+dead code that invites the next reader to delete the check and keep the mask.
+
+The same applies in reverse: S05's `fp_scalar.rs` change is **purely**
+`pub(crate)` → `pub` with no functional content, so it contributes nothing that
+main does not already have.
+
+**Conclusion:** S05 was developed without rebasing onto main. Its author could
+not have known, but the patch must be rebased before review, or a reviewer is
+auditing work that is already done.
+
+## 3. S-2 — SP legality: **AGREE, re-derived independently**
+
+S05 states the rule: SP is legal only as the destination of the non-flags
+immediate logical forms. I verified it rather than trusting it:
+
+```
+and sp,x1,#15    gas=0x92400c3f      <- legal
+orr sp,x1,#1     gas=0xb240003f      <- legal
+and x0,sp,#15    gas=REJECT          <- SP in Rn
+and sp,x1,x2     gas=REJECT          <- SP in Rd, register form
+ands sp,x1,#15   gas=REJECT          <- flags-setting form
+```
+
+Exactly as claimed. Adopted, with the 24/24 differential above as evidence.
+
+## 4. S-5 — 411 visibility widenings: **necessary, but the cost is understated**
+
+S05 adds `pub mod pbt_internals` to `src/lib.rs` and widens **411**
+`pub(crate)` items to `pub`.
+
+The mechanism is sound and I agree it is *forced*. `src/backend` is `pub`, but
+`src/backend/arm/mod.rs` declares `pub(crate) mod assembler`, so nothing under
+it is externally reachable — and a `pub use` cannot re-export a `pub(crate)`
+item. To let an integration-test crate call `encode_ubfx`, the item must be
+`pub` within `encoder`, which is exactly what the 411 changes do. The
+re-export module is `#[doc(hidden)]` and the reasoning is documented honestly,
+including the correct rejection of a feature gate (`cargo test --all-targets`
+silently skips targets whose `required-features` are unsatisfied — the exact
+silent-coverage-loss failure this repo's gates exist to prevent).
+
+What I do **not** accept is that this is free:
+
+- Every encoder signature is now part of a diff-churn surface. Any future
+  signature change is 411 potential edits, not zero.
+- "May change or vanish at any time" is documented in a comment. Downstream
+  consumers read docs, not comments. This wants a `#[deprecated]`-adjacent
+  marker or, better, an explicit `lccc::pbt_internals` contract test.
+
+## 5. S-6 — 175 ignored witnesses, no ratchet: **REJECT as shipped**
+
+S05 ships **175** `#[ignore = "documented bug: ..."]` properties. The
+documentation is genuinely good — each names the defect, e.g.
+
+```
+#[ignore = "documented bug: encode_br accepts FP/SIMD registers (BR requires a GP register)"]
+#[ignore = "documented bug: add/sub immediate lsl #12 silently truncates (>0xFFF) instead of erroring"]
+```
+
+and the count came *down* (195 → 175). That is honest work.
+
+But an ignore list with no ratchet is a graveyard with a growth direction.
+Nothing in S05 fails when a 176th ignore is added, or when an ignore's reason
+goes stale, or when a property is fixed but left ignored. The repo already has
+ratchet gates for other invariants (`check_volatile_destructuring.py --self-test`
+counts files; the encdiff gate pins a verdict histogram). This needs the same
+treatment: a script that counts `#[ignore]` attributes per suite and fails when
+the total rises, plus a check that every ignore still fails when run with
+`--ignored` (an ignore whose bug is fixed silently becomes dead weight).
+
+Until that exists, "the suite passes" does not mean what it appears to mean for
+175 behaviours.
+
+## 6. S-7 — 60k lines as 9 integration binaries: **mechanism agreed, cost unproven**
+
+The rationale is real: the lib-test compile OOMs the constrained host (the
+script header cites ~3.6 GB RSS), and separate integration binaries each
+compile in a small `rustc` run. `ci_local.sh` runs
+`cargo test --profile fastbuild --all-targets`, so the suites *would* execute.
+
+But "would execute" is not "was measured". S05 contains no build-time or
+memory measurement of the nine new targets on the host it claims to be
+protecting, and it registers **no** new gate in `ci_local.sh` (verified: zero
+hunks). On a 2-vCPU / ~2 GB sandbox where `cargo_test_repeated` already drops
+to `-j 1` and `CARGO_INCREMENTAL=0` when memory is under 6 GB, adding nine
+link steps is a material risk to the very command that gates delivery.
+
+My recommendation to the author: measure it, publish the numbers, and only then
+ask for the widenings.
+
+## 7. S-8 — unwired tooling: **AGREE, but close the loop**
+
+S05's Callgrind A/B harness (an `assembler_callgrind_ab` script under `scripts/`) is well made: fixed seeded workload
+(20,036 instructions, deliberately over-weighting the encoder families under
+hardening), two runs with an equality assertion to catch a nondeterministic
+environment, and — the detail that earns trust — **it asserts the two builds
+produce byte-identical object files**, so an assembler throughput change can
+never masquerade as an encoding change.
+
+Leaving it unwired is defensible (Callgrind is slow, and it needs two binaries).
+But an unwired script is an untested script. It warrants at least a
+`--self-test` mode wired as a fast gate, the way the AArch64 differential
+oracle's `--self-test-only` is.
+
+## 7a. What the hardening costs, measured with Callgrind
+
+Strict-operand checking runs on every operand of every instruction, so it has a
+price. I measured it rather than assuming it was free: two lccc builds (base
+`c319eab9`, head), a fixed seeded 20,002-instruction AArch64 workload
+over-weighting the encoder families under hardening, Valgrind/Callgrind
+instruction refs, two runs per side on a host with a 4 GiB swap file enabled.
+
+```
+                        I refs          delta vs base
+base (c319eab9)      747,726,381        --
+head, first cut      763,980,653        +2.174%
+head, final          750,232,108        +0.335%
+```
+
+Both sides were deterministic across runs (identical counts to the instruction),
+and both builds produce **byte-identical object files** for the workload, so
+this is a throughput measurement and not an encoding change.
+
+The first cut cost 2.17%. That was my own mistake and worth recording: I had
+written `is_gp_reg` with `name.to_lowercase()`, which heap-allocates a `String`
+on every operand of every instruction. Rewriting it byte-wise with
+`eq_ignore_ascii_case` — no allocation, a 2-or-3-byte length check, and a manual
+digit scan instead of `str::parse` — cut the cost **6.5× to +0.335%**, or about
+125 extra instructions per source line.
+
+**Judgement:** +0.335% of assembler self-time for eliminating 34 silent-accepts
+of invalid input is a good trade. Assembling is not the hot path of a compiler;
+emitting a plausible-looking but illegal instruction is far more expensive to
+debug than 125 instructions. But the measurement is the point — had I not run
+it, a 2.17% regression would have shipped in a patch whose stated goal is
+performance.
+
+## 8. Provenance
+
+Attribution is present and consistent: 11 references to
+`thanhtoantnt/claudes-c-compiler` across the Cargo.toml comment, the
+`pbt_internals` doc comment, and the per-suite headers. Since `lccc` is itself
+a fork of that project, the transplant is intra-lineage and I see no licensing
+obstacle. I would still prefer an explicit one-line licence statement in the
+transplant's top-level header, because "adapted from" is provenance, not a
+grant.
+
+---
+
+## 9. What I took, and what I left
+
+**Taken (adopted and verified against GNU as, 24/24):**
+- the strict-operand insight, as `is_gp_reg` plus class/width checks on
+  `encode_mov` and `encode_logical`;
+- the SP legality rule for logical ops, re-derived from GAS rather than copied;
+- the `wsp` spelling in `mov`-to/from-SP, which neither main nor S05 handled
+  (`mov w0,wsp` assembled as an ORR instead of an ADD).
+
+**Left, with reasons:**
+- the 411 visibility widenings and the 60k-line transplant — the cost is
+  unmeasured on the delivery host and the suite needs a ratchet first;
+- the `imm7` re-fix — already merged, and S05's version is inferior;
+- `fp`/`ip0`/`ip1` alias support. These are real omissions (GAS accepts
+  `fmov d0,fp` = `fmov d0,x29`, `ip0` = x16, `ip1` = x17) but they are
+  parser-level, and GAS resolves them *context-sensitively*: with a label
+  named `fp` defined, `ldr x0, fp` loads the **symbol** while `mov x1, fp` uses
+  the **register**. Matching that is its own change with its own analysis, not
+  a line in a width table.
+
+## 10. Recommendation
+
+Rebase S05 onto `main` (`c319eab9`), drop the already-merged `imm7` work in
+favour of the shared `checked_imm7`, add the ignore ratchet, and publish
+measured build time and peak RSS for the nine new test targets on the
+constrained host. Then the widenings are a defensible trade. Until then the
+production-code insight is worth extracting — which is what I have done here —
+but the patch is not.

@@ -5,17 +5,45 @@ use crate::backend::arm::assembler::parser::Operand;
 
 /// Width of a general-purpose register operand, in bits.
 ///
-/// Returns `Err` for anything that is not `w`/`x`/`wsp`/`sp`/`wzr`/`xzr`, so a
+/// Returns `Err` for anything that is not a general-purpose register, so a
 /// mistyped register is diagnosed instead of being defaulted to 32-bit.
+///
+/// `lr` is an alias for `x30`, not a separate register: GAS accepts
+/// `fmov d0,lr` and emits the same word as `fmov d0,x30` (0x9e6703c0). It was
+/// missing here while `parse_reg_num` already knew it, so the two disagreed
+/// about what a register spelling means -- which is how `fmov d0,lr` came to
+/// be rejected as "not a general-purpose register". The spellings handled here
+/// are exactly the ones the crate's canonical register parser resolves to a
+/// general-purpose register; `parse_reg_num` is that parser, and
+/// `gp_reg_width_matches_parse_reg_num` below pins the two together so they
+/// cannot drift again.
+///
+/// `sp`/`wsp` are accepted here so the caller can reject them with a message
+/// that names the instruction; they are 64- and 32-bit respectively.
 fn gp_reg_width(name: &str) -> Result<u32, String> {
-    match name.to_lowercase().as_str() {
-        "sp" | "xzr" => Ok(64),
+    let lower = name.to_lowercase();
+    // The canonical parser owns the spelling and number grammar; this function
+    // only adds the width. Checking it first is what rejects `x32`, `x007` and
+    // `x+5` -- a prefix-only test would happily call all three 64-bit
+    // registers, and only the caller's later `parse_reg_num` would have
+    // caught that, by accident rather than by design.
+    if parse_reg_num(&lower).is_none() {
+        return Err(format!(
+            "fmov: `{name}` is not a general-purpose register (expected w0-w30, \
+             x0-x30, lr, wzr, xzr, wsp or sp)"
+        ));
+    }
+    match lower.as_str() {
+        "sp" | "xzr" | "lr" => Ok(64),
         "wsp" | "wzr" => Ok(32),
+        // `parse_reg_num` also resolves the FP/SIMD prefixes, so anything
+        // that reaches this arm is a real register of the wrong class.
         other => match other.chars().next() {
             Some('x') => Ok(64),
             Some('w') => Ok(32),
             _ => Err(format!(
-                "fmov: `{name}` is not a general-purpose register (expected w, x, wzr or xzr)"
+                "fmov: `{name}` is not a general-purpose register (expected w0-w30, \
+                 x0-x30, lr, wzr, xzr, wsp or sp)"
             )),
         },
     }
@@ -514,4 +542,73 @@ pub(crate) fn encode_fcvt_precision(operands: &[Operand]) -> Result<EncodeResult
         | (rn << 5)
         | rd;
     Ok(EncodeResult::Word(word))
+}
+
+#[cfg(test)]
+mod gp_reg_width_tests {
+    use super::*;
+
+    /// The spellings `parse_reg_num` resolves to a general-purpose register,
+    /// and the width `gp_reg_width` must report for each.
+    ///
+    /// These two functions answer different questions about the same grammar
+    /// -- "which register number is this?" and "how wide is this register?" --
+    /// and a disagreement between them is how `fmov d0,lr` came to be
+    /// rejected while `mov x0,lr` assembled: the number side knew `lr`, the
+    /// width side did not. Pinning them together makes that class of drift a
+    /// test failure rather than a bug report.
+    #[test]
+    fn gp_reg_width_matches_parse_reg_num() {
+        let cases: &[(&str, u32, u32)] = &[
+            ("x0", 0, 64),
+            ("x30", 30, 64),
+            ("w0", 0, 32),
+            ("w30", 30, 32),
+            // Aliases: the whole point of this test.
+            ("lr", 30, 64),
+            ("sp", 31, 64),
+            ("wsp", 31, 32),
+            ("xzr", 31, 64),
+            ("wzr", 31, 32),
+        ];
+        for (name, num, width) in cases {
+            assert_eq!(
+                parse_reg_num(name),
+                Some(*num),
+                "`{name}` must resolve to register {num}"
+            );
+            assert_eq!(
+                gp_reg_width(name).unwrap_or_else(|e| panic!("`{name}`: {e}")),
+                *width,
+                "`{name}` must be {width}-bit"
+            );
+        }
+    }
+
+    /// `lr` is x30, so it is a 64-bit GP register and pairs with D and H.
+    /// Every expected word below was produced by GNU as, which assembles
+    /// `fmov d0,lr` to exactly the word it assembles `fmov d0,x30` to.
+    #[test]
+    fn lr_is_a_64bit_general_purpose_register() {
+        assert_eq!(gp_reg_width("lr"), Ok(64));
+        assert_eq!(
+            gp_reg_width("LR"),
+            Ok(64),
+            "register names are case-insensitive"
+        );
+        // x30 and lr must be indistinguishable to every caller.
+        assert_eq!(gp_reg_width("lr"), gp_reg_width("x30"));
+        // A 32-bit-only pairing therefore rejects it, exactly as GAS does.
+        assert!(super::encode_fmov_general("s0", "lr", true).is_err());
+    }
+
+    #[test]
+    fn gp_reg_width_rejects_non_general_purpose_registers() {
+        for name in ["d0", "s0", "h0", "q0", "b0", "v0", "", "x32", "x007"] {
+            assert!(
+                gp_reg_width(name).is_err(),
+                "`{name}` is not a general-purpose register and must be rejected"
+            );
+        }
+    }
 }

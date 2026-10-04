@@ -188,6 +188,81 @@ pub fn parse_reg_num(name: &str) -> Option<u32> {
 }
 
 /// Check if a register name is a 64-bit (X) register or SP.
+/// Check whether `name` spells a general-purpose register: `x0`-`x30`,
+/// `w0`-`w30`, or one of the `sp`/`wsp`/`xzr`/`wzr`/`lr` aliases.
+///
+/// This is the class check the permissive readers (`get_reg`, and
+/// `parse_reg_num` on its own) do not make: `parse_reg_num` resolves `d0` and
+/// `lr` to plain numbers, so an FP/SIMD register reaches encoders that only
+/// have a GP encoding and is silently assembled as one. `mov d0, x1`,
+/// `mov x0, d1`, `and x0, x1, d2` and `clz x0, d1` were all accepted that way
+/// and produced words GNU as rejects outright.
+///
+/// Deliberately excludes `x31`/`w31`: register 31 is spelled `xzr`/`wzr` in
+/// the GP forms, matching the parser and GNU as.
+pub(crate) fn is_gp_reg(name: &str) -> bool {
+    // Allocation-free on purpose. This runs on every operand of every
+    // instruction, and an earlier `to_lowercase()` here cost 2.17% of the
+    // assembler's total instruction count (measured with Callgrind, see
+    // docs/REVIEW_S05_ADJUDICATION.md). `eq_ignore_ascii_case` and byte-wise
+    // scanning allocate nothing.
+    if name.eq_ignore_ascii_case("sp")
+        || name.eq_ignore_ascii_case("wsp")
+        || name.eq_ignore_ascii_case("xzr")
+        || name.eq_ignore_ascii_case("wzr")
+        || name.eq_ignore_ascii_case("lr")
+    {
+        return true;
+    }
+    let b = name.as_bytes();
+    // 2 or 3 bytes: a prefix and one or two digits. Register numbers never
+    // exceed 30, so anything longer cannot be a GP register.
+    if b.len() < 2 || b.len() > 3 {
+        return false;
+    }
+    if !matches!(b[0], b'x' | b'X' | b'w' | b'W') {
+        return false;
+    }
+    // Canonical decimal only: no leading zero, and 31 is spelled xzr/wzr --
+    // the same rule `parse_reg_num` uses, so the class check and the parser
+    // cannot disagree.
+    if b.len() == 3 && b[1] == b'0' {
+        return false;
+    }
+    let mut v = 0u32;
+    for &d in &b[1..] {
+        if !d.is_ascii_digit() {
+            return false;
+        }
+        v = v * 10 + (d - b'0') as u32;
+    }
+    v <= 30
+}
+
+/// Reads two general-purpose register operands, rejecting FP/SIMD spellings.
+///
+/// `get_reg` resolves any register name to a bare 0-31 number, so `clz x0, d1`
+/// used to assemble as a real instruction that GNU as rejects. Encoders whose
+/// only encoding is the GP "data-processing (1 source)" or shifted-register
+/// form call this instead so the class error is reported at the operand that
+/// caused it. `sp`/`wsp` remain legal, since they are GP registers for these
+/// encodings; only FP/SIMD spellings are refused.
+pub(crate) fn get_gp_reg_pair(operands: &[Operand], mn: &str) -> Result<(u32, bool, u32), String> {
+    for i in 0..2 {
+        if let Some(Operand::Reg(n)) = operands.get(i) {
+            if !is_gp_reg(n) {
+                return Err(format!(
+                    "{mn}: operand {i} `{n}` is not a general-purpose register \
+                     (expected x0-x30, w0-w30, lr, sp or xzr)"
+                ));
+            }
+        }
+    }
+    let (rd, is_64) = get_reg(operands, 0)?;
+    let (rn, _) = get_reg(operands, 1)?;
+    Ok((rd, is_64, rn))
+}
+
 fn is_64bit_reg(name: &str) -> bool {
     let name = name.to_lowercase();
     name.starts_with('x') || name == "sp" || name == "xzr" || name == "lr"

@@ -1682,6 +1682,178 @@ mod aarch64_encoder_tests {
         }
     }
 
+    /// ADD/SUB, CLZ/REV/RBIT and SXTB/SXTH/UXTH/UXTB have no FP or SIMD
+    /// encoding at all, but `parse_reg_num` resolves `h2` to `2`, so
+    /// `add x0,x1,h2` assembled as `add x0,x1,x2`. GNU as rejects all three.
+    #[test]
+    fn gp_only_arith_and_bitfield_encoders_reject_fp_registers() {
+        for insn in [
+            "add x0,x1,h2",
+            "add x0,x1,v2",
+            "add x0,x1,s2",
+            "sub x0,x1,s2",
+            "clz x0,d1",
+            "rev x0,d1",
+            "rev16 x0,d1",
+            "rev32 x0,d1",
+            "rbit x0,d1",
+            "sxtb x0,s1",
+            "sxth x0,s1",
+            "uxtb x0,s1",
+            "uxth x0,s1",
+        ] {
+            assert!(
+                assemble(&one_insn(insn)).is_err(),
+                "`{insn}` names an FP/SIMD register in a GP-only encoding; \\
+                 GNU as rejects it"
+            );
+        }
+        // `add d0,d1,d2` is the legal scalar-FP 3-same form and stays legal;
+        // only the GP dispatch path rejects FP operands.
+        assert!(assemble(&one_insn("add d0,d1,d2")).is_ok());
+        // The GP spellings still assemble, and SP is still legal in add/sub.
+        assert_eq!(word_of(&one_insn("add x0,x1,x2")), 0x8b02_0020);
+        assert_eq!(word_of(&one_insn("add sp,sp,#16")), 0x9100_43ff);
+        assert_eq!(word_of(&one_insn("clz x0,x1")), 0xdac0_1020);
+        assert_eq!(word_of(&one_insn("rev x0,x1")), 0xdac0_0c20);
+    }
+
+    /// The extend aliases are `SXTB <Xd>, <Wn>`: the *source* is always the
+    /// 32-bit form. GNU as assembles `sxtb x0,w1` and rejects `sxtb x0,x1`.
+    #[test]
+    fn extend_aliases_require_a_32bit_source_register() {
+        assert_eq!(word_of(&one_insn("sxtb x0,w1")), 0x9340_1c20);
+        assert_eq!(word_of(&one_insn("sxtb w0,w1")), 0x1300_1c20);
+        assert_eq!(word_of(&one_insn("sxth x0,w1")), 0x9340_3c20);
+        assert_eq!(word_of(&one_insn("sxtw x0,w1")), 0x9340_7c20);
+        for insn in [
+            "sxtb x0,x1",
+            "sxth x0,x1",
+            "uxtb x0,x1",
+            "uxth x0,x1",
+            "sxtb w0,x1",
+        ] {
+            assert!(
+                assemble(&one_insn(insn)).is_err(),
+                "`{insn}` uses a 64-bit source with an extend alias; \\
+                 GNU as rejects it"
+            );
+        }
+    }
+
+    /// The permissive operand readers resolve *any* register spelling to a
+    /// bare 0-31 number, so an FP/SIMD register reached encoders that only
+    /// have a GP encoding and was silently assembled as one. `mov x0, d1`,
+    /// `mov d0, x1`, `mov d0, lr` and `and x0, x1, d2` were all accepted and
+    /// produced words GNU as rejects outright.
+    #[test]
+    fn gp_only_encoders_reject_fp_and_simd_registers() {
+        for insn in [
+            "mov d0,x1",
+            "mov x0,d1",
+            "mov d0,lr",
+            "mov d0,sp",
+            "and x0,x1,d2",
+            "orr x0,s1,x2",
+            "and x0,x1,h2",
+            "and x0,x1,v2",
+        ] {
+            assert!(
+                assemble(&one_insn(insn)).is_err(),
+                "`{insn}` mixes an FP/SIMD register into a GP-only encoding; \\
+                 GNU as rejects it"
+            );
+        }
+    }
+
+    /// SP is legal as the destination of the non-flags-setting *immediate*
+    /// logical forms and nowhere else. GNU as assembles `and sp,x1,#15` and
+    /// rejects `and x0,sp,#15`, `and sp,x1,x2` and `ands sp,x1,#15`.
+    #[test]
+    fn logical_immediate_sp_legality_matches_gas() {
+        assert_eq!(word_of(&one_insn("and sp,x1,#15")), 0x9240_0c3f);
+        assert_eq!(word_of(&one_insn("orr sp,x1,#1")), 0xb240_003f);
+        for insn in [
+            "and x0,sp,#15",
+            "and sp,x1,x2",
+            "and x0,sp,x2",
+            "ands sp,x1,#15",
+        ] {
+            assert!(
+                assemble(&one_insn(insn)).is_err(),
+                "`{insn}` uses SP where the architecture does not allow it; \\
+                 GNU as rejects it"
+            );
+        }
+        // The plain forms are untouched.
+        assert_eq!(word_of(&one_insn("and x0,x1,x2")), 0x8a02_0020);
+        assert_eq!(word_of(&one_insn("and x0,x1,#15")), 0x9240_0c20);
+    }
+
+    /// `mov` to or from SP lowers to ADD, and both the 64-bit `sp` and the
+    /// 32-bit `wsp` spelling take that form. `wsp` was missed, so
+    /// `mov w0,wsp` assembled as an ORR (0x2a1f03e0) instead of an ADD
+    /// (0x110003e0).
+    #[test]
+    fn mov_to_or_from_sp_lowers_to_add_for_both_spellings() {
+        assert_eq!(word_of(&one_insn("mov sp,x1")), 0x9100_003f);
+        assert_eq!(word_of(&one_insn("mov x0,sp")), 0x9100_03e0);
+        assert_eq!(word_of(&one_insn("mov sp,sp")), 0x9100_03ff);
+        assert_eq!(word_of(&one_insn("mov w0,wsp")), 0x1100_03e0);
+        assert_eq!(word_of(&one_insn("mov wsp,w1")), 0x1100_003f);
+        // A `mov` to/from SP is an ADD, never an ORR: the two differ in bit 30.
+        for insn in ["mov sp,x1", "mov x0,sp", "mov w0,wsp", "mov wsp,w1"] {
+            assert_eq!(
+                word_of(&one_insn(insn)) & (1 << 30),
+                0,
+                "`{insn}` must lower to ADD, which has bit 30 clear"
+            );
+        }
+    }
+
+    /// `lr` is an alias for `x30`, not a register of its own. GNU as assembles
+    /// `fmov d0,lr` to exactly the word it assembles `fmov d0,x30` to
+    /// (0x9e6703c0); lccc rejected it, because the width helper that decides
+    /// whether the GP operand is 32- or 64-bit did not list `lr` even though
+    /// the crate's own register parser did. The two must agree about what a
+    /// register spelling means.
+    ///
+    /// `fp` (x29), `ip0` (x16) and `ip1` (x17) are the same class of omission
+    /// but are deliberately NOT fixed here: they are unrecognised at the
+    /// parser level, and GAS resolves them context-sensitively -- `ldr x0, fp`
+    /// loads the *symbol* `fp` when one is defined, while `mov x1, fp` uses
+    /// the register. Matching that needs parser work with its own analysis,
+    /// not a one-line addition to a width table.
+    #[test]
+    fn lr_alias_is_a_64bit_general_purpose_register() {
+        // Same words as the x30 spellings, from GNU as.
+        assert_eq!(word_of(&one_insn("fmov d0,lr")), 0x9e67_03c0);
+        assert_eq!(word_of(&one_insn("fmov d0,x30")), 0x9e67_03c0);
+        assert_eq!(word_of(&one_insn("fmov d30,lr")), 0x9e67_03de);
+        assert_eq!(word_of(&one_insn("fmov lr,d0")), 0x9e66_001e);
+        assert_eq!(word_of(&one_insn("fmov x30,d0")), 0x9e66_001e);
+        // H pairs with either GP width, and `lr` is 64-bit, so sf=1.
+        assert_eq!(word_of(&one_insn("fmov h0,lr")), 0x9ee7_03c0);
+
+        // The alias and the numbered spelling are the same register.
+        assert_eq!(
+            word_of(&one_insn("fmov d0,lr")),
+            word_of(&one_insn("fmov d0,x30")),
+            "`lr` must encode identically to `x30`"
+        );
+
+        // S only pairs with a 32-bit GP register, so `lr` is rejected -- the
+        // same reason GAS gives, rather than "unknown register".
+        let err = match assemble(&one_insn("fmov s0,lr")) {
+            Ok(_) => panic!("`fmov s0,lr` must be rejected: GAS rejects it"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("64-bit"),
+            "`fmov s0,lr` should fail on width, not on spelling: {err}"
+        );
+    }
+
     /// The `#fbits` operand of the fixed-point conversions was parsed and then
     /// thrown away, so `fcvtzs x10,s30,#55` assembled as `fcvtzs x10,s30` --
     /// wrong by a factor of 2^55. Two fields are involved: bit 21 flips from 1

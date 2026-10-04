@@ -191,8 +191,7 @@ pub(crate) fn encode_extr(operands: &[Operand]) -> Result<EncodeResult, String> 
 // ── Bit manipulation ─────────────────────────────────────────────────────
 
 pub(crate) fn encode_clz(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
+    let (rd, is_64, rn) = get_gp_reg_pair(operands, "clz")?;
     let sf = sf_bit(is_64);
     // CLZ: sf 1 0 11010110 00000 00010 0 Rn Rd
     let word = ((sf << 31) | (1 << 30) | (0b011010110 << 21)) | (0b000100 << 10) | (rn << 5) | rd;
@@ -200,8 +199,7 @@ pub(crate) fn encode_clz(operands: &[Operand]) -> Result<EncodeResult, String> {
 }
 
 pub(crate) fn encode_cls(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
+    let (rd, is_64, rn) = get_gp_reg_pair(operands, "cls")?;
     let sf = sf_bit(is_64);
     let word = ((sf << 31) | (1 << 30) | (0b011010110 << 21)) | (0b000101 << 10) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
@@ -226,16 +224,14 @@ pub(crate) fn encode_rbit(operands: &[Operand]) -> Result<EncodeResult, String> 
         return Ok(EncodeResult::Word(word));
     }
     // Scalar form: RBIT Rd, Rn
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
+    let (rd, is_64, rn) = get_gp_reg_pair(operands, "rbit")?;
     let sf = sf_bit(is_64);
     let word = ((sf << 31) | (1 << 30) | (0b011010110 << 21)) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
 }
 
 pub(crate) fn encode_rev(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
+    let (rd, is_64, rn) = get_gp_reg_pair(operands, "rev")?;
     let sf = sf_bit(is_64);
     let opc = if is_64 { 0b000011 } else { 0b000010 };
     let word = ((sf << 31) | (1 << 30) | (0b011010110 << 21)) | (opc << 10) | (rn << 5) | rd;
@@ -243,8 +239,7 @@ pub(crate) fn encode_rev(operands: &[Operand]) -> Result<EncodeResult, String> {
 }
 
 pub(crate) fn encode_rev16(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
+    let (rd, is_64, rn) = get_gp_reg_pair(operands, "rev16")?;
     let sf = sf_bit(is_64);
     let word = ((sf << 31) | (1 << 30) | (0b011010110 << 21)) | (0b000001 << 10) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
@@ -267,8 +262,7 @@ pub(crate) fn encode_rev32(operands: &[Operand]) -> Result<EncodeResult, String>
             | rd;
         return Ok(EncodeResult::Word(word));
     }
-    let (rd, _) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
+    let (rd, _, rn) = get_gp_reg_pair(operands, "rev32")?;
     // REV32 is 64-bit only: 1 1 0 11010110 00000 000010 Rn Rd
     let word = ((1u32 << 31) | (1 << 30) | (0b011010110 << 21)) | (0b000010 << 10) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
