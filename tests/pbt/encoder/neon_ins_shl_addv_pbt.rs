@@ -132,7 +132,10 @@ const INS_ELEM_GOLDEN: &[(u32, u32, &str, u32, u32, u32)] = &[
 #[test]
 fn ins_gp_form_matches_llvm() {
     for &(rd, rn, elem, idx, want) in INS_GP_GOLDEN {
-        let got = word_of(encode_neon_ins(&[lane(rd, elem, idx), gp_for_elem(rn, elem)]));
+        let got = word_of(encode_neon_ins(&[
+            lane(rd, elem, idx),
+            gp_for_elem(rn, elem),
+        ]));
         assert_eq!(
             got, want,
             "ins v{rd}.{elem}[{idx}], x{rn}: got 0x{got:08X}, want 0x{want:08X}"

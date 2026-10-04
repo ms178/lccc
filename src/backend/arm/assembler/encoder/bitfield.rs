@@ -29,9 +29,7 @@ fn bitfield_reg_pair(operands: &[Operand]) -> Result<((u32, u32), bool), String>
 fn imm_in_range(operands: &[Operand], idx: usize, hi: u32, what: &str) -> Result<u32, String> {
     let v = get_imm(operands, idx)?;
     if !(0..=hi as i64).contains(&v) {
-        return Err(format!(
-            "operand {idx}: {what} {v} out of range 0..={hi}"
-        ));
+        return Err(format!("operand {idx}: {what} {v} out of range 0..={hi}"));
     }
     Ok(v as u32)
 }
@@ -337,7 +335,7 @@ pub fn encode_rbit(operands: &[Operand]) -> Result<EncodeResult, String> {
     // NEON vector form: RBIT Vd.T, Vn.T (reverse bits in each byte) —
     // defined only for .8b/.16b with both arrangements identical.
     if let Some(Operand::RegArrangement { .. }) = operands.first() {
-        let (rd, rn, _rm, q) = get_neon_logical_operands(operands, "rbit")?;
+        let (rd, rn, q) = get_neon_logical2_operands(operands, "rbit")?;
         // RBIT (vector): 0 Q 1 01110 01 10000 00101 10 Rn Rd
         let word = (q << 30)
             | (1 << 29)
@@ -409,7 +407,7 @@ pub fn encode_rev32(operands: &[Operand]) -> Result<EncodeResult, String> {
             _ => {
                 return Err(format!(
                     "rev32: arrangement .{arr_d} is not valid (use .4h/.8h/.2s/.4s)"
-                ))
+                ));
             }
         };
         // REV32 Vd.T, Vn.T: 0 Q 1 01110 size 10 0000 0000 10 Rn Rd
@@ -461,7 +459,7 @@ pub fn encode_crc32(mnemonic: &str, operands: &[Operand]) -> Result<EncodeResult
         _ => {
             return Err(format!(
                 "unknown CRC mnemonic `{mnemonic}` (crc32{{b,h,w,x}} / crc32c{{b,h,w,x}})"
-            ))
+            ));
         }
     };
     // Rd and Rn are the 32-bit view for every variant; sf in the encoding

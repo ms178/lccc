@@ -1109,7 +1109,10 @@ pub fn encode_shift(operands: &[Operand], shift_type: u32) -> Result<EncodeResul
 /// from the ARM — both must be diagnosed, not silently re-banked.
 pub fn encode_sxtw(operands: &[Operand]) -> Result<EncodeResult, String> {
     if operands.len() != 2 {
-        return Err(format!("sxtw requires exactly 2 operands, got {}", operands.len()));
+        return Err(format!(
+            "sxtw requires exactly 2 operands, got {}",
+            operands.len()
+        ));
     }
     let rd = get_gpr_strict_x(operands, 0)?;
     let rn = get_gpr_strict_w(operands, 1)?;
@@ -1121,7 +1124,10 @@ pub fn encode_sxtw(operands: &[Operand]) -> Result<EncodeResult, String> {
 /// Encode SXTH Rd, Wn -> SBFM Rd, Xn, #0, #15 (W or X destination).
 pub fn encode_sxth(operands: &[Operand]) -> Result<EncodeResult, String> {
     if operands.len() != 2 {
-        return Err(format!("sxth requires exactly 2 operands, got {}", operands.len()));
+        return Err(format!(
+            "sxth requires exactly 2 operands, got {}",
+            operands.len()
+        ));
     }
     let (rd, is_64) = get_gpr_strict(operands, 0)?;
     let rn = get_gpr_strict_w(operands, 1)?;
@@ -1134,7 +1140,10 @@ pub fn encode_sxth(operands: &[Operand]) -> Result<EncodeResult, String> {
 /// Encode SXTB Rd, Wn -> SBFM Rd, Xn, #0, #7 (W or X destination).
 pub fn encode_sxtb(operands: &[Operand]) -> Result<EncodeResult, String> {
     if operands.len() != 2 {
-        return Err(format!("sxtb requires exactly 2 operands, got {}", operands.len()));
+        return Err(format!(
+            "sxtb requires exactly 2 operands, got {}",
+            operands.len()
+        ));
     }
     let (rd, is_64) = get_gpr_strict(operands, 0)?;
     let rn = get_gpr_strict_w(operands, 1)?;
@@ -1156,7 +1165,10 @@ pub fn encode_sxtb(operands: &[Operand]) -> Result<EncodeResult, String> {
 /// rejected here.
 pub fn encode_uxtw(operands: &[Operand]) -> Result<EncodeResult, String> {
     if operands.len() != 2 {
-        return Err(format!("uxtw requires exactly 2 operands, got {}", operands.len()));
+        return Err(format!(
+            "uxtw requires exactly 2 operands, got {}",
+            operands.len()
+        ));
     }
     let rd = get_gpr_strict_x(operands, 0)?;
     let rn = get_gpr_strict_w(operands, 1)?;
@@ -1169,7 +1181,10 @@ pub fn encode_uxtw(operands: &[Operand]) -> Result<EncodeResult, String> {
 /// Encode UXTH Wd, Wn -> UBFM Wd, Wn, #0, #15 (W destination only).
 pub fn encode_uxth(operands: &[Operand]) -> Result<EncodeResult, String> {
     if operands.len() != 2 {
-        return Err(format!("uxth requires exactly 2 operands, got {}", operands.len()));
+        return Err(format!(
+            "uxth requires exactly 2 operands, got {}",
+            operands.len()
+        ));
     }
     let rd = get_gpr_strict_w(operands, 0)?;
     let rn = get_gpr_strict_w(operands, 1)?;
@@ -1184,7 +1199,10 @@ pub fn encode_uxth(operands: &[Operand]) -> Result<EncodeResult, String> {
 /// fail-closed contract diagnoses the width instead of guessing it.
 pub fn encode_uxtb(operands: &[Operand]) -> Result<EncodeResult, String> {
     if operands.len() != 2 {
-        return Err(format!("uxtb requires exactly 2 operands, got {}", operands.len()));
+        return Err(format!(
+            "uxtb requires exactly 2 operands, got {}",
+            operands.len()
+        ));
     }
     let rd = get_gpr_strict_w(operands, 0)?;
     let rn = get_gpr_strict_w(operands, 1)?;
@@ -1220,7 +1238,10 @@ pub fn encode_orn(operands: &[Operand]) -> Result<EncodeResult, String> {
     let sf = sf_bit(is_64);
 
     if operands.len() > 4 {
-        return Err(format!("orn takes at most 4 operands, got {}", operands.len()));
+        return Err(format!(
+            "orn takes at most 4 operands, got {}",
+            operands.len()
+        ));
     }
     let (shift_type, shift_amount) = get_shift_imm6(operands, 3, is_64)?;
 
@@ -1249,7 +1270,10 @@ pub fn encode_eon(operands: &[Operand]) -> Result<EncodeResult, String> {
     let sf = sf_bit(is_64);
 
     if operands.len() > 4 {
-        return Err(format!("eon takes at most 4 operands, got {}", operands.len()));
+        return Err(format!(
+            "eon takes at most 4 operands, got {}",
+            operands.len()
+        ));
     }
     let (shift_type, shift_amount) = get_shift_imm6(operands, 3, is_64)?;
 
@@ -1278,7 +1302,10 @@ pub fn encode_bics(operands: &[Operand]) -> Result<EncodeResult, String> {
     let sf = sf_bit(is_64);
 
     if operands.len() > 4 {
-        return Err(format!("bics takes at most 4 operands, got {}", operands.len()));
+        return Err(format!(
+            "bics takes at most 4 operands, got {}",
+            operands.len()
+        ));
     }
     let (shift_type, shift_amount) = get_shift_imm6(operands, 3, is_64)?;
 

@@ -33,6 +33,7 @@
 
 use lccc::pbt_internals::EncodeResult;
 use lccc::pbt_internals::Operand;
+use lccc::pbt_internals::encode_instruction;
 use lccc::pbt_internals::encode_neon_float_elem;
 use proptest::prelude::*;
 
@@ -389,6 +390,41 @@ fn rejects_too_few_operands() {
 }
 
 #[test]
+fn fmul_and_fmulx_dispatch_select_distinct_opcodes() {
+    // By-element FMUL has U=0; FMULX has U=1.
+    let fmul_lane = vec![reg_arr(0, "4s"), reg_arr(1, "4s"), lane(2, "s", 3)];
+    let fmulx_lane = fmul_lane.clone();
+    assert_eq!(
+        word_of(encode_instruction("fmul", &fmul_lane, "")),
+        0x4FA29820
+    );
+    assert_eq!(
+        word_of(encode_instruction("fmulx", &fmulx_lane, "")),
+        0x6FA29820
+    );
+
+    // Three-same FMUL and FMULX differ in U; scalar FMULX uses its D form.
+    let three_same = vec![reg_arr(0, "4s"), reg_arr(1, "4s"), reg_arr(2, "4s")];
+    assert_eq!(
+        word_of(encode_instruction("fmul", &three_same, "")),
+        0x6E22DC20
+    );
+    assert_eq!(
+        word_of(encode_instruction("fmulx", &three_same, "")),
+        0x4E22DC20
+    );
+    let scalar = vec![
+        Operand::Reg("d0".into()),
+        Operand::Reg("d1".into()),
+        Operand::Reg("d2".into()),
+    ];
+    assert_eq!(
+        word_of(encode_instruction("fmulx", &scalar, "")),
+        0x5E62DC20
+    );
+}
+
+#[test]
 fn rejects_non_lane_third_operand() {
     // third operand must be a vector RegLane, not a bare vector register
     let ops = vec![reg_arr(0, "4s"), reg_arr(1, "4s"), reg_arr(2, "4s")];
@@ -396,7 +432,11 @@ fn rejects_non_lane_third_operand() {
     let non_vector_lane = vec![
         reg_arr(0, "4s"),
         reg_arr(1, "4s"),
-        Operand::RegLane { reg: "x2".into(), elem_size: "s".into(), index: 0 },
+        Operand::RegLane {
+            reg: "x2".into(),
+            elem_size: "s".into(),
+            index: 0,
+        },
     ];
     assert!(encode_neon_float_elem(&non_vector_lane, 0, 0b1001).is_err());
 }
@@ -415,18 +455,10 @@ fn rejects_unsupported_arrangement() {
 
 #[test]
 fn rejects_arrangement_and_lane_size_mismatches_and_extra_operands() {
-    let mismatched_arrangement = vec![
-        reg_arr(0, "4s"),
-        reg_arr(1, "2s"),
-        lane(2, "s", 0),
-    ];
+    let mismatched_arrangement = vec![reg_arr(0, "4s"), reg_arr(1, "2s"), lane(2, "s", 0)];
     assert!(encode_neon_float_elem(&mismatched_arrangement, 0, 0b1001).is_err());
 
-    let mismatched_lane = vec![
-        reg_arr(0, "4s"),
-        reg_arr(1, "4s"),
-        lane(2, "d", 0),
-    ];
+    let mismatched_lane = vec![reg_arr(0, "4s"), reg_arr(1, "4s"), lane(2, "d", 0)];
     assert!(encode_neon_float_elem(&mismatched_lane, 0, 0b1001).is_err());
 
     let extra = vec![

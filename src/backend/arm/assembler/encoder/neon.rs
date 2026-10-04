@@ -36,10 +36,9 @@ fn parse_vreg_num(name: &str) -> Result<u32, String> {
 
 pub fn get_vreg_arrangement(operands: &[Operand], idx: usize) -> Result<(u32, String), String> {
     match operands.get(idx) {
-        Some(Operand::RegArrangement { reg, arrangement }) => Ok((
-            parse_vreg_num(reg)?,
-            arrangement.to_ascii_lowercase(),
-        )),
+        Some(Operand::RegArrangement { reg, arrangement }) => {
+            Ok((parse_vreg_num(reg)?, arrangement.to_ascii_lowercase()))
+        }
         other => Err(format!(
             "expected arranged vector register at operand {idx}, got {other:?}"
         )),
@@ -54,8 +53,7 @@ pub fn get_vreg_arrangement(operands: &[Operand], idx: usize) -> Result<(u32, St
 pub fn get_neon_reg(operands: &[Operand], idx: usize) -> Result<(u32, String), String> {
     match operands.get(idx) {
         Some(Operand::RegArrangement { reg, arrangement }) => {
-            let num = parse_reg_num(reg)
-                .ok_or_else(|| format!("invalid NEON register: {reg}"))?;
+            let num = parse_reg_num(reg).ok_or_else(|| format!("invalid NEON register: {reg}"))?;
             Ok((num, arrangement.clone()))
         }
         Some(Operand::Reg(name)) => {
@@ -93,7 +91,10 @@ pub fn encode_cnt(operands: &[Operand]) -> Result<EncodeResult, String> {
     // Encoding: 0 Q 00 1110 size 10 0000 0101 10 Rn Rd
     // Only valid for matching .8b (Q=0) and .16b (Q=1) arrangements.
     if operands.len() != 2 {
-        return Err(format!("cnt requires exactly 2 operands, got {}", operands.len()));
+        return Err(format!(
+            "cnt requires exactly 2 operands, got {}",
+            operands.len()
+        ));
     }
     let (rd, arr_d) = get_vreg_arrangement(operands, 0)?;
     let (rn, arr_n) = get_vreg_arrangement(operands, 1)?;
@@ -651,7 +652,10 @@ pub fn encode_neon_pmul(operands: &[Operand]) -> Result<EncodeResult, String> {
 /// Encode NEON MLA Vd.T, Vn.T, Vm.T (multiply-accumulate)
 pub fn encode_neon_mla(operands: &[Operand]) -> Result<EncodeResult, String> {
     if operands.len() != 3 {
-        return Err(format!("mla requires exactly 3 operands, got {}", operands.len()));
+        return Err(format!(
+            "mla requires exactly 3 operands, got {}",
+            operands.len()
+        ));
     }
     let (rd, arr_d) = get_vreg_arrangement(operands, 0)?;
     let (rn, arr_n) = get_vreg_arrangement(operands, 1)?;
@@ -680,7 +684,10 @@ pub fn encode_neon_mla(operands: &[Operand]) -> Result<EncodeResult, String> {
 /// Encode NEON MLS Vd.T, Vn.T, Vm.T (multiply-subtract)
 pub fn encode_neon_mls(operands: &[Operand]) -> Result<EncodeResult, String> {
     if operands.len() != 3 {
-        return Err(format!("mls requires exactly 3 operands, got {}", operands.len()));
+        return Err(format!(
+            "mls requires exactly 3 operands, got {}",
+            operands.len()
+        ));
     }
     let (rd, arr_d) = get_vreg_arrangement(operands, 0)?;
     let (rn, arr_n) = get_vreg_arrangement(operands, 1)?;
@@ -836,7 +843,10 @@ pub fn encode_neon_across(
 /// Encode NEON UMOV: move element to a general-purpose register.
 pub fn encode_neon_umov(operands: &[Operand]) -> Result<EncodeResult, String> {
     if operands.len() != 2 {
-        return Err(format!("umov requires exactly 2 operands, got {}", operands.len()));
+        return Err(format!(
+            "umov requires exactly 2 operands, got {}",
+            operands.len()
+        ));
     }
     let (rd, is_64) = get_gpr_strict(operands, 0)?;
 
@@ -881,7 +891,10 @@ pub fn encode_neon_umov(operands: &[Operand]) -> Result<EncodeResult, String> {
 /// Encode NEON DUP: broadcast a GP register or vector lane to every vector lane.
 pub fn encode_neon_dup(operands: &[Operand]) -> Result<EncodeResult, String> {
     if operands.len() != 2 {
-        return Err(format!("dup requires exactly 2 operands, got {}", operands.len()));
+        return Err(format!(
+            "dup requires exactly 2 operands, got {}",
+            operands.len()
+        ));
     }
     let (rd, arr_d) = get_vreg_arrangement(operands, 0)?;
     if arr_d == "1d" {
@@ -964,7 +977,10 @@ pub fn encode_neon_dup(operands: &[Operand]) -> Result<EncodeResult, String> {
 /// Encode NEON INS (insert an element from a GP or vector register).
 pub fn encode_neon_ins(operands: &[Operand]) -> Result<EncodeResult, String> {
     if operands.len() != 2 {
-        return Err(format!("ins requires exactly 2 operands, got {}", operands.len()));
+        return Err(format!(
+            "ins requires exactly 2 operands, got {}",
+            operands.len()
+        ));
     }
     match (&operands[0], &operands[1]) {
         // INS Vd.Ts[dst_idx], Wn/Xn (general register to vector element).
@@ -2575,7 +2591,10 @@ pub fn encode_neon_elem(
     opcode: u32,
 ) -> Result<EncodeResult, String> {
     if operands.len() != 3 {
-        return Err(format!("NEON by-element requires exactly 3 operands, got {}", operands.len()));
+        return Err(format!(
+            "NEON by-element requires exactly 3 operands, got {}",
+            operands.len()
+        ));
     }
     let (rd, arr_d) = get_vreg_arrangement(operands, 0)?;
     let (rn, arr_n) = get_vreg_arrangement(operands, 1)?;
@@ -2585,7 +2604,11 @@ pub fn encode_neon_elem(
         ));
     }
     let (rm_name, elem_size, index) = match &operands[2] {
-        Operand::RegLane { reg, elem_size, index } => (reg, elem_size.to_ascii_lowercase(), *index),
+        Operand::RegLane {
+            reg,
+            elem_size,
+            index,
+        } => (reg, elem_size.to_ascii_lowercase(), *index),
         other => return Err(format!("expected register lane, got {other:?}")),
     };
     let rm = parse_vreg_num(rm_name)?;
@@ -2650,7 +2673,11 @@ pub fn encode_neon_float_elem(
         ));
     }
     let (rm_name, elem_size, index) = match &operands[2] {
-        Operand::RegLane { reg, elem_size, index } => (reg, elem_size.to_ascii_lowercase(), *index),
+        Operand::RegLane {
+            reg,
+            elem_size,
+            index,
+        } => (reg, elem_size.to_ascii_lowercase(), *index),
         other => return Err(format!("expected register lane, got {other:?}")),
     };
     let rm = parse_vreg_num(rm_name)?;

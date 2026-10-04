@@ -131,16 +131,12 @@ proptest! {
         prop_assert!(res.is_err(), "br {} must be rejected, got {:?}", name, res);
     }
 
-    // WITNESS — register class. BR requires a GP register; FP/SIMD operands
-    // are the wrong class. llvm-mc rejects `br v0`/`br d0`. The encoder
-    // accepts them and encodes them as `br xN`.
-    #[ignore = "documented bug: encode_br accepts FP/SIMD registers (BR requires a GP register)"]
+    // Negative contract: BR accepts only a GP register; FP/SIMD spellings
+    // such as Vn, Dn, and Qn must be rejected.
     #[test]
-    fn prop_br_rejects_fpsimd((name, n) in arb_fpsimd_reg()) {
+    fn prop_br_rejects_fpsimd((name, _n) in arb_fpsimd_reg()) {
         let res = encode_br(&[Operand::Reg(name.clone())]);
         prop_assert!(res.is_err(), "br {} must be rejected, got {:?}", name, res);
-        // Current behavior: silently encodes identically to br x{n}.
-        prop_assert_eq!(word(encode_br(&[Operand::Reg(name)])), BR_OPCODE | (n << 5));
     }
 }
 
@@ -191,13 +187,12 @@ proptest! {
         prop_assert!(res.is_err(), "blr {} must be rejected, got {:?}", name, res);
     }
 
-    // WITNESS — register class (BLR requires a GP register).
-    #[ignore = "documented bug: encode_blr accepts FP/SIMD registers (BLR requires a GP register)"]
+    // Negative contract: BLR accepts only a GP register; FP/SIMD spellings
+    // must be rejected.
     #[test]
-    fn prop_blr_rejects_fpsimd((name, n) in arb_fpsimd_reg()) {
+    fn prop_blr_rejects_fpsimd((name, _n) in arb_fpsimd_reg()) {
         let res = encode_blr(&[Operand::Reg(name.clone())]);
         prop_assert!(res.is_err(), "blr {} must be rejected, got {:?}", name, res);
-        prop_assert_eq!(word(encode_blr(&[Operand::Reg(name)])), BLR_OPCODE | (n << 5));
     }
 }
 
@@ -252,13 +247,12 @@ proptest! {
         prop_assert!(res.is_err(), "ret {} must be rejected, got {:?}", name, res);
     }
 
-    // WITNESS — register class (RET requires a GP register).
-    #[ignore = "documented bug: encode_ret accepts FP/SIMD registers (RET requires a GP register)"]
+    // Negative contract: RET accepts only a GP register; FP/SIMD spellings
+    // must be rejected.
     #[test]
-    fn prop_ret_rejects_fpsimd((name, n) in arb_fpsimd_reg()) {
+    fn prop_ret_rejects_fpsimd((name, _n) in arb_fpsimd_reg()) {
         let res = encode_ret(&[Operand::Reg(name.clone())]);
         prop_assert!(res.is_err(), "ret {} must be rejected, got {:?}", name, res);
-        prop_assert_eq!(word(encode_ret(&[Operand::Reg(name)])), RET_OPCODE | (n << 5));
     }
 }
 

@@ -307,16 +307,18 @@ fn rejects_mismatched_vector_arrangements_and_extra_operands() {
 
     let valid = vec![va(0, "4h"), va(1, "4h"), lane(2, "h", 0)];
     assert!(encode_neon_elem(&valid, 0, 0b1000).is_ok());
-    assert!(encode_neon_elem(&[valid[0].clone(), valid[1].clone() ], 0, 0b1000).is_err());
-    assert!(encode_neon_elem(
-        &[
-            valid[0].clone(),
-            valid[1].clone(),
-            valid[2].clone(),
-            va(3, "4h"),
-        ],
-        0,
-        0b1000
-    )
-    .is_err());
+    assert!(encode_neon_elem(&[valid[0].clone(), valid[1].clone()], 0, 0b1000).is_err());
+    assert!(
+        encode_neon_elem(
+            &[
+                valid[0].clone(),
+                valid[1].clone(),
+                valid[2].clone(),
+                va(3, "4h"),
+            ],
+            0,
+            0b1000
+        )
+        .is_err()
+    );
 }

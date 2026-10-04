@@ -276,8 +276,10 @@ fn ins_gp_form_requires_element_width_and_gpr_class() {
         } else {
             Operand::Reg("x1".into())
         };
-        assert!(encode_neon_ins(&[lane(0, elem, 0), wrong]).is_err(),
-            "wrong GP width must be rejected for .{elem}");
+        assert!(
+            encode_neon_ins(&[lane(0, elem, 0), wrong]).is_err(),
+            "wrong GP width must be rejected for .{elem}"
+        );
     }
     assert!(encode_neon_ins(&[lane(0, "s", 0), Operand::Reg("v1".into())]).is_err());
     assert!(encode_neon_ins(&[lane(0, "s", 0), gp_for_elem(1, "s"), gp_for_elem(2, "s")]).is_err());

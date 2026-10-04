@@ -1261,8 +1261,7 @@ pub fn get_gpr_strict(operands: &[Operand], idx: usize) -> Result<(u32, bool), S
             let numbered = matches!(bytes.first(), Some(b'x' | b'w'))
                 && bytes[1..].iter().all(|b| b.is_ascii_digit())
                 && bytes.len() > 1;
-            let is_gpr_spelling =
-                numbered || lower == "xzr" || lower == "wzr" || lower == "lr";
+            let is_gpr_spelling = numbered || lower == "xzr" || lower == "wzr" || lower == "lr";
             if !is_gpr_spelling {
                 return Err(format!(
                     "operand {idx}: `{name}` is not a general-purpose register"

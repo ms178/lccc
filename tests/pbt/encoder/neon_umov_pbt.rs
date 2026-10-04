@@ -398,8 +398,16 @@ fn rejects_non_gpr_destinations_and_extra_operands() {
 
 #[test]
 fn rejects_non_vector_lane_sources() {
-    let fp_lane = Operand::RegLane { reg: "d1".into(), elem_size: "s".into(), index: 0 };
-    let gpr_lane = Operand::RegLane { reg: "x1".into(), elem_size: "s".into(), index: 0 };
+    let fp_lane = Operand::RegLane {
+        reg: "d1".into(),
+        elem_size: "s".into(),
+        index: 0,
+    };
+    let gpr_lane = Operand::RegLane {
+        reg: "x1".into(),
+        elem_size: "s".into(),
+        index: 0,
+    };
     assert!(encode_neon_umov(&[gp(false, 0), fp_lane]).is_err());
     assert!(encode_neon_umov(&[gp(false, 0), gpr_lane]).is_err());
 }

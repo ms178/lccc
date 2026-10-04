@@ -109,9 +109,9 @@ fn llvm_mc_word(asm: &str) -> Option<u32> {
         .unwrap_or_else(|| panic!("llvm-mc produced no encoding for `{}`", asm));
     let l = line.rfind("// encoding:").expect("checked above") + "// encoding:".len();
     let tail = &line[l..];
-    let lb = tail.find('[').unwrap_or_else(|| {
-        panic!("llvm-mc encoding for `{}` has no byte list: {}", asm, tail)
-    });
+    let lb = tail
+        .find('[')
+        .unwrap_or_else(|| panic!("llvm-mc encoding for `{}` has no byte list: {}", asm, tail));
     let rb = tail.find(']').expect("closing bracket after opening");
     let inner = &tail[lb + 1..rb];
     let bytes: Vec<u8> = inner
@@ -123,10 +123,7 @@ fn llvm_mc_word(asm: &str) -> Option<u32> {
         })
         .collect();
     if bytes.len() != 4 {
-        panic!(
-            "llvm-mc encoding for `{}` is not 4 bytes: {:?}",
-            asm, bytes
-        );
+        panic!("llvm-mc encoding for `{}` is not 4 bytes: {:?}", asm, bytes);
     }
     Some(
         bytes[0] as u32

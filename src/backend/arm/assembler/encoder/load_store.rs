@@ -855,10 +855,7 @@ fn reg_name_at(operands: &[Operand], idx: usize) -> Result<String, String> {
     }
 }
 
-pub fn encode_ldnp_stnp(
-    operands: &[Operand],
-    is_load: bool,
-) -> Result<EncodeResult, String> {
+pub fn encode_ldnp_stnp(operands: &[Operand], is_load: bool) -> Result<EncodeResult, String> {
     if operands.len() != 3 {
         return Err(format!(
             "ldnp/stnp requires 3 operands, got {}",

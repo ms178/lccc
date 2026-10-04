@@ -440,15 +440,30 @@ fn golden_dup_general_form() {
         0x4E010C00
     );
     // dup v0.8b,  w0   => 0x0E010C00  (Q=0)
-    assert_eq!(word_of(encode_neon_dup(&[dst(0, "8b"), gp(0, "8b")])), 0x0E010C00);
+    assert_eq!(
+        word_of(encode_neon_dup(&[dst(0, "8b"), gp(0, "8b")])),
+        0x0E010C00
+    );
     // dup v0.4s,  w0   => 0x4E040C00
-    assert_eq!(word_of(encode_neon_dup(&[dst(0, "4s"), gp(0, "4s")])), 0x4E040C00);
+    assert_eq!(
+        word_of(encode_neon_dup(&[dst(0, "4s"), gp(0, "4s")])),
+        0x4E040C00
+    );
     // dup v0.8h,  w0   => 0x4E020C00
-    assert_eq!(word_of(encode_neon_dup(&[dst(0, "8h"), gp(0, "8h")])), 0x4E020C00);
+    assert_eq!(
+        word_of(encode_neon_dup(&[dst(0, "8h"), gp(0, "8h")])),
+        0x4E020C00
+    );
     // dup v0.2d,  x0   => 0x4E080C00
-    assert_eq!(word_of(encode_neon_dup(&[dst(0, "2d"), gp(0, "2d")])), 0x4E080C00);
+    assert_eq!(
+        word_of(encode_neon_dup(&[dst(0, "2d"), gp(0, "2d")])),
+        0x4E080C00
+    );
     // dup v0.8b,  w5   => 0x0E010CA0
-    assert_eq!(word_of(encode_neon_dup(&[dst(0, "8b"), gp(5, "8b")])), 0x0E010CA0);
+    assert_eq!(
+        word_of(encode_neon_dup(&[dst(0, "8b"), gp(5, "8b")])),
+        0x0E010CA0
+    );
     // dup v31.2d, x30  => 0x4E080FDF
     assert_eq!(
         word_of(encode_neon_dup(&[dst(31, "2d"), gp(30, "2d")])),
