@@ -42,6 +42,15 @@ gcc_assembler = []
 # When enabled and GCC is used, a prominent warning is printed.
 gcc_m16 = []
 
+# Property-based testing for the AArch64/RISC-V assembler encoders, IR
+# constant folding, long-double conversions and the preprocessor's constant
+# expression evaluator (transplanted from the thanhtoantnt/claudes-c-compiler
+# pbt-tests campaign and adapted to this tree). The suites double as the
+# executable oracle for the encoder validation hardening: every bug witness
+# that gets fixed is un-ignored so the fix stays regression-locked.
+[dev-dependencies]
+proptest = "1"
+
 # Release profile for shipped compiler binaries.
 #
 # * thin LTO: most of fat-LTO's cross-crate inlining benefit at a fraction

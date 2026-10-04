@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc ef9fffe3d2ace217b4af4b01c0162b4b0bf09c794b05a446e5a33dffce8d6e63 # shrinks to opcode_oob = 16, u_bit_oob = 2

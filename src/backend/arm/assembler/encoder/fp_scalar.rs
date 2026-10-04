@@ -107,7 +107,7 @@ fn encode_fmov_general(fp_name: &str, gp_name: &str, to_fp: bool) -> Result<Enco
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_fmov(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_fmov(operands: &[Operand]) -> Result<EncodeResult, String> {
     if operands.len() != 2 {
         return Err(format!("fmov requires 2 operands, got {}", operands.len()));
     }
@@ -138,7 +138,7 @@ pub(crate) fn encode_fmov(operands: &[Operand]) -> Result<EncodeResult, String> 
     }
 }
 
-pub(crate) fn encode_fp_arith(operands: &[Operand], opcode: u32) -> Result<EncodeResult, String> {
+pub fn encode_fp_arith(operands: &[Operand], opcode: u32) -> Result<EncodeResult, String> {
     let (rd, _) = get_reg(operands, 0)?;
     let (rn, _) = get_reg(operands, 1)?;
     let (rm, _) = get_reg(operands, 2)?;
@@ -161,7 +161,7 @@ pub(crate) fn encode_fp_arith(operands: &[Operand], opcode: u32) -> Result<Encod
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_fneg(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_fneg(operands: &[Operand]) -> Result<EncodeResult, String> {
     let (rd, _) = get_reg(operands, 0)?;
     let (rn, _) = get_reg(operands, 1)?;
     let rd_name = match &operands[0] {
@@ -175,7 +175,7 @@ pub(crate) fn encode_fneg(operands: &[Operand]) -> Result<EncodeResult, String> 
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_fabs(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_fabs(operands: &[Operand]) -> Result<EncodeResult, String> {
     let (rd, _) = get_reg(operands, 0)?;
     let (rn, _) = get_reg(operands, 1)?;
     let rd_name = match &operands[0] {
@@ -189,7 +189,7 @@ pub(crate) fn encode_fabs(operands: &[Operand]) -> Result<EncodeResult, String> 
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_fsqrt(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_fsqrt(operands: &[Operand]) -> Result<EncodeResult, String> {
     let (rd, _) = get_reg(operands, 0)?;
     let (rn, _) = get_reg(operands, 1)?;
     let rd_name = match &operands[0] {
@@ -205,7 +205,7 @@ pub(crate) fn encode_fsqrt(operands: &[Operand]) -> Result<EncodeResult, String>
 
 /// Encode FP 1-source ops: FRINTN/P/M/Z/A/X/I
 /// Format: 0 00 11110 ftype 1 opcode 10000 Rn Rd
-pub(crate) fn encode_fp_1src(operands: &[Operand], opcode: u32) -> Result<EncodeResult, String> {
+pub fn encode_fp_1src(operands: &[Operand], opcode: u32) -> Result<EncodeResult, String> {
     let (rd, _) = get_reg(operands, 0)?;
     let (rn, _) = get_reg(operands, 1)?;
     let rd_name = match &operands[0] {
@@ -249,10 +249,7 @@ pub(crate) fn fp_ftype(name: &str) -> Result<u32, String> {
 
 /// Encode FMADD/FMSUB: Rd = Ra +/- (Rn * Rm)
 /// Format: 0 00 11111 ftype 0 Rm o1 Ra Rn Rd
-pub(crate) fn encode_fmadd_fmsub(
-    operands: &[Operand],
-    is_sub: bool,
-) -> Result<EncodeResult, String> {
+pub fn encode_fmadd_fmsub(operands: &[Operand], is_sub: bool) -> Result<EncodeResult, String> {
     let (rd, _) = get_reg(operands, 0)?;
     let (rn, _) = get_reg(operands, 1)?;
     let (rm, _) = get_reg(operands, 2)?;
@@ -275,10 +272,7 @@ pub(crate) fn encode_fmadd_fmsub(
 
 /// Encode FNMADD/FNMSUB: Rd = -Ra +/- (Rn * Rm)
 /// Format: 0 00 11111 ftype 1 Rm o1 Ra Rn Rd
-pub(crate) fn encode_fnmadd_fnmsub(
-    operands: &[Operand],
-    is_sub: bool,
-) -> Result<EncodeResult, String> {
+pub fn encode_fnmadd_fnmsub(operands: &[Operand], is_sub: bool) -> Result<EncodeResult, String> {
     let (rd, _) = get_reg(operands, 0)?;
     let (rn, _) = get_reg(operands, 1)?;
     let (rm, _) = get_reg(operands, 2)?;
@@ -300,7 +294,7 @@ pub(crate) fn encode_fnmadd_fnmsub(
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_fcmp(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_fcmp(operands: &[Operand]) -> Result<EncodeResult, String> {
     let (rn, _) = get_reg(operands, 0)?;
     let rn_name = match &operands[0] {
         Operand::Reg(r) => r.to_lowercase(),
@@ -376,7 +370,7 @@ fn fcvt_rounding_name(rmode: u32, opcode: u32) -> &'static str {
     }
 }
 
-pub(crate) fn encode_fcvt_rounding(
+pub fn encode_fcvt_rounding(
     operands: &[Operand],
     rmode: u32,
     opcode: u32,
@@ -430,18 +424,15 @@ pub(crate) fn encode_fcvt_rounding(
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_ucvtf(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_ucvtf(operands: &[Operand]) -> Result<EncodeResult, String> {
     encode_int_to_float(operands, false)
 }
 
-pub(crate) fn encode_scvtf(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_scvtf(operands: &[Operand]) -> Result<EncodeResult, String> {
     encode_int_to_float(operands, true)
 }
 
-pub(crate) fn encode_int_to_float(
-    operands: &[Operand],
-    is_signed: bool,
-) -> Result<EncodeResult, String> {
+pub fn encode_int_to_float(operands: &[Operand], is_signed: bool) -> Result<EncodeResult, String> {
     // SCVTF/UCVTF: integer-to-float conversion
     // Encoding: sf 00 11110 ftype 1 00 opcode 000000 Rn Rd
     // sf: 0=W source, 1=X source
@@ -472,7 +463,7 @@ pub(crate) fn encode_int_to_float(
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_fcvt_precision(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_fcvt_precision(operands: &[Operand]) -> Result<EncodeResult, String> {
     // FCVT: float precision conversion (e.g., FCVT Dd, Sn or FCVT Sd, Dn)
     // Encoding: 0 00 11110 ftype 1 0001 opc 10000 Rn Rd
     // ftype: source precision (00=S, 01=D, 11=H)
