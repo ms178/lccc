@@ -4175,6 +4175,10 @@ def _dso_emit_semantics_i386_test(args, oracles):
         if r.returncode != 0:
             status = "FAIL" if os.environ.get("LCCC_REQUIRE_I386") == "1" else "SKIP"
             return Result(name, status, f"no -m32 toolchain: {r.stderr.decode()[:150]}")
+        verdict = i386_exec_verdict()
+        if verdict is not None:
+            status, why = verdict
+            return Result(name, status, f"host cannot execute i386 binaries: {why}")
         lccc_ld = os.path.join(os.path.dirname(os.path.abspath(args.lccc)), "lccc-ld")
         shim = _shim_for(td, lccc_ld)
         env = dict(os.environ, LD_LIBRARY_PATH=td)
@@ -4711,6 +4715,10 @@ def _dso_pointer_equality_i386_test(args, oracles):
             # unusable -m32 toolchain is a broken runner, not a reason to skip.
             status = "FAIL" if os.environ.get("LCCC_REQUIRE_I386") == "1" else "SKIP"
             return Result(name, status, f"no -m32 toolchain: {r.stderr.decode()[:150]}")
+        verdict = i386_exec_verdict()
+        if verdict is not None:
+            status, why = verdict
+            return Result(name, status, f"host cannot execute i386 binaries: {why}")
         lccc_ld = os.path.join(os.path.dirname(os.path.abspath(args.lccc)), "lccc-ld")
         shim = _shim_for(td, lccc_ld)
         env = dict(os.environ, LD_LIBRARY_PATH=td)
@@ -4741,62 +4749,62 @@ def _dso_pointer_equality_i386_test(args, oracles):
             shutil.rmtree(td, ignore_errors=True)
 
 
-_GOTX_ASM = r"""	.text
-	.globl	target
-	.type	target, @function
-target:	movl	$42, %eax
-	ret
-	.globl	f_mov, f_mov32, f_movr9, f_call, f_jmp, f_high, f_dso, f_test, f_add, f_cmp
-f_mov:	movq	var@GOTPCREL(%rip), %rax
-	movq	(%rax), %rax
-	ret
-f_mov32: movl	var@GOTPCREL(%rip), %eax
-	leaq	var(%rip), %rcx
-	cmpl	%ecx, %eax
-	sete	%al
-	movzbl	%al, %eax
-	ret
-f_movr9: movq	var@GOTPCREL(%rip), %r9
-	movq	(%r9), %rax
-	ret
-f_call:	subq	$8, %rsp
-	call	*target@GOTPCREL(%rip)
-	addq	$8, %rsp
-	ret
-f_jmp:	jmp	*target@GOTPCREL(%rip)
-f_high:	movl	var@GOTPCREL+4(%rip), %eax
-	leaq	var(%rip), %rcx
-	shrq	$32, %rcx
-	cmpl	%ecx, %eax
-	sete	%al
-	movzbl	%al, %eax
-	ret
-f_dso:	movq	puts@GOTPCREL(%rip), %rax
-	testq	%rax, %rax
-	setne	%al
-	movzbl	%al, %eax
-	ret
-f_test:	movq	$-1, %rcx
-	xorl	%eax, %eax
-	testq	%rcx, var@GOTPCREL(%rip)
-	setne	%al
-	ret
-f_add:	xorl	%eax, %eax
-	addq	var@GOTPCREL(%rip), %rax
-	leaq	var(%rip), %rcx
-	cmpq	%rcx, %rax
-	sete	%al
-	movzbl	%al, %eax
-	ret
-f_cmp:	leaq	var(%rip), %rcx
-	xorl	%eax, %eax
-	cmpq	var@GOTPCREL(%rip), %rcx
-	sete	%al
-	ret
-	.data
-	.globl	var
-var:	.quad	7
-	.section .note.GNU-stack,"",@progbits
+_GOTX_ASM = r"""        .text
+        .globl  target
+        .type   target, @function
+target: movl    $42, %eax
+        ret
+        .globl  f_mov, f_mov32, f_movr9, f_call, f_jmp, f_high, f_dso, f_test, f_add, f_cmp
+f_mov:  movq    var@GOTPCREL(%rip), %rax
+        movq    (%rax), %rax
+        ret
+f_mov32: movl   var@GOTPCREL(%rip), %eax
+        leaq    var(%rip), %rcx
+        cmpl    %ecx, %eax
+        sete    %al
+        movzbl  %al, %eax
+        ret
+f_movr9: movq   var@GOTPCREL(%rip), %r9
+        movq    (%r9), %rax
+        ret
+f_call: subq    $8, %rsp
+        call    *target@GOTPCREL(%rip)
+        addq    $8, %rsp
+        ret
+f_jmp:  jmp     *target@GOTPCREL(%rip)
+f_high: movl    var@GOTPCREL+4(%rip), %eax
+        leaq    var(%rip), %rcx
+        shrq    $32, %rcx
+        cmpl    %ecx, %eax
+        sete    %al
+        movzbl  %al, %eax
+        ret
+f_dso:  movq    puts@GOTPCREL(%rip), %rax
+        testq   %rax, %rax
+        setne   %al
+        movzbl  %al, %eax
+        ret
+f_test: movq    $-1, %rcx
+        xorl    %eax, %eax
+        testq   %rcx, var@GOTPCREL(%rip)
+        setne   %al
+        ret
+f_add:  xorl    %eax, %eax
+        addq    var@GOTPCREL(%rip), %rax
+        leaq    var(%rip), %rcx
+        cmpq    %rcx, %rax
+        sete    %al
+        movzbl  %al, %eax
+        ret
+f_cmp:  leaq    var(%rip), %rcx
+        xorl    %eax, %eax
+        cmpq    var@GOTPCREL(%rip), %rcx
+        sete    %al
+        ret
+        .data
+        .globl  var
+var:    .quad   7
+        .section .note.GNU-stack,"",@progbits
 """
 _GOTX_MAIN = r"""#include <stdio.h>
 long f_mov(void), f_movr9(void);
@@ -4877,81 +4885,81 @@ def _gotpcrelx_relax_test(args, oracles):
             shutil.rmtree(td, ignore_errors=True)
 
 
-_GOTEDGE_ASM = r"""	.text
-	.globl	g_rexb, g_lcall, g_lcmp, g_ladd, g_got64, g_sec, g_code4
+_GOTEDGE_ASM = r"""     .text
+        .globl  g_rexb, g_lcall, g_lcmp, g_ladd, g_got64, g_sec, g_code4
 # REX.B set on a RIP-relative load into %rax (REX.B selects nothing there).
-g_rexb:	.byte	0x49, 0x8b, 0x05
-	.reloc	., R_X86_64_REX_GOTPCRELX, gvar-4
-	.long	0
-	movq	(%rax), %rax
-	ret
+g_rexb: .byte   0x49, 0x8b, 0x05
+        .reloc  ., R_X86_64_REX_GOTPCRELX, gvar-4
+        .long   0
+        movq    (%rax), %rax
+        ret
 # REX-prefixed indirect call through a LOCAL function's slot.
-g_lcall: subq	$8, %rsp
-	.byte	0x40, 0xff, 0x15
-	.reloc	., R_X86_64_REX_GOTPCRELX, lfunc-4
-	.long	0
-	addq	$8, %rsp
-	ret
-lfunc:	movl	$55, %eax
-	ret
+g_lcall: subq   $8, %rsp
+        .byte   0x40, 0xff, 0x15
+        .reloc  ., R_X86_64_REX_GOTPCRELX, lfunc-4
+        .long   0
+        addq    $8, %rsp
+        ret
+lfunc:  movl    $55, %eax
+        ret
 # cmp against a local's slot: an immediate without PIC, a real slot with it.
-g_lcmp:	leaq	lvar(%rip), %rcx
-	xorl	%eax, %eax
-	cmpq	lvar@GOTPCREL(%rip), %rcx
-	sete	%al
-	ret
+g_lcmp: leaq    lvar(%rip), %rcx
+        xorl    %eax, %eax
+        cmpq    lvar@GOTPCREL(%rip), %rcx
+        sete    %al
+        ret
 # Plain GOTPCREL (no relaxation promise) on an add of a local.
-g_ladd:	xorl	%eax, %eax
-	.byte	0x48, 0x03, 0x05
-	.reloc	., R_X86_64_GOTPCREL, lvar-4
-	.long	0
-	leaq	lvar(%rip), %rcx
-	cmpq	%rcx, %rax
-	sete	%al
-	movzbl	%al, %eax
-	ret
+g_ladd: xorl    %eax, %eax
+        .byte   0x48, 0x03, 0x05
+        .reloc  ., R_X86_64_GOTPCREL, lvar-4
+        .long   0
+        leaq    lvar(%rip), %rcx
+        cmpq    %rcx, %rax
+        sete    %al
+        movzbl  %al, %eax
+        ret
 # Large-model GOT64 slot offset of a local.
-g_got64: leaq	_GLOBAL_OFFSET_TABLE_(%rip), %rcx
-	movabsq	$lvar@GOT, %rax
-	movq	(%rcx,%rax), %rax
-	leaq	lvar(%rip), %rcx
-	cmpq	%rcx, %rax
-	sete	%al
-	movzbl	%al, %eax
-	ret
+g_got64: leaq   _GLOBAL_OFFSET_TABLE_(%rip), %rcx
+        movabsq $lvar@GOT, %rax
+        movq    (%rcx,%rax), %rax
+        leaq    lvar(%rip), %rcx
+        cmpq    %rcx, %rax
+        sete    %al
+        movzbl  %al, %eax
+        ret
 # A section symbol through the GOT (empty st_name).
-g_sec:	leaq	.rodata.edge(%rip), %rcx
-	xorl	%eax, %eax
-	cmpq	.rodata.edge@GOTPCREL(%rip), %rcx
-	sete	%al
-	ret
+g_sec:  leaq    .rodata.edge(%rip), %rcx
+        xorl    %eax, %eax
+        cmpq    .rodata.edge@GOTPCREL(%rip), %rcx
+        sete    %al
+        ret
 # REX2 call: no prefix-preserving rewrite exists (never executed: APX).
-g_code4: .byte	0xd5, 0x00, 0xff, 0x15
-	.reloc	., R_X86_64_CODE_4_GOTPCRELX, lfunc-4
-	.long	0
-	ret
-	.byte	0x4c
+g_code4: .byte  0xd5, 0x00, 0xff, 0x15
+        .reloc  ., R_X86_64_CODE_4_GOTPCRELX, lfunc-4
+        .long   0
+        ret
+        .byte   0x4c
 # REX_GOTPCRELX at offset 2 of its section: no REX byte in the section;
 # the 0x4c above belongs to the previous one and must not be touched.
-	.section .text.edge2,"ax",@progbits
-	.globl	g_start2
-g_start2: .byte	0x8b, 0x05
-	.reloc	., R_X86_64_REX_GOTPCRELX, gvar-4
-	.long	0
-	leaq	gvar_l(%rip), %rcx
-	cmpl	%ecx, %eax
-	sete	%al
-	movzbl	%al, %eax
-	ret
-	.data
-	.globl	gvar
-	.p2align 3
+        .section .text.edge2,"ax",@progbits
+        .globl  g_start2
+g_start2: .byte 0x8b, 0x05
+        .reloc  ., R_X86_64_REX_GOTPCRELX, gvar-4
+        .long   0
+        leaq    gvar_l(%rip), %rcx
+        cmpl    %ecx, %eax
+        sete    %al
+        movzbl  %al, %eax
+        ret
+        .data
+        .globl  gvar
+        .p2align 3
 gvar:
-gvar_l:	.quad	7
-lvar:	.quad	9
-	.section .rodata.edge,"a",@progbits
-	.quad	5
-	.section .note.GNU-stack,"",@progbits
+gvar_l: .quad   7
+lvar:   .quad   9
+        .section .rodata.edge,"a",@progbits
+        .quad   5
+        .section .note.GNU-stack,"",@progbits
 """
 _GOTEDGE_MAIN = r"""#include <stdio.h>
 long g_rexb(void);
@@ -5370,33 +5378,33 @@ def _got64_spellings(obj, td):
 
 # `objabs` lives in its own object: GAS refuses `@GOTPCREL` on a symbol it
 # already knows to be absolute.
-_ABSSYM_DEF = r"""	.globl	objabs
-	.set	objabs, 0x777
-	.section .note.GNU-stack,"",@progbits
+_ABSSYM_DEF = r"""      .globl  objabs
+        .set    objabs, 0x777
+        .section .note.GNU-stack,"",@progbits
 """
-_ABSSYM_ASM = r"""	.text
-	.globl	a_obj, a_def, a_rel, a_expr, a_anchor4, a_ptr
-a_obj:	movq	objabs@GOTPCREL(%rip), %rax
-	ret
-a_def:	movq	defabs@GOTPCREL(%rip), %rax
-	ret
-a_rel:	movq	defrel@GOTPCREL(%rip), %rax
-	ret
-a_expr:	movq	defexpr@GOTPCREL(%rip), %rax
-	ret
-a_anchor4: leaq	anchor_l+4(%rip), %rax
-	ret
-a_ptr:	leaq	ptrs_l(%rip), %rax
-	movq	(%rax,%rdi,8), %rax
-	ret
-	.data
-	.globl	anchor, anchor_end
-	.p2align 3
+_ABSSYM_ASM = r"""      .text
+        .globl  a_obj, a_def, a_rel, a_expr, a_anchor4, a_ptr
+a_obj:  movq    objabs@GOTPCREL(%rip), %rax
+        ret
+a_def:  movq    defabs@GOTPCREL(%rip), %rax
+        ret
+a_rel:  movq    defrel@GOTPCREL(%rip), %rax
+        ret
+a_expr: movq    defexpr@GOTPCREL(%rip), %rax
+        ret
+a_anchor4: leaq anchor_l+4(%rip), %rax
+        ret
+a_ptr:  leaq    ptrs_l(%rip), %rax
+        movq    (%rax,%rdi,8), %rax
+        ret
+        .data
+        .globl  anchor, anchor_end
+        .p2align 3
 anchor:
-anchor_l: .quad	1, 2
+anchor_l: .quad 1, 2
 anchor_end:
-ptrs_l:	.quad	objabs, defabs, defrel, defexpr
-	.section .note.GNU-stack,"",@progbits
+ptrs_l: .quad   objabs, defabs, defrel, defexpr
+        .section .note.GNU-stack,"",@progbits
 """
 _ABSSYM_MAIN = r"""#define _GNU_SOURCE
 #include <dlfcn.h>
@@ -5498,21 +5506,21 @@ __attribute__((noinline)) int *pa(void) { return &a; }
 int ie_r12(void), ie_add(void);
 int main(void) { printf("%d %d %d %d\n", *pa(), *pb(), ie_r12(), ie_add()); return 0; }
 """
-_IELE_ASM = r"""	.text
-	.globl	ie_r12, ie_add
-ie_r12:	pushq	%r12
-	movq	tv@gottpoff(%rip), %r12
-	movl	%fs:(%r12), %eax
-	popq	%r12
-	ret
-ie_add:	movq	%fs:0, %rax
-	addq	tv@gottpoff(%rip), %rax
-	movl	(%rax), %eax
-	ret
-	.section .tdata,"awT",@progbits
-	.p2align 2
-tv:	.long	33
-	.section .note.GNU-stack,"",@progbits
+_IELE_ASM = r"""        .text
+        .globl  ie_r12, ie_add
+ie_r12: pushq   %r12
+        movq    tv@gottpoff(%rip), %r12
+        movl    %fs:(%r12), %eax
+        popq    %r12
+        ret
+ie_add: movq    %fs:0, %rax
+        addq    tv@gottpoff(%rip), %rax
+        movl    (%rax), %eax
+        ret
+        .section .tdata,"awT",@progbits
+        .p2align 2
+tv:     .long   33
+        .section .note.GNU-stack,"",@progbits
 """
 
 
@@ -5586,41 +5594,41 @@ def _ie_to_le_local_test(args, oracles):
             shutil.rmtree(td, ignore_errors=True)
 
 
-_IEF_ASM = r"""	.text
-	.globl	ie_movl, ie_gadd, apx
+_IEF_ASM = r""" .text
+        .globl  ie_movl, ie_gadd, apx
 # movl ly@gottpoff(%rip), %ecx -- no REX.W, so no prefix byte the IE->LE
 # rewrite may touch (GNU as refuses to assemble it; hand-encoded).
-ie_movl:	.byte	0x8b, 0x0d
-	.reloc	., R_X86_64_GOTTPOFF, ly-4
-	.long	0
-	movslq	%ecx, %rcx
-	movl	%fs:(%rcx), %eax
-	ret
+ie_movl:        .byte   0x8b, 0x0d
+        .reloc  ., R_X86_64_GOTTPOFF, ly-4
+        .long   0
+        movslq  %ecx, %rcx
+        movl    %fs:(%rcx), %eax
+        ret
 # addq of the executable's own GLOBAL TLS symbol.
-ie_gadd:	movq	%fs:0, %rax
-	addq	gx@gottpoff(%rip), %rax
-	movl	(%rax), %eax
-	ret
+ie_gadd:        movq    %fs:0, %rax
+        addq    gx@gottpoff(%rip), %rax
+        movl    (%rax), %eax
+        ret
 # APX forms (encoded, never executed).
-apx:	addq	ly@gottpoff(%rip), %rax, %r17
-	addq	%r20, ly@gottpoff(%rip), %r9
-	addq	gx@gottpoff(%rip), %r21, %r22
-	{nf} addq	ly@gottpoff(%rip), %r18
-	{nf} addq	ly@gottpoff(%rip), %r18, %r11
-	movrs	ly@gottpoff(%rip), %r19
-	movq	gx@gottpoff(%rip), %r25
-	movq	ly@gottpoff(%rip), %r31
-	addq	gx@gottpoff(%rip), %r16
-	addq	ly@gottpoff(%rip), %r8
-	ret
-	.section .tdata,"awT",@progbits
-	.p2align 2
-ly:	.long	44
-	.globl	gx
-	.type	gx,@object
-	.size	gx,4
-gx:	.long	55
-	.section .note.GNU-stack,"",@progbits
+apx:    addq    ly@gottpoff(%rip), %rax, %r17
+        addq    %r20, ly@gottpoff(%rip), %r9
+        addq    gx@gottpoff(%rip), %r21, %r22
+        {nf} addq       ly@gottpoff(%rip), %r18
+        {nf} addq       ly@gottpoff(%rip), %r18, %r11
+        movrs   ly@gottpoff(%rip), %r19
+        movq    gx@gottpoff(%rip), %r25
+        movq    ly@gottpoff(%rip), %r31
+        addq    gx@gottpoff(%rip), %r16
+        addq    ly@gottpoff(%rip), %r8
+        ret
+        .section .tdata,"awT",@progbits
+        .p2align 2
+ly:     .long   44
+        .globl  gx
+        .type   gx,@object
+        .size   gx,4
+gx:     .long   55
+        .section .note.GNU-stack,"",@progbits
 """
 
 # `apx` after the IE -> LE rewrite, one (bytes before the imm32, symbol)
@@ -5778,34 +5786,34 @@ def _ie_to_le_forms_test(args, oracles):
             shutil.rmtree(td, ignore_errors=True)
 
 
-_MOVRS_ASM = r"""	.text
-	.globl	mvr, mvd, mvf
+_MOVRS_ASM = r"""       .text
+        .globl  mvr, mvd, mvf
 # Executed: both become plain moves when the target is this executable's.
-mvr:	movrs	ly@gottpoff(%rip), %rax
-	movl	%fs:(%rax), %eax
-	ret
-mvd:	movrs	dat@GOTPCREL(%rip), %rax
-	movq	(%rax), %rax
-	ret
+mvr:    movrs   ly@gottpoff(%rip), %rax
+        movl    %fs:(%rax), %eax
+        ret
+mvd:    movrs   dat@GOTPCREL(%rip), %rax
+        movq    (%rax), %rax
+        ret
 # Encoded only (a library's symbol keeps its MOVRS load).
-mvf:	movrs	gx@gottpoff(%rip), %r12
-	movrs	dat@GOTPCREL(%rip), %r13
-	movrs	ext@GOTPCREL(%rip), %rcx
-	addq	dat@GOTPCREL(%rip), %r12
-	ret
-	.data
-	.globl	dat
-	.type	dat,@object
-	.size	dat,8
-dat:	.quad	1
-	.section .tdata,"awT",@progbits
-	.p2align 2
-ly:	.long	44
-	.globl	gx
-	.type	gx,@object
-	.size	gx,4
-gx:	.long	55
-	.section .note.GNU-stack,"",@progbits
+mvf:    movrs   gx@gottpoff(%rip), %r12
+        movrs   dat@GOTPCREL(%rip), %r13
+        movrs   ext@GOTPCREL(%rip), %rcx
+        addq    dat@GOTPCREL(%rip), %r12
+        ret
+        .data
+        .globl  dat
+        .type   dat,@object
+        .size   dat,8
+dat:    .quad   1
+        .section .tdata,"awT",@progbits
+        .p2align 2
+ly:     .long   44
+        .globl  gx
+        .type   gx,@object
+        .size   gx,4
+gx:     .long   55
+        .section .note.GNU-stack,"",@progbits
 """
 
 
@@ -5947,58 +5955,58 @@ def _movrs_relocations_test(args, oracles):
 # Plain R_X86_64_GOTPCREL (assembled with -mrelax-relocations=no): every
 # relaxable shape, a library symbol, an absolute symbol and a MOVRS load.
 _PLAIN_GOTPCREL_ASM = """\
-	.text
-	.globl	pgd, pgr, pgc, pgx, pga, pgm
-	.type	pgd, @function
-pgd:	mov	dat@GOTPCREL(%rip), %rax
-	mov	(%rax), %eax
-	ret
-	.size	pgd, .-pgd
-	.type	pgr, @function
-pgr:	mov	dat@GOTPCREL(%rip), %r11
-	mov	(%r11), %eax
-	ret
-	.size	pgr, .-pgr
-	.type	pgc, @function
-pgc:	push	%rbx
-	call	*fn@GOTPCREL(%rip)
-	pop	%rbx
-	jmp	*fn@GOTPCREL(%rip)
-	.size	pgc, .-pgc
-	.type	pgx, @function
-pgx:	mov	ext@GOTPCREL(%rip), %rax
-	mov	(%rax), %eax
-	ret
-	.size	pgx, .-pgx
-	.type	pga, @function
-pga:	mov	absv@GOTPCREL(%rip), %rax
-	ret
-	.size	pga, .-pga
-	.type	pgm, @function
-pgm:	movrs	dat@GOTPCREL(%rip), %eax
-	ret
-	.size	pgm, .-pgm
-	.type	fn, @function
-fn:	mov	$5, %eax
-	ret
-	.size	fn, .-fn
-	.globl	absv
-	.set	absv, 0x1234
-	.data
-	.type	dat, @object
-dat:	.long	44
-	.size	dat, 4
+        .text
+        .globl  pgd, pgr, pgc, pgx, pga, pgm
+        .type   pgd, @function
+pgd:    mov     dat@GOTPCREL(%rip), %rax
+        mov     (%rax), %eax
+        ret
+        .size   pgd, .-pgd
+        .type   pgr, @function
+pgr:    mov     dat@GOTPCREL(%rip), %r11
+        mov     (%r11), %eax
+        ret
+        .size   pgr, .-pgr
+        .type   pgc, @function
+pgc:    push    %rbx
+        call    *fn@GOTPCREL(%rip)
+        pop     %rbx
+        jmp     *fn@GOTPCREL(%rip)
+        .size   pgc, .-pgc
+        .type   pgx, @function
+pgx:    mov     ext@GOTPCREL(%rip), %rax
+        mov     (%rax), %eax
+        ret
+        .size   pgx, .-pgx
+        .type   pga, @function
+pga:    mov     absv@GOTPCREL(%rip), %rax
+        ret
+        .size   pga, .-pga
+        .type   pgm, @function
+pgm:    movrs   dat@GOTPCREL(%rip), %eax
+        ret
+        .size   pgm, .-pgm
+        .type   fn, @function
+fn:     mov     $5, %eax
+        ret
+        .size   fn, .-fn
+        .globl  absv
+        .set    absv, 0x1234
+        .data
+        .type   dat, @object
+dat:    .long   44
+        .size   dat, 4
 """
 
 _PLAIN_GOTPCREL_SCRIPT_ASM = """\
-	.text
-	.globl	_start
-_start:	mov	dat@GOTPCREL(%rip), %rax
-	call	*fn@GOTPCREL(%rip)
-	ret
-fn:	ret
-	.data
-dat:	.long	1
+        .text
+        .globl  _start
+_start: mov     dat@GOTPCREL(%rip), %rax
+        call    *fn@GOTPCREL(%rip)
+        ret
+fn:     ret
+        .data
+dat:    .long   1
 """
 
 
@@ -9200,6 +9208,29 @@ int main(void){
     expect_stdout="11 22 33 44 / 55 66 77 88\n",
     tags=("icf",)),
 
+case("icf_folds_local_dynamic_tls_twins",
+    # ICF-folded sections are aliased into the section map for symbol
+    # resolution, so their relocations once leaked into the application
+    # pass: byte-identical TLS twins (libstdc++.a's __cxa_get_globals /
+    # __cxa_get_globals_fast are exactly this shape) applied their TLSLD
+    # relaxation a second time onto the representative's already-rewritten
+    # bytes and the link died with "unrecognized code sequence".  The twins
+    # must fold, the LD->LE relaxation must fire exactly once, and the
+    # thread-local arithmetic must stay correct (37 = (1+2)*10 + (3+4)).
+    {"t.c": """
+static __thread int counter;
+static __thread int stamp;
+__attribute__((noinline)) int get_a(int k){ counter += k; stamp += 2; return counter + stamp; }
+__attribute__((noinline)) int get_b(int k){ counter += k; stamp += 2; return counter + stamp; }
+int main(void){ int a = get_a(1); int b = get_b(2); return a * 10 + b; }
+"""},
+    compile_flags=["-O1", "-fPIC", "-ffunction-sections"],
+    lccc_only_flags=["-Wl,--icf=all"],
+    expect_stdout="",  # expected exit below; the program intentionally prints nothing
+    expect_exit=37,  # (1+2)*10 + (3+4): get_a(1)=3, get_b(2)=7 — TLS values survive the fold
+    expect_same_address=[["get_a", "get_b"]],
+    tags=("icf", "tls")),
+
 case("icf_transitive_cross_object_fold",
     # Positive cross-object proof for iterative ICF: f1->g1 and f2->g2 fold
     # only because the leaves are proven equivalent first (same global
@@ -9572,6 +9603,15 @@ class Result:
     def __init__(self, name, status, detail=""):
         self.name, self.status, self.detail = name, status, detail
 
+# Environmental skip: the host KERNEL cannot run a class of binaries the
+# test needs (no 32-bit dynamic loader on a rootless sandbox, or a seccomp
+# policy that kills 32-bit syscall entry).  Distinct from SKIP because
+# --strict exists to catch "CI silently ran less" — and no hosted runner
+# can ever be in this state, so an ENV skip there is impossible by
+# construction (the verdict helper only yields it for kernel-policy
+# blocks; a missing tool stays SKIP and still fails --strict).
+ENV_SKIP = "SKIP-ENV"
+
 def compile_sources(td, c, flags):
     objs = []
     for fname, content in c.sources.items():
@@ -9601,6 +9641,79 @@ def run_bin(path, args, td, env=None):
         return r.returncode, r.stdout.decode(errors="replace")
     except subprocess.TimeoutExpired:
         return None, "<timeout>"
+    except FileNotFoundError as exc:
+        # A 32-bit binary whose PT_INTERP (/lib/ld-linux.so.2) is absent
+        # raises before exec; a missing interpreter is an environment
+        # property, not a verdict, so it must never take the runner down.
+        return None, f"<noexec: {exc}>"
+    except OSError as exc:
+        return None, f"<noexec: {exc}>"
+
+_I386_EXEC_PROBE = None
+
+def i386_exec_probe():
+    """(ok, kernel_policy, reason): can this host EXECUTE i386 binaries?
+
+    Rootless sandboxes can install an -m32 compile+link toolchain from
+    unpacked packages (the LCCC_SYSROOT doctrine) yet still be unable to
+    run what it produces: without root the 32-bit dynamic loader cannot be
+    placed at /lib/ld-linux.so.2 (exec itself raises ENOENT), and under a
+    seccomp policy that blocks 32-bit syscall entry the loader dies with
+    SIGSYS before main.  `kernel_policy` marks exactly those two states;
+    every other failure is an ordinary broken toolchain.
+
+    The compile/link capability is already guarded per-test ("no -m32
+    toolchain"); this probe distinguishes the remaining run capability,
+    once per process, exactly like i386_userspace.py's up-front probe
+    (compile, link AND run).
+    """
+    global _I386_EXEC_PROBE
+    if _I386_EXEC_PROBE is None:
+        td = tempfile.mkdtemp(prefix="lnk.i386exec.")
+        try:
+            with open(os.path.join(td, "p.c"), "w") as f:
+                f.write("int main(void){return 0;}\n")
+            r = sh([CC, "-m32", "p.c", "-o", "p"], cwd=td)
+            if r.returncode != 0:
+                _I386_EXEC_PROBE = (False, False,
+                                    "no -m32 toolchain: " + r.stderr.decode()[:150])
+            else:
+                try:
+                    rr = sh([os.path.join(td, "p")], cwd=td)
+                except FileNotFoundError as exc:
+                    _I386_EXEC_PROBE = (False, True,
+                                        f"no 32-bit dynamic loader (rootless host): {exc}")
+                else:
+                    if rr.returncode == 0:
+                        _I386_EXEC_PROBE = (True, False, "")
+                    elif rr.returncode == -31:  # SIGSYS: seccomp blocks 32-bit syscall entry
+                        _I386_EXEC_PROBE = (False, True,
+                                            "32-bit execution blocked by host syscall policy (SIGSYS)")
+                    else:
+                        _I386_EXEC_PROBE = (False, False,
+                                            f"i386 probe exited rc={rr.returncode}: "
+                                            + rr.stderr.decode(errors="replace")[:150])
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+    return _I386_EXEC_PROBE
+
+def i386_exec_verdict():
+    """(status, reason) when this host cannot run i386 binaries, else None.
+
+    With LCCC_REQUIRE_I386=1 (CI) an ordinary broken toolchain escalates to
+    FAIL — the fail-closed multilib contract: a hosted runner that lost
+    gcc-multilib must go red, never silently skip.  A kernel-level
+    execution block is an ENV skip even under the contract: no hosted
+    runner is ever in that state (gcc-multilib pulls in the 32-bit loader,
+    and no CI image seccomps 32-bit syscall entry), so the carve-out masks
+    no CI regression while keeping rootless research sandboxes honest.
+    """
+    ok, kernel_policy, reason = i386_exec_probe()
+    if ok:
+        return None
+    if os.environ.get("LCCC_REQUIRE_I386") == "1" and not kernel_policy:
+        return "FAIL", reason
+    return (ENV_SKIP if kernel_policy else "SKIP"), reason
 
 # field kind -> (assembly directive, symbol, in-range value, out-of-range value)
 # (relocation, directive, symbol, a value that fits, one that does not).
@@ -10567,9 +10680,16 @@ def _defsym_order_test(args, oracles):
 
         shim = _shim_for(td, lccc_ld)
 
-        def run(name, link, want_out):
+        def run(name, link, want_out, i386=False):
             """Link with each command in `link` (label -> argv) per order,
             run, and require `want_out`."""
+            if i386:
+                verdict = i386_exec_verdict()
+                if verdict is not None:
+                    status, why = verdict
+                    results.append(Result(name, status,
+                                          f"host cannot execute i386 binaries: {why}"))
+                    return
             problems = []
             for i, order in enumerate(orders):
                 wl = ",".join(f"--defsym={d}" for d in order)
@@ -10590,7 +10710,7 @@ def _defsym_order_test(args, oracles):
         run("defsym_forward_reference_i386",
             {"lccc": [CC, "-m32", f"-B{shim}", "-no-pie", "m32.o", "d32.o"],
              "GNU": [CC, "-m32", "-no-pie", "m32.o", "d32.o"]},
-            b"4 4 4 1\n")
+            b"4 4 4 1\n", i386=True)
         # The addresses slide, the absolute does not (lccc only; see above).
         run("defsym_address_slides_in_pie",
             {"lccc": [CC, f"-B{shim}", "-pie", "m.o", "d.o"]}, b"4 4 4 1\n")
@@ -10955,7 +11075,7 @@ def _registry(args, oracles):
         one("script_undefined_pulls_archive_i386", _script_undefined_archive_test_i386,
             "script"),
         _Entry(tuple(n for n, _ in i386_userspace.CASES),
-               lambda: i386_userspace.run_all(args, CC, Result), ("shared",)),
+               lambda: i386_userspace.run_all(args, CC, Result, ENV_SKIP), ("shared",)),
         one("script_vdso_dynamic", _vdso_script_test, "script"),
         one("script_vdso_declared_note_phdrs", _vdso_note_phdr_test, "script"),
         one("script_elf32_i386_relocations", _elf32_script_test, "script", "kernel"),
@@ -11137,6 +11257,7 @@ def main():
     nfail = sum(1 for r in results if r.status == "FAIL")
     nwarn = sum(1 for r in results if r.status == "WARN")
     nskip = sum(1 for r in results if r.status == "SKIP")
+    nenvskip = sum(1 for r in results if r.status == ENV_SKIP)
     print()
     for r in results:
         if r.status != "PASS" or args.verbose:
@@ -11145,7 +11266,8 @@ def main():
     # "bfd{mold}{wild}" string could not drift when the list did, so a lost
     # registration was invisible in the one line a reviewer would look at --
     # which is exactly how the missing lld entry survived a rebase.
-    print(f"\n== linker tests: {npass} pass, {nfail} fail, {nwarn} warn, {nskip} skip "
+    print(f"\n== linker tests: {npass} pass, {nfail} fail, {nwarn} warn, {nskip} skip"
+          f"{', ' + str(nenvskip) + ' env-skip' if nenvskip else ''} "
           f"(oracles: {' '.join(n for n, _ in oracles)}) ==")
     if args.json:
         with open(args.json, "w") as f:
@@ -11157,6 +11279,8 @@ def main():
     # --strict: a SKIP is a test that did not run (a missing compiler, a
     # fixture the toolchain refused) and a WARN a known defect; in CI, where
     # the job installs every tool, both are failures to be fixed, not parked.
+    # ENV skips are the one exception: they mark host-kernel execution
+    # policies no CI runner has, so parking them keeps the contract intact.
     if args.strict and (nskip or nwarn):
         print(f"error: --strict: {nskip} skipped and {nwarn} warned test(s)", file=sys.stderr)
         sys.exit(1)
