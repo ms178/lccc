@@ -15,22 +15,35 @@ pub(crate) fn encode_ldr_str_auto(
         _ => return Err("ldr/str needs register operand".to_string()),
     };
 
-    let size = if reg_name.starts_with('w') {
-        0b10 // 32-bit
-    } else if reg_name.starts_with('x') || reg_name == "sp" || reg_name == "xzr" || reg_name == "lr"
-    {
-        0b11 // 64-bit
-    } else if reg_name.starts_with('s') {
-        0b10 // 32-bit float
-    } else if reg_name.starts_with('d') {
-        0b11 // 64-bit float
-    } else if reg_name.starts_with('q') {
-        0b00 // 128-bit: size=00 with opc adjustment in encode_ldr_str
+    // `b` and `h` were simply absent from this table, so they fell through to
+    // the 64-bit default and every byte/halfword FP access was encoded as a
+    // doubleword one: `str b9, [x10]` assembled to the same word as
+    // `str d9, [x10]`. The default is now an error rather than a guess --
+    // silently picking a width is how the original defect stayed invisible.
+    let (size, is_128bit) = if reg_name == "sp" || reg_name == "xzr" || reg_name == "lr" {
+        (0b11, false) // 64-bit GPR
+    } else if reg_name == "wsp" || reg_name == "wzr" {
+        (0b10, false) // 32-bit GPR
     } else {
-        0b11 // default 64-bit
+        match reg_name.chars().next() {
+            Some('w') => (0b10, false), // 32-bit GPR
+            Some('x') => (0b11, false), // 64-bit GPR
+            Some('b') => (0b00, false), //  8-bit FP
+            Some('h') => (0b01, false), // 16-bit FP
+            Some('s') => (0b10, false), // 32-bit FP
+            Some('d') => (0b11, false), // 64-bit FP
+            // 128-bit: size=00 with the opc adjustment applied in encode_ldr_str.
+            // `v` and `q` name the same 128-bit register file.
+            Some('q') | Some('v') => (0b00, true),
+            _ => {
+                return Err(format!(
+                    "ldr/str: unrecognised register `{reg_name}` \
+                     (expected w, x, b, h, s, d or q)"
+                ));
+            }
+        }
     };
 
-    let is_128bit = reg_name.starts_with('q');
     encode_ldr_str(operands, is_load, size, false, is_128bit)
 }
 
@@ -733,28 +746,106 @@ pub(crate) fn encode_ldp_stp(operands: &[Operand], is_load: bool) -> Result<Enco
 /// Encode LDNP/STNP (load/store pair non-temporal)
 /// Encoding: opc 101 V 000 L imm7 Rt2 Rn Rt
 /// TODO: Only handles integer registers (V=0). FP/SIMD register support needed for V=1.
+/// Classify a register for the load/store-PAIR encodings.
+///
+/// Returns `(opc, V, scale)`, where `opc` is the 2-bit class field at 31:30,
+/// `V` at bit 26 selects the SIMD/FP encoding space, and `scale` is log2 of the
+/// access width -- the shift applied to the byte offset before it is stored in
+/// the imm7 field.
+///
+/// ```text
+///   GPR W  -> (00, 0, 2)     FP S  -> (00, 1, 2)
+///   GPR X  -> (10, 0, 3)     FP D  -> (01, 1, 3)
+///                            FP Q  -> (10, 1, 4)
+/// ```
+///
+/// `ldnp`/`stnp` previously hardcoded `V = 0` and chose `opc` from "is this a
+/// 64-bit register", which is a GPR-only question. Every FP non-temporal pair
+/// was therefore encoded as the corresponding GPR pair: `ldnp s24, s13,
+/// [x20, #80]` produced exactly the word GAS produces for `ldnp w24, w13,
+/// [x20, #80]` -- a pair of 32-bit integer loads in place of two single-precision
+/// float loads. `ldp`/`stp` already classified correctly, which is why the
+/// defect survived: the common pair instructions were right and the rare
+/// non-temporal ones were silently wrong.
+fn pair_reg_fields(name: &str) -> Result<(u32, u32, u32), String> {
+    let n = name.to_lowercase();
+    let fields = match n.as_str() {
+        "sp" | "xzr" | "lr" => (0b10u32, 0u32, 3u32),
+        "wsp" | "wzr" => (0b00, 0, 2),
+        _ => match n.chars().next() {
+            Some('x') => (0b10, 0, 3),
+            Some('w') => (0b00, 0, 2),
+            Some('s') => (0b00, 1, 2),
+            Some('d') => (0b01, 1, 3),
+            Some('q') | Some('v') => (0b10, 1, 4),
+            _ => {
+                return Err(format!(
+                    "ldnp/stnp: unsupported register `{name}` \
+                     (expected w, x, s, d or q)"
+                ));
+            }
+        },
+    };
+    Ok(fields)
+}
+
+/// Fetch the register *name* at `idx`; the pair encoders need the class, which
+/// the numeric `get_reg` does not carry.
+fn reg_name_at(operands: &[Operand], idx: usize) -> Result<String, String> {
+    match operands.get(idx) {
+        Some(Operand::Reg(r)) => Ok(r.clone()),
+        other => Err(format!("expected register at operand {idx}, got {other:?}")),
+    }
+}
+
 pub(crate) fn encode_ldnp_stnp(
     operands: &[Operand],
     is_load: bool,
 ) -> Result<EncodeResult, String> {
-    if operands.len() < 3 {
-        return Err("ldnp/stnp requires 3 operands".to_string());
+    if operands.len() != 3 {
+        return Err(format!(
+            "ldnp/stnp requires 3 operands, got {}",
+            operands.len()
+        ));
     }
 
-    let (rt1, is_64) = get_reg(operands, 0)?;
-    let (rt2, _) = get_reg(operands, 1)?;
+    let name1 = reg_name_at(operands, 0)?;
+    let name2 = reg_name_at(operands, 1)?;
 
-    let opc: u32 = if is_64 { 0b10 } else { 0b00 };
+    // One opc/V field covers the whole pair, so both registers must be the
+    // same class and width. A mismatched pair has no encoding at all; it must
+    // be diagnosed rather than silently downgraded to the GPR form.
+    let (opc, v, shift) = pair_reg_fields(&name1)?;
+    let (opc2, v2, _) = pair_reg_fields(&name2)?;
+    if (opc, v) != (opc2, v2) {
+        return Err(format!(
+            "ldnp/stnp: `{name1}` and `{name2}` are different register classes; \
+             a pair needs two registers of the same kind and width"
+        ));
+    }
+
+    let rt1 = parse_reg_num(&name1).ok_or_else(|| format!("invalid register: {name1}"))?;
+    let rt2 = parse_reg_num(&name2).ok_or_else(|| format!("invalid register: {name2}"))?;
     let l: u32 = if is_load { 1 } else { 0 };
-    let shift = if is_64 { 3 } else { 2 }; // scale factor: 8 for 64-bit, 4 for 32-bit
 
     match operands.get(2) {
         Some(Operand::Mem { base, offset }) => {
             let rn = parse_reg_num(base).ok_or("invalid base reg")?;
+            let align = 1i64 << shift;
+            // The imm7 field is scaled, so an unaligned offset would be
+            // truncated and the pair would access the wrong address.
+            if *offset % align != 0 {
+                return Err(format!(
+                    "ldnp/stnp: offset {offset} is not a multiple of {align} \
+                     (required by the {name1} access width)"
+                ));
+            }
             let imm7 = ((*offset >> shift) as i32) & 0x7F;
-            // LDNP/STNP: opc 101 V=0 000 L imm7 Rt2 Rn Rt
+            // LDNP/STNP: opc(31:30) 101(29:27) V(26) 000(25:23) L(22)
+            //            imm7(21:15) Rt2(14:10) Rn(9:5) Rt(4:0)
             let word = (opc << 30)
                 | (0b101 << 27)
+                | (v << 26)
                 | (l << 22)
                 | ((imm7 as u32 & 0x7F) << 15)
                 | (rt2 << 10)
@@ -762,7 +853,7 @@ pub(crate) fn encode_ldnp_stnp(
                 | rt1;
             Ok(EncodeResult::Word(word))
         }
-        _ => Err(format!("unsupported ldnp/stnp operands: {:?}", operands)),
+        _ => Err(format!("unsupported ldnp/stnp operands: {operands:?}")),
     }
 }
 

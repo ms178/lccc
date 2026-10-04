@@ -27,8 +27,14 @@ pub(crate) fn encode_fmov(operands: &[Operand]) -> Result<EncodeResult, String> 
 
     if rd_is_fp && rm_is_fp {
         // FMOV between FP registers
-        let is_double = rd_lower.starts_with('d') || rm_lower.starts_with('d');
-        let ftype = if is_double { 0b01 } else { 0b00 };
+        // Prefer the destination; fall back to Rm when Rd is not an FP reg.
+        let ftype = if rd_lower.starts_with('h') || rm_lower.starts_with('h') {
+            0b11
+        } else if rd_lower.starts_with('d') || rm_lower.starts_with('d') {
+            0b01
+        } else {
+            fp_ftype(&rd_lower).or_else(|_| fp_ftype(&rm_lower))?
+        };
         // 0 00 11110 ftype 1 0000 00 10000 Rn Rd
         let word = (0b00011110 << 24)
             | (ftype << 22)
@@ -82,8 +88,7 @@ pub(crate) fn encode_fp_arith(operands: &[Operand], opcode: u32) -> Result<Encod
         Operand::Reg(r) => r.to_lowercase(),
         _ => String::new(),
     };
-    let is_double = rd_name.starts_with('d');
-    let ftype = if is_double { 0b01 } else { 0b00 };
+    let ftype = fp_ftype(&rd_name)?;
 
     // 0 00 11110 ftype 1 Rm opcode 10 Rn Rd
     let word = (0b00011110 << 24)
@@ -104,8 +109,7 @@ pub(crate) fn encode_fneg(operands: &[Operand]) -> Result<EncodeResult, String> 
         Operand::Reg(r) => r.to_lowercase(),
         _ => String::new(),
     };
-    let is_double = rd_name.starts_with('d');
-    let ftype = if is_double { 0b01 } else { 0b00 };
+    let ftype = fp_ftype(&rd_name)?;
     // FNEG: 0 00 11110 ftype 1 0000 10 10000 Rn Rd
     let word =
         (0b00011110 << 24) | (ftype << 22) | (0b100001 << 16) | (0b10000 << 10) | (rn << 5) | rd;
@@ -119,8 +123,7 @@ pub(crate) fn encode_fabs(operands: &[Operand]) -> Result<EncodeResult, String> 
         Operand::Reg(r) => r.to_lowercase(),
         _ => String::new(),
     };
-    let is_double = rd_name.starts_with('d');
-    let ftype = if is_double { 0b01 } else { 0b00 };
+    let ftype = fp_ftype(&rd_name)?;
     // FABS: 0 00 11110 ftype 1 0000 01 10000 Rn Rd
     let word =
         (0b00011110 << 24) | (ftype << 22) | (0b100000 << 16) | (0b110000 << 10) | (rn << 5) | rd;
@@ -134,8 +137,7 @@ pub(crate) fn encode_fsqrt(operands: &[Operand]) -> Result<EncodeResult, String>
         Operand::Reg(r) => r.to_lowercase(),
         _ => String::new(),
     };
-    let is_double = rd_name.starts_with('d');
-    let ftype = if is_double { 0b01 } else { 0b00 };
+    let ftype = fp_ftype(&rd_name)?;
     // FSQRT: 0 00 11110 ftype 1 0000 11 10000 Rn Rd
     let word =
         (0b00011110 << 24) | (ftype << 22) | (0b100001 << 16) | (0b110000 << 10) | (rn << 5) | rd;
@@ -151,8 +153,7 @@ pub(crate) fn encode_fp_1src(operands: &[Operand], opcode: u32) -> Result<Encode
         Operand::Reg(r) => r.to_lowercase(),
         _ => String::new(),
     };
-    let is_double = rd_name.starts_with('d');
-    let ftype = if is_double { 0b01u32 } else { 0b00 };
+    let ftype = fp_ftype(&rd_name)?;
     let word = (0b00011110u32 << 24)
         | (ftype << 22)
         | (1 << 21)
@@ -161,6 +162,31 @@ pub(crate) fn encode_fp_1src(operands: &[Operand], opcode: u32) -> Result<Encode
         | (rn << 5)
         | rd;
     Ok(EncodeResult::Word(word))
+}
+
+/// The scalar-FP `type` field, from a register name.
+///
+/// ```text
+///   S (single, 32-bit)  -> 0b00
+///   D (double, 64-bit)  -> 0b01
+///   H (half,   16-bit)  -> 0b11
+/// ```
+///
+/// Every call site used to ask only "does the name start with `d`?", which is a
+/// two-way question with a three-way answer: half-precision registers fell into
+/// the single-precision branch, so `fmadd h11, h3, h2, h12` assembled as
+/// `fmadd s11, s3, s2, s12`. Nothing rejected it and nothing warned -- the
+/// instruction simply operated on the wrong half of the register.
+pub(crate) fn fp_ftype(name: &str) -> Result<u32, String> {
+    match name.to_lowercase().chars().next() {
+        Some('s') => Ok(0b00),
+        Some('d') => Ok(0b01),
+        Some('h') => Ok(0b11),
+        _ => Err(format!(
+            "unsupported floating-point register `{name}` \
+             (expected h, s or d for this instruction)"
+        )),
+    }
 }
 
 /// Encode FMADD/FMSUB: Rd = Ra +/- (Rn * Rm)
@@ -177,8 +203,7 @@ pub(crate) fn encode_fmadd_fmsub(
         Operand::Reg(r) => r.to_lowercase(),
         _ => String::new(),
     };
-    let is_double = rd_name.starts_with('d');
-    let ftype = if is_double { 0b01u32 } else { 0b00 };
+    let ftype = fp_ftype(&rd_name)?;
     let o1 = if is_sub { 1u32 } else { 0 };
     let word = (0b00011111u32 << 24)
         | (ftype << 22)
@@ -204,8 +229,7 @@ pub(crate) fn encode_fnmadd_fnmsub(
         Operand::Reg(r) => r.to_lowercase(),
         _ => String::new(),
     };
-    let is_double = rd_name.starts_with('d');
-    let ftype = if is_double { 0b01u32 } else { 0b00 };
+    let ftype = fp_ftype(&rd_name)?;
     let o1 = if is_sub { 1u32 } else { 0 };
     let word = (0b00011111u32 << 24)
         | (ftype << 22)
@@ -224,8 +248,7 @@ pub(crate) fn encode_fcmp(operands: &[Operand]) -> Result<EncodeResult, String> 
         Operand::Reg(r) => r.to_lowercase(),
         _ => String::new(),
     };
-    let is_double = rn_name.starts_with('d');
-    let ftype = if is_double { 0b01 } else { 0b00 };
+    let ftype = fp_ftype(&rn_name)?;
 
     // FCMP Dn, #0.0
     if operands.len() < 2 || matches!(operands.get(1), Some(Operand::Imm(0))) {
@@ -263,11 +286,11 @@ pub(crate) fn encode_fcvt_rounding(
         Operand::Reg(name) => name.to_lowercase(),
         _ => return Err("fcvt*: expected register source".to_string()),
     };
-    let ftype: u32 = if src_name.starts_with('d') {
-        0b01
-    } else {
-        0b00
-    };
+    // ftype: 00=S source, 01=D source, 11=H source.
+    // The `h` case was missing, so `fcvtzu w4, h17, #13` converted a
+    // single-precision value it did not have instead of the half-precision one
+    // it was given.
+    let ftype = fp_ftype(&src_name)?;
     let sf: u32 = if rd_is_64 { 1 } else { 0 };
 
     let word =
@@ -304,11 +327,8 @@ pub(crate) fn encode_int_to_float(
         Operand::Reg(name) => name.to_lowercase(),
         _ => return Err("scvtf/ucvtf: expected register dest".to_string()),
     };
-    let ftype: u32 = if dst_name.starts_with('d') {
-        0b01
-    } else {
-        0b00
-    };
+    // ftype: 00=S destination, 01=D destination, 11=H destination.
+    let ftype = fp_ftype(&dst_name)?;
     let sf: u32 = if rn_is_64 { 1 } else { 0 };
     let opcode: u32 = if is_signed { 0b010 } else { 0b011 };
 

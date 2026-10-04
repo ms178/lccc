@@ -1,3 +1,4 @@
+use super::base::check_branch_offset;
 use super::*;
 
 // ── Pseudo-instruction encoders ──────────────────────────────────────
@@ -438,8 +439,24 @@ pub(crate) fn get_branch_target(operands: &[Operand], idx: usize) -> Result<Stri
 
 pub(crate) fn encode_j_pseudo(operands: &[Operand]) -> Result<EncodeResult, String> {
     // j offset -> jal x0, offset
+    //
+    // `j` is the ordinary spelling of `jal x0, offset`, so a literal target
+    // has to be validated exactly as `encode_jal` validates one. It was not:
+    // `j 17` encoded to the same word as `j 16`, silently branching to the
+    // wrong address, because the J-type immediate has no bit-0 field.
+    //
+    // The length check also removes an index-out-of-bounds panic: the previous
+    // code indexed `operands[0]` without checking that any operand existed.
+    if operands.len() != 1 {
+        return Err(format!(
+            "j: expected 1 operand (offset or label), got {}",
+            operands.len()
+        ));
+    }
     match &operands[0] {
         Operand::Symbol(s) | Operand::Label(s) | Operand::Reg(s) => {
+            // Symbolic targets stay relocations so the linker can relax them;
+            // the offset is not knowable at assembly time.
             Ok(EncodeResult::WordWithReloc {
                 word: encode_j(OP_JAL, 0, 0),
                 reloc: Relocation {
@@ -449,7 +466,10 @@ pub(crate) fn encode_j_pseudo(operands: &[Operand]) -> Result<EncodeResult, Stri
                 },
             })
         }
-        Operand::Imm(imm) => Ok(EncodeResult::Word(encode_j(OP_JAL, 0, *imm as i32))),
+        Operand::Imm(imm) => {
+            check_branch_offset(*imm, -(1 << 20), 1 << 20, "j")?;
+            Ok(EncodeResult::Word(encode_j(OP_JAL, 0, *imm as i32)))
+        }
         _ => Err("j: expected offset or label".to_string()),
     }
 }

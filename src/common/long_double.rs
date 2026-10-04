@@ -585,8 +585,25 @@ impl X87Decomposed {
     fn is_inf(&self) -> bool {
         self.is_special() && self.mantissa == 0x8000_0000_0000_0000
     }
+    /// Unbiased exponent: the scale the significand is multiplied by.
+    ///
+    /// For normals this is `biased_exp - 16383`. For an x87 subnormal
+    /// (`biased_exp == 0` with a non-zero mantissa) IEEE defines the exponent
+    /// as the **minimum normal** exponent, i.e. `-16382`, not `-16383`; the raw
+    /// `biased - 16383` arithmetic makes every subnormal off by a factor of 2.
+    ///
+    /// This is presently unobservable through `x87_bytes_to_f64` (the only
+    /// caller): every x87 subnormal lies below `2^-16382 ~= 3.4e-4932`, which
+    /// is far under f64's `2^-1074` underflow limit, so the narrowing correctly
+    /// returns `+-0.0` either way. It is fixed for semantic correctness so that
+    /// a future caller which scales rather than underflows gets the right
+    /// answer, and so the value is not wrong-by-2x waiting to be discovered.
     fn unbiased_exp(&self) -> i32 {
-        self.biased_exp as i32 - 16383
+        if self.biased_exp == 0 && self.mantissa != 0 {
+            -16382 // subnormal: clamped to the minimum normal exponent
+        } else {
+            self.biased_exp as i32 - 16383
+        }
     }
 }
 
@@ -728,6 +745,35 @@ fn x87_encode(sign: bool, biased_exp: u16, mantissa64: u64) -> [u8; 16] {
 /// `eval_const_binop_float` and the constant folder, small long-double
 /// arithmetic folded to zero.
 ///
+/// Right-shift a 128-bit significand by `sh` bits with round-half-to-even.
+///
+/// Returns `(truncated, round_up)`; the caller adds `round_up` to the truncated
+/// value so that a carry out of the target field stays visible (the f64 and x87
+/// kernels both need to detect it and bump the exponent).
+///
+/// Shared by [`scaled_significand_to_f64`] and [`encode_x87_from_scaled`]: the
+/// two narrowing kernels used to carry byte-identical private copies, and a
+/// rounding rule that exists twice is a rounding rule that drifts.
+fn round_shift_half_even(m: u128, sh: i64) -> (u128, bool) {
+    if sh <= 0 {
+        return (m, false);
+    }
+    if sh >= 128 {
+        // Everything below the round bit is shifted out, so the exact quotient
+        // lies in [0, 1). Only `sh == 128` can round up, and only when
+        // m/2^128 > 1/2 -- at exactly 1/2 the tie goes to even, i.e. down to 0.
+        return (0, sh == 128 && m > (1u128 << 127));
+    }
+    let sh = sh as u32;
+    let truncated = m >> sh;
+    let round_bit = (m >> (sh - 1)) & 1;
+    let sticky = m & ((1u128 << (sh - 1)) - 1);
+    (
+        truncated,
+        round_bit == 1 && (sticky != 0 || (truncated & 1) == 1),
+    )
+}
+
 /// Doing the scaling in integer arithmetic with an explicit guard/sticky round
 /// step avoids the intermediate underflow entirely and additionally makes the
 /// narrowing correctly rounded instead of truncating.
@@ -748,27 +794,6 @@ fn scaled_significand_to_f64(sign: bool, m: u128, e: i64) -> f64 {
     let e = e - lz as i64;
     let big_e = e + 127;
 
-    /// Right-shift `m` by `sh` bits with round-half-to-even.
-    /// Returns `(truncated, round_up)`; `round_up` must be added to the
-    /// truncated value by the caller (so a carry out of the field is visible).
-    fn round_shift(m: u128, sh: i64) -> (u128, bool) {
-        if sh <= 0 {
-            return (m, false);
-        }
-        if sh >= 128 {
-            // Everything below the round bit is shifted out. The exact
-            // quotient lies in [0, 1); only `sh == 128` can round up, and
-            // only when m/2^128 > 1/2 (ties go to even, i.e. down to 0).
-            return (0, sh == 128 && m > (1u128 << 127));
-        }
-        let sh = sh as u32;
-        let truncated = m >> sh;
-        let round_bit = (m >> (sh - 1)) & 1;
-        let sticky = m & ((1u128 << (sh - 1)) - 1);
-        let round_up = round_bit == 1 && (sticky != 0 || (truncated & 1) == 1);
-        (truncated, round_up)
-    }
-
     let sign_bit = (sign as u64) << 63;
 
     if big_e > 1023 {
@@ -782,7 +807,7 @@ fn scaled_significand_to_f64(sign: bool, m: u128, e: i64) -> f64 {
     if big_e >= -1022 {
         // Normal f64: keep 53 significand bits (1 implicit + 52 stored).
         // 128 - 53 = 75.
-        let (mut frac53, round_up) = round_shift(m, 75);
+        let (mut frac53, round_up) = round_shift_half_even(m, 75);
         if round_up {
             frac53 += 1;
         }
@@ -809,7 +834,7 @@ fn scaled_significand_to_f64(sign: bool, m: u128, e: i64) -> f64 {
     if sh > 128 {
         return if sign { -0.0 } else { 0.0 };
     }
-    let (mut frac52, round_up) = round_shift(m, sh);
+    let (mut frac52, round_up) = round_shift_half_even(m, sh);
     if round_up {
         frac52 += 1;
     }
@@ -1167,27 +1192,9 @@ fn encode_x87_from_scaled(sign: bool, m: u128, e: i64) -> [u8; 16] {
         return make_x87_infinity(sign);
     }
 
-    /// Right-shift `m` by `sh` with round-half-to-even.
-    fn round_shift(m: u128, sh: i64) -> (u128, bool) {
-        if sh <= 0 {
-            return (m, false);
-        }
-        if sh >= 128 {
-            return (0, sh == 128 && m > (1u128 << 127));
-        }
-        let sh = sh as u32;
-        let truncated = m >> sh;
-        let round_bit = (m >> (sh - 1)) & 1;
-        let sticky = m & ((1u128 << (sh - 1)) - 1);
-        (
-            truncated,
-            round_bit == 1 && (sticky != 0 || (truncated & 1) == 1),
-        )
-    }
-
     let (mut mant64, up) = if big_e >= -16382 {
         // Normal x87: 64-bit significand with the integer bit at 63.
-        round_shift(m, 64)
+        round_shift_half_even(m, 64)
     } else {
         // x87 subnormal / underflow. Both the subnormal encoding (exponent 0)
         // and the smallest normal (exponent 1) use the SAME scale,
@@ -1200,7 +1207,7 @@ fn encode_x87_from_scaled(sign: bool, m: u128, e: i64) -> [u8; 16] {
         if sh > 128 {
             return make_x87_zero(sign);
         }
-        round_shift(m, sh)
+        round_shift_half_even(m, sh)
     };
     if up {
         mant64 += 1;
@@ -4401,5 +4408,125 @@ mod widening_tests {
                 v.to_bits()
             );
         }
+    }
+}
+
+// =============================================================================
+// x87 exponent semantics and the shared round-half-to-even helper
+// =============================================================================
+#[cfg(test)]
+mod exponent_and_rounding_tests {
+    use super::*;
+
+    fn x87(sign: bool, biased_exp: u16, mantissa: u64) -> X87Decomposed {
+        X87Decomposed {
+            sign,
+            biased_exp,
+            mantissa,
+        }
+    }
+
+    /// IEEE: an x87 subnormal carries the MINIMUM NORMAL exponent (-16382),
+    /// not `biased - 16383` (-16383). The two differ by a factor of two.
+    ///
+    /// This is currently unobservable through `x87_bytes_to_f64`, the only
+    /// caller: every x87 subnormal lies below `2^-16382 ~= 3.4e-4932`, far
+    /// under f64's `2^-1074` underflow limit, so the narrowing returns `+-0.0`
+    /// either way. This test pins the *semantics* so that a future caller which
+    /// scales rather than underflows inherits the right value.
+    #[test]
+    fn x87_subnormal_exponent_is_the_minimum_normal_exponent() {
+        // Subnormal: biased_exp == 0 with a non-zero mantissa.
+        assert_eq!(x87(false, 0, 1).unbiased_exp(), -16382);
+        assert_eq!(x87(true, 0, u64::MAX).unbiased_exp(), -16382);
+        // The smallest NORMAL (biased_exp == 1) uses the SAME scale -- that is
+        // precisely what makes the subnormal step contiguous with the normals.
+        assert_eq!(x87(false, 1, 1 << 63).unbiased_exp(), -16382);
+        // Zero is not a subnormal and keeps the plain biased arithmetic.
+        assert_eq!(x87(false, 0, 0).unbiased_exp(), -16383);
+        // Sanity on the normal path.
+        assert_eq!(x87(false, 16383, 1 << 63).unbiased_exp(), 0);
+        assert_eq!(x87(false, 0x7FFF, 1 << 63).unbiased_exp(), 16384);
+    }
+
+    /// Every x87 subnormal underflows to signed zero when narrowed to f64 --
+    /// the reason the exponent correction above changes no observable output
+    /// today. Asserted so the two facts are documented together.
+    #[test]
+    fn x87_subnormals_still_narrow_to_signed_zero() {
+        for (sign, want) in [(false, 0.0f64), (true, -0.0f64)] {
+            // Smallest subnormal, and the largest subnormal (all mantissa bits).
+            for mantissa in [1u64, u64::MAX] {
+                let d = x87(sign, 0, mantissa);
+                let bytes = x87_encode(sign, 0, mantissa);
+                let got = x87_bytes_to_f64(&bytes);
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "x87 subnormal must narrow to signed zero"
+                );
+                assert!(d.unbiased_exp() < -1074);
+            }
+        }
+    }
+
+    // -- round_shift_half_even ----------------------------------------------
+
+    #[test]
+    fn round_shift_no_shift_is_identity() {
+        assert_eq!(round_shift_half_even(0xdead_beef, 0), (0xdead_beef, false));
+        assert_eq!(round_shift_half_even(0xdead_beef, -5), (0xdead_beef, false));
+    }
+
+    /// Ties go to EVEN: 1.5 -> 2 (up, to even) but 2.5 -> 2 (down, already even).
+    #[test]
+    fn round_shift_ties_go_to_even() {
+        // 3/2 = 1.5 -> 2   (1 is odd, so round up to the even neighbour)
+        assert_eq!(round_shift_half_even(0b11, 1), (1, true));
+        // 5/2 = 2.5 -> 2   (2 is even, so stay)
+        assert_eq!(round_shift_half_even(0b101, 1), (2, false));
+        // 7/2 = 3.5 -> 4
+        assert_eq!(round_shift_half_even(0b111, 1), (3, true));
+        // 9/2 = 4.5 -> 4
+        assert_eq!(round_shift_half_even(0b1001, 1), (4, false));
+        // 11/2 = 5.5 -> 6
+        assert_eq!(round_shift_half_even(0b1011, 1), (5, true));
+    }
+
+    /// Anything strictly above the half-way point rounds up; strictly below
+    /// rounds down. The sticky bits below the round bit are what distinguish
+    /// "exactly half" from "just over half".
+    #[test]
+    fn round_shift_sticky_bits_break_ties_upward() {
+        // 7/4 = 1.75 -> 2 (round bit set AND sticky set)
+        assert_eq!(round_shift_half_even(0b111, 2), (1, true));
+        // 6/4 = 1.5 -> 2  (round bit set, sticky clear, truncated odd -> up)
+        assert_eq!(round_shift_half_even(0b110, 2), (1, true));
+        // 5/4 = 1.25 -> 1 (round bit clear)
+        assert_eq!(round_shift_half_even(0b101, 2), (1, false));
+        // 4/4 = 1 exact, no rounding
+        assert_eq!(round_shift_half_even(0b100, 2), (1, false));
+    }
+
+    /// Shifting everything out leaves [0, 1). Only `sh == 128` can round up,
+    /// and only when the value exceeds one half; exactly one half is a tie
+    /// that goes to even, i.e. down to zero.
+    #[test]
+    fn round_shift_total_shift_edges() {
+        assert_eq!(round_shift_half_even(u128::MAX, 128), (0, true)); // > 1/2
+        assert_eq!(round_shift_half_even(1u128 << 127, 128), (0, false)); // == 1/2, tie -> 0
+        assert_eq!(round_shift_half_even((1u128 << 127) - 1, 128), (0, false)); // < 1/2
+        assert_eq!(round_shift_half_even(u128::MAX, 129), (0, false)); // beyond 128
+    }
+
+    /// A carry out of the field must be reported, not folded in, so the caller
+    /// can bump the exponent. Folding it here would wrap the significand.
+    #[test]
+    fn round_shift_reports_carry_without_wrapping() {
+        let (m, up) = round_shift_half_even(u128::MAX, 1);
+        assert_eq!(m, u128::MAX >> 1);
+        assert!(up, "the caller must see the carry");
+        // The caller's contract: add `up`, and detect the overflow itself.
+        assert_eq!(m.checked_add(up as u128), Some(1u128 << 127));
     }
 }

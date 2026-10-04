@@ -336,11 +336,17 @@ impl ElfWriter {
                 }
                 Ok(EncodeResult::Skip) => {}
                 Err(e) => {
-                    // Log error but don't fail the whole assembly
-                    eprintln!(
-                        "warning: failed to resolve deferred instruction '{}': {}",
-                        pinstr.mnemonic, e
-                    );
+                    // This branch used to print a warning and continue, which
+                    // left the NOP placeholder emitted at line 792 in the
+                    // output: a file containing `str z15, [x9, #45, mul vl]`
+                    // assembled to a bare `nop` and exited 0. An assembler
+                    // that cannot encode an instruction must say so -- silently
+                    // substituting a NOP turns an unsupported instruction into
+                    // a program that runs and does the wrong thing.
+                    return Err(format!(
+                        "{}: failed to resolve deferred instruction `{} {}`: {}",
+                        pinstr.section, pinstr.mnemonic, pinstr.raw_operands, e
+                    ));
                 }
             }
         }
