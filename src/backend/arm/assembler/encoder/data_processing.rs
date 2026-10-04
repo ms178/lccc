@@ -3,7 +3,7 @@ use crate::backend::arm::assembler::parser::Operand;
 
 // ── MOV ──────────────────────────────────────────────────────────────────
 
-pub(crate) fn encode_mov(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_mov(operands: &[Operand]) -> Result<EncodeResult, String> {
     if operands.len() < 2 {
         return Err("mov requires 2 operands".to_string());
     }
@@ -184,7 +184,7 @@ pub(crate) fn encode_mov(operands: &[Operand]) -> Result<EncodeResult, String> {
     Err(format!("unsupported mov operands: {:?}", operands))
 }
 
-pub(crate) fn encode_mov_wide_imm(rd: u32, is_64: bool, imm: u64) -> Result<EncodeResult, String> {
+pub fn encode_mov_wide_imm(rd: u32, is_64: bool, imm: u64) -> Result<EncodeResult, String> {
     let sf = sf_bit(is_64);
     let mut words = Vec::new();
     let max_hw = if is_64 { 4 } else { 2 };
@@ -221,7 +221,7 @@ pub(crate) fn encode_mov_wide_imm(rd: u32, is_64: bool, imm: u64) -> Result<Enco
 
 /// Classification of an `:abs_g*:` modifier for movz/movk (GAS parity).
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct AbsGSpec {
+pub struct AbsGSpec {
     /// Right-shift applied to the 64-bit value before masking: 0/16/32/48.
     pub shift: u32,
     /// Signed variant (`:abs_g*_s:`) — the field is the sign-extended
@@ -239,7 +239,7 @@ pub(crate) struct AbsGSpec {
 ///   back to immediate handling).
 /// * `Err`       — the kind looks like abs_g but is not a valid ABI form;
 ///   a precise error beats a misleading "expected immediate" later.
-pub(crate) fn abs_g_spec(kind: &str) -> Result<Option<AbsGSpec>, String> {
+pub fn abs_g_spec(kind: &str) -> Result<Option<AbsGSpec>, String> {
     let spec = match kind {
         "abs_g0" => (0, false, false),
         "abs_g1" => (16, false, false),
@@ -271,13 +271,13 @@ pub(crate) fn abs_g_spec(kind: &str) -> Result<Option<AbsGSpec>, String> {
 }
 
 /// Build a MOVZ (is_movz) / MOVK word with the given halfword selector.
-pub(crate) fn movw_word(is_movz: bool, rd: u32, is_64: bool, hw: u32, imm16: u32) -> u32 {
+pub fn movw_word(is_movz: bool, rd: u32, is_64: bool, hw: u32, imm16: u32) -> u32 {
     let sf = sf_bit(is_64);
     let base = if is_movz { 0b1010_0101u32 } else { 0b1110_0101 };
     (sf << 31) | (base << 23) | (hw << 21) | ((imm16 & 0xFFFF) << 5) | rd
 }
 
-pub(crate) fn encode_movz(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_movz(operands: &[Operand]) -> Result<EncodeResult, String> {
     let (rd, is_64) = get_reg(operands, 0)?;
     let sf = sf_bit(is_64);
 
@@ -318,7 +318,7 @@ pub(crate) fn encode_movz(operands: &[Operand]) -> Result<EncodeResult, String> 
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_movk(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_movk(operands: &[Operand]) -> Result<EncodeResult, String> {
     let (rd, is_64) = get_reg(operands, 0)?;
 
     // Handle :abs_g*: modifiers
@@ -353,7 +353,7 @@ pub(crate) fn encode_movk(operands: &[Operand]) -> Result<EncodeResult, String> 
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_movn(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_movn(operands: &[Operand]) -> Result<EncodeResult, String> {
     let (rd, is_64) = get_reg(operands, 0)?;
 
     // GAS parity: MOVN supports no :abs_g*: relocations — the MOVW
@@ -388,7 +388,7 @@ pub(crate) fn encode_movn(operands: &[Operand]) -> Result<EncodeResult, String> 
 
 // ── ADD/SUB ──────────────────────────────────────────────────────────────
 
-pub(crate) fn encode_add_sub(
+pub fn encode_add_sub(
     operands: &[Operand],
     is_sub: bool,
     set_flags: bool,
@@ -596,7 +596,7 @@ pub(crate) fn encode_add_sub(
 
 // ── Logical ──────────────────────────────────────────────────────────────
 
-pub(crate) fn encode_logical(operands: &[Operand], opc: u32) -> Result<EncodeResult, String> {
+pub fn encode_logical(operands: &[Operand], opc: u32) -> Result<EncodeResult, String> {
     if operands.len() < 3 {
         return Err("logical op requires 3 operands".to_string());
     }
@@ -606,8 +606,18 @@ pub(crate) fn encode_logical(operands: &[Operand], opc: u32) -> Result<EncodeRes
         return encode_neon_logical(operands, opc);
     }
 
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
+    // SP is legal ONLY as the destination of the non-flags immediate forms
+    // (ARM ARM "Logical (immediate)": AND/ORR/EOR Rd may be SP; ANDS and the
+    // register forms take no SP anywhere). Oracle: `and sp, x1, #15` assembles
+    // in GNU as; `and x0, sp, #15` and `and sp, x1, x2` do not.
+    let sp_ok_in_rd = matches!(operands.get(2), Some(Operand::Imm(_))) && opc != 0b11;
+    let (rd, is_64) = if sp_ok_in_rd {
+        get_gpr_or_sp(operands, 0)?
+    } else {
+        get_gpr_strict(operands, 0)?
+    };
+    let (rn, rn64) = get_gpr_strict(operands, 1)?;
+    check_same_width(is_64, &[rn64])?;
     let sf = sf_bit(is_64);
 
     // AND/ORR/EOR Rd, Rn, #imm (bitmask immediate)
@@ -629,6 +639,10 @@ pub(crate) fn encode_logical(operands: &[Operand], opc: u32) -> Result<EncodeRes
     // AND/ORR/EOR Rd, Rn, Rm [, shift #amount]
     if let Some(Operand::Reg(rm_name)) = operands.get(2) {
         let rm = parse_reg_num(rm_name).ok_or("invalid rm")?;
+        // sf consistency for Rm (X with x, W with w).
+        if is_64bit_reg(rm_name) != is_64 {
+            return Err("logical: register width mismatch (mixed x/w operands)".to_string());
+        }
 
         let (shift_type, shift_amount) =
             if let Some(Operand::Shift { kind, amount }) = operands.get(3) {
@@ -643,6 +657,15 @@ pub(crate) fn encode_logical(operands: &[Operand], opc: u32) -> Result<EncodeRes
             } else {
                 (0, 0)
             };
+        // Shift amount is 6 bits for X registers, 5 for W; out-of-range
+        // values must be rejected, not masked/truncated into the opcode
+        // bits (GNU as: "immediate value out of range").
+        let max_shift = if is_64 { 63 } else { 31 };
+        if shift_amount as u32 > max_shift {
+            return Err(format!(
+                "logical: shift amount {shift_amount} out of range 0..={max_shift}"
+            ));
+        }
 
         let word = ((sf << 31) | (opc << 29) | (0b01010 << 24) | (shift_type << 22))
             | (rm << 16)
@@ -657,7 +680,7 @@ pub(crate) fn encode_logical(operands: &[Operand], opc: u32) -> Result<EncodeRes
 
 /// Encode a bitmask immediate for AArch64.
 /// Returns (N, immr, imms) if the value is a valid bitmask immediate.
-pub(crate) fn encode_bitmask_imm(val: u64, is_64: bool) -> Option<(u32, u32, u32)> {
+pub fn encode_bitmask_imm(val: u64, is_64: bool) -> Option<(u32, u32, u32)> {
     if val == 0 || (!is_64 && val == 0xFFFFFFFF) || (is_64 && val == u64::MAX) {
         return None; // Not a valid bitmask immediate
     }
@@ -744,45 +767,49 @@ pub(crate) fn encode_bitmask_imm(val: u64, is_64: bool) -> Option<(u32, u32, u32
 
 // ── MUL/DIV ──────────────────────────────────────────────────────────────
 
-pub(crate) fn encode_mul(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_mul(operands: &[Operand]) -> Result<EncodeResult, String> {
     // NEON vector form: MUL Vd.T, Vn.T, Vm.T
     if let Some(Operand::RegArrangement { .. }) = operands.first() {
         return encode_neon_mul(operands);
     }
     // MUL Rd, Rn, Rm is MADD Rd, Rn, Rm, XZR
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-    let (rm, _) = get_reg(operands, 2)?;
+    let (rd, is_64) = get_gpr_strict(operands, 0)?;
+    let (rn, rn64) = get_gpr_strict(operands, 1)?;
+    let (rm, rm64) = get_gpr_strict(operands, 2)?;
+    check_same_width(is_64, &[rn64, rm64])?;
     let sf = sf_bit(is_64);
     let word = (sf << 31) | (0b0011011000 << 21) | (rm << 16) | (0b11111 << 10) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_madd(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-    let (rm, _) = get_reg(operands, 2)?;
-    let (ra, _) = get_reg(operands, 3)?;
+pub fn encode_madd(operands: &[Operand]) -> Result<EncodeResult, String> {
+    let (rd, is_64) = get_gpr_strict(operands, 0)?;
+    let (rn, rn64) = get_gpr_strict(operands, 1)?;
+    let (rm, rm64) = get_gpr_strict(operands, 2)?;
+    let (ra, ra64) = get_gpr_strict(operands, 3)?;
+    check_same_width(is_64, &[rn64, rm64, ra64])?;
     let sf = sf_bit(is_64);
     let word = ((sf << 31) | (0b0011011000 << 21) | (rm << 16)) | (ra << 10) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_msub(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-    let (rm, _) = get_reg(operands, 2)?;
-    let (ra, _) = get_reg(operands, 3)?;
+pub fn encode_msub(operands: &[Operand]) -> Result<EncodeResult, String> {
+    let (rd, is_64) = get_gpr_strict(operands, 0)?;
+    let (rn, rn64) = get_gpr_strict(operands, 1)?;
+    let (rm, rm64) = get_gpr_strict(operands, 2)?;
+    let (ra, ra64) = get_gpr_strict(operands, 3)?;
+    check_same_width(is_64, &[rn64, rm64, ra64])?;
     let sf = sf_bit(is_64);
     let word =
         (sf << 31) | (0b0011011000 << 21) | (rm << 16) | (1 << 15) | (ra << 10) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_div(operands: &[Operand], unsigned: bool) -> Result<EncodeResult, String> {
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-    let (rm, _) = get_reg(operands, 2)?;
+pub fn encode_div(operands: &[Operand], unsigned: bool) -> Result<EncodeResult, String> {
+    let (rd, is_64) = get_gpr_strict(operands, 0)?;
+    let (rn, rn64) = get_gpr_strict(operands, 1)?;
+    let (rm, rm64) = get_gpr_strict(operands, 2)?;
+    check_same_width(is_64, &[rn64, rm64])?;
     let sf = sf_bit(is_64);
     let o1 = if unsigned { 0u32 } else { 1u32 };
     // Data-processing (2 source): sf 0 S=0 11010110 Rm 00001 o1 Rn Rd
@@ -797,52 +824,57 @@ pub(crate) fn encode_div(operands: &[Operand], unsigned: bool) -> Result<EncodeR
 }
 
 /// Encode SMULL Xd, Wn, Wm -> SMADDL Xd, Wn, Wm, XZR
-pub(crate) fn encode_smull(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, _) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-    let (rm, _) = get_reg(operands, 2)?;
+pub fn encode_smull(operands: &[Operand]) -> Result<EncodeResult, String> {
+    let rd = get_gpr_strict_x(operands, 0)?;
+    let (rn, rn64) = get_gpr_strict(operands, 1)?;
+    let (rm, rm64) = get_gpr_strict(operands, 2)?;
+    check_same_width(false, &[rn64, rm64])?;
     // SMADDL: 1 00 11011 001 Rm 0 11111 Rn Rd (Ra=XZR makes it SMULL)
     let word = (1u32 << 31) | (0b0011011001 << 21) | (rm << 16) | (0b011111 << 10) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
 }
 
 /// Encode UMULL Xd, Wn, Wm -> UMADDL Xd, Wn, Wm, XZR
-pub(crate) fn encode_umull(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, _) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-    let (rm, _) = get_reg(operands, 2)?;
+pub fn encode_umull(operands: &[Operand]) -> Result<EncodeResult, String> {
+    let rd = get_gpr_strict_x(operands, 0)?;
+    let (rn, rn64) = get_gpr_strict(operands, 1)?;
+    let (rm, rm64) = get_gpr_strict(operands, 2)?;
+    check_same_width(false, &[rn64, rm64])?;
     // UMADDL: 1 00 11011 101 Rm 0 11111 Rn Rd (Ra=XZR makes it UMULL)
     let word = (1u32 << 31) | (0b0011011101 << 21) | (rm << 16) | (0b011111 << 10) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
 }
 
 /// Encode SMADDL Xd, Wn, Wm, Xa (signed multiply-add long)
-pub(crate) fn encode_smaddl(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, _) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-    let (rm, _) = get_reg(operands, 2)?;
-    let (ra, _) = get_reg(operands, 3)?;
+pub fn encode_smaddl(operands: &[Operand]) -> Result<EncodeResult, String> {
+    let rd = get_gpr_strict_x(operands, 0)?;
+    let (rn, rn64) = get_gpr_strict(operands, 1)?;
+    let (rm, rm64) = get_gpr_strict(operands, 2)?;
+    let ra = get_gpr_strict_x(operands, 3)?;
+    check_same_width(false, &[rn64, rm64])?;
     // SMADDL: 1 00 11011 001 Rm 0 Ra Rn Rd
     let word = (1u32 << 31) | (0b0011011001 << 21) | (rm << 16) | (ra << 10) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
 }
 
 /// Encode UMADDL Xd, Wn, Wm, Xa (unsigned multiply-add long)
-pub(crate) fn encode_umaddl(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, _) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-    let (rm, _) = get_reg(operands, 2)?;
-    let (ra, _) = get_reg(operands, 3)?;
+pub fn encode_umaddl(operands: &[Operand]) -> Result<EncodeResult, String> {
+    let rd = get_gpr_strict_x(operands, 0)?;
+    let (rn, rn64) = get_gpr_strict(operands, 1)?;
+    let (rm, rm64) = get_gpr_strict(operands, 2)?;
+    let ra = get_gpr_strict_x(operands, 3)?;
+    check_same_width(false, &[rn64, rm64])?;
     // UMADDL: 1 00 11011 101 Rm 0 Ra Rn Rd
     let word = (1u32 << 31) | (0b0011011101 << 21) | (rm << 16) | (ra << 10) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
 }
 
 /// Encode MNEG Xd, Xn, Xm -> MSUB Xd, Xn, Xm, XZR
-pub(crate) fn encode_mneg(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-    let (rm, _) = get_reg(operands, 2)?;
+pub fn encode_mneg(operands: &[Operand]) -> Result<EncodeResult, String> {
+    let (rd, is_64) = get_gpr_strict(operands, 0)?;
+    let (rn, rn64) = get_gpr_strict(operands, 1)?;
+    let (rm, rm64) = get_gpr_strict(operands, 2)?;
+    check_same_width(is_64, &[rn64, rm64])?;
     let sf = sf_bit(is_64);
     // MSUB with Ra=XZR: sf 00 11011 000 Rm 1 11111 Rn Rd
     let word = (sf << 31)
@@ -855,28 +887,29 @@ pub(crate) fn encode_mneg(operands: &[Operand]) -> Result<EncodeResult, String> 
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_umulh(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, _) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-    let (rm, _) = get_reg(operands, 2)?;
+pub fn encode_umulh(operands: &[Operand]) -> Result<EncodeResult, String> {
+    let rd = get_gpr_strict_x(operands, 0)?;
+    let rn = get_gpr_strict_x(operands, 1)?;
+    let rm = get_gpr_strict_x(operands, 2)?;
     // UMULH: 1 00 11011 1 10 Rm 0 11111 Rn Rd
     let word = (1u32 << 31) | (0b0011011110 << 21) | (rm << 16) | (0b011111 << 10) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_smulh(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, _) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-    let (rm, _) = get_reg(operands, 2)?;
+pub fn encode_smulh(operands: &[Operand]) -> Result<EncodeResult, String> {
+    let rd = get_gpr_strict_x(operands, 0)?;
+    let rn = get_gpr_strict_x(operands, 1)?;
+    let rm = get_gpr_strict_x(operands, 2)?;
     // SMULH: 1 00 11011 0 10 Rm 0 11111 Rn Rd
     let word = (1u32 << 31) | (0b0011011010 << 21) | (rm << 16) | (0b011111 << 10) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_neg(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_neg(operands: &[Operand]) -> Result<EncodeResult, String> {
     // NEG Rd, Rm [, shift #amount] -> SUB Rd, XZR, Rm [, shift #amount]
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rm, _) = get_reg(operands, 1)?;
+    let (rd, is_64) = get_gpr_strict(operands, 0)?;
+    let (rm, rm64) = get_gpr_strict(operands, 1)?;
+    check_same_width(is_64, &[rm64])?;
     let sf = sf_bit(is_64);
     let (shift_type, shift_amount) = if let Some(Operand::Shift { kind, amount }) = operands.get(2)
     {
@@ -901,10 +934,11 @@ pub(crate) fn encode_neg(operands: &[Operand]) -> Result<EncodeResult, String> {
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_negs(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_negs(operands: &[Operand]) -> Result<EncodeResult, String> {
     // NEGS Rd, Rm [, shift #amount] -> SUBS Rd, XZR, Rm [, shift #amount]
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rm, _) = get_reg(operands, 1)?;
+    let (rd, is_64) = get_gpr_strict(operands, 0)?;
+    let (rm, rm64) = get_gpr_strict(operands, 1)?;
+    check_same_width(is_64, &[rm64])?;
     let sf = sf_bit(is_64);
     let (shift_type, shift_amount) = if let Some(Operand::Shift { kind, amount }) = operands.get(2)
     {
@@ -930,14 +964,15 @@ pub(crate) fn encode_negs(operands: &[Operand]) -> Result<EncodeResult, String> 
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_mvn(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_mvn(operands: &[Operand]) -> Result<EncodeResult, String> {
     // NEON vector form: MVN Vd.T, Vn.T (alias of NOT)
     if let Some(Operand::RegArrangement { .. }) = operands.first() {
         return encode_neon_not(operands);
     }
     // MVN Rd, Rm [, shift #amount] -> ORN Rd, XZR, Rm [, shift #amount]
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rm, _) = get_reg(operands, 1)?;
+    let (rd, is_64) = get_gpr_strict(operands, 0)?;
+    let (rm, rm64) = get_gpr_strict(operands, 1)?;
+    check_same_width(is_64, &[rm64])?;
     let sf = sf_bit(is_64);
     let (shift_type, shift_amount) = if let Some(Operand::Shift { kind, amount }) = operands.get(2)
     {
@@ -964,20 +999,22 @@ pub(crate) fn encode_mvn(operands: &[Operand]) -> Result<EncodeResult, String> {
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_adc(operands: &[Operand], set_flags: bool) -> Result<EncodeResult, String> {
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-    let (rm, _) = get_reg(operands, 2)?;
+pub fn encode_adc(operands: &[Operand], set_flags: bool) -> Result<EncodeResult, String> {
+    let (rd, is_64) = get_gpr_strict(operands, 0)?;
+    let (rn, rn64) = get_gpr_strict(operands, 1)?;
+    let (rm, rm64) = get_gpr_strict(operands, 2)?;
+    check_same_width(is_64, &[rn64, rm64])?;
     let sf = sf_bit(is_64);
     let s = if set_flags { 1u32 } else { 0 };
     let word = ((sf << 31) | (s << 29) | (0b11010000 << 21) | (rm << 16)) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_sbc(operands: &[Operand], set_flags: bool) -> Result<EncodeResult, String> {
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-    let (rm, _) = get_reg(operands, 2)?;
+pub fn encode_sbc(operands: &[Operand], set_flags: bool) -> Result<EncodeResult, String> {
+    let (rd, is_64) = get_gpr_strict(operands, 0)?;
+    let (rn, rn64) = get_gpr_strict(operands, 1)?;
+    let (rm, rm64) = get_gpr_strict(operands, 2)?;
+    check_same_width(is_64, &[rn64, rm64])?;
     let sf = sf_bit(is_64);
     let s = if set_flags { 1u32 } else { 0 };
     let word =
@@ -987,7 +1024,7 @@ pub(crate) fn encode_sbc(operands: &[Operand], set_flags: bool) -> Result<Encode
 
 // ── Shifts ───────────────────────────────────────────────────────────────
 
-pub(crate) fn encode_shift(operands: &[Operand], shift_type: u32) -> Result<EncodeResult, String> {
+pub fn encode_shift(operands: &[Operand], shift_type: u32) -> Result<EncodeResult, String> {
     let (rd, is_64) = get_reg(operands, 0)?;
     let (rn, _) = get_reg(operands, 1)?;
 
@@ -1077,33 +1114,33 @@ pub(crate) fn encode_shift(operands: &[Operand], shift_type: u32) -> Result<Enco
 
 // ── Extensions ───────────────────────────────────────────────────────────
 
-pub(crate) fn encode_sxtw(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_sxtw(operands: &[Operand]) -> Result<EncodeResult, String> {
     // SXTW Xd, Wn -> SBFM Xd, Xn, #0, #31
-    let (rd, _) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
+    let rd = get_gpr_strict_x(operands, 0)?;
+    let (rn, _) = get_gpr_strict(operands, 1)?;
     let word = ((1u32 << 31) | (0b100110 << 23) | (1 << 22)) | (31 << 10) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_sxth(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
+pub fn encode_sxth(operands: &[Operand]) -> Result<EncodeResult, String> {
+    let (rd, is_64) = get_gpr_strict(operands, 0)?;
+    let (rn, _) = get_gpr_strict(operands, 1)?;
     let sf = sf_bit(is_64);
     let n = if is_64 { 1u32 } else { 0 };
     let word = ((sf << 31) | (0b100110 << 23) | (n << 22)) | (15 << 10) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_sxtb(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
+pub fn encode_sxtb(operands: &[Operand]) -> Result<EncodeResult, String> {
+    let (rd, is_64) = get_gpr_strict(operands, 0)?;
+    let (rn, _) = get_gpr_strict(operands, 1)?;
     let sf = sf_bit(is_64);
     let n = if is_64 { 1u32 } else { 0 };
     let word = ((sf << 31) | (0b100110 << 23) | (n << 22)) | (7 << 10) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_uxtw(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_uxtw(operands: &[Operand]) -> Result<EncodeResult, String> {
     // UXTW is MOV Wd, Wn (the upper 32 bits are zeroed)
     // Or: UBFM Xd, Xn, #0, #31
     let (rd, _) = get_reg(operands, 0)?;
@@ -1113,9 +1150,9 @@ pub(crate) fn encode_uxtw(operands: &[Operand]) -> Result<EncodeResult, String> 
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_uxth(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
+pub fn encode_uxth(operands: &[Operand]) -> Result<EncodeResult, String> {
+    let (rd, is_64) = get_gpr_strict(operands, 0)?;
+    let (rn, _) = get_gpr_strict(operands, 1)?;
     let sf = sf_bit(is_64);
     let n = if is_64 { 1u32 } else { 0 };
     let word =
@@ -1123,9 +1160,9 @@ pub(crate) fn encode_uxth(operands: &[Operand]) -> Result<EncodeResult, String> 
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_uxtb(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
+pub fn encode_uxtb(operands: &[Operand]) -> Result<EncodeResult, String> {
+    let (rd, is_64) = get_gpr_strict(operands, 0)?;
+    let (rn, _) = get_gpr_strict(operands, 1)?;
     let sf = sf_bit(is_64);
     let n = if is_64 { 1u32 } else { 0 };
     let word =
@@ -1134,7 +1171,7 @@ pub(crate) fn encode_uxtb(operands: &[Operand]) -> Result<EncodeResult, String> 
 }
 
 /// Encode ORN (logical OR NOT): ORN Rd, Rn, Rm (scalar or vector)
-pub(crate) fn encode_orn(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_orn(operands: &[Operand]) -> Result<EncodeResult, String> {
     if operands.len() < 3 {
         return Err("orn requires 3 operands".to_string());
     }
@@ -1157,9 +1194,10 @@ pub(crate) fn encode_orn(operands: &[Operand]) -> Result<EncodeResult, String> {
         return Ok(EncodeResult::Word(word));
     }
 
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-    let (rm, _) = get_reg(operands, 2)?;
+    let (rd, is_64) = get_gpr_strict(operands, 0)?;
+    let (rn, rn64) = get_gpr_strict(operands, 1)?;
+    let (rm, rm64) = get_gpr_strict(operands, 2)?;
+    check_same_width(is_64, &[rn64, rm64])?;
     let sf = sf_bit(is_64);
 
     let (shift_type, shift_amount) = if let Some(Operand::Shift { kind, amount }) = operands.get(3)
@@ -1190,13 +1228,14 @@ pub(crate) fn encode_orn(operands: &[Operand]) -> Result<EncodeResult, String> {
 }
 
 /// Encode EON (exclusive OR NOT): EON Rd, Rn, Rm [, shift #amount]
-pub(crate) fn encode_eon(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_eon(operands: &[Operand]) -> Result<EncodeResult, String> {
     if operands.len() < 3 {
         return Err("eon requires 3 operands".to_string());
     }
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-    let (rm, _) = get_reg(operands, 2)?;
+    let (rd, is_64) = get_gpr_strict(operands, 0)?;
+    let (rn, rn64) = get_gpr_strict(operands, 1)?;
+    let (rm, rm64) = get_gpr_strict(operands, 2)?;
+    check_same_width(is_64, &[rn64, rm64])?;
     let sf = sf_bit(is_64);
 
     let (shift_type, shift_amount) = if let Some(Operand::Shift { kind, amount }) = operands.get(3)
@@ -1227,13 +1266,14 @@ pub(crate) fn encode_eon(operands: &[Operand]) -> Result<EncodeResult, String> {
 }
 
 /// Encode BICS (bitwise clear, setting flags): BICS Rd, Rn, Rm [, shift #amount]
-pub(crate) fn encode_bics(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_bics(operands: &[Operand]) -> Result<EncodeResult, String> {
     if operands.len() < 3 {
         return Err("bics requires 3 operands".to_string());
     }
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-    let (rm, _) = get_reg(operands, 2)?;
+    let (rd, is_64) = get_gpr_strict(operands, 0)?;
+    let (rn, rn64) = get_gpr_strict(operands, 1)?;
+    let (rm, rm64) = get_gpr_strict(operands, 2)?;
+    check_same_width(is_64, &[rn64, rm64])?;
     let sf = sf_bit(is_64);
 
     let (shift_type, shift_amount) = if let Some(Operand::Shift { kind, amount }) = operands.get(3)
@@ -1267,7 +1307,7 @@ pub(crate) fn encode_bics(operands: &[Operand]) -> Result<EncodeResult, String> 
 /// Scalar register: BIC Xd, Xn, Xm [, shift #amount] -> AND NOT (opc=00, N=1)
 /// Scalar immediate: BIC Xd, Xn, #imm -> AND Xd, Xn, #~imm
 /// NEON vector: BIC Vd.T, Vn.T, Vm.T
-pub(crate) fn encode_bic(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_bic(operands: &[Operand]) -> Result<EncodeResult, String> {
     if operands.len() < 3 {
         return Err("bic requires 3 operands".to_string());
     }
@@ -1277,8 +1317,9 @@ pub(crate) fn encode_bic(operands: &[Operand]) -> Result<EncodeResult, String> {
         return encode_neon_bic(operands);
     }
 
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
+    let (rd, is_64) = get_gpr_strict(operands, 0)?;
+    let (rn, rn64) = get_gpr_strict(operands, 1)?;
+    check_same_width(is_64, &[rn64])?;
     let sf = sf_bit(is_64);
 
     // BIC Xd, Xn, #imm -> AND Xd, Xn, #~imm (bitmask immediate, inverted)
@@ -1309,6 +1350,9 @@ pub(crate) fn encode_bic(operands: &[Operand]) -> Result<EncodeResult, String> {
     // BIC Xd, Xn, Xm [, shift #amount]: sf 00 01010 shift 1 Rm imm6 Rn Rd (N=1)
     if let Some(Operand::Reg(rm_name)) = operands.get(2) {
         let rm = parse_reg_num(rm_name).ok_or("invalid rm register for bic")?;
+        if is_64bit_reg(rm_name) != is_64 {
+            return Err("bic: register width mismatch (mixed x/w operands)".to_string());
+        }
 
         let (shift_type, shift_amount) =
             if let Some(Operand::Shift { kind, amount }) = operands.get(3) {

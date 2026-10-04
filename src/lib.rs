@@ -124,6 +124,46 @@ pub(crate) mod pgo;
 #[cfg(test)]
 pub(crate) mod test_support;
 
+/// Test-internals re-exports for the property-based integration test
+/// binaries under `tests/pbt/`.
+///
+/// Why this exists: the PBT campaign (transplanted from
+/// thanhtoantnt/claudes-c-compiler and adapted) is ~60k lines of test code.
+/// Compiled as part of the monolithic lib-test binary, the single `rustc`
+/// invocation for crate + tests exceeds the memory budget of the constrained
+/// research host (kernel-OOM at ~3.6 GB RSS with the co-tenant web preview).
+/// As separate integration-test binaries, each suite compiles in a small
+/// `rustc` run that links the already-built rlib, and the lib-test compile
+/// stays at its pre-transplant weight.
+///
+/// The re-exports are `#[doc(hidden)]`: they are an implementation detail of
+/// this binary crate's own test suite, not API surface. The visibility
+/// promotion of the underlying functions (`pub(crate)` -> `pub`) is likewise
+/// inert for every shipped binary.
+#[doc(hidden)]
+pub mod pbt_internals {
+    // AArch64 assembler encoder surface (Operand/EncodeResult/relocations,
+    // every encode_* entry point and the shared operand-reading helpers).
+    pub use crate::backend::arm::assembler::encoder::*;
+    pub use crate::backend::arm::assembler::parser::Operand;
+    // Constant folding / long-double conversions.
+    pub use crate::common::const_arith::{
+        eval_const_binop, eval_const_binop_float, truncate_and_extend_bits,
+    };
+    pub use crate::common::const_eval::{
+        eval_binop_with_types, eval_builtin_call, eval_literal, irconst_to_bits, promote_sub_int,
+    };
+    pub use crate::common::long_double::{
+        f64_to_f128_bytes_lossless, f64_to_x87_bytes_simple, f128_bytes_to_f64, x87_bytes_to_f64,
+    };
+    pub use crate::common::source::Span;
+    // Preprocessor constant-expression evaluator.
+    pub use crate::frontend::preprocessor::conditionals::eval_const_expr;
+    // AST types used by the const-eval suites.
+    pub use crate::frontend::parser::ast::{BinOp, Expr};
+    pub use crate::ir::reexports::IrConst;
+}
+
 /// Shared entry point for all compiler binaries. Spawns the real work on a
 /// thread with a large stack so deeply recursive C files don't overflow.
 pub fn compiler_main() {

@@ -4,7 +4,7 @@ use crate::backend::arm::assembler::parser::Operand;
 // ── Bitfield extract/insert ──────────────────────────────────────────────
 
 /// Encode UBFX Rd, Rn, #lsb, #width -> UBFM Rd, Rn, #lsb, #(lsb+width-1)
-pub(crate) fn encode_ubfx(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_ubfx(operands: &[Operand]) -> Result<EncodeResult, String> {
     let (rd, is_64) = get_reg(operands, 0)?;
     let (rn, _) = get_reg(operands, 1)?;
     let lsb = get_imm(operands, 2)? as u32;
@@ -26,7 +26,7 @@ pub(crate) fn encode_ubfx(operands: &[Operand]) -> Result<EncodeResult, String> 
 }
 
 /// Encode SBFX Rd, Rn, #lsb, #width -> SBFM Rd, Rn, #lsb, #(lsb+width-1)
-pub(crate) fn encode_sbfx(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_sbfx(operands: &[Operand]) -> Result<EncodeResult, String> {
     let (rd, is_64) = get_reg(operands, 0)?;
     let (rn, _) = get_reg(operands, 1)?;
     let lsb = get_imm(operands, 2)? as u32;
@@ -42,7 +42,7 @@ pub(crate) fn encode_sbfx(operands: &[Operand]) -> Result<EncodeResult, String> 
 }
 
 /// Encode UBFM Rd, Rn, #immr, #imms (raw form)
-pub(crate) fn encode_ubfm(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_ubfm(operands: &[Operand]) -> Result<EncodeResult, String> {
     let (rd, is_64) = get_reg(operands, 0)?;
     let (rn, _) = get_reg(operands, 1)?;
     let immr = get_imm(operands, 2)? as u32;
@@ -61,7 +61,7 @@ pub(crate) fn encode_ubfm(operands: &[Operand]) -> Result<EncodeResult, String> 
 }
 
 /// Encode SBFM Rd, Rn, #immr, #imms (raw form)
-pub(crate) fn encode_sbfm(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_sbfm(operands: &[Operand]) -> Result<EncodeResult, String> {
     let (rd, is_64) = get_reg(operands, 0)?;
     let (rn, _) = get_reg(operands, 1)?;
     let immr = get_imm(operands, 2)? as u32;
@@ -74,7 +74,7 @@ pub(crate) fn encode_sbfm(operands: &[Operand]) -> Result<EncodeResult, String> 
 }
 
 /// Encode SBFIZ Rd, Rn, #lsb, #width — alias for SBFM Rd, Rn, #(-lsb MOD regsize), #(width-1)
-pub(crate) fn encode_sbfiz(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_sbfiz(operands: &[Operand]) -> Result<EncodeResult, String> {
     let (rd, is_64) = get_reg(operands, 0)?;
     let (rn, _) = get_reg(operands, 1)?;
     let lsb = get_imm(operands, 2)? as u32;
@@ -90,7 +90,7 @@ pub(crate) fn encode_sbfiz(operands: &[Operand]) -> Result<EncodeResult, String>
 }
 
 /// Encode UBFIZ Rd, Rn, #lsb, #width — alias for UBFM Rd, Rn, #(-lsb MOD regsize), #(width-1)
-pub(crate) fn encode_ubfiz(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_ubfiz(operands: &[Operand]) -> Result<EncodeResult, String> {
     let (rd, is_64) = get_reg(operands, 0)?;
     let (rn, _) = get_reg(operands, 1)?;
     let lsb = get_imm(operands, 2)? as u32;
@@ -112,7 +112,7 @@ pub(crate) fn encode_ubfiz(operands: &[Operand]) -> Result<EncodeResult, String>
 }
 
 /// Encode BFM Rd, Rn, #immr, #imms (bitfield move)
-pub(crate) fn encode_bfm(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_bfm(operands: &[Operand]) -> Result<EncodeResult, String> {
     let (rd, is_64) = get_reg(operands, 0)?;
     let (rn, _) = get_reg(operands, 1)?;
     let immr = get_imm(operands, 2)? as u32;
@@ -132,7 +132,7 @@ pub(crate) fn encode_bfm(operands: &[Operand]) -> Result<EncodeResult, String> {
 }
 
 /// Encode BFI Rd, Rn, #lsb, #width -> BFM Rd, Rn, #(-lsb mod width_reg), #(width-1)
-pub(crate) fn encode_bfi(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_bfi(operands: &[Operand]) -> Result<EncodeResult, String> {
     let (rd, is_64) = get_reg(operands, 0)?;
     let (rn, _) = get_reg(operands, 1)?;
     let lsb = get_imm(operands, 2)? as u32;
@@ -154,7 +154,7 @@ pub(crate) fn encode_bfi(operands: &[Operand]) -> Result<EncodeResult, String> {
 }
 
 /// Encode BFXIL Rd, Rn, #lsb, #width -> BFM Rd, Rn, #lsb, #(lsb+width-1)
-pub(crate) fn encode_bfxil(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_bfxil(operands: &[Operand]) -> Result<EncodeResult, String> {
     let (rd, is_64) = get_reg(operands, 0)?;
     let (rn, _) = get_reg(operands, 1)?;
     let lsb = get_imm(operands, 2)? as u32;
@@ -175,7 +175,7 @@ pub(crate) fn encode_bfxil(operands: &[Operand]) -> Result<EncodeResult, String>
 }
 
 /// Encode EXTR Rd, Rn, Rm, #lsb
-pub(crate) fn encode_extr(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_extr(operands: &[Operand]) -> Result<EncodeResult, String> {
     let (rd, is_64) = get_reg(operands, 0)?;
     let (rn, _) = get_reg(operands, 1)?;
     let (rm, _) = get_reg(operands, 2)?;
@@ -190,7 +190,7 @@ pub(crate) fn encode_extr(operands: &[Operand]) -> Result<EncodeResult, String> 
 
 // ── Bit manipulation ─────────────────────────────────────────────────────
 
-pub(crate) fn encode_clz(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_clz(operands: &[Operand]) -> Result<EncodeResult, String> {
     let (rd, is_64) = get_reg(operands, 0)?;
     let (rn, _) = get_reg(operands, 1)?;
     let sf = sf_bit(is_64);
@@ -199,7 +199,7 @@ pub(crate) fn encode_clz(operands: &[Operand]) -> Result<EncodeResult, String> {
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_cls(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_cls(operands: &[Operand]) -> Result<EncodeResult, String> {
     let (rd, is_64) = get_reg(operands, 0)?;
     let (rn, _) = get_reg(operands, 1)?;
     let sf = sf_bit(is_64);
@@ -207,7 +207,7 @@ pub(crate) fn encode_cls(operands: &[Operand]) -> Result<EncodeResult, String> {
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_rbit(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_rbit(operands: &[Operand]) -> Result<EncodeResult, String> {
     // NEON vector form: RBIT Vd.T, Vn.T (reverse bits in each byte)
     if let Some(Operand::RegArrangement { .. }) = operands.first() {
         let (rd, arr_d) = get_neon_reg(operands, 0)?;
@@ -233,7 +233,7 @@ pub(crate) fn encode_rbit(operands: &[Operand]) -> Result<EncodeResult, String> 
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_rev(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_rev(operands: &[Operand]) -> Result<EncodeResult, String> {
     let (rd, is_64) = get_reg(operands, 0)?;
     let (rn, _) = get_reg(operands, 1)?;
     let sf = sf_bit(is_64);
@@ -242,7 +242,7 @@ pub(crate) fn encode_rev(operands: &[Operand]) -> Result<EncodeResult, String> {
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_rev16(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_rev16(operands: &[Operand]) -> Result<EncodeResult, String> {
     let (rd, is_64) = get_reg(operands, 0)?;
     let (rn, _) = get_reg(operands, 1)?;
     let sf = sf_bit(is_64);
@@ -250,7 +250,7 @@ pub(crate) fn encode_rev16(operands: &[Operand]) -> Result<EncodeResult, String>
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_rev32(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_rev32(operands: &[Operand]) -> Result<EncodeResult, String> {
     // Check for NEON vector form: REV32 Vd.T, Vn.T
     if let Some(Operand::RegArrangement { .. }) = operands.first() {
         let (rd, arr_d) = get_neon_reg(operands, 0)?;
@@ -276,7 +276,7 @@ pub(crate) fn encode_rev32(operands: &[Operand]) -> Result<EncodeResult, String>
 
 // ── CRC32 ────────────────────────────────────────────────────────────────
 
-pub(crate) fn encode_crc32(mnemonic: &str, operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_crc32(mnemonic: &str, operands: &[Operand]) -> Result<EncodeResult, String> {
     let (rd, _) = get_reg(operands, 0)?;
     let (rn, _) = get_reg(operands, 1)?;
     let (rm, _) = get_reg(operands, 2)?;

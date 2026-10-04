@@ -4,10 +4,7 @@ use crate::backend::arm::assembler::parser::Operand;
 // ── Loads/Stores ─────────────────────────────────────────────────────────
 
 /// Auto-detect LDR/STR size from the first register operand.
-pub(crate) fn encode_ldr_str_auto(
-    operands: &[Operand],
-    is_load: bool,
-) -> Result<EncodeResult, String> {
+pub fn encode_ldr_str_auto(operands: &[Operand], is_load: bool) -> Result<EncodeResult, String> {
     // Determine size from register: Wn -> 32-bit (size=10), Xn -> 64-bit (size=11)
     // FP: Sn -> 32-bit, Dn -> 64-bit, Qn -> 128-bit
     let reg_name = match operands.first() {
@@ -34,7 +31,7 @@ pub(crate) fn encode_ldr_str_auto(
     encode_ldr_str(operands, is_load, size, false, is_128bit)
 }
 
-pub(crate) fn encode_ldr_str(
+pub fn encode_ldr_str(
     operands: &[Operand],
     is_load: bool,
     size: u32,
@@ -316,7 +313,7 @@ pub(crate) fn encode_ldr_str(
 
 /// Encode LDUR/STUR (unscaled immediate offset load/store)
 /// Format: size 111 V 00 opc 0 imm9 00 Rn Rt
-pub(crate) fn encode_ldur_stur(
+pub fn encode_ldur_stur(
     operands: &[Operand],
     is_load: bool,
     op2_bits: u32,
@@ -378,7 +375,7 @@ pub(crate) fn encode_ldur_stur(
 }
 
 /// Encode LDTR/STTR with explicit size (for ldtrh, ldtrb, etc.)
-pub(crate) fn encode_ldtr_sized(
+pub fn encode_ldtr_sized(
     operands: &[Operand],
     is_load: bool,
     size: u32,
@@ -406,7 +403,7 @@ pub(crate) fn encode_ldtr_sized(
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_ldrsw(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_ldrsw(operands: &[Operand]) -> Result<EncodeResult, String> {
     if operands.len() < 2 {
         return Err("ldrsw requires 2 operands".to_string());
     }
@@ -509,7 +506,7 @@ pub(crate) fn encode_ldrsw(operands: &[Operand]) -> Result<EncodeResult, String>
     Err(format!("unsupported ldrsw operands: {:?}", operands))
 }
 
-pub(crate) fn encode_ldrs(operands: &[Operand], size: u32) -> Result<EncodeResult, String> {
+pub fn encode_ldrs(operands: &[Operand], size: u32) -> Result<EncodeResult, String> {
     // LDRSB/LDRSH: sign-extending byte/halfword loads
     if operands.len() < 2 {
         return Err("ldrsb/ldrsh requires 2 operands".to_string());
@@ -617,7 +614,7 @@ pub(crate) fn encode_ldrs(operands: &[Operand], size: u32) -> Result<EncodeResul
     Err(format!("unsupported ldrsb/ldrsh operands: {:?}", operands))
 }
 
-pub(crate) fn encode_ldp_stp(operands: &[Operand], is_load: bool) -> Result<EncodeResult, String> {
+pub fn encode_ldp_stp(operands: &[Operand], is_load: bool) -> Result<EncodeResult, String> {
     if operands.len() < 3 {
         return Err("ldp/stp requires 3 operands".to_string());
     }
@@ -733,10 +730,7 @@ pub(crate) fn encode_ldp_stp(operands: &[Operand], is_load: bool) -> Result<Enco
 /// Encode LDNP/STNP (load/store pair non-temporal)
 /// Encoding: opc 101 V 000 L imm7 Rt2 Rn Rt
 /// TODO: Only handles integer registers (V=0). FP/SIMD register support needed for V=1.
-pub(crate) fn encode_ldnp_stnp(
-    operands: &[Operand],
-    is_load: bool,
-) -> Result<EncodeResult, String> {
+pub fn encode_ldnp_stnp(operands: &[Operand], is_load: bool) -> Result<EncodeResult, String> {
     if operands.len() < 3 {
         return Err("ldnp/stnp requires 3 operands".to_string());
     }
@@ -770,7 +764,7 @@ pub(crate) fn encode_ldnp_stnp(
 
 /// Encode LDXR/STXR and byte/halfword variants.
 /// `forced_size`: None = auto-detect from register width, Some(0b00) = byte, Some(0b01) = halfword
-pub(crate) fn encode_ldxr_stxr(
+pub fn encode_ldxr_stxr(
     operands: &[Operand],
     is_load: bool,
     forced_size: Option<u32>,
@@ -802,7 +796,7 @@ pub(crate) fn encode_ldxr_stxr(
 }
 
 /// Encode LDAXR/STLXR and byte/halfword variants.
-pub(crate) fn encode_ldaxr_stlxr(
+pub fn encode_ldaxr_stlxr(
     operands: &[Operand],
     is_load: bool,
     forced_size: Option<u32>,
@@ -847,7 +841,7 @@ pub(crate) fn encode_ldaxr_stlxr(
 /// LDAXP Xt1, Xt2, [Xn]  : sz 001000 0 1 1 11111 1 Rt2 Rn Rt
 /// STXP  Ws, Xt1, Xt2, [Xn] : sz 001000 0 0 1 Rs 0 Rt2 Rn Rt
 /// STLXP Ws, Xt1, Xt2, [Xn] : sz 001000 0 0 1 Rs 1 Rt2 Rn Rt
-pub(crate) fn encode_ldxp_stxp(
+pub fn encode_ldxp_stxp(
     operands: &[Operand],
     is_load: bool,
     acquire_release: bool,
@@ -903,7 +897,7 @@ pub(crate) fn encode_ldxp_stxp(
 }
 
 /// Encode LDAR/STLR and byte/halfword variants.
-pub(crate) fn encode_ldar_stlr(
+pub fn encode_ldar_stlr(
     operands: &[Operand],
     is_load: bool,
     forced_size: Option<u32>,
@@ -927,7 +921,7 @@ pub(crate) fn encode_ldar_stlr(
 
 // ── Address computation ──────────────────────────────────────────────────
 
-pub(crate) fn encode_adrp(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_adrp(operands: &[Operand]) -> Result<EncodeResult, String> {
     let (rd, _) = get_reg(operands, 0)?;
 
     let (sym, addend) = match operands.get(1) {
@@ -972,7 +966,7 @@ pub(crate) fn encode_adrp(operands: &[Operand]) -> Result<EncodeResult, String> 
     })
 }
 
-pub(crate) fn encode_adr(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_adr(operands: &[Operand]) -> Result<EncodeResult, String> {
     let (rd, _) = get_reg(operands, 0)?;
 
     // Check for immediate offset form: adr Rd, #imm
@@ -1005,7 +999,7 @@ pub(crate) fn encode_adr(operands: &[Operand]) -> Result<EncodeResult, String> {
 /// Format: PRFM <prfop>, [<Xn|SP>{, #<pimm>}]
 /// Encoding: 1111 1001 10 imm12 Rn Rt
 /// where Rt is the 5-bit prefetch operation type.
-pub(crate) fn encode_prfm(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_prfm(operands: &[Operand]) -> Result<EncodeResult, String> {
     if operands.len() < 2 {
         return Err("prfm requires 2 operands".to_string());
     }
@@ -1101,7 +1095,7 @@ pub(crate) fn encode_prfm(operands: &[Operand]) -> Result<EncodeResult, String> 
 }
 
 /// Map prefetch operation name to its 5-bit encoding.
-pub(crate) fn encode_prfop(name: &str) -> Result<u32, String> {
+pub fn encode_prfop(name: &str) -> Result<u32, String> {
     match name.to_lowercase().as_str() {
         "pldl1keep" => Ok(0b00000),
         "pldl1strm" => Ok(0b00001),
@@ -1165,7 +1159,7 @@ fn parse_atomic_order_suffix(
 /// Encode CAS/CASA/CASAL/CASL and byte/halfword variants (Compare and Swap).
 /// CAS  SZ  |001000|1|A|1|Rs|R|11111|Rn|Rt   (LLVM AArch64InstrFormats.td;
 /// round-trip verified against Capstone for all twelve order/size forms)
-pub(crate) fn encode_cas(mnemonic: &str, operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_cas(mnemonic: &str, operands: &[Operand]) -> Result<EncodeResult, String> {
     if operands.len() < 3 {
         return Err(format!("{} requires 3 operands", mnemonic));
     }
@@ -1215,7 +1209,7 @@ pub(crate) fn encode_cas(mnemonic: &str, operands: &[Operand]) -> Result<EncodeR
 /// Only Xs and Xt occupy encoding fields; Xs+1 / Xt+1 are architecturally
 /// implied, so the text operands are validated to match exactly (GAS
 /// parity: even-numbered start register, consecutive pairs, uniform width).
-pub(crate) fn encode_casp(mnemonic: &str, operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_casp(mnemonic: &str, operands: &[Operand]) -> Result<EncodeResult, String> {
     if operands.len() != 5 {
         return Err(format!(
             "{} requires exactly 5 operands (Xs, Xs+1, Xt, Xt+1, [Xn])",
@@ -1317,7 +1311,7 @@ pub(crate) fn encode_casp(mnemonic: &str, operands: &[Operand]) -> Result<Encode
 /// Encode SWP/SWPA/SWPAL/SWPL and byte/halfword variants (Swap).
 /// SWP Xs, Xt, [Xn]: size 111000 AR 1 Rs 1 000 00 Rn Rt
 /// Variants: swp, swpa, swpal, swpl, swpb, swpab, swpalb, swplb, swph, swpah, swpalh, swplh
-pub(crate) fn encode_swp(mnemonic: &str, operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_swp(mnemonic: &str, operands: &[Operand]) -> Result<EncodeResult, String> {
     if operands.len() < 3 {
         return Err(format!("{} requires 3 operands", mnemonic));
     }
@@ -1357,7 +1351,7 @@ pub(crate) fn encode_swp(mnemonic: &str, operands: &[Operand]) -> Result<EncodeR
 /// Encode LDADD/LDCLR/LDEOR/LDSET and their acquire/release/byte/halfword variants (LSE atomics).
 /// LDADD Rs, Rt, [Xn]: size 111000 A R 1 Rs 0 opc 00 Rn Rt
 /// opc: LDADD=000, LDCLR=001, LDEOR=010, LDSET=011
-pub(crate) fn encode_ldop(mnemonic: &str, operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_ldop(mnemonic: &str, operands: &[Operand]) -> Result<EncodeResult, String> {
     if operands.len() < 3 {
         return Err(format!("{} requires 3 operands", mnemonic));
     }
@@ -1409,7 +1403,7 @@ pub(crate) fn encode_ldop(mnemonic: &str, operands: &[Operand]) -> Result<Encode
 /// These are aliases for LDADD/LDCLR/LDEOR/LDSET with Rt=XZR (register 31).
 /// STADD Ws, [Xn] encodes as LDADD Ws, WZR, [Xn]
 /// Variants: stadd/stclr/steor/stset, plus 'l' (release), 'b' (byte), 'h' (half).
-pub(crate) fn encode_stop(mnemonic: &str, operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_stop(mnemonic: &str, operands: &[Operand]) -> Result<EncodeResult, String> {
     if operands.len() < 2 {
         return Err(format!("{} requires 2 operands", mnemonic));
     }

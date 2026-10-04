@@ -3,7 +3,7 @@ use crate::backend::arm::assembler::parser::Operand;
 
 // ── System instructions ──────────────────────────────────────────────────
 
-pub(crate) fn encode_dmb(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_dmb(operands: &[Operand]) -> Result<EncodeResult, String> {
     let option = match operands.first() {
         Some(Operand::Barrier(b)) | Some(Operand::Symbol(b)) => match b.to_lowercase().as_str() {
             "sy" => 0b1111u32,
@@ -27,7 +27,7 @@ pub(crate) fn encode_dmb(operands: &[Operand]) -> Result<EncodeResult, String> {
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_dsb(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_dsb(operands: &[Operand]) -> Result<EncodeResult, String> {
     let option = match operands.first() {
         Some(Operand::Barrier(b)) | Some(Operand::Symbol(b)) => match b.to_lowercase().as_str() {
             "sy" => 0b1111u32,
@@ -51,7 +51,7 @@ pub(crate) fn encode_dsb(operands: &[Operand]) -> Result<EncodeResult, String> {
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_mrs(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_mrs(operands: &[Operand]) -> Result<EncodeResult, String> {
     // MRS Xt, system_reg
     let (rt, _) = get_reg(operands, 0)?;
     let sysreg = match operands.get(1) {
@@ -181,13 +181,13 @@ pub(crate) fn encode_mrs(operands: &[Operand]) -> Result<EncodeResult, String> {
 }
 
 /// Compute sysreg encoding from (op0, op1, CRn, CRm, op2) fields.
-pub(crate) fn sysreg_encoding(op0: u32, op1: u32, crn: u32, crm: u32, op2: u32) -> u32 {
+pub fn sysreg_encoding(op0: u32, op1: u32, crn: u32, crm: u32, op2: u32) -> u32 {
     ((op0 & 3) << 14) | ((op1 & 7) << 11) | ((crn & 0xF) << 7) | ((crm & 0xF) << 3) | (op2 & 7)
 }
 
 /// Try to parse a numbered debug/performance register family name like
 /// `dbgbcr15_el1` or `dbgwvr0_el1` into its encoding. Returns None if not matched.
-pub(crate) fn parse_numbered_sysreg(name: &str) -> Option<u32> {
+pub fn parse_numbered_sysreg(name: &str) -> Option<u32> {
     // Debug breakpoint/watchpoint registers: dbg{b,w}{c,v}r<n>_el1
     // dbgbcr<n>_el1: op0=2, op1=0, CRn=0, CRm=n, op2=5
     // dbgbvr<n>_el1: op0=2, op1=0, CRn=0, CRm=n, op2=4
@@ -238,7 +238,7 @@ pub(crate) fn parse_numbered_sysreg(name: &str) -> Option<u32> {
 
 /// Parse generic system register name like `s3_0_c1_c0_1` into encoding bits.
 /// Also handles numbered register families like `dbgbcr15_el1`.
-pub(crate) fn parse_generic_sysreg(name: &str) -> Result<u32, String> {
+pub fn parse_generic_sysreg(name: &str) -> Result<u32, String> {
     // Try numbered register families first
     if let Some(enc) = parse_numbered_sysreg(name) {
         return Ok(enc);
@@ -273,7 +273,7 @@ pub(crate) fn parse_generic_sysreg(name: &str) -> Result<u32, String> {
     }
 }
 
-pub(crate) fn encode_msr(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_msr(operands: &[Operand]) -> Result<EncodeResult, String> {
     let sysreg = match operands.first() {
         Some(Operand::Symbol(s)) => s.to_lowercase(),
         _ => return Err("msr needs system register name".to_string()),
@@ -400,19 +400,19 @@ pub(crate) fn encode_msr(operands: &[Operand]) -> Result<EncodeResult, String> {
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_svc(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_svc(operands: &[Operand]) -> Result<EncodeResult, String> {
     let imm = get_imm(operands, 0)?;
     let word = 0xd4000001 | ((imm as u32 & 0xFFFF) << 5);
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_hvc(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_hvc(operands: &[Operand]) -> Result<EncodeResult, String> {
     let imm = get_imm(operands, 0)?;
     let word = 0xd4000002 | ((imm as u32 & 0xFFFF) << 5);
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_ic(raw_operands: &str) -> Result<EncodeResult, String> {
+pub fn encode_ic(raw_operands: &str) -> Result<EncodeResult, String> {
     let parts: Vec<&str> = raw_operands.splitn(2, ',').collect();
     let op_name = parts[0].trim().to_lowercase();
     let rt = if parts.len() > 1 {
@@ -431,13 +431,13 @@ pub(crate) fn encode_ic(raw_operands: &str) -> Result<EncodeResult, String> {
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_smc(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_smc(operands: &[Operand]) -> Result<EncodeResult, String> {
     let imm = get_imm(operands, 0)?;
     let word = 0xd4000003 | ((imm as u32 & 0xFFFF) << 5);
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_at(_operands: &[Operand], raw_operands: &str) -> Result<EncodeResult, String> {
+pub fn encode_at(_operands: &[Operand], raw_operands: &str) -> Result<EncodeResult, String> {
     let parts: Vec<&str> = raw_operands.splitn(2, ',').collect();
     let op_name = parts[0].trim().to_lowercase();
     let rt = if parts.len() > 1 {
@@ -459,7 +459,7 @@ pub(crate) fn encode_at(_operands: &[Operand], raw_operands: &str) -> Result<Enc
 }
 
 /// Encode `sys #op1, Cn, Cm, #op2, Xt` instruction.
-pub(crate) fn encode_sys(raw_operands: &str) -> Result<EncodeResult, String> {
+pub fn encode_sys(raw_operands: &str) -> Result<EncodeResult, String> {
     let parts: Vec<&str> = raw_operands.split(',').map(|s| s.trim()).collect();
     if parts.len() < 4 {
         return Err(format!(
@@ -504,16 +504,13 @@ pub(crate) fn encode_sys(raw_operands: &str) -> Result<EncodeResult, String> {
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_brk(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_brk(operands: &[Operand]) -> Result<EncodeResult, String> {
     let imm = get_imm(operands, 0)?;
     let word = 0xd4200000 | ((imm as u32 & 0xFFFF) << 5);
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_tlbi(
-    _operands: &[Operand],
-    raw_operands: &str,
-) -> Result<EncodeResult, String> {
+pub fn encode_tlbi(_operands: &[Operand], raw_operands: &str) -> Result<EncodeResult, String> {
     let parts: Vec<&str> = raw_operands.splitn(2, ',').collect();
     let op_name = parts[0].trim().to_lowercase();
     let rt = if parts.len() > 1 {
@@ -578,7 +575,7 @@ pub(crate) fn encode_tlbi(
 }
 
 /// Encode HINT #imm (system hint instruction)
-pub(crate) fn encode_bti(raw_operands: &str) -> Result<EncodeResult, String> {
+pub fn encode_bti(raw_operands: &str) -> Result<EncodeResult, String> {
     let target = raw_operands.trim().to_lowercase();
     let word = match target.as_str() {
         "" => 0xd503241f,   // bti (no target)
@@ -590,7 +587,7 @@ pub(crate) fn encode_bti(raw_operands: &str) -> Result<EncodeResult, String> {
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_hint(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_hint(operands: &[Operand]) -> Result<EncodeResult, String> {
     let imm = get_imm(operands, 0)?;
     // HINT: 11010101 00000011 0010 CRm op2 11111
     // CRm = imm >> 3, op2 = imm & 7
@@ -600,7 +597,7 @@ pub(crate) fn encode_hint(operands: &[Operand]) -> Result<EncodeResult, String> 
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_dc(operands: &[Operand], raw_operands: &str) -> Result<EncodeResult, String> {
+pub fn encode_dc(operands: &[Operand], raw_operands: &str) -> Result<EncodeResult, String> {
     // Check for the operation type in the operands or raw string
     let op = match operands.first() {
         Some(Operand::Symbol(s)) => s.to_lowercase(),

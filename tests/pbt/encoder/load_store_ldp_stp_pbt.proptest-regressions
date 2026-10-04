@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 841a470ca2e79b4b805832c0de3149e1538daa785eead6f2b20b3650e10409ba # shrinks to cls = RegClass { prefix: 'w', opc: 0, v: 0, shift: 2 }, is_load = false, form = 0, imm7_raw = 0, low = 1
+cc a242552a58c28f3334334a6fd3f189f17d1c63a1c7969bb859d900a7e543d7e5 # shrinks to cls = RegClass { prefix: 'w', opc: 0, v: 0, shift: 2 }, is_load = false, form = 0, imm7_out = 64
