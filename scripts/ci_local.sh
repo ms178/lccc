@@ -1112,6 +1112,43 @@ else
     SKIPPED=$((SKIPPED + 1))
 fi
 
+# The second aarch64 instrument, and the one that exists because the oracle
+# above is structurally blind to a whole bug class: it feeds the assembler
+# words objdump just decoded, so everything it hands over is a *valid*
+# encoding by construction. `bic x0, x1, w2`, `mov sp, xzr` and
+# `add x0, x1, x2, ror #3` are not encodings and can never appear there --
+# yet accepting them silently is exactly as wrong as mis-encoding one. The
+# matrix is a curated accept/reject table whose every expectation is GNU
+# as's own verdict, re-checked against the cross assembler at gate time
+# (423 rows, ~2 s, no compiler and no network), and it is what turned the
+# review's "the operand checks look like class checks" into 38 executed
+# counterexamples. It needs only `as`/`objcopy`, so it is skipped, not
+# passed, when the cross-binutils are absent.
+if [ -n "$A64_AS" ] && [ -n "$A64_OBJCOPY" ]; then
+    gate "aarch64-operand-legality" fast \
+        python3 scripts/aarch64_operand_legality_matrix.py --check \
+        --as "$A64_AS" --objcopy "$A64_OBJCOPY"
+else
+    echo "SKIP  aarch64-operand-legality (aarch64-linux-gnu binutils not" \
+         "available)"
+    SKIPPED=$((SKIPPED + 1))
+fi
+
+# The same table, asserted against *our* encoder. The gate above proves the
+# table still says what GNU as says; this one proves we still do too -- a row
+# can be correct while the encoder is wrong, which is the shape of every bug
+# the matrix was written for. It needs `objcopy` (to read our own object) and
+# the fastbuild binary, and is skipped, not passed, without them.
+if [ -n "$A64_OBJCOPY" ] && [ -x target/fastbuild/lccc ]; then
+    gate "aarch64-operand-legality-encoder" fast \
+        python3 scripts/aarch64_operand_legality_matrix.py \
+        --check-lccc target/fastbuild/lccc --objcopy "$A64_OBJCOPY"
+else
+    echo "SKIP  aarch64-operand-legality-encoder (aarch64-linux-gnu-objcopy or" \
+         "target/fastbuild/lccc not available)"
+    SKIPPED=$((SKIPPED + 1))
+fi
+
 # Cross-vendor oracle (docs/GODBOLT_ORACLE.md).  Only the OFFLINE half runs
 # here: the live sweep needs godbolt.org, and a network dependency inside
 # ci_local turns an outage into a red local gate -- the exact failure shape
