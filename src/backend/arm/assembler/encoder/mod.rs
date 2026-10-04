@@ -19,13 +19,13 @@ mod load_store;
 mod neon;
 mod system;
 
-pub(crate) use bitfield::*;
-pub(crate) use compare_branch::*;
-pub(crate) use data_processing::*;
-pub(crate) use fp_scalar::*;
-pub(crate) use load_store::*;
-pub(crate) use neon::*;
-pub(crate) use system::*;
+pub use bitfield::*;
+pub use compare_branch::*;
+pub use data_processing::*;
+pub use fp_scalar::*;
+pub use load_store::*;
+pub use neon::*;
+pub use system::*;
 
 /// Result of encoding an instruction.
 #[derive(Debug, Clone)]
@@ -206,7 +206,7 @@ fn is_fp_reg(name: &str) -> bool {
 }
 
 /// Encode a condition code string to 4-bit encoding.
-fn encode_cond(cond: &str) -> Option<u32> {
+pub fn encode_cond(cond: &str) -> Option<u32> {
     match cond.to_lowercase().as_str() {
         "eq" => Some(0),
         "ne" => Some(1),
@@ -463,12 +463,46 @@ pub fn encode_instruction(
         "fmul" => {
             if matches!(operands.first(), Some(Operand::RegArrangement { .. })) {
                 if matches!(operands.get(2), Some(Operand::RegLane { .. })) {
-                    encode_neon_float_elem(operands, 1, 0b1001)
+                    // By-element FMUL: U=0, opc=1001 (FMULX is the U=1 form).
+                    // The previous U=1 emitted FMULX encodings for plain FMUL.
+                    // Oracle: `fmul v0.4s, v1.4s, v2.s[3]` = 0x4FA29820.
+                    encode_neon_float_elem(operands, 0, 0b1001)
                 } else {
                     encode_neon_float_three_same(operands, 1, 0, 0b11011)
                 }
             } else {
                 encode_fp_arith(operands, 0b0000)
+            }
+        }
+        "fmulx" => {
+            if matches!(operands.first(), Some(Operand::RegArrangement { .. })) {
+                if matches!(operands.get(2), Some(Operand::RegLane { .. })) {
+                    // By-element FMULX: U=1, opc=1001.
+                    // Oracle: `fmulx v0.4s, v1.4s, v2.s[3]` = 0x6FA29820.
+                    encode_neon_float_elem(operands, 1, 0b1001)
+                } else {
+                    // Three-same FMULX: U=0, opc=11011 (FMUL is the U=1 form).
+                    // Oracle: `fmulx v0.4s, v1.4s, v2.4s` = 0x4E22DC20.
+                    encode_neon_float_three_same(operands, 0, 0, 0b11011)
+                }
+            } else {
+                // Scalar FMULX Dd, Dn, Dm ("scalar three same FP":
+                // 0 M 0 11110 size 1 Rm opcode 1 Rn Rd with M=1, U=0,
+                // opc=11011, size=01 for double).
+                // Oracle: `fmulx d0, d1, d2` = 0x5E62DC20.
+                let (rd, _) = get_reg(operands, 0)?;
+                let (rn, _) = get_reg(operands, 1)?;
+                let (rm, _) = get_reg(operands, 2)?;
+                let word = (1u32 << 30)
+                    | (0b11110 << 24)
+                    | (0b01 << 22)
+                    | (1u32 << 21)
+                    | (rm << 16)
+                    | (0b11011 << 11)
+                    | (1u32 << 10)
+                    | (rn << 5)
+                    | rd;
+                Ok(EncodeResult::Word(word))
             }
         }
         "fdiv" => {
@@ -1181,7 +1215,7 @@ pub fn encode_instruction(
 
 // ── Encoding helpers ──────────────────────────────────────────────────────
 
-pub(crate) fn get_reg(operands: &[Operand], idx: usize) -> Result<(u32, bool), String> {
+pub fn get_reg(operands: &[Operand], idx: usize) -> Result<(u32, bool), String> {
     match operands.get(idx) {
         Some(Operand::Reg(name)) => {
             let num = parse_reg_num(name).ok_or_else(|| format!("invalid register: {}", name))?;
@@ -1195,7 +1229,173 @@ pub(crate) fn get_reg(operands: &[Operand], idx: usize) -> Result<(u32, bool), S
     }
 }
 
-fn get_imm(operands: &[Operand], idx: usize) -> Result<i64, String> {
+/// Read a strictly-general-purpose register operand (`x0`-`x30`, `w0`-`w30`,
+/// `xzr`, `wzr`). SP/WSP and every FP/SIMD register spelling (`v`/`q`/`d`/
+/// `s`/`h`/`b`) are rejected instead of being silently aliased into the
+/// shared 0-31 number space: `parse_reg_num` maps `sp` to 31, where most
+/// instruction groups read XZR, so accepting it would emit a valid-looking
+/// but semantically wrong word. GNU as rejects these with "operand
+/// mismatch" / "operand n must be a general purpose register".
+///
+/// Register 31 is accepted ONLY in its dedicated spellings `xzr`/`wzr`:
+/// `x31`/`w31` are not ARMv8 register names (GNU as: "operand 0 must be a
+/// general purpose register"; llvm-mc silently rewrites them to zr, which is
+/// a leniency, not a contract). This also matches the assembler parser,
+/// which accepts x/w names only up to 30 — hand-built `Operand::Reg` values
+/// must not be held to a weaker standard than parsed ones.
+pub fn get_gpr_strict(operands: &[Operand], idx: usize) -> Result<(u32, bool), String> {
+    match operands.get(idx) {
+        Some(Operand::Reg(name)) => {
+            let lower = name.to_lowercase();
+            if lower == "sp" || lower == "wsp" {
+                return Err(format!(
+                    "operand {idx}: sp/wsp is not valid for this instruction"
+                ));
+            }
+            // Byte-wise spelling check. `&lower[1..]` on a name whose first
+            // character is multi-byte UTF-8 would slice into a code point and
+            // panic, so the digit check runs over bytes and is only consulted
+            // when the first byte is an ASCII 'x'/'w' — at which point index 1
+            // is guaranteed to be a char boundary.
+            let bytes = lower.as_bytes();
+            let numbered = matches!(bytes.first(), Some(b'x' | b'w'))
+                && bytes[1..].iter().all(|b| b.is_ascii_digit())
+                && bytes.len() > 1;
+            let is_gpr_spelling =
+                numbered || lower == "xzr" || lower == "wzr" || lower == "lr";
+            if !is_gpr_spelling {
+                return Err(format!(
+                    "operand {idx}: `{name}` is not a general-purpose register"
+                ));
+            }
+            let num = parse_reg_num(name).ok_or_else(|| format!("invalid register: {}", name))?;
+            if numbered && num == 31 {
+                return Err(format!(
+                    "operand {idx}: `{name}` is not a valid register spelling; \
+                     register 31 is written `xzr`/`wzr`"
+                ));
+            }
+            let is_64 = is_64bit_reg(name);
+            Ok((num, is_64))
+        }
+        other => Err(format!(
+            "expected register at operand {}, got {:?}",
+            idx, other
+        )),
+    }
+}
+
+/// Like [`get_gpr_strict`], but SP/WSP is also accepted (for the few
+/// instruction groups where the stack pointer is a legal destination,
+/// e.g. AND/ORR/EOR (immediate) Rd). FP/SIMD spellings are still rejected.
+pub fn get_gpr_or_sp(operands: &[Operand], idx: usize) -> Result<(u32, bool), String> {
+    match operands.get(idx) {
+        Some(Operand::Reg(name)) => {
+            let lower = name.to_lowercase();
+            if lower == "sp" || lower == "wsp" {
+                return Ok((31u32, lower == "sp"));
+            }
+        }
+        other => {
+            return Err(format!(
+                "expected register at operand {}, got {:?}",
+                idx, other
+            ));
+        }
+    }
+    get_gpr_strict(operands, idx)
+}
+
+/// Like [`get_gpr_strict`], but additionally requires the 64-bit `x`/`xzr`
+/// spelling — for instructions defined only in the X form (BR/BLR/RET,
+/// SMULH/UMULH, ...). The 32-bit `w` form of the same register number is an
+/// unallocated encoding that GNU as rejects.
+pub fn get_gpr_strict_x(operands: &[Operand], idx: usize) -> Result<u32, String> {
+    let (num, is_64) = get_gpr_strict(operands, idx)?;
+    if !is_64 {
+        return Err(format!(
+            "operand {idx}: this instruction requires a 64-bit x register"
+        ));
+    }
+    Ok(num)
+}
+
+/// Like [`get_gpr_strict`], but additionally requires the 32-bit `w`/`wzr`
+/// spelling — for operands defined only in the W form. The whole
+/// sign/zero-extend family spells its source `Wn` in every destination
+/// width (`SXTB Xd, Wn`, `SXTW Xd, Wn`, `UXTW Xd, Wn`, ...): the operation
+/// reads only the low 32 bits, so the X spelling produces the identical
+/// word, but GNU as rejects it ("operand mismatch") and the ARMv8 ARM
+/// documents no such form — lccc diagnoses instead of guessing the bank.
+pub fn get_gpr_strict_w(operands: &[Operand], idx: usize) -> Result<u32, String> {
+    let (num, is_64) = get_gpr_strict(operands, idx)?;
+    if is_64 {
+        return Err(format!(
+            "operand {idx}: this operand requires a 32-bit w register"
+        ));
+    }
+    Ok(num)
+}
+
+/// Assert that every already-read register operand of an instruction agrees
+/// with the destination's operand width (`sf` consistency). Mixed `x`/`w`
+/// operands assemble to a word whose sf bit matches only the destination —
+// a silent miscompile GNU as rejects with "operand mismatch".
+pub fn check_same_width(rd_is_64: bool, rest: &[bool]) -> Result<(), String> {
+    for (i, is_64) in rest.iter().enumerate() {
+        if *is_64 != rd_is_64 {
+            return Err(format!(
+                "operand {}: register width mismatch (mixed x/w operands)",
+                i + 1
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Read the optional shift operand of a logical (shifted register)
+/// instruction (`lsl/lsr/asr/ror #amount`) at `operands[idx]`.
+///
+/// Contract shared by AND/ORR/EOR/ANDS/BIC/ORN/EON/BICS:
+/// * `None` at `idx` means "no shift" (type LSL, amount 0);
+/// * a `Shift` operand must name one of the four shift kinds — unknown kinds
+///   are diagnosed, not silently read as `lsl`;
+/// * the amount must fit the imm6 field for the register width: 0..=31 for
+///   W (sf=0) and 0..=63 for X (sf=1). Out-of-range amounts are
+///   unallocated encodings, not truncatable values (GNU as: "shift amount
+///   out of range 0 to 31/63").
+///
+/// Callers still enforce the instruction's total arity (3 or 4 operands for
+/// the two-register-source logical forms).
+pub fn get_shift_imm6(operands: &[Operand], idx: usize, is_64: bool) -> Result<(u32, u32), String> {
+    let (kind, amount) = match operands.get(idx) {
+        None => return Ok((0, 0)),
+        Some(Operand::Shift { kind, amount }) => (kind.as_str(), *amount),
+        Some(other) => {
+            return Err(format!("operand {idx}: expected a shift, got {other:?}"));
+        }
+    };
+    let st = match kind {
+        "lsl" => 0b00u32,
+        "lsr" => 0b01,
+        "asr" => 0b10,
+        "ror" => 0b11,
+        _ => {
+            return Err(format!(
+                "operand {idx}: unknown shift kind `{kind}` (lsl/lsr/asr/ror)"
+            ));
+        }
+    };
+    let max = if is_64 { 63u32 } else { 31 };
+    if amount > max {
+        return Err(format!(
+            "operand {idx}: shift amount {amount} out of range 0..={max}"
+        ));
+    }
+    Ok((st, amount))
+}
+
+pub fn get_imm(operands: &[Operand], idx: usize) -> Result<i64, String> {
     match operands.get(idx) {
         Some(Operand::Imm(v)) => Ok(*v),
         other => Err(format!(
@@ -1205,7 +1405,7 @@ fn get_imm(operands: &[Operand], idx: usize) -> Result<i64, String> {
     }
 }
 
-fn get_symbol(operands: &[Operand], idx: usize) -> Result<(String, i64), String> {
+pub fn get_symbol(operands: &[Operand], idx: usize) -> Result<(String, i64), String> {
     match operands.get(idx) {
         Some(Operand::Symbol(s)) => Ok((s.clone(), 0)),
         Some(Operand::Label(s)) => Ok((s.clone(), 0)),
@@ -1224,7 +1424,7 @@ fn get_symbol(operands: &[Operand], idx: usize) -> Result<(String, i64), String>
     }
 }
 
-fn sf_bit(is_64: bool) -> u32 {
+pub fn sf_bit(is_64: bool) -> u32 {
     if is_64 { 1 } else { 0 }
 }
 

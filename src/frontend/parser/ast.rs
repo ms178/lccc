@@ -977,9 +977,10 @@ pub enum TypeSpecifier {
     Decimal32,
     Decimal64,
     Decimal128,
-    #[expect(dead_code)] // Matched in type resolution but not currently emitted by parser
+    // Not currently emitted by the parser (matched only in type resolution);
+    // reachable via the doc-hidden test-internals re-exports, so the
+    // dead-code lint cannot apply here.
     Signed,
-    #[expect(dead_code)] // Matched in type resolution but not currently emitted by parser
     Unsigned,
     UnsignedChar,
     UnsignedShort,
