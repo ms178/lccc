@@ -3,9 +3,9 @@
 //! `encode_neon_ins` encodes the AArch64 NEON `INS` instruction (alias of
 //! `MOV`, vector copy group) in two forms:
 //!   * general : `INS Vd.Ts[dst], Wn/Xn` (W for .b/.h/.s, X for .d)
-//!    -> `0 1 0 01110 000 imm5 0 0111 1 Rn Rd`
+//!     -> `0 1 0 01110 000 imm5 0 0111 1 Rn Rd`
 //!   * element : `INS Vd.Ts[dst], Vn.Ts[src]`
-//!    -> `0 1 1 01110 000 imm5 0 imm4 1 Rn Rd`
+//!     -> `0 1 1 01110 000 imm5 0 imm4 1 Rn Rd`
 //!
 //! Reference encodings used as golden oracles below were captured from
 //! `llvm-mc-18 -triple=aarch64 -show-encoding` and confirmed identical to this
