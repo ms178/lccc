@@ -1590,3 +1590,165 @@ impl ElfWriter {
         self.base.write_elf(output_path, &config, true)
     }
 }
+
+// =============================================================================
+// Branch-displacement range validation (upstream fork issue #121)
+// =============================================================================
+//
+// Deliberately mirrors the AArch64 module of the same name: defect #121 was
+// present in BOTH writers, and a fix verified on one target only is a fix
+// verified on half the defect.
+// =============================================================================
+// Branch-displacement validation (upstream fork issue #121, and the bit-0
+// truncation found while testing it)
+// =============================================================================
+//
+// Deliberately mirrors the AArch64 module of the same name: defect #121 was
+// present in BOTH writers, and a fix verified on one target only is a fix
+// verified on half the defect.
+//
+// Ground truth established by experiment, and worth stating because it is not
+// what the code's shape suggests:
+//
+//   * A branch whose target is a SYMBOL -- local or external, forward or
+//     backward -- is always emitted as an `R_RISCV_BRANCH` / `R_RISCV_JAL`
+//     relocation. It is never patched inline, because linker relaxation can
+//     shrink the code after assembly and the offset is genuinely unknowable
+//     here. `resolve_local_branches` therefore never sees reloc types 16/17.
+//
+//   * A branch whose target is a LITERAL immediate is encoded on the spot, and
+//     *that* is where a bad offset can be silently mangled -- which is why the
+//     validation lives in `encoder/base.rs`, not in the relocation resolver.
+#[cfg(test)]
+mod branch_range_tests {
+    use super::super::parser::parse_asm;
+    use super::*;
+
+    fn assemble(asm: &str) -> Result<ElfWriter, String> {
+        let statements = parse_asm(asm)?;
+        let mut writer = ElfWriter::new();
+        writer.process_statements(&statements)?;
+        Ok(writer)
+    }
+
+    /// `ElfWriter` is not `Debug`, so `expect_err` is unavailable; match instead.
+    fn expect_err(asm: &str, what: &str) -> String {
+        match assemble(asm) {
+            Ok(_) => panic!("{what}"),
+            Err(e) => e,
+        }
+    }
+
+    /// Bit 0 of a B-type displacement is implicit (`imm[4:1]` only), so an odd
+    /// literal offset used to be silently truncated -- `beq x1, x2, 17`
+    /// encoded to the identical word `0x00208863` as `beq x1, x2, 16`.
+    #[test]
+    fn odd_literal_branch_offset_is_diagnosed_not_truncated() {
+        let err = expect_err(
+            ".text\nbeq x1, x2, 17\n",
+            "an odd literal branch offset must be diagnosed, not truncated",
+        );
+        assert!(
+            err.contains("misaligned branch offset"),
+            "expected a misalignment diagnostic, got: {err}"
+        );
+    }
+
+    /// Same defect, J-type (`imm[10:1]` only): `jal x1, 4097` and
+    /// `jal x1, 4096` both encoded to `0x000010ef`.
+    #[test]
+    fn odd_literal_jal_offset_is_diagnosed_not_truncated() {
+        let err = expect_err(
+            ".text\njal x1, 4097\n",
+            "an odd literal jal offset must be diagnosed, not truncated",
+        );
+        assert!(
+            err.contains("misaligned branch offset"),
+            "expected a misalignment diagnostic, got: {err}"
+        );
+    }
+
+    /// The even neighbours must still encode, and must encode to *different*
+    /// words -- a check that only "something was rejected" would also pass for
+    /// an encoder that rounded everything to zero.
+    #[test]
+    fn even_literal_offsets_encode_distinctly() {
+        let mut words = vec![];
+        for imm in [0i64, 16, 4094] {
+            let asm = format!(".text\nbeq x1, x2, {imm}\n");
+            let w =
+                assemble(&asm).unwrap_or_else(|e| panic!("beq x1, x2, {imm} should encode: {e}"));
+            let data = w.base.sections[".text"].data.clone();
+            assert_eq!(
+                data.len(),
+                4,
+                "one branch is 4 bytes (no compression in process_statements)"
+            );
+            words.push(u32::from_le_bytes([data[0], data[1], data[2], data[3]]));
+        }
+        assert_eq!(words.len(), 3);
+        assert!(
+            words[0] != words[1] && words[1] != words[2],
+            "distinct even offsets must give distinct words, got {words:#x?}"
+        );
+    }
+
+    /// B-type holds a 13-bit signed displacement, so 8192 is past the end.
+    #[test]
+    fn out_of_range_literal_branch_offset_is_diagnosed() {
+        let err = expect_err(
+            ".text\nbeq x1, x2, 8192\n",
+            "a literal branch offset outside +-4 KiB must be diagnosed",
+        );
+        assert!(
+            err.contains("branch out of range"),
+            "expected a range diagnostic, got: {err}"
+        );
+    }
+
+    /// J-type holds a 21-bit signed displacement.
+    #[test]
+    fn out_of_range_literal_jal_offset_is_diagnosed() {
+        let err = expect_err(
+            ".text\njal x1, 2097152\n",
+            "a literal jal offset outside +-1 MiB must be diagnosed",
+        );
+        assert!(
+            err.contains("branch out of range"),
+            "expected a range diagnostic, got: {err}"
+        );
+    }
+
+    /// Lock in the deliberate design: symbol targets stay as relocations for
+    /// the linker, because relaxation may still shrink the code. If this ever
+    /// starts resolving inline, branch distances silently stop being relaxed.
+    #[test]
+    fn branch_to_symbol_stays_a_relocation_for_the_linker() {
+        for (asm, sym) in [
+            (".text\nbeq x1, x2, .Lfwd\nnop\n.Lfwd:\nnop\n", ".Lfwd"),
+            (".text\n.Lb:\nnop\nbeq x1, x2, .Lb\n", ".Lb"),
+            (".text\nbeq x1, x2, extern_sym\n", "extern_sym"),
+        ] {
+            let w = assemble(asm).unwrap_or_else(|e| panic!("`{asm}` should assemble: {e}"));
+            let relocs = &w.base.sections[".text"].relocs;
+            assert_eq!(
+                relocs.len(),
+                1,
+                "branch to `{sym}` must be left as exactly one relocation for the linker, got {}",
+                relocs.len()
+            );
+            assert_eq!(relocs[0].symbol_name, sym);
+        }
+    }
+
+    /// The implicit-`rd` form (`jal offset`) must be validated too, not only
+    /// the two-operand form -- they are separate code paths in `encode_jal`.
+    #[test]
+    fn implicit_rd_jal_form_is_validated_too() {
+        expect_err(
+            ".text\njal 4097\n",
+            "the one-operand jal form must validate its offset as well",
+        );
+        assemble(".text\njal 4096\n").expect("even, in-range offset must encode");
+    }
+}

@@ -52,12 +52,46 @@ pub(crate) fn encode_auipc(operands: &[Operand]) -> Result<EncodeResult, String>
     }
 }
 
+/// Validate a literal PC-relative branch displacement.
+///
+/// The B-type (+-4 KiB) and J-type (+-1 MiB) encodings both encode bit 0 of the
+/// displacement IMPLICITLY -- `encode_b` splits `imm[4:1]`, `encode_j` splits
+/// `imm[10:1]`, and neither layout has an `imm[0]` field. An odd offset is
+/// therefore silently truncated: `beq x1, x2, 17` encoded to the *identical*
+/// word `0x00208863` as `beq x1, x2, 16`, branching 16 bytes instead of 17.
+///
+/// Only a LITERAL immediate operand reaches here. A branch whose target is a
+/// symbol becomes an `R_RISCV_BRANCH` / `R_RISCV_JAL` relocation that the
+/// linker resolves -- deliberately, because linker relaxation can shrink the
+/// code after assembly, so the offset is genuinely not knowable here. For a
+/// literal it IS knowable, so truncating it is a misassembly, not a deferral.
+fn check_branch_offset(imm: i64, lo: i64, hi: i64, what: &str) -> Result<(), String> {
+    if imm & 1 != 0 {
+        return Err(format!(
+            "{what}: misaligned branch offset {imm}; RISC-V branch and jump \
+             immediates encode bit 0 implicitly, so {imm} would silently branch \
+             to {} -- use an even offset",
+            imm & !1
+        ));
+    }
+    if !(lo..hi).contains(&imm) {
+        return Err(format!(
+            "{what}: branch out of range: offset {imm} is not encodable \
+             (allowed {lo}..{hi})"
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn encode_jal(operands: &[Operand]) -> Result<EncodeResult, String> {
     // jal rd, offset  OR  jal offset (rd = ra)
     if operands.len() == 1 {
         // jal offset (implicit rd = ra)
         match &operands[0] {
-            Operand::Imm(imm) => Ok(EncodeResult::Word(encode_j(OP_JAL, 1, *imm as i32))),
+            Operand::Imm(imm) => {
+                check_branch_offset(*imm, -(1 << 20), 1 << 20, "jal")?;
+                Ok(EncodeResult::Word(encode_j(OP_JAL, 1, *imm as i32)))
+            }
             Operand::Symbol(s) | Operand::Label(s) | Operand::Reg(s) => {
                 Ok(EncodeResult::WordWithReloc {
                     word: encode_j(OP_JAL, 1, 0),
@@ -73,7 +107,10 @@ pub(crate) fn encode_jal(operands: &[Operand]) -> Result<EncodeResult, String> {
     } else {
         let rd = get_reg(operands, 0)?;
         match &operands[1] {
-            Operand::Imm(imm) => Ok(EncodeResult::Word(encode_j(OP_JAL, rd, *imm as i32))),
+            Operand::Imm(imm) => {
+                check_branch_offset(*imm, -(1 << 20), 1 << 20, "jal")?;
+                Ok(EncodeResult::Word(encode_j(OP_JAL, rd, *imm as i32)))
+            }
             Operand::Symbol(s) | Operand::Label(s) | Operand::Reg(s) => {
                 Ok(EncodeResult::WordWithReloc {
                     word: encode_j(OP_JAL, rd, 0),
@@ -138,13 +175,16 @@ pub(crate) fn encode_branch_instr(
     let rs2 = get_reg(operands, 1)?;
 
     match &operands.get(2) {
-        Some(Operand::Imm(imm)) => Ok(EncodeResult::Word(encode_b(
-            OP_BRANCH,
-            funct3,
-            rs1,
-            rs2,
-            *imm as i32,
-        ))),
+        Some(Operand::Imm(imm)) => {
+            check_branch_offset(*imm, -(1 << 12), 1 << 12, "branch")?;
+            Ok(EncodeResult::Word(encode_b(
+                OP_BRANCH,
+                funct3,
+                rs1,
+                rs2,
+                *imm as i32,
+            )))
+        }
         Some(Operand::Symbol(s)) | Some(Operand::Label(s)) | Some(Operand::Reg(s)) => {
             Ok(EncodeResult::WordWithReloc {
                 word: encode_b(OP_BRANCH, funct3, rs1, rs2, 0),

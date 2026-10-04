@@ -3,63 +3,25 @@
 Date: 2026-10-03
 Base: `070bf71e` (`ms178/lccc` main, post-#743)
 Audit: `engineering/AUDIT-2026-10-03-thanhtoantnt-fork.md`
-Commits: `08a64eeb` (long-double widening), `c14a10f7` (branch range + regnum)
+Merged upstream as: PR #746 (long-double widening + branch range + regnum)
 
 ---
 
-## 0. Read this first — the sandbox was wiped bare
+## 1. Environment note
 
-The session started with **`/home/user` completely empty**: no repo, no
-artifacts, no `.base_ref`, no toolchain, no swap. Everything below was
-re-bootstrapped from scratch. Future sessions should assume the same and follow
-§1 verbatim rather than rediscovering it.
+The work below was done on a 2-core / 1.9 GiB sandbox that is wiped between
+sessions, so the toolchain and `target/` had to live outside the workspace.
+That recipe is reproduced in **Appendix A**; it is host setup, not project
+content, and is kept at the back of this document for that reason.
 
----
+Two of its constraints *are* project content and are worth stating here:
 
-## 1. Environment bootstrap (exact, verified working)
-
-```bash
-# --- swap (hard requirement: 1.9 GiB RAM, 2 cores) -------------------------
-sudo -n dd if=/dev/zero of=/swapfile bs=1M count=4096 status=none
-sudo -n chmod 600 /swapfile && sudo -n mkswap /swapfile && sudo -n swapon /swapfile
-echo '/swapfile none swap sw 0 0' | sudo -n tee -a /etc/fstab
-
-# --- Rust OUTSIDE the persisted workspace ----------------------------------
-# WHY: the snapshot publisher (scripts/lccc_delivery.py) caps the visible
-# workspace at 64 MiB / 256 files. A rustup install is ~1.5 GB / 30k files and
-# would blow that cap, and `target/` was 3.9 GB / 7 623 files on its own.
-sudo -n mkdir -p /opt/rustup /opt/cargo /opt/lccc-target
-sudo -n chown -R user:user /opt/rustup /opt/cargo /opt/lccc-target
-export RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
-sh /tmp/rustup-init.sh -y --no-modify-path --profile minimal \
-   --default-toolchain stable -c rustfmt -c clippy
-rustup default stable          # REQUIRED: rustup-init alone leaves no default
-
-# --- the build env every later command needs -------------------------------
-export RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo
-export PATH=/opt/cargo/bin:$PATH
-export CARGO_TARGET_DIR=/opt/lccc-target CARGO_BUILD_JOBS=2
-
-# --- bridge for scripts that hardcode ./target -----------------------------
-# ci_local.sh reads `target/fastbuild/lccc` and writes `target/ci_local.pass`.
-# A SYMLINK (1 entry, os.walk does not descend) keeps those paths working while
-# the bytes live outside the workspace. Do NOT copy the tree back.
-ln -s /opt/lccc-target/target /home/user/lccc/target
-```
-
-Gotchas that each cost real time:
-
-- `rustup-init --component rustfmt clippy` is rejected; the flag is `-c`, twice.
-- After `rustup-init`, `rustc` fails with *"rustup could not choose a version"*
-  until `rustup default stable` is run.
-- `ci_local.sh` defaults `CARGO_HOME=$HOME/.cargo`; it must be overridden or it
-  will not find the toolchain.
-- `build_lccc_fast.sh` writes `target/lccc-rustflags`; `ci_local.sh` reads it
-  back. Both resolve through the symlink — but if the symlink is recreated, copy
-  the rustflags file across first.
-- Everything under `/opt` is **not persisted** across sessions; only `/home/user`
-  is. Budget ~4 min for a cold `fastbuild` and ~5 min for the toolchain install.
+- `target/` is huge (3.9 GB / 7 623 files). `scripts/ci_local.sh` hardcodes
+  `target/fastbuild/lccc` and writes `target/ci_local.pass`, so it cannot simply
+  be moved; on a small root disk, symlink it out rather than copying it back.
+- The snapshot publisher (`scripts/lccc_delivery.py`) caps the *visible*
+  workspace at 64 MiB / 256 files. A rustup install (~1.5 GB / 30 k files) blows
+  that cap on its own, which is why the toolchain is installed to `/opt`.
 
 ---
 
@@ -277,14 +239,12 @@ export RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo
 export PATH=/opt/cargo/bin:$PATH
 export CARGO_TARGET_DIR=/opt/lccc-target CARGO_BUILD_JOBS=2 CI_LOCAL_JOBS=1
 
-cargo test --lib                                   # expect 4044 passed
+cargo test --lib                                   # 4044 passed at time of writing
 python3 scripts/ldconst_differential.py --n 3000   # expect 3444/3444, 0 mismatches
 ./scripts/ci_local.sh --fast                       # must be green
 LCCC_SNAPSHOT_UNGATED=1 ./scripts/lccc-snapshot.sh "<slug>" "<desc>"
 ```
 
-Known-good state at end of session: base `070bf71e`, head `c14a10f7`, patch
-`/home/user/ms178-1.patch`.
 
 ---
 
@@ -297,3 +257,45 @@ Known-good state at end of session: base `070bf71e`, head `c14a10f7`, patch
    standardise on `0xC000_0000_0000_0000` (long_double)? GCC emits the latter.
 3. **`lccc_delivery.py` budget.** §4.1: authorise modifying the census, or
    relocate the checkout out of `/home/user` instead?
+
+---
+
+## Appendix A — sandbox bootstrap (host setup, not project content)
+
+Kept because the environment is wiped between agent sessions and rediscovering
+this costs ~25 min each time. Nothing here is specific to this project.
+
+```bash
+# --- swap (hard requirement: 1.9 GiB RAM, 2 cores) -------------------------
+sudo -n dd if=/dev/zero of=/swapfile bs=1M count=4096 status=none
+sudo -n chmod 600 /swapfile && sudo -n mkswap /swapfile && sudo -n swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo -n tee -a /etc/fstab
+
+# --- Rust OUTSIDE the persisted workspace ----------------------------------
+sudo -n mkdir -p /opt/rustup /opt/cargo /opt/lccc-target
+sudo -n chown -R user:user /opt/rustup /opt/cargo /opt/lccc-target
+export RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
+sh /tmp/rustup-init.sh -y --no-modify-path --profile minimal \
+   --default-toolchain stable -c rustfmt -c clippy
+rustup default stable          # REQUIRED: rustup-init alone leaves no default
+
+export RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo
+export PATH=/opt/cargo/bin:$PATH
+export CARGO_TARGET_DIR=/opt/lccc-target CARGO_BUILD_JOBS=2
+
+# --- bridge for scripts that hardcode ./target -----------------------------
+ln -s /opt/lccc-target/target /home/user/lccc/target
+```
+
+Gotchas that each cost real time:
+
+- `rustup-init --component rustfmt clippy` is rejected; the flag is `-c`, twice.
+- After `rustup-init`, `rustc` fails with *"rustup could not choose a version"*
+  until `rustup default stable` is run.
+- `ci_local.sh` defaults `CARGO_HOME=$HOME/.cargo`; it must be overridden or it
+  will not find the toolchain.
+- `build_lccc_fast.sh` writes `target/lccc-rustflags`; `ci_local.sh` reads it
+  back. Both resolve through the symlink -- but if the symlink is recreated, copy
+  the rustflags file across first.
+- Budget ~4 min for a cold `fastbuild` and ~5 min for the toolchain install.
