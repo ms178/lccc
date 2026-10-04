@@ -81,7 +81,18 @@ impl Parser {
         // page read-only and the first run-time store through/to `gp`
         // took SIGSEGV (found by Csmith seed 20260928 vs GCC; minimal
         // repro tests/regression/pointer_const_multi_level_relro.c).
-        while self.consume_if(&TokenKind::Star) {
+        // Bounded: see POINTER_DEPTH_BUDGET. The span is taken BEFORE
+        // consuming so the diagnostic points at the offending `*`.
+        let mut star_depth = 0u32;
+        loop {
+            let star_span = self.peek_span();
+            if !self.consume_if(&TokenKind::Star) {
+                break;
+            }
+            star_depth += 1;
+            if !self.enter_pointer_level(star_depth, star_span) {
+                break;
+            }
             derived.push(DerivedDeclarator::Pointer);
             // Only the outermost level's qualifiers describe the object.
             self.attrs.set_pointer_const(false);
@@ -676,8 +687,17 @@ impl Parser {
     ) {
         let mut pointer_depth: u32 = 0;
         let mut is_restrict = false;
-        while self.consume_if(&TokenKind::Star) {
+        loop {
+            // Bounded: see POINTER_DEPTH_BUDGET. The span is taken before
+            // consuming so the diagnostic points at the offending `*`.
+            let star_span = self.peek_span();
+            if !self.consume_if(&TokenKind::Star) {
+                break;
+            }
             pointer_depth += 1;
+            if !self.enter_pointer_level(pointer_depth, star_span) {
+                break;
+            }
             // Preserve the optimization-significant qualifier instead of
             // dropping it with const/volatile. Scan exactly the qualifier run
             // attached to this `*`, before nested function declarators begin.
@@ -800,8 +820,15 @@ impl Parser {
         } else if matches!(self.peek(), TokenKind::Star) {
             // Function pointer or pointer-to-array: (*name)(params) or (*name)[N]
             let mut inner_ptr_depth = 0u32;
-            while self.consume_if(&TokenKind::Star) {
+            loop {
+                let star_span = self.peek_span();
+                if !self.consume_if(&TokenKind::Star) {
+                    break;
+                }
                 inner_ptr_depth += 1;
+                if !self.enter_pointer_level(inner_ptr_depth, star_span) {
+                    break;
+                }
                 self.skip_cv_qualifiers();
                 // Also skip __attribute__(...) after pointer qualifiers.
                 // E.g., `void (*__attribute__((unused)) fp)(int)` is valid GNU C.
@@ -1000,8 +1027,15 @@ impl Parser {
         // e.g. (int(__attribute__((noinline)) *)(void)) function_pointer
         self.skip_gcc_extensions();
 
-        while self.consume_if(&TokenKind::Star) {
+        loop {
+            let star_span = self.peek_span();
+            if !self.consume_if(&TokenKind::Star) {
+                break;
+            }
             total_ptrs += 1;
+            if !self.enter_pointer_level(total_ptrs, star_span) {
+                break;
+            }
             self.skip_cv_qualifiers();
             // Also skip attributes after each pointer star, e.g. (* __attribute__((unused)))
             self.skip_gcc_extensions();

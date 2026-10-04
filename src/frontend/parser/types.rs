@@ -1231,8 +1231,20 @@ impl Parser {
     pub(super) fn parse_va_arg_type(&mut self) -> TypeSpecifier {
         if let Some(type_spec) = self.parse_type_specifier() {
             let mut result_type = type_spec;
-            // Parse pointer declarators
-            while self.consume_if(&TokenKind::Star) {
+            // Parse pointer declarators. Bounded: see POINTER_DEPTH_BUDGET.
+            // These loops build the nested TypeSpecifier directly, so unlike
+            // the declarator loops there is no DerivedDeclarator count to
+            // cap later -- the depth has to be refused here.
+            let mut ptr_depth = 0u32;
+            loop {
+                let star_span = self.peek_span();
+                if !self.consume_if(&TokenKind::Star) {
+                    break;
+                }
+                ptr_depth += 1;
+                if !self.enter_pointer_level(ptr_depth, star_span) {
+                    break;
+                }
                 result_type = TypeSpecifier::Pointer(Box::new(result_type), AddressSpace::Default);
                 self.skip_cv_qualifiers();
             }
@@ -1297,7 +1309,16 @@ impl Parser {
         self.attrs.set_const(false);
         self.attrs.set_volatile(false);
 
-        while self.consume_if(&TokenKind::Star) {
+        let mut ptr_depth = 0u32;
+        loop {
+            let star_span = self.peek_span();
+            if !self.consume_if(&TokenKind::Star) {
+                break;
+            }
+            ptr_depth += 1;
+            if !self.enter_pointer_level(ptr_depth, star_span) {
+                break;
+            }
             result_type = TypeSpecifier::Pointer(Box::new(result_type), AddressSpace::Default);
             let mut q = 0u8;
             loop {
@@ -1418,8 +1439,17 @@ impl Parser {
         // Consume address space qualifiers that appear before the first '*'
         // e.g., typeof(var) __seg_gs * → __seg_gs sets parsing_address_space
         self.skip_cv_qualifiers();
-        // Parse leading pointer(s)
-        while self.consume_if(&TokenKind::Star) {
+        // Parse leading pointer(s). Bounded: see POINTER_DEPTH_BUDGET.
+        let mut ptr_depth = 0u32;
+        loop {
+            let star_span = self.peek_span();
+            if !self.consume_if(&TokenKind::Star) {
+                break;
+            }
+            ptr_depth += 1;
+            if !self.enter_pointer_level(ptr_depth, star_span) {
+                break;
+            }
             // Capture any address space qualifier that preceded the '*'
             // (e.g., __seg_gs in "typeof(var) __seg_gs *")
             let addr_space = std::mem::take(&mut self.attrs.parsing_address_space);

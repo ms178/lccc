@@ -88,6 +88,10 @@ pub struct TypeScopeFrame {
     /// Keys that were overwritten in `struct_layouts`: (key, previous_value).
     /// Uses Rc<StructLayout> so saving/restoring is a cheap refcount bump.
     pub struct_layouts_shadowed: Vec<(String, RcLayout)>,
+    /// Base record keys whose alias was newly inserted into `record_alias`.
+    pub record_alias_added: Vec<String>,
+    /// Base record keys whose alias was overwritten: (base, previous alias).
+    pub record_alias_shadowed: Vec<(String, String)>,
     /// Keys newly inserted into `ctype_cache`.
     pub ctype_cache_added: Vec<String>,
     /// Keys that were overwritten in `ctype_cache`: (key, previous_value).
@@ -108,6 +112,8 @@ impl TypeScopeFrame {
             enums_added: Vec::new(),
             struct_layouts_added: Vec::new(),
             struct_layouts_shadowed: Vec::new(),
+            record_alias_added: Vec::new(),
+            record_alias_shadowed: Vec::new(),
             ctype_cache_added: Vec::new(),
             ctype_cache_shadowed: Vec::new(),
             typedefs_added: Vec::new(),
@@ -132,6 +138,12 @@ pub struct TypeContext {
     /// that take &self (via the TypeConvertContext trait) may need to insert
     /// forward-declaration layouts when encountering struct/union types.
     pub struct_layouts: RefCell<FxHashMap<String, RcLayout>>,
+    /// Base record key -> the key currently denoting that tag.
+    ///
+    /// Only non-identity while an inner-scope definition shadows an outer one
+    /// (C 6.7.2.3): `struct.S` then denotes `struct.S#1` until the scope pops.
+    /// Scoped like `struct_layouts` so shadowing unwinds with the scope.
+    pub record_alias: RefCell<FxHashMap<String, String>>,
     /// Enum constant values
     pub enum_constants: FxHashMap<String, i64>,
     /// Typedef mappings (name -> resolved CType)
@@ -167,6 +179,8 @@ pub struct TypeContext {
     /// Counter for anonymous struct/union CType keys generated from &self contexts.
     /// Uses Cell for interior mutability since type_spec_to_ctype takes &self.
     anon_ctype_counter: std::cell::Cell<u32>,
+    /// Counter for shadowing record definitions; see `next_struct_variant_id`.
+    struct_variant_counter: std::cell::Cell<u64>,
 }
 
 // We cannot directly implement `StructLayoutProvider` for `TypeContext` because
@@ -179,6 +193,7 @@ impl TypeContext {
     pub fn new() -> Self {
         let mut tc = Self {
             struct_layouts: RefCell::new(FxHashMap::default()),
+            record_alias: RefCell::new(FxHashMap::default()),
             enum_constants: FxHashMap::default(),
             typedefs: FxHashMap::default(),
             typedef_alignments: FxHashMap::default(),
@@ -191,6 +206,7 @@ impl TypeContext {
             ctype_cache: RefCell::new(FxHashMap::default()),
             scope_stack: RefCell::new(Vec::new()),
             anon_ctype_counter: std::cell::Cell::new(0),
+            struct_variant_counter: std::cell::Cell::new(0),
         };
         tc.seed_builtin_typedefs();
         tc
@@ -406,6 +422,74 @@ impl TypeContext {
         id
     }
 
+    /// Next id for a *shadowing* record definition: a `struct S { ... }` inside
+    /// an inner scope when a different `struct S` is already visible.
+    ///
+    /// C 6.7.2.3 makes that a NEW type, incompatible with the outer one, so it
+    /// cannot share the outer one's type key. The id is used as a `#N` suffix
+    /// on the base key (`struct.S#1`); `CType::record_display_tag` strips it for
+    /// diagnostics so users still see `struct S`.
+    /// Next record-variant suffix. Variant keys must be unique for the whole
+    /// translation unit, so this is a plain counter rather than anything keyed
+    /// off the source: two shadowing definitions at the same nesting depth in
+    /// different branches would collide on a depth- or scope-derived scheme.
+    /// `u64` because uniqueness is the invariant the type system rests on and
+    /// it is not worth reasoning about a wrap; 1.8e19 increments would need
+    /// more record definitions than fit in addressable memory, and in a debug
+    /// build the `+ 1` panics rather than silently reusing a key.
+    pub fn next_struct_variant_id(&self) -> u64 {
+        let id = self.struct_variant_counter.get();
+        self.struct_variant_counter.set(id + 1);
+        id
+    }
+
+    /// Record that `base` is currently denoted by `active`, scoped so the
+    /// mapping disappears when the shadowing scope pops.
+    pub fn set_record_alias_from_ref(&self, base: &str, active: &str) {
+        let mut alias = self.record_alias.borrow_mut();
+        let mut stack = self.scope_stack.borrow_mut();
+        if let Some(frame) = stack.last_mut() {
+            // Record the state as it was BEFORE this frame touched it, at most
+            // once per base key. Two definitions of one tag in the same frame
+            // (a redefinition -- REDEF-1, which lccc does not yet diagnose but
+            // GCC does) would otherwise push two undo entries, and `pop_scope`
+            // removes the `added` entries first and then replays the `shadowed`
+            // ones, so the second entry would resurrect an alias belonging to a
+            // scope that no longer exists. One entry per key makes the undo
+            // idempotent instead of order-dependent.
+            let tracked = frame.record_alias_added.iter().any(|k| k == base)
+                || frame.record_alias_shadowed.iter().any(|(k, _)| k == base);
+            if !tracked {
+                match alias.get(base).cloned() {
+                    Some(prev) => frame.record_alias_shadowed.push((base.to_string(), prev)),
+                    None => frame.record_alias_added.push(base.to_string()),
+                }
+            }
+        }
+        alias.insert(base.to_string(), active.to_string());
+    }
+
+    /// The key that currently denotes record tag key `base`: the shadowing
+    /// variant while one is live, otherwise `base` itself.
+    ///
+    /// Every place that turns a source-level tag into a record `CType` must go
+    /// through this, or an inner-scope `struct S` value gets typed as the outer
+    /// `struct S` and the two become indistinguishable to the type checker.
+    ///
+    /// Returns a borrow, not an owned copy: the overwhelmingly common case is
+    /// "no shadowing in effect", and record type resolution happens for every
+    /// elaborated type in the translation unit, so cloning here would be a
+    /// pure waste.
+    pub fn resolve_record_key<'a>(&self, base: &'a str) -> std::borrow::Cow<'a, str> {
+        // Copy out under the guard: a Cow::Borrowed tied to the Ref guard would
+        // not outlive it. The common path still allocates nothing.
+        let active = self.record_alias.borrow().get(base).cloned();
+        match active {
+            Some(active) => std::borrow::Cow::Owned(active),
+            None => std::borrow::Cow::Borrowed(base),
+        }
+    }
+
     /// Insert a struct layout from a &self context (interior mutability via RefCell).
     pub fn insert_struct_layout_from_ref(&self, key: &str, layout: StructLayout) {
         self.struct_layouts
@@ -443,6 +527,15 @@ impl TypeContext {
             let layouts = self.struct_layouts.get_mut();
             for key in frame.struct_layouts_added {
                 layouts.remove(&key);
+            }
+            {
+                let mut alias = self.record_alias.borrow_mut();
+                for key in frame.record_alias_added {
+                    alias.remove(&key);
+                }
+                for (key, val) in frame.record_alias_shadowed {
+                    alias.insert(key, val);
+                }
             }
             for (key, val) in frame.struct_layouts_shadowed {
                 // Don't restore an empty forward-declaration layout over a full
@@ -574,5 +667,107 @@ impl TypeContext {
                 frame.ctype_cache_added.push(key.to_string());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod record_alias_tests {
+    use super::TypeContext;
+    use std::borrow::Cow;
+
+    #[test]
+    fn absent_tag_borrows_rather_than_allocates() {
+        // The common path: no alias means no String, which is the whole point
+        // of returning a Cow here.
+        let ctx = TypeContext::new();
+        match ctx.resolve_record_key("struct.S") {
+            Cow::Borrowed(b) => assert_eq!(b, "struct.S"),
+            Cow::Owned(_) => panic!("expected a borrow on the no-alias path"),
+        }
+    }
+
+    #[test]
+    fn alias_is_visible_while_its_scope_lives() {
+        let mut ctx = TypeContext::new();
+        ctx.push_scope();
+        ctx.set_record_alias_from_ref("struct.S", "struct.S#1");
+        assert_eq!(ctx.resolve_record_key("struct.S").as_ref(), "struct.S#1");
+    }
+
+    #[test]
+    fn pop_scope_undoes_the_alias() {
+        let mut ctx = TypeContext::new();
+        ctx.push_scope();
+        ctx.set_record_alias_from_ref("struct.S", "struct.S#1");
+        ctx.pop_scope();
+        match ctx.resolve_record_key("struct.S") {
+            Cow::Borrowed(b) => assert_eq!(b, "struct.S"),
+            Cow::Owned(o) => panic!("alias outlived its scope: {o}"),
+        }
+    }
+
+    #[test]
+    fn nested_shadow_restores_the_outer_variant_not_the_base() {
+        // Two nesting levels: leaving the inner scope must restore the OUTER
+        // variant, not the bare base key, or the middle scope silently loses
+        // its own shadowing.
+        let mut ctx = TypeContext::new();
+        ctx.push_scope();
+        ctx.set_record_alias_from_ref("struct.S", "struct.S#1");
+        ctx.push_scope();
+        ctx.set_record_alias_from_ref("struct.S", "struct.S#2");
+        assert_eq!(ctx.resolve_record_key("struct.S").as_ref(), "struct.S#2");
+        ctx.pop_scope();
+        assert_eq!(ctx.resolve_record_key("struct.S").as_ref(), "struct.S#1");
+        ctx.pop_scope();
+        assert_eq!(ctx.resolve_record_key("struct.S").as_ref(), "struct.S");
+    }
+
+    #[test]
+    fn two_definitions_in_one_frame_do_not_leak_an_alias_past_the_pop() {
+        // REDEF-1's structural half. A redefinition in the SAME frame used to
+        // push an `added` entry and then a `shadowed` one; pop_scope removes
+        // `added` first and then replays `shadowed`, so the alias came back
+        // pointing at a variant from a scope that no longer exists -- a
+        // dangling alias that would make every later `struct S` in the file
+        // resolve to the dead inner record.
+        let mut ctx = TypeContext::new();
+        ctx.push_scope();
+        ctx.set_record_alias_from_ref("struct.S", "struct.S#1");
+        ctx.set_record_alias_from_ref("struct.S", "struct.S#2");
+        assert_eq!(ctx.resolve_record_key("struct.S").as_ref(), "struct.S#2");
+        ctx.pop_scope();
+        assert_eq!(
+            ctx.resolve_record_key("struct.S").as_ref(),
+            "struct.S",
+            "the alias must be gone, not resurrected"
+        );
+    }
+
+    #[test]
+    fn redefinition_over_a_shadowed_outer_alias_restores_the_outer_one() {
+        // Same double-set, but with an outer alias to restore: the frame must
+        // remember the value that was live BEFORE it started, not the
+        // intermediate one.
+        let mut ctx = TypeContext::new();
+        ctx.push_scope();
+        ctx.set_record_alias_from_ref("struct.S", "struct.S#1");
+        ctx.push_scope();
+        ctx.set_record_alias_from_ref("struct.S", "struct.S#2");
+        ctx.set_record_alias_from_ref("struct.S", "struct.S#3");
+        assert_eq!(ctx.resolve_record_key("struct.S").as_ref(), "struct.S#3");
+        ctx.pop_scope();
+        assert_eq!(ctx.resolve_record_key("struct.S").as_ref(), "struct.S#1");
+        ctx.pop_scope();
+        assert_eq!(ctx.resolve_record_key("struct.S").as_ref(), "struct.S");
+    }
+
+    #[test]
+    fn variant_ids_are_unique_and_monotonic() {
+        let ctx = TypeContext::new();
+        let a = ctx.next_struct_variant_id();
+        let b = ctx.next_struct_variant_id();
+        assert_ne!(a, b);
+        assert!(b > a, "ids must not repeat: {a} then {b}");
     }
 }

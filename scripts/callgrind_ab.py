@@ -192,16 +192,42 @@ def _measure(args,benches,outroot,manifest,cache):
     return 2 if not rows else 1 if failures else 0
 
 
-# Every long option `main`'s parser defines, so the option-string rewrite below
-# never swallows one of the script's own flags into `--opt=`.
-_OWN_OPTIONS=frozenset(('--opt','--out-root','--gcc-include-command','--heavy','--help'))
+def build_parser():
+    """The one parser `main` parses with, factored out so its option set can be
+    read off it rather than restated beside it."""
+    ap=argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument('mine');ap.add_argument('ref')
+    ap.add_argument('--opt',required=True);ap.add_argument('bench',nargs='*')
+    ap.add_argument('--heavy',action='store_true')
+    ap.add_argument('--out-root',type=Path)
+    ap.add_argument('--gcc-include-command',default='gcc')
+    return ap
+
+
+def long_options(ap):
+    """Every long option `ap` defines, derived from the parser itself.
+
+    `_OWN_OPTIONS` used to be a hand-written frozenset declared next to main --
+    a second source of truth.  Add an option to the parser and forget the set,
+    and the rewrite in main silently swallows the new flag into `--opt=`, which
+    turns "missing required --opt" into a bogus value and hides the real error.
+    Deriving it makes that drift impossible rather than merely tested for.
+    argparse exposes no public enumeration of a parser's options, so this reads
+    `_actions`, which has been stable since 3.4 and is what `format_usage`
+    itself walks.
+    """
+    return frozenset(opt.split('=',1)[0] for action in ap._actions
+                     for opt in action.option_strings if opt.startswith('--'))
+
+
+# Every long option the parser defines, so the option-string rewrite below never
+# swallows one of the script's own flags into `--opt=`.
+_OWN_OPTIONS=long_options(build_parser())
 
 
 def main(argv=None):
     argv=list(sys.argv[1:] if argv is None else argv)
-    ap=argparse.ArgumentParser(description=__doc__.splitlines()[0]);ap.add_argument('mine');ap.add_argument('ref')
-    ap.add_argument('--opt',required=True);ap.add_argument('bench',nargs='*');ap.add_argument('--heavy',action='store_true')
-    ap.add_argument('--out-root',type=Path);ap.add_argument('--gcc-include-command',default='gcc')
+    ap=build_parser()
     # Preserve the original third positional quoted option-string, including
     # a single '-O2' (argparse would mistake that positional for an option).
     # Anything spelling one of this parser's own long options is left alone:

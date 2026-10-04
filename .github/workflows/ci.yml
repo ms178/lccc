@@ -45,6 +45,24 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends mold lld
 
+      # The record-tag identity gate diffs against a real compiler, and it needs
+      # one that understands -std=c23. ubuntu-latest ships GCC 13, which does
+      # not: it rejects the FLAG, and because a rejection of the flag and a
+      # rejection of the program both look like "reject", five negative rows
+      # then "agreed" with lccc and one positive row went red. That is PR #737,
+      # and the red was the gate's fault, not the compiler's. Per the doctrine
+      # stated above, the oracle set is provisioned explicitly rather than left
+      # to the image. The gate independently probes for a compiler that accepts
+      # both -std=c17 and -std=c23, refuses to run without one, runs a positive
+      # control per dialect before any row, requires every rejection to be for
+      # the stated reason, and prints the oracle's --version in its summary --
+      # so this step is what makes the oracle deterministic, and the gate is
+      # what makes a missing one loud instead of vacuous.
+      - name: Install a C23-capable GCC oracle
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-14
+
       - name: Cache cargo registry
         uses: actions/cache@v6
         with:
@@ -176,6 +194,13 @@ jobs:
       # missing tier fails and so does an unexpected one.
       - name: Loop-alignment contract gate (emitted assembly)
         run: python3 scripts/check_loop_alignment.py --lccc target/fastbuild/lccc
+
+      # Nested same-tag record identity, differential against the host GCC.
+      # The runtime corpus cannot cover this: GCC rejects the offending program
+      # so there is no output to compare. TAG-ID-1 shipped as a miscompile with
+      # every corpus and unit test green, which is why it gets its own oracle.
+      - name: Record tag identity gate (nested same-tag structs)
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_record_tag_identity.sh
 
       # The result artifact is retained already, but GitHub's public job view
       # hides raw logs/artifacts from anonymous triage. Turn each result into a
@@ -923,6 +948,11 @@ jobs:
           bash tests/regression/check_boot_size_measurement.sh
           bash tests/regression/check_env_test_hygiene.sh
           bash tests/regression/check_peephole_whitespace.sh
+          # The wrapper's argument parsing is exercised separately: it once
+          # stored the literal `--phase` flag, selected nothing, ran no phase
+          # and still printed PASS.  The invariance gate above cannot see that,
+          # so the parser gets its own compiler-free case table.
+          bash tests/regression/check_peephole_whitespace.sh --selftest
           bash tests/regression/check_peephole_trace_bisect.sh
           # The trace-bisect tool is also exercised directly, so a broken
           # operand parser fails CI even if the wrapper gate is skipped.

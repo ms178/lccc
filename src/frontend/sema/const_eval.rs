@@ -944,8 +944,12 @@ impl<'a> SemaConstEval<'a> {
             ) => {
                 // Look up cached layout for tagged structs
                 if let Some(tag) = tag {
-                    let key = format!("struct.{}", tag);
-                    if let Some(layout) = self.types.borrow_struct_layouts().get(&key) {
+                    // Through the alias, not the raw tag: inside a shadowing
+                    // scope the tag denotes the inner record, and sizeof has to
+                    // report the inner size.
+                    let base = format!("struct.{}", tag);
+                    let key = self.types.resolve_record_key(&base);
+                    if let Some(layout) = self.types.borrow_struct_layouts().get(key.as_ref()) {
                         return Some(layout.size);
                     }
                 }
@@ -981,8 +985,9 @@ impl<'a> SemaConstEval<'a> {
                 reverse_sso,
             ) => {
                 if let Some(tag) = tag {
-                    let key = format!("union.{}", tag);
-                    if let Some(layout) = self.types.borrow_struct_layouts().get(&key) {
+                    let base = format!("union.{}", tag);
+                    let key = self.types.resolve_record_key(&base);
+                    if let Some(layout) = self.types.borrow_struct_layouts().get(key.as_ref()) {
                         return Some(layout.size);
                     }
                 }
@@ -1124,8 +1129,9 @@ impl<'a> SemaConstEval<'a> {
                 reverse_sso,
             ) => {
                 if let Some(tag) = tag {
-                    let key = format!("struct.{}", tag);
-                    if let Some(layout) = self.types.borrow_struct_layouts().get(&key) {
+                    let base = format!("struct.{}", tag);
+                    let key = self.types.resolve_record_key(&base);
+                    if let Some(layout) = self.types.borrow_struct_layouts().get(key.as_ref()) {
                         return layout.align;
                     }
                 }
@@ -1159,8 +1165,9 @@ impl<'a> SemaConstEval<'a> {
                 reverse_sso,
             ) => {
                 if let Some(tag) = tag {
-                    let key = format!("union.{}", tag);
-                    if let Some(layout) = self.types.borrow_struct_layouts().get(&key) {
+                    let base = format!("union.{}", tag);
+                    let key = self.types.resolve_record_key(&base);
+                    if let Some(layout) = self.types.borrow_struct_layouts().get(key.as_ref()) {
                         return layout.align;
                     }
                 }
@@ -1335,7 +1342,28 @@ fn ctype_from_type_spec(spec: &TypeSpecifier, types: &TypeContext) -> CType {
         TypeSpecifier::Double => CType::Double,
         TypeSpecifier::LongDouble => CType::LongDouble,
         TypeSpecifier::Pointer(inner, addr_space) => {
-            CType::Pointer(Box::new(ctype_from_type_spec(inner, types)), *addr_space)
+            // Iterative pointer spine -- see type_checker::resolve_type_spec
+            // and type_builder::resolve_type_spec_to_ctype for why.
+            if !matches!(**inner, TypeSpecifier::Pointer(_, _)) {
+                CType::Pointer(Box::new(ctype_from_type_spec(inner, types)), *addr_space)
+            } else {
+                let mut spaces = Vec::with_capacity(8);
+                spaces.push(*addr_space);
+                let mut cur: &TypeSpecifier = inner;
+                let mut ty = loop {
+                    match cur {
+                        TypeSpecifier::Pointer(i, s) => {
+                            spaces.push(*s);
+                            cur = i;
+                        }
+                        other => break ctype_from_type_spec(other, types),
+                    }
+                };
+                for space in spaces.iter().rev() {
+                    ty = CType::Pointer(Box::new(ty), *space);
+                }
+                ty
+            }
         }
         TypeSpecifier::Array(elem, size) => {
             let elem_ty = ctype_from_type_spec(elem, types);
@@ -1363,14 +1391,14 @@ fn ctype_from_type_spec(spec: &TypeSpecifier, types: &TypeContext) -> CType {
         }
         TypeSpecifier::Struct(tag, ..) => {
             if let Some(tag) = tag {
-                CType::Struct(format!("struct.{}", tag).into())
+                CType::Struct(types.resolve_record_key(&format!("struct.{}", tag)).into())
             } else {
                 CType::Int // anonymous struct without context
             }
         }
         TypeSpecifier::Union(tag, ..) => {
             if let Some(tag) = tag {
-                CType::Union(format!("union.{}", tag).into())
+                CType::Union(types.resolve_record_key(&format!("union.{}", tag)).into())
             } else {
                 CType::Int // anonymous union without context
             }

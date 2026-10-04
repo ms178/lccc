@@ -72,6 +72,34 @@ def extractall_takes_filter() -> bool:
         return False
 
 
+def _neutralize_archive_attrs(m: tarfile.TarInfo) -> tarfile.TarInfo:
+    """Metadata half of tarfile's ``data`` filter, for pre-3.12 interpreters.
+
+    Mirrors ``scripts/lccc_recover.py:neutralize_archive_attrs`` exactly.  An
+    unfiltered ``extractall`` calls ``chown``/``chmod`` with the archive's own
+    values, and this archive is fetched over the network, so ownership and
+    permissions are attacker-controlled inputs here, not trusted metadata:
+    ownership is dropped (``None`` becomes ``chown(path, -1, -1)``, a no-op)
+    and modes are clamped to what the filter would allow.
+    """
+    m.uid = None
+    m.gid = None
+    m.uname = None
+    m.gname = None
+    mode = m.mode
+    if mode is None:
+        return m
+    mode &= 0o755
+    if m.isfile() or m.islnk():
+        if not mode & 0o100:
+            mode &= ~0o111
+        mode |= 0o600
+    elif m.isdir() or m.issym():
+        mode = None
+    m.mode = mode
+    return m
+
+
 def extract_untrusted(tf: tarfile.TarFile, dest: Path) -> None:
     """Extract a downloaded third-party tarball without trusting its members.
 
@@ -103,6 +131,20 @@ def extract_untrusted(tf: tarfile.TarFile, dest: Path) -> None:
             raise ValueError(f"refusing archive member {m.name!r}: escapes the destination")
         if "\0" in m.name:
             raise ValueError(f"refusing archive member {m.name!r}: NUL byte in name")
+        # Path-shape parity with scripts/lccc_recover.py.  PurePosixPath does
+        # not treat a backslash as a separator, so on a Windows host
+        # `..\\..\\evil` is one harmless-looking component here while the OS
+        # sees a traversal.  tarfile's own filter strips a leading os.sep for
+        # the same reason.  This project only ships Linux paths, and the
+        # pinned gzip-1.14.tar.xz has no backslash in any of its 525 member
+        # names, so rejecting them costs nothing and keeps the two helpers'
+        # rules from drifting apart.
+        if "\\" in m.name:
+            raise ValueError(f"refusing archive member {m.name!r}: backslash in name")
+        if m.name.startswith("//") or (
+            len(m.name) >= 2 and m.name[1] == ":" and m.name[0].isalpha()
+        ):
+            raise ValueError(f"refusing archive member {m.name!r}: drive/UNC name")
         # Entry TYPE, not just name and mode.  Measured: tarfile's data filter
         # rejects FIFO/char/block members with SpecialFileError, but an
         # unfiltered extractall happily creates the FIFO -- so without this the
@@ -124,6 +166,14 @@ def extract_untrusted(tf: tarfile.TarFile, dest: Path) -> None:
     if extractall_takes_filter():
         tf.extractall(dest, filter="data")
     else:
+        # Same metadata contract as the filter, applied by hand.  See
+        # scripts/lccc_recover.py neutralize_archive_attrs for the derivation;
+        # the two copies are pinned equal by
+        # tests/corpus/test_workload_extraction_safety.py, which feeds both
+        # helpers the same hostile archives and compares verdicts and the
+        # resulting on-disk attributes.
+        for m in tf.getmembers():
+            _neutralize_archive_attrs(m)
         tf.extractall(dest)
 
 
