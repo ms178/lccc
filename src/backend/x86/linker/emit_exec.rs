@@ -2811,6 +2811,27 @@ pub(super) fn emit_executable(
             if relas.is_empty() {
                 continue;
             }
+            // ICF-folded sections are aliased into `section_map` so their
+            // symbols resolve to the surviving representative — which also
+            // means the map lookup below would succeed for them and apply
+            // their relocations onto the representative's output bytes a
+            // SECOND time.  Byte-identical sections with element-wise
+            // identical relocations (the ICF equivalence) make that a
+            // no-op for every ordinary relocation type, but the TLS
+            // GD/LD -> LE rewrites are sequence-shaped, not field-shaped:
+            // the twin's TLSLD reloc would inspect bytes the first
+            // application already rewrote (`66 66 66 64 48 8b ...` is not
+            // `48 8d 3d ... e8 ...`) and die with "unrecognized code
+            // sequence" — measured on libstdc++.a(eh_globals.o), where
+            // `__cxa_get_globals` and `__cxa_get_globals_fast` are
+            // foldable TLS twins.  GC/COMDAT losers are not in the map at
+            // all (the merge skips them); folded ones are, so the dead
+            // set is the exact discriminator.  Skipping the twin is
+            // lossless: the representative's own relocations write the
+            // identical values.
+            if dead_sections.contains(&(obj_idx, sec_idx)) {
+                continue;
+            }
             let (out_idx, sec_off) = match section_map.get(&(obj_idx, sec_idx)) {
                 Some(&v) => v,
                 None => continue,

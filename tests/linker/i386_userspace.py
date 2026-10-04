@@ -285,15 +285,30 @@ def _ok(r, what):
 
 def _probe(e):
     """Independent -m32 eligibility: compile, link and run with the system
-    linker.  Returns None when eligible, else the reason."""
+    linker.  Returns (reason, kernel_policy); (None, False) when eligible.
+
+    `kernel_policy` marks host-kernel execution blocks (no 32-bit dynamic
+    loader on a rootless sandbox, or a seccomp policy that kills 32-bit
+    syscall entry): states no hosted CI runner can be in, which the caller
+    reports as an environmental skip instead of a plain SKIP, so --strict
+    keeps refusing ordinary "did not run" skips.
+    """
     _w(e.td, "probe.c", "#include <stdio.h>\nint main(void){puts(\"ok\");return 0;}\n")
     r = e.gcc("probe.c", "-o", "probe", lccc=False)
     if r.returncode != 0:
-        return "gcc -m32 cannot link (no i386 multilib): " + r.stderr.decode()[:200]
-    r = e.run(e.path("probe"), False)
-    if r.returncode != 0 or r.stdout != b"ok\n":
-        return "the host cannot run i386 executables"
-    return None
+        return "gcc -m32 cannot link (no i386 multilib): " + r.stderr.decode()[:200], False
+    try:
+        r = e.run(e.path("probe"), False)
+    except FileNotFoundError as exc:
+        # Rootless sandboxes without /lib/ld-linux.so.2 raise ENOENT from
+        # the exec itself; that is a probe verdict ("cannot run"), not an
+        # exception to take the runner down with.
+        return f"the host cannot run i386 executables ({exc})", True
+    if r.returncode == 0 and r.stdout == b"ok\n":
+        return None, False
+    if r.returncode == -31:  # SIGSYS: seccomp blocks 32-bit syscall entry
+        return "the host cannot run i386 executables (SIGSYS: host syscall policy)", True
+    return "the host cannot run i386 executables", False
 
 
 def _expect_same_runs(e, exe_ref, exe_new, libdir_ref, libdir_new, label):
@@ -969,18 +984,27 @@ CASES = [
 ]
 
 
-def run_all(args, cc, result_cls):
-    """Run the selected cases; returns Result objects."""
+def run_all(args, cc, result_cls, env_skip_status="SKIP-ENV"):
+    """Run the selected cases; returns Result objects.
+
+    `env_skip_status` is the verdict class used for host-kernel execution
+    blocks (see _probe); run_linker_tests passes its SKIP-ENV so --strict
+    can tell "did not run" skips (still refused) from "cannot run on this
+    host's kernel" skips (accepted, impossible on hosted CI runners).
+    """
     selected = [(n, f) for n, f in CASES if not args.filter or args.filter in n]
     if not selected:
         return []
     probe_env = Env(args, cc)
     try:
-        reason = _probe(probe_env)
+        reason, kernel_policy = _probe(probe_env)
     finally:
         probe_env.close(False)
     if reason:
-        status = "FAIL" if os.environ.get("LCCC_REQUIRE_I386") == "1" else "SKIP"
+        if os.environ.get("LCCC_REQUIRE_I386") == "1" and not kernel_policy:
+            status = "FAIL"
+        else:
+            status = env_skip_status if kernel_policy else "SKIP"
         return [result_cls(n, status, reason) for n, _ in selected]
     results = []
     for name, fn in selected:

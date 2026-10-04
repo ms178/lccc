@@ -15,9 +15,15 @@
 # relocation set it derives against the set it derives from GNU ld's image is
 # the strongest available check short of booting a kernel in QEMU.
 #
-# The sources are fetched from kernel.org's cgit (NOT GitHub, which rate-limits
-# raw fetches aggressively and silently returns a 429 HTML body that then fails
-# to compile with a confusing error).
+# The sources are fetched from kernel.org's cgit first (NOT GitHub, which
+# rate-limits raw fetches aggressively and silently returns a 429 HTML body
+# that then fails to compile with a confusing error).  When kernel.org is
+# unreachable from the build network (403/blocked egress — observed in
+# locked-down research sandboxes), the same path is retried ONCE from the
+# gregkh/linux stable mirror on GitHub.  The mirror is safe to fall back
+# to precisely because every file is pinned by SHA-256 below: a doctored
+# or HTML body cannot pass the pin check, so the fallback can only ever
+# deliver the exact v6.12 sources or a hard error.
 #
 # Usage:
 #   tests/linker/setup_kernel_tools.sh [--kver v6.12] [--prefix DIR]
@@ -61,14 +67,25 @@ if [[ -x "$BIN/relocs" ]]; then
 fi
 
 BASE="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain"
+MIRROR="https://raw.githubusercontent.com/gregkh/linux"
+
+# fetch <dest> <cgit-path-with-query>: kernel.org first, mirror fallback.
+# The SHA-256 pins (and the SPDX first-line sanity check) make the fallback
+# tamper-proof; a mirror outage or HTML body dies with the pin error.
+fetch() {
+  local dest=$1 path=$2
+  if ! curl -fsSL --max-time 60 -o "$dest" "$BASE/$path"; then
+    echo "note: kernel.org fetch failed for $path; trying the gregkh mirror" >&2
+    curl -fsSL --max-time 60 -o "$dest" "$MIRROR/$KVER/${path%%\?*}"
+  fi
+}
 
 echo "fetching arch/x86/tools/relocs sources at $KVER"
 for f in relocs.c relocs.h relocs_common.c relocs_32.c relocs_64.c; do
-  curl -fsSL -o "$SRC/$f" "$BASE/arch/x86/tools/$f?h=$KVER"
+  fetch "$SRC/$f" "arch/x86/tools/$f?h=$KVER"
 done
 # relocs.h includes <tools/le_byteshift.h> from the kernel's tools/include.
-curl -fsSL -o "$SRC/tools/le_byteshift.h" \
-     "$BASE/tools/include/tools/le_byteshift.h?h=$KVER"
+fetch "$SRC/tools/le_byteshift.h" "tools/include/tools/le_byteshift.h?h=$KVER"
 
 # Sanity: a rate-limited or redirected fetch yields an HTML error page that
 # compiles into a wall of nonsense. Catch it here with a clear message.
