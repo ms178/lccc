@@ -463,7 +463,7 @@ pub fn encode_instruction(
         "fmul" => {
             if matches!(operands.first(), Some(Operand::RegArrangement { .. })) {
                 if matches!(operands.get(2), Some(Operand::RegLane { .. })) {
-                    encode_neon_float_elem(operands, 1, 0b1001)
+                    encode_neon_float_elem(operands, 0b1001)
                 } else {
                     encode_neon_float_three_same(operands, 1, 0, 0b11011)
                 }
@@ -583,14 +583,22 @@ pub fn encode_instruction(
         "fcmp" => encode_fcmp(operands),
         "fcvtzs" => {
             if matches!(operands.first(), Some(Operand::RegArrangement { .. })) {
-                encode_neon_float_two_misc(operands, 0, 1, 0b11011)
+                if operands.get(2).is_some() {
+                    encode_neon_float_two_misc_fixed(operands, 0, true)
+                } else {
+                    encode_neon_float_two_misc(operands, 0, 1, 0b11011)
+                }
             } else {
                 encode_fcvt_rounding(operands, 0b11, 0b000)
             }
         }
         "fcvtzu" => {
             if matches!(operands.first(), Some(Operand::RegArrangement { .. })) {
-                encode_neon_float_two_misc(operands, 1, 1, 0b11011)
+                if operands.get(2).is_some() {
+                    encode_neon_float_two_misc_fixed(operands, 1, true)
+                } else {
+                    encode_neon_float_two_misc(operands, 1, 1, 0b11011)
+                }
             } else {
                 encode_fcvt_rounding(operands, 0b11, 0b001)
             }
@@ -605,14 +613,22 @@ pub fn encode_instruction(
         "fcvtpu" => encode_fcvt_rounding(operands, 0b01, 0b001),
         "ucvtf" => {
             if matches!(operands.first(), Some(Operand::RegArrangement { .. })) {
-                encode_neon_float_two_misc(operands, 1, 0, 0b11101)
+                if operands.get(2).is_some() {
+                    encode_neon_float_two_misc_fixed(operands, 1, false)
+                } else {
+                    encode_neon_float_two_misc(operands, 1, 0, 0b11101)
+                }
             } else {
                 encode_ucvtf(operands)
             }
         }
         "scvtf" => {
             if matches!(operands.first(), Some(Operand::RegArrangement { .. })) {
-                encode_neon_float_two_misc(operands, 0, 0, 0b11101)
+                if operands.get(2).is_some() {
+                    encode_neon_float_two_misc_fixed(operands, 0, false)
+                } else {
+                    encode_neon_float_two_misc(operands, 0, 0, 0b11101)
+                }
             } else {
                 encode_scvtf(operands)
             }
@@ -625,14 +641,14 @@ pub fn encode_instruction(
         // NEON float three-same instructions (vector-only)
         "fmla" => {
             if matches!(operands.get(2), Some(Operand::RegLane { .. })) {
-                encode_neon_float_elem(operands, 0, 0b0001)
+                encode_neon_float_elem(operands, 0b0001)
             } else {
                 encode_neon_float_three_same(operands, 0, 0, 0b11001)
             }
         }
         "fmls" => {
             if matches!(operands.get(2), Some(Operand::RegLane { .. })) {
-                encode_neon_float_elem(operands, 0, 0b0101)
+                encode_neon_float_elem(operands, 0b0101)
             } else {
                 encode_neon_float_three_same(operands, 0, 1, 0b11001)
             }
@@ -941,14 +957,14 @@ pub fn encode_instruction(
         "pmul" => encode_neon_pmul(operands),
         "mla" => {
             if matches!(operands.get(2), Some(Operand::RegLane { .. })) {
-                encode_neon_elem(operands, 0, 0b0000)
+                encode_neon_elem(operands, 1, 0b0000)
             } else {
                 encode_neon_mla(operands)
             }
         }
         "mls" => {
             if matches!(operands.get(2), Some(Operand::RegLane { .. })) {
-                encode_neon_elem(operands, 0, 0b0100)
+                encode_neon_elem(operands, 1, 0b0100)
             } else {
                 encode_neon_mls(operands)
             }

@@ -739,6 +739,23 @@ jobs:
       - name: Install checker dependency (PyYAML)
         run: sudo apt-get install -y --no-install-recommends python3-yaml
 
+      # AArch64 differential oracle: harness self-test only. The full sweep
+      # is ~25,000 assembler invocations and belongs to an offline run, but
+      # the harness's own invariants must hold on every pass -- a oracle
+      # that has drifted out of agreement with GAS reports "OK" for
+      # everything and proves nothing. The cross-binutils are a declared
+      # dependency of this step, not an image property: without them the
+      # toolchain probe would silently degrade the gate into a no-op.
+      - name: AArch64 differential oracle self-test
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends \
+            binutils-aarch64-linux-gnu
+          python3 scripts/aarch64_encoder_differential.py --self-test-only \
+            --gas "$(command -v aarch64-linux-gnu-as)" \
+            --objcopy "$(command -v aarch64-linux-gnu-objcopy)" \
+            --lccc target/fastbuild/lccc
+
       # Keep every standalone gate from ci_local.sh represented in hosted CI.
       # Group the compact contracts to avoid YAML drift and setup overhead;
       # the expensive codegen-quality gate remains in bench.yml.
