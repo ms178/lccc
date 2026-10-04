@@ -2,8 +2,10 @@
 //!
 //! `encode_neon_ins` encodes the AArch64 NEON `INS` instruction (alias of
 //! `MOV`, vector copy group) in two forms:
-//!   * general : `INS Vd.Ts[dst], Xn`  -> `0 Q 0 01110 000 imm5 0 0111 Rn Rd`
-//!   * element : `INS Vd.Ts[dst], Vn.Ts[src]` -> `0 Q 1 01110 000 imm5 0 imm4 1 Rn Rd`
+//!   * general : `INS Vd.Ts[dst], Wn/Xn` (W for .b/.h/.s, X for .d)
+//!                -> `0 1 0 01110 000 imm5 0 0111 1 Rn Rd`
+//!   * element : `INS Vd.Ts[dst], Vn.Ts[src]`
+//!                -> `0 1 1 01110 000 imm5 0 imm4 1 Rn Rd`
 //!
 //! Reference encodings used as golden oracles below were captured from
 //! `llvm-mc-18 -triple=aarch64 -show-encoding` and confirmed identical to this
@@ -27,6 +29,17 @@ fn lane(rd: u32, elem_size: &str, index: u32) -> Operand {
 
 fn gp(num: u32) -> Operand {
     Operand::Reg(format!("x{num}"))
+}
+
+/// Correct-width GP source for `INS Vd.Ts[index], Rn`.
+fn gp_for_elem(num: u32, elem: &str) -> Operand {
+    let prefix = if elem == "d" { "x" } else { "w" };
+    let name = if num == 31 {
+        format!("{prefix}zr")
+    } else {
+        format!("{prefix}{num}")
+    };
+    Operand::Reg(name)
 }
 
 /// Per-element-size (size) metadata derived from the ARM ARM `imm5` element-size
@@ -80,7 +93,7 @@ proptest! {
         // The lane index must respect the element-size bound (b<=15, h<=7,
         // s<=3, d<=1); out-of-range lanes are now rejected by the encoder.
         let idx = idx_mod % (size_meta(elem).unwrap().2 + 1);
-        let ops = vec![lane(rd, elem, idx), gp(rn)];
+        let ops = vec![lane(rd, elem, idx), gp_for_elem(rn, elem)];
         let w = word_of(encode_neon_ins(&ops));
         prop_assert_eq!(w & 0x1F, rd, "Rd field must equal destination register");
         prop_assert_eq!((w >> 5) & 0x1F, rn, "Rn field must equal source GP register");
@@ -98,7 +111,7 @@ proptest! {
     ) {
         let (sentinel, shift, max_lane) = size_meta(elem).unwrap();
         let idx = max_lane; // boundary value: exercises top index bit
-        let w = word_of(encode_neon_ins(&[lane(rd, elem, idx), gp(rn)]));
+        let w = word_of(encode_neon_ins(&[lane(rd, elem, idx), gp_for_elem(rn, elem)]));
         let imm5 = (w >> 16) & 0x1F;
         prop_assert_eq!(imm5 & sentinel, sentinel, "size sentinel must be set");
         prop_assert_eq!(imm5, (idx << shift) | sentinel, "imm5 must pack index+size");
@@ -182,7 +195,7 @@ proptest! {
         let bad_index = max_lane + over;
         let ops: Vec<Operand> = vec![
             Operand::RegLane { reg: "v0".into(), elem_size: elem.into(), index: bad_index },
-            gp(1),
+            gp_for_elem(1, elem),
         ];
         prop_assert!(encode_neon_ins(&ops).is_err(),
             "out-of-range lane [{bad_index}] for .{elem} (max {max_lane}) must be rejected, \
@@ -197,35 +210,35 @@ proptest! {
 // (llvm-mc prints little-endian bytes; reconstructed to a u32 word below.)
 #[test]
 fn golden_matches_llvm_mc() {
-    // general form:  INS Vd.Ts[idx], (W|X)n   -> MOV (vector from general)
+    // general form:  INS Vd.Ts[idx], Wn/Xn   -> MOV (vector from general)
     //  ins v0.s[0], w1   = 0x4e041c20
     assert_eq!(
-        word_of(encode_neon_ins(&[lane(0, "s", 0), gp(1)])),
+        word_of(encode_neon_ins(&[lane(0, "s", 0), gp_for_elem(1, "s")])),
         0x4e041c20
     );
     //  ins v5.s[2], w3   = 0x4e141c65
     assert_eq!(
-        word_of(encode_neon_ins(&[lane(5, "s", 2), gp(3)])),
+        word_of(encode_neon_ins(&[lane(5, "s", 2), gp_for_elem(3, "s")])),
         0x4e141c65
     );
     //  ins v9.b[0], w10  = 0x4e011d49
     assert_eq!(
-        word_of(encode_neon_ins(&[lane(9, "b", 0), gp(10)])),
+        word_of(encode_neon_ins(&[lane(9, "b", 0), gp_for_elem(10, "b")])),
         0x4e011d49
     );
     //  ins v2.h[7], w4   = 0x4e1e1c82
     assert_eq!(
-        word_of(encode_neon_ins(&[lane(2, "h", 7), gp(4)])),
+        word_of(encode_neon_ins(&[lane(2, "h", 7), gp_for_elem(4, "h")])),
         0x4e1e1c82
     );
     //  ins v3.d[0], x9   = 0x4e081d23
     assert_eq!(
-        word_of(encode_neon_ins(&[lane(3, "d", 0), gp(9)])),
+        word_of(encode_neon_ins(&[lane(3, "d", 0), gp_for_elem(9, "d")])),
         0x4e081d23
     );
     //  ins v31.d[1], x30 = 0x4e181fdf
     assert_eq!(
-        word_of(encode_neon_ins(&[lane(31, "d", 1), gp(30)])),
+        word_of(encode_neon_ins(&[lane(31, "d", 1), gp_for_elem(30, "d")])),
         0x4e181fdf
     );
 
@@ -250,4 +263,22 @@ fn golden_matches_llvm_mc() {
         word_of(encode_neon_ins(&[lane(4, "d", 1), lane(6, "d", 0)])),
         0x6e1804c4
     );
+}
+
+#[test]
+fn ins_gp_form_requires_element_width_and_gpr_class() {
+    for elem in ["b", "h", "s", "d"] {
+        let correct = gp_for_elem(1, elem);
+        assert!(encode_neon_ins(&[lane(0, elem, 0), correct]).is_ok());
+
+        let wrong = if elem == "d" {
+            Operand::Reg("w1".into())
+        } else {
+            Operand::Reg("x1".into())
+        };
+        assert!(encode_neon_ins(&[lane(0, elem, 0), wrong]).is_err(),
+            "wrong GP width must be rejected for .{elem}");
+    }
+    assert!(encode_neon_ins(&[lane(0, "s", 0), Operand::Reg("v1".into())]).is_err());
+    assert!(encode_neon_ins(&[lane(0, "s", 0), gp_for_elem(1, "s"), gp_for_elem(2, "s")]).is_err());
 }

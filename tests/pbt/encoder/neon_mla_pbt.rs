@@ -18,12 +18,9 @@
 //! `mul v0.4s, v1.4s, v2.4s` (= `0x4EA29C20`, opcode 10011) differs from
 //! `mla v0.4s, v1.4s, v2.4s` by exactly bit 11, as expected.
 //!
-//! ## Finding (documented by the `#[ignore]`d test `mla_rejects_doubleword`)
-//! `MLA` (like `MUL`/`MLS`) is architecturally defined only for `size != 0b11`,
-//! i.e. arrangements `.8b/.16b/.4h/.8h/.2s/.4s`. The `.1d`/`.2d` arrangements
-//! (`size = 0b11`) are **unallocated** for this instruction, yet
-//! `encode_neon_mla` accepts them and emits a silently-wrong word instead of
-//! returning `Err`. See `MLA_DWORD_BUG_REPORT.md`.
+//! `MLA` is defined only for `size != 0b11`; the active regression rejects the
+//! unallocated `.1d` and `.2d` arrangements. The encoder also requires exact
+//! arity and identical arrangements for all three vector operands.
 
 use lccc::pbt_internals::EncodeResult;
 use lccc::pbt_internals::Operand;
@@ -190,18 +187,10 @@ proptest! {
     }
 }
 
-// --- documented finding: unallocated doubleword encoding -----------------
+// --- active negative-contract regression -----------------------------------
 
-/// `MLA` (vector) is only defined for `size != 0b11`; `.1d`/`.2d` are
-/// unallocated (ARMv8-A ARM, Advanced SIMD three same: the `size==11` row is
-/// UNALLOCATED for the multiply family). The encoder should reject them.
-///
-/// This test is `#[ignore]`d because the current implementation emits a word
-/// instead of returning `Err`, i.e. it does NOT meet the contract.
-/// Run with `cargo test -- --ignored mla_rejects_doubleword` to reproduce.
-/// See `MLA_DWORD_BUG_REPORT.md`.
+/// `.1d`/`.2d` are unallocated for vector MLA (`size == 0b11`).
 #[test]
-#[ignore]
 fn mla_rejects_doubleword() {
     for arr in &["1d", "2d"] {
         let ops = vec![va(0, arr), va(1, arr), va(2, arr)];
@@ -219,4 +208,11 @@ fn mla_rejects_doubleword() {
                 .unwrap_or(0),
         );
     }
+}
+
+#[test]
+fn mla_rejects_mismatched_arrangements_and_extra_operands() {
+    assert!(encode_neon_mla(&[va(0, "4s"), va(1, "2s"), va(2, "4s")]).is_err());
+    assert!(encode_neon_mla(&[va(0, "4s"), va(1, "4s"), va(2, "4s"), va(3, "4s")]).is_err());
+    assert!(encode_neon_mla(&[va(0, "4s"), va(1, "4s")]).is_err());
 }

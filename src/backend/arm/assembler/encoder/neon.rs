@@ -3,8 +3,6 @@ use crate::backend::arm::assembler::parser::Operand;
 
 // ── NEON/SIMD ────────────────────────────────────────────────────────────
 
-/// Helper to extract register number from a RegArrangement operand
-
 /// Validate that a NEON register list is consecutive modulo 32 (ARM ISA
 /// requirement for ld1/st1/ld2/... multi-register forms). Only the first
 /// register is encoded; hardware derives the rest, so a non-consecutive
@@ -29,37 +27,82 @@ pub fn validate_consecutive_reglist(regs: &[Operand], rt: u32) -> Result<(), Str
     Ok(())
 }
 
+fn parse_vreg_num(name: &str) -> Result<u32, String> {
+    if !name.starts_with('v') && !name.starts_with('V') {
+        return Err(format!("`{name}` is not a vector register"));
+    }
+    parse_reg_num(name).ok_or_else(|| format!("invalid vector register: {name}"))
+}
+
+fn get_vreg_arrangement(operands: &[Operand], idx: usize) -> Result<(u32, String), String> {
+    match operands.get(idx) {
+        Some(Operand::RegArrangement { reg, arrangement }) => Ok((
+            parse_vreg_num(reg)?,
+            arrangement.to_ascii_lowercase(),
+        )),
+        other => Err(format!(
+            "expected arranged vector register at operand {idx}, got {other:?}"
+        )),
+    }
+}
+
+/// Extract a register number and arrangement from a NEON operand.
+///
+/// This compatibility helper also accepts a bare register where older
+/// encoders do not need an arrangement; validation-sensitive encoders should
+/// use `get_vreg_arrangement` instead.
 pub fn get_neon_reg(operands: &[Operand], idx: usize) -> Result<(u32, String), String> {
     match operands.get(idx) {
         Some(Operand::RegArrangement { reg, arrangement }) => {
-            let num =
-                parse_reg_num(reg).ok_or_else(|| format!("invalid NEON register: {}", reg))?;
+            let num = parse_reg_num(reg)
+                .ok_or_else(|| format!("invalid NEON register: {reg}"))?;
             Ok((num, arrangement.clone()))
         }
         Some(Operand::Reg(name)) => {
-            let num = parse_reg_num(name).ok_or_else(|| format!("invalid register: {}", name))?;
+            let num = parse_reg_num(name).ok_or_else(|| format!("invalid register: {name}"))?;
             Ok((num, String::new()))
         }
         other => Err(format!(
-            "expected NEON register at operand {}, got {:?}",
-            idx, other
+            "expected NEON register at operand {idx}, got {other:?}"
         )),
+    }
+}
+
+fn arrangement_element_size(arrangement: &str) -> Option<&'static str> {
+    match arrangement {
+        "8b" | "16b" => Some("b"),
+        "4h" | "8h" => Some("h"),
+        "2s" | "4s" => Some("s"),
+        "1d" | "2d" => Some("d"),
+        _ => None,
+    }
+}
+
+fn max_lane_for_element_size(elem_size: &str) -> Option<u32> {
+    match elem_size {
+        "b" => Some(15),
+        "h" => Some(7),
+        "s" => Some(3),
+        "d" => Some(1),
+        _ => None,
     }
 }
 
 pub fn encode_cnt(operands: &[Operand]) -> Result<EncodeResult, String> {
     // CNT Vd.<T>, Vn.<T>
     // Encoding: 0 Q 00 1110 size 10 0000 0101 10 Rn Rd
-    // Only valid for .8b (Q=0) and .16b (Q=1)
-    if operands.len() < 2 {
-        return Err("cnt requires 2 operands".to_string());
+    // Only valid for matching .8b (Q=0) and .16b (Q=1) arrangements.
+    if operands.len() != 2 {
+        return Err(format!("cnt requires exactly 2 operands, got {}", operands.len()));
     }
-    let (rd, arr_d) = get_neon_reg(operands, 0)?;
-    let (rn, _arr_n) = get_neon_reg(operands, 1)?;
+    let (rd, arr_d) = get_vreg_arrangement(operands, 0)?;
+    let (rn, arr_n) = get_vreg_arrangement(operands, 1)?;
 
-    // CNT is defined only for the byte arrangements .8b (Q=0) and .16b (Q=1);
-    // every other arrangement is UNALLOCATED (ARM ARM, "Advanced SIMD two
-    // misc"): GNU as rejects `cnt v0.4h, v1.4h` outright.
+    if arr_d != arr_n {
+        return Err(format!(
+            "cnt: source arrangement .{arr_n} does not match destination .{arr_d}"
+        ));
+    }
     if arr_d != "8b" && arr_d != "16b" {
         return Err(format!(
             "cnt: only .8b/.16b arrangements are valid, got .{arr_d}"
@@ -517,10 +560,21 @@ pub fn encode_neon_pmul(operands: &[Operand]) -> Result<EncodeResult, String> {
 
 /// Encode NEON MLA Vd.T, Vn.T, Vm.T (multiply-accumulate)
 pub fn encode_neon_mla(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, arr_d) = get_neon_reg(operands, 0)?;
-    let (rn, _) = get_neon_reg(operands, 1)?;
-    let (rm, _) = get_neon_reg(operands, 2)?;
+    if operands.len() != 3 {
+        return Err(format!("mla requires exactly 3 operands, got {}", operands.len()));
+    }
+    let (rd, arr_d) = get_vreg_arrangement(operands, 0)?;
+    let (rn, arr_n) = get_vreg_arrangement(operands, 1)?;
+    let (rm, arr_m) = get_vreg_arrangement(operands, 2)?;
+    if arr_d != arr_n || arr_d != arr_m {
+        return Err(format!(
+            "mla: operand arrangements must match, got .{arr_d}, .{arr_n}, .{arr_m}"
+        ));
+    }
     let (q, size) = neon_arr_to_q_size(&arr_d)?;
+    if size == 0b11 {
+        return Err(format!("mla: .{arr_d} is unallocated (size=11)"));
+    }
     // MLA: 0 Q 0 01110 size 1 Rm 10010 1 Rn Rd
     let word = (q << 30)
         | (0b001110 << 24)
@@ -535,12 +589,19 @@ pub fn encode_neon_mla(operands: &[Operand]) -> Result<EncodeResult, String> {
 
 /// Encode NEON MLS Vd.T, Vn.T, Vm.T (multiply-subtract)
 pub fn encode_neon_mls(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, arr_d) = get_neon_reg(operands, 0)?;
-    let (rn, _) = get_neon_reg(operands, 1)?;
-    let (rm, _) = get_neon_reg(operands, 2)?;
+    if operands.len() != 3 {
+        return Err(format!("mls requires exactly 3 operands, got {}", operands.len()));
+    }
+    let (rd, arr_d) = get_vreg_arrangement(operands, 0)?;
+    let (rn, arr_n) = get_vreg_arrangement(operands, 1)?;
+    let (rm, arr_m) = get_vreg_arrangement(operands, 2)?;
+    if arr_d != arr_n || arr_d != arr_m {
+        return Err(format!(
+            "mls: operand arrangements must match, got .{arr_d}, .{arr_n}, .{arr_m}"
+        ));
+    }
     let (q, size) = neon_arr_to_q_size(&arr_d)?;
-    // MLS (like MUL/MLA) is unallocated for size=0b11 (.1d/.2d): GNU as and
-    // llvm-mc reject `mls v0.1d, v0.1d, v0.1d` with "invalid operand".
+    // MLS (like MUL/MLA) is unallocated for size=0b11 (.1d/.2d).
     if size == 0b11 {
         return Err(format!("mls: .{arr_d} is unallocated (size=11)"));
     }
@@ -670,36 +731,33 @@ pub fn encode_neon_across(
     Ok(EncodeResult::Word(word))
 }
 
-/// Encode NEON UMOV: move element to GP register
+/// Encode NEON UMOV: move element to a general-purpose register.
 pub fn encode_neon_umov(operands: &[Operand]) -> Result<EncodeResult, String> {
-    if operands.len() < 2 {
-        return Err("umov requires 2 operands".to_string());
+    if operands.len() != 2 {
+        return Err(format!("umov requires exactly 2 operands, got {}", operands.len()));
     }
-    let (rd, is_64) = get_reg(operands, 0)?;
+    let (rd, is_64) = get_gpr_strict(operands, 0)?;
 
-    // Second operand should be a RegLane (v0.b[0])
     match operands.get(1) {
         Some(Operand::RegLane {
             reg,
             elem_size,
             index,
         }) => {
-            let rn = parse_reg_num(reg).ok_or("invalid NEON register")?;
+            let rn = parse_vreg_num(reg)?;
+            let elem_size = elem_size.to_ascii_lowercase();
             let q = if is_64 { 1u32 } else { 0 };
 
-            // The GP-destination width must match the element size
-            // (X <-> .d, W <-> .b/.h/.s); GNU as rejects `umov x0, v0.s[0]`
-            // and `umov w0, v0.d[0]` with "operand mismatch", and lane
-            // indexes above the element-size bound with "register element
-            // index out of range".
+            // UMOV requires Xd for .d lanes and Wd for .b/.h/.s lanes.
             let imm5 = match (elem_size.as_str(), is_64, *index) {
-                ("b", false, idx) if idx <= 0xF => ((idx & 0xF) << 1) | 0b00001,
-                ("h", false, idx) if idx <= 0x7 => ((idx & 0x7) << 2) | 0b00010,
-                ("s", false, idx) if idx <= 0x3 => ((idx & 0x3) << 3) | 0b00100,
-                ("d", true, idx) if idx <= 0x1 => ((idx & 0x1) << 4) | 0b01000,
+                ("b", false, idx) if idx <= 0xF => (idx << 1) | 0b00001,
+                ("h", false, idx) if idx <= 0x7 => (idx << 2) | 0b00010,
+                ("s", false, idx) if idx <= 0x3 => (idx << 3) | 0b00100,
+                ("d", true, idx) if idx <= 0x1 => (idx << 4) | 0b01000,
                 _ => {
                     return Err(format!(
-                        "umov: invalid {} destination for .{elem_size}[{index}]                          (X <-> .d, W <-> .b/.h/.s; lanes: b<=15, h<=7, s<=3, d<=1)",
+                        "umov: invalid {} destination for .{elem_size}[{index}] \
+                         (X <-> .d, W <-> .b/.h/.s; lanes: b<=15, h<=7, s<=3, d<=1)",
                         if is_64 { "64-bit" } else { "32-bit" },
                     ));
                 }
@@ -714,33 +772,39 @@ pub fn encode_neon_umov(operands: &[Operand]) -> Result<EncodeResult, String> {
                 | rd;
             Ok(EncodeResult::Word(word))
         }
-        _ => Err("umov: expected register lane operand".to_string()),
+        _ => Err("umov: expected vector register lane operand".to_string()),
     }
 }
 
-/// Encode NEON DUP: broadcast GP register to all vector lanes
+/// Encode NEON DUP: broadcast a GP register or vector lane to every vector lane.
 pub fn encode_neon_dup(operands: &[Operand]) -> Result<EncodeResult, String> {
-    if operands.len() < 2 {
-        return Err("dup requires 2 operands".to_string());
+    if operands.len() != 2 {
+        return Err(format!("dup requires exactly 2 operands, got {}", operands.len()));
     }
-    let (rd, arr_d) = get_neon_reg(operands, 0)?;
+    let (rd, arr_d) = get_vreg_arrangement(operands, 0)?;
+    if arr_d == "1d" {
+        return Err("dup: the .1d arrangement is reserved".to_string());
+    }
+    let (q, _) = neon_arr_to_q_size(&arr_d)?;
+    let dest_elem = arrangement_element_size(&arr_d)
+        .ok_or_else(|| format!("unsupported dup arrangement: {arr_d}"))?;
 
-    // DUP Vd.T, Rn (general form - broadcast GP reg to vector)
-    if let Some(Operand::Reg(rn_name)) = operands.get(1) {
-        let rn = parse_reg_num(rn_name).ok_or("invalid rn")?;
-        let (q, _) = neon_arr_to_q_size(&arr_d)?;
-
-        // imm5 encoding for element size:
-        // .8b/.16b: imm5 = 00001
-        // .4h/.8h:  imm5 = 00010
-        // .2s/.4s:  imm5 = 00100
-        // .2d:      imm5 = 01000
-        let imm5 = match arr_d.as_str() {
-            "8b" | "16b" => 0b00001u32,
-            "4h" | "8h" => 0b00010,
-            "2s" | "4s" => 0b00100,
-            "2d" => 0b01000,
-            _ => return Err(format!("unsupported dup arrangement: {}", arr_d)),
+    // DUP Vd.T, Rn (general form - broadcast GP register)
+    if matches!(operands.get(1), Some(Operand::Reg(_))) {
+        let (rn, rn_is_64) = get_gpr_strict(operands, 1)?;
+        let expected_64 = dest_elem == "d";
+        if rn_is_64 != expected_64 {
+            return Err(format!(
+                "dup: .{dest_elem} lanes require a {}-bit GP source",
+                if expected_64 { "64" } else { "32" }
+            ));
+        }
+        let imm5 = match dest_elem {
+            "b" => 0b00001u32,
+            "h" => 0b00010,
+            "s" => 0b00100,
+            "d" => 0b01000,
+            _ => unreachable!(),
         };
 
         // DUP Vd.T, Rn: 0 Q 0 01110 000 imm5 0 0001 1 Rn Rd
@@ -749,28 +813,42 @@ pub fn encode_neon_dup(operands: &[Operand]) -> Result<EncodeResult, String> {
         return Ok(EncodeResult::Word(word));
     }
 
-    // DUP Vd.T, Vn.Ts[index] (broadcast element to all lanes)
+    // DUP Vd.T, Vn.Ts[index] (broadcast one vector element to all lanes)
     if let Some(Operand::RegLane {
         reg,
         elem_size,
         index,
     }) = operands.get(1)
     {
-        let rn = parse_reg_num(reg).ok_or("invalid NEON register")?;
-        let (q, _) = neon_arr_to_q_size(&arr_d)?;
-
-        // imm5 encodes both element size and index:
-        // .b[i]: imm5 = (i << 1) | 0b00001
-        // .h[i]: imm5 = (i << 2) | 0b00010
-        // .s[i]: imm5 = (i << 3) | 0b00100
-        // .d[i]: imm5 = (i << 4) | 0b01000
-        let imm5 = match elem_size.as_str() {
-            "b" => ((*index & 0xF) << 1) | 0b00001,
-            "h" => ((*index & 0x7) << 2) | 0b00010,
-            "s" => ((*index & 0x3) << 3) | 0b00100,
-            "d" => ((*index & 0x1) << 4) | 0b01000,
-            _ => return Err(format!("unsupported dup element size: {}", elem_size)),
+        let rn = parse_vreg_num(reg)?;
+        let elem_size = elem_size.to_ascii_lowercase();
+        if elem_size != dest_elem {
+            return Err(format!(
+                "dup: source lane .{elem_size} does not match destination .{arr_d}"
+            ));
+        }
+        let max_index = max_lane_for_element_size(&elem_size)
+            .ok_or_else(|| format!("unsupported dup element size: {elem_size}"))?;
+        if *index > max_index {
+            return Err(format!(
+                "dup: lane index {index} is out of range for .{elem_size} (max {max_index})"
+            ));
+        }
+        let shift = match elem_size.as_str() {
+            "b" => 1,
+            "h" => 2,
+            "s" => 3,
+            "d" => 4,
+            _ => unreachable!(),
         };
+        let sentinel = match elem_size.as_str() {
+            "b" => 0b00001,
+            "h" => 0b00010,
+            "s" => 0b00100,
+            "d" => 0b01000,
+            _ => unreachable!(),
+        };
+        let imm5 = (*index << shift) | sentinel;
 
         // DUP Vd.T, Vn.Ts[i]: 0 Q 0 01110 000 imm5 0 0000 1 Rn Rd
         let word =
@@ -778,44 +856,53 @@ pub fn encode_neon_dup(operands: &[Operand]) -> Result<EncodeResult, String> {
         return Ok(EncodeResult::Word(word));
     }
 
-    Err("unsupported dup operands".to_string())
+    Err("dup: expected (RegArrangement, Reg) or (RegArrangement, RegLane) operands".to_string())
 }
 
-/// Encode NEON INS (insert element from GP register): INS Vd.Ts[index], Xn
+/// Encode NEON INS (insert an element from a GP or vector register).
 pub fn encode_neon_ins(operands: &[Operand]) -> Result<EncodeResult, String> {
-    if operands.len() < 2 {
-        return Err("ins requires 2 operands".to_string());
+    if operands.len() != 2 {
+        return Err(format!("ins requires exactly 2 operands, got {}", operands.len()));
     }
     match (&operands[0], &operands[1]) {
-        // INS Vd.Ts[dst_idx], Xn (general register to element)
+        // INS Vd.Ts[dst_idx], Wn/Xn (general register to vector element).
         (
             Operand::RegLane {
                 reg,
                 elem_size,
                 index,
             },
-            Operand::Reg(rn_name),
+            Operand::Reg(_),
         ) => {
-            let rd = parse_reg_num(reg).ok_or("invalid NEON register")?;
-            let rn = parse_reg_num(rn_name).ok_or("invalid register")?;
+            let rd = parse_vreg_num(reg)?;
+            let elem_size = elem_size.to_ascii_lowercase();
+            let (rn, rn_is_64) = get_gpr_strict(operands, 1)?;
+            let expected_64 = elem_size == "d";
+            if rn_is_64 != expected_64 {
+                return Err(format!(
+                    "ins: .{elem_size} lane requires a {}-bit GP source",
+                    if expected_64 { "64" } else { "32" }
+                ));
+            }
 
             let imm5 = match elem_size.as_str() {
-                "b" if *index <= 0xF => ((*index & 0xF) << 1) | 0b00001,
-                "h" if *index <= 0x7 => ((*index & 0x7) << 2) | 0b00010,
-                "s" if *index <= 0x3 => ((*index & 0x3) << 3) | 0b00100,
-                "d" if *index <= 0x1 => ((*index & 0x1) << 4) | 0b01000,
+                "b" if *index <= 0xF => ((*index) << 1) | 0b00001,
+                "h" if *index <= 0x7 => ((*index) << 2) | 0b00010,
+                "s" if *index <= 0x3 => ((*index) << 3) | 0b00100,
+                "d" if *index <= 0x1 => ((*index) << 4) | 0b01000,
                 _ => {
                     return Err(format!(
-                        "ins: out-of-range lane index {index} for .{elem_size}                          (valid: b<=15, h<=7, s<=3, d<=1)"
+                        "ins: out-of-range lane index {index} for .{elem_size} \
+                         (valid: b<=15, h<=7, s<=3, d<=1)"
                     ));
                 }
             };
 
-            // INS Vd.Ts[i], Xn: 0 1 0 01110 000 imm5 0 0011 1 Rn Rd
+            // INS Vd.Ts[i], Rn: 0 1 0 01110 000 imm5 0 0011 1 Rn Rd
             let word = (0b01001110000u32 << 21) | (imm5 << 16) | (0b000111 << 10) | (rn << 5) | rd;
             Ok(EncodeResult::Word(word))
         }
-        // INS Vd.Ts[dst_idx], Vn.Ts[src_idx] (element to element)
+        // INS Vd.Ts[dst_idx], Vn.Ts[src_idx] (vector element to vector element).
         (
             Operand::RegLane {
                 reg: rd_name,
@@ -828,26 +915,29 @@ pub fn encode_neon_ins(operands: &[Operand]) -> Result<EncodeResult, String> {
                 index: src_idx,
             },
         ) => {
-            let rd = parse_reg_num(rd_name).ok_or("invalid NEON rd")?;
-            let rn = parse_reg_num(rn_name).ok_or("invalid NEON rn")?;
+            let rd = parse_vreg_num(rd_name)?;
+            let rn = parse_vreg_num(rn_name)?;
+            let dst_size = dst_size.to_ascii_lowercase();
+            let src_size = src_size.to_ascii_lowercase();
 
             let (imm5, imm4) = match (dst_size.as_str(), src_size.as_str()) {
                 ("b", "b") if *dst_idx <= 0xF && *src_idx <= 0xF => {
-                    (((*dst_idx & 0xF) << 1) | 0b00001, *src_idx & 0xF)
+                    (((*dst_idx) << 1) | 0b00001, *src_idx)
                 }
                 ("h", "h") if *dst_idx <= 0x7 && *src_idx <= 0x7 => {
-                    (((*dst_idx & 0x7) << 2) | 0b00010, (*src_idx & 0x7) << 1)
+                    (((*dst_idx) << 2) | 0b00010, *src_idx << 1)
                 }
                 ("s", "s") if *dst_idx <= 0x3 && *src_idx <= 0x3 => {
-                    (((*dst_idx & 0x3) << 3) | 0b00100, (*src_idx & 0x3) << 2)
+                    (((*dst_idx) << 3) | 0b00100, *src_idx << 2)
                 }
                 ("d", "d") if *dst_idx <= 0x1 && *src_idx <= 0x1 => {
-                    (((*dst_idx & 0x1) << 4) | 0b01000, (*src_idx & 0x1) << 3)
+                    (((*dst_idx) << 4) | 0b01000, *src_idx << 3)
                 }
                 _ => {
                     return Err(format!(
-                        "ins: invalid element sizes/indexes .{dst_size}[{dst_idx}] <- \
-                         .{src_size}[{src_idx}] (sizes must match; lanes: b<=15, h<=7, s<=3, d<=1)"
+                        "ins: invalid element sizes/indexes .{dst_size}[{dst_idx}] \
+                         <- .{src_size}[{src_idx}] \
+                         (sizes must match; lanes: b<=15, h<=7, s<=3, d<=1)"
                     ));
                 }
             };
@@ -857,7 +947,7 @@ pub fn encode_neon_ins(operands: &[Operand]) -> Result<EncodeResult, String> {
                 (0b01101110000u32 << 21) | (imm5 << 16) | (imm4 << 11) | (1 << 10) | (rn << 5) | rd;
             Ok(EncodeResult::Word(word))
         }
-        _ => Err("ins: expected (RegLane, Reg) or (RegLane, RegLane) operands".to_string()),
+        _ => Err("ins: expected (RegLane, GP Reg) or (RegLane, RegLane) operands".to_string()),
     }
 }
 
@@ -2333,22 +2423,48 @@ pub fn encode_neon_elem(
     u_bit: u32,
     opcode: u32,
 ) -> Result<EncodeResult, String> {
-    if operands.len() < 3 {
-        return Err("NEON by-element requires 3 operands".to_string());
+    if operands.len() != 3 {
+        return Err(format!("NEON by-element requires exactly 3 operands, got {}", operands.len()));
     }
-    let (rd, arr_d) = get_neon_reg(operands, 0)?;
-    let (rn, _) = get_neon_reg(operands, 1)?;
-    let (rm, index) = match &operands[2] {
-        Operand::RegLane { reg, index, .. } => (parse_reg_num(reg).ok_or("invalid reg")?, *index),
-        _ => return Err(format!("expected register lane, got {:?}", operands[2])),
+    let (rd, arr_d) = get_vreg_arrangement(operands, 0)?;
+    let (rn, arr_n) = get_vreg_arrangement(operands, 1)?;
+    if arr_d != arr_n {
+        return Err(format!(
+            "NEON by-element: source arrangement .{arr_n} does not match destination .{arr_d}"
+        ));
+    }
+    let (rm_name, elem_size, index) = match &operands[2] {
+        Operand::RegLane { reg, elem_size, index } => (reg, elem_size.to_ascii_lowercase(), *index),
+        other => return Err(format!("expected register lane, got {other:?}")),
     };
+    let rm = parse_vreg_num(rm_name)?;
     let (q, size) = neon_arr_to_q_size(&arr_d)?;
+    let (expected_elem, max_index, max_rm) = match size {
+        0b01 => ("h", 7, 15),
+        0b10 => ("s", 3, 31),
+        _ => return Err("unsupported element size for by-element".to_string()),
+    };
+    if elem_size != expected_elem {
+        return Err(format!(
+            "NEON by-element: .{elem_size} lane does not match .{arr_d} operands"
+        ));
+    }
+    if index > max_index {
+        return Err(format!(
+            "NEON by-element: lane index {index} is out of range for .{elem_size} (max {max_index})"
+        ));
+    }
+    if rm > max_rm {
+        return Err(format!(
+            "NEON by-element: source V{rm} is out of range for .{elem_size} form (max V{max_rm})"
+        ));
+    }
     let (h, l, m_bit) = match size {
         0b01 => ((index >> 2) & 1, (index >> 1) & 1, index & 1),
         0b10 => ((index >> 1) & 1, index & 1, (rm >> 4) & 1),
-        _ => return Err("unsupported element size for by-element".to_string()),
+        _ => unreachable!(),
     };
-    let rm_enc = if size == 0b01 { rm & 0xF } else { rm & 0x1F };
+    let rm_enc = rm & 0xF;
     let word = (q << 30)
         | (u_bit << 29)
         | (0b01111 << 24)
@@ -2369,29 +2485,41 @@ pub fn encode_neon_float_elem(
     u_bit: u32,
     opcode: u32,
 ) -> Result<EncodeResult, String> {
-    if operands.len() < 3 {
-        return Err("NEON float by-element requires 3 operands".to_string());
+    if operands.len() != 3 {
+        return Err(format!(
+            "NEON float by-element requires exactly 3 operands, got {}",
+            operands.len()
+        ));
     }
-    let (rd, arr_d) = get_neon_reg(operands, 0)?;
-    let (rn, _) = get_neon_reg(operands, 1)?;
-    let (rm, index) = match &operands[2] {
-        Operand::RegLane { reg, index, .. } => (parse_reg_num(reg).ok_or("invalid reg")?, *index),
-        _ => return Err(format!("expected register lane, got {:?}", operands[2])),
+    let (rd, arr_d) = get_vreg_arrangement(operands, 0)?;
+    let (rn, arr_n) = get_vreg_arrangement(operands, 1)?;
+    if arr_d != arr_n {
+        return Err(format!(
+            "NEON float by-element: source arrangement .{arr_n} does not match destination .{arr_d}"
+        ));
+    }
+    let (rm_name, elem_size, index) = match &operands[2] {
+        Operand::RegLane { reg, elem_size, index } => (reg, elem_size.to_ascii_lowercase(), *index),
+        other => return Err(format!("expected register lane, got {other:?}")),
     };
-    let (q, sz) = match arr_d.as_str() {
-        "2s" => (0u32, 0u32),
-        "4s" => (1, 0),
-        "2d" => (1, 1),
-        _ => return Err(format!("float by-element: unsupported: {}", arr_d)),
+    let rm = parse_vreg_num(rm_name)?;
+    let (q, sz, expected_elem) = match arr_d.as_str() {
+        "2s" => (0u32, 0u32, "s"),
+        "4s" => (1, 0, "s"),
+        "2d" => (1, 1, "d"),
+        _ => return Err(format!("float by-element: unsupported arrangement {arr_d}")),
     };
-    // Lane index is bounded by the element size (.s <= 3, .d <= 1); GNU as
-    // rejects `fmul v0.4s, v0.4s, v0.s[4]` with "vector lane must be an
-    // integer in range [0, 3]".
+    if elem_size != expected_elem {
+        return Err(format!(
+            "float by-element: .{elem_size} lane does not match .{arr_d} operands"
+        ));
+    }
+    // Lane index is bounded by the element size (.s <= 3, .d <= 1).
     let max_index = if sz == 0 { 3 } else { 1 };
     if index > max_index {
         return Err(format!(
-            "float by-element: out-of-range lane index {index} (max {max_index} for .{})",
-            if sz == 0 { "s" } else { "d" }
+            "float by-element: out-of-range lane index {index} \
+             (max {max_index} for .{expected_elem})"
         ));
     }
     let (h, l, m_bit) = if sz == 0 {
@@ -2399,12 +2527,9 @@ pub fn encode_neon_float_elem(
     } else {
         (index & 1, 0u32, (rm >> 4) & 1)
     };
-    let rm_enc = rm & 0x1F;
+    let rm_enc = rm & 0xF;
     // "Advanced SIMD vector by element": Q U 0 1111 1 sz L M Rm opcode H 0 Rn Rd.
-    // Bits 28-23 are the fixed pattern 0b011111 (bit 23 is MANDATORY and was
-    // previously missing, misencoding every by-element instruction by
-    // 0x0080_0000; oracle: GAS 2.44 aarch64-linux-gnu-as + clang golden
-    // values, e.g. `fmla v0.4s, v1.4s, v2.s[3]` = 0x4FA21820).
+    // Bits 28-23 are the fixed pattern 0b011111 (bit 23 is mandatory).
     let word = (q << 30)
         | (u_bit << 29)
         | (0b011111 << 23)

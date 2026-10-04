@@ -1,20 +1,19 @@
 //! Property-based tests for three AArch64 NEON encoders in `neon.rs`:
-//!   * `encode_neon_ins`  — `INS Vd.Ts[dst], (Xn | Vn.Ts[src])`  (Advanced SIMD copy)
+//!   * `encode_neon_ins`  — `INS Vd.Ts[dst], (Wn/Xn | Vn.Ts[src])`
+//!                         (W for .b/.h/.s, X for .d; Advanced SIMD copy)
 //!   * `encode_neon_shl`  — `SHL Vd.T, Vn.T, #shift`           (shift left by immediate)
 //!   * `encode_neon_addv` — `ADDV Vd.T, Vn.T`                   (integer add across lanes)
 //!
-//! Conventions follow the sibling `neon_*_pbt.rs` files: `//! independent `proptest` suite, and golden words captured from
+//! Conventions follow the sibling `neon_*_pbt.rs` files: independent `proptest`
+//! suites, and golden words captured from
 //! `llvm-mc-18 -triple=aarch64 -assemble -show-encoding` (llvm-mc prints
 //! little-endian bytes; words below are reconstructed to a `u32`).
 //!
-//! ## Bug witnesses
-//! Every property that currently *fails* against the real SUT (i.e. documents a
-//! genuine encoder defect) is annotated `#[ignore]` so `cargo test` stays green
-//! by default.  Reproduce a witness with
-//!   `cargo test --lib neon_ins_shl_addv_pbt -- --ignored <name>`.
+//! ## Findings
+//! The INS lane-index and GP-width contracts are checked in the active tests.
+//! SHL and ADDV retain separate witnesses for findings outside this remediation.
 //!
 //! Confirmed findings referenced here:
-//!   * `INS`  lane-index truncation        — `pbt-out/bug_reports/encode_neon_ins_lane_index_truncation.md` (issue #87)
 //!   * `ADDV` opcode field one bit too low  — `pbt-out/bug_reports/encode_neon_addv_wrong_opcode_field.md`     (issue #191)
 //!   * `ADDV` accepts unallocated arrs      — `pbt-out/bug_reports/encode_neon_addv_accepts_unallocated_arrangements.md` (issue #190)
 //!   * `SHL`  out-of-range shift masking    — `pbt-out/bug_reports/encode_neon_shl_out_of_range_shift_masking.md`
@@ -49,6 +48,17 @@ fn lane(rd: u32, elem_size: &str, index: u32) -> Operand {
 /// `Operand::Reg("x{n}")` — a general-purpose (X) register.
 fn gp(n: u32) -> Operand {
     Operand::Reg(format!("x{n}"))
+}
+
+/// Width-correct GP source for the general INS form.
+fn gp_for_elem(n: u32, elem: &str) -> Operand {
+    let prefix = if elem == "d" { "x" } else { "w" };
+    let name = if n == 31 {
+        format!("{prefix}zr")
+    } else {
+        format!("{prefix}{n}")
+    };
+    Operand::Reg(name)
 }
 
 /// `Operand::Imm(v)`.
@@ -122,7 +132,7 @@ const INS_ELEM_GOLDEN: &[(u32, u32, &str, u32, u32, u32)] = &[
 #[test]
 fn ins_gp_form_matches_llvm() {
     for &(rd, rn, elem, idx, want) in INS_GP_GOLDEN {
-        let got = word_of(encode_neon_ins(&[lane(rd, elem, idx), gp(rn)]));
+        let got = word_of(encode_neon_ins(&[lane(rd, elem, idx), gp_for_elem(rn, elem)]));
         assert_eq!(
             got, want,
             "ins v{rd}.{elem}[{idx}], x{rn}: got 0x{got:08X}, want 0x{want:08X}"
@@ -155,7 +165,7 @@ proptest! {
     ) {
         let (sentinel, shift, max_lane) = ins_size_meta(elem).unwrap();
         let idx = idx % (max_lane + 1); // keep within per-size range
-        let w = word_of(encode_neon_ins(&[lane(rd, elem, idx), gp(rn)]));
+        let w = word_of(encode_neon_ins(&[lane(rd, elem, idx), gp_for_elem(rn, elem)]));
         prop_assert_eq!(w & 0x1F, rd, "Rd");
         prop_assert_eq!((w >> 5) & 0x1F, rn, "Rn");
         prop_assert_eq!((w >> 16) & 0x1F, (idx << shift) | sentinel, "imm5 == index|sentinel");
@@ -207,12 +217,10 @@ proptest! {
     //   .b -> [0,15], .h -> [0,7], .s -> [0,3], .d -> [0,1].
     // llvm-mc-18 rejects `ins v0.b[16], w1` with
     //   "vector lane must be an integer in range [0, 15]".
-    // The encoder currently MASKS the index (e.g. `index & 0xF`) and emits a
-    // word instead of `Err` — see encode_neon_ins_lane_index_truncation.md.
+    // The encoder must return `Err` rather than truncate the index.
     //
-    // EXPECTED: Err.  Run: `cargo test --lib ins_rejects_out_of_range_lane -- --ignored`
+    // EXPECTED: Err; kept active as a regression contract.
     #[test]
-    #[ignore]
     fn ins_rejects_out_of_range_lane(
         elem in ins_elem_strategy(),
         over in 1u32..=16u32,
@@ -221,26 +229,24 @@ proptest! {
         let bad = max_lane + over;
         let ops: Vec<Operand> = vec![
             Operand::RegLane { reg: "v0".into(), elem_size: elem.into(), index: bad },
-            gp(1),
+            gp_for_elem(1, elem),
         ];
         prop_assert!(encode_neon_ins(&ops).is_err(),
             "out-of-range lane [{bad}] for .{elem} (max {max_lane}) must be Err, not truncated");
     }
 }
 
-/// Deterministic regression witness for the INS lane-truncation bug.
-/// `#[ignore]`d; reproduce with `cargo test --lib ins_lane_truncation_regression -- --ignored`.
+/// Deterministic regression check for out-of-range INS lane indices.
 #[test]
-#[ignore]
 fn ins_lane_truncation_regression() {
     // .b max lane is 15; index 16 must be rejected, not `16 & 0xF = 0`.
-    let ops = vec![lane(0, "b", 16), gp(1)];
+    let ops = vec![lane(0, "b", 16), gp_for_elem(1, "b")];
     assert!(
         encode_neon_ins(&ops).is_err(),
         "INS .b[16] must be rejected (valid range 0..=15)"
     );
     // .d max lane is 1; index 2 must be rejected, not `2 & 0x1 = 0`.
-    let ops = vec![lane(0, "d", 2), gp(1)];
+    let ops = vec![lane(0, "d", 2), gp_for_elem(1, "d")];
     assert!(
         encode_neon_ins(&ops).is_err(),
         "INS .d[2] must be rejected (valid range 0..=1)"

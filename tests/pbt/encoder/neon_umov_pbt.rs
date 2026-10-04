@@ -22,21 +22,11 @@
 //!   `umov w0, v0.b[15]`  => `0x0E1F3C00`
 //!   `umov x9, v3.d[1]`   => `0x4E183C69`
 //!
-//! # Findings surfaced
+//! # Validation contracts
 //!
-//! The encoder's Q-bit logic (`q = if is_64 { 1 } else { 0 }`) is **correct**:
-//! Q is 1 exactly for the 64-bit `Xd` form. However two real defects are exposed
-//! by the negative-contract properties below:
-//!
-//!   * **`prop_rejects_width_element_size_mismatch`** — `llvm-mc-18` rejects
-//!     `umov x0, v0.s[0]` and `umov w0, v0.d[0]` with "invalid operand for
-//!     instruction": the GP-destination width must be consistent with the
-//!     element size (X↔D, W↔{B,H,S}). The encoder silently encodes the
-//!     mismatched combination into an architecturally UNDEFINED word.
-//!   * **`prop_rejects_out_of_range_lane_index`** — `llvm-mc-18` rejects
-//!     `umov w0, v0.b[16]` with "vector lane must be an integer in range
-//!     [0, 15]". The encoder silently masks the index (`& 0xF`/`& 0x7`/
-//!     `& 0x3`/`& 0x1`) instead of returning `Err`.
+//! The active properties verify the required width pairing (X for `.d`, W for
+//! `.b/.h/.s`), lane bounds, vector-register source class, and exact operand
+//! count, alongside the reference encoding for valid inputs.
 
 use lccc::pbt_internals::EncodeResult;
 use lccc::pbt_internals::Operand;
@@ -47,10 +37,11 @@ use proptest::prelude::*;
 
 /// GP destination register. `dest_x == true` => `xN` (64-bit), else `wN`.
 fn gp(dest_x: bool, num: u32) -> Operand {
-    let name = if dest_x {
-        format!("x{num}")
+    let prefix = if dest_x { "x" } else { "w" };
+    let name = if num == 31 {
+        format!("{prefix}zr")
     } else {
-        format!("w{num}")
+        format!("{prefix}{num}")
     };
     Operand::Reg(name)
 }
@@ -226,13 +217,8 @@ proptest! {
     }
 
     // === Oracle: negative contract (GP-width / element-size mismatch) ===
-    // FINDING (EXPECTED TO FAIL). The GP-destination width must be consistent
-    // with the element size: X goes with D, W goes with B/H/S. `llvm-mc-18`
-    // rejects e.g. `umov x0, v0.s[0]` and `umov w0, v0.d[0]` with
-    //   "invalid operand for instruction".
-    // The encoder instead produces an architecturally UNDEFINED word because it
-    // derives Q solely from the destination register name, ignoring element
-    // size.
+    // The GP destination width must be consistent with the element size:
+    // X goes with D, W goes with B/H/S.
     #[test]
     fn prop_rejects_width_element_size_mismatch(
         bad in prop_oneof![
@@ -262,12 +248,7 @@ proptest! {
     }
 
     // === Oracle: negative contract (out-of-range lane index) ============
-    // FINDING (EXPECTED TO FAIL). The ARMv8 ARM constrains the lane index per
-    // element size: .b -> [0,15], .h -> [0,7], .s -> [0,3], .d -> [0,1].
-    // `llvm-mc-18` rejects e.g. `umov w0, v0.b[16]` with "vector lane must be
-    // an integer in range [0, 15]". No AArch64 spec defines
-    // wrapping/truncation as intentional, so the encoder MUST return Err. The
-    // current code silently masks the index.
+    // The ARMv8 ARM constrains lane indices to b<=15, h<=7, s<=3 and d<=1.
     #[test]
     fn prop_rejects_out_of_range_lane_index(
         bad in prop_oneof![
@@ -407,4 +388,18 @@ fn rejects_too_few_operands() {
     // Exactly two valid operands must succeed.
     assert!(encode_neon_umov(&[gp(false, 0), lane(0, "s", 0)]).is_ok());
     assert!(encode_neon_umov(&[gp(true, 0), lane(0, "d", 0)]).is_ok());
+}
+
+#[test]
+fn rejects_non_gpr_destinations_and_extra_operands() {
+    assert!(encode_neon_umov(&[Operand::Reg("v0".into()), lane(1, "s", 0)]).is_err());
+    assert!(encode_neon_umov(&[gp(false, 0), lane(1, "s", 0), gp(false, 1)]).is_err());
+}
+
+#[test]
+fn rejects_non_vector_lane_sources() {
+    let fp_lane = Operand::RegLane { reg: "d1".into(), elem_size: "s".into(), index: 0 };
+    let gpr_lane = Operand::RegLane { reg: "x1".into(), elem_size: "s".into(), index: 0 };
+    assert!(encode_neon_umov(&[gp(false, 0), fp_lane]).is_err());
+    assert!(encode_neon_umov(&[gp(false, 0), gpr_lane]).is_err());
 }

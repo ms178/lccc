@@ -19,16 +19,9 @@
 //! As a cross-check, each `MLS` word equals the corresponding `MLA`
 //! word with bit 29 (U) set, exactly as the ARMv8-A ARM layout requires.
 //!
-//! ## Finding (surfaced by the FAILING PBT property `rejects_unallocated_doubleword`)
-//! `MLS` (like `MUL`/`MLA`) is architecturally defined only for `size != 0b11`,
-//! i.e. arrangements `.8b/.16b/.4h/.8h/.2s/.4s`. The `.1d`/`.2d` arrangements
-//! (`size = 0b11`) are **unallocated** for this instruction — `llvm-mc`
-//! rejects them with "invalid operand for instruction" — yet
-//! `encode_neon_mls` accepts them and emits a silently-wrong word instead of
-//! returning `Err`. The property `rejects_unallocated_doubleword` therefore
-//! FAILS and proptest shrinks to the minimal witness `mls v0.1d, v0.1d, v0.1d`
-//! (`Ok(0x2E209400)` instead of `Err`). See the bug report under
-//! `pbt-out/bug_reports/`.
+//! `MLS` is defined only for `size != 0b11`; the active regression rejects the
+//! unallocated `.1d` and `.2d` arrangements. The encoder also requires exact
+//! arity and identical arrangements for all three vector operands.
 
 use lccc::pbt_internals::EncodeResult;
 use lccc::pbt_internals::Operand;
@@ -199,16 +192,9 @@ proptest! {
     }
 }
 
-// --- SUT violation: unallocated doubleword encoding (FAILING property) ----
+// --- active negative-contract regression -----------------------------------
 
-/// `MLS` (vector) is only defined for `size != 0b11`; `.1d`/`.2d` are
-/// unallocated (ARMv8-A ARM, Advanced SIMD three same: the `size==11` row is
-/// UNALLOCATED for the multiply family). `llvm-mc` rejects these with
-/// "invalid operand for instruction". The encoder MUST reject them too.
-///
-/// This is a **failing** PBT property: the current implementation emits a
-/// word instead of returning `Err`. proptest shrinks the counterexample to
-/// the minimal witness `mls v0.1d, v0.1d, v0.1d` -> `Ok(0x2E209400)`.
+/// `.1d`/`.2d` are unallocated for vector MLS (`size == 0b11`).
 #[test]
 fn rejects_unallocated_doubleword() {
     proptest!(|(rd in 0u32..=31, rn in 0u32..=31, rm in 0u32..=31,
@@ -220,4 +206,11 @@ fn rejects_unallocated_doubleword() {
              expected Err but got Ok",
         );
     });
+}
+
+#[test]
+fn mls_rejects_mismatched_arrangements_and_extra_operands() {
+    assert!(encode_neon_mls(&[va(0, "4s"), va(1, "2s"), va(2, "4s")]).is_err());
+    assert!(encode_neon_mls(&[va(0, "4s"), va(1, "4s"), va(2, "4s"), va(3, "4s")]).is_err());
+    assert!(encode_neon_mls(&[va(0, "4s"), va(1, "4s")]).is_err());
 }

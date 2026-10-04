@@ -14,14 +14,8 @@
 //!   `cnt v0.8b, v0.8b`   => `0x0e205800`
 //!   `cnt v0.16b, v0.16b` => `0x4e205800`
 //!
-//! NOTE on findings:
-//!  * `prop_cnt_source_arrangement_ignored` documents that the source register's
-//!    arrangement (`_arr_n`) is read then discarded — only the destination's
-//!    arrangement drives the Q bit.
-//!  * `prop_cnt_rejects_non_byte_arrangements` is a NEGATIVE-CONTRACT property:
-//!    it asserts that out-of-spec destination arrangements are rejected. It is
-//!    EXPECTED TO FAIL with the current implementation, which silently encodes
-//!    any non-`16b` arrangement as Q=0.
+//! Regression properties verify that both vector arrangements match and that
+//! only the valid byte arrangements `.8b` and `.16b` are accepted.
 
 use lccc::pbt_internals::EncodeResult;
 use lccc::pbt_internals::Operand;
@@ -123,38 +117,40 @@ proptest! {
         prop_assert_eq!(w16 & mask, CNT_BASE & mask);
     }
 
-    /// Documents finding: the SOURCE register's arrangement (`_arr_n`) is read
-    /// then discarded. Varying it (even to a bare `Operand::Reg`) leaves the
-    /// encoded word identical — only the destination arrangement matters.
+    /// Source and destination arrangements must agree; bare registers are not
+    /// valid operands for CNT either.
     #[test]
-    fn prop_cnt_source_arrangement_ignored(
+    fn prop_cnt_rejects_source_arrangement_mismatch(
         rd in reg_num_strategy(),
         rn in reg_num_strategy(),
-        src_arr in invalid_arr_strategy(),
+        src_arr in prop_oneof![
+            Just("16b"),
+            Just("4h"),
+            Just("8h"),
+            Just("2s"),
+            Just("4s"),
+            Just("1d"),
+            Just("2d"),
+        ],
     ) {
         let dest = vreg_arr(rd, "8b");
-        let ref_word = word_of(encode_cnt(&[dest.clone(), vreg_arr(rn, "8b")]));
+        let mismatched = vec![dest.clone(), vreg_arr(rn, src_arr)];
+        prop_assert!(encode_cnt(&mismatched).is_err(),
+            "CNT .8b destination with .{src_arr} source must be rejected");
 
-        let varied = word_of(encode_cnt(&[dest.clone(), vreg_arr(rn, src_arr)]));
-        prop_assert_eq!(varied, ref_word, "source arrangement unexpectedly changed encoding");
-
-        // A bare register (no arrangement) as source must also encode identically.
-        let bare = word_of(encode_cnt(&[dest, Operand::Reg(format!("v{rn}"))]));
-        prop_assert_eq!(bare, ref_word, "bare-Reg source changed encoding");
+        let bare = vec![dest, Operand::Reg(format!("v{rn}"))];
+        prop_assert!(encode_cnt(&bare).is_err(), "bare vector register must be rejected");
     }
 
-    /// NEGATIVE CONTRACT (EXPECTED TO FAIL): per the ARMv8 ARM, CNT is defined
-    /// ONLY for `.8b` and `.16b`. Any other *destination* arrangement is
-    /// UNDEFINED and must be rejected with `Err`. The current implementation
-    /// silently encodes every non-`16b` arrangement as Q=0, so this property
-    /// fails — surfacing the missing range validation.
+    /// Negative contract: CNT is defined only for `.8b` and `.16b`; every
+    /// other destination arrangement must be rejected.
     #[test]
     fn prop_cnt_rejects_non_byte_arrangements(
         rd in reg_num_strategy(),
         rn in reg_num_strategy(),
         arr in invalid_arr_strategy(),
     ) {
-        let ops = vec![vreg_arr(rd, arr), vreg_arr(rn, "8b")];
+        let ops = vec![vreg_arr(rd, arr), vreg_arr(rn, arr)];
         prop_assert!(
             encode_cnt(&ops).is_err(),
             "CNT with dest arrangement .{} should be rejected (UNDEFINED for CNT), got {:?}",
@@ -195,6 +191,10 @@ fn rejects_too_few_operands() {
     assert!(
         encode_cnt(&[vreg_arr(0, "8b")]).is_err(),
         "1 operand must error"
+    );
+    assert!(
+        encode_cnt(&[vreg_arr(0, "8b"), vreg_arr(1, "8b"), vreg_arr(2, "8b")]).is_err(),
+        "extra operands must error"
     );
     // Exactly two valid operands must succeed.
     assert!(encode_cnt(&[vreg_arr(0, "8b"), vreg_arr(1, "8b")]).is_ok());

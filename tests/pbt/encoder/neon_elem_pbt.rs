@@ -28,21 +28,10 @@
 //! the documented layout, independent of this crate's implementation; a
 //! hand-derived golden table anchors absolute correctness of the fixed fields.
 //!
-//! ## Findings (FAILING — `#[ignore]`d so `cargo test` stays green)
-//! * **Out-of-range lane index silently wraps** — `prop_out_of_range_index_must_error`.
-//!   The sibling `encode_neon_elem_long` rejects indices past the element-size
-//!   bound (`neon.rs:266`, `neon.rs:273`), establishing the crate contract.
-//!   `encode_neon_elem` does *not*: it masks with `index >> n & 1`, so e.g.
-//!   halfword index 8 aliases index 0 and word index 4 aliases index 0. Silent
-//!   corruption, no `Err`.
-//! * **Halfword Rm silently truncated (V16–V31 alias V0–V15)** —
-//!   `prop_halfword_rm_above_v15_must_be_rejected`. For the `.h` form the ARM
-//!   constrains Rm to V0–V15, but the encoder masks with `rm & 0xF` instead of
-//!   validating, so `v{N+16}.h[0]` aliases `v{N}.h[0]`.
-//! * **`elem_size` of the lane operand is ignored** — `elem_size_mismatch_accepted`.
-//!   Softer: `v0.4h, v1.4h, v2.s[0]` is accepted even though the lane size `.s`
-//!   contradicts the arrangement `.4h`; the index is interpreted as a halfword
-//!   index regardless. The function never reads `Operand::RegLane::elem_size`.
+//! ## Validation contracts
+//! Active negative properties verify lane-index bounds, the halfword Rm
+//! restriction (V0–V15), matching lane element sizes and matching vector
+//! arrangements. Valid cases are compared against an independent reference.
 
 use lccc::pbt_internals::EncodeResult;
 use lccc::pbt_internals::Operand;
@@ -99,9 +88,7 @@ fn valid_case() -> impl Strategy<Value = (&'static str, u32, u32)> {
 }
 
 /// Independent reference encoder assembled straight from the ARMv8-A layout.
-/// For the word form it places Rm[3:0] in the Rm field and M=Rm[4] separately,
-/// matching the architecture rather than the implementation's redundant
-/// double-write of bit 20.
+/// For the word form it places Rm[3:0] in the Rm field and M=Rm[4] separately.
 fn ref_encode_elem(
     rd: u32,
     rn: u32,
@@ -155,7 +142,7 @@ type GoldenRow = (u32, u32, u32, u32, &'static str, u32, u32, u32);
 // Each entry: (Rd, Rn, Rm, index, arrangement, u_bit, opcode, word),
 // hand-derived field-by-field from the layout in the module header. The lane
 // `elem_size` is implied by the arrangement's element class (".h" vs ".s").
-// All eight values were verified by nibble decomposition.
+// All six values were verified by nibble decomposition.
 const GOLDEN: &[GoldenRow] = &[
     // mul v0.4h, v1.4h, v2.h[0]      (U=0, opc=1000)
     (0, 1, 2, 0, "4h", 0, 0b1000, 0x0F428020),
@@ -273,23 +260,13 @@ proptest! {
     }
 }
 
-// --- confirmed findings: FAILING, `#[ignore]`d ---------------------------
-//
-// These assert the documented range contracts and FAIL on the current
-// implementation. `#[ignore]` keeps `cargo test` green; run explicitly with
-// `cargo test -- --ignored`.
+// --- active negative-contract regressions ---------------------------------
 
 proptest! {
-    // === BUG: out-of-range lane index silently wraps ======================
-    // Halfword indices must be 0..=7, word indices 0..=3; anything larger
-    // cannot be encoded and must yield `Err` (the long sibling
-    // `encode_neon_elem_long` enforces exactly this at `neon.rs:266`/`:273`).
-    // `encode_neon_elem` masks instead, aliasing out-of-range indices to 0.
     #[test]
-    #[ignore = "documented bug: out-of-range by-element index silently wraps (no Err)"]
-    fn prop_out_of_range_index_must_error(
-        idx_h in 8u32..=0xFFFF,
-        idx_s in 4u32..=0xFFFF,
+    fn rejects_out_of_range_lane_indices(
+        idx_h in 8u32..=u32::MAX,
+        idx_s in 4u32..=u32::MAX,
     ) {
         let h_ops = vec![va(0, "4h"), va(1, "4h"), lane(2, "h", idx_h)];
         prop_assert!(encode_neon_elem(&h_ops, 0, 0b1000).is_err(),
@@ -300,104 +277,46 @@ proptest! {
             "word index {idx_s} must be rejected");
     }
 
-    // === BUG: halfword Rm V16–V31 alias V0–V15 ============================
-    // For the halfword (`.h`) by-element form the ARMv8-A ARM constrains Rm to
-    // V0–V15 (M is sourced from the index, leaving a 4-bit Rm field). The
-    // encoder masks with `rm & 0xF` instead of validating, so `v{N+16}.h[0]`
-    // aliases `v{N}.h[0]`. Asserts the range contract; FAILS on the current
-    // implementation.
     #[test]
-    #[ignore = "documented bug: halfword by-element Rm V16-V31 aliases V0-V15"]
-    fn prop_halfword_rm_above_v15_must_be_rejected(rm in 16u32..=31) {
+    fn rejects_halfword_rm_above_v15(rm in 16u32..=31) {
         let ops = vec![va(0, "4h"), va(1, "4h"), lane(rm, "h", 0)];
-        let res = encode_neon_elem(&ops, 0, 0b1000);
-        prop_assert!(res.is_err(),
-            "halfword by-element Rm must be V0-V15 (ARM DDI 0487); \
-             v{rm}.h[0] must be rejected, but got {:?}", res);
+        prop_assert!(encode_neon_elem(&ops, 0, 0b1000).is_err(),
+            "halfword by-element source V{rm} must be rejected (valid range V0–V15)");
+    }
+
+    #[test]
+    fn rejects_element_size_mismatch(
+        bad in prop_oneof![
+            Just(("4h", "s")),
+            Just(("8h", "b")),
+            Just(("2s", "h")),
+            Just(("4s", "d")),
+        ],
+    ) {
+        let (arr, elem) = bad;
+        let ops = vec![va(0, arr), va(1, arr), lane(2, elem, 0)];
+        prop_assert!(encode_neon_elem(&ops, 0, 0b1000).is_err(),
+            "lane size .{elem} must not be accepted with .{arr} operands");
     }
 }
 
-/// Concrete demonstration of the index-aliasing bug: halfword index 8 encodes
-/// identically to index 0, and word index 4 encodes identically to index 0.
-/// Pins the buggy behaviour so the finding is unambiguous; it will fail (as
-/// intended) once the encoder is fixed to reject out-of-range indices.
 #[test]
-#[ignore = "documented bug: out-of-range index silently wraps"]
-fn out_of_range_index_silently_aliases_zero() {
-    // halfword: index 8 → H:L:M = 0:0:0 = index 0
-    let lo = word_of(encode_neon_elem(
-        &[va(0, "4h"), va(1, "4h"), lane(2, "h", 0)],
-        0,
-        0b1000,
-    ));
-    let hi = word_of(encode_neon_elem(
-        &[va(0, "4h"), va(1, "4h"), lane(2, "h", 8)],
-        0,
-        0b1000,
-    ));
-    assert_eq!(
-        lo, hi,
-        "halfword index 0 (0x{lo:08X}) and index 8 (0x{hi:08X}) encode identically \
-         — index was silently truncated",
-    );
+fn rejects_mismatched_vector_arrangements_and_extra_operands() {
+    let mismatched = vec![va(0, "4h"), va(1, "8h"), lane(2, "h", 0)];
+    assert!(encode_neon_elem(&mismatched, 0, 0b1000).is_err());
 
-    // word: index 4 → H:L = 0:0 = index 0
-    let lo = word_of(encode_neon_elem(
-        &[va(0, "4s"), va(1, "4s"), lane(2, "s", 0)],
+    let valid = vec![va(0, "4h"), va(1, "4h"), lane(2, "h", 0)];
+    assert!(encode_neon_elem(&valid, 0, 0b1000).is_ok());
+    assert!(encode_neon_elem(&[valid[0].clone(), valid[1].clone() ], 0, 0b1000).is_err());
+    assert!(encode_neon_elem(
+        &[
+            valid[0].clone(),
+            valid[1].clone(),
+            valid[2].clone(),
+            va(3, "4h"),
+        ],
         0,
-        0b1000,
-    ));
-    let hi = word_of(encode_neon_elem(
-        &[va(0, "4s"), va(1, "4s"), lane(2, "s", 4)],
-        0,
-        0b1000,
-    ));
-    assert_eq!(
-        lo, hi,
-        "word index 0 (0x{lo:08X}) and index 4 (0x{hi:08X}) encode identically \
-         — index was silently truncated",
-    );
-}
-
-/// Concrete demonstration of the Rm-aliasing bug: `v{N+16}.h[0]` encodes
-/// identically to `v{N}.h[0]` (both collapse to Rm field = N). `#[ignore]`d
-/// so default `cargo test` stays green.
-#[test]
-#[ignore = "documented bug: halfword by-element Rm V16-V31 aliases V0-V15"]
-fn halfword_rm_silently_aliases_v16_to_v0() {
-    for n in 0u32..16 {
-        let lo = word_of(encode_neon_elem(
-            &[va(0, "4h"), va(1, "4h"), lane(n, "h", 0)],
-            0,
-            0b1000,
-        ));
-        let hi = word_of(encode_neon_elem(
-            &[va(0, "4h"), va(1, "4h"), lane(n + 16, "h", 0)],
-            0,
-            0b1000,
-        ));
-        assert_eq!(
-            lo,
-            hi,
-            "v{n}.h[0] (0x{lo:08X}) and v{}.h[0] (0x{hi:08X}) encode identically \
-             — Rm was silently truncated",
-            n + 16,
-        );
-    }
-}
-
-/// Softer finding: `elem_size` of the lane operand is never consulted. A `.s`
-/// lane paired with a `.4h` arrangement is accepted and the index is decoded
-/// as a halfword index. `#[ignore]`d.
-#[test]
-#[ignore = "documented soft finding: lane elem_size is ignored (not validated against arrangement)"]
-fn elem_size_mismatch_accepted() {
-    // v0.4h, v1.4h, v2.s[0] — lane size '.s' contradicts arrangement '.4h',
-    // yet this is accepted and produces a valid halfword-by-element word.
-    let mismatch = vec![va(0, "4h"), va(1, "4h"), lane(2, "s", 0)];
-    let res = encode_neon_elem(&mismatch, 0, 0b1000);
-    assert!(
-        res.is_ok(),
-        "elem_size mismatch should be rejected but was accepted as {res:?}"
-    );
+        0b1000
+    )
+    .is_err());
 }

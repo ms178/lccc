@@ -25,22 +25,11 @@
 //!   `fmla v0.4s,v0.4s,v0.s[1]  = 0x4FA01000`  (opcode=0001, U=0)
 //!   `fmls v5.2d,v7.2d,v9.d[1]  = 0x4FC958E5`  (opcode=0101, U=0, sz=1)
 //!
-//! ## Findings (witnessed by the `#[ignore]`d properties)
+//! ## Validation contracts
 //!
-//! 1. **Bit 23 is emitted as `0` instead of `1`.** The encoder ORs in
-//!    `(0b01111 << 24)` (bits [27:24] only); the float-by-element group
-//!    requires `(0b011111 << 23)` so that **bit 23 = 1**. Consequently every
-//!    emitted word is wrong by `0x00800000` (e.g. it produces `0x4F029020`
-//!    for `fmul v0.4s,v1.4s,v2.s[0]` instead of `0x4F829020`). See
-//!    `prop_matches_arm_reference` / `golden_*`.
-//! 2. **No lane-index range check.** `llvm-mc-18` rejects
-//!    `fmul v0.4s,v0.4s,v0.s[4]` ("vector lane must be an integer in range
-//!    [0, 3]") and `fmul v0.2d,v0.2d,v0.d[2]` ("range [0, 1]"). The encoder
-//!    silently masks the index (`index & 3` / `index & 1`), so an
-//!    out-of-range lane aliases a valid one. See
-//!    `prop_rejects_out_of_range_lane_index`.
-//!
-//! Full details in `NEON_FLOAT_ELEM_BUG_REPORT.md`.
+//! Active properties compare valid words against the ARM encoding layout and
+//! reject out-of-range lane indices. Deterministic negative checks cover lane
+//! element-size and vector-arrangement mismatches as well as exact arity.
 
 use lccc::pbt_internals::EncodeResult;
 use lccc::pbt_internals::Operand;
@@ -144,7 +133,7 @@ proptest! {
     // === Oracle: field isolation (Rd / Rn / Rm / opcode) =================
     // Rd occupies [4:0], Rn [9:5], the index+Rm group [21:11] (L M Rm
     // opcode H), and opcode [15:12]. Varying one operand leaves every other
-    // field bit-identical. (Independent of the bit-23 bug, so this passes.)
+    // field bit-identical.
     #[test]
     fn prop_fields_isolated(
         sz in 0u32..=1u32,
@@ -232,16 +221,12 @@ proptest! {
     }
 }
 
-// --- properties (bug witnesses: #[ignore]) --------------------------------
+// --- active reference and negative-contract properties --------------------
 
 proptest! {
     // === Oracle: differential / reference (ARM ARM template) =============
-    // FINDING (EXPECTED TO FAIL). For every valid operand set the encoded word
-    // must equal the ARM ARM `0 Q U 0 11111 sz L M Rm opcode H 0 Rn Rd`
-    // template (bit 23 = 1). The encoder instead emits bit 23 = 0
-    // (`(0b01111 << 24)` instead of `(0b011111 << 23)`), so every word is wrong
-    // by 0x0080_0000. Marked `#[ignore]` to keep `cargo test` green; run with
-    // `cargo test -- --ignored` to witness the failure.
+    // The encoded word must equal the ARM ARM
+    // `0 Q U 0 11111 sz L M Rm opcode H 0 Rn Rd` template.
     #[test]
         fn prop_matches_arm_reference(
         (q, sz) in qs_strategy(),
@@ -264,11 +249,8 @@ proptest! {
     }
 
     // === Oracle: negative contract (out-of-range lane index) ============
-    // FINDING (EXPECTED TO FAIL). The lane index is constrained by element
-    // size: .s -> [0,3], .d -> [0,1]. `llvm-mc-18` rejects e.g.
-    // `fmul v0.4s,v0.4s,v0.s[4]` with "vector lane must be an integer in range
-    // [0, 3]". No AArch64 spec defines wrapping/truncation as intentional, so
-    // the encoder MUST return `Err`. It instead silently masks the index.
+    // The lane index is constrained by element size: .s -> [0,3], .d -> [0,1].
+    // Out-of-range values must return `Err`, not wrap into a valid lane.
     #[test]
         fn prop_rejects_out_of_range_lane_index(
         bad in prop_oneof![
@@ -294,7 +276,6 @@ proptest! {
 // Every word below was emitted by `llvm-mc-18 --triple=aarch64 --assemble
 // --show-encoding`; the little-endian instruction bytes were reversed to form
 // the 32-bit word. These anchor the reference oracle to the real assembler.
-// They are `#[ignore]`d because they all witness the bit-23 defect.
 
 #[test]
 fn golden_fmul_by_element() {
@@ -409,9 +390,15 @@ fn rejects_too_few_operands() {
 
 #[test]
 fn rejects_non_lane_third_operand() {
-    // third operand must be a RegLane, not a bare vector register
+    // third operand must be a vector RegLane, not a bare vector register
     let ops = vec![reg_arr(0, "4s"), reg_arr(1, "4s"), reg_arr(2, "4s")];
     assert!(encode_neon_float_elem(&ops, 0, 0b1001).is_err());
+    let non_vector_lane = vec![
+        reg_arr(0, "4s"),
+        reg_arr(1, "4s"),
+        Operand::RegLane { reg: "x2".into(), elem_size: "s".into(), index: 0 },
+    ];
+    assert!(encode_neon_float_elem(&non_vector_lane, 0, 0b1001).is_err());
 }
 
 #[test]
@@ -424,4 +411,29 @@ fn rejects_unsupported_arrangement() {
             "arrangement {arr} must be rejected"
         );
     }
+}
+
+#[test]
+fn rejects_arrangement_and_lane_size_mismatches_and_extra_operands() {
+    let mismatched_arrangement = vec![
+        reg_arr(0, "4s"),
+        reg_arr(1, "2s"),
+        lane(2, "s", 0),
+    ];
+    assert!(encode_neon_float_elem(&mismatched_arrangement, 0, 0b1001).is_err());
+
+    let mismatched_lane = vec![
+        reg_arr(0, "4s"),
+        reg_arr(1, "4s"),
+        lane(2, "d", 0),
+    ];
+    assert!(encode_neon_float_elem(&mismatched_lane, 0, 0b1001).is_err());
+
+    let extra = vec![
+        reg_arr(0, "4s"),
+        reg_arr(1, "4s"),
+        lane(2, "s", 0),
+        reg_arr(3, "4s"),
+    ];
+    assert!(encode_neon_float_elem(&extra, 0, 0b1001).is_err());
 }

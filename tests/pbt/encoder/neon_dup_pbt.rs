@@ -3,7 +3,7 @@
 //! lane of a vector register.
 //!
 //! `encode_neon_dup` handles two syntactic forms:
-//!   * **general**  — `DUP Vd.<T>, Rn`            (broadcast a GP register)
+//!   * **general**  — `DUP Vd.<T>, Wn/Xn` (Wn for .b/.h/.s, Xn for .d)
 //!   * **element**  — `DUP Vd.<T>, Vn.<Ts>[index]` (broadcast one vector lane)
 //!
 //! Encoding (ARMv8 ARM, "Advanced SIMD copy"), differing only in the opcode
@@ -17,10 +17,10 @@
 //!   .8b/.16b / .b[i]: sentinel 00001, index in bits [4:1]  (max lane 15)
 //!   .4h/.8h  / .h[i]: sentinel 00010, index in bits [4:2]  (max lane 7)
 //!   .2s/.4s  / .s[i]: sentinel 00100, index in bits [4:3]  (max lane 3)
-//!   .2d/.1d  / .d[i]: sentinel 01000, index in bit  [4]    (max lane 1)
+//!   .2d      / .d[i]:     sentinel 01000, index in bit  [4]    (max lane 1)
 //!
-//! `Q` (bit 30) is 1 for the "wide" arrangements (16b, 8h, 4s, 2d) and 0 for
-//! the narrow ones (8b, 4h, 2s, 1d).
+//! `.1d` is reserved for DUP. `Q` (bit 30) is 1 for the 128-bit arrangements
+//! (16b, 8h, 4s, 2d) and 0 for the 64-bit arrangements (8b, 4h, 2s).
 //!
 //! # Reference oracle
 //!
@@ -28,42 +28,18 @@
 //! directly from the ARM ARM encoding templates above (an aarch64 cross
 //! assembler such as `llvm-mc` was not available in this environment to produce
 //! independent anchors). Worked examples derived from the template:
-//!   `dup v0.16b, x0`      => 0x4E010C00  (general, Q=1, byte)
-//!   `dup v0.8b,  x0`      => 0x0E010C00  (general, Q=0, byte)
+//!   `dup v0.16b, w0`      => 0x4E010C00  (general, Q=1, byte)
+//!   `dup v0.8b,  w0`      => 0x0E010C00  (general, Q=0, byte)
 //!   `dup v0.16b, v0.b[0]` => 0x4E010400  (element, Q=1, byte lane 0)
+//!   `dup v0.8b, v0.b[15]` => 0x0E1F0400  (Q=0 destination, high source lane)
 //!   `dup v0.4s,  v0.s[3]` => 0x4E1C0400  (element, Q=1, word lane 3)
 //!   `dup v0.2d,  v0.d[1]` => 0x4E180400  (element, Q=1, double lane 1)
 //!
-//! # Findings surfaced
+//! # Validation contracts
 //!
-//! The core bit-packing of `encode_neon_dup` is **correct** for valid inputs:
-//! the opcode field, Q bit, imm5 size sentinel, imm5 lane index, and the Rd/Rn
-//! fields all land in the right places (every passing oracle below confirms
-//! this). Two genuine defects are exposed by the negative-contract properties,
-//! both marked `#[ignore]` so the default suite stays green:
-//!
-//!   * **`prop_rejects_out_of_range_lane_index`** (IGNORED witness) — the
-//!     element form silently masks the lane index (`& 0xF` / `& 0x7` /
-//!     `& 0x3` / `& 0x1`) instead of rejecting it. A lane index that exceeds
-//!     the field width for its element size (e.g. `.b[16]`, `.h[8]`, `.s[4]`,
-//!     `.d[2]`) wraps to an in-range value and produces a valid-looking but
-//!     *wrong* encoding. No AArch64 spec defines such wrapping as intentional;
-//!     `llvm-mc` rejects `dup v0.16b, v0.b[16]` with "vector lane must be an
-//!     integer in range [0, 15]". The encoder must return `Err`.
-//!   * **`prop_rejects_arrangement_element_size_mismatch`** (IGNORED witness) —
-//!     the element form derives `Q` from the destination arrangement and
-//!     `imm5` from the source element size **independently**, so a mismatched
-//!     pair such as `DUP Vd.4S, Vn.H[3]` is silently encoded (here into an
-//!     architecturally UNDEFINED / differently-disassembled word) rather than
-//!     rejected. `llvm-mc` rejects these with "invalid operand for
-//!     instruction".
-//!
-//! # Secondary observation (no test asserted either way)
-//!
-//! `DUP Vd.1D, Rn` (the 64-bit scalar general form, imm5 = 01000, Q = 0) is
-//! listed by the ARM ARM but the encoder rejects the `.1d` arrangement in the
-//! general-form `imm5` match. Whether `.1d` is a required arrangement for this
-//! implementation is unspecified, so no property asserts it.
+//! Regression properties cover out-of-range lane indices, mismatched lane and
+//! destination element sizes, GP source width, and the reserved `.1d` form.
+//! All valid positive cases are compared with the ARM encoding template.
 
 use lccc::pbt_internals::EncodeResult;
 use lccc::pbt_internals::Operand;
@@ -80,9 +56,26 @@ fn dst(rd: u32, arr: &str) -> Operand {
     }
 }
 
-/// GP source register `Xn` for the general form.
-fn gp(rn: u32) -> Operand {
-    Operand::Reg(format!("x{rn}"))
+/// Width-correct GP source for the general form (W for .b/.h/.s, X for .d).
+fn gp(rn: u32, arr: &str) -> Operand {
+    let prefix = if arr == "2d" { "x" } else { "w" };
+    let name = if rn == 31 {
+        format!("{prefix}zr")
+    } else {
+        format!("{prefix}{rn}")
+    };
+    Operand::Reg(name)
+}
+
+/// A deliberately wrong-width GP source, for negative-contract properties.
+fn wrong_gp(rn: u32, arr: &str) -> Operand {
+    let prefix = if arr == "2d" { "w" } else { "x" };
+    let name = if rn == 31 {
+        format!("{prefix}zr")
+    } else {
+        format!("{prefix}{rn}")
+    };
+    Operand::Reg(name)
 }
 
 /// `Vn.<elem>[index]` source lane for the element form.
@@ -111,25 +104,23 @@ fn word_of(res: Result<EncodeResult, String>) -> u32 {
 fn q_of(arr: &str) -> u32 {
     match arr {
         "16b" | "8h" | "4s" | "2d" => 1,
-        "8b" | "4h" | "2s" | "1d" => 0,
+        "8b" | "4h" | "2s" => 0,
         _ => unreachable!("invalid arrangement {arr} in oracle"),
     }
 }
 
-/// Architecturally valid max lane index for a *consistent* arrangement (used to
-/// keep the passing oracle inside the field width so the encoder's masking is a
-/// no-op).
-fn max_lane_for(arr: &str) -> u32 {
+/// Architecturally valid max lane index for a consistent destination and lane
+/// arrangement pair.
+fn max_source_lane_for(arr: &str) -> u32 {
+    // The lane comes from a 128-bit source register, so its range depends on
+    // element size, not on the destination's Q bit. For example, `.8b` may
+    // select any `Vn.b[0..=15]` lane before writing the low 64-bit result.
     match arr {
-        "8b" => 7,
-        "16b" => 15,
-        "4h" => 3,
-        "8h" => 7,
-        "2s" => 1,
-        "4s" => 3,
-        "1d" => 0,
+        "8b" | "16b" => 15,
+        "4h" | "8h" => 7,
+        "2s" | "4s" => 3,
         "2d" => 1,
-        _ => 0,
+        _ => unreachable!("unsupported arrangement {arr} for DUP lane source"),
     }
 }
 
@@ -190,7 +181,6 @@ fn element_pair_strategy() -> impl Strategy<Value = (&'static str, &'static str)
         Just(("8h", "h")),
         Just(("2s", "s")),
         Just(("4s", "s")),
-        Just(("1d", "d")),
         Just(("2d", "d")),
     ]
 }
@@ -207,12 +197,12 @@ proptest! {
         rd in reg_num_strategy(),
         rn in reg_num_strategy(),
     ) {
-        let ops = vec![dst(rd, arr), gp(rn)];
+        let ops = vec![dst(rd, arr), gp(rn, arr)];
         let w = word_of(encode_neon_dup(&ops));
         prop_assert_eq!(
             w, reference_word_general(rd, arr, rn),
-            "general-form word must equal ARM ARM template for dup v{}.{}, x{}",
-            rd, arr, rn
+            "general-form word must equal ARM ARM template for dup v{}.{}, {}{}",
+            rd, arr, if arr == "2d" { "x" } else { "w" }, rn
         );
     }
 
@@ -227,7 +217,7 @@ proptest! {
         rn in reg_num_strategy(),
         idx_mod in any::<u32>(),
     ) {
-        let max = max_lane_for(arr);
+        let max = max_source_lane_for(arr);
         let idx = idx_mod % (max + 1);
         let ops = vec![dst(rd, arr), lane(rn, elem, idx)];
         let w = word_of(encode_neon_dup(&ops));
@@ -251,13 +241,13 @@ proptest! {
         idx_mod in any::<u32>(),
     ) {
         // general form
-        let wg = word_of(encode_neon_dup(&[dst(rd, arr), gp(rn)]));
+        let wg = word_of(encode_neon_dup(&[dst(rd, arr), gp(rn, arr)]));
         prop_assert_eq!(wg >> 31, 0u32, "bit 31 must be 0 (general)");
         prop_assert_eq!((wg >> 21) & 0x1FF, 0b001110000u32, "bits 29-21 fixed (general)");
         prop_assert_eq!((wg >> 10) & 0x3F, 0b000011u32, "bits 15-10 = DUP-general opcode");
 
         // element form
-        let idx = idx_mod % (max_lane_for(earr) + 1);
+        let idx = idx_mod % (max_source_lane_for(earr) + 1);
         let we = word_of(encode_neon_dup(&[dst(rd, earr), lane(rn, elem, idx)]));
         prop_assert_eq!(we >> 31, 0u32, "bit 31 must be 0 (element)");
         prop_assert_eq!((we >> 21) & 0x1FF, 0b001110000u32, "bits 29-21 fixed (element)");
@@ -274,10 +264,10 @@ proptest! {
         rn in reg_num_strategy(),
         idx_mod in any::<u32>(),
     ) {
-        let wg = word_of(encode_neon_dup(&[dst(rd, arr), gp(rn)]));
+        let wg = word_of(encode_neon_dup(&[dst(rd, arr), gp(rn, arr)]));
         prop_assert_eq!((wg >> 30) & 1, q_of(arr), "Q mismatch (general) for .{}", arr);
 
-        let idx = idx_mod % (max_lane_for(earr) + 1);
+        let idx = idx_mod % (max_source_lane_for(earr) + 1);
         let we = word_of(encode_neon_dup(&[dst(rd, earr), lane(rn, elem, idx)]));
         prop_assert_eq!((we >> 30) & 1, q_of(earr), "Q mismatch (element) for .{}", earr);
     }
@@ -293,7 +283,7 @@ proptest! {
         rn in reg_num_strategy(),
         idx_mod in any::<u32>(),
     ) {
-        let idx = idx_mod % (max_lane_for(arr) + 1);
+        let idx = idx_mod % (max_source_lane_for(arr) + 1);
 
         let base = word_of(encode_neon_dup(&[dst(0, arr), lane(0, elem, idx)]));
 
@@ -321,18 +311,29 @@ proptest! {
         idx_mod in any::<u32>(),
     ) {
         // general form: imm5 is just the size sentinel
-        let wg = word_of(encode_neon_dup(&[dst(rd, arr), gp(rn)]));
+        let wg = word_of(encode_neon_dup(&[dst(rd, arr), gp(rn, arr)]));
         let imm5_g = (wg >> 16) & 0x1F;
         let (sentinel_g, _, _) = size_meta(general_elem_for(arr)).unwrap();
         prop_assert_eq!(imm5_g, sentinel_g, "general imm5 must be the size sentinel");
 
         // element form: imm5 == (index << shift) | sentinel
-        let idx = idx_mod % (max_lane_for(earr) + 1);
+        let idx = idx_mod % (max_source_lane_for(earr) + 1);
         let we = word_of(encode_neon_dup(&[dst(rd, earr), lane(rn, elem, idx)]));
         let imm5_e = (we >> 16) & 0x1F;
         let (sentinel_e, shift_e, _) = size_meta(elem).unwrap();
         prop_assert_eq!(imm5_e, (idx << shift_e) | sentinel_e, "element imm5 must pack index+size");
         prop_assert_eq!(imm5_e & sentinel_e, sentinel_e, "size sentinel must be set");
+    }
+
+    // A valid arrangement with the wrong-width GPR source must be rejected.
+    #[test]
+    fn prop_rejects_wrong_gp_source_width(
+        arr in general_arr_strategy(),
+        rn in reg_num_strategy(),
+    ) {
+        let ops = vec![dst(0, arr), wrong_gp(rn, arr)];
+        prop_assert!(encode_neon_dup(&ops).is_err(),
+            "DUP .{arr} with a wrong-width GP source must be rejected");
     }
 
     // === Oracle: negative contract — malformed operands (currently OK) ===
@@ -344,7 +345,7 @@ proptest! {
         bad_arr in "[0-9]{1,2}[a-z]{1,2}".prop_filter(
             "not a valid arrangement", |s| !matches!(
                 s.as_str(),
-                "8b"|"16b"|"4h"|"8h"|"2s"|"4s"|"1d"|"2d"
+                "8b"|"16b"|"4h"|"8h"|"2s"|"4s"|"2d"
             )),
         bad_reg in "(v|x)(3[2-9]|[4-9][0-9])", // numeric, always > 31
     ) {
@@ -357,7 +358,7 @@ proptest! {
         // unsupported arrangement on the destination (general path)
         let ops: Vec<Operand> = vec![
             Operand::RegArrangement { reg: "v0".into(), arrangement: bad_arr.clone() },
-            gp(0),
+            gp(0, "4s"),
         ];
         prop_assert!(encode_neon_dup(&ops).is_err(),
             "arrangement {:?} must be rejected", bad_arr);
@@ -370,16 +371,9 @@ proptest! {
             "source register {:?} must be rejected", bad_reg);
     }
 
-    // === Oracle: negative contract — out-of-range lane index =============
-    // FINDING (EXPECTED TO FAIL — hence #[ignore]). The lane index must fit the
-    // imm5 field for its element size: .b -> [0,15], .h -> [0,7], .s -> [0,3],
-    // .d -> [0,1]. `llvm-mc` rejects e.g. `dup v0.16b, v0.b[16]` with
-    // "vector lane must be an integer in range [0, 15]". No AArch64 spec defines
-    // wrapping/truncation as intentional, so the encoder MUST return Err.
-    // The current code silently masks the index (`& 0xF`/`& 0x7`/`& 0x3`/
-    // `& 0x1`) and emits a valid-looking but *wrong* word.
+    // === Negative contract: out-of-range lane index ======================
+    // The lane index must fit the imm5 field for its element size.
     #[test]
-    #[ignore = "bug witness: element-form lane index is masked, not validated"]
     fn prop_rejects_out_of_range_lane_index(
         bad in prop_oneof![
             Just(("16b", "b", 16u32)),
@@ -397,15 +391,9 @@ proptest! {
             bad_index, elem, encode_neon_dup(&ops));
     }
 
-    // === Oracle: negative contract — arrangement / element-size mismatch ==
-    // FINDING (EXPECTED TO FAIL — hence #[ignore]). The source element size in
-    // `DUP Vd.<T>, Vn.<Ts>[i]` must match the destination arrangement's element
-    // size (e.g. `.4S` <-> `.s[i]`). A mismatched pair is silently encoded into
-    // an architecturally UNDEFINED / differently-disassembled word because Q is
-    // taken from the arrangement and imm5 from the element size independently.
-    // `llvm-mc` rejects these with "invalid operand for instruction".
+    // === Negative contract: arrangement / element-size mismatch ===========
+    // The source lane size must agree with the destination arrangement.
     #[test]
-    #[ignore = "bug witness: arrangement/element-size mismatch is not validated"]
     fn prop_rejects_arrangement_element_size_mismatch(
         bad in prop_oneof![
             Just(("4s",  "h")),
@@ -446,24 +434,24 @@ fn general_elem_for(arr: &str) -> &'static str {
 
 #[test]
 fn golden_dup_general_form() {
-    // dup v0.16b, x0   => 0x4E010C00
+    // dup v0.16b, w0   => 0x4E010C00
     assert_eq!(
-        word_of(encode_neon_dup(&[dst(0, "16b"), gp(0)])),
+        word_of(encode_neon_dup(&[dst(0, "16b"), gp(0, "16b")])),
         0x4E010C00
     );
-    // dup v0.8b,  x0   => 0x0E010C00  (Q=0)
-    assert_eq!(word_of(encode_neon_dup(&[dst(0, "8b"), gp(0)])), 0x0E010C00);
-    // dup v0.4s,  x0   => 0x4E040C00
-    assert_eq!(word_of(encode_neon_dup(&[dst(0, "4s"), gp(0)])), 0x4E040C00);
-    // dup v0.8h,  x0   => 0x4E020C00
-    assert_eq!(word_of(encode_neon_dup(&[dst(0, "8h"), gp(0)])), 0x4E020C00);
+    // dup v0.8b,  w0   => 0x0E010C00  (Q=0)
+    assert_eq!(word_of(encode_neon_dup(&[dst(0, "8b"), gp(0, "8b")])), 0x0E010C00);
+    // dup v0.4s,  w0   => 0x4E040C00
+    assert_eq!(word_of(encode_neon_dup(&[dst(0, "4s"), gp(0, "4s")])), 0x4E040C00);
+    // dup v0.8h,  w0   => 0x4E020C00
+    assert_eq!(word_of(encode_neon_dup(&[dst(0, "8h"), gp(0, "8h")])), 0x4E020C00);
     // dup v0.2d,  x0   => 0x4E080C00
-    assert_eq!(word_of(encode_neon_dup(&[dst(0, "2d"), gp(0)])), 0x4E080C00);
-    // dup v0.8b,  x5   => 0x0E010CA0
-    assert_eq!(word_of(encode_neon_dup(&[dst(0, "8b"), gp(5)])), 0x0E010CA0);
+    assert_eq!(word_of(encode_neon_dup(&[dst(0, "2d"), gp(0, "2d")])), 0x4E080C00);
+    // dup v0.8b,  w5   => 0x0E010CA0
+    assert_eq!(word_of(encode_neon_dup(&[dst(0, "8b"), gp(5, "8b")])), 0x0E010CA0);
     // dup v31.2d, x30  => 0x4E080FDF
     assert_eq!(
-        word_of(encode_neon_dup(&[dst(31, "2d"), gp(30)])),
+        word_of(encode_neon_dup(&[dst(31, "2d"), gp(30, "2d")])),
         0x4E080FDF
     );
 }
@@ -479,6 +467,12 @@ fn golden_dup_element_form() {
     assert_eq!(
         word_of(encode_neon_dup(&[dst(0, "16b"), lane(0, "b", 15)])),
         0x4E1F0400
+    );
+    // A narrow destination can still select any byte lane in the 128-bit source.
+    // dup v0.8b, v1.b[15]  => 0x0E1F0420
+    assert_eq!(
+        word_of(encode_neon_dup(&[dst(0, "8b"), lane(1, "b", 15)])),
+        0x0E1F0420
     );
     // dup v0.4s,  v0.s[0]  => 0x4E040400
     assert_eq!(
@@ -516,11 +510,22 @@ fn rejects_too_few_operands() {
     );
     // Exactly two valid operands must succeed for both forms.
     assert!(
-        encode_neon_dup(&[dst(0, "4s"), gp(0)]).is_ok(),
+        encode_neon_dup(&[dst(0, "4s"), gp(0, "4s")]).is_ok(),
         "general form must succeed"
     );
     assert!(
         encode_neon_dup(&[dst(0, "4s"), lane(0, "s", 0)]).is_ok(),
         "element form must succeed"
     );
+}
+#[test]
+fn rejects_extra_operands_and_non_gpr_sources() {
+    assert!(encode_neon_dup(&[dst(0, "4s"), gp(0, "4s"), gp(1, "4s")]).is_err());
+    assert!(encode_neon_dup(&[dst(0, "4s"), Operand::Reg("v1".into())]).is_err());
+}
+
+#[test]
+fn rejects_reserved_one_d_arrangement() {
+    assert!(encode_neon_dup(&[dst(0, "1d"), Operand::Reg("x0".into())]).is_err());
+    assert!(encode_neon_dup(&[dst(0, "1d"), lane(1, "d", 0)]).is_err());
 }
