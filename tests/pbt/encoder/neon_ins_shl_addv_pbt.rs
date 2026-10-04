@@ -1,6 +1,6 @@
 //! Property-based tests for three AArch64 NEON encoders in `neon.rs`:
 //!   * `encode_neon_ins`  — `INS Vd.Ts[dst], (Wn/Xn | Vn.Ts[src])`
-//!                         (W for .b/.h/.s, X for .d; Advanced SIMD copy)
+//!    (W for .b/.h/.s, X for .d; Advanced SIMD copy)
 //!   * `encode_neon_shl`  — `SHL Vd.T, Vn.T, #shift`           (shift left by immediate)
 //!   * `encode_neon_addv` — `ADDV Vd.T, Vn.T`                   (integer add across lanes)
 //!

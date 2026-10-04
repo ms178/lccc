@@ -178,17 +178,10 @@ proptest! {
             "RBIT does not support .{arr}; expected Err but got Ok");
     }
 
-    // === FINDING #1 (failing): source arrangement mismatch silently accepted ===
-    // RBIT (vector) is `RBIT Vd.T, Vn.T` with BOTH operands sharing the same
-    // arrangement T, and T ∈ {8B, 16B} only (ARM DDI 0487, RBIT (vector)).
-    // The encoder validates ONLY the destination arrangement (`arr_d`) and
-    // discards the source arrangement (`arr_n`, via `let (rn, _) = ...`). A
-    // pairing like `rbit v0.16b, v1.4s` is silently encoded as if the source
-    // were `.16b` instead of being rejected. This input is fully reachable:
-    // the parser turns `v1.4s` into `RegArrangement{v1,"4s"}` in any slot.
-    // `#[ignore]`d so the suite stays green; run with `--ignored`.
+    // === Negative contract: source and destination arrangements must match ===
+    // RBIT (vector) requires both operands to have the same arrangement T,
+    // and T ∈ {8B, 16B} (ARM DDI 0487, RBIT (vector)).
     #[test]
-    #[ignore]
     fn rbit_rejects_mismatched_source_arrangement(
         src_arr in prop_oneof![
             Just("4h"), Just("8h"), Just("2s"), Just("4s"), Just("1d"), Just("2d")
@@ -204,13 +197,9 @@ proptest! {
              arrangement mismatch); got Ok");
     }
 
-    // === FINDING #2 (failing): non-vector register class silently accepted ===
-    // `parse_reg_num` accepts any of x/w/d/s/q/v/h/b prefixes, so a
-    // `RegArrangement` built from a GPR name (e.g. `x0.16b`, reachable since
-    // the parser's `is_register` returns true for x0/w0) is encoded as if it
-    // were a vector register. RBIT operands MUST be SIMD registers V0-V31.
+    // === Negative contract: reject non-vector register classes =============
+    // RBIT operands must be SIMD registers V0-V31, not GPR spellings.
     #[test]
-    #[ignore]
     fn rbit_rejects_non_vector_register_class(
         gpr in prop_oneof![
             Just("x0"), Just("x31"), Just("w5"), Just("sp")
@@ -242,13 +231,11 @@ fn rbit_rejects_too_few_operands() {
     assert!(encode_neon_rbit(&[va(0, "16b"), va(1, "16b")]).is_ok());
 }
 
-// --- FINDING #1: empirical reproduction (run with `--ignored --nocapture`) --
+// --- Regression: concrete mismatched source arrangements ------------------
 
-/// Confirms FINDING #1 with concrete illegal pairings. Currently the
-/// implementation silently accepts them; this test will `panic!` (showing the
-/// accepted word) until the encoder validates the source arrangement.
+/// Concrete illegal arrangements must be rejected rather than encoded using
+/// the destination's Q bit.
 #[test]
-#[ignore]
 fn rbit_mismatch_reproduction() {
     let cases: &[(u32, &str, u32, &str)] = &[
         (0, "16b", 1, "4s"), // rbit v0.16b, v1.4s
