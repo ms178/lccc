@@ -1436,3 +1436,470 @@ mod branch_range_tests {
         assert!(w.base.sections[".text"].relocs.is_empty());
     }
 }
+
+// =============================================================================
+// AArch64 encoder regression tests
+// =============================================================================
+//
+// Every expected word in this module was produced by GNU Binutils 2.44
+// (`aarch64-linux-gnu-as`) and pasted here, rather than derived from the
+// encoder under test. A unit test that re-derives its expectations from the
+// code it guards shares every wrong assumption that code has, and passes
+// forever -- which is exactly how the four defects below survived.
+//
+// The pinned values are therefore "what GAS does", and the assertions are
+// "lccc must match it", including the cases where GAS *rejects* the input.
+#[cfg(test)]
+mod aarch64_encoder_tests {
+    use super::super::parser::parse_asm;
+    use super::*;
+
+    fn assemble(asm: &str) -> Result<ElfWriter, String> {
+        let statements = parse_asm(asm)?;
+        let mut writer = ElfWriter::new();
+        writer.process_statements(&statements)?;
+        Ok(writer)
+    }
+
+    /// Assemble one instruction and return its single little-endian word.
+    fn word_of(asm: &str) -> u32 {
+        let w = assemble(asm).unwrap_or_else(|e| panic!("`{asm}` must assemble: {e}"));
+        let data = &w.base.sections[".text"].data;
+        assert_eq!(data.len(), 4, "`{asm}` must encode to exactly one word");
+        u32::from_le_bytes([data[0], data[1], data[2], data[3]])
+    }
+
+    fn one_insn(insn: &str) -> String {
+        format!(".text\n{insn}\n")
+    }
+
+    /// Defect 2: `str b9,[x10]` encoded with the *double* size field, so the
+    /// B and D forms were indistinguishable. GAS: 3d000149 vs fd000149.
+    #[test]
+    fn fp_ldr_str_size_field_follows_the_register_width() {
+        assert_eq!(
+            word_of(&one_insn("str b9,[x10]")),
+            0x3d00_0149,
+            "`str b9,[x10]`"
+        );
+        assert_eq!(
+            word_of(&one_insn("str d9,[x10]")),
+            0xfd00_0149,
+            "`str d9,[x10]`"
+        );
+        assert_eq!(
+            word_of(&one_insn("str s9,[x10]")),
+            0xbd00_0149,
+            "`str s9,[x10]`"
+        );
+        assert_eq!(
+            word_of(&one_insn("str q9,[x10]")),
+            0x3d80_0149,
+            "`str q9,[x10]`"
+        );
+
+        // The four forms must be mutually distinguishable -- a shared size
+        // field is precisely the bug this guards.
+        let forms = ["b9", "s9", "d9", "q9"].map(|r| word_of(&one_insn(&format!("str {r},[x10]"))));
+        for i in 0..forms.len() {
+            for j in (i + 1)..forms.len() {
+                assert_ne!(
+                    forms[i], forms[j],
+                    "`str` size field collapsed two register widths together"
+                );
+            }
+        }
+    }
+
+    /// Defect 1: FP `ldnp`/`stnp` hardcoded `V=0`, so `ldnp s24,s13,[x20,#80]`
+    /// assembled as the GPR (`w`) form. GAS: 2c4a3698 vs 284a3698.
+    #[test]
+    fn fp_ldnp_stnp_sets_the_v_bit() {
+        let fp = word_of(&one_insn("ldnp s24,s13,[x20,#80]"));
+        let gpr = word_of(&one_insn("ldnp w24,w13,[x20,#80]"));
+        assert_eq!(fp, 0x2c4a_3698, "`ldnp s24,s13,[x20,#80]`");
+        assert_eq!(gpr, 0x284a_3698, "`ldnp w24,w13,[x20,#80]`");
+        assert_ne!(fp, gpr, "the FP pair must not reuse the GPR encoding");
+        assert_eq!(fp >> 26 & 1, 1, "V must be set for FP pairs");
+        assert_eq!(gpr >> 26 & 1, 0, "V must be clear for GPR pairs");
+
+        assert_eq!(word_of(&one_insn("stnp d2,d3,[x4,#-8]")), 0x6c3f_8c82);
+    }
+
+    /// Defect 4: half-precision scalar FP was encoded as single (`ftype` 00
+    /// instead of 11) because the test was a two-way `starts_with('d')`.
+    #[test]
+    fn half_precision_scalar_fp_uses_ftype_11() {
+        assert_eq!(word_of(&one_insn("fmadd h11,h3,h2,h12")), 0x1fc2_306b);
+        assert_eq!(word_of(&one_insn("fmadd s11,s3,s2,s12")), 0x1f02_306b);
+        assert_eq!(word_of(&one_insn("fmadd d4,d5,d6,d7")), 0x1f46_1ca4);
+        assert_eq!(word_of(&one_insn("fadd h1,h2,h3")), 0x1ee3_2841);
+        assert_eq!(word_of(&one_insn("fcvt s2,h3")), 0x1ee2_4062);
+        assert_eq!(word_of(&one_insn("scvtf h1,w2")), 0x1ee2_0041);
+
+        // The whole point: h and s must not share an encoding.
+        assert_ne!(
+            word_of(&one_insn("fmadd h11,h3,h2,h12")),
+            word_of(&one_insn("fmadd s11,s3,s2,s12"))
+        );
+    }
+
+    /// `fmov` between FP registers is a same-width move: it carries one `type`
+    /// field, so mixed widths are invalid. The old code preferred whichever
+    /// operand it happened to look at first and assembled all of them.
+    #[test]
+    fn fmov_rejects_mismatched_fp_widths() {
+        for insn in [
+            "fmov s0,d1",
+            "fmov d0,s1",
+            "fmov h0,s1",
+            "fmov s0,h1",
+            "fmov h0,d1",
+        ] {
+            let err = match assemble(&one_insn(insn)) {
+                Ok(_) => panic!("`{insn}` is not a valid fmov (GAS rejects it) but assembled"),
+                Err(e) => e,
+            };
+            assert!(
+                err.contains("different floating-point widths"),
+                "`{insn}`: expected a width diagnostic, got: {err}"
+            );
+        }
+    }
+
+    /// FMOV (general) covers H as well as S and D, and `sf` follows the GP
+    /// register: H pairs with either width, but S only with W and D only
+    /// with X. `fmov h0,w1` used to emit the *single* encoding (1e270020).
+    #[test]
+    fn fmov_general_covers_half_precision_and_pairs_widths() {
+        assert_eq!(word_of(&one_insn("fmov h0,w1")), 0x1ee7_0020);
+        assert_eq!(word_of(&one_insn("fmov h0,x1")), 0x9ee7_0020);
+        assert_eq!(word_of(&one_insn("fmov w0,h1")), 0x1ee6_0020);
+        assert_eq!(word_of(&one_insn("fmov x0,h1")), 0x9ee6_0020);
+        assert_eq!(word_of(&one_insn("fmov s0,w1")), 0x1e27_0020);
+        assert_eq!(word_of(&one_insn("fmov d0,x1")), 0x9e67_0020);
+        assert_eq!(word_of(&one_insn("fmov w0,s1")), 0x1e26_0020);
+        assert_eq!(word_of(&one_insn("fmov x0,d1")), 0x9e66_0020);
+        assert_eq!(word_of(&one_insn("fmov h0,wzr")), 0x1ee7_03e0);
+        assert_eq!(word_of(&one_insn("fmov h0,xzr")), 0x9ee7_03e0);
+
+        // S only pairs with W; D only pairs with X.
+        for insn in ["fmov s0,x1", "fmov d0,w1"] {
+            let err = match assemble(&one_insn(insn)) {
+                Ok(_) => panic!("`{insn}` is not a valid fmov (GAS rejects it) but assembled"),
+                Err(e) => e,
+            };
+            assert!(
+                err.contains("general-purpose register"),
+                "`{insn}`: expected a GP-width diagnostic, got: {err}"
+            );
+        }
+        // Q and B have no FMOV (general) form at all.
+        for insn in ["fmov q0,x1", "fmov x0,q1", "fmov b0,w1"] {
+            assert!(
+                assemble(&one_insn(insn)).is_err(),
+                "`{insn}` must be rejected"
+            );
+        }
+    }
+
+    /// Immediate offsets were masked into their fields (`& 0x1FF`, `& 0x7F`),
+    /// so an out-of-range offset wrapped into a plausible-looking instruction
+    /// instead of being diagnosed -- `ldr x0,[x1,#32768]` became `ldur x0,[x1]`.
+    #[test]
+    fn out_of_range_offsets_are_diagnosed_not_masked() {
+        for insn in [
+            "ldr x0,[x1,#32768]",
+            "ldr x0,[x1,#-257]",
+            "stp x0,x1,[x2,#8192]",
+            "stp x0,x1,[x2,#-520]",
+            "ldnp x0,x1,[x2,#8192]",
+        ] {
+            let err = match assemble(&one_insn(insn)) {
+                Ok(_) => panic!("`{insn}` wraps its offset silently; GAS rejects it"),
+                Err(e) => e,
+            };
+            assert!(
+                err.contains("offset"),
+                "`{insn}`: expected an offset diagnostic, got: {err}"
+            );
+        }
+        // Misalignment is the same defect wearing a different hat: the pair
+        // immediate is scaled, so a non-multiple would truncate away.
+        let err = match assemble(&one_insn("stp x0,x1,[x2,#4]")) {
+            Ok(_) => panic!("`stp x0,x1,[x2,#4]` is misaligned; GAS rejects it"),
+            Err(e) => e,
+        };
+        assert!(err.contains("multiple of 8"), "got: {err}");
+    }
+
+    /// The range check must be inclusive *and* signed: the extreme legal
+    /// offsets on both sides have to keep encoding.
+    #[test]
+    fn in_range_offsets_still_encode_at_their_boundaries() {
+        assert_eq!(word_of(&one_insn("ldr x0,[x1,#255]")), 0xf84f_f020);
+        assert_eq!(word_of(&one_insn("ldr x0,[x1,#-256]")), 0xf850_0020);
+        assert_eq!(word_of(&one_insn("stp x0,x1,[x2,#504]")), 0xa91f_8440);
+        assert_eq!(word_of(&one_insn("stp x0,x1,[x2,#-512]")), 0xa920_0440);
+        assert_eq!(word_of(&one_insn("stp q0,q1,[x2,#1008]")), 0xad1f_8440);
+    }
+
+    /// The unscaled (LDUR/STUR) form *does* exist for 128-bit accesses --
+    /// `size == 00` with `opc == 10` selects Q. Pinned because this is a
+    /// tempting thing to "fix": 8 is not a multiple of the Q access width, so
+    /// the scaled form correctly declines, but GAS still assembles the
+    /// instruction as `stur q0,[x1,#8]` (3c808020).
+    #[test]
+    fn unscaled_form_exists_for_128bit_accesses() {
+        assert_eq!(word_of(&one_insn("str q0,[x1,#8]")), 0x3c80_8020);
+        assert_eq!(word_of(&one_insn("ldr q0,[x1,#8]")), 0x3cc0_8020);
+        assert_eq!(word_of(&one_insn("str q0,[x1,#-256]")), 0x3c90_0020);
+    }
+
+    /// A load/store pair encodes one register class for both registers, so
+    /// they must agree -- and `b`/`h` have no pair form at all.
+    #[test]
+    fn pair_registers_must_share_a_register_class() {
+        for insn in ["stp s0,x1,[x0]", "ldp s0,x1,[x0]", "stp w0,x1,[x0]"] {
+            let err = match assemble(&one_insn(insn)) {
+                Ok(_) => panic!("`{insn}` mixes register classes; GAS rejects it"),
+                Err(e) => e,
+            };
+            assert!(
+                err.contains("different register classes"),
+                "`{insn}`: expected a class diagnostic, got: {err}"
+            );
+        }
+        for insn in ["stp b0,b1,[x0]", "stp h0,h1,[x0]", "ldnp b0,b1,[x0]"] {
+            let err = match assemble(&one_insn(insn)) {
+                Ok(_) => panic!("`{insn}` has no pair form; GAS rejects it"),
+                Err(e) => e,
+            };
+            assert!(
+                err.contains("unsupported register"),
+                "`{insn}`: expected an unsupported-register diagnostic, got: {err}"
+            );
+        }
+    }
+
+    /// The `#fbits` operand of the fixed-point conversions was parsed and then
+    /// thrown away, so `fcvtzs x10,s30,#55` assembled as `fcvtzs x10,s30` --
+    /// wrong by a factor of 2^55. Two fields are involved: bit 21 flips from 1
+    /// to 0 (integer vs fixed-point form) and bits 15..10 carry
+    /// `scale = 64 - fbits`.
+    #[test]
+    fn fixed_point_conversions_encode_fbits() {
+        // Fixed-point form: bit 21 clear, scale = 64 - fbits.
+        assert_eq!(word_of(&one_insn("fcvtzs x10,s30,#55")), 0x9e18_27ca);
+        assert_eq!(word_of(&one_insn("fcvtzu x10,d4,#16")), 0x9e59_c08a);
+        assert_eq!(word_of(&one_insn("fcvtzs w4,s17,#13")), 0x1e18_ce24);
+        assert_eq!(word_of(&one_insn("fcvtzu w4,h17,#13")), 0x1ed9_ce24);
+        assert_eq!(word_of(&one_insn("scvtf h23,x8,#48")), 0x9ec2_4117);
+        assert_eq!(word_of(&one_insn("scvtf s1,w2,#1")), 0x1e02_fc41);
+        assert_eq!(word_of(&one_insn("ucvtf s0,w1,#31")), 0x1e03_8420);
+        assert_eq!(word_of(&one_insn("scvtf d1,x2,#64")), 0x9e42_0041);
+        assert_eq!(word_of(&one_insn("scvtf h1,w2,#16")), 0x1ec2_c041);
+        assert_eq!(word_of(&one_insn("ucvtf d0,x1,#40")), 0x9e43_6020);
+
+        // Integer form: bit 21 set, scale 0. These must be unchanged by the
+        // fix -- and must stay distinct from their fixed-point twins.
+        assert_eq!(word_of(&one_insn("fcvtzs x0,s1")), 0x9e38_0020);
+        assert_eq!(word_of(&one_insn("fcvtzs x0,s1,#64")), 0x9e18_0020);
+        assert_ne!(
+            word_of(&one_insn("fcvtzs x0,s1")),
+            word_of(&one_insn("fcvtzs x0,s1,#64")),
+            "fbits=64 must still differ from the integer form (scale 0, bit 21 clear)"
+        );
+        assert_eq!(word_of(&one_insn("scvtf s1,w2")), 0x1e22_0041);
+        assert_eq!(word_of(&one_insn("ucvtf s0,w1")), 0x1e23_0020);
+        assert_eq!(word_of(&one_insn("fcvtzu w0,d1")), 0x1e79_0020);
+
+        // fbits is bounded by the width of the integer operand.
+        for insn in [
+            "scvtf s1,w2,#64",
+            "fcvtzs w0,s1,#33",
+            "fcvtzs x0,s1,#0",
+            "scvtf s1,w2,#0",
+        ] {
+            assert!(
+                assemble(&one_insn(insn)).is_err(),
+                "`{insn}` is out of range; GAS rejects it"
+            );
+        }
+    }
+
+    /// The *vector* fixed-point conversions are a different encoding from the
+    /// integer ones, not a variant of them: the integer form is
+    /// `0 Q U 0 1 1 1 0 size 1 10000 opcode 10 Rn Rd`, while the fixed-point
+    /// form is `0 Q U 0 1 1 1 1 0 immh:immb 111111 Rn Rd` for FCVTZS/U and
+    /// `... 111001 ...` for SCVTF/UCVTF. lccc routed every vector conversion to
+    /// the integer form, so `fcvtzs v20.2d,v12.2d,#13` assembled as
+    /// `fcvtzs v20.2d,v12.2d` -- wrong by a factor of 2^13.
+    ///
+    /// `immh:immb` is `2 * esize - fbits`, which is why the constants below
+    /// look like they count down as `fbits` counts up.
+    #[test]
+    fn vector_fixed_point_conversions_encode_immh_immb() {
+        assert_eq!(word_of(&one_insn("fcvtzs v20.2d,v12.2d,#13")), 0x4f73_fd94);
+        assert_eq!(word_of(&one_insn("scvtf v20.2d,v24.2d,#57")), 0x4f47_e714);
+        assert_eq!(word_of(&one_insn("ucvtf v26.2d,v17.2d,#30")), 0x6f62_e63a);
+        assert_eq!(word_of(&one_insn("fcvtzs v3.2d,v11.2d,#10")), 0x4f76_fd63);
+        assert_eq!(word_of(&one_insn("fcvtzs v18.2d,v5.2d,#62")), 0x4f42_fcb2);
+        assert_eq!(word_of(&one_insn("scvtf v22.4s,v11.4s,#20")), 0x4f2c_e576);
+
+        // Boundaries of immh:immb for each element width, and the Q bit.
+        assert_eq!(word_of(&one_insn("fcvtzs v1.8h,v2.8h,#16")), 0x4f10_fc41);
+        assert_eq!(word_of(&one_insn("fcvtzs v1.8h,v2.8h,#1")), 0x4f1f_fc41);
+        assert_eq!(word_of(&one_insn("fcvtzs v1.4h,v2.4h,#5")), 0x0f1b_fc41);
+        assert_eq!(word_of(&one_insn("fcvtzs v1.4s,v2.4s,#32")), 0x4f20_fc41);
+        assert_eq!(word_of(&one_insn("fcvtzs v1.4s,v2.4s,#1")), 0x4f3f_fc41);
+        assert_eq!(word_of(&one_insn("fcvtzs v1.2s,v2.2s,#1")), 0x0f3f_fc41);
+        assert_eq!(word_of(&one_insn("fcvtzs v1.2d,v2.2d,#1")), 0x4f7f_fc41);
+
+        // U bit and the integer-to-FP opcode.
+        assert_eq!(word_of(&one_insn("fcvtzu v1.8h,v2.8h,#7")), 0x6f19_fc41);
+        assert_eq!(word_of(&one_insn("scvtf v1.8h,v2.8h,#4")), 0x4f1c_e441);
+        assert_eq!(word_of(&one_insn("ucvtf v1.4s,v2.4s,#12")), 0x6f34_e441);
+        assert_eq!(word_of(&one_insn("scvtf v1.2d,v2.2d,#1")), 0x4f7f_e441);
+        assert_eq!(word_of(&one_insn("ucvtf v1.2s,v2.2s,#20")), 0x2f2c_e441);
+
+        // The integer form must be untouched by the fixed-point path.
+        assert_eq!(word_of(&one_insn("fcvtzs v20.2d,v12.2d")), 0x4ee1_b994);
+        assert_ne!(
+            word_of(&one_insn("fcvtzs v20.2d,v12.2d")),
+            word_of(&one_insn("fcvtzs v20.2d,v12.2d,#13")),
+            "the fixed-point form must not collapse onto the integer form"
+        );
+
+        // fbits is bounded by the element width.
+        for insn in [
+            "fcvtzs v1.8h,v2.8h,#17",
+            "fcvtzs v1.4s,v2.4s,#33",
+            "fcvtzs v1.2d,v2.2d,#65",
+            "scvtf v1.4s,v2.4s,#0",
+        ] {
+            assert!(
+                assemble(&one_insn(insn)).is_err(),
+                "`{insn}` is out of range; GAS rejects it"
+            );
+        }
+    }
+
+    /// Only FCVTZS and FCVTZU round toward zero, and they are the only members
+    /// of the family with a fixed-point form. The other eight rounding modes
+    /// must reject `#fbits` rather than encode a rounding the hardware lacks.
+    #[test]
+    fn only_the_z_rounding_modes_take_fbits() {
+        for insn in [
+            "fcvtas w1,s2,#8",
+            "fcvtau x1,d2,#8",
+            "fcvtns x0,s1,#8",
+            "fcvtnu x3,d4,#17",
+            "fcvtms w1,s2,#8",
+            "fcvtmu x1,d2,#8",
+            "fcvtps w1,s2,#8",
+            "fcvtpu x1,d2,#8",
+        ] {
+            assert!(
+                assemble(&one_insn(insn)).is_err(),
+                "`{insn}` has no fixed-point form; GAS rejects it"
+            );
+        }
+        // ...and they keep working without it.
+        assert_eq!(word_of(&one_insn("fcvtas w1,s2")), 0x1e24_0041);
+        assert_eq!(word_of(&one_insn("fcvtns x0,s1")), 0x9e20_0020);
+        assert_eq!(word_of(&one_insn("fcvtzs x0,s1,#8")), 0x9e18_e020);
+        assert_eq!(word_of(&one_insn("fcvtzu x0,s1,#8")), 0x9e19_e020);
+    }
+
+    /// Advanced-SIMD by-element forms. Two independent errors lived here:
+    /// `mla`/`mls` omitted bit 29 (the U field, which is 1 for them and 0 for
+    /// `mul`/`sqdmulh`/`sqrdmulh`), and the FP by-element forms omitted bit 23
+    /// entirely while `fmul` wrongly set bit 29. `mla v0.4s,v1.4s,v2.s[1]`
+    /// assembled as 0x4fa20020 -- a MUL, which discards the accumulator -- so
+    /// the program ran and computed the wrong thing.
+    #[test]
+    fn neon_by_element_encodes_u_and_prefix_bits() {
+        // Integer by element: U = 1 for MLA/MLS, 0 for the rest.
+        assert_eq!(word_of(&one_insn("mul v0.4s,v1.4s,v2.s[1]")), 0x4fa2_8020);
+        assert_eq!(word_of(&one_insn("mla v0.4s,v1.4s,v2.s[1]")), 0x6fa2_0020);
+        assert_eq!(word_of(&one_insn("mls v0.4s,v1.4s,v2.s[1]")), 0x6fa2_4020);
+        assert_eq!(
+            word_of(&one_insn("sqdmulh v0.4s,v1.4s,v2.s[1]")),
+            0x4fa2_c020
+        );
+        assert_eq!(
+            word_of(&one_insn("sqrdmulh v0.4s,v1.4s,v2.s[1]")),
+            0x4fa2_d020
+        );
+        assert_eq!(word_of(&one_insn("mla v0.8h,v1.8h,v2.h[3]")), 0x6f72_0020);
+        assert_eq!(word_of(&one_insn("mls v0.2s,v1.2s,v2.s[3]")), 0x2fa2_4820);
+
+        // FP by element: bits 28..23 are the fixed prefix 011111, bit 29 is 0.
+        assert_eq!(word_of(&one_insn("fmul v0.4s,v1.4s,v2.s[1]")), 0x4fa2_9020);
+        assert_eq!(word_of(&one_insn("fmla v0.4s,v1.4s,v2.s[1]")), 0x4fa2_1020);
+        assert_eq!(word_of(&one_insn("fmls v0.4s,v1.4s,v2.s[1]")), 0x4fa2_5020);
+        assert_eq!(word_of(&one_insn("fmul v0.2d,v1.2d,v2.d[0]")), 0x4fc2_9020);
+        assert_eq!(word_of(&one_insn("fmla v0.2d,v1.2d,v2.d[0]")), 0x4fc2_1020);
+        assert_eq!(word_of(&one_insn("fmla v0.2s,v1.2s,v2.s[3]")), 0x0fa2_1820);
+        assert_eq!(word_of(&one_insn("fmla v0.4s,v1.4s,v2.s[0]")), 0x4f82_1020);
+
+        // An accumulator-based and a non-accumulator form must differ in the
+        // U bit, and `fmul` must not carry the integer group's U=1 habit.
+        let mla = word_of(&one_insn("mla v0.4s,v1.4s,v2.s[1]"));
+        let mul = word_of(&one_insn("mul v0.4s,v1.4s,v2.s[1]"));
+        assert_ne!(
+            mla & (1 << 29),
+            mul & (1 << 29),
+            "MLA must set U where MUL clears it"
+        );
+        assert_eq!(
+            word_of(&one_insn("fmul v0.4s,v1.4s,v2.s[1]")) & (1 << 29),
+            0,
+            "the FP by-element group has no U field"
+        );
+    }
+
+    /// A symbolic-operand instruction that cannot be encoded used to leave the
+    /// NOP placeholder in the output and print a warning, so an unsupported
+    /// SVE store assembled to a bare `nop` and exited 0.
+    #[test]
+    fn unencodable_deferred_instruction_fails_closed() {
+        let err = match assemble(".text\nstr z15,[x9,#45,mul vl]\n") {
+            Ok(w) => panic!(
+                "an unencodable deferred instruction must fail, but produced \
+                 {bytes:02x?} (a NOP placeholder is 1f2003d5)",
+                bytes = &w.base.sections[".text"].data
+            ),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("failed to resolve deferred instruction"),
+            "expected the deferred-resolution diagnostic, got: {err}"
+        );
+    }
+
+    /// ...but the fail-closed path must not break the instructions that
+    /// legitimately resolve through it: a literal-pool load is deferred too,
+    /// and has to come out as a real LDR, not as the placeholder.
+    #[test]
+    fn supported_deferred_instruction_still_resolves() {
+        let w =
+            assemble(".text\n.Ltab:\nldr x0, .Ltab\n").expect("a literal-pool ldr must assemble");
+        let data = &w.base.sections[".text"].data;
+        assert!(!data.is_empty(), "the LDR must be emitted");
+        assert_ne!(
+            data,
+            &AARCH64_NOP.to_vec(),
+            "the deferred instruction left its NOP placeholder unresolved"
+        );
+        // An LDR literal is 0x?8 / 0x?c in its high byte (opc<1:0> == 00),
+        // little-endian, so that byte is the *last* of the four.
+        let opcode_byte = data[data.len() - 1];
+        assert_eq!(
+            opcode_byte & 0x3f,
+            0x18,
+            "expected an LDR-literal opcode, got {data:02x?}"
+        );
+    }
+}

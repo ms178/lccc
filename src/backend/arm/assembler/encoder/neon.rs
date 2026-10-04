@@ -1962,6 +1962,83 @@ pub(crate) fn encode_neon_float_two_misc(
     Ok(EncodeResult::Word(word))
 }
 
+/// Fixed-point variant of the Advanced-SIMD two-register-miscellaneous
+/// conversions: `FCVTZS/U <Vd>.<T>, <Vn>.<T>, #<fbits>` and
+/// `SCVTF/UCVTF <Vd>.<T>, <Vn>.<T>, #<fbits>`.
+///
+/// This is a *different encoding* from the integer form above, not a variant
+/// of it:
+///
+///   0 Q U 0 1 1 1 1 0 immh:immb opcode 111111 Rn Rd   (FCVTZS/U, FP -> int)
+///   0 Q U 0 1 1 1 1 0 immh:immb opcode 111001 Rn Rd   (SCVTF/UCVTF, int -> FP)
+///
+/// `immh:immb` is the usual Advanced-SIMD shift field, which for these
+/// instructions encodes `2 * esize - fbits`. lccc routed every vector
+/// conversion to the integer form and dropped the operand, so
+/// `fcvtzs v20.2d,v12.2d,#13` assembled as `fcvtzs v20.2d,v12.2d` --
+/// a conversion wrong by a factor of 2^13.
+pub(crate) fn encode_neon_float_two_misc_fixed(
+    operands: &[Operand],
+    u: u32,
+    to_int: bool,
+) -> Result<EncodeResult, String> {
+    let what = match (u, to_int) {
+        (0, true) => "fcvtzs",
+        (1, true) => "fcvtzu",
+        (0, false) => "scvtf",
+        (1, false) => "ucvtf",
+        _ => unreachable!(),
+    };
+    let fbits = match operands.get(2) {
+        Some(Operand::Imm(v)) => *v,
+        other => {
+            return Err(format!(
+                "{what} (fixed-point): expected an immediate #fbits operand, \\
+                 got {other:?}"
+            ));
+        }
+    };
+    let (rd, arr_d) = get_neon_reg(operands, 0)?;
+    let (rn, _) = get_neon_reg(operands, 1)?;
+
+    let (q, esize) = match arr_d.as_str() {
+        "8h" => (1u32, 16i64),
+        "4h" => (0, 16),
+        "4s" => (1, 32),
+        "2s" => (0, 32),
+        "2d" => (1, 64),
+        _ => {
+            return Err(format!(
+                "{what} (fixed-point): unsupported arrangement `{arr_d}` \\
+                 (expected 4h, 8h, 2s, 4s or 2d)"
+            ));
+        }
+    };
+    if !(1..=esize).contains(&fbits) {
+        return Err(format!(
+            "{what}: fbits must be in 1..={esize} for an arrangement of \\
+             {esize}-bit elements, got {fbits}"
+        ));
+    }
+
+    // immh:immb == 2 * esize - fbits. The range check above guarantees immh is
+    // one of the values that selects this element size and is not the reserved
+    // 0000 pattern: fbits == esize gives immh == esize >> 3, the smallest legal
+    // immh for the size, and fbits == 1 gives the largest.
+    let immh_immb = (2 * esize - fbits) as u32;
+    // 111111 for the FP-to-integer conversions, 111001 for integer-to-FP.
+    let opcode: u32 = if to_int { 0b111111 } else { 0b111001 };
+
+    let word = (q << 30)
+        | (u << 29)
+        | (0b01111 << 24)
+        | (immh_immb << 16)
+        | (opcode << 10)
+        | (rn << 5)
+        | rd;
+    Ok(EncodeResult::Word(word))
+}
+
 // ── NEON shift right narrow (SHRN/RSHRN) ─────────────────────────────────
 /// Format: 0 Q 0 01111 0 immh immb opcode 1 Rn Rd
 /// SHRN opcode=10000, RSHRN opcode=10001
@@ -2254,9 +2331,15 @@ pub(crate) fn encode_neon_float_cmp_zero(
 
 // ── NEON by-element (non-long) ───────────────────────────────────────────
 /// MUL/MLA/MLS by element: 0 Q U 01111 size L M Rm opcode H 0 Rn Rd
+/// `u` is bit 29, the U field of the Advanced-SIMD by-element group. It is
+/// **1 only for MLA and MLS**; MUL, SQDMULH and SQRDMULH use 0. Passing 0 for
+/// every caller assembled `mla v0.4s,v1.4s,v2.s[1]` as 0x4fa20020, where GAS
+/// emits 0x6fa20020 -- and since MUL by element is opcode 1000 vs MLA's 0000,
+/// the result was not merely a different instruction, it was a *multiply that
+/// discards the accumulator*, i.e. a silently wrong answer.
 pub(crate) fn encode_neon_elem(
     operands: &[Operand],
-    u_bit: u32,
+    u: u32,
     opcode: u32,
 ) -> Result<EncodeResult, String> {
     if operands.len() < 3 {
@@ -2276,7 +2359,7 @@ pub(crate) fn encode_neon_elem(
     };
     let rm_enc = if size == 0b01 { rm & 0xF } else { rm & 0x1F };
     let word = (q << 30)
-        | (u_bit << 29)
+        | (u << 29)
         | (0b01111 << 24)
         | (size << 22)
         | (l << 21)
@@ -2290,9 +2373,16 @@ pub(crate) fn encode_neon_elem(
 }
 
 // ── NEON float by-element ────────────────────────────────────────────────
+/// In the FP by-element group, bits 28..23 are the fixed prefix `011111` and
+/// bit 29 is 0 -- there is no U field here at all. The old signature took a
+/// `u_bit` anyway, which invited `fmul` to pass 1 (the integer-group habit)
+/// and set a bit that belongs to the prefix, while bit 23 was never emitted.
+/// Net effect: `fmul v0.4s,v1.4s,v2.s[1]` assembled as 0x6f229020 against
+/// GAS's 0x4fa29020, and `fmla`/`fmls` were short bit 23 (0x4f22... vs
+/// 0x4fa2...). The parameter is gone rather than documented, because a
+/// parameter that must always be zero is a bug waiting to be reintroduced.
 pub(crate) fn encode_neon_float_elem(
     operands: &[Operand],
-    u_bit: u32,
     opcode: u32,
 ) -> Result<EncodeResult, String> {
     if operands.len() < 3 {
@@ -2317,8 +2407,8 @@ pub(crate) fn encode_neon_float_elem(
     };
     let rm_enc = rm & 0x1F;
     let word = (q << 30)
-        | (u_bit << 29)
-        | (0b01111 << 24)
+        // bits 28..23 = 011111
+        | (0b0011111 << 23)
         | (sz << 22)
         | (l << 21)
         | (m_bit << 20)

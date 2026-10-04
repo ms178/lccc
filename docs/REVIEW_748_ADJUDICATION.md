@@ -269,7 +269,7 @@ Every scalar-FP call site derived `type` from a two-way question — "does the
 name start with `d`?" — which has a three-way answer. `h` registers took the
 single-precision branch, so `fmadd h11, h3, h2, h12` assembled as
 `fmadd s11, s3, s2, s12`. Replaced with a shared `fp_ftype` helper across all
-13 sites. Eleven previously-divergent H mnemonics now match GAS bit for bit:
+13 sites. Twelve previously-divergent H mnemonics now match GAS bit for bit:
 `fmadd fmsub fnmadd fnmsub fadd fsub fmul fdiv fmax fmin fmaxnm fminnm`.
 
 Measured effect of D alone: **163 → 121 misencodings, 2 056 → 2 098 verified
@@ -280,9 +280,21 @@ identical**, with no regressions in the 4 064-test suite.
 - Fixed-point `fcvtz*`/`scvtf` appear to ignore the `fbits` operand.
 - `ld1r`/`ld2r`/`ld3r`/`ld4r`/`ld1`/`st1` post-index-by-register forms differ
   in the `Rm`/opcode fields.
-- AdvSIMD `mls` by element is missing a bit 29.
 - `mov` does not consider `MOVN`.
 - No SVE/SME support at all (3 538 of the rejections).
+
+### 7.4 Corrected since this document was written
+
+- **AdvSIMD by element.** This list used to say "`mls` by element is missing a
+  bit 29", which understated it. Two independent errors were present: `mla` and
+  `mls` omitted bit 29, the U field, which is 1 for them and 0 for
+  `mul`/`sqdmulh`/`sqrdmulh` -- so `mla v0.4s,v1.4s,v2.s[1]` assembled as
+  `0x4fa20020`, a MUL that discards the accumulator. Separately, the FP
+  by-element forms (`fmul`/`fmla`/`fmls`) never emitted bit 23, which belongs
+  to their fixed `011111` prefix, and `fmul` wrongly set bit 29 by copying the
+  integer group's habit. All 20 probed forms now match GAS. (An earlier note
+  of mine blamed "bit 30" for both; that was wrong -- it is bit 29 for the
+  integer forms and bit 23 for the FP ones.)
 
 ---
 

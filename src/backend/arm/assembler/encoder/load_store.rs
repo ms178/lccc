@@ -3,6 +3,58 @@ use crate::backend::arm::assembler::parser::Operand;
 
 // ── Loads/Stores ─────────────────────────────────────────────────────────
 
+// ── Checked offset fields ──────────────────────────────────────────────────
+//
+// The AArch64 load/store immediate fields are NARROW and SIGNED, and the
+// original code masked every offset into them with `& 0x1FF` / `& 0x7F`.
+// Masking cannot fail, so an offset that does not fit was silently wrapped:
+//
+// ldr x0, [x1, #32768] -> scaled imm12 needs 4096 (too big), so it fell
+// through to the unscaled form, where
+// 32768 & 0x1FF == 0, assembling `ldur x0, [x1]`
+// -- a load from the base register instead of
+// base+32768, with no diagnostic.
+// stp x0, x1, [x2, #8192] -> (8192 >> 3) & 0x7F == 0, storing to [x2].
+//
+// Both are the same defect class as the RISC-V branch truncation fixed
+// elsewhere in this tree: an immediate that does not fit is mangled into a
+// plausible-looking instruction instead of being refused.
+//
+// These helpers are the single place that decision is made. Every caller must
+// go through one of them; the `& MASK` idiom is not to be reintroduced.
+
+/// Encode `offset` as the signed 9-bit immediate of an unscaled, pre-index or
+/// post-index load/store. Legal range is -256..=255.
+pub(crate) fn checked_imm9(offset: i64, what: &str) -> Result<u32, String> {
+    if !(-256..=255).contains(&offset) {
+        return Err(format!(
+            "{what}: offset {offset} is outside the signed 9-bit immediate of this addressing mode (allowed -256..=255); it would silently wrap. Use a register offset, or materialise the address into a register."
+        ));
+    }
+    Ok((offset as u32) & 0x1FF)
+}
+
+/// Encode `offset` as the scaled signed 7-bit immediate of a load/store pair.
+/// `shift` is log2 of the access width, so the legal *byte* range is
+/// -64*2^shift ..= 63*2^shift, in steps of 2^shift.
+pub(crate) fn checked_imm7(offset: i64, shift: u32, what: &str) -> Result<u32, String> {
+    let align = 1i64 << shift;
+    if offset % align != 0 {
+        return Err(format!(
+            "{what}: offset {offset} is not a multiple of {align}; this pair accesses {align}-byte elements and the immediate is scaled"
+        ));
+    }
+    let scaled = offset >> shift;
+    if !(-64..=63).contains(&scaled) {
+        return Err(format!(
+            "{what}: offset {offset} scales to {scaled}, which is outside the signed 7-bit immediate of a load/store pair (allowed -64..=63, i.e. {}..={} bytes); it would silently wrap",
+            -64 * align,
+            63 * align
+        ));
+    }
+    Ok((scaled as u32) & 0x7F)
+}
+
 /// Auto-detect LDR/STR size from the first register operand.
 pub(crate) fn encode_ldr_str_auto(
     operands: &[Operand],
@@ -28,7 +80,7 @@ pub(crate) fn encode_ldr_str_auto(
         match reg_name.chars().next() {
             Some('w') => (0b10, false), // 32-bit GPR
             Some('x') => (0b11, false), // 64-bit GPR
-            Some('b') => (0b00, false), //  8-bit FP
+            Some('b') => (0b00, false), // 8-bit FP
             Some('h') => (0b01, false), // 16-bit FP
             Some('s') => (0b10, false), // 32-bit FP
             Some('d') => (0b11, false), // 64-bit FP
@@ -37,8 +89,7 @@ pub(crate) fn encode_ldr_str_auto(
             Some('q') | Some('v') => (0b00, true),
             _ => {
                 return Err(format!(
-                    "ldr/str: unrecognised register `{reg_name}` \
-                     (expected w, x, b, h, s, d or q)"
+                    "ldr/str: unrecognised register `{reg_name}` (expected w, x, b, h, s, d or q)"
                 ));
             }
         }
@@ -110,8 +161,14 @@ pub(crate) fn encode_ldr_str(
                 }
             }
 
-            // Unscaled offset (LDUR/STUR form)
-            let imm9 = (*offset as i32) & 0x1FF;
+            // Unscaled offset (LDUR/STUR form).
+            //
+            // The unscaled form *does* exist for 128-bit accesses: `size == 00`
+            // with `opc == 10` is STUR/LDUR of a Q register. `str q0,[x1,#8]`
+            // is therefore legal (GAS emits 3c808020) even though 8 is not a
+            // multiple of the Q access width -- it simply cannot use the
+            // scaled form. Do not "helpfully" reject it.
+            let imm9 = checked_imm9(*offset, "ldr/str")?;
             let opc = if is_128bit {
                 if is_load { 0b11 } else { 0b10 }
             } else if is_load {
@@ -130,7 +187,7 @@ pub(crate) fn encode_ldr_str(
         // [base, #offset]! (pre-index)
         Some(Operand::MemPreIndex { base, offset }) => {
             let rn = parse_reg_num(base).ok_or("invalid base reg")?;
-            let imm9 = (*offset as i32) & 0x1FF;
+            let imm9 = checked_imm9(*offset, if is_load { "ldr/str" } else { "ldr/str" })?;
             let opc = if is_128bit {
                 if is_load { 0b11 } else { 0b10 }
             } else if is_load {
@@ -150,7 +207,7 @@ pub(crate) fn encode_ldr_str(
         // [base], #offset (post-index)
         Some(Operand::MemPostIndex { base, offset }) => {
             let rn = parse_reg_num(base).ok_or("invalid base reg")?;
-            let imm9 = (*offset as i32) & 0x1FF;
+            let imm9 = checked_imm9(*offset, if is_load { "ldr/str" } else { "ldr/str" })?;
             let opc = if is_128bit {
                 if is_load { 0b11 } else { 0b10 }
             } else if is_load {
@@ -445,7 +502,7 @@ pub(crate) fn encode_ldrsw(operands: &[Operand]) -> Result<EncodeResult, String>
                 }
             }
             // Unscaled: LDURSW
-            let imm9 = (*offset as i32) & 0x1FF;
+            let imm9 = checked_imm9(*offset, "ldrsw")?;
             let word =
                 (((0b10 << 30) | (0b111 << 27)) | (0b10 << 22) | ((imm9 as u32 & 0x1FF) << 12))
                     | (rn << 5)
@@ -455,7 +512,7 @@ pub(crate) fn encode_ldrsw(operands: &[Operand]) -> Result<EncodeResult, String>
 
         Some(Operand::MemPostIndex { base, offset }) => {
             let rn = parse_reg_num(base).ok_or("invalid base reg")?;
-            let imm9 = (*offset as i32) & 0x1FF;
+            let imm9 = checked_imm9(*offset, "ldrsw")?;
             let word = ((0b10 << 30) | (0b111 << 27))
                 | (0b10 << 22)
                 | ((imm9 as u32 & 0x1FF) << 12)
@@ -467,7 +524,7 @@ pub(crate) fn encode_ldrsw(operands: &[Operand]) -> Result<EncodeResult, String>
 
         Some(Operand::MemPreIndex { base, offset }) => {
             let rn = parse_reg_num(base).ok_or("invalid base reg")?;
-            let imm9 = (*offset as i32) & 0x1FF;
+            let imm9 = checked_imm9(*offset, "ldrsw")?;
             let word = ((0b10 << 30) | (0b111 << 27))
                 | (0b10 << 22)
                 | ((imm9 as u32 & 0x1FF) << 12)
@@ -549,7 +606,7 @@ pub(crate) fn encode_ldrs(operands: &[Operand], size: u32) -> Result<EncodeResul
             }
         }
         // Unscaled
-        let imm9 = (*offset as i32) & 0x1FF;
+        let imm9 = checked_imm9(*offset, "ldrs")?;
         let word = (((size << 30) | (0b111 << 27)) | (opc << 22) | ((imm9 as u32 & 0x1FF) << 12))
             | (rn << 5)
             | rt;
@@ -559,7 +616,7 @@ pub(crate) fn encode_ldrs(operands: &[Operand], size: u32) -> Result<EncodeResul
     // Post-index: ldrsb/ldrsh Rt, [Xn], #imm
     if let Some(Operand::MemPostIndex { base, offset }) = operands.get(1) {
         let rn = parse_reg_num(base).ok_or("invalid base reg")?;
-        let imm9 = (*offset as i32) & 0x1FF;
+        let imm9 = checked_imm9(*offset, "ldrs")?;
         let word = (size << 30)
             | (0b111 << 27)
             | (opc << 22)
@@ -573,7 +630,7 @@ pub(crate) fn encode_ldrs(operands: &[Operand], size: u32) -> Result<EncodeResul
     // Pre-index: ldrsb/ldrsh Rt, [Xn, #imm]!
     if let Some(Operand::MemPreIndex { base, offset }) = operands.get(1) {
         let rn = parse_reg_num(base).ok_or("invalid base reg")?;
-        let imm9 = (*offset as i32) & 0x1FF;
+        let imm9 = checked_imm9(*offset, "ldrs")?;
         let word = (size << 30)
             | (0b111 << 27)
             | (opc << 22)
@@ -631,68 +688,40 @@ pub(crate) fn encode_ldrs(operands: &[Operand], size: u32) -> Result<EncodeResul
 }
 
 pub(crate) fn encode_ldp_stp(operands: &[Operand], is_load: bool) -> Result<EncodeResult, String> {
-    if operands.len() < 3 {
-        return Err("ldp/stp requires 3 operands".to_string());
+    if operands.len() != 3 {
+        return Err(format!(
+            "ldp/stp requires 3 operands, got {}",
+            operands.len()
+        ));
     }
 
-    let (rt1, is_64) = get_reg(operands, 0)?;
-    let (rt2, _) = get_reg(operands, 1)?;
-    let fp = is_fp_reg(match &operands[0] {
-        Operand::Reg(r) => r.as_str(),
-        _ => "",
-    });
+    let name1 = reg_name_at(operands, 0)?;
+    let name2 = reg_name_at(operands, 1)?;
 
-    let opc = if fp {
-        let r = match &operands[0] {
-            Operand::Reg(r) => r.to_lowercase(),
-            _ => String::new(),
-        };
-        if r.starts_with('s') {
-            0b00
-        } else if r.starts_with('d') {
-            0b01
-        } else if r.starts_with('q') || is_64 {
-            0b10
-        } else {
-            0b00
-        }
-    } else if is_64 {
-        0b10
-    } else {
-        0b00
-    };
+    // Same classifier as `ldnp/stnp`, deliberately shared: the two encodings
+    // differ only in the no-allocate bit, so they cannot disagree about what a
+    // register class means. `ldp`/`stp` used to carry its own copy, which
+    // mapped `b`/`h` registers onto the S pair (there is no such pair form) and
+    // never checked that the two registers of a pair shared a class -- so
+    // `stp b0, b1, [x0]` silently assembled as `stp s0, s1, [x0]`.
+    let what = if is_load { "ldp" } else { "stp" };
+    let (opc, v, shift) = pair_reg_fields(&name1, what)?;
+    let (opc2, v2, _) = pair_reg_fields(&name2, what)?;
+    if (opc, v) != (opc2, v2) {
+        return Err(format!(
+            "{what}: `{name1}` and `{name2}` are different register classes; a pair needs two registers of the same kind and width"
+        ));
+    }
 
-    let v = if fp { 1u32 } else { 0u32 };
+    let rt1 = parse_reg_num(&name1).ok_or_else(|| format!("invalid register: {name1}"))?;
+    let rt2 = parse_reg_num(&name2).ok_or_else(|| format!("invalid register: {name2}"))?;
     let l = if is_load { 1u32 } else { 0u32 };
-
-    // Shift depends on register size
-    let shift = if fp {
-        let r = match &operands[0] {
-            Operand::Reg(r) => r.to_lowercase(),
-            _ => String::new(),
-        };
-        if r.starts_with('s') {
-            2
-        } else if r.starts_with('d') {
-            3
-        } else if r.starts_with('q') {
-            4
-        } else if is_64 {
-            3
-        } else {
-            2
-        }
-    } else if is_64 {
-        3
-    } else {
-        2
-    };
 
     match operands.get(2) {
         // STP rt1, rt2, [base, #offset]! (pre-index)
         Some(Operand::MemPreIndex { base, offset }) => {
             let rn = parse_reg_num(base).ok_or("invalid base reg")?;
-            let imm7 = ((*offset >> shift) as i32) & 0x7F;
+            let imm7 = checked_imm7(*offset, shift, if is_load { "ldp" } else { "stp" })?;
             let word = (opc << 30)
                 | (0b101 << 27)
                 | (v << 26)
@@ -708,7 +737,7 @@ pub(crate) fn encode_ldp_stp(operands: &[Operand], is_load: bool) -> Result<Enco
         // LDP/STP rt1, rt2, [base], #offset (post-index)
         Some(Operand::MemPostIndex { base, offset }) => {
             let rn = parse_reg_num(base).ok_or("invalid base reg")?;
-            let imm7 = ((*offset >> shift) as i32) & 0x7F;
+            let imm7 = checked_imm7(*offset, shift, if is_load { "ldp" } else { "stp" })?;
             let word = (opc << 30)
                 | (0b101 << 27)
                 | (v << 26)
@@ -724,7 +753,7 @@ pub(crate) fn encode_ldp_stp(operands: &[Operand], is_load: bool) -> Result<Enco
         // LDP/STP rt1, rt2, [base, #offset] (signed offset)
         Some(Operand::Mem { base, offset }) => {
             let rn = parse_reg_num(base).ok_or("invalid base reg")?;
-            let imm7 = ((*offset >> shift) as i32) & 0x7F;
+            let imm7 = checked_imm7(*offset, shift, if is_load { "ldp" } else { "stp" })?;
             let word = (opc << 30)
                 | (0b101 << 27)
                 | (v << 26)
@@ -754,9 +783,9 @@ pub(crate) fn encode_ldp_stp(operands: &[Operand], is_load: bool) -> Result<Enco
 /// the imm7 field.
 ///
 /// ```text
-///   GPR W  -> (00, 0, 2)     FP S  -> (00, 1, 2)
-///   GPR X  -> (10, 0, 3)     FP D  -> (01, 1, 3)
-///                            FP Q  -> (10, 1, 4)
+/// GPR W -> (00, 0, 2) FP S -> (00, 1, 2)
+/// GPR X -> (10, 0, 3) FP D -> (01, 1, 3)
+/// FP Q -> (10, 1, 4)
 /// ```
 ///
 /// `ldnp`/`stnp` previously hardcoded `V = 0` and chose `opc` from "is this a
@@ -767,7 +796,7 @@ pub(crate) fn encode_ldp_stp(operands: &[Operand], is_load: bool) -> Result<Enco
 /// float loads. `ldp`/`stp` already classified correctly, which is why the
 /// defect survived: the common pair instructions were right and the rare
 /// non-temporal ones were silently wrong.
-fn pair_reg_fields(name: &str) -> Result<(u32, u32, u32), String> {
+fn pair_reg_fields(name: &str, what: &str) -> Result<(u32, u32, u32), String> {
     let n = name.to_lowercase();
     let fields = match n.as_str() {
         "sp" | "xzr" | "lr" => (0b10u32, 0u32, 3u32),
@@ -780,8 +809,7 @@ fn pair_reg_fields(name: &str) -> Result<(u32, u32, u32), String> {
             Some('q') | Some('v') => (0b10, 1, 4),
             _ => {
                 return Err(format!(
-                    "ldnp/stnp: unsupported register `{name}` \
-                     (expected w, x, s, d or q)"
+                    "{what}: unsupported register `{name}` (a load/store pair expects w, x, s, d or q)"
                 ));
             }
         },
@@ -815,12 +843,12 @@ pub(crate) fn encode_ldnp_stnp(
     // One opc/V field covers the whole pair, so both registers must be the
     // same class and width. A mismatched pair has no encoding at all; it must
     // be diagnosed rather than silently downgraded to the GPR form.
-    let (opc, v, shift) = pair_reg_fields(&name1)?;
-    let (opc2, v2, _) = pair_reg_fields(&name2)?;
+    let what = if is_load { "ldnp" } else { "stnp" };
+    let (opc, v, shift) = pair_reg_fields(&name1, what)?;
+    let (opc2, v2, _) = pair_reg_fields(&name2, what)?;
     if (opc, v) != (opc2, v2) {
         return Err(format!(
-            "ldnp/stnp: `{name1}` and `{name2}` are different register classes; \
-             a pair needs two registers of the same kind and width"
+            "{what}: `{name1}` and `{name2}` are different register classes; a pair needs two registers of the same kind and width"
         ));
     }
 
@@ -836,13 +864,12 @@ pub(crate) fn encode_ldnp_stnp(
             // truncated and the pair would access the wrong address.
             if *offset % align != 0 {
                 return Err(format!(
-                    "ldnp/stnp: offset {offset} is not a multiple of {align} \
-                     (required by the {name1} access width)"
+                    "ldnp/stnp: offset {offset} is not a multiple of {align} (required by the {name1} access width)"
                 ));
             }
-            let imm7 = ((*offset >> shift) as i32) & 0x7F;
+            let imm7 = checked_imm7(*offset, shift, if is_load { "ldnp" } else { "stnp" })?;
             // LDNP/STNP: opc(31:30) 101(29:27) V(26) 000(25:23) L(22)
-            //            imm7(21:15) Rt2(14:10) Rn(9:5) Rt(4:0)
+            // imm7(21:15) Rt2(14:10) Rn(9:5) Rt(4:0)
             let word = (opc << 30)
                 | (0b101 << 27)
                 | (v << 26)
@@ -934,9 +961,9 @@ pub(crate) fn encode_ldaxr_stlxr(
 
 /// Encode LDXP/STXP/LDAXP/STLXP (exclusive pair) instructions.
 ///
-/// LDXP  Xt1, Xt2, [Xn]  : sz 001000 0 1 1 11111 0 Rt2 Rn Rt
-/// LDAXP Xt1, Xt2, [Xn]  : sz 001000 0 1 1 11111 1 Rt2 Rn Rt
-/// STXP  Ws, Xt1, Xt2, [Xn] : sz 001000 0 0 1 Rs 0 Rt2 Rn Rt
+/// LDXP Xt1, Xt2, [Xn] : sz 001000 0 1 1 11111 0 Rt2 Rn Rt
+/// LDAXP Xt1, Xt2, [Xn] : sz 001000 0 1 1 11111 1 Rt2 Rn Rt
+/// STXP Ws, Xt1, Xt2, [Xn] : sz 001000 0 0 1 Rs 0 Rt2 Rn Rt
 /// STLXP Ws, Xt1, Xt2, [Xn] : sz 001000 0 0 1 Rs 1 Rt2 Rn Rt
 pub(crate) fn encode_ldxp_stxp(
     operands: &[Operand],
@@ -955,7 +982,7 @@ pub(crate) fn encode_ldxp_stxp(
             _ => return Err("ldxp needs memory operand".to_string()),
         };
         let sz = if is_64 { 1u32 } else { 0 };
-        // 1 sz 001000 0 1 1 11111 o0 Rt2 Rn Rt  (bit23=0)
+        // 1 sz 001000 0 1 1 11111 o0 Rt2 Rn Rt (bit23=0)
         let word = (1u32 << 31)
             | (sz << 30)
             | (0b001000 << 24)
@@ -979,7 +1006,7 @@ pub(crate) fn encode_ldxp_stxp(
             _ => return Err("stxp needs memory operand".to_string()),
         };
         let sz = if is_64 { 1u32 } else { 0 };
-        // 1 sz 001000 0 0 1 Rs o0 Rt2 Rn Rt  (bit23=0, bit22=0)
+        // 1 sz 001000 0 0 1 Rs o0 Rt2 Rn Rt (bit23=0, bit22=0)
         let word = (1u32 << 31)
             | (sz << 30)
             | (0b001000 << 24)
@@ -1222,10 +1249,10 @@ pub(crate) fn encode_prfop(name: &str) -> Result<u32, String> {
 /// (everything after the `cas` / `casp` stem).
 ///
 /// Valid suffixes:
-///   ""    relaxed          "b"  byte   (CAS family only)
-///   "a"   acquire          "h"  half   (CAS family only)
-///   "l"   release
-///   "al"  acquire+release
+/// "" relaxed "b" byte (CAS family only)
+/// "a" acquire "h" half (CAS family only)
+/// "l" release
+/// "al" acquire+release
 /// Byte/half letters always trail the order letters (`casalb`, `caslb`, ...).
 ///
 /// The parse is exact rather than a `contains` probe: a lenient contains
@@ -1254,7 +1281,7 @@ fn parse_atomic_order_suffix(
 }
 
 /// Encode CAS/CASA/CASAL/CASL and byte/halfword variants (Compare and Swap).
-/// CAS  SZ  |001000|1|A|1|Rs|R|11111|Rn|Rt   (LLVM AArch64InstrFormats.td;
+/// CAS SZ |001000|1|A|1|Rs|R|11111|Rn|Rt (LLVM AArch64InstrFormats.td;
 /// round-trip verified against Capstone for all twelve order/size forms)
 pub(crate) fn encode_cas(mnemonic: &str, operands: &[Operand]) -> Result<EncodeResult, String> {
     if operands.len() < 3 {
@@ -1292,11 +1319,11 @@ pub(crate) fn encode_cas(mnemonic: &str, operands: &[Operand]) -> Result<EncodeR
 
 /// Encode CASP/CASPA/CASPAL/CASPL (Compare and Swap **Pair**, LSE).
 ///
-/// CASP  0|SZ|001000|0|A|1|Rs|R|11111|Rn|Rt
+/// CASP 0|SZ|001000|0|A|1|Rs|R|11111|Rn|Rt
 ///
 /// Layout per LLVM AArch64InstrFormats.td (Capstone round-trip verified):
 /// - bit 31 is always 0 and SZ (bit 30) selects X pairs (1) vs W pairs (0);
-///   this is why CASP does NOT live at the same size-field position as CAS.
+/// this is why CASP does NOT live at the same size-field position as CAS.
 /// - bit 23 (NP) is 0 here and 1 for CAS — the architectural CAS/CASP split.
 /// - A (bit 22) / R (bit 15) are the acquire/release order bits.
 ///

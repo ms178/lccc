@@ -1074,6 +1074,29 @@ fi
 gate "ensure-gcc-torture-contract" fast \
     bash tests/regression/check_ensure_gcc_torture.sh
 
+# The AArch64 differential oracle is the tool that found the four encoder
+# defects above, and it is also the tool most likely to rot silently: a
+# harness that has drifted out of agreement with GAS reports "OK" for
+# everything and proves nothing. `--self-test-only` exercises the harness's
+# own invariants (GAS/lccc agreement on known words, junk rejection,
+# sparse-address extraction, the objdump canary) in a couple of seconds, so
+# it runs on every --fast pass. The full sweep stays a manual, offline run.
+#
+# The gate is skipped, not failed, when the cross-binutils or the fastbuild
+# lccc are absent: a dev box without aarch64 tooling is not a regression.
+A64_AS="$(command -v aarch64-linux-gnu-as || true)"
+A64_OBJCOPY="$(command -v aarch64-linux-gnu-objcopy || true)"
+if [ -n "$A64_AS" ] && [ -n "$A64_OBJCOPY" ] && [ -x target/fastbuild/lccc ]; then
+    gate "aarch64-oracle-selftest" fast \
+        python3 scripts/aarch64_encoder_differential.py --self-test-only \
+        --gas "$A64_AS" --objcopy "$A64_OBJCOPY" \
+        --lccc target/fastbuild/lccc
+else
+    echo "SKIP  aarch64-oracle-selftest (aarch64-linux-gnu binutils or" \
+         "target/fastbuild/lccc not available)"
+    SKIPPED=$((SKIPPED + 1))
+fi
+
 # Cross-vendor oracle (docs/GODBOLT_ORACLE.md).  Only the OFFLINE half runs
 # here: the live sweep needs godbolt.org, and a network dependency inside
 # ci_local turns an outage into a red local gate -- the exact failure shape
