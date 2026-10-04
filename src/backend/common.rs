@@ -391,7 +391,10 @@ fn link_with_gcc(
         cmd.arg(arg);
     }
 
-    if !is_nostdlib && !is_shared {
+    // `-nodefaultlibs` drops the C and math libraries here as well; libgcc
+    // stays, and the driver's own `-lgcc` (added below, if any) is untouched.
+    let is_nodefaultlibs = user_args.iter().any(|a| a == "-nodefaultlibs");
+    if !is_nostdlib && !is_nodefaultlibs && !is_shared {
         cmd.arg("-lc");
         cmd.arg("-lm");
     }
@@ -812,11 +815,22 @@ fn resolve_builtin_link_setup(
         i += 1;
     }
 
+    // `-nostartfiles` and `-nodefaultlibs` are the other two GNU link-file
+    // switches and they are complementary (measured on GCC 14.2): with
+    // `-nostartfiles` the startup objects go and libc stays; with
+    // `-nodefaultlibs` the startup objects stay and libc/libm go -- while
+    // libgcc STAYS, because it is what resolves the runtime calls this
+    // backend itself emits (`__divti3` links under `-nodefaultlibs` and fails
+    // under `-nostdlib`; both measured).  Derived from `user_args`, the same
+    // single source `is_nostdlib` already uses.
+    let is_nostartfiles = user_args.iter().any(|a| a == "-nostartfiles");
+    let is_nodefaultlibs = user_args.iter().any(|a| a == "-nodefaultlibs");
+
     // CRT objects
     let mut crt_before: Vec<String> = Vec::new();
     let mut crt_after: Vec<String> = Vec::new();
 
-    if !is_nostdlib {
+    if !is_nostdlib && !is_nostartfiles {
         // crt1.o comes from the CRT dir
         if let Some(ref crt) = crt_dir {
             crt_before.push(format!("{}/crt1.o", crt));
@@ -855,11 +869,14 @@ fn resolve_builtin_link_setup(
         }
     }
 
-    // Default libraries
-    let needed_libs: Vec<String> = if !is_nostdlib {
-        vec!["gcc".to_string(), "c".to_string(), "m".to_string()]
-    } else {
+    // Default libraries.  `-nodefaultlibs` keeps libgcc (see above) and drops
+    // the C and math libraries, which is exactly GCC's split.
+    let needed_libs: Vec<String> = if is_nostdlib {
         vec![]
+    } else if is_nodefaultlibs {
+        vec!["gcc".to_string()]
+    } else {
+        vec!["gcc".to_string(), "c".to_string(), "m".to_string()]
     };
 
     // Combined paths: user first, then system

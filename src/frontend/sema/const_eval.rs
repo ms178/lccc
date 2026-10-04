@@ -931,7 +931,7 @@ impl<'a> SemaConstEval<'a> {
             TypeSpecifier::Array(elem, Some(size)) => {
                 let elem_size = self.sizeof_type_spec(elem)?;
                 let n = self.eval_const_expr(size)?.to_i64()?;
-                Some(elem_size * n as usize)
+                Some(elem_size.saturating_mul(n as usize))
             }
             TypeSpecifier::Array(_, None) => Some(ptr_sz), // incomplete array
             TypeSpecifier::Struct(

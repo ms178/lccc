@@ -1,4 +1,6 @@
 pub(crate) mod asm_constraints;
+pub(crate) mod asm_scan;
+pub(crate) mod builtin;
 pub(crate) mod const_arith;
 pub(crate) mod const_eval;
 pub(crate) mod decimal;

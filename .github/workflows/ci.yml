@@ -785,6 +785,20 @@ jobs:
           python3 scripts/edg_corpus_mine.py verify-index
           python3 scripts/edg_changes_mine.py verify-artifacts
           python3 -m unittest discover -s tests/corpus -p 'test_*.py'
+          # Array-bound contract (E22): a bad bound is diagnosed (never
+          # wrapped), a byte size that cannot exist is rejected instead of
+          # wrapping into a bogus section, and a huge .bss object is emitted
+          # sparsely under a hard address-space limit rather than being
+          # materialised and OOM-killed. Mirrored in scripts/ci_local.sh.
+          python3 scripts/check_array_bound_contract.py
+          # Sparse NOBITS `.bss` (E22): the zeros are a size, not bytes, so a
+          # 4 GiB array compiles, links and runs from a ~5 KB executable, a
+          # label inside a sparse tail keeps its offset, an oversized alignment
+          # in a NOBITS section is free while the same alignment in a section
+          # that must materialise the gap is a diagnostic (and never an aborted
+          # process), and negative/oversized counts follow GAS exactly.
+          # Mirrored in scripts/ci_local.sh (parity-checked).
+          CCC=target/fastbuild/lccc bash tests/regression/check_sparse_bss_nobits.sh
           bash tests/regression/check_frontend_diagnostic_recovery.sh
           # E5 (EDG register): deep-nesting crash class -> clean bounded
           # error; deep-but-legal inputs keep compiling; in-budget nesting
@@ -792,6 +806,19 @@ jobs:
           python3 scripts/check_deep_nesting_robustness.py
           python3 scripts/test_differential_corpus_paths.py
           bash tests/regression/check_loop_memset.sh
+          # A13/A14: a pass may synthesise a libcall only when this TU does
+          # not define that symbol (per symbol, so an asm label, an alias or
+          # a static definition counts), and a constant-size memcpy/memset
+          # call may be expanded only while the callee still is the builtin.
+          # Refusals, positive controls, the -fno-builtin/-ffreestanding
+          # contract, the ungated __*_chk rows and three runtime programs.
+          bash tests/regression/check_libcall_synthesis_no_selfcall.sh
+          # The inliner's __builtin_va_arg_pack_len() sentinel rewrite matched
+          # in the wrong value space, leaving a live call to the undefined
+          # __lccc_va_arg_pack_len whenever the cloned caller was offset (gzip
+          # 1.14's gnulib open-safer.c under glibc fortify failed to link).
+          # No sentinel at -O0..-O3, wrapper semantics, gcc as the reference.
+          bash tests/regression/check_va_arg_pack_len_folds.sh
           bash tests/regression/check_bool_pair_tail_jmp.sh
           bash tests/regression/check_bool_pair_prune.sh
           bash tests/regression/check_demorgan_branch_split.sh
@@ -910,6 +937,11 @@ jobs:
           # The trace-bisect tool is also exercised directly, so a broken
           # operand parser fails CI even if the wrapper gate is skipped.
           python3 scripts/peephole_trace_bisect.py --selftest
+          # The Clang-C corpus capability probe: an unimplemented option must
+          # never read as support, and a `-W`-spelled unknown option must not
+          # slip past a `--`-only negative control.  Synthetic compiler, no
+          # toolchain and no corpus needed.
+          python3 scripts/lccc_capability_probe.py --selftest
           bash tests/regression/check_atomic_backends.sh
           # Torture-corpus provisioning: stamp trust, integrity manifest,
           # auto-repair and invalidate-before-replace (synthetic tarball).

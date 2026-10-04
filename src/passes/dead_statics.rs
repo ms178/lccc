@@ -242,9 +242,7 @@ pub(crate) fn eliminate_dead_global_stores(module: &mut IrModule) {
             continue;
         }
         if !inline_asm_templates.is_empty()
-            && inline_asm_templates
-                .iter()
-                .any(|t| asm_mentions_symbol(t, global.name.as_str()))
+            && toplevel_asm_mentions(&inline_asm_templates, global.name.as_str())
         {
             continue;
         }
@@ -526,7 +524,9 @@ fn ids_for_name<'a>(name_to_ids: &'a FxHashMap<&str, Vec<usize>>, name: &str) ->
 fn asm_symbol_base(s: &str) -> &str {
     let bytes = s.as_bytes();
     let mut start = 0;
-    while start < bytes.len() && !is_asm_ident_start(bytes[start]) {
+    while start < bytes.len()
+        && !(bytes[start].is_ascii_alphabetic() || bytes[start] == b'_' || bytes[start] == b'.')
+    {
         start += 1;
     }
     let mut end = start;
@@ -536,68 +536,15 @@ fn asm_symbol_base(s: &str) -> &str {
     if start < end { &s[start..end] } else { s }
 }
 
-#[inline]
-fn is_asm_ident_start(c: u8) -> bool {
-    c.is_ascii_alphabetic() || c == b'_' || c == b'.'
-}
+use crate::common::asm_scan::is_asm_ident_char;
 
-#[inline]
-fn is_asm_ident_char(c: u8) -> bool {
-    c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b'$'
-}
-
-/// True iff `name` occurs in `asm` as its own token, not as a substring of a
-/// longer identifier (`log` must not match `logarithm`; `foo` must not match
-/// `foobar`). Names that themselves contain `@`/`+` still match exactly.
+/// True iff any of `blobs` names `name` as a whole identifier.
 ///
-/// AT&T syntax: `$symbol` is an immediate reference to `symbol`'s address
-/// (e.g. `movabsq $g, %rax`). The `$` is NOT part of the identifier, but
-/// `is_asm_ident_char` includes `$` to handle embedded `$` in symbol names
-/// like `foo$bar`. Therefore `$g` must be recognized as a reference to `g`,
-/// while `foo$bar` must NOT be recognized as a reference to `bar`.
-/// We handle this by treating a preceding `$` as an immediate prefix when
-/// the char before `$` is NOT an ident char (or `$` is at start); if the
-/// char before `$` IS ident, then `$` is embedded and the match is rejected.
-fn asm_mentions_symbol(asm: &str, name: &str) -> bool {
-    if name.is_empty() {
-        return false;
-    }
-    let bytes = asm.as_bytes();
-    let mut search_from = 0;
-    while let Some(rel) = asm[search_from..].find(name) {
-        let abs = search_from + rel;
-        let before_ok = if abs == 0 {
-            true
-        } else {
-            let prev = bytes[abs - 1];
-            if !is_asm_ident_char(prev) {
-                true
-            } else if prev == b'$' {
-                // `$` preceded by non-ident or start => immediate prefix `$g`
-                // `$` preceded by ident => embedded `$` like `foo$bar`
-                if abs >= 2 {
-                    !is_asm_ident_char(bytes[abs - 2])
-                } else {
-                    true
-                }
-            } else {
-                false
-            }
-        };
-        let after = abs + name.len();
-        let after_ok = after == bytes.len() || !is_asm_ident_char(bytes[after]);
-        if before_ok && after_ok {
-            return true;
-        }
-        // `name` is a valid UTF-8 substring of `asm`, so this stays on a
-        // character boundary (unlike `abs + 1`).
-        search_from = abs + name.len();
-    }
-    false
-}
-
+/// The scanner lives in `common::asm_scan` because the A13/A14 symbol
+/// inventory asks the same question about top-level assembly; one
+/// implementation means a miss cannot differ between the two callers.
 fn toplevel_asm_mentions<S: AsRef<str>>(blobs: &[S], name: &str) -> bool {
-    blobs.iter().any(|s| asm_mentions_symbol(s.as_ref(), name))
+    crate::common::asm_scan::any_blob_mentions(blobs, name)
 }
 
 /// Visit every symbol name an instruction can reference.
@@ -840,9 +787,7 @@ fn compute_reachability(
                 if func.is_static
                     && !func.is_declaration
                     && !is_marked(&reachable, i)
-                    && inline_templates
-                        .iter()
-                        .any(|t| asm_mentions_symbol(t, func.name.as_str()))
+                    && toplevel_asm_mentions(&inline_templates, func.name.as_str())
                 {
                     mark_reachable(i, &mut reachable, &mut worklist);
                 }
@@ -852,9 +797,7 @@ fn compute_reachability(
                 if global.is_static
                     && !global.is_extern
                     && !is_marked(&reachable, id)
-                    && inline_templates
-                        .iter()
-                        .any(|t| asm_mentions_symbol(t, global.name.as_str()))
+                    && toplevel_asm_mentions(&inline_templates, global.name.as_str())
                 {
                     mark_reachable(id, &mut reachable, &mut worklist);
                 }
@@ -999,7 +942,7 @@ fn filter_symbol_attrs(module: &mut IrModule) {
         if has_toplevel_asm && toplevel_asm_mentions(&module.toplevel_asm, n) {
             return true;
         }
-        !inline_templates.is_empty() && inline_templates.iter().any(|t| asm_mentions_symbol(t, n))
+        !inline_templates.is_empty() && toplevel_asm_mentions(&inline_templates, n)
     });
 }
 
@@ -1620,41 +1563,6 @@ mod tests {
         m.functions.push(f);
         eliminate_dead_global_stores(&mut m);
         assert_eq!(store_count(&m), 0, "unrelated inline-asm: store gone");
-    }
-
-    #[test]
-    fn asm_mentions_symbol_basic() {
-        assert!(asm_mentions_symbol("movl g(%%rip), %0", "g"));
-        assert!(asm_mentions_symbol("movl g@GOTPCREL(%%rip), %0", "g"));
-        assert!(!asm_mentions_symbol("movl other(%%rip), %0", "g"));
-        assert!(!asm_mentions_symbol("movl foobar, %0", "foo"));
-        assert!(!asm_mentions_symbol("movl foo, %0", "foobar"));
-    }
-
-    #[test]
-    fn asm_mentions_symbol_immediate_prefix() {
-        // $g forms must be recognized
-        assert!(asm_mentions_symbol("movabsq $g, %rax", "g"), "$g immediate");
-        assert!(
-            asm_mentions_symbol("movl $g+4, %eax", "g"),
-            "$g+4 immediate"
-        );
-        assert!(asm_mentions_symbol("leaq $g, %rax", "g"), "leaq $g");
-        // Embedded $ must NOT spuriously match
-        assert!(
-            !asm_mentions_symbol("movl foo$bar, %0", "bar"),
-            "foo$bar should not match bar"
-        );
-        assert!(
-            !asm_mentions_symbol("movl foo$bar, %0", "foo"),
-            "foo$bar should not match foo (whole token is foo$bar)"
-        );
-        // Longer identifier must not match shorter
-        assert!(!asm_mentions_symbol("movl g_long, %0", "g"));
-        assert!(!asm_mentions_symbol("movl my_g, %0", "g"));
-        // $ embedded case: foo$bar contains $ but bar is not separate
-        // $ at start with no preceding ident is immediate, not embedded
-        assert!(asm_mentions_symbol("$g", "g"));
     }
 
     #[test]

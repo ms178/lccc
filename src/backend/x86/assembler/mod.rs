@@ -15,13 +15,18 @@ pub mod encoder;
 pub mod parser;
 
 use elf_writer::ElfWriter;
-use parser::parse_asm;
+use parser::parse_asm_with_warnings;
 
 /// Assemble AT&T syntax x86-64 assembly text into an ELF object file.
 ///
 /// This is the default assembler (used when the `gcc_assembler` feature is disabled).
 pub fn assemble(asm_text: &str, output_path: &str) -> Result<(), String> {
-    let items = parse_asm(asm_text)?;
+    let (items, warnings) = parse_asm_with_warnings(asm_text)?;
+    // GAS reports these on stderr and still writes the object; the exact same
+    // inputs are warnings here, so they are printed and the assembly goes on.
+    for warning in &warnings {
+        eprintln!("ccc: warning: {warning}");
+    }
     let items = cfi::lower_cfi(items, cfi::CfiArch::X86_64)?;
     let obj = ElfWriter::new();
     let elf_bytes = obj.build(&items)?;

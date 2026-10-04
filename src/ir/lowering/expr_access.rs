@@ -320,8 +320,8 @@ impl Lowerer {
                 // brace elision and designators as the array planner applies
                 // them; arrays of aggregates count their top-level items.
                 match self.unsized_array_len(init, elem_ct) {
-                    Some(n) => n * elem_size,
-                    None => elem_size * self.compute_init_list_array_size(items),
+                    Some(n) => n.saturating_mul(elem_size),
+                    None => elem_size.saturating_mul(self.compute_init_list_array_size(items)),
                 }
             }
             _ => self.sizeof_type(type_spec),
@@ -680,16 +680,10 @@ impl Lowerer {
     ) -> &'a Expr {
         let controlling_ctype = self.get_expr_ctype(controlling);
         let controlling_ir_type = self.get_expr_type(controlling);
-        // Per C11 6.5.1.1p2, the controlling expression undergoes lvalue conversion,
-        // which includes array-to-pointer and function-to-pointer decay, and strips
-        // top-level qualifiers.
-        let controlling_ctype = controlling_ctype.map(|ct| match ct {
-            CType::Array(elem, _) => CType::Pointer(elem, AddressSpace::Default),
-            CType::Function(ft) => {
-                CType::Pointer(Box::new(CType::Function(ft)), AddressSpace::Default)
-            }
-            other => other,
-        });
+        // Per C11 6.5.1.1p2, the controlling expression undergoes lvalue
+        // conversion, which includes array-to-pointer and function-to-pointer
+        // decay, and strips top-level qualifiers.
+        let controlling_ctype = controlling_ctype.map(|ct| ct.decayed_value_ctype());
         // Determine if the controlling expression's type has a const-qualified pointee.
         // Lvalue conversion strips top-level qualifiers. So for non-pointer types like
         // `const int x`, the type becomes `int` (ctrl_is_const = false).

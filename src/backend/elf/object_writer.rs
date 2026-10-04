@@ -35,6 +35,14 @@ pub struct ObjSection {
     pub sh_type: u32,
     pub sh_flags: u64,
     pub data: Vec<u8>,
+    /// Section size when it differs from `data.len()`.
+    ///
+    /// Only a NOBITS section can differ (its contents are never emitted, so an
+    /// assembler may hold a zero fill as a size instead of as bytes -- see
+    /// `elf_writer_common::Section::pad_fill`). `None` means `data.len()`, and
+    /// that is what every PROGBITS/EXEC section uses, so behaviour there is
+    /// byte-for-byte unchanged.
+    pub sh_size: Option<u64>,
     pub sh_addralign: u64,
     /// Relocations targeting this section.
     pub relocs: Vec<ObjReloc>,
@@ -280,8 +288,22 @@ pub fn write_relocatable_object(
     let mut section_offsets: Vec<usize> = Vec::new();
     for sec_name in content_sections {
         let section = sections.get(sec_name).unwrap();
-        let align = section.sh_addralign.max(1) as usize;
-        offset = (offset + align - 1) & !(align - 1);
+        // Only a section with file contents is laid out at an aligned file
+        // offset. A NOBITS section occupies no file space, so its `sh_offset`
+        // is whatever the running offset is (GAS writes the running offset
+        // too): aligning it would pad the file with bytes no loader reads.
+        // `.bss` aligned to 2^40 is legal and free, and before this split it
+        // asked the writer for a 1 TiB image.
+        if section.sh_type != SHT_NOBITS {
+            let align = section.sh_addralign.max(1) as usize;
+            offset = offset.checked_next_multiple_of(align).ok_or_else(|| {
+                format!(
+                    "section '{}' asks for alignment {}, which no object file \
+                     can represent (a file offset has to be aligned to it)",
+                    sec_name, section.sh_addralign
+                )
+            })?;
+        }
         section_offsets.push(offset);
         if section.sh_type != SHT_NOBITS {
             offset += section.data.len();
@@ -327,7 +349,19 @@ pub fn write_relocatable_object(
 
     // ── Write ELF ──
     let total_size = shdr_offset + num_sections * shdr_size;
-    let mut elf = Vec::with_capacity(total_size);
+    // The object image has to exist as bytes, so a layout it cannot hold is
+    // reported rather than aborted: `Vec::with_capacity` aborts the process
+    // when the allocation fails, and a section whose alignment is wider than
+    // its own contents (`.text` + `.p2align 40`) is exactly such a layout.
+    let mut elf: Vec<u8> = Vec::new();
+    elf.try_reserve_exact(total_size).map_err(|_| {
+        format!(
+            "cannot write an object of {} bytes: this assembler materialises \
+             section contents, so the layout does not fit in memory (a section \
+             alignment wider than the section's own bytes pads the file)",
+            total_size
+        )
+    })?;
 
     // ELF header (e_ident)
     elf.extend_from_slice(&ELF_MAGIC);
@@ -523,7 +557,7 @@ pub fn write_relocatable_object(
                 section.sh_flags as u32,
                 0,
                 sh_offset,
-                section.data.len() as u32,
+                section.sh_size.unwrap_or(section.data.len() as u64) as u32,
                 0,
                 0,
                 section.sh_addralign as u32,
@@ -636,7 +670,7 @@ pub fn write_relocatable_object(
                 section.sh_flags,
                 0,
                 sh_offset,
-                section.data.len() as u64,
+                section.sh_size.unwrap_or(section.data.len() as u64),
                 0,
                 0,
                 section.sh_addralign,

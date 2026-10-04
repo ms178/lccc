@@ -54,9 +54,19 @@ pub trait TypeConvertContext {
     /// Lowering: evaluates the expression's type.
     fn resolve_typeof_expr(&self, expr: &Expr) -> CType;
 
-    /// Try to evaluate a constant expression to a usize (for array sizes).
-    /// Returns None if the expression cannot be evaluated at compile time.
-    fn eval_const_expr_as_usize(&self, expr: &Expr) -> Option<usize>;
+    /// Evaluate a constant array bound to an element count.
+    ///
+    /// `elem` is the array's element type, needed because the bound that must
+    /// be rejected is the *byte* size, not the element count: a bound is only
+    /// usable when `count * size_of(elem) <= max_object_bytes()`. Callers pass
+    /// the element type they are about to wrap, so the test happens before the
+    /// `CType::Array` exists and no size can be computed from a bound that is
+    /// not a valid object size.
+    ///
+    /// Returns None if the expression cannot be evaluated at compile time (the
+    /// array then keeps its existing unsized behaviour) *or* if it violates the
+    /// bound rules, in which case the implementation has emitted a diagnostic.
+    fn eval_array_bound_len(&self, expr: &Expr, elem: &CType) -> Option<usize>;
 
     /// Convert a TypeSpecifier to a CType.
     ///
@@ -100,7 +110,7 @@ pub trait TypeConvertContext {
                 let elem_ctype = self.resolve_type_spec_to_ctype(elem);
                 let size = size_expr
                     .as_ref()
-                    .and_then(|e| self.eval_const_expr_as_usize(e));
+                    .and_then(|e| self.eval_array_bound_len(e, &elem_ctype));
                 CType::Array(Box::new(elem_ctype), size)
             }
             TypeSpecifier::FunctionPointer(return_type, params, variadic) => {
@@ -343,7 +353,7 @@ pub fn build_full_ctype_with_base(
                     // [Pointer, FunctionPointer, Array(N)]).
                     let size = size_expr
                         .as_ref()
-                        .and_then(|e| ctx.eval_const_expr_as_usize(e));
+                        .and_then(|e| ctx.eval_array_bound_len(e, &result));
                     result = CType::Array(Box::new(result), size);
                     i += 1;
                 }
@@ -359,7 +369,7 @@ pub fn build_full_ctype_with_base(
             if let DerivedDeclarator::Array(size_expr) = d {
                 let size = size_expr
                     .as_ref()
-                    .and_then(|e| ctx.eval_const_expr_as_usize(e));
+                    .and_then(|e| ctx.eval_array_bound_len(e, &result));
                 result = CType::Array(Box::new(result), size);
             }
         }
@@ -386,7 +396,7 @@ pub fn build_full_ctype_with_base(
                         if let DerivedDeclarator::Array(size_expr) = &derived[j] {
                             let size = size_expr
                                 .as_ref()
-                                .and_then(|e| ctx.eval_const_expr_as_usize(e));
+                                .and_then(|e| ctx.eval_array_bound_len(e, &result));
                             result = CType::Array(Box::new(result), size);
                         }
                     }

@@ -21,7 +21,7 @@ __attribute__((noinline)) double legacy_sse(double x) {
 }
 
 int main(void) {
-    alignas(32) unsigned char src[64], dst[64];
+    _Alignas(32) unsigned char src[64], dst[64];
     for (int i = 0; i < 64; i++) src[i] = (unsigned char)(i * 3);
     copy64(dst, src);
     for (int i = 0; i < 64; i++)

@@ -241,7 +241,7 @@ impl Lowerer {
                 while ai < arr_size {
                     if item_pos >= inits.len() {
                         // Remaining elements are zero-initialized
-                        push_zero_bytes(elements, elem_size * (arr_size - ai));
+                        push_zero_bytes(elements, elem_size.saturating_mul(arr_size - ai));
                         break;
                     }
                     // Collect scalars_per_elem items for this struct element,

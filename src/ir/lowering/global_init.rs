@@ -1386,7 +1386,7 @@ impl Lowerer {
                 } else {
                     let elem_ct = self.type_spec_to_ctype(elem_ts);
                     match (self.unsized_array_len(init, &elem_ct), init) {
-                        (Some(n), _) => e_size * n,
+                        (Some(n), _) => e_size.saturating_mul(n),
                         (None, Initializer::List(items)) => {
                             e_size * self.compute_init_list_array_size(items)
                         }

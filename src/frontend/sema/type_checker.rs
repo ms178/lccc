@@ -287,8 +287,21 @@ impl<'a> ExprTypeChecker<'a> {
                 )
             }
 
-            // Comma: type of the right expression
-            Expr::Comma(_, rhs, _) => self.infer_expr_ctype(rhs),
+            // Comma: the result is the right operand's value and type
+            // (C11 6.5.17p3) AFTER the usual lvalue conversion, so an array
+            // operand decays to a pointer exactly as in every other value
+            // context (C11 6.3.2.1p3). Returning the raw right-hand type broke
+            // that: for `struct s { char c[17]; }; sizeof(0, f().c)` reported
+            // 17 (the ARRAY size) while codegen already materialised the
+            // decayed address -- GCC reports 8, i.e. sizeof(char *). The two
+            // halves of the compiler must agree on a type; sema saying "array"
+            // while codegen says "pointer" is a latent bug in every pass that
+            // trusts the inferred type. The conversion lives in
+            // `CType::decayed_value_ctype` so sema, the sizeof/alignof sizing
+            // paths and the lowerer's type maps share one implementation.
+            Expr::Comma(_, rhs, _) => self
+                .infer_expr_ctype(rhs)
+                .map(|ct| ct.decayed_value_ctype()),
 
             // Function call: determine return type
             Expr::FunctionCall(func, args, _) => {

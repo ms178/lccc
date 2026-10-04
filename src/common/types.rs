@@ -43,6 +43,32 @@ pub fn set_target_ptr_size(size: usize) {
     TARGET_PTR_SIZE.with(|c| c.set(size));
 }
 
+/// Largest object size this compiler will lay out, in bytes: the *target's*
+/// `PTRDIFF_MAX`.
+///
+/// GCC uses the same bound ("maximum object size" in its diagnostics) and it
+/// is the only value that keeps C's object-size arithmetic well defined: an
+/// object may be at most `PTRDIFF_MAX` bytes, because pointer subtraction
+/// between two pointers into it must be representable in `ptrdiff_t`.  The
+/// value therefore depends on the target pointer width, not on the host's:
+/// on `-m32` the limit is 2^31-1, and using the 64-bit limit there accepted
+/// `char a[4294967296]` -- whose element count then truncated to zero in a
+/// 32-bit `usize` and produced a zero-byte `.bss` (GCC rejects it).
+///
+/// Every byte-size computation must test this limit in `u128` *before*
+/// narrowing, because the arithmetic that computes it overflows exactly for
+/// the inputs that need rejecting: `int a[4611686018427387904]` is 2^64 bytes,
+/// which wraps to 0 in 64-bit arithmetic -- the compiler used to accept that
+/// and emit a zero-byte `.bss` (see `size_ctx`, which saturates instead).
+#[inline]
+pub fn max_object_bytes() -> u64 {
+    if target_ptr_size() == 4 {
+        i32::MAX as u64
+    } else {
+        i64::MAX as u64
+    }
+}
+
 /// Get the target pointer size for the current thread.
 pub fn target_ptr_size() -> usize {
     TARGET_PTR_SIZE.with(|c| c.get())
@@ -1621,7 +1647,15 @@ impl CType {
     pub fn size_ctx(&self, ctx: &dyn StructLayoutProvider) -> usize {
         let ptr_sz = target_ptr_size();
         match self {
-            CType::Void => 0,
+            // GCC's documented extension: `sizeof(void)` is 1, and so is
+            // `sizeof` of any expression whose value has void type
+            // (`sizeof((void)0)`, `sizeof(*void_ptr)` -- the latter is also
+            // handled at the deref, for the same reason). Alignment already
+            // reports 1 for void, and void * arithmetic steps one byte, so the
+            // three agree; 0 stays reserved for the types that genuinely have
+            // no size yet (linked structs/unions whose layout is not computed),
+            // which must NOT read as 1.
+            CType::Void => 1,
             CType::Bool | CType::Char | CType::UChar => 1,
             CType::Short | CType::UShort => 2,
             CType::Int | CType::UInt => 4,
@@ -1657,7 +1691,13 @@ impl CType {
                 }
             }
             CType::Pointer(_, _) => ptr_sz,
-            CType::Array(elem, Some(n)) => elem.size_ctx(ctx) * n,
+            // Saturation, not wrapping: a length that overflows `usize`
+            // must only ever make the object *larger* than it can be, never
+            // smaller, so that no path can silently produce an under-sized
+            // object. Sema rejects the construct before it gets here (a
+            // constant bound whose byte size exceeds `max_object_bytes()`),
+            // and the assembler rejects the saturated count as a backstop.
+            CType::Array(elem, Some(n)) => elem.size_ctx(ctx).saturating_mul(*n),
             CType::Array(_, None) => ptr_sz, // incomplete array treated as pointer
             CType::Function(_) => ptr_sz,    // function pointer size
             CType::Struct(key) | CType::Union(key) => {
@@ -2117,6 +2157,39 @@ impl CType {
             (Some(t), None) => Some(t),
             (None, Some(e)) => Some(e),
             (None, None) => None,
+        }
+    }
+
+    /// The *value* conversion of an expression: array-to-pointer and
+    /// function-to-pointer decay (C11 6.3.2.1p3 and p4).
+    ///
+    /// This is the conversion that applies to an expression **value**, so it is
+    /// the single source of truth for every pass that needs the type of a value
+    /// rather than the type of an object. `sizeof`'s array exception
+    /// (C11 6.5.3.4p4, "the operand is not converted") covers only the operand
+    /// *as written*; the results of the comma operator (C11 6.5.17p3) and of
+    /// the conditional operator (C11 6.5.15) are values, so an array or
+    /// function operand of either has already decayed and `sizeof` of the
+    /// operator expression is the pointer size:
+    ///
+    /// ```c
+    /// int a[4];
+    /// sizeof((0, a));    // 8,  not 16: the operand is `(0, a)`, an int *
+    /// sizeof(1 ? a : a); // 8,  not 16
+    /// sizeof(a);         // 16: the exception applies to the operand itself
+    /// ```
+    ///
+    /// Every other type is returned unchanged. Qualifiers are deliberately not
+    /// stripped: callers that also need the lvalue-conversion qualifier drop
+    /// (C11 6.3.2.1p2) must do it themselves, because a decayed `T *` value
+    /// still carries the pointee qualifiers of `T`.
+    pub fn decayed_value_ctype(&self) -> CType {
+        match self {
+            CType::Array(elem, _) => CType::Pointer(elem.clone(), AddressSpace::Default),
+            CType::Function(ft) => {
+                CType::Pointer(Box::new(CType::Function(ft.clone())), AddressSpace::Default)
+            }
+            other => other.clone(),
         }
     }
 

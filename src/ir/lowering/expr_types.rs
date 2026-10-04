@@ -939,14 +939,8 @@ impl Lowerer {
             .or_else(|| self.lookup_sema_expr_type(controlling));
         let controlling_ir_type = self.get_expr_type(controlling);
         // Per C11 6.5.1.1p2, lvalue conversion includes array-to-pointer and
-        // function-to-pointer decay.
-        let controlling_ctype = controlling_ctype.map(|ct| match ct {
-            CType::Array(elem, _) => CType::Pointer(elem, AddressSpace::Default),
-            CType::Function(ft) => {
-                CType::Pointer(Box::new(CType::Function(ft)), AddressSpace::Default)
-            }
-            other => other,
-        });
+        // function-to-pointer decay; one shared spelling of that conversion.
+        let controlling_ctype = controlling_ctype.map(|ct| ct.decayed_value_ctype());
         // Lvalue conversion also strips top-level qualifiers.
         // Only use ctrl_is_const for pointer types (where it reflects pointee constness).
         let ctrl_is_const = if let Some(ref ct) = controlling_ctype {
@@ -1623,8 +1617,17 @@ impl Lowerer {
             }
             Expr::Conditional(_, then_expr, else_expr, _) => {
                 use crate::common::const_arith::is_null_pointer_constant;
-                let then_ct = self.get_expr_ctype(then_expr);
-                let else_ct = self.get_expr_ctype(else_expr);
+                // C11 6.5.15p3-p6 operate on the *values* of the arms, so both
+                // arms undergo lvalue conversion first (C11 6.3.2.1p2-p3):
+                // `1 ? arr : (int *)0` is an `int *`, not an array.  Decaying
+                // here keeps the composite rules (pointer/pointer, pointer/NPC)
+                // reachable for array and function-designator arms.
+                let then_ct = self
+                    .get_expr_ctype(then_expr)
+                    .map(|ct| ct.decayed_value_ctype());
+                let else_ct = self
+                    .get_expr_ctype(else_expr)
+                    .map(|ct| ct.decayed_value_ctype());
                 CType::conditional_composite_type(
                     then_ct,
                     else_ct,
@@ -1634,8 +1637,10 @@ impl Lowerer {
             }
             Expr::GnuConditional(cond, else_expr, _) => {
                 use crate::common::const_arith::is_null_pointer_constant;
-                let cond_ct = self.get_expr_ctype(cond);
-                let else_ct = self.get_expr_ctype(else_expr);
+                let cond_ct = self.get_expr_ctype(cond).map(|ct| ct.decayed_value_ctype());
+                let else_ct = self
+                    .get_expr_ctype(else_expr)
+                    .map(|ct| ct.decayed_value_ctype());
                 CType::conditional_composite_type(
                     cond_ct,
                     else_ct,
@@ -1643,7 +1648,10 @@ impl Lowerer {
                     is_null_pointer_constant(else_expr),
                 )
             }
-            Expr::Comma(_, last, _) => self.get_expr_ctype(last),
+            // The comma operator yields the right operand's *value*
+            // (C11 6.5.17p3), so the result undergoes lvalue conversion:
+            // `(0, arr)` has type `int *`, not `int[4]`.
+            Expr::Comma(_, last, _) => self.get_expr_ctype(last).map(|ct| ct.decayed_value_ctype()),
             Expr::StringLiteral(_, _) => {
                 // String literals have type char[] which decays to char*
                 Some(CType::Pointer(Box::new(CType::Char), AddressSpace::Default))

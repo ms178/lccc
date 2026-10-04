@@ -9,6 +9,27 @@ use crate::common::types::{CType, IrType};
 use crate::frontend::parser::ast::{BinOp, Expr, Initializer, TypeSpecifier, UnaryOp};
 
 impl Lowerer {
+    /// `sizeof` of the *value* of `e`, i.e. after the lvalue conversion of
+    /// C11 6.3.2.1p2-p4. Used for the operands of operators whose result is an
+    /// rvalue (the comma and conditional operators), where `sizeof`'s array
+    /// exception (C11 6.5.3.4p4) cannot apply to the nested array operand.
+    ///
+    /// The type is authoritative whenever the lowerer can name it: the
+    /// fallback, [`Self::sizeof_expr`], deliberately reports the *storage* size
+    /// for the expressions whose operand sizeof does not convert (identifiers
+    /// of array type, string literals), which is precisely the answer that must
+    /// not be given for a value. A string literal is the case that makes the
+    /// distinction observable — its CType is already `char *` (the lowerer
+    /// decays it when building the type), so testing "is it an array/function
+    /// type" would miss it and report 4 for `sizeof((0, "abc"))` where GCC
+    /// reports 8.
+    fn sizeof_decayed_value(&self, e: &Expr) -> usize {
+        if let Some(ct) = self.get_expr_ctype(e) {
+            return self.ctype_size(&ct.decayed_value_ctype());
+        }
+        self.sizeof_expr(e)
+    }
+
     /// Get the sizeof for an identifier expression.
     fn sizeof_identifier(&self, name: &str) -> usize {
         if let Some(info) = self.func_state.as_ref().and_then(|fs| fs.locals.get(name)) {
@@ -357,27 +378,35 @@ impl Lowerer {
 
             // Conditional: use composite type for accurate sizeof
             Expr::Conditional(_, then_e, else_e, _) => {
+                // The operator's result is a value, so an array/function arm
+                // has decayed before the two arms merge (C11 6.5.15p3-p6 with
+                // the lvalue conversion of C11 6.3.2.1p3-p4): `sizeof(1 ? a : a)`
+                // is the pointer size, not the array size.
                 if let Some(ctype) = self.get_expr_ctype(expr) {
-                    return self.ctype_size(&ctype);
+                    return self.ctype_size(&ctype.decayed_value_ctype());
                 }
-                let ts = self.sizeof_expr(then_e);
-                let es = self.sizeof_expr(else_e);
+                let ts = self.sizeof_decayed_value(then_e);
+                let es = self.sizeof_decayed_value(else_e);
                 ts.max(es)
             }
             Expr::GnuConditional(cond, else_e, _) => {
                 if let Some(ctype) = self.get_expr_ctype(expr) {
-                    return self.ctype_size(&ctype);
+                    return self.ctype_size(&ctype.decayed_value_ctype());
                 }
-                let cs = self.sizeof_expr(cond);
-                let es = self.sizeof_expr(else_e);
+                let cs = self.sizeof_decayed_value(cond);
+                let es = self.sizeof_decayed_value(else_e);
                 cs.max(es)
             }
 
             // Assignment: type of the left-hand side
             Expr::Assign(lhs, _, _) | Expr::CompoundAssign(_, lhs, _, _) => self.sizeof_expr(lhs),
 
-            // Comma: type of the right expression
-            Expr::Comma(_, rhs, _) => self.sizeof_expr(rhs),
+            // Comma: the operator's result is the *value* of the right operand
+            // (C11 6.5.17p3), so it has already undergone the lvalue conversion
+            // of C11 6.3.2.1p3-p4. sizeof's array exception (C11 6.5.3.4p4)
+            // protects the operand as written -- here the comma expression --
+            // and not the array operand nested inside it.
+            Expr::Comma(_, rhs, _) => self.sizeof_decayed_value(rhs),
 
             // Function call: use the actual return type
             Expr::FunctionCall(_, _, _) => {

@@ -317,6 +317,24 @@ gate "comdat-signature-identity" fast \
 gate "loop-memset-decisions" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_loop_memset.sh
 
+# A13/A14: a pass may synthesise a libcall only when the TU does not define
+# that symbol, and the backend may expand a constant-size memcpy/memset call
+# only while the callee still is the builtin.  Covers the refusals, the
+# positive controls (the optimisations must not be lost), the
+# -fno-builtin/-ffreestanding/-fno-builtin-<fn> contracts, the ungated
+# __*_chk rows and three runtime programs.
+gate "libcall-synthesis-no-selfcall" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_libcall_synthesis_no_selfcall.sh
+
+# The inliner's __builtin_va_arg_pack_len() sentinel rewrite matched in the
+# wrong value space and left a live call to the undefined
+# __lccc_va_arg_pack_len for every call site whose clone was offset (gzip
+# 1.14's gnulib open-safer.c under glibc fortify failed to link).  The gate
+# asserts no sentinel survives at -O0/-O1/-O2/-O3, runs the wrapper semantics
+# (one/two/zero forwarded arguments) and takes gcc as the reference.
+gate "va-arg-pack-len-folds" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_va_arg_pack_len_folds.sh
+
 gate "bool-pair-tail-jmp-contract" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_bool_pair_tail_jmp.sh
 
@@ -570,6 +588,22 @@ gate "gas-oracle-pair-self-test" fast \
 # self-tests, the mocked corpus-runner verdict contracts, and the corpus
 # exclusion path tests run without any compiler — they gate the TEST
 # INFRASTRUCTURE itself, which generic import checks cannot.
+# Array-bound contract: a bad bound is diagnosed (never wrapped), a byte size
+# that cannot exist is rejected instead of wrapping into a bogus section, and a
+# huge `.bss` object is emitted sparsely under a hard RLIMIT_AS rather than
+# being materialised and OOM-killed. Driven under that limit so the "constant
+# memory" half is a real requirement, not a hope.
+gate "array-bound-contract" fast \
+    python3 scripts/check_array_bound_contract.py
+
+# Sparse NOBITS `.bss` (E22): the zeros are a size, not bytes, so a 4 GiB array
+# compiles, links and runs from a ~5 KB executable, a label inside a sparse tail
+# keeps its offset, an oversized alignment in a NOBITS section is free while the
+# same alignment in a section that must materialise the gap is a diagnostic (and
+# never an aborted process), and negative/oversized counts follow GAS exactly.
+gate "sparse-bss-nobits" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_sparse_bss_nobits.sh
+
 gate "edg-changes-miner-selftest" fast \
     python3 scripts/edg_changes_mine.py selftest
 gate "edg-corpus-miner-selftest" fast \
@@ -1009,6 +1043,19 @@ gate "peephole-trace-bisect" fast \
 # fails even when the wrapper gate is skipped.
 gate "peephole-trace-bisect-selftest" fast \
     python3 scripts/peephole_trace_bisect.py --selftest
+
+# The capability probe is what turns the Clang-C corpus from "almost every RUN
+# filtered" (102 of 5 130 planned invocations executed) into a measured grid,
+# and it is only worth anything if a flag the compiler ignores can never be
+# reported as established.  The selftest drives the tool against a synthetic
+# compiler that reproduces the contract the probe depends on -- including one
+# that accepts a `-W`-spelled unknown option, one that ignores
+# LCCC_STRICT_OPTIONS, and one that keeps tolerating `-Wno-<unknown>` under
+# strict options; each mutation must abort the probe.  It also pins the
+# per-invocation coverage rule against a weighted-sum misreading.  Pure
+# Python, no toolchain, no corpus: fast.
+gate "capability-probe-selftest" fast \
+    python3 scripts/lccc_capability_probe.py --selftest
 
 # The one-move phi-diamond preinitialisation hoists the cheap incoming
 # above the branch. A memory-source init may fault on the path it lands

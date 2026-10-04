@@ -538,8 +538,8 @@ impl Lowerer {
         if let TypeSpecifier::Array(elem, Some(size_expr)) = ts {
             let elem_size = self.sizeof_type(elem);
             return self
-                .expr_as_array_size(size_expr)
-                .map(|n| elem_size * n as usize)
+                .array_bound_elems(size_expr, elem_size)
+                .map(|n| elem_size.saturating_mul(n))
                 .unwrap_or(elem_size);
         }
         self.struct_union_layout(ts)
@@ -663,7 +663,7 @@ impl Lowerer {
                     Some(
                         size_expr
                             .as_ref()
-                            .and_then(|e| self.expr_as_array_size(e).map(|n| n as usize)),
+                            .and_then(|e| self.array_bound_elems(e, 0)),
                     )
                 } else {
                     None
@@ -700,9 +700,9 @@ impl Lowerer {
                 if let TypeSpecifier::Array(elem, size_expr) = resolved {
                     let n = size_expr
                         .as_ref()
-                        .and_then(|e| self.expr_as_array_size(e))
+                        .and_then(|e| self.array_bound_elems(e, 0))
                         .unwrap_or(1);
-                    dims.push(n as usize);
+                    dims.push(n);
                     current = elem;
                 } else {
                     break;
@@ -841,19 +841,20 @@ impl Lowerer {
                     .rposition(|d| matches!(d, DerivedDeclarator::Pointer));
                 let array_dims: Vec<Option<usize>> = if let Some(lpp) = last_ptr_pos {
                     // First try: collect Array dims after the last pointer
-                    let after_dims: Vec<Option<usize>> =
-                        derived[lpp + 1..]
-                            .iter()
-                            .filter_map(|d| {
-                                if let DerivedDeclarator::Array(size_expr) = d {
-                                    Some(size_expr.as_ref().and_then(|e| {
-                                        self.expr_as_array_size(e).map(|n| n as usize)
-                                    }))
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
+                    let after_dims: Vec<Option<usize>> = derived[lpp + 1..]
+                        .iter()
+                        .filter_map(|d| {
+                            if let DerivedDeclarator::Array(size_expr) = d {
+                                Some(
+                                    size_expr
+                                        .as_ref()
+                                        .and_then(|e| self.array_bound_elems(e, 0)),
+                                )
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
                     if !after_dims.is_empty() {
                         after_dims
                     } else if has_func_ptr {
@@ -863,9 +864,11 @@ impl Lowerer {
                             .iter()
                             .filter_map(|d| {
                                 if let DerivedDeclarator::Array(size_expr) = d {
-                                    Some(size_expr.as_ref().and_then(|e| {
-                                        self.expr_as_array_size(e).map(|n| n as usize)
-                                    }))
+                                    Some(
+                                        size_expr
+                                            .as_ref()
+                                            .and_then(|e| self.array_bound_elems(e, 0)),
+                                    )
                                 } else {
                                     None
                                 }
@@ -923,7 +926,7 @@ impl Lowerer {
                         Some(
                             size_expr
                                 .as_ref()
-                                .and_then(|e| self.expr_as_array_size(e).map(|n| n as usize))
+                                .and_then(|e| self.array_bound_elems(e, 0))
                                 .unwrap_or(1),
                         )
                     } else {
@@ -1088,8 +1091,8 @@ impl Lowerer {
         loop {
             let resolved = self.resolve_type_spec(&current_owned);
             if let TypeSpecifier::Array(inner, Some(size_expr)) = &resolved {
-                if let Some(n) = self.expr_as_array_size(size_expr) {
-                    dims.push(n as usize);
+                if let Some(n) = self.array_bound_elems(size_expr, 0) {
+                    dims.push(n);
                 }
                 current_owned = inner.as_ref().clone();
             } else if let TypeSpecifier::TypedefName(name) = &resolved {
