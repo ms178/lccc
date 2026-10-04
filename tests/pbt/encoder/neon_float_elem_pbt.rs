@@ -425,6 +425,36 @@ fn fmul_and_fmulx_dispatch_select_distinct_opcodes() {
 }
 
 #[test]
+fn scalar_fmulx_rejects_wrong_register_class_and_arity() {
+    let invalid_operands = [
+        vec![
+            Operand::Reg("s0".into()),
+            Operand::Reg("s1".into()),
+            Operand::Reg("s2".into()),
+        ],
+        vec![
+            Operand::Reg("d0".into()),
+            Operand::Reg("x1".into()),
+            Operand::Reg("d2".into()),
+        ],
+        vec![Operand::Reg("d0".into()), Operand::Reg("d1".into())],
+        vec![
+            Operand::Reg("d0".into()),
+            Operand::Reg("d1".into()),
+            Operand::Reg("d2".into()),
+            Operand::Reg("d3".into()),
+        ],
+    ];
+
+    for operands in invalid_operands {
+        assert!(
+            encode_instruction("fmulx", &operands, "").is_err(),
+            "accepted invalid scalar FMULX operands: {operands:?}"
+        );
+    }
+}
+
+#[test]
 fn rejects_non_lane_third_operand() {
     // third operand must be a vector RegLane, not a bare vector register
     let ops = vec![reg_arr(0, "4s"), reg_arr(1, "4s"), reg_arr(2, "4s")];

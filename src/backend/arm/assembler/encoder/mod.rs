@@ -490,9 +490,30 @@ pub fn encode_instruction(
                 // 0 M 0 11110 size 1 Rm opcode 1 Rn Rd with M=1, U=0,
                 // opc=11011, size=01 for double).
                 // Oracle: `fmulx d0, d1, d2` = 0x5E62DC20.
-                let (rd, _) = get_reg(operands, 0)?;
-                let (rn, _) = get_reg(operands, 1)?;
-                let (rm, _) = get_reg(operands, 2)?;
+                if operands.len() != 3 {
+                    return Err(format!(
+                        "scalar fmulx requires exactly 3 operands, got {}",
+                        operands.len()
+                    ));
+                }
+                let mut regs = [0u32; 3];
+                for (idx, reg) in regs.iter_mut().enumerate() {
+                    let name = match operands.get(idx) {
+                        Some(Operand::Reg(name))
+                            if name.starts_with('d') || name.starts_with('D') =>
+                        {
+                            name
+                        }
+                        other => {
+                            return Err(format!(
+                                "scalar fmulx operand {idx} must be a D register, got {other:?}"
+                            ));
+                        }
+                    };
+                    *reg = parse_reg_num(name)
+                        .ok_or_else(|| format!("invalid D register at operand {idx}: {name}"))?;
+                }
+                let [rd, rn, rm] = regs;
                 let word = (1u32 << 30)
                     | (0b11110 << 24)
                     | (0b01 << 22)
