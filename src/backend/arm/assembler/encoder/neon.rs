@@ -2027,23 +2027,7 @@ pub fn encode_neon_sri(operands: &[Operand]) -> Result<EncodeResult, String> {
 
 /// Encode NEON RBIT Vd.T, Vn.T (per-byte bit reversal in each element).
 pub fn encode_neon_rbit(operands: &[Operand]) -> Result<EncodeResult, String> {
-    if operands.len() != 2 {
-        return Err(format!(
-            "neon rbit requires exactly 2 operands, got {}",
-            operands.len()
-        ));
-    }
-    let (rd, arr_d) = get_neon_reg(operands, 0)?;
-    let (rn, _) = get_neon_reg(operands, 1)?;
-
-    // Only .8b and .16b arrangements are valid for NEON RBIT
-    if arr_d != "8b" && arr_d != "16b" {
-        return Err(format!(
-            "neon rbit: unsupported arrangement .{}, expected .8b or .16b",
-            arr_d
-        ));
-    }
-    let q: u32 = if arr_d == "16b" { 1 } else { 0 };
+    let (rd, rn, q) = get_neon_logical2_operands(operands, "rbit")?;
     // RBIT Vd.T, Vn.T: 0 Q 1 01110 01 10000 00101 10 Rn Rd
     let word = (q << 30)
         | (1 << 29)
