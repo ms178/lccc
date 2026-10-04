@@ -74,7 +74,12 @@ pub enum AsmItem {
     /// Emit 64-bit values: `.quad val, ...` (can be symbol references)
     Quad(Vec<DataValue>),
     /// Emit zero bytes: `.zero N`
-    Zero(u32),
+    /// `.zero N` / `.space N` / a zero-valued `.fill`. A byte count, not a
+    /// 32-bit quantity: assembly can legitimately reserve more than 4 GiB
+    /// (`int a[4000000000];` is a 16 GB `.bss` object, and GCC emits it), and
+    /// truncating the operand to 32 bits silently shrank the section --
+    /// measured as a `.bss` of 3115098112 bytes for a 16000000000-byte array.
+    Zero(u64),
     /// Deferred `.skip` with expression: evaluated after all labels are known.
     /// Used by kernel alternatives framework for label-arithmetic expressions
     /// like `.skip -(((6651f-6641f)-(662b-661b)) > 0) * ((6651f-6641f)-(662b-661b)), 0x90`.
@@ -461,7 +466,22 @@ fn expand_rept_blocks(lines: &[&str]) -> Result<Vec<String>, String> {
 
 /// Parse assembly text into a list of AsmItems.
 pub fn parse_asm(text: &str) -> Result<Vec<AsmItem>, String> {
+    parse_asm_with_warnings(text).map(|(items, _)| items)
+}
+
+/// Parse, collecting the warnings GAS would print for the same input.
+///
+/// The parser is the only place that sees the directive before it is lowered,
+/// and GAS reports several conditions as *warnings* rather than errors -- a
+/// negative `.zero`/`.skip`/`.space` repeat count is ignored with one
+/// (".space repeat count is negative, ignored"), and an alignment exponent
+/// beyond 63 is clamped with another ("alignment too large: 63 assumed").
+/// Both are accepted input in a real object, so they must not be errors here
+/// either; `assemble` prints what this returns. `parse_asm` is the wrapper for
+/// callers (and tests) with nowhere to report a warning.
+pub fn parse_asm_with_warnings(text: &str) -> Result<(Vec<AsmItem>, Vec<String>), String> {
     let mut items = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
 
     // Strip C-style /* */ comments (used in hand-written assembly like musl)
     let text = asm_preprocess::strip_c_comments(text);
@@ -507,7 +527,7 @@ pub fn parse_asm(text: &str) -> Result<Vec<AsmItem>, String> {
             if part.is_empty() {
                 continue;
             }
-            match parse_line_items(part) {
+            match parse_line_items(part, &mut warnings) {
                 Ok(line_items) => items.extend(line_items),
                 Err(e) => {
                     // Decorator diagnostics (`\0raw:`) are GAS-bare: GNU as
@@ -521,7 +541,7 @@ pub fn parse_asm(text: &str) -> Result<Vec<AsmItem>, String> {
         }
     }
 
-    Ok(items)
+    Ok((items, warnings))
 }
 
 /// Strip trailing comment from a line using x86 comment style (`#`).
@@ -559,7 +579,7 @@ fn directive_arg<'a>(line: &'a str, directive: &str) -> Option<&'a str> {
 ///
 /// A line may contain a label followed by an instruction on the same line
 /// (e.g., `1: stmxcsr -8(%rsp)`), which produces two items.
-fn parse_line_items(line: &str) -> Result<Vec<AsmItem>, String> {
+fn parse_line_items(line: &str, warnings: &mut Vec<String>) -> Result<Vec<AsmItem>, String> {
     let mut items = Vec::new();
 
     // Check for label (may be followed by instruction on same line)
@@ -607,7 +627,7 @@ fn parse_line_items(line: &str) -> Result<Vec<AsmItem>, String> {
 
     // Parse the remaining content as a directive or instruction
     if rest.starts_with('.') {
-        items.push(parse_directive(rest)?);
+        items.push(parse_directive(rest, warnings)?);
     } else if is_prefixed_instruction(rest) {
         items.push(parse_prefixed_instruction(rest)?);
     } else {
@@ -645,7 +665,7 @@ fn try_parse_label(line: &str) -> Option<(String, &str)> {
 }
 
 /// Parse a directive line (starts with '.').
-fn parse_directive(line: &str) -> Result<AsmItem, String> {
+fn parse_directive(line: &str, warnings: &mut Vec<String>) -> Result<AsmItem, String> {
     let parts: Vec<&str> = line.splitn(2, |c: char| c.is_whitespace()).collect();
     let directive = parts[0];
     let args = parts.get(1).map(|s| s.trim()).unwrap_or("");
@@ -725,7 +745,11 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
                 parse_integer_expr(align_field).map_err(|_| format!("bad alignment: {args}"))?;
             let align: u64 = if directive == ".p2align" {
                 let exp: u32 = if !(0..=63).contains(&align_val) {
-                    // GAS clamps rather than rejecting.
+                    // GAS clamps rather than rejecting, and says so:
+                    // "alignment too large: 63 assumed" (binutils 2.47).
+                    warnings.push(format!(
+                        "{align_field}: warning: alignment too large: 63 assumed"
+                    ));
                     63
                 } else {
                     align_val as u32
@@ -892,8 +916,20 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
         ".zero" | ".skip" | ".space" => {
             let (expr_str, fill) = split_skip_args(args);
             if let Ok(val) = parse_integer_expr(expr_str) {
-                if fill == 0 {
-                    Ok(AsmItem::Zero(val as u32))
+                if val < 0 {
+                    // GAS reads the count as a signed quantity and IGNORES a
+                    // negative one, with a warning and rc 0: verified against
+                    // binutils 2.47, `.skip -5` warns ".space repeat count is
+                    // negative, ignored" and contributes no bytes. Matching
+                    // that exactly matters because the count is carried as
+                    // `u64` here, so the alternative -- converting it -- is
+                    // what would turn a negative count into a huge section.
+                    warnings.push(format!(
+                        "{line}: warning: .space repeat count is negative, ignored"
+                    ));
+                    Ok(AsmItem::Zero(0))
+                } else if fill == 0 {
+                    Ok(AsmItem::Zero(val as u64))
                 } else {
                     Ok(AsmItem::SkipExpr(expr_str.to_string(), fill))
                 }
@@ -926,7 +962,7 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
                     };
                     let total_bytes = repeat * size.min(8);
                     if value == 0 {
-                        Ok(AsmItem::Zero(total_bytes as u32))
+                        Ok(AsmItem::Zero(total_bytes))
                     } else {
                         let mut data = Vec::with_capacity(total_bytes as usize);
                         let value_bytes = value.to_le_bytes();

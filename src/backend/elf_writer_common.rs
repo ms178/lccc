@@ -459,11 +459,215 @@ struct Section {
     section_type: u32,
     flags: u64,
     data: Vec<u8>,
+    /// Zero bytes not materialised in `data`, held only for NOBITS sections.
+    ///
+    /// A NOBITS section's contents never appear in the object file, so its
+    /// zero bytes do not have to exist in memory either: GCC assembles
+    /// `int a[1000000000];` in constant memory, while materialising the fill
+    /// cost this compiler 4 GiB of RAM and then a SIGKILL. The tail keeps
+    /// "how large is the section" (`cursor`) and "which bytes exist"
+    /// (`data`) separate, and nothing but the ELF header's `sh_size` and the
+    /// offsets derived from `cursor` ever needs the former.
+    ///
+    /// Invariant: `zero_tail == 0` for every non-NOBITS section. It is
+    /// established by `pad_fill` (which only withholds zeros for NOBITS) and
+    /// restored by `materialize_tail`, so `data` alone is the section's
+    /// content for PROGBITS/EXEC sections at all times -- every unchanged
+    /// `data` reader in this file keeps its exact old meaning there.
+    zero_tail: u64,
     alignment: u64,
     relocations: Vec<ElfRelocation>,
     jumps: Vec<JumpInfo>,
     align_markers: Vec<AlignMarker>,
     comdat_group: Option<String>,
+}
+
+impl Section {
+    /// Offset just past the section's contents, held-back zeros included.
+    ///
+    /// Every offset, label position and layout decision must use this, never
+    /// `data.len()`: for a NOBITS section the two differ by the tail.
+    #[inline]
+    fn cursor(&self) -> u64 {
+        self.data.len() as u64 + self.zero_tail
+    }
+
+    /// [`Self::cursor`] as a `usize`, for the callers that index with it.
+    #[inline]
+    fn cursor_usize(&self) -> usize {
+        self.data.len() + self.zero_tail as usize
+    }
+
+    /// Turn every held-back zero into real bytes.
+    ///
+    /// Only the paths that need the bytes (a later write into the tail, or an
+    /// output stage that cannot express the size) call this, and the memory
+    /// guard decides whether it can be done at all.
+    fn materialize_tail(&mut self) -> Result<(), String> {
+        if self.zero_tail == 0 {
+            return Ok(());
+        }
+        let n = usize::try_from(self.zero_tail).map_err(|_| {
+            format!(
+                "section '{}' is too large to materialise ({} held-back bytes)",
+                self.name, self.zero_tail
+            )
+        })?;
+        check_fill_fits(n, &self.name)?;
+        self.data
+            .try_reserve(n)
+            .map_err(|_| dense_fill_error(n, &self.name))?;
+        self.data.resize(self.data.len() + n, 0);
+        self.zero_tail = 0;
+        Ok(())
+    }
+
+    /// Append `n` bytes of `fill`, holding them back when both the section and
+    /// the fill allow it (NOBITS, zero fill).
+    fn pad_fill(&mut self, n: u64, fill: u8) -> Result<(), String> {
+        if self.section_type == SHT_NOBITS && fill == 0 {
+            self.zero_tail = self
+                .zero_tail
+                .checked_add(n)
+                .ok_or_else(|| format!("section '{}' exceeds the addressable size", self.name))?;
+            return Ok(());
+        }
+        self.materialize_tail()?;
+        let n = usize::try_from(n)
+            .map_err(|_| format!("fill of {} bytes does not fit this target", n))?;
+        extend_fill(self, n, fill)
+    }
+
+    /// Patch `bytes` into the section at `offset`.
+    ///
+    /// A patch needs real bytes where it writes, so a held-back NOBITS tail is
+    /// materialised first; for every other section (and for any NOBITS section
+    /// that never held a tail) this is exactly `data[offset..].copy_from_slice`.
+    /// The bounds check turns a logic error into a diagnostic instead of a
+    /// panic, because the callers derive offsets from label positions and from
+    /// jump-relaxation state.
+    fn write_bytes_at(&mut self, offset: usize, bytes: &[u8]) -> Result<(), String> {
+        self.materialize_tail()?;
+        let end = offset + bytes.len();
+        if end > self.data.len() {
+            return Err(format!(
+                "patch of {} bytes at offset {} exceeds section '{}' ({} bytes)",
+                bytes.len(),
+                offset,
+                self.name,
+                self.data.len()
+            ));
+        }
+        self.data[offset..end].copy_from_slice(bytes);
+        Ok(())
+    }
+
+    /// Append bytes; materialises any tail first so `data` stays a prefix of
+    /// the section's true content.
+    fn push_bytes(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.materialize_tail()?;
+        self.data
+            .try_reserve(bytes.len())
+            .map_err(|_| dense_fill_error(self.cursor_usize(), &self.name))?;
+        self.data.extend_from_slice(bytes);
+        Ok(())
+    }
+}
+
+/// Memory available to this process for one dense fill, in bytes.
+///
+/// `MemAvailable + SwapFree` from `/proc/meminfo` is the kernel's own estimate
+/// of what can still be touched without entering reclaim, which is exactly what
+/// the next sentence needs to know. `None` on targets without `/proc` (the
+/// guard is then skipped and the fallible reservation is the only protection).
+fn available_memory_bytes() -> Option<u64> {
+    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let mut mem_available = None;
+    let mut swap_free = None;
+    for line in info.lines() {
+        let (key, rest) = line.split_once(':')?;
+        let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+        match key {
+            "MemAvailable" => mem_available = Some(kb),
+            "SwapFree" => swap_free = Some(kb),
+            _ => {}
+        }
+    }
+    Some(
+        mem_available?
+            .saturating_add(swap_free.unwrap_or(0))
+            .saturating_mul(1024),
+    )
+}
+
+/// The one diagnostic every guarded dense allocation reports.
+fn dense_fill_error(n: usize, section: &str) -> String {
+    format!(
+        "cannot assemble {} bytes of data in section '{}': this compiler \
+         materialises section contents, so the object does not fit in memory \
+         (GCC emits .bss as NOBITS and needs no memory for it)",
+        n, section
+    )
+}
+
+/// Dense fills at least this large are checked against available memory
+/// *before* their pages are touched.
+///
+/// Touching pages the kernel cannot back is what makes the process die with
+/// SIGKILL, which neither a diagnostic nor `try_reserve` can intercept:
+/// measured with a 16 GiB `.bss` object, RSS climbed to 1.8 GiB and the OOM
+/// killer removed the compiler before the reservation's error path was reached.
+const MEMORY_GUARD_MIN_FILL: usize = 64 << 20;
+
+/// Refuse a dense fill that cannot be backed by memory, *before* allocating it.
+fn check_fill_fits(n: usize, section: &str) -> Result<(), String> {
+    if n < MEMORY_GUARD_MIN_FILL {
+        return Ok(());
+    }
+    if let Some(available) = available_memory_bytes()
+        && n as u64 > available / 2
+    {
+        return Err(dense_fill_error(n, section));
+    }
+    Ok(())
+}
+
+/// Clone a section's byte image fallibly.
+///
+/// The byte image of a section is as large as the objects in it, so this is
+/// the second size-proportional allocation on the path that turned a legal
+/// `int a[1000000000];` into a SIGKILL (the first is the fill itself, see
+/// [`extend_fill`]). Both are reports instead of aborts now; the follow-up is
+/// to stop materialising `.bss` contents at all.
+fn clone_bytes(data: &[u8], section: &str) -> Result<Vec<u8>, String> {
+    let mut out: Vec<u8> = Vec::new();
+    check_fill_fits(data.len(), section)?;
+    out.try_reserve_exact(data.len())
+        .map_err(|_| dense_fill_error(data.len(), section))?;
+    out.extend_from_slice(data);
+    Ok(out)
+}
+
+/// Append `n` copies of `fill` to `section`, reserving fallibly first.
+///
+/// Dense fills are the one place where the assembler allocates memory
+/// proportional to a *source-level object's* size: a zero-initialised global
+/// reaches the assembler as `.zero <object size>` (`GlobalInit::Zero`), and
+/// explicit `.skip` padding as a fill run. `int a[1000000000];` is legal C that
+/// GCC assembles in O(1) memory (`.bss` is NOBITS, its contents never exist in
+/// the object), but here the bytes are materialised, so the compiler used to
+/// take twice the object's size in RAM and die with SIGKILL when that did not
+/// fit (measured: 777 MiB peak for a 400 MiB array, SIGKILL at 4 GiB).
+/// `try_reserve` turns "cannot fit" into one assembler diagnostic; `reserve`
+/// would abort the process.
+fn extend_fill(section: &mut Section, n: usize, fill: u8) -> Result<(), String> {
+    check_fill_fits(n, &section.name)?;
+    section
+        .data
+        .try_reserve(n)
+        .map_err(|_| dense_fill_error(n, &section.name))?;
+    section.data.extend(std::iter::repeat_n(fill, n));
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -790,12 +994,34 @@ pub(crate) fn section_padding(
     is_exec: bool,
     after_insn: bool,
     table: NopTable,
-) -> Vec<u8> {
+    section: &str,
+) -> Result<Vec<u8>, String> {
+    // Padding that has to exist as bytes is refused when the memory for it is
+    // not there. `vec![fill; n]` aborts the process when the allocation fails
+    // (Rust's allocation-error handler), and `.section .text` + `.p2align 40`
+    // is exactly that call: measured SIGABRT, "memory allocation of
+    // 1099511628408 bytes failed", where GAS at least reports its own
+    // allocation failure. Padding in a NOBITS section never reaches this
+    // function -- it is held as a size (see `Section::pad_fill`).
+    check_fill_fits(count, section)?;
     if is_exec {
-        exec_padding(count, after_insn, table)
+        // The NOP run itself (exec_padding) allocates directly, so the guard
+        // above is what keeps it inside what this process can hold; the run is
+        // capped at 2^32-1 bytes by the alignment handler before this point.
+        Ok(exec_padding(count, after_insn, table))
     } else {
-        vec![0u8; count]
+        fill_run(count, 0, section)
     }
+}
+
+/// A padding run of `n` bytes of `fill`, allocated fallibly.
+fn fill_run(n: usize, fill: u8, section: &str) -> Result<Vec<u8>, String> {
+    check_fill_fits(n, section)?;
+    let mut out: Vec<u8> = Vec::new();
+    out.try_reserve_exact(n)
+        .map_err(|_| dense_fill_error(n, section))?;
+    out.extend(std::iter::repeat_n(fill, n));
+    Ok(out)
 }
 
 // ─── Expression evaluator ─────────────────────────────────────────────
@@ -1191,6 +1417,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 section_type: ty,
                 flags: fl,
                 data: Vec::new(),
+                zero_tail: 0,
                 alignment: 1,
                 relocations: Vec::new(),
                 jumps: Vec::new(),
@@ -1248,6 +1475,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             section_type,
             flags,
             data: Vec::new(),
+            zero_tail: 0,
             // Section alignment starts at 1 and is raised by the `.p2align` /
             // `.align` directives the section actually contains (see the
             // AsmItem::Align arm), mirroring GNU as exactly.
@@ -1381,7 +1609,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 let resolved = match expr {
                     SizeExpr::CurrentMinusSymbol(start_sym) => {
                         if let Some(sec_idx) = self.current_section {
-                            let current_off = self.sections[sec_idx].data.len() as u64;
+                            let current_off = self.sections[sec_idx].cursor();
                             let end_label = format!(".Lsize_end_{}", name);
                             self.place_label(&end_label, sec_idx, current_off);
                             SizeExpr::SymbolDiff(end_label, start_sym.clone())
@@ -1396,7 +1624,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             AsmItem::Label(name) => {
                 self.ensure_section()?;
                 let sec_idx = self.current_section.unwrap();
-                let offset = self.sections[sec_idx].data.len() as u64;
+                let offset = self.sections[sec_idx].cursor();
                 self.place_label(name, sec_idx, offset);
 
                 if name.chars().all(|c| c.is_ascii_digit()) {
@@ -1423,7 +1651,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 if let Some(sec_idx) = self.current_section {
                     let is_exec = self.sections[sec_idx].flags & SHF_EXECINSTR != 0;
                     if is_exec {
-                        let current = self.sections[sec_idx].data.len();
+                        let current = self.sections[sec_idx].cursor_usize();
                         self.sections[sec_idx].align_markers.push(AlignMarker {
                             offset: current,
                             padding: 0,
@@ -1457,7 +1685,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     // (verified: `.p2align 63` at offset 0 -> addralign 1;
                     // `.byte 1; .p2align 63` -> error, binutils 2.47).
                     if align >= 1u64 << 63 {
-                        if section.data.len() as u64 != 0 {
+                        if section.cursor() != 0 {
                             return Err(format!(
                                 "jump over nop padding out of range (align {align})"
                             ));
@@ -1471,7 +1699,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     if align > section.alignment {
                         section.alignment = align;
                     }
-                    let current = section.data.len() as u64;
+                    let current = section.cursor();
                     let aligned = current.div_ceil(align) * align;
                     let mut padding = (aligned - current) as usize;
                     if let Some(skip) = max_skip {
@@ -1479,13 +1707,23 @@ impl<A: X86Arch> ElfWriterCore<A> {
                             padding = 0;
                         }
                     }
+                    // In a NOBITS section the gap is a size, not bytes: GAS
+                    // allows any alignment there (verified against binutils
+                    // 2.47, `.section .bss` + `.p2align 40` assembles to
+                    // `sh_addralign` = 2^40 with rc 0, with or without an
+                    // explicit fill byte) and so does this writer. The marker
+                    // is still recorded -- `reconcile_section_alignments`
+                    // derives `sh_addralign` from markers, and the
+                    // post-relaxation sweep skips NOBITS sections, so nothing
+                    // re-applies the gap as bytes.
+                    let nobits = section.section_type == SHT_NOBITS;
                     // GAS refuses pathological alignment padding instead of
                     // materializing it: executable sections cap at the
                     // jump-over-NOP rel32 reach ("jump over nop padding out
                     // of range"), data sections die on the fill. Padding that
                     // cannot fit a 32-bit byte count is never legitimate in a
                     // real object, so the writer rejects it uniformly.
-                    if padding as u64 > 0xFFFF_FFFF {
+                    if !nobits && padding as u64 > 0xFFFF_FFFF {
                         return Err(format!(
                             "alignment padding of {padding} bytes too large (align {align})"
                         ));
@@ -1515,21 +1753,28 @@ impl<A: X86Arch> ElfWriterCore<A> {
                             seq,
                         });
                     }
+                    if nobits {
+                        if padding > 0 {
+                            section.pad_fill(padding as u64, 0)?;
+                        }
+                        return Ok(());
+                    }
                     let is_exec = section.flags & SHF_EXECINSTR != 0;
                     let pad_bytes = match fill {
                         // 0x90 in an executable section keeps GAS's optimal
                         // multi-byte NOP padding (tc-i386 treats the default
                         // fill specially); any other byte pads verbatim.
-                        Some(f) if is_exec && *f != 0x90 => vec![*f; padding],
-                        Some(f) if !is_exec => vec![*f; padding],
+                        Some(f) if is_exec && *f != 0x90 => fill_run(padding, *f, &section.name)?,
+                        Some(f) if !is_exec => fill_run(padding, *f, &section.name)?,
                         _ => section_padding(
                             padding,
                             is_exec,
                             after_insn,
                             NopTable::for_mode(A::default_code_mode(), self.code_mode),
-                        ),
+                            &section.name,
+                        )?,
                     };
-                    section.data.extend_from_slice(&pad_bytes);
+                    section.push_bytes(&pad_bytes)?;
                 }
             }
             AsmItem::Byte(vals) => {
@@ -1550,22 +1795,23 @@ impl<A: X86Arch> ElfWriterCore<A> {
             AsmItem::CfaAdvance { from, to } => {
                 self.ensure_section()?;
                 let sec_idx = self.current_section.unwrap();
-                let offset = self.sections[sec_idx].data.len();
+                let offset = self.sections[sec_idx].cursor_usize();
                 self.deferred_cfa_advances.push(CfaAdvance {
                     sec_idx,
                     offset,
                     from: from.clone(),
                     to: to.clone(),
                 });
-                self.sections[sec_idx].data.extend([0u8; CFA_ADVANCE_MAX]);
+                self.sections[sec_idx].pad_fill(CFA_ADVANCE_MAX as u64, 0)?;
             }
             AsmItem::Sleb128(vals) => {
                 self.emit_leb_values(vals, true)?;
             }
             AsmItem::Zero(n) => {
                 self.ensure_section()?;
+                let n = *n;
                 let section = self.current_section_mut()?;
-                section.data.extend(std::iter::repeat_n(0u8, *n as usize));
+                section.pad_fill(n, 0)?;
             }
             AsmItem::Org(sym, offset, fill) => {
                 self.process_org(sym, *offset, *fill)?;
@@ -1584,15 +1830,16 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     // the kernel-alternatives case deferral exists for — still
                     // need to wait for label resolution.
                     if let Some(n) = parse_const_skip(expr) {
+                        let fill_byte = *fill;
                         let section = self.current_section_mut()?;
-                        section.data.extend(std::iter::repeat_n(*fill, n));
+                        section.pad_fill(n as u64, fill_byte)?;
                     } else if let Some((sym, addend)) = parse_org_style_skip(expr) {
                         // `LABEL + N - .` is a location-counter target. Emit
                         // it as `.org` so jump relaxation can restretch the
                         // padding (early_idt_handler_array).
                         self.process_org(&sym, addend, *fill)?;
                     } else {
-                        let offset = self.sections[sec_idx].data.len();
+                        let offset = self.sections[sec_idx].cursor_usize();
                         self.deferred_skips.push(DeferredSkip {
                             sec_idx,
                             offset,
@@ -1604,10 +1851,9 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 } else {
                     // Simple integer parse for architectures without deferred skip support
                     if let Ok(val) = expr.trim().parse::<u64>() {
+                        let fill_byte = *fill;
                         let section = self.current_section_mut()?;
-                        section
-                            .data
-                            .extend(std::iter::repeat_n(*fill, val as usize));
+                        section.pad_fill(val, fill_byte)?;
                     } else {
                         return Err(format!("unsupported .skip expression: {}", expr));
                     }
@@ -1615,7 +1861,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             }
             AsmItem::Asciz(bytes) | AsmItem::Ascii(bytes) => {
                 let section = self.current_section_mut()?;
-                section.data.extend_from_slice(bytes);
+                section.push_bytes(bytes)?;
             }
             AsmItem::Comm(name, size, align) => {
                 let sym_idx = self.symbols.len();
@@ -1721,7 +1967,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     None => data,
                 };
                 let section = self.current_section_mut()?;
-                section.data.extend_from_slice(data);
+                section.push_bytes(data)?;
             }
             AsmItem::Instruction(instr) => {
                 self.encode_instruction(instr)?;
@@ -1747,7 +1993,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             Some(idx) => idx,
             None => return Ok(()),
         };
-        let current = self.sections[sec_idx].data.len() as u64;
+        let current = self.sections[sec_idx].cursor();
         let target = if sym.is_empty() {
             offset as u64
         } else if sym == "." {
@@ -1802,8 +2048,11 @@ impl<A: X86Arch> ElfWriterCore<A> {
             // positioning directive, not an alignment one.  Verified against
             // GAS 2.47: `nop; .org .+16; ret` -> 90 00*15 c3, while
             // `.org .+16, 0x90` fills with 0x90.
-            let data = &mut self.sections[sec_idx].data;
-            data.resize(data.len() + padding, fill);
+            // `pad_fill` and not a raw resize: it holds a zero run in a
+            // NOBITS section as a size (so `.org` with a far target cannot
+            // allocate the gap) and checks every materialised run against
+            // available memory before `Vec::resize` can abort on it.
+            self.sections[sec_idx].pad_fill(padding as u64, fill)?;
         }
         Ok(())
     }
@@ -1875,10 +2124,10 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 DataValue::Integer(v) => {
                     let section = &mut self.sections[sec_idx];
                     match size {
-                        1 => section.data.push(*v as u8),
-                        2 => section.data.extend_from_slice(&(*v as i16).to_le_bytes()),
-                        4 => section.data.extend_from_slice(&(*v as i32).to_le_bytes()),
-                        _ => section.data.extend_from_slice(&v.to_le_bytes()),
+                        1 => section.push_bytes(&[*v as u8])?,
+                        2 => section.push_bytes(&(*v as i16).to_le_bytes())?,
+                        4 => section.push_bytes(&(*v as i32).to_le_bytes())?,
+                        _ => section.push_bytes(&v.to_le_bytes())?,
                     }
                 }
                 DataValue::Symbol(sym) => {
@@ -1888,7 +2137,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                             if let Some(pos) = target.find('-') {
                                 let a = target[..pos].trim().to_string();
                                 let b = target[pos + 1..].trim().to_string();
-                                let offset = self.sections[sec_idx].data.len() as u64;
+                                let offset = self.sections[sec_idx].cursor();
                                 self.sections[sec_idx].relocations.push(ElfRelocation {
                                     offset,
                                     symbol: a,
@@ -1902,12 +2151,12 @@ impl<A: X86Arch> ElfWriterCore<A> {
                                     patch_size: size as u8,
                                 });
                                 let section = &mut self.sections[sec_idx];
-                                section.data.extend(std::iter::repeat_n(0, size));
+                                section.pad_fill(size as u64, 0)?;
                                 continue;
                             }
                         }
                     }
-                    let offset = self.sections[sec_idx].data.len() as u64;
+                    let offset = self.sections[sec_idx].cursor();
                     self.sections[sec_idx].relocations.push(ElfRelocation {
                         offset,
                         symbol: sym.clone(),
@@ -1917,10 +2166,10 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         patch_size: size as u8,
                     });
                     let section = &mut self.sections[sec_idx];
-                    section.data.extend(std::iter::repeat_n(0, size));
+                    section.pad_fill(size as u64, 0)?;
                 }
                 DataValue::SymbolOffset(sym, addend) => {
-                    let offset = self.sections[sec_idx].data.len() as u64;
+                    let offset = self.sections[sec_idx].cursor();
                     self.sections[sec_idx].relocations.push(ElfRelocation {
                         offset,
                         symbol: sym.clone(),
@@ -1930,7 +2179,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         patch_size: size as u8,
                     });
                     let section = &mut self.sections[sec_idx];
-                    section.data.extend(std::iter::repeat_n(0, size));
+                    section.pad_fill(size as u64, 0)?;
                 }
                 DataValue::SymbolDiff(a, b) => {
                     self.emit_symbol_diff(sec_idx, a, b, size, 0)?;
@@ -1946,7 +2195,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     // `.` as either operand is THIS directive's position: register a
                     // synthetic label at the current offset so the post-layout
                     // fold resolves it (header.S: `.long (section_table - .) / 8`).
-                    let here = self.sections[sec_idx].data.len() as u64;
+                    let here = self.sections[sec_idx].cursor();
                     let dot_name = format!(".Ldot_{}_{}", sec_idx, here);
                     let a_res = if a == "." {
                         self.place_label(&dot_name, sec_idx, here);
@@ -1962,7 +2211,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     };
                     self.deferred_scaled_diffs.push(ScaledDiff {
                         sec_idx,
-                        offset: self.sections[sec_idx].data.len(),
+                        offset: self.sections[sec_idx].cursor_usize(),
                         a: a_res,
                         b: b_res,
                         scale: *scale,
@@ -1971,7 +2220,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         size,
                     });
                     let section = &mut self.sections[sec_idx];
-                    section.data.extend(std::iter::repeat_n(0, size));
+                    section.pad_fill(size as u64, 0)?;
                 }
             }
         }
@@ -1999,7 +2248,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 && s[..n - 1].bytes().all(|c| c.is_ascii_digit())
         }
 
-        let offset = self.sections[sec_idx].data.len() as u64;
+        let offset = self.sections[sec_idx].cursor();
         let a_resolved = self
             .aliases
             .get(a)
@@ -2031,7 +2280,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 patch_size: size as u8,
             });
             let section = &mut self.sections[sec_idx];
-            section.data.extend(std::iter::repeat_n(0, size));
+            section.pad_fill(size as u64, 0)?;
         } else if is_numeric_label(&a_resolved) || is_numeric_label(&b_resolved) {
             // A numeric label on EITHER side forces the deferred/positional
             // path regardless of `size`: the `size <= 2` branch below only
@@ -2045,7 +2294,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             // .long field silently stayed zero. Resolution happens later,
             // after jump relaxation and `.skip` sizing have settled the
             // final layout, exactly like the existing `size <= 2` path.
-            let offset_usize = self.sections[sec_idx].data.len();
+            let offset_usize = self.sections[sec_idx].cursor_usize();
             self.deferred_byte_diffs.push((
                 sec_idx,
                 offset_usize,
@@ -2055,11 +2304,11 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 addend,
             ));
             let section = &mut self.sections[sec_idx];
-            section.data.extend(std::iter::repeat_n(0, size));
+            section.pad_fill(size as u64, 0)?;
         } else if size <= 2 && A::supports_deferred_skips() {
             // For byte/short-sized diffs, defer resolution until after
             // deferred skips are inserted (skip insertion shifts offsets).
-            let offset_usize = self.sections[sec_idx].data.len();
+            let offset_usize = self.sections[sec_idx].cursor_usize();
             self.deferred_byte_diffs.push((
                 sec_idx,
                 offset_usize,
@@ -2069,7 +2318,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 addend,
             ));
             let section = &mut self.sections[sec_idx];
-            section.data.extend(std::iter::repeat_n(0, size));
+            section.pad_fill(size as u64, 0)?;
         } else {
             self.sections[sec_idx].relocations.push(ElfRelocation {
                 offset,
@@ -2084,7 +2333,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 patch_size: size as u8,
             });
             let section = &mut self.sections[sec_idx];
-            section.data.extend(std::iter::repeat_n(0, size));
+            section.pad_fill(size as u64, 0)?;
         }
         Ok(())
     }
@@ -2144,7 +2393,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             .get(b)
             .cloned()
             .unwrap_or_else(|| b.to_string());
-        let offset = self.sections[sec_idx].data.len();
+        let offset = self.sections[sec_idx].cursor_usize();
         if b_resolved == "." {
             return Err("symbol minus current position in .uleb128 is unsupported".to_string());
         }
@@ -2162,7 +2411,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
     fn encode_instruction(&mut self, instr: &Instruction) -> Result<(), String> {
         self.ensure_section()?;
         let sec_idx = self.current_section.unwrap();
-        let base_offset = self.sections[sec_idx].data.len() as u64;
+        let base_offset = self.sections[sec_idx].cursor();
 
         // GAS `.` in an operand expression is the position of THIS
         // instruction's start (statement position). Rewrite every
@@ -2213,7 +2462,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             A::encode_instruction(instr, base_offset)?
         };
         let instr_len = result.bytes.len();
-        self.sections[sec_idx].data.extend_from_slice(&result.bytes);
+        self.sections[sec_idx].push_bytes(&result.bytes)?;
 
         // Register jump for relaxation if detected
         if let Some(jump_det) = result.jump {
@@ -2632,7 +2881,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     k => off - shifts[k - 1].1,
                 }
             });
-            self.fixup_alignment_markers(sec_idx);
+            self.fixup_alignment_markers(sec_idx)?;
         }
         Ok(())
     }
@@ -2660,7 +2909,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 encode_uleb128(&mut encoded, diff as u64);
             }
             const PLACE: usize = 10;
-            if *offset + PLACE > self.sections[*sec_idx].data.len() {
+            if *offset + PLACE > self.sections[*sec_idx].cursor_usize() {
                 return Err("internal: .uleb128 diff placeholder overflow".to_string());
             }
             self.sections[*sec_idx]
@@ -2766,23 +3015,25 @@ impl<A: X86Arch> ElfWriterCore<A> {
             let diff = (pos_a.1 as i64) - (pos_b.1 as i64) + addend;
             match size {
                 1 => {
-                    self.sections[*sec_idx].data[*offset] = diff as u8;
+                    self.sections[*sec_idx].write_bytes_at(*offset, &[diff as u8])?;
                 }
                 2 => {
                     let bytes = (diff as i16).to_le_bytes();
-                    self.sections[*sec_idx].data[*offset] = bytes[0];
-                    self.sections[*sec_idx].data[*offset + 1] = bytes[1];
+                    self.sections[*sec_idx].write_bytes_at(*offset, &bytes[..1])?;
+                    self.sections[*sec_idx].write_bytes_at(*offset + 1, &bytes[1..2])?;
                 }
                 4 => {
                     let bytes = (diff as i32).to_le_bytes();
                     for (k, b) in bytes.iter().enumerate() {
-                        self.sections[*sec_idx].data[*offset + k] = *b;
+                        self.sections[*sec_idx]
+                            .write_bytes_at(*offset + k, std::slice::from_ref(b))?;
                     }
                 }
                 8 => {
                     let bytes = diff.to_le_bytes();
                     for (k, b) in bytes.iter().enumerate() {
-                        self.sections[*sec_idx].data[*offset + k] = *b;
+                        self.sections[*sec_idx]
+                            .write_bytes_at(*offset + k, std::slice::from_ref(b))?;
                     }
                 }
                 _ => unreachable!(),
@@ -3024,10 +3275,10 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 .ok_or_else(|| format!("overflow folding ({} - {})", d.a, d.b))?;
             let bytes = value.to_le_bytes();
             let sec = &mut self.sections[d.sec_idx];
-            if d.offset + d.size > sec.data.len() {
+            if d.offset + d.size > sec.cursor_usize() {
                 return Err("internal: scaled diff placeholder overflow".to_string());
             }
-            sec.data[d.offset..d.offset + d.size].copy_from_slice(&bytes[..d.size]);
+            sec.write_bytes_at(d.offset, &bytes[..d.size])?;
         }
         Ok(())
     }
@@ -3075,7 +3326,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
         // if a future arch ever overrides the default `false`.
         self.relax_jumps()?;
         for sec_idx in 0..self.sections.len() {
-            self.fixup_alignment_markers(sec_idx);
+            self.fixup_alignment_markers(sec_idx)?;
         }
         if A::supports_deferred_skips() {
             self.resolve_deferred_skips()?;
@@ -3094,7 +3345,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
         // Running the fixup for every section first makes the pre-relaxation
         // layout correct; `relax_jumps` then keeps it correct as it shrinks.
         for sec_idx in 0..self.sections.len() {
-            self.fixup_alignment_markers(sec_idx);
+            self.fixup_alignment_markers(sec_idx)?;
         }
 
         // Relax long jumps to short form where possible.
@@ -3104,7 +3355,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
         // maintains them for sections that actually contain jumps
         // (.eh_frame never had its `.align` padding fixed up otherwise).
         for sec_idx in 0..self.sections.len() {
-            self.fixup_alignment_markers(sec_idx);
+            self.fixup_alignment_markers(sec_idx)?;
         }
 
         // Now that the tight buckets are final, recompute section header
@@ -3158,7 +3409,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
 
         let mut shared_sections: FxHashMap<String, ObjSection> = FxHashMap::default();
         for sec in &self.sections {
-            let mut data = sec.data.clone();
+            let mut data = clone_bytes(&sec.data, &sec.name)?;
             let mut relocs = Vec::new();
 
             for reloc in &sec.relocations {
@@ -3174,7 +3425,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         .iter()
                         .find(|s| s.name.eq_ignore_ascii_case(base))
                 {
-                    let value = (target.data.len() as i64 + reloc.addend) as u32;
+                    let value = (target.cursor_usize() as i64 + reloc.addend) as u32;
                     let off = reloc.offset as usize;
                     if off + 4 <= data.len() {
                         data[off..off + 4].copy_from_slice(&value.to_le_bytes());
@@ -3278,6 +3529,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     sh_type: sec.section_type,
                     sh_flags: sec.flags,
                     data,
+                    // A held-back NOBITS tail is a size, not bytes.
+                    sh_size: (sec.zero_tail != 0).then_some(sec.cursor()),
                     sh_addralign: sec.alignment,
                     relocs,
                     comdat_group: sec.comdat_group.clone(),
@@ -3329,7 +3582,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     SizeExpr::Constant(v) => *v,
                     SizeExpr::CurrentMinusSymbol(start_sym) => {
                         if let Some(&(sec_idx, start_off)) = self.label_positions.get(start_sym) {
-                            let end = self.sections[sec_idx].data.len() as u64;
+                            let end = self.sections[sec_idx].cursor();
                             end - start_off
                         } else {
                             0
@@ -3365,7 +3618,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                             if let Some(rest) = normalized.strip_prefix(".-") {
                                 if let Some(&(sec_idx, start_off)) = self.label_positions.get(rest)
                                 {
-                                    let end = self.sections[sec_idx].data.len() as u64;
+                                    let end = self.sections[sec_idx].cursor();
                                     end - start_off
                                 } else {
                                     0
@@ -3668,7 +3921,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 any_change = true;
 
                 // Recompute alignment padding after the size changes.
-                self.fixup_alignment_markers(sec_idx);
+                self.fixup_alignment_markers(sec_idx)?;
                 first_pass = false;
 
                 if !any_change {
@@ -4122,6 +4375,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
     /// later removes bytes from a code section (a shrinking `.uleb128`),
     /// which moves targets without touching the jumps.
     fn patch_short_jumps(&mut self, sec_idx: usize) -> Result<(), String> {
+        self.sections[sec_idx].materialize_tail()?;
         let mut local_labels: FxHashMap<String, usize> = FxHashMap::default();
         for (name, &(s_idx, offset)) in &self.label_positions {
             if s_idx == sec_idx {
@@ -4209,7 +4463,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             patches.push((disp_at, disp as u8));
         }
         for (off, byte) in patches {
-            self.sections[sec_idx].data[off] = byte;
+            self.sections[sec_idx].write_bytes_at(off, &[byte])?;
         }
         self.sections[sec_idx].relocations.extend(push_pc8);
         Ok(())
@@ -4265,9 +4519,17 @@ impl<A: X86Arch> ElfWriterCore<A> {
     /// a prefix.  A queue whose next anchor would break the sort (not
     /// produced by any known input) is flushed first, so the result stays
     /// exact regardless.
-    fn fixup_alignment_markers(&mut self, sec_idx: usize) {
+    fn fixup_alignment_markers(&mut self, sec_idx: usize) -> Result<(), String> {
         if self.sections[sec_idx].align_markers.is_empty() {
-            return;
+            return Ok(());
+        }
+        // A NOBITS section never needs this sweep: its padding is held as a
+        // size (`pad_fill`), and nothing in it can move, because jump
+        // relaxation only rewrites executable sections. Rebuilding a run here
+        // would turn a held size into bytes -- 2^40 of them for a `.p2align 40`
+        // in `.bss`, which is legal and free.
+        if self.sections[sec_idx].section_type == SHT_NOBITS {
+            return Ok(());
         }
 
         // Sort by offset to ensure front-to-back processing
@@ -4450,21 +4712,26 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 // An `.align` with an explicit non-`0x90` fill byte pads
                 // verbatim (GAS tc-i386 keeps multi-byte NOPs only for the
                 // default/0x90 fill in executable sections).
+                let sec_name = self.sections[sec_idx].name.clone();
                 let new_bytes = match &kind {
-                    AlignMarkerKind::Org { fill, .. } => vec![*fill; needed_padding],
+                    AlignMarkerKind::Org { fill, .. } => {
+                        fill_run(needed_padding, *fill, &sec_name)?
+                    }
                     AlignMarkerKind::Align { fill, .. } => match fill {
-                        Some(f) if is_exec && *f != 0x90 => vec![*f; needed_padding],
-                        Some(f) if !is_exec => vec![*f; needed_padding],
-                        _ => section_padding(needed_padding, is_exec, after_insn, nops),
+                        Some(f) if is_exec && *f != 0x90 => {
+                            fill_run(needed_padding, *f, &sec_name)?
+                        }
+                        Some(f) if !is_exec => fill_run(needed_padding, *f, &sec_name)?,
+                        _ => section_padding(needed_padding, is_exec, after_insn, nops, &sec_name)?,
                     },
                     // Tight-loop padding is unconditional max-skip-0 style
                     // alignment and always uses optimal multi-byte NOPs.
                     AlignMarkerKind::TightLoop { .. } => {
-                        section_padding(needed_padding, is_exec, after_insn, nops)
+                        section_padding(needed_padding, is_exec, after_insn, nops, &sec_name)?
                     }
                 };
                 debug_assert_eq!(new_bytes.len(), needed_padding);
-                let current_len = queue.len_after(self.sections[sec_idx].data.len());
+                let current_len = queue.len_after(self.sections[sec_idx].cursor_usize());
                 if current_offset + existing_padding <= current_len {
                     // Anchor the shift at the run's END. When the run was
                     // empty, END is the marker itself, and source order
@@ -4510,6 +4777,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             marker_idx += 1;
         }
         self.flush_padding_edits(sec_idx, &mut queue);
+        Ok(())
     }
 
     /// Queue one padding rewrite of `fixup_alignment_markers`, flushing
@@ -4611,7 +4879,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
     /// after layout yields the exact GAS value.
     fn substitute_dot(&mut self, expr: &str) -> Option<(usize, String)> {
         let sec_idx = self.current_section?;
-        let offset = self.sections[sec_idx].data.len() as u64;
+        let offset = self.sections[sec_idx].cursor();
         let bytes = expr.as_bytes();
         let mut out = String::with_capacity(expr.len() + 24);
         let mut label_made = false;
@@ -5012,24 +5280,24 @@ impl<A: X86Arch> ElfWriterCore<A> {
             // Patch resolved relocations into section data
             for (offset, value, psz) in resolved {
                 if psz == 1 {
-                    self.sections[sec_idx].data[offset] = value as u8;
+                    self.sections[sec_idx].write_bytes_at(offset, &[value as u8])?;
                 } else if psz == 2 {
                     let bytes = (value as i16).to_le_bytes();
-                    self.sections[sec_idx].data[offset..offset + 2].copy_from_slice(&bytes);
+                    self.sections[sec_idx].write_bytes_at(offset, &bytes)?;
                 } else if psz == 8 {
                     // .quad a - b: full 64-bit patch. The old catch-all wrote
                     // only 4 bytes, silently truncating negative or >4GiB
                     // differences (e.g. `.quad a - b` with a < b kept its
                     // upper half zero instead of sign-extending).
                     let bytes = value.to_le_bytes();
-                    self.sections[sec_idx].data[offset..offset + 8].copy_from_slice(&bytes);
+                    self.sections[sec_idx].write_bytes_at(offset, &bytes)?;
                 } else {
                     let bytes = (value as i32).to_le_bytes();
-                    self.sections[sec_idx].data[offset..offset + 4].copy_from_slice(&bytes);
+                    self.sections[sec_idx].write_bytes_at(offset, &bytes)?;
                 }
             }
             for (offset, value) in pc8_patches {
-                self.sections[sec_idx].data[offset] = value;
+                self.sections[sec_idx].write_bytes_at(offset, &[value])?;
             }
 
             self.sections[sec_idx].relocations = unresolved;

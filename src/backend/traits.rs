@@ -526,6 +526,53 @@ pub trait ArchCodegen {
         false
     }
 
+    /// Whether the backend emits the REGISTER-OFFSET symbol form
+    /// `sym+disp(%off,%idx,scale)`: a GlobalAddr `Add`ed to a
+    /// register-resident offset (the sliding-window `window[cur_match]`
+    /// shape), folded into one memory operand whose SIB base slot carries
+    /// the offset register and whose displacement carries the symbol. Gates
+    /// `can_indexed_addr_fold`'s register-offset arm; without it a skipped
+    /// `Add` producer would rematerialise against a never-written home.
+    /// Default: unsupported.
+    fn supports_indexed_sym_reg_base(&self) -> bool {
+        false
+    }
+
+    /// Load half of [`Self::supports_indexed_sym_reg_base`]. `off` and
+    /// `index` are BOTH consumed at the access with no IR operand: the RA
+    /// link extension (`collect_folded_gep_links_all`) is part of the
+    /// contract, exactly as for the plain indexed form. A `false` return
+    /// after the decision side's static preconditions held is a contract
+    /// violation (the dead-`Add` decision would leave the address unmade);
+    /// the only admissible refusals are the dynamic register-form checks the
+    /// extension is designed to preclude.
+    fn emit_load_indexed_sym_reg_base(
+        &mut self,
+        _dest: &Value,
+        _sym: &str,
+        _off: &Value,
+        _index: &Value,
+        _shift: u8,
+        _disp: i64,
+        _ty: IrType,
+    ) -> bool {
+        false
+    }
+
+    /// Store dual of [`Self::emit_load_indexed_sym_reg_base`].
+    fn emit_store_indexed_sym_reg_base(
+        &mut self,
+        _val: &Operand,
+        _sym: &str,
+        _off: &Value,
+        _index: &Value,
+        _shift: u8,
+        _disp: i64,
+        _ty: IrType,
+    ) -> bool {
+        false
+    }
+
     /// Constant-offset GEP folds with a REGISTER-RESIDENT base (non-alloca).
     ///
     /// Sound only when ALL of the following hold on the backend:

@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "flags": "-O2 -march=x86-64-v3",
+  "flags": "-O2 -march=x86-64-v3 -fno-pie",
   "entries": {
     "expat_name_length": {
       "insns": 70,
@@ -15,19 +15,25 @@
       "push": 6
     },
     "gzip_crc32_loop": {
-      "insns": 14,
+      "insns": 13,
       "stack": 0,
       "got": 0,
       "push": 0
     },
     "ra01_global_match_probe": {
-      "insns": 92,
-      "stack": 2,
+      "insns": 87,
+      "stack": 4,
       "got": 0,
       "push": 6
     },
+    "reg_off_window_probe": {
+      "insns": 8,
+      "stack": 0,
+      "got": 0,
+      "push": 0
+    },
     "zlib_ng_adler32_c": {
-      "insns": 270,
+      "insns": 269,
       "stack": 14,
       "got": 0,
       "push": 6

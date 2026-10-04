@@ -1403,7 +1403,10 @@ impl Lowerer {
         let elem_size = elem_ct.size();
         // Zero-init first if fewer initializers than elements
         if items.len() < num_elems {
-            self.zero_init_alloca(alloca, elem_size * num_elems);
+            // Saturating, so a bogus element count can only over-reserve the
+            // alloca, never under-reserve it and leave the zero fill (or the
+            // initializers that follow) writing past the allocation.
+            self.zero_init_alloca(alloca, elem_size.saturating_mul(num_elems));
         }
         for (idx, item) in items.iter().enumerate() {
             if idx >= num_elems {

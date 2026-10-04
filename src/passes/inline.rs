@@ -3213,17 +3213,38 @@ fn inline_call_site(
             }
         }
 
-        if !plan.len_values.is_empty() && !extra.is_empty() {
+        if !plan.len_values.is_empty() {
+            // The sentinel means "the number of arguments the call site
+            // forwarded beyond the wrapper's named parameters" — zero when
+            // the call site passes only the named ones.  Folding it to that
+            // count is what makes the wrapper's `__va_arg_pack_len()` checks
+            // decide, so the rewrite must not be skipped when nothing is
+            // forwarded; a surviving sentinel call is an undefined
+            // `__lccc_va_arg_pack_len` at link time (gzip 1.14's gnulib
+            // open-safer.c under glibc fortify: the reference compilers all
+            // fold the check away).
             let len_const = IrConst::I32(extra.len() as i32);
+            // Match in the CLONE's value space.  Cloning already applied
+            // `+ value_offset` to every value (`v + offset` is the clone's
+            // spelling of the original `v`), so shifting the plan values once
+            // is the whole computation.  Adding the offset to the clone's
+            // dest as well counted it twice and matched nothing, which left
+            // the sentinel call in the emitted code for every call site whose
+            // clone was non-trivially offset — i.e. almost all of them.
+            let shifted: Vec<Value> = plan
+                .len_values
+                .iter()
+                .map(|v| Value(v.0 + value_offset))
+                .collect();
             for block in &mut inlined_blocks {
                 for inst in &mut block.instructions {
                     if let Instruction::Call { func, info } = inst {
                         if func == "__lccc_va_arg_pack_len" {
                             if let Some(d) = info.dest {
-                                if plan.len_values.contains(&Value(d.0 + value_offset)) {
+                                if shifted.contains(&d) {
                                     // Rewrite in place: sentinel call -> Copy of the count.
                                     *inst = Instruction::Copy {
-                                        dest: Value(d.0 + value_offset),
+                                        dest: d,
                                         src: Operand::Const(len_const.clone()),
                                     };
                                 }

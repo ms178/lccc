@@ -12,7 +12,7 @@
 use super::lower::Lowerer;
 use crate::common::const_arith;
 use crate::common::const_eval as shared_const_eval;
-use crate::common::types::{CType, IrType};
+use crate::common::types::{CType, IrType, max_object_bytes};
 use crate::frontend::parser::ast::{
     BinOp, DerivedDeclarator, Expr, Initializer, SizeofArg, StructFieldDecl, TypeSpecifier, UnaryOp,
 };
@@ -1054,6 +1054,49 @@ impl Lowerer {
             return self.const_to_i64(&val);
         }
         None
+    }
+
+    /// Array bound as a signed integer, validated *before* it can become a
+    /// `usize`.
+    ///
+    /// These callers are the last place where the bound is still signed, so the
+    /// two constraint violations that make the value unusable as a size have to
+    /// be caught here:
+    ///
+    ///  * C11 6.7.6.2p5 requires a constant array bound to be greater than
+    ///    zero. A negative value used to be `as usize`-wrapped into an
+    ///    astronomically large element count, which turned a plain compile
+    ///    error into a multi-gigabyte `.bss` reservation: with the bound
+    ///    `sizeof(...) == 8 ? 1 : -1` the compiler walked into
+    ///    "memory allocation of 17179869168 bytes failed" (SIGABRT) instead of
+    ///    reporting the bad bound. Diagnose it.
+    ///  * An array whose *byte* size exceeds `PTRDIFF_MAX` cannot exist,
+    ///    because C11 6.5.6p9 requires pointer differences to be
+    ///    representable; GCC rejects exactly that with "size of array is too
+    ///    large" and so does this check. `elem_size` of 0 skips the byte test
+    ///    for callers that only know the element count.
+    ///
+    /// Returns `None` for a rejected or non-constant bound, so callers keep
+    /// their existing unsized-array behaviour; the diagnostic is what makes
+    /// the compile fail with an explanation.
+    pub(super) fn checked_array_bound(&self, expr: &Expr, elem_size: usize) -> Option<i64> {
+        let n = self.expr_as_array_size(expr)?;
+        if n < 0 {
+            self.emit_error("size of array is negative", expr.span());
+            return None;
+        }
+        if elem_size > 0 && (n as u128) * (elem_size as u128) > max_object_bytes() as u128 {
+            self.emit_error("size of array is too large", expr.span());
+            return None;
+        }
+        Some(n)
+    }
+
+    /// [`Self::checked_array_bound`] as an element count, for the callers that
+    /// use the bound directly as a `usize`.
+    pub(super) fn array_bound_elems(&self, expr: &Expr, elem_size: usize) -> Option<usize> {
+        self.checked_array_bound(expr, elem_size)
+            .map(|n| n as usize)
     }
 
     /// Check if an expression is always non-zero at compile time, even if we

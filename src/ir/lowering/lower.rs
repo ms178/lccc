@@ -371,6 +371,14 @@ impl Lowerer {
         self.diagnostics.borrow_mut().warning(message, span);
     }
 
+    /// Emit an error diagnostic with a source span, for constraint violations
+    /// that the lowering itself is the last place to notice (e.g. an array
+    /// bound that is negative or too large to be an object, both of which would
+    /// otherwise be silently wrapped into a `usize` element count).
+    pub(super) fn emit_error(&self, message: impl Into<String>, span: Span) {
+        self.diagnostics.borrow_mut().error(message, span);
+    }
+
     /// Look up the shared type metadata for a variable by name.
     ///
     /// Checks locals first, then globals. Returns `&VarInfo` which provides

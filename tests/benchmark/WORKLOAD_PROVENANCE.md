@@ -34,6 +34,7 @@ these test-source licenses do not relicense the compiler/runtime.
 | `zstd_count` | `packages/zstd/PKGBUILD`, `lib/compress/zstd_compress_internal.h` | `lib/compress/zstd_compress_internal.h`, `ZSTD_count` | BSD-3-Clause / GPL-2.0 | `zstd_compress_internal.h`: ZSTD 1.5.7 | Unaligned 64-bit XOR and `__builtin_ctzll` trailing zero count matching loop. |
 | `lz4_compress` | `packages/lz4/PKGBUILD`, `lib/lz4.c` | `lib/lz4.c`, `LZ4_compress_fast` core | BSD-2-Clause | `lz4.c`: LZ4 1.10.0 | Hash-table sliding window 4-byte matching, token output, and literal run encoding. |
 | `glibc_strstr` | `toolchain-stable/glibc/PKGBUILD`, `string/str-two-way.h` | `string/str-two-way.h`, `string/strstr.c` | LGPL-2.1-or-later | `str-two-way.h` | Boyer–Moore–Horspool bad-character shift scan — glibc's `two_way_short_needle` short-needle path (right-to-left scan + 256-entry shift table); the full Crochemore-Perrin factorization is NOT part of the extracted kernel. |
+| `ra01_global_match` | `packages/gzip/PKGBUILD`, `gzip` 1.14 | `deflate.c`, `longest_match` **access shape** (no lines copied) | GPL-3.0-or-later (shape only; see note) | not a source extract — no upstream lines are copied | Keeps the chain walk `cur_match = prev[cur_match & 32767]` with the distance limit and chain budget, the two probe compares at `match[best]` / `match[best-1]`, and the 258-byte extension loop.  Removes gzip's hash insertion, configuration and I/O.  This is the RA-01 address-shape kernel whose oracle delta is tracked in `tests/oracle/delta_corpus.json`. |
 
 ## Archive retrieval record
 
@@ -104,6 +105,7 @@ fast cross-compiler output oracles:
 | `binary_search` | sorted table lookup | midpoint splitting, branch-heavy search, array loads | sum of successful search indices |
 | `ring_fifo` | SPSC bounded queue | mask-based wrap, producer/consumer state, dependent load/store | final FNV/LCG stream checksum |
 | `histogram` | 256-bin reduction | scattered indexed increments, loop reduction, 64-bit sum | total count and final checksum |
+| `ra01_global_match` | register-indexed chain walk over two file-scope arrays | symbol+register addressing (absolute SIB vs base materialisation), loop-carried index copies, spill/repair pressure around the inner compare chain | deterministic checksum identical to GCC at -O0..-O3 |
 
 These are not substitutes for gzip/zlib-ng/expat/SQLite/glibc/kernel extracts;
 they are stable screening kernels for regressions in addressing, branches,

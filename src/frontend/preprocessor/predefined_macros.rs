@@ -971,8 +971,6 @@ impl Preprocessor {
                 self.define_simple_macro("__ARM_ALIGN_MAX_STACK_PWR", "16");
                 self.define_simple_macro("__AARCH64EL__", "1");
                 self.define_simple_macro("__AARCH64_CMODEL_SMALL__", "1");
-                // ARM: char is unsigned by default
-                self.define_simple_macro("__CHAR_UNSIGNED__", "1");
                 // Replace x86 include paths with aarch64 paths
                 self.system_include_paths.retain(|p| {
                     let s = p.to_string_lossy();

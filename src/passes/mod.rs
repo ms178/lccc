@@ -42,6 +42,7 @@ pub(crate) mod ip_purity;
 pub(crate) mod ipcp;
 pub(crate) mod iv_strength_reduce;
 pub(crate) mod iv_widen;
+pub(crate) mod libcall;
 pub(crate) mod licm;
 pub(crate) mod load_forward;
 pub(crate) mod loop_align;
@@ -1104,6 +1105,7 @@ fn late_vectorize_entry(
 
 pub(crate) fn run_passes(
     module: &mut IrModule,
+    builtin_policy: &crate::common::builtin::BuiltinPolicy,
     opt_level: u32,
     target: crate::backend::Target,
     code16gcc: bool,
@@ -1124,6 +1126,13 @@ pub(crate) fn run_passes(
     // without this entry checkpoint a malformed phi from the frontend
     // (Csmith 20260945: a φ missing its entry-edge incoming) would only be
     // reported by the backend's pre-eliminate_phis tag, falsely implicating
+    // A13/A14: snapshot the CLI withdrawals and this TU's own definition
+    // set once.  Every synthesis decision below (and every const-size
+    // expansion later, through the backend's own publication) is answered
+    // from this object; nothing re-collects mid-pipeline, because inlining
+    // merges bodies but never introduces a new defined *symbol*.
+    let libcalls =
+        crate::passes::libcall::LibcallAllowance::from_module(module, builtin_policy.clone());
     // everything in between.
     if std::env::var_os("CCC_VALIDATE_SSA").is_some() {
         // Dump BEFORE validating so a phi-arity/dominance panic at the
@@ -1330,7 +1339,7 @@ pub(crate) fn run_passes(
         ip_purity::run(module);
         o1_checkpoint!("ip_purity");
         if !pass_disabled(&disabled, "fortifyfold") {
-            fortify_fold::run(module, target.is_32bit());
+            fortify_fold::run(module, target.is_32bit(), &libcalls);
         }
         o1_checkpoint!("fortifyfold");
         constant_fold::run(module);
@@ -1476,7 +1485,7 @@ pub(crate) fn run_passes(
     );
     preloop_dump!("inline_phase");
     if !pass_disabled(&disabled, "fortifyfold") {
-        fortify_fold::run(module, target.is_32bit());
+        fortify_fold::run(module, target.is_32bit(), &libcalls);
         preloop_dump!("fortify_fold");
     }
     // Fold strlen("literal") after inlining so __builtin_constant_p patterns
@@ -1842,7 +1851,7 @@ pub(crate) fn run_passes(
             let n = timed_pass!(
                 "loop_idiom",
                 run_on_visited(module, &dirty, &mut changed, |func| {
-                    loop_idiom::run_function(func, &aliased_names, &local_globals)
+                    loop_idiom::run_function(func, &aliased_names, &local_globals, &libcalls)
                 })
             );
             total_changes += n;
@@ -2900,7 +2909,7 @@ pub(crate) fn run_passes(
     if !pass_disabled(&disabled, "loop_memset") && std::env::var_os("CCC_NO_MEMSET_LOOP").is_none()
     {
         for function in &mut module.functions {
-            let changed = loop_memset::run(function);
+            let changed = loop_memset::run(function, &libcalls);
             if changed > 0 {
                 verify::verify_after_func_pass(function, "loop_memset");
             }

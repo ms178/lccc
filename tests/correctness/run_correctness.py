@@ -451,6 +451,84 @@ int main(void) {
 }
 ''', [], None),
 
+    # C11 6.3.2.1p4: a *function designator* in a value context converts to a
+    # pointer to the function, exactly like an array decay.  The comma operator
+    # is a value context, so `(0, f)` is a function pointer and every context
+    # below must treat it as one -- the sema-side type must agree with what
+    # codegen materialises (the address), or the two disagree about what the
+    # expression is.  Differential against the reference compiler.
+    ("comma_operator_designator_decay", r'''
+#include <stdio.h>
+static int inc(int x) { return x + 1; }
+static int arr[4];
+static int (*plain(void))(int) { return inc; }
+int main(void) {
+    int (*fp)(int) = (0, inc);
+    printf("%d\n", fp(41));
+    printf("%d\n", (0, inc)(1));
+    int (*same)(int) = (0, plain());
+    printf("%d\n", same(2) == fp(2));
+    /* the decayed pointer survives a comparison and a cast */
+    printf("%d\n", (0, inc) == inc);
+    printf("%d\n", ((int (*)(int))(0, inc))(3));
+    int (*ap)[4] = (0, &arr);
+    (*ap)[2] = 7;
+    printf("%d %d\n", arr[2], (0, arr) == arr);
+    printf("%zu %zu %zu\n", sizeof(arr), sizeof((0, arr)), sizeof(ap));
+    return 0;
+}
+''', [], None),
+
+    # Lvalue conversion (C11 6.3.2.1p2-p4) applies to the *values* of the
+    # comma and conditional operators, so an array or function-designator
+    # operand of either decays even though sizeof's array exception
+    # (C11 6.5.3.4p4) protects the operand as written. Every row below is a
+    # shape that GCC and LCCC must agree on, for the size AND for the value
+    # (the decayed address has to remain usable, not merely be sized right).
+    # The `_Generic`/`typeof` rows pin the same rule in the *type* domain, and
+    # the string-literal and `(void)` rows pin the cases where the operand's
+    # CType is not literally an array (a literal already has `char *` type, and
+    # void takes GCC's `sizeof == 1` extension).
+    ("comma_conditional_decay_matrix", r'''
+#include <stdio.h>
+static int arr[4] = {10, 20, 30, 40};
+static int arr2[2] = {7, 8};
+struct s { char c[17]; int a[3]; };
+static struct s sv;
+static int inc(int x) { return x + 1; }
+static int dec(int x) { return x - 1; }
+static int (*plain(void))(int) { return inc; }
+
+int main(void) {
+    int *p = (0, arr);
+    printf("%d %zu\n", p[2], sizeof((0, arr)));
+    printf("%zu %zu %zu\n", sizeof(arr), sizeof((arr, 0)), sizeof((arr, arr)));
+    printf("%zu %zu\n", sizeof(1 ? arr : arr2), sizeof(0 ? arr : arr2));
+    printf("%zu %zu\n", sizeof(1 ? (0, arr) : arr2), sizeof(1 ? plain() : dec));
+    printf("%zu %zu\n", sizeof(1 ? arr : 0), sizeof(1 ? (int *)0 : arr));
+    printf("%zu %zu %zu\n", sizeof((0, sv.c)), sizeof(1 ? sv.c : sv.c), sizeof(sv.c));
+    printf("%zu %zu\n", sizeof((0, sv.a)), sizeof(sv.a));
+    printf("%zu %zu %zu\n", sizeof((0, "abc")), sizeof(1 ? "abc" : "def"), sizeof("abc"));
+    printf("%zu %zu\n", sizeof((0, (void)0)), sizeof((void)0));
+    printf("%d %d\n",
+        _Generic((0, arr), int *: 1, default: 2),
+        _Generic(1 ? arr : arr, int *: 1, default: 2));
+    printf("%zu %zu\n", sizeof(typeof((0, arr))), sizeof(typeof(1 ? arr : arr)));
+    char *cp = (0, sv.c);
+    cp[3] = 'q';
+    printf("%d %c\n", (0, sv.c)[3], sv.c[3]);
+    int *mp = 1 ? sv.a : sv.a;
+    mp[1] = 5;
+    printf("%d %d\n", sv.a[1], (1 ? sv.a : sv.a)[1]);
+    printf("%d %d %d\n", (0, inc)(4), (1 ? inc : dec)(4), (0 ? inc : dec)(4));
+    int (*f)(int) = 1 ? inc : dec;
+    printf("%d\n", f(10));
+    printf("%d %d\n", *((0, arr) + 1), *(1 ? arr : arr + 1));
+    printf("%zu %zu %zu\n", sizeof(*(&arr)), sizeof(&arr), sizeof("abc"));
+    return 0;
+}
+''', [], None),
+
     ("comma_operator", r'''
 #include <stdio.h>
 int main(void) {

@@ -2047,6 +2047,126 @@ impl X86Codegen {
         }
     }
 
+    /// `sym+disp(%off, %idx, scale)`: the symbol stays the displacement, the
+    /// offset register takes the SIB base slot and the scaled index the SIB
+    /// index slot. Both registers are read at the access; the decision side
+    /// (`can_indexed_addr_fold`'s register-offset arm) has already refused
+    /// this form under PIC (a symbol needs its own staging register, and the
+    /// SIB has no third slot) and excluded the register-offset `Add` from
+    /// ever materialising.
+    fn sib_mem64_sym_base(
+        sym: &str,
+        base_reg: &str,
+        index_reg: &str,
+        shift: u8,
+        disp: i64,
+    ) -> String {
+        let head = if disp == 0 {
+            sym.to_string()
+        } else if disp > 0 {
+            format!("{}+{}", sym, disp)
+        } else {
+            format!("{}{}", sym, disp)
+        };
+        if shift == 0 {
+            format!("{}(%{}, %{})", head, base_reg, index_reg)
+        } else {
+            format!("{}(%{}, %{}, {})", head, base_reg, index_reg, 1u32 << shift)
+        }
+    }
+
+    /// Load half of the register-offset symbol fold; see
+    /// [`sib_mem64_sym_base`] and `ArchCodegen::supports_indexed_sym_reg_base`.
+    /// Non-PIC only (the deciding arm refuses PIC): under PIC the symbol would
+    /// need a staging register and the fold would cost the same LEA it saves.
+    pub(super) fn emit_load_indexed_sym_reg_base_impl(
+        &mut self,
+        dest: &Value,
+        sym: &str,
+        off: &Value,
+        index: &Value,
+        shift: u8,
+        disp: i64,
+        ty: IrType,
+    ) -> bool {
+        // Same basename rule as emit_load_indexed_sym_impl: the GOT verdict
+        // is computed on the base symbol, exactly like `rip_rel_blocked` does
+        // on the deciding side.
+        let base_sym = sym.split(['+', '-']).next().unwrap_or(sym);
+        if self.state.needs_got_for_addr(base_sym) {
+            return false;
+        }
+        if self.state.pic_mode {
+            return false;
+        }
+        // The off register takes the SIB BASE slot: it needs the same
+        // 64-bit-form guarantee the index gets.  Narrow offset types are
+        // extended in place by `ensure_sib_index_form` exactly as a SIB
+        // index is, so this is a freshness check plus that extension.
+        let Some(off_reg) = self.fresh_home_of(off.0) else {
+            return false;
+        };
+        if is_xmm_reg(off_reg) || !self.ensure_sib_index_form(off) {
+            return false;
+        }
+        let Some(&x) = self.reg_assignments.get(&index.0) else {
+            return false;
+        };
+        if is_xmm_reg(x) || !self.ensure_sib_index_form(index) {
+            return false;
+        }
+        let off_name = phys_reg_name(off_reg);
+        let index_name = phys_reg_name(x);
+        // A SIB cannot encode %rsp in the index slot (index=100 means "no
+        // index"); %rsp is not allocatable, so this guards a contract break,
+        // not a live case.  %rsp IS encodable in the base slot (mod=10 keeps
+        // the disp32 we always carry), so only the index slot is checked.
+        if index_name == "rsp" {
+            return false;
+        }
+        let mem = Self::sib_mem64_sym_base(sym, off_name, index_name, shift, disp);
+        self.emit_load_indexed_common(dest, index, shift, ty, mem)
+    }
+
+    /// Store dual of [`Self::emit_load_indexed_sym_reg_base_impl`].
+    pub(super) fn emit_store_indexed_sym_reg_base_impl(
+        &mut self,
+        val: &Operand,
+        sym: &str,
+        off: &Value,
+        index: &Value,
+        shift: u8,
+        disp: i64,
+        ty: IrType,
+    ) -> bool {
+        let base_sym = sym.split(['+', '-']).next().unwrap_or(sym);
+        if self.state.needs_got_for_addr(base_sym) {
+            return false;
+        }
+        if self.state.pic_mode {
+            return false;
+        }
+        let Some(off_reg) = self.fresh_home_of(off.0) else {
+            return false;
+        };
+        if is_xmm_reg(off_reg) || !self.ensure_sib_index_form(off) {
+            return false;
+        }
+        let Some(&x) = self.reg_assignments.get(&index.0) else {
+            return false;
+        };
+        if is_xmm_reg(x) || !self.ensure_sib_index_form(index) {
+            return false;
+        }
+        let off_name = phys_reg_name(off_reg);
+        let index_name = phys_reg_name(x);
+        if index_name == "rsp" {
+            return false;
+        }
+        let mem = Self::sib_mem64_sym_base(sym, off_name, index_name, shift, disp);
+        self.emit_store_indexed_common(val, index, shift, ty, mem)
+    }
+
     fn emit_load_indexed_common(
         &mut self,
         dest: &Value,

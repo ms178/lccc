@@ -91,6 +91,7 @@ impl ElfWriterBase {
                     sh_type,
                     sh_flags,
                     data: Vec::new(),
+                    sh_size: None,
                     sh_addralign: align,
                     relocs: Vec::new(),
                     comdat_group: None,

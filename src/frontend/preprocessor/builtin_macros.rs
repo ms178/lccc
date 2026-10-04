@@ -399,9 +399,17 @@ fn define_type_traits_macros(macros: &mut MacroTable) {
     def(macros, "__ORDER_BIG_ENDIAN__", "4321");
     def(macros, "__ORDER_PDP_ENDIAN__", "3412");
 
-    // __CHAR_UNSIGNED__: NOT defined for x86/i686/riscv where char is signed.
-    // Only ARM defines char as unsigned by default. This is set per-target
-    // in predefined_macros.rs set_target().
+    // __CHAR_UNSIGNED__: defined iff the target's plain `char` is unsigned.
+    // Derived from the same process-global `char_is_unsigned()` the type
+    // system consults, so the type, this macro and glibc's `<limits.h>`
+    // (which computes CHAR_MIN/CHAR_MAX from it) cannot disagree — the three
+    // used to drift, and `-funsigned-char` on x86-64 flipped only the type,
+    // leaving CHAR_MIN at -128.  The driver records the per-target default
+    // (unsigned on AArch64/RISC-V SysV, signed on x86) before parsing and the
+    // -funsigned-char / -fsigned-char overrides after it.
+    if crate::common::types::char_is_unsigned() {
+        def(macros, "__CHAR_UNSIGNED__", "1");
+    }
     // __WCHAR_UNSIGNED__: wchar_t is signed on Linux (unlike Windows).
     // Do not define it (it would be detected as "defined" by #ifdef).
 

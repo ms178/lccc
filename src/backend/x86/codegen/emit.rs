@@ -8289,6 +8289,7 @@ impl ArchCodegen for X86Codegen {
                     &crate::common::fx_hash::FxHashMap::default(),
                     &crate::common::fx_hash::FxHashMap::default(),
                     &crate::common::fx_hash::FxHashMap::default(),
+                    &crate::common::fx_hash::FxHashMap::default(),
                     &crate::common::fx_hash::FxHashSet::default(),
                     &crate::common::fx_hash::FxHashSet::default(),
                     &crate::common::fx_hash::FxHashSet::default(),
@@ -8817,6 +8818,14 @@ impl ArchCodegen for X86Codegen {
         // in one memory operand. The symbol hook still supports every legal
         // direct symbol by rebuilding its base in the reserved address scratch
         // and retaining the scale in the consuming SIB operand.
+        std::env::var_os("CCC_NO_X64_SIB").is_none()
+    }
+
+    fn supports_indexed_sym_reg_base(&self) -> bool {
+        // `sym+disp(%off,%idx,scale)`: the symbol is the displacement and the
+        // SIB carries BOTH registers, so PIC (which needs a staging register
+        // for the symbol) has no encoding — the deciding arm refuses PIC for
+        // the same reason. Kill switch alongside the other SIB folds.
         std::env::var_os("CCC_NO_X64_SIB").is_none()
     }
 
@@ -9363,6 +9372,8 @@ impl ArchCodegen for X86Codegen {
         fn emit_store_indexed(&mut self, val: &Operand, base: &Value, index: &Value, shift: u8, disp: i64, ty: IrType) -> bool => emit_store_indexed_impl;
         fn emit_load_indexed_sym(&mut self, dest: &Value, sym: &str, index: &Value, shift: u8, disp: i64, ty: IrType) -> bool => emit_load_indexed_sym_impl;
         fn emit_store_indexed_sym(&mut self, val: &Operand, sym: &str, index: &Value, shift: u8, disp: i64, ty: IrType) -> bool => emit_store_indexed_sym_impl;
+        fn emit_load_indexed_sym_reg_base(&mut self, dest: &Value, sym: &str, off: &Value, index: &Value, shift: u8, disp: i64, ty: IrType) -> bool => emit_load_indexed_sym_reg_base_impl;
+        fn emit_store_indexed_sym_reg_base(&mut self, val: &Operand, sym: &str, off: &Value, index: &Value, shift: u8, disp: i64, ty: IrType) -> bool => emit_store_indexed_sym_reg_base_impl;
         fn emit_typed_store_to_slot(&mut self, instr: &'static str, ty: IrType, slot: StackSlot) => emit_typed_store_to_slot_impl;
         fn emit_typed_load_from_slot(&mut self, instr: &'static str, slot: StackSlot) => emit_typed_load_from_slot_impl;
         fn emit_save_acc(&mut self) => emit_save_acc_impl;

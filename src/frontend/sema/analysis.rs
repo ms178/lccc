@@ -21,11 +21,11 @@ use crate::common::error::DiagnosticEngine;
 use crate::common::source::Span;
 use crate::common::symbol_table::{Symbol, SymbolTable};
 use crate::common::type_builder;
-use crate::common::types::{AddressSpace, CType, FunctionType, StructLayout};
+use crate::common::types::{AddressSpace, CType, FunctionType, StructLayout, max_object_bytes};
 use crate::frontend::parser::ast::{
     BinOp, BlockItem, CompoundStmt, Declaration, DerivedDeclarator, Designator, EnumVariant, Expr,
     ExprId, ExternalDecl, ForInit, FunctionDef, Initializer, SizeofArg, Stmt, StructFieldDecl,
-    TranslationUnit, TypeSpecifier,
+    TranslationUnit, TypeSpecifier, UnaryOp,
 };
 use crate::frontend::sema::builtins;
 
@@ -158,6 +158,7 @@ impl SemanticAnalyzer {
                     self.analyze_function_def(func);
                 }
                 ExternalDecl::Declaration(decl) => {
+                    self.check_file_scope_array_bounds(decl);
                     self.analyze_declaration(decl, /* is_global */ true);
                 }
                 ExternalDecl::TopLevelAsm(_) => {
@@ -378,6 +379,126 @@ impl SemanticAnalyzer {
             .as_deref()
             .and_then(|e| self.eval_const_expr(e))
             .map(|v| v as usize)
+    }
+
+    /// Diagnose a file-scope array whose bound cannot be an integer constant
+    /// expression (C11 6.7.6.2p2: "the size of each array is a constant
+    /// expression greater than zero" / 6.6 for what an ICE is).
+    ///
+    /// GCC: `int n = 5; int a[n];` at file scope is
+    /// "error: variably modified 'a' at file scope".  LCCC used to accept it
+    /// and fabricate a 1024-byte object (and accept `int a[f()];` the same
+    /// way), which is silent wrong code for a program that cannot be compiled
+    /// at all -- and it disguised the missing diagnostic as a size bug.
+    ///
+    /// The predicate is deliberately **conservative**: only constructs that can
+    /// never appear in an integer constant expression are rejected
+    ///
+    ///   * a call (6.6p3 forbids function calls outright),
+    ///   * an assignment, increment or decrement (same clause),
+    ///   * a comma operator (same clause),
+    ///   * a reference to an object that is not an enum constant (6.6p6:
+    ///     an ICE may name only enumeration constants, character constants,
+    ///     sizeof results, and operands that are not variable-length).
+    ///
+    /// It does *not* reject a bound just because this compiler's evaluator
+    /// failed to fold it: a false "variably modified" on legal code would be a
+    /// worse defect than the missing diagnostic it replaces.
+    fn check_file_scope_array_bounds(&mut self, decl: &Declaration) {
+        if decl.is_typedef() {
+            return;
+        }
+        for declarator in &decl.declarators {
+            // A function declaration has no bound to check; the array
+            // declarators that describe parameters are handled by the
+            // parameter adjustment path, not here.
+            if DerivedDeclarator::declares_function(&declarator.derived) {
+                continue;
+            }
+            for derived in &declarator.derived {
+                let DerivedDeclarator::Array(Some(bound)) = derived else {
+                    continue;
+                };
+                if Self::bound_definitely_not_an_ice(bound, self) {
+                    let what = if declarator.name.is_empty() {
+                        "array".to_string()
+                    } else {
+                        format!("'{}'", declarator.name)
+                    };
+                    self.diagnostics.borrow_mut().error(
+                        format!("variably modified {} at file scope", what),
+                        bound.span(),
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    /// See [`Self::check_file_scope_array_bounds`] for why each arm is here.
+    ///
+    /// The walk is structural: an operator whose operands may all be integer
+    /// constant expressions (arithmetic, arithmetic casts, `?:` on constants,
+    /// unary `+ - ~ !`) is only as constant as its operands, so the operands
+    /// are examined in turn. `int n = 5; int a[n + 1];` is rejected by GCC and
+    /// must be rejected here too, which is exactly what the recursion buys.
+    fn bound_definitely_not_an_ice(expr: &Expr, analyzer: &SemanticAnalyzer) -> bool {
+        match expr {
+            // 6.6p3: calls, assignments, increments/decrements and commas are
+            // never part of an integer constant expression.
+            Expr::FunctionCall(..)
+            | Expr::Assign(..)
+            | Expr::CompoundAssign(..)
+            | Expr::Comma(..)
+            | Expr::PostfixOp(..)
+            | Expr::UnaryOp(UnaryOp::PreInc, _, _)
+            | Expr::UnaryOp(UnaryOp::PreDec, _, _) => true,
+
+            // 6.6p6: an object reference is allowed only for enumeration
+            // constants. Measured against GCC 14.2: `const int n = 5;
+            // int a[n];` and `int a[n + 1];` are both "variably modified 'a'
+            // at file scope", so a resolved non-enum name is not an ICE
+            // operand. A name this analyzer cannot resolve is left alone, so
+            // the normal diagnostics for unknown identifiers still fire.
+            Expr::Identifier(name, _) => {
+                !analyzer
+                    .result
+                    .type_context
+                    .enum_constants
+                    .contains_key(name)
+                    && analyzer.symbol_table.lookup(name).is_some()
+            }
+
+            // Operations that are ICE-compatible if and only if their operands
+            // are (C11 6.6p6: operators in the constant-expression grammar are
+            // the arithmetic, relational, equality, bitwise, logical and
+            // conditional operators, `sizeof`, and arithmetic-to-arithmetic
+            // casts).
+            Expr::BinaryOp(_, lhs, rhs, _) => {
+                Self::bound_definitely_not_an_ice(lhs, analyzer)
+                    || Self::bound_definitely_not_an_ice(rhs, analyzer)
+            }
+            Expr::Conditional(cond, then_e, else_e, _) => {
+                Self::bound_definitely_not_an_ice(cond, analyzer)
+                    || Self::bound_definitely_not_an_ice(then_e, analyzer)
+                    || Self::bound_definitely_not_an_ice(else_e, analyzer)
+            }
+            Expr::GnuConditional(cond, else_e, _) => {
+                Self::bound_definitely_not_an_ice(cond, analyzer)
+                    || Self::bound_definitely_not_an_ice(else_e, analyzer)
+            }
+            Expr::UnaryOp(
+                UnaryOp::Plus | UnaryOp::Neg | UnaryOp::BitNot | UnaryOp::LogicalNot,
+                inner,
+                _,
+            ) => Self::bound_definitely_not_an_ice(inner, analyzer),
+            Expr::Cast(_, inner, _) => Self::bound_definitely_not_an_ice(inner, analyzer),
+
+            // Everything else is a literal, an `sizeof`/`_Alignof` result, an
+            // enum constant, or something this check does not model; none of
+            // those are turned into a diagnostic here.
+            _ => false,
+        }
     }
 
     fn analyze_declaration(&mut self, decl: &Declaration, _is_global: bool) {
@@ -677,6 +798,27 @@ impl SemanticAnalyzer {
                 decl.alignment
             };
 
+            // GCC caps an object's alignment and says so
+            // ("requested alignment '1099511627776' exceeds maximum
+            // 268435456"); its limit is MAX_OFILE_ALIGNMENT, 2^28. Adopting
+            // the same bound keeps the diagnostic at the source instead of
+            // leaving an object whose `sh_addralign` no linker will honour --
+            // and before this check the value was handed to the assembler,
+            // which tried to materialise the gap and aborted the process with
+            // an allocation failure.
+            const MAX_OBJECT_ALIGNMENT: usize = 268435456;
+            if let Some(a) = explicit_alignment
+                && a > MAX_OBJECT_ALIGNMENT
+            {
+                self.diagnostics.borrow_mut().error(
+                    format!(
+                        "requested alignment '{}' exceeds maximum {}",
+                        a, MAX_OBJECT_ALIGNMENT
+                    ),
+                    init_decl.span,
+                );
+            }
+
             // Composite type (C11 6.2.7p4): a redeclaration of an object with
             // linkage as an array of unknown size takes the size from the
             // prior visible declaration.  gcc.c-torture/compile 20001018-1:
@@ -884,7 +1026,9 @@ impl SemanticAnalyzer {
     /// Scalar types = 1, arrays = element_count * per_element, structs = sum of fields.
     fn flat_scalar_count_for_type(&self, ty: &CType) -> usize {
         match ty {
-            CType::Array(elem_ty, Some(size)) => *size * self.flat_scalar_count_for_type(elem_ty),
+            CType::Array(elem_ty, Some(size)) => {
+                size.saturating_mul(self.flat_scalar_count_for_type(elem_ty))
+            }
             CType::Array(_, None) => 0, // unsized arrays contribute 0 scalars
             CType::Struct(key) | CType::Union(key) => {
                 let layouts = self.result.type_context.borrow_struct_layouts();
@@ -2278,13 +2422,10 @@ impl SemanticAnalyzer {
             return result;
         }
         let ctype = self.type_spec_to_ctype(&param.type_spec);
-        match ctype {
-            CType::Array(elem, _) => CType::Pointer(elem, AddressSpace::Default),
-            CType::Function(ft) => {
-                CType::Pointer(Box::new(CType::Function(ft)), AddressSpace::Default)
-            }
-            other => other,
-        }
+        // Parameter declarations are adjusted to pointer type (C11 6.7.6.3p7/p8):
+        // an array parameter is a pointer, a function parameter is a pointer to
+        // function — the same value conversion the shared helper implements.
+        ctype.decayed_value_ctype()
     }
 
     /// Convert an AST TypeSpecifier to a CType.
@@ -2612,7 +2753,7 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
         checker.infer_expr_ctype(expr).unwrap_or(CType::Int)
     }
 
-    fn eval_const_expr_as_usize(&self, expr: &Expr) -> Option<usize> {
+    fn eval_array_bound_len(&self, expr: &Expr, elem: &CType) -> Option<usize> {
         self.eval_const_expr(expr).and_then(|v| {
             if v < 0 {
                 // C standard requires array sizes to be positive (constraint violation).
@@ -2621,10 +2762,32 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
                 self.diagnostics
                     .borrow_mut()
                     .error("size of array is negative", expr.span());
-                None
-            } else {
-                Some(v as usize)
+                return None;
             }
+            // A count that does not fit the target's `usize` cannot become an
+            // element count at all: on `-m32` the conversion would truncate and
+            // `char a[4294967296]` became a zero-element array. (Unreachable on
+            // LP64, where `i64::MAX` fits a 64-bit `usize`.)
+            if (v as u128) > usize::MAX as u128 {
+                self.diagnostics
+                    .borrow_mut()
+                    .error("size of array is too large", expr.span());
+                return None;
+            }
+            let n = v as usize;
+            // The bound must describe an existing object: GCC's maximum object
+            // size, the target's PTRDIFF_MAX bytes. Tested in u128 because the
+            // product that overflows is exactly the one that must be rejected --
+            // `int a[4611686018427387904]` is 2^64 bytes and used to wrap to a
+            // zero-byte object that compiled and linked without a word.
+            let elem_size = elem.size_ctx(&*self.result.type_context.borrow_struct_layouts());
+            if (n as u128) * (elem_size as u128) > max_object_bytes() as u128 {
+                self.diagnostics
+                    .borrow_mut()
+                    .error("size of array is too large", expr.span());
+                return None;
+            }
+            Some(n)
         })
     }
 }

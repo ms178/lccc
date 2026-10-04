@@ -296,6 +296,7 @@ fn can_indexed_addr_fold(
     cg: &dyn ArchCodegen,
     info: &IndexedGepInfo,
     global_addr_map: &FxHashMap<u32, String>,
+    reg_off_sym_map: &FxHashMap<u32, RegOffSym>,
     gep_dest: u32,
 ) -> bool {
     // CCC_NO_FOLDED_INDEX_LIVENESS: same contract as the register-base arm
@@ -319,6 +320,18 @@ fn can_indexed_addr_fold(
     // register-resident (the RA link extension keeps it live to there).
     if cg.get_phys_reg_for_value(info.index.0).is_none() {
         return false;
+    }
+    // Register-offset symbol base (`sym+disp(%off,%idx,scale)`): a GlobalAddr
+    // `Add`ed with a register offset is consumed AT the access — the SIB's
+    // base slot carries the offset register and the displacement the symbol.
+    // This arm answers "may this access fold"; the EMITTER dispatch only
+    // takes the symbol form once the deadening pass has removed the `Add`
+    // (dead_global_addrs), because that is the only case where the form pays
+    // for itself: a live `Add` reads fine through its own register home.
+    if let Some(ro) = reg_off_sym_map.get(&info.base.0) {
+        if reg_off_sym_fold_ok(cg, ro, info) {
+            return true;
+        }
     }
     if cg.get_phys_reg_for_value(info.base.0).is_some() {
         return true;
@@ -377,6 +390,40 @@ fn can_indexed_addr_fold(
         return true;
     }
     false
+}
+
+/// Decision predicate for the register-offset symbol fold — the SAME
+/// function the emitter dispatch uses, so "the deadening pass skipped the
+/// `Add`" can never disagree with "the emitter refused and fell back to a
+/// never-materialised address".
+///
+/// Every check here is STATIC (RA homes, symbol legality, mode), because the
+/// decision is re-evaluated at the consumer with the same inputs; the only
+/// dynamic gate left is the register-form freshness that the RA link
+/// extension (`collect_folded_gep_links_all`) is contractually responsible
+/// for — the identical division of labour the plain indexed fold uses (see
+/// the CCC_NO_FOLDED_INDEX_LIVENESS contract).
+fn reg_off_sym_fold_ok(cg: &dyn ArchCodegen, ro: &RegOffSym, info: &IndexedGepInfo) -> bool {
+    if !cg.supports_indexed_sym_reg_base() {
+        return false;
+    }
+    // Non-PIC only: the symbol must be a plain memory-operand displacement.
+    // Under PIC it would need its own staging register and the SIB has no
+    // third slot — the fold would cost exactly the LEA it removes.
+    if cg.state_ref().pic_mode {
+        return false;
+    }
+    if rip_rel_blocked(cg, &ro.sym) {
+        return false;
+    }
+    // Both registers are consumed at the access with no IR operand.
+    if cg.get_phys_reg_for_value(ro.off.0).is_none() {
+        return false;
+    }
+    if cg.get_phys_reg_for_value(info.index.0).is_none() {
+        return false;
+    }
+    true
 }
 
 /// Per-function def / alloca / param facts used by GEP-fold soundness.
@@ -1061,6 +1108,24 @@ pub(crate) fn collect_folded_gep_links_all(func: &IrFunction) -> FxHashMap<u32, 
     for (dest, info) in &m {
         out.entry(info.base.0).or_default().push(*dest);
         out.entry(info.index.0).or_default().push(*dest);
+    }
+    // Register-offset symbol folds consume the OFFSET register at the access
+    // exactly like an index. The links map must be a SUPERSET of what the
+    // emitter finally accepts, so it is built here from a map without the
+    // GOT/TLS/absolute exclusions (a retained link only over-constrains the
+    // allocator, never under-constrains — same argument as the cmp-replay
+    // operand links in the x86 prologue).
+    {
+        let no_exclusions: FxHashSet<String> = FxHashSet::default();
+        let unfiltered = build_global_addr_map(func, &no_exclusions, None);
+        if !unfiltered.is_empty() {
+            let reg_off = build_reg_offset_sym_map(func, &unfiltered);
+            for (dest, info) in &m {
+                if let Some(ro) = reg_off.get(&info.base.0) {
+                    out.entry(ro.off.0).or_default().push(*dest);
+                }
+            }
+        }
     }
     if std::env::var_os("CCC_DEBUG_FOLDED_INDEX").is_some() {
         let mut links: Vec<(&u32, &Vec<u32>)> = out.iter().collect();
@@ -1844,6 +1909,108 @@ fn build_global_addr_map(
                 map.insert(dest, sym);
                 queue.push(dest);
             }
+        }
+    }
+    map
+}
+
+/// A `Add(symbol-address, register-offset)` destination foldable as
+/// `sym+disp(%off,%idx,scale)` — the sliding-window shape (`window[cur_match]`)
+/// GCC keeps as a single memory operand. The `Add` itself never materialises
+/// when every one of its uses is the base of a GEP taking the register-offset
+/// arm of `can_indexed_addr_fold` (see the deadening block there).
+pub(crate) struct RegOffSym {
+    /// Symbol string exactly as `global_addr_map` composes it (`sym` or
+    /// `sym+K`).
+    pub(super) sym: String,
+    /// The symbol-address VALUE (`global_addr_map[sym_val] == sym`). Needed by
+    /// the refusal escape, which rebuilds the `Add` from the symbol's NAME
+    /// (never from a home — the GlobalAddr may itself have been deadened).
+    pub(super) sym_val: Value,
+    /// The register-resident offset operand.
+    pub(super) off: Value,
+}
+
+/// Map of `Add(symbol, register)` destinations. Built from the SAME filtered
+/// `global_addr_map` the emitters consult, so "is this Add a symbol+register
+/// address" is answered identically on the deciding side and at the access.
+///
+/// Shape requirements, each chosen to make the fold's contract checkable:
+///   * the `Add` has a single definition, is 8 bytes wide (pointer arithmetic)
+///     and is not a float;
+///   * one operand is a mapped symbol address, the other a VALUE of integral
+///     type (any width — `window + (unsigned)t` is the common C shape);
+///   * the offset operand is not itself a mapped symbol (symbol+symbol is
+///     not a register offset and can never fold).
+///
+/// Narrow offsets are admitted on the same terms the SIB INDEX already is:
+/// `ensure_sib_index_form` extends them in place at the access (movslq /
+/// movl / movzbq ...), which is sound because the extension preserves the
+/// low bits and only writes the DEFINED 64-bit form of the value — the RA
+/// link extension keeps the home live to that point (see
+/// collect_folded_gep_links_all).
+pub(super) fn build_reg_offset_sym_map(
+    func: &IrFunction,
+    global_addr_map: &FxHashMap<u32, String>,
+) -> FxHashMap<u32, RegOffSym> {
+    if env_flag_set("CCC_NO_REG_OFF_SYM") || global_addr_map.is_empty() {
+        return FxHashMap::default();
+    }
+    let mut def_count: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut val_ty: FxHashMap<u32, IrType> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Some(dest) = inst.dest() {
+                *def_count.entry(dest.0).or_insert(0) += 1;
+                if let Some(ty) = inst.result_type() {
+                    val_ty.insert(dest.0, ty);
+                }
+            }
+        }
+    }
+    let single = |id: u32| def_count.get(&id).copied() == Some(1);
+
+    let mut map: FxHashMap<u32, RegOffSym> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            let Instruction::BinOp {
+                dest,
+                op: IrBinOp::Add,
+                lhs,
+                rhs,
+                ty,
+            } = inst
+            else {
+                continue;
+            };
+            if ty.is_float() || ty.is_long_double() || ty.size() != 8 || !single(dest.0) {
+                continue;
+            }
+            let (Operand::Value(x), Operand::Value(y)) = (lhs, rhs) else {
+                continue;
+            };
+            let (sym_side, off) = if global_addr_map.contains_key(&x.0) {
+                (x, y)
+            } else if global_addr_map.contains_key(&y.0) {
+                (y, x)
+            } else {
+                continue;
+            };
+            if global_addr_map.contains_key(&off.0) {
+                continue;
+            }
+            match val_ty.get(&off.0) {
+                Some(ty) if ty.is_integer() || *ty == IrType::Ptr => {}
+                _ => continue,
+            }
+            map.insert(
+                dest.0,
+                RegOffSym {
+                    sym: global_addr_map[&sym_side.0].clone(),
+                    sym_val: *sym_side,
+                    off: *off,
+                },
+            );
         }
     }
     map
@@ -3502,6 +3669,12 @@ fn pre_size_output_buffer(cg: &mut dyn ArchCodegen, module: &IrModule) {
 }
 
 fn collect_symbol_sets(cg: &mut dyn ArchCodegen, module: &IrModule) {
+    // A14b: publish this module's defined symbols for the const-size
+    // expansion gate.  Same collector as the pass-side rule, so the two
+    // halves of A14 cannot disagree about what this TU defines.
+    crate::backend::libcall_policy::set_module_state(crate::common::builtin::symbol_inventory(
+        module,
+    ));
     let state = cg.state();
     state
         .extern_function_symbols
@@ -3935,7 +4108,10 @@ pub(crate) fn inline_memcpy_len(func: &str, args: &[Operand], is_variadic: bool)
         _ => return None,
     };
     match func {
-        "memcpy" => Some(n as usize),
+        // A14a/b: expand only while the callee still is the builtin.
+        "memcpy" if crate::backend::libcall_policy::may_assume_builtin("memcpy") => {
+            Some(n as usize)
+        }
         "__memcpy_chk" => {
             if args.len() < 4 {
                 return None;
@@ -3969,7 +4145,10 @@ pub(crate) fn inline_memset_const_len(
         _ => return None,
     };
     match func {
-        "memset" => Some(n as usize),
+        // A14a/b: expand only while the callee still is the builtin.
+        "memset" if crate::backend::libcall_policy::may_assume_builtin("memset") => {
+            Some(n as usize)
+        }
         "__memset_chk" => {
             if args.len() < 4 {
                 return None;
@@ -4478,6 +4657,15 @@ fn generate_function(
         FxHashSet::default()
     };
 
+    // `Add(symbol, register)` bases (sliding-window shapes).  Built from the
+    // already GOT/TLS/abs-filtered map so the deciding side and the emitter
+    // agree on symbol legality by construction.
+    let reg_off_sym_map = if cg.supports_indexed_sym_reg_base() {
+        build_reg_offset_sym_map(func, &global_addr_map)
+    } else {
+        FxHashMap::default()
+    };
+
     let remat_global_addrs = if cg.supports_global_addr_remat() {
         build_rematerializable_global_addr_set_for(func, &global_addr_map)
     } else {
@@ -4532,7 +4720,7 @@ fn generate_function(
             if load_cmp_ptrs_func.contains(dest) {
                 continue; // pointer needed materialised by a cmp-mem fold
             }
-            if can_indexed_addr_fold(cg, info, &global_addr_map, *dest) {
+            if can_indexed_addr_fold(cg, info, &global_addr_map, &reg_off_sym_map, *dest) {
                 foldable_folds.insert(*dest);
             }
         }
@@ -4552,6 +4740,14 @@ fn generate_function(
                 if let Some(info) = indexed_gep_map.get(dest) {
                     if global_addr_map.contains_key(&info.base.0) {
                         *folded_base_uses.entry(info.base.0).or_insert(0) += 1;
+                    } else if let Some(ro) = reg_off_sym_map.get(&info.base.0) {
+                        // Only folds that actually take the REGISTER-OFFSET
+                        // arm count as attributable uses: a fold that fell
+                        // back to the register-base arm reads the `Add`'s
+                        // own home, so the `Add` must keep materialising.
+                        if reg_off_sym_fold_ok(cg, ro, info) {
+                            *folded_base_uses.entry(info.base.0).or_insert(0) += 1;
+                        }
                     }
                 }
             }
@@ -4588,7 +4784,25 @@ fn generate_function(
                 // emit_load_indexed_sym_impl) and a register-resident
                 // index. The symbol form therefore cannot refuse, and it
                 // never reads the base's (now never-written) slot.
-                if cg.get_phys_reg_for_value(base).is_none() {
+                // SYM-FORM GUARANTEE (see above): a mapped base with no
+                // register home can only fold through the symbol arm, which
+                // has already verified every refusal is precluded.
+                //
+                // REGISTER-OFFSET `Add` bases are the second such class: the
+                // fold reads the OFFSET register, never the `Add`'s own home,
+                // and `reg_off_sym_fold_ok` (checked for every attributed
+                // use above) has excluded every static refusal.  Unlike a
+                // GlobalAddr the `Add` does have a home — the RA homes it
+                // because it is live in the IR — which is exactly why it
+                // must be deadened here or the `leaq`/`addq` pair stays.
+                //
+                // The equality test above is the whole proof for this
+                // class: `folded_uses` counted ONLY uses whose fold takes the
+                // register-offset arm, so `total == folded_uses` says every
+                // use does — and the store-consumer guard excluded the one
+                // emitter class (value staging) that could refuse late.
+                let reg_off_base = reg_off_sym_map.contains_key(&base);
+                if cg.get_phys_reg_for_value(base).is_none() || reg_off_base {
                     dead_global_addrs.insert(base);
                 }
             }
@@ -5009,7 +5223,13 @@ fn generate_function(
                 }
                 if let Some(info) = indexed_gep_map.get(&dest.0) {
                     if !load_cmp_ptrs.contains(&dest.0)
-                        && can_indexed_addr_fold(cg, info, &global_addr_map, dest.0)
+                        && can_indexed_addr_fold(
+                            cg,
+                            info,
+                            &global_addr_map,
+                            &reg_off_sym_map,
+                            dest.0,
+                        )
                     {
                         cg.state().folded_gep_values.insert(dest.0);
                         cg.state().current_program_point += 1;
@@ -5397,6 +5617,7 @@ fn generate_function(
                 &gep_fold_map,
                 &indexed_gep_map,
                 &global_addr_map,
+                &reg_off_sym_map,
                 &global_addr_ptr_set,
                 &dead_global_addrs,
                 &remat_global_addrs,
@@ -5510,6 +5731,27 @@ fn rematerialize_skipped_indexed(cg: &mut dyn ArchCodegen, ptr: &Value, info: &I
     }
 }
 
+/// Escape hatch for the register-offset symbol fold: rebuild a DEADENED
+/// `Add(symbol, register)` through [`ArchCodegen::emit_rematerialized_global_addr`],
+/// which needs only the symbol's NAME and the offset OPERAND — so it stays
+/// sound when a dynamic edge the decision predicate cannot see (an intervening
+/// clobber) invalidated the offset's home: the hook's general fallback routes
+/// the operand through `operand_to_rcx`, i.e. the ordinary reload machinery.
+/// The bare `Add`'s own home would be a never-written register at this point.
+///
+/// Unreachable in the absence of such a clobber — the emitter's refusals other
+/// than freshness are all precluded by `reg_off_sym_fold_ok` — but a fold whose
+/// refusal path reads a never-written register is exactly the bug class this
+/// file's comments call out (narrow_compare_constant_semantics), so the path
+/// is implemented, not assumed away. The assert fails loudly rather than
+/// compiling a wrong address if a future refusal class appears.
+fn rematerialize_dead_reg_off_add(cg: &mut dyn ArchCodegen, add: &Value, ro: &RegOffSym) {
+    assert!(
+        cg.emit_rematerialized_global_addr(add, &ro.sym, &Operand::Value(ro.off), false),
+        "register-offset symbol fold refused at the access but its symbol cannot be rematerialised"
+    );
+}
+
 /// S11: rematerialising a skipped GEP rebuilds the address through
 /// %rax, destroying the accumulator. A store whose value came from a
 /// dead-producer-skipped indexed load holds that value ONLY in %rax at this
@@ -5564,6 +5806,7 @@ pub(super) fn generate_instruction(
     gep_fold_map: &FxHashMap<u32, GepFoldInfo>,
     indexed_gep_map: &FxHashMap<u32, IndexedGepInfo>,
     global_addr_map: &FxHashMap<u32, String>,
+    reg_off_sym_map: &FxHashMap<u32, RegOffSym>,
     global_addr_ptr_set: &FxHashSet<u32>,
     dead_global_addrs: &FxHashSet<u32>,
     remat_global_addrs: &FxHashSet<u32>,
@@ -5715,6 +5958,8 @@ pub(super) fn generate_instruction(
                 gep_fold_map,
                 indexed_gep_map,
                 global_addr_map,
+                reg_off_sym_map,
+                dead_global_addrs,
                 const_addr_vals,
             );
         }
@@ -5900,6 +6145,8 @@ pub(super) fn generate_instruction(
                 gep_fold_map,
                 indexed_gep_map,
                 global_addr_map,
+                reg_off_sym_map,
+                dead_global_addrs,
                 const_addr_vals,
             );
             clobber_after_call_like(cg);
@@ -6274,6 +6521,8 @@ fn generate_load(
     gep_fold_map: &FxHashMap<u32, GepFoldInfo>,
     indexed_gep_map: &FxHashMap<u32, IndexedGepInfo>,
     global_addr_map: &FxHashMap<u32, String>,
+    reg_off_sym_map: &FxHashMap<u32, RegOffSym>,
+    dead_global_addrs: &FxHashSet<u32>,
     const_addr_vals: &FxHashMap<u32, i64>,
 ) {
     if seg_override != AddressSpace::Default {
@@ -6328,7 +6577,42 @@ fn generate_load(
         rematerialize_const_addr(cg, ptr, gep_info);
     }
     if let Some(info) = indexed_gep_map.get(&ptr.0) {
-        if !is_wide_int_type(ty) && can_indexed_addr_fold(cg, info, global_addr_map, ptr.0) {
+        if !is_wide_int_type(ty)
+            && can_indexed_addr_fold(cg, info, global_addr_map, reg_off_sym_map, ptr.0)
+        {
+            // Register-offset symbol form — ONLY when the base `Add` was
+            // deadened, i.e. when every one of its uses is a fold taking
+            // this arm (the deadening pass proved exactly that; the base is
+            // therefore never materialised, and the register-base arm below
+            // must never read its home).  A live `Add` keeps the plain
+            // register-base form: reading the symbol through its offset
+            // register would extend that register's live range for no
+            // instruction saved (measured: RA-01's probe body is 87 either
+            // way, and the aggressive dispatch only added pressure).
+            if let Some(ro) = reg_off_sym_map.get(&info.base.0) {
+                if dead_global_addrs.contains(&info.base.0) {
+                    if reg_off_sym_fold_ok(cg, ro, info)
+                        && cg.emit_load_indexed_sym_reg_base(
+                            dest,
+                            &ro.sym,
+                            &ro.off,
+                            &info.index,
+                            info.shift,
+                            info.disp,
+                            ty,
+                        )
+                    {
+                        return;
+                    }
+                    // Dynamic refusal (freshness): rebuild the address and
+                    // take the generic tail. The paths below would read the
+                    // deadened `Add`'s never-written home.
+                    rematerialize_dead_reg_off_add(cg, &info.base, ro);
+                    rematerialize_skipped_indexed(cg, ptr, info);
+                    cg.emit_load(dest, ptr, ty);
+                    return;
+                }
+            }
             if cg.emit_load_indexed(dest, &info.base, &info.index, info.shift, info.disp, ty) {
                 return;
             }
@@ -6358,6 +6642,8 @@ fn generate_store(
     gep_fold_map: &FxHashMap<u32, GepFoldInfo>,
     indexed_gep_map: &FxHashMap<u32, IndexedGepInfo>,
     global_addr_map: &FxHashMap<u32, String>,
+    reg_off_sym_map: &FxHashMap<u32, RegOffSym>,
+    dead_global_addrs: &FxHashSet<u32>,
     const_addr_vals: &FxHashMap<u32, i64>,
 ) {
     if seg_override != AddressSpace::Default {
@@ -6404,7 +6690,36 @@ fn generate_store(
         remat_indexed_acc_safe(cg, val, |cg| rematerialize_const_addr(cg, ptr, gep_info));
     }
     if let Some(info) = indexed_gep_map.get(&ptr.0) {
-        if !is_wide_int_type(ty) && can_indexed_addr_fold(cg, info, global_addr_map, ptr.0) {
+        if !is_wide_int_type(ty)
+            && can_indexed_addr_fold(cg, info, global_addr_map, reg_off_sym_map, ptr.0)
+        {
+            // Register-offset symbol form, deadened-`Add` only (see
+            // generate_load).
+            if let Some(ro) = reg_off_sym_map.get(&info.base.0) {
+                if dead_global_addrs.contains(&info.base.0) {
+                    if reg_off_sym_fold_ok(cg, ro, info)
+                        && cg.emit_store_indexed_sym_reg_base(
+                            val,
+                            &ro.sym,
+                            &ro.off,
+                            &info.index,
+                            info.shift,
+                            info.disp,
+                            ty,
+                        )
+                    {
+                        return;
+                    }
+                    // Dynamic refusal (freshness): rebuild the address and
+                    // take the generic tail (see generate_load).
+                    rematerialize_dead_reg_off_add(cg, &info.base, ro);
+                    remat_indexed_acc_safe(cg, val, |cg| {
+                        rematerialize_skipped_indexed(cg, ptr, info)
+                    });
+                    cg.emit_store(val, ptr, ty);
+                    return;
+                }
+            }
             if cg.emit_store_indexed(val, &info.base, &info.index, info.shift, info.disp, ty) {
                 return;
             }
@@ -6775,8 +7090,119 @@ mod indexed_gep_machinst_gate_tests {
 }
 
 #[cfg(test)]
+mod reg_offset_sym_map_tests {
+    use super::*;
+
+    /// `window` GlobalAddr plus a register offset added to it, with the GEP
+    /// that consumes the sum as its base.
+    fn function_with(mirrored: bool, second_def: bool) -> IrFunction {
+        let mut function =
+            IrFunction::new("reg_off_sym".to_string(), IrType::U32, Vec::new(), false);
+        let mut instructions = vec![
+            Instruction::GlobalAddr {
+                dest: Value(0),
+                name: "window".to_string(),
+            },
+            // The offset is an 8-byte integer here; narrow integer types
+            // are accepted too (they are extended in place at the access),
+            // while symbol-typed operands are rejected — the rejection case
+            // below exercises exactly that.
+            Instruction::Cast {
+                dest: Value(1),
+                src: Operand::Const(IrConst::I32(3)),
+                from_ty: IrType::I32,
+                to_ty: IrType::I64,
+            },
+            Instruction::BinOp {
+                dest: Value(2),
+                op: IrBinOp::Add,
+                lhs: if mirrored {
+                    Operand::Value(Value(1))
+                } else {
+                    Operand::Value(Value(0))
+                },
+                rhs: if mirrored {
+                    Operand::Value(Value(0))
+                } else {
+                    Operand::Value(Value(1))
+                },
+                ty: IrType::I64,
+            },
+            Instruction::GetElementPtr {
+                dest: Value(3),
+                base: Value(2),
+                offset: Operand::Const(IrConst::I64(5)),
+                ty: IrType::Ptr,
+            },
+        ];
+        if second_def {
+            instructions.push(Instruction::BinOp {
+                dest: Value(2),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(0)),
+                rhs: Operand::Value(Value(1)),
+                ty: IrType::I64,
+            });
+        }
+        function.blocks = vec![BasicBlock {
+            label: crate::ir::reexports::BlockId(0),
+            instructions,
+            terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+            source_spans: Vec::new(),
+        }];
+        function.next_value_id = 4;
+        function
+    }
+
+    fn map_for() -> FxHashMap<u32, String> {
+        let mut m: FxHashMap<u32, String> = FxHashMap::default();
+        m.insert(0, "window".to_string());
+        m
+    }
+
+    #[test]
+    fn accepts_add_of_global_and_register_value() {
+        let function = function_with(false, false);
+        let map = build_reg_offset_sym_map(&function, &map_for());
+        let ro = map.get(&2).expect("Add(GlobalAddr, Value) must map");
+        assert_eq!(ro.sym, "window");
+        assert_eq!(ro.sym_val.0, 0);
+        assert_eq!(ro.off.0, 1);
+    }
+
+    #[test]
+    fn accepts_mirrored_operand_order() {
+        let function = function_with(true, false);
+        let map = build_reg_offset_sym_map(&function, &map_for());
+        assert_eq!(map.get(&2).map(|ro| ro.off.0), Some(1));
+    }
+
+    #[test]
+    fn rejects_multi_def_add() {
+        let function = function_with(false, true);
+        assert!(build_reg_offset_sym_map(&function, &map_for()).is_empty());
+    }
+
+    #[test]
+    fn rejects_symbol_plus_symbol() {
+        let function = function_with(false, false);
+        let mut map = map_for();
+        // The offset operand is itself a mapped symbol: not a register offset.
+        map.insert(1, "other".to_string());
+        assert!(build_reg_offset_sym_map(&function, &map).is_empty());
+    }
+
+    #[test]
+    fn rejects_unmapped_addends() {
+        let function = function_with(false, false);
+        assert!(build_reg_offset_sym_map(&function, &FxHashMap::default()).is_empty());
+    }
+}
+
+#[cfg(test)]
 mod remat_call_arg_tests {
     use super::*;
+    use crate::common::builtin::BuiltinPolicy;
     use crate::ir::reexports::CallInfo;
 
     fn function_with_global_addr_call(
@@ -6821,6 +7247,28 @@ mod remat_call_arg_tests {
         map
     }
 
+    /// Run `f` in the world a real compilation is in: the driver published
+    /// the builtin policy and the module published exactly these `defined`
+    /// symbols (`libcall_policy::published_policy_for_test`).
+    ///
+    /// The remat set is built from the same predicate that decides the
+    /// const-size inline expansion, and that predicate fails closed before
+    /// publication — without the window a test would observe "no module has
+    /// been compiled yet" rather than the engine's behaviour, and the
+    /// no-definition window is the shape of a translation unit that only
+    /// *uses* the builtin.
+    fn with_module_definitions<T>(defined: &[&str], f: impl FnOnce() -> T) -> T {
+        let inventory = crate::common::builtin::SymbolInventory {
+            defined: defined.iter().map(|name| name.to_string()).collect(),
+            ..crate::common::builtin::SymbolInventory::default()
+        };
+        let _window = crate::backend::libcall_policy::published_policy_for_test(
+            BuiltinPolicy::default(),
+            inventory,
+        );
+        f()
+    }
+
     #[test]
     fn call_arg_use_is_rematerializable() {
         // glibc_memcmp's glibc_left: a bare GlobalAddr passed as a call
@@ -6846,8 +7294,36 @@ mod remat_call_arg_tests {
             false,
             false,
         );
-        let set = build_rematerializable_global_addr_set_for(&func, &global_addr_map());
+        let set = with_module_definitions(&[], || {
+            build_rematerializable_global_addr_set_for(&func, &global_addr_map())
+        });
         assert!(!set.contains(&0));
+    }
+
+    #[test]
+    fn module_defined_memcpy_keeps_the_root_homed() {
+        // The other half of the exclusion above.  A module that *defines*
+        // `memcpy` makes the const-size call a real call again (A14: the
+        // callee is no longer the library's), so it travels the
+        // remat-capable call emitter and the root must stay in the set —
+        // the exclusion tracks the expansion decision, not the call shape.
+        let func = function_with_global_addr_call(
+            vec![
+                Operand::Value(Value(0)),
+                Operand::Value(Value(1)),
+                Operand::Const(IrConst::I64(8)),
+            ],
+            "memcpy",
+            false,
+            false,
+        );
+        let set = with_module_definitions(&["memcpy"], || {
+            build_rematerializable_global_addr_set_for(&func, &global_addr_map())
+        });
+        assert!(
+            set.contains(&0),
+            "a TU-defined memcpy is not inline-expanded: the root must be rematerializable"
+        );
     }
 
     #[test]
@@ -6855,15 +7331,34 @@ mod remat_call_arg_tests {
         // The set must agree EXACTLY with the x86 inline-memset predicate:
         // excluded iff the backend would inline-expand (which bypasses the
         // remat-capable call emitter). The policy itself is CPU-row
-        // dependent, so the test pins the wiring, not the row.
+        // dependent, so the test pins the wiring, not the row — and it
+        // pins it in every world the predicate distinguishes: the library
+        // builtin, a module that defines `memset`, and a CLI withdrawal.
         let args = vec![
             Operand::Value(Value(0)),
             Operand::Const(IrConst::I32(0)),
             Operand::Const(IrConst::I64(16)),
         ];
         let func = function_with_global_addr_call(args.clone(), "memset", false, false);
+        for defined in [&[][..], &["memset"][..]] {
+            let (set, inlined) = with_module_definitions(defined, || {
+                (
+                    build_rematerializable_global_addr_set_for(&func, &global_addr_map()),
+                    x86_inline_memset_len("memset", &args, false).is_some(),
+                )
+            });
+            assert_eq!(set.contains(&0), !inlined, "defined={defined:?}");
+        }
+
+        let mut withdrawn = BuiltinPolicy::default();
+        withdrawn.withdraw_one("memset");
+        let _window = crate::backend::libcall_policy::published_policy_for_test(
+            withdrawn,
+            crate::common::builtin::SymbolInventory::default(),
+        );
         let set = build_rematerializable_global_addr_set_for(&func, &global_addr_map());
         let inlined = x86_inline_memset_len("memset", &args, false).is_some();
+        assert!(!inlined, "a withdrawn memset must not be expanded");
         assert_eq!(set.contains(&0), !inlined);
     }
 

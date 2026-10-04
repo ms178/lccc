@@ -1682,8 +1682,8 @@ impl Lowerer {
             if let Some(ev) = elem_runtime {
                 let mut count: usize = 1;
                 for expr in array_dims.iter().copied().flatten() {
-                    if let Some(c) = self.expr_as_array_size(expr) {
-                        count = count.saturating_mul(c as usize);
+                    if let Some(c) = self.array_bound_elems(expr, 0) {
+                        count = count.saturating_mul(c);
                     }
                 }
                 let ptr_int_ty = target_int_ir_type();
@@ -1719,9 +1719,9 @@ impl Lowerer {
         };
 
         for expr in array_dims.iter().copied().flatten() {
-            if let Some(const_val) = self.expr_as_array_size(expr) {
+            if let Some(const_val) = self.array_bound_elems(expr, 0) {
                 // Constant dimension - accumulate
-                const_product *= const_val as usize;
+                const_product *= const_val;
             } else {
                 // Runtime dimension - emit multiplication
                 let dim_val = self.lower_expr(expr);
@@ -1880,7 +1880,7 @@ impl Lowerer {
             // We need to compute this from the (i+1)th dimension.
             let inner_dim = &array_dims[i + 1];
             if let Some(expr) = inner_dim {
-                if let Some(const_val) = self.expr_as_array_size(expr) {
+                if let Some(const_val) = self.checked_array_bound(expr, 0) {
                     // Inner dimension is a compile-time constant
                     current_const_stride *= const_val as usize;
                     if current_stride.is_some() {

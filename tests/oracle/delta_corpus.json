@@ -1,12 +1,18 @@
 {
   "schema": 1,
-  "flags": "-O2 -march=x86-64-v3",
+  "flags": "-O2 -march=x86-64-v3 -fno-pie",
+  "flags_note": "Deliberately non-PIE. The one-instruction RA-01 form `sym(,%idx,scale)` has no RIP-relative encoding, so under PIE the corpus would measure a code model in which the optimisation cannot exist at all - a comparison of code models, not of compilers, and one that flatters LCCC. Non-PIE is also the harder target for the global-address rematerialisation work: the address is a bare symbol (no GOT indirection to hide behind), so the gate asks the same question of every compiler and keeps the stricter bar. Every oracle is measured on Compiler Explorer with exactly these flags.",
   "oracles": [
     "gcc16.2",
     "clang",
     "icx"
   ],
   "entries": [
+    {
+      "id": "reg_off_window_probe",
+      "source": "engineering/evidence/godbolt/reg_off_window_fold.c",
+      "function": "reg_off_window_probe"
+    },
     {
       "id": "ra01_global_match_probe",
       "source": "engineering/evidence/godbolt/ra01_global_remat.c",

@@ -533,6 +533,18 @@ INVOCATION_CONTRACTS: tuple[InvocationContract, ...] = (
         local_gate=("gas-oracle-pair-self-test", "fast"),
     ),
     InvocationContract(
+        # The capability probe's self-test only: a real probe run needs a built
+        # compiler and the corpus index, so CI pins the contract, not a
+        # capability list from a machine.  No PROGRAM_ENV_CHANNELS entry is
+        # needed -- the probe sets LCCC_STRICT_OPTIONS itself for every
+        # subprocess it starts, so a step `env:` cannot change a verdict.
+        program="scripts/lccc_capability_probe.py",
+        name="capability-probe-selftest",
+        sides=_BOTH,
+        rest_spec=("--selftest",),
+        local_gate=("capability-probe-selftest", "fast"),
+    ),
+    InvocationContract(
         program="scripts/test_asmdiff.py",
         name="asmdiff-semantic-validation",
         sides=_BOTH,
