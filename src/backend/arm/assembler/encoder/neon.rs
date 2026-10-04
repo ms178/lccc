@@ -3085,11 +3085,17 @@ pub fn encode_neon_scalar_qshrn(
         return Err(format!("scalar qshrn: u_bit must be 0 or 1, got {u_bit}"));
     }
     let (rd, rd_name) = match &operands[0] {
-        Operand::Reg(r) => (parse_reg_num(r).ok_or("invalid reg")?, r.to_ascii_lowercase()),
+        Operand::Reg(r) => (
+            parse_reg_num(r).ok_or("invalid reg")?,
+            r.to_ascii_lowercase(),
+        ),
         _ => return Err("expected destination register".to_string()),
     };
     let (rn, rn_name) = match &operands[1] {
-        Operand::Reg(r) => (parse_reg_num(r).ok_or("invalid reg")?, r.to_ascii_lowercase()),
+        Operand::Reg(r) => (
+            parse_reg_num(r).ok_or("invalid reg")?,
+            r.to_ascii_lowercase(),
+        ),
         _ => return Err("expected source register".to_string()),
     };
     // Determine destination element width and the required wider source view.
