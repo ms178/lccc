@@ -5,17 +5,45 @@ use crate::backend::arm::assembler::parser::Operand;
 
 /// Width of a general-purpose register operand, in bits.
 ///
-/// Returns `Err` for anything that is not `w`/`x`/`wsp`/`sp`/`wzr`/`xzr`, so a
+/// Returns `Err` for anything that is not a general-purpose register, so a
 /// mistyped register is diagnosed instead of being defaulted to 32-bit.
+///
+/// `lr` is an alias for `x30`, not a separate register: GAS accepts
+/// `fmov d0,lr` and emits the same word as `fmov d0,x30` (0x9e6703c0). It
+/// was missing here while `parse_reg_num` already knew it, so the two
+/// disagreed about what a register spelling means -- which is how
+/// `fmov d0,lr` came to be rejected as "not a general-purpose register".
+/// The spellings handled here are exactly the ones the crate's canonical
+/// register parser resolves to a general-purpose register; `parse_reg_num`
+/// is that parser, and `gp_reg_width_matches_parse_reg_num` below pins the
+/// two together so they cannot drift again.
+///
+/// `sp`/`wsp` are accepted here so the caller can reject them with a message
+/// that names the instruction; they are 64- and 32-bit respectively.
 fn gp_reg_width(name: &str) -> Result<u32, String> {
-    match name.to_lowercase().as_str() {
-        "sp" | "xzr" => Ok(64),
+    let lower = name.to_lowercase();
+    // The canonical parser owns the spelling and number grammar; this
+    // function only adds the width. Checking it first is what rejects
+    // `x32`, `x007` and `x+5` -- a prefix-only test would happily call all
+    // three 64-bit registers, and only the caller's later `parse_reg_num`
+    // would have caught that, by accident rather than by design.
+    if parse_reg_num(&lower).is_none() {
+        return Err(format!(
+            "fmov: `{name}` is not a general-purpose register (expected w0-w30, \
+             x0-x30, lr, wzr, xzr, wsp or sp)"
+        ));
+    }
+    match lower.as_str() {
+        "sp" | "xzr" | "lr" => Ok(64),
         "wsp" | "wzr" => Ok(32),
+        // `parse_reg_num` also resolves the FP/SIMD prefixes, so anything
+        // that reaches this arm is a real register of the wrong class.
         other => match other.chars().next() {
             Some('x') => Ok(64),
             Some('w') => Ok(32),
             _ => Err(format!(
-                "fmov: `{name}` is not a general-purpose register (expected w, x, wzr or xzr)"
+                "fmov: `{name}` is not a general-purpose register (expected w0-w30, \
+                 x0-x30, lr, wzr, xzr, wsp or sp)"
             )),
         },
     }
@@ -107,7 +135,7 @@ fn encode_fmov_general(fp_name: &str, gp_name: &str, to_fp: bool) -> Result<Enco
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_fmov(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_fmov(operands: &[Operand]) -> Result<EncodeResult, String> {
     if operands.len() != 2 {
         return Err(format!("fmov requires 2 operands, got {}", operands.len()));
     }
@@ -138,7 +166,7 @@ pub(crate) fn encode_fmov(operands: &[Operand]) -> Result<EncodeResult, String> 
     }
 }
 
-pub(crate) fn encode_fp_arith(operands: &[Operand], opcode: u32) -> Result<EncodeResult, String> {
+pub fn encode_fp_arith(operands: &[Operand], opcode: u32) -> Result<EncodeResult, String> {
     let (rd, _) = get_reg(operands, 0)?;
     let (rn, _) = get_reg(operands, 1)?;
     let (rm, _) = get_reg(operands, 2)?;
@@ -161,7 +189,7 @@ pub(crate) fn encode_fp_arith(operands: &[Operand], opcode: u32) -> Result<Encod
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_fneg(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_fneg(operands: &[Operand]) -> Result<EncodeResult, String> {
     let (rd, _) = get_reg(operands, 0)?;
     let (rn, _) = get_reg(operands, 1)?;
     let rd_name = match &operands[0] {
@@ -175,7 +203,7 @@ pub(crate) fn encode_fneg(operands: &[Operand]) -> Result<EncodeResult, String> 
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_fabs(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_fabs(operands: &[Operand]) -> Result<EncodeResult, String> {
     let (rd, _) = get_reg(operands, 0)?;
     let (rn, _) = get_reg(operands, 1)?;
     let rd_name = match &operands[0] {
@@ -189,7 +217,7 @@ pub(crate) fn encode_fabs(operands: &[Operand]) -> Result<EncodeResult, String> 
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_fsqrt(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_fsqrt(operands: &[Operand]) -> Result<EncodeResult, String> {
     let (rd, _) = get_reg(operands, 0)?;
     let (rn, _) = get_reg(operands, 1)?;
     let rd_name = match &operands[0] {
@@ -205,7 +233,7 @@ pub(crate) fn encode_fsqrt(operands: &[Operand]) -> Result<EncodeResult, String>
 
 /// Encode FP 1-source ops: FRINTN/P/M/Z/A/X/I
 /// Format: 0 00 11110 ftype 1 opcode 10000 Rn Rd
-pub(crate) fn encode_fp_1src(operands: &[Operand], opcode: u32) -> Result<EncodeResult, String> {
+pub fn encode_fp_1src(operands: &[Operand], opcode: u32) -> Result<EncodeResult, String> {
     let (rd, _) = get_reg(operands, 0)?;
     let (rn, _) = get_reg(operands, 1)?;
     let rd_name = match &operands[0] {
@@ -249,10 +277,7 @@ pub(crate) fn fp_ftype(name: &str) -> Result<u32, String> {
 
 /// Encode FMADD/FMSUB: Rd = Ra +/- (Rn * Rm)
 /// Format: 0 00 11111 ftype 0 Rm o1 Ra Rn Rd
-pub(crate) fn encode_fmadd_fmsub(
-    operands: &[Operand],
-    is_sub: bool,
-) -> Result<EncodeResult, String> {
+pub fn encode_fmadd_fmsub(operands: &[Operand], is_sub: bool) -> Result<EncodeResult, String> {
     let (rd, _) = get_reg(operands, 0)?;
     let (rn, _) = get_reg(operands, 1)?;
     let (rm, _) = get_reg(operands, 2)?;
@@ -275,10 +300,7 @@ pub(crate) fn encode_fmadd_fmsub(
 
 /// Encode FNMADD/FNMSUB: Rd = -Ra +/- (Rn * Rm)
 /// Format: 0 00 11111 ftype 1 Rm o1 Ra Rn Rd
-pub(crate) fn encode_fnmadd_fnmsub(
-    operands: &[Operand],
-    is_sub: bool,
-) -> Result<EncodeResult, String> {
+pub fn encode_fnmadd_fnmsub(operands: &[Operand], is_sub: bool) -> Result<EncodeResult, String> {
     let (rd, _) = get_reg(operands, 0)?;
     let (rn, _) = get_reg(operands, 1)?;
     let (rm, _) = get_reg(operands, 2)?;
@@ -300,7 +322,7 @@ pub(crate) fn encode_fnmadd_fnmsub(
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_fcmp(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_fcmp(operands: &[Operand]) -> Result<EncodeResult, String> {
     let (rn, _) = get_reg(operands, 0)?;
     let rn_name = match &operands[0] {
         Operand::Reg(r) => r.to_lowercase(),
@@ -376,7 +398,7 @@ fn fcvt_rounding_name(rmode: u32, opcode: u32) -> &'static str {
     }
 }
 
-pub(crate) fn encode_fcvt_rounding(
+pub fn encode_fcvt_rounding(
     operands: &[Operand],
     rmode: u32,
     opcode: u32,
@@ -430,18 +452,15 @@ pub(crate) fn encode_fcvt_rounding(
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_ucvtf(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_ucvtf(operands: &[Operand]) -> Result<EncodeResult, String> {
     encode_int_to_float(operands, false)
 }
 
-pub(crate) fn encode_scvtf(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_scvtf(operands: &[Operand]) -> Result<EncodeResult, String> {
     encode_int_to_float(operands, true)
 }
 
-pub(crate) fn encode_int_to_float(
-    operands: &[Operand],
-    is_signed: bool,
-) -> Result<EncodeResult, String> {
+pub fn encode_int_to_float(operands: &[Operand], is_signed: bool) -> Result<EncodeResult, String> {
     // SCVTF/UCVTF: integer-to-float conversion
     // Encoding: sf 00 11110 ftype 1 00 opcode 000000 Rn Rd
     // sf: 0=W source, 1=X source
@@ -472,7 +491,7 @@ pub(crate) fn encode_int_to_float(
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_fcvt_precision(operands: &[Operand]) -> Result<EncodeResult, String> {
+pub fn encode_fcvt_precision(operands: &[Operand]) -> Result<EncodeResult, String> {
     // FCVT: float precision conversion (e.g., FCVT Dd, Sn or FCVT Sd, Dn)
     // Encoding: 0 00 11110 ftype 1 0001 opc 10000 Rn Rd
     // ftype: source precision (00=S, 01=D, 11=H)
@@ -514,4 +533,73 @@ pub(crate) fn encode_fcvt_precision(operands: &[Operand]) -> Result<EncodeResult
         | (rn << 5)
         | rd;
     Ok(EncodeResult::Word(word))
+}
+
+#[cfg(test)]
+mod gp_reg_width_tests {
+    use super::*;
+
+    /// The spellings `parse_reg_num` resolves to a general-purpose register,
+    /// and the width `gp_reg_width` must report for each.
+    ///
+    /// These two functions answer different questions about the same grammar
+    /// -- "which register number is this?" and "how wide is this register?" --
+    /// and a disagreement between them is how `fmov d0,lr` came to be
+    /// rejected while `mov x0,lr` assembled: the number side knew `lr`, the
+    /// width side did not. Pinning them together makes that class of drift a
+    /// test failure rather than a bug report.
+    #[test]
+    fn gp_reg_width_matches_parse_reg_num() {
+        let cases: &[(&str, u32, u32)] = &[
+            ("x0", 0, 64),
+            ("x30", 30, 64),
+            ("w0", 0, 32),
+            ("w30", 30, 32),
+            // Aliases: the whole point of this test.
+            ("lr", 30, 64),
+            ("sp", 31, 64),
+            ("wsp", 31, 32),
+            ("xzr", 31, 64),
+            ("wzr", 31, 32),
+        ];
+        for (name, num, width) in cases {
+            assert_eq!(
+                parse_reg_num(name),
+                Some(*num),
+                "`{name}` must resolve to register {num}"
+            );
+            assert_eq!(
+                gp_reg_width(name).unwrap_or_else(|e| panic!("`{name}`: {e}")),
+                *width,
+                "`{name}` must be {width}-bit"
+            );
+        }
+    }
+
+    /// `lr` is x30, so it is a 64-bit GP register and pairs with D and H.
+    /// Every expected word below was produced by GNU as, which assembles
+    /// `fmov d0,lr` to exactly the word it assembles `fmov d0,x30` to.
+    #[test]
+    fn lr_is_a_64bit_general_purpose_register() {
+        assert_eq!(gp_reg_width("lr"), Ok(64));
+        assert_eq!(
+            gp_reg_width("LR"),
+            Ok(64),
+            "register names are case-insensitive"
+        );
+        // x30 and lr must be indistinguishable to every caller.
+        assert_eq!(gp_reg_width("lr"), gp_reg_width("x30"));
+        // A 32-bit-only pairing therefore rejects it, exactly as GAS does.
+        assert!(encode_fmov_general("s0", "lr", true).is_err());
+    }
+
+    #[test]
+    fn gp_reg_width_rejects_non_general_purpose_registers() {
+        for name in ["d0", "s0", "h0", "q0", "b0", "v0", "", "x32", "x007"] {
+            assert!(
+                gp_reg_width(name).is_err(),
+                "`{name}` is not a general-purpose register and must be rejected"
+            );
+        }
+    }
 }

@@ -280,6 +280,37 @@ gate "loop-alignment-contract" fast \
 gate "fuzz-harness-tests" fast \
     python3 -m unittest discover -s tests/fuzz -p 'test_*.py'
 
+# PBT bug-witness ratchet: the ignore count may only ratchet down, and every
+# ignored bug-witness must still fail under --ignored (a passing witness is
+# dead weight whose bug is fixed -- activate it). Skips whose reason is not
+# "documented bug" are exempt from the liveness check but still pinned.
+# Requires the test binaries: run after the cargo-test gate (or standalone
+# once target/fastbuild is warm).
+gate "pbt-ignore-ratchet" fast \
+    python3 scripts/pbt_ignore_ratchet.py
+
+# Callgrind A/B harness self-test: same binary on both sides must measure a
+# delta of exactly zero (verifies workload generation, the byte-identity
+# comparison and Ir parsing without a second build). The full two-build A/B
+# is a research-loop tool, not a gate -- Callgrind is ~100x realtime.
+callgrind_selftest() {
+    local vg vglib
+    if command -v valgrind >/dev/null 2>&1; then
+        vg=$(command -v valgrind)
+    elif [ -x "$HOME/.local/opt/valgrind-apt/usr/bin/valgrind" ]; then
+        vg="$HOME/.local/opt/valgrind-apt/usr/bin/valgrind"
+        vglib="$HOME/.local/opt/valgrind-apt/usr/libexec/valgrind"
+    else
+        echo "SKIP: no valgrind on this host (research-only tool)"
+        return 0
+    fi
+    PATH="$(dirname "$vg"):$PATH" \
+        VALGRIND_LIB="${vglib:-${VALGRIND_LIB:-}}" \
+        bash scripts/assembler_callgrind_ab.sh --self-test \
+            target/fastbuild/lccc-arm
+}
+gate "assembler-callgrind-selftest" fast callgrind_selftest
+
 gate "fuzz-engine-wiring" fast \
     python3 scripts/fuzz_diff.py --check-engines
 

@@ -124,6 +124,57 @@ pub(crate) mod pgo;
 #[cfg(test)]
 pub(crate) mod test_support;
 
+/// Test-internals re-exports for the property-based integration test
+/// binaries under `tests/pbt/`.
+///
+/// Why this exists: the PBT campaign (transplanted from
+/// thanhtoantnt/claudes-c-compiler and adapted) is ~60k lines of test code.
+/// Compiled as part of the monolithic lib-test binary, the single `rustc`
+/// invocation for crate + tests exceeds the memory budget of the constrained
+/// research host (kernel-OOM at ~3.6 GB RSS with the co-tenant web preview).
+/// As separate integration-test binaries, each suite compiles in a small
+/// `rustc` run that links the already-built rlib, and the lib-test compile
+/// stays at its pre-transplant weight.
+///
+/// Visibility contract (deliberate, reviewed): integration tests are separate
+/// crates and can only reach items through a `pub` path, so this module is
+/// `pub` + `#[doc(hidden)]`. It is NOT private API — Rust has no
+/// "visible-to-in-tree-integration-tests-only" visibility — and it is NOT
+/// covered by any stability guarantee: it exists solely for this binary
+/// crate's own test suite, may change or vanish at any time, and downstream
+/// crates must not rely on it. A feature gate was considered and rejected:
+/// `cargo test --all-targets` (what CI and `ci_local.sh` run) silently SKIPS
+/// test targets whose `required-features` are unsatisfied, so gating would
+/// remove the entire PBT suite from the default run — the exact
+/// silent-coverage-loss failure mode this repo's gate infrastructure exists
+/// to prevent. The wildcard re-export mirrors the encoder module's own
+/// `pub use` composition; tests consume individual symbols and any narrowing
+/// list would churn on every new suite for zero additional safety (the items
+/// are already `pub` through the module tree).
+#[doc(hidden)]
+pub mod pbt_internals {
+    // AArch64 assembler encoder surface (Operand/EncodeResult/relocations,
+    // every encode_* entry point and the shared operand-reading helpers).
+    pub use crate::backend::arm::assembler::encoder::*;
+    pub use crate::backend::arm::assembler::parser::Operand;
+    // Constant folding / long-double conversions.
+    pub use crate::common::const_arith::{
+        eval_const_binop, eval_const_binop_float, truncate_and_extend_bits,
+    };
+    pub use crate::common::const_eval::{
+        eval_binop_with_types, eval_builtin_call, eval_literal, irconst_to_bits, promote_sub_int,
+    };
+    pub use crate::common::long_double::{
+        f64_to_f128_bytes_lossless, f64_to_x87_bytes_simple, f128_bytes_to_f64, x87_bytes_to_f64,
+    };
+    pub use crate::common::source::Span;
+    // Preprocessor constant-expression evaluator.
+    pub use crate::frontend::preprocessor::conditionals::eval_const_expr;
+    // AST types used by the const-eval suites.
+    pub use crate::frontend::parser::ast::{BinOp, Expr};
+    pub use crate::ir::reexports::IrConst;
+}
+
 /// Shared entry point for all compiler binaries. Spawns the real work on a
 /// thread with a large stack so deeply recursive C files don't overflow.
 pub fn compiler_main() {

@@ -19,13 +19,13 @@ mod load_store;
 mod neon;
 mod system;
 
-pub(crate) use bitfield::*;
-pub(crate) use compare_branch::*;
-pub(crate) use data_processing::*;
-pub(crate) use fp_scalar::*;
-pub(crate) use load_store::*;
-pub(crate) use neon::*;
-pub(crate) use system::*;
+pub use bitfield::*;
+pub use compare_branch::*;
+pub use data_processing::*;
+pub use fp_scalar::*;
+pub use load_store::*;
+pub use neon::*;
+pub use system::*;
 
 /// Result of encoding an instruction.
 #[derive(Debug, Clone)]
@@ -154,49 +154,150 @@ pub struct Relocation {
 
 /// Parse a register name to its 5-bit encoding number (0-30, 31 for sp/zr).
 pub fn parse_reg_num(name: &str) -> Option<u32> {
-    let name = name.to_lowercase();
-    match name.as_str() {
-        "sp" | "wsp" => Some(31),
-        "xzr" | "wzr" => Some(31),
-        "lr" => Some(30),
+    // Allocation-free on purpose: this runs for every register operand of
+    // every instruction, and the old `to_lowercase()` here was a measurable
+    // share of the assembler's total instruction count (the byte-wise
+    // rewrite below is the single largest win of the fail-closed pass).
+    // Semantics are identical to the lowercasing version: the alias table,
+    // the eight register prefixes, bare canonical decimal (no leading
+    // zero, no sign), numbers 0..=31.
+    if name.eq_ignore_ascii_case("sp") || name.eq_ignore_ascii_case("wsp") {
+        return Some(31);
+    }
+    if name.eq_ignore_ascii_case("xzr") || name.eq_ignore_ascii_case("wzr") {
+        return Some(31);
+    }
+    if name.eq_ignore_ascii_case("lr") {
+        return Some(30);
+    }
+    let b = name.as_bytes();
+    match b.first() {
+        Some(
+            b'x' | b'X' | b'w' | b'W' | b'd' | b'D' | b's' | b'S' | b'q' | b'Q' | b'v' | b'V'
+            | b'h' | b'H' | b'b' | b'B',
+        ) => {}
+        _ => return None,
+    }
+    // `str::parse::<u32>` is far more permissive than the register grammar:
+    // it accepts a leading `+` and arbitrary leading zeros, so "x+5",
+    // "x007" and "w+31" all used to resolve to a real register instead of
+    // being rejected. Accept only bare decimal digits, and only in
+    // canonical (no leading zero) form -- matching GAS, which rejects
+    // "x007" as an unknown symbol. (Upstream fork issues #118 and #207.)
+    let digits = &b[1..];
+    // Valid register numbers fit in at most two digits. Bound the input
+    // before accumulating so an oversized spelling cannot overflow `u32`
+    // (or wrap into an unrelated register in optimized builds).
+    if digits.is_empty()
+        || digits.len() > 2
+        || !digits.iter().all(|d| d.is_ascii_digit())
+        || (digits.len() > 1 && digits[0] == b'0')
+    {
+        return None;
+    }
+    let mut num: u32 = 0;
+    for &d in digits {
+        num = num * 10 + (d - b'0') as u32;
+    }
+    if num <= 31 { Some(num) } else { None }
+}
+
+/// Check if a register name is a 64-bit (X) register or SP.
+/// Allocation-free: this runs on hot operand paths (the old
+/// `to_lowercase()` here was part of the +1.5% Ir regression the Callgrind
+/// A/B caught).
+fn is_64bit_reg(name: &str) -> bool {
+    match name.as_bytes().first() {
+        Some(b'x' | b'X') => true,
         _ => {
-            let prefix = name.chars().next()?;
-            match prefix {
-                'x' | 'w' | 'd' | 's' | 'q' | 'v' | 'h' | 'b' => {
-                    // `str::parse::<u32>` is far more permissive than the
-                    // AArch64 register grammar: it accepts a leading `+` and
-                    // arbitrary leading zeros, so "x+5", "x007" and "w+31"
-                    // all used to resolve to a real register instead of being
-                    // rejected. Accept only bare decimal digits, and only in
-                    // canonical (no leading zero) form -- matching GAS, which
-                    // rejects "x007" as an unknown symbol.
-                    // (Upstream fork issues #118 and #207.)
-                    let digits = &name[1..];
-                    if digits.is_empty()
-                        || !digits.bytes().all(|b| b.is_ascii_digit())
-                        || (digits.len() > 1 && digits.starts_with('0'))
-                    {
-                        return None;
-                    }
-                    let num: u32 = digits.parse().ok()?;
-                    if num <= 31 { Some(num) } else { None }
-                }
-                _ => None,
-            }
+            name.eq_ignore_ascii_case("sp")
+                || name.eq_ignore_ascii_case("xzr")
+                || name.eq_ignore_ascii_case("lr")
         }
     }
 }
 
-/// Check if a register name is a 64-bit (X) register or SP.
-fn is_64bit_reg(name: &str) -> bool {
-    let name = name.to_lowercase();
-    name.starts_with('x') || name == "sp" || name == "xzr" || name == "lr"
-}
-
 /// Check if a register name is a 32-bit (W) register.
 fn is_32bit_reg(name: &str) -> bool {
-    let name = name.to_lowercase();
-    name.starts_with('w') || name == "wsp" || name == "wzr"
+    match name.as_bytes().first() {
+        Some(b'w' | b'W') => true,
+        _ => name.eq_ignore_ascii_case("wsp") || name.eq_ignore_ascii_case("wzr"),
+    }
+}
+
+/// Check whether `name` spells a general-purpose register: `x0`-`x30`,
+/// `w0`-`w30`, or one of the `sp`/`wsp`/`xzr`/`wzr`/`lr` aliases.
+///
+/// This is the class check the permissive readers (`get_reg`, and
+/// `parse_reg_num` on its own) do not make: `parse_reg_num` resolves `d0` and
+/// `lr` to plain numbers, so an FP/SIMD register reaches encoders that only
+/// have a GP encoding and is silently assembled as one. `mov d0, x1`,
+/// `mov x0, d1`, `and x0, x1, d2` and `clz x0, d1` were all accepted that way
+/// and produced words GNU as rejects outright.
+///
+/// Deliberately excludes `x31`/`w31`: register 31 is spelled `xzr`/`wzr` in
+/// the GP forms, matching the parser and GNU as.
+pub fn is_gp_reg(name: &str) -> bool {
+    // Allocation-free on purpose. This runs on every operand of every
+    // instruction, and a `to_lowercase()` here costs 2.17% of the
+    // assembler's total instruction count (measured with Callgrind; the
+    // byte-wise rewrite cuts the class-check cost 6.5x to +0.335%).
+    // `eq_ignore_ascii_case` and byte-wise scanning allocate nothing.
+    if name.eq_ignore_ascii_case("sp")
+        || name.eq_ignore_ascii_case("wsp")
+        || name.eq_ignore_ascii_case("xzr")
+        || name.eq_ignore_ascii_case("wzr")
+        || name.eq_ignore_ascii_case("lr")
+    {
+        return true;
+    }
+    let b = name.as_bytes();
+    // 2 or 3 bytes: a prefix and one or two digits. Register numbers never
+    // exceed 30, so anything longer cannot be a GP register.
+    if b.len() < 2 || b.len() > 3 {
+        return false;
+    }
+    if !matches!(b[0], b'x' | b'X' | b'w' | b'W') {
+        return false;
+    }
+    // Canonical decimal only: no leading zero, and 31 is spelled xzr/wzr --
+    // the same rule `parse_reg_num` uses, so the class check and the parser
+    // cannot disagree.
+    if b.len() == 3 && b[1] == b'0' {
+        return false;
+    }
+    let mut v = 0u32;
+    for &d in &b[1..] {
+        if !d.is_ascii_digit() {
+            return false;
+        }
+        v = v * 10 + (d - b'0') as u32;
+    }
+    v <= 30
+}
+
+/// Reads two general-purpose register operands, rejecting FP/SIMD spellings.
+///
+/// `get_reg` resolves any register name to a bare 0-31 number, so `clz x0, d1`
+/// used to assemble as a real instruction that GNU as rejects. Encoders whose
+/// only encoding is the GP "data-processing (1 source)" or shifted-register
+/// form call this instead so the class error is reported at the operand that
+/// caused it. `sp`/`wsp` remain legal, since they are GP registers for these
+/// encodings; only FP/SIMD spellings are refused.
+pub fn get_gp_reg_pair(operands: &[Operand], mn: &str) -> Result<(u32, bool, u32), String> {
+    for i in 0..2 {
+        if let Some(Operand::Reg(n)) = operands.get(i) {
+            if !is_gp_reg(n) {
+                return Err(format!(
+                    "{mn}: operand {i} `{n}` is not a general-purpose register \
+                     (expected x0-x30, w0-w30, lr, sp or xzr)"
+                ));
+            }
+        }
+    }
+    let (rd, is_64) = get_reg(operands, 0)?;
+    let (rn, _) = get_reg(operands, 1)?;
+    Ok((rd, is_64, rn))
 }
 
 /// Check if a register is a floating-point/SIMD register.
@@ -206,7 +307,7 @@ fn is_fp_reg(name: &str) -> bool {
 }
 
 /// Encode a condition code string to 4-bit encoding.
-fn encode_cond(cond: &str) -> Option<u32> {
+pub fn encode_cond(cond: &str) -> Option<u32> {
     match cond.to_lowercase().as_str() {
         "eq" => Some(0),
         "ne" => Some(1),
@@ -463,12 +564,75 @@ pub fn encode_instruction(
         "fmul" => {
             if matches!(operands.first(), Some(Operand::RegArrangement { .. })) {
                 if matches!(operands.get(2), Some(Operand::RegLane { .. })) {
-                    encode_neon_float_elem(operands, 0b1001)
+                    // By-element FMUL: U=0, opc=1001 (FMULX is the U=1 form).
+                    // The previous U=1 emitted FMULX encodings for plain FMUL.
+                    // Oracle: `fmul v0.4s, v1.4s, v2.s[3]` = 0x4FA29820.
+                    encode_neon_float_elem(operands, 0, 0b1001)
                 } else {
                     encode_neon_float_three_same(operands, 1, 0, 0b11011)
                 }
+            } else if matches!(operands.get(2), Some(Operand::RegLane { .. })) {
+                // Scalar by-element FMUL: Sd, Sn, Vm.S[index] / Dd, Dn, Vm.D[index].
+                // Oracle: `fmul d0, d1, v2.d[1]` = 0x5FC29820 (GAS 2.47 + llvm-mc 23.1.2).
+                encode_neon_float_elem_scalar(operands, 0)
             } else {
                 encode_fp_arith(operands, 0b0000)
+            }
+        }
+        "fmulx" => {
+            if matches!(operands.first(), Some(Operand::RegArrangement { .. })) {
+                if matches!(operands.get(2), Some(Operand::RegLane { .. })) {
+                    // By-element FMULX: U=1, opc=1001.
+                    // Oracle: `fmulx v0.4s, v1.4s, v2.s[3]` = 0x6FA29820.
+                    encode_neon_float_elem(operands, 1, 0b1001)
+                } else {
+                    // Three-same FMULX: U=0, opc=11011 (FMUL is the U=1 form).
+                    // Oracle: `fmulx v0.4s, v1.4s, v2.4s` = 0x4E22DC20.
+                    encode_neon_float_three_same(operands, 0, 0, 0b11011)
+                }
+            } else if matches!(operands.get(2), Some(Operand::RegLane { .. })) {
+                // Scalar by-element FMULX: U=1 form of the scalar by-element.
+                // Oracle: `fmulx d0, d1, v2.d[1]` = 0x7FC29820 (GAS + llvm-mc).
+                encode_neon_float_elem_scalar(operands, 1)
+            } else {
+                // Scalar FMULX Dd, Dn, Dm ("scalar three same FP":
+                // 0 M 0 11110 size 1 Rm opcode 1 Rn Rd with M=1, U=0,
+                // opc=11011, size=01 for double).
+                // Oracle: `fmulx d0, d1, d2` = 0x5E62DC20.
+                if operands.len() != 3 {
+                    return Err(format!(
+                        "scalar fmulx requires exactly 3 operands, got {}",
+                        operands.len()
+                    ));
+                }
+                let mut regs = [0u32; 3];
+                for (idx, reg) in regs.iter_mut().enumerate() {
+                    let name = match operands.get(idx) {
+                        Some(Operand::Reg(name))
+                            if name.starts_with('d') || name.starts_with('D') =>
+                        {
+                            name
+                        }
+                        other => {
+                            return Err(format!(
+                                "scalar fmulx operand {idx} must be a D register, got {other:?}"
+                            ));
+                        }
+                    };
+                    *reg = parse_reg_num(name)
+                        .ok_or_else(|| format!("invalid D register at operand {idx}: {name}"))?;
+                }
+                let [rd, rn, rm] = regs;
+                let word = (1u32 << 30)
+                    | (0b11110 << 24)
+                    | (0b01 << 22)
+                    | (1u32 << 21)
+                    | (rm << 16)
+                    | (0b11011 << 11)
+                    | (1u32 << 10)
+                    | (rn << 5)
+                    | rd;
+                Ok(EncodeResult::Word(word))
             }
         }
         "fdiv" => {
@@ -641,14 +805,18 @@ pub fn encode_instruction(
         // NEON float three-same instructions (vector-only)
         "fmla" => {
             if matches!(operands.get(2), Some(Operand::RegLane { .. })) {
-                encode_neon_float_elem(operands, 0b0001)
+                encode_neon_float_elem(operands, 0, 0b0001)
             } else {
                 encode_neon_float_three_same(operands, 0, 0, 0b11001)
             }
         }
         "fmls" => {
             if matches!(operands.get(2), Some(Operand::RegLane { .. })) {
-                encode_neon_float_elem(operands, 0b0101)
+                // By-element FMLS: U=0, opc=0101 (the U bit distinguishes
+                // FMUL/FMULX, not FMLA/FMLS). Oracle: GAS 2.47 and llvm-mc
+                // 23.1.2 both assemble `fmls v0.4s,v1.4s,v2.s[3]` to
+                // 0x4fa25820 (bit 29 clear).
+                encode_neon_float_elem(operands, 0, 0b0101)
             } else {
                 encode_neon_float_three_same(operands, 0, 1, 0b11001)
             }
@@ -1197,7 +1365,7 @@ pub fn encode_instruction(
 
 // ── Encoding helpers ──────────────────────────────────────────────────────
 
-pub(crate) fn get_reg(operands: &[Operand], idx: usize) -> Result<(u32, bool), String> {
+pub fn get_reg(operands: &[Operand], idx: usize) -> Result<(u32, bool), String> {
     match operands.get(idx) {
         Some(Operand::Reg(name)) => {
             let num = parse_reg_num(name).ok_or_else(|| format!("invalid register: {}", name))?;
@@ -1211,7 +1379,164 @@ pub(crate) fn get_reg(operands: &[Operand], idx: usize) -> Result<(u32, bool), S
     }
 }
 
-fn get_imm(operands: &[Operand], idx: usize) -> Result<i64, String> {
+/// Read a strictly-general-purpose register operand (`x0`-`x30`, `w0`-`w30`,
+/// `xzr`, `wzr`). SP/WSP and every FP/SIMD register spelling (`v`/`q`/`d`/
+/// `s`/`h`/`b`) are rejected instead of being silently aliased into the
+/// shared 0-31 number space: `parse_reg_num` maps `sp` to 31, where most
+/// instruction groups read XZR, so accepting it would emit a valid-looking
+/// but semantically wrong word. GNU as rejects these with "operand
+/// mismatch" / "operand n must be a general purpose register".
+///
+/// Register 31 is accepted ONLY in its dedicated spellings `xzr`/`wzr`:
+/// `x31`/`w31` are not ARMv8 register names (GNU as: "operand 0 must be a
+/// general purpose register"; llvm-mc silently rewrites them to zr, which is
+/// a leniency, not a contract). This also matches the assembler parser,
+/// which accepts x/w names only up to 30 — hand-built `Operand::Reg` values
+/// must not be held to a weaker standard than parsed ones.
+pub fn get_gpr_strict(operands: &[Operand], idx: usize) -> Result<(u32, bool), String> {
+    match operands.get(idx) {
+        Some(Operand::Reg(name)) => {
+            // Allocation-free on the accepting path: this reader sits on the
+            // hottest operand paths of the whole assembler (the old version
+            // lowercased the name twice per operand, which the Callgrind A/B
+            // attributed a measurable share of the +1.5% regression to).
+            // Error construction still allocates -- errors are cold.
+            if name.eq_ignore_ascii_case("sp") || name.eq_ignore_ascii_case("wsp") {
+                return Err(format!(
+                    "operand {idx}: sp/wsp is not valid for this instruction"
+                ));
+            }
+            // `is_gp_reg` accepts x0-x30/w0-w30 and the xzr/wzr/lr aliases
+            // with canonical decimal only, and structurally cannot accept
+            // an "x31"/"w31" spelling (its digit scan bounds the value at
+            // 30), so the old post-hoc x31 rejection is unnecessary here.
+            if !is_gp_reg(name) {
+                return Err(format!(
+                    "operand {idx}: `{name}` is not a general-purpose register"
+                ));
+            }
+            let num = parse_reg_num(name).ok_or_else(|| format!("invalid register: {name}"))?;
+            let is_64 = is_64bit_reg(name);
+            Ok((num, is_64))
+        }
+        other => Err(format!(
+            "expected register at operand {}, got {:?}",
+            idx, other
+        )),
+    }
+}
+
+/// Like [`get_gpr_strict`], but SP/WSP is also accepted (for the few
+/// instruction groups where the stack pointer is a legal destination,
+/// e.g. AND/ORR/EOR (immediate) Rd). FP/SIMD spellings are still rejected.
+pub fn get_gpr_or_sp(operands: &[Operand], idx: usize) -> Result<(u32, bool), String> {
+    match operands.get(idx) {
+        Some(Operand::Reg(name)) => {
+            let lower = name.to_lowercase();
+            if lower == "sp" || lower == "wsp" {
+                return Ok((31u32, lower == "sp"));
+            }
+        }
+        other => {
+            return Err(format!(
+                "expected register at operand {}, got {:?}",
+                idx, other
+            ));
+        }
+    }
+    get_gpr_strict(operands, idx)
+}
+
+/// Like [`get_gpr_strict`], but additionally requires the 64-bit `x`/`xzr`
+/// spelling — for instructions defined only in the X form (BR/BLR/RET,
+/// SMULH/UMULH, ...). The 32-bit `w` form of the same register number is an
+/// unallocated encoding that GNU as rejects.
+pub fn get_gpr_strict_x(operands: &[Operand], idx: usize) -> Result<u32, String> {
+    let (num, is_64) = get_gpr_strict(operands, idx)?;
+    if !is_64 {
+        return Err(format!(
+            "operand {idx}: this instruction requires a 64-bit x register"
+        ));
+    }
+    Ok(num)
+}
+
+/// Like [`get_gpr_strict`], but additionally requires the 32-bit `w`/`wzr`
+/// spelling — for operands defined only in the W form. The whole
+/// sign/zero-extend family spells its source `Wn` in every destination
+/// width (`SXTB Xd, Wn`, `SXTW Xd, Wn`, `UXTW Xd, Wn`, ...): the operation
+/// reads only the low 32 bits, so the X spelling produces the identical
+/// word, but GNU as rejects it ("operand mismatch") and the ARMv8 ARM
+/// documents no such form — lccc diagnoses instead of guessing the bank.
+pub fn get_gpr_strict_w(operands: &[Operand], idx: usize) -> Result<u32, String> {
+    let (num, is_64) = get_gpr_strict(operands, idx)?;
+    if is_64 {
+        return Err(format!(
+            "operand {idx}: this operand requires a 32-bit w register"
+        ));
+    }
+    Ok(num)
+}
+
+/// Assert that every already-read register operand of an instruction agrees
+/// with the destination's operand width (`sf` consistency). Mixed `x`/`w`
+/// operands assemble to a word whose sf bit matches only the destination —
+// a silent miscompile GNU as rejects with "operand mismatch".
+pub fn check_same_width(rd_is_64: bool, rest: &[bool]) -> Result<(), String> {
+    for (i, is_64) in rest.iter().enumerate() {
+        if *is_64 != rd_is_64 {
+            return Err(format!(
+                "operand {}: register width mismatch (mixed x/w operands)",
+                i + 1
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Read the optional shift operand of a logical (shifted register)
+/// instruction (`lsl/lsr/asr/ror #amount`) at `operands[idx]`.
+///
+/// Contract shared by AND/ORR/EOR/ANDS/BIC/ORN/EON/BICS:
+/// * `None` at `idx` means "no shift" (type LSL, amount 0);
+/// * a `Shift` operand must name one of the four shift kinds — unknown kinds
+///   are diagnosed, not silently read as `lsl`;
+/// * the amount must fit the imm6 field for the register width: 0..=31 for
+///   W (sf=0) and 0..=63 for X (sf=1). Out-of-range amounts are
+///   unallocated encodings, not truncatable values (GNU as: "shift amount
+///   out of range 0 to 31/63").
+///
+/// Callers still enforce the instruction's total arity (3 or 4 operands for
+/// the two-register-source logical forms).
+pub fn get_shift_imm6(operands: &[Operand], idx: usize, is_64: bool) -> Result<(u32, u32), String> {
+    let (kind, amount) = match operands.get(idx) {
+        None => return Ok((0, 0)),
+        Some(Operand::Shift { kind, amount }) => (kind.as_str(), *amount),
+        Some(other) => {
+            return Err(format!("operand {idx}: expected a shift, got {other:?}"));
+        }
+    };
+    let st = match kind {
+        "lsl" => 0b00u32,
+        "lsr" => 0b01,
+        "asr" => 0b10,
+        "ror" => 0b11,
+        _ => {
+            return Err(format!(
+                "operand {idx}: unknown shift kind `{kind}` (lsl/lsr/asr/ror)"
+            ));
+        }
+    };
+    let max = if is_64 { 63u32 } else { 31 };
+    if amount > max {
+        return Err(format!(
+            "operand {idx}: shift amount {amount} out of range 0..={max}"
+        ));
+    }
+    Ok((st, amount))
+}
+
+pub fn get_imm(operands: &[Operand], idx: usize) -> Result<i64, String> {
     match operands.get(idx) {
         Some(Operand::Imm(v)) => Ok(*v),
         other => Err(format!(
@@ -1221,7 +1546,7 @@ fn get_imm(operands: &[Operand], idx: usize) -> Result<i64, String> {
     }
 }
 
-fn get_symbol(operands: &[Operand], idx: usize) -> Result<(String, i64), String> {
+pub fn get_symbol(operands: &[Operand], idx: usize) -> Result<(String, i64), String> {
     match operands.get(idx) {
         Some(Operand::Symbol(s)) => Ok((s.clone(), 0)),
         Some(Operand::Label(s)) => Ok((s.clone(), 0)),
@@ -1240,7 +1565,7 @@ fn get_symbol(operands: &[Operand], idx: usize) -> Result<(String, i64), String>
     }
 }
 
-fn sf_bit(is_64: bool) -> u32 {
+pub fn sf_bit(is_64: bool) -> u32 {
     if is_64 { 1 } else { 0 }
 }
 
@@ -1287,7 +1612,10 @@ mod parse_reg_num_tests {
     fn rejects_malformed_register_spellings() {
         for name in [
             "x+5", "x+0", "w+31", "x007", "w007", "x00", "x05", "d007", "x", "w", "x32", "w32",
-            "x99", "x-1", "y5", "5", "", "x 5", "x5x", "x1_0",
+            "x99",
+            "x4294967297",
+            "v4294967296",
+            "x-1", "y5", "5", "", "x 5", "x5x", "x1_0",
         ] {
             assert_eq!(
                 parse_reg_num(name),
