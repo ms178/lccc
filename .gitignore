@@ -122,3 +122,6 @@ work/
 /docs/.edg-changes.lock
 /tests/corpus/clang-c/.index.lock
 /tests/corpus/.corpus-publish.lock
+
+# Property-based-test runtime artifacts (failing-case dumps).
+/pbt-out/
