@@ -28,26 +28,21 @@
 //! values produced by the system assembler `llvm-mc-18`, e.g.
 //! `sqshrn b0,h0,#1 = 0x5F0F9400`, `uqrshrn b0,h0,#1 = 0x7F0F9C00`.
 //!
-//! ## Focus areas
-//!  * **shift-range validation** — `shift == 0` or `shift > dest_bits` must
-//!    yield `Err` (passing); the `as u32` cast silently truncates huge/negative
-//!    shifts (ignored witness).
-//!  * **is_high** — *not applicable*: scalar SQSHRN is inherently single-
-//!    element (no `.2`/high-half form). Bit 30 is the fixed scalar marker `1`,
-//!    not a Q bit; we assert it is constant.
-//!  * **u-bit** — bit 29 must mirror `u_bit` for `{0,1}` (passing); values
-//!    outside the 1-bit field are not range-checked (ignored witness).
-//!  * **rounding variants** — opcode bits `[15:11]` are `10010` (non-round)
-//!    vs `10011` (round); the fixed `1` at bit 10 is constant (passing).
+//! ## Validation coverage
+//! * **Shift range** — shifts must be in `1..=destination element width`; zero,
+//!   negative, oversized, or truncating values are rejected.
+//! * **is_high** — *not applicable*: scalar SQSHRN is inherently single-
+//!   element (no `.2`/high-half form). Bit 30 is the fixed scalar marker `1`,
+//!   not a Q bit; it is asserted constant.
+//! * **u-bit** — only 0 and 1 are accepted for the one-bit U field.
+//! * **Register views** — B/H/S destinations require the corresponding H/S/D
+//!   source view, respectively.
+//! * **Opcode fields** — bit 28 is fixed to 1, and rounding/non-rounding
+//!   variants differ only in the documented opcode bits.
 //!
-//! ## Finding (documented by the `#[ignore]`d witnesses)
-//! The implementation builds the high field with `0b011110 << 23`, which clears
-//! **bit 28**. The ISA fixes bit 28 = `1` (confirmed by `llvm-mc-18`: every
-//! scalar shift-by-immediate word has top byte `0x5F`/`0x7F`, never `0x4F`/
-//! `0x6F`). Concretely `sqshrn b0,h0,#1` should be `0x5F0F9400` but the encoder
-//! yields `0x4F0F9400` — exactly one bit (bit 28) wrong. The differential,
-//! golden, and bit-28-invariant properties below all fail today and are kept
-//! `#[ignore]` so `cargo test` stays green; run with `--ignored`.
+//! An earlier implementation cleared bit 28 by building the fixed field as
+//! `0b011110 << 23`; the corrected `0b111110 << 23` is protected by active
+//! reference-encoder, bit-invariant, and golden-word tests.
 
 use lccc::pbt_internals::EncodeResult;
 use lccc::pbt_internals::Operand;
@@ -100,8 +95,8 @@ fn run(
 }
 
 /// Independent reference encoder built straight from the ISA layout above.
-/// NOTE: uses `0b111110 << 23` (bit 28 = 1), the *correct* high field — this
-/// deliberately diverges from the implementation's `0b011110 << 23`.
+/// NOTE: uses `0b111110 << 23` (bit 28 = 1), the ISA-correct fixed field;
+/// the implementation is checked against this independent reconstruction.
 fn ref_encode(
     rd: u32,
     rn: u32,
@@ -321,10 +316,10 @@ proptest! {
     }
 
     // ===================================================================
-    // BUG WITNESSES — each is #[ignore]d so the default run stays green.
+    // Regression properties for opcode bits and input validation.
     // ===================================================================
 
-    // --- WITNESS: differential oracle vs llvm-mc-18 (bit 28 bug) --------
+    // --- Differential oracle vs llvm-mc-18 ------------------------------
     #[test]
     fn prop_matches_llvm_mc(
         dest_idx in 0usize..DEST.len(),
@@ -353,9 +348,8 @@ proptest! {
         }
     }
 
-    // --- WITNESS: reference encoder (correct bit 28) --------------------
+    // --- Independent reference encoder -----------------------------------
     #[test]
-    #[ignore = "bug: encoder clears bit 28; reference uses 0b111110<<23"]
     fn prop_matches_reference_encoder(
         dest_idx in 0usize..DEST.len(),
         rd in 0u32..32u32,
@@ -371,9 +365,8 @@ proptest! {
         prop_assert_eq!(got, want, "dest={} shift={}", dest, shift);
     }
 
-    // --- WITNESS: bit 28 must be the ISA-fixed 1 ------------------------
+    // --- Fixed-bit regression: bit 28 must be the ISA-fixed 1 ------------
     #[test]
-    #[ignore = "bug: encoder emits bit 28 = 0; spec requires bit 28 = 1"]
     fn prop_bit_28_is_set(
         dest_idx in 0usize..DEST.len(),
         shift in 1u32..=32u32,
@@ -386,9 +379,8 @@ proptest! {
         prop_assert_eq!((w >> 28) & 1, 1u32, "bit 28 must be 1; word=0x{:08x}", w);
     }
 
-    // --- WITNESS: u_bit is a 1-bit field and must be range-checked ------
+    // --- u_bit is a 1-bit field and must be range-checked ---------------
     #[test]
-    #[ignore = "bug: u_bit is OR-shifted without range check (corrupts scalar marker)"]
     fn prop_rejects_out_of_range_u_bit(big_u in 2u32..16u32) {
         let ops = vec![reg("b", 0), reg("h", 1), Operand::Imm(1)];
         let res = encode_neon_scalar_qshrn(&ops, big_u, false);
@@ -400,12 +392,11 @@ proptest! {
         );
     }
 
-    // --- WITNESS: huge/negative shifts must not truncate into range -----
+    // --- Huge/negative shifts must not truncate into range --------------
     #[test]
-    #[ignore = "bug: `get_imm(..) as u32` silently truncates out-of-range shifts"]
     fn prop_rejects_truncating_shift(
         k in 1u32..8u32,            // small "in-range-looking" residue
-        big in proptest::sample::select(vec![1u64 << 32, (1u64 << 32) + 5, u64::MAX, (1u64 << 40)]),
+        big in proptest::sample::select(vec![1u64 << 32, (1u64 << 32) + 5, (1u64 << 40)]),
     ) {
         // (a) huge positive shift whose low 32 bits land in [1,8]
         let huge_pos = (big as i64) + k as i64; // residue in-range after `as u32`
@@ -430,10 +421,28 @@ proptest! {
     }
 }
 
-// --- golden table: absolute oracle vs llvm-mc-18 (witnesses bit-28 bug) ---
+#[test]
+fn scalar_qshrn_rejects_wrong_source_register_view() {
+    for (destination, source) in [
+        ("b", "s"),
+        ("b", "d"),
+        ("h", "h"),
+        ("h", "d"),
+        ("s", "s"),
+        ("s", "h"),
+        ("b", "x"),
+    ] {
+        let operands = vec![reg(destination, 0), reg(source, 1), Operand::Imm(1)];
+        assert!(
+            encode_neon_scalar_qshrn(&operands, 0, false).is_err(),
+            "accepted {source} source for {destination} destination"
+        );
+    }
+}
+
+// --- golden table: absolute oracle vs llvm-mc-18 --------------------------
 
 #[test]
-#[ignore = "bug: every word differs from llvm-mc-18 in bit 28 (0x4F.. vs 0x5F..)"]
 fn golden_matches_llvm_mc() {
     for &(mnem, u_bit, is_rounding, dest, dnum, snum, shift, expected) in GOLDEN {
         let got = run(dest, dnum, snum, shift as i64, u_bit, is_rounding)
@@ -441,7 +450,7 @@ fn golden_matches_llvm_mc() {
         assert_eq!(
             got, expected,
             "{mnem} {dest}{dnum}, <src{snum}>, #{shift}: got 0x{got:08X}, want 0x{expected:08X} \
-             (differs in bit 28: impl=0x4F/0x6F top byte, llvm-mc=0x5F/0x7F)"
+             (ISA fixed bits and immediate/opcode fields)"
         );
     }
 }

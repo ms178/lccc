@@ -3081,40 +3081,39 @@ pub fn encode_neon_scalar_qshrn(
             operands.len()
         ));
     }
+    if u_bit > 1 {
+        return Err(format!("scalar qshrn: u_bit must be 0 or 1, got {u_bit}"));
+    }
     let (rd, rd_name) = match &operands[0] {
-        Operand::Reg(r) => (parse_reg_num(r).ok_or("invalid reg")?, r.to_lowercase()),
-        _ => return Err("expected register".to_string()),
+        Operand::Reg(r) => (parse_reg_num(r).ok_or("invalid reg")?, r.to_ascii_lowercase()),
+        _ => return Err("expected destination register".to_string()),
     };
-    let rn = match &operands[1] {
-        Operand::Reg(r) => parse_reg_num(r).ok_or("invalid reg")?,
-        _ => return Err("expected register".to_string()),
+    let (rn, rn_name) = match &operands[1] {
+        Operand::Reg(r) => (parse_reg_num(r).ok_or("invalid reg")?, r.to_ascii_lowercase()),
+        _ => return Err("expected source register".to_string()),
     };
-    let shift = get_imm(operands, 2)? as u32;
-    // Determine element bits from destination register type
-    let element_bits = if rd_name.starts_with('b') {
-        8u32
-    }
-    // b <- h (narrow from 16-bit)
-    else if rd_name.starts_with('h') {
-        16
-    }
-    // h <- s (narrow from 32-bit), immh base = 16
-    else if rd_name.starts_with('s') {
-        32
-    }
-    // s <- d (narrow from 64-bit), immh base = 32
-    else {
-        return Err(format!("scalar qshrn: unsupported dest: {}", rd_name));
+    // Determine destination element width and the required wider source view.
+    let (element_bits, source_prefix) = match rd_name.chars().next() {
+        Some('b') => (8u32, 'h'),
+        Some('h') => (16, 's'),
+        Some('s') => (32, 'd'),
+        _ => return Err(format!("scalar qshrn: unsupported destination: {rd_name}")),
     };
-    if shift == 0 || shift > element_bits {
-        return Err(format!("scalar qshrn: shift {} out of range", shift));
+    if !rn_name.starts_with(source_prefix) {
+        return Err(format!(
+            "scalar qshrn: destination {rd_name} requires a {source_prefix} source register, got {rn_name}"
+        ));
     }
-    let immhb = (element_bits * 2) - shift; // source element bits - shift
+    let shift = get_imm(operands, 2)?;
+    if shift <= 0 || shift > i64::from(element_bits) {
+        return Err(format!("scalar qshrn: shift {shift} out of range"));
+    }
+    let immhb = (element_bits * 2) - shift as u32; // source element bits - shift
     let opcode_bits: u32 = if is_rounding { 0b100111 } else { 0b100101 };
-    // 01 U 11110 immh:immb opcode 1 Rn Rd
+    // 01 U 111110 immh:immb opcode 1 Rn Rd (bit 28 is fixed to 1).
     let word = (0b01 << 30)
         | (u_bit << 29)
-        | (0b011110 << 23)
+        | (0b111110 << 23)
         | ((immhb >> 3) << 19)
         | ((immhb & 7) << 16)
         | (opcode_bits << 10)
