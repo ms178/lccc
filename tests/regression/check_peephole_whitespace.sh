@@ -38,11 +38,118 @@ set -uo pipefail
 repo_root=$(CDPATH= cd -P -- "$(dirname -- "$(readlink -f -- "$0")")/../.." && pwd -P)
 cd "$repo_root"
 
+# --- argument parsing -------------------------------------------------------
+# `ONLY_PHASE` is the phase NUMBER, never the literal `--phase`: it used to be
+# `${1:-}`, so the documented `--phase 1` stored the flag itself, `want_phase`
+# matched nothing, every phase was skipped -- and the gate still printed PASS
+# for all four of them.  A selector that silently selects nothing is worse than
+# no selector, so malformed input is REJECTED rather than reinterpreted:
+#
+#   * `--phase=` is an error, not "run every phase" (an empty selector that
+#     widens scope is exactly the failure this gate exists to prevent);
+#   * a repeated selector is an error, not silently last-wins;
+#   * anything after the selector is an error, not silently ignored.
+#
+# Factored into a function so --selftest drives it with cases instead of trust,
+# and needs no compiler, no cargo and no corpus to do it.
+PHASE_USAGE="usage: $0 [--phase {1|2|3|4}]"
+
+parse_phase_args() { # parse_phase_args "$@" -> sets ONLY_PHASE; rc 0 ok, 2 usage
+    ONLY_PHASE=''
+    local seen=0 pending=0 arg
+    for arg in "$@"; do
+        case "$arg" in
+            --phase | --phase=*)
+                if [ "$seen" -ne 0 ]; then
+                    echo "$PHASE_USAGE (repeated --phase)" >&2
+                    return 2
+                fi
+                seen=1
+                if [ "$arg" = '--phase' ]; then
+                    pending=1
+                else
+                    ONLY_PHASE=${arg#--phase=}
+                    if [ -z "$ONLY_PHASE" ]; then
+                        echo "$PHASE_USAGE (empty --phase=)" >&2
+                        return 2
+                    fi
+                fi
+                ;;
+            *)
+                if [ "$pending" -eq 1 ]; then
+                    pending=0
+                    ONLY_PHASE=$arg
+                else
+                    echo "$PHASE_USAGE (unexpected argument '$arg')" >&2
+                    return 2
+                fi
+                ;;
+        esac
+    done
+    if [ "$pending" -eq 1 ]; then
+        echo "$PHASE_USAGE (--phase needs a value)" >&2
+        return 2
+    fi
+    case "$ONLY_PHASE" in
+        '' | 1 | 2 | 3 | 4) return 0 ;;
+        *) echo "$PHASE_USAGE (no phase '$ONLY_PHASE')" >&2; return 2 ;;
+    esac
+}
+
 # Compiler-free enumeration is the EXACT phase-3 selection, not a test-only
 # replica. It runs before toolchain discovery and before any cargo command.
 if [[ ${1:-} == --list ]]; then
     exec python3 scripts/corpus_selection.py "${2:-$repo_root/tests}" \
       --every "${CORPUS_EVERY:-15}"
+fi
+
+# Compiler-free proof that the argument parser does what the usage line claims.
+# This is the part of the gate that regressed once already -- it accepted
+# `--phase 1`, stored the flag, selected nothing and still printed PASS -- so it
+# gets a case table rather than a comment.  Runs before toolchain discovery: no
+# cargo, no compiler, no corpus.
+if [[ ${1:-} == --selftest ]]; then
+    st_fail=0
+    st_case() { # st_case <want_rc> <want_phase> [args...]
+        local want_rc=$1 want_phase=$2
+        shift 2
+        parse_phase_args "$@" >/dev/null 2>&1
+        local rc=$?
+        if [ "$rc" -ne "$want_rc" ] ||
+            { [ "$rc" -eq 0 ] && [ "$ONLY_PHASE" != "$want_phase" ]; }; then
+            printf 'FAIL  args=[%s] rc=%s want=%s phase=[%s] want=[%s]\n' \
+                "$*" "$rc" "$want_rc" "$ONLY_PHASE" "$want_phase"
+            st_fail=1
+        else
+            printf 'ok    args=[%s] -> rc=%s phase=[%s]\n' "$*" "$rc" "$ONLY_PHASE"
+        fi
+    }
+    echo "== parser self-test =="
+    st_case 0 ''                        # no selector: run every phase
+    st_case 0 '1' --phase 1
+    st_case 0 '2' --phase 2
+    st_case 0 '3' --phase 3
+    st_case 0 '4' --phase 4
+    st_case 0 '1' --phase=1
+    st_case 0 '4' --phase=4
+    st_case 2 '' --phase=               # empty selector must NOT widen to all
+    st_case 2 '' --phase                # missing value
+    st_case 2 '' --phase 5              # out of range
+    st_case 2 '' --phase 0
+    st_case 2 '' --phase x
+    st_case 2 '' --bogus
+    st_case 2 '' stray                  # bare positional
+    st_case 2 '' --phase 1 unexpected   # trailing argument
+    st_case 2 '' --phase 1 --phase 2    # repeated selector
+    st_case 2 '' --phase=1 --phase=2
+    st_case 2 '' --phase --phase
+    st_case 2 '' --phase=1 stray
+    if [ "$st_fail" -ne 0 ]; then
+        echo "check_peephole_whitespace: parser self-test FAILED" >&2
+        exit 1
+    fi
+    echo "check_peephole_whitespace: parser self-test PASS (19 cases)"
+    exit 0
 fi
 
 # Prefer the persisted rustup installation: the phases drive `cargo test`
@@ -62,19 +169,7 @@ CORPUS_EVERY=${CORPUS_EVERY:-15}
 # matched nothing, every phase was skipped -- and the gate still printed PASS
 # for all four of them.  A selector that silently selects nothing is worse than
 # no selector, so the argument is parsed and validated here instead.
-ONLY_PHASE=''
-case "${1:-}" in
-    '') ;;
-    --phase)
-        ONLY_PHASE=${2:-}
-        [[ -n "$ONLY_PHASE" ]] || { echo "usage: $0 [--phase {1|2|3|4}]" >&2; exit 2; } ;;
-    --phase=*) ONLY_PHASE=${1#--phase=} ;;
-    *) echo "usage: $0 [--phase {1|2|3|4}]" >&2; exit 2 ;;
-esac
-case "$ONLY_PHASE" in
-    '' | 1 | 2 | 3 | 4) ;;
-    *) echo "usage: $0 [--phase {1|2|3|4}]" >&2; exit 2 ;;
-esac
+parse_phase_args "$@" || exit $?
 
 fail=0
 declare -a RESULTS=()

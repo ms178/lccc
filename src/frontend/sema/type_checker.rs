@@ -636,7 +636,37 @@ impl<'a> ExprTypeChecker<'a> {
             TypeSpecifier::ComplexDouble => CType::ComplexDouble,
             TypeSpecifier::ComplexLongDouble => CType::ComplexLongDouble,
             TypeSpecifier::Pointer(inner, addr_space) => {
-                CType::Pointer(Box::new(self.resolve_type_spec(inner)), *addr_space)
+                // A pointer chain is a linear spine, so walking it is a loop,
+                // not a recursion: see the same transform in
+                // type_builder::resolve_type_spec_to_ctype. Three
+                // near-duplicate TypeSpecifier->CType resolvers exist (this
+                // one, const_eval::ctype_from_type_spec and type_builder's);
+                // each recursed once per `*` and each could be driven to stack
+                // overflow by a deeply-starred declarator. The recursive call
+                // below handles only the innermost NON-pointer node, so
+                // pointer depth costs no stack frames at any level.
+                if !matches!(**inner, TypeSpecifier::Pointer(_, _)) {
+                    // Single level -- the overwhelmingly common case. Zero
+                    // allocation, identical result.
+                    CType::Pointer(Box::new(self.resolve_type_spec(inner)), *addr_space)
+                } else {
+                    let mut spaces = Vec::with_capacity(8);
+                    spaces.push(*addr_space);
+                    let mut cur: &TypeSpecifier = inner;
+                    let mut ty = loop {
+                        match cur {
+                            TypeSpecifier::Pointer(i, s) => {
+                                spaces.push(*s);
+                                cur = i;
+                            }
+                            other => break self.resolve_type_spec(other),
+                        }
+                    };
+                    for space in spaces.iter().rev() {
+                        ty = CType::Pointer(Box::new(ty), *space);
+                    }
+                    ty
+                }
             }
             TypeSpecifier::Array(elem, size) => {
                 let elem_ct = self.resolve_type_spec(elem);
@@ -702,7 +732,11 @@ impl<'a> ExprTypeChecker<'a> {
                 reverse_sso,
             ) => {
                 if let Some(tag) = tag {
-                    CType::Struct(format!("struct.{}", tag).into())
+                    CType::Struct(
+                        self.types
+                            .resolve_record_key(&format!("struct.{}", tag))
+                            .into(),
+                    )
                 } else if let Some(fs) = fields {
                     // Without a tag name but with fields, register the anonymous
                     // struct layout so member access resolution works correctly
@@ -730,7 +764,11 @@ impl<'a> ExprTypeChecker<'a> {
                 reverse_sso,
             ) => {
                 if let Some(tag) = tag {
-                    CType::Union(format!("union.{}", tag).into())
+                    CType::Union(
+                        self.types
+                            .resolve_record_key(&format!("union.{}", tag))
+                            .into(),
+                    )
                 } else if let Some(fs) = fields {
                     // Same as struct: register anonymous union layout for member access
                     self.resolve_anon_struct_or_union(

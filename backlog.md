@@ -225,7 +225,75 @@ are not CI reds, which is why they are a list rather than a gate.
 
 ## P0 — largest measured gaps
 
-### TAG-ID-1 · **NEW 2026-10-02** — nested same-tag structs share one type identity (miscompile)
+### TAG-ID-1 · **FIXED 2026-10-03** — nested same-tag structs no longer alias; the miscompile is gone
+
+`f(s)` for the reproducer below is now a hard error matching GCC, and no
+binary is produced. Pinned by
+[`tests/regression/check_record_tag_identity.sh`](tests/regression/check_record_tag_identity.sh),
+a 50-row differential against a probed GCC oracle, wired into
+`ci_local.sh --fast` and hosted CI. Rows live in one table and the expected
+count is derived from its length, so a row that silently stops running is itself
+a failure -- the count had already drifted three times in prose (15, 16, 28)
+while the gate ran something else. The summary prints the oracle's `--version`,
+and the gate passes unchanged against both GCC 14.2 and GCC 16.2, which is the
+evidence that the choice of oracle does not move a verdict. Disabling
+`check_record_argument_compatibility` fails the gate, so it is not decorative.
+
+The oracle is probed, not assumed. Hosted CI proved why: ubuntu-24.04's stock
+gcc is 13.3.0, which does not know `-std=c23`, so five negative rows "agreed"
+with lccc by both rejecting — GCC rejecting the FLAG, lccc rejecting the
+PROGRAM — and the resulting red was misattributed to the compiler. The gate now
+selects the first of `gcc-16 gcc-15 gcc-14 gcc` that compiles a trivial TU at
+both `-std=c17` and `-std=c23`, fails with an explanation if there is none, runs
+a positive control per dialect before any row, and requires every negative row
+to be rejected *for the right reason* (`incompatible type` on both sides),
+printing both diagnostics when a row goes red.
+
+Three defects, not one:
+1. `resolve_struct_or_union` keyed records by tag alone, so an inner
+   `struct S { int c; }` and an outer `struct S { char c; }` were the same
+   `CType`. Now a shadowing definition with non-corresponding members gets
+   `struct.S#N`; corresponding members (N3037) keep the shared key so valid C23
+   still compiles.
+2. Every tag→`CType` site rebuilt the key from the raw source tag, so the
+   distinct key never reached the type checker. A scoped `record_alias` map in
+   `TypeContext` (unwound by `pop_scope`) now resolves them in
+   `sema/type_checker.rs` and `sema/const_eval.rs`, including the four
+   sizeof/alignof lookups, which are separate sites from the ones that build
+   `CType`s.
+3. `check_call_arguments` compared **only** arity and pointer/float mixing — it
+   never compared record types at all. `check_record_argument_compatibility`
+   now does, exempting anonymous records and `transparent_union` parameters,
+   and reports the 1-based argument index the way GCC does.
+   This third gap is why the first two fixes alone changed nothing, and it is
+   the one worth remembering: a type-identity fix is inert if no comparison
+   consumes the identity.
+
+The plumbing has to be complete, not merely present. Two follow-on defects were
+found by probing rather than by reading: the non-defining arm of
+`resolve_struct_or_union` (a tag-only spelling such as `struct S b;` or a
+parameter) returned the BASE key instead of the aliased one, which gave two
+spellings of one type different identities inside the same scope and rejected
+the valid assignment `struct S {int c;} a; struct S b; b = a;`; and
+`record_layouts_correspond` compared member types by key, so anonymous members
+— which get a fresh `__anon_struct_N` per conversion — never corresponded and a
+valid C23 program was rejected outright. Both are gated.
+
+Residual, asserted rather than hidden: definitions with **corresponding**
+members share one key, which is what C23 requires and is too permissive pre-C23,
+so `pos_n3037` and `pos_anon_member` under `-std=c17` are accepted by lccc and
+rejected by GCC. Two rows pin that exact shape. It cannot miscompile —
+corresponding members means identical layouts — and closing it needs `-std`
+threaded into sema (which has no notion of it today) plus a mode-gated N3037
+relation; making keys always distinct without that relation would reject valid
+C23.
+
+Original report, retained for the differential evidence. It is a `####`
+sub-heading rather than an entry so this file keeps exactly one `### TAG-ID-1`
+under P0 — two entries with the same id, one of them marked NEW, reads as an
+open item and breaks any tool that scans entries by heading.
+
+#### TAG-ID-1 · original report 2026-10-02 — nested same-tag structs shared one type identity (miscompile)
 
 A correctness defect, ranked above the codegen gaps below because it silently
 produces a wrong answer rather than a slow one. Reproducer and full evidence:
@@ -277,6 +345,145 @@ compatibility relation for C23 only; then each matrix row pinned as a
 Found by the EDG `src/Changes` distillation (E7): the top-scored C-relevant
 entry in `docs/edg_changes_c_extract.md` is "C23: New tag compatibility rules"
 (N3037, *C-score +10*), which is what made the differential worth running.
+
+### PTR-COMPAT-1 · **FIXED 2026-10-04** — call arguments never checked pointer compatibility
+
+`check_call_arguments` compared arity plus pointer/float mixing and nothing
+else. TAG-ID-1's fix closed the by-value record path; a *pointer* to one of the
+two distinct same-tag records walked straight through the `_ => return` arm, so
+the miscompile's nearest neighbour was still accepted:
+
+```c
+struct S { char c; };
+void f(struct S *p);
+void g(void) { struct S { int c; } s; f(&s); }   /* GCC: error; lccc: accepted */
+```
+
+C23 6.5.2.2p7 makes argument/parameter compatibility a constraint, and GCC 14
+onward rejects the pointer spelling by default, so this was not a warning
+difference. The gap was much wider than records: `int *` where `char *` was
+expected, `long (*)(void)` where `int (*)(void)` was expected, and `struct A *`
+where `struct B *` was expected were all silently accepted.
+
+`pointer_argument_compat` / `pointee_compat` now implement 6.3.2.3 plus
+6.7.6.1p2, recursing through pointer and array chains so `struct S **` is caught
+too. Every rule was pinned against GCC 16.2 rather than read off the standard,
+because the standard's "compatible" and GCC's default diagnostics differ:
+
+| case | GCC 16.2 | rule implemented |
+|---|---|---|
+| `int *` → `void *`, and back | accept | 6.3.2.3p2, **top level only** |
+| `void **` → `int **`, both directions | REJECT | the exemption does not recurse |
+| `int (*)[3]` vs `int (*)[4]` | REJECT | array size is part of the type |
+| `int (*)(void)` vs `long (*)(void)` | REJECT | signature compared |
+| `char *` → `signed char *` / `unsigned char *` / `int *` → `unsigned *` | accept | `-Wpointer-sign` is a warning |
+| `_Bool *` → `int *` | REJECT | not a sign pair |
+| `long *` → `long long *`, `float *` → `double *` | REJECT | different types |
+| `f(0)`, `f(NULL)` | accept | null constant: the check stays silent |
+
+`Unknown` is a first-class verdict meaning "these shapes are not modelled
+precisely enough to decide". This check is being introduced where nothing ran
+before, so firing on a shape it does not understand would reject valid code — a
+strictly worse failure than the one it closes. Measured: a 81-case differential
+against GCC 16.2 went from 11 divergences to 4, with **zero false rejections**,
+and the 887-case regression corpus is unchanged at 874 passed / 0 failed.
+
+Two things this found on the way, both fixed:
+
+* **`FunctionType` derived `PartialEq` over `params: Vec<(CType, Option<String>)>`,
+  so parameter NAMES were part of function-type compatibility.** C23 6.7.6.3p15
+  keeps names out of the type. Comparing with `==` rejected `call(dbl)` where
+  `dbl` is `int dbl(int x)` and the parameter is `int (*)(int)` — i.e. every
+  callback in C. `function_types_compatible` compares return type, arity and
+  parameter types only, and a unit test asserts the derived `PartialEq` still
+  differs so the distinction cannot be silently re-broken.
+* **Parameter types were converted twice, and only one converter was correct.**
+  `type_builder::convert_param_decls_to_ctypes` resolved just `p.type_spec`,
+  while `SemanticAnalyzer::param_decl_ctype` also handled `fptr_params`.
+  A prototype reaches the compiler through the former and a definition through
+  the latter, so the same signature was typed differently depending on whether
+  the body had been seen: `void f(int (*p)(int));` typed `p` as `int *` and
+  every call to `f` with a real function pointer was a hard error, while the
+  identical call to the *definition* was fine. The analyzer's own doc comment
+  already recorded this failure mode for the SQLite amalgamation; it had been
+  fixed on one side of the duplication and not the other. One implementation now
+  lives in `type_builder::param_decl_to_ctype` and both sides call it.
+
+### ANON-KEY-1 · **NEW 2026-10-04** — anonymous record keys are not canonical across construction paths
+
+An anonymous `struct { ... }` gets a fresh `__anon_struct_N` key per conversion,
+and source-level spellings are stable — verified on nine (typedef by value, by
+pointer, as a return type, as a member, in an array, as an array element, behind
+a pointer member, in `_Generic`, and a declarator pair). But a builtin's
+parameter type is built by a different path than the header typedef it matches,
+so `__m128i` can hold two different keys for one type.
+
+Consequence: both `check_record_argument_compatibility` and `pointee_compat`
+must exempt `__anon_` keys, which costs one missed diagnostic (an anonymous
+record passed where a named one was declared — GCC rejects, lccc accepts).
+
+Removing the exemption was tried and measured, which is why the cost is known:
+70 semantic errors in `include/emmintrin.h` alone and **19 corpus failures**, all
+of them SSE/AVX (`_mm_loadu_si128`, `_mm_storeu_si128`, `_mm_cmppd`). The
+exemption is load-bearing, not lazy. Canonicalising anonymous keys across
+construction paths would let both checks tighten and would close the missed
+diagnostic; until then any attempt must be measured against the SIMD corpus.
+
+### PARSER-ALIGN-1 · **NEW 2026-10-04** — `_Alignof` in `_Static_assert` ignores block scope
+
+```c
+struct S { char c; };
+int h(void) {
+    struct S { int c; } a; (void)a;
+    _Static_assert(_Alignof(struct S) == 4, "reads 1");   /* fails */
+    return 0;
+}
+```
+
+`_Static_assert` is evaluated by the **parser** (`parse_static_assert`), which
+resolves `_Alignof(struct S)` through its own `struct_tag_alignments` map. That
+map is keyed by bare tag and is never unwound at block scope — the parser has no
+block scoping at all, only a save/restore around nested functions — so inside a
+shadowing scope it still holds the outer record's alignment.
+
+Bounded precisely: `sizeof` is unaffected (it resolves in sema), and the same
+`_Alignof` is correct in an array bound and in an enum constant, which also go
+through sema. Only `_Static_assert` is wrong. Pinned by the
+`gap_alignof_static_assert` gate row as a stated divergence, so it cannot widen
+and a fix turns the row red. Fixing it means giving the parser block-scope
+tracking, which is a parser-core change well outside a type-identity fix.
+
+### CONST-QUAL-1 · **NEW 2026-10-04** — `CType` does not encode qualifiers
+
+`CType` has no `const`/`volatile` variant; the flags ride on `ParamDecl`
+(`is_const`, `is_volatile`, `is_restrict`) for parameter lists only. So
+`struct S { const int i; }` and `struct S { int i; }` have identical member
+types and correspond, where C23 6.7.3p10 says they do not and GCC rejects the
+call. Fixing it means threading qualifiers through the type enum, every
+comparison, IR and the ABI — a project, not a patch, and out of scope for a
+record-identity fix. Recorded because the differential found it, not guessed it.
+
+### INTPTR-1 · **NEW 2026-10-04** — no integer/pointer conversion diagnostic
+
+`int call(int (*p)(int)) { return p; }` is `-Wint-conversion`, an error by
+default since GCC 14; lccc accepts it. Same class as PTR-COMPAT-1 but on the
+return path rather than the argument path, and it needs the scalar-conversion
+half of 6.5.1.6 rather than the pointer half.
+
+### REDEF-1 · **NEW 2026-10-04** — redefining a record in one scope is not diagnosed
+
+```c
+struct S { char c; };
+int h(void) { struct S { int c; } a; struct S { int d; } b; ... }
+```
+
+GCC: `error: redefinition of struct or union 'struct S'`. lccc accepts it. This
+is also the shape that would exercise the alias-undo bookkeeping twice in one
+frame, so `set_record_alias_from_ref` now records at most one undo entry per
+base key per frame — without that, `pop_scope` removes the `added` entry and
+then replays the `shadowed` one, resurrecting an alias that belongs to a scope
+which no longer exists. The guard is in place even though the diagnostic is not;
+a unit test covers the double-set/pop round-trip.
 
 ### IVOPTS-1 · **NEW 2026-09-30** — index-form addressing is never strength-reduced
 

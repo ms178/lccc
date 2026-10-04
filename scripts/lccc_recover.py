@@ -97,6 +97,44 @@ def bundle_metadata(path):
     return r
 
 
+def neutralize_archive_attrs(member):
+    """Strip the archive-supplied ownership/permission an unfiltered extractall applies.
+
+    The member loop in extract() validates NAMES and TYPES.  It cannot cover
+    metadata, because on the 3.9+ floor `filter='data'` does not exist and a
+    bare extractall still calls chown/chmod with the archive's own values:
+    running as root, an archive can chown the extracted tree to any uid/gid,
+    and any mode can be planted on a file.  tarfile's `data` filter closes
+    both (Lib/tarfile.py `_get_filtered_attrs`, `for_data=True`), so this is
+    that filter's metadata half, implemented against the documented behaviour
+    rather than approximated:
+
+      * uid/gid/uname/gname -> None.  TarFile.chown maps None to -1, and
+        chown(path, -1, -1) leaves ownership untouched.
+      * mode &= 0o755, which clears setuid/setgid/sticky AND the group/other
+        write bits; for a regular file the executable bits are then dropped
+        unless the owner has one, and 0o600 is forced on; directories and
+        symlinks get None, and TarFile.chmod returns at once for None, so
+        their mode stays whatever the OS created under the umask.
+
+    Special files never reach this: the caller rejects every type but
+    regular/dir/symlink, which is where the filter raises SpecialFileError.
+    tests/corpus/test_recovery_contracts.py asserts this agrees with the real
+    tarfile.data_filter member-for-member on interpreters that have one, so
+    the equivalence is machine-checked rather than asserted in a comment.
+    """
+    member.uid=None;member.gid=None;member.uname=None;member.gname=None
+    mode=member.mode
+    if mode is None:return member
+    mode&=0o755
+    if member.isfile() or member.islnk():
+        if not mode&0o100:mode&=~0o111
+        mode|=0o600
+    elif member.isdir() or member.issym():mode=None
+    member.mode=mode
+    return member
+
+
 def extract(archive,stage,r):
     require(Path(archive).is_file() and not Path(archive).is_symlink() and sha(archive)==r['archive_sha256'],'source archive hash mismatch/missing')
     with tarfile.open(archive,'r:gz') as t:
@@ -125,11 +163,14 @@ def extract(archive,stage,r):
                 link=PurePosixPath(member.linkname)
                 require(not link.is_absolute() and '..' not in link.parts,'escaping archive link target')
             require(not member.mode & 0o7000,'setuid/setgid/sticky archive member')
-        # PEP 706 data filter where the interpreter provides it; the loop above
-        # is the version-independent guarantee this falls back on.
+        # PEP 706 data filter where the interpreter provides it; on the floor
+        # versions the filter is applied by hand instead -- the loop above
+        # covers names/types/links, this covers the metadata half, and together
+        # they are the same guarantee rather than a narrower one.
         if extractall_takes_filter():
             t.extractall(stage,filter='data')
         else:
+            for member in members:neutralize_archive_attrs(member)
             t.extractall(stage)
     repo=stage/'lccc';require(repo.is_dir(),'source root missing');return repo
 

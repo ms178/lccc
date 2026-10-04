@@ -188,6 +188,34 @@ class ArgumentVectorContract(unittest.TestCase):
             cg.main(['mock-mine','mock-ref','--out-root','/tmp/lccc-cg-contract'])
         self.assertEqual(caught.exception.code,2)
 
+    def test_own_options_is_derived_from_the_parser_not_a_restatement(self):
+        # `_OWN_OPTIONS` used to be a hand-written frozenset declared next to
+        # main -- a second source of truth.  Add an option to the parser, forget
+        # the set, and main rewrites that flag into `--opt=<flag>`, reporting a
+        # bogus value instead of the real problem.  Deriving it removes the
+        # duplicate; this pins that it really IS derived, by growing a parser
+        # and watching the derived set grow with it.
+        self.assertEqual(cg._OWN_OPTIONS,cg.long_options(cg.build_parser()))
+        grown=cg.build_parser()
+        grown.add_argument('--brand-new-flag',action='store_true')
+        self.assertIn('--brand-new-flag',cg.long_options(grown))
+        self.assertNotIn('--brand-new-flag',cg._OWN_OPTIONS)
+
+    def test_every_own_option_survives_the_option_string_rewrite(self):
+        # Behavioural counterpart to the derivation: for each long option the
+        # parser defines, `mine ref <opt>` must still be reported as the missing
+        # option string it is, rather than rewritten into `--opt=<opt>` and
+        # accepted.  A hand-maintained list that dropped one option would let
+        # that flag through silently, which is the failure derivation prevents.
+        for opt in sorted(cg._OWN_OPTIONS):
+            with self.subTest(option=opt):
+                want=0 if opt=='--help' else 2
+                with mock.patch.object(sys,'argv',['callgrind_ab.py']), \
+                        self.assertRaises(SystemExit) as caught:
+                    cg.main(['mock-mine','mock-ref',opt])
+                self.assertEqual(caught.exception.code,want,
+                    f'{opt} was swallowed into --opt= instead of being reported')
+
 
 class InterspersedCliRatchetTests(unittest.TestCase):
     """A `nargs='*'` positional parsed by plain `parse_args` is a latent red CI.
@@ -217,7 +245,78 @@ class InterspersedCliRatchetTests(unittest.TestCase):
         'scripts/tight_loop_oracle.py','scripts/x86_gcc_torture.py','tests/stress/reduce_ice.py',
     ))
 
+    @staticmethod
+    def _is_parser_ctor(node):
+        import ast
+        if not isinstance(node,ast.Call):return False
+        f=node.func
+        return ((isinstance(f,ast.Attribute) and f.attr=='ArgumentParser') or
+                (isinstance(f,ast.Name) and f.id=='ArgumentParser'))
+
+    def _base_key(self,node,parsers):
+        """Resolve what an attribute call is made on, to a stable per-parser key.
+
+        Walks down `a.b.c(...)` to the base expression: a Name that was bound to
+        an ArgumentParser, or an anonymous construction site.  Returns None for
+        anything else, so an unrelated `x.parse_args()` on a non-parser is not
+        mistaken for this parser's.
+        """
+        import ast
+        cur=node
+        while isinstance(cur,ast.Attribute):cur=cur.value
+        if isinstance(cur,ast.Name):return cur.id if cur.id in parsers else None
+        if isinstance(cur,ast.Call):
+            return f'anon@{id(cur)}' if self._is_parser_ctor(cur) else None
+        return None
+
+    def _tree_offends(self,tree):
+        """True when one parser in this tree has a star positional AND a plain parse."""
+        import ast
+        parsers=set()
+        facts={}
+        def note(key,what):
+            if key is not None:facts.setdefault(key,set()).add(what)
+        for node in ast.walk(tree):
+            if isinstance(node,ast.Assign) and self._is_parser_ctor(node.value):
+                for target in node.targets:
+                    if isinstance(target,ast.Name):parsers.add(target.id)
+            if self._is_parser_ctor(node):note(f'anon@{id(node)}','exists')
+        for node in ast.walk(tree):
+            if not (isinstance(node,ast.Call) and isinstance(node.func,ast.Attribute)):continue
+            key=self._base_key(node.func,parsers)
+            if key is None:continue
+            attr=node.func.attr
+            if attr=='add_argument':
+                for kw in node.keywords:
+                    if kw.arg!='nargs':continue
+                    if isinstance(kw.value,ast.Constant) and kw.value.value=='*':note(key,'star')
+                    if isinstance(kw.value,ast.Attribute) and kw.value.attr in ('REMAINDER','PARSER'):
+                        note(key,'incompatible')
+                if any(isinstance(a,ast.Constant) and isinstance(a.value,str)
+                       and a.value=='*subparsers*' for a in node.args):
+                    note(key,'incompatible')
+            elif attr=='add_subparsers':note(key,'incompatible')
+            elif attr in ('parse_args','parse_known_args'):note(key,'plain')
+            elif attr=='parse_intermixed_args':note(key,'intermixed')
+        return any({'star','plain'} <= what and not ({'incompatible','intermixed'} & what)
+                   for what in facts.values())
+
     def offenders(self):
+        """Files where ONE parser has both a nargs='*' positional and a plain parse.
+
+        The previous scan kept two file-level booleans -- "some add_argument
+        somewhere has nargs='*'" and "some call somewhere is named parse_args"
+        -- and reported the file when both were true.  That never associated
+        them: a file with a star positional on one parser and a plain
+        parse_args on an unrelated parser was flagged, and a parser reached
+        through an alias was missed.  This resolves the receiver of every call,
+        so both facts have to belong to the same object.
+
+        Deliberate limits: a parser passed between functions or rebound
+        (`p2 = p1`) is not tracked, and `parents=` inheritance is not resolved.
+        Both need real dataflow, and both under-report rather than over-report,
+        which the exactness test below surfaces as a KNOWN/found diff.
+        """
         import ast
         found=set()
         for path in sorted(REPO.rglob('*.py')):
@@ -225,20 +324,91 @@ class InterspersedCliRatchetTests(unittest.TestCase):
             if rel.startswith('tests/corpus/clang-c/') or '/clang-c/' in rel:continue
             try:tree=ast.parse(path.read_text(),rel)
             except SyntaxError:continue
-            star=False;plain=False;incompatible=False
-            for node in ast.walk(tree):
-                if not (isinstance(node,ast.Call) and isinstance(node.func,ast.Attribute)):continue
-                if node.func.attr=='add_argument':
-                    for kw in node.keywords:
-                        if kw.arg!='nargs':continue
-                        if isinstance(kw.value,ast.Constant) and kw.value.value=='*':star=True
-                        if isinstance(kw.value,ast.Attribute) and kw.value.attr in ('REMAINDER','PARSER'):incompatible=True
-                    if any(isinstance(a,ast.Constant) and isinstance(a.value,str) and a.value=='*subparsers*' for a in node.args):
-                        incompatible=True
-                if node.func.attr=='add_subparsers':incompatible=True
-                if node.func.attr in ('parse_args','parse_known_args'):plain=True
-            if star and plain and not incompatible:found.add(rel)
+            if self._tree_offends(tree):found.add(rel)
         return found
+
+    def test_scan_attributes_the_star_positional_to_its_own_parser(self):
+        """Precision, pinned with sources rather than claimed in a comment.
+
+        The file-level boolean version of this scan reported the first case as
+        an offender -- it saw a star positional and a parse_args in the same
+        file and stopped asking whose they were.
+        """
+        import ast
+        unrelated = (
+            "import argparse\n"
+            "a = argparse.ArgumentParser()\n"
+            "a.add_argument('bench', nargs='*')\n"
+            "a.parse_intermixed_args()\n"
+            "b = argparse.ArgumentParser()\n"
+            "b.add_argument('--flag')\n"
+            "b.parse_args()\n"
+        )
+        same_parser = (
+            "import argparse\n"
+            "a = argparse.ArgumentParser()\n"
+            "a.add_argument('bench', nargs='*')\n"
+            "a.parse_args()\n"
+        )
+        intermixed = (
+            "import argparse\n"
+            "a = argparse.ArgumentParser()\n"
+            "a.add_argument('bench', nargs='*')\n"
+            "a.parse_intermixed_args()\n"
+        )
+        subparsers = (
+            "import argparse\n"
+            "a = argparse.ArgumentParser()\n"
+            "a.add_argument('bench', nargs='*')\n"
+            "a.add_subparsers()\n"
+            "a.parse_args()\n"
+        )
+        remainder = (
+            "import argparse\n"
+            "a = argparse.ArgumentParser()\n"
+            "a.add_argument('rest', nargs=argparse.REMAINDER)\n"
+            "a.add_argument('bench', nargs='*')\n"
+            "a.parse_args()\n"
+        )
+        anonymous = (
+            "import argparse\n"
+            "argparse.ArgumentParser().add_argument('bench', nargs='*')\n"
+        )
+        # Distinguishing cases.  The two above are NOT: the old file-level scan
+        # suppressed on a global 'intermixed'/'incompatible' flag, so a file
+        # containing either read the same under both scans.  These two differ,
+        # one in each direction, and are what make this test able to fail.
+        star_parser_parsed_elsewhere = (
+            "import argparse\n"
+            "a = argparse.ArgumentParser()\n"
+            "a.add_argument('bench', nargs='*')\n"   # parsed by a caller, not here
+            "b = argparse.ArgumentParser()\n"
+            "b.add_argument('--flag')\n"
+            "b.parse_args()\n"
+        )
+        offender_beside_a_subparser_file = (
+            "import argparse\n"
+            "a = argparse.ArgumentParser()\n"
+            "a.add_argument('bench', nargs='*')\n"
+            "a.parse_args()\n"                        # real offender
+            "b = argparse.ArgumentParser()\n"
+            "b.add_subparsers()\n"                    # unrelated parser
+        )
+        cases = [('two unrelated parsers', unrelated, False),
+                 ('one parser, plain parse', same_parser, True),
+                 ('already interspersed', intermixed, False),
+                 ('subparsers make the remedy unsafe', subparsers, False),
+                 ('REMAINDER makes the remedy unsafe', remainder, False),
+                 ('anonymous construction is not attributed', anonymous, False),
+                 # false positive of the old scan: star and plain are real, but
+                 # on different parsers
+                 ('star positional parsed elsewhere', star_parser_parsed_elsewhere, False),
+                 # false negative of the old scan: an unrelated subparser file
+                 # globally suppressed a genuine offender
+                 ('offender beside an unrelated subparser', offender_beside_a_subparser_file, True)]
+        for label, source, expected in cases:
+            with self.subTest(case=label):
+                self.assertEqual(self._tree_offends(ast.parse(source)), expected)
 
     def test_no_new_star_positional_parsed_by_plain_parse_args(self):
         found=self.offenders()
@@ -248,13 +418,24 @@ class InterspersedCliRatchetTests(unittest.TestCase):
             'parse_intermixed_args so an optional before the positional cannot '
             'starve it on CPython 3.12.3 (the hosted runner): '+', '.join(new))
 
-    def test_known_ratchet_has_not_grown_and_records_progress(self):
+    def test_known_ratchet_is_exact_and_current(self):
+        """KNOWN must be a real, current inventory -- not a ceiling with slack.
+
+        The test this replaces ended in `if paid: self.assertTrue(paid)`, which
+        is true by construction: `paid` is only evaluated when non-empty, so no
+        input could ever fail it.  A ratchet that cannot fail is decoration.
+        These can: a stale path means a script was renamed or deleted and the
+        entry is claiming an offender that no longer exists, and a cured entry
+        means the debt was paid without the ratchet being shrunk.
+        """
         found=self.offenders()
-        self.assertLessEqual(len(found),len(self.KNOWN),
-            'the interspersed-CLI ratchet grew; fix the new offender rather than raising it')
-        paid=sorted(self.KNOWN-found)
-        if paid:  # informational: shrink KNOWN when an offender is fixed
-            self.assertTrue(paid)
+        stale=sorted(rel for rel in self.KNOWN if not (REPO/rel).is_file())
+        self.assertEqual(stale,[],
+            'ratchet entries are not files in the tree; drop them: '+', '.join(stale))
+        cured=sorted(self.KNOWN-found)
+        self.assertEqual(cured,[],
+            'these no longer parse a star positional with plain parse_args; '
+            'shrink KNOWN so the ratchet stays tight: '+', '.join(cured))
 
     def test_no_offender_uses_a_feature_parse_intermixed_args_refuses(self):
         # The remedy must stay applicable: REMAINDER/PARSER/subparsers would make

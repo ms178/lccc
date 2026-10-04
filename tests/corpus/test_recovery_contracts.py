@@ -142,14 +142,14 @@ class ExtractSafetyTests(unittest.TestCase):
         member=tarfile.TarInfo(name);member.type=tarfile.SYMTYPE;member.linkname=target;member.mode=0o775
         return member
 
-    def test_escaping_symlink_refused_with_the_data_filter(self):
+    def test_escaping_symlink_refused_by_the_member_rules(self):
         path,digest=self.archive([self.sym('lccc/evil','../../../../etc/passwd')])
         with tempfile.TemporaryDirectory() as stage:
             with self.assertRaises(ValueError) as caught:
                 recovery.extract(path,Path(stage),{'archive_sha256':digest})
         self.assertIn('escaping archive link target',str(caught.exception))
 
-    def test_escaping_symlink_refused_without_the_data_filter(self):
+    def test_escaping_symlink_refused_on_the_legacy_path(self):
         # A pre-3.12 interpreter: extractall accepts no `filter` keyword, so the
         # TypeError fallback runs -- the loop must still be what refuses it.
         path,digest=self.archive([self.sym('lccc/evil','../../../../etc/passwd')])
@@ -200,6 +200,119 @@ class ExtractSafetyTests(unittest.TestCase):
                 with self.assertRaises(TypeError) as caught:
                     recovery.extract(path,Path(stage),{'archive_sha256':digest})
         self.assertIn('unrelated internal failure',str(caught.exception))
+
+
+def _bytes(root,extra):
+    buf=io.BytesIO()
+    with tarfile.open(fileobj=buf,mode='w:gz') as t:
+        head=tarfile.TarInfo(root);head.type=tarfile.DIRTYPE;head.mode=0o775;t.addfile(head)
+        for member in extra:t.addfile(member)
+    return buf.getvalue()
+
+
+def _reg(name,mode=0o644,uid=0,gid=0,uname='root',gname='root'):
+    member=tarfile.TarInfo(name);member.type=tarfile.REGTYPE;member.size=0;member.mode=mode
+    member.uid,member.gid,member.uname,member.gname=uid,gid,uname,gname
+    return member
+
+
+def _snapshot(root):
+    out={}
+    for path in sorted(Path(root).rglob('*')):
+        st=path.lstat()
+        out[path.relative_to(root).as_posix()]=(
+            'dir' if os.path.isdir(path) and not os.path.islink(path) else 'file',
+            st.st_mode&0o7777,st.st_uid,st.st_gid)
+    return out
+
+
+class MetadataContractTests(unittest.TestCase):
+    """The pre-3.12 fallback must neutralize ownership and mode, not just names.
+
+    The member loop validates names, types and link targets.  It cannot cover
+    metadata: an unfiltered extractall chowns and chmods with the archive's own
+    values, and this helper restores LOCAL artifacts whose neighbouring
+    metadata is not a signature.  tarfile's data filter closes that gap on
+    3.12+/3.11.4+; neutralize_archive_attrs is its metadata half on the floor.
+    """
+
+    def setUp(self):
+        self._td=tempfile.TemporaryDirectory();self.addCleanup(self._td.cleanup)
+        self.root=Path(self._td.name)
+
+    def write(self,data):
+        path=self.root/'src.tar.gz';path.write_bytes(data)
+        return path,{'archive_sha256':hashlib.sha256(data).hexdigest()}
+
+    def test_supported_path_passes_filter_data(self):
+        # `filter` has to stay in the stub signature: extractall_takes_filter
+        # probes inspect.signature(tarfile.TarFile.extractall) at call time, so
+        # a `**kw` wrapper reads as unsupported and flips the helper to the
+        # legacy branch.  Measured -- a `**kw` spy made this observe ABSENT.
+        seen={}
+        real=tarfile.TarFile.extractall
+        def spy(self,path='.',members=None,*,filter=None,**kw):
+            seen['filter']=filter if filter is not None else 'ABSENT'
+            return real(self,path,members=members,filter=filter)
+        archive,record=self.write(_bytes('lccc',[_reg('lccc/ok.txt')]))
+        with tempfile.TemporaryDirectory() as stage:
+            with mock.patch.object(tarfile.TarFile,'extractall',spy):
+                recovery.extract(archive,Path(stage),record)
+        self.assertEqual(seen.get('filter'),'data')
+
+    def test_legacy_path_neutralizes_ownership_and_mode(self):
+        real=tarfile.TarFile.extractall
+        seen={}
+        def spy(self,path='.',members=None,*,filter=None,**kw):
+            seen['members']=[(m.mode,m.uid,m.gid,m.uname,m.gname)
+                             for m in (members if members is not None else self.getmembers())]
+            return real(self,path,members=members,filter='fully_trusted')
+        archive,record=self.write(_bytes('lccc',[
+            _reg('lccc/x',mode=0o777,uid=1234,gid=4321,uname='mallory',gname='mallory')]))
+        with tempfile.TemporaryDirectory() as stage:
+            with mock.patch.object(recovery,'extractall_takes_filter',lambda: False), \
+                    mock.patch.object(tarfile.TarFile,'extractall',spy):
+                recovery.extract(archive,Path(stage),record)
+        self.assertTrue(seen['members'],'the guard never reached extractall')
+        for mode,uid,gid,uname,gname in seen['members']:
+            self.assertIsNone(uid);self.assertIsNone(gid)
+            self.assertIsNone(uname);self.assertIsNone(gname)
+            self.assertTrue(mode is None or not mode&0o022,
+                            f'group/other write survived: {mode!r}')
+
+    def test_legacy_path_matches_the_data_filter_attribute_for_attribute(self):
+        # Expectation derived from the real filter rather than a hand-written
+        # table, so it tracks CPython instead of drifting from it.
+        sub=tarfile.TarInfo('lccc/sub');sub.type=tarfile.DIRTYPE;sub.mode=0o707
+        entries=[sub,_reg('lccc/a',mode=0o777),_reg('lccc/b',mode=0o600),_reg('lccc/c',mode=0o000)]
+        real=tarfile.TarFile.extractall
+        def legacy(self,path='.',members=None,**kw):
+            kw.pop('filter',None)
+            return real(self,path,members=members,filter='fully_trusted')
+        with tempfile.TemporaryDirectory() as filtered,tempfile.TemporaryDirectory() as legacy_dir:
+            archive,record=self.write(_bytes('lccc',entries))
+            recovery.extract(archive,Path(filtered),record)
+            with mock.patch.object(recovery,'extractall_takes_filter',lambda: False), \
+                    mock.patch.object(tarfile.TarFile,'extractall',legacy):
+                recovery.extract(archive,Path(legacy_dir),record)
+            self.assertEqual(_snapshot(Path(filtered)/'lccc'),_snapshot(Path(legacy_dir)/'lccc'))
+
+    def test_neutralizer_matches_tarfile_data_filter_over_the_mode_matrix(self):
+        if not hasattr(tarfile,'data_filter'):
+            self.skipTest('tarfile.data_filter unavailable on this interpreter')
+        import copy
+        kinds=((tarfile.REGTYPE,'reg'),(tarfile.DIRTYPE,'dir'),(tarfile.SYMTYPE,'sym'))
+        for mode in (0o777,0o755,0o644,0o600,0o400,0o000,0o4755,0o2755,0o1777,0o707):
+            for kind,label in kinds:
+                with self.subTest(mode=oct(mode),type=label):
+                    base=tarfile.TarInfo('lccc/x');base.type=kind;base.mode=mode
+                    base.uid,base.gid=1234,4321;base.uname,base.gname='mallory','mallory'
+                    if kind==tarfile.SYMTYPE:base.linkname='target'
+                    ref=tarfile.data_filter(copy.deepcopy(base),'/tmp/dest')
+                    got=recovery.neutralize_archive_attrs(copy.deepcopy(base))
+                    self.assertEqual(
+                        (got.mode,got.uid,got.gid,got.uname,got.gname),
+                        (ref.mode,ref.uid,ref.gid,ref.uname,ref.gname))
 
 
 if __name__=='__main__':unittest.main()

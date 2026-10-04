@@ -69,6 +69,17 @@ class Case:
         self.expect_stdout = expect_stdout  # None -> compare against oracles
         self.expect_exit = expect_exit
         self.compile_flags = compile_flags or ["-O1"]
+        # A PIE link needs position-independent input, but whether the compiler
+        # produces that by default depends on how it was configured
+        # (--enable-default-pie).  A fixture that omits the flag therefore
+        # passes on a distro gcc and fails on a from-source one -- with *every*
+        # linker rejecting the object, not just ours.  Pin the code model
+        # rather than inheriting the toolchain default, unless the case chose
+        # one deliberately (several pin -fno-pic on purpose, and those must
+        # keep failing loudly if the link is a PIE).
+        if compile_flags is None and any(
+                f in ("-pie", "--pie") for f in self.ldflags):
+            self.compile_flags = ["-O1", "-fPIE"]
         self.setup = setup                  # callable(tmpdir) for archives etc.
         self.oracle_only_flags = oracle_only_flags or []
         self.lccc_only_flags = lccc_only_flags or []

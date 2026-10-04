@@ -53,7 +53,7 @@ C
 gcc -fPIC -O1 -c "$tmp/tls.c" -o "$tmp/tls.o"
 gcc -fPIC -O1 -c "$tmp/tls3.c" -o "$tmp/tls3.o"
 as "$tmp/ie.s" -o "$tmp/ie.o"
-gcc -c "$tmp/main.c" -o "$tmp/main.o"
+gcc -fPIE -c "$tmp/main.c" -o "$tmp/main.o"
 gcc -fPIC -O1 -c "$tmp/hid.c" -o "$tmp/hid.o"
 grep -q "R_X86_64_TLSGD.*tv2" <(readelf -rW "$tmp/tls.o") || { echo "fixture lost its TLSGD"; exit 1; }
 grep -q "R_X86_64_GOTTPOFF.*tv3" <(readelf -rW "$tmp/ie.o") || { echo "fixture lost its GOTTPOFF"; exit 1; }
@@ -76,7 +76,7 @@ cat >"$tmp/mainh.c" <<'C'
 extern int geth(void);
 int main(void){ printf("%d\n", geth()); return 0; }
 C
-gcc -c "$tmp/mainh.c" -o "$tmp/mainh.o"
+gcc -fPIE -c "$tmp/mainh.c" -o "$tmp/mainh.o"
 gcc -B "$tmp/shim" "$tmp/hid.o" "$tmp/mainh.o" -o "$tmp/a-hid" -pie -rdynamic
 [ "$(tpoff_have "$tmp/a-hid" tvh)" = "0" ] || { echo "hidden: tvh unexpectedly dynamic"; exit 1; }
 [ "$("$tmp/a-hid")" = "44" ] || { echo "hidden: wrong output"; exit 1; }

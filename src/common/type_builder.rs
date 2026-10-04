@@ -92,10 +92,43 @@ pub trait TypeConvertContext {
             TypeSpecifier::ComplexLongDouble => CType::ComplexLongDouble,
 
             // === Compound types (shared logic) ===
-            TypeSpecifier::Pointer(inner, addr_space) => CType::Pointer(
-                Box::new(self.resolve_type_spec_to_ctype(inner)),
-                *addr_space,
-            ),
+            TypeSpecifier::Pointer(inner, addr_space) => {
+                // A pointer chain is a LINEAR SPINE -- `int ****p` is
+                // Pointer(Pointer(Pointer(Pointer(Int)))) -- so walking it is a
+                // loop, not a recursion. This arm used to recurse one frame per
+                // `*`, on a path with no frame budget at all: the parser's
+                // PARSER_FRAME_BUDGET machinery covers expressions, blocks,
+                // initializers and record definitions, but not this. Measured
+                // under gdb, ~400k stars abort with rc=134 inside this very arm
+                // ("has overflowed its stack") on a file GCC 16.2 accepts, and
+                // the declaration alone is enough to trigger it -- no call site
+                // involved. Collecting the address spaces on the way down and
+                // wrapping on the way up moves the cost from the thread stack to
+                // the heap, so the legal depth is bounded by memory instead of
+                // by a fixed stack size.
+                //
+                // The single-level fast path keeps the common case identical to
+                // the old code: no scratch allocation, one call, one Box. Only
+                // a genuinely multi-level pointer pays for the Vec, and even
+                // then it trades N call frames for N pushes, which is cheaper.
+                if !matches!(&**inner, TypeSpecifier::Pointer(..)) {
+                    return CType::Pointer(
+                        Box::new(self.resolve_type_spec_to_ctype(inner)),
+                        *addr_space,
+                    );
+                }
+                let mut spaces: Vec<AddressSpace> = vec![*addr_space];
+                let mut node: &TypeSpecifier = inner;
+                while let TypeSpecifier::Pointer(next, space) = node {
+                    spaces.push(*space);
+                    node = next.as_ref();
+                }
+                let mut ty = self.resolve_type_spec_to_ctype(node);
+                for space in spaces.into_iter().rev() {
+                    ty = CType::Pointer(Box::new(ty), space);
+                }
+                ty
+            }
             TypeSpecifier::Array(elem, size_expr) => {
                 let elem_ctype = self.resolve_type_spec_to_ctype(elem);
                 let size = size_expr
@@ -220,16 +253,67 @@ fn find_function_pointer_core(derived: &[DerivedDeclarator]) -> Option<usize> {
 /// Convert a ParamDecl list to a list of (CType, Option<name>) pairs.
 ///
 /// Uses the provided `TypeConvertContext` to resolve each parameter's type.
+/// Convert one parameter declaration to the CType it denotes.
+///
+/// This is the single implementation, and it exists because there used to be
+/// two. This one resolved only `p.type_spec`; `SemanticAnalyzer::param_decl_ctype`
+/// resolved the function-pointer fields as well. A parameter list reaches the
+/// compiler by two routes -- a prototype goes through `build_full_ctype_with_base`
+/// (here) and a definition through the analyzer -- so the same signature was
+/// typed differently depending on whether the body had been seen yet:
+///
+///     void f(int (*p)(int));              // prototype: p is `int *`
+///     void f(int (*p)(int)) { ... }       // definition: p is `int (*)(int)`
+///
+/// and `void g(void) { int (*q)(int); f(q); }` was a hard type error against the
+/// prototype while the identical call to the definition was fine. The analyzer's
+/// doc comment already recorded this failure mode for the SQLite amalgamation
+/// (`int (*xStress)(void*, PgHdr*)` typed as `int *`); it was fixed on one side
+/// of the duplication and not the other. Both sides now call this.
+pub fn param_decl_to_ctype(ctx: &dyn TypeConvertContext, param: &ParamDecl) -> CType {
+    if let Some(ref fptr_params) = param.fptr_params {
+        // `float (*func)(float, float)`: the specifier is the pointee function's
+        // return type, and the parenthesised declarator's own parameter list
+        // rides on `fptr_params`.
+        let return_ctype = ctx.resolve_type_spec_to_ctype(&param.type_spec);
+        let actual_return = match return_ctype {
+            CType::Pointer(inner, _) => *inner,
+            other => other,
+        };
+        let param_types: Vec<(CType, Option<String>)> = fptr_params
+            .iter()
+            .map(|p| (param_decl_to_ctype(ctx, p), p.name.clone()))
+            .collect();
+        let func_type = CType::Function(Box::new(FunctionType {
+            return_type: actual_return,
+            params: param_types,
+            variadic: param.fptr_variadic,
+        }));
+        let mut result = CType::Pointer(Box::new(func_type), AddressSpace::Default);
+        // `(**fpp)(int)` is a pointer to a function pointer; CType would
+        // otherwise erase the distinction from `void *(*fp)(size_t)`.
+        for _ in 1..param.fptr_inner_ptr_depth.max(1) {
+            result = CType::Pointer(Box::new(result), AddressSpace::Default);
+        }
+        return result;
+    }
+    // C23 6.7.6.3p8: a parameter declared as an array is adjusted to a pointer
+    // to its first element, and one declared as a function to a pointer to that
+    // function. Both adjustments belong to the parameter, not to the caller.
+    match ctx.resolve_type_spec_to_ctype(&param.type_spec) {
+        CType::Array(elem, _) => CType::Pointer(elem, AddressSpace::Default),
+        CType::Function(ft) => CType::Pointer(Box::new(CType::Function(ft)), AddressSpace::Default),
+        other => other,
+    }
+}
+
 fn convert_param_decls_to_ctypes(
     ctx: &dyn TypeConvertContext,
     params: &[ParamDecl],
 ) -> Vec<(CType, Option<String>)> {
     params
         .iter()
-        .map(|p| {
-            let ty = ctx.resolve_type_spec_to_ctype(&p.type_spec);
-            (ty, p.name.clone())
-        })
+        .map(|p| (param_decl_to_ctype(ctx, p), p.name.clone()))
         .collect()
 }
 

@@ -21,7 +21,7 @@ use crate::common::error::DiagnosticEngine;
 use crate::common::source::Span;
 use crate::common::symbol_table::{Symbol, SymbolTable};
 use crate::common::type_builder;
-use crate::common::types::{AddressSpace, CType, FunctionType, StructLayout};
+use crate::common::types::{AddressSpace, CType, FunctionType, RcLayout, StructLayout};
 use crate::frontend::parser::ast::{
     BinOp, BlockItem, CompoundStmt, Declaration, DerivedDeclarator, Designator, EnumVariant, Expr,
     ExprId, ExternalDecl, ForInit, FunctionDef, Initializer, SizeofArg, Stmt, StructFieldDecl,
@@ -31,6 +31,7 @@ use crate::frontend::sema::builtins;
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use std::cell::RefCell;
+use std::rc::Rc;
 
 /// Outcome of a case segment in a switch statement for -Wreturn-type analysis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2053,11 +2054,133 @@ impl SemanticAnalyzer {
             functions: &self.result.functions,
             expr_types: Some(&self.result.expr_types),
         };
-        for (arg, (param_ty, _)) in args.iter().zip(params) {
+        for (index, (arg, (param_ty, _))) in args.iter().zip(params).enumerate() {
             if let Some(arg_ty) = checker.infer_expr_ctype(arg) {
                 self.check_pointer_float_conversion(&arg_ty, param_ty, arg.span());
+                self.check_record_argument_compatibility(
+                    &arg_ty,
+                    param_ty,
+                    name,
+                    index + 1,
+                    arg.span(),
+                );
+                self.check_pointer_argument_compatibility(
+                    &arg_ty,
+                    param_ty,
+                    name,
+                    index + 1,
+                    arg.span(),
+                );
             }
         }
+    }
+
+    /// A by-value record argument must have a compatible record type.
+    ///
+    /// C 6.5.2.2p1 makes passing an incompatible struct or union a constraint
+    /// violation, but this call path only ever checked arity and pointer/float
+    /// mixing -- so a `struct S { int c; }` value passed where
+    /// `struct S { char c; }` was expected compiled silently and truncated at
+    /// runtime (`f(s)` returned 44 for `s.c == 300`, in
+    /// tests/bugs/nested_tag_struct_identity.c) while GCC 16.2 rejects it.
+    ///
+    /// Anonymous records are exempt exactly as in `check_assignment_
+    /// compatibility`, and so is a `transparent_union` parameter, which accepts
+    /// its members by ABI design.
+    /// Report an incompatible pointer argument. Kept as its own diagnostic
+    /// rather than folded into the record one so a reader -- and the gate's
+    /// reason checks -- can tell "wrong record" from "wrong pointee" apart.
+    fn check_pointer_argument_compatibility(
+        &self,
+        from: &CType,
+        to: &CType,
+        name: &str,
+        index: usize,
+        span: Span,
+    ) {
+        if pointer_argument_compat(from, to) != PtrCompat::Incompatible {
+            return;
+        }
+        let (from_text, to_text) = (from.to_string(), to.to_string());
+        // Pointers to two distinct same-tag records print identically, exactly
+        // as the records themselves do, so say what actually distinguishes them.
+        let message = if from_text == to_text {
+            format!(
+                "incompatible pointer type for argument {} to '{}': '{}' here points at a different type from the '{}' of the parameter, despite the shared spelling",
+                index, name, from_text, to_text
+            )
+        } else {
+            format!(
+                "incompatible pointer type for argument {} to '{}': have '{}' but expected '{}'",
+                index, name, from_text, to_text
+            )
+        };
+        self.diagnostics.borrow_mut().error(message, span);
+    }
+
+    fn check_record_argument_compatibility(
+        &self,
+        from: &CType,
+        to: &CType,
+        name: &str,
+        // 1-based argument position, so the diagnostic can say which argument
+        // is wrong the way GCC does ("argument 2 of 'f'") instead of leaving
+        // the reader to count them off the call.
+        index: usize,
+        span: Span,
+    ) {
+        let (a, b) = match (from, to) {
+            (CType::Struct(a), CType::Struct(b)) | (CType::Union(a), CType::Union(b)) => (a, b),
+            _ => return,
+        };
+        if a == b || a.starts_with("__anon_") || b.starts_with("__anon_") {
+            // Anonymous records are exempt from this comparison, and the
+            // exemption is load-bearing rather than lazy. lccc does NOT
+            // guarantee one key per anonymous record type: source-level
+            // spellings are stable (verified on nine: typedef by value, by
+            // pointer, as a return type, as a member, in an array, as an array
+            // element, behind a pointer member, in `_Generic`, and a declarator
+            // pair), but a builtin's parameter type is constructed by a
+            // different path than the header typedef it matches, and the two
+            // get distinct `__anon_struct_N` keys for what is one type.
+            //
+            // Removing this exemption was tried and measured: it produced 70
+            // semantic errors in `include/emmintrin.h` alone and failed 35 of
+            // the regression corpus, all of them SIMD. Tightening it is only
+            // safe once anonymous record keys are canonicalised across
+            // construction paths -- tracked as ANON-KEY-1 in backlog.md. The
+            // cost of leaving it is one accepted program GCC rejects (an
+            // anonymous record passed where a named one was declared), which
+            // is a missed diagnostic; the cost of removing it is rejecting
+            // every SSE intrinsic, which is a broken compiler.
+            return;
+        }
+        if matches!(to, CType::Union(_))
+            && self
+                .result
+                .type_context
+                .borrow_struct_layouts()
+                .get(&**b)
+                .is_some_and(|layout| layout.is_transparent_union)
+        {
+            return;
+        }
+        // Two records with the same tag but different definitions print
+        // identically, so say what actually distinguishes them rather than
+        // emitting "have 'struct S' but expected 'struct S'".
+        let (from_text, to_text) = (from.to_string(), to.to_string());
+        let message = if from_text == to_text {
+            format!(
+                "incompatible type for argument {} to '{}': '{}' here is a different type from the '{}' of the parameter, despite the shared tag",
+                index, name, from_text, to_text
+            )
+        } else {
+            format!(
+                "incompatible type for argument {} to '{}': have '{}' but expected '{}'",
+                index, name, from_text, to_text
+            )
+        };
+        self.diagnostics.borrow_mut().error(message, span);
     }
 
     fn check_assignment_compatibility(
@@ -2219,6 +2342,11 @@ impl SemanticAnalyzer {
             TypeSpecifier::Struct(Some(tag), None, ..) => {
                 // Reference to a named struct with no inline body.
                 // Check if it was previously defined (key format: "struct.tag").
+                // Deliberately the BASE key, not resolve_record_key: this asks
+                // whether the tag has been defined at all, and the definition
+                // path records a variant under both its own key and the base
+                // key, so the base is exactly the right question here. The size
+                // itself comes from const_eval's sizeof, which does resolve.
                 let key = format!("struct.{}", tag);
                 if !self.defined_structs.borrow().contains(key.as_str()) {
                     self.diagnostics.borrow_mut().error(
@@ -2228,6 +2356,7 @@ impl SemanticAnalyzer {
                 }
             }
             TypeSpecifier::Union(Some(tag), None, ..) => {
+                // Base key on purpose; see the struct arm above.
                 let key = format!("union.{}", tag);
                 if !self.defined_structs.borrow().contains(key.as_str()) {
                     self.diagnostics
@@ -2255,36 +2384,10 @@ impl SemanticAnalyzer {
     /// `int (*xStress)(void*, PgHdr*)` as `int *` and rejected
     /// `p->xStress = xStress` in the SQLite amalgamation.
     fn param_decl_ctype(&self, param: &crate::frontend::parser::ast::ParamDecl) -> CType {
-        if let Some(ref fptr_params) = param.fptr_params {
-            let return_ctype = self.type_spec_to_ctype(&param.type_spec);
-            let actual_return = if let CType::Pointer(inner, _) = return_ctype {
-                *inner
-            } else {
-                return_ctype
-            };
-            let param_types: Vec<(CType, Option<String>)> = fptr_params
-                .iter()
-                .map(|p| (self.param_decl_ctype(p), p.name.clone()))
-                .collect();
-            let func_type = CType::Function(Box::new(FunctionType {
-                return_type: actual_return,
-                params: param_types,
-                variadic: param.fptr_variadic,
-            }));
-            let mut result = CType::Pointer(Box::new(func_type), AddressSpace::Default);
-            for _ in 1..param.fptr_inner_ptr_depth.max(1) {
-                result = CType::Pointer(Box::new(result), AddressSpace::Default);
-            }
-            return result;
-        }
-        let ctype = self.type_spec_to_ctype(&param.type_spec);
-        match ctype {
-            CType::Array(elem, _) => CType::Pointer(elem, AddressSpace::Default),
-            CType::Function(ft) => {
-                CType::Pointer(Box::new(CType::Function(ft)), AddressSpace::Default)
-            }
-            other => other,
-        }
+        // One implementation, in `type_builder`, shared with the prototype path
+        // so a signature cannot depend on whether the body has been seen. See
+        // `param_decl_to_ctype` for why the duplication was a live defect.
+        type_builder::param_decl_to_ctype(self, param)
     }
 
     /// Convert an AST TypeSpecifier to a CType.
@@ -2457,6 +2560,63 @@ impl SemanticAnalyzer {
     }
 }
 
+/// Member-type comparison that sees through anonymous record keys.
+///
+/// Every conversion of an anonymous `struct { ... }` mints a fresh
+/// `__anon_struct_N` key, so two textually identical definitions carry
+/// different keys and plain equality says "not corresponding" for a pair C23
+/// 6.2.7 explicitly makes compatible -- which turned a valid C23 program into a
+/// hard error.  Anonymous members are therefore compared by recursing into
+/// their layouts; named records keep key equality, because for them the key IS
+/// the identity this whole mechanism exists to establish.
+///
+/// Recursion terminates: an anonymous record has no tag, so it cannot appear
+/// inside its own definition, and depth is bounded by the source nesting.
+fn member_types_correspond(x: &CType, y: &CType, layouts: &FxHashMap<String, RcLayout>) -> bool {
+    if x == y {
+        return true;
+    }
+    let (kx, ky) = match (x, y) {
+        (CType::Struct(a), CType::Struct(b)) => (a, b),
+        (CType::Union(a), CType::Union(b)) => (a, b),
+        _ => return false,
+    };
+    let is_anon = |k: &Rc<str>| k.starts_with("__anon_struct_");
+    if !is_anon(kx) || !is_anon(ky) {
+        return false;
+    }
+    match (layouts.get(&**kx), layouts.get(&**ky)) {
+        (Some(lx), Some(ly)) => record_layouts_correspond(lx, ly, layouts),
+        _ => false,
+    }
+}
+
+/// Whether two record layouts have *corresponding* members: the N3037
+/// (C23 6.2.9) relation, reduced to what a computed layout can express.
+///
+/// Same record kind, same member count, and per member the same name, offset,
+/// type, and bit-field width and bit offset. Size and alignment follow from
+/// those, but are compared too so that any unexplained difference also counts
+/// as non-corresponding -- erring toward two distinct types, which is the safe
+/// direction.
+fn record_layouts_correspond(
+    a: &StructLayout,
+    b: &StructLayout,
+    layouts: &FxHashMap<String, RcLayout>,
+) -> bool {
+    a.is_union == b.is_union
+        && a.size == b.size
+        && a.align == b.align
+        && a.fields.len() == b.fields.len()
+        && a.fields.iter().zip(&b.fields).all(|(x, y)| {
+            x.name == y.name
+                && x.offset == y.offset
+                && x.bit_offset == y.bit_offset
+                && x.bit_width == y.bit_width
+                && member_types_correspond(&x.ty, &y.ty, layouts)
+        })
+}
+
 /// Implement TypeConvertContext so shared type_builder functions can call back
 /// into sema for type resolution and constant expression evaluation.
 ///
@@ -2465,6 +2625,7 @@ impl SemanticAnalyzer {
 /// - struct/union: converts fields and computes layout
 /// - enum: returns CType::Enum with name info (preserves enum identity)
 /// - typeof: returns CType::Int (sema doesn't have full expr type resolution yet)
+
 impl type_builder::TypeConvertContext for SemanticAnalyzer {
     fn resolve_typedef(&self, name: &str) -> CType {
         if let Some(resolved) = self.result.type_context.typedefs.get(name) {
@@ -2490,20 +2651,17 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
             .map(|f| self.convert_struct_fields(f))
             .unwrap_or_default();
         let max_field_align = if is_packed { Some(1) } else { pragma_pack };
-        let key = if let Some(tag) = name {
+        let base_key = if let Some(tag) = name {
             format!("{}.{}", prefix, tag)
         } else {
             let id = self.result.type_context.next_anon_struct_id();
             format!("__anon_struct_{}", id)
         };
-        // Track whether this struct/union has been defined (has a body in the
-        // AST, e.g. `struct X { ... }` or `struct X {}`), as opposed to just
-        // forward-declared (`struct X;`). This distinction is needed for the
-        // incomplete type check in analyze_declaration.
-        if fields.is_some() {
-            self.defined_structs.borrow_mut().insert(key.clone());
-        }
-        if !struct_fields.is_empty() {
+        // The layout is computed BEFORE the key is settled, because deciding
+        // whether this definition shadows a different one needs the members.
+        let defined_layout: Option<StructLayout> = if struct_fields.is_empty() {
+            None
+        } else {
             let mut layout = if is_union {
                 StructLayout::for_union_with_packing(
                     &struct_fields,
@@ -2526,6 +2684,81 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
                     layout.size = (layout.size + mask) & !mask;
                 }
             }
+            Some(layout)
+        };
+        // C 6.7.2.3: a record definition in an inner scope declares a NEW type,
+        // incompatible with any outer type of the same tag. lccc keyed records
+        // by tag alone, so an inner `struct S { int c; }` and an outer
+        // `struct S { char c; }` were the SAME CType -- no compatibility check
+        // could ever fire, and passing one where the other was expected was
+        // silent: `f(s)` returned 44 for `s.c == 300` (tests/bugs/
+        // nested_tag_struct_identity.c) where GCC 16.2 rejects the program.
+        // A shadowing definition therefore gets its own key. Members that
+        // correspond (the N3037 / C23 6.2.9 case) keep the shared key so valid
+        // C23 still compiles, and two layout-identical definitions cannot
+        // miscompile whichever way they are keyed.
+        // `struct S` may already denote a variant in this scope: an inner
+        // definition rebinds the tag to its own key through record_alias.
+        // Resolve that BEFORE anything else, so the shadow comparison and every
+        // non-defining spelling agree on which type the tag currently means.
+        // Two things broke without it:
+        //   * the shadow test compared against the OUTERMOST layout under
+        //     base_key, so a third nesting level was judged against a type that
+        //     is no longer the visible one;
+        //   * the non-defining arm returned base_key, so inside a shadowing
+        //     scope `struct S {int c;} a; struct S b; b = a;` gave the two
+        //     spellings of one type different identities and rejected a valid
+        //     assignment that GCC accepts.
+        // Anonymous records are exempt: their key is already unique per
+        // conversion and never aliased.
+        let visible: std::borrow::Cow<'_, str> = if name.is_some() {
+            self.result.type_context.resolve_record_key(&base_key)
+        } else {
+            std::borrow::Cow::Borrowed(&base_key)
+        };
+        let key: String = match (&defined_layout, name) {
+            (Some(new_layout), Some(_)) => {
+                // Scoped so the Ref is dropped before the alias is mutated.
+                let shadows_different = {
+                    let layouts = self.result.type_context.borrow_struct_layouts();
+                    layouts.get(visible.as_ref()).is_some_and(|prev| {
+                        // An empty layout is a forward declaration, which this
+                        // definition completes rather than shadows.  Note the
+                        // negation: a shadow is a definition that does NOT
+                        // correspond, so dropping the `!` inverts the whole
+                        // mechanism (verified -- it silently restored the
+                        // TAG-ID-1 miscompile and the gate went red).
+                        !prev.fields.is_empty()
+                            && !record_layouts_correspond(prev, new_layout, &layouts)
+                    })
+                };
+                if shadows_different {
+                    let id = self.result.type_context.next_struct_variant_id();
+                    let variant = format!("{}#{}", base_key, id);
+                    // While this scope lives, the tag denotes the variant, so
+                    // every tag->CType site resolves to the inner type.
+                    self.result
+                        .type_context
+                        .set_record_alias_from_ref(&base_key, &variant);
+                    variant
+                } else {
+                    visible.into_owned()
+                }
+            }
+            _ => visible.into_owned(),
+        };
+        // Track whether this struct/union has been defined (has a body in the
+        // AST, e.g. `struct X { ... }` or `struct X {}`), as opposed to just
+        // forward-declared (`struct X;`). This distinction is needed for the
+        // incomplete type check in analyze_declaration.
+        if fields.is_some() {
+            let mut defined = self.defined_structs.borrow_mut();
+            defined.insert(key.clone());
+            if key != base_key {
+                defined.insert(base_key.clone());
+            }
+        }
+        if let Some(layout) = defined_layout {
             self.result
                 .type_context
                 .insert_struct_layout_scoped_from_ref(&key, layout);
@@ -2632,5 +2865,671 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
 impl Default for SemanticAnalyzer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pointer compatibility for call arguments
+// ---------------------------------------------------------------------------
+//
+// C23 6.5.2.2p7 makes "the argument type is compatible with the parameter type"
+// a constraint, so passing a `struct A *` where a `struct B *` is expected is
+// an error rather than a warning, and GCC 14 onward rejects it by default.
+// lccc checked only arity plus pointer/float mixing at this site, which is how
+// TAG-ID-1 shipped as a miscompile: `check_record_argument_compatibility`
+// closed the by-value path, but a pointer to one of the two distinct same-tag
+// records sailed straight through its `_ => return` arm.
+//
+// Every rule below was pinned against GCC 16.2 rather than read off the
+// standard, because the standard's "compatible" and GCC's default diagnostics
+// are not the same thing:
+//
+//   int *   -> void *                 accept  (6.3.2.3p2)
+//   void *  -> int *                  accept  (6.3.2.3p2)
+//   void ** -> int **                 REJECT  <- the exemption is top-level only
+//   int **  -> void **                REJECT
+//   int (*)[3] vs int (*)[4]          REJECT  (array size is part of the type)
+//   int (*)(void) vs long (*)(void)   REJECT
+//   int (*)(int)  vs int (*)(long)    REJECT
+//   char *  -> signed char *          accept  (-Wpointer-sign is a warning)
+//   char *  -> unsigned char *        accept  (-Wpointer-sign is a warning)
+//   int *   -> unsigned *             accept  (-Wpointer-sign is a warning)
+//   _Bool * -> int *                  REJECT  (not a sign pair)
+//   long *  -> long long *            REJECT  (different types)
+//   float * -> double *               REJECT
+//   struct A ** vs struct B **        REJECT  (recurses to the pointee)
+
+/// Verdict of the pointer half of the call-argument compatibility constraint.
+///
+/// `Unknown` is a first-class answer, not a fallback: it means the shapes
+/// involved are not modelled precisely enough to decide. This check is being
+/// introduced where nothing ran before, so firing on a shape it does not
+/// understand would reject valid code -- a strictly worse failure than the one
+/// it closes. Every arm that cannot decide says so instead of guessing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PtrCompat {
+    Compatible,
+    Incompatible,
+    Unknown,
+}
+
+/// Signed and unsigned variants of one rank. GCC diagnoses these with
+/// `-Wpointer-sign`, which is a warning rather than a constraint violation, so
+/// they must stay acceptable here or every `char *`/`unsigned char *` pair in
+/// existing code would start failing the build. `_Bool` is deliberately absent:
+/// GCC rejects `_Bool *` against `int *`.
+fn same_scalar_modulo_sign(a: &CType, b: &CType) -> bool {
+    matches!(
+        (a, b),
+        (CType::Char, CType::UChar)
+            | (CType::UChar, CType::Char)
+            | (CType::Short, CType::UShort)
+            | (CType::UShort, CType::Short)
+            | (CType::Int, CType::UInt)
+            | (CType::UInt, CType::Int)
+            | (CType::Long, CType::ULong)
+            | (CType::ULong, CType::Long)
+            | (CType::LongLong, CType::ULongLong)
+            | (CType::ULongLong, CType::LongLong)
+            | (CType::Int128, CType::UInt128)
+            | (CType::UInt128, CType::Int128)
+    )
+}
+
+/// Function-type compatibility, C23 6.7.6.3p15: the return type and the
+/// parameter types decide it, and *parameter names are not part of the type*.
+/// `FunctionType` derives `PartialEq` over `params: Vec<(CType, Option<String>)>`,
+/// so a bare `==` compares the names too -- which is wrong, and observably so:
+/// `int dbl(int x)` against a parameter declared `int (*)(int)` has one named
+/// parameter and one unnamed, and every callback in C is written that way.
+fn function_types_compatible(a: &FunctionType, b: &FunctionType) -> bool {
+    a.variadic == b.variadic
+        && a.return_type == b.return_type
+        && a.params.len() == b.params.len()
+        && a.params
+            .iter()
+            .zip(&b.params)
+            .all(|((a_ty, _), (b_ty, _))| a_ty == b_ty)
+}
+
+/// Compatibility of two pointed-to types (C23 6.7.6.1p2). Recurses through
+/// pointer and array chains, which is what makes `struct S **` an error too
+/// rather than only the single-level case.
+fn pointee_compat(from: &CType, to: &CType) -> PtrCompat {
+    if from == to {
+        return PtrCompat::Compatible;
+    }
+    if same_scalar_modulo_sign(from, to) {
+        return PtrCompat::Compatible;
+    }
+    match (from, to) {
+        (CType::Pointer(a, a_space), CType::Pointer(b, b_space)) => {
+            // The `void *` exemption converts a `void *` EXPRESSION (6.3.2.3p2);
+            // it does not make `void **` and `int **` compatible, and GCC
+            // rejects both directions of that.
+            match (**a == CType::Void, **b == CType::Void) {
+                (true, true) => PtrCompat::Compatible,
+                (true, false) | (false, true) => PtrCompat::Incompatible,
+                (false, false) => {
+                    if a_space != b_space {
+                        PtrCompat::Incompatible
+                    } else {
+                        pointee_compat(a, b)
+                    }
+                }
+            }
+        }
+        (CType::Array(a, a_len), CType::Array(b, b_len)) => {
+            // An unsized array is compatible with any size; two sizes that
+            // differ are different types.
+            match (a_len, b_len) {
+                (Some(x), Some(y)) if x != y => PtrCompat::Incompatible,
+                _ => pointee_compat(a, b),
+            }
+        }
+        (CType::Function(a), CType::Function(b)) => {
+            if function_types_compatible(a, b) {
+                PtrCompat::Compatible
+            } else {
+                PtrCompat::Incompatible
+            }
+        }
+        (CType::Struct(a), CType::Struct(b)) | (CType::Union(a), CType::Union(b)) => {
+            // ANON-KEY-1, the same exemption `check_record_argument_compatibility`
+            // carries and for the same reason: lccc does not canonicalise
+            // anonymous record keys across construction paths, so an intrinsic's
+            // parameter and the caller's spelling of one typedef can hold
+            // different `__anon_struct_N` keys for one type. Measured, not
+            // assumed -- dropping it fails 19 corpus tests, all of them SSE/AVX
+            // (`_mm_loadu_si128`, `_mm_storeu_si128`, `_mm_cmppd`). `Unknown`
+            // rather than `Compatible` because the honest verdict is that the
+            // key model cannot decide, and that silence must not spread to
+            // named records, where the key IS the identity.
+            if a.starts_with("__anon_") || b.starts_with("__anon_") {
+                PtrCompat::Unknown
+            } else {
+                PtrCompat::Incompatible
+            }
+        }
+        // Enums, vectors and mismatched categories: the key IS the identity and
+        // `from == to` above already compared it, so anything reaching here is a
+        // different type.
+        _ => PtrCompat::Incompatible,
+    }
+}
+
+/// The pointer half of C23 6.5.2.2p7 for a single call argument.
+fn pointer_argument_compat(from: &CType, to: &CType) -> PtrCompat {
+    match (from, to) {
+        (CType::Pointer(from_inner, from_space), CType::Pointer(to_inner, to_space)) => {
+            if **from_inner == CType::Void || **to_inner == CType::Void {
+                return PtrCompat::Compatible;
+            }
+            if from_space != to_space {
+                return PtrCompat::Incompatible;
+            }
+            pointee_compat(from_inner, to_inner)
+        }
+        // An array argument decays to a pointer to its first element.
+        (CType::Array(from_inner, _), CType::Pointer(to_inner, _)) => {
+            if **to_inner == CType::Void {
+                PtrCompat::Compatible
+            } else {
+                pointee_compat(from_inner, to_inner)
+            }
+        }
+        (CType::Pointer(from_inner, _), CType::Array(to_inner, _)) => {
+            if **from_inner == CType::Void {
+                PtrCompat::Compatible
+            } else {
+                pointee_compat(from_inner, to_inner)
+            }
+        }
+        // A function designator decays to a pointer to the function. Only that
+        // decay is decided here; a function value against a non-function
+        // pointer is left to the other checks rather than guessed at.
+        (CType::Function(from_sig), CType::Pointer(to_inner, _)) => match &**to_inner {
+            CType::Function(to_sig) => {
+                if function_types_compatible(from_sig, to_sig) {
+                    PtrCompat::Compatible
+                } else {
+                    PtrCompat::Incompatible
+                }
+            }
+            CType::Void => PtrCompat::Compatible,
+            _ => PtrCompat::Unknown,
+        },
+        // Not pointer-shaped. A null pointer constant arrives here as an
+        // integer type and has to keep working (`f(0)`, `f(NULL)`), and scalar
+        // mixing is `check_pointer_float_conversion`'s job.
+        _ => PtrCompat::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod record_layouts_correspond_tests {
+    use super::{member_types_correspond, record_layouts_correspond};
+    use crate::common::fx_hash::FxHashMap;
+    use crate::common::types::{CType, RcLayout, StructFieldLayout, StructLayout};
+    use std::rc::Rc;
+
+    fn layout(
+        is_union: bool,
+        size: usize,
+        align: usize,
+        fields: Vec<StructFieldLayout>,
+    ) -> StructLayout {
+        StructLayout {
+            fields,
+            size,
+            align,
+            is_union,
+            is_transparent_union: false,
+            reverse_sso: false,
+        }
+    }
+
+    fn field(name: &str, ty: CType, offset: usize) -> StructFieldLayout {
+        StructFieldLayout {
+            name: name.to_string(),
+            ty,
+            offset,
+            bit_offset: None,
+            bit_width: None,
+            sso: crate::common::types::SsoMode::None,
+            sso_storage_ty: None,
+        }
+    }
+
+    fn anon(
+        key: &str,
+        size: usize,
+        align: usize,
+        fields: Vec<StructFieldLayout>,
+    ) -> (String, RcLayout) {
+        (key.to_string(), Rc::new(layout(false, size, align, fields)))
+    }
+
+    #[test]
+    fn identical_named_records_correspond() {
+        let m = FxHashMap::default();
+        let a = layout(false, 4, 4, vec![field("i", CType::Int, 0)]);
+        let b = layout(false, 4, 4, vec![field("i", CType::Int, 0)]);
+        assert!(record_layouts_correspond(&a, &b, &m));
+    }
+
+    #[test]
+    fn a_different_member_name_does_not_correspond() {
+        let m = FxHashMap::default();
+        let a = layout(false, 4, 4, vec![field("i", CType::Int, 0)]);
+        let b = layout(false, 4, 4, vec![field("j", CType::Int, 0)]);
+        assert!(!record_layouts_correspond(&a, &b, &m));
+    }
+
+    #[test]
+    fn a_different_member_type_does_not_correspond() {
+        let m = FxHashMap::default();
+        let a = layout(false, 1, 1, vec![field("c", CType::Char, 0)]);
+        let b = layout(false, 4, 4, vec![field("c", CType::Int, 0)]);
+        assert!(!record_layouts_correspond(&a, &b, &m));
+    }
+
+    #[test]
+    fn a_struct_and_a_union_do_not_correspond() {
+        let m = FxHashMap::default();
+        let a = layout(false, 4, 4, vec![field("i", CType::Int, 0)]);
+        let b = layout(true, 4, 4, vec![field("i", CType::Int, 0)]);
+        assert!(!record_layouts_correspond(&a, &b, &m));
+    }
+
+    #[test]
+    fn a_different_bit_field_width_does_not_correspond() {
+        let m = FxHashMap::default();
+        let mut fa = field("b", CType::Int, 0);
+        fa.bit_width = Some(3);
+        let mut fb = field("b", CType::Int, 0);
+        fb.bit_width = Some(5);
+        let a = layout(false, 4, 4, vec![fa]);
+        let b = layout(false, 4, 4, vec![fb]);
+        assert!(!record_layouts_correspond(&a, &b, &m));
+    }
+
+    #[test]
+    fn anonymous_members_correspond_structurally_not_by_key() {
+        // C23 6.2.7: two anonymous members are compatible when their members
+        // correspond. Each conversion mints a fresh __anon_struct_N, so key
+        // equality alone rejected valid C23 here.
+        let mut m: FxHashMap<String, RcLayout> = FxHashMap::default();
+        let (k1, l1) = anon("__anon_struct_1", 4, 4, vec![field("i", CType::Int, 0)]);
+        let (k2, l2) = anon("__anon_struct_2", 4, 4, vec![field("i", CType::Int, 0)]);
+        m.insert(k1.clone(), l1);
+        m.insert(k2.clone(), l2);
+        let a = layout(false, 4, 4, vec![field("", CType::Struct(k1.into()), 0)]);
+        let b = layout(false, 4, 4, vec![field("", CType::Struct(k2.into()), 0)]);
+        assert!(record_layouts_correspond(&a, &b, &m));
+    }
+
+    #[test]
+    fn anonymous_members_with_different_shapes_do_not_correspond() {
+        let mut m: FxHashMap<String, RcLayout> = FxHashMap::default();
+        let (k1, l1) = anon("__anon_struct_1", 4, 4, vec![field("i", CType::Int, 0)]);
+        let (k2, l2) = anon("__anon_struct_2", 1, 1, vec![field("c", CType::Char, 0)]);
+        m.insert(k1.clone(), l1);
+        m.insert(k2.clone(), l2);
+        let a = layout(false, 4, 4, vec![field("", CType::Struct(k1.into()), 0)]);
+        let b = layout(false, 1, 1, vec![field("", CType::Struct(k2.into()), 0)]);
+        assert!(!record_layouts_correspond(&a, &b, &m));
+    }
+
+    #[test]
+    fn a_struct_member_and_a_union_member_never_correspond() {
+        // Different record kinds are different types however alike they look.
+        let m = FxHashMap::default();
+        assert!(!member_types_correspond(
+            &CType::Struct("struct.A".into()),
+            &CType::Union("struct.A".into()),
+            &m
+        ));
+    }
+
+    #[test]
+    fn named_records_keep_key_equality() {
+        // For a NAMED record the key is the identity this mechanism exists to
+        // establish, so two different keys must stay non-corresponding even if
+        // their layouts happen to match -- otherwise the miscompile returns.
+        let mut m: FxHashMap<String, RcLayout> = FxHashMap::default();
+        m.insert(
+            "struct.A".to_string(),
+            Rc::new(layout(false, 4, 4, vec![field("i", CType::Int, 0)])),
+        );
+        m.insert(
+            "struct.B".to_string(),
+            Rc::new(layout(false, 4, 4, vec![field("i", CType::Int, 0)])),
+        );
+        assert!(!member_types_correspond(
+            &CType::Struct("struct.A".into()),
+            &CType::Struct("struct.B".into()),
+            &m
+        ));
+    }
+}
+
+#[cfg(test)]
+mod pointer_argument_compat_tests {
+    use super::{PtrCompat, function_types_compatible, pointee_compat, pointer_argument_compat};
+    use crate::common::types::{AddressSpace, CType, FunctionType};
+    use std::rc::Rc;
+
+    fn ptr(t: CType) -> CType {
+        CType::Pointer(Box::new(t), AddressSpace::Default)
+    }
+    fn segfs(t: CType) -> CType {
+        CType::Pointer(Box::new(t), AddressSpace::SegFs)
+    }
+    fn arr(t: CType, n: Option<usize>) -> CType {
+        CType::Array(Box::new(t), n)
+    }
+    /// Named parameters, so that every case here also proves the comparison
+    /// ignores them: C23 6.7.6.3p15 keeps names out of the type.
+    fn sig(ret: CType, params: Vec<CType>, named: bool) -> CType {
+        CType::Function(Box::new(FunctionType {
+            return_type: ret,
+            params: params
+                .into_iter()
+                .enumerate()
+                .map(|(i, t)| (t, if named { Some(format!("p{i}")) } else { None }))
+                .collect(),
+            variadic: false,
+        }))
+    }
+    fn record(key: &str) -> CType {
+        CType::Struct(Rc::from(key))
+    }
+
+    // --- the `void *` exemption is top-level only (6.3.2.3p2) --------------
+    #[test]
+    fn object_pointer_converts_to_void_pointer() {
+        assert_eq!(
+            pointer_argument_compat(&ptr(CType::Int), &ptr(CType::Void)),
+            PtrCompat::Compatible
+        );
+    }
+
+    #[test]
+    fn void_pointer_converts_to_object_pointer() {
+        assert_eq!(
+            pointer_argument_compat(&ptr(CType::Void), &ptr(CType::Char)),
+            PtrCompat::Compatible
+        );
+    }
+
+    #[test]
+    fn double_void_pointer_is_not_double_int_pointer() {
+        // The single most important case in this module: folding the void
+        // exemption into the recursion would accept both of these, and GCC
+        // rejects both directions.
+        assert_eq!(
+            pointer_argument_compat(&ptr(ptr(CType::Void)), &ptr(ptr(CType::Int))),
+            PtrCompat::Incompatible
+        );
+        assert_eq!(
+            pointer_argument_compat(&ptr(ptr(CType::Int)), &ptr(ptr(CType::Void))),
+            PtrCompat::Incompatible
+        );
+    }
+
+    // --- sign pairs are -Wpointer-sign, a warning, so not an error ---------
+    #[test]
+    fn signed_unsigned_pairs_of_one_rank_are_compatible() {
+        for (a, b) in [
+            (CType::Char, CType::UChar),
+            (CType::Short, CType::UShort),
+            (CType::Int, CType::UInt),
+            (CType::Long, CType::ULong),
+            (CType::LongLong, CType::ULongLong),
+            (CType::Int128, CType::UInt128),
+        ] {
+            assert_eq!(
+                pointer_argument_compat(&ptr(a.clone()), &ptr(b.clone())),
+                PtrCompat::Compatible,
+                "{a:?} -> {b:?}"
+            );
+            assert_eq!(
+                pointer_argument_compat(&ptr(b.clone()), &ptr(a.clone())),
+                PtrCompat::Compatible,
+                "{b:?} -> {a:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bool_is_not_part_of_the_sign_pairs() {
+        assert_eq!(
+            pointer_argument_compat(&ptr(CType::Bool), &ptr(CType::Int)),
+            PtrCompat::Incompatible
+        );
+    }
+
+    #[test]
+    fn different_ranks_are_not_a_sign_pair() {
+        assert_eq!(
+            pointer_argument_compat(&ptr(CType::Long), &ptr(CType::LongLong)),
+            PtrCompat::Incompatible
+        );
+        assert_eq!(
+            pointer_argument_compat(&ptr(CType::Float), &ptr(CType::Double)),
+            PtrCompat::Incompatible
+        );
+    }
+
+    // --- pointee identity ---------------------------------------------------
+    #[test]
+    fn unrelated_scalar_pointees_are_incompatible() {
+        assert_eq!(
+            pointer_argument_compat(&ptr(CType::Int), &ptr(CType::Char)),
+            PtrCompat::Incompatible
+        );
+    }
+
+    #[test]
+    fn pointers_to_distinct_same_tag_records_are_incompatible() {
+        // The TAG-ID-1 hole: by value was checked, through a pointer was not.
+        assert_eq!(
+            pointer_argument_compat(&record("struct.S#1"), &record("struct.S")),
+            PtrCompat::Unknown, // bare records are the record check's job
+        );
+        assert_eq!(
+            pointer_argument_compat(&ptr(record("struct.S#1")), &ptr(record("struct.S"))),
+            PtrCompat::Incompatible
+        );
+    }
+
+    #[test]
+    fn pointers_to_records_of_different_tags_are_incompatible() {
+        assert_eq!(
+            pointer_argument_compat(&ptr(record("struct.A")), &ptr(record("struct.B"))),
+            PtrCompat::Incompatible
+        );
+    }
+
+    #[test]
+    fn struct_and_union_with_the_same_name_are_incompatible() {
+        assert_eq!(
+            pointer_argument_compat(
+                &ptr(record("struct.A")),
+                &ptr(CType::Union(Rc::from("union.A")))
+            ),
+            PtrCompat::Incompatible
+        );
+    }
+
+    #[test]
+    fn nested_record_pointers_recurse_to_the_ultimate_pointee() {
+        assert_eq!(
+            pointer_argument_compat(&ptr(ptr(record("struct.A"))), &ptr(ptr(record("struct.B")))),
+            PtrCompat::Incompatible
+        );
+        assert_eq!(
+            pointer_argument_compat(&ptr(ptr(record("struct.A"))), &ptr(ptr(record("struct.A")))),
+            PtrCompat::Compatible
+        );
+    }
+
+    // --- array pointees -----------------------------------------------------
+    #[test]
+    fn array_pointee_size_is_part_of_the_type() {
+        assert_eq!(
+            pointer_argument_compat(
+                &ptr(arr(CType::Int, Some(3))),
+                &ptr(arr(CType::Int, Some(4)))
+            ),
+            PtrCompat::Incompatible
+        );
+        assert_eq!(
+            pointer_argument_compat(
+                &ptr(arr(CType::Int, Some(3))),
+                &ptr(arr(CType::Int, Some(3)))
+            ),
+            PtrCompat::Compatible
+        );
+    }
+
+    #[test]
+    fn unsized_array_pointee_matches_any_size() {
+        assert_eq!(
+            pointer_argument_compat(&ptr(arr(CType::Int, None)), &ptr(arr(CType::Int, Some(9)))),
+            PtrCompat::Compatible
+        );
+    }
+
+    // --- decay --------------------------------------------------------------
+    #[test]
+    fn array_argument_decays_to_pointer_to_element() {
+        assert_eq!(
+            pointer_argument_compat(
+                &arr(record("struct.S#1"), Some(4)),
+                &ptr(record("struct.S"))
+            ),
+            PtrCompat::Incompatible
+        );
+        assert_eq!(
+            pointer_argument_compat(&arr(CType::Int, Some(4)), &ptr(CType::Int)),
+            PtrCompat::Compatible
+        );
+        assert_eq!(
+            pointer_argument_compat(&arr(CType::Int, Some(4)), &ptr(CType::Void)),
+            PtrCompat::Compatible
+        );
+    }
+
+    #[test]
+    fn function_designator_decays_to_pointer_to_function() {
+        assert_eq!(
+            pointer_argument_compat(
+                &sig(CType::Int, vec![CType::Int], true),
+                &ptr(sig(CType::Int, vec![CType::Int], false))
+            ),
+            PtrCompat::Compatible
+        );
+        assert_eq!(
+            pointer_argument_compat(
+                &sig(CType::Long, vec![CType::Int], false),
+                &ptr(sig(CType::Int, vec![CType::Int], false))
+            ),
+            PtrCompat::Incompatible
+        );
+        assert_eq!(
+            pointer_argument_compat(&sig(CType::Int, vec![CType::Int], false), &ptr(CType::Void)),
+            PtrCompat::Compatible
+        );
+    }
+
+    #[test]
+    fn parameter_names_do_not_decide_function_compatibility() {
+        // Regression guard for the callback idiom: `int dbl(int x)` against a
+        // parameter declared `int (*)(int)` differs only in the name.
+        let named = sig(CType::Int, vec![CType::Int], true);
+        let unnamed = sig(CType::Int, vec![CType::Int], false);
+        if let (CType::Function(a), CType::Function(b)) = (&named, &unnamed) {
+            assert!(function_types_compatible(a, b));
+            assert_ne!(a, b, "the derived PartialEq does compare names");
+        } else {
+            panic!("expected function types");
+        }
+    }
+
+    #[test]
+    fn function_signature_differences_do_decide_compatibility() {
+        let a = sig(CType::Int, vec![CType::Int], false);
+        let b = sig(CType::Int, vec![CType::Long], false);
+        if let (CType::Function(x), CType::Function(y)) = (&a, &b) {
+            assert!(!function_types_compatible(x, y));
+        } else {
+            panic!("expected function types");
+        }
+    }
+
+    // --- silence where the check has no business guessing -------------------
+    #[test]
+    fn null_pointer_constants_stay_silent() {
+        // `f(0)` and `f(NULL)` reach here as an integer type; diagnosing them
+        // would break the single most common way to write a null pointer.
+        assert_eq!(
+            pointer_argument_compat(&CType::Int, &ptr(CType::Char)),
+            PtrCompat::Unknown
+        );
+        assert_eq!(
+            pointer_argument_compat(&CType::Long, &ptr(CType::Void)),
+            PtrCompat::Unknown
+        );
+    }
+
+    #[test]
+    fn scalar_arguments_are_not_this_checks_concern() {
+        assert_eq!(
+            pointer_argument_compat(&CType::Double, &CType::Int),
+            PtrCompat::Unknown
+        );
+    }
+
+    #[test]
+    fn address_spaces_do_not_mix() {
+        assert_eq!(
+            pointer_argument_compat(&segfs(CType::Int), &ptr(CType::Int)),
+            PtrCompat::Incompatible
+        );
+        assert_eq!(
+            pointer_argument_compat(&segfs(CType::Int), &segfs(CType::Int)),
+            PtrCompat::Compatible
+        );
+    }
+
+    #[test]
+    fn pointee_compat_treats_identical_types_as_compatible() {
+        assert_eq!(
+            pointee_compat(&CType::Double, &CType::Double),
+            PtrCompat::Compatible
+        );
+    }
+    #[test]
+    fn anonymous_record_pointees_are_undecidable_not_incompatible() {
+        // ANON-KEY-1: `_mm_loadu_si128` and its caller can hold different
+        // `__anon_struct_N` keys for one typedef, so this must stay silent.
+        assert_eq!(
+            pointer_argument_compat(
+                &ptr(record("__anon_struct_3")),
+                &ptr(record("__anon_struct_9"))
+            ),
+            PtrCompat::Unknown
+        );
+        assert_eq!(
+            pointer_argument_compat(&ptr(record("__anon_struct_3")), &ptr(record("struct.S"))),
+            PtrCompat::Unknown
+        );
+        // ... and the silence must not spread to named records.
+        assert_eq!(
+            pointer_argument_compat(&ptr(record("struct.A")), &ptr(record("struct.B"))),
+            PtrCompat::Incompatible
+        );
     }
 }

@@ -626,6 +626,47 @@ impl Parser {
     ///     stack-overflow ceiling.
     pub(super) const TYPE_FRAME_BUDGET: u32 = 2_048;
 
+    /// Bound on pointer-indirection levels within a single declarator.
+    ///
+    /// This class needs its own bound because it is not a recursion. `CType`
+    /// is a recursive enum, so its derived `Clone`, `Drop` and `PartialEq`
+    /// each recurse once per level, and unlike expressions, blocks,
+    /// initializers and record definitions, pointer depth is a property of the
+    /// FINISHED type rather than of the parse -- so no live-frame counter ever
+    /// sees it. Measured under gdb: `int ****…p` with ~400k stars parsed
+    /// cleanly and then aborted with rc=134 ("has overflowed its stack")
+    /// inside `CType::clone`, on a file GCC 16.2 accepts. The declaration
+    /// alone is enough; no call site is involved.
+    ///
+    /// 4096 is >1000x the deepest declarator in real code (kernel, glibc and
+    /// sqlite all stay at four levels or fewer) while keeping a 4096-deep
+    /// clone/drop comfortably inside even an 8 MB stack, so the bound holds
+    /// regardless of which thread the type is destroyed on and regardless of
+    /// build profile.
+    pub(super) const POINTER_DEPTH_BUDGET: u32 = 4_096;
+
+    /// One pointer-indirection level of a declarator. Unlike the recursion
+    /// budgets this is a plain depth cap rather than a frame registration: the
+    /// levels are counted as the `*` tokens are consumed, so there is nothing
+    /// to unwind and no matching exit call.
+    pub(super) fn enter_pointer_level(&mut self, depth: u32, span: Span) -> bool {
+        if depth > Self::POINTER_DEPTH_BUDGET {
+            if !self.nesting_budget_diagnosed {
+                self.nesting_budget_diagnosed = true;
+                self.error_count += 1;
+                self.diagnostics.error(
+                    format!(
+                        "pointer nesting too deep (exceeds {} levels)",
+                        Self::POINTER_DEPTH_BUDGET
+                    ),
+                    span,
+                );
+            }
+            return false;
+        }
+        true
+    }
+
     /// Shared budget machinery (generalized from the original
     /// expression-only counter): every recursive parser entry point that a
     /// hostile TU can drive to stack overflow registers a frame here.

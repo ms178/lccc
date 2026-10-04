@@ -1481,6 +1481,26 @@ pub fn align_up(offset: usize, align: usize) -> usize {
     }
 }
 
+impl CType {
+    /// The user-visible tag of a record type key.
+    ///
+    /// Strips the internal `struct.`/`union.` prefix and the `#N` suffix that
+    /// marks a shadowing definition (C 6.7.2.3: an inner-scope `struct S` is a
+    /// distinct type from an outer `struct S`, so the two need distinct keys
+    /// while still printing identically). A C identifier cannot contain `#`, so
+    /// cutting there is unambiguous.
+    pub fn record_display_tag(key: &str) -> &str {
+        let without_prefix = key
+            .strip_prefix("union.")
+            .or_else(|| key.strip_prefix("struct."))
+            .unwrap_or(key);
+        match without_prefix.find('#') {
+            Some(i) => &without_prefix[..i],
+            None => without_prefix,
+        }
+    }
+}
+
 impl std::fmt::Display for CType {
     /// Format a CType as its C-language type name (e.g., `int`, `unsigned long`,
     /// `char *`, `void (*)(int, double)`). Used in compiler diagnostics to show
@@ -1562,8 +1582,7 @@ impl std::fmt::Display for CType {
                 write!(f, ")")
             }
             CType::Struct(name) => {
-                // Strip the "struct." prefix if present for cleaner display
-                let display_name = name.strip_prefix("struct.").unwrap_or(name);
+                let display_name = CType::record_display_tag(name);
                 if display_name.starts_with("__anon_struct_") {
                     write!(f, "struct <anonymous>")
                 } else {
@@ -1571,11 +1590,7 @@ impl std::fmt::Display for CType {
                 }
             }
             CType::Union(name) => {
-                // Strip the "union." or "struct." prefix if present
-                let display_name = name
-                    .strip_prefix("union.")
-                    .or_else(|| name.strip_prefix("struct."))
-                    .unwrap_or(name);
+                let display_name = CType::record_display_tag(name);
                 if display_name.starts_with("__anon_struct_") {
                     write!(f, "union <anonymous>")
                 } else {
@@ -2531,5 +2546,53 @@ mod cast_nop_tests {
         // i686: F128 is 12 bytes there but still a float — excluded by class.
         assert!(!IrType::cast_is_bitidentical_nop(IrType::F128, IrType::F64));
         assert!(!IrType::cast_is_bitidentical_nop(IrType::F64, IrType::F128));
+    }
+}
+
+#[cfg(test)]
+mod record_display_tag_tests {
+    use super::CType;
+
+    #[test]
+    fn strips_the_struct_prefix() {
+        assert_eq!(CType::record_display_tag("struct.S"), "S");
+    }
+
+    #[test]
+    fn strips_the_union_prefix() {
+        assert_eq!(CType::record_display_tag("union.U"), "U");
+    }
+
+    #[test]
+    fn strips_a_variant_suffix() {
+        assert_eq!(CType::record_display_tag("struct.S#1"), "S");
+        assert_eq!(CType::record_display_tag("union.U#3"), "U");
+    }
+
+    #[test]
+    fn leaves_an_anonymous_key_alone() {
+        // An anonymous record has no tag to show; its key is what a diagnostic
+        // quotes, and stripping part of it would print a name that exists
+        // nowhere in the source.
+        assert_eq!(
+            CType::record_display_tag("__anon_struct_4"),
+            "__anon_struct_4"
+        );
+    }
+
+    #[test]
+    fn only_the_first_hash_delimits_the_variant() {
+        // Documented, not accidental: '#' is the variant marker, so a tag
+        // containing one is already ambiguous. Pinned so changing the marker is
+        // a deliberate edit here rather than a silent behaviour change.
+        assert_eq!(CType::record_display_tag("struct.a#b#2"), "a");
+    }
+
+    #[test]
+    fn display_of_a_variant_reads_like_its_base_tag() {
+        // The user-facing promise: a variant key must never leak '#N' into a
+        // diagnostic, or every shadowing scope would print an internal name.
+        assert_eq!(CType::Struct("struct.S#1".into()).to_string(), "struct S");
+        assert_eq!(CType::Union("union.U#2".into()).to_string(), "union U");
     }
 }

@@ -26,6 +26,31 @@ fn elf_range<'a>(
         .ok_or_else(|| format!("{}: {} extends past end of file", filename, what))
 }
 
+/// Whether a section holds DWARF debug information.
+///
+/// i386 uses implicit-addend `REL` relocations, so applying one means reading
+/// the existing bytes at `r_offset` out of the target section. Producers
+/// routinely emit a debug relocation whose field runs a couple of bytes past
+/// the end of its section: `gcc -m32 -g` under binutils 2.44 puts an
+/// `R_386_32` against `.text` at offset 0x76 in a `.debug_info` that is only
+/// 0x74 bytes long, and GCC 16.2's 32-bit `libgcc.a(_muldi3.o)` has four such
+/// fields. GNU ld 2.44, lld and mold all link those objects silently.
+///
+/// Treating one as a hard error made lccc-ld unable to link *any* 32-bit
+/// program built with `-g` by a current GCC -- the section is pure debug
+/// metadata, is never executed, and the field cannot be written anyway
+/// without spilling into the following section. So: skip these, and keep the
+/// strict diagnostic for every section that carries program semantics.
+fn is_debug_section(name: &str) -> bool {
+    // The relocation section for `.debug_info` is `.rel.debug_info`; strip
+    // either relocation prefix before testing the underlying section name.
+    let n = name
+        .strip_prefix(".rela")
+        .or_else(|| name.strip_prefix(".rel"))
+        .unwrap_or(name);
+    n.starts_with(".debug") || n.starts_with(".zdebug")
+}
+
 /// Decode the in-place addend carried by an Elf32_Rel relocation.  i386 uses
 /// one-, two-, and four-byte relocation fields; reading every addend as i32
 /// corrupts R_386_{,PC}{8,16} and can read beyond a valid section.
@@ -272,7 +297,20 @@ pub(super) fn parse_elf32(data: &[u8], filename: &str) -> Result<InputObject, St
                     let r_info = read_u32(entry, 4);
                     let sym_idx = r_info >> 8;
                     let rel_type = r_info & 0xff;
-                    let addend = rel_addend(&sec_data, r_offset, rel_type, filename, &sec_name)?;
+                    let addend =
+                        match rel_addend(&sec_data, r_offset, rel_type, filename, &sec_name) {
+                            Ok(addend) => addend,
+                            Err(e) => {
+                                // See is_debug_section: an out-of-range field in
+                                // DWARF is benign and universally tolerated, so
+                                // drop just that relocation. Anything else is a
+                                // genuine corrupt or unsupported object.
+                                if !is_debug_section(&sec_name) {
+                                    return Err(e);
+                                }
+                                continue;
+                            }
+                        };
                     relocs.push((r_offset, rel_type, sym_idx, addend));
                 }
             }
@@ -361,6 +399,17 @@ mod tests {
             rel_addend(&bytes, 3, R_386_PC32, "x.o", ".text").unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn debug_sections_are_recognised_with_and_without_the_rel_prefix() {
+        assert!(is_debug_section(".debug_info"));
+        assert!(is_debug_section(".zdebug_line"));
+        assert!(is_debug_section(".rel.debug_info"));
+        assert!(!is_debug_section(".text"));
+        assert!(!is_debug_section(".rodata"));
+        assert!(is_debug_section(".rela.debug_info"));
+        assert!(!is_debug_section(".rel.text"));
     }
 
     #[test]
