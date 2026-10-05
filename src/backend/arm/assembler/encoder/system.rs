@@ -52,127 +52,16 @@ pub(crate) fn encode_dsb(operands: &[Operand]) -> Result<EncodeResult, String> {
 }
 
 pub(crate) fn encode_mrs(operands: &[Operand]) -> Result<EncodeResult, String> {
-    // MRS Xt, system_reg
-    let (rt, _) = get_reg(operands, 0)?;
+    // MRS Xt, system_reg -- Rt is an X register (XZR is encodable as the
+    // "discard" spelling, SP is not: field 31 reads as the zero register, so
+    // `mrs sp,currentel` used to assemble as `mrs xzr,currentel`).
+    let rt = system_rt_x(operands, 0, "mrs")?;
     let sysreg = match operands.get(1) {
         Some(Operand::Symbol(s)) => s.to_lowercase(),
         _ => return Err("mrs needs system register name".to_string()),
     };
 
-    let encoding = match sysreg.as_str() {
-        "sp_el0" => 0xc208u32,
-        "tpidr_el0" => 0xde82,
-        "tpidr_el1" => 0xc684,
-        "tpidr_el2" => 0xe682,
-        "tpidrro_el0" => 0xde83,
-        "tcr_el1" => 0xc102,
-        "ttbr0_el1" => 0xc100,
-        "sctlr_el1" => 0xc080,
-        "mdscr_el1" => 0x8012,
-        "id_aa64mmfr0_el1" => 0xc038,
-        "id_aa64mmfr1_el1" => 0xc039,
-        "cpacr_el1" => 0xc082,
-        "par_el1" => 0xc3a0,
-        "osdlr_el1" => 0x809c,
-        "currentel" => 0xc212,
-        "elr_el1" => 0xc201,
-        "spsr_el1" => 0xc200,
-        "esr_el1" => 0xc290,
-        "far_el1" => 0xc300,
-        "vbar_el1" => 0xc600,
-        "mpidr_el1" => 0xc005,
-        "contextidr_el1" => 0xc681,
-        "mair_el1" => 0xc510,
-        "isr_el1" => 0xc608,
-        "oslsr_el1" => 0x808c,
-        "midr_el1" => 0xc000,
-        "revidr_el1" => 0xc006,
-        "id_aa64pfr0_el1" => 0xc020,
-        "id_aa64pfr1_el1" => 0xc021,
-        "id_aa64isar0_el1" => 0xc030,
-        "id_aa64isar1_el1" => 0xc031,
-        "id_aa64isar2_el1" => 0xc032,
-        "amair_el1" => 0xc518,
-        "hcr_el2" => 0xe088,
-        "cptr_el2" => 0xe08a,
-        "hstr_el2" => 0xe08b,
-        "hacr_el2" => 0xe08f,
-        "vpidr_el2" => 0xe000,
-        "vmpidr_el2" => 0xe005,
-        "actlr_el2" => 0xe081,
-        "elr_el2" => 0xe201,
-        "esr_el2" => 0xe290,
-        "afsr0_el2" => 0xe288,
-        "afsr1_el2" => 0xe289,
-        "far_el2" => 0xe300,
-        "hpfar_el2" => 0xe304,
-        "spsr_el2" => 0xe200,
-        "sctlr_el2" => 0xe080,
-        "mdcr_el2" => 0xe089,
-        "tcr_el2" => 0xe102,
-        "ttbr0_el2" => 0xe100,
-        "vttbr_el2" => 0xe108,
-        "vtcr_el2" => 0xe10a,
-        "vbar_el2" => 0xe600,
-        "mair_el2" => 0xe510,
-        "amair_el2" => 0xe518,
-        "sp_el1" => 0xe208,
-        "pmuserenr_el0" => 0xdcf0,
-        "cntfrq_el0" => 0xdf00,
-        "cntpct_el0" => 0xdf01,
-        "cntv_ctl_el0" => 0xdf19,
-        "cntp_ctl_el0" => 0xdf11,
-        "cntv_cval_el0" => 0xdf1c,
-        "cntp_cval_el0" => 0xdf12,
-        "ctr_el0" => 0xd801,
-        "ttbr1_el1" => 0xc101,
-        "cntkctl_el1" => 0xc708,
-        "id_aa64dfr0_el1" => 0xc028,
-        "oslar_el1" => 0x8084,
-        "cntvct_el0" => 0xdf02,
-        "clidr_el1" => 0xc801,
-        "ccsidr_el1" => 0xc800,
-        "csselr_el1" => 0xd000,
-        "id_aa64mmfr2_el1" => 0xc03a,
-        "id_aa64dfr1_el1" => 0xc029,
-        "actlr_el1" => 0xc081,
-        "afsr0_el1" => 0xc288,
-        "afsr1_el1" => 0xc289,
-        "id_pfr0_el1" => 0xc008,
-        "id_pfr1_el1" => 0xc009,
-        "cnthctl_el2" => 0xe708,
-        "cntvoff_el2" => 0xe703,
-        "sp_el2" => 0xf208,
-        "pmintenset_el1" => 0xc4f1,
-        "pmintenclr_el1" => 0xc4f2,
-        "pmcr_el0" => 0xdce0,
-        "pmcntenset_el0" => 0xdce1,
-        "pmcntenclr_el0" => 0xdce2,
-        "pmovsclr_el0" => 0xdce3,
-        "pmselr_el0" => 0xdce5,
-        "pmceid0_el0" => 0xdce6,
-        "pmceid1_el0" => 0xdce7,
-        "pmccntr_el0" => 0xdce8,
-        "pmxevtyper_el0" => 0xdce9,
-        "pmxevcntr_el0" => 0xdcea,
-        "pmccfiltr_el0" => 0xdf7f,
-        "dczid_el0" => 0xd807,
-        "daif" => 0xda11,
-        "fpcr" => 0xda20,
-        "fpsr" => 0xda21,
-        "nzcv" => 0xda10,
-        "spsel" => 0xc210,
-        "mdccint_el1" => 0x8010,
-        "fpexc32_el2" => 0xe298,
-        "dbgauthstatus_el1" => 0x83f6,
-        "spsr_abt" => 0xe219,
-        "spsr_und" => 0xe21a,
-        "spsr_irq" => 0xe218,
-        "spsr_fiq" => 0xe21b,
-        "ifsr32_el2" => 0xe281,
-        "dacr32_el2" => 0xe180,
-        _ => parse_generic_sysreg(&sysreg)?,
-    };
+    let encoding = sysreg_encoding_named(&sysreg)?;
 
     // MRS encoding: 0xd520_0000 has L=1 (bit 21) for read.
     // Bits [20:19] = op0, supplied entirely by the sysreg encoding field.
@@ -185,92 +74,107 @@ pub(crate) fn sysreg_encoding(op0: u32, op1: u32, crn: u32, crm: u32, op2: u32) 
     ((op0 & 3) << 14) | ((op1 & 7) << 11) | ((crn & 0xF) << 7) | ((crm & 0xF) << 3) | (op2 & 7)
 }
 
-/// Try to parse a numbered debug/performance register family name like
-/// `dbgbcr15_el1` or `dbgwvr0_el1` into its encoding. Returns None if not matched.
-pub(crate) fn parse_numbered_sysreg(name: &str) -> Option<u32> {
-    // Debug breakpoint/watchpoint registers: dbg{b,w}{c,v}r<n>_el1
-    // dbgbcr<n>_el1: op0=2, op1=0, CRn=0, CRm=n, op2=5
-    // dbgbvr<n>_el1: op0=2, op1=0, CRn=0, CRm=n, op2=4
-    // dbgwcr<n>_el1: op0=2, op1=0, CRn=0, CRm=n, op2=7
-    // dbgwvr<n>_el1: op0=2, op1=0, CRn=0, CRm=n, op2=6
-    let prefixes: &[(&str, &str, u32)] = &[
-        ("dbgbcr", "_el1", 5),
-        ("dbgbvr", "_el1", 4),
-        ("dbgwcr", "_el1", 7),
-        ("dbgwvr", "_el1", 6),
-    ];
-    for &(prefix, suffix, op2) in prefixes {
-        if let Some(rest) = name.strip_prefix(prefix) {
-            if let Some(num_str) = rest.strip_suffix(suffix) {
-                if let Ok(n) = num_str.parse::<u32>() {
-                    if n <= 15 {
-                        return Some(sysreg_encoding(2, 0, 0, n, op2));
-                    }
-                }
-            }
-        }
+/// Resolve a system-register name to its 16-bit `op0:op1:CRn:CRm:op2`
+/// encoding.
+///
+/// The names come from `sysreg_table::SYSREGS` -- generated by
+/// `scripts/aarch64_sysreg_table.py` from binutils' own register table and
+/// verified against the pinned GNU as in both directions, so the compiler and
+/// the assembler cannot disagree about what a register is called or which
+/// system register it names.  `mrs` and `msr` share the table on purpose: the
+/// two directions used to be separate hand-written lists that had already
+/// drifted apart, and a name stands for the same system-register number in
+/// both.
+///
+/// The fallback covers what that table cannot express -- the raw
+/// `s<op0>_<op1>_c<CRn>_c<CRm>_<op2>` spelling and the numbered debug and
+/// performance families.  It is reached only for names the generated table
+/// does not contain, where GNU as rejects most spellings too: the
+/// operand-legality matrix's `sweep system sysreg` group pins both directions
+/// of every name in the table, so a name added or removed here without the
+/// assembler agreeing fails a gate.
+pub(crate) fn sysreg_encoding_named(name: &str) -> Result<u32, String> {
+    let table = super::sysreg_table::SYSREGS;
+    if let Ok(i) = table.binary_search_by(|&(n, _)| sysreg_name_cmp(n, name)) {
+        return Ok(table[i].1);
     }
-
-    // Performance monitor event count registers: pmevcntr<n>_el0, pmevtyper<n>_el0
-    // pmevcntr<n>_el0: op0=3, op1=3, CRn=14, CRm=8+n/8, op2=n%8
-    // pmevtyper<n>_el0: op0=3, op1=3, CRn=14, CRm=12+n/8, op2=n%8
-    if let Some(rest) = name.strip_prefix("pmevcntr") {
-        if let Some(num_str) = rest.strip_suffix("_el0") {
-            if let Ok(n) = num_str.parse::<u32>() {
-                if n <= 30 {
-                    return Some(sysreg_encoding(3, 3, 14, 8 + n / 8, n % 8));
-                }
-            }
-        }
-    }
-    if let Some(rest) = name.strip_prefix("pmevtyper") {
-        if let Some(num_str) = rest.strip_suffix("_el0") {
-            if let Ok(n) = num_str.parse::<u32>() {
-                if n <= 30 {
-                    return Some(sysreg_encoding(3, 3, 14, 12 + n / 8, n % 8));
-                }
-            }
-        }
-    }
-
-    None
+    parse_generic_sysreg(name)
 }
 
-/// Parse generic system register name like `s3_0_c1_c0_1` into encoding bits.
-/// Also handles numbered register families like `dbgbcr15_el1`.
-pub(crate) fn parse_generic_sysreg(name: &str) -> Result<u32, String> {
-    // Try numbered register families first
-    if let Some(enc) = parse_numbered_sysreg(name) {
-        return Ok(enc);
+/// Order two system-register spellings the way the generated table is sorted
+/// (by the lower-case name) but without an allocation: ASCII-case-folded byte
+/// compare, shorter-is-smaller when one is a prefix of the other.
+///
+/// The fold is not cosmetic.  GNU as resolves `DBGBVR7_EL1`, `DbgBvr7_El1` and
+/// `PAN` exactly like their lower-case spellings -- the assembler is
+/// case-insensitive about register names -- and a plain `str` compare made the
+/// compiler's answer depend on the case of the mnemonic's operand, one layer
+/// below the `to_lowercase()` the *instruction* encoders do.  Doing it here, in
+/// the resolver itself, keeps the table contract single-sourced: every caller
+/// gets GNU as's behaviour whether or not it remembered to normalise, and the
+/// two directions (`mrs`/`msr`) share it.
+fn sysreg_name_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let (ab, bb) = (a.as_bytes(), b.as_bytes());
+    for i in 0..ab.len().min(bb.len()) {
+        let (x, y) = (ab[i].to_ascii_lowercase(), bb[i].to_ascii_lowercase());
+        if x != y {
+            return x.cmp(&y);
+        }
     }
+    ab.len().cmp(&bb.len())
+}
 
-    // Format: s<op0>_<op1>_c<CRn>_c<CRm>_<op2>
+/// Parse the raw `s<op0>_<op1>_c<CRn>_c<CRm>_<op2>` system-register spelling.
+///
+/// This is the escape hatch for registers the named table has no name for, and
+/// it is the form an assembler-level test or a generated header tends to use.
+/// Every field is range-checked against its width before it is encoded --
+/// `sysreg_encoding` masks, so without the check `s4_0_c1_c0_1` (op0 is two
+/// bits), `s3_8_c1_c0_1` (op1 is three), `s3_0_c16_c0_1` (CRn/CRm are four) and
+/// `s3_0_c1_c0_8` (op2 is three) all assembled into *some* other register while
+/// GNU as rejects every one of them.  A wrong system register is a silent
+/// wrong answer at run time, so the check is the whole point of the function.
+///
+/// The numbered debug and performance families (`dbgbcr7_el1`, `pmevcntr3_el0`)
+/// are NOT handled here any more: they are real names in binutils' table and
+/// resolve through `sysreg_table::SYSREGS`, so a second implementation of the
+/// same mapping -- which is what this function used to carry -- could only
+/// drift away from the verified one.  Names outside the table's families
+/// (`dbgbcr16_el1`, `pmevcntr31_el0`) are rejected, which is also what GNU as
+/// does and what the matrix's `sweep system sysreg` group pins.
+pub(crate) fn parse_generic_sysreg(name: &str) -> Result<u32, String> {
+    // Format: s<op0>_<op1>_c<CRn>_c<CRm>_<op2>.  GNU as reads the prefix
+    // letters case-insensitively (`S3_0_C1_C0_1` assembles to the same word as
+    // the lower-case spelling, and so do the mixed forms), so the prefixes are
+    // matched that way here too -- a spelling the assembler accepts must not
+    // fail on the case of its separator letters.
     let parts: Vec<&str> = name.split('_').collect();
-    if parts.len() == 5
-        && parts[0].starts_with('s')
-        && parts[2].starts_with('c')
-        && parts[3].starts_with('c')
+    let bad = || format!("unsupported system register: {}", name);
+    let prefixed = |text: &str, prefix: char| {
+        text.as_bytes()
+            .first()
+            .is_some_and(|b| (*b as char).eq_ignore_ascii_case(&prefix))
+    };
+    if parts.len() != 5
+        || !prefixed(parts[0], 's')
+        || !prefixed(parts[2], 'c')
+        || !prefixed(parts[3], 'c')
     {
-        let op0: u32 = parts[0][1..]
-            .parse()
-            .map_err(|_| format!("unsupported system register: {}", name))?;
-        let op1: u32 = parts[1]
-            .parse()
-            .map_err(|_| format!("unsupported system register: {}", name))?;
-        let crn: u32 = parts[2][1..]
-            .parse()
-            .map_err(|_| format!("unsupported system register: {}", name))?;
-        let crm: u32 = parts[3][1..]
-            .parse()
-            .map_err(|_| format!("unsupported system register: {}", name))?;
-        let op2: u32 = parts[4]
-            .parse()
-            .map_err(|_| format!("unsupported system register: {}", name))?;
-        let enc = sysreg_encoding(op0, op1, crn, crm, op2);
-        Ok(enc)
-    } else {
-        Err(format!("unsupported system register: {}", name))
+        return Err(bad());
     }
+    let field = |text: &str, strip: usize| -> Result<u32, String> {
+        text.get(strip..)
+            .and_then(|d| d.parse::<u32>().ok())
+            .ok_or_else(bad)
+    };
+    let (op0, op1) = (field(parts[0], 1)?, field(parts[1], 0)?);
+    let (crn, crm) = (field(parts[2], 1)?, field(parts[3], 1)?);
+    let op2 = field(parts[4], 0)?;
+    // Widths: op0 is 2 bits, op1 and op2 are 3, CRn and CRm are 4.
+    if op0 > 3 || op1 > 7 || crn > 15 || crm > 15 || op2 > 7 {
+        return Err(bad());
+    }
+    Ok(sysreg_encoding(op0, op1, crn, crm, op2))
 }
 
 pub(crate) fn encode_msr(operands: &[Operand]) -> Result<EncodeResult, String> {
@@ -281,118 +185,74 @@ pub(crate) fn encode_msr(operands: &[Operand]) -> Result<EncodeResult, String> {
 
     // MSR (immediate): msr <pstatefield>, #imm
     // Encoding: 1101_0101_0000_0 op1[18:16] 0100 CRm[11:8] op2[7:5] 11111[4:0]
-    // daifset: op1=3, op2=6; daifclr: op1=3, op2=7; spsel: op1=0, op2=5
+    // with the immediate in CRm and the field named by (op1, CRm, op2).
+    //
+    // Every field here except DAIFSet/DAIFClr also has a *register* form --
+    // `msr pan,x0`, `msr spsel,x0` -- because the field IS a 16-bit
+    // system-register number (`mrs x0,pan` reads it back).  An operand that is
+    // not an immediate therefore falls THROUGH this match to the shared
+    // system-register write below; returning an error here made `msr pan,x0`
+    // "expected immediate at operand 1" while GNU as assembles it.  DAIFSet
+    // and DAIFClr are the exception: they exist only as `#imm`, so they do
+    // fail here, exactly as GNU as does.
     match sysreg.as_str() {
-        "daifset" => {
-            let imm = get_imm(operands, 1)? as u32 & 0xF;
-            let word = 0xd5034000 | (imm << 8) | (0b110 << 5) | 0x1F;
-            return Ok(EncodeResult::Word(word));
-        }
-        "daifclr" => {
-            let imm = get_imm(operands, 1)? as u32 & 0xF;
-            let word = 0xd5034000 | (imm << 8) | (0b111 << 5) | 0x1F;
-            return Ok(EncodeResult::Word(word));
-        }
+        "daifset" => return msr_pstate_imm_only(operands, 1, 3, 0b110, 0, "daifset"),
+        "daifclr" => return msr_pstate_imm_only(operands, 1, 3, 0b111, 0, "daifclr"),
+        // SPSel: one bit (bits 1-3 are RES0, and GNU as rejects
+        // `msr spsel,#2`), op1=0, CRm=4, op2=5.
         "spsel" => {
-            // SPSel: op1=0, op2=5 (MSR immediate form)
-            // If the second operand is a register, fall through to MSR register form
-            if let Ok(imm) = get_imm(operands, 1) {
-                let imm = imm as u32 & 0xF;
-                let word = 0xd5004000 | (imm << 8) | (0b101 << 5) | 0x1F;
-                return Ok(EncodeResult::Word(word));
+            if let Some(word) = msr_pstate_field(operands, 1, 0, 0b101, 0, "spsel")? {
+                return Ok(word);
+            }
+        }
+        // The pointer-authentication/speculation-control fields, each one bit:
+        // PAN (0, 4, 4), UAO (0, 4, 3), SSBS/DIT/TCO (3, 4, 1/2/4) and
+        // ALLINT (1, 4, 0).  The first five all have register forms too, so a
+        // non-immediate operand falls through like PAN's does.
+        "uao" => {
+            if let Some(word) = msr_pstate_field(operands, 1, 0, 0b011, 0, "uao")? {
+                return Ok(word);
+            }
+        }
+        "allint" => {
+            if let Some(word) = msr_pstate_field(operands, 1, 1, 0b000, 0, "allint")? {
+                return Ok(word);
+            }
+        }
+        // The SME state fields (SVCR's S<M|Z> bits) are immediate-only, and
+        // their one-bit immediate lands in CRm's low bit: `msr svcrsm,#1` is
+        // CRm=3.  GNU as rejects `msr svcrsm,x0` (there is no such register
+        // name), so these do not fall through.
+        "svcrsm" => return msr_pstate_imm_only(operands, 1, 3, 0b011, 0b010, "svcrsm"),
+        "svcrza" => return msr_pstate_imm_only(operands, 1, 3, 0b011, 0b100, "svcrza"),
+        "svcrsmza" => return msr_pstate_imm_only(operands, 1, 3, 0b011, 0b110, "svcrsmza"),
+        "pan" => {
+            if let Some(word) = msr_pstate_field(operands, 1, 0, 0b100, 0, "pan")? {
+                return Ok(word);
+            }
+        }
+        "ssbs" => {
+            if let Some(word) = msr_pstate_field(operands, 1, 3, 0b001, 0, "ssbs")? {
+                return Ok(word);
+            }
+        }
+        "dit" => {
+            if let Some(word) = msr_pstate_field(operands, 1, 3, 0b010, 0, "dit")? {
+                return Ok(word);
+            }
+        }
+        "tco" => {
+            if let Some(word) = msr_pstate_field(operands, 1, 3, 0b100, 0, "tco")? {
+                return Ok(word);
             }
         }
         _ => {}
     }
 
-    // MSR (register): msr sysreg, Xt
-    let (rt, _) = get_reg(operands, 1)?;
+    // MSR (register): msr sysreg, Xt -- X register only (see encode_mrs).
+    let rt = system_rt_x(operands, 1, "msr")?;
 
-    let encoding = match sysreg.as_str() {
-        "sp_el0" => 0xc208u32,
-        "tpidr_el0" => 0xde82,
-        "tpidr_el1" => 0xc684,
-        "tpidr_el2" => 0xe682,
-        "tpidrro_el0" => 0xde83,
-        "tcr_el1" => 0xc102,
-        "ttbr0_el1" => 0xc100,
-        "sctlr_el1" => 0xc080,
-        "mdscr_el1" => 0x8012,
-        "cpacr_el1" => 0xc082,
-        "par_el1" => 0xc3a0,
-        "osdlr_el1" => 0x809c,
-        "oslar_el1" => 0x8084,
-        "oslsr_el1" => 0x808c,
-        "elr_el1" => 0xc201,
-        "spsr_el1" => 0xc200,
-        "esr_el1" => 0xc290,
-        "far_el1" => 0xc300,
-        "vbar_el1" => 0xc600,
-        "contextidr_el1" => 0xc681,
-        "mair_el1" => 0xc510,
-        "amair_el1" => 0xc518,
-        "hcr_el2" => 0xe088,
-        "cptr_el2" => 0xe08a,
-        "hstr_el2" => 0xe08b,
-        "elr_el2" => 0xe201,
-        "esr_el2" => 0xe290,
-        "far_el2" => 0xe300,
-        "spsr_el2" => 0xe200,
-        "sctlr_el2" => 0xe080,
-        "mdcr_el2" => 0xe089,
-        "tcr_el2" => 0xe102,
-        "ttbr0_el2" => 0xe100,
-        "vttbr_el2" => 0xe108,
-        "vtcr_el2" => 0xe10a,
-        "vbar_el2" => 0xe600,
-        "mair_el2" => 0xe510,
-        "sp_el1" => 0xe208,
-        "csselr_el1" => 0xd000,
-        "actlr_el1" => 0xc081,
-        "cnthctl_el2" => 0xe708,
-        "cntvoff_el2" => 0xe703,
-        "sp_el2" => 0xf208,
-        "vpidr_el2" => 0xe000,
-        "vmpidr_el2" => 0xe005,
-        "hacr_el2" => 0xe08f,
-        "actlr_el2" => 0xe081,
-        "afsr0_el2" => 0xe288,
-        "afsr1_el2" => 0xe289,
-        "amair_el2" => 0xe518,
-        "hpfar_el2" => 0xe304,
-        "pmintenset_el1" => 0xc4f1,
-        "pmintenclr_el1" => 0xc4f2,
-        "pmcr_el0" => 0xdce0,
-        "pmcntenset_el0" => 0xdce1,
-        "pmcntenclr_el0" => 0xdce2,
-        "pmovsclr_el0" => 0xdce3,
-        "pmselr_el0" => 0xdce5,
-        "pmccntr_el0" => 0xdce8,
-        "pmxevtyper_el0" => 0xdce9,
-        "pmxevcntr_el0" => 0xdcea,
-        "pmuserenr_el0" => 0xdcf0,
-        "pmccfiltr_el0" => 0xdf7f,
-        "cntv_ctl_el0" => 0xdf19,
-        "cntp_ctl_el0" => 0xdf11,
-        "cntp_cval_el0" => 0xdf12,
-        "cntv_cval_el0" => 0xdf1c,
-        "ttbr1_el1" => 0xc101,
-        "cntkctl_el1" => 0xc708,
-        "daif" => 0xda11,
-        "fpcr" => 0xda20,
-        "fpsr" => 0xda21,
-        "nzcv" => 0xda10,
-        "spsel" => 0xc210,
-        "mdccint_el1" => 0x8010,
-        "fpexc32_el2" => 0xe298,
-        "spsr_abt" => 0xe219,
-        "spsr_und" => 0xe21a,
-        "spsr_irq" => 0xe218,
-        "spsr_fiq" => 0xe21b,
-        "ifsr32_el2" => 0xe281,
-        "dacr32_el2" => 0xe180,
-        _ => parse_generic_sysreg(&sysreg)?,
-    };
+    let encoding = sysreg_encoding_named(&sysreg)?;
 
     // MSR encoding: 0xd500_0000 has L=0 (bit 21) for write.
     // Bits [20:19] = op0, supplied entirely by the sysreg encoding field.
@@ -400,52 +260,205 @@ pub(crate) fn encode_msr(operands: &[Operand]) -> Result<EncodeResult, String> {
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_svc(operands: &[Operand]) -> Result<EncodeResult, String> {
+/// Read the 16-bit comment immediate of SVC/HVC/SMC/BRK/HLT.
+///
+/// The field is sixteen bits and unsigned; the old readers masked with
+/// `& 0xFFFF`, so `svc #65536` silently encoded `svc #0` and `brk #-1`
+/// encoded `brk #65535` -- two instructions whose whole purpose is to be
+/// recognisable in a crash dump.
+fn exception_imm(operands: &[Operand], mn: &str) -> Result<u32, String> {
     let imm = get_imm(operands, 0)?;
-    let word = 0xd4000001 | ((imm as u32 & 0xFFFF) << 5);
-    Ok(EncodeResult::Word(word))
+    if !(0..=0xFFFF).contains(&imm) {
+        return Err(format!(
+            "{mn}: immediate {imm} does not fit the 16-bit comment field \
+             (allowed 0..=65535)"
+        ));
+    }
+    Ok(imm as u32)
+}
+
+/// Read an `Xn` register operand for a system instruction's Rt/Rt2 slot.
+///
+/// MRS/MSR/SYS/DC/IC/TLBI/AT all put a 64-bit general-purpose register in
+/// these fields.  The permissive `get_reg` reader accepted `w0` -- whose
+/// encoding differs from the X spelling by nothing at all, since the field
+/// holds only the register *number* -- so `msr nzcv,w0` assembled as
+/// `msr nzcv,x0`, and it accepted `sp`, which is the same number as `xzr`
+/// while meaning the opposite.
+fn system_rt_x(operands: &[Operand], idx: usize, mn: &str) -> Result<u32, String> {
+    // The same GpReg reader every other GP operand goes through, so an `d0` or
+    // a `v0.4s` here is rejected by the one piece of code that knows what a
+    // general-purpose register is, instead of by a prefix test that happened to
+    // miss the FP spellings.
+    let reg = reg_operand(operands, idx, GpRole::RegOrZr, mn)?;
+    if !reg.is_64 {
+        return Err(format!(
+            "{mn}: operand {idx} `{}` is 32-bit; system register transfers move a \
+             64-bit register",
+            operand_spelling(operands, idx)
+        ));
+    }
+    Ok(reg.num)
+}
+
+/// Encode an MSR (immediate) pstate field access.
+///
+/// `MSR <pstatefield>, #imm` encodes as `1101 0101 0000 0 op1 0100 CRm op2 11111`
+/// (bits [15:12] are the fixed `0100`) with the immediate in CRm.  The
+/// immediate's width is the field's: SPSel, PAN, UAO, SSBS, DIT, TCO, ALLINT
+/// and the SME SVCR bits are one bit, DAIFSet/DAIFClr are four, and the width
+/// is what turns `msr spsel,#2` into an error rather than a silent
+/// `msr spsel,#0`.
+///
+/// `crm_base` is the CRm value the immediate is OR-ed into.  It is zero for
+/// every field whose immediate IS CRm, but SVCR's `S<M>`/`S<Z>` bits are two
+/// separate fields sharing `op1=3, op2=3`: `svcrsm` is CRm `0b010|imm` and
+/// `svcrza` is CRm `0b100|imm`, which is why `msr svcrsm,#1` is CRm=3 and not
+/// CRm=1.  (The low bit of CRm is reserved zero in that encoding, so the OR is
+/// exact for the one-bit immediate.)
+///
+/// `Ok(None)` means "operand `idx` is not an immediate", i.e. not this form at
+/// all: the caller then resolves the same field through the shared
+/// system-register table (the `msr <field>,<Xn>` spelling).
+fn msr_pstate_field(
+    operands: &[Operand],
+    idx: usize,
+    op1: u32,
+    op2: u32,
+    crm_base: u32,
+    name: &str,
+) -> Result<Option<EncodeResult>, String> {
+    let imm = match get_imm(operands, idx) {
+        Ok(imm) => imm,
+        Err(_) => return Ok(None),
+    };
+    let max = if op2 >= 0b110 { 0xF } else { 1 };
+    if !(0..=max).contains(&imm) {
+        return Err(format!(
+            "msr {name}: immediate {imm} is outside the {}-bit field (allowed 0..={max})",
+            if max == 1 { 1 } else { 4 }
+        ));
+    }
+    let word = 0xd5000000
+        | (op1 << 16)
+        | (0b0100 << 12)
+        | ((crm_base | imm as u32) << 8)
+        | (op2 << 5)
+        | 0x1F;
+    Ok(Some(EncodeResult::Word(word)))
+}
+
+/// The immediate-only PSTATE fields (DAIFSet/DAIFClr).
+///
+/// A non-immediate operand is an error here rather than a fall-through,
+/// because the field has no register spelling at all -- GNU as rejects
+/// `msr daifset,x0` for the same reason.
+fn msr_pstate_imm_only(
+    operands: &[Operand],
+    idx: usize,
+    op1: u32,
+    op2: u32,
+    crm_base: u32,
+    name: &str,
+) -> Result<EncodeResult, String> {
+    match msr_pstate_field(operands, idx, op1, op2, crm_base, name)? {
+        Some(word) => Ok(word),
+        None => Err(format!(
+            "msr {name}: needs an immediate operand ({name} is write-only and \
+             has no register spelling)"
+        )),
+    }
+}
+
+/// Encode HLT (halt to debugger): `1101 0100 010 imm16 0010` with imm16 in
+/// bits 20..5.  HLT was dispatched nowhere, so every `hlt` was "unsupported
+/// instruction" (the `brk` encoder next to it is the same shape with a
+/// different opcode).
+pub(crate) fn encode_hlt(operands: &[Operand]) -> Result<EncodeResult, String> {
+    let imm = get_imm(operands, 0)?;
+    if !(0..=0xFFFF).contains(&imm) {
+        return Err(format!(
+            "hlt: immediate {imm} does not fit the 16-bit comment field (allowed 0..=65535)"
+        ));
+    }
+    Ok(EncodeResult::Word(0xd4400000 | ((imm as u32) << 5)))
+}
+
+/// The Rt field of a `sys`-class instruction (`dc`, `ic`, `tlbi`, `at`).
+///
+/// Those four families are one encoding with a fixed op1/CRn/CRm/op2 per
+/// operation and an optional 64-bit register.  The tables below encode the
+/// "no register" operations with Rt already set to 31, so the low five bits of
+/// the base word say whether the operation takes a register at all -- and GNU
+/// as pins both directions in the `system Rt` rows of
+/// tests/aarch64/operand-legality.tsv: `ic iallu,x0` and `tlbi vmalle1,x0` are
+/// errors (those operations have no register operand), while `at s1e1r` and
+/// `ic ivau` are errors (their register is mandatory).  The published readers
+/// defaulted to register 0 when the operand was missing and accepted any
+/// register spelling when it was present, so `dc zva,w0` assembled as
+/// `dc zva,x0` and `at s1e1r` assembled with Rt = x0.
+fn sys_class_rt(rt_spelling: Option<&str>, base: u32, mn: &str) -> Result<u32, String> {
+    let takes_register = base & 0x1F != 0x1F;
+    match (takes_register, rt_spelling) {
+        (false, None) => Ok(31),
+        (false, Some(name)) => Err(format!(
+            "{mn}: this operation takes no register operand, but `{name}` was \
+             given (the encoding has Rt = 31)"
+        )),
+        (true, None) => Err(format!(
+            "{mn}: this operation needs a 64-bit register operand (x0-x30)"
+        )),
+        (true, Some(name)) => {
+            let lower = name.to_lowercase();
+            if lower == "sp" || lower == "wsp" {
+                return Err(format!(
+                    "{mn}: `{name}` is not valid here; this field takes a 64-bit \
+                     general-purpose register"
+                ));
+            }
+            if lower.starts_with('w') {
+                return Err(format!(
+                    "{mn}: `{name}` is 32-bit; system instruction registers are \
+                     64-bit"
+                ));
+            }
+            parse_reg_num(name).ok_or_else(|| format!("{mn}: invalid register `{name}`"))
+        }
+    }
+}
+
+pub(crate) fn encode_svc(operands: &[Operand]) -> Result<EncodeResult, String> {
+    let imm = exception_imm(operands, "svc")?;
+    Ok(EncodeResult::Word(0xd4000001 | (imm << 5)))
 }
 
 pub(crate) fn encode_hvc(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let imm = get_imm(operands, 0)?;
-    let word = 0xd4000002 | ((imm as u32 & 0xFFFF) << 5);
-    Ok(EncodeResult::Word(word))
+    let imm = exception_imm(operands, "hvc")?;
+    Ok(EncodeResult::Word(0xd4000002 | (imm << 5)))
 }
 
 pub(crate) fn encode_ic(raw_operands: &str) -> Result<EncodeResult, String> {
     let parts: Vec<&str> = raw_operands.splitn(2, ',').collect();
     let op_name = parts[0].trim().to_lowercase();
-    let rt = if parts.len() > 1 {
-        let reg_str = parts[1].trim();
-        parse_reg_num(reg_str).ok_or_else(|| format!("ic: invalid register '{}'", reg_str))?
-    } else {
-        31 // xzr
-    };
     let base = match op_name.as_str() {
         "ialluis" => 0xd508711fu32,
         "iallu" => 0xd508751f,
         "ivau" => 0xd50b7520,
         _ => return Err(format!("unsupported ic operation: {}", op_name)),
     };
+    let rt = sys_class_rt(parts.get(1).map(|s| s.trim()), base, "ic")?;
     let word = (base & !0x1F) | rt;
     Ok(EncodeResult::Word(word))
 }
 
 pub(crate) fn encode_smc(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let imm = get_imm(operands, 0)?;
-    let word = 0xd4000003 | ((imm as u32 & 0xFFFF) << 5);
-    Ok(EncodeResult::Word(word))
+    let imm = exception_imm(operands, "smc")?;
+    Ok(EncodeResult::Word(0xd4000003 | (imm << 5)))
 }
 
 pub(crate) fn encode_at(_operands: &[Operand], raw_operands: &str) -> Result<EncodeResult, String> {
     let parts: Vec<&str> = raw_operands.splitn(2, ',').collect();
     let op_name = parts[0].trim().to_lowercase();
-    let rt = if parts.len() > 1 {
-        let reg_str = parts[1].trim();
-        parse_reg_num(reg_str).ok_or_else(|| format!("at: invalid register '{}'", reg_str))?
-    } else {
-        31
-    };
     // AT encoding: SYS instruction. Base words from GCC:
     let base = match op_name.as_str() {
         "s1e1r" => 0xd5087800u32,
@@ -454,6 +467,7 @@ pub(crate) fn encode_at(_operands: &[Operand], raw_operands: &str) -> Result<Enc
         "s1e0w" => 0xd5087860,
         _ => return Err(format!("unsupported at operation: {}", op_name)),
     };
+    let rt = sys_class_rt(parts.get(1).map(|s| s.trim()), base, "at")?;
     let word = (base & !0x1F) | rt;
     Ok(EncodeResult::Word(word))
 }
@@ -505,9 +519,8 @@ pub(crate) fn encode_sys(raw_operands: &str) -> Result<EncodeResult, String> {
 }
 
 pub(crate) fn encode_brk(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let imm = get_imm(operands, 0)?;
-    let word = 0xd4200000 | ((imm as u32 & 0xFFFF) << 5);
-    Ok(EncodeResult::Word(word))
+    let imm = exception_imm(operands, "brk")?;
+    Ok(EncodeResult::Word(0xd4200000 | (imm << 5)))
 }
 
 pub(crate) fn encode_tlbi(
@@ -516,12 +529,6 @@ pub(crate) fn encode_tlbi(
 ) -> Result<EncodeResult, String> {
     let parts: Vec<&str> = raw_operands.splitn(2, ',').collect();
     let op_name = parts[0].trim().to_lowercase();
-    let rt = if parts.len() > 1 {
-        let reg_str = parts[1].trim();
-        parse_reg_num(reg_str).ok_or_else(|| format!("tlbi: invalid register '{}'", reg_str))?
-    } else {
-        31 // xzr
-    };
     // TLBI encoding: SYS instruction with fixed fields
     // Full word from GCC objdump for known ops (with Rt=x0):
     let base = match op_name.as_str() {
@@ -573,6 +580,7 @@ pub(crate) fn encode_tlbi(
         _ => return Err(format!("unsupported tlbi operation: {}", op_name)),
     };
     // Replace Rt field (bits 4:0)
+    let rt = sys_class_rt(parts.get(1).map(|s| s.trim()), base, "tlbi")?;
     let word = (base & !0x1F) | rt;
     Ok(EncodeResult::Word(word))
 }
@@ -592,6 +600,12 @@ pub(crate) fn encode_bti(raw_operands: &str) -> Result<EncodeResult, String> {
 
 pub(crate) fn encode_hint(operands: &[Operand]) -> Result<EncodeResult, String> {
     let imm = get_imm(operands, 0)?;
+    // The hint number is seven bits (CRm:op2); GNU as rejects #128 and up.
+    if !(0..=127).contains(&imm) {
+        return Err(format!(
+            "hint: immediate {imm} does not fit the 7-bit hint field (allowed 0..=127)"
+        ));
+    }
     // HINT: 11010101 00000011 0010 CRm op2 11111
     // CRm = imm >> 3, op2 = imm & 7
     let crm = ((imm as u32) >> 3) & 0xF;
@@ -607,46 +621,286 @@ pub(crate) fn encode_dc(operands: &[Operand], raw_operands: &str) -> Result<Enco
         _ => raw_operands.to_lowercase(),
     };
 
-    // Find the register operand (second operand or last operand)
-    let rt = match operands.get(1) {
-        Some(Operand::Reg(name)) => parse_reg_num(name).ok_or("invalid register for dc")?,
-        _ => {
-            if let Some(Operand::Reg(name)) = operands.last() {
-                parse_reg_num(name).ok_or("invalid register for dc")?
-            } else {
-                0
-            }
-        }
-    };
+    // The register operand, if the operation has one: `dc zva, x0`.  The base
+    // words below have Rt = 0 for the register-taking operations, so the
+    // reader here has to supply it; the shared validator enforces the class.
+    let rt_spelling = operands.iter().skip(1).find_map(|o| match o {
+        Operand::Reg(name) => Some(name.as_str()),
+        _ => None,
+    });
+    let dc_rt = |base: u32| sys_class_rt(rt_spelling, base, "dc");
 
     if op.contains("civac") {
         // DC CIVAC: sys #3, c7, c14, #1, Xt
-        let word = 0xd50b7e20 | rt;
+        let word = 0xd50b7e20 | dc_rt(0xd50b7e20)?;
         return Ok(EncodeResult::Word(word));
     }
     if op.contains("cvac") {
         // DC CVAC: sys #3, c7, c10, #1, Xt
-        let word = 0xd50b7a20 | rt;
+        let word = 0xd50b7a20 | dc_rt(0xd50b7a20)?;
         return Ok(EncodeResult::Word(word));
     }
     if op.contains("cvap") {
         // DC CVAP: sys #3, c7, c12, #1, Xt
-        let word = 0xd50b7c20 | rt;
+        let word = 0xd50b7c20 | dc_rt(0xd50b7c20)?;
         return Ok(EncodeResult::Word(word));
     }
     if op.contains("cvau") {
-        let word = 0xd50b7b20 | rt;
+        let word = 0xd50b7b20 | dc_rt(0xd50b7b20)?;
         return Ok(EncodeResult::Word(word));
     }
     if op.contains("ivac") {
-        let word = 0xd5087620 | rt;
+        let word = 0xd5087620 | dc_rt(0xd5087620)?;
         return Ok(EncodeResult::Word(word));
     }
     if op.contains("zva") {
         // DC ZVA: sys #3, c7, c4, #1, Xt
-        let word = 0xd50b7420 | rt;
+        let word = 0xd50b7420 | dc_rt(0xd50b7420)?;
         return Ok(EncodeResult::Word(word));
     }
 
     Err(format!("unsupported dc variant: {}", raw_operands))
+}
+
+mod sysreg_table_tests {
+    use super::super::sysreg_table::SYSREGS;
+    use super::*;
+
+    fn enc_mrs(reg: &str, sysreg: &str) -> Result<u32, String> {
+        match encode_mrs(&[
+            Operand::Reg(reg.to_string()),
+            Operand::Symbol(sysreg.to_string()),
+        ])? {
+            EncodeResult::Word(w) => Ok(w),
+            other => panic!("mrs {reg},{sysreg}: expected one word, got {other:?}"),
+        }
+    }
+
+    fn enc_msr(sysreg: &str, operand: Operand) -> Result<u32, String> {
+        match encode_msr(&[Operand::Symbol(sysreg.to_string()), operand])? {
+            EncodeResult::Word(w) => Ok(w),
+            other => panic!("msr {sysreg}: expected one word, got {other:?}"),
+        }
+    }
+
+    /// `sysreg_encoding_named` binary-searches `SYSREGS`, so the table's order
+    /// is part of its correctness: one out-of-order row makes an arbitrary set
+    /// of names unresolvable, and nothing else in the build would notice.  The
+    /// count is the binutils 2.47 register list the table was generated from;
+    /// regenerating against a newer binutils changes it deliberately and this
+    /// assertion is what makes that show up as a decision.
+    #[test]
+    fn generated_table_is_sorted_unique_and_complete_for_binutils_2_47() {
+        assert_eq!(SYSREGS.len(), 1619, "generated table changed size");
+        for pair in SYSREGS.windows(2) {
+            assert!(
+                pair[0].0 < pair[1].0,
+                "SYSREGS is not sorted (or has a duplicate): {:?} then {:?}",
+                pair[0].0,
+                pair[1].0
+            );
+        }
+        for name in [
+            "accdata_el1",
+            "actlrmask_el1",
+            "afgdtp0_el1",
+            "cntv_cval_el0",
+            "dbgbcr0_el1",
+            "fpmr",
+            "midr_el1",
+            "pan",
+            "sp_el0",
+            "sp_el1",
+            "tco",
+            "uao",
+        ] {
+            assert!(
+                SYSREGS.binary_search_by(|&(n, _)| n.cmp(name)).is_ok(),
+                "{name} missing from the generated table"
+            );
+        }
+    }
+
+    /// The encodings the hand-written tables had wrong or missing.  Every one
+    /// of these is a GNU as word (the pin is `tests/aarch64/operand-legality.tsv`
+    /// for the full 1619-name sweep; this test is the no-tool, always-run half).
+    #[test]
+    fn known_system_registers_encode_as_gnu_as_does() {
+        for (name, want) in [
+            // 0xdf1c is not CNTV_CVAL: `mrs x0,cntv_cval_el0` used to read an
+            // unallocated system register.
+            ("cntv_cval_el0", 0xd53be340u32),
+            ("sp_el0", 0xd5384100),
+            ("pan", 0xd5384260),
+            ("uao", 0xd5384280),
+            ("allint", 0xd5384300),
+            ("spsel", 0xd5384200),
+            ("tco", 0xd53b42e0),
+            ("midr_el1", 0xd5380000),
+            ("cntvct_el0", 0xd53be040),
+            ("sctlr_el1", 0xd5381000),
+        ] {
+            assert_eq!(enc_mrs("x0", name), Ok(want), "mrs x0,{name}");
+        }
+        // The register form of the same fields, which the write side used to
+        // reject for 28 readable-only names and for pan/dit/ssbs/tco.
+        for (name, want) in [
+            ("pan", 0xd5184260u32),
+            ("sp_el0", 0xd5184100),
+            ("spsel", 0xd5184200),
+            ("nzcv", 0xd51b4200),
+            ("clidr_el1", 0xd5190020),
+        ] {
+            assert_eq!(
+                enc_msr(name, Operand::Reg("x0".to_string())),
+                Ok(want),
+                "msr {name},x0"
+            );
+        }
+        // `mrs` takes an X register, but the field is only five bits, so both
+        // the zero register (as the discard spelling) and x30 work; SP does not.
+        assert_eq!(enc_mrs("xzr", "pan"), Ok(0xd538427f));
+        assert_eq!(enc_mrs("x30", "pan"), Ok(0xd538427e));
+        assert!(enc_mrs("sp", "pan").is_err());
+        assert!(enc_mrs("w0", "pan").is_err());
+    }
+
+    /// The PSTATE immediate forms.  The words are GNU as's, and the widths are
+    /// what makes `#2` an error on the one-bit fields rather than a silent
+    /// alias of `#0`.
+    #[test]
+    fn pstate_immediate_forms_match_gnu_as() {
+        for (field, imm, want) in [
+            ("spsel", 1, 0xd50041bfu32),
+            ("pan", 1, 0xd500419f),
+            ("uao", 1, 0xd500417f),
+            ("ssbs", 1, 0xd503413f),
+            ("dit", 1, 0xd503415f),
+            ("tco", 1, 0xd503419f),
+            ("allint", 1, 0xd501411f),
+            ("daifset", 1, 0xd50341df),
+            ("daifset", 15, 0xd5034fdf),
+            ("daifclr", 15, 0xd5034fff),
+            // SVCR's S<M>/S<Z> bits: one bit, OR-ed into CRm's reserved-low-bit
+            // pair, so `#1` steps CRm by one from 2/4/6 rather than setting it.
+            ("svcrsm", 1, 0xd503437f),
+            ("svcrza", 1, 0xd503457f),
+            ("svcrsmza", 1, 0xd503477f),
+        ] {
+            assert_eq!(
+                enc_msr(field, Operand::Imm(imm)),
+                Ok(want),
+                "msr {field},#{imm}"
+            );
+        }
+        for (field, imm) in [
+            ("spsel", 2),
+            ("pan", 2),
+            ("uao", 2),
+            ("ssbs", 2),
+            ("dit", 2),
+            ("tco", 2),
+            ("allint", 2),
+            ("daifset", 16),
+            ("daifclr", 16),
+            ("svcrsm", 2),
+            ("svcrza", 2),
+            ("svcrsmza", 2),
+        ] {
+            assert!(
+                enc_msr(field, Operand::Imm(imm)).is_err(),
+                "msr {field},#{imm} should be rejected (immediate wider than the field)"
+            );
+        }
+        // DAIFSet/DAIFClr have no register form at all; the fields above them
+        // do, and a non-immediate operand must reach the register form rather
+        // than fail as "expected immediate".
+        assert!(enc_msr("daifset", Operand::Reg("x0".to_string())).is_err());
+        assert!(enc_msr("daifclr", Operand::Reg("x0".to_string())).is_err());
+        assert!(enc_msr("svcrsm", Operand::Reg("x0".to_string())).is_err());
+        // `msr nzcv,#15` is NOT a pstate immediate: NZCV is a system register
+        // with a register form only, and GNU as rejects the immediate.
+        assert!(enc_msr("nzcv", Operand::Imm(15)).is_err());
+    }
+
+    /// The numbered debug/performance families resolve through the generated
+    /// table (they are names in binutils' list, not a special case), and names
+    /// outside the table -- including out-of-range family numbers -- do not.
+    #[test]
+    fn numbered_families_resolve_through_the_generated_table() {
+        assert_eq!(sysreg_encoding_named("dbgbcr7_el1"), Ok(0x803d));
+        assert_eq!(enc_mrs("x0", "dbgbcr7_el1"), Ok(0xd53007a0));
+        assert_eq!(sysreg_encoding_named("pmevtyper10_el0"), Ok(0xdf6a));
+        assert_eq!(enc_mrs("x0", "pmevtyper10_el0"), Ok(0xd53bed40));
+        // `mrs x0,dbgwvr15_el1` is 0xd5300fc0 and `msr dbgwvr15_el1,x0` is
+        // 0xd5100fc0 in GNU as, i.e. field 0x807e in both directions.  (The
+        // earlier expectation here, 0x80de, was a hand-copied digit error that
+        // disagreed with its own mnemonic word -- which is exactly why the
+        // matrix derives every expectation from the assembler and not from
+        // arithmetic performed in a comment.)
+        assert_eq!(sysreg_encoding_named("dbgwvr15_el1"), Ok(0x807e));
+        assert_eq!(
+            enc_msr("dbgwvr15_el1", Operand::Reg("x0".into())),
+            Ok(0xd5100fc0)
+        );
+        // GNU as rejects these, and so must we: 16 breakpoints, 31 counters.
+        for name in ["dbgbcr16_el1", "pmevcntr31_el0", "pmevtyper31_el0"] {
+            assert!(
+                sysreg_encoding_named(name).is_err(),
+                "{name} is not a register binutils 2.47 knows"
+            );
+        }
+        assert!(sysreg_encoding_named("not_a_sysreg").is_err());
+        // The case fold must not be a way past the range checks: GNU as rejects
+        // `mrs x0,S4_0_C1_C0_1`, `msr S3_8_C1_C0_1,x0` and
+        // `mrs x0,S3_0_C16_C0_1` (measured), so the out-of-range digits are
+        // rejected under any case.
+        for name in ["S4_0_C1_C0_1", "S3_8_C1_C0_1", "S3_0_C16_C0_1"] {
+            assert!(
+                sysreg_encoding_named(name).is_err(),
+                "{name} must be rejected (GNU as rejects it)"
+            );
+        }
+        // The generated table is resolved case-insensitively too -- GNU as
+        // assembles `mrs x0,DBGBVR7_EL1`, `mrs x0,DbgBvr7_El1` and
+        // `msr PAN,x0` to the same words as the lower-case spellings
+        // (0xd5300780, 0xd5300780 and 0xd5184260).
+        assert_eq!(sysreg_encoding_named("DBGBVR7_EL1"), Ok(0x803c));
+        assert_eq!(sysreg_encoding_named("DbgBvr7_El1"), Ok(0x803c));
+        assert_eq!(enc_msr("PAN", Operand::Reg("x0".into())), Ok(0xd5184260));
+        assert_eq!(enc_mrs("x0", "PAN"), Ok(0xd5384260));
+    }
+
+    /// The raw `s<op0>_<op1>_c<CRn>_c<CRm>_<op2>` escape hatch, which is what
+    /// generated headers and assembler-level tests write.  Every field is
+    /// range-checked: `sysreg_encoding` masks, so without the check an
+    /// out-of-range digit silently addresses a *different* system register --
+    /// `s4_0_c1_c0_1` would have been actlr_el1's number truncated.
+    #[test]
+    fn raw_spelling_range_checks_every_field() {
+        assert_eq!(sysreg_encoding_named("s3_0_c1_c0_1"), Ok(0xc081));
+        assert_eq!(sysreg_encoding_named("S3_0_C1_C0_1"), Ok(0xc081));
+        assert_eq!(sysreg_encoding_named("S3_0_c1_C0_1"), Ok(0xc081));
+        assert_eq!(sysreg_encoding_named("s03_0_c1_c0_1"), Ok(0xc081));
+        // GNU as: `mrs x0,s0_0_c0_c0_0` is 0xd5200000 and
+        // `mrs x0,s3_0_c15_c15_7` is 0xd538ffe0 -> fields 0x0000 and 0xc7ff.
+        assert_eq!(sysreg_encoding_named("s0_0_c0_c0_0"), Ok(0x0000));
+        assert_eq!(sysreg_encoding_named("s3_0_c15_c15_7"), Ok(0xc7ff));
+        for name in [
+            "s4_0_c1_c0_1",  // op0 is two bits
+            "s3_8_c1_c0_1",  // op1 is three
+            "s3_0_c16_c0_1", // CRn is four
+            "s3_0_c1_c16_1", // CRm is four
+            "s3_0_c1_c0_8",  // op2 is three
+            "s3_0_c1_c0",
+            "s3_0_c1_c0_1_2",
+            "s3_x_c1_c0_1",
+            "ss_0_c1_c0_1",
+        ] {
+            assert!(
+                sysreg_encoding_named(name).is_err(),
+                "{name} must be rejected (GNU as rejects it)"
+            );
+        }
+    }
 }

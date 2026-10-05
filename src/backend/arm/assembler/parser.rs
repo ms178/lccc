@@ -2125,6 +2125,7 @@ fn parse_single_operand(s: &str) -> Result<Operand, String> {
         || lower.starts_with("lsr ")
         || lower.starts_with("asr ")
         || lower.starts_with("ror ")
+        || lower.starts_with("msl ")
     {
         let kind = &lower[..3];
         let amount_str = s[4..].trim();
@@ -2203,7 +2204,22 @@ fn parse_single_operand(s: &str) -> Result<Operand, String> {
                             .and_then(|v| u32::try_from(v).ok())
                     });
                     if let Some(idx) = idx_result {
-                        if matches!(elem_size.as_str(), "b" | "h" | "s" | "d") {
+                        // A lane may be spelled with either the bare element
+                        // (`v2.h[3]`, what objdump prints) or the full vector
+                        // arrangement (`v2.4h[3]`), which GNU as also accepts
+                        // and which denotes the same lane.  Only the braced
+                        // structure form (`ld1 {v0.16b}[5]`) insists on the
+                        // bare element, and that path strips the index before
+                        // it ever gets here.
+                        let elem = match elem_size.as_str() {
+                            "b" | "h" | "s" | "d" => Some(elem_size.clone()),
+                            "8b" | "16b" => Some("b".to_string()),
+                            "4h" | "8h" => Some("h".to_string()),
+                            "2s" | "4s" => Some("s".to_string()),
+                            "1d" | "2d" => Some("d".to_string()),
+                            _ => None,
+                        };
+                        if let Some(elem_size) = elem {
                             return Ok(Operand::RegLane {
                                 reg: reg_part.to_string(),
                                 elem_size,
@@ -2512,8 +2528,16 @@ fn parse_extend_shift(s: &str) -> (Option<String>, Option<u8>) {
         None
     };
     match kind {
-        "lsl" | "lsr" | "asr" | "ror" | "sxtw" | "sxtx" | "sxth" | "sxtb" | "uxtw" | "uxtx"
-        | "uxth" | "uxtb" => (Some(kind.to_string()), shift),
+        // `msl` (masking shift left) is not a general shift kind -- only
+        // MOVI/MVNI's 32-bit-lane forms have it.  It is still parsed as one
+        // here, because a modifier this function refuses silently becomes a
+        // *different operand kind*: `movi v0.4s, #1, msl #8` used to be parsed
+        // as an unshifted MOVI (cmode 0000) with the `msl #8` clause dropped
+        // somewhere downstream, i.e. a different immediate than the programmer
+        // wrote, with no diagnostic.  The encoders decide which shift kinds
+        // their form actually has.
+        "lsl" | "lsr" | "asr" | "ror" | "msl" | "sxtw" | "sxtx" | "sxth" | "sxtb" | "uxtw"
+        | "uxtx" | "uxth" | "uxtb" => (Some(kind.to_string()), shift),
         _ => (None, None),
     }
 }

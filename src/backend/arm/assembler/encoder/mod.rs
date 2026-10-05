@@ -17,6 +17,7 @@ mod data_processing;
 mod fp_scalar;
 mod load_store;
 mod neon;
+mod sysreg_table;
 mod system;
 
 pub(crate) use bitfield::*;
@@ -187,6 +188,391 @@ pub fn parse_reg_num(name: &str) -> Option<u32> {
     }
 }
 
+/// Identity of a general-purpose register operand.
+///
+/// A register *number* is not a register identity. AArch64 gives encoding 31
+/// two different meanings, and which one applies depends on the instruction
+/// form *and* on the operand slot: in `add x0, x1, x2` slot 2 reads 31 as XZR,
+/// in `add x0, sp, #8` slot 1 reads 31 as SP, and `clz x0, sp` is not an
+/// instruction at all, because CLZ's source slot accepts only `Xn` or `XZR`.
+///
+/// Collapsing a spelling to a number before the form has been checked is how
+/// an invalid operand turns into a *different valid instruction*. Two real
+/// cases, both rejected by GNU as and both silently assembled here:
+/// `fmov h0, wsp` encoded as `FMOV H0, WZR` (0x1ee703e0), reading the zero
+/// register where the stack pointer was written, and `mov d0, #1` encoded as
+/// `movz w0, #1`. `GpReg` keeps the three identities -- numbered, SP, ZR --
+/// apart until each slot's role has been checked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GpReg {
+    /// 0..=30 for `x0`-`x30`/`w0`-`w30`/`lr`; 31 for the `sp`/`zr` aliases.
+    pub num: u32,
+    /// `x`, `sp`, `xzr` and `lr` spell 64-bit registers; `w`, `wsp` and `wzr`
+    /// spell 32-bit ones.
+    pub is_64: bool,
+    /// `sp`/`wsp`. The stack pointer is never the zero register.
+    pub is_sp: bool,
+    /// `xzr`/`wzr`. The zero register is never the stack pointer.
+    pub is_zr: bool,
+}
+
+/// What one operand slot of a GP-only instruction may hold.
+///
+/// These are the architecture's own operand classes, spelled per slot. A class
+/// check ("is this a GP register?") cannot answer the question an encoder has
+/// to answer ("may *this slot* of *this form* hold the stack pointer?"), which
+/// is why `sp` passed a class check and then encoded as the zero register.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GpRole {
+    /// `Rd`/`Rn`/`Rm` where 31 means the zero register: `Xn|XZR`, `Wn|WZR`.
+    /// The stack pointer is not encodable here.
+    RegOrZr,
+    /// Slots where 31 means the stack pointer: `Xn|SP`, `Wn|WSP`. The zero
+    /// register is not encodable here.
+    RegOrSp,
+    /// Slots that accept either meaning of 31, such as the destination of the
+    /// non-flags-setting logical immediates and the first operand of the
+    /// `cmp`/`cmn`/`mov`-to-SP aliases.
+    RegSpOrZr,
+    /// A numbered register only; neither 31-encoding is legal in this slot.
+    Reg,
+}
+
+impl GpReg {
+    /// Resolve a register spelling to a general-purpose identity.
+    ///
+    /// Accepts exactly the spellings GNU as accepts for a GP register:
+    /// `x0`-`x30`, `w0`-`w30`, `lr`, `sp`/`wsp`, `xzr`/`wzr`. It refuses
+    /// FP/SIMD spellings (`d0`, `v3`), out-of-range numbers (`x32`),
+    /// non-canonical decimals (`x007`), and `x31`/`w31`: register 31 is
+    /// spelled by the role the form gives it, and accepting a role-free
+    /// spelling is exactly what lets a caller mistake SP for ZR.
+    ///
+    /// Allocation-free and case-insensitive on purpose -- this is on the
+    /// assembler's hot path, where an earlier `to_lowercase()` cost 2.17% of
+    /// total instruction count (Callgrind; see
+    /// `docs/REVIEW_756_ADJUDICATION.md`).
+    pub(crate) fn by_name(name: &str) -> Option<GpReg> {
+        if name.eq_ignore_ascii_case("sp") {
+            return Some(GpReg {
+                num: 31,
+                is_64: true,
+                is_sp: true,
+                is_zr: false,
+            });
+        }
+        if name.eq_ignore_ascii_case("wsp") {
+            return Some(GpReg {
+                num: 31,
+                is_64: false,
+                is_sp: true,
+                is_zr: false,
+            });
+        }
+        if name.eq_ignore_ascii_case("xzr") {
+            return Some(GpReg {
+                num: 31,
+                is_64: true,
+                is_sp: false,
+                is_zr: true,
+            });
+        }
+        if name.eq_ignore_ascii_case("wzr") {
+            return Some(GpReg {
+                num: 31,
+                is_64: false,
+                is_sp: false,
+                is_zr: true,
+            });
+        }
+        if name.eq_ignore_ascii_case("lr") {
+            return Some(GpReg {
+                num: 30,
+                is_64: true,
+                is_sp: false,
+                is_zr: false,
+            });
+        }
+        let b = name.as_bytes();
+        let (is_64, digits) = match b.first()? {
+            b'x' | b'X' => (true, &b[1..]),
+            b'w' | b'W' => (false, &b[1..]),
+            _ => return None,
+        };
+        if digits.is_empty() || digits.len() > 2 {
+            return None;
+        }
+        // Canonical decimal only: `x007` is not a register spelling, and
+        // accepting it would give one register two spellings that a caller
+        // could then disagree about.
+        if digits.len() == 2 && digits[0] == b'0' {
+            return None;
+        }
+        let mut num = 0u32;
+        for &d in digits {
+            if !d.is_ascii_digit() {
+                return None;
+            }
+            num = num * 10 + u32::from(d - b'0');
+        }
+        // 31 is spelled `xzr`/`wzr`/`sp`/`wsp`, never `x31`.
+        if num > 30 {
+            return None;
+        }
+        Some(GpReg {
+            num,
+            is_64,
+            is_sp: false,
+            is_zr: false,
+        })
+    }
+
+    /// Whether two operands have the same register width.
+    pub(crate) fn same_width_as(self, other: GpReg) -> bool {
+        self.is_64 == other.is_64
+    }
+}
+
+/// The spelling of operand `idx`, for diagnostics.
+pub(crate) fn operand_spelling(operands: &[Operand], idx: usize) -> String {
+    match operands.get(idx) {
+        Some(Operand::Reg(n)) => n.clone(),
+        Some(_) | None => String::from("?"),
+    }
+}
+
+/// Read one register operand and check it against the role its slot has.
+///
+/// Every GP-only encoder routes its operands through here, so a register-class
+/// error, an illegal use of encoding 31, and a width mismatch are all reported
+/// at the operand that caused them -- and, unlike the assembler being
+/// compared against, with the fix named:
+///
+/// ```text
+/// clz: operand 1 `sp` is the stack pointer, but this slot reads encoding 31
+/// as the zero register; write `xzr` if the zero register is what you meant
+/// ```
+pub(crate) fn reg_operand(
+    operands: &[Operand],
+    idx: usize,
+    role: GpRole,
+    mn: &str,
+) -> Result<GpReg, String> {
+    reg_operand_msg(operands, idx, role, Some(mn))
+}
+
+/// [`reg_operand`] with the mnemonic made optional, so the leaf readers that
+/// do not carry one at the call site (`get_gpr_strict`, used by dozens of
+/// load/store and system encoders) share this function's spelling grammar,
+/// class checks and diagnostics instead of growing a second implementation.
+/// A second implementation is not hypothetical: three separate name parsers
+/// (a class check, a name-to-number parse and a width predicate) are how
+/// `fmov h0, wsp` came to be encoded as `FMOV H0, WZR`.
+fn reg_operand_msg(
+    operands: &[Operand],
+    idx: usize,
+    role: GpRole,
+    mn: Option<&str>,
+) -> Result<GpReg, String> {
+    // Borrowed, not cloned: this runs once per register operand of every
+    // GP instruction, and the whole point of `GpReg` is that validation costs
+    // no allocation.  `mn` is `Some` on the paths that have one, and the
+    // prefix is built only when a diagnostic is actually needed (errors are
+    // cold; the accepting path is not).
+    let mn = match mn {
+        Some(m) => format!("{m}: "),
+        None => String::new(),
+    };
+    let name = match operands.get(idx) {
+        Some(Operand::Reg(n)) => n.as_str(),
+        Some(_) => {
+            return Err(format!(
+                "{mn}operand {idx} must be a register, not an immediate or memory operand"
+            ));
+        }
+        None => return Err(format!("{mn}missing operand {idx} (expected a register)")),
+    };
+    let reg = GpReg::by_name(name).ok_or_else(|| {
+        format!(
+            "{mn}operand {idx} `{name}` is not a general-purpose register \
+             (expected x0-x30, w0-w30, lr, sp, wzr or xzr)"
+        )
+    })?;
+    match role {
+        GpRole::RegOrZr if reg.is_sp => Err(format!(
+            "{mn}operand {idx} `{name}` is the stack pointer, but this slot reads \
+             encoding 31 as the zero register; write `{}` if the zero register is \
+             what you meant",
+            if reg.is_64 { "xzr" } else { "wzr" }
+        )),
+        GpRole::RegOrSp if reg.is_zr => Err(format!(
+            "{mn}operand {idx} `{name}` is the zero register, but this slot reads \
+             encoding 31 as the stack pointer; write `{}` if the stack pointer is \
+             what you meant",
+            if reg.is_64 { "sp" } else { "wsp" }
+        )),
+        GpRole::Reg if reg.is_sp || reg.is_zr => Err(format!(
+            "{mn}operand {idx} `{name}` is not allowed here; this slot takes a \
+             numbered register (x0-x30/w0-w30) only"
+        )),
+        _ => Ok(reg),
+    }
+}
+
+/// Read a register operand under the `Xn|XZR` / `Wn|WZR` contract with no
+/// mnemonic at the call site: the zero register is encodable (field 31 *is*
+/// the zero register in these slots), the stack pointer is not.
+///
+/// This is the reader every load/store data register, every exclusive/atomic
+/// data register and the system `Rt` slots want.  It is deliberately the same
+/// function as `reg_operand`, not a neighbour of it: the earlier split (an
+/// "is this a GP register" predicate plus a separate name-to-number parse plus
+/// a separate width parse) is exactly what let `str sp,[x0]` assemble, where
+/// field 31 stores the zero register and the stack pointer is silently lost.
+pub(crate) fn get_gpr_strict(operands: &[Operand], idx: usize) -> Result<(u32, bool), String> {
+    let reg = reg_operand_msg(operands, idx, GpRole::RegOrZr, None)?;
+    Ok((reg.num, reg.is_64))
+}
+
+/// [`get_gpr_strict`] for the slots that must be 64-bit: `ldrsw`'s Rt has no
+/// W form, so `ldrsw w0,[x1]` used to assemble as `ldrsw x0`.
+pub(crate) fn get_gpr_strict_x(operands: &[Operand], idx: usize) -> Result<u32, String> {
+    let reg = reg_operand_msg(operands, idx, GpRole::RegOrZr, None)?;
+    if !reg.is_64 {
+        return Err(format!(
+            "operand {idx}: `{}` is 32-bit, but this slot takes a 64-bit register \
+             (x0-x30 or xzr)",
+            operand_spelling(operands, idx)
+        ));
+    }
+    Ok(reg.num)
+}
+
+/// [`get_gpr_strict`] for the slots that must be 32-bit: `ldrb`/`ldrh` have no
+/// 64-bit destination (`ldrh x0,[x1]` used to assemble as `ldrh w0`).
+pub(crate) fn get_gpr_strict_w(operands: &[Operand], idx: usize) -> Result<u32, String> {
+    let reg = reg_operand_msg(operands, idx, GpRole::RegOrZr, None)?;
+    if reg.is_64 {
+        return Err(format!(
+            "operand {idx}: `{}` is 64-bit, but this slot takes a 32-bit register \
+             (w0-w30 or wzr)",
+            operand_spelling(operands, idx)
+        ));
+    }
+    Ok(reg.num)
+}
+
+/// Read the two operands of a "data-processing (1 source)" instruction
+/// (`clz`, `cls`, `rbit`, `rev`, `rev16`).
+///
+/// Both slots are `Rd|XZR`, so neither may be the stack pointer, and both must
+/// be the same width: `clz x0, w1` has no encoding.
+pub(crate) fn dp1src_reg_pair(operands: &[Operand], mn: &str) -> Result<(GpReg, GpReg), String> {
+    let rd = reg_operand(operands, 0, GpRole::RegOrZr, mn)?;
+    let rn = reg_operand(operands, 1, GpRole::RegOrZr, mn)?;
+    if !rd.same_width_as(rn) {
+        return Err(format!(
+            "{mn}: `{}` and `{}` are different widths; both operands of {mn} must \
+             be the same size",
+            operand_spelling(operands, 0),
+            operand_spelling(operands, 1)
+        ));
+    }
+    Ok((rd, rn))
+}
+
+/// Read the three register operands of a shifted-register logical
+/// (`and`, `orr`, `eor`, `orn`, `eon`, `bic`, `bics`).
+///
+/// All three slots are `Rd|Rn|Rm` with 31 meaning the zero register, so the
+/// stack pointer is not encodable in any of them, and all three must share one
+/// width.
+pub(crate) fn logical_reg3(
+    operands: &[Operand],
+    mn: &str,
+) -> Result<(GpReg, GpReg, GpReg), String> {
+    let rd = reg_operand(operands, 0, GpRole::RegOrZr, mn)?;
+    let rn = reg_operand(operands, 1, GpRole::RegOrZr, mn)?;
+    let rm = reg_operand(operands, 2, GpRole::RegOrZr, mn)?;
+    if !rd.same_width_as(rn) || !rd.same_width_as(rm) {
+        return Err(format!(
+            "{mn}: `{}`, `{}` and `{}` must all be the same width",
+            operand_spelling(operands, 0),
+            operand_spelling(operands, 1),
+            operand_spelling(operands, 2)
+        ));
+    }
+    Ok((rd, rn, rm))
+}
+
+/// Encode the `option` field of an extended-register operand.
+///
+/// The old code fell through to `_ => 0b011`, so a misspelt extend silently
+/// became UXTX and encoded a different instruction.
+pub(crate) fn extend_option(kind: &str, mn: &str) -> Result<u32, String> {
+    let option = match kind.to_ascii_lowercase().as_str() {
+        "uxtb" => 0b000,
+        "uxth" => 0b001,
+        "uxtw" => 0b010,
+        "uxtx" => 0b011,
+        "sxtb" => 0b100,
+        "sxth" => 0b101,
+        "sxtw" => 0b110,
+        "sxtx" => 0b111,
+        other => {
+            return Err(format!(
+                "{mn}: unknown extend `{other}` (expected uxtb, uxth, uxtw, uxtx, \
+                 sxtb, sxth, sxtw or sxtx)"
+            ));
+        }
+    };
+    Ok(option)
+}
+
+/// Encode the `shift`+`imm6` fields of a shifted-register operand.
+///
+/// The old code fell through to `_ => 0b00` for an unknown shift kind and
+/// masked the amount with `& 0x3F`, so `add x0, x1, x2, lsl #64` silently
+/// became `add x0, x1, x2` and `orr w0, w1, w2, ror #31` became an LSL. Both
+/// are wrong-code bugs, not strictness bugs: an out-of-range amount now
+/// reports the legal range, and `ror` is refused where the architecture has no
+/// rotate (arithmetic forms), instead of being reinterpreted.
+pub(crate) fn shift_field(
+    kind: &str,
+    amount: u32,
+    is_64: bool,
+    allow_ror: bool,
+    mn: &str,
+) -> Result<(u32, u32), String> {
+    let max = if is_64 { 63 } else { 31 };
+    let shift = match kind.to_ascii_lowercase().as_str() {
+        "lsl" => 0b00,
+        "lsr" => 0b01,
+        "asr" => 0b10,
+        "ror" if allow_ror => 0b11,
+        "ror" => {
+            return Err(format!(
+                "{mn}: `ror` is not available in this form (only the logical \
+                 instructions and `mvn` have a rotate); use lsl, lsr or asr"
+            ));
+        }
+        other => {
+            return Err(format!(
+                "{mn}: unknown shift `{other}` (expected lsl, lsr, asr{})",
+                if allow_ror { " or ror" } else { "" }
+            ));
+        }
+    };
+    if amount > max {
+        return Err(format!(
+            "{mn}: shift amount #{amount} is out of range for a {}-bit operand \
+             (0-{max})",
+            if is_64 { 64 } else { 32 }
+        ));
+    }
+    Ok((shift, amount))
+}
+
 /// Check if a register name is a 64-bit (X) register or SP.
 fn is_64bit_reg(name: &str) -> bool {
     let name = name.to_lowercase();
@@ -292,10 +678,10 @@ pub fn encode_instruction(
             }
         }
         "subs" => encode_add_sub(operands, true, true),
-        "and" => encode_logical(operands, 0b00),
-        "orr" => encode_logical(operands, 0b01),
-        "eor" => encode_logical(operands, 0b10),
-        "ands" => encode_logical(operands, 0b11),
+        "and" => encode_logical(operands, 0b00, "and"),
+        "orr" => encode_logical(operands, 0b01, "orr"),
+        "eor" => encode_logical(operands, 0b10, "eor"),
+        "ands" => encode_logical(operands, 0b11, "ands"),
         "orn" => encode_orn(operands),
         "eon" => encode_eon(operands),
         "bics" => encode_bics(operands),
@@ -398,10 +784,10 @@ pub fn encode_instruction(
         // Loads/stores - size determined from register width
         "ldr" => encode_ldr_str_auto(operands, true),
         "str" => encode_ldr_str_auto(operands, false),
-        "ldrb" => encode_ldr_str(operands, true, 0b00, false, false), // byte load
-        "strb" => encode_ldr_str(operands, false, 0b00, false, false),
-        "ldrh" => encode_ldr_str(operands, true, 0b01, false, false), // halfword load
-        "strh" => encode_ldr_str(operands, false, 0b01, false, false),
+        "ldrb" => encode_ldr_str(operands, true, 0b00, false, false, true), // byte load
+        "strb" => encode_ldr_str(operands, false, 0b00, false, false, true),
+        "ldrh" => encode_ldr_str(operands, true, 0b01, false, false, true), // halfword load
+        "strh" => encode_ldr_str(operands, false, 0b01, false, false, true),
         "ldrw" | "ldrsw" => encode_ldrsw(operands),
         "ldrsb" => encode_ldrs(operands, 0b00),
         "ldrsh" => encode_ldrs(operands, 0b01),
@@ -461,14 +847,25 @@ pub fn encode_instruction(
             }
         }
         "fmul" => {
-            if matches!(operands.first(), Some(Operand::RegArrangement { .. })) {
-                if matches!(operands.get(2), Some(Operand::RegLane { .. })) {
-                    encode_neon_float_elem(operands, 0b1001)
-                } else {
-                    encode_neon_float_three_same(operands, 1, 0, 0b11011)
-                }
+            // The element operand is what makes this a by-element instruction:
+            // the two registers may be spelled either as scalars (`s0,s1`,
+            // which is how a compiler emits it) or as 64-bit vectors, so
+            // dispatching on the *first* operand's spelling sent every
+            // scalar-spelled `fmul s0,s1,v2.s[0]` to the scalar two-operand
+            // encoder, which then rejected the lane operand.
+            if matches!(operands.get(2), Some(Operand::RegLane { .. })) {
+                encode_neon_float_elem(operands, 0b1001, 0, "fmul")
+            } else if matches!(operands.first(), Some(Operand::RegArrangement { .. })) {
+                encode_neon_float_three_same(operands, 1, 0, 0b11011)
             } else {
                 encode_fp_arith(operands, 0b0000)
+            }
+        }
+        "fmulx" => {
+            if matches!(operands.get(2), Some(Operand::RegLane { .. })) {
+                encode_neon_float_elem(operands, 0b1001, 1, "fmulx")
+            } else {
+                encode_neon_float_three_same(operands, 1, 0, 0b11011)
             }
         }
         "fdiv" => {
@@ -641,18 +1038,24 @@ pub fn encode_instruction(
         // NEON float three-same instructions (vector-only)
         "fmla" => {
             if matches!(operands.get(2), Some(Operand::RegLane { .. })) {
-                encode_neon_float_elem(operands, 0b0001)
+                encode_neon_float_elem(operands, 0b0001, 0, "fmla")
             } else {
                 encode_neon_float_three_same(operands, 0, 0, 0b11001)
             }
         }
         "fmls" => {
             if matches!(operands.get(2), Some(Operand::RegLane { .. })) {
-                encode_neon_float_elem(operands, 0b0101)
+                encode_neon_float_elem(operands, 0b0101, 0, "fmls")
             } else {
                 encode_neon_float_three_same(operands, 0, 1, 0b11001)
             }
         }
+        // FP across-vector reductions: FMAXV/FMINV use size 00/10 with opcode
+        // 01111; FMAXNMV/FMINNMV use the same size split with opcode 01100.
+        "fmaxv" => encode_neon_fp_across(operands, "fmaxv", 0b00, 0b01111),
+        "fminv" => encode_neon_fp_across(operands, "fminv", 0b10, 0b01111),
+        "fmaxnmv" => encode_neon_fp_across(operands, "fmaxnmv", 0b00, 0b01100),
+        "fminnmv" => encode_neon_fp_across(operands, "fminnmv", 0b10, 0b01100),
         "frecps" => encode_neon_float_three_same(operands, 0, 0, 0b11111),
         "frsqrts" => encode_neon_float_three_same(operands, 0, 1, 0b11111),
         "fcmeq" => {
@@ -833,6 +1236,9 @@ pub fn encode_instruction(
         "ushll2" => encode_neon_shll(operands, 1, true),
         "sshll" => encode_neon_shll(operands, 0, false),
         "sshll2" => encode_neon_shll(operands, 0, true),
+        // SHLL/SHLL2 live in their own encoding space (see encode_neon_shll_alias).
+        "shll" => encode_neon_shll_alias(operands, false),
+        "shll2" => encode_neon_shll_alias(operands, true),
         // NEON three-different extras
         "uabal" => encode_neon_three_diff(operands, 1, 0b0101, false),
         "uabal2" => encode_neon_three_diff(operands, 1, 0b0101, true),
@@ -886,7 +1292,8 @@ pub fn encode_instruction(
         "uminv" => encode_neon_across(operands, 1, 0b11010),
         "smaxv" => encode_neon_across(operands, 0, 0b01010),
         "sminv" => encode_neon_across(operands, 0, 0b11010),
-        "umov" => encode_neon_umov(operands),
+        "umov" => encode_neon_umov_smov(operands, "umov", false),
+        "smov" => encode_neon_umov_smov(operands, "smov", true),
         "dup" => encode_neon_dup(operands),
         "ins" => encode_neon_ins(operands),
         "not" => encode_neon_not(operands),
@@ -1124,6 +1531,7 @@ pub fn encode_instruction(
         "at" => encode_at(operands, raw_operands),
         "sys" => encode_sys(raw_operands),
         "brk" => encode_brk(operands),
+        "hlt" => encode_hlt(operands),
 
         // Bitfield extract/insert
         "ubfx" => encode_ubfx(operands),
@@ -1159,6 +1567,7 @@ pub fn encode_instruction(
 
         // Prefetch
         "prfm" => encode_prfm(operands),
+        "prfum" => encode_prfum(operands),
 
         // LSE atomics
         "cas" | "casa" | "casal" | "casl" | "casb" | "casab" | "casalb" | "caslb" | "cash"
@@ -1173,7 +1582,16 @@ pub fn encode_instruction(
         | "ldclrah" | "ldclralh" | "ldclrlh" | "ldeor" | "ldeora" | "ldeoral" | "ldeorl"
         | "ldeorb" | "ldeorab" | "ldeoralb" | "ldeorlb" | "ldeorh" | "ldeorah" | "ldeoralh"
         | "ldeorlh" | "ldset" | "ldseta" | "ldsetal" | "ldsetl" | "ldsetb" | "ldsetab"
-        | "ldsetalb" | "ldsetlb" | "ldseth" | "ldsetah" | "ldsetalh" | "ldsetlh" => {
+        | "ldsetalb" | "ldsetlb" | "ldseth" | "ldsetah" | "ldsetalh" | "ldsetlh"
+        // signed/unsigned min/max additions (LSE)
+        | "ldsmax" | "ldsmaxa" | "ldsmaxal" | "ldsmaxl" | "ldsmaxb" | "ldsmaxab" | "ldsmaxalb"
+        | "ldsmaxlb" | "ldsmaxh" | "ldsmaxah" | "ldsmaxalh" | "ldsmaxlh" | "ldsmin" | "ldsmina"
+        | "ldsminal" | "ldsminl" | "ldsminb" | "ldsminab" | "ldsminalb" | "ldsminlb" | "ldsminh"
+        | "ldsminah" | "ldsminalh" | "ldsminlh" | "ldumax" | "ldumaxa" | "ldumaxal" | "ldumaxl"
+        | "ldumaxb" | "ldumaxab" | "ldumaxalb" | "ldumaxlb" | "ldumaxh" | "ldumaxah"
+        | "ldumaxalh" | "ldumaxlh" | "ldumin" | "ldumina" | "lduminal" | "lduminl" | "lduminb"
+        | "lduminab" | "lduminalb" | "lduminlb" | "lduminh" | "lduminah" | "lduminalh"
+        | "lduminlh" => {
             encode_ldop(mnemonic, operands)
         }
         // LSE atomic store aliases (Rt=XZR, discard result)

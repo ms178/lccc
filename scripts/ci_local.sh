@@ -676,6 +676,16 @@ gate "inline-asm-utf8" fast \
 gate "asm-diff-oracle-gas-2.47" fast \
     bash scripts/ensure_gas_247.sh x86_64-linux-gnu
 
+# The same provisioning for the AArch64 side, and it is load-bearing for
+# every aarch64 gate below: they take their verdicts FROM a 2.47 `as`, and
+# `$A64_AS` is resolved from the pinned prefix.  Without this gate the local
+# mirror only *preferred* a cache entry nothing local was installing, so a
+# clean box silently fell back to a distro `as` that disagrees with 1077
+# rows 2.47 accepts.  Idempotent and tarball-cached like the x86 gate, so on
+# a warm box it is a `test -x` away from free.
+gate "a64-gas-provision" fast \
+    bash scripts/ensure_gas_247.sh aarch64-linux-gnu
+
 # The differential oracle's OWN contract suites, compiler-free exactly
 # like the gates above but anchored to the REAL pinned pair: asmdiff's
 # parser/oracle unit tests (the mocked failure modes — failed disassembler,
@@ -1099,7 +1109,21 @@ gate "ensure-gcc-torture-contract" fast \
 #
 # The gate is skipped, not failed, when the cross-binutils or the fastbuild
 # lccc are absent: a dev box without aarch64 tooling is not a regression.
-A64_AS="$(command -v aarch64-linux-gnu-as || true)"
+#
+# Which GNU as is not a detail.  These gates take their verdicts FROM the
+# assembler, and the operand-legality matrix enumerates the system-register
+# table generated from binutils 2.47: a distro 2.44 `as` has never heard of
+# `tco`, `afgdtp0_el1` or `actlrmask_el1` and disagrees with 1077 rows that
+# 2.47 accepts (measured), so the distro binary turns an agreement gate into a
+# red one.  Prefer the pinned pair `ensure_gas_247.sh` installs and fall back
+# to the distro only when it is absent.  `objcopy` is not part of that pair --
+# the matrix uses it only to read the bytes back out of an object we just
+# assembled -- so it stays the distro one.
+if [ -x "$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/as" ]; then
+    A64_AS="$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/as"
+else
+    A64_AS="$(command -v aarch64-linux-gnu-as || true)"
+fi
 A64_OBJCOPY="$(command -v aarch64-linux-gnu-objcopy || true)"
 if [ -n "$A64_AS" ] && [ -n "$A64_OBJCOPY" ] && [ -x target/fastbuild/lccc ]; then
     gate "aarch64-oracle-selftest" fast \
@@ -1109,6 +1133,63 @@ if [ -n "$A64_AS" ] && [ -n "$A64_OBJCOPY" ] && [ -x target/fastbuild/lccc ]; th
 else
     echo "SKIP  aarch64-oracle-selftest (aarch64-linux-gnu binutils or" \
          "target/fastbuild/lccc not available)"
+    SKIPPED=$((SKIPPED + 1))
+fi
+
+# The second aarch64 instrument, and the one that exists because the oracle
+# above is structurally blind to a whole bug class: it feeds the assembler
+# words objdump just decoded, so everything it hands over is a *valid*
+# encoding by construction. `bic x0, x1, w2`, `mov sp, xzr` and
+# `add x0, x1, x2, ror #3` are not encodings and can never appear there --
+# yet accepting them silently is exactly as wrong as mis-encoding one. The
+# matrix is a curated accept/reject table whose every expectation is GNU
+# as's own verdict, re-checked against the cross assembler at gate time
+# (423 rows, ~2 s, no compiler and no network), and it is what turned the
+# review's "the operand checks look like class checks" into 38 executed
+# counterexamples. It needs only `as`/`objcopy`, so it is skipped, not
+# passed, when the cross-binutils are absent.
+if [ -n "$A64_AS" ] && [ -n "$A64_OBJCOPY" ]; then
+    gate "aarch64-operand-legality" fast \
+        python3 scripts/aarch64_operand_legality_matrix.py --check \
+        --as "$A64_AS" --objcopy "$A64_OBJCOPY"
+else
+    echo "SKIP  aarch64-operand-legality (aarch64-linux-gnu binutils not" \
+         "available)"
+    SKIPPED=$((SKIPPED + 1))
+fi
+
+# The same table, asserted against *our* encoder. The gate above proves the
+# table still says what GNU as says; this one proves we still do too -- a row
+# can be correct while the encoder is wrong, which is the shape of every bug
+# the matrix was written for. It needs `objcopy` (to read our own object) and
+# the fastbuild binary, and is skipped, not passed, without them.
+if [ -n "$A64_OBJCOPY" ] && [ -x target/fastbuild/lccc ]; then
+    gate "aarch64-operand-legality-encoder" fast \
+        python3 scripts/aarch64_operand_legality_matrix.py \
+        --check-lccc target/fastbuild/lccc --objcopy "$A64_OBJCOPY"
+else
+    echo "SKIP  aarch64-operand-legality-encoder (aarch64-linux-gnu-objcopy or" \
+         "target/fastbuild/lccc not available)"
+    SKIPPED=$((SKIPPED + 1))
+fi
+
+# The system-register table the encoder resolves `mrs`/`msr` names through is
+# generated from binutils' own `aarch64-sys-regs.def`, so it is only correct
+# relative to a binutils release, and only complete relative to the .def it
+# was generated from.  This gate holds three verdicts together at once: the
+# .def file, the pinned GNU as, and the words this crate's encoder emits for
+# every name in BOTH directions (1619 names, two assembler runs, ~4 s) -- the
+# 115-name table it replaced had drifted from itself, and nothing was asking
+# the assembler.  It needs the pinned binutils tarball for the .def file, so it
+# is skipped, not passed, when that is absent (like the gates above).
+if [ -n "$A64_AS" ] && [ -n "$A64_OBJCOPY" ] && \
+   [ -f "${GAS_DL_DIR:-$HOME/dl}/binutils-2.47.tar.xz" ]; then
+    gate "aarch64-sysreg-table" fast \
+        python3 scripts/aarch64_sysreg_table.py --check \
+        --as "$A64_AS" --objcopy "$A64_OBJCOPY" --lccc target/fastbuild/lccc
+else
+    echo "SKIP  aarch64-sysreg-table (pinned binutils tarball or aarch64" \
+         "binutils not available)"
     SKIPPED=$((SKIPPED + 1))
 fi
 

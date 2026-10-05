@@ -764,20 +764,61 @@ jobs:
       - name: Install checker dependency (PyYAML)
         run: sudo apt-get install -y --no-install-recommends python3-yaml
 
-      # AArch64 differential oracle: harness self-test only. The full sweep
-      # is ~25,000 assembler invocations and belongs to an offline run, but
-      # the harness's own invariants must hold on every pass -- a oracle
-      # that has drifted out of agreement with GAS reports "OK" for
-      # everything and proves nothing. The cross-binutils are a declared
-      # dependency of this step, not an image property: without them the
-      # toolchain probe would silently degrade the gate into a no-op.
-      - name: AArch64 differential oracle self-test
+      # Provision the AArch64 oracle.  `objcopy` comes from the distro
+      # package, but `as` must be the PINNED 2.47 pair: the generator that
+      # produced the encoder's system-register table and the operand-legality
+      # matrix's expectations both read binutils 2.47, and the runner's distro
+      # binutils does not know names 2.47 added (`tco`, `afgdtp0_el1`,
+      # `actlrmask_el1`: measured 1077 rows of false drift against a 2.44 `as`),
+      # so a distro `as` turns an agreement gate into a red one.
+      - name: Install GNU as 2.47 for AArch64 differential
         run: |
           set -euo pipefail
           sudo apt-get install -y --no-install-recommends \
             binutils-aarch64-linux-gnu
+          bash scripts/ensure_gas_247.sh aarch64-linux-gnu
+
+      # AArch64 differential oracle: harness self-test only. The full sweep
+      # is ~25,000 assembler invocations and belongs to an offline run, but
+      # the harness's own invariants must hold on every pass -- a oracle
+      # that has drifted out of agreement with GAS reports "OK" for
+      # everything and proves nothing.
+      - name: AArch64 differential oracle self-test
+        run: |
+          set -euo pipefail
           python3 scripts/aarch64_encoder_differential.py --self-test-only \
-            --gas "$(command -v aarch64-linux-gnu-as)" \
+            --gas "$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/as" \
+            --objcopy "$(command -v aarch64-linux-gnu-objcopy)" \
+            --lccc target/fastbuild/lccc
+
+      # Operand-legality matrix, both halves: `--check` re-derives every row
+      # from the pinned 2.47 assembler (so the table cannot rot silently), and
+      # `--check-lccc` asserts the same rows against our own encoder (so a
+      # correct table cannot hide a wrong encoder).  This is the instrument for
+      # the bug class the differential oracle above is structurally blind to:
+      # an invalid operand combination is not an encoding, so objdump can never
+      # emit one for the oracle to re-assemble.
+      - name: AArch64 operand-legality matrix
+        run: |
+          set -euo pipefail
+          python3 scripts/aarch64_operand_legality_matrix.py --check \
+            --as "$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/as" \
+            --objcopy "$(command -v aarch64-linux-gnu-objcopy)"
+          python3 scripts/aarch64_operand_legality_matrix.py \
+            --check-lccc target/fastbuild/lccc \
+            --objcopy "$(command -v aarch64-linux-gnu-objcopy)"
+
+      # The encoder's system-register table is generated from binutils' own
+      # `aarch64-sys-regs.def` and verified against the pinned assembler for
+      # every name in both directions (1619 names, two assembler runs).  It is
+      # the completeness half of the matrix gate above: a name binutils knows
+      # that we do not is invisible to a table that only enumerates our own
+      # rows, and that is how a system register ends up "unsupported".
+      - name: AArch64 system-register table
+        run: |
+          set -euo pipefail
+          python3 scripts/aarch64_sysreg_table.py --check \
+            --as "$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/as" \
             --objcopy "$(command -v aarch64-linux-gnu-objcopy)" \
             --lccc target/fastbuild/lccc
 
