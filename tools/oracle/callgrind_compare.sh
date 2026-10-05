@@ -60,16 +60,19 @@ for src in "$ROOT"/tests/oracle/programs/*.c; do
   case "$p" in *_kernel) continue;; esac
   [ -n "$ONLY" ] && [ "$ONLY" != "$p" ] && continue
   declare -A IR MISS JSONROW OUTS
-  ok=1; refsum=0; failed=""
+  failed=""
   for tool in lccc "${refarr[@]}"; do
     cc=$(cc_of "$tool") || { failed="$p: compiler $tool missing"; break; }
     bin="$OUT/${p}.$tool"
     "$cc" "$OPT" -g "$src" -o "$bin" 2>"$OUT/${p}.$tool.err" || {
       failed="$p: $tool build failed (see $OUT/${p}.$tool.err)"; break; }
-    "$bin" > "$OUT/${p}.$tool.stdout" 2>/dev/null
+    "$bin" > "$OUT/${p}.$tool.stdout" 2>/dev/null || {
+      failed="$p: $tool program failed"; break; }
     cg="$OUT/${p}.$tool.cg"
-    valgrind --tool=callgrind --cache-sim=yes --callgrind-out-file="$cg" \
-             "$bin" >/dev/null 2>"$OUT/${p}.$tool.vg"
+    if ! valgrind --tool=callgrind --cache-sim=yes --callgrind-out-file="$cg" \
+             "$bin" >/dev/null 2>"$OUT/${p}.$tool.vg"; then
+      failed="$p: Callgrind failed for $tool"; break;
+    fi
     row=$(python3 "$IR_TOOL" --json --show Ir,D1mr,DLmr "$cg") || {
       failed="$p: callgrind_own_ir.py failed on $cg"; break; }
     IR[$tool]=$(printf '%s' "$row" | python3 -c 'import json,sys;print(json.load(sys.stdin)["totals"]["Ir"])')
@@ -77,12 +80,13 @@ for src in "$ROOT"/tests/oracle/programs/*.c; do
     JSONROW[$tool]=$row
     OUTS[$tool]=$(md5sum < "$OUT/${p}.$tool.stdout" | cut -d' ' -f1)
   done
-  [ "$ok" = 1 ] || { echo "FAIL: $failed" >&2; rm -rf "$OUT"; exit 1; }
+  [ -z "$failed" ] || { echo "FAIL: $failed" >&2; exit 1; }
   # Every compiler must produce the same stdout before any ratio is reported.
   for tool in "${refarr[@]}"; do
     if [ "${OUTS[$tool]}" != "${OUTS[lccc]}" ]; then
       echo "MISMATCH: $p stdout differs between lccc and $tool" >&2
-      diff <("$OUT/${p}.lccc" 2>/dev/null) <("$OUT/${p}.${tool}" 2>/dev/null) | head -5 >&2
+      diff "$OUT/${p}.lccc.stdout" "$OUT/${p}.${tool}.stdout" | head -5 >&2
+      exit 1
     fi
   done
   first=${refarr[0]}

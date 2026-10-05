@@ -20,12 +20,16 @@ compares is a valid encoding by construction.  The instruments that can:
 
 | instrument | what it pins | invocation |
 |---|---|---|
-| `tests/aarch64/operand-legality.tsv` (**6347 rows: 5410 accepted / 937 rejected**) | every row's verdict is GNU as's own; `operand_legality_matrix_matches_the_encoder` (`include_str!`) pins the encoder both ways | `python3 scripts/aarch64_operand_legality_matrix.py --check-lccc target/fastbuild/lccc --objcopy <distro> --as <pinned>` |
+| `tests/aarch64/operand-legality.tsv` (**6817 rows: 5564 accepted / 1253 rejected**) | every row's verdict is GNU as's own; `operand_legality_matrix_matches_the_encoder` (`include_str!`) pins the encoder both ways | `python3 scripts/aarch64_operand_legality_matrix.py --check-lccc target/fastbuild/lccc --objcopy <distro> --as <pinned>` |
 | `src/backend/arm/assembler/encoder/sysreg_table.rs` (**1619 names**, generated from `opcodes/aarch64-sys-regs.def`) | `.def` ↔ pinned GNU as ↔ generated table ↔ encoder words, both directions | `python3 scripts/aarch64_sysreg_table.py --check --as <pinned> --objcopy <distro> --lccc target/fastbuild/lccc` |
 
-Measured this session: matrix `--check` **6347/6347 agree** with the pinned `as` (42 s);
-`--check-lccc` **6347/6347 agree** with the encoder (34 s in `ci_local.sh`); sysreg table
-**1619/1619** (4 s).  `ci_local.sh --fast` runs all three as `aarch64-operand-legality`,
+The recorded matrix runs covered the 6,347-row inventory then in use: `--check`
+reported **6347/6347** agreement with pinned `as` (42 s), and `--check-lccc`
+reported **6347/6347** agreement with the encoder (34 s in `ci_local.sh`). The
+checked-in fixture now includes the load/store sweep and totals **6,817 rows
+(5,564 accepted / 1,253 rejected)**; CI should recheck the expanded inventory.
+The sysreg table check reported **1619/1619** (4 s). `ci_local.sh --fast` runs
+the three AArch64 parity gates `aarch64-operand-legality`,
 `aarch64-operand-legality-encoder` and `aarch64-sysreg-table`.
 
 The verdict authority is the **pinned 2.47 `as`**
@@ -129,8 +133,8 @@ rewritten`).
 | check | verdict |
 |---|---|
 | `cargo test --profile fastbuild --locked -j2 --lib` | **4126 passed, 0 failed, 7 ignored** |
-| matrix vs pinned `as` (`--check`) | **6347/6347** |
-| matrix vs encoder (`--check-lccc`) | **6347/6347** |
+| matrix vs pinned `as` (`--check`) | **6347/6347 on the recorded 6,347-row inventory; current 6,817-row inventory awaits CI** |
+| matrix vs encoder (`--check-lccc`) | **6347/6347 on the recorded 6,347-row inventory; current 6,817-row inventory awaits CI** |
 | sysreg table (`.def`/`as`/table/encoder) | **1619/1619** |
 | `check_ci_gate_parity.py` + `test_ci_gate_parity.py` | PASS; 66 tests OK |
 | `ci_local.sh --fast` | see the run log behind `target/ci_local.pass` |
@@ -140,7 +144,7 @@ rewritten`).
 
 1. **Godbolt-oracle evidence** for the AArch64 encoder work: per-test hard data against
    GCC 16.2 / Clang 23.1 / ICX, "beat the best of their solutions", no guesswork.
-2. **Red-team audit** of `ms178-1.patch`, all open PRs and the last 10 closed PRs, with a
+2. **Red-team audit** of the AArch64 encoder changes, all open PRs and the last 10 closed PRs, with a
    `docs/REVIEW_<n>_ADJUDICATION.md` (salvage / agree / disagree, quantified, empirical).
 3. **archpkgbuilds benchmark extraction** (gzip, zlib-ng, expat, SQLite, kernel, glibc) into
    the integrated benchmark section over the lccc 39-corpus.

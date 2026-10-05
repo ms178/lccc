@@ -121,15 +121,15 @@ def profile(path: str):
     return per_addr, per_addr_line, fns, objs, cmd
 
 
-LOAD = re.compile(r"^(mov|movz|movs)[a-z]*\\s")
+LOAD = re.compile(r"^(mov|movz|movs)[a-z]*\s")
 STORE_MNEMONICS = ("mov", "movz", "movs")
-ALU = re.compile(r"^(add|sub|xor|and|or|not|neg|shl|shr|sar|sal|rol|ror|rol|imul|mul|div|idiv|adc|sbb|inc|dec|cmov[a-z]+)\\s")
-CONTROL = re.compile(r"^(cmp|test|j[a-z]+|call|ret|nop|hlt)\\b")
+ALU = re.compile(r"^(add|sub|xor|and|or|not|neg|shl|shr|sar|sal|rol|ror|rol|imul|mul|div|idiv|adc|sbb|inc|dec|cmov[a-z]+)\s")
+CONTROL = re.compile(r"^(cmp|test|j[a-z]+|call|ret|nop|hlt)\b")
 
 
 def classify(mnemonic: str, operands: str) -> str:
     """Coarse class for one disassembled instruction (operands from objdump)."""
-    mem_dst = re.match(r"^[^,]*%[a-z0-9]+\\b", operands) is None
+    mem_dst = re.match(r"^[^,]*%[a-z0-9]+\b", operands) is None
     if mnemonic == "lea":
         return "lea"
     if mnemonic.startswith(("mov", "movz", "movs")):
