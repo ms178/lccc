@@ -3,22 +3,31 @@ use crate::backend::arm::assembler::parser::Operand;
 
 // ── Floating point ───────────────────────────────────────────────────────
 
-/// Width of a general-purpose register operand, in bits.
+/// Whether `name` spells a floating-point/SIMD register: a `b`/`h`/`s`/`d`/
+/// `q`/`v` prefix followed by a canonical register number.
 ///
-/// Returns `Err` for anything that is not `w`/`x`/`wsp`/`sp`/`wzr`/`xzr`, so a
-/// mistyped register is diagnosed instead of being defaulted to 32-bit.
-fn gp_reg_width(name: &str) -> Result<u32, String> {
-    match name.to_lowercase().as_str() {
-        "sp" | "xzr" => Ok(64),
-        "wsp" | "wzr" => Ok(32),
-        other => match other.chars().next() {
-            Some('x') => Ok(64),
-            Some('w') => Ok(32),
-            _ => Err(format!(
-                "fmov: `{name}` is not a general-purpose register (expected w, x, wzr or xzr)"
-            )),
-        },
+/// The first-letter test this replaces (`matches!(c, 'd' | 's' | ...)`) counted
+/// *any* name starting with `s` as single-precision, so `sp` was classified as
+/// an FP register and `fmov d0, sp` was diagnosed as a floating-point width
+/// mismatch -- a true statement about the wrong operand.  Classification now
+/// decides between two disjoint grammars: `GpReg::by_name` owns the GP
+/// spellings and this owns the FP ones, so a name is never both.
+fn is_fp_spelling(name: &str) -> bool {
+    let Some((first, rest)) = name.as_bytes().split_first() else {
+        return false;
+    };
+    if !matches!(
+        first,
+        b'b' | b'B' | b'h' | b'H' | b's' | b'S' | b'd' | b'D' | b'q' | b'Q' | b'v' | b'V'
+    ) {
+        return false;
     }
+    !rest.is_empty()
+        && rest.len() <= 2
+        && rest.iter().all(u8::is_ascii_digit)
+        // Canonical decimal only, matching the GP grammar: `s007` is not a
+        // register spelling.
+        && !(rest.len() == 2 && rest[0] == b'0')
 }
 
 /// FMOV between two FP registers.
@@ -63,7 +72,27 @@ fn encode_fmov_fp_fp(rd_name: &str, rm_name: &str) -> Result<EncodeResult, Strin
 /// (general) form at all, which `fp_ftype` already rejects by name.
 fn encode_fmov_general(fp_name: &str, gp_name: &str, to_fp: bool) -> Result<EncodeResult, String> {
     let ftype = fp_ftype(fp_name)?;
-    let gp_is_64 = gp_reg_width(gp_name)? == 64;
+    // The GP slot of FMOV (general) is `Xn|XZR` or `Wn|WZR`: encoding 31 here
+    // is the zero register, so the stack pointer is not encodable and neither
+    // is the role-free `x31`/`w31` spelling.  `fmov h0, wsp` used to assemble
+    // as `FMOV H0, WZR` (0x1ee703e0) -- silently moving the zero register
+    // where the stack pointer was written -- and GNU as rejects it even with
+    // `-march=armv8.2-a+fp16`, which is what makes the H form legal at all.
+    let gp = GpReg::by_name(gp_name).ok_or_else(|| {
+        format!(
+            "fmov: `{gp_name}` is not a general-purpose register (expected \
+             w0-w30, x0-x30, lr, wzr or xzr)"
+        )
+    })?;
+    if gp.is_sp {
+        return Err(format!(
+            "fmov: `{gp_name}` is the stack pointer, which FMOV (general) cannot \
+             move; encoding 31 in this slot is the zero register, so write `{}` \
+             if that is what you meant",
+            if gp.is_64 { "xzr" } else { "wzr" }
+        ));
+    }
+    let gp_is_64 = gp.is_64;
 
     let sf = match ftype {
         // S only pairs with a 32-bit GP register.
@@ -85,7 +114,7 @@ fn encode_fmov_general(fp_name: &str, gp_name: &str, to_fp: bool) -> Result<Enco
     };
 
     let fp_num = parse_reg_num(fp_name).ok_or_else(|| format!("invalid register: {fp_name}"))?;
-    let gp_num = parse_reg_num(gp_name).ok_or_else(|| format!("invalid register: {gp_name}"))?;
+    let gp_num = gp.num;
 
     // In both directions Rn is the source and Rd the destination.
     let (rn, rd) = if to_fp {
@@ -123,8 +152,10 @@ pub(crate) fn encode_fmov(operands: &[Operand]) -> Result<EncodeResult, String> 
         _ => return Err("fmov needs register operands".to_string()),
     };
 
-    let rd_is_fp = is_fp_reg(&rd_name);
-    let rm_is_fp = is_fp_reg(&rm_name);
+    // Classify by identity: see `is_fp_spelling` for why the first-letter
+    // test sent `fmov d0, sp` down the FP-to-FP path.
+    let rd_is_fp = is_fp_spelling(&rd_name);
+    let rm_is_fp = is_fp_spelling(&rm_name);
 
     match (rd_is_fp, rm_is_fp) {
         (true, true) => encode_fmov_fp_fp(&rd_name, &rm_name),
@@ -514,4 +545,111 @@ pub(crate) fn encode_fcvt_precision(operands: &[Operand]) -> Result<EncodeResult
         | (rn << 5)
         | rd;
     Ok(EncodeResult::Word(word))
+}
+
+#[cfg(test)]
+mod fmov_gp_operand_tests {
+    use super::*;
+
+    fn word(r: Result<EncodeResult, String>) -> u32 {
+        match r {
+            Ok(EncodeResult::Word(w)) => w,
+            Ok(other) => panic!("expected a single word, got {other:?}"),
+            Err(e) => panic!("expected an encoding, got error: {e}"),
+        }
+    }
+
+    fn err(r: Result<EncodeResult, String>) -> String {
+        match r {
+            Err(e) => e,
+            Ok(v) => panic!("expected an error, got {v:?}"),
+        }
+    }
+
+    /// `lr` is x30, so it is a 64-bit GP register and pairs with D and H.
+    /// Every expected word below was produced by GNU as, which assembles
+    /// `fmov d0,lr` to exactly the word it assembles `fmov d0,x30` to.
+    #[test]
+    fn lr_is_a_64bit_general_purpose_register() {
+        assert_eq!(
+            word(encode_fmov_general("d0", "lr", true)),
+            word(encode_fmov_general("d0", "x30", true)),
+            "`lr` and `x30` must be indistinguishable to every caller"
+        );
+        assert_eq!(word(encode_fmov_general("d0", "lr", true)), 0x9e6703c0);
+        assert_eq!(
+            word(encode_fmov_general("d0", "LR", true)),
+            0x9e6703c0,
+            "register names are case-insensitive"
+        );
+        // A 32-bit-only pairing therefore rejects it, exactly as GAS does.
+        assert!(encode_fmov_general("s0", "lr", true).is_err());
+    }
+
+    /// Encoding 31 in the GP slot of FMOV (general) is the zero register, so
+    /// `xzr`/`wzr` assemble and `sp`/`wsp` do not.  This is the wrong-code bug
+    /// the width-only check allowed: `fmov h0, wsp` encoded as `FMOV H0, WZR`
+    /// (0x1ee703e0) instead of failing, because H pairs with either GP width
+    /// and so reached the encoder at all.
+    #[test]
+    fn the_gp_slot_takes_the_zero_register_but_never_the_stack_pointer() {
+        assert_eq!(word(encode_fmov_general("d0", "xzr", true)), 0x9e6703e0);
+        assert_eq!(word(encode_fmov_general("h0", "wzr", true)), 0x1ee703e0);
+        for gp in ["sp", "wsp", "SP", "Wsp"] {
+            let e = err(encode_fmov_general("h0", gp, true));
+            assert!(
+                e.contains("stack pointer") && e.contains("zero register"),
+                "`fmov h0, {gp}` must explain the 31 ambiguity, got: {e}"
+            );
+        }
+        // The full dispatcher must reject it too, not just the leaf encoder.
+        let ops = vec![
+            Operand::Reg("h0".to_string()),
+            Operand::Reg("wsp".to_string()),
+        ];
+        assert!(encode_fmov(&ops).is_err());
+    }
+
+    /// The GP grammar is `x0`-`x30`, `w0`-`w30`, `lr`, `xzr`/`wzr`.  `x31`/`w31`
+    /// are role-free spellings of encoding 31 and are refused, as are FP
+    /// spellings, out-of-range numbers and non-canonical decimals.
+    #[test]
+    fn rejects_spellings_that_are_not_general_purpose_registers() {
+        for name in [
+            "d0", "s0", "h0", "q0", "b0", "v0", "", "x32", "x007", "x31", "w31", "x+5",
+        ] {
+            assert!(
+                encode_fmov_general("d0", name, true).is_err(),
+                "`fmov d0, {name}` must be rejected"
+            );
+        }
+        // `sp` is a *valid* GP spelling that this instruction cannot use, so it
+        // is reported as a role error rather than an unknown register.
+        let e = err(encode_fmov_general("d0", "sp", true));
+        assert!(e.contains("stack pointer"), "unexpected message: {e}");
+    }
+
+    /// The two operand grammars are disjoint, so classification cannot send a
+    /// stack pointer down the FP-to-FP path (which reported a floating-point
+    /// width mismatch for `fmov d0, sp`).
+    #[test]
+    fn operand_classification_separates_the_two_grammars() {
+        for name in ["sp", "wsp", "x0", "w30", "lr", "xzr", "wzr"] {
+            assert!(!is_fp_spelling(name), "`{name}` is not an FP register");
+            assert!(GpReg::by_name(name).is_some(), "`{name}` is a GP register");
+        }
+        for name in ["s0", "d31", "h1", "q0", "b7", "v3", "S15"] {
+            assert!(is_fp_spelling(name), "`{name}` is an FP register");
+            assert!(
+                GpReg::by_name(name).is_none(),
+                "`{name}` is not a GP register"
+            );
+        }
+        for name in ["s", "s007", "", "sp0"] {
+            assert!(
+                !is_fp_spelling(name),
+                "`{name}` is not a canonical spelling"
+            );
+        }
+    }
 }

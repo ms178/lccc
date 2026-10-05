@@ -144,6 +144,16 @@ impl ElfWriterBase {
     /// Code sections are NOP-padded using the architecture's NOP instruction;
     /// data sections are zero-padded.
     pub fn align_to(&mut self, align: u64) {
+        self.align_to_capped(align, None);
+    }
+
+    /// Align, but skip the padding entirely when it would exceed `max_pad`.
+    ///
+    /// This is GAS `.p2align N,,M`: if honouring the alignment would insert
+    /// more than M bytes, the location counter is left unchanged. The section
+    /// `sh_addralign` is still raised so the ELF header reflects the
+    /// programmer's requested alignment even when a particular site skipped.
+    pub fn align_to_capped(&mut self, align: u64, max_pad: Option<u64>) {
         if align <= 1 {
             return;
         }
@@ -151,15 +161,18 @@ impl ElfWriterBase {
             let current = section.data.len() as u64;
             let aligned = (current + align - 1) & !(align - 1);
             let padding = (aligned - current) as usize;
-            if section.sh_flags & SHF_EXECINSTR != 0 && align >= 4 {
-                let full_nops = padding / 4;
-                let remainder = padding % 4;
-                for _ in 0..full_nops {
-                    section.data.extend_from_slice(&self.nop_bytes);
+            let skip = max_pad.is_some_and(|m| (padding as u64) > m);
+            if !skip {
+                if section.sh_flags & SHF_EXECINSTR != 0 && align >= 4 {
+                    let full_nops = padding / 4;
+                    let remainder = padding % 4;
+                    for _ in 0..full_nops {
+                        section.data.extend_from_slice(&self.nop_bytes);
+                    }
+                    section.data.extend(std::iter::repeat_n(0u8, remainder));
+                } else {
+                    section.data.extend(std::iter::repeat_n(0u8, padding));
                 }
-                section.data.extend(std::iter::repeat_n(0u8, remainder));
-            } else {
-                section.data.extend(std::iter::repeat_n(0u8, padding));
             }
             if align > section.sh_addralign {
                 section.sh_addralign = align;

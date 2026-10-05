@@ -29,6 +29,77 @@ pub(crate) fn validate_consecutive_reglist(regs: &[Operand], rt: u32) -> Result<
     Ok(())
 }
 
+/// 8-bit Advanced-SIMD modified immediate. GAS accepts the signed-or-unsigned
+/// 8-bit range [-128, 255] and encodes the low 8 bits; anything outside that
+/// is rejected rather than silently wrapped (the previous `& 0xFF` path
+/// assembled `movi v0.16b, #256` as `#0`).
+fn neon_imm8(imm: i64, mn: &str) -> Result<u32, String> {
+    if !(-128..=255).contains(&imm) {
+        return Err(format!(
+            "{mn}: immediate #{imm} is out of range for an 8-bit vector immediate (-128 to 255)"
+        ));
+    }
+    Ok(imm as u8 as u32)
+}
+
+/// Split an imm8 into the `abc` / `defgh` fields of a modified immediate.
+fn neon_imm8_fields(imm8: u32) -> (u32, u32) {
+    ((imm8 >> 5) & 0x7, imm8 & 0x1F)
+}
+
+/// cmode (and, for MOVI, the `op` bit) of a MOVI/MVNI modified immediate.
+///
+/// The architecture's table, not a shift of the immediate:
+///
+/// | arrangement | shift        | cmode |
+/// |-------------|--------------|-------|
+/// | .8b/.16b    | (none)       | 1110  |
+/// | .4h/.8h     | lsl #0 / #8  | 1000 / 1010 |
+/// | .2s/.4s     | lsl #0/8/16/24 | 0000/0010/0100/0110 |
+/// | .2s/.4s     | msl #8 / #16 | 1100 / 1101 |
+///
+/// Unknown kinds used to fall through to "unshifted", so `msl` (which the
+/// parser also did not recognise) assembled as a different instruction.
+fn movi_mvni_cmode(arr: &str, shift: Option<(&str, u32)>, mn: &str) -> Result<u32, String> {
+    match arr {
+        "8b" | "16b" => {
+            if shift.is_some() {
+                return Err(format!(
+                    "{mn}: .{arr} does not take a shift (only an 8-bit immediate)"
+                ));
+            }
+            Ok(0b1110)
+        }
+        "4h" | "8h" => match shift {
+            None | Some(("lsl", 0)) => Ok(0b1000),
+            Some(("lsl", 8)) => Ok(0b1010),
+            Some((kind, amount)) => Err(format!(
+                "{mn}: .{arr} shift `{kind} #{amount}` is not encodable (only lsl #0 or lsl #8)"
+            )),
+        },
+        "2s" | "4s" => match shift {
+            None | Some(("lsl", 0)) => Ok(0b0000),
+            Some(("lsl", 8)) => Ok(0b0010),
+            Some(("lsl", 16)) => Ok(0b0100),
+            Some(("lsl", 24)) => Ok(0b0110),
+            Some(("msl", 8)) => Ok(0b1100),
+            Some(("msl", 16)) => Ok(0b1101),
+            Some((kind, amount)) => Err(format!(
+                "{mn}: .{arr} shift `{kind} #{amount}` is not encodable \
+                 (lsl #0/#8/#16/#24 or msl #8/#16)"
+            )),
+        },
+        other => Err(format!("{mn}: unsupported arrangement .{other}")),
+    }
+}
+
+fn optional_shift(operands: &[Operand]) -> Option<(&str, u32)> {
+    match operands.get(2) {
+        Some(Operand::Shift { kind, amount }) => Some((kind.as_str(), *amount)),
+        _ => None,
+    }
+}
+
 pub(crate) fn get_neon_reg(operands: &[Operand], idx: usize) -> Result<(u32, String), String> {
     match operands.get(idx) {
         Some(Operand::RegArrangement { reg, arrangement }) => {
@@ -586,20 +657,33 @@ pub(crate) fn encode_neon_shift_imm(
 
 /// Encode NEON EXT Vd.T, Vn.T, Vm.T, #index
 pub(crate) fn encode_neon_ext(operands: &[Operand]) -> Result<EncodeResult, String> {
-    if operands.len() < 4 {
-        return Err("ext requires 4 operands".to_string());
-    }
+    expect_operands(operands, 4, "ext")?;
     let (rd, arr_d) = get_neon_reg(operands, 0)?;
     let (rn, _) = get_neon_reg(operands, 1)?;
     let (rm, _) = get_neon_reg(operands, 2)?;
-    let index = get_imm(operands, 3)? as u32;
+    let index = get_imm(operands, 3)?;
 
-    let q: u32 = if arr_d == "16b" { 1 } else { 0 };
+    // Only .8b (imm 0-7) and .16b (imm 0-15) exist. Masking `#16` to `#0`
+    // assembled a different extract; GAS rejects it.
+    let (q, max): (u32, i64) = match arr_d.as_str() {
+        "16b" => (1, 15),
+        "8b" => (0, 7),
+        other => {
+            return Err(format!(
+                "ext: arrangement .{other} is not encodable (expected .8b or .16b)"
+            ));
+        }
+    };
+    if index < 0 || index > max {
+        return Err(format!(
+            "ext: index #{index} is out of range for .{arr_d} (0 to {max})"
+        ));
+    }
 
     // EXT Vd.T, Vn.T, Vm.T, #index
     // Encoding: 0 Q 10 1110 00 0 Rm 0 imm4 0 Rn Rd
     let word =
-        ((((q << 30) | (0b101110 << 24)) | (rm << 16)) | ((index & 0xF) << 11)) | (rn << 5) | rd;
+        ((((q << 30) | (0b101110 << 24)) | (rm << 16)) | ((index as u32) << 11)) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
 }
 
@@ -611,7 +695,20 @@ pub(crate) fn encode_neon_addv(operands: &[Operand]) -> Result<EncodeResult, Str
     let (rd, _) = get_neon_reg(operands, 0)?;
     let (rn, arr_n) = get_neon_reg(operands, 1)?;
 
-    let (q, size) = neon_arr_to_q_size(&arr_n)?;
+    // ADDV exists only for .8b/.16b/.4h/.8h/.4s. `.2d` and `.2s` encode
+    // unallocated words (GAS rejects them).
+    let (q, size) = match arr_n.as_str() {
+        "8b" => (0u32, 0b00u32),
+        "16b" => (1, 0b00),
+        "4h" => (0, 0b01),
+        "8h" => (1, 0b01),
+        "4s" => (1, 0b10),
+        other => {
+            return Err(format!(
+                "addv: arrangement .{other} is not encodable (expected .8b, .16b, .4h, .8h or .4s)"
+            ));
+        }
+    };
 
     // ADDV: 0 Q 0 01110 size 11000 11011 10 Rn Rd
     let word = (q << 30)
@@ -848,119 +945,49 @@ pub(crate) fn encode_neon_movi(operands: &[Operand]) -> Result<EncodeResult, Str
     }
     let (rd, arr_d) = get_neon_reg(operands, 0)?;
     let imm = get_imm(operands, 1)?;
+    let shift = optional_shift(operands);
 
-    match arr_d.as_str() {
-        "16b" | "8b" => {
-            // MOVI Vd.16b, #imm8
-            // Encoding: 0 Q 00 1111 00000 abc 1110 01 defgh Rd
-            // where imm8 = abc:defgh
-            let q: u32 = if arr_d == "16b" { 1 } else { 0 };
-            let imm8 = imm as u32 & 0xFF;
-            let abc = (imm8 >> 5) & 0x7;
-            let defgh = imm8 & 0x1F;
-            // 0 Q op 0 1111 0 a b c cmode(1110) o2(0) 1 defgh Rd
-            let word = (q << 30)
-                | (0b0011110 << 23)
-                | ((abc >> 2) << 18)
-                | (((abc >> 1) & 1) << 17)
-                | ((abc & 1) << 16)
-                | (0b1110 << 12)
-                | (0b01 << 10)
-                | (defgh << 5)
-                | rd;
-            Ok(EncodeResult::Word(word))
+    // MOVI Vd.2d, #imm64 -- 8 bits, each expanding to 0x00 or 0xFF. Not an
+    // 8-bit truncated immediate: `#0x0101010101010101` is rejected by GAS
+    // and by the byte-mask check below. Q=1, op=1, cmode=1110.
+    if arr_d == "2d" {
+        if shift.is_some() {
+            return Err("movi: .2d does not take a shift".to_string());
         }
-        "2d" => {
-            // MOVI Vd.2d, #imm
-            // The 64-bit immediate is encoded as 8 bits, where each bit expands
-            // to 8 bits (0x00 or 0xFF) in the result.
-            // Convert the 64-bit value to the 8-bit encoding.
-            let imm64 = imm as u64;
-            let mut imm8 = 0u32;
-            for i in 0..8 {
-                let byte_val = (imm64 >> (i * 8)) & 0xFF;
-                if byte_val == 0xFF {
-                    imm8 |= 1 << i;
-                } else if byte_val != 0 {
-                    return Err(format!(
-                        "movi .2d: each byte of immediate must be 0x00 or 0xFF, got 0x{:02x} at byte {}",
-                        byte_val, i
-                    ));
-                }
+        let imm64 = imm as u64;
+        let mut imm8 = 0u32;
+        for i in 0..8 {
+            let byte_val = (imm64 >> (i * 8)) & 0xFF;
+            if byte_val == 0xFF {
+                imm8 |= 1 << i;
+            } else if byte_val != 0 {
+                return Err(format!(
+                    "movi .2d: each byte of immediate must be 0x00 or 0xFF, got 0x{byte_val:02x} at byte {i}"
+                ));
             }
-            let abc = (imm8 >> 5) & 0x7;
-            let defgh = imm8 & 0x1F;
-            // MOVI Vd.2d, #imm: 0 1 1 0 1111 00 abc 1110 01 defgh Rd  (op=1, Q=1)
-            let word = (0b01101111 << 24)
-                | ((abc >> 2) << 18)
-                | (((abc >> 1) & 1) << 17)
-                | ((abc & 1) << 16)
-                | (0b111001 << 10)
-                | (defgh << 5)
-                | rd;
-            Ok(EncodeResult::Word(word))
         }
-        "2s" | "4s" => {
-            // MOVI Vd.2s/4s, #imm8 (32-bit element, no shift)
-            // Encoding: 0 Q op(0) 0 1111 0 abc cmode(0000) o2(0) 1 defgh Rd
-            let q: u32 = if arr_d == "4s" { 1 } else { 0 };
-            let imm8 = imm as u32 & 0xFF;
-            let abc = (imm8 >> 5) & 0x7;
-            let defgh = imm8 & 0x1F;
-
-            // Check for optional LSL shift operand
-            let (cmode, shift_val) = if operands.len() > 2 {
-                if let Some(Operand::Shift { kind, amount }) = operands.get(2) {
-                    if kind == "lsl" {
-                        match amount {
-                            0 => (0b0000u32, 0),
-                            8 => (0b0010, 8),
-                            16 => (0b0100, 16),
-                            24 => (0b0110, 24),
-                            _ => return Err(format!("movi: unsupported shift amount: {}", amount)),
-                        }
-                    } else {
-                        (0b0000, 0)
-                    }
-                } else {
-                    (0b0000, 0)
-                }
-            } else {
-                (0b0000, 0)
-            };
-            let _ = shift_val;
-
-            let word = (q << 30)
-                | (0b0011110 << 23)
-                | ((abc >> 2) << 18)
-                | (((abc >> 1) & 1) << 17)
-                | ((abc & 1) << 16)
-                | (cmode << 12)
-                | (0b01 << 10)
-                | (defgh << 5)
-                | rd;
-            Ok(EncodeResult::Word(word))
-        }
-        "4h" | "8h" => {
-            // MOVI Vd.4h/8h, #imm8
-            let q: u32 = if arr_d == "8h" { 1 } else { 0 };
-            let imm8 = imm as u32 & 0xFF;
-            let abc = (imm8 >> 5) & 0x7;
-            let defgh = imm8 & 0x1F;
-            // cmode=1000 for .4h/.8h with no shift
-            let word = (q << 30)
-                | (0b0011110 << 23)
-                | ((abc >> 2) << 18)
-                | (((abc >> 1) & 1) << 17)
-                | ((abc & 1) << 16)
-                | (0b1000 << 12)
-                | (0b01 << 10)
-                | (defgh << 5)
-                | rd;
-            Ok(EncodeResult::Word(word))
-        }
-        _ => Err(format!("movi: unsupported arrangement: {}", arr_d)),
+        let (abc, defgh) = neon_imm8_fields(imm8);
+        let word =
+            (0b0110_1111 << 24) | (abc << 16) | (0b1110 << 12) | (0b01 << 10) | (defgh << 5) | rd;
+        return Ok(EncodeResult::Word(word));
     }
+
+    let cmode = movi_mvni_cmode(&arr_d, shift, "movi")?;
+    let q: u32 = match arr_d.as_str() {
+        "16b" | "8h" | "4s" => 1,
+        "8b" | "4h" | "2s" => 0,
+        other => return Err(format!("movi: unsupported arrangement: {other}")),
+    };
+    let (abc, defgh) = neon_imm8_fields(neon_imm8(imm, "movi")?);
+    // MOVI (op=0): 0 Q 0 01111 00 abc cmode 01 defgh Rd
+    let word = (q << 30)
+        | (0b001_1110 << 23)
+        | (abc << 16)
+        | (cmode << 12)
+        | (0b01 << 10)
+        | (defgh << 5)
+        | rd;
+    Ok(EncodeResult::Word(word))
 }
 
 /// Encode NEON BIC (bitwise clear vector): BIC Vd.T, Vn.T, Vm.T
@@ -1045,6 +1072,9 @@ pub(crate) fn encode_neon_tbl(operands: &[Operand]) -> Result<EncodeResult, Stri
     // The second operand is a register list
     let (rn, num_regs) = match &operands[1] {
         Operand::RegList(regs) => {
+            if regs.is_empty() {
+                return Err("tbl: register list is empty".to_string());
+            }
             let first_reg = match &regs[0] {
                 Operand::RegArrangement { reg, .. } => parse_reg_num(reg).ok_or("invalid reg")?,
                 Operand::Reg(name) => parse_reg_num(name).ok_or("invalid reg")?,
@@ -1055,11 +1085,16 @@ pub(crate) fn encode_neon_tbl(operands: &[Operand]) -> Result<EncodeResult, Stri
         }
         _ => return Err("tbl: expected register list as second operand".to_string()),
     };
+    if !(1..=4).contains(&num_regs) {
+        return Err(format!(
+            "tbl: table must have 1 to 4 registers, got {num_regs}"
+        ));
+    }
 
     let (rm, _) = get_neon_reg(operands, 2)?;
 
     // len field: 1 reg -> 00, 2 -> 01, 3 -> 10, 4 -> 11
-    let len = (num_regs - 1) & 0x3;
+    let len = num_regs - 1;
 
     // TBL: 0 Q 00 1110 000 Rm 0 len 0 00 Rn Rd
     let word = ((((q << 30) | (0b001110 << 24)) | (rm << 16)) | (len << 13)) | (rn << 5) | rd;
@@ -1076,6 +1111,9 @@ pub(crate) fn encode_neon_tbx(operands: &[Operand]) -> Result<EncodeResult, Stri
 
     let (rn, num_regs) = match &operands[1] {
         Operand::RegList(regs) => {
+            if regs.is_empty() {
+                return Err("tbx: register list is empty".to_string());
+            }
             let first_reg = match &regs[0] {
                 Operand::RegArrangement { reg, .. } => parse_reg_num(reg).ok_or("invalid reg")?,
                 Operand::Reg(name) => parse_reg_num(name).ok_or("invalid reg")?,
@@ -1086,9 +1124,14 @@ pub(crate) fn encode_neon_tbx(operands: &[Operand]) -> Result<EncodeResult, Stri
         }
         _ => return Err("tbx: expected register list as second operand".to_string()),
     };
+    if !(1..=4).contains(&num_regs) {
+        return Err(format!(
+            "tbx: table must have 1 to 4 registers, got {num_regs}"
+        ));
+    }
 
     let (rm, _) = get_neon_reg(operands, 2)?;
-    let len = (num_regs - 1) & 0x3;
+    let len = num_regs - 1;
 
     // TBX: 0 Q 00 1110 000 Rm 0 len 1 00 Rn Rd (op=1 for TBX vs op=0 for TBL)
     let word = (q << 30) | (0b001110 << 24) | (rm << 16) | (len << 13) | (1 << 12) | (rn << 5) | rd;
@@ -1763,64 +1806,28 @@ pub(crate) fn encode_neon_mvni(operands: &[Operand]) -> Result<EncodeResult, Str
         return Err("mvni requires 2 operands".to_string());
     }
     let (rd, arr_d) = get_neon_reg(operands, 0)?;
-    let imm = get_imm(operands, 1)?;
-    let imm8 = imm as u32 & 0xFF;
-
-    // Extract abc:defgh for encoding
-    let abc = (imm8 >> 5) & 0x7;
-    let defgh = imm8 & 0x1f;
-
-    match arr_d.as_str() {
-        "2s" | "4s" => {
-            let q: u32 = if arr_d == "4s" { 1 } else { 0 };
-            // Check for optional shift
-            let cmode = if let Some(Operand::Shift { kind, amount }) = operands.get(2) {
-                if kind.to_lowercase() == "lsl" {
-                    match *amount {
-                        0 => 0b0000u32,
-                        8 => 0b0010,
-                        16 => 0b0100,
-                        24 => 0b0110,
-                        _ => return Err(format!("mvni: unsupported shift amount: {}", amount)),
-                    }
-                } else if kind.to_lowercase() == "msl" {
-                    match *amount {
-                        8 => 0b1100u32,
-                        16 => 0b1101,
-                        _ => return Err(format!("mvni: unsupported MSL shift: {}", amount)),
-                    }
-                } else {
-                    0b0000
-                }
-            } else {
-                0b0000
-            };
-            // MVNI: 0 Q 1 0 1111 00 abc cmode 01 defgh Rd  (op=1)
-            let word = (q << 30)
-                | (1 << 29)
-                | (0b0111100 << 22)
-                | (abc << 16)
-                | (cmode << 12)
-                | (0b01 << 10)
-                | (defgh << 5)
-                | rd;
-            Ok(EncodeResult::Word(word))
+    let cmode = movi_mvni_cmode(&arr_d, optional_shift(operands), "mvni")?;
+    // MVNI has no .8b/.16b/.2d form (those encodings belong to MOVI/MOVI.2d).
+    let q: u32 = match arr_d.as_str() {
+        "8h" | "4s" => 1,
+        "4h" | "2s" => 0,
+        other => {
+            return Err(format!(
+                "mvni: arrangement .{other} is not encodable (expected .4h/.8h/.2s/.4s)"
+            ));
         }
-        "4h" | "8h" => {
-            let q: u32 = if arr_d == "8h" { 1 } else { 0 };
-            // MVNI 16-bit: cmode=1000, op=1
-            let word = (q << 30)
-                | (1 << 29)
-                | (0b0111100 << 22)
-                | (abc << 16)
-                | (0b1000 << 12)
-                | (0b01 << 10)
-                | (defgh << 5)
-                | rd;
-            Ok(EncodeResult::Word(word))
-        }
-        _ => Err(format!("mvni: unsupported arrangement: {}", arr_d)),
-    }
+    };
+    let (abc, defgh) = neon_imm8_fields(neon_imm8(get_imm(operands, 1)?, "mvni")?);
+    // MVNI (op=1): 0 Q 1 01111 00 abc cmode 01 defgh Rd
+    let word = (q << 30)
+        | (1 << 29)
+        | (0b011_1100 << 22)
+        | (abc << 16)
+        | (cmode << 12)
+        | (0b01 << 10)
+        | (defgh << 5)
+        | rd;
+    Ok(EncodeResult::Word(word))
 }
 
 // ── NEON float three-same ────────────────────────────────────────────────
@@ -2233,6 +2240,9 @@ pub(crate) fn encode_neon_ldnr(
     }
     let (rt, arr, num_regs) = match &operands[0] {
         Operand::RegList(regs) => {
+            if regs.is_empty() {
+                return Err(format!("ld{num_structs}r: register list is empty"));
+            }
             let (first_reg, arrangement) = match &regs[0] {
                 Operand::RegArrangement { reg, arrangement } => (
                     parse_reg_num(reg).ok_or("invalid reg")?,
@@ -2267,32 +2277,35 @@ pub(crate) fn encode_neon_ldnr(
             ));
         }
     };
-    // opcode: ld1r=110, ld2r=110(S=1), ld3r=111, ld4r=111(S=1)
-    let (opcode, s_bit) = match num_structs {
+    // Advanced SIMD load-and-replicate (ARM ARM C4):
+    //   L (bit 22) = 1, S (bit 12) = 0, R (bit 21) distinguishes 2/4 from 1/3,
+    //   opcode[15:13] is 110 for LD1R/LD2R and 111 for LD3R/LD4R.
+    // The previous encoding put the 2/4 distinction in S, which produced the
+    // unallocated words 0x4d40d000 / 0x4d40f000 (GAS: 0x4d60c000 / 0x4d60e000).
+    let (opcode, r_bit) = match num_structs {
         1 => (0b110u32, 0u32),
         2 => (0b110, 1),
         3 => (0b111, 0),
         4 => (0b111, 1),
         _ => return Err(format!("unsupported: ld{}r", num_structs)),
     };
-    let base = match &operands[1] {
-        Operand::Mem { base, .. } => parse_reg_num(base).ok_or("invalid base")?,
-        Operand::MemPostIndex { base, .. } => parse_reg_num(base).ok_or("invalid base")?,
+    let (base, has_post, rm) = match &operands[1] {
+        Operand::Mem { base, offset: 0 } => (mem_xn_or_sp(base, "ldnr")?, false, 0u32),
+        Operand::Mem { offset, .. } => {
+            return Err(format!(
+                "ld{num_structs}r: offset #{offset} is not encodable in the no-writeback form (use post-index)"
+            ));
+        }
+        Operand::MemPostIndex { base, .. } => (mem_xn_or_sp(base, "ldnr")?, true, 0b11111u32),
         _ => return Err("expected memory operand".to_string()),
     };
-    // check for post-index
-    let rm = match &operands[1] {
-        Operand::MemPostIndex { .. } => 0b11111u32, // immediate post-index
-        _ => 0u32,
-    };
-    let has_post = rm != 0;
     let word = (q << 30)
         | (0b001101 << 24)
-        | (if has_post { 1u32 } else { 0 } << 23)
+        | (u32::from(has_post) << 23)
         | (1 << 22)
+        | (r_bit << 21)
         | (if has_post { rm } else { 0 } << 16)
         | (opcode << 13)
-        | (s_bit << 12)
         | (size << 10)
         | (base << 5)
         | rt;
