@@ -153,79 +153,526 @@ pub struct Relocation {
 }
 
 /// Parse a register name to its 5-bit encoding number (0-30, 31 for sp/zr).
+///
+/// Allocation-free: the previous `to_lowercase()` copy showed up as ~2% of
+/// assembler instruction-retirement on the Callgrind A/B (see
+/// `docs/REVIEW_756_ADJUDICATION.md`). Identity aliases are matched
+/// case-insensitively; numbered forms accept only canonical decimal digits.
 pub fn parse_reg_num(name: &str) -> Option<u32> {
-    let name = name.to_lowercase();
-    match name.as_str() {
-        "sp" | "wsp" => Some(31),
-        "xzr" | "wzr" => Some(31),
-        "lr" => Some(30),
-        _ => {
-            let prefix = name.chars().next()?;
-            match prefix {
-                'x' | 'w' | 'd' | 's' | 'q' | 'v' | 'h' | 'b' => {
-                    // `str::parse::<u32>` is far more permissive than the
-                    // AArch64 register grammar: it accepts a leading `+` and
-                    // arbitrary leading zeros, so "x+5", "x007" and "w+31"
-                    // all used to resolve to a real register instead of being
-                    // rejected. Accept only bare decimal digits, and only in
-                    // canonical (no leading zero) form -- matching GAS, which
-                    // rejects "x007" as an unknown symbol.
-                    // (Upstream fork issues #118 and #207.)
-                    let digits = &name[1..];
-                    if digits.is_empty()
-                        || !digits.bytes().all(|b| b.is_ascii_digit())
-                        || (digits.len() > 1 && digits.starts_with('0'))
-                    {
-                        return None;
-                    }
-                    let num: u32 = digits.parse().ok()?;
-                    if num <= 31 { Some(num) } else { None }
-                }
-                _ => None,
-            }
-        }
+    if name.eq_ignore_ascii_case("sp")
+        || name.eq_ignore_ascii_case("wsp")
+        || name.eq_ignore_ascii_case("xzr")
+        || name.eq_ignore_ascii_case("wzr")
+    {
+        return Some(31);
     }
+    if name.eq_ignore_ascii_case("lr") {
+        return Some(30);
+    }
+    let b = name.as_bytes();
+    let prefix = *b.first()?;
+    match prefix.to_ascii_lowercase() {
+        b'x' | b'w' | b'd' | b's' | b'q' | b'v' | b'h' | b'b' => {
+            // `str::parse::<u32>` is far more permissive than the
+            // AArch64 register grammar: it accepts a leading `+` and
+            // arbitrary leading zeros, so "x+5", "x007" and "w+31"
+            // all used to resolve to a real register instead of being
+            // rejected. Accept only bare decimal digits, and only in
+            // canonical (no leading zero) form -- matching GAS, which
+            // rejects "x007" as an unknown symbol.
+            // (Upstream fork issues #118 and #207.)
+            let digits = &b[1..];
+            if digits.is_empty()
+                || !digits.iter().all(|d| d.is_ascii_digit())
+                || (digits.len() > 1 && digits[0] == b'0')
+            {
+                return None;
+            }
+            let mut num = 0u32;
+            for &d in digits {
+                num = num.checked_mul(10)?.checked_add(u32::from(d - b'0'))?;
+                if num > 31 {
+                    return None;
+                }
+            }
+            Some(num)
+        }
+        _ => None,
+    }
+}
+
+/// Identity of a general-purpose register operand.
+///
+/// A register *number* is not a register identity. AArch64 gives encoding 31
+/// two different meanings, and which one applies depends on the instruction
+/// form *and* on the operand slot: in `add x0, x1, x2` slot 2 reads 31 as XZR,
+/// in `add x0, sp, #8` slot 1 reads 31 as SP, and `clz x0, sp` is not an
+/// instruction at all, because CLZ's source slot accepts only `Xn` or `XZR`.
+///
+/// Collapsing a spelling to a number before the form has been checked is how
+/// an invalid operand turns into a *different valid instruction*. Two real
+/// cases, both rejected by GNU as and both silently assembled here:
+/// `fmov h0, wsp` encoded as `FMOV H0, WZR` (0x1ee703e0), reading the zero
+/// register where the stack pointer was written, and `mov d0, #1` encoded as
+/// `movz w0, #1`. `GpReg` keeps the three identities -- numbered, SP, ZR --
+/// apart until each slot's role has been checked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GpReg {
+    /// 0..=30 for `x0`-`x30`/`w0`-`w30`/`lr`; 31 for the `sp`/`zr` aliases.
+    pub num: u32,
+    /// `x`, `sp`, `xzr` and `lr` spell 64-bit registers; `w`, `wsp` and `wzr`
+    /// spell 32-bit ones.
+    pub is_64: bool,
+    /// `sp`/`wsp`. The stack pointer is never the zero register.
+    pub is_sp: bool,
+    /// `xzr`/`wzr`. The zero register is never the stack pointer.
+    pub is_zr: bool,
+}
+
+/// What one operand slot of a GP-only instruction may hold.
+///
+/// These are the architecture's own operand classes, spelled per slot. A class
+/// check ("is this a GP register?") cannot answer the question an encoder has
+/// to answer ("may *this slot* of *this form* hold the stack pointer?"), which
+/// is why `sp` passed a class check and then encoded as the zero register.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GpRole {
+    /// `Rd`/`Rn`/`Rm` where 31 means the zero register: `Xn|XZR`, `Wn|WZR`.
+    /// The stack pointer is not encodable here.
+    RegOrZr,
+    /// Slots where 31 means the stack pointer: `Xn|SP`, `Wn|WSP`. The zero
+    /// register is not encodable here.
+    RegOrSp,
+    /// Slots that accept either meaning of 31, such as the destination of the
+    /// non-flags-setting logical immediates and the first operand of the
+    /// `cmp`/`cmn`/`mov`-to-SP aliases.
+    RegSpOrZr,
+    /// A numbered register only; neither 31-encoding is legal in this slot.
+    Reg,
+}
+
+impl GpReg {
+    /// Resolve a register spelling to a general-purpose identity.
+    ///
+    /// Accepts exactly the spellings GNU as accepts for a GP register:
+    /// `x0`-`x30`, `w0`-`w30`, `lr`, `sp`/`wsp`, `xzr`/`wzr`. It refuses
+    /// FP/SIMD spellings (`d0`, `v3`), out-of-range numbers (`x32`),
+    /// non-canonical decimals (`x007`), and `x31`/`w31`: register 31 is
+    /// spelled by the role the form gives it, and accepting a role-free
+    /// spelling is exactly what lets a caller mistake SP for ZR.
+    ///
+    /// Allocation-free and case-insensitive on purpose -- this is on the
+    /// assembler's hot path, where an earlier `to_lowercase()` cost 2.17% of
+    /// total instruction count (Callgrind; see
+    /// `docs/REVIEW_756_ADJUDICATION.md`).
+    pub(crate) fn by_name(name: &str) -> Option<GpReg> {
+        if name.eq_ignore_ascii_case("sp") {
+            return Some(GpReg {
+                num: 31,
+                is_64: true,
+                is_sp: true,
+                is_zr: false,
+            });
+        }
+        if name.eq_ignore_ascii_case("wsp") {
+            return Some(GpReg {
+                num: 31,
+                is_64: false,
+                is_sp: true,
+                is_zr: false,
+            });
+        }
+        if name.eq_ignore_ascii_case("xzr") {
+            return Some(GpReg {
+                num: 31,
+                is_64: true,
+                is_sp: false,
+                is_zr: true,
+            });
+        }
+        if name.eq_ignore_ascii_case("wzr") {
+            return Some(GpReg {
+                num: 31,
+                is_64: false,
+                is_sp: false,
+                is_zr: true,
+            });
+        }
+        if name.eq_ignore_ascii_case("lr") {
+            return Some(GpReg {
+                num: 30,
+                is_64: true,
+                is_sp: false,
+                is_zr: false,
+            });
+        }
+        let b = name.as_bytes();
+        let (is_64, digits) = match b.first()? {
+            b'x' | b'X' => (true, &b[1..]),
+            b'w' | b'W' => (false, &b[1..]),
+            _ => return None,
+        };
+        if digits.is_empty() || digits.len() > 2 {
+            return None;
+        }
+        // Canonical decimal only: `x007` is not a register spelling, and
+        // accepting it would give one register two spellings that a caller
+        // could then disagree about.
+        if digits.len() == 2 && digits[0] == b'0' {
+            return None;
+        }
+        let mut num = 0u32;
+        for &d in digits {
+            if !d.is_ascii_digit() {
+                return None;
+            }
+            num = num * 10 + u32::from(d - b'0');
+        }
+        // 31 is spelled `xzr`/`wzr`/`sp`/`wsp`, never `x31`.
+        if num > 30 {
+            return None;
+        }
+        Some(GpReg {
+            num,
+            is_64,
+            is_sp: false,
+            is_zr: false,
+        })
+    }
+
+    /// Whether two operands have the same register width.
+    pub(crate) fn same_width_as(self, other: GpReg) -> bool {
+        self.is_64 == other.is_64
+    }
+}
+
+/// The spelling of operand `idx`, for diagnostics.
+pub(crate) fn operand_spelling(operands: &[Operand], idx: usize) -> String {
+    match operands.get(idx) {
+        Some(Operand::Reg(n)) => n.clone(),
+        Some(_) | None => String::from("?"),
+    }
+}
+
+/// Read one register operand and check it against the role its slot has.
+///
+/// Every GP-only encoder routes its operands through here, so a register-class
+/// error, an illegal use of encoding 31, and a width mismatch are all reported
+/// at the operand that caused them -- and, unlike the assembler being
+/// compared against, with the fix named:
+///
+/// ```text
+/// clz: operand 1 `sp` is the stack pointer, but this slot reads encoding 31
+/// as the zero register; write `xzr` if the zero register is what you meant
+/// ```
+pub(crate) fn reg_operand(
+    operands: &[Operand],
+    idx: usize,
+    role: GpRole,
+    mn: &str,
+) -> Result<GpReg, String> {
+    // Borrowed, not cloned: this runs once per register operand of every
+    // GP instruction, and the whole point of `GpReg` is that validation costs
+    // no allocation.
+    let name = match operands.get(idx) {
+        Some(Operand::Reg(n)) => n.as_str(),
+        Some(_) => {
+            return Err(format!(
+                "{mn}: operand {idx} must be a register, not an immediate or memory operand"
+            ));
+        }
+        None => return Err(format!("{mn}: missing operand {idx} (expected a register)")),
+    };
+    let reg = GpReg::by_name(name).ok_or_else(|| {
+        format!(
+            "{mn}: operand {idx} `{name}` is not a general-purpose register \
+             (expected x0-x30, w0-w30, lr, sp, wzr or xzr)"
+        )
+    })?;
+    match role {
+        GpRole::RegOrZr if reg.is_sp => Err(format!(
+            "{mn}: operand {idx} `{name}` is the stack pointer, but this slot reads \
+             encoding 31 as the zero register; write `{}` if the zero register is \
+             what you meant",
+            if reg.is_64 { "xzr" } else { "wzr" }
+        )),
+        GpRole::RegOrSp if reg.is_zr => Err(format!(
+            "{mn}: operand {idx} `{name}` is the zero register, but this slot reads \
+             encoding 31 as the stack pointer; write `{}` if the stack pointer is \
+             what you meant",
+            if reg.is_64 { "sp" } else { "wsp" }
+        )),
+        GpRole::Reg if reg.is_sp || reg.is_zr => Err(format!(
+            "{mn}: operand {idx} `{name}` is not allowed here; this slot takes a \
+             numbered register (x0-x30/w0-w30) only"
+        )),
+        _ => Ok(reg),
+    }
+}
+
+/// Read the two operands of a "data-processing (1 source)" instruction
+/// (`clz`, `cls`, `rbit`, `rev`, `rev16`).
+///
+/// Both slots are `Rd|XZR`, so neither may be the stack pointer, and both must
+/// be the same width: `clz x0, w1` has no encoding.
+pub(crate) fn dp1src_reg_pair(operands: &[Operand], mn: &str) -> Result<(GpReg, GpReg), String> {
+    let rd = reg_operand(operands, 0, GpRole::RegOrZr, mn)?;
+    let rn = reg_operand(operands, 1, GpRole::RegOrZr, mn)?;
+    if !rd.same_width_as(rn) {
+        return Err(format!(
+            "{mn}: `{}` and `{}` are different widths; both operands of {mn} must \
+             be the same size",
+            operand_spelling(operands, 0),
+            operand_spelling(operands, 1)
+        ));
+    }
+    Ok((rd, rn))
+}
+
+/// Read the three register operands of a shifted-register logical
+/// (`and`, `orr`, `eor`, `orn`, `eon`, `bic`, `bics`).
+///
+/// All three slots are `Rd|Rn|Rm` with 31 meaning the zero register, so the
+/// stack pointer is not encodable in any of them, and all three must share one
+/// width.
+pub(crate) fn logical_reg3(
+    operands: &[Operand],
+    mn: &str,
+) -> Result<(GpReg, GpReg, GpReg), String> {
+    let rd = reg_operand(operands, 0, GpRole::RegOrZr, mn)?;
+    let rn = reg_operand(operands, 1, GpRole::RegOrZr, mn)?;
+    let rm = reg_operand(operands, 2, GpRole::RegOrZr, mn)?;
+    if !rd.same_width_as(rn) || !rd.same_width_as(rm) {
+        return Err(format!(
+            "{mn}: `{}`, `{}` and `{}` must all be the same width",
+            operand_spelling(operands, 0),
+            operand_spelling(operands, 1),
+            operand_spelling(operands, 2)
+        ));
+    }
+    Ok((rd, rn, rm))
+}
+
+/// Encode the `option` field of an extended-register operand.
+///
+/// The old code fell through to `_ => 0b011`, so a misspelt extend silently
+/// became UXTX and encoded a different instruction.
+pub(crate) fn extend_option(kind: &str, mn: &str) -> Result<u32, String> {
+    let option = match kind.to_ascii_lowercase().as_str() {
+        "uxtb" => 0b000,
+        "uxth" => 0b001,
+        "uxtw" => 0b010,
+        "uxtx" => 0b011,
+        "sxtb" => 0b100,
+        "sxth" => 0b101,
+        "sxtw" => 0b110,
+        "sxtx" => 0b111,
+        other => {
+            return Err(format!(
+                "{mn}: unknown extend `{other}` (expected uxtb, uxth, uxtw, uxtx, \
+                 sxtb, sxth, sxtw or sxtx)"
+            ));
+        }
+    };
+    Ok(option)
+}
+
+/// Encode the `shift`+`imm6` fields of a shifted-register operand.
+///
+/// The old code fell through to `_ => 0b00` for an unknown shift kind and
+/// masked the amount with `& 0x3F`, so `add x0, x1, x2, lsl #64` silently
+/// became `add x0, x1, x2` and `orr w0, w1, w2, ror #31` became an LSL. Both
+/// are wrong-code bugs, not strictness bugs: an out-of-range amount now
+/// reports the legal range, and `ror` is refused where the architecture has no
+/// rotate (arithmetic forms), instead of being reinterpreted.
+pub(crate) fn shift_field(
+    kind: &str,
+    amount: u32,
+    is_64: bool,
+    allow_ror: bool,
+    mn: &str,
+) -> Result<(u32, u32), String> {
+    let max = if is_64 { 63 } else { 31 };
+    let shift = match kind.to_ascii_lowercase().as_str() {
+        "lsl" => 0b00,
+        "lsr" => 0b01,
+        "asr" => 0b10,
+        "ror" if allow_ror => 0b11,
+        "ror" => {
+            return Err(format!(
+                "{mn}: `ror` is not available in this form (only the logical \
+                 instructions and `mvn` have a rotate); use lsl, lsr or asr"
+            ));
+        }
+        other => {
+            return Err(format!(
+                "{mn}: unknown shift `{other}` (expected lsl, lsr, asr{})",
+                if allow_ror { " or ror" } else { "" }
+            ));
+        }
+    };
+    if amount > max {
+        return Err(format!(
+            "{mn}: shift amount #{amount} is out of range for a {}-bit operand \
+             (0-{max})",
+            if is_64 { 64 } else { 32 }
+        ));
+    }
+    Ok((shift, amount))
 }
 
 /// Check if a register name is a 64-bit (X) register or SP.
 fn is_64bit_reg(name: &str) -> bool {
-    let name = name.to_lowercase();
-    name.starts_with('x') || name == "sp" || name == "xzr" || name == "lr"
+    name.eq_ignore_ascii_case("sp")
+        || name.eq_ignore_ascii_case("xzr")
+        || name.eq_ignore_ascii_case("lr")
+        || name
+            .as_bytes()
+            .first()
+            .is_some_and(|&c| c == b'x' || c == b'X')
 }
 
 /// Check if a register name is a 32-bit (W) register.
 fn is_32bit_reg(name: &str) -> bool {
-    let name = name.to_lowercase();
-    name.starts_with('w') || name == "wsp" || name == "wzr"
+    name.eq_ignore_ascii_case("wsp")
+        || name.eq_ignore_ascii_case("wzr")
+        || name
+            .as_bytes()
+            .first()
+            .is_some_and(|&c| c == b'w' || c == b'W')
 }
 
 /// Check if a register is a floating-point/SIMD register.
 fn is_fp_reg(name: &str) -> bool {
-    let c = name.chars().next().unwrap_or(' ').to_ascii_lowercase();
-    matches!(c, 'd' | 's' | 'q' | 'v' | 'h' | 'b')
+    matches!(
+        name.as_bytes().first().map(|c| c.to_ascii_lowercase()),
+        Some(b'd' | b's' | b'q' | b'v' | b'h' | b'b')
+    )
 }
 
 /// Encode a condition code string to 4-bit encoding.
 fn encode_cond(cond: &str) -> Option<u32> {
-    match cond.to_lowercase().as_str() {
-        "eq" => Some(0),
-        "ne" => Some(1),
-        "cs" | "hs" => Some(2),
-        "cc" | "lo" => Some(3),
-        "mi" => Some(4),
-        "pl" => Some(5),
-        "vs" => Some(6),
-        "vc" => Some(7),
-        "hi" => Some(8),
-        "ls" => Some(9),
-        "ge" => Some(10),
-        "lt" => Some(11),
-        "gt" => Some(12),
-        "le" => Some(13),
-        "al" => Some(14),
-        "nv" => Some(15),
-        _ => None,
+    // Allocation-free: condition codes are four-character tokens on the
+    // branch hot path. `eq_ignore_ascii_case` matches GAS's case folding
+    // without a temporary String.
+    if cond.eq_ignore_ascii_case("eq") {
+        Some(0)
+    } else if cond.eq_ignore_ascii_case("ne") {
+        Some(1)
+    } else if cond.eq_ignore_ascii_case("cs") || cond.eq_ignore_ascii_case("hs") {
+        Some(2)
+    } else if cond.eq_ignore_ascii_case("cc") || cond.eq_ignore_ascii_case("lo") {
+        Some(3)
+    } else if cond.eq_ignore_ascii_case("mi") {
+        Some(4)
+    } else if cond.eq_ignore_ascii_case("pl") {
+        Some(5)
+    } else if cond.eq_ignore_ascii_case("vs") {
+        Some(6)
+    } else if cond.eq_ignore_ascii_case("vc") {
+        Some(7)
+    } else if cond.eq_ignore_ascii_case("hi") {
+        Some(8)
+    } else if cond.eq_ignore_ascii_case("ls") {
+        Some(9)
+    } else if cond.eq_ignore_ascii_case("ge") {
+        Some(10)
+    } else if cond.eq_ignore_ascii_case("lt") {
+        Some(11)
+    } else if cond.eq_ignore_ascii_case("gt") {
+        Some(12)
+    } else if cond.eq_ignore_ascii_case("le") {
+        Some(13)
+    } else if cond.eq_ignore_ascii_case("al") {
+        Some(14)
+    } else if cond.eq_ignore_ascii_case("nv") {
+        Some(15)
+    } else {
+        None
     }
+}
+
+/// 64-bit address register: `Xn` or `SP`. Encoding 31 is the stack pointer.
+/// A W-register or the zero register is not a valid memory base (GAS rejects
+/// `str x0, [w0]` and `str x0, [xzr]`; both previously encoded as `[x0]`).
+pub(crate) fn mem_xn_or_sp(name: &str, mn: &str) -> Result<u32, String> {
+    let r = GpReg::by_name(name).ok_or_else(|| {
+        format!("{mn}: `{name}` is not a 64-bit address register (expected x0-x30, lr or sp)")
+    })?;
+    if !r.is_64 {
+        return Err(format!(
+            "{mn}: `{name}` is 32-bit; the address register must be Xn or SP"
+        ));
+    }
+    if r.is_zr {
+        return Err(format!(
+            "{mn}: the zero register cannot be a memory base; use SP or Xn"
+        ));
+    }
+    Ok(r.num)
+}
+
+/// 64-bit GP data register: `Xt|XZR`. Encoding 31 is the zero register.
+/// Used by MRS/MSR/SYS/DC/IC/AT/TLBI, which have no SP encoding in Rt.
+pub(crate) fn gp_xt(name: &str, mn: &str) -> Result<u32, String> {
+    let r = GpReg::by_name(name).ok_or_else(|| {
+        format!(
+            "{mn}: `{name}` is not a 64-bit general-purpose register (expected x0-x30, lr or xzr)"
+        )
+    })?;
+    if !r.is_64 {
+        return Err(format!(
+            "{mn}: `{name}` is 32-bit; this instruction takes Xt (x0-x30, lr, xzr)"
+        ));
+    }
+    if r.is_sp {
+        return Err(format!(
+            "{mn}: the stack pointer is not valid here; write `xzr` if the zero register is what you meant"
+        ));
+    }
+    Ok(r.num)
+}
+
+/// Index register of a register-offset load/store: `Xm|XZR` or `Wm|WZR`.
+/// Encoding 31 is the zero register; SP is not encodable as Rm
+/// (`str x0, [x1, sp]` previously stored using XZR as the index).
+pub(crate) fn mem_rm(name: &str, mn: &str) -> Result<GpReg, String> {
+    let r = GpReg::by_name(name).ok_or_else(|| {
+        format!("{mn}: `{name}` is not a general-purpose index register (expected x/w0-30, lr, xzr or wzr)")
+    })?;
+    if r.is_sp {
+        return Err(format!(
+            "{mn}: the stack pointer cannot be an index register; write `{}` if the zero register is what you meant",
+            if r.is_64 { "xzr" } else { "wzr" }
+        ));
+    }
+    Ok(r)
+}
+
+/// Shared arity guard. Duplicated `if operands.len() < n` sites drift in
+/// both the count and the diagnostic; one helper keeps them honest.
+pub(crate) fn expect_operands(operands: &[Operand], n: usize, mn: &str) -> Result<(), String> {
+    if operands.len() < n {
+        return Err(format!("{mn} requires {n} operands"));
+    }
+    Ok(())
+}
+
+/// Reject an immediate that does not fit in `[min, max]` instead of masking
+/// it into a different legal encoding (the silent-wrap class).
+pub(crate) fn imm_in_range(
+    imm: i64,
+    min: i64,
+    max: i64,
+    mn: &str,
+    what: &str,
+) -> Result<u32, String> {
+    if imm < min || imm > max {
+        return Err(format!(
+            "{mn}: {what} #{imm} is out of range ({min} to {max})"
+        ));
+    }
+    Ok(imm as u32)
 }
 
 /// Encode an AArch64 instruction from its mnemonic and parsed operands.
@@ -292,10 +739,10 @@ pub fn encode_instruction(
             }
         }
         "subs" => encode_add_sub(operands, true, true),
-        "and" => encode_logical(operands, 0b00),
-        "orr" => encode_logical(operands, 0b01),
-        "eor" => encode_logical(operands, 0b10),
-        "ands" => encode_logical(operands, 0b11),
+        "and" => encode_logical(operands, 0b00, "and"),
+        "orr" => encode_logical(operands, 0b01, "orr"),
+        "eor" => encode_logical(operands, 0b10, "eor"),
+        "ands" => encode_logical(operands, 0b11, "ands"),
         "orn" => encode_orn(operands),
         "eon" => encode_eon(operands),
         "bics" => encode_bics(operands),

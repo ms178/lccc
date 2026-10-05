@@ -1,6 +1,37 @@
 use super::*;
 use crate::backend::arm::assembler::parser::Operand;
 
+/// Register-offset extend/shift: the S bit means "shift by the access-size
+/// scale", not "any positive shift". `ldr x0, [x1, x2, lsl #1]` used to
+/// assemble as scaled-by-8. llvm-mc 23.1.2 rejects that form.
+fn mem_reg_offset_option(
+    extend: Option<&str>,
+    shift: Option<u8>,
+    index_is_64: bool,
+    scale: u8,
+    mn: &str,
+) -> Result<(u32, u32), String> {
+    let amt = shift.unwrap_or(0);
+    if amt != 0 && amt != scale {
+        return Err(format!(
+            "{mn}: shift #{amt} is not valid for this access size (expected #0 or #{scale})"
+        ));
+    }
+    let s_bit = u32::from(amt == scale && scale > 0);
+    match (extend, index_is_64) {
+        (None | Some("lsl") | Some("uxtx"), true) => Ok((0b011, s_bit)),
+        (Some("sxtx"), true) => Ok((0b111, s_bit)),
+        (None | Some("uxtw"), false) => Ok((0b010, s_bit)),
+        (Some("sxtw"), false) => Ok((0b110, s_bit)),
+        (Some("lsl"), false) => Err(format!(
+            "{mn}: a 32-bit index cannot take `lsl`; write `uxtw` or `sxtw`"
+        )),
+        (Some(other), _) => Err(format!(
+            "{mn}: extend `{other}` is not valid for this index width"
+        )),
+    }
+}
+
 // ── Loads/Stores ─────────────────────────────────────────────────────────
 
 // ── Checked offset fields ──────────────────────────────────────────────────
@@ -25,6 +56,37 @@ use crate::backend::arm::assembler::parser::Operand;
 
 /// Encode `offset` as the signed 9-bit immediate of an unscaled, pre-index or
 /// post-index load/store. Legal range is -256..=255.
+/// Atomic / exclusive / pair-less `[Xn]` operand: SP is a legal base, a
+/// non-zero offset is not (the architecture has no encoding for it; the
+/// previous `..` match dropped the offset and assembled `[x0, #8]` as `[x0]`).
+fn atomic_xn(mem: Option<&Operand>, mn: &str) -> Result<u32, String> {
+    match mem {
+        Some(Operand::Mem { base, offset: 0 }) => mem_xn_or_sp(base, mn),
+        Some(Operand::Mem { offset, .. }) => Err(format!(
+            "{mn}: offset #{offset} is not encodable (only `[Xn]` / `[SP]` with offset 0)"
+        )),
+        Some(Operand::MemPostIndex { .. }) | Some(Operand::MemPreIndex { .. }) => Err(format!(
+            "{mn}: writeback addressing is not available on this form"
+        )),
+        _ => Err(format!("{mn}: expected memory operand [Xn]")),
+    }
+}
+
+/// Rt of a GPR load/store: encoding 31 is XZR, never SP. `str sp, [x0]`
+/// previously stored XZR.
+fn gpr_rt_not_sp(name: &str, mn: &str) -> Result<GpReg, String> {
+    let r = GpReg::by_name(name)
+        .ok_or_else(|| format!("{mn}: `{name}` is not a general-purpose register"))?;
+    if r.is_sp {
+        return Err(format!(
+            "{mn}: the stack pointer cannot be the transferred register; \
+             write `{}` if the zero register is what you meant",
+            if r.is_64 { "xzr" } else { "wzr" }
+        ));
+    }
+    Ok(r)
+}
+
 pub(crate) fn checked_imm9(offset: i64, what: &str) -> Result<u32, String> {
     if !(-256..=255).contains(&offset) {
         return Err(format!(
@@ -72,6 +134,19 @@ pub(crate) fn encode_ldr_str_auto(
     // doubleword one: `str b9, [x10]` assembled to the same word as
     // `str d9, [x10]`. The default is now an error rather than a guess --
     // silently picking a width is how the original defect stayed invisible.
+    // SP is never a transferred register of LDR/STR (encoding 31 is XZR).
+    // Catch it here so `str sp, [x0]` is rejected instead of storing XZR.
+    if let Some(gp) = GpReg::by_name(&reg_name) {
+        if gp.is_sp {
+            return Err(format!(
+                "{}: the stack pointer cannot be the transferred register; write `{}` \
+                 if the zero register is what you meant",
+                if is_load { "ldr" } else { "str" },
+                if gp.is_64 { "xzr" } else { "wzr" }
+            ));
+        }
+    }
+
     let (size, is_128bit) = if reg_name == "sp" || reg_name == "xzr" || reg_name == "lr" {
         (0b11, false) // 64-bit GPR
     } else if reg_name == "wsp" || reg_name == "wzr" {
@@ -128,7 +203,7 @@ pub(crate) fn encode_ldr_str(
     match operands.get(1) {
         // [base, #offset]
         Some(Operand::Mem { base, offset }) => {
-            let rn = parse_reg_num(base).ok_or("invalid base reg")?;
+            let rn = mem_xn_or_sp(base, "ldr/str")?;
 
             // Unsigned offset encoding
             // Size determines the shift for offset alignment
@@ -186,7 +261,7 @@ pub(crate) fn encode_ldr_str(
 
         // [base, #offset]! (pre-index)
         Some(Operand::MemPreIndex { base, offset }) => {
-            let rn = parse_reg_num(base).ok_or("invalid base reg")?;
+            let rn = mem_xn_or_sp(base, "ldr/str")?;
             let imm9 = checked_imm9(*offset, if is_load { "ldr/str" } else { "ldr/str" })?;
             let opc = if is_128bit {
                 if is_load { 0b11 } else { 0b10 }
@@ -206,7 +281,7 @@ pub(crate) fn encode_ldr_str(
 
         // [base], #offset (post-index)
         Some(Operand::MemPostIndex { base, offset }) => {
-            let rn = parse_reg_num(base).ok_or("invalid base reg")?;
+            let rn = mem_xn_or_sp(base, "ldr/str")?;
             let imm9 = checked_imm9(*offset, if is_load { "ldr/str" } else { "ldr/str" })?;
             let opc = if is_128bit {
                 if is_load { 0b11 } else { 0b10 }
@@ -234,7 +309,7 @@ pub(crate) fn encode_ldr_str(
             // Check if index is a :lo12: modifier
             if index.starts_with(':') {
                 // Parse modifier from the index string
-                let rn = parse_reg_num(base).ok_or("invalid base reg")?;
+                let rn = mem_xn_or_sp(base, "ldr/str")?;
                 let mod_str = index.trim_start_matches(':');
                 let (kind, sym) = if let Some(colon_pos) = mod_str.find(':') {
                     (&mod_str[..colon_pos], &mod_str[colon_pos + 1..])
@@ -290,8 +365,9 @@ pub(crate) fn encode_ldr_str(
                 });
             }
 
-            let rn = parse_reg_num(base).ok_or("invalid base reg")?;
-            let rm = parse_reg_num(index).ok_or("invalid index reg")?;
+            let rn = mem_xn_or_sp(base, "ldr/str")?;
+            let rm_reg = mem_rm(index, "ldr/str")?;
+            let rm = rm_reg.num;
             let opc = if is_128bit {
                 if is_load { 0b11 } else { 0b10 }
             } else if is_load {
@@ -299,45 +375,9 @@ pub(crate) fn encode_ldr_str(
             } else {
                 0b00
             };
-            // Register offset: size 111 V opc 1 Rm option S 10 Rn Rt
-            // Determine option and S from extend/shift specifiers
-            let is_w_index = index.starts_with('w') || index.starts_with('W');
-            let shift_amount: u8 = match shift {
-                Some(s) => *s,
-                None => 0,
-            };
-            let (option, s_bit) = match extend.as_deref() {
-                Some("lsl") => {
-                    // LSL with shift: S=1 if shift amount > 0
-                    let s_val = if shift_amount > 0 { 1u32 } else { 0u32 };
-                    (0b011u32, s_val)
-                }
-                Some("sxtw") => {
-                    let s_val = if shift_amount > 0 { 1u32 } else { 0u32 };
-                    (0b110u32, s_val)
-                }
-                Some("sxtx") => {
-                    let s_val = if shift_amount > 0 { 1u32 } else { 0u32 };
-                    (0b111u32, s_val)
-                }
-                Some("uxtw") => {
-                    let s_val = if shift_amount > 0 { 1u32 } else { 0u32 };
-                    (0b010u32, s_val)
-                }
-                Some("uxtx") => {
-                    let s_val = if shift_amount > 0 { 1u32 } else { 0u32 };
-                    (0b011u32, s_val)
-                }
-                None => {
-                    // Default: if W register index, use UXTW; if X register, use LSL
-                    if is_w_index {
-                        (0b010u32, 0u32) // UXTW, no shift
-                    } else {
-                        (0b011u32, 0u32) // LSL, no shift
-                    }
-                }
-                _ => (0b011u32, 0u32), // default LSL
-            };
+            let scale = if is_128bit { 4 } else { actual_size as u8 };
+            let (option, s_bit) =
+                mem_reg_offset_option(extend.as_deref(), *shift, rm_reg.is_64, scale, "ldr/str")?;
             let word = (actual_size << 30)
                 | (0b111 << 27)
                 | (v << 26)
@@ -422,10 +462,10 @@ pub(crate) fn encode_ldur_stur(
         (sz, if is_load { 0b01u32 } else { 0b00 })
     };
 
-    let (rn, imm9) = match &operands[1] {
+    let (rn, imm9_enc) = match &operands[1] {
         Operand::Mem { base, offset } => {
-            let rn = parse_reg_num(base).ok_or("invalid base reg")?;
-            (rn, *offset as i32)
+            let rn = mem_xn_or_sp(base, "ldur/stur")?;
+            (rn, checked_imm9(*offset, "ldur/stur")?)
         }
         _ => {
             return Err(format!(
@@ -434,8 +474,6 @@ pub(crate) fn encode_ldur_stur(
             ));
         }
     };
-
-    let imm9_enc = (imm9 as u32) & 0x1FF;
     let word = (size << 30)
         | (0b111 << 27)
         | (v << 26)
@@ -458,14 +496,13 @@ pub(crate) fn encode_ldtr_sized(
     }
     let (rt, _) = get_reg(operands, 0)?;
     let opc = if is_load { 0b01u32 } else { 0b00 };
-    let (rn, imm9) = match &operands[1] {
+    let (rn, imm9_enc) = match &operands[1] {
         Operand::Mem { base, offset } => {
-            let rn = parse_reg_num(base).ok_or("invalid base reg")?;
-            (rn, *offset as i32)
+            let rn = mem_xn_or_sp(base, "ldtr/sttr")?;
+            (rn, checked_imm9(*offset, "ldtr/sttr")?)
         }
         _ => return Err("ldtr/sttr: expected memory operand".to_string()),
     };
-    let imm9_enc = (imm9 as u32) & 0x1FF;
     let word = (size << 30)
         | (0b111 << 27)
         | (opc << 22)
@@ -481,11 +518,25 @@ pub(crate) fn encode_ldrsw(operands: &[Operand]) -> Result<EncodeResult, String>
         return Err("ldrsw requires 2 operands".to_string());
     }
 
-    let (rt, _) = get_reg(operands, 0)?;
+    // LDRSW writes a 64-bit Xt; a W destination is not encodable (GAS rejects
+    // `ldrsw w0, [x0]`). Encoding 31 is XZR, not SP.
+    let rt_reg = gpr_rt_not_sp(
+        match operands.first() {
+            Some(Operand::Reg(n)) => n.as_str(),
+            _ => return Err("ldrsw: expected Xt destination".to_string()),
+        },
+        "ldrsw",
+    )?;
+    if !rt_reg.is_64 {
+        return Err(
+            "ldrsw: destination must be a 64-bit Xt (W-registers are not encodable)".to_string(),
+        );
+    }
+    let rt = rt_reg.num;
 
     match operands.get(1) {
         Some(Operand::Mem { base, offset }) => {
-            let rn = parse_reg_num(base).ok_or("invalid base reg")?;
+            let rn = mem_xn_or_sp(base, "ldrsw")?;
             // LDRSW: size=10 111 V=0 01 opc=10 -> unsigned offset
             // Actually: 10 111 0 01 10 imm12 Rn Rt
             let abs_offset = *offset as u64;
@@ -511,7 +562,7 @@ pub(crate) fn encode_ldrsw(operands: &[Operand]) -> Result<EncodeResult, String>
         }
 
         Some(Operand::MemPostIndex { base, offset }) => {
-            let rn = parse_reg_num(base).ok_or("invalid base reg")?;
+            let rn = mem_xn_or_sp(base, "ldr/str")?;
             let imm9 = checked_imm9(*offset, "ldrsw")?;
             let word = ((0b10 << 30) | (0b111 << 27))
                 | (0b10 << 22)
@@ -523,7 +574,7 @@ pub(crate) fn encode_ldrsw(operands: &[Operand]) -> Result<EncodeResult, String>
         }
 
         Some(Operand::MemPreIndex { base, offset }) => {
-            let rn = parse_reg_num(base).ok_or("invalid base reg")?;
+            let rn = mem_xn_or_sp(base, "ldr/str")?;
             let imm9 = checked_imm9(*offset, "ldrsw")?;
             let word = ((0b10 << 30) | (0b111 << 27))
                 | (0b10 << 22)
@@ -540,25 +591,11 @@ pub(crate) fn encode_ldrsw(operands: &[Operand]) -> Result<EncodeResult, String>
             extend,
             shift,
         }) => {
-            let rn = parse_reg_num(base).ok_or("invalid base reg")?;
-            let rm = parse_reg_num(index).ok_or("invalid index reg")?;
-            let (option, s_bit) = match (extend.as_deref(), shift) {
-                (Some("lsl"), Some(2)) => (0b011u32, 1u32),
-                (Some("lsl"), Some(0)) | (Some("lsl"), None) => (0b011, 0),
-                (None, None) | (None, Some(0)) => (0b011, 0),
-                (Some("sxtw"), Some(2)) => (0b110, 1),
-                (Some("sxtw"), Some(0)) | (Some("sxtw"), None) => (0b110, 0),
-                (Some("uxtw"), Some(2)) => (0b010, 1),
-                (Some("uxtw"), Some(0)) | (Some("uxtw"), None) => (0b010, 0),
-                (Some("sxtx"), Some(2)) => (0b111, 1),
-                (Some("sxtx"), Some(0)) | (Some("sxtx"), None) => (0b111, 0),
-                _ => {
-                    return Err(format!(
-                        "unsupported ldrsw extend/shift: {:?}/{:?}",
-                        extend, shift
-                    ));
-                }
-            };
+            let rn = mem_xn_or_sp(base, "ldr/str")?;
+            let rm_reg = mem_rm(index, "ldrsw")?;
+            let rm = rm_reg.num;
+            let (option, s_bit) =
+                mem_reg_offset_option(extend.as_deref(), *shift, rm_reg.is_64, 2, "ldrsw")?;
             // LDRSW reg: 10 111 0 00 10 1 Rm option S 10 Rn Rt
             let word = (0b10 << 30)
                 | (0b111 << 27)
@@ -589,7 +626,7 @@ pub(crate) fn encode_ldrs(operands: &[Operand], size: u32) -> Result<EncodeResul
     let opc = if is_64 { 0b10 } else { 0b11 }; // 64-bit target: opc=10, 32-bit: opc=11
 
     if let Some(Operand::Mem { base, offset }) = operands.get(1) {
-        let rn = parse_reg_num(base).ok_or("invalid base reg")?;
+        let rn = mem_xn_or_sp(base, "ldr/str")?;
         let shift = size;
         let abs_offset = *offset as u64;
         let align = 1u64 << shift;
@@ -615,7 +652,7 @@ pub(crate) fn encode_ldrs(operands: &[Operand], size: u32) -> Result<EncodeResul
 
     // Post-index: ldrsb/ldrsh Rt, [Xn], #imm
     if let Some(Operand::MemPostIndex { base, offset }) = operands.get(1) {
-        let rn = parse_reg_num(base).ok_or("invalid base reg")?;
+        let rn = mem_xn_or_sp(base, "ldr/str")?;
         let imm9 = checked_imm9(*offset, "ldrs")?;
         let word = (size << 30)
             | (0b111 << 27)
@@ -629,7 +666,7 @@ pub(crate) fn encode_ldrs(operands: &[Operand], size: u32) -> Result<EncodeResul
 
     // Pre-index: ldrsb/ldrsh Rt, [Xn, #imm]!
     if let Some(Operand::MemPreIndex { base, offset }) = operands.get(1) {
-        let rn = parse_reg_num(base).ok_or("invalid base reg")?;
+        let rn = mem_xn_or_sp(base, "ldr/str")?;
         let imm9 = checked_imm9(*offset, "ldrs")?;
         let word = (size << 30)
             | (0b111 << 27)
@@ -649,28 +686,11 @@ pub(crate) fn encode_ldrs(operands: &[Operand], size: u32) -> Result<EncodeResul
         shift,
     }) = operands.get(1)
     {
-        let rn = parse_reg_num(base).ok_or("invalid base reg")?;
-        let rm = parse_reg_num(index).ok_or("invalid index reg")?;
-        let is_w_index = index.starts_with('w') || index.starts_with('W');
-        let shift_amount: u8 = match shift {
-            Some(s) => *s,
-            None => 0,
-        };
-        let (option, s_bit) = match extend.as_deref() {
-            Some("lsl") => (0b011u32, if shift_amount > 0 { 1u32 } else { 0 }),
-            Some("sxtw") => (0b110u32, if shift_amount > 0 { 1u32 } else { 0 }),
-            Some("sxtx") => (0b111u32, if shift_amount > 0 { 1u32 } else { 0 }),
-            Some("uxtw") => (0b010u32, if shift_amount > 0 { 1u32 } else { 0 }),
-            Some("uxtx") => (0b011u32, if shift_amount > 0 { 1u32 } else { 0 }),
-            None => {
-                if is_w_index {
-                    (0b010u32, 0u32)
-                } else {
-                    (0b011u32, 0u32)
-                }
-            }
-            _ => (0b011u32, 0u32),
-        };
+        let rn = mem_xn_or_sp(base, "ldr/str")?;
+        let rm_reg = mem_rm(index, "ldrs")?;
+        let rm = rm_reg.num;
+        let (option, s_bit) =
+            mem_reg_offset_option(extend.as_deref(), *shift, rm_reg.is_64, size as u8, "ldrs")?;
         let word = (size << 30)
             | (0b111 << 27)
             | (opc << 22)
@@ -720,7 +740,7 @@ pub(crate) fn encode_ldp_stp(operands: &[Operand], is_load: bool) -> Result<Enco
     match operands.get(2) {
         // STP rt1, rt2, [base, #offset]! (pre-index)
         Some(Operand::MemPreIndex { base, offset }) => {
-            let rn = parse_reg_num(base).ok_or("invalid base reg")?;
+            let rn = mem_xn_or_sp(base, "ldr/str")?;
             let imm7 = checked_imm7(*offset, shift, if is_load { "ldp" } else { "stp" })?;
             let word = (opc << 30)
                 | (0b101 << 27)
@@ -736,7 +756,7 @@ pub(crate) fn encode_ldp_stp(operands: &[Operand], is_load: bool) -> Result<Enco
 
         // LDP/STP rt1, rt2, [base], #offset (post-index)
         Some(Operand::MemPostIndex { base, offset }) => {
-            let rn = parse_reg_num(base).ok_or("invalid base reg")?;
+            let rn = mem_xn_or_sp(base, "ldr/str")?;
             let imm7 = checked_imm7(*offset, shift, if is_load { "ldp" } else { "stp" })?;
             let word = (opc << 30)
                 | (0b101 << 27)
@@ -752,7 +772,7 @@ pub(crate) fn encode_ldp_stp(operands: &[Operand], is_load: bool) -> Result<Enco
 
         // LDP/STP rt1, rt2, [base, #offset] (signed offset)
         Some(Operand::Mem { base, offset }) => {
-            let rn = parse_reg_num(base).ok_or("invalid base reg")?;
+            let rn = mem_xn_or_sp(base, "ldr/str")?;
             let imm7 = checked_imm7(*offset, shift, if is_load { "ldp" } else { "stp" })?;
             let word = (opc << 30)
                 | (0b101 << 27)
@@ -798,9 +818,17 @@ pub(crate) fn encode_ldp_stp(operands: &[Operand], is_load: bool) -> Result<Enco
 /// non-temporal ones were silently wrong.
 fn pair_reg_fields(name: &str, what: &str) -> Result<(u32, u32, u32), String> {
     let n = name.to_lowercase();
+    // Encoding 31 in a pair transferred register is XZR/WZR, never SP.
+    // `ldp sp, x1, [x0]` previously assembled as `ldp xzr, x1, [x0]`.
+    if n == "sp" || n == "wsp" {
+        return Err(format!(
+            "{what}: the stack pointer cannot be a transferred register of a pair; write `{}` if the zero register is what you meant",
+            if n == "sp" { "xzr" } else { "wzr" }
+        ));
+    }
     let fields = match n.as_str() {
-        "sp" | "xzr" | "lr" => (0b10u32, 0u32, 3u32),
-        "wsp" | "wzr" => (0b00, 0, 2),
+        "xzr" | "lr" => (0b10u32, 0u32, 3u32),
+        "wzr" => (0b00, 0, 2),
         _ => match n.chars().next() {
             Some('x') => (0b10, 0, 3),
             Some('w') => (0b00, 0, 2),
@@ -858,7 +886,7 @@ pub(crate) fn encode_ldnp_stnp(
 
     match operands.get(2) {
         Some(Operand::Mem { base, offset }) => {
-            let rn = parse_reg_num(base).ok_or("invalid base reg")?;
+            let rn = mem_xn_or_sp(base, "ldr/str")?;
             let align = 1i64 << shift;
             // The imm7 field is scaled, so an unaligned offset would be
             // truncated and the pair would access the wrong address.
@@ -895,10 +923,7 @@ pub(crate) fn encode_ldxr_stxr(
 ) -> Result<EncodeResult, String> {
     if is_load {
         let (rt, is_64) = get_reg(operands, 0)?;
-        let rn = match operands.get(1) {
-            Some(Operand::Mem { base, .. }) => parse_reg_num(base).ok_or("invalid base")?,
-            _ => return Err("ldxr needs memory operand".to_string()),
-        };
+        let rn = atomic_xn(operands.get(1), "ldxr")?;
         let size = forced_size.unwrap_or(if is_64 { 0b11 } else { 0b10 });
         let word = ((size << 30) | (0b001000010 << 21) | (0b11111 << 16))
             | (0b11111 << 10)
@@ -908,10 +933,7 @@ pub(crate) fn encode_ldxr_stxr(
     } else {
         let (ws, _) = get_reg(operands, 0)?;
         let (rt, is_64) = get_reg(operands, 1)?;
-        let rn = match operands.get(2) {
-            Some(Operand::Mem { base, .. }) => parse_reg_num(base).ok_or("invalid base")?,
-            _ => return Err("stxr needs memory operand".to_string()),
-        };
+        let rn = atomic_xn(operands.get(2), "stxr")?;
         let size = forced_size.unwrap_or(if is_64 { 0b11 } else { 0b10 });
         let word =
             ((size << 30) | (0b001000000 << 21) | (ws << 16)) | (0b11111 << 10) | (rn << 5) | rt;
@@ -927,10 +949,7 @@ pub(crate) fn encode_ldaxr_stlxr(
 ) -> Result<EncodeResult, String> {
     if is_load {
         let (rt, is_64) = get_reg(operands, 0)?;
-        let rn = match operands.get(1) {
-            Some(Operand::Mem { base, .. }) => parse_reg_num(base).ok_or("invalid base")?,
-            _ => return Err("ldaxr needs memory operand".to_string()),
-        };
+        let rn = atomic_xn(operands.get(1), "ldaxr")?;
         let size = forced_size.unwrap_or(if is_64 { 0b11 } else { 0b10 });
         let word = (size << 30)
             | (0b001000010 << 21)
@@ -943,10 +962,7 @@ pub(crate) fn encode_ldaxr_stlxr(
     } else {
         let (ws, _) = get_reg(operands, 0)?;
         let (rt, is_64) = get_reg(operands, 1)?;
-        let rn = match operands.get(2) {
-            Some(Operand::Mem { base, .. }) => parse_reg_num(base).ok_or("invalid base")?,
-            _ => return Err("stlxr needs memory operand".to_string()),
-        };
+        let rn = atomic_xn(operands.get(2), "stlxr")?;
         let size = forced_size.unwrap_or(if is_64 { 0b11 } else { 0b10 });
         let word = (size << 30)
             | (0b001000000 << 21)
@@ -975,12 +991,7 @@ pub(crate) fn encode_ldxp_stxp(
         // LDXP/LDAXP Rt, Rt2, [Rn]
         let (rt, is_64) = get_reg(operands, 0)?;
         let (rt2, _) = get_reg(operands, 1)?;
-        let rn = match operands.get(2) {
-            Some(Operand::Mem { base, .. }) => {
-                parse_reg_num(base).ok_or("ldxp needs memory operand")?
-            }
-            _ => return Err("ldxp needs memory operand".to_string()),
-        };
+        let rn = atomic_xn(operands.get(2), "ldxp")?;
         let sz = if is_64 { 1u32 } else { 0 };
         // 1 sz 001000 0 1 1 11111 o0 Rt2 Rn Rt (bit23=0)
         let word = (1u32 << 31)
@@ -999,12 +1010,7 @@ pub(crate) fn encode_ldxp_stxp(
         let (ws, _) = get_reg(operands, 0)?; // status register (always W)
         let (rt, is_64) = get_reg(operands, 1)?;
         let (rt2, _) = get_reg(operands, 2)?;
-        let rn = match operands.get(3) {
-            Some(Operand::Mem { base, .. }) => {
-                parse_reg_num(base).ok_or("stxp needs memory operand")?
-            }
-            _ => return Err("stxp needs memory operand".to_string()),
-        };
+        let rn = atomic_xn(operands.get(3), "stxp")?;
         let sz = if is_64 { 1u32 } else { 0 };
         // 1 sz 001000 0 0 1 Rs o0 Rt2 Rn Rt (bit23=0, bit22=0)
         let word = (1u32 << 31)
@@ -1027,10 +1033,7 @@ pub(crate) fn encode_ldar_stlr(
     forced_size: Option<u32>,
 ) -> Result<EncodeResult, String> {
     let (rt, is_64) = get_reg(operands, 0)?;
-    let rn = match operands.get(1) {
-        Some(Operand::Mem { base, .. }) => parse_reg_num(base).ok_or("invalid base")?,
-        _ => return Err("ldar/stlr needs memory operand".to_string()),
-    };
+    let rn = atomic_xn(operands.get(1), "ldar/stlr")?;
     let size = forced_size.unwrap_or(if is_64 { 0b11 } else { 0b10 });
     let l = if is_load { 1u32 } else { 0 };
     // LDAR/STLR: size 001000 1 L 0 11111 1 11111 Rn Rt
@@ -1148,8 +1151,7 @@ pub(crate) fn encode_prfm(operands: &[Operand]) -> Result<EncodeResult, String> 
     // Second operand: memory address [Xn{, #imm}]
     match &operands[1] {
         Operand::Mem { base, offset } => {
-            let rn = parse_reg_num(base)
-                .ok_or_else(|| format!("prfm: invalid base register: {}", base))?;
+            let rn = mem_xn_or_sp(base, "prfm")?;
             let imm = *offset;
             if imm < 0 || imm % 8 != 0 {
                 return Err(format!(
@@ -1176,32 +1178,18 @@ pub(crate) fn encode_prfm(operands: &[Operand]) -> Result<EncodeResult, String> 
             shift,
         } => {
             // PRFM (register): 11 111 0 00 10 1 Rm option S 10 Rn Rt
-            let rn = parse_reg_num(base)
-                .ok_or_else(|| format!("prfm: invalid base register: {}", base))?;
-            let rm = parse_reg_num(index)
-                .ok_or_else(|| format!("prfm: invalid index register: {}", index))?;
-            let is_w_index = index.starts_with('w') || index.starts_with('W');
-            let shift_amount: u8 = match shift {
-                Some(s) => *s,
-                None => 0,
-            };
-            let (option, s_bit) = match extend.as_deref() {
-                Some("lsl") => (0b011u32, if shift_amount > 0 { 1u32 } else { 0 }),
-                Some("sxtw") => (0b110u32, if shift_amount > 0 { 1u32 } else { 0 }),
-                Some("sxtx") => (0b111u32, if shift_amount > 0 { 1u32 } else { 0 }),
-                Some("uxtw") => (0b010u32, if shift_amount > 0 { 1u32 } else { 0 }),
-                None => {
-                    if is_w_index {
-                        (0b010u32, 0u32)
-                    } else {
-                        (0b011u32, 0u32)
-                    }
-                }
-                _ => (0b011u32, 0u32),
-            };
+            let rn = mem_xn_or_sp(base, "prfm")?;
+            let rm_reg = mem_rm(index, "prfm")?;
+            let rm = rm_reg.num;
+            let (option, s_bit) =
+                mem_reg_offset_option(extend.as_deref(), *shift, rm_reg.is_64, 3, "prfm")?;
+            // PRFM (register): size=11 V=0 opc=10, register offset.
+            // opc lives at bits 23:22, so it is `<< 22` not `<< 23`. The
+            // off-by-one produced 0xf9206800 for `prfm pldl1keep,[x0,x0]`;
+            // GAS emits 0xf8a06800.
             let word = (0b11 << 30)
                 | (0b111 << 27)
-                | (0b10 << 23)
+                | (0b10 << 22)
                 | (1 << 21)
                 | (rm << 16)
                 | (option << 13)
@@ -1289,10 +1277,7 @@ pub(crate) fn encode_cas(mnemonic: &str, operands: &[Operand]) -> Result<EncodeR
     }
     let (rs, is_64) = get_reg(operands, 0)?;
     let (rt, _) = get_reg(operands, 1)?;
-    let rn = match operands.get(2) {
-        Some(Operand::Mem { base, .. }) => parse_reg_num(base).ok_or("cas: invalid base")?,
-        _ => return Err("cas requires memory operand [Xn]".to_string()),
-    };
+    let rn = atomic_xn(operands.get(2), mnemonic)?;
     let mn = mnemonic.to_lowercase();
     let suffix = mn.strip_prefix("cas").unwrap_or("");
     let (a, l, size_letter) = parse_atomic_order_suffix("cas", suffix)?;
@@ -1340,10 +1325,14 @@ pub(crate) fn encode_casp(mnemonic: &str, operands: &[Operand]) -> Result<Encode
             mnemonic
         ));
     }
-    let (rs, rs_64) = get_reg(operands, 0)?;
-    let (rs1, rs1_64) = get_reg(operands, 1)?;
-    let (rt, rt_64) = get_reg(operands, 2)?;
-    let (rt1, rt1_64) = get_reg(operands, 3)?;
+    let rs_reg = reg_operand(operands, 0, GpRole::Reg, mnemonic)?;
+    let rs1_reg = reg_operand(operands, 1, GpRole::Reg, mnemonic)?;
+    let rt_reg = reg_operand(operands, 2, GpRole::Reg, mnemonic)?;
+    let rt1_reg = reg_operand(operands, 3, GpRole::Reg, mnemonic)?;
+    let (rs, rs_64) = (rs_reg.num, rs_reg.is_64);
+    let (rs1, rs1_64) = (rs1_reg.num, rs1_reg.is_64);
+    let (rt, rt_64) = (rt_reg.num, rt_reg.is_64);
+    let (rt1, rt1_64) = (rt1_reg.num, rt1_reg.is_64);
 
     // SP/xzr (register 31) can never be a pair member: the pair registers
     // are architectural GPRs, and 31 would alias the stack pointer / zero
@@ -1380,36 +1369,7 @@ pub(crate) fn encode_casp(mnemonic: &str, operands: &[Operand]) -> Result<Encode
 
     // Base register: plain GPR64sp — no offset/writeback forms exist for
     // CASP, and XZR-as-base is not encodable (31 here means SP).
-    let rn = match operands.get(4) {
-        Some(Operand::Mem { base, offset: 0 }) => {
-            let b = base.to_lowercase();
-            if b == "xzr" || b == "wzr" {
-                return Err(format!(
-                    "{}: xzr/wzr is not a valid CASP base register",
-                    mnemonic
-                ));
-            }
-            if !is_64bit_reg(base) {
-                return Err(format!(
-                    "{}: CASP base register must be an X register or SP",
-                    mnemonic
-                ));
-            }
-            parse_reg_num(base).ok_or_else(|| format!("{}: invalid base register", mnemonic))?
-        }
-        Some(Operand::Mem { .. }) => {
-            return Err(format!(
-                "{}: memory operand must be a plain base register [Xn] (no offset/writeback)",
-                mnemonic
-            ));
-        }
-        other => {
-            return Err(format!(
-                "{}: expected memory operand [Xn], got {:?}",
-                mnemonic, other
-            ));
-        }
-    };
+    let rn = atomic_xn(operands.get(4), mnemonic)?;
 
     let mn = mnemonic.to_lowercase();
     let suffix = mn.strip_prefix("casp").unwrap_or("");
@@ -1441,10 +1401,7 @@ pub(crate) fn encode_swp(mnemonic: &str, operands: &[Operand]) -> Result<EncodeR
     }
     let (rs, is_64) = get_reg(operands, 0)?;
     let (rt, _) = get_reg(operands, 1)?;
-    let rn = match operands.get(2) {
-        Some(Operand::Mem { base, .. }) => parse_reg_num(base).ok_or("swp: invalid base")?,
-        _ => return Err("swp requires memory operand [Xn]".to_string()),
-    };
+    let rn = atomic_xn(operands.get(2), mnemonic)?;
     let mn = mnemonic.to_lowercase();
     let suffix = mn.strip_prefix("swp").unwrap_or("");
     // Determine size: 'b' suffix = byte (00), 'h' suffix = half (01), else register-based
@@ -1481,10 +1438,7 @@ pub(crate) fn encode_ldop(mnemonic: &str, operands: &[Operand]) -> Result<Encode
     }
     let (rs, is_64) = get_reg(operands, 0)?;
     let (rt, _) = get_reg(operands, 1)?;
-    let rn = match operands.get(2) {
-        Some(Operand::Mem { base, .. }) => parse_reg_num(base).ok_or("ldop: invalid base")?,
-        _ => return Err(format!("{} requires memory operand [Xn]", mnemonic)),
-    };
+    let rn = atomic_xn(operands.get(2), mnemonic)?;
     let mn = mnemonic.to_lowercase();
     // Determine base op and suffix
     let (base, suffix) = if let Some(s) = mn.strip_prefix("ldadd") {
@@ -1532,12 +1486,7 @@ pub(crate) fn encode_stop(mnemonic: &str, operands: &[Operand]) -> Result<Encode
         return Err(format!("{} requires 2 operands", mnemonic));
     }
     let (rs, is_64) = get_reg(operands, 0)?;
-    let rn = match operands.get(1) {
-        Some(Operand::Mem { base, .. }) => {
-            parse_reg_num(base).ok_or_else(|| format!("{}: invalid base", mnemonic))?
-        }
-        _ => return Err(format!("{} requires memory operand [Xn]", mnemonic)),
-    };
+    let rn = atomic_xn(operands.get(1), mnemonic)?;
     let mn = mnemonic.to_lowercase();
     // Determine base op from the prefix
     let (opc, suffix) = if let Some(s) = mn.strip_prefix("stadd") {

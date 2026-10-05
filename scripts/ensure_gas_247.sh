@@ -558,6 +558,11 @@ make -j2 >make.log 2>&1
 mkdir -p "$prefix/bin"
 cp gas/as-new "$as"
 cp binutils/objdump "$od"
+# objcopy is the third half of the AArch64 matrix (read .text). Same
+# 2.47 build, same prefix.
+if [[ -x binutils/objcopy ]]; then
+    cp binutils/objcopy "$prefix/bin/objcopy"
+fi
 # The freshly installed pair must pass the SAME validation the cache
 # fast path applies — an install that cannot justify itself is a failure,
 # not a print-and-hope.
