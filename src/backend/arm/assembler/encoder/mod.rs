@@ -17,6 +17,7 @@ mod data_processing;
 mod fp_scalar;
 mod load_store;
 mod neon;
+mod sysreg_table;
 mod system;
 
 pub(crate) use bitfield::*;
@@ -543,11 +544,26 @@ fn is_32bit_reg(name: &str) -> bool {
 }
 
 /// Check if a register is a floating-point/SIMD register.
+/// Is `name` a SIMD/FP register (`b<0-31>`, `h`, `s`, `d`, `q`, `v<0-31>`)?
+///
+/// A first-letter test is not enough: `sp` starts with `s` and `b`/`h`/`d`/`q`
+/// are also the width letters of the GPR loads (`ldrb`, `ldrh`, ...).  The
+/// half-word form `sp` (*stack pointer*) therefore tested as an S register,
+/// which made `stur sp,[x0,#8]` encode as `stur s31,[x0,#8]` -- a store of the
+/// wrong register file -- and let `ldur sp,[x0,#8]` slip past the transferred-
+/// register gate as a scalar FP access.  A name is an FP register only when the
+/// width letter is followed by a register number.
 fn is_fp_reg(name: &str) -> bool {
-    matches!(
-        name.as_bytes().first().map(|c| c.to_ascii_lowercase()),
-        Some(b'd' | b's' | b'q' | b'v' | b'h' | b'b')
-    )
+    let bytes = name.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+    let width = bytes[0].to_ascii_lowercase();
+    if !matches!(width, b'd' | b's' | b'q' | b'v' | b'h' | b'b') {
+        return false;
+    }
+    let digits = &name[1..];
+    !digits.is_empty() && digits.bytes().all(|c| c.is_ascii_digit())
 }
 
 /// Encode a condition code string to 4-bit encoding.
@@ -845,21 +861,38 @@ pub fn encode_instruction(
         // Loads/stores - size determined from register width
         "ldr" => encode_ldr_str_auto(operands, true),
         "str" => encode_ldr_str_auto(operands, false),
-        "ldrb" => encode_ldr_str(operands, true, 0b00, false, false), // byte load
-        "strb" => encode_ldr_str(operands, false, 0b00, false, false),
-        "ldrh" => encode_ldr_str(operands, true, 0b01, false, false), // halfword load
-        "strh" => encode_ldr_str(operands, false, 0b01, false, false),
+        // Mnemonic-keyed destination classes: the `b`/`h` spellings are
+        // 32-bit-register accesses (LdstDest::Gpr32), and `ldrsb/ldrsh` take
+        // w or x.  An `ldrb x9,[x10]` is a different instruction than the one
+        // written and GNU as rejects it; see LdstDest in load_store.rs.
+        "ldrb" => encode_ldr_str_checked(operands, true, 0b00, false, false, LdstDest::Gpr32),
+        "strb" => encode_ldr_str_checked(operands, false, 0b00, false, false, LdstDest::Gpr32),
+        "ldrh" => encode_ldr_str_checked(operands, true, 0b01, false, false, LdstDest::Gpr32),
+        "strh" => encode_ldr_str_checked(operands, false, 0b01, false, false, LdstDest::Gpr32),
         "ldrw" | "ldrsw" => encode_ldrsw(operands),
-        "ldrsb" => encode_ldrs(operands, 0b00),
-        "ldrsh" => encode_ldrs(operands, 0b01),
-        "ldur" => encode_ldur_stur(operands, true, 0b00),
-        "stur" => encode_ldur_stur(operands, false, 0b00),
-        "ldtr" => encode_ldur_stur(operands, true, 0b10),
-        "sttr" => encode_ldur_stur(operands, false, 0b10),
-        "ldtrh" => encode_ldtr_sized(operands, true, 0b01),
-        "sttrh" => encode_ldtr_sized(operands, false, 0b01),
-        "ldtrb" => encode_ldtr_sized(operands, true, 0b00),
-        "sttrb" => encode_ldtr_sized(operands, false, 0b00),
+        "ldrsb" => encode_ldrs_checked(operands, 0b00, LdstDest::Gpr32Or64, "ldrsb"),
+        "ldrsh" => encode_ldrs_checked(operands, 0b01, LdstDest::Gpr32Or64, "ldrsh"),
+        "ldur" => encode_ldur_stur_checked(operands, true, 0b00, LdstDest::Any, None, false, "ldur"),
+        "stur" => encode_ldur_stur_checked(operands, false, 0b00, LdstDest::Any, None, false, "stur"),
+        // Unscaled spelled widths (measured words: ldurb 38408000, sturh 78008000).
+        "ldurb" => encode_ldur_stur_checked(operands, true, 0b00, LdstDest::Gpr32, Some(0b00), false, "ldurb"),
+        "sturb" => encode_ldur_stur_checked(operands, false, 0b00, LdstDest::Gpr32, Some(0b00), false, "sturb"),
+        "ldurh" => encode_ldur_stur_checked(operands, true, 0b00, LdstDest::Gpr32, Some(0b01), false, "ldurh"),
+        "sturh" => encode_ldur_stur_checked(operands, false, 0b00, LdstDest::Gpr32, Some(0b01), false, "sturh"),
+        "ldursb" => encode_ldur_stur_checked(operands, true, 0b00, LdstDest::Gpr32Or64, Some(0b00), true, "ldursb"),
+        "ldursh" => encode_ldur_stur_checked(operands, true, 0b00, LdstDest::Gpr32Or64, Some(0b01), true, "ldursh"),
+        "ldursw" => encode_ldur_stur_checked(operands, true, 0b00, LdstDest::Gpr64, Some(0b10), true, "ldursw"),
+        // Unprivileged base: no FP/SIMD form exists, so the bare spellings are
+        // GPR-only as well.
+        "ldtr" => encode_ldur_stur_checked(operands, true, 0b10, LdstDest::Gpr32Or64, None, false, "ldtr"),
+        "sttr" => encode_ldur_stur_checked(operands, false, 0b10, LdstDest::Gpr32Or64, None, false, "sttr"),
+        "ldtrb" => encode_ldur_stur_checked(operands, true, 0b10, LdstDest::Gpr32, Some(0b00), false, "ldtrb"),
+        "sttrb" => encode_ldur_stur_checked(operands, false, 0b10, LdstDest::Gpr32, Some(0b00), false, "sttrb"),
+        "ldtrh" => encode_ldur_stur_checked(operands, true, 0b10, LdstDest::Gpr32, Some(0b01), false, "ldtrh"),
+        "sttrh" => encode_ldur_stur_checked(operands, false, 0b10, LdstDest::Gpr32, Some(0b01), false, "sttrh"),
+        "ldtrsb" => encode_ldur_stur_checked(operands, true, 0b10, LdstDest::Gpr32Or64, Some(0b00), true, "ldtrsb"),
+        "ldtrsh" => encode_ldur_stur_checked(operands, true, 0b10, LdstDest::Gpr32Or64, Some(0b01), true, "ldtrsh"),
+        "ldtrsw" => encode_ldur_stur_checked(operands, true, 0b10, LdstDest::Gpr64, Some(0b10), true, "ldtrsw"),
         "ldp" => encode_ldp_stp(operands, true),
         "stp" => encode_ldp_stp(operands, false),
         "ldnp" => encode_ldnp_stnp(operands, true),
@@ -908,14 +941,25 @@ pub fn encode_instruction(
             }
         }
         "fmul" => {
-            if matches!(operands.first(), Some(Operand::RegArrangement { .. })) {
-                if matches!(operands.get(2), Some(Operand::RegLane { .. })) {
-                    encode_neon_float_elem(operands, 0b1001)
-                } else {
-                    encode_neon_float_three_same(operands, 1, 0, 0b11011)
-                }
+            // The element operand is what makes this a by-element instruction:
+            // the two registers may be spelled either as scalars (`s0,s1`,
+            // which is how a compiler emits it) or as 64-bit vectors, so
+            // dispatching on the *first* operand's spelling sent every
+            // scalar-spelled `fmul s0,s1,v2.s[0]` to the scalar two-operand
+            // encoder, which then rejected the lane operand.
+            if matches!(operands.get(2), Some(Operand::RegLane { .. })) {
+                encode_neon_float_elem(operands, 0b1001, 0, "fmul")
+            } else if matches!(operands.first(), Some(Operand::RegArrangement { .. })) {
+                encode_neon_float_three_same(operands, 1, 0, 0b11011)
             } else {
                 encode_fp_arith(operands, 0b0000)
+            }
+        }
+        "fmulx" => {
+            if matches!(operands.get(2), Some(Operand::RegLane { .. })) {
+                encode_neon_float_elem(operands, 0b1001, 1, "fmulx")
+            } else {
+                encode_neon_float_three_same(operands, 1, 0, 0b11011)
             }
         }
         "fdiv" => {
@@ -1088,14 +1132,14 @@ pub fn encode_instruction(
         // NEON float three-same instructions (vector-only)
         "fmla" => {
             if matches!(operands.get(2), Some(Operand::RegLane { .. })) {
-                encode_neon_float_elem(operands, 0b0001)
+                encode_neon_float_elem(operands, 0b0001, 0, "fmla")
             } else {
                 encode_neon_float_three_same(operands, 0, 0, 0b11001)
             }
         }
         "fmls" => {
             if matches!(operands.get(2), Some(Operand::RegLane { .. })) {
-                encode_neon_float_elem(operands, 0b0101)
+                encode_neon_float_elem(operands, 0b0101, 0, "fmls")
             } else {
                 encode_neon_float_three_same(operands, 0, 1, 0b11001)
             }
@@ -1322,6 +1366,8 @@ pub fn encode_instruction(
         "ld2r" => encode_neon_ldnr(operands, 2),
         "ld3r" => encode_neon_ldnr(operands, 3),
         "ld4r" => encode_neon_ldnr(operands, 4),
+        "shll" => encode_neon_shll_alias(operands, false),
+        "shll2" => encode_neon_shll_alias(operands, true),
         "ushr" => encode_neon_ushr(operands),
         "sshr" => encode_neon_sshr(operands),
         "shl" => encode_neon_shl(operands),
@@ -1331,9 +1377,14 @@ pub fn encode_instruction(
         "addv" => encode_neon_addv(operands),
         "umaxv" => encode_neon_across(operands, 1, 0b01010),
         "uminv" => encode_neon_across(operands, 1, 0b11010),
+        "fmaxv" => encode_neon_fp_across(operands, "fmaxv", 0b00, 0b01111),
+        "fminv" => encode_neon_fp_across(operands, "fminv", 0b10, 0b01111),
+        "fmaxnmv" => encode_neon_fp_across(operands, "fmaxnmv", 0b00, 0b01100),
+        "fminnmv" => encode_neon_fp_across(operands, "fminnmv", 0b10, 0b01100),
+        "smov" => encode_neon_umov_smov(operands, "smov", true),
         "smaxv" => encode_neon_across(operands, 0, 0b01010),
         "sminv" => encode_neon_across(operands, 0, 0b11010),
-        "umov" => encode_neon_umov(operands),
+        "umov" => encode_neon_umov_smov(operands, "umov", false),
         "dup" => encode_neon_dup(operands),
         "ins" => encode_neon_ins(operands),
         "not" => encode_neon_not(operands),
@@ -1565,6 +1616,7 @@ pub fn encode_instruction(
         "isb" => Ok(EncodeResult::Word(0xd5033fdf)),
         "mrs" => encode_mrs(operands),
         "msr" => encode_msr(operands),
+        "hlt" => encode_hlt(operands),
         "svc" => encode_svc(operands),
         "hvc" => encode_hvc(operands),
         "smc" => encode_smc(operands),
@@ -1605,7 +1657,11 @@ pub fn encode_instruction(
         | "crc32cx" => encode_crc32(mnemonic, operands),
 
         // Prefetch
-        "prfm" => encode_prfm(operands),
+        "prfm" => encode_prfm(operands, false),
+        // PRFUM: the unscaled (imm9) form of PRFM, `prfum pldl1keep,[x0,#-8]`
+        // (0xf89f8000).  The signed offset is the whole point of the form: the
+        // unsigned form cannot express a negative or unaligned offset at all.
+        "prfum" => encode_prfm(operands, true),
 
         // LSE atomics
         "cas" | "casa" | "casal" | "casl" | "casb" | "casab" | "casalb" | "caslb" | "cash"
@@ -1620,7 +1676,18 @@ pub fn encode_instruction(
         | "ldclrah" | "ldclralh" | "ldclrlh" | "ldeor" | "ldeora" | "ldeoral" | "ldeorl"
         | "ldeorb" | "ldeorab" | "ldeoralb" | "ldeorlb" | "ldeorh" | "ldeorah" | "ldeoralh"
         | "ldeorlh" | "ldset" | "ldseta" | "ldsetal" | "ldsetl" | "ldsetb" | "ldsetab"
-        | "ldsetalb" | "ldsetlb" | "ldseth" | "ldsetah" | "ldsetalh" | "ldsetlh" => {
+        | "ldsetalb" | "ldsetlb" | "ldseth" | "ldsetah" | "ldsetalh" | "ldsetlh"
+        // FEAT_LSE min/max: opc 100..111.  `ldsmax x0,x1,[x2]` (0xf8204021) and
+        // `ldumin x0,x1,[x2]` were rejected outright although the instruction
+        // exists; `ldsmaxb/ldsmaxh/...` are the same family one size down.
+        | "ldsmax" | "ldsmaxa" | "ldsmaxal" | "ldsmaxl" | "ldsmaxb" | "ldsmaxab"
+        | "ldsmaxalb" | "ldsmaxlb" | "ldsmaxh" | "ldsmaxah" | "ldsmaxalh" | "ldsmaxlh"
+        | "ldsmin" | "ldsmina" | "ldsminal" | "ldsminl" | "ldsminb" | "ldsminab"
+        | "ldsminalb" | "ldsminlb" | "ldsminh" | "ldsminah" | "ldsminalh" | "ldsminlh"
+        | "ldumax" | "ldumaxa" | "ldumaxal" | "ldumaxl" | "ldumaxb" | "ldumaxab"
+        | "ldumaxalb" | "ldumaxlb" | "ldumaxh" | "ldumaxah" | "ldumaxalh" | "ldumaxlh"
+        | "ldumin" | "ldumina" | "lduminal" | "lduminl" | "lduminb" | "lduminab"
+        | "lduminalb" | "lduminlb" | "lduminh" | "lduminah" | "lduminalh" | "lduminlh" => {
             encode_ldop(mnemonic, operands)
         }
         // LSE atomic store aliases (Rt=XZR, discard result)

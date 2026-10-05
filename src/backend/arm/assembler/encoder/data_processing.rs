@@ -42,19 +42,31 @@ pub(crate) fn encode_mov(operands: &[Operand]) -> Result<EncodeResult, String> {
             elem_size,
             index,
         }),
-        Some(Operand::Reg(rn_name)),
+        Some(Operand::Reg(_)),
     ) = (operands.first(), operands.get(1))
     {
         let vd = parse_reg_num(vd_name).ok_or("invalid NEON vd")?;
-        let rn = parse_reg_num(rn_name).ok_or("invalid rn")?;
         // INS Vd.Ts[index], Rn
         // Encoding: 0 1 0 0 1110 000 imm5 0 0011 1 Rn Rd
         // imm5 encoding depends on element size and index
+        check_lane(*index, elem_size, "mov", "destination element")?;
+        // The source is one element wide: W for .b/.h/.s, X for .d.
+        let src = reg_operand(operands, 1, GpRole::RegOrZr, "mov")?;
+        let wants_64 = elem_size == "d";
+        if src.is_64 != wants_64 {
+            return Err(format!(
+                "mov: `{}` does not feed a `.{elem_size}` element; the source is \
+                 one element wide, so it must be a {} register",
+                operand_spelling(operands, 1),
+                if wants_64 { "64-bit" } else { "32-bit" }
+            ));
+        }
+        let rn = src.num;
         let imm5 = match elem_size.as_str() {
-            "b" => ((*index & 0xF) << 1) | 0b00001,
-            "h" => ((*index & 0x7) << 2) | 0b00010,
-            "s" => ((*index & 0x3) << 3) | 0b00100,
-            "d" => ((*index & 0x1) << 4) | 0b01000,
+            "b" => (*index << 1) | 0b00001,
+            "h" => (*index << 2) | 0b00010,
+            "s" => (*index << 3) | 0b00100,
+            "d" => (*index << 4) | 0b01000,
             _ => return Err(format!("unsupported element size for ins: {}", elem_size)),
         };
         let word = (0b01001110000u32 << 21) | (imm5 << 16) | (0b000111 << 10) | (rn << 5) | vd;
@@ -63,7 +75,7 @@ pub(crate) fn encode_mov(operands: &[Operand]) -> Result<EncodeResult, String> {
 
     // NEON lane extract: mov x0, v0.d[1] -> UMOV Xd, Vn.D[index]
     if let (
-        Some(Operand::Reg(rd_name)),
+        Some(Operand::Reg(_)),
         Some(Operand::RegLane {
             reg: vn_name,
             elem_size,
@@ -71,17 +83,37 @@ pub(crate) fn encode_mov(operands: &[Operand]) -> Result<EncodeResult, String> {
         }),
     ) = (operands.first(), operands.get(1))
     {
-        let rd = parse_reg_num(rd_name).ok_or("invalid rd")?;
-        let vn = parse_reg_num(vn_name).ok_or("invalid NEON vn")?;
         // UMOV Rd, Vn.Ts[index]
         // Encoding: 0 Q 0 0 1110 000 imm5 0 0111 1 Rn Rd
+        //
+        // The `mov Rd, Vn.Ts[i]` *alias* is narrower than UMOV itself: GNU as
+        // accepts it only for `.s` into a W register and `.d` into an X
+        // register, and rejects `mov w0,v1.b[3]`, `mov x0,v1.h[2]` and
+        // `mov x0,v1.s[2]` -- the sizes are written explicitly when those are
+        // meant (`umov`/`smov`).  Encodings borrowed from the wide rule would
+        // accept assembly the oracle rejects.
+        let rd = reg_operand(operands, 0, GpRole::RegOrZr, "mov")?;
+        if rd.is_sp {
+            return Err(
+                "mov: the stack pointer cannot be the destination of a lane read".to_string(),
+            );
+        }
+        let vn = parse_reg_num(vn_name).ok_or("invalid NEON vn")?;
+        check_lane(*index, elem_size, "mov", "source element")?;
+        let ok = matches!((elem_size.as_str(), rd.is_64), ("s", false) | ("d", true));
+        if !ok {
+            return Err(format!(
+                "mov: `{}` cannot be read from a `.{elem_size}` element -- the mov \
+                 alias exists for `.s` into a 32-bit register and `.d` into a \
+                 64-bit one; use umov or smov for the other widths",
+                operand_spelling(operands, 0)
+            ));
+        }
         let (q, imm5) = match elem_size.as_str() {
-            "b" => (0u32, ((*index & 0xF) << 1) | 0b00001),
-            "h" => (0, ((*index & 0x7) << 2) | 0b00010),
-            "s" => (0, ((*index & 0x3) << 3) | 0b00100),
-            "d" => (1, ((*index & 0x1) << 4) | 0b01000),
-            _ => return Err(format!("unsupported element size for umov: {}", elem_size)),
+            "s" => (0u32, (*index << 3) | 0b00100),
+            _ => (1, (*index << 4) | 0b01000),
         };
+        let rd = rd.num;
         let word =
             (q << 30) | (0b001110000u32 << 21) | (imm5 << 16) | (0b001111 << 10) | (vn << 5) | rd;
         return Ok(EncodeResult::Word(word));
@@ -96,13 +128,21 @@ pub(crate) fn encode_mov(operands: &[Operand]) -> Result<EncodeResult, String> {
         }),
         Some(Operand::RegLane {
             reg: vn_name,
-            elem_size: _es_n,
+            elem_size: es_n,
             index: idx_n,
         }),
     ) = (operands.first(), operands.get(1))
     {
         let vd = parse_reg_num(vd_name).ok_or("invalid NEON vd")?;
         let vn = parse_reg_num(vn_name).ok_or("invalid NEON vn")?;
+        if es_d != es_n {
+            return Err(format!(
+                "mov: destination element is `.{es_d}` but the source is `.{es_n}`; \
+                 both must be the same element type"
+            ));
+        }
+        check_lane(*idx_d, es_d, "mov", "destination element")?;
+        check_lane(*idx_n, es_n, "mov", "source element")?;
         // INS Vd.Ts[i1], Vn.Ts[i2]
         // Encoding: 0 1 1 01110 000 imm5 0 imm4 1 Rn Rd
         let (imm5, imm4) = match es_d.as_str() {

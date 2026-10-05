@@ -2257,13 +2257,27 @@ fn parse_single_operand(s: &str) -> Result<Operand, String> {
                             .and_then(|v| u32::try_from(v).ok())
                     });
                     if let Some(idx) = idx_result {
-                        if matches!(elem_size.as_str(), "b" | "h" | "s" | "d") {
-                            return Ok(Operand::RegLane {
-                                reg: reg_part.to_string(),
-                                elem_size,
-                                index: idx,
-                            });
-                        }
+                        // `v0.16b[3]` and `v0.b[3]` are the same operand to
+                        // GNU as: the arrangement spelling names the *element*
+                        // type, and its index bound is the element's, not the
+                        // arrangement's (`ins v0.8b[15],v1.b[15]` assembles,
+                        // `ins v0.4h[8],v1.h[0]` does not).  Measured on GAS
+                        // 2.47: exactly the eight canonical arrangements are
+                        // accepted here and all of them encode the same word
+                        // as the element spelling.
+                        let elem = match elem_size.as_str() {
+                            "b" | "h" | "s" | "d" => elem_size.clone(),
+                            "8b" | "16b" => "b".to_string(),
+                            "4h" | "8h" => "h".to_string(),
+                            "2s" | "4s" => "s".to_string(),
+                            "1d" | "2d" => "d".to_string(),
+                            _ => return Ok(Operand::Symbol(s.to_string())),
+                        };
+                        return Ok(Operand::RegLane {
+                            reg: reg_part.to_string(),
+                            elem_size: elem,
+                            index: idx,
+                        });
                     }
                 }
             }
@@ -2529,6 +2543,17 @@ fn parse_memory_operand(s: &str) -> Result<Operand, String> {
     let sub_parts: Vec<&str> = second.splitn(2, ',').collect();
     let index_str = sub_parts[0].trim();
     if is_register(index_str) {
+        // There is no writeback form of a register offset: the pre/post-index
+        // addressing modes are immediate-only.  Dropping the writeback made
+        // `ldr x0,[x0,x1]!` assemble as the plain register-offset load, i.e.
+        // as an instruction whose base register is never updated.
+        if has_writeback {
+            return Err(format!(
+                "`[{base},{index_str}]!` is not an addressing mode: writeback exists \
+                 for the immediate forms only (`[{base}, #imm]!`), and the register \
+                 offset has no writeback form at all"
+            ));
+        }
         let (extend, shift) = if sub_parts.len() > 1 {
             parse_extend_shift(sub_parts[1].trim())?
         } else {
@@ -2543,6 +2568,12 @@ fn parse_memory_operand(s: &str) -> Result<Operand, String> {
     }
 
     // Fallback: treat as register offset
+    if has_writeback {
+        return Err(format!(
+            "`[{base},{second}]!` is not an addressing mode; writeback exists for the \
+             immediate form only"
+        ));
+    }
     Ok(Operand::MemRegOffset {
         base,
         index: second.to_string(),
