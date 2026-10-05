@@ -528,7 +528,15 @@ impl ElfWriter {
                 Ok(())
             }
 
-            AsmDirective::Align(bytes) | AsmDirective::Balign(bytes) => {
+            AsmDirective::Align {
+                bytes,
+                max_pad,
+                fill,
+            } => {
+                self.base.align_to_capped_ex(*bytes, *max_pad, *fill);
+                Ok(())
+            }
+            AsmDirective::Balign(bytes) => {
                 self.base.align_to(*bytes);
                 Ok(())
             }
@@ -1682,6 +1690,178 @@ mod aarch64_encoder_tests {
         }
     }
 
+    /// ADD/SUB, CLZ/REV/RBIT and SXTB/SXTH/UXTH/UXTB have no FP or SIMD
+    /// encoding at all, but `parse_reg_num` resolves `h2` to `2`, so
+    /// `add x0,x1,h2` assembled as `add x0,x1,x2`. GNU as rejects all three.
+    #[test]
+    fn gp_only_arith_and_bitfield_encoders_reject_fp_registers() {
+        for insn in [
+            "add x0,x1,h2",
+            "add x0,x1,v2",
+            "add x0,x1,s2",
+            "sub x0,x1,s2",
+            "clz x0,d1",
+            "rev x0,d1",
+            "rev16 x0,d1",
+            "rev32 x0,d1",
+            "rbit x0,d1",
+            "sxtb x0,s1",
+            "sxth x0,s1",
+            "uxtb x0,s1",
+            "uxth x0,s1",
+        ] {
+            assert!(
+                assemble(&one_insn(insn)).is_err(),
+                "`{insn}` names an FP/SIMD register in a GP-only encoding; \\
+                 GNU as rejects it"
+            );
+        }
+        // `add d0,d1,d2` is the legal scalar-FP 3-same form and stays legal;
+        // only the GP dispatch path rejects FP operands.
+        assert!(assemble(&one_insn("add d0,d1,d2")).is_ok());
+        // The GP spellings still assemble, and SP is still legal in add/sub.
+        assert_eq!(word_of(&one_insn("add x0,x1,x2")), 0x8b02_0020);
+        assert_eq!(word_of(&one_insn("add sp,sp,#16")), 0x9100_43ff);
+        assert_eq!(word_of(&one_insn("clz x0,x1")), 0xdac0_1020);
+        assert_eq!(word_of(&one_insn("rev x0,x1")), 0xdac0_0c20);
+    }
+
+    /// The extend aliases are `SXTB <Xd>, <Wn>`: the *source* is always the
+    /// 32-bit form. GNU as assembles `sxtb x0,w1` and rejects `sxtb x0,x1`.
+    #[test]
+    fn extend_aliases_require_a_32bit_source_register() {
+        assert_eq!(word_of(&one_insn("sxtb x0,w1")), 0x9340_1c20);
+        assert_eq!(word_of(&one_insn("sxtb w0,w1")), 0x1300_1c20);
+        assert_eq!(word_of(&one_insn("sxth x0,w1")), 0x9340_3c20);
+        assert_eq!(word_of(&one_insn("sxtw x0,w1")), 0x9340_7c20);
+        for insn in [
+            "sxtb x0,x1",
+            "sxth x0,x1",
+            "uxtb x0,x1",
+            "uxth x0,x1",
+            "sxtb w0,x1",
+        ] {
+            assert!(
+                assemble(&one_insn(insn)).is_err(),
+                "`{insn}` uses a 64-bit source with an extend alias; \\
+                 GNU as rejects it"
+            );
+        }
+    }
+
+    /// The permissive operand readers resolve *any* register spelling to a
+    /// bare 0-31 number, so an FP/SIMD register reached encoders that only
+    /// have a GP encoding and was silently assembled as one. `mov x0, d1`,
+    /// `mov d0, x1`, `mov d0, lr` and `and x0, x1, d2` were all accepted and
+    /// produced words GNU as rejects outright.
+    #[test]
+    fn gp_only_encoders_reject_fp_and_simd_registers() {
+        for insn in [
+            "mov d0,x1",
+            "mov x0,d1",
+            "mov d0,lr",
+            "mov d0,sp",
+            "and x0,x1,d2",
+            "orr x0,s1,x2",
+            "and x0,x1,h2",
+            "and x0,x1,v2",
+        ] {
+            assert!(
+                assemble(&one_insn(insn)).is_err(),
+                "`{insn}` mixes an FP/SIMD register into a GP-only encoding; \\
+                 GNU as rejects it"
+            );
+        }
+    }
+
+    /// SP is legal as the destination of the non-flags-setting *immediate*
+    /// logical forms and nowhere else. GNU as assembles `and sp,x1,#15` and
+    /// rejects `and x0,sp,#15`, `and sp,x1,x2` and `ands sp,x1,#15`.
+    #[test]
+    fn logical_immediate_sp_legality_matches_gas() {
+        assert_eq!(word_of(&one_insn("and sp,x1,#15")), 0x9240_0c3f);
+        assert_eq!(word_of(&one_insn("orr sp,x1,#1")), 0xb240_003f);
+        for insn in [
+            "and x0,sp,#15",
+            "and sp,x1,x2",
+            "and x0,sp,x2",
+            "ands sp,x1,#15",
+        ] {
+            assert!(
+                assemble(&one_insn(insn)).is_err(),
+                "`{insn}` uses SP where the architecture does not allow it; \\
+                 GNU as rejects it"
+            );
+        }
+        // The plain forms are untouched.
+        assert_eq!(word_of(&one_insn("and x0,x1,x2")), 0x8a02_0020);
+        assert_eq!(word_of(&one_insn("and x0,x1,#15")), 0x9240_0c20);
+    }
+
+    /// `mov` to or from SP lowers to ADD, and both the 64-bit `sp` and the
+    /// 32-bit `wsp` spelling take that form. `wsp` was missed, so
+    /// `mov w0,wsp` assembled as an ORR (0x2a1f03e0) instead of an ADD
+    /// (0x110003e0).
+    #[test]
+    fn mov_to_or_from_sp_lowers_to_add_for_both_spellings() {
+        assert_eq!(word_of(&one_insn("mov sp,x1")), 0x9100_003f);
+        assert_eq!(word_of(&one_insn("mov x0,sp")), 0x9100_03e0);
+        assert_eq!(word_of(&one_insn("mov sp,sp")), 0x9100_03ff);
+        assert_eq!(word_of(&one_insn("mov w0,wsp")), 0x1100_03e0);
+        assert_eq!(word_of(&one_insn("mov wsp,w1")), 0x1100_003f);
+        // A `mov` to/from SP is an ADD, never an ORR: the two differ in bit 30.
+        for insn in ["mov sp,x1", "mov x0,sp", "mov w0,wsp", "mov wsp,w1"] {
+            assert_eq!(
+                word_of(&one_insn(insn)) & (1 << 30),
+                0,
+                "`{insn}` must lower to ADD, which has bit 30 clear"
+            );
+        }
+    }
+
+    /// `lr` is an alias for `x30`, not a register of its own. GNU as assembles
+    /// `fmov d0,lr` to exactly the word it assembles `fmov d0,x30` to
+    /// (0x9e6703c0); lccc rejected it, because the width helper that decides
+    /// whether the GP operand is 32- or 64-bit did not list `lr` even though
+    /// the crate's own register parser did. The two must agree about what a
+    /// register spelling means.
+    ///
+    /// `fp` (x29), `ip0` (x16) and `ip1` (x17) are the same class of omission
+    /// but are deliberately NOT fixed here: they are unrecognised at the
+    /// parser level, and GAS resolves them context-sensitively -- `ldr x0, fp`
+    /// loads the *symbol* `fp` when one is defined, while `mov x1, fp` uses
+    /// the register. Matching that needs parser work with its own analysis,
+    /// not a one-line addition to a width table.
+    #[test]
+    fn lr_alias_is_a_64bit_general_purpose_register() {
+        // Same words as the x30 spellings, from GNU as.
+        assert_eq!(word_of(&one_insn("fmov d0,lr")), 0x9e67_03c0);
+        assert_eq!(word_of(&one_insn("fmov d0,x30")), 0x9e67_03c0);
+        assert_eq!(word_of(&one_insn("fmov d30,lr")), 0x9e67_03de);
+        assert_eq!(word_of(&one_insn("fmov lr,d0")), 0x9e66_001e);
+        assert_eq!(word_of(&one_insn("fmov x30,d0")), 0x9e66_001e);
+        // H pairs with either GP width, and `lr` is 64-bit, so sf=1.
+        assert_eq!(word_of(&one_insn("fmov h0,lr")), 0x9ee7_03c0);
+
+        // The alias and the numbered spelling are the same register.
+        assert_eq!(
+            word_of(&one_insn("fmov d0,lr")),
+            word_of(&one_insn("fmov d0,x30")),
+            "`lr` must encode identically to `x30`"
+        );
+
+        // S only pairs with a 32-bit GP register, so `lr` is rejected -- the
+        // same reason GAS gives, rather than "unknown register".
+        let err = match assemble(&one_insn("fmov s0,lr")) {
+            Ok(_) => panic!("`fmov s0,lr` must be rejected: GAS rejects it"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("64-bit"),
+            "`fmov s0,lr` should fail on width, not on spelling: {err}"
+        );
+    }
+
     /// The `#fbits` operand of the fixed-point conversions was parsed and then
     /// thrown away, so `fcvtzs x10,s30,#55` assembled as `fcvtzs x10,s30` --
     /// wrong by a factor of 2^55. Two fields are involved: bit 21 flips from 1
@@ -1901,5 +2081,273 @@ mod aarch64_encoder_tests {
             0x18,
             "expected an LDR-literal opcode, got {data:02x?}"
         );
+    }
+    /// The operand-legality matrix, asserted against *this crate's* encoder.
+    ///
+    /// `tests/aarch64/operand-legality.tsv` is generated from GNU as by
+    /// `scripts/aarch64_operand_legality_matrix.py`, and `ci_local.sh` re-checks
+    /// it against the cross assembler at gate time.  This test is the same table
+    /// with no external tools, so the guarantee also holds on a dev box that has
+    /// no aarch64 binutils -- and, unlike an `.is_err()` assertion, it pins the
+    /// accepted encodings as well as the rejections.
+    ///
+    /// It exists because a register-*class* check cannot answer the question an
+    /// encoder has to answer.  `clz x0, sp`, `mov sp, xzr`, `add x0, w1, w2`,
+    /// `fmov h0, wsp` and `lsl x0, x1, #64` are all made of general-purpose
+    /// registers, and every one of them used to assemble: the first four into a
+    /// different instruction than the one written, the last into the corrupt
+    /// word 0xfffffc20 from an unchecked `width - 1 - amount` underflow.
+    #[test]
+    fn operand_legality_matrix_matches_the_encoder() {
+        let table = include_str!("../../../../tests/aarch64/operand-legality.tsv");
+        let mut checked = 0usize;
+        let mut accepted = 0usize;
+        let mut rejected = 0usize;
+        let mut drift: Vec<String> = Vec::new();
+
+        for line in table.lines() {
+            if line.starts_with('#') || line.trim().is_empty() {
+                continue;
+            }
+            let mut fields = line.split('\t');
+            let (Some(group), Some(insn), Some(expect)) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                continue;
+            };
+            if group == "group" {
+                continue; // column header
+            }
+            checked += 1;
+            let result = assemble(&one_insn(insn));
+            let encoded = result.as_ref().ok().map(|w| {
+                w.base.sections[".text"]
+                    .data
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            });
+            match expect.strip_prefix("OK ") {
+                Some(hex) => {
+                    accepted += 1;
+                    match encoded {
+                        Some(got) if got == hex => {}
+                        Some(got) => {
+                            drift.push(format!("[{group}] {insn}: gas=OK {hex} encoder=OK {got}"))
+                        }
+                        None => {
+                            // `ElfWriter` is not `Debug`, so take the message
+                            // from the `Err` arm rather than `unwrap_err`.
+                            let why = match &result {
+                                Err(e) => e.as_str(),
+                                Ok(_) => "encoder produced no section data",
+                            };
+                            drift.push(format!(
+                                "[{group}] {insn}: gas=OK {hex} encoder=REJECT ({why})"
+                            ));
+                        }
+                    }
+                }
+                None => {
+                    rejected += 1;
+                    if let Some(got) = encoded {
+                        drift.push(format!("[{group}] {insn}: gas=REJECT encoder=OK {got}"));
+                    }
+                }
+            }
+        }
+
+        // Ratchets: the table only means something while it is big enough to
+        // cover the families it was written for.  A regeneration that silently
+        // dropped rows would otherwise still pass.
+        assert!(
+            checked >= 420,
+            "the matrix shrank to {checked} rows; it had 423"
+        );
+        assert!(
+            accepted >= 250,
+            "only {accepted} accepted rows remain; there were 251"
+        );
+        assert!(
+            rejected >= 170,
+            "only {rejected} rejected rows remain; there were 172"
+        );
+        assert!(
+            drift.is_empty(),
+            "{} matrix row(s) disagree with this encoder:\n{}",
+            drift.len(),
+            drift
+                .iter()
+                .take(20)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    /// Families that #762 left on the fail-open path, pinned to GNU as 2.47
+    /// words (little-endian display as the architectural word).
+    #[test]
+    fn fail_closed_families_match_gas_pins() {
+        fn must_reject(insn: &str) {
+            assert!(
+                assemble(&one_insn(insn)).is_err(),
+                "`{insn}` must be rejected"
+            );
+        }
+
+        // LD2R/LD4R used to emit unallocated words (R/S bits swapped).
+        assert_eq!(word_of(&one_insn("ld2r {v0.16b,v1.16b},[x0]")), 0x4d60_c000);
+        assert_eq!(
+            word_of(&one_insn("ld4r {v0.16b,v1.16b,v2.16b,v3.16b},[x0]")),
+            0x4d60_e000
+        );
+        assert_eq!(word_of(&one_insn("ld1r {v0.16b},[x0]")), 0x4d40_c000);
+        assert_eq!(
+            word_of(&one_insn("ld3r {v0.16b,v1.16b,v2.16b},[x0]")),
+            0x4d40_e000
+        );
+
+        // MOVI/MVNI shift matrix: msl was dropped (parser) and .4h lsl #8
+        // always encoded cmode=1000.
+        assert_eq!(word_of(&one_insn("movi v0.4s,#1,msl #8")), 0x4f00_c420);
+        assert_eq!(word_of(&one_insn("movi v0.4h,#1,lsl #8")), 0x0f00_a420);
+        assert_eq!(word_of(&one_insn("movi v0.16b,#0")), 0x4f00_e400);
+        assert_eq!(word_of(&one_insn("movi v0.2d,#0")), 0x6f00_e400);
+        assert_eq!(word_of(&one_insn("mvni v0.4s,#1,msl #8")), 0x6f00_c420);
+        must_reject("movi v0.16b,#256");
+        must_reject("movi v0.2d,#0x0101010101010101");
+        must_reject("movi v0.4s,#1,lsr #8");
+
+        // EXT index is per-arrangement, not masked.
+        assert!(assemble(&one_insn("ext v0.16b,v1.16b,v2.16b,#1")).is_ok());
+        assert!(assemble(&one_insn("ext v0.16b,v1.16b,v2.16b,#15")).is_ok());
+        must_reject("ext v0.16b,v1.16b,v2.16b,#16");
+        must_reject("ext v0.8b,v1.8b,v2.8b,#8");
+        must_reject("ext v0.4s,v1.4s,v2.4s,#1");
+
+        // ADDV: .2d is unallocated.
+        must_reject("addv d0,v0.2d");
+        assert!(assemble(&one_insn("addv s0,v0.4s")).is_ok());
+
+        // TBL table size 1..=4.
+        must_reject("tbl v0.16b,{v0.16b,v1.16b,v2.16b,v3.16b,v4.16b},v5.16b");
+        assert!(assemble(&one_insn("tbl v0.16b,{v0.16b},v1.16b")).is_ok());
+
+        // PRFM register form opc bits.
+        assert_eq!(word_of(&one_insn("prfm pldl1keep,[x0,x0]")), 0xf8a0_6800);
+
+        // SP is never a transferred GPR of STR/LDR.
+        must_reject("str sp,[x0]");
+        must_reject("ldr sp,[x0]");
+        assert!(assemble(&one_insn("str xzr,[x0]")).is_ok());
+        assert!(assemble(&one_insn("str x0,[sp]")).is_ok());
+
+        // Pair transferred registers and register-offset Rm: 31 is ZR, not SP.
+        must_reject("ldp sp,x1,[x0]");
+        must_reject("stp x0,sp,[x1]");
+        must_reject("ldnp sp,x1,[x0]");
+        must_reject("str x0,[x1,sp]");
+        must_reject("prfm pldl1keep,[w0]");
+        assert!(assemble(&one_insn("ldp xzr,x1,[x0]")).is_ok());
+        assert!(assemble(&one_insn("str x0,[x1,xzr]")).is_ok());
+        assert!(assemble(&one_insn("ldp x0,x1,[sp]")).is_ok());
+
+        // LDRSW writes Xt.
+        must_reject("ldrsw w0,[x0]");
+        assert!(assemble(&one_insn("ldrsw x0,[x0]")).is_ok());
+
+        // LDUR imm9 is signed 9-bit, not masked.
+        must_reject("ldur x0,[x0,#256]");
+        assert!(assemble(&one_insn("ldur x0,[x0,#255]")).is_ok());
+
+        // Atomics drop no offsets.
+        must_reject("cas x0,x1,[x2,#8]");
+        must_reject("swp x0,x1,[x2,#8]");
+        assert!(assemble(&one_insn("cas x0,x1,[x2]")).is_ok());
+
+        // System immediates are range-checked, not masked.
+        must_reject("svc #65536");
+        must_reject("brk #65536");
+        must_reject("msr daifset,#16");
+        must_reject("msr spsel,#2");
+        must_reject("mrs w0,nzcv");
+        must_reject("mrs d0,fpcr");
+        must_reject("hint #128");
+        assert!(assemble(&one_insn("svc #0")).is_ok());
+        assert!(assemble(&one_insn("msr daifset,#15")).is_ok());
+
+        // MOVZ is Xd|XZR with a 16-bit immediate.
+        must_reject("movz d0,#1");
+        must_reject("movz w0,#0x10000");
+        must_reject("movz sp,#1");
+        assert_eq!(word_of(&one_insn("movz x0,#1")), 0xd280_0020);
+
+        // GNU as encodes UXTW as MOV Wd,Wn (0x2a0103e0), not the ARM ARM
+        // UBFM Xd,Xn,#0,#31 word (0xd3407c20) that llvm-mc emits. Both
+        // destination spellings assemble to the same MOV; an X source is
+        // rejected.  Measured against aarch64-linux-gnu-as 2.44, 2026-10-05.
+        assert_eq!(word_of(&one_insn("uxtw x0,w1")), 0x2a01_03e0);
+        assert_eq!(word_of(&one_insn("uxtw w0,w1")), 0x2a01_03e0);
+        assert_eq!(word_of(&one_insn("mov w0,w1")), 0x2a01_03e0);
+        must_reject("uxtw x0,x1");
+        must_reject("uxtw w0,x1");
+        assert_eq!(word_of(&one_insn("sxtw x0,w1")), 0x9340_7c20);
+        must_reject("sxtw w0,w1");
+
+        // Fail-closed: truncation, SIMD-as-GPR, illegal scale, bitmask.
+        must_reject("mov w0,#0x100000000");
+        must_reject("and w0,w1,#0x100000001");
+        must_reject("casp d0,d1,d2,d3,[x4]");
+        must_reject("ldr x0,[x1,x2,lsl #1]");
+        assert!(assemble(&one_insn("ldr x0,[x1,x2,lsl #3]")).is_ok());
+        assert!(
+            assemble(".text\n.p2align foo\n").is_err(),
+            "malformed .p2align exponent must be rejected"
+        );
+        must_reject("ext v0.16b,v1.8b,v2.16b,#1");
+        must_reject("tbl v0.4s,{v0.16b},v1.16b");
+
+        // .p2align N,,M skips padding that would exceed M.
+        {
+            // 4 bytes of code, then .p2align 4,,10: 12 bytes of padding would
+            // be needed to reach 16, which exceeds 10, so the location
+            // counter stays at 4. Without the cap, lccc used to emit 12
+            // bytes of NOP.
+            let asm = ".text\nmovz x0,#1\n.p2align 4,,10\nmovz x1,#2\n";
+            let w = assemble(asm).expect("p2align program");
+            let n = w.base.sections[".text"].data.len();
+            assert_eq!(
+                n, 8,
+                "p2align 4,,10 at offset 4 must not pad (got {n} bytes)"
+            );
+        }
+        {
+            // At offset 4, .p2align 3,,8 needs 4 bytes (<= 8) so it pads.
+            let asm = ".text\nmovz x0,#1\n.p2align 3,,8\nmovz x1,#2\n";
+            let w = assemble(asm).expect("p2align program");
+            let n = w.base.sections[".text"].data.len();
+            assert_eq!(n, 12, "p2align 3,,8 at offset 4 must pad 4 bytes (got {n})");
+        }
+        {
+            // Fill is honoured in .data AND .text (GAS 2.44:
+            // `.byte 1; .p2align 3, 0xff; .byte 2` → 01ffffffffffffff02).
+            let asm = ".data\n.byte 1\n.p2align 3, 0xff\n.byte 2\n";
+            let w = assemble(asm).expect("p2align fill data");
+            let d = &w.base.sections[".data"].data;
+            assert_eq!(
+                d.as_slice(),
+                &[0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02],
+                "data p2align fill"
+            );
+            let asm = ".text\n.byte 1\n.p2align 3, 0xff\n.byte 2\n";
+            let w = assemble(asm).expect("p2align fill text");
+            let d = &w.base.sections[".text"].data;
+            assert_eq!(
+                d.as_slice(),
+                &[0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02],
+                "text p2align fill"
+            );
+        }
     }
 }

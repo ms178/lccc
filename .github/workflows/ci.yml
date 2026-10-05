@@ -781,6 +781,29 @@ jobs:
             --objcopy "$(command -v aarch64-linux-gnu-objcopy)" \
             --lccc target/fastbuild/lccc
 
+      # Operand-legality matrix, both halves: `--check` re-derives every row
+      # from the cross assembler (so the table cannot rot silently), and
+      # `--check-lccc` asserts the same 423 rows against our own encoder (so a
+      # correct table cannot hide a wrong encoder).  This is the instrument for
+      # the bug class the differential oracle above is structurally blind to:
+      # an invalid operand combination is not an encoding, so objdump can never
+      # emit one for the oracle to re-assemble.
+      - name: AArch64 operand-legality matrix
+        run: |
+          set -euo pipefail
+          bash scripts/ensure_gas_247.sh aarch64-linux-gnu
+          AS="$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/as"
+          OC="$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/objcopy"
+          python3 scripts/aarch64_operand_legality_matrix.py --check \
+            --as "$AS" --objcopy "$OC"
+          python3 scripts/aarch64_operand_legality_matrix.py \
+            --check-lccc target/fastbuild/lccc --objcopy "$OC"
+
+      - name: ARM codegen assembler-parity
+        run: |
+          set -euo pipefail
+          CCC_ARM=target/fastbuild/lccc-arm scripts/check_arm_codegen_assembles.sh
+
       # Keep every standalone gate from ci_local.sh represented in hosted CI.
       # Group the compact contracts to avoid YAML drift and setup overhead;
       # the expensive codegen-quality gate remains in bench.yml.

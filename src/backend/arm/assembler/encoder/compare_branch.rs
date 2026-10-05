@@ -46,7 +46,7 @@ pub(crate) fn encode_tst(operands: &[Operand]) -> Result<EncodeResult, String> {
     if is_32 {
         new_ops[0] = Operand::Reg("wzr".to_string());
     }
-    encode_logical(&new_ops, 0b11)
+    encode_logical(&new_ops, 0b11, "tst")
 }
 
 pub(crate) fn encode_ccmp_ccmn(

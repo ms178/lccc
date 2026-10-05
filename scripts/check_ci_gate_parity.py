@@ -527,6 +527,12 @@ INVOCATION_CONTRACTS: tuple[InvocationContract, ...] = (
     ),
     InvocationContract(
         program="scripts/ensure_gas_247.sh",
+        name="gas-provision-aarch64",
+        sides=frozenset({"hosted"}),
+        rest_spec=("aarch64-linux-gnu",),
+    ),
+    InvocationContract(
+        program="scripts/ensure_gas_247.sh",
         name="gas-self-test",
         sides=_BOTH,
         rest_spec=("--self-test",),

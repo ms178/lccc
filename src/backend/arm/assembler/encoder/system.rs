@@ -52,8 +52,12 @@ pub(crate) fn encode_dsb(operands: &[Operand]) -> Result<EncodeResult, String> {
 }
 
 pub(crate) fn encode_mrs(operands: &[Operand]) -> Result<EncodeResult, String> {
-    // MRS Xt, system_reg
-    let (rt, _) = get_reg(operands, 0)?;
+    // MRS Xt, system_reg. Encoding 31 is XZR; a W or FP destination
+    // previously encoded as X0 (`mrs w0, nzcv`, `mrs d0, fpcr`).
+    let rt = match operands.first() {
+        Some(Operand::Reg(name)) => gp_xt(name, "mrs")?,
+        _ => return Err("mrs: expected Xt destination".to_string()),
+    };
     let sysreg = match operands.get(1) {
         Some(Operand::Symbol(s)) => s.to_lowercase(),
         _ => return Err("mrs needs system register name".to_string()),
@@ -284,20 +288,22 @@ pub(crate) fn encode_msr(operands: &[Operand]) -> Result<EncodeResult, String> {
     // daifset: op1=3, op2=6; daifclr: op1=3, op2=7; spsel: op1=0, op2=5
     match sysreg.as_str() {
         "daifset" => {
-            let imm = get_imm(operands, 1)? as u32 & 0xF;
+            let imm = imm_in_range(get_imm(operands, 1)?, 0, 15, "msr daifset", "immediate")?;
             let word = 0xd5034000 | (imm << 8) | (0b110 << 5) | 0x1F;
             return Ok(EncodeResult::Word(word));
         }
         "daifclr" => {
-            let imm = get_imm(operands, 1)? as u32 & 0xF;
+            let imm = imm_in_range(get_imm(operands, 1)?, 0, 15, "msr daifclr", "immediate")?;
             let word = 0xd5034000 | (imm << 8) | (0b111 << 5) | 0x1F;
             return Ok(EncodeResult::Word(word));
         }
         "spsel" => {
-            // SPSel: op1=0, op2=5 (MSR immediate form)
-            // If the second operand is a register, fall through to MSR register form
-            if let Ok(imm) = get_imm(operands, 1) {
-                let imm = imm as u32 & 0xF;
+            // SPSel: op1=0, op2=5 (MSR immediate form). The immediate is a
+            // 1-bit SPSel value (0 or 1); masking `#16` to `#0` used to
+            // assemble a different PSTATE write. GAS rejects anything
+            // outside 0..=1.
+            if let Ok(imm_raw) = get_imm(operands, 1) {
+                let imm = imm_in_range(imm_raw, 0, 1, "msr spsel", "immediate")?;
                 let word = 0xd5004000 | (imm << 8) | (0b101 << 5) | 0x1F;
                 return Ok(EncodeResult::Word(word));
             }
@@ -305,8 +311,13 @@ pub(crate) fn encode_msr(operands: &[Operand]) -> Result<EncodeResult, String> {
         _ => {}
     }
 
-    // MSR (register): msr sysreg, Xt
-    let (rt, _) = get_reg(operands, 1)?;
+    // MSR (register): msr sysreg, Xt. Encoding 31 is XZR; SP and W/FP
+    // registers are not encodable (`msr fpcr, w0` and `msr fpcr, d0`
+    // previously wrote X0).
+    let rt = match operands.get(1) {
+        Some(Operand::Reg(name)) => gp_xt(name, "msr")?,
+        _ => return Err("msr: expected Xt source register".to_string()),
+    };
 
     let encoding = match sysreg.as_str() {
         "sp_el0" => 0xc208u32,
@@ -401,14 +412,14 @@ pub(crate) fn encode_msr(operands: &[Operand]) -> Result<EncodeResult, String> {
 }
 
 pub(crate) fn encode_svc(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let imm = get_imm(operands, 0)?;
-    let word = 0xd4000001 | ((imm as u32 & 0xFFFF) << 5);
+    let imm = imm_in_range(get_imm(operands, 0)?, 0, 0xFFFF, "svc", "immediate")?;
+    let word = 0xd4000001 | (imm << 5);
     Ok(EncodeResult::Word(word))
 }
 
 pub(crate) fn encode_hvc(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let imm = get_imm(operands, 0)?;
-    let word = 0xd4000002 | ((imm as u32 & 0xFFFF) << 5);
+    let imm = imm_in_range(get_imm(operands, 0)?, 0, 0xFFFF, "hvc", "immediate")?;
+    let word = 0xd4000002 | (imm << 5);
     Ok(EncodeResult::Word(word))
 }
 
@@ -417,7 +428,7 @@ pub(crate) fn encode_ic(raw_operands: &str) -> Result<EncodeResult, String> {
     let op_name = parts[0].trim().to_lowercase();
     let rt = if parts.len() > 1 {
         let reg_str = parts[1].trim();
-        parse_reg_num(reg_str).ok_or_else(|| format!("ic: invalid register '{}'", reg_str))?
+        gp_xt(reg_str, "ic")?
     } else {
         31 // xzr
     };
@@ -432,8 +443,8 @@ pub(crate) fn encode_ic(raw_operands: &str) -> Result<EncodeResult, String> {
 }
 
 pub(crate) fn encode_smc(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let imm = get_imm(operands, 0)?;
-    let word = 0xd4000003 | ((imm as u32 & 0xFFFF) << 5);
+    let imm = imm_in_range(get_imm(operands, 0)?, 0, 0xFFFF, "smc", "immediate")?;
+    let word = 0xd4000003 | (imm << 5);
     Ok(EncodeResult::Word(word))
 }
 
@@ -442,7 +453,7 @@ pub(crate) fn encode_at(_operands: &[Operand], raw_operands: &str) -> Result<Enc
     let op_name = parts[0].trim().to_lowercase();
     let rt = if parts.len() > 1 {
         let reg_str = parts[1].trim();
-        parse_reg_num(reg_str).ok_or_else(|| format!("at: invalid register '{}'", reg_str))?
+        gp_xt(reg_str, "at")?
     } else {
         31
     };
@@ -489,24 +500,30 @@ pub(crate) fn encode_sys(raw_operands: &str) -> Result<EncodeResult, String> {
         .trim()
         .parse()
         .map_err(|_| format!("sys: invalid op2: {}", parts[3]))?;
+    if op1 > 7 {
+        return Err(format!("sys: op1 #{op1} is out of range (0 to 7)"));
+    }
+    if crn > 15 {
+        return Err(format!("sys: CRn #{crn} is out of range (0 to 15)"));
+    }
+    if crm > 15 {
+        return Err(format!("sys: CRm #{crm} is out of range (0 to 15)"));
+    }
+    if op2 > 7 {
+        return Err(format!("sys: op2 #{op2} is out of range (0 to 7)"));
+    }
     let rt = if parts.len() >= 5 {
-        let reg = parts[4].trim().to_lowercase();
-        parse_reg_num(&reg).ok_or_else(|| format!("sys: invalid register: {}", parts[4]))?
+        gp_xt(parts[4].trim(), "sys")?
     } else {
         31 // xzr if no register specified
     };
-    let word = 0xd5080000
-        | ((op1 & 7) << 16)
-        | ((crn & 0xF) << 12)
-        | ((crm & 0xF) << 8)
-        | ((op2 & 7) << 5)
-        | rt;
+    let word = 0xd5080000 | (op1 << 16) | (crn << 12) | (crm << 8) | (op2 << 5) | rt;
     Ok(EncodeResult::Word(word))
 }
 
 pub(crate) fn encode_brk(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let imm = get_imm(operands, 0)?;
-    let word = 0xd4200000 | ((imm as u32 & 0xFFFF) << 5);
+    let imm = imm_in_range(get_imm(operands, 0)?, 0, 0xFFFF, "brk", "immediate")?;
+    let word = 0xd4200000 | (imm << 5);
     Ok(EncodeResult::Word(word))
 }
 
@@ -518,7 +535,7 @@ pub(crate) fn encode_tlbi(
     let op_name = parts[0].trim().to_lowercase();
     let rt = if parts.len() > 1 {
         let reg_str = parts[1].trim();
-        parse_reg_num(reg_str).ok_or_else(|| format!("tlbi: invalid register '{}'", reg_str))?
+        gp_xt(reg_str, "tlbi")?
     } else {
         31 // xzr
     };
@@ -591,11 +608,10 @@ pub(crate) fn encode_bti(raw_operands: &str) -> Result<EncodeResult, String> {
 }
 
 pub(crate) fn encode_hint(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let imm = get_imm(operands, 0)?;
-    // HINT: 11010101 00000011 0010 CRm op2 11111
-    // CRm = imm >> 3, op2 = imm & 7
-    let crm = ((imm as u32) >> 3) & 0xF;
-    let op2 = (imm as u32) & 0x7;
+    // HINT #imm is a 7-bit immediate (CRm:op2). Masking used to wrap #128 to #0.
+    let imm = imm_in_range(get_imm(operands, 0)?, 0, 127, "hint", "immediate")?;
+    let crm = imm >> 3;
+    let op2 = imm & 0x7;
     let word = 0xd503201f | (crm << 8) | (op2 << 5);
     Ok(EncodeResult::Word(word))
 }
@@ -607,14 +623,15 @@ pub(crate) fn encode_dc(operands: &[Operand], raw_operands: &str) -> Result<Enco
         _ => raw_operands.to_lowercase(),
     };
 
-    // Find the register operand (second operand or last operand)
+    // Find the register operand (second operand or last operand). DC takes
+    // Xt; a W register previously encoded as the matching X register.
     let rt = match operands.get(1) {
-        Some(Operand::Reg(name)) => parse_reg_num(name).ok_or("invalid register for dc")?,
+        Some(Operand::Reg(name)) => gp_xt(name, "dc")?,
         _ => {
             if let Some(Operand::Reg(name)) = operands.last() {
-                parse_reg_num(name).ok_or("invalid register for dc")?
+                gp_xt(name, "dc")?
             } else {
-                0
+                return Err("dc: expected Xt operand".to_string());
             }
         }
     };
