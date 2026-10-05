@@ -781,6 +781,23 @@ jobs:
             --objcopy "$(command -v aarch64-linux-gnu-objcopy)" \
             --lccc target/fastbuild/lccc
 
+      # Operand-legality matrix, both halves: `--check` re-derives every row
+      # from the cross assembler (so the table cannot rot silently), and
+      # `--check-lccc` asserts the same 423 rows against our own encoder (so a
+      # correct table cannot hide a wrong encoder).  This is the instrument for
+      # the bug class the differential oracle above is structurally blind to:
+      # an invalid operand combination is not an encoding, so objdump can never
+      # emit one for the oracle to re-assemble.
+      - name: AArch64 operand-legality matrix
+        run: |
+          set -euo pipefail
+          python3 scripts/aarch64_operand_legality_matrix.py --check \
+            --as "$(command -v aarch64-linux-gnu-as)" \
+            --objcopy "$(command -v aarch64-linux-gnu-objcopy)"
+          python3 scripts/aarch64_operand_legality_matrix.py \
+            --check-lccc target/fastbuild/lccc \
+            --objcopy "$(command -v aarch64-linux-gnu-objcopy)"
+
       # Keep every standalone gate from ci_local.sh represented in hosted CI.
       # Group the compact contracts to avoid YAML drift and setup overhead;
       # the expensive codegen-quality gate remains in bench.yml.

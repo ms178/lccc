@@ -144,22 +144,54 @@ impl ElfWriterBase {
     /// Code sections are NOP-padded using the architecture's NOP instruction;
     /// data sections are zero-padded.
     pub fn align_to(&mut self, align: u64) {
+        self.align_to_capped(align, None);
+    }
+
+    /// Align, but skip the padding entirely when it would exceed `max_pad`.
+    ///
+    /// This is GAS `.p2align N,,M`: if honouring the alignment would insert
+    /// more than M bytes, the location counter is left unchanged. The section
+    /// `sh_addralign` is still raised so the ELF header reflects the
+    /// programmer's requested alignment even when a particular site skipped.
+    pub fn align_to_capped(&mut self, align: u64, max_pad: Option<u64>) {
+        self.align_to_capped_ex(align, max_pad, None);
+    }
+
+    /// GAS `.p2align N[, fill[, max]]`.
+    ///
+    /// When `fill` is `Some`, every pad byte is that value in every section
+    /// (`.text` included: `.p2align 3, 0xff` is 0xff, not NOP). When `fill`
+    /// is `None`, executable sections emit the architecture NOP at NOP-sized
+    /// boundaries and zeros in the unaligned prefix; other sections zero-fill.
+    /// That is the GNU as 2.44/2.47 pattern for `.byte 1; .p2align 3`.
+    pub fn align_to_capped_ex(
+        &mut self,
+        align: u64,
+        max_pad: Option<u64>,
+        fill: Option<u8>,
+    ) {
         if align <= 1 {
             return;
         }
+        let nop = self.nop_bytes.clone();
         if let Some(section) = self.sections.get_mut(&self.current_section) {
             let current = section.data.len() as u64;
             let aligned = (current + align - 1) & !(align - 1);
             let padding = (aligned - current) as usize;
-            if section.sh_flags & SHF_EXECINSTR != 0 && align >= 4 {
-                let full_nops = padding / 4;
-                let remainder = padding % 4;
-                for _ in 0..full_nops {
-                    section.data.extend_from_slice(&self.nop_bytes);
+            let skip = max_pad.is_some_and(|m| (padding as u64) > m);
+            if !skip {
+                if let Some(b) = fill {
+                    section.data.extend(std::iter::repeat_n(b, padding));
+                } else if section.sh_flags & SHF_EXECINSTR != 0 && align >= 4 {
+                    let full_nops = padding / 4;
+                    let remainder = padding % 4;
+                    for _ in 0..full_nops {
+                        section.data.extend_from_slice(&nop);
+                    }
+                    section.data.extend(std::iter::repeat_n(0u8, remainder));
+                } else {
+                    section.data.extend(std::iter::repeat_n(0u8, padding));
                 }
-                section.data.extend(std::iter::repeat_n(0u8, remainder));
-            } else {
-                section.data.extend(std::iter::repeat_n(0u8, padding));
             }
             if align > section.sh_addralign {
                 section.sh_addralign = align;

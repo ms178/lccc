@@ -138,8 +138,20 @@ pub enum AsmDirective {
     SymbolType(String, SymbolKind),
     /// Symbol size: `.size name, expr`
     Size(String, SizeExpr),
-    /// Alignment: `.align N` or `.p2align N` (stored as byte count, already converted from 2^N)
-    Align(u64),
+    /// Alignment: `.align N` / `.p2align N[, fill[, max]]`.
+    ///
+    /// `bytes` is the alignment in bytes (already converted from 2^N).
+    /// `max_pad` is the GAS third parameter: if the padding that would be
+    /// required exceeds it, the directive is a no-op rather than over-aligning.
+    /// `fill` is the GAS second parameter: when present, every pad byte is
+    /// that value in every section (including `.text`). When absent,
+    /// executable sections are NOP-padded at the architecture's instruction
+    /// width and other sections are zero-padded.
+    Align {
+        bytes: u64,
+        max_pad: Option<u64>,
+        fill: Option<u8>,
+    },
     /// Byte-alignment: `.balign N` (stored as byte count directly)
     Balign(u64),
     /// Emit bytes: `.byte val, val, ...` (can be symbol differences for size computations)
@@ -1703,14 +1715,47 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
         ".type" => parse_type_directive(args)?,
         ".size" => parse_size_directive(args)?,
         ".align" | ".p2align" => {
-            let align_val: u64 = args
-                .trim()
-                .split(',')
+            // GAS: .p2align align[, fill[, max]]
+            // align is log2(bytes). The third parameter is a padding cap:
+            // if honouring the alignment would insert more than `max` bytes,
+            // the directive is skipped. Ignoring it made lccc emit three
+            // NOPs where GAS emitted one for `.p2align 4,,10` at offset 4,
+            // shifting every later branch target (measured on the ARM
+            // codegen corpus).
+            let mut parts = args.trim().split(',');
+            let align_val: u64 = parts
                 .next()
                 .and_then(|s| parse_int_literal(s.trim()).ok())
                 .unwrap_or(0) as u64;
-            // AArch64 .align N means 2^N bytes (same as .p2align)
-            AsmDirective::Align(1u64 << align_val)
+            let fill_tok = parts.next().map(str::trim);
+            let fill = match fill_tok {
+                None | Some("") => None,
+                Some(tok) => {
+                    let v = parse_int_literal(tok).map_err(|_| {
+                        format!(".p2align: fill `{tok}` is not an integer")
+                    })?;
+                    if !(0..=255).contains(&v) {
+                        return Err(format!(
+                            ".p2align: fill {v} is not a byte"
+                        ));
+                    }
+                    Some(v as u8)
+                }
+            };
+            let max_pad = parts
+                .next()
+                .and_then(|s| parse_int_literal(s.trim()).ok())
+                .map(|v| v as u64);
+            if align_val > 63 {
+                return Err(format!(
+                    ".p2align: alignment exponent {align_val} is out of range"
+                ));
+            }
+            AsmDirective::Align {
+                bytes: 1u64 << align_val,
+                max_pad,
+                fill,
+            }
         }
         ".balign" => {
             let align_val: u64 = args
@@ -2119,12 +2164,13 @@ fn parse_single_operand(s: &str) -> Result<Operand, String> {
         return parse_modifier(s);
     }
 
-    // Shift: lsl, lsr, asr, ror
+    // Shift: lsl, lsr, asr, ror, msl (MOVI/MVNI "masking shift left")
     let lower = s.to_lowercase();
     if lower.starts_with("lsl ")
         || lower.starts_with("lsr ")
         || lower.starts_with("asr ")
         || lower.starts_with("ror ")
+        || lower.starts_with("msl ")
     {
         let kind = &lower[..3];
         let amount_str = s[4..].trim();
@@ -2512,8 +2558,8 @@ fn parse_extend_shift(s: &str) -> (Option<String>, Option<u8>) {
         None
     };
     match kind {
-        "lsl" | "lsr" | "asr" | "ror" | "sxtw" | "sxtx" | "sxth" | "sxtb" | "uxtw" | "uxtx"
-        | "uxth" | "uxtb" => (Some(kind.to_string()), shift),
+        "lsl" | "lsr" | "asr" | "ror" | "msl" | "sxtw" | "sxtx" | "sxth" | "sxtb" | "uxtw"
+        | "uxtx" | "uxth" | "uxtb" => (Some(kind.to_string()), shift),
         _ => (None, None),
     }
 }
