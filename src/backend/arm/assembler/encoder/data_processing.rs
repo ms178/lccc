@@ -42,19 +42,31 @@ pub(crate) fn encode_mov(operands: &[Operand]) -> Result<EncodeResult, String> {
             elem_size,
             index,
         }),
-        Some(Operand::Reg(rn_name)),
+        Some(Operand::Reg(_)),
     ) = (operands.first(), operands.get(1))
     {
         let vd = parse_reg_num(vd_name).ok_or("invalid NEON vd")?;
-        let rn = parse_reg_num(rn_name).ok_or("invalid rn")?;
         // INS Vd.Ts[index], Rn
         // Encoding: 0 1 0 0 1110 000 imm5 0 0011 1 Rn Rd
         // imm5 encoding depends on element size and index
+        check_lane(*index, elem_size, "mov", "destination element")?;
+        // The source is one element wide: W for .b/.h/.s, X for .d.
+        let src = reg_operand(operands, 1, GpRole::RegOrZr, "mov")?;
+        let wants_64 = elem_size == "d";
+        if src.is_64 != wants_64 {
+            return Err(format!(
+                "mov: `{}` does not feed a `.{elem_size}` element; the source is \
+                 one element wide, so it must be a {} register",
+                operand_spelling(operands, 1),
+                if wants_64 { "64-bit" } else { "32-bit" }
+            ));
+        }
+        let rn = src.num;
         let imm5 = match elem_size.as_str() {
-            "b" => ((*index & 0xF) << 1) | 0b00001,
-            "h" => ((*index & 0x7) << 2) | 0b00010,
-            "s" => ((*index & 0x3) << 3) | 0b00100,
-            "d" => ((*index & 0x1) << 4) | 0b01000,
+            "b" => (*index << 1) | 0b00001,
+            "h" => (*index << 2) | 0b00010,
+            "s" => (*index << 3) | 0b00100,
+            "d" => (*index << 4) | 0b01000,
             _ => return Err(format!("unsupported element size for ins: {}", elem_size)),
         };
         let word = (0b01001110000u32 << 21) | (imm5 << 16) | (0b000111 << 10) | (rn << 5) | vd;
@@ -63,7 +75,7 @@ pub(crate) fn encode_mov(operands: &[Operand]) -> Result<EncodeResult, String> {
 
     // NEON lane extract: mov x0, v0.d[1] -> UMOV Xd, Vn.D[index]
     if let (
-        Some(Operand::Reg(rd_name)),
+        Some(Operand::Reg(_)),
         Some(Operand::RegLane {
             reg: vn_name,
             elem_size,
@@ -71,17 +83,37 @@ pub(crate) fn encode_mov(operands: &[Operand]) -> Result<EncodeResult, String> {
         }),
     ) = (operands.first(), operands.get(1))
     {
-        let rd = parse_reg_num(rd_name).ok_or("invalid rd")?;
-        let vn = parse_reg_num(vn_name).ok_or("invalid NEON vn")?;
         // UMOV Rd, Vn.Ts[index]
         // Encoding: 0 Q 0 0 1110 000 imm5 0 0111 1 Rn Rd
+        //
+        // The `mov Rd, Vn.Ts[i]` *alias* is narrower than UMOV itself: GNU as
+        // accepts it only for `.s` into a W register and `.d` into an X
+        // register, and rejects `mov w0,v1.b[3]`, `mov x0,v1.h[2]` and
+        // `mov x0,v1.s[2]` -- the sizes are written explicitly when those are
+        // meant (`umov`/`smov`).  Encodings borrowed from the wide rule would
+        // accept assembly the oracle rejects.
+        let rd = reg_operand(operands, 0, GpRole::RegOrZr, "mov")?;
+        if rd.is_sp {
+            return Err(
+                "mov: the stack pointer cannot be the destination of a lane read".to_string(),
+            );
+        }
+        let vn = parse_reg_num(vn_name).ok_or("invalid NEON vn")?;
+        check_lane(*index, elem_size, "mov", "source element")?;
+        let ok = matches!((elem_size.as_str(), rd.is_64), ("s", false) | ("d", true));
+        if !ok {
+            return Err(format!(
+                "mov: `{}` cannot be read from a `.{elem_size}` element -- the mov \
+                 alias exists for `.s` into a 32-bit register and `.d` into a \
+                 64-bit one; use umov or smov for the other widths",
+                operand_spelling(operands, 0)
+            ));
+        }
         let (q, imm5) = match elem_size.as_str() {
-            "b" => (0u32, ((*index & 0xF) << 1) | 0b00001),
-            "h" => (0, ((*index & 0x7) << 2) | 0b00010),
-            "s" => (0, ((*index & 0x3) << 3) | 0b00100),
-            "d" => (1, ((*index & 0x1) << 4) | 0b01000),
-            _ => return Err(format!("unsupported element size for umov: {}", elem_size)),
+            "s" => (0u32, (*index << 3) | 0b00100),
+            _ => (1, (*index << 4) | 0b01000),
         };
+        let rd = rd.num;
         let word =
             (q << 30) | (0b001110000u32 << 21) | (imm5 << 16) | (0b001111 << 10) | (vn << 5) | rd;
         return Ok(EncodeResult::Word(word));
@@ -96,13 +128,21 @@ pub(crate) fn encode_mov(operands: &[Operand]) -> Result<EncodeResult, String> {
         }),
         Some(Operand::RegLane {
             reg: vn_name,
-            elem_size: _es_n,
+            elem_size: es_n,
             index: idx_n,
         }),
     ) = (operands.first(), operands.get(1))
     {
         let vd = parse_reg_num(vd_name).ok_or("invalid NEON vd")?;
         let vn = parse_reg_num(vn_name).ok_or("invalid NEON vn")?;
+        if es_d != es_n {
+            return Err(format!(
+                "mov: destination element is `.{es_d}` but the source is `.{es_n}`; \
+                 both must be the same element type"
+            ));
+        }
+        check_lane(*idx_d, es_d, "mov", "destination element")?;
+        check_lane(*idx_n, es_n, "mov", "source element")?;
         // INS Vd.Ts[i1], Vn.Ts[i2]
         // Encoding: 0 1 1 01110 000 imm5 0 imm4 1 Rn Rd
         let (imm5, imm4) = match es_d.as_str() {
@@ -533,6 +573,17 @@ pub(crate) fn encode_add_sub(
 
     // ADD Rd, Rn, #imm
     if let Some(Operand::Imm(imm)) = operands.get(2) {
+        // The immediate form has one encoding for Rn and it reads 31 as the
+        // stack pointer, so `subs x0, xzr, #1` cannot mean what it says:
+        // GNU as refuses it, and accepting it encoded `subs x0, sp, #1`.
+        if rn_reg.is_zr {
+            return Err(format!(
+                "{mn}: `{}` is the zero register, but the immediate form reads \
+                 encoding 31 as the stack pointer; write `sp` if the stack pointer is \
+                 what you meant",
+                operand_spelling(operands, 1)
+            ));
+        }
         let imm_signed = *imm;
         // Handle negative immediates: add #-N -> sub #N and vice versa
         let (imm_val, actual_op) = if imm_signed < 0 {
@@ -978,29 +1029,24 @@ pub(crate) fn encode_mul(operands: &[Operand]) -> Result<EncodeResult, String> {
         return encode_neon_mul(operands);
     }
     // MUL Rd, Rn, Rm is MADD Rd, Rn, Rm, XZR
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-    let (rm, _) = get_reg(operands, 2)?;
+    let (regs, is_64) = gp_same_width(operands, 3, "mul")?;
+    let (rd, rn, rm) = (regs[0], regs[1], regs[2]);
     let sf = sf_bit(is_64);
     let word = (sf << 31) | (0b0011011000 << 21) | (rm << 16) | (0b11111 << 10) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
 }
 
 pub(crate) fn encode_madd(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-    let (rm, _) = get_reg(operands, 2)?;
-    let (ra, _) = get_reg(operands, 3)?;
+    let (regs, is_64) = gp_same_width(operands, 4, "madd")?;
+    let (rd, rn, rm, ra) = (regs[0], regs[1], regs[2], regs[3]);
     let sf = sf_bit(is_64);
     let word = ((sf << 31) | (0b0011011000 << 21) | (rm << 16)) | (ra << 10) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
 }
 
 pub(crate) fn encode_msub(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-    let (rm, _) = get_reg(operands, 2)?;
-    let (ra, _) = get_reg(operands, 3)?;
+    let (regs, is_64) = gp_same_width(operands, 4, "msub")?;
+    let (rd, rn, rm, ra) = (regs[0], regs[1], regs[2], regs[3]);
     let sf = sf_bit(is_64);
     let word =
         (sf << 31) | (0b0011011000 << 21) | (rm << 16) | (1 << 15) | (ra << 10) | (rn << 5) | rd;
@@ -1008,9 +1054,9 @@ pub(crate) fn encode_msub(operands: &[Operand]) -> Result<EncodeResult, String> 
 }
 
 pub(crate) fn encode_div(operands: &[Operand], unsigned: bool) -> Result<EncodeResult, String> {
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-    let (rm, _) = get_reg(operands, 2)?;
+    let mn = if unsigned { "udiv" } else { "sdiv" };
+    let (regs, is_64) = gp_same_width(operands, 3, mn)?;
+    let (rd, rn, rm) = (regs[0], regs[1], regs[2]);
     let sf = sf_bit(is_64);
     let o1 = if unsigned { 0u32 } else { 1u32 };
     // Data-processing (2 source): sf 0 S=0 11010110 Rm 00001 o1 Rn Rd
@@ -1026,9 +1072,9 @@ pub(crate) fn encode_div(operands: &[Operand], unsigned: bool) -> Result<EncodeR
 
 /// Encode SMULL Xd, Wn, Wm -> SMADDL Xd, Wn, Wm, XZR
 pub(crate) fn encode_smull(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, _) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-    let (rm, _) = get_reg(operands, 2)?;
+    let rd = gp_widened(operands, 0, true, "smull")?;
+    let rn = gp_widened(operands, 1, false, "smull")?;
+    let rm = gp_widened(operands, 2, false, "smull")?;
     // SMADDL: 1 00 11011 001 Rm 0 11111 Rn Rd (Ra=XZR makes it SMULL)
     let word = (1u32 << 31) | (0b0011011001 << 21) | (rm << 16) | (0b011111 << 10) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
@@ -1036,9 +1082,9 @@ pub(crate) fn encode_smull(operands: &[Operand]) -> Result<EncodeResult, String>
 
 /// Encode UMULL Xd, Wn, Wm -> UMADDL Xd, Wn, Wm, XZR
 pub(crate) fn encode_umull(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, _) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-    let (rm, _) = get_reg(operands, 2)?;
+    let rd = gp_widened(operands, 0, true, "umull")?;
+    let rn = gp_widened(operands, 1, false, "umull")?;
+    let rm = gp_widened(operands, 2, false, "umull")?;
     // UMADDL: 1 00 11011 101 Rm 0 11111 Rn Rd (Ra=XZR makes it UMULL)
     let word = (1u32 << 31) | (0b0011011101 << 21) | (rm << 16) | (0b011111 << 10) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
@@ -1046,10 +1092,10 @@ pub(crate) fn encode_umull(operands: &[Operand]) -> Result<EncodeResult, String>
 
 /// Encode SMADDL Xd, Wn, Wm, Xa (signed multiply-add long)
 pub(crate) fn encode_smaddl(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, _) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-    let (rm, _) = get_reg(operands, 2)?;
-    let (ra, _) = get_reg(operands, 3)?;
+    let rd = gp_widened(operands, 0, true, "smaddl")?;
+    let rn = gp_widened(operands, 1, false, "smaddl")?;
+    let rm = gp_widened(operands, 2, false, "smaddl")?;
+    let ra = gp_widened(operands, 3, true, "smaddl")?;
     // SMADDL: 1 00 11011 001 Rm 0 Ra Rn Rd
     let word = (1u32 << 31) | (0b0011011001 << 21) | (rm << 16) | (ra << 10) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
@@ -1057,10 +1103,10 @@ pub(crate) fn encode_smaddl(operands: &[Operand]) -> Result<EncodeResult, String
 
 /// Encode UMADDL Xd, Wn, Wm, Xa (unsigned multiply-add long)
 pub(crate) fn encode_umaddl(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, _) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-    let (rm, _) = get_reg(operands, 2)?;
-    let (ra, _) = get_reg(operands, 3)?;
+    let rd = gp_widened(operands, 0, true, "umaddl")?;
+    let rn = gp_widened(operands, 1, false, "umaddl")?;
+    let rm = gp_widened(operands, 2, false, "umaddl")?;
+    let ra = gp_widened(operands, 3, true, "umaddl")?;
     // UMADDL: 1 00 11011 101 Rm 0 Ra Rn Rd
     let word = (1u32 << 31) | (0b0011011101 << 21) | (rm << 16) | (ra << 10) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
@@ -1068,9 +1114,8 @@ pub(crate) fn encode_umaddl(operands: &[Operand]) -> Result<EncodeResult, String
 
 /// Encode MNEG Xd, Xn, Xm -> MSUB Xd, Xn, Xm, XZR
 pub(crate) fn encode_mneg(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-    let (rm, _) = get_reg(operands, 2)?;
+    let (regs, is_64) = gp_same_width(operands, 3, "mneg")?;
+    let (rd, rn, rm) = (regs[0], regs[1], regs[2]);
     let sf = sf_bit(is_64);
     // MSUB with Ra=XZR: sf 00 11011 000 Rm 1 11111 Rn Rd
     let word = (sf << 31)
@@ -1084,18 +1129,18 @@ pub(crate) fn encode_mneg(operands: &[Operand]) -> Result<EncodeResult, String> 
 }
 
 pub(crate) fn encode_umulh(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, _) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-    let (rm, _) = get_reg(operands, 2)?;
+    let rd = gp_widened(operands, 0, true, "umulh")?;
+    let rn = gp_widened(operands, 1, true, "umulh")?;
+    let rm = gp_widened(operands, 2, true, "umulh")?;
     // UMULH: 1 00 11011 1 10 Rm 0 11111 Rn Rd
     let word = (1u32 << 31) | (0b0011011110 << 21) | (rm << 16) | (0b011111 << 10) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
 }
 
 pub(crate) fn encode_smulh(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, _) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-    let (rm, _) = get_reg(operands, 2)?;
+    let rd = gp_widened(operands, 0, true, "smulh")?;
+    let rn = gp_widened(operands, 1, true, "smulh")?;
+    let rm = gp_widened(operands, 2, true, "smulh")?;
     // SMULH: 1 00 11011 0 10 Rm 0 11111 Rn Rd
     let word = (1u32 << 31) | (0b0011011010 << 21) | (rm << 16) | (0b011111 << 10) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
@@ -1207,25 +1252,46 @@ pub(crate) fn encode_mvn(operands: &[Operand]) -> Result<EncodeResult, String> {
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_adc(operands: &[Operand], set_flags: bool) -> Result<EncodeResult, String> {
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-    let (rm, _) = get_reg(operands, 2)?;
+/// ADC/ADCS (and, one opcode bit apart, SBC/SBCS): `Rd, Rn, Rm` with a single
+/// `sf` for all three slots, each of which reads encoding 31 as the zero
+/// register.
+///
+/// Every one of those three facts was fail-open here: the readers were the
+/// permissive `get_reg`, so `adc x0,x1,sp` assembled as `adc x0,x1,xzr`,
+/// `adc sp,x1,x2` as `adc xzr,x1,x2`, and `adc x0,x1,w0` (a 32-bit third
+/// operand in a 64-bit instruction) by ignoring the width of everything but the
+/// destination.  GNU as refuses all three.
+fn encode_add_sub_carry(
+    operands: &[Operand],
+    mn: &str,
+    subtract: bool,
+    set_flags: bool,
+) -> Result<EncodeResult, String> {
+    let (regs, is_64) = gp_same_width(operands, 3, mn)?;
+    let (rd, rn, rm) = (regs[0], regs[1], regs[2]);
     let sf = sf_bit(is_64);
     let s = if set_flags { 1u32 } else { 0 };
-    let word = ((sf << 31) | (s << 29) | (0b11010000 << 21) | (rm << 16)) | (rn << 5) | rd;
+    let sub = if subtract { 1u32 << 30 } else { 0 };
+    let word = ((sf << 31) | sub | (s << 29) | (0b11010000 << 21) | (rm << 16)) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
 }
 
+pub(crate) fn encode_adc(operands: &[Operand], set_flags: bool) -> Result<EncodeResult, String> {
+    encode_add_sub_carry(
+        operands,
+        if set_flags { "adcs" } else { "adc" },
+        false,
+        set_flags,
+    )
+}
+
 pub(crate) fn encode_sbc(operands: &[Operand], set_flags: bool) -> Result<EncodeResult, String> {
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-    let (rm, _) = get_reg(operands, 2)?;
-    let sf = sf_bit(is_64);
-    let s = if set_flags { 1u32 } else { 0 };
-    let word =
-        ((sf << 31) | (1 << 30) | (s << 29) | (0b11010000 << 21) | (rm << 16)) | (rn << 5) | rd;
-    Ok(EncodeResult::Word(word))
+    encode_add_sub_carry(
+        operands,
+        if set_flags { "sbcs" } else { "sbc" },
+        true,
+        set_flags,
+    )
 }
 
 // ── Shifts ───────────────────────────────────────────────────────────────

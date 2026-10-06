@@ -17,6 +17,7 @@ mod data_processing;
 mod fp_scalar;
 mod load_store;
 mod neon;
+mod sysreg_table;
 mod system;
 
 pub(crate) use bitfield::*;
@@ -354,6 +355,92 @@ pub(crate) fn operand_spelling(operands: &[Operand], idx: usize) -> String {
     }
 }
 
+/// Whether `name` spells a floating-point/SIMD register.
+///
+/// The two register grammars are disjoint by construction -- this is the
+/// floating-point half of the pair whose general-purpose half is
+/// [`GpReg::by_name`] -- so a reader can always say which grammar the operand
+/// it refused belongs to.
+pub(crate) fn is_fp_spelling_pub(name: &str) -> bool {
+    let Some((&first, rest)) = name.as_bytes().split_first() else {
+        return false;
+    };
+    if !matches!(first | 0x20, b'b' | b'h' | b's' | b'd' | b'q' | b'v') {
+        return false;
+    }
+    !rest.is_empty()
+        && rest.len() <= 2
+        && rest.iter().all(u8::is_ascii_digit)
+        && !(rest.len() == 2 && rest[0] == b'0')
+}
+
+/// A transferred register of a load/store: one of the two register files.
+///
+/// `LDR`/`STR` and their unscaled, signed, pair and by-element relatives are
+/// the instructions whose data register may come from *either* file -- `ldr
+/// d0,[x0]` and `ldr x0,[x0]` are the same mnemonic, and the width letter is
+/// what selects the access size.  The reader therefore answers both questions
+/// a caller has: which file (`is_fp`), and how wide (`letter` for the
+/// floating-point file, `is_64` for the general-purpose one).
+///
+/// `v<n>` without an arrangement is refused here rather than at each call
+/// site: the scalar forms are spelled `b`/`h`/`s`/`d`/`q`, and accepting the
+/// vector spelling would assemble an instruction the programmer did not write.
+pub(crate) struct LdstRt {
+    pub num: u32,
+    pub is_fp: bool,
+    /// The width letter of a floating-point register (`b`/`h`/`s`/`d`/`q`),
+    /// or 0 for a general-purpose one.
+    pub letter: u8,
+    /// General-purpose only: 64-bit spelling (`x`, `lr`, `sp`, `xzr`).
+    pub is_64: bool,
+    /// The spelling, for diagnostics.
+    pub name: String,
+}
+
+/// Read a load/store data register: see [`LdstRt`].
+pub(crate) fn ldst_rt(operands: &[Operand], idx: usize, mn: &str) -> Result<LdstRt, String> {
+    let name = match operands.get(idx) {
+        Some(Operand::Reg(n)) => n.as_str(),
+        Some(_) => {
+            return Err(format!(
+                "{mn}: operand {idx} must be a register, not an immediate or memory operand"
+            ));
+        }
+        None => return Err(format!("{mn}: missing operand {idx} (expected a register)")),
+    };
+    if let Some(gp) = GpReg::by_name(name) {
+        return Ok(LdstRt {
+            num: gp.num,
+            is_fp: false,
+            letter: 0,
+            is_64: gp.is_64,
+            name: name.to_string(),
+        });
+    }
+    if let Ok((num, letter, n)) = fp_reg(operands, idx, mn) {
+        if letter == b'v' {
+            return Err(format!(
+                "{mn}: `{n}` is a vector register; this instruction takes the 128-bit \
+                 scalar spelling `q{}`",
+                &n[1..]
+            ));
+        }
+        return Ok(LdstRt {
+            num,
+            is_fp: true,
+            letter,
+            is_64: true,
+            name: n,
+        });
+    }
+    Err(format!(
+        "{mn}: operand {idx} `{name}` is not a load/store data register; this slot \
+         takes a general-purpose register (x0-x30, w0-w30, lr, sp, wsp, xzr, wzr) \
+         or a floating-point one (b0-b31, h0-h31, s0-s31, d0-d31, q0-q31)"
+    ))
+}
+
 /// Read one register operand and check it against the role its slot has.
 ///
 /// Every GP-only encoder routes its operands through here, so a register-class
@@ -453,6 +540,81 @@ pub(crate) fn logical_reg3(
     Ok((rd, rn, rm))
 }
 
+/// Whether the two register operands of a conversion are both floating-point
+/// registers, i.e. whether the *scalar SIMD&FP* form of it was written.
+///
+/// The eleven float-conversion mnemonics each have two forms whose operands are
+/// spelled differently: the general-purpose-destination one (`fcvtms w0,s1`,
+/// `scvtf s0,w1`) and the scalar register-file one (`fcvtms s0,s1`,
+/// `scvtf s0,s1`).  Neither reader can decide for the other — `reg_operand`
+/// refuses an FP spelling and `fp_reg` refuses a GP one — so the dispatcher
+/// asks this question first and each form's own reader then validates what it
+/// is given.
+pub(crate) fn scalar_fp_pair(operands: &[Operand], mn: &str) -> bool {
+    fp_reg(operands, 0, mn).is_ok() && fp_reg(operands, 1, mn).is_ok()
+}
+
+/// Read `n` general-purpose operands that must all share one width, with
+/// encoding 31 read as the zero register.
+///
+/// This is the shape of the multiply/divide, conditional-select, bitfield and
+/// extract families: every slot is `Xd|XZR` (never SP), and one instruction
+/// covers both widths through `sf`, so a mixed list has no encoding.  Both
+/// halves are checked here because both were fail-open: `mul sp, x1, x2`
+/// (SP in a zero-register slot) and `madd wzr, x1, x2, x3` (a 32-bit
+/// destination with 64-bit sources) assembled happily, the first as the XZR
+/// form and the second by ignoring the widths entirely.
+///
+/// Returns the register numbers and the shared width.
+pub(crate) fn gp_same_width(
+    operands: &[Operand],
+    n: usize,
+    mn: &str,
+) -> Result<(Vec<u32>, bool), String> {
+    let mut nums = Vec::with_capacity(n);
+    let mut is_64 = false;
+    let mut first_name = String::new();
+    for i in 0..n {
+        let r = reg_operand(operands, i, GpRole::RegOrZr, mn)?;
+        if i == 0 {
+            is_64 = r.is_64;
+            first_name = operand_spelling(operands, i);
+        } else if r.is_64 != is_64 {
+            return Err(format!(
+                "{mn}: `{first_name}` and `{}` are different widths; this instruction \
+                 has one sf field, so every register operand of {mn} must be the same \
+                 size",
+                operand_spelling(operands, i)
+            ));
+        }
+        nums.push(r.num);
+    }
+    Ok((nums, is_64))
+}
+
+/// Read one general-purpose operand and require a specific width.
+///
+/// The `*MADDL`/`*MULL` long forms take a 64-bit destination and 32-bit
+/// sources, so their slots cannot all be the same width and each one has to
+/// say which it is.
+pub(crate) fn gp_widened(
+    operands: &[Operand],
+    idx: usize,
+    is_64: bool,
+    mn: &str,
+) -> Result<u32, String> {
+    let r = reg_operand(operands, idx, GpRole::RegOrZr, mn)?;
+    if r.is_64 != is_64 {
+        return Err(format!(
+            "{mn}: operand {idx} `{}` must be the {}-bit {} register of this form",
+            operand_spelling(operands, idx),
+            if is_64 { 64 } else { 32 },
+            if is_64 { "destination" } else { "source" },
+        ));
+    }
+    Ok(r.num)
+}
+
 /// Encode the `option` field of an extended-register operand.
 ///
 /// The old code fell through to `_ => 0b011`, so a misspelt extend silently
@@ -543,11 +705,26 @@ fn is_32bit_reg(name: &str) -> bool {
 }
 
 /// Check if a register is a floating-point/SIMD register.
+/// Is `name` a SIMD/FP register (`b<0-31>`, `h`, `s`, `d`, `q`, `v<0-31>`)?
+///
+/// A first-letter test is not enough: `sp` starts with `s` and `b`/`h`/`d`/`q`
+/// are also the width letters of the GPR loads (`ldrb`, `ldrh`, ...).  The
+/// half-word form `sp` (*stack pointer*) therefore tested as an S register,
+/// which made `stur sp,[x0,#8]` encode as `stur s31,[x0,#8]` -- a store of the
+/// wrong register file -- and let `ldur sp,[x0,#8]` slip past the transferred-
+/// register gate as a scalar FP access.  A name is an FP register only when the
+/// width letter is followed by a register number.
 fn is_fp_reg(name: &str) -> bool {
-    matches!(
-        name.as_bytes().first().map(|c| c.to_ascii_lowercase()),
-        Some(b'd' | b's' | b'q' | b'v' | b'h' | b'b')
-    )
+    let bytes = name.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+    let width = bytes[0].to_ascii_lowercase();
+    if !matches!(width, b'd' | b's' | b'q' | b'v' | b'h' | b'b') {
+        return false;
+    }
+    let digits = &name[1..];
+    !digits.is_empty() && digits.bytes().all(|c| c.is_ascii_digit())
 }
 
 /// Encode a condition code string to 4-bit encoding.
@@ -845,47 +1022,64 @@ pub fn encode_instruction(
         // Loads/stores - size determined from register width
         "ldr" => encode_ldr_str_auto(operands, true),
         "str" => encode_ldr_str_auto(operands, false),
-        "ldrb" => encode_ldr_str(operands, true, 0b00, false, false), // byte load
-        "strb" => encode_ldr_str(operands, false, 0b00, false, false),
-        "ldrh" => encode_ldr_str(operands, true, 0b01, false, false), // halfword load
-        "strh" => encode_ldr_str(operands, false, 0b01, false, false),
+        // Mnemonic-keyed destination classes: the `b`/`h` spellings are
+        // 32-bit-register accesses (LdstDest::Gpr32), and `ldrsb/ldrsh` take
+        // w or x.  An `ldrb x9,[x10]` is a different instruction than the one
+        // written and GNU as rejects it; see LdstDest in load_store.rs.
+        "ldrb" => encode_ldr_str_checked(operands, true, 0b00, false, false, LdstDest::Gpr32),
+        "strb" => encode_ldr_str_checked(operands, false, 0b00, false, false, LdstDest::Gpr32),
+        "ldrh" => encode_ldr_str_checked(operands, true, 0b01, false, false, LdstDest::Gpr32),
+        "strh" => encode_ldr_str_checked(operands, false, 0b01, false, false, LdstDest::Gpr32),
         "ldrw" | "ldrsw" => encode_ldrsw(operands),
-        "ldrsb" => encode_ldrs(operands, 0b00),
-        "ldrsh" => encode_ldrs(operands, 0b01),
-        "ldur" => encode_ldur_stur(operands, true, 0b00),
-        "stur" => encode_ldur_stur(operands, false, 0b00),
-        "ldtr" => encode_ldur_stur(operands, true, 0b10),
-        "sttr" => encode_ldur_stur(operands, false, 0b10),
-        "ldtrh" => encode_ldtr_sized(operands, true, 0b01),
-        "sttrh" => encode_ldtr_sized(operands, false, 0b01),
-        "ldtrb" => encode_ldtr_sized(operands, true, 0b00),
-        "sttrb" => encode_ldtr_sized(operands, false, 0b00),
+        "ldrsb" => encode_ldrs_checked(operands, 0b00, LdstDest::Gpr32Or64, "ldrsb"),
+        "ldrsh" => encode_ldrs_checked(operands, 0b01, LdstDest::Gpr32Or64, "ldrsh"),
+        "ldur" => encode_ldur_stur_checked(operands, true, 0b00, LdstDest::Any, None, false, "ldur"),
+        "stur" => encode_ldur_stur_checked(operands, false, 0b00, LdstDest::Any, None, false, "stur"),
+        // Unscaled spelled widths (measured words: ldurb 38408000, sturh 78008000).
+        "ldurb" => encode_ldur_stur_checked(operands, true, 0b00, LdstDest::Gpr32, Some(0b00), false, "ldurb"),
+        "sturb" => encode_ldur_stur_checked(operands, false, 0b00, LdstDest::Gpr32, Some(0b00), false, "sturb"),
+        "ldurh" => encode_ldur_stur_checked(operands, true, 0b00, LdstDest::Gpr32, Some(0b01), false, "ldurh"),
+        "sturh" => encode_ldur_stur_checked(operands, false, 0b00, LdstDest::Gpr32, Some(0b01), false, "sturh"),
+        "ldursb" => encode_ldur_stur_checked(operands, true, 0b00, LdstDest::Gpr32Or64, Some(0b00), true, "ldursb"),
+        "ldursh" => encode_ldur_stur_checked(operands, true, 0b00, LdstDest::Gpr32Or64, Some(0b01), true, "ldursh"),
+        "ldursw" => encode_ldur_stur_checked(operands, true, 0b00, LdstDest::Gpr64, Some(0b10), true, "ldursw"),
+        // Unprivileged base: no FP/SIMD form exists, so the bare spellings are
+        // GPR-only as well.
+        "ldtr" => encode_ldur_stur_checked(operands, true, 0b10, LdstDest::Gpr32Or64, None, false, "ldtr"),
+        "sttr" => encode_ldur_stur_checked(operands, false, 0b10, LdstDest::Gpr32Or64, None, false, "sttr"),
+        "ldtrb" => encode_ldur_stur_checked(operands, true, 0b10, LdstDest::Gpr32, Some(0b00), false, "ldtrb"),
+        "sttrb" => encode_ldur_stur_checked(operands, false, 0b10, LdstDest::Gpr32, Some(0b00), false, "sttrb"),
+        "ldtrh" => encode_ldur_stur_checked(operands, true, 0b10, LdstDest::Gpr32, Some(0b01), false, "ldtrh"),
+        "sttrh" => encode_ldur_stur_checked(operands, false, 0b10, LdstDest::Gpr32, Some(0b01), false, "sttrh"),
+        "ldtrsb" => encode_ldur_stur_checked(operands, true, 0b10, LdstDest::Gpr32Or64, Some(0b00), true, "ldtrsb"),
+        "ldtrsh" => encode_ldur_stur_checked(operands, true, 0b10, LdstDest::Gpr32Or64, Some(0b01), true, "ldtrsh"),
+        "ldtrsw" => encode_ldur_stur_checked(operands, true, 0b10, LdstDest::Gpr64, Some(0b10), true, "ldtrsw"),
         "ldp" => encode_ldp_stp(operands, true),
         "stp" => encode_ldp_stp(operands, false),
         "ldnp" => encode_ldnp_stnp(operands, true),
         "stnp" => encode_ldnp_stnp(operands, false),
-        "ldxr" => encode_ldxr_stxr(operands, true, None),
-        "stxr" => encode_ldxr_stxr(operands, false, None),
-        "ldxrb" => encode_ldxr_stxr(operands, true, Some(0b00)),
-        "stxrb" => encode_ldxr_stxr(operands, false, Some(0b00)),
-        "ldxrh" => encode_ldxr_stxr(operands, true, Some(0b01)),
-        "stxrh" => encode_ldxr_stxr(operands, false, Some(0b01)),
-        "ldaxr" => encode_ldaxr_stlxr(operands, true, None),
-        "stlxr" => encode_ldaxr_stlxr(operands, false, None),
-        "ldaxrb" => encode_ldaxr_stlxr(operands, true, Some(0b00)),
-        "stlxrb" => encode_ldaxr_stlxr(operands, false, Some(0b00)),
-        "ldaxrh" => encode_ldaxr_stlxr(operands, true, Some(0b01)),
-        "stlxrh" => encode_ldaxr_stlxr(operands, false, Some(0b01)),
-        "ldar" => encode_ldar_stlr(operands, true, None),
-        "stlr" => encode_ldar_stlr(operands, false, None),
-        "ldarb" => encode_ldar_stlr(operands, true, Some(0b00)),
-        "stlrb" => encode_ldar_stlr(operands, false, Some(0b00)),
-        "ldarh" => encode_ldar_stlr(operands, true, Some(0b01)),
-        "stlrh" => encode_ldar_stlr(operands, false, Some(0b01)),
-        "ldxp" => encode_ldxp_stxp(operands, true, false),
-        "ldaxp" => encode_ldxp_stxp(operands, true, true),
-        "stxp" => encode_ldxp_stxp(operands, false, false),
-        "stlxp" => encode_ldxp_stxp(operands, false, true),
+        "ldxr" => encode_ldxr_stxr(operands, "ldxr", true, None),
+        "stxr" => encode_ldxr_stxr(operands, "stxr", false, None),
+        "ldxrb" => encode_ldxr_stxr(operands, "ldxrb", true, Some(0b00)),
+        "stxrb" => encode_ldxr_stxr(operands, "stxrb", false, Some(0b00)),
+        "ldxrh" => encode_ldxr_stxr(operands, "ldxrh", true, Some(0b01)),
+        "stxrh" => encode_ldxr_stxr(operands, "stxrh", false, Some(0b01)),
+        "ldaxr" => encode_ldaxr_stlxr(operands, "ldaxr", true, None),
+        "stlxr" => encode_ldaxr_stlxr(operands, "stlxr", false, None),
+        "ldaxrb" => encode_ldaxr_stlxr(operands, "ldaxrb", true, Some(0b00)),
+        "stlxrb" => encode_ldaxr_stlxr(operands, "stlxrb", false, Some(0b00)),
+        "ldaxrh" => encode_ldaxr_stlxr(operands, "ldaxrh", true, Some(0b01)),
+        "stlxrh" => encode_ldaxr_stlxr(operands, "stlxrh", false, Some(0b01)),
+        "ldar" => encode_ldar_stlr(operands, "ldar", true, None),
+        "stlr" => encode_ldar_stlr(operands, "stlr", false, None),
+        "ldarb" => encode_ldar_stlr(operands, "ldarb", true, Some(0b00)),
+        "stlrb" => encode_ldar_stlr(operands, "stlrb", false, Some(0b00)),
+        "ldarh" => encode_ldar_stlr(operands, "ldarh", true, Some(0b01)),
+        "stlrh" => encode_ldar_stlr(operands, "stlrh", false, Some(0b01)),
+        "ldxp" => encode_ldxp_stxp(operands, "ldxp", true, false),
+        "ldaxp" => encode_ldxp_stxp(operands, "ldaxp", true, true),
+        "stxp" => encode_ldxp_stxp(operands, "stxp", false, false),
+        "stlxp" => encode_ldxp_stxp(operands, "stlxp", false, true),
 
         // Address computation
         "adrp" => encode_adrp(operands),
@@ -908,14 +1102,25 @@ pub fn encode_instruction(
             }
         }
         "fmul" => {
-            if matches!(operands.first(), Some(Operand::RegArrangement { .. })) {
-                if matches!(operands.get(2), Some(Operand::RegLane { .. })) {
-                    encode_neon_float_elem(operands, 0b1001)
-                } else {
-                    encode_neon_float_three_same(operands, 1, 0, 0b11011)
-                }
+            // The element operand is what makes this a by-element instruction:
+            // the two registers may be spelled either as scalars (`s0,s1`,
+            // which is how a compiler emits it) or as 64-bit vectors, so
+            // dispatching on the *first* operand's spelling sent every
+            // scalar-spelled `fmul s0,s1,v2.s[0]` to the scalar two-operand
+            // encoder, which then rejected the lane operand.
+            if matches!(operands.get(2), Some(Operand::RegLane { .. })) {
+                encode_neon_float_elem(operands, 0b1001, 0, "fmul")
+            } else if matches!(operands.first(), Some(Operand::RegArrangement { .. })) {
+                encode_neon_float_three_same(operands, 1, 0, 0b11011)
             } else {
                 encode_fp_arith(operands, 0b0000)
+            }
+        }
+        "fmulx" => {
+            if matches!(operands.get(2), Some(Operand::RegLane { .. })) {
+                encode_neon_float_elem(operands, 0b1001, 1, "fmulx")
+            } else {
+                encode_neon_float_three_same(operands, 1, 0, 0b11011)
             }
         }
         "fdiv" => {
@@ -1035,6 +1240,8 @@ pub fn encode_instruction(
                 } else {
                     encode_neon_float_two_misc(operands, 0, 1, 0b11011)
                 }
+            } else if scalar_fp_pair(operands, "fcvtzs") {
+                encode_fp_convert_scalar("fcvtzs", operands)
             } else {
                 encode_fcvt_rounding(operands, 0b11, 0b000)
             }
@@ -1046,9 +1253,22 @@ pub fn encode_instruction(
                 } else {
                     encode_neon_float_two_misc(operands, 1, 1, 0b11011)
                 }
+            } else if scalar_fp_pair(operands, "fcvtzu") {
+                encode_fp_convert_scalar("fcvtzu", operands)
             } else {
                 encode_fcvt_rounding(operands, 0b11, 0b001)
             }
+        }
+        // The remaining eight rounding conversions have no fixed-point form and
+        // no general-purpose-destination *and* register-file ambiguity to
+        // resolve: when both operands are floating-point registers the form is
+        // the scalar SIMD&FP one (`fcvtas s0,s1`), otherwise the result goes to
+        // a general-purpose register (`fcvtas w0,s1`).
+        "fcvtas" | "fcvtau" | "fcvtns" | "fcvtnu" | "fcvtms" | "fcvtmu" | "fcvtps"
+        | "fcvtpu"
+            if scalar_fp_pair(operands, &mn) =>
+        {
+            encode_fp_convert_scalar(&mn, operands)
         }
         "fcvtas" => encode_fcvt_rounding(operands, 0b00, 0b100),
         "fcvtau" => encode_fcvt_rounding(operands, 0b00, 0b101),
@@ -1065,6 +1285,8 @@ pub fn encode_instruction(
                 } else {
                     encode_neon_float_two_misc(operands, 1, 0, 0b11101)
                 }
+            } else if scalar_fp_pair(operands, "ucvtf") {
+                encode_fp_convert_scalar("ucvtf", operands)
             } else {
                 encode_ucvtf(operands)
             }
@@ -1076,6 +1298,8 @@ pub fn encode_instruction(
                 } else {
                     encode_neon_float_two_misc(operands, 0, 0, 0b11101)
                 }
+            } else if scalar_fp_pair(operands, "scvtf") {
+                encode_fp_convert_scalar("scvtf", operands)
             } else {
                 encode_scvtf(operands)
             }
@@ -1088,14 +1312,14 @@ pub fn encode_instruction(
         // NEON float three-same instructions (vector-only)
         "fmla" => {
             if matches!(operands.get(2), Some(Operand::RegLane { .. })) {
-                encode_neon_float_elem(operands, 0b0001)
+                encode_neon_float_elem(operands, 0b0001, 0, "fmla")
             } else {
                 encode_neon_float_three_same(operands, 0, 0, 0b11001)
             }
         }
         "fmls" => {
             if matches!(operands.get(2), Some(Operand::RegLane { .. })) {
-                encode_neon_float_elem(operands, 0b0101)
+                encode_neon_float_elem(operands, 0b0101, 0, "fmls")
             } else {
                 encode_neon_float_three_same(operands, 0, 1, 0b11001)
             }
@@ -1322,6 +1546,8 @@ pub fn encode_instruction(
         "ld2r" => encode_neon_ldnr(operands, 2),
         "ld3r" => encode_neon_ldnr(operands, 3),
         "ld4r" => encode_neon_ldnr(operands, 4),
+        "shll" => encode_neon_shll_alias(operands, false),
+        "shll2" => encode_neon_shll_alias(operands, true),
         "ushr" => encode_neon_ushr(operands),
         "sshr" => encode_neon_sshr(operands),
         "shl" => encode_neon_shl(operands),
@@ -1331,9 +1557,14 @@ pub fn encode_instruction(
         "addv" => encode_neon_addv(operands),
         "umaxv" => encode_neon_across(operands, 1, 0b01010),
         "uminv" => encode_neon_across(operands, 1, 0b11010),
+        "fmaxv" => encode_neon_fp_across(operands, "fmaxv", 0b00, 0b01111),
+        "fminv" => encode_neon_fp_across(operands, "fminv", 0b10, 0b01111),
+        "fmaxnmv" => encode_neon_fp_across(operands, "fmaxnmv", 0b00, 0b01100),
+        "fminnmv" => encode_neon_fp_across(operands, "fminnmv", 0b10, 0b01100),
+        "smov" => encode_neon_umov_smov(operands, "smov", true),
         "smaxv" => encode_neon_across(operands, 0, 0b01010),
         "sminv" => encode_neon_across(operands, 0, 0b11010),
-        "umov" => encode_neon_umov(operands),
+        "umov" => encode_neon_umov_smov(operands, "umov", false),
         "dup" => encode_neon_dup(operands),
         "ins" => encode_neon_ins(operands),
         "not" => encode_neon_not(operands),
@@ -1565,11 +1796,14 @@ pub fn encode_instruction(
         "isb" => Ok(EncodeResult::Word(0xd5033fdf)),
         "mrs" => encode_mrs(operands),
         "msr" => encode_msr(operands),
+        "hlt" => encode_hlt(operands),
         "svc" => encode_svc(operands),
         "hvc" => encode_hvc(operands),
         "smc" => encode_smc(operands),
         "at" => encode_at(operands, raw_operands),
         "sys" => encode_sys(raw_operands),
+        // SYSL: the load-form of SYS (SYSL Xt, #op1, cCRn, cCRm, #op2).
+        "sysl" => encode_sysl(raw_operands),
         "brk" => encode_brk(operands),
 
         // Bitfield extract/insert
@@ -1605,7 +1839,11 @@ pub fn encode_instruction(
         | "crc32cx" => encode_crc32(mnemonic, operands),
 
         // Prefetch
-        "prfm" => encode_prfm(operands),
+        "prfm" => encode_prfm(operands, false),
+        // PRFUM: the unscaled (imm9) form of PRFM, `prfum pldl1keep,[x0,#-8]`
+        // (0xf89f8000).  The signed offset is the whole point of the form: the
+        // unsigned form cannot express a negative or unaligned offset at all.
+        "prfum" => encode_prfm(operands, true),
 
         // LSE atomics
         "cas" | "casa" | "casal" | "casl" | "casb" | "casab" | "casalb" | "caslb" | "cash"
@@ -1620,7 +1858,18 @@ pub fn encode_instruction(
         | "ldclrah" | "ldclralh" | "ldclrlh" | "ldeor" | "ldeora" | "ldeoral" | "ldeorl"
         | "ldeorb" | "ldeorab" | "ldeoralb" | "ldeorlb" | "ldeorh" | "ldeorah" | "ldeoralh"
         | "ldeorlh" | "ldset" | "ldseta" | "ldsetal" | "ldsetl" | "ldsetb" | "ldsetab"
-        | "ldsetalb" | "ldsetlb" | "ldseth" | "ldsetah" | "ldsetalh" | "ldsetlh" => {
+        | "ldsetalb" | "ldsetlb" | "ldseth" | "ldsetah" | "ldsetalh" | "ldsetlh"
+        // FEAT_LSE min/max: opc 100..111.  `ldsmax x0,x1,[x2]` (0xf8204021) and
+        // `ldumin x0,x1,[x2]` were rejected outright although the instruction
+        // exists; `ldsmaxb/ldsmaxh/...` are the same family one size down.
+        | "ldsmax" | "ldsmaxa" | "ldsmaxal" | "ldsmaxl" | "ldsmaxb" | "ldsmaxab"
+        | "ldsmaxalb" | "ldsmaxlb" | "ldsmaxh" | "ldsmaxah" | "ldsmaxalh" | "ldsmaxlh"
+        | "ldsmin" | "ldsmina" | "ldsminal" | "ldsminl" | "ldsminb" | "ldsminab"
+        | "ldsminalb" | "ldsminlb" | "ldsminh" | "ldsminah" | "ldsminalh" | "ldsminlh"
+        | "ldumax" | "ldumaxa" | "ldumaxal" | "ldumaxl" | "ldumaxb" | "ldumaxab"
+        | "ldumaxalb" | "ldumaxlb" | "ldumaxh" | "ldumaxah" | "ldumaxalh" | "ldumaxlh"
+        | "ldumin" | "ldumina" | "lduminal" | "lduminl" | "lduminb" | "lduminab"
+        | "lduminalb" | "lduminlb" | "lduminh" | "lduminah" | "lduminalh" | "lduminlh" => {
             encode_ldop(mnemonic, operands)
         }
         // LSE atomic store aliases (Rt=XZR, discard result)
@@ -1644,16 +1893,121 @@ pub fn encode_instruction(
 
 // ── Encoding helpers ──────────────────────────────────────────────────────
 
+/// Read a register operand as a *general-purpose* register: its number and
+/// whether it is 64-bit.
+///
+/// This used to be `parse_reg_num` + `is_64bit_reg`, which between them accept
+/// every register spelling the parser can produce -- `parse_reg_num` collapses
+/// `d0`, `s0`, `h0`, `b0`, `q0` and `v0` onto the same number as `x0`. A
+/// caller therefore had no way to say "GP slot" and no way to be told it had
+/// been handed a floating-point register: `mul d0, x1, x2` parsed `d0` as
+/// register 0 within the *GP* multiply and emitted `mul x0, x1, x2`. The
+/// 1,624-row `sweep register class` group in the operand-legality matrix
+/// exists to pin every such slot, and it found 401 of them.
+///
+/// The GP grammar is now exactly [`GpReg::by_name`]'s -- `x0`-`x30`,
+/// `w0`-`w30`, `lr`, `sp`/`wsp`, `xzr`/`wzr` -- so a floating-point or vector
+/// spelling is refused here, at the operand that has it, and the message names
+/// the two grammars instead of the number the parser collapsed it onto.
+/// Callers that own a *floating-point* slot want [`fp_reg`]; the ones that own
+/// a slot which genuinely accepts both register files (the `LDR`/`STR` data
+/// register, `FMOV`'s mixed forms, `MRS`/`MSR`'s numerics) ask for what they
+/// mean explicitly.
 pub(crate) fn get_reg(operands: &[Operand], idx: usize) -> Result<(u32, bool), String> {
     match operands.get(idx) {
-        Some(Operand::Reg(name)) => {
-            let num = parse_reg_num(name).ok_or_else(|| format!("invalid register: {}", name))?;
-            let is_64 = is_64bit_reg(name);
-            Ok((num, is_64))
-        }
+        Some(Operand::Reg(name)) => match GpReg::by_name(name) {
+            Some(r) => Ok((r.num, r.is_64)),
+            None => Err(format!(
+                "operand {idx} `{name}` is not a general-purpose register; this slot \
+                 takes x0-x30, w0-w30, lr, sp, wsp, xzr or wzr{}",
+                if is_fp_spelling_pub(name) {
+                    format!(
+                        " (`{name}` is a floating-point/SIMD register, which is a \
+                         different register file -- check the instruction's form)"
+                    )
+                } else {
+                    String::new()
+                }
+            )),
+        },
         other => Err(format!(
             "expected register at operand {}, got {:?}",
             idx, other
+        )),
+    }
+}
+
+/// Read a register operand as a floating-point/SIMD register: its number and
+/// its width letter, lower-cased.
+///
+/// Returns the letter (`b`, `h`, `s`, `d`, `q` or `v`) rather than a width
+/// enum because the families disagree about which of them are *spellable*:
+/// scalar arithmetic takes `h`/`s`/`d` only, rounding-precision conversions
+/// add `h`, the load/store data register takes all six, and `v<n>` without an
+/// arrangement is only legal where the form does not need one.  Deciding that
+/// at the call site keeps the reader honest about the class and leaves each
+/// family's own grammar visible where it is enforced.
+pub(crate) fn fp_reg(
+    operands: &[Operand],
+    idx: usize,
+    mn: &str,
+) -> Result<(u32, u8, String), String> {
+    let name = match operands.get(idx) {
+        Some(Operand::Reg(n)) => n.as_str(),
+        Some(_) => {
+            return Err(format!(
+                "{mn}: operand {idx} must be a register, not an immediate or memory operand"
+            ));
+        }
+        None => return Err(format!("{mn}: missing operand {idx} (expected a register)")),
+    };
+    let lower = name.to_ascii_lowercase();
+    let Some((&first, rest)) = lower.as_bytes().split_first() else {
+        return Err(format!("{mn}: operand {idx} is an empty register name"));
+    };
+    if !matches!(first, b'b' | b'h' | b's' | b'd' | b'q' | b'v') || rest.is_empty() {
+        return Err(format!(
+            "{mn}: operand {idx} `{name}` is not a floating-point register; this slot \
+             takes b0-b31, h0-h31, s0-s31, d0-d31, q0-q31 or v0-v31, and `{name}` is a \
+             general-purpose register if it is a register at all"
+        ));
+    }
+    if rest.len() > 2
+        || !rest.iter().all(u8::is_ascii_digit)
+        || (rest.len() == 2 && rest[0] == b'0')
+    {
+        return Err(format!(
+            "{mn}: operand {idx} `{name}` is not a canonical register number"
+        ));
+    }
+    let mut num = 0u32;
+    for &d in rest {
+        num = num * 10 + u32::from(d - b'0');
+    }
+    if num > 31 {
+        return Err(format!(
+            "{mn}: operand {idx} `{name}` is out of range; the register file has 32 \
+             registers (0-31)"
+        ));
+    }
+    Ok((num, first, name.to_string()))
+}
+
+/// The scalar-FP `type` field for a width letter.
+///
+/// ```text
+/// S (single, 32-bit) -> 0b00
+/// D (double, 64-bit) -> 0b01
+/// H (half, 16-bit)  -> 0b11
+/// ```
+pub(crate) fn fp_ftype_letter(letter: u8, mn: &str) -> Result<u32, String> {
+    match letter {
+        b's' => Ok(0b00),
+        b'd' => Ok(0b01),
+        b'h' => Ok(0b11),
+        _ => Err(format!(
+            "{mn}: this instruction has no `{}`-register form; it takes h, s or d",
+            char::from(letter)
         )),
     }
 }
@@ -1756,5 +2110,87 @@ mod parse_reg_num_tests {
         assert_eq!(parse_reg_num("x01"), None);
         assert_eq!(parse_reg_num("x007"), None);
         assert_eq!(parse_reg_num("x030"), None);
+    }
+}
+
+#[cfg(test)]
+mod register_class_tests {
+    use super::*;
+
+    fn reg(r: &str) -> Operand {
+        Operand::Reg(r.to_string())
+    }
+    fn cond(c: &str) -> Operand {
+        Operand::Cond(c.to_string())
+    }
+    fn enc(mn: &str, ops: &[Operand]) -> u32 {
+        match encode_instruction(mn, ops, "") {
+            Ok(EncodeResult::Word(w)) => w,
+            Ok(other) => panic!("{mn}: expected a single word, got {other:?}"),
+            Err(e) => panic!("{mn}: expected an encoding, got error: {e}"),
+        }
+    }
+
+    /// ADC/SBC have one `sf` for all three slots, and every slot reads
+    /// encoding 31 as the zero register.  All four of those facts used to be
+    /// fail-open: SP in the destination and in the third operand assembled as
+    /// the zero register, and a 32-bit operand next to 64-bit ones was ignored.
+    #[test]
+    fn add_subtract_with_carry_is_one_width_and_refuses_the_stack_pointer() {
+        assert_eq!(enc("adc", &[reg("xzr"), reg("x1"), reg("x2")]), 0x9a02003f);
+        assert_eq!(enc("adc", &[reg("x0"), reg("xzr"), reg("x2")]), 0x9a0203e0);
+        assert_eq!(enc("adc", &[reg("x0"), reg("x1"), reg("xzr")]), 0x9a1f0020);
+        assert_eq!(enc("adcs", &[reg("wzr"), reg("w1"), reg("w2")]), 0x3a02003f);
+        assert_eq!(enc("sbc", &[reg("x0"), reg("x1"), reg("xzr")]), 0xda1f0020);
+        assert_eq!(enc("sbc", &[reg("wzr"), reg("w1"), reg("w2")]), 0x5a02003f);
+        assert_eq!(enc("sbcs", &[reg("wzr"), reg("w1"), reg("w2")]), 0x7a02003f);
+        for (mn, ops) in [
+            ("adc", vec![reg("sp"), reg("x1"), reg("x2")]),
+            ("adc", vec![reg("wsp"), reg("w1"), reg("w2")]),
+            ("adc", vec![reg("x0"), reg("x1"), reg("sp")]),
+            ("adc", vec![reg("x0"), reg("x1"), reg("w0")]),
+            ("adc", vec![reg("w0"), reg("x1"), reg("x2")]),
+            ("adc", vec![reg("xzr"), reg("x1"), reg("w2")]),
+            ("sbc", vec![reg("x0"), reg("x1"), reg("wzr")]),
+        ] {
+            assert!(
+                encode_instruction(mn, &ops, "").is_err(),
+                "{mn} {ops:?} has no encoding"
+            );
+        }
+    }
+
+    /// The conditional-select aliases: the destination is an `Rd|XZR` slot and
+    /// the two register operands share one width, so `cset sp, eq` (which used
+    /// to assemble as `cset xzr, eq`) and the mixed-width forms are refused.
+    #[test]
+    fn conditional_selects_refuse_the_stack_pointer() {
+        assert_eq!(enc("cset", &[reg("xzr"), cond("eq")]), 0x9a9f17ff);
+        assert_eq!(enc("csetm", &[reg("wzr"), cond("ne")]), 0x5a9f03ff);
+        assert_eq!(
+            enc("cinc", &[reg("xzr"), reg("x1"), cond("eq")]),
+            0x9a81143f
+        );
+        assert_eq!(
+            enc("cinv", &[reg("x0"), reg("xzr"), cond("eq")]),
+            0xda9f13e0
+        );
+        assert_eq!(
+            enc("cneg", &[reg("xzr"), reg("xzr"), cond("eq")]),
+            0xda9f17ff
+        );
+        for (mn, ops) in [
+            ("cset", vec![reg("sp"), cond("eq")]),
+            ("csetm", vec![reg("wsp"), cond("ne")]),
+            ("cinc", vec![reg("sp"), reg("x1"), cond("eq")]),
+            ("cinc", vec![reg("w0"), reg("x1"), cond("eq")]),
+            ("cinv", vec![reg("xzr"), reg("w1"), cond("eq")]),
+            ("cneg", vec![reg("w0"), reg("x1"), cond("eq")]),
+        ] {
+            assert!(
+                encode_instruction(mn, &ops, "").is_err(),
+                "{mn} {ops:?} has no encoding"
+            );
+        }
     }
 }

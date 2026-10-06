@@ -392,7 +392,8 @@ def run(cmd: Sequence[str], env: Optional[dict] = None, timeout: int = 600) -> s
 
 
 def compile_and_run(compiler: str, flags: Sequence[str], src: Path, exe: Path,
-                    env_extra: Optional[dict] = None) -> Tuple[bool, str]:
+                    env_extra: Optional[dict] = None,
+                    run_timeout: int = 60) -> Tuple[bool, str]:
     env = dict(os.environ)
     if env_extra:
         env.update(env_extra)
@@ -400,9 +401,14 @@ def compile_and_run(compiler: str, flags: Sequence[str], src: Path, exe: Path,
     if cp.returncode != 0:
         return False, f"COMPILE FAILED ({compiler}):\n{cp.stderr[-4000:]}"
     try:
-        rp = run([str(exe)], timeout=60)
+        rp = run([str(exe)], timeout=run_timeout)
     except subprocess.TimeoutExpired:
         return False, f"RUN TIMEOUT ({compiler})"
+    except OSError as e:
+        # The driver reported success but produced no runnable image (a
+        # `-fsyntax-only`-style reference, or a driver that exited 0 after a
+        # silent failure).  That is an unusable arm, not a traceback.
+        return False, f"NO EXECUTABLE ({compiler}): {e}"
     if rp.returncode != 0:
         return False, f"RUN FAILED ({compiler}) rc={rp.returncode}\n{rp.stderr[-2000:]}"
     return True, rp.stdout
@@ -426,6 +432,8 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=None, help="cap on configurations (default: all)")
     ap.add_argument("--seed", type=int, default=1, help="shuffle seed for --limit sampling")
     ap.add_argument("--keep", default=None, help="directory to keep failing programs in")
+    ap.add_argument("--run-timeout", type=int, default=60,
+                    help="seconds allowed per arm run (default: 60)")
     ap.add_argument("--no-gcc", action="store_true", help="skip the independent reference arm")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
@@ -454,9 +462,23 @@ def main() -> int:
                 arms["gcc-O0"] = (args.gcc, ["-O0", "-w"], None)
             outputs = {}
             bad = []
+            # A reference arm that cannot produce output says nothing about
+            # lccc: the generated stress programs are deliberately long, and
+            # `gcc -O0` on one of them can exceed any sane timeout.  Counting
+            # that as a batch failure used to surface in
+            # scripts/fuzz_diff.py's stress_suite engine as
+            # "[LCCC_CRASH] unroll_stress ... [gcc-O0] RUN TIMEOUT (gcc)" --
+            # a crash report for a compiler that had not crashed.  Reference
+            # arms are therefore reported as inconclusive skips; the arms
+            # *under test* (lccc-on / lccc-off) keep failing the batch.
+            skips = []
             for name, (cc, fl, env) in arms.items():
-                ok, out = compile_and_run(cc, fl, src, tmp / f"{src.stem}.{name}", env)
+                ok, out = compile_and_run(cc, fl, src, tmp / f"{src.stem}.{name}",
+                                          env, args.run_timeout)
                 if not ok:
+                    if name.startswith("gcc"):
+                        skips.append(f"[{name}] {out}")
+                        continue
                     bad.append(f"[{name}] {out}")
                     continue
                 outputs[name] = parse_results(out)
@@ -468,6 +490,9 @@ def main() -> int:
                     if len(set(vals.values())) > 1:
                         mism.append((cfg, vals))
             checked += len(batch)
+            for sk in skips:
+                print(f"  [SKIP] {src.name}: reference arm inconclusive: {sk}",
+                      flush=True)
             if bad or mism:
                 failures += len(mism) + len(bad)
                 print(f"\n=== FAIL batch {src.name} ===")

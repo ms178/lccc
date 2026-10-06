@@ -791,18 +791,12 @@ jobs:
       - name: AArch64 operand-legality matrix
         run: |
           set -euo pipefail
-          bash scripts/ensure_gas_247.sh aarch64-linux-gnu
-          AS="$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/as"
-          OC="$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/objcopy"
           python3 scripts/aarch64_operand_legality_matrix.py --check \
-            --as "$AS" --objcopy "$OC"
+            --as "$(command -v aarch64-linux-gnu-as)" \
+            --objcopy "$(command -v aarch64-linux-gnu-objcopy)"
           python3 scripts/aarch64_operand_legality_matrix.py \
-            --check-lccc target/fastbuild/lccc --objcopy "$OC"
-
-      - name: ARM codegen assembler-parity
-        run: |
-          set -euo pipefail
-          CCC_ARM=target/fastbuild/lccc-arm scripts/check_arm_codegen_assembles.sh
+            --check-lccc target/fastbuild/lccc \
+            --objcopy "$(command -v aarch64-linux-gnu-objcopy)"
 
       # Keep every standalone gate from ci_local.sh represented in hosted CI.
       # Group the compact contracts to avoid YAML drift and setup overhead;

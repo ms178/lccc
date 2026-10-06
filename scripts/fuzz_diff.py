@@ -645,7 +645,8 @@ def run_stress_suite(
               + ", ".join(label for label, _ in combos))
 
     def evaluate_stress(test_id: str, unit: CompileUnit,
-                        env_extra: dict[str, str]) -> DiffResult:
+                        env_extra: dict[str, str],
+                        extra_cflags: list[str]) -> DiffResult:
         return evaluate_single_test(
             test_id,
             unit,
@@ -653,20 +654,34 @@ def run_stress_suite(
             ref_compilers,
             opt_levels,
             runner,
-            [],
+            extra_cflags,
             repro_dir,
             compile_timeout,
             run_timeout,
             env_extra=env_extra,
         )
 
-    # (name, script) for stdout generators; each takes the case seed as argv[1].
+    # (name, script, flags) for stdout generators; each takes the case seed as
+    # argv[1].
+    #
+    # `gen_fp_stress` is pinned to `-ffp-contract=off` for BOTH compilers.
+    # LCCC's documented default code-generation baseline is x86-64-v3, which
+    # includes FMA3, so `a*b + c` is contracted into a real `vfmadd*sd`; the
+    # reference `/usr/bin/gcc` targets baseline x86-64, where FMA does not
+    # exist, so it cannot contract even though C's default
+    # `-ffp-contract=fast` would allow it.  Both answers are conforming C, and
+    # they differ by 1 ulp — a fuzz harness comparing them would report
+    # contraction policy as a miscompile (four `gen_fp_stress` seeds did).
+    # Pinning contraction makes the comparison measure arithmetic instead of
+    # policy; verified: with `-ffp-contract=off` lccc and gcc agree
+    # bit-for-bit on the reproducers in the harness's repro directory.
     generators = [
-        ("gen_fp_stress", REPO / "scripts" / "gen_fp_stress.py"),
-        ("gen_gep_stress", REPO / "scripts" / "gen_gep_chain_stress.py"),
-        ("gen_slot_stress", REPO / "scripts" / "gen_slot_stress.py"),
+        ("gen_fp_stress", REPO / "scripts" / "gen_fp_stress.py",
+         ["-ffp-contract=off"]),
+        ("gen_gep_stress", REPO / "scripts" / "gen_gep_chain_stress.py", []),
+        ("gen_slot_stress", REPO / "scripts" / "gen_slot_stress.py", []),
     ]
-    for name, script_path in generators:
+    for name, script_path, gen_flags in generators:
         if not script_path.exists():
             continue
         for i in range(count):
@@ -686,7 +701,8 @@ def run_stress_suite(
             unit = CompileUnit(files={"test.c": code})
             for label, combo_env in combos:
                 combo_id = test_id if len(combos) == 1 else f"{test_id}[{label}]"
-                results.append(evaluate_stress(combo_id, unit, combo_env))
+                results.append(evaluate_stress(combo_id, unit, combo_env,
+                                               gen_flags))
 
     # Self-contained differential tester: its own exit code is the verdict.
     # Bounded sample (12 configurations in one TU = 3 compile+run arms); the

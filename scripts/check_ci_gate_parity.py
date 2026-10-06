@@ -402,6 +402,8 @@ def program_args(tokens: list[str], program: str) -> list[str] | None:
 # exists to prevent, so the check is equality, not containment.
 PINNED_AS = "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"
 PINNED_OBJDUMP = "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump"
+PINNED_A64_AS = "$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/as"
+PINNED_A64_OBJCOPY = "$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/objcopy"
 
 
 @dataclass(frozen=True)
@@ -505,6 +507,50 @@ INVOCATION_CONTRACTS: tuple[InvocationContract, ...] = (
         local_gate=("i686-asm-diff", "fast"),
     ),
     InvocationContract(
+        program="scripts/aarch64_operand_legality_matrix.py",
+        name="aarch64-operand-legality-table",
+        sides=_BOTH,
+        option_spec={
+            "--as": (PINNED_A64_AS,),
+            "--objcopy": (PINNED_A64_OBJCOPY,),
+        },
+        rest_spec=("--check",),
+        local_gate=("aarch64-operand-legality", "fast"),
+    ),
+    InvocationContract(
+        program="scripts/aarch64_operand_legality_matrix.py",
+        name="aarch64-operand-legality-encoder",
+        sides=_BOTH,
+        option_spec={
+            "--objcopy": (PINNED_A64_OBJCOPY,),
+        },
+        rest_spec=("--check-lccc", "target/fastbuild/lccc"),
+        local_gate=("aarch64-operand-legality-encoder", "fast"),
+    ),
+    InvocationContract(
+        program="scripts/aarch64_legality_probe_differ.py",
+        name="aarch64-legality-probe",
+        sides=_BOTH,
+        option_spec={
+            "--lccc": ("target/fastbuild/lccc",),
+            "--as": (PINNED_A64_AS,),
+            "--objcopy": (PINNED_A64_OBJCOPY,),
+        },
+        local_gate=("aarch64-legality-probe", "fast"),
+    ),
+    InvocationContract(
+        program="scripts/aarch64_sysreg_table.py",
+        name="aarch64-sysreg-table",
+        sides=_BOTH,
+        option_spec={
+            "--as": (PINNED_A64_AS,),
+            "--objcopy": (PINNED_A64_OBJCOPY,),
+            "--lccc": ("target/fastbuild/lccc",),
+        },
+        rest_spec=("--check",),
+        local_gate=("aarch64-sysreg-table", "fast"),
+    ),
+    InvocationContract(
         program="scripts/encdiff.py",
         name="encdiff-corpus",
         sides=_BOTH,
@@ -528,8 +574,9 @@ INVOCATION_CONTRACTS: tuple[InvocationContract, ...] = (
     InvocationContract(
         program="scripts/ensure_gas_247.sh",
         name="gas-provision-aarch64",
-        sides=frozenset({"hosted"}),
+        sides=_BOTH,
         rest_spec=("aarch64-linux-gnu",),
+        local_gate=("a64-gas-provision", "fast"),
     ),
     InvocationContract(
         program="scripts/ensure_gas_247.sh",

@@ -30,6 +30,69 @@ fn is_fp_spelling(name: &str) -> bool {
         && !(rest.len() == 2 && rest[0] == b'0')
 }
 
+/// The mnemonic for a scalar-FP arithmetic opcode field, for diagnostics.
+///
+/// The dispatcher passes the field, not the name; a diagnostic that says
+/// "fadd: `s0` and `d1` are different widths" is worth the four lines, and a
+/// diagnostic that says "fp_arith: ..." is not.
+const fn fp_arith_name(opcode: u32) -> &'static str {
+    match opcode {
+        0b0000 => "fmul",
+        0b0001 => "fdiv",
+        0b0010 => "fadd",
+        0b0011 => "fsub",
+        0b0100 => "fmax",
+        0b0101 => "fmin",
+        0b0110 => "fmaxnm",
+        0b0111 => "fminnm",
+        _ => "scalar-FP arithmetic",
+    }
+}
+
+/// Read `n` floating-point register operands that must all share one width.
+///
+/// Every scalar-FP form carries a single `type` field, so the operand widths
+/// are not independent: `fadd s0, d1, d2` has no encoding, and the encoder
+/// used to accept it and emit `fadd s0, s1, s2` -- the widths of the *source*
+/// operands were simply not read.  Reading them here makes the check a
+/// property of the reader rather than a rule each of the eleven arithmetic
+/// encoders has to remember, and it is what the `sweep register class` rows
+/// like `fadd s0, d1, d2` / `fadd s0, d1, d1` pin.
+///
+/// Returns the register numbers and the shared width letter.
+fn fp_same_width(operands: &[Operand], n: usize, mn: &str) -> Result<(Vec<u32>, u8), String> {
+    let mut nums = Vec::with_capacity(n);
+    let mut letter = 0u8;
+    let mut first_name = String::new();
+    for i in 0..n {
+        let (num, l, name) = fp_reg(operands, i, mn)?;
+        if i == 0 {
+            letter = l;
+            first_name = name;
+        } else if l != letter {
+            return Err(format!(
+                "{mn}: `{first_name}` and `{name}` are different floating-point widths; \
+                 this instruction has one type field, so every register operand of {mn} \
+                 must be the same size (`{}`-register form or `{}`-register form)",
+                char::from(letter),
+                char::from(l)
+            ));
+        }
+        nums.push(num);
+    }
+    Ok((nums, letter))
+}
+
+/// Read the integer operand of a conversion.
+///
+/// `FCVTZS Wd, Sn`, `SCVTF Sd, Wn` and their relatives take `Wd|Xd` / `Wn|Xn`
+/// with encoding 31 read as the *zero* register -- never the stack pointer,
+/// which is what `reg_operand(..., GpRole::RegOrZr, ..)` enforces.
+fn fp_conv_gp(operands: &[Operand], idx: usize, mn: &str) -> Result<(u32, bool), String> {
+    let r = reg_operand(operands, idx, GpRole::RegOrZr, mn)?;
+    Ok((r.num, r.is_64))
+}
+
 /// FMOV between two FP registers.
 ///
 /// This is a *same-width* move: the instruction carries a single `type` field,
@@ -170,15 +233,10 @@ pub(crate) fn encode_fmov(operands: &[Operand]) -> Result<EncodeResult, String> 
 }
 
 pub(crate) fn encode_fp_arith(operands: &[Operand], opcode: u32) -> Result<EncodeResult, String> {
-    let (rd, _) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-    let (rm, _) = get_reg(operands, 2)?;
-
-    let rd_name = match &operands[0] {
-        Operand::Reg(r) => r.to_lowercase(),
-        _ => String::new(),
-    };
-    let ftype = fp_ftype(&rd_name)?;
+    let mn = fp_arith_name(opcode);
+    let (regs, letter) = fp_same_width(operands, 3, mn)?;
+    let (rd, rn, rm) = (regs[0], regs[1], regs[2]);
+    let ftype = fp_ftype_letter(letter, mn)?;
 
     // 0 00 11110 ftype 1 Rm opcode 10 Rn Rd
     let word = (0b00011110 << 24)
@@ -193,13 +251,9 @@ pub(crate) fn encode_fp_arith(operands: &[Operand], opcode: u32) -> Result<Encod
 }
 
 pub(crate) fn encode_fneg(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, _) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-    let rd_name = match &operands[0] {
-        Operand::Reg(r) => r.to_lowercase(),
-        _ => String::new(),
-    };
-    let ftype = fp_ftype(&rd_name)?;
+    let (regs, letter) = fp_same_width(operands, 2, "fneg")?;
+    let (rd, rn) = (regs[0], regs[1]);
+    let ftype = fp_ftype_letter(letter, "fneg")?;
     // FNEG: 0 00 11110 ftype 1 0000 10 10000 Rn Rd
     let word =
         (0b00011110 << 24) | (ftype << 22) | (0b100001 << 16) | (0b10000 << 10) | (rn << 5) | rd;
@@ -207,13 +261,9 @@ pub(crate) fn encode_fneg(operands: &[Operand]) -> Result<EncodeResult, String> 
 }
 
 pub(crate) fn encode_fabs(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, _) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-    let rd_name = match &operands[0] {
-        Operand::Reg(r) => r.to_lowercase(),
-        _ => String::new(),
-    };
-    let ftype = fp_ftype(&rd_name)?;
+    let (regs, letter) = fp_same_width(operands, 2, "fabs")?;
+    let (rd, rn) = (regs[0], regs[1]);
+    let ftype = fp_ftype_letter(letter, "fabs")?;
     // FABS: 0 00 11110 ftype 1 0000 01 10000 Rn Rd
     let word =
         (0b00011110 << 24) | (ftype << 22) | (0b100000 << 16) | (0b110000 << 10) | (rn << 5) | rd;
@@ -221,13 +271,9 @@ pub(crate) fn encode_fabs(operands: &[Operand]) -> Result<EncodeResult, String> 
 }
 
 pub(crate) fn encode_fsqrt(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, _) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-    let rd_name = match &operands[0] {
-        Operand::Reg(r) => r.to_lowercase(),
-        _ => String::new(),
-    };
-    let ftype = fp_ftype(&rd_name)?;
+    let (regs, letter) = fp_same_width(operands, 2, "fsqrt")?;
+    let (rd, rn) = (regs[0], regs[1]);
+    let ftype = fp_ftype_letter(letter, "fsqrt")?;
     // FSQRT: 0 00 11110 ftype 1 0000 11 10000 Rn Rd
     let word =
         (0b00011110 << 24) | (ftype << 22) | (0b100001 << 16) | (0b110000 << 10) | (rn << 5) | rd;
@@ -237,13 +283,9 @@ pub(crate) fn encode_fsqrt(operands: &[Operand]) -> Result<EncodeResult, String>
 /// Encode FP 1-source ops: FRINTN/P/M/Z/A/X/I
 /// Format: 0 00 11110 ftype 1 opcode 10000 Rn Rd
 pub(crate) fn encode_fp_1src(operands: &[Operand], opcode: u32) -> Result<EncodeResult, String> {
-    let (rd, _) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-    let rd_name = match &operands[0] {
-        Operand::Reg(r) => r.to_lowercase(),
-        _ => String::new(),
-    };
-    let ftype = fp_ftype(&rd_name)?;
+    let (regs, letter) = fp_same_width(operands, 2, "frint*")?;
+    let (rd, rn) = (regs[0], regs[1]);
+    let ftype = fp_ftype_letter(letter, "frint*")?;
     let word = (0b00011110u32 << 24)
         | (ftype << 22)
         | (1 << 21)
@@ -284,15 +326,10 @@ pub(crate) fn encode_fmadd_fmsub(
     operands: &[Operand],
     is_sub: bool,
 ) -> Result<EncodeResult, String> {
-    let (rd, _) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-    let (rm, _) = get_reg(operands, 2)?;
-    let (ra, _) = get_reg(operands, 3)?;
-    let rd_name = match &operands[0] {
-        Operand::Reg(r) => r.to_lowercase(),
-        _ => String::new(),
-    };
-    let ftype = fp_ftype(&rd_name)?;
+    let mn = if is_sub { "fmsub" } else { "fmadd" };
+    let (regs, letter) = fp_same_width(operands, 4, mn)?;
+    let (rd, rn, rm, ra) = (regs[0], regs[1], regs[2], regs[3]);
+    let ftype = fp_ftype_letter(letter, mn)?;
     let o1 = if is_sub { 1u32 } else { 0 };
     let word = (0b00011111u32 << 24)
         | (ftype << 22)
@@ -310,15 +347,10 @@ pub(crate) fn encode_fnmadd_fnmsub(
     operands: &[Operand],
     is_sub: bool,
 ) -> Result<EncodeResult, String> {
-    let (rd, _) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-    let (rm, _) = get_reg(operands, 2)?;
-    let (ra, _) = get_reg(operands, 3)?;
-    let rd_name = match &operands[0] {
-        Operand::Reg(r) => r.to_lowercase(),
-        _ => String::new(),
-    };
-    let ftype = fp_ftype(&rd_name)?;
+    let mn = if is_sub { "fnmsub" } else { "fnmadd" };
+    let (regs, letter) = fp_same_width(operands, 4, mn)?;
+    let (rd, rn, rm, ra) = (regs[0], regs[1], regs[2], regs[3]);
+    let ftype = fp_ftype_letter(letter, mn)?;
     let o1 = if is_sub { 1u32 } else { 0 };
     let word = (0b00011111u32 << 24)
         | (ftype << 22)
@@ -332,12 +364,8 @@ pub(crate) fn encode_fnmadd_fnmsub(
 }
 
 pub(crate) fn encode_fcmp(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rn, _) = get_reg(operands, 0)?;
-    let rn_name = match &operands[0] {
-        Operand::Reg(r) => r.to_lowercase(),
-        _ => String::new(),
-    };
-    let ftype = fp_ftype(&rn_name)?;
+    let (rn, letter, _) = fp_reg(operands, 0, "fcmp")?;
+    let ftype = fp_ftype_letter(letter, "fcmp")?;
 
     // FCMP Dn, #0.0
     if operands.len() < 2 || matches!(operands.get(1), Some(Operand::Imm(0))) {
@@ -348,7 +376,16 @@ pub(crate) fn encode_fcmp(operands: &[Operand]) -> Result<EncodeResult, String> 
         return Ok(EncodeResult::Word(word));
     }
 
-    let (rm, _) = get_reg(operands, 1)?;
+    let (rm, rm_letter, rm_name) = fp_reg(operands, 1, "fcmp")?;
+    if rm_letter != letter {
+        return Err(format!(
+            "fcmp: the two operands must be the same floating-point width \
+             (`{}`-register form and `{}`-register form given)",
+            char::from(letter),
+            char::from(rm_letter)
+        ));
+    }
+    let _ = rm_name;
     // FCMP Dn, Dm: 0 00 11110 ftype 1 Rm 00 1000 Rn 00 000
     let word =
         (0b00011110 << 24) | (ftype << 22) | (1 << 21) | (rm << 16) | (0b001000 << 10) | (rn << 5);
@@ -420,21 +457,16 @@ pub(crate) fn encode_fcvt_rounding(
     if operands.len() < 2 {
         return Err("fcvt* requires 2 operands".to_string());
     }
-    let (rd, rd_is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-
-    let src_name = match &operands[1] {
-        Operand::Reg(name) => name.to_lowercase(),
-        _ => return Err("fcvt*: expected register source".to_string()),
-    };
+    let what = fcvt_rounding_name(rmode, opcode);
+    let (rd, rd_is_64) = fp_conv_gp(operands, 0, what)?;
+    let (rn, src_letter, _) = fp_reg(operands, 1, what)?;
     // ftype: 00=S source, 01=D source, 11=H source.
     // The `h` case was missing, so `fcvtzu w4, h17, #13` converted a
     // single-precision value it did not have instead of the half-precision one
     // it was given.
-    let ftype = fp_ftype(&src_name)?;
+    let ftype = fp_ftype_letter(src_letter, what)?;
     let sf: u32 = if rd_is_64 { 1 } else { 0 };
 
-    let what = fcvt_rounding_name(rmode, opcode);
     // Only FCVTZS and FCVTZU have a fixed-point form; the other eight rounding
     // modes are integer-only. GAS rejects `fcvtas w1,s2,#8`, and so must we --
     // accepting it would encode a rounding mode the hardware does not have.
@@ -481,19 +513,14 @@ pub(crate) fn encode_int_to_float(
     if operands.len() < 2 {
         return Err("scvtf/ucvtf requires 2 operands".to_string());
     }
-    let (rd, _) = get_reg(operands, 0)?;
-    let (rn, rn_is_64) = get_reg(operands, 1)?;
-
-    let dst_name = match &operands[0] {
-        Operand::Reg(name) => name.to_lowercase(),
-        _ => return Err("scvtf/ucvtf: expected register dest".to_string()),
-    };
+    let what = if is_signed { "scvtf" } else { "ucvtf" };
+    let (rd, dst_letter, _) = fp_reg(operands, 0, what)?;
+    let (rn, rn_is_64) = fp_conv_gp(operands, 1, what)?;
     // ftype: 00=S destination, 01=D destination, 11=H destination.
-    let ftype = fp_ftype(&dst_name)?;
+    let ftype = fp_ftype_letter(dst_letter, what)?;
     let sf: u32 = if rn_is_64 { 1 } else { 0 };
     let opcode: u32 = if is_signed { 0b010 } else { 0b011 };
 
-    let what = if is_signed { "scvtf" } else { "ucvtf" };
     let (bit21, scale) = fp_fbits_field(operands, if rn_is_64 { 64 } else { 32 }, what)?;
 
     let word = (((sf << 31) | (0b11110 << 24) | (ftype << 22) | (bit21 << 21)) | (opcode << 16))
@@ -501,6 +528,146 @@ pub(crate) fn encode_int_to_float(
         | (rn << 5)
         | rd;
     Ok(EncodeResult::Word(word))
+}
+
+/// Base words (`s`/`d` form, `h` form) of the twelve scalar SIMD&FP
+/// conversions whose two operands live in one register file at one width.
+///
+/// `fcvtms s0, s1` is *not* `fcvtms w0, s1` with an odd destination: it is the
+/// scalar register-file form, and the rounding mode is baked into the opcode
+/// field instead of living in a `rmode` field, so every mnemonic has a base of
+/// its own.  The `h` form is a separate base as well, because its element-size
+/// field is the half-precision one and not the `size` bit of the `s`/`d` pair.
+///
+/// Each base below is the value binutils' own AArch64 encoding table gives
+/// (`opcodes/aarch64-tbl.h`, `SIMD_INSN`/`SF16_INSN` with class `asisdmisc`
+/// and qualifier `QL_S_2SAMESD`/`QL_S_2SAMEH`), and the mask that comes with it
+/// — 0xffbffc00 for the `s`/`d` base, 0xfffffc00 for the `h` one — says
+/// exactly what the encoder varies: bit 22 (`size`, `s` = 0, `d` = 1) and the
+/// two register fields.  GNU as 2.47 assembles `fcvtms s0,s1` to 0x5e21b820,
+/// `fcvtms d0,d1` to 0x5e61b820 and `fcvtms h0,h1` to 0x5e79b820: these bases
+/// with both register fields zero.
+const FCVT_SIMD_SCALAR_BASES: &[(&str, u32, u32)] = &[
+    ("fcvtns", 0x5e21a800, 0x5e79a800),
+    ("fcvtnu", 0x7e21a800, 0x7e79a800),
+    ("fcvtps", 0x5ea1a800, 0x5ef9a800),
+    ("fcvtpu", 0x7ea1a800, 0x7ef9a800),
+    ("fcvtms", 0x5e21b800, 0x5e79b800),
+    ("fcvtmu", 0x7e21b800, 0x7e79b800),
+    ("fcvtzs", 0x5ea1b800, 0x5ef9b800),
+    ("fcvtzu", 0x7ea1b800, 0x7ef9b800),
+    ("fcvtas", 0x5e21c800, 0x5e79c800),
+    ("fcvtau", 0x7e21c800, 0x7e79c800),
+    ("scvtf", 0x5e21d800, 0x5e79d800),
+    ("ucvtf", 0x7e21d800, 0x7e79d800),
+];
+
+/// `(mnemonic, name of the error's instruction)` for the twelve scalar
+/// SIMD&FP conversions above — the set the dispatcher hands to
+/// [`encode_fp_convert_scalar`] rather than to the general-purpose-destination
+/// encoders.
+pub(crate) fn is_scalar_fp_convert(name: &str) -> bool {
+    FCVT_SIMD_SCALAR_BASES.iter().any(|(m, _, _)| *m == name)
+}
+
+/// Encode a scalar SIMD&FP conversion: `fcvtms s0,s1`, `scvtf d0,d1`, and the
+/// fixed-point forms `fcvtzs s0,s1,#fbits` and `ucvtf h0,h1,#fbits`.
+///
+/// Both register operands are read from the floating-point register file and
+/// must be spelled at the same width; every mixed spelling (`fcvtms s0,d1`,
+/// `scvtf d0,s1`, `fcvtms s0,h1`) is refused by GNU as and has no encoding.
+/// The third operand, when present, is the fixed-point scale — a bit count, so
+/// its range is the element width, not the register number space — and only
+/// `fcvtzs`, `fcvtzu`, `scvtf` and `ucvtf` have that form.
+///
+/// The fixed-point field is the `immh`-style scale: `64 - fbits` for the `s`
+/// and `d` elements (with the element size as its top bit, so `d` reads
+/// `0x40 | (64 - fbits)`) and `32 - fbits` for a half-precision one, which is
+/// exactly how GNU as lays out `fcvtzs d0,d1,#7` (0x5f79fc20),
+/// `fcvtzs s0,s1,#32` (0x5f20fc20) and `fcvtzs h0,h1,#16` (0x5f10fc20).
+pub(crate) fn encode_fp_convert_scalar(
+    name: &str,
+    operands: &[Operand],
+) -> Result<EncodeResult, String> {
+    let (rd, dst_letter, dst_name) = fp_reg(operands, 0, name)?;
+    let (rn, src_letter, src_name) = fp_reg(operands, 1, name)?;
+    if !matches!(dst_letter, b'h' | b's' | b'd') {
+        return Err(format!(
+            "{name}: `{dst_name}` is not a 16/32/64-bit floating-point register; the \
+             scalar form takes h0-h31, s0-s31 or d0-d31 (a vector form needs an \
+             arrangement, for example `{name} v0.4s, v1.4s`)"
+        ));
+    }
+    if dst_letter != src_letter {
+        return Err(format!(
+            "{name}: `{dst_name}` and `{src_name}` have different floating-point widths; \
+             the scalar form of {name} converts within one width (h, s or d)"
+        ));
+    }
+    // The element width is the only width either operand is allowed to have,
+    // and it is also the fixed-point bit count's range.
+    let elem_bits: u32 = match dst_letter {
+        b'h' => 16,
+        b's' => 32,
+        _ => 64,
+    };
+
+    if operands.len() == 3 {
+        if !matches!(name, "fcvtzs" | "fcvtzu" | "scvtf" | "ucvtf") {
+            return Err(format!(
+                "{name} has no fixed-point form: the `#fbits` operand is only available \
+                 on fcvtzs, fcvtzu, scvtf and ucvtf"
+            ));
+        }
+        let fbits = match operands.get(2) {
+            Some(Operand::Imm(v)) => *v,
+            other => {
+                return Err(format!(
+                    "{name}: expected an immediate fbits operand at operand 3, got {other:?}"
+                ));
+            }
+        };
+        if !(1..=elem_bits as i64).contains(&fbits) {
+            return Err(format!(
+                "{name}: fbits must be in 1..={elem_bits} for a {elem_bits}-bit \
+                 floating-point operand, got {fbits}"
+            ));
+        }
+        // 64 - fbits, with the element size as the field's top bit for `d`;
+        // the half-precision element uses 32 - fbits, whose value always has
+        // the bit the `h` base sets.
+        let immh: u32 = match dst_letter {
+            b'h' => 32 - fbits as u32,
+            b's' => 64 - fbits as u32,
+            _ => 64 + (64 - fbits as u32),
+        };
+        let base: u32 = match name {
+            "fcvtzs" => 0x5f00fc00,
+            "fcvtzu" => 0x7f00fc00,
+            "scvtf" => 0x5f00e400,
+            _ => 0x7f00e400,
+        };
+        return Ok(EncodeResult::Word(base | (immh << 16) | (rn << 5) | rd));
+    }
+    if operands.len() != 2 {
+        return Err(format!(
+            "{name} takes 2 or 3 operands (Sd, Sn or Sd, Sn, #fbits), got {}",
+            operands.len()
+        ));
+    }
+
+    let (_, base_sd, base_h) = FCVT_SIMD_SCALAR_BASES
+        .iter()
+        .find(|(m, _, _)| *m == name)
+        .ok_or_else(|| format!("{name}: no scalar SIMD&FP encoding"))?;
+    // Bit 22 is `size`: the H form has no such bit and its own base instead.
+    let size = if dst_letter == b'd' { 1u32 << 22 } else { 0 };
+    let base = if dst_letter == b'h' {
+        *base_h
+    } else {
+        *base_sd
+    };
+    Ok(EncodeResult::Word(base | size | (rn << 5) | rd))
 }
 
 pub(crate) fn encode_fcvt_precision(operands: &[Operand]) -> Result<EncodeResult, String> {
@@ -511,30 +678,25 @@ pub(crate) fn encode_fcvt_precision(operands: &[Operand]) -> Result<EncodeResult
     if operands.len() < 2 {
         return Err("fcvt requires 2 operands".to_string());
     }
-    let (rd, _) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-
-    let dst_name = match &operands[0] {
-        Operand::Reg(name) => name.to_lowercase(),
-        _ => return Err("fcvt: expected register dest".to_string()),
-    };
-    let src_name = match &operands[1] {
-        Operand::Reg(name) => name.to_lowercase(),
-        _ => return Err("fcvt: expected register source".to_string()),
-    };
-
-    let ftype: u32 = match src_name.chars().next() {
-        Some('s') => 0b00,
-        Some('d') => 0b01,
-        Some('h') => 0b11,
-        _ => return Err(format!("fcvt: unsupported source type: {}", src_name)),
-    };
-    let opc: u32 = match dst_name.chars().next() {
-        Some('s') => 0b00,
-        Some('d') => 0b01,
-        Some('h') => 0b11,
-        _ => return Err(format!("fcvt: unsupported dest type: {}", dst_name)),
-    };
+    let (rd, dst_letter, dst_name) = fp_reg(operands, 0, "fcvt")?;
+    let (rn, src_letter, src_name) = fp_reg(operands, 1, "fcvt")?;
+    // FCVT is a *precision* conversion: it re-encodes a value in a different
+    // floating-point width, so the two operands must differ.  The instruction
+    // has no same-width form at all (that is what makes it an alias-free
+    // conversion rather than a rounding step), and GNU as refuses `fcvt s0,s1`
+    // exactly as it refuses `fcvt h0,h1` and `fcvt d0,d1`.  The old code took
+    // the two width letters independently and assembled all three, emitting an
+    // undefined encoding whose disassembly is `.inst`, not `fcvt`.
+    if dst_letter == src_letter {
+        return Err(format!(
+            "fcvt: `{dst_name}` and `{src_name}` are the same floating-point width; fcvt \
+             converts between widths (h to s, h to d, s to d and back), so the two \
+             operands must differ (for a same-width rounding conversion use fcvtms, \
+             fcvtns, fcvtas, fcvtzs, ...)"
+        ));
+    }
+    let ftype: u32 = fp_ftype_letter(src_letter, "fcvt")?;
+    let opc: u32 = fp_ftype_letter(dst_letter, "fcvt")?;
 
     let word = (0b00011110 << 24)
         | (ftype << 22)
@@ -650,6 +812,208 @@ mod fmov_gp_operand_tests {
                 !is_fp_spelling(name),
                 "`{name}` is not a canonical spelling"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod scalar_conversion_tests {
+    use super::*;
+
+    fn reg(name: &str) -> Operand {
+        Operand::Reg(name.to_string())
+    }
+    fn imm(v: i64) -> Operand {
+        Operand::Imm(v)
+    }
+    fn word(mn: &str, operands: &[Operand]) -> u32 {
+        match encode_fp_convert_scalar(mn, operands) {
+            Ok(EncodeResult::Word(w)) => w,
+            Ok(other) => panic!("{mn}: expected a single word, got {other:?}"),
+            Err(e) => panic!("{mn}: expected an encoding, got error: {e}"),
+        }
+    }
+    fn err(mn: &str, operands: &[Operand]) -> String {
+        match encode_fp_convert_scalar(mn, operands) {
+            Err(e) => e,
+            Ok(v) => panic!("{mn}: expected an error, got {v:?}"),
+        }
+    }
+
+    /// Every word below is GNU as 2.47's own output, and the bases come from
+    /// binutils' AArch64 encoding table.  All twelve mnemonics are checked at
+    /// all three widths, because "one base word per mnemonic" is a claim about
+    /// a family: a single spot check would not notice a base that is right for
+    /// `s` and wrong for `h`.
+    #[test]
+    fn two_operand_conversions_match_gnu_as() {
+        for (mn, s_word, d_word, h_word) in [
+            ("fcvtns", 0x5e21a820u32, 0x5e61a820, 0x5e79a820),
+            ("fcvtnu", 0x7e21a820, 0x7e61a820, 0x7e79a820),
+            ("fcvtps", 0x5ea1a820, 0x5ee1a820, 0x5ef9a820),
+            ("fcvtpu", 0x7ea1a820, 0x7ee1a820, 0x7ef9a820),
+            ("fcvtms", 0x5e21b820, 0x5e61b820, 0x5e79b820),
+            ("fcvtmu", 0x7e21b820, 0x7e61b820, 0x7e79b820),
+            ("fcvtzs", 0x5ea1b820, 0x5ee1b820, 0x5ef9b820),
+            ("fcvtzu", 0x7ea1b820, 0x7ee1b820, 0x7ef9b820),
+            ("fcvtas", 0x5e21c820, 0x5e61c820, 0x5e79c820),
+            ("fcvtau", 0x7e21c820, 0x7e61c820, 0x7e79c820),
+            ("scvtf", 0x5e21d820, 0x5e61d820, 0x5e79d820),
+            ("ucvtf", 0x7e21d820, 0x7e61d820, 0x7e79d820),
+        ] {
+            assert_eq!(word(mn, &[reg("s0"), reg("s1")]), s_word, "{mn} s0, s1");
+            assert_eq!(word(mn, &[reg("d0"), reg("d1")]), d_word, "{mn} d0, d1");
+            assert_eq!(word(mn, &[reg("h0"), reg("h1")]), h_word, "{mn} h0, h1");
+            // The register fields are the low 10 bits, in both halves: `Rn` is
+            // bits 9..5 and `Rd` bits 4..0, so a high-numbered pair proves the
+            // fields are placed rather than merely OR'd into the base.
+            assert_eq!(
+                word(mn, &[reg("s31"), reg("s30")]),
+                (s_word & !0x3FF) | (30 << 5) | 31,
+                "{mn} s31, s30"
+            );
+        }
+    }
+
+    /// The fixed-point forms, measured from GNU as at both ends of every
+    /// element width's range: the bit count is *inclusive* at the element width
+    /// (`#32` for a single, `#64` for a double, `#16` for a half) and its field
+    /// is the complement, with the element size as that field's top bit.
+    #[test]
+    fn fixed_point_forms_match_gnu_as() {
+        for (mn, w, f, want) in [
+            ("fcvtzs", "s", 1, 0x5f3ffc20u32),
+            ("fcvtzs", "s", 3, 0x5f3dfc20),
+            ("fcvtzs", "s", 32, 0x5f20fc20),
+            ("fcvtzs", "d", 7, 0x5f79fc20),
+            ("fcvtzs", "d", 64, 0x5f40fc20),
+            ("fcvtzs", "h", 1, 0x5f1ffc20),
+            ("fcvtzs", "h", 16, 0x5f10fc20),
+            ("fcvtzu", "s", 16, 0x7f30fc20),
+            ("fcvtzu", "h", 3, 0x7f1dfc20),
+            ("scvtf", "s", 3, 0x5f3de420),
+            ("scvtf", "d", 3, 0x5f7de420),
+            ("ucvtf", "s", 32, 0x7f20e420),
+            ("ucvtf", "d", 64, 0x7f40e420),
+            ("ucvtf", "h", 16, 0x7f10e420),
+        ] {
+            let ops = [
+                reg(&format!("{w}0")),
+                reg(&format!("{w}1")),
+                imm(i64::from(f)),
+            ];
+            assert_eq!(word(mn, &ops), want, "{mn} {w}0, {w}1, #{f}");
+        }
+    }
+
+    #[test]
+    fn the_fixed_point_bit_count_is_bounded_by_the_element_width() {
+        for (w, max) in [("h", 16i64), ("s", 32), ("d", 64)] {
+            let ok = [reg(&format!("{w}0")), reg(&format!("{w}1")), imm(max)];
+            assert!(
+                encode_fp_convert_scalar("fcvtzs", &ok).is_ok(),
+                "fcvtzs {w}0, {w}1, #{max} is encodable"
+            );
+            for bad in [0, max + 1] {
+                let ops = [reg(&format!("{w}0")), reg(&format!("{w}1")), imm(bad)];
+                let e = err("fcvtzs", &ops);
+                assert!(
+                    e.contains("fbits must be in"),
+                    "fcvtzs {w}0, {w}1, #{bad}: {e}"
+                );
+            }
+        }
+    }
+
+    /// Two register operands of different widths, and every spelling that is
+    /// not a scalar element register, are refused: the family converts within
+    /// one width, and `v0` needs an arrangement to name one.
+    #[test]
+    fn mixed_width_and_non_scalar_spellings_are_refused() {
+        for (mn, a, b) in [
+            ("fcvtms", "s0", "d1"),
+            ("fcvtms", "d0", "s1"),
+            ("fcvtms", "s0", "h1"),
+            ("fcvtms", "h0", "d1"),
+            ("scvtf", "d0", "s1"),
+            ("ucvtf", "s0", "h1"),
+        ] {
+            let e = err(mn, &[reg(a), reg(b)]);
+            assert!(
+                e.contains("different floating-point widths"),
+                "{mn} {a}, {b}: {e}"
+            );
+        }
+        // Every non-element spelling is refused, and the message names the
+        // offending register: `q0`/`b0` are floating-point registers of the
+        // wrong width, `x0`/`w0`/`sp` are not floating-point registers at all.
+        for bad in ["v0", "q0", "b0", "x0", "w0", "sp"] {
+            let e = err("fcvtms", &[reg(bad), reg("s1")]);
+            assert!(e.contains(bad), "fcvtms {bad}, s1 must be refused: {e}");
+            assert!(
+                e.contains("floating-point") || e.contains("register"),
+                "fcvtms {bad}, s1: {e}"
+            );
+        }
+        let e = err("fcvtms", &[reg("v0"), reg("v1")]);
+        assert!(e.contains("vector"), "{e}");
+    }
+
+    #[test]
+    fn only_the_integer_conversions_have_a_fixed_point_form() {
+        for mn in [
+            "fcvtas", "fcvtau", "fcvtns", "fcvtnu", "fcvtps", "fcvtpu", "fcvtms", "fcvtmu",
+        ] {
+            let ops = [reg("s0"), reg("s1"), imm(3)];
+            let e = err(mn, &ops);
+            assert!(
+                e.contains("no fixed-point form"),
+                "{mn} s0, s1, #3 must name the missing form: {e}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod fcvt_precision_tests {
+    use super::*;
+
+    fn reg(name: &str) -> Operand {
+        Operand::Reg(name.to_string())
+    }
+    fn word(ops: &[Operand]) -> u32 {
+        match encode_fcvt_precision(ops) {
+            Ok(EncodeResult::Word(w)) => w,
+            Ok(other) => panic!("expected a single word, got {other:?}"),
+            Err(e) => panic!("expected an encoding, got error: {e}"),
+        }
+    }
+
+    /// `fcvt` is a *precision* conversion: every mixed width pair is one
+    /// instruction, and every equal-width pair has no encoding at all (the old
+    /// encoder assembled those to a word that disassembles as `.inst`).
+    #[test]
+    fn converts_between_widths_and_refuses_equal_ones() {
+        for (d, s, want) in [
+            ("s", "d", 0x1e624020u32),
+            ("d", "s", 0x1e22c020),
+            ("h", "s", 0x1e23c020),
+            ("h", "d", 0x1e63c020),
+            ("s", "h", 0x1ee24020),
+            ("d", "h", 0x1ee2c020),
+        ] {
+            assert_eq!(
+                word(&[reg(&format!("{d}0")), reg(&format!("{s}1"))]),
+                want,
+                "fcvt {d}0, {s}1"
+            );
+        }
+        for w in ["h", "s", "d"] {
+            let e = match encode_fcvt_precision(&[reg(&format!("{w}0")), reg(&format!("{w}1"))]) {
+                Err(e) => e,
+                Ok(v) => panic!("fcvt {w}0, {w}1 must be refused, got {v:?}"),
+            };
+            assert!(e.contains("same floating-point width"), "{w}: {e}");
         }
     }
 }
