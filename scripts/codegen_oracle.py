@@ -114,14 +114,15 @@ class AsmStats:
     instructions: int = 0
     loads: int = 0
     stores: int = 0
+    # Compatibility alias: this has ALWAYS counted explicit stack-addressed
+    # instructions, not allocator spills. Use stack_census.py for causality.
     spills: int = 0
+    stack_refs: int = 0
+    xmm_reg_moves: int = 0
     branches: int = 0
     vectors: int = 0
-    # Call sites inside this one function.  Ranked per-function gaps are only
-    # comparable between two compilers that put the SAME work in the function,
-    # and the call count is how you tell: a compiler that declines to inline
-    # shows a small body and a high call count, and "wins" the gap by charging
-    # the callee to nobody.  See engineering/evidence/ORACLE-METRIC-1.
+    # Different call counts warn of a scope mismatch; equal counts do NOT
+    # establish equal work (different callees, tail calls, unrolling, etc.).
     calls: int = 0
 
 
@@ -214,7 +215,7 @@ def _stats(lines: Iterable[str], arch: str) -> AsmStats:
         # `call` x86; `b`/`j` are NOT calls and are excluded deliberately,
         # because a tail jump to an out-of-line copy is exactly the shape that
         # makes one compiler's function look smaller than another's.
-        if mnemonic in {"call", "bl", "blr", "jal", "jalr", "tail"}:
+        if mnemonic in {"call", "callq", "bl", "blr", "jal", "jalr", "tail"}:
             stats.calls += 1
 
         if arch == "aarch64":
@@ -227,6 +228,7 @@ def _stats(lines: Iterable[str], arch: str) -> AsmStats:
                 stats.stores += 1
             if "[sp" in operands or "[x29" in operands:
                 stats.spills += 1
+                stats.stack_refs += 1
             if (re.search(r"\b[vsdq][0-9]+(?:\.|\b)", operands)
                     or mnemonic in {"addv", "smaxv", "fmaxv", "sadalp"}):
                 stats.vectors += 1
@@ -248,6 +250,7 @@ def _stats(lines: Iterable[str], arch: str) -> AsmStats:
                 stats.stores += 1
             if "(sp)" in operands:
                 stats.spills += 1
+                stats.stack_refs += 1
             if mnemonic.startswith("v") and len(mnemonic) > 1:
                 stats.vectors += 1
             continue
@@ -256,16 +259,33 @@ def _stats(lines: Iterable[str], arch: str) -> AsmStats:
             stats.branches += 1
         if _is_simd_instruction(mnemonic):
             stats.vectors += 1
-        if "(" in operands:
-            split_operands = operands.rsplit(",", 1)
-            source = split_operands[0]
-            destination = split_operands[1] if len(split_operands) > 1 else ""
-            if "(" in source:
-                stats.loads += 1
-            if "(" in destination:
-                stats.stores += 1
+        # AT&T commas inside (base,index,scale) are NOT operand separators.
+        # The former rsplit(",", 1) called indexed stores loads, and counted
+        # LEA/NOP address expressions as memory traffic.
+        ops = re.split(r",(?![^()]*\))", operands)
+        ops = [op.strip() for op in ops]
+        if mnemonic in {"movsd", "movss", "movapd", "movaps",
+                        "vmovsd", "vmovss", "vmovapd", "vmovaps"}:
+            if len(ops) >= 2 and all(re.fullmatch(r"%xmm\d+", op) for op in ops):
+                stats.xmm_reg_moves += 1
+        if "(" in operands and not mnemonic.startswith(("lea", "nop", "prefetch")):
+            source_mem = any("(" in op for op in ops[:-1])
+            dest_mem = bool(ops and "(" in ops[-1])
+            # Counts are instructions with an explicit data read/write, not
+            # bytes, uops, cache misses, or implicit push/call stack accesses.
+            read_only = mnemonic.startswith(("cmp", "test", "bt", "call", "jmp", "push"))
+            # bts/btr/btc are RMW, unlike bt itself.
+            if mnemonic.startswith(("bts", "btr", "btc", "cmpxchg")):
+                read_only = False
+            if len(ops) == 1 and mnemonic.startswith(("mul", "imul", "div", "idiv", "fld", "fild", "fadd", "fsub", "fmul", "fdiv", "fcom")):
+                read_only = True
+            write_only = mnemonic.startswith(("mov", "vmov", "set", "pop", "fst", "vst"))
+            exchange = mnemonic.startswith(("xchg", "xadd"))
+            stats.loads += int(source_mem or (dest_mem and not write_only))
+            stats.stores += int((dest_mem and not read_only) or (source_mem and exchange))
             if _STACK_MEM.search(operands):
                 stats.spills += 1
+                stats.stack_refs += 1
     return stats
 
 
@@ -443,7 +463,7 @@ def _write_artifacts(result: dict[str, Any], artifact_dir: Path) -> None:
 
 def _print_table(result: dict[str, Any]) -> None:
     print(f"\n{result['source']} :: {result.get('function') or '<all functions>'}")
-    print(f"{'compiler':<12} {'insns':>7} {'loads':>6} {'stores':>7} {'spills':>7} {'branch':>7} {'best-x':>8}  name")
+    print(f"{'compiler':<12} {'insns':>7} {'loads':>6} {'stores':>7} {'stack':>7} {'branch':>7} {'best-x':>8}  name")
     print("-" * 92)
     for record in result["records"]:
         ratio = record.get("ratio_vs_best")
@@ -466,7 +486,7 @@ def _markdown(results: list[dict[str, Any]], path: Path) -> None:
         "These are screening metrics, not PMU evidence; verify wins with controlled",
         "runtime and hardware counters on the intended target before making claims.",
         "",
-        "| Source | Function | LCCC | Best | Best compiler | LCCC/best | Loads | Stores | Spills | Branches |",
+        "| Source | Function | LCCC | Best | Best compiler | LCCC/best | Loads | Stores | Stack refs | Branches |",
         "|---|---:|---:|---:|---|---:|---:|---:|---:|---:|",
     ]
     for result in results:
@@ -516,9 +536,9 @@ def _print_totals(results: list[dict[str, Any]]) -> None:
                 agg[field] += record.get(field, 0)
             agg["sources"] += 1
     print(f"\nTOTALS across {len(results)} source(s) per compiler:"
-          " instruction/load/store/spill/branch/vector sums, per-source bests")
+          " instruction/load/store/explicit-stack/branch/vector sums, per-source bests")
     print(f"{'compiler':<12} {'insns':>7} {'loads':>6} {'stores':>7} "
-          f"{'spills':>7} {'branch':>7} {'vector':>6} {'best':>5}")
+          f"{'stack':>7} {'branch':>7} {'vector':>6} {'best':>5}")
     print("-" * 72)
     for key, agg in sorted(totals.items(), key=lambda kv: kv[1]["instructions"]):
         print(f"{key:<12} {agg['instructions']:>7.0f} {agg['loads']:>6.0f} "
@@ -684,7 +704,7 @@ def _print_rank(rows: list[RankRow], verbose: bool, baseline: dict[str, Any]) ->
     """The scoreboard's ranking table: worst gaps first, positive gaps only
     unless verbose, with the total gap and the behind/tied/ahead split."""
     print(f"{'gap':>5} {'benchmark':<22} {'function':<22} "
-          f"{'insns':>6} {'loads':>6} {'store':>6} {'spill':>6} "
+          f"{'insns':>6} {'loads':>6} {'store':>6} {'stack':>6} "
           f"{'brnch':>6} {'vec':>6} {'call':>5}   best")
     print("-" * 114)
     total_gap = 0
@@ -704,7 +724,7 @@ def _print_rank(rows: list[RankRow], verbose: bool, baseline: dict[str, Any]) ->
         # codegen gap: the smaller one has moved work out of line and the
         # oracle never measured where it went.  Flag it instead of ranking it.
         flag = ""
-        if gap > 0 and best.calls != local.calls:
+        if best.calls != local.calls:
             flag = "  <-- CALLS DIFFER, gap not comparable"
             suspect.append(f"{bench}:{fname} (lccc {local.calls} calls vs "
                            f"{best_name} {best.calls})")
@@ -722,8 +742,8 @@ def _print_rank(rows: list[RankRow], verbose: bool, baseline: dict[str, Any]) ->
           f"({len(rows)} compared)")
     if suspect:
         print(f"\nWARNING: {len(suspect)} of the {behind} 'behind' rows compare "
-              f"functions with DIFFERENT call counts, so their gap measures an "
-              f"inlining decision, not code generation:")
+              f"functions with DIFFERENT call counts; inspect callee bodies "
+              f"before interpreting either wins or losses:")
         for s in suspect[:12]:
             print(f"  {s}")
         if len(suspect) > 12:
@@ -741,10 +761,11 @@ def _rank_markdown(rows: list[RankRow], verbose: bool, path: Path, flags: str) -
         "and the Compiler Explorer oracles. These are screening metrics, not PMU",
         "evidence; verify wins with controlled runtime and hardware counters on the",
         "intended target before making claims.",
+        "Equal call counts do not prove equivalent work. Stack refs are not spills.",
         "",
         f"- flags: `{flags}`",
         "",
-        "| Gap | Benchmark | Function | LCCC insns | Best insns | Best compiler | LCCC loads | stores | spills | branches | vectors | LCCC calls | Best calls | Comparable |",
+        "| Gap | Benchmark | Function | LCCC insns | Best insns | Best compiler | LCCC loads | stores | stack refs | branches | vectors | LCCC calls | Best calls | Comparable |",
         "|---:|---|---|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|:--:|",
     ]
     flagged: list[tuple[int, str, str, int, int]] = []
@@ -752,20 +773,20 @@ def _rank_markdown(rows: list[RankRow], verbose: bool, path: Path, flags: str) -
         if gap <= 0 and not verbose:
             continue
         best = per[best_name]
-        # See _print_rank: a gap across differing call counts measures an
-        # inlining decision, not code generation, and must not be ranked as if
-        # it did.  The column keeps the row (hiding data is worse) but marks it.
+        # Mismatched call counts are a scope warning, not a proof of why.
+        # Equal counts are unproven too: different callees/tail calls can
+        # perform different amounts of work with identical static counts.
         same = best.calls == local.calls
-        if gap > 0 and not same:
+        if not same:
             flagged.append((gap, bench, fname, local.calls, best.calls))
         lines.append(
             f"| {gap} | `{bench}` | `{fname}` | {local.instructions} | "
             f"{best.instructions} | {best_name} | {local.loads} | {local.stores} | "
             f"{local.spills} | {local.branches} | {local.vectors} | "
-            f"{local.calls} | {best.calls} | {'yes' if same else '**no**'} |"
+            f"{local.calls} | {best.calls} | {'unproven' if same else '**no**'} |"
         )
     if flagged:
-        total = sum(g for g, *_ in flagged)
+        total = sum(max(0, g) for g, *_ in flagged)
         behind_total = sum(g for g, *_ in
                            ((r[0],) for r in rows if r[0] > 0))
         lines += [
@@ -775,7 +796,7 @@ def _rank_markdown(rows: list[RankRow], verbose: bool, path: Path, flags: str) -
             "",
             "A per-function instruction gap is only a codegen gap if both",
             "compilers put the same work in that function. When the call counts",
-            "differ, the smaller body has moved work out of line and this",
+            "differ, work may have moved out of line and this",
             "single-function view never measured where it went. On this corpus",
             "that is not a corner case: it is the top of the table.",
             "",

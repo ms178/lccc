@@ -155,3 +155,21 @@ This remains VM wall-clock screening without PMU data. The recipe/archive
 checksum discrepancy described above is still unresolved, and the archive
 signature was not verified in this VM; the end-to-end runner reports both
 limitations on every run.
+
+## 2026-10-06: checksum composition (not a second byte-scan benchmark)
+
+`zlib_ng_adler32_combine.c` extracts `adler32_combine_` from zlib-ng 2.3.3,
+selected from archpkgbuilds commit `d9953b4f185fe6b33506af4b5730039af7849174`,
+`packages/zlib-ng/PKGBUILD`. Upstream `adler32.c` SHA-256:
+`bc5308ff3ea584bf13b626e39ad261abbaf7f87e6eb92a9195c8cef70bc0bf9d`.
+The arithmetic body is unchanged; changes are the standalone `int64_t` type,
+function name, `noinline` for observable repeated calls, and an original harness.
+The Zlib license remains in force (see the bundled license directory).
+
+Validation compares all 1025 splits of a 1024-byte message against an independent
+byte-at-a-time Adler checksum, checks invalid negative lengths and algebraic
+zero-run checksums through `INT64_MAX`. The measured loop composes valid chunk
+checksums selected by a carried checksum (no dead loop or fixed constant output).
+`-DPASSES=N` scales runtime; default 50 million. This exercises division by
+65521, multiply, carry-free modular corrections and branch/CMOV decisions,
+which the existing byte-accumulator kernel does not isolate.

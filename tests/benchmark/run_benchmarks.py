@@ -125,6 +125,8 @@ BENCHMARKS: tuple[Benchmark, ...] = (
               ("tls_seg_access.c",), ("workload", "glibc", "tls", "memory")),
     Benchmark("zlib_ng_adler32", "zlib-ng Adler-32 NMAX accumulator",
               ("zlib_ng_adler32.c",), ("workload", "zlib-ng", "checksum", "loop")),
+    Benchmark("zlib_ng_adler32_combine", "zlib-ng checksum composition / modular arithmetic",
+              ("zlib_ng_adler32_combine.c",), ("workload", "zlib-ng", "checksum", "integer")),
     Benchmark("expat_xml_scan", "Expat UTF-8 XML name-token scan",
               ("expat_xml_scan.c",), ("workload", "expat", "parser", "branch")),
     Benchmark("sqlite_varint", "SQLite 1–9 byte varint decoder",

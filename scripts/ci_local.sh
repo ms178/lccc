@@ -173,6 +173,12 @@ fi
 gate "rust-toolchain-selector" fast \
     bash tests/regression/check_rust_toolchain_selector.sh
 
+gate "linker-oracle-versions" fast \
+    bash tests/regression/check_linker_oracle_versions.sh
+
+gate "audit-loop-contracts" fast \
+    env CCC="$LCCC" bash tests/regression/check_audit_loop_contracts.sh
+
 # The unit-test gate is what GitHub's required check runs on every PR, so it
 # belongs in the fast set: a red PR has to be reproducible with --fast.
 #

@@ -3213,17 +3213,20 @@ fn inline_call_site(
             }
         }
 
-        if !plan.len_values.is_empty() && !extra.is_empty() {
+        // Zero extra arguments is a valid count too. The plan contains
+        // original callee IDs, but inlined_blocks have ALREADY been remapped.
+        if !plan.len_values.is_empty() {
             let len_const = IrConst::I32(extra.len() as i32);
             for block in &mut inlined_blocks {
                 for inst in &mut block.instructions {
                     if let Instruction::Call { func, info } = inst {
                         if func == "__lccc_va_arg_pack_len" {
                             if let Some(d) = info.dest {
-                                if plan.len_values.contains(&Value(d.0 + value_offset)) {
-                                    // Rewrite in place: sentinel call -> Copy of the count.
+                                if plan.len_values.iter().any(|v| v.0 + value_offset == d.0) {
+                                    // Keep the already-remapped destination: adding the
+                                    // offset again leaves every use undefined (VAPACK-LEN-1).
                                     *inst = Instruction::Copy {
-                                        dest: Value(d.0 + value_offset),
+                                        dest: d,
                                         src: Operand::Const(len_const.clone()),
                                     };
                                 }

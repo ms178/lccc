@@ -114,6 +114,10 @@ pub(crate) struct RaConfig {
     pub(crate) no_map_vecreg: bool,
     /// `CCC_NO_FP_COPY_WEB`: disable x86 FP copy-web homes (default: false).
     pub(crate) no_fp_copy_web: bool,
+    /// `CCC_FP_EXTRACT_HOMES`: experimental scalar lane-extract homes (default: false).
+    /// Correctness/assembly validated; runtime is highly link-layout-sensitive.
+    /// Keep opt-in until layout-distributed and target-hardware A/B is stable.
+    pub(crate) fp_extract_homes: bool,
     /// `CCC_CALLER_SAVE_SPANNING`: enable caller-save spans (default: false).
     pub(crate) caller_save_spanning: bool,
     /// `CCC_NO_RDX_HAZARD`: disable position-aware %rdx admission on x86-64
@@ -339,6 +343,7 @@ impl RaConfig {
             no_reduction_vecreg: present("CCC_NO_REDUCTION_VECREG"),
             no_map_vecreg: present("CCC_NO_MAP_VECREG"),
             no_fp_copy_web: present("CCC_NO_FP_COPY_WEB"),
+            fp_extract_homes: present("CCC_FP_EXTRACT_HOMES"),
             caller_save_spanning: present("CCC_CALLER_SAVE_SPANNING"),
             no_rdx_hazard: present("CCC_NO_RDX_HAZARD"),
             no_segment_scan: present("CCC_NO_SEGMENT_SCAN"),
@@ -5009,7 +5014,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         FxHashSet::default()
     };
     let f64_value_set = if arm_fp_pool || (x86_fp_pool && !config.ra_config.no_fp_copy_web) {
-        collect_f64_values(func)
+        collect_f64_values(func, config.ra_config.fp_extract_homes)
     } else {
         FxHashSet::default()
     };
@@ -7238,6 +7243,10 @@ fn collect_non_gpr_values(func: &IrFunction, is_32bit: bool) -> FxHashSet<u32> {
                             | IntrinsicOp::VecHorizontalAddF32x8
                             | IntrinsicOp::VecHorizontalAddF32x4
                     ) || op.produces_vector_value()
+                        // Scalar intrinsic result typing is shared with the
+                        // FP scan. A lane extract must pass BOTH filters;
+                        // admitting it only in collect_f64_values is inert.
+                        || inst.result_type().as_ref().is_some_and(is_scalar_fp)
                     {
                         non_gpr_values.insert(d.0);
                     }
@@ -8587,7 +8596,7 @@ fn is_scalar_fp(ty: &IrType) -> bool {
 ///
 /// Copy propagation is what makes loop-carried FP accumulators (Copy form
 /// after phi elimination) visible to the scan.
-fn collect_f64_values(func: &IrFunction) -> FxHashSet<u32> {
+fn collect_f64_values(func: &IrFunction, fp_extract_homes: bool) -> FxHashSet<u32> {
     use crate::ir::intrinsics::IntrinsicOp as O;
 
     let mut f64_values: FxHashSet<u32> = FxHashSet::default();
@@ -8653,7 +8662,8 @@ fn collect_f64_values(func: &IrFunction) -> FxHashSet<u32> {
                         | O::StrictRecipMulAddF64x4
                         | O::VecHorizontalAddF32x8
                         | O::VecHorizontalAddF32x4
-                ) =>
+                ) || (fp_extract_homes
+                    && inst.result_type().as_ref().is_some_and(is_scalar_fp)) =>
                 {
                     f64_values.insert(d.0);
                 }
@@ -11170,6 +11180,7 @@ mod ra_config_tests {
         switch!(no_reduction_vecreg, "CCC_NO_REDUCTION_VECREG");
         switch!(no_map_vecreg, "CCC_NO_MAP_VECREG");
         switch!(no_fp_copy_web, "CCC_NO_FP_COPY_WEB");
+        switch!(fp_extract_homes, "CCC_FP_EXTRACT_HOMES");
         switch!(caller_save_spanning, "CCC_CALLER_SAVE_SPANNING");
         switch!(no_rdx_hazard, "CCC_NO_RDX_HAZARD");
         switch!(no_segment_scan, "CCC_NO_SEGMENT_SCAN");
@@ -14766,5 +14777,64 @@ mod fp_phi_move_tests {
             fp_phi_move_conflicts(&seg_cov, &iv_map, &assignments, 48, 50, 32),
             "a source with no coverage info must fail closed"
         );
+    }
+}
+
+#[cfg(test)]
+mod scalar_lane_class_tests {
+    use super::*;
+    use crate::ir::reexports::{BasicBlock, BlockId, Value};
+
+    #[test]
+    fn fp_lane_results_and_copies_are_scalar_but_integer_lanes_are_not() {
+        use IntrinsicOp as O;
+        let ops = [
+            O::VecExtractLaneF64x2,
+            O::VecExtractLaneF64x4,
+            O::VecExtractLaneF32x4,
+            O::VecExtractLaneF32x8,
+            O::VecExtractLaneI64x2,
+            O::VecExtractLaneI32x4,
+        ];
+        let mut f = IrFunction::new("lane_classes".into(), IrType::Void, vec![], false);
+        let mut instructions: Vec<_> = ops
+            .into_iter()
+            .enumerate()
+            .map(|(i, op)| Instruction::Intrinsic {
+                dest: Some(Value(i as u32)),
+                op,
+                dest_ptr: None,
+                args: vec![Operand::Value(Value(20)), Operand::Const(IrConst::I32(1))],
+            })
+            .collect();
+        instructions.push(Instruction::Copy {
+            dest: Value(8),
+            src: Operand::Value(Value(0)),
+        });
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions,
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+        });
+        let scalars = collect_f64_values(&f, true);
+        let conservative = collect_f64_values(&f, false);
+        assert!(conservative.is_empty(), "lane homes must remain opt-in");
+        let non_gpr = collect_non_gpr_values(&f, false);
+        let types = crate::backend::common::compute_value_type_map(&f);
+        for id in [0, 1, 2, 3, 8] {
+            assert!(
+                non_gpr.contains(&id),
+                "v{id} must pass the GPR exclusion filter"
+            );
+            assert!(
+                types.get(&id).is_some_and(is_scalar_fp),
+                "v{id} needs scalar FP type"
+            );
+            assert!(scalars.contains(&id), "v{id}");
+        }
+        for id in [4, 5, 20] {
+            assert!(!scalars.contains(&id), "v{id}");
+        }
     }
 }

@@ -1,0 +1,24 @@
+compiler        insns B/trip  insn/B   vec
+------------------------------------------
+nbody              18     56  0.3214  128b
+    loop .LBB2      composite insns=  46 B/trip=    0 nests .LBB4
+    loop .LBB4      innermost insns=  18 B/trip=   56
+    loop .LBB7      composite insns= 111 B/trip=    0 nests .LBB10,.LBB12
+    loop .LBB10     composite insns=  53 B/trip=    0 nests .LBB12
+    loop .LBB12     innermost insns=  43 B/trip=    1
+    loop .LBB17     composite insns=  46 B/trip=    0 nests .LBB19
+    loop .LBB19     innermost insns=  18 B/trip=   56
+nbody-after-fp     18     56  0.3214  128b
+    loop .LBB2      composite insns=  46 B/trip=    0 nests .LBB4
+    loop .LBB4      innermost insns=  18 B/trip=   56
+    loop .LBB7      composite insns= 105 B/trip=    0 nests .LBB10,.LBB12
+    loop .LBB10     composite insns=  47 B/trip=    0 nests .LBB12
+    loop .LBB12     innermost insns=  37 B/trip=    1
+    loop .LBB17     composite insns=  46 B/trip=    0 nests .LBB19
+    loop .LBB19     innermost insns=  18 B/trip=   56
+gcc16.2            18    112  0.1607  128b  <-- best
+    loop .L15       innermost insns=  21 B/trip=  112
+    loop .L16       composite insns=  68 B/trip=    0 nests .L21,.L18,.L17
+    loop .L21       composite insns=  39 B/trip=    0 nests .L18
+    loop .L18       innermost insns=  29 B/trip=   56
+    loop .L17       innermost insns=  18 B/trip=  112

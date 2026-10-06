@@ -40,6 +40,12 @@ import godbolt_cache as GC  # noqa: E402
 FILE_SCOPE_STORAGE_RE = re.compile(r"(?m)^\s*static\s+\w+[^;]*\[")
 
 
+class TestAllCompetition(unittest.TestCase):
+    def test_all_vendors_includes_classic_and_llvm_intel(self):
+        self.assertEqual(set(G.ORACLE_SET["all-vendors"]),
+                         {"cg162", "cclang2310", "cicc2021100", "cicxlatest"})
+
+
 class TestStreamJoin(unittest.TestCase):
     def test_stdout_chunks_rejoin_with_newline(self):
         # Exactly the shape the API returns: one chunk per line, and the

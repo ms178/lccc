@@ -91,10 +91,16 @@ jobs:
       - name: Verify manifest Rust-toolchain selection
         run: bash tests/regression/check_rust_toolchain_selector.sh
 
+      - name: Verify restored linker oracle versions
+        run: bash tests/regression/check_linker_oracle_versions.sh
+
       # Keep CI on the documented compiler build policy: fastbuild, Rust -O1
       # and two jobs. This is deliberately not Cargo's default release -O3.
       - name: Build
         run: ./scripts/build_lccc_fast.sh
+
+      - name: Audit loop branch and must-execute contracts
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_audit_loop_contracts.sh
 
       - name: Run tests
         env:

@@ -28,6 +28,9 @@ THE ORACLES.  Defaults are the newest of each independent vendor:
     cclang2310   Clang 23.1.0    (LLVM)
     cicxlatest   ICX latest      (Intel -- icx, not the legacy icc)
 
+`--oracle-set all-vendors` additionally runs legacy ICC 2021.10
+(cicc2021100); the default retains the three current-vendor channels.
+
 Compiler Explorer is treated as EVIDENCE, never as authority.  A remote
 compiler that rejects a program, times out or is unavailable is reported
 as SKIP with its reason; it is never allowed to pass silently, and a
@@ -139,9 +142,10 @@ ORACLE_SET = {
     "gnu": ["cg162"],
     "llvm": ["cclang2310"],
     "intel": ["cicxlatest"],
-    "all-vendors": ["cg162", "cclang2310", "cicxlatest"],
+    "all-vendors": ["cg162", "cclang2310", "cicc2021100", "cicxlatest"],
 }
-VENDOR = {"cg162": "GNU", "cclang2310": "LLVM", "cicxlatest": "Intel"}
+VENDOR = {"cg162": "GNU", "cclang2310": "LLVM", "cicxlatest": "Intel",
+          "cicc2021100": "Intel (classic)"}
 
 # An x86 mnemonic at the start of a line in `as -S` output.  Deliberately
 # narrow: labels, directives, comments and .cfi_* lines must not count.

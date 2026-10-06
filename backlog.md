@@ -15,7 +15,13 @@ there, not here.
 - Deep research: [`engineering/DECISIONS.md`](engineering/DECISIONS.md) (measured
   negative-space, do-not-retry grounds), [`ideas/`](ideas/README.md).
 
-Last broad triage rebuild: **2026-09-16**, fictional base `8ca2fd4`.
+Current audit adjudication: **2026-10-06**, upstream
+`08f4e1a124d753e9eeddb1c43ce68b54d4d95f68`. See
+[`engineering/FOLLOWUP-2026-10-06-codegen-audit.md`](engineering/FOLLOWUP-2026-10-06-codegen-audit.md)
+for measured dispositions, regression commands, evidence and outstanding work.
+The historical triage below is **not** a current compiler/runtime scoreboard.
+
+Last historical broad triage rebuild: **2026-09-16**, base recorded as `8ca2fd4`.
 The historical numbers below are from that earlier screen, not the current
 baseline. On **2026-09-25**, `main` at `7ddb770f` was remeasured in 39
 randomized paired, output-checked VM workloads against the candidate and GCC;
@@ -41,60 +47,6 @@ An item with no reproducer does not belong here.
 
 ---
 
-### ALIGN-1 · **NEW 2026-09-30** — `aligned()` on a function *definition* is ignored
-
-Found by making rustc enumerate dead state (`unused_assignments` was un-allowed
-crate-wide): `parser/nested_functions.rs` parsed `aligned(...)` off a nested
-function's declarator, combined `decl_aligned` with `post_aligned` into an
-`alignment`, and nothing could consume it.
-
-The mechanism, verified: function alignment reaches codegen through
-`IrModule::function_alignments`, keyed by the **plain** function name
-(`ir/lowering/global_decl.rs` inserts from a prototype's `decl.alignment`;
-`backend/generation.rs:3706` emits `.p2align` for a *definition* out of that
-map), while a nested function's IR name is **mangled** `parent.inner`
-(`ir/lowering/nested_functions.rs:879` and `:1258`). Any value computed at the
-definition site therefore cannot match the lookup.
-
-Consequence today: `__attribute__((aligned(N)))` on a function **definition**
-(top-level or nested) does not reach the emitted `.p2align`; only a *prototype*
-carries it. GCC honours the definition form.
-
-Deliberately NOT shipped this session: the dead computation was removed and the
-discard documented in place (the drop is declared intentional at the
-`FunctionDef` construction), because wiring it needs the mangled key and a
-codegen assertion, not a one-line insert. The dangerous fix — deleting the
-computation and saying nothing — would have cemented the dropped attribute as
-intended behaviour.
-
-**MEASURED 2026-09-30** (one file, `-O2 -S`, GCC 14 as oracle; the directive
-preceding a label is the one that positions it):
-
-| function in `align_test.c` | attribute on | GCC | LCCC |
-|---|---|---|---|
-| `via_def` | definition only | `.align 64` | `.p2align 4` (**ignored**) |
-| `via_proto` | prototype | `.align 64` | `.p2align 6` |
-| `plain` | none | `.p2align 4` | `.p2align 4` |
-| `proto_then_def` | prototype + definition | `.align 64` | `.p2align 6` |
-
-So the gap is exactly the definition channel, and the prototype channel works.
-Reproduce with:
-`printf '%s\n' '__attribute__((aligned(64))) void via_def(void) { }' \
-  '__attribute__((aligned(64))) void via_proto(void);' 'void via_proto(void) { }' \
-  'void plain(void) { }' > align_test.c && target/fastbuild/lccc -O2 -S align_test.c -o -`
-and compare against `gcc -O2 -S`.
-
-**Second observation, cosmetic but worth knowing:** for a function whose
-alignment *does* come through the map, LCCC emits two directives where GCC emits
-one — `.p2align 6` (the attribute) followed by `.p2align 4` (a default emitted by
-another layer). Harmless, because the second pads nothing after the first, but it
-hides which directive carries the attribute from anyone reading the asm. Worth
-folding into the same fix.
-
-**First step for the fix:** the mangled key (`parent.inner`) plus a codegen
-assertion; the characterisation above is the acceptance test — the
-`via_def` row must move to `.p2align 6` while the other three stay put.
-
 ### ALIGN-1 · **CLOSED 2026-09-30** — the definition channel of `aligned()` now reaches codegen
 
 Was: `__attribute__((aligned(N)))` on a function **definition** was parsed and
@@ -119,22 +71,9 @@ alignment to one (`-O0`/`-O2`, with and without `noinline`), so there is no orac
 to match; LCCC ignores it too, and the wiring that made it honour the attribute
 was tested, found not to fire, and removed rather than shipped.
 
-### ALIGN-2 · **NEW 2026-09-30** — a redundant trailing `.p2align` hides which directive carries the attribute
+### ALIGN-2 · **CLOSED by ALIGN-3** — redundant function alignment directive
 
-For a function whose alignment comes through `function_alignments`, the asm is
-
-```text
-    .p2align 6        <- the attribute
-    .globl f
-    .p2align 4        <- a default, emitted by another layer
-f:
-```
-
-Harmless — the second pads nothing after the first — but it makes the attribute
-invisible to anyone reading the asm, and it made a naive gate fail. GCC emits a
-single directive. **First step:** find the emitter of the second directive (it is
-not the `function_alignments` site) and suppress it when the first already
-applied.
+Do not reopen the old report: ALIGN-3 below supersedes it.
 
 ### VOLATILE-BF-1 · **CLOSED 2026-09-30** — a volatile bitfield emitted non-volatile accesses
 
@@ -485,51 +424,89 @@ then replays the `shadowed` one, resurrecting an alias that belongs to a scope
 which no longer exists. The guard is in place even though the diagnostic is not;
 a unit test covers the double-set/pop round-trip.
 
-### IVOPTS-1 · **NEW 2026-09-30** — index-form addressing is never strength-reduced
+### IVOPTS-1 · **RE-SCOPED 2026-10-06** — shared scalar/SIMD address recurrences
 
-The largest single measured codegen defect, and the one that explains most of
-the honest corpus deficit (see
-[`ORACLE-METRIC-1`](engineering/evidence/ORACLE-METRIC-1/README.md): +15.8 % vs GCC over
-the 47 non-recursion benchmarks, median per-file ratio 1.17).
+IVSR is **already implemented** in `src/passes/iv_strength_reduce.rs`, with
+innermost-first selection, same-base recurrence grouping and affine forms.
+`global_addr_cse`, LICM, IV widening and un-IVSR also exist. The missing work
+is coverage/profitability/proof across their interfaces, not adding a first IV pass.
 
-`nbody`'s inner loop — 5 bodies × 5 000 000 iterations, the hottest loop in the
-corpus — is **110 instructions against GCC's 14 (7.9×)**, with **zero** stack
-references, so it is not register pressure. Per iteration we emit:
+The old **110 vs 14** claim compared unidentified loop scopes. On pinned
+upstream, `hot_loop_metric.py --symbol main --all-loops` classifies `.LBB7`
+as a **composite outer loop**, not the pair-loop body. The actual `.LBB12`
+pair loop has **43 instructions**, versus **29** in GCC 16.2 `.L18`; after
+FP-LANE-1 it has **37**. These are static counts per pair, not cycle counts.
+Whole-TU LCCC/GCC is 302/215 before and 296/215 after. The claimed zero stack
+traffic is false for this code: the pair loop stores/reloads two extracted FP
+lanes. The old mnemonic census mixed memory loads/stores with register copies
+and SSE with VEX spellings; it cannot establish redundant FP moves.
 
-| waste | count/iter | GCC's equivalent |
-|---|---:|---|
-| `imulq $56, %r9, %r15` — index×stride by multiply | 2 | `addq $56, %rax`, once |
-| `leaq bodies(%rip), %rcx` — static base re-materialised | 2 | hoisted to `%r12` outside |
-| `cmpl $5000000, -72(%rbp)` — outer bound from a stack slot | 3 | register |
-| `movsd`/`movupd`/`movq` data movement | 56 of 110 | displacement addressing |
+**Concrete remaining boundary:** SLP `VecLoadF64x2`/`VecStoreF64x2` carry
+base/byte-offset operands directly; IVSR enumerates only `GetElementPtr`
+offset uses. A multiply retained for an intrinsic reader cannot die just
+because a scalar GEP acquired a pointer recurrence. Reproducer:
+`tests/benchmark/programs/nbody.c`, `-O2 -march=x86-64-v3`,
+`LCCC_DUMP_IR=1 CCC_IVSR_DEBUG=1` (both dumps go to stderr).
 
-GCC walks the array with one pointer bump and reaches every field through a
-displacement (`vsubsd 8(%rax), %xmm7, %xmm2`). We stay in index form, recompute
-`i*56` twice, and move the results around. The signature is a missing
-**induction-variable strength reduction / IVopts** stage plus weak loop-invariant
-address hoisting, and it is the same signature in `spectral_norm` (+114 %),
-`moving_stats` (+66 %), `struct_copy` (+62 %) and `matmul` — the struct-array
-and FP kernels that dominate the real deficit table.
+Next experiment: share a *proven* byte-address recurrence between scalar GEPs
+and vector memory intrinsics, preserving displacement, real/hidden uses,
+SSA dominance and nonzero-loop guards. Reject if the pressure cost exceeds
+the removed scaling. Do not enable scalar-derived IVs or GLA spill gaps globally.
+Before expansion, prove wrap/cast legality: IVSR-WRAP-1 below was real wrong code.
 
-Corpus-wide mnemonic census (51 programs, `-O2 -march=x86-64-v3`):
+### IVSR-WRAP-1 · **FIXED 2026-10-06** — truncating backedge was treated as a copy
 
-| pattern | LCCC | GCC | ratio |
-|---|---:|---:|---:|
-| `movsd` scalar FP move | 171 | 54 | **3.2×** |
-| `leaq sym(%rip)` static base | 145 | 91 | **1.6×** |
-| `imul $const,` index scaling | 87 | 55 | **1.6×** |
-| stack refs | 655 | 773 | 0.85× (we are better) |
+`unsigned char x=254; ... a[x]; ++x` must visit 254,255,0,1. Baseline returned
+509 instead of 510; disabling IVSR returned 510. `look_through_casts` now
+looks through only same-type casts and Copies. A narrowing or signedness-
+changing conversion cannot disappear from recurrence matching. Regression:
+`tests/regression/ivsr_narrow_wrap.c` (8-/16-bit indices, zero trips and wraps).
+This does **not** prove all unsigned 32-bit pointer recurrences sound; a reusable
+no-wrap proof for every derived expression remains a hard prerequisite.
 
-Work order, cheapest first, each independently measurable:
-1. Hoist loop-invariant `leaq sym(%rip)` bases out of loops (145 → ≤91 target).
-2. Strength-reduce `idx*stride` on a unit-step induction variable to a stride
-   bump; prefer displacement addressing over materialised addresses.
-3. Coalesce the scalar FP register-to-register moves (171 → ~54 target).
-Do **not** start from the register allocator: these functions do not spill.
+### VAPACK-LEN-1 · **FIXED 2026-10-06** — fortified open broke full gzip linkage
 
-Reproduction: `python3 scripts/oracle_asm.py tests/benchmark/programs/nbody.c
---function main --flags "-O2 -march=x86-64-v3"`, then compare the inner loop
-against `gcc -S -O2 -march=x86-64-v3`.
+The pinned gzip 1.14 end-to-end build failed with undefined
+`__lccc_va_arg_pack_len`. Reduced to `_FORTIFY_SOURCE=3; open(p,flags,mode)`.
+Inliner plan IDs were in the callee namespace; cloned blocks were already
+remapped. The old check added the offset a second time and never matched;
+the would-be replacement also added it twice. Zero extra arguments were
+incorrectly excluded. Match each original ID plus the offset to the already-
+remapped destination, preserve that destination and materialize count zero too.
+`va_arg_pack_len_inline.c` covers 0/1/4 extras, branches and distinct sites;
+`fortify_open_va_pack.c` covers the actual libc wrapper. Both pass O1–O3;
+baseline fails linking. Integrated into the audit contract gate.
+
+### FP-LANE-1 · **TYPING FIXED; ALLOCATION OPT-IN 2026-10-06** — SLP scalar extract results lacked FP classification
+
+Four F32/F64 lane-extract intrinsics now expose their scalar `result_type`.
+Both RA filters consume that shared type: non-GPR exclusion AND scalar-FP
+candidacy. Updating the second filter alone is ineffective (measured).
+With `CCC_FP_EXTRACT_HOMES=1`, existing x86 scalar-home emitters remove the nbody lane stack round trips:
+43 -> 37 inner-pair instructions; no other instruction/stack count changed
+in the 55-program same-source candidate A/B screen. Unit + scalar/SLP execution
+tests pin the contract. **Do not enable by default:** the longer pinned test
+without `-lm` regressed 52.9% on median, while `-lm` improved 20.5%; matched-data-
+address control improved 10.6%. Link layout shifts `bodies` so the fifth velocity
+store crosses a page. Both adverse/positive evidence are retained in the follow-up.
+Default lane homes remain conservative; Raptor Lake is unmeasured.
+
+### ORACLE-MEM-2 · **FIXED 2026-10-06** — address expressions were counted as memory traffic
+
+The AT&T parser split inside SIB addressing and counted LEA/NOP as loads.
+Indexed store, read/modify/write and stack tests now cover the distinction.
+`stack_refs` is explicit; legacy JSON `spills` is a compatibility alias, NOT
+an allocator diagnosis. Equal call counts now mean **unproven**, not comparable;
+disparate call counts flag wins as well as losses. Tests:
+`python3 scripts/test_codegen_oracle.py`.
+
+### ORACLE-SEM-2 · **FIXED 2026-10-06** — valid ICC memcmp result called a miscompile
+
+The four-compiler execution oracle found ICC -1 versus libc/LCCC -213.
+C specifies the sign, not the magnitude. Normalize only this C semantic boundary
+in `tests/oracle/programs/strings.c`, with explicit less/greater/equal/zero-length
+checks; never normalize arbitrary output in the harness. The `all-vendors` preset
+now includes ICC as well as ICX. Eight programs agree with all four oracles.
 
 ### METRIC-1 · **CLOSED 2026-09-30** — the oracle metric was ranking an inlining artifact
 
@@ -832,50 +809,28 @@ only **10.7 % are spills** — and `sha256_transform`, the RA-PRESSURE-3 target,
 has **zero** spill references.
 Evidence: [`engineering/evidence/SPILL-01/README.md`](engineering/evidence/SPILL-01/README.md).
 
-### DO-WHILE-BRANCH-1 · **NEW 2026-09-29** — bottom-tested backedges pay 4 instructions for one branch
-A bottom-tested loop's exit condition is materialised as an `i1`, zero-extended
-to `i32`, then `test`+`jne` — while the `cmp` that produced it sits in the same
-block, unused as a branch:
+### DO-WHILE-BRANCH-1 · **CLOSED AS STALE 2026-10-06**
 
-    .LBB1:  addl $1, %esi
-            cmpl %edi, %esi
-            setl %r8b        <-- 3 instructions and 1 uop
-            movzbl %r8b, %r8d    wasted per iteration
-            testb %r8b, %r8b
-            jne .LBB1
+On upstream `08f4e1a`, the published `int f(int n){int i=0; do{i++;}while(i<n);
+return i;}` already emits `addl; cmpl; jl`, without materializing a boolean.
+Five variants (`<`, `<=`, `!=`, step 2, explicit break) are now pinned by
+`tests/regression/check_audit_loop_contracts.sh`, mirrored in local/hosted CI.
+No new peephole or claimed speedup is warranted for already-correct code.
 
-Measured scope (`-O2`, **no env vars**, counting `setCC` inside the loop body):
-all six bottom-tested shapes tested show it — `do{}while` with `<`, `!=`, `<=`,
-step 1 and step 2, returning the counter or a constant, and `for(;;){…break;}`.
-The TOP-tested `while` and the do-while the vectorizer turns into
-marching-pointer form both already emit `cmp` + `jCC` directly, so the machinery
-exists and this is a missing case in one lowering path, not a missing
-capability. 9 of the first 60 `tests/regression/*.c` emit at least one `setCC`.
-NOT the same item as LOOP-PREHEADER-2's rotation note: `loop_rotate` is opt-in
-(`CCC_LOOP_ROTATE=1`), and `CCC_DISABLE_PASSES=loop_rotate` leaves every count
-above unchanged, so this is the default bottom-tested lowering, not rotation.
-Reproducer: `int f(int n){int i=0; do{i++;}while(i<n); return i;}` — no
-pointers, no `main`, no specialisation involved.
-Done = the loop body contains no `setCC` and the backedge is a single `jCC`,
-pinned by an assembly gate, with no instruction-count regression elsewhere.
-Full analysis: `engineering/FOLLOWUP-2026-09-29-pr681-ci-red-audit-adjudication.md`.
+### LOOP-PREHEADER-3 · **PROPOSAL REJECTED 2026-10-06; optimization still open**
 
-### LOOP-PREHEADER-3 · **NEW 2026-09-29** — LICM's must-execute rule is stricter than it needs to be
-`loop_preheader` makes a guarded loop's preheader dedicated, and LICM then
-hoists the loop BOUND — but a load in the loop BODY is still refused, because
-LICM requires the load's block to dominate *every* loop block, which only the
-header does. Measured on the SQLite `if (p == 0) return;` shape: steady-state
-memory operands per iteration go 2 -> 1 with the pass, not 1 -> 0
-(`check_loop_preheader.sh` contract 2 pins exactly that delta).
-The rule that is actually needed is weaker and still sound: a block *dominated
-by the header* is entered only when the loop is entered, because the loop-exit
-branch cannot be taken before the body's first instruction runs. "Must be the
-header" is a special case of "must be dominated by the header".
-This widens the gate that prevents the documented `sqlite3_get_auxdata` NULL
-segfault, so it needs the SQLite fixture, the `20051215-1.c` guarded-deref
-torture shape, and a differential sweep before it lands. Not a drive-by.
-When it lands, tighten `check_loop_preheader.sh` contract 2 from `-ne 1` to
-`-ne 0` — the gate was written so that this is a one-token edit.
+The former instruction to hoist a load because its block is *dominated by the
+header* was unsound: that is true for every block of a natural loop, including
+conditional/zero-trip/early-exit paths. Example:
+`for(int i=0;i<n;i++) if(take) sum+=*p;` with `n=17,take=0,p=NULL` is defined.
+Hoisting `*p` to the preheader introduces a fault. An early break before the
+load is another counterexample. Both are in `audit_loop_contracts.c`.
+
+A future improvement needs must-execute proof on the **first entered iteration**
+(or independently safe speculation), including exits and potentially nonreturning
+operations before the load, plus alias, volatile, atomic and lifetime checks.
+Keep the current conservative LICM gate. Do NOT change the existing preheader
+assembly contract from one load to zero on header-dominance alone.
 
 ### LOOP-PREHEADER-4 · **CLOSED 2026-09-29** — the pass's module doc motivated itself with a loop it does not fire on
 *(numbered -4, not -2: LOOP-PREHEADER-2 is already taken by the `loop_rotate`
@@ -897,10 +852,11 @@ cannot drift away from the behaviour again.
 emits `testl %edx, %edx` twice — once for `cmovneq %rdi, %r8` and again for
 `cmovneq %rsi, %rdi` — instead of reusing the first select's result. One
 redundant `test` per pair of same-condition selects. Small; worth folding into whichever pass
-DO-WHILE-BRANCH-1 ends up needing.
+the now-closed DO-WHILE-BRANCH-1 used to describe. That closure does not
+establish this separate vectorizer layout proposal.
 
 ### RA-CSAVE-1 · **NEW 2026-09-28** — callee-save save/restore traffic
-Opened from the SPILL-01 census: 562 of 1267 stack references (44.4 %) are
+Historical SPILL-01: 562 of 1267 stack references (44.4 %) are
 callee-saved registers being saved on entry and restored on exit, more than
 spills and allocas combined. Every register taken from the callee-saved pool
 costs two stack references per call. Before touching eviction policy: measure
@@ -909,6 +865,14 @@ callee-homes=`) versus saved defensively, and whether the corpus's hot
 functions would rather spill a caller-saved value. Done = a census-driven,
 output-checked change that reduces `csave` references on the corpus without an
 instruction-count regression, or a documented bound.
+
+2026-10-06 census (`--corpus`, programs + kernel corpus, `-O2 -march=x86-64-v3`):
+Final default: **589 / 1298 = 45.4%** callee-save references;
+**128 / 1298 = 9.9%** classified spills, 14 unknown and 262 `temp` references.
+(The opt-in FP candidate had 1294 total, 12 unknown and 260 `temp`.) This is a static census, not
+execution frequency: once-per-call saves cannot be priced as once-per-iteration
+loads. `temp` classification is not proof those references are unavoidable.
+No default allocation-policy change is justified by percentages alone.
 
 ### RA-PRESSURE-3 · **RE-SCOPED 2026-09-28** — sha256 round loop
 The historical framing ("land a generic phi-copy cycle resolver") is
@@ -1137,6 +1101,10 @@ lld 23.1 (`release/23.x`), mold 2.42.1, bfd 2.47 — verify versions
 before trusting a prebuilt (W3: a stale `wild` 0.7.0 produced two false
 lccc failures). Setup: `tools/linker/setup_oracles.sh`,
 `tests/linker/setup_oracles.sh`.
+2026-10-06: restored bfd/mold binaries now must pass actual `--version` checks,
+not merely exist in version-named directories. Reproducer/tests:
+`tests/regression/check_linker_oracle_versions.sh`. Mold's upstream v2.42.1
+CMake option was verified as `-DMOLD_TARGETS='X86_64;I386'`; it is already set.
 
 ---
 

@@ -55,6 +55,11 @@
 # Idempotent: re-running verifies and skips whatever already checks out.
 set -euo pipefail
 
+# Apply the same version proof to freshly built AND restored executables.
+# A stale binary in a directory named bfd-2.47 must never be published as 2.47.
+# shellcheck source=oracle_versions.sh
+source "$(dirname "${BASH_SOURCE[0]}")/oracle_versions.sh"
+
 JOBS="${JOBS:-2}"                      # research policy: -j2
 ARTIFACTS="${ARTIFACTS:-$HOME/artifacts/oracles}"
 PREFIX="${PREFIX:-$ARTIFACTS}"         # install root == persistent root
@@ -130,6 +135,8 @@ else
     note "ld    : $("$PREFIX/bfd-$BINUTILS_VER/bin/ld" --version | head -1) (built)"
 fi
 
+oracle_require_version "$PREFIX/bfd-$BINUTILS_VER/bin/ld" "$BINUTILS_VER"
+
 # ── mold 2.42.1, MOLD_USE_SYSTEM_* defaults (self-contained binary) ─────────
 if [ -x "$PREFIX/mold-$MOLD_VER/bin/mold" ]; then
     note "mold  : $("$PREFIX/mold-$MOLD_VER/bin/mold" --version) (restored from $ARTIFACTS)"
@@ -151,6 +158,8 @@ else
     cache_prefix "mold-$MOLD_VER"
     note "mold  : $("$PREFIX/mold-$MOLD_VER/bin/mold" --version) (built, targets $MOLD_TARGETS)"
 fi
+
+oracle_require_version "$PREFIX/mold-$MOLD_VER/bin/mold" "$MOLD_VER"
 
 # ── LLVM lld 23.1.x (apt.llvm.org release build) ───────────────────────────
 LLD_BIN=/usr/bin/ld.lld-$LLD_MAJOR

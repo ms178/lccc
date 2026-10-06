@@ -1077,16 +1077,21 @@ fn look_through_casts(val_id: u32, loop_defs: &FxHashMap<u32, &Instruction>) -> 
     for _ in 0..MAX_CAST_CHAIN_LENGTH {
         if let Some(inst) = loop_defs.get(&current) {
             match inst {
+                // A truncation on the backedge is part of the recurrence,
+                // not a transparent copy. In particular, C promotes u8/u16
+                // increments to int and then truncates: the wrap is DEFINED.
+                // Replacing that recurrence with a pointer bump walks off
+                // the array at 255 -> 0 (IVSR-WRAP-1).
                 Instruction::Cast {
                     src: Operand::Value(v),
+                    from_ty,
+                    to_ty,
                     ..
-                }
-                | Instruction::Copy {
+                } if from_ty == to_ty => current = v.0,
+                Instruction::Copy {
                     src: Operand::Value(v),
                     ..
-                } => {
-                    current = v.0;
-                }
+                } => current = v.0,
                 _ => break,
             }
         } else {

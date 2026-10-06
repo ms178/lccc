@@ -597,5 +597,18 @@ class CallSiteWiringTests(unittest.TestCase):
                          'probe; route them through a guarded helper: ' + ', '.join(offenders))
 
 
+class FailedCommandEvidenceTests(unittest.TestCase):
+    def test_failed_build_retains_stdout_and_stderr(self):
+        from subprocess import CompletedProcess
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / 'build.log'
+            result = CompletedProcess(['make'], 2, 'compile context\n', 'link error\n')
+            with mock.patch.object(runner.subprocess, 'run', return_value=result):
+                with self.assertRaisesRegex(RuntimeError, 'command failed'):
+                    runner.run(['make'], log=log)
+            self.assertIn('compile context', log.read_text())
+            self.assertIn('link error', log.read_text())
+
+
 if __name__ == '__main__':
     unittest.main()
