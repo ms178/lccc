@@ -5,8 +5,9 @@ use crate::backend::arm::assembler::parser::Operand;
 
 /// Encode UBFX Rd, Rn, #lsb, #width -> UBFM Rd, Rn, #lsb, #(lsb+width-1)
 pub(crate) fn encode_ubfx(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
+    let (regs, is_64) = gp_same_width(operands, 2, "ubfx")?;
+    let (rd, rn) = (regs[0], regs[1]);
+    let _ = rn;
     let lsb = get_imm(operands, 2)? as u32;
     let width = get_imm(operands, 3)? as u32;
     let sf = sf_bit(is_64);
@@ -27,8 +28,9 @@ pub(crate) fn encode_ubfx(operands: &[Operand]) -> Result<EncodeResult, String> 
 
 /// Encode SBFX Rd, Rn, #lsb, #width -> SBFM Rd, Rn, #lsb, #(lsb+width-1)
 pub(crate) fn encode_sbfx(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
+    let (regs, is_64) = gp_same_width(operands, 2, "sbfx")?;
+    let (rd, rn) = (regs[0], regs[1]);
+    let _ = rn;
     let lsb = get_imm(operands, 2)? as u32;
     let width = get_imm(operands, 3)? as u32;
     let sf = sf_bit(is_64);
@@ -43,8 +45,9 @@ pub(crate) fn encode_sbfx(operands: &[Operand]) -> Result<EncodeResult, String> 
 
 /// Encode UBFM Rd, Rn, #immr, #imms (raw form)
 pub(crate) fn encode_ubfm(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
+    let (regs, is_64) = gp_same_width(operands, 2, "ubfm")?;
+    let (rd, rn) = (regs[0], regs[1]);
+    let _ = rn;
     let immr = get_imm(operands, 2)? as u32;
     let imms = get_imm(operands, 3)? as u32;
     let sf = sf_bit(is_64);
@@ -62,8 +65,9 @@ pub(crate) fn encode_ubfm(operands: &[Operand]) -> Result<EncodeResult, String> 
 
 /// Encode SBFM Rd, Rn, #immr, #imms (raw form)
 pub(crate) fn encode_sbfm(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
+    let (regs, is_64) = gp_same_width(operands, 2, "sbfm")?;
+    let (rd, rn) = (regs[0], regs[1]);
+    let _ = rn;
     let immr = get_imm(operands, 2)? as u32;
     let imms = get_imm(operands, 3)? as u32;
     let sf = sf_bit(is_64);
@@ -75,8 +79,9 @@ pub(crate) fn encode_sbfm(operands: &[Operand]) -> Result<EncodeResult, String> 
 
 /// Encode SBFIZ Rd, Rn, #lsb, #width — alias for SBFM Rd, Rn, #(-lsb MOD regsize), #(width-1)
 pub(crate) fn encode_sbfiz(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
+    let (regs, is_64) = gp_same_width(operands, 2, "sbfiz")?;
+    let (rd, rn) = (regs[0], regs[1]);
+    let _ = rn;
     let lsb = get_imm(operands, 2)? as u32;
     let width = get_imm(operands, 3)? as u32;
     let regsize = if is_64 { 64u32 } else { 32 };
@@ -91,8 +96,12 @@ pub(crate) fn encode_sbfiz(operands: &[Operand]) -> Result<EncodeResult, String>
 
 /// Encode UBFIZ Rd, Rn, #lsb, #width — alias for UBFM Rd, Rn, #(-lsb MOD regsize), #(width-1)
 pub(crate) fn encode_ubfiz(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
+    // Two general-purpose slots that share one width: these forms read
+    // encoding 31 as the zero register, and `sf` with `N` is a single field,
+    // so neither `bfi wzr, x1, #1, #2` nor `bfi x0, w1, #1, #2` is an
+    // encoding.
+    let (regs, is_64) = gp_same_width(operands, 2, "ubfiz")?;
+    let (rd, rn) = (regs[0], regs[1]);
     let lsb = get_imm(operands, 2)? as u32;
     let width = get_imm(operands, 3)? as u32;
     let regsize = if is_64 { 64u32 } else { 32 };
@@ -113,8 +122,12 @@ pub(crate) fn encode_ubfiz(operands: &[Operand]) -> Result<EncodeResult, String>
 
 /// Encode BFM Rd, Rn, #immr, #imms (bitfield move)
 pub(crate) fn encode_bfm(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
+    // Two general-purpose slots that share one width: these forms read
+    // encoding 31 as the zero register, and `sf` with `N` is a single field,
+    // so neither `bfi wzr, x1, #1, #2` nor `bfi x0, w1, #1, #2` is an
+    // encoding.
+    let (regs, is_64) = gp_same_width(operands, 2, "bfm")?;
+    let (rd, rn) = (regs[0], regs[1]);
     let immr = get_imm(operands, 2)? as u32;
     let imms = get_imm(operands, 3)? as u32;
     let sf = sf_bit(is_64);
@@ -133,8 +146,12 @@ pub(crate) fn encode_bfm(operands: &[Operand]) -> Result<EncodeResult, String> {
 
 /// Encode BFI Rd, Rn, #lsb, #width -> BFM Rd, Rn, #(-lsb mod width_reg), #(width-1)
 pub(crate) fn encode_bfi(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
+    // Two general-purpose slots that share one width: these forms read
+    // encoding 31 as the zero register, and `sf` with `N` is a single field,
+    // so neither `bfi wzr, x1, #1, #2` nor `bfi x0, w1, #1, #2` is an
+    // encoding.
+    let (regs, is_64) = gp_same_width(operands, 2, "bfi")?;
+    let (rd, rn) = (regs[0], regs[1]);
     let lsb = get_imm(operands, 2)? as u32;
     let width = get_imm(operands, 3)? as u32;
     let sf = sf_bit(is_64);
@@ -155,8 +172,12 @@ pub(crate) fn encode_bfi(operands: &[Operand]) -> Result<EncodeResult, String> {
 
 /// Encode BFXIL Rd, Rn, #lsb, #width -> BFM Rd, Rn, #lsb, #(lsb+width-1)
 pub(crate) fn encode_bfxil(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
+    // Two general-purpose slots that share one width: these forms read
+    // encoding 31 as the zero register, and `sf` with `N` is a single field,
+    // so neither `bfi wzr, x1, #1, #2` nor `bfi x0, w1, #1, #2` is an
+    // encoding.
+    let (regs, is_64) = gp_same_width(operands, 2, "bfxil")?;
+    let (rd, rn) = (regs[0], regs[1]);
     let lsb = get_imm(operands, 2)? as u32;
     let width = get_imm(operands, 3)? as u32;
     let sf = sf_bit(is_64);
@@ -176,9 +197,10 @@ pub(crate) fn encode_bfxil(operands: &[Operand]) -> Result<EncodeResult, String>
 
 /// Encode EXTR Rd, Rn, Rm, #lsb
 pub(crate) fn encode_extr(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-    let (rm, _) = get_reg(operands, 2)?;
+    // All three slots read encoding 31 as the zero register and share one
+    // width through `sf`/`N`; `extr sp, x1, x2, #3` used to assemble.
+    let (regs, is_64) = gp_same_width(operands, 3, "extr")?;
+    let (rd, rn, rm) = (regs[0], regs[1], regs[2]);
     let lsb = get_imm(operands, 3)? as u32;
     let sf = sf_bit(is_64);
     let n = if is_64 { 1u32 } else { 0u32 };
@@ -284,9 +306,13 @@ pub(crate) fn encode_rev32(operands: &[Operand]) -> Result<EncodeResult, String>
 // ── CRC32 ────────────────────────────────────────────────────────────────
 
 pub(crate) fn encode_crc32(mnemonic: &str, operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, _) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-    let (rm, _) = get_reg(operands, 2)?;
+    // `crc32b/h/w` are W-register instructions end to end; the `x` forms keep
+    // the 32-bit accumulator and destination but take a 64-bit source, so the
+    // three slots cannot be read as one width list.  `crc32x w0,w1,w2`,
+    // `crc32b w0,w1,x2` and `crc32x x0,w1,x2` all used to assemble.
+    let rd = gp_widened(operands, 0, false, mnemonic)?;
+    let rn = gp_widened(operands, 1, false, mnemonic)?;
+    let rm = gp_widened(operands, 2, mnemonic.ends_with('x'), mnemonic)?;
 
     let is_c = mnemonic.contains("crc32c");
     let c_bit = if is_c { 1u32 } else { 0 };

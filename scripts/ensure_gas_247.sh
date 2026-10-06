@@ -499,6 +499,36 @@ cache=${GAS_CACHE:-${HOME}/.cache}
 tarball="$dl_dir/binutils-$ver.tar.xz"
 mkdir -p "$dl_dir" "$cache"
 
+# Provisioning is a READ-MODIFY-WRITE over two shared paths: the download
+# cache (the tarball and its `.part` staging name) and the extracted source
+# tree (`$cache/binutils-2.47` and its `.extracting` scratch directory).
+# The per-target build directory is private, but those two are not, so two
+# invocations under one workspace contend: one is told `Directory not empty`
+# while it removes the other's `.extracting` tree, and the loser's tar finds
+# the winner's files already in place ("binutils-2.47/COPYING: Cannot open:
+# File exists").  Measured 2026-10-05 while provisioning the x86_64 pair and
+# the aarch64 triple side by side; both then failed and had to be re-run.
+#
+# Serialize the whole read-modify-write with an advisory lock on the shared
+# cache, and RE-CHECK the fast path after acquiring it: a second caller that
+# waited for the first to finish must find a valid pair and return, not
+# rebuild it.  `flock` is util-linux and always present; if it is missing the
+# provision still works, just unserialized (the guard below is a warning, not
+# a failure, because a single-threaded CI step is the common case).
+lock="$dl_dir/.ensure_gas_247.lock"
+if command -v flock >/dev/null 2>&1; then
+    exec 9>"$lock"
+    flock 9
+fi
+
+# Double-checked under the lock: the pair may have been installed while this
+# invocation waited for it.
+if [[ -x "$as" && -x "$od" ]] && validate_pair && _pair_provenance_ok; then
+    "$as" --version | sed -n '1,1p'
+    "$od" --version | sed -n '1,1p'
+    exit 0
+fi
+
 # Mirror chain: ftp.gnu.org first (canonical), then well-known mirrors that
 # answer from the sandbox network. --connect-timeout keeps a blackholed
 # host from stalling the provision.

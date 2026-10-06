@@ -55,7 +55,12 @@ pub(crate) fn encode_ccmp_ccmn(
 ) -> Result<EncodeResult, String> {
     // CCMP/CCMN Rn, #imm5, #nzcv, cond
     // The only difference: CCMP has bit 30 = 1, CCMN has bit 30 = 0
-    let (rn, is_64) = get_reg(operands, 0)?;
+    //
+    // Rn reads encoding 31 as the zero register: `ccmp sp, x1, #0, eq`
+    // assembled as `ccmp xzr, x1, #0, eq`, which is a different comparison.
+    let name = if is_ccmp { "ccmp" } else { "ccmn" };
+    let rn_reg = reg_operand(operands, 0, GpRole::RegOrZr, name)?;
+    let (rn, is_64) = (rn_reg.num, rn_reg.is_64);
     let sf = sf_bit(is_64);
     let op = if is_ccmp { 1u32 << 30 } else { 0u32 };
 
@@ -75,11 +80,22 @@ pub(crate) fn encode_ccmp_ccmn(
         return Ok(EncodeResult::Word(word));
     }
 
-    // CCMP/CCMN Rn, Rm, #nzcv, cond
-    if let (Some(Operand::Reg(rm_name)), Some(Operand::Imm(nzcv)), Some(Operand::Cond(cond))) =
+    // CCMP/CCMN Rn, Rm, #nzcv, cond.  The register form has one `sf`-style
+    // width for both operands: `ccmp x0, w1, #0, eq` has no encoding.
+    if let (Some(Operand::Reg(_)), Some(Operand::Imm(nzcv)), Some(Operand::Cond(cond))) =
         (operands.get(1), operands.get(2), operands.get(3))
     {
-        let rm = parse_reg_num(rm_name).ok_or("invalid rm")?;
+        // Rm is a general-purpose register of the same width as Rn.  The
+        // spelling must be read as a *GP* register: `parse_reg_num` would
+        // accept `d0` here too, and CCMP's second operand has no FP form.
+        let rm_reg = reg_operand(operands, 1, GpRole::RegOrZr, "ccmp/ccmn")?;
+        if rm_reg.is_64 != (sf == 1) {
+            return Err(format!(
+                "ccmp/ccmn: `{}` has a different width than the first operand",
+                operand_spelling(operands, 1)
+            ));
+        }
+        let rm = rm_reg.num;
         let cond_val = encode_cond(cond).ok_or("invalid condition")?;
         let word = (sf << 31)
             | op
@@ -92,16 +108,14 @@ pub(crate) fn encode_ccmp_ccmn(
         return Ok(EncodeResult::Word(word));
     }
 
-    let name = if is_ccmp { "ccmp" } else { "ccmn" };
     Err(format!("unsupported {} operands", name))
 }
 
 // ── Conditional select ───────────────────────────────────────────────────
 
 pub(crate) fn encode_csel(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-    let (rm, _) = get_reg(operands, 2)?;
+    let (regs, is_64) = gp_same_width(operands, 3, "csel")?;
+    let (rd, rn, rm) = (regs[0], regs[1], regs[2]);
     let cond = match operands.get(3) {
         Some(Operand::Cond(c)) => encode_cond(c).ok_or("invalid cond")?,
         _ => return Err("csel requires condition".to_string()),
@@ -112,9 +126,8 @@ pub(crate) fn encode_csel(operands: &[Operand]) -> Result<EncodeResult, String> 
 }
 
 pub(crate) fn encode_csinc(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-    let (rm, _) = get_reg(operands, 2)?;
+    let (regs, is_64) = gp_same_width(operands, 3, "csinc")?;
+    let (rd, rn, rm) = (regs[0], regs[1], regs[2]);
     let cond = match operands.get(3) {
         Some(Operand::Cond(c)) => encode_cond(c).ok_or("invalid cond")?,
         _ => return Err("csinc requires condition".to_string()),
@@ -126,9 +139,8 @@ pub(crate) fn encode_csinc(operands: &[Operand]) -> Result<EncodeResult, String>
 }
 
 pub(crate) fn encode_csinv(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-    let (rm, _) = get_reg(operands, 2)?;
+    let (regs, is_64) = gp_same_width(operands, 3, "csinv")?;
+    let (rd, rn, rm) = (regs[0], regs[1], regs[2]);
     let cond = match operands.get(3) {
         Some(Operand::Cond(c)) => encode_cond(c).ok_or("invalid cond")?,
         _ => return Err("csinv requires condition".to_string()),
@@ -141,9 +153,8 @@ pub(crate) fn encode_csinv(operands: &[Operand]) -> Result<EncodeResult, String>
 }
 
 pub(crate) fn encode_csneg(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
-    let (rm, _) = get_reg(operands, 2)?;
+    let (regs, is_64) = gp_same_width(operands, 3, "csneg")?;
+    let (rd, rn, rm) = (regs[0], regs[1], regs[2]);
     let cond = match operands.get(3) {
         Some(Operand::Cond(c)) => encode_cond(c).ok_or("invalid cond")?,
         _ => return Err("csneg requires condition".to_string()),
@@ -160,8 +171,11 @@ pub(crate) fn encode_csneg(operands: &[Operand]) -> Result<EncodeResult, String>
 }
 
 pub(crate) fn encode_cset(operands: &[Operand]) -> Result<EncodeResult, String> {
-    // CSET Rd, cond -> CSINC Rd, XZR, XZR, invert(cond)
-    let (rd, is_64) = get_reg(operands, 0)?;
+    // CSET Rd, cond -> CSINC Rd, XZR, XZR, invert(cond).  The destination is
+    // an `Rd|XZR` slot, so `cset sp,eq` (which used to assemble as `cset xzr,eq`)
+    // is not encodable; XZR and WZR are.
+    let rd_reg = reg_operand(operands, 0, GpRole::RegOrZr, "cset")?;
+    let (rd, is_64) = (rd_reg.num, rd_reg.is_64);
     let cond = match operands.get(1) {
         Some(Operand::Cond(c)) => encode_cond(c).ok_or("invalid cond")?,
         _ => return Err("cset requires condition".to_string()),
@@ -179,8 +193,10 @@ pub(crate) fn encode_cset(operands: &[Operand]) -> Result<EncodeResult, String> 
 }
 
 pub(crate) fn encode_csetm(operands: &[Operand]) -> Result<EncodeResult, String> {
-    // CSETM Rd, cond -> CSINV Rd, XZR, XZR, invert(cond)
-    let (rd, is_64) = get_reg(operands, 0)?;
+    // CSETM Rd, cond -> CSINV Rd, XZR, XZR, invert(cond); the destination is
+    // an `Rd|XZR` slot, so the stack pointer has no encoding here either.
+    let rd_reg = reg_operand(operands, 0, GpRole::RegOrZr, "csetm")?;
+    let (rd, is_64) = (rd_reg.num, rd_reg.is_64);
     let cond = match operands.get(1) {
         Some(Operand::Cond(c)) => encode_cond(c).ok_or("invalid cond")?,
         _ => return Err("csetm requires condition".to_string()),
@@ -195,7 +211,100 @@ pub(crate) fn encode_csetm(operands: &[Operand]) -> Result<EncodeResult, String>
 
 // ── Branches ─────────────────────────────────────────────────────────────
 
+/// Read the branch-target register of BR/BLR/RET.
+///
+/// These transfer control to an address *in a register*, so the operand is a
+/// 64-bit general-purpose register; XZR is encodable (field 31, `br xzr` is a
+/// real instruction) but SP is not -- `br sp` used to assemble as `br xzr`,
+/// i.e. a branch to address zero.
+fn branch_reg(operands: &[Operand], idx: usize, mn: &str) -> Result<u32, String> {
+    // `GpReg::by_name`, not `parse_reg_num`: the latter accepts the FP/SIMD
+    // width letters too (`d0`, `s3`, `q31`, `v7`), so `br d0` used to assemble
+    // as `br x0` -- a branch into general-purpose register 0 because the
+    // programmer wrote a double register.  The audit that flagged this class
+    // (`branch_reg`, the SYS Rt readers, the atomic bases) found it in every
+    // function that "checked a few spellings and then parsed the rest".
+    let name = match operands.get(idx) {
+        Some(Operand::Reg(name)) => name.as_str(),
+        Some(other) => {
+            return Err(format!(
+                "{mn}: expected a register to branch to, got {other:?}"
+            ));
+        }
+        None => return Err(format!("{mn}: missing branch register")),
+    };
+    let reg = GpReg::by_name(name).ok_or_else(|| {
+        format!(
+            "{mn}: `{name}` is not a branch register; the target is a 64-bit \
+             general-purpose register (x0-x30, lr or xzr)"
+        )
+    })?;
+    if !reg.is_64 {
+        return Err(format!(
+            "{mn}: `{name}` is 32-bit; a branch target is a 64-bit register"
+        ));
+    }
+    if reg.is_sp {
+        return Err(format!(
+            "{mn}: `{name}` cannot be branched to; write `xzr` for address 0"
+        ));
+    }
+    // XZR is a real operand here (field 31): `br xzr` branches to address 0,
+    // and GNU as accepts it.
+    Ok(reg.num)
+}
+
+/// The Rt of CBZ/CBNZ/TBZ/TBNZ: a 32- or 64-bit general-purpose register.
+/// ZR is encodable (it is a real register value, 0), SP is not (`cbz sp,.`
+/// used to assemble as `cbz xzr,.`), and neither are FP/SIMD registers
+/// (`cbz d0,.` used to assemble as `cbz x0,.`).
+fn test_reg(operands: &[Operand], idx: usize, mn: &str) -> Result<(u32, bool), String> {
+    let reg = reg_operand(operands, idx, GpRole::RegOrZr, mn)?;
+    Ok((reg.num, reg.is_64))
+}
+
+/// The 14-bit branch offset of CBZ/CBNZ (imm19) and TBZ/TBNZ (imm14), as a
+/// *scaled* field, or `None` when the operand is a symbol to be relocated.
+fn branch_offset_scaled(
+    operands: &[Operand],
+    idx: usize,
+    bits: u32,
+    mn: &str,
+) -> Result<Option<u32>, String> {
+    match operands.get(idx) {
+        Some(Operand::Imm(v)) => {
+            let (lo, hi) = (-(1i64 << (bits - 1)), (1i64 << (bits - 1)) - 1);
+            if v % 4 != 0 {
+                return Err(format!(
+                    "{mn}: branch offset {v} is not a multiple of 4 (instructions \
+                     are 4 bytes)"
+                ));
+            }
+            let scaled = v / 4;
+            if scaled < lo || scaled > hi {
+                return Err(format!(
+                    "{mn}: branch offset {v} is out of range for the {bits}-bit \
+                     scaled field"
+                ));
+            }
+            Ok(Some((scaled as u32) & ((1 << bits) - 1)))
+        }
+        _ => Ok(None),
+    }
+}
+
 pub(crate) fn encode_branch(operands: &[Operand]) -> Result<EncodeResult, String> {
+    if operands.len() != 1 {
+        return Err(format!(
+            "b takes exactly one branch target, got {} operands",
+            operands.len()
+        ));
+    }
+    if let Some(scaled) = branch_offset_scaled(operands, 0, 26, "b")? {
+        // `b #imm` is a raw PC-relative offset in bytes, like GNU as: the
+        // encoded field is the offset divided by four.
+        return Ok(EncodeResult::Word((0b000101 << 26) | scaled));
+    }
     let (sym, addend) = get_symbol(operands, 0)?;
     // B: 000101 imm26 (filled by linker/assembler)
     Ok(EncodeResult::WordWithReloc {
@@ -209,6 +318,15 @@ pub(crate) fn encode_branch(operands: &[Operand]) -> Result<EncodeResult, String
 }
 
 pub(crate) fn encode_bl(operands: &[Operand]) -> Result<EncodeResult, String> {
+    if operands.len() != 1 {
+        return Err(format!(
+            "bl takes exactly one branch target, got {} operands",
+            operands.len()
+        ));
+    }
+    if let Some(scaled) = branch_offset_scaled(operands, 0, 26, "bl")? {
+        return Ok(EncodeResult::Word((0b100101 << 26) | scaled));
+    }
     let (sym, addend) = get_symbol(operands, 0)?;
     // BL: 100101 imm26
     Ok(EncodeResult::WordWithReloc {
@@ -223,6 +341,16 @@ pub(crate) fn encode_bl(operands: &[Operand]) -> Result<EncodeResult, String> {
 
 pub(crate) fn encode_cond_branch(cond: &str, operands: &[Operand]) -> Result<EncodeResult, String> {
     let cond_val = encode_cond(cond).ok_or_else(|| format!("unknown condition: {}", cond))?;
+    if operands.len() != 1 {
+        return Err(format!(
+            "b.{cond} takes exactly one branch target, got {} operands",
+            operands.len()
+        ));
+    }
+    if let Some(scaled) = branch_offset_scaled(operands, 0, 19, "b.cond")? {
+        let word = (0b01010100 << 24) | (scaled << 5) | cond_val;
+        return Ok(EncodeResult::Word(word));
+    }
     let (sym, addend) = get_symbol(operands, 0)?;
     // B.cond: 01010100 imm19 0 cond
     let word = (0b01010100 << 24) | cond_val;
@@ -237,14 +365,14 @@ pub(crate) fn encode_cond_branch(cond: &str, operands: &[Operand]) -> Result<Enc
 }
 
 pub(crate) fn encode_br(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rn, _) = get_reg(operands, 0)?;
+    let rn = branch_reg(operands, 0, "br")?;
     // BR: 1101011 0000 11111 000000 Rn 00000
     let word = 0xd61f0000 | (rn << 5);
     Ok(EncodeResult::Word(word))
 }
 
 pub(crate) fn encode_blr(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rn, _) = get_reg(operands, 0)?;
+    let rn = branch_reg(operands, 0, "blr")?;
     // BLR: 1101011 0001 11111 000000 Rn 00000
     let word = 0xd63f0000 | (rn << 5);
     Ok(EncodeResult::Word(word))
@@ -254,7 +382,7 @@ pub(crate) fn encode_ret(operands: &[Operand]) -> Result<EncodeResult, String> {
     let rn = if operands.is_empty() {
         30 // default to x30 (LR)
     } else {
-        get_reg(operands, 0)?.0
+        branch_reg(operands, 0, "ret")?
     };
     // RET: 1101011 0010 11111 000000 Rn 00000
     let word = 0xd65f0000 | (rn << 5);
@@ -262,7 +390,21 @@ pub(crate) fn encode_ret(operands: &[Operand]) -> Result<EncodeResult, String> {
 }
 
 pub(crate) fn encode_cbz(operands: &[Operand], is_nz: bool) -> Result<EncodeResult, String> {
-    let (rt, is_64) = get_reg(operands, 0)?;
+    let mn = if is_nz { "cbnz" } else { "cbz" };
+    if operands.len() != 2 {
+        return Err(format!(
+            "{mn} takes a register and a label, got {} operands",
+            operands.len()
+        ));
+    }
+    let (rt, is_64) = test_reg(operands, 0, mn)?;
+    if let Some(scaled) = branch_offset_scaled(operands, 1, 19, mn)? {
+        let sf = sf_bit(is_64);
+        let op = if is_nz { 1u32 } else { 0u32 };
+        return Ok(EncodeResult::Word(
+            (sf << 31) | (0b011010 << 25) | (op << 24) | (scaled << 5) | rt,
+        ));
+    }
     let (sym, addend) = get_symbol(operands, 1)?;
     let sf = sf_bit(is_64);
     let op = if is_nz { 1u32 } else { 0u32 };
@@ -279,8 +421,33 @@ pub(crate) fn encode_cbz(operands: &[Operand], is_nz: bool) -> Result<EncodeResu
 }
 
 pub(crate) fn encode_tbz(operands: &[Operand], is_nz: bool) -> Result<EncodeResult, String> {
-    let (rt, _) = get_reg(operands, 0)?;
+    let mn = if is_nz { "tbnz" } else { "tbz" };
+    if operands.len() != 3 {
+        return Err(format!(
+            "{mn} takes a register, a bit number and a label, got {} operands",
+            operands.len()
+        ));
+    }
+    let (rt, is_64) = test_reg(operands, 0, mn)?;
     let bit = get_imm(operands, 1)?;
+    // The bit number is six bits wide; `tbz w0,#32,.` has no encoding because
+    // a 32-bit register has no bit 32, and the old reader masked with 0x3F so
+    // `tbz x0,#64,.` silently became `tbz x0,#0,.`.
+    let max_bit = if is_64 { 63 } else { 31 };
+    if !(0..=max_bit).contains(&bit) {
+        return Err(format!(
+            "{mn}: bit {bit} is outside the {}-bit register (allowed 0..={max_bit})",
+            if is_64 { 64 } else { 32 }
+        ));
+    }
+    if let Some(scaled) = branch_offset_scaled(operands, 2, 14, mn)? {
+        let b5 = ((bit as u32) >> 5) & 1;
+        let b40 = (bit as u32) & 0x1F;
+        let op = if is_nz { 1u32 } else { 0u32 };
+        return Ok(EncodeResult::Word(
+            (b5 << 31) | (0b011011 << 25) | (op << 24) | (b40 << 19) | (scaled << 5) | rt,
+        ));
+    }
     let (sym, addend) = get_symbol(operands, 2)?;
     let b5 = ((bit as u32) >> 5) & 1;
     let b40 = (bit as u32) & 0x1F;
@@ -299,17 +466,27 @@ pub(crate) fn encode_tbz(operands: &[Operand], is_nz: bool) -> Result<EncodeResu
 
 // ── Additional conditional operations ────────────────────────────────────
 
+/// Read the two register operands of a conditional-select alias (`cneg`,
+/// `cinc`, `cinv`).
+///
+/// Both slots are `Rd|Rn` with encoding 31 meaning the zero register, and the
+/// instruction has one `sf` for both, so `cneg x0,sp,eq` and `cinc w0,x1,eq`
+/// have no encoding — the first used to assemble as the XZR form and the second
+/// by ignoring the source's width.
+fn cond_select_alias_regs(operands: &[Operand], mn: &str) -> Result<(u32, u32, u32), String> {
+    let (regs, is_64) = gp_same_width(operands, 2, mn)?;
+    Ok((regs[0], regs[1], sf_bit(is_64)))
+}
+
 /// Encode CNEG Rd, Rn, cond -> CSNEG Rd, Rn, Rn, invert(cond)
 pub(crate) fn encode_cneg(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
+    let (rd, rn, sf) = cond_select_alias_regs(operands, "cneg")?;
     let cond = match operands.get(2) {
         Some(Operand::Cond(c)) => {
             encode_cond(c).ok_or_else(|| format!("unknown condition: {}", c))?
         }
         _ => return Err("cneg: expected condition code as third operand".to_string()),
     };
-    let sf = sf_bit(is_64);
     // Invert the condition (flip bit 0)
     let inv_cond = cond ^ 1;
     // CSNEG: sf 1 0 11010100 Rm cond 0 1 Rn Rd (with Rm = Rn)
@@ -326,15 +503,13 @@ pub(crate) fn encode_cneg(operands: &[Operand]) -> Result<EncodeResult, String> 
 
 /// Encode CINC Rd, Rn, cond -> CSINC Rd, Rn, Rn, invert(cond)
 pub(crate) fn encode_cinc(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
+    let (rd, rn, sf) = cond_select_alias_regs(operands, "cinc")?;
     let cond = match operands.get(2) {
         Some(Operand::Cond(c)) => {
             encode_cond(c).ok_or_else(|| format!("unknown condition: {}", c))?
         }
         _ => return Err("cinc: expected condition code as third operand".to_string()),
     };
-    let sf = sf_bit(is_64);
     let inv_cond = cond ^ 1;
     // CSINC: sf 0 0 11010100 Rm cond 0 1 Rn Rd (with Rm = Rn)
     let word = (sf << 31)
@@ -349,15 +524,13 @@ pub(crate) fn encode_cinc(operands: &[Operand]) -> Result<EncodeResult, String> 
 
 /// Encode CINV Rd, Rn, cond -> CSINV Rd, Rn, Rn, invert(cond)
 pub(crate) fn encode_cinv(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rd, is_64) = get_reg(operands, 0)?;
-    let (rn, _) = get_reg(operands, 1)?;
+    let (rd, rn, sf) = cond_select_alias_regs(operands, "cinv")?;
     let cond = match operands.get(2) {
         Some(Operand::Cond(c)) => {
             encode_cond(c).ok_or_else(|| format!("unknown condition: {}", c))?
         }
         _ => return Err("cinv: expected condition code as third operand".to_string()),
     };
-    let sf = sf_bit(is_64);
     let inv_cond = cond ^ 1;
     // CSINV: sf 1 0 11010100 Rm cond 0 0 Rn Rd (with Rm = Rn)
     let word = (sf << 31)
