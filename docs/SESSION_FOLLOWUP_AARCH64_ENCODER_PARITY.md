@@ -2,6 +2,16 @@
 
 **Status:** merged upstream as part of PR #765 and extended by PR #766; `ci_local.sh --fast`
 green (rustfmt + clippy included).
+
+> **Revision note (2026-10-06).**  The counts here are the shipped ones: the
+> table is **10411 rows in 55 groups** and the sysreg table **1619 names**.  Two
+> corrections to what this document first recorded: the hosted matrix step is
+> provisioned with the *pinned* pair again (it had been switched to the runner's
+> distro `as`, which disagrees with 1077 rows and made the gate red), and the
+> verification rows below are re-derived in
+> `docs/VERIFICATION_AARCH64_MATRIX_2026-10-06.md`, which carries the commands,
+> the oracle's provenance and the raw output.  Rows marked *author-measured*
+> there are the ones this document recorded; everything else was re-run.
 **Audience:** anyone touching the AArch64 assembler encoder, the differential tooling
 around it, or the CI mirrors that provision its oracles.
 
@@ -21,7 +31,7 @@ compares is a valid encoding by construction.  The instruments that can:
 
 | instrument | what it pins | invocation |
 |---|---|---|
-| `tests/aarch64/operand-legality.tsv` (**10401 rows; the exact per-group counts are the 55-line ratchet table in `elf_writer.rs`**) | every row's verdict is GNU as's own; `operand_legality_matrix_matches_the_encoder` (`include_str!`) pins the encoder both ways | `python3 scripts/aarch64_operand_legality_matrix.py --check-lccc target/fastbuild/lccc --objcopy <distro> --as <pinned>` |
+| `tests/aarch64/operand-legality.tsv` (**10411 rows; the exact per-group counts are the 55-line ratchet table in `elf_writer.rs`**) | every row's verdict is GNU as's own; `operand_legality_matrix_matches_the_encoder` (`include_str!`) pins the encoder both ways | `python3 scripts/aarch64_operand_legality_matrix.py --check-lccc target/fastbuild/lccc --objcopy <distro> --as <pinned>` |
 | `src/backend/arm/assembler/encoder/sysreg_table.rs` (**1619 names**, generated from `opcodes/aarch64-sys-regs.def`) | `.def` ↔ pinned GNU as ↔ generated table ↔ encoder words, both directions | `python3 scripts/aarch64_sysreg_table.py --check --as <pinned> --objcopy <distro> --lccc target/fastbuild/lccc` |
 
 The verdicts are asserted, not quoted: `--check` re-derives every row from the pinned
@@ -209,8 +219,8 @@ rewritten`).
 | check | verdict |
 |---|---|
 | `cargo test --profile fastbuild --locked -j2 --lib` | **4131 passed, 0 failed, 7 ignored** |
-| matrix vs pinned `as` (`--check`) | **10401 rows agree** |
-| matrix vs encoder (`--check-lccc`) | **10401 rows agree** |
+| matrix vs pinned `as` (`--check`) | **10411 rows agree** |
+| matrix vs encoder (`--check-lccc`) | **10411 rows agree** |
 | scalar-conversion sweep vs pinned `as` (1018 spellings) | **0 disagreements** |
 | CASP pair sweep vs pinned `as` (228 spellings) | **0 disagreements** |
 | sysreg table (`.def`/`as`/table/encoder) | **1619/1619** |

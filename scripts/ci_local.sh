@@ -1147,10 +1147,12 @@ fi
 # yet accepting them silently is exactly as wrong as mis-encoding one. The
 # matrix is a curated accept/reject table whose every expectation is GNU
 # as's own verdict, re-checked against the cross assembler at gate time
-# (423 rows, ~2 s, no compiler and no network), and it is what turned the
-# review's "the operand checks look like class checks" into 38 executed
-# counterexamples. It needs only `as`/`objcopy`, so it is skipped, not
-# passed, when the cross-binutils are absent.
+# (10411 rows in two batched assembler runs -- 0.1 s measured with the pinned
+# pair -- so the whole table is re-derived rather than sampled, with no
+# compiler and no network), and it is what turned the review's "the operand
+# checks look like class checks" into 38 executed counterexamples. It needs
+# only `as`/`objcopy`, so it is skipped, not passed, when the cross-binutils
+# are absent.
 if [ -n "$A64_AS" ] && [ -n "$A64_OBJCOPY" ]; then
     gate "aarch64-operand-legality" fast \
         python3 scripts/aarch64_operand_legality_matrix.py --check \
@@ -1171,6 +1173,7 @@ if [ -n "$A64_OBJCOPY" ] && [ -x target/fastbuild/lccc ]; then
     gate "aarch64-operand-legality-encoder" fast \
         python3 scripts/aarch64_operand_legality_matrix.py \
         --check-lccc target/fastbuild/lccc \
+        --jobs 2 \
         --objcopy "$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/objcopy"
 else
     echo "SKIP  aarch64-operand-legality-encoder (aarch64-linux-gnu-objcopy or" \

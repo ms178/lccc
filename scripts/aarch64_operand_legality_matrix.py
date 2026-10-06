@@ -53,9 +53,21 @@ USAGE
 ``--check`` needs ``aarch64-linux-gnu-as`` and ``aarch64-linux-gnu-objcopy``;
 ``--check-lccc`` needs ``aarch64-linux-gnu-objcopy`` (to read our own object)
 and invokes the compiler through a symlink named ``aarch64-linux-gnu-ccc``,
-because LCCC selects its backend from ``argv[0]``.  The same table is also
-compiled into the unit-test suite, so the guarantee holds on a host with no
-cross-binutils at all.
+because LCCC selects its backend from ``argv[0]``.  Each mode requires only the
+tools it actually drives.  The same table is also compiled into the unit-test
+suite, so the guarantee holds on a host with no cross-binutils at all.
+
+COST, AND WHY IT IS SHAPED THIS WAY
+-----------------------------------
+The table half re-derives all 10411 rows in TWO assembler runs (see
+``batch_encode``): 0.1 s measured with the pinned pair, against 37.8 s for the
+per-row path it replaced, which is what makes re-deriving the whole table on
+every pass reasonable instead of a reason to sample it.  The differential half
+cannot be batched the same way -- whether the compiler reports a failing line
+and continues is not a property any measurement pins -- so it stays one
+invocation per row and takes ``--jobs N`` to run them concurrently, with the
+reported rows and their order independent of the job count.
+
 It exits 0 when every row matches GNU as, 1 on any mismatch, and 2 when the
 toolchain is missing (so a caller can distinguish "wrong" from "cannot tell").
 The ``aarch64-operand-legality`` gate in ``ci_local.sh`` runs it in ``--check``
@@ -356,6 +368,21 @@ GROUPS: dict[str, list[str]] = {
         "mov x0,#0x5555555555555555", "mov x0,#0x123456789abcdef0",
         "mov w0,#0", "mov w0,#-1", "mov w0,#0xffff", "mov wsp,#0x12345",
         "mov sp,#0x1234", "mov sp,#-1", "mov xzr,#0x100000000",
+    ],
+    # An immediate is a 64-bit value; the DESTINATION is what makes it fit or
+    # not.  A 33-bit-and-wider value in a `w` destination is not a
+    # truncation, it is not an encoding at all, and an encoder that masks the
+    # immediate instead of refusing it silently drops the top half -- the
+    # fail-closed shape this family was audited for.  Every rejected row is
+    # paired with its `x`-destination control at the *same* immediate, so a
+    # regression that starts masking shows up as one row flipping, not as a
+    # whole mnemonic disappearing.
+    "immediate width overflow": [
+        "mov w0,#0x100000000", "mov x0,#0x100000001",
+        "and w0,w1,#0x100000001", "and x0,x1,#0x100000001",
+        "orr w0,w1,#0x100000001", "orr x0,x1,#0x100000001",
+        "eor w0,w1,#0x100000001", "eor x0,x1,#0x100000001",
+        "ands w0,w1,#0x100000001", "ands x0,x1,#0x100000001",
     ],
     # --- cmp/cmn/tst: the pinned-destination aliases ------------------------
     # CMP/CMN are SUBS/ADDS with the destination pinned to 11111, and TST is
@@ -1299,6 +1326,7 @@ def assemble(
     objcopy: str,
     tmp: Path,
     prologue: str = PROLOGUE,
+    stem: str = "m",
 ) -> str:
     """One assembler's verdict for one instruction.
 
@@ -1306,10 +1334,15 @@ def assemble(
     one-instruction file yields the encoding itself -- or ``REJECT`` when the
     assembler exits non-zero.  ``command`` is the assembler invocation with the
     source and ``-o`` arguments appended by the caller's convention.
+
+    ``stem`` names the three scratch files.  The default is the historical
+    shared name; a caller that runs verdicts concurrently (the differential
+    half's ``--jobs``) passes a per-row stem so two assemblers never share a
+    source, object or binary path.
     """
-    src = tmp / "m.s"
-    obj = tmp / "m.o"
-    binf = tmp / "m.bin"
+    src = tmp / f"{stem}.s"
+    obj = tmp / f"{stem}.o"
+    binf = tmp / f"{stem}.bin"
     src.write_text(prologue + insn + "\n")
     for f in (obj, binf):
         if f.exists():
@@ -1328,8 +1361,104 @@ def assemble(
 
 
 def encode(insn: str, as_bin: str, objcopy: str, tmp: Path) -> str:
-    """GNU as's verdict for one instruction: ``OK <hexwords>`` or ``REJECT``."""
+    """GNU as's verdict for one instruction: ``OK <hexwords>`` or ``REJECT``.
+
+    The single-row reference path, and the one ``--check``/``--regenerate``
+    used before ``batch_encode`` existed; kept because it is the shortest way
+    to ask what GNU as thinks of one spelling while editing an encoder arm, and
+    because it is the control the batched path is measured against
+    (``docs/VERIFICATION_AARCH64_MATRIX_2026-10-06.md`` §2).
+    """
     return assemble(insn, [as_bin], objcopy, tmp)
+
+
+def batch_encode(
+    insns: list[str],
+    as_bin: str,
+    objcopy: str,
+    tmp: Path,
+    prologue: str = PROLOGUE,
+) -> dict[str, str]:
+    """GNU as's verdict for many instructions, in two assembler runs.
+
+    ``encode`` spawns ``as`` and ``objcopy`` per row: at 10411 rows that is
+    20822 process spawns (measured: 37.8 s with the pinned 2.47 pair) to
+    re-derive a table that only changes when the architecture or the pin does.
+    GNU as is a batch tool -- it reports every failing line, keeps going, and
+    writes no object for a file it diagnosed -- so one run yields the whole
+    reject set from the diagnostics and a second run of the survivors yields
+    the encodings in order.  It is the same two-run contract
+    ``aarch64_sysreg_table.py`` already proves for 1619 system registers.
+
+    Attribution is only sound when the exit status and the diagnostics agree,
+    so both mismatches are fatal rather than silently re-labelling rows: ``as``
+    reporting errors while exiting 0 would mark failing rows accepted, and
+    ``as`` exiting non-zero with no attributable line would mark every row
+    accepted.  The byte count is checked too -- a line that expands to more or
+    less than one word (a `;`-separated pair, a directive) would shift every
+    following verdict.
+
+    ``insns`` must be unique; the matrix is deduplicated by ``_expand``.
+    """
+    if len(set(insns)) != len(insns):
+        raise SystemExit(
+            "operand-legality matrix: batch_encode needs unique instructions; "
+            "the matrix is deduplicated by _expand()"
+        )
+    src = tmp / "batch.s"
+    obj = tmp / "batch.o"
+    binf = tmp / "batch.bin"
+    prologue_lines = prologue.count("\n")
+    src.write_text(prologue + "".join(f"{i}\n" for i in insns))
+    for f in (obj, binf):
+        if f.exists():
+            f.unlink()
+    r = subprocess.run(
+        [as_bin, str(src), "-o", str(obj)], capture_output=True, text=True
+    )
+    rejected = {
+        int(m.group(1)) - prologue_lines - 1
+        for m in re.finditer(r"batch\.s:(\d+): Error", r.stderr)
+    }
+    if any(n < 0 or n >= len(insns) for n in rejected):
+        raise SystemExit(
+            f"operand-legality matrix: GNU as ({as_bin}) blamed a line outside "
+            f"the instruction block: {sorted(rejected)}"
+        )
+    if not r.returncode and rejected:
+        raise SystemExit(
+            "operand-legality matrix: GNU as exited 0 but reported errors on "
+            f"{len(rejected)} line(s); the verdict attribution cannot be trusted"
+        )
+    if r.returncode and not rejected:
+        raise SystemExit(
+            f"operand-legality matrix: GNU as ({as_bin}) failed without "
+            f"reporting a line; cannot attribute verdicts: {r.stderr.strip()[:400]}"
+        )
+    accepted = [i for n, i in enumerate(insns) if n not in rejected]
+    if not accepted:
+        return {i: "REJECT" for i in insns}
+    if rejected:
+        src.write_text(prologue + "".join(f"{i}\n" for i in accepted))
+        subprocess.run(
+            [as_bin, str(src), "-o", str(obj)], check=True, capture_output=True
+        )
+    subprocess.run(
+        [objcopy, "-O", "binary", "--only-section=.text", str(obj), str(binf)],
+        check=True,
+        capture_output=True,
+    )
+    data = binf.read_bytes()
+    if len(data) != 4 * len(accepted):
+        raise SystemExit(
+            f"operand-legality matrix: assembled {len(accepted)} instructions "
+            f"but .text holds {len(data)} bytes; a row did not encode to "
+            "exactly one word"
+        )
+    out = {i: "REJECT" for i in insns}
+    for n, i in enumerate(accepted):
+        out[i] = "OK " + data[4 * n : 4 * n + 4].hex()
+    return out
 
 
 def parse_table(path: Path) -> list[tuple[str, str, str]]:
@@ -1393,6 +1522,14 @@ def main() -> int:
     )
     ap.add_argument("--as", dest="as_bin", default=None)
     ap.add_argument("--objcopy", default=None)
+    ap.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        metavar="N",
+        help="how many encoder verdicts to run concurrently in --check-lccc "
+        "(default 1; the table half is batched and ignores this)",
+    )
     args = ap.parse_args()
 
     if args.dump:
@@ -1408,15 +1545,32 @@ def main() -> int:
         for g, _ in _expand():
             counts[g] = counts.get(g, 0) + 1
         total = sum(counts.values())
-        print(f"            (_, {total}),  // total rows")
+        # Paste-ready for elf_writer.rs: the first entry's NAME is unused there
+        # (`let (_, want_total) = GROUP_RATCHETS[0];` reads its number), so the
+        # placeholder is printed in the form the file holds rather than as `_`,
+        # which is not valid expression syntax and silently breaks the build if
+        # it is pasted verbatim.
+        print(f'            ("", {total}),  // total rows')
         for g in sorted(counts):
             print(f'            ("{g}", {counts[g]}),')
         return 0
 
     as_bin, objcopy = find_tools(args.as_bin, args.objcopy)
-    if not as_bin or not objcopy:
+    # The tool requirement follows the mode: the table half drives GNU as and
+    # reads its object with `objcopy`, while the differential half drives the
+    # encoder and only needs `objcopy` to read OUR object -- it never invokes
+    # `as`.  Requiring both for both turned a missing cross assembler into a
+    # failure of a gate that could have run.
+    if not objcopy:
         print(
-            "operand-legality matrix: cross-binutils not found; cannot verify",
+            "operand-legality matrix: objcopy not found; cannot read an object",
+            file=sys.stderr,
+        )
+        return 2
+    if (args.check or args.regenerate) and not as_bin:
+        print(
+            "operand-legality matrix: GNU as not found; "
+            "--check/--regenerate need it",
             file=sys.stderr,
         )
         return 2
@@ -1424,9 +1578,10 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         if args.regenerate:
-            rows = [
-                (g, i, encode(i, as_bin, objcopy, tmp)) for g, i in _expand()
-            ]
+            verdicts = batch_encode(
+                [i for _, i in _expand()], as_bin, objcopy, tmp
+            )
+            rows = [(g, i, verdicts[i]) for g, i in _expand()]
             write_table(rows, TABLE)
             n_rej = sum(1 for _, _, e in rows if e == "REJECT")
             print(
@@ -1479,11 +1634,14 @@ def main() -> int:
             return 1
 
         if args.check:
-            drift = []
-            for group, insn, expected in rows:
-                got = encode(insn, as_bin, objcopy, tmp)
-                if got != expected:
-                    drift.append((group, insn, expected, got))
+            verdicts = batch_encode(
+                [insn for _, insn, _ in rows], as_bin, objcopy, tmp
+            )
+            drift = [
+                (group, insn, expected, verdicts[insn])
+                for group, insn, expected in rows
+                if verdicts[insn] != expected
+            ]
 
             if drift:
                 print(
@@ -1517,11 +1675,40 @@ def main() -> int:
                 return 2
             link = tmp / "aarch64-linux-gnu-ccc"
             link.symlink_to(lccc.resolve())
-            bad = []
-            for group, insn, expected in rows:
-                got = assemble(insn, [str(link), "-c"], objcopy, tmp, prologue=".text\n")
-                if got != expected:
-                    bad.append((group, insn, expected, got))
+            # One encoder invocation per row, unlike the table half: whether
+            # this compiler reports a failing line and continues (the property
+            # that lets GNU as be batched above) is not pinned by any
+            # measurement, and a mis-attributed verdict would be worse than a
+            # slow gate.  `--jobs` therefore buys the wall-clock back with
+            # parallelism instead of batching -- each row gets its own stem, and
+            # `map` returns in row order, so the reported rows and their order
+            # are identical at any job count.
+            def verdict(job: tuple[int, str]) -> tuple[int, str]:
+                n, insn = job
+                return n, assemble(
+                    insn,
+                    [str(link), "-c"],
+                    objcopy,
+                    tmp,
+                    prologue=".text\n",
+                    stem=f"m{n}",
+                )
+
+            jobs = max(1, min(args.jobs, len(rows)))
+            work = list(enumerate(insn for _, insn, _ in rows))
+            if jobs == 1:
+                results = [verdict(job) for job in work]
+            else:
+                from concurrent.futures import ThreadPoolExecutor
+
+                with ThreadPoolExecutor(max_workers=jobs) as pool:
+                    results = list(pool.map(verdict, work))
+            got_by_row = [got for _, got in results]
+            bad = [
+                (group, insn, expected, got_by_row[n])
+                for n, (group, insn, expected) in enumerate(rows)
+                if got_by_row[n] != expected
+            ]
 
             if bad:
                 print(

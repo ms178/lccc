@@ -2678,7 +2678,11 @@ fn ld_replicate_reglist(operands: &[Operand], mn: &str, num_structs: u32) -> Res
         }
     }
     let first = first_reg.ok_or_else(|| format!("{mn}: empty register list"))?;
-    let arr = arrangement.unwrap();
+    // `arrangement` is set in the same breath as `first_reg` above, so this is
+    // unreachable rather than a live case -- but it is an encoder path an
+    // attacker-shaped input reaches first, and the crate's rule is that a
+    // rejected instruction is an `Err`, never a panic.
+    let arr = arrangement.ok_or_else(|| format!("{mn}: empty register list"))?;
     if !matches!(arr, "8b" | "16b" | "4h" | "8h" | "2s" | "4s" | "1d" | "2d") {
         return Err(format!(
             "{mn}: unsupported arrangement `{arr}` \

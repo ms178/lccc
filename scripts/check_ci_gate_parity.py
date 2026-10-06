@@ -523,6 +523,7 @@ INVOCATION_CONTRACTS: tuple[InvocationContract, ...] = (
         sides=_BOTH,
         option_spec={
             "--objcopy": (PINNED_A64_OBJCOPY,),
+            "--jobs": ("2",),
         },
         rest_spec=("--check-lccc", "target/fastbuild/lccc"),
         local_gate=("aarch64-operand-legality-encoder", "fast"),

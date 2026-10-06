@@ -1,6 +1,18 @@
 # Session 2026-10-05: PR #765 merged with the S20a encoder halves, and the
 # verbatim loop rotation re-implemented
 
+> **Revision note (2026-10-06).**  This is that session's record, written when
+> the operand-legality matrix held **6817 rows**; the counts below are the ones
+> that session measured and are kept as written rather than rewritten.  The
+> table has since grown to **10411 rows in 55 groups**, and the current
+> verification evidence is `SESSION_FOLLOWUP_AARCH64_ENCODER_PARITY.md` §4.
+> The `loop_invert` verbatim-duplication mode described in §3 here and in
+> `SESSION_FOLLOWUP_S21_LOOP_ROTATION.md` is likewise a record of that work:
+> `src/passes/loop_invert.rs` is **not** part of the encoder/matrix delta that
+> carries these documents, so its measurements cannot be reproduced from this
+> tree, and the test it names
+> (`a_verbatim_copy_lands_after_the_edge_copies`) does not exist here.
+
 Two work streams landed together on top of `ms178/lccc` main `08f4e1a1` (the
 merge of PR #765, "fail-closed operand legality, two-oracle parity, and the
 fail-open remainder"):

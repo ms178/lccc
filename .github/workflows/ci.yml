@@ -783,20 +783,62 @@ jobs:
 
       # Operand-legality matrix, both halves: `--check` re-derives every row
       # from the cross assembler (so the table cannot rot silently), and
-      # `--check-lccc` asserts the same 423 rows against our own encoder (so a
-      # correct table cannot hide a wrong encoder).  This is the instrument for
-      # the bug class the differential oracle above is structurally blind to:
-      # an invalid operand combination is not an encoding, so objdump can never
-      # emit one for the oracle to re-assemble.
+      # `--check-lccc` asserts the same 10411 rows against our own encoder (so
+      # a correct table cannot hide a wrong encoder).  This is the instrument
+      # for the bug class the differential oracle above is structurally blind
+      # to: an invalid operand combination is not an encoding, so objdump can
+      # never emit one for the oracle to re-assemble.
+      #
+      # The oracle is the PINNED pair, provisioned here, not the runner
+      # image's `binutils-aarch64-linux-gnu`: the table's expectations were
+      # measured against 2.47, and the image's distro `as` disagrees with
+      # 1077 rows that 2.47 accepts (measured 2026-10-05), which turns an
+      # agreement gate into a red one on rows that are not defects.  The
+      # sysreg step below reads the same provisioner's cached tarball for
+      # binutils' own `aarch64-sys-regs.def`, so the two steps share one
+      # provisioning (and one oracle).
       - name: AArch64 operand-legality matrix
         run: |
           set -euo pipefail
+          bash scripts/ensure_gas_247.sh aarch64-linux-gnu
           python3 scripts/aarch64_operand_legality_matrix.py --check \
-            --as "$(command -v aarch64-linux-gnu-as)" \
-            --objcopy "$(command -v aarch64-linux-gnu-objcopy)"
+            --as "$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/as" \
+            --objcopy "$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/objcopy"
           python3 scripts/aarch64_operand_legality_matrix.py \
             --check-lccc target/fastbuild/lccc \
-            --objcopy "$(command -v aarch64-linux-gnu-objcopy)"
+            --jobs 2 \
+            --objcopy "$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/objcopy"
+
+      # The spelling sweeper: the matrix pins rows a human chose, so it cannot
+      # see "the same instruction written a different way".  411 generated
+      # spellings, both verdicts, against the same pinned pair.
+      - name: AArch64 legality probe (spelling sweep)
+        run: |
+          set -euo pipefail
+          python3 scripts/aarch64_legality_probe_differ.py \
+            --lccc target/fastbuild/lccc \
+            --as "$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/as" \
+            --objcopy "$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/objcopy"
+
+      # The generated system-register table: binutils' own .def, the pinned
+      # `as`, and our encoder held to one verdict per name in both directions
+      # (1619 names, two assembler runs).  The .def comes from the tarball the
+      # provisioner above leaves in GAS_DL_DIR.
+      - name: AArch64 system-register table
+        run: |
+          set -euo pipefail
+          python3 scripts/aarch64_sysreg_table.py --check \
+            --as "$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/as" \
+            --objcopy "$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/objcopy" \
+            --lccc target/fastbuild/lccc
+
+      # Layout/directive bugs (`.p2align N,,M`) are invisible to the word
+      # oracle: compile every tests/regression/arm_*.c, assemble it with the
+      # integrated assembler and byte-compare .text against GNU as.
+      - name: ARM codegen assembler-parity
+        run: |
+          set -euo pipefail
+          CCC_ARM=target/fastbuild/lccc-arm scripts/check_arm_codegen_assembles.sh
 
       # Keep every standalone gate from ci_local.sh represented in hosted CI.
       # Group the compact contracts to avoid YAML drift and setup overhead;

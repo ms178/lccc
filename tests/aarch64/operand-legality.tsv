@@ -490,6 +490,16 @@ mov immediate wide forms	mov wsp,#0x12345	REJECT
 mov immediate wide forms	mov sp,#0x1234	REJECT
 mov immediate wide forms	mov sp,#-1	REJECT
 mov immediate wide forms	mov xzr,#0x100000000	OK 3f00c0d2
+immediate width overflow	mov w0,#0x100000000	REJECT
+immediate width overflow	mov x0,#0x100000001	OK e00300b2
+immediate width overflow	and w0,w1,#0x100000001	REJECT
+immediate width overflow	and x0,x1,#0x100000001	OK 20000092
+immediate width overflow	orr w0,w1,#0x100000001	REJECT
+immediate width overflow	orr x0,x1,#0x100000001	OK 200000b2
+immediate width overflow	eor w0,w1,#0x100000001	REJECT
+immediate width overflow	eor x0,x1,#0x100000001	OK 200000d2
+immediate width overflow	ands w0,w1,#0x100000001	REJECT
+immediate width overflow	ands x0,x1,#0x100000001	OK 200000f2
 cmp/cmn/tst aliases	cmp x0,x1	OK 1f0001eb
 cmp/cmn/tst aliases	cmp w0,w1	OK 1f00016b
 cmp/cmn/tst aliases	cmp x0,x30	OK 1f001eeb

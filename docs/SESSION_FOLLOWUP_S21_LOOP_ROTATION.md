@@ -32,6 +32,15 @@ point: lccc wins `memory` by 8x and loses the byte-walking programs badly.
 > control. `docs/SESSION_FOLLOWUP_2026-10-05_MERGE_765.md` §3 has the current
 > form of the argument and the fresh measurements; the numbers in §3 below are
 > the ones this document recorded when the pass was first written.
+>
+> **Not in this tree (2026-10-06).**  That rebuild is not part of the
+> encoder/matrix delta that ships this document: `src/passes/loop_invert.rs` is
+> untouched by it, `a_verbatim_copy_lands_after_the_edge_copies` does not
+> exist, and no file under `src/` differs for it.  §2.1 and §3 below are
+> therefore a specification to re-apply, not a description of this revision;
+> treat their numbers as unreproduced here.  §1's instruments
+> (`tools/oracle/hot_instr.py`, `callgrind_compare.sh`, `callgrind_own_ir.py`)
+> ARE present and runnable, and §5's harness defects are fixed in them.
 
 ## 1. The instruments (new, in `tools/oracle/`)
 

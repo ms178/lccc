@@ -39,6 +39,7 @@ legality matrix uses).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import re
 import shutil
@@ -52,6 +53,8 @@ REPO = Path(__file__).resolve().parent.parent
 DEFAULT_OUT = REPO / "src/backend/arm/assembler/encoder/sysreg_table.rs"
 DEF_MEMBER = "binutils-2.47/opcodes/aarch64-sys-regs.def"
 BINUTILS_VERSION = "2.47"
+# The provisioner that owns the tarball pin (see pinned_tarball_sha256).
+ENSURE_GAS_247 = REPO / "scripts" / "ensure_gas_247.sh"
 
 # The `.arch` directive the AArch64 oracle gates assemble under; the table is
 # only meaningful relative to the same feature set GNU as is asked about.
@@ -85,6 +88,39 @@ def sysreg_encoding(op0: int, op1: int, crn: int, crm: int, op2: int) -> int:
         | ((crm & 0xF) << 3) | (op2 & 7)
 
 
+def pinned_tarball_sha256() -> str:
+    """The binutils tarball pin, read from the provisioner that owns it.
+
+    ``scripts/ensure_gas_247.sh`` pins the tarball's bytes on *every* trust
+    path -- a fresh fetch from a mirror, an already-cached copy, and a file
+    pre-placed through ``GAS_DL_DIR`` are all the same defect if the bytes are
+    not the ones we ordered.  This script reads the same tarball out of that
+    same directory, so it applies the same pin; the constant is read out of the
+    provisioner rather than copied, so there is one pin instead of two that can
+    drift apart.  An unreadable pin is fatal: extracting an unverified archive
+    that another process may have written is the hole this closes, and a
+    missing check must not read as "nothing to check".
+    """
+    want = re.search(
+        r"^GAS_TARBALL_SHA256=([0-9a-f]{64})$",
+        ENSURE_GAS_247.read_text(),
+        re.M,
+    )
+    if not want:
+        die(f"cannot read GAS_TARBALL_SHA256 from {ENSURE_GAS_247}; refusing to "
+            "extract an unverified binutils tarball", 2)
+    return want.group(1)
+
+
+def sha256_of(path: Path) -> str:
+    """Streaming digest: the tarball is tens of MB and need not be resident."""
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def find_def(explicit_def: str | None, tarball: str | None) -> tuple[list[str], dict[str, int]]:
     """(names, name -> encoding) from binutils' own system-register table."""
     text = None
@@ -100,6 +136,12 @@ def find_def(explicit_def: str | None, tarball: str | None) -> tuple[list[str], 
         for cand in candidates:
             if not cand.is_file():
                 continue
+            want = pinned_tarball_sha256()
+            got = sha256_of(cand)
+            if got != want:
+                die(f"{cand} is not the pinned binutils-{BINUTILS_VERSION} "
+                    f"tarball: sha256 {got}, expected {want}; refusing to "
+                    "extract it", 2)
             with tarfile.open(cand, "r:xz") as tf:
                 member = tf.extractfile(DEF_MEMBER)
                 if member is None:
