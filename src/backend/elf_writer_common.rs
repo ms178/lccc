@@ -1451,24 +1451,25 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     // GAS computes the alignment in signed arithmetic: an
                     // exponent of 63 (or one clamped to it — negative or > 63
                     // inputs warn and assume 63) makes 1<<63 negative
-                    // internally, so the alignment is neither recorded on the
-                    // section nor padded. A nonzero offset with such an
-                    // alignment errors on the jump-over-NOP reach instead
-                    // (verified: `.p2align 63` at offset 0 -> addralign 1;
-                    // `.byte 1; .p2align 63` -> error, binutils 2.47).
-                    if align >= 1u64 << 63 {
-                        if section.data.len() as u64 != 0 {
-                            return Err(format!(
-                                "jump over nop padding out of range (align {align})"
-                            ));
-                        }
-                        return Ok(());
-                    }
+                    // internally, so such an alignment is NEVER recorded on
+                    // the section and its pad is never materialized
+                    // (verified: `.p2align 63` at offset 0 -> addralign 1,
+                    // binutils 2.47).  The pad decision, however, follows the
+                    // ordinary flow: at offset 0 padding is trivially 0; a
+                    // positive max-skip may skip it even at a nonzero offset
+                    // (`.p2align 63,,5` at offset 1 assembles to 552 bytes,
+                    // addralign 1); only a nonzero pad that survives the
+                    // skip test errors ("jump over nop padding out of
+                    // range").  Testing the skip BEFORE the error is what
+                    // keeps fail-closed parity with GAS — the old code
+                    // errored first and rejected inputs GAS accepts.
+                    let absurd = align >= 1u64 << 63;
                     // GAS records the alignment on the section even when the
                     // max-skip test then refuses to pad (binutils 2.44:
                     // `.byte 1; .p2align 4,,1` -> no padding, addralign 16),
-                    // so the bump happens before the skip decision.
-                    if align > section.alignment {
+                    // so the bump happens before the skip decision — but only
+                    // for representable alignments (see above).
+                    if !absurd && align > section.alignment {
                         section.alignment = align;
                     }
                     let current = section.data.len() as u64;
@@ -1479,13 +1480,23 @@ impl<A: X86Arch> ElfWriterCore<A> {
                             padding = 0;
                         }
                     }
+                    if absurd {
+                        if padding != 0 {
+                            return Err(format!(
+                                "jump over nop padding out of range (align {align})"
+                            ));
+                        }
+                        return Ok(());
+                    }
                     // GAS refuses pathological alignment padding instead of
                     // materializing it: executable sections cap at the
                     // jump-over-NOP rel32 reach ("jump over nop padding out
-                    // of range"), data sections die on the fill. Padding that
-                    // cannot fit a 32-bit byte count is never legitimate in a
-                    // real object, so the writer rejects it uniformly.
-                    if padding as u64 > 0xFFFF_FFFF {
+                    // of range"), data sections die on the fill.  The
+                    // directive-fill cap is the deterministic stand-in for
+                    // that FS-dependent verdict (beyond 256 MiB GAS's own
+                    // answer is free-disk state) and bounds the allocation
+                    // the way the old 4 GiB check nominally did.
+                    if padding > crate::backend::elf::MAX_DIRECTIVE_FILL {
                         return Err(format!(
                             "alignment padding of {padding} bytes too large (align {align})"
                         ));
@@ -1564,8 +1575,14 @@ impl<A: X86Arch> ElfWriterCore<A> {
             }
             AsmItem::Zero(n) => {
                 self.ensure_section()?;
+                if *n > crate::backend::elf::MAX_DIRECTIVE_FILL {
+                    return Err(format!(
+                        ".zero: {n} bytes exceed the {}-byte directive limit",
+                        crate::backend::elf::MAX_DIRECTIVE_FILL
+                    ));
+                }
                 let section = self.current_section_mut()?;
-                section.data.extend(std::iter::repeat_n(0u8, *n as usize));
+                section.data.extend(std::iter::repeat_n(0u8, *n));
             }
             AsmItem::Org(sym, offset, fill) => {
                 self.process_org(sym, *offset, *fill)?;
@@ -1584,6 +1601,12 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     // the kernel-alternatives case deferral exists for — still
                     // need to wait for label resolution.
                     if let Some(n) = parse_const_skip(expr) {
+                        if n > crate::backend::elf::MAX_DIRECTIVE_FILL {
+                            return Err(format!(
+                                ".skip: {n} bytes exceed the {}-byte directive limit",
+                                crate::backend::elf::MAX_DIRECTIVE_FILL
+                            ));
+                        }
                         let section = self.current_section_mut()?;
                         section.data.extend(std::iter::repeat_n(*fill, n));
                     } else if let Some((sym, addend)) = parse_org_style_skip(expr) {
@@ -1603,14 +1626,23 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     }
                 } else {
                     // Simple integer parse for architectures without deferred skip support
-                    if let Ok(val) = expr.trim().parse::<u64>() {
-                        let section = self.current_section_mut()?;
-                        section
-                            .data
-                            .extend(std::iter::repeat_n(*fill, val as usize));
-                    } else {
-                        return Err(format!("unsupported .skip expression: {}", expr));
+                    let val: i64 = expr
+                        .trim()
+                        .parse()
+                        .map_err(|_| format!("unsupported .skip expression: {}", expr))?;
+                    // Negative counts emit nothing (GAS `.skip -1` no-op);
+                    // runaway positives are refused before materialization.
+                    let val = val.max(0) as u64;
+                    if val > crate::backend::elf::MAX_DIRECTIVE_FILL as u64 {
+                        return Err(format!(
+                            ".skip: {val} bytes exceed the {}-byte directive limit",
+                            crate::backend::elf::MAX_DIRECTIVE_FILL
+                        ));
                     }
+                    let section = self.current_section_mut()?;
+                    section
+                        .data
+                        .extend(std::iter::repeat_n(*fill, val as usize));
                 }
             }
             AsmItem::Asciz(bytes) | AsmItem::Ascii(bytes) => {
@@ -1778,6 +1810,15 @@ impl<A: X86Arch> ElfWriterCore<A> {
         } else {
             0
         };
+        // `.org` pads with a constant fill from a possibly tiny source —
+        // the same unbounded-output amplifier as `.zero`; refuse before
+        // materializing (GAS dies writing runaway pads too).
+        if padding > crate::backend::elf::MAX_DIRECTIVE_FILL {
+            return Err(format!(
+                ".org: {padding} bytes of fill exceed the {}-byte directive limit",
+                crate::backend::elf::MAX_DIRECTIVE_FILL
+            ));
+        }
         // Record .org marker for post-relaxation fixup (even when padding == 0,
         // because code before it may shrink during jump relaxation)
         if !sym.is_empty() {
@@ -2547,6 +2588,15 @@ impl<A: X86Arch> ElfWriterCore<A> {
             if count == 0 {
                 continue;
             }
+            // Deferred skips resolve after labels are known — the expression
+            // can compute a huge runtime size (`.skip 1<<40`); refuse before
+            // the vec allocation (GAS dies on runaway pads as well).
+            if count > crate::backend::elf::MAX_DIRECTIVE_FILL {
+                return Err(format!(
+                    ".skip: {count} bytes exceed the {}-byte directive limit",
+                    crate::backend::elf::MAX_DIRECTIVE_FILL
+                ));
+            }
 
             let fill_bytes: Vec<u8> = vec![*fill; count];
             self.sections[*sec_idx]
@@ -2632,7 +2682,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     k => off - shifts[k - 1].1,
                 }
             });
-            self.fixup_alignment_markers(sec_idx);
+            self.fixup_alignment_markers(sec_idx)?;
         }
         Ok(())
     }
@@ -3075,7 +3125,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
         // if a future arch ever overrides the default `false`.
         self.relax_jumps()?;
         for sec_idx in 0..self.sections.len() {
-            self.fixup_alignment_markers(sec_idx);
+            self.fixup_alignment_markers(sec_idx)?;
         }
         if A::supports_deferred_skips() {
             self.resolve_deferred_skips()?;
@@ -3094,7 +3144,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
         // Running the fixup for every section first makes the pre-relaxation
         // layout correct; `relax_jumps` then keeps it correct as it shrinks.
         for sec_idx in 0..self.sections.len() {
-            self.fixup_alignment_markers(sec_idx);
+            self.fixup_alignment_markers(sec_idx)?;
         }
 
         // Relax long jumps to short form where possible.
@@ -3104,7 +3154,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
         // maintains them for sections that actually contain jumps
         // (.eh_frame never had its `.align` padding fixed up otherwise).
         for sec_idx in 0..self.sections.len() {
-            self.fixup_alignment_markers(sec_idx);
+            self.fixup_alignment_markers(sec_idx)?;
         }
 
         // Now that the tight buckets are final, recompute section header
@@ -3668,7 +3718,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 any_change = true;
 
                 // Recompute alignment padding after the size changes.
-                self.fixup_alignment_markers(sec_idx);
+                self.fixup_alignment_markers(sec_idx)?;
                 first_pass = false;
 
                 if !any_change {
@@ -4265,9 +4315,9 @@ impl<A: X86Arch> ElfWriterCore<A> {
     /// a prefix.  A queue whose next anchor would break the sort (not
     /// produced by any known input) is flushed first, so the result stays
     /// exact regardless.
-    fn fixup_alignment_markers(&mut self, sec_idx: usize) {
+    fn fixup_alignment_markers(&mut self, sec_idx: usize) -> Result<(), String> {
         if self.sections[sec_idx].align_markers.is_empty() {
-            return;
+            return Ok(());
         }
 
         // Sort by offset to ensure front-to-back processing
@@ -4434,6 +4484,17 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     needed_padding = 0;
                 }
             }
+            // Relaxation only ever shrinks code, so the regenerated run can
+            // grow past the original apply-time check (a `.p2align 29` in
+            // .text whose offset moves down wants up to 512 MiB of NOPs).
+            // Refuse before `vec![..]` materializes it — same deterministic
+            // ceiling as the initial apply.
+            if needed_padding > crate::backend::elf::MAX_DIRECTIVE_FILL {
+                return Err(format!(
+                    ".align: regenerating {needed_padding} bytes of padding exceeds the {}-byte directive limit",
+                    crate::backend::elf::MAX_DIRECTIVE_FILL
+                ));
+            }
             let existing_padding = self.sections[sec_idx].align_markers[marker_idx].padding;
 
             if needed_padding != existing_padding {
@@ -4510,6 +4571,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             marker_idx += 1;
         }
         self.flush_padding_edits(sec_idx, &mut queue);
+        Ok(())
     }
 
     /// Queue one padding rewrite of `fixup_alignment_markers`, flushing
@@ -6138,6 +6200,96 @@ ret
             assemble_err(".text\nt1: nop\n.data\n.quad t1 - .\n", true),
             "cannot represent relocation type BFD_RELOC_64_PCREL"
         );
+    }
+
+    /// GNU as 2.47 ordering inside the align-apply: a positive max-skip
+    /// may SKIP even the signed-shift bucket (align >= 1<<63), the bucket
+    /// itself never raises sh_addralign, and only a pad that survives the
+    /// skip test errors.
+    #[test]
+    fn gas247_absurd_align_skip_before_error() {
+        // @0: no-op, no raise (GAS records nothing for this bucket).
+        let obj = assemble_object(".data\n.p2align 63\n.byte 3\n");
+        assert_eq!(section_bytes(&obj, ".data").unwrap(), vec![3u8]);
+        assert_eq!(
+            section_addralign(&obj, ".data"),
+            Some(1),
+            "bucket never raises"
+        );
+        // @1 with a positive cap: SKIP — GAS accepts, align stays 1.
+        let obj = assemble_object(".data\n.byte 1\n.p2align 63,,5\n.byte 2\n");
+        assert_eq!(
+            section_bytes(&obj, ".data").unwrap().len(),
+            2,
+            "p2align 63,,5 @1 must skip the pad (GAS assembles it)"
+        );
+        assert_eq!(section_addralign(&obj, ".data"), Some(1));
+        // @1 without a cap: error (GAS "jump over nop padding out of range").
+        let err = assemble_err(".data\n.byte 1\n.p2align 63\n", false);
+        assert!(
+            err.contains("63") || err.contains("out of range"),
+            "got: {err}"
+        );
+        // Clamp family behaves like 63.
+        assemble_object(".data\n.p2align 64\n.byte 3\n");
+        assemble_object(".data\n.p2align -1\n.byte 3\n");
+        assert!(assemble_err(".data\n.byte 1\n.p2align 64\n", false).len() > 0);
+        assert!(assemble_err(".data\n.byte 1\n.p2align -1\n", false).len() > 0);
+        // Raise-on-skip stays intact for representable alignments.
+        let obj = assemble_object(".data\n.byte 1\n.p2align 4,,0\n.byte 2\n");
+        assert_eq!(
+            section_bytes(&obj, ".data").unwrap().len(),
+            17,
+            "max-skip 0 is unlimited: full 15-byte pad"
+        );
+        assert_eq!(section_addralign(&obj, ".data"), Some(16));
+    }
+
+    /// The directive-fill ceiling refuses `.zero` / `.skip` / `.org` and
+    /// align padding at 256 MiB + 1, BEFORE any allocation — the old
+    /// 4 GiB threshold let `.p2align 29,,4294967295` materialize 512 MiB
+    /// and `.zero -1` reach for 4 GiB - 1.
+    #[test]
+    fn gas247_fill_ceiling_refuses_before_alloc() {
+        // Negatives stay no-ops (GAS-accepted) instead of wrapping.
+        let obj = assemble_object(".data\n.zero -1\n.space -5,0x90\n");
+        assert_eq!(section_bytes(&obj, ".data").unwrap().len(), 0);
+        // 256 MiB + 1: refused.
+        let err = assemble_err(".data\n.zero 268435457\n", false);
+        assert!(
+            err.contains("268435457") || err.contains("limit"),
+            "got: {err}"
+        );
+        // Same ceiling through the SkipExpr path.
+        let err = assemble_err(".data\n.space 268435457,0x90\n", false);
+        assert!(
+            err.contains("limit") || err.contains("268435457"),
+            "got: {err}"
+        );
+        // Align padding above the ceiling but below the old 4 GiB cap.
+        let err = assemble_err(".data\n.byte 1\n.p2align 29,,4294967295\n", false);
+        assert!(
+            err.contains("too large") || err.contains("limit"),
+            "got: {err}"
+        );
+        // .org past the ceiling.
+        let err = assemble_err(".data\n.org 268435457\n", false);
+        assert!(
+            err.contains("268435457") || err.contains("limit"),
+            "got: {err}"
+        );
+        // Accepted: exactly at the ceiling is allowed; fill law stays GAS.
+        assemble_object(".data\n.fill -1,1,255\n.fill 4611686018427387904,4\n.fill 1,9\n");
+        // A literal above u64::MAX must surface as an error somewhere in
+        // the pipeline (GAS: expression error); x86 defers the repeat to
+        // the writer, which evaluates it when the gap is resolved.
+        let err = assemble_err(".data\n.fill 18446744073709551616,1,0\n", false);
+        assert!(
+            err.contains("18446744073709551616") || err.contains("integer") || err.contains("bad"),
+            "got: {err}"
+        );
+        let obj = assemble_object(".data\n.zero 64\n");
+        assert_eq!(section_bytes(&obj, ".data").unwrap().len(), 64);
     }
 }
 

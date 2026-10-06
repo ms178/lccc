@@ -73,8 +73,11 @@ pub enum AsmItem {
     Sleb128(Vec<DataValue>),
     /// Emit 64-bit values: `.quad val, ...` (can be symbol references)
     Quad(Vec<DataValue>),
-    /// Emit zero bytes: `.zero N`
-    Zero(u32),
+    /// Emit zero bytes: `.zero N`.  `usize`, not `u32`: the old `as u32`
+    /// cast silently truncated (`.zero 2^32` → 0 bytes) and turned
+    /// `.zero -1` into a request for 4 GiB-1; negative counts now parse
+    /// to 0 (GAS accepts `.zero -1` as a no-op).
+    Zero(usize),
     /// Deferred `.skip` with expression: evaluated after all labels are known.
     /// Used by kernel alternatives framework for label-arithmetic expressions
     /// like `.skip -(((6651f-6641f)-(662b-661b)) > 0) * ((6651f-6641f)-(662b-661b)), 0x90`.
@@ -721,6 +724,17 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
             // pads with 0x2c).
             let mut fields = args.split(',');
             let align_field = fields.next().unwrap_or("").trim();
+            // Bare byte-form directives (`.balign` / `.align` with no operand)
+            // are accepted by GAS as align-1 no-ops.  `.p2align` with no
+            // operand still requires an expression (GAS: "expected
+            // expression"), so it keeps the parse error below.
+            if align_field.is_empty() && directive != ".p2align" {
+                return Ok(AsmItem::Align {
+                    align: 1,
+                    fill: None,
+                    max_skip: None,
+                });
+            }
             let align_val: i64 =
                 parse_integer_expr(align_field).map_err(|_| format!("bad alignment: {args}"))?;
             let align: u64 = if directive == ".p2align" {
@@ -773,9 +787,12 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
             }
             let max_skip = match skip_val {
                 None => None,
-                Some(s) if s < 0 => {
-                    return Err(format!("alignment max-skip must be non-negative: {args}"));
-                }
+                // GAS: a max-skip of 0 or negative means NO skip threshold —
+                // the full pad is always emitted (measured on binutils 2.47:
+                // `.p2align 4,,0` and `.p2align 16,,-1` both pad at @1).  The
+                // old `s < 0 → Err` rejected `,,-1` and `s == 0 → Some(0)`
+                // made the writer skip exactly where GAS pads.
+                Some(s) if s <= 0 => None,
                 Some(s) => Some(s as u64),
             };
             Ok(AsmItem::Align {
@@ -893,7 +910,11 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
             let (expr_str, fill) = split_skip_args(args);
             if let Ok(val) = parse_integer_expr(expr_str) {
                 if fill == 0 {
-                    Ok(AsmItem::Zero(val as u32))
+                    // GAS: a negative count emits nothing (`.zero -1`
+                    // accepted as a no-op); keep the full positive range
+                    // (usize, no 32-bit truncation) — the writer's
+                    // directive-fill cap rejects runaway materializations.
+                    Ok(AsmItem::Zero(if val <= 0 { 0 } else { val as usize }))
                 } else {
                     Ok(AsmItem::SkipExpr(expr_str.to_string(), fill))
                 }
@@ -909,11 +930,9 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
             let repeat_str = parts[0].trim();
             match parse_integer_expr(repeat_str) {
                 Ok(repeat) => {
-                    let repeat = repeat as u64;
-                    let size = if parts.len() > 1 {
+                    let size: i64 = if parts.len() > 1 {
                         parse_integer_expr(parts[1].trim())
                             .map_err(|_| format!("bad .fill size: {}", parts[1].trim()))?
-                            as u64
                     } else {
                         1
                     };
@@ -924,11 +943,37 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
                     } else {
                         0
                     };
-                    let total_bytes = repeat * size.min(8);
+                    // GAS (read.c): non-positive repeat/size emit nothing —
+                    // `.fill -1` is accepted as a no-op — and a wrapping
+                    // repeat*size also emits zero bytes.  The old code
+                    // cast-then-multiply: `.fill -1,1,0xff` overflowed to
+                    // 4 GiB-1 and looped until OOM.
+                    if repeat <= 0 || size <= 0 {
+                        return Ok(AsmItem::Zero(0));
+                    }
+                    let repeat = repeat as u64;
+                    let size = size as u64;
+                    // A wrapping repeat*size is GAS's "out of memory" case,
+                    // measured as emitting ZERO bytes (`.fill 2^62,4`):
+                    // checked arithmetic → 0, never a silent wrap.
+                    let Some(total_bytes) = repeat.checked_mul(size.min(8)) else {
+                        return Ok(AsmItem::Zero(0));
+                    };
+                    // The materialized Vec lives before the writer's fill
+                    // cap can intervene — refuse over-limit requests here
+                    // (GAS's own verdict for >256 MiB depends on free disk
+                    // and is not pinnable).
+                    if total_bytes > crate::backend::elf::MAX_DIRECTIVE_FILL as u64 {
+                        return Err(format!(
+                            ".fill: {total_bytes} bytes exceed the {}-byte directive limit",
+                            crate::backend::elf::MAX_DIRECTIVE_FILL
+                        ));
+                    }
+                    let total_bytes = total_bytes as usize;
                     if value == 0 {
-                        Ok(AsmItem::Zero(total_bytes as u32))
+                        Ok(AsmItem::Zero(total_bytes))
                     } else {
-                        let mut data = Vec::with_capacity(total_bytes as usize);
+                        let mut data = Vec::with_capacity(total_bytes);
                         let value_bytes = value.to_le_bytes();
                         for _ in 0..repeat {
                             for j in 0..size.min(8) as usize {
@@ -5287,6 +5332,109 @@ main:
         assert!(m.index.is_some(), "scale-4 index must survive");
         assert_eq!(m.scale, Some(4));
         assert!(m.base.is_some(), "base must survive");
+    }
+
+    /// GNU as 2.47 operand semantics for the alignment directives:
+    /// max-skip <= 0 means UNLIMITED (the full pad is emitted), bare
+    /// byte-form directives default to align 1, exponents clamp to 63,
+    /// and the fill is truncated to its low byte.
+    #[test]
+    fn gas247_align_operand_semantics() {
+        for (src, want) in [
+            (".p2align 4,,0", None),
+            (".p2align 4,,-1", None),
+            (".p2align 4,,5", Some(5u64)),
+            (".p2align 4", None),
+            (".p2align 4,,", None),
+        ] {
+            match parse_directive(src).unwrap_or_else(|e| panic!("{src}: {e}")) {
+                AsmItem::Align { max_skip, .. } => assert_eq!(
+                    max_skip, want,
+                    "{src}: max_skip must be {want:?} (GAS: <=0 is unlimited)"
+                ),
+                other => panic!("{src}: parsed as {other:?}"),
+            }
+        }
+        // Bare byte-form directives are align-1 no-ops (GAS-accepted).
+        for src in [".balign", ".align"] {
+            match parse_directive(src).unwrap_or_else(|e| panic!("{src}: {e}")) {
+                AsmItem::Align { align, .. } => assert_eq!(align, 1, "{src}"),
+                other => panic!("{src}: parsed as {other:?}"),
+            }
+        }
+        // Bare `.p2align` still requires its exponent expression.
+        assert!(
+            parse_directive(".p2align").is_err(),
+            "bare .p2align is a GAS error"
+        );
+        // Exponent clamp family reaches the writer as 1<<63.
+        for src in [".p2align 63", ".p2align 64", ".p2align -1"] {
+            match parse_directive(src).unwrap_or_else(|e| panic!("{src}: {e}")) {
+                AsmItem::Align { align, .. } => assert_eq!(align, 1u64 << 63, "{src}"),
+                other => panic!("{src}: parsed as {other:?}"),
+            }
+        }
+        // Fill truncation pin: -129 keeps only the low byte (0x7f).
+        match parse_directive(".p2align 4,-129").expect("fill parse") {
+            AsmItem::Align { fill, .. } => assert_eq!(fill, Some(0x7f)),
+            other => panic!("parsed as {other:?}"),
+        }
+        // Non-power-of-two byte counts are errors (GAS: "alignment not a power of 2").
+        assert!(parse_directive(".balign 3").is_err(), ".balign 3");
+        assert!(parse_directive(".balign -16").is_err(), ".balign -16");
+    }
+
+    /// `.zero` / `.fill` operand law: negatives emit nothing, the full
+    /// positive range survives (the old `as u32` truncated 2^32+4 to 4
+    /// bytes), overflowing repeat*size collapses to 0 bytes, and
+    /// over-limit requests are refused at parse time.
+    #[test]
+    fn gas247_zero_fill_operand_semantics() {
+        match parse_directive(".zero -1").expect(".zero -1 is a no-op") {
+            AsmItem::Zero(n) => assert_eq!(n, 0, ".zero -1 must emit nothing"),
+            other => panic!("parsed as {other:?}"),
+        }
+        match parse_directive(".zero 4294967300").expect(".zero 2^32+4") {
+            AsmItem::Zero(n) => assert_eq!(
+                n, 4294967300,
+                "the 32-bit truncation must be gone (old code produced 4)"
+            ),
+            other => panic!("parsed as {other:?}"),
+        }
+        for (src, want) in [
+            (".fill -1,1,5", 0usize),
+            (".fill 2,0,7", 0),
+            (".fill 1,9", 8),
+            (".fill 4611686018427387904,4", 0),
+        ] {
+            match parse_directive(src).unwrap_or_else(|e| panic!("{src}: {e}")) {
+                AsmItem::Zero(n) => assert_eq!(n, want, "{src}"),
+                other => panic!("{src}: parsed as {other:?}"),
+            }
+        }
+        assert!(
+            parse_directive(".fill 268435457,1,1").is_err(),
+            "256 MiB + 1 must be refused before the Vec is built"
+        );
+        // Out-of-i64-range literals take their two's-complement pattern
+        // (GAS 2.47: every count in 2^63..2^64-1 is negative -> zero bytes;
+        // 2^64 is an expression error).
+        match parse_directive(".fill 18446744073709551615,1,5") {
+            Ok(AsmItem::Zero(n)) => assert_eq!(n, 0, "u64max repeat is -1"),
+            other => panic!(".fill u64max: {other:?}"),
+        }
+        match parse_directive(".zero 18446744073709551615") {
+            Ok(AsmItem::Zero(n)) => assert_eq!(n, 0),
+            other => panic!(".zero u64max: {other:?}"),
+        }
+        match parse_directive(".zero 9223372036854775808") {
+            Ok(AsmItem::Zero(n)) => assert_eq!(n, 0),
+            other => panic!(".zero 2^63: {other:?}"),
+        }
+        // NOTE: `.fill` DEFERS an unvalued repeat to the writer (by design,
+        // for label-valued repeats), so the >u64::MAX rejection for
+        // `18446744073709551616` is asserted at assemble level in
+        // `gas247_fill_ceiling_refuses_before_alloc`.
     }
 }
 

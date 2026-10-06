@@ -330,7 +330,8 @@ GROUPS: dict[str, list[str]] = {
         "ld2r {v0.16b,v1.16b},[x0]", "ld4r {v0.16b,v1.16b,v2.16b,v3.16b},[x0]",
         "ld1r {v0.16b},[x0]", "movi v0.4s,#1,msl #8", "movi v0.4h,#1,lsl #8",
         "movi v0.16b,#0", "movi v0.2d,#0", "movi v0.16b,#256",
-        "movi v0.2d,#0x0101010101010101", "ext v0.16b,v1.16b,v2.16b,#16",
+        "movi v0.2d,#0x0101010101010101", "ext v0.16b,v1.16b,v2.16b,#1",
+        "ext v0.16b,v1.16b,v2.16b,#16",
         "ext v0.8b,v1.8b,v2.8b,#8", "addv d0,v0.2d", "addv s0,v0.4s",
         "tbl v0.16b,{v0.16b},v1.16b",
     ],
@@ -340,12 +341,12 @@ GROUPS: dict[str, list[str]] = {
         "ldr x0,[x1,x2,lsl #1]", "ldr x0,[x1,x2,lsl #3]",
         "casp d0,d1,d2,d3,[x4]", "casp x0,x1,x2,x3,[x4]",
         "mov w0,#0x100000000", "and w0,w1,#0x100000001",
-        "cas x0,x1,[x2]", "cas x0,x1,[x2,#8]", "swp x0,x1,[x2,#8]",
+        "cas x0,x1,[x2]", "cas x0,x1,[x2,#8]", "swp x0,x1,[x2]", "swp x0,x1,[x2,#8]",
         "prfm pldl1keep,[x0,x0]",
     ],
     "fail-closed system": [
-        "svc #0", "svc #65536", "brk #65536", "msr daifset,#15", "msr daifset,#16",
-        "msr spsel,#2", "mrs w0,nzcv", "mrs d0,fpcr", "hint #128",
+        "svc #0", "svc #65536", "brk #0", "brk #65536", "msr daifset,#15", "msr daifset,#16",
+        "msr spsel,#2", "mrs x0,nzcv", "mrs w0,nzcv", "mrs d0,fpcr", "hint #0", "hint #128",
         "movz x0,#1", "movz d0,#1", "movz w0,#0x10000", "movz sp,#1",
     ],
 }
@@ -382,14 +383,26 @@ def assemble(
         if f.exists():
             f.unlink()
     r = subprocess.run(
-        [*command, str(src), "-o", str(obj)], capture_output=True, text=True
+        [*command, str(src), "-o", str(obj)],
+        capture_output=True,
+        text=True,
+        timeout=30,
     )
+    # A panic (101), a signal, or an internal abort is not a legal REJECT.
+    # The previous mapping of every non-zero exit to REJECT made a crashed
+    # encoder look fail-closed.
+    err = r.stderr or ""
+    if r.returncode not in (0, 1) or "panicked" in err:
+        raise SystemExit(
+            f"assembler crashed on {insn!r}: rc={r.returncode}\n{err}"
+        )
     if r.returncode != 0:
         return "REJECT"
     subprocess.run(
         [objcopy, "-O", "binary", "--only-section=.text", str(obj), str(binf)],
         check=True,
         capture_output=True,
+        timeout=30,
     )
     return "OK " + binf.read_bytes().hex()
 
@@ -454,7 +467,16 @@ def main() -> int:
         return 0
 
     as_bin, objcopy = find_tools(args.as_bin, args.objcopy)
-    if not as_bin or not objcopy:
+    # `--check-lccc` assembles with lccc and only needs objcopy to read
+    # `.text`; demanding `as` there made the gate depend on distro
+    # cross-binutils the pinned-pair design deliberately replaced.
+    if args.lccc and not (args.check or args.regenerate) and not objcopy:
+        print(
+            "operand-legality matrix: objcopy not found; cannot read .text",
+            file=sys.stderr,
+        )
+        return 2
+    if (args.check or args.regenerate) and (not as_bin or not objcopy):
         print(
             "operand-legality matrix: cross-binutils not found; cannot verify",
             file=sys.stderr,

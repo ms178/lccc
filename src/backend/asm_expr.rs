@@ -674,6 +674,33 @@ pub fn parse_integer_expr(s: &str) -> Result<i64, String> {
 mod tests {
     use super::*;
 
+    /// GNU as 2.47 (measured): a decimal literal in 2^63..2^64-1 is the
+    /// two's-complement pattern (negative as i64); anything ABOVE u64::MAX
+    /// is an expression error, not a wrap to some other value.
+    #[test]
+    fn gas247_literal_range_edges() {
+        assert_eq!(
+            parse_integer_expr("18446744073709551615").ok(),
+            Some(-1),
+            "u64max is the all-ones pattern"
+        );
+        assert_eq!(
+            parse_integer_expr("9223372036854775808").ok(),
+            Some(i64::MIN),
+            "2^63 is its two's-complement pattern"
+        );
+        assert_eq!(
+            parse_integer_expr("0xffffffffffffffff").ok(),
+            Some(-1),
+            "hex u64max likewise"
+        );
+        assert!(
+            parse_integer_expr("18446744073709551616").is_err(),
+            "2^64 must be an expression error, got {:?}",
+            parse_integer_expr("18446744073709551616")
+        );
+    }
+
     /// test the GAS comparison semantics
     #[test]
     fn test_gas_comparisons() {

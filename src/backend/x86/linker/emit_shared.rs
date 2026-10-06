@@ -182,6 +182,12 @@ pub(super) fn emit_shared_library(
     output_sections: &mut [OutputSection],
     hash_style: crate::backend::linker_common::HashStyle,
     section_map: &FxHashMap<(usize, usize), (usize, u64)>,
+    // Same discriminator as `emit_executable`: ICF-folded / GC / COMDAT
+    // losers. The `-shared` path does not currently run ICF, so callers
+    // pass an empty set; the skip is still required so a future ICF
+    // enablement cannot re-apply sequence-shaped TLS rewrites onto a
+    // folded twin (the `__cxa_get_globals` class).
+    dead_sections: &crate::common::fx_hash::FxHashSet<(usize, usize)>,
     needed_sonames: &[String],
     output_path: &str,
     soname: Option<String>,
@@ -2633,6 +2639,9 @@ pub(super) fn emit_shared_library(
         for sec_idx in 0..objects[obj_idx].sections.len() {
             let relas = &objects[obj_idx].relocations[sec_idx];
             if relas.is_empty() {
+                continue;
+            }
+            if dead_sections.contains(&(obj_idx, sec_idx)) {
                 continue;
             }
             let (out_idx, sec_off) = match section_map.get(&(obj_idx, sec_idx)) {

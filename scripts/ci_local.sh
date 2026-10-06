@@ -1120,7 +1120,7 @@ fi
 # yet accepting them silently is exactly as wrong as mis-encoding one. The
 # matrix is a curated accept/reject table whose every expectation is GNU
 # as's own verdict, re-checked against the cross assembler at gate time
-# (423 rows, ~2 s, no compiler and no network), and it is what turned the
+# (generated table, ~2 s, no compiler and no network), and it is what turned the
 # review's "the operand checks look like class checks" into 38 executed
 # counterexamples. It needs only `as`/`objcopy`, so it is skipped, not
 # passed, when the cross-binutils are absent.

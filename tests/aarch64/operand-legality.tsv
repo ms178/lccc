@@ -436,6 +436,7 @@ fail-closed neon	movi v0.16b,#0	OK 00e4004f
 fail-closed neon	movi v0.2d,#0	OK 00e4006f
 fail-closed neon	movi v0.16b,#256	REJECT
 fail-closed neon	movi v0.2d,#0x0101010101010101	REJECT
+fail-closed neon	ext v0.16b,v1.16b,v2.16b,#1	OK 2008026e
 fail-closed neon	ext v0.16b,v1.16b,v2.16b,#16	REJECT
 fail-closed neon	ext v0.8b,v1.8b,v2.8b,#8	REJECT
 fail-closed neon	addv d0,v0.2d	REJECT
@@ -457,16 +458,20 @@ fail-closed load/store	mov w0,#0x100000000	REJECT
 fail-closed load/store	and w0,w1,#0x100000001	REJECT
 fail-closed load/store	cas x0,x1,[x2]	OK 417ca0c8
 fail-closed load/store	cas x0,x1,[x2,#8]	REJECT
+fail-closed load/store	swp x0,x1,[x2]	OK 418020f8
 fail-closed load/store	swp x0,x1,[x2,#8]	REJECT
 fail-closed load/store	prfm pldl1keep,[x0,x0]	OK 0068a0f8
 fail-closed system	svc #0	OK 010000d4
 fail-closed system	svc #65536	REJECT
+fail-closed system	brk #0	OK 000020d4
 fail-closed system	brk #65536	REJECT
 fail-closed system	msr daifset,#15	OK df4f03d5
 fail-closed system	msr daifset,#16	REJECT
 fail-closed system	msr spsel,#2	REJECT
+fail-closed system	mrs x0,nzcv	OK 00423bd5
 fail-closed system	mrs w0,nzcv	REJECT
 fail-closed system	mrs d0,fpcr	REJECT
+fail-closed system	hint #0	OK 1f2003d5
 fail-closed system	hint #128	REJECT
 fail-closed system	movz x0,#1	OK 200080d2
 fail-closed system	movz d0,#1	REJECT

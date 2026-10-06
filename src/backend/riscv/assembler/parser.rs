@@ -368,22 +368,40 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
         ".size" => parse_size_directive(args),
 
         ".align" | ".p2align" => {
-            let val: u64 = args
+            // GAS grammar (read.c): exponent form; garbage is an error
+            // (the old `unwrap_or(0)` silently assembled `.align junk`
+            // as align-1) and out-of-range exponents clamp to 63 into
+            // the writer's signed-shift bucket.
+            let raw = args
                 .trim()
                 .split(',')
                 .next()
                 .and_then(|s| parse_int_literal(s.trim()).ok())
-                .unwrap_or(0) as u64;
-            Directive::Align(val)
+                .ok_or_else(|| format!(".align: bad operand: {args}"))?;
+            // Out-of-range exponents (negative or > 63) clamp to 63 —
+            // NOT to 0: measured `.p2align -1` behaves like `.p2align 63`
+            // (read.c's `address16 = ...` — same rule on every GAS
+            // target), landing in the writer's signed-shift bucket.
+            Directive::Align(if (0..=63).contains(&raw) {
+                raw as u64
+            } else {
+                63
+            })
         }
         ".balign" => {
-            let val: u64 = args
-                .trim()
-                .split(',')
-                .next()
-                .and_then(|s| parse_int_literal(s.trim()).ok())
-                .unwrap_or(1) as u64;
-            Directive::Balign(val)
+            // Byte-count form: bare is a no-op (GAS-accepted), anything
+            // else must be a non-negative power of two or it is an error
+            // ("alignment not a power of 2"), never a silent default.
+            let tok = args.trim().split(',').next().unwrap_or("").trim();
+            let raw: i64 = if tok.is_empty() {
+                1
+            } else {
+                parse_int_literal(tok).map_err(|_| format!(".balign: bad operand: {args}"))?
+            };
+            if raw < 0 || (raw != 0 && !(raw as u64).is_power_of_two()) {
+                return Err(format!(".balign: alignment {raw} is not a power of 2"));
+            }
+            Directive::Balign(if raw == 0 { 1 } else { raw as u64 })
         }
 
         ".byte" => {
@@ -405,9 +423,11 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
 
         ".zero" | ".space" => {
             let parts: Vec<&str> = args.trim().split(',').collect();
-            let size: usize = parse_int_literal(parts[0].trim())
-                .map_err(|_| format!("invalid .zero size: {}", args))?
-                as usize;
+            // GAS: a negative size emits nothing (`.zero -1` is a no-op);
+            // the old `as usize` cast turned -1 into 2^64 bytes.
+            let size_raw = parse_int_literal(parts[0].trim())
+                .map_err(|_| format!("invalid .zero size: {}", args))?;
+            let size: usize = if size_raw <= 0 { 0 } else { size_raw as usize };
             let fill: u8 = if parts.len() > 1 {
                 parse_data_value_int(parts[1].trim())? as u8
             } else {
@@ -419,12 +439,10 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
             // .fill repeat, size, value
             let parts: Vec<&str> = args.splitn(3, ',').collect();
             let repeat = parse_int_literal(parts[0].trim())
-                .map_err(|_| format!("bad .fill repeat: {}", parts[0].trim()))?
-                as u64;
+                .map_err(|_| format!("bad .fill repeat: {}", parts[0].trim()))?;
             let size = if parts.len() > 1 {
                 parse_int_literal(parts[1].trim())
                     .map_err(|_| format!("bad .fill size: {}", parts[1].trim()))?
-                    as u64
             } else {
                 1
             };
@@ -435,7 +453,29 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
             } else {
                 0
             };
-            let total_bytes = (repeat * size.min(8)) as usize;
+            // GAS: non-positive repeat/size emit nothing; a wrapping
+            // repeat*size emits zero bytes too (both measured on 2.47).
+            // The old code cast-then-multiplied and hung/OOM'd on
+            // `.fill -1,1,0xff`.
+            if repeat <= 0 || size <= 0 {
+                return Ok(AsmStatement::Directive(Directive::Zero {
+                    size: 0,
+                    fill: 0,
+                }));
+            }
+            let repeat = repeat as u64;
+            let size = size as u64;
+            // GAS: overflow -> zero bytes, no diagnostic.
+            let total_bytes = repeat.checked_mul(size.min(8)).unwrap_or_default();
+            // Refuse before the value≠0 branch materializes its Vec
+            // (same verdict as the writer's directive-fill cap).
+            if total_bytes > crate::backend::elf::MAX_DIRECTIVE_FILL as u64 {
+                return Err(format!(
+                    ".fill: {total_bytes} bytes exceed the {}-byte directive limit",
+                    crate::backend::elf::MAX_DIRECTIVE_FILL
+                ));
+            }
+            let total_bytes = total_bytes as usize;
             if value == 0 {
                 Directive::Zero {
                     size: total_bytes,

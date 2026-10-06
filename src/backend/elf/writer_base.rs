@@ -17,6 +17,29 @@ use super::object_writer::{ElfConfig, ObjReloc, ObjSection};
 use super::symbol_table::{ObjSymbol, SymbolTableInput, build_elf_symbol_table};
 use crate::common::fx_hash::FxHashMap;
 
+/// Single-directive materialization ceiling (bytes) for generated fill:
+/// alignment padding, `.zero`, `.space`, `.fill`.
+///
+/// These directives amplify: a constant-length source line requests an
+/// arbitrary amount of output, so without a bound the assembler's memory
+/// (not its correctness) is the first thing an input can exhaust — a 2 GiB
+/// VM plus swap dies on `.p2align 32` long before any oracle opinion
+/// matters. GNU as materializes against the *filesystem* instead: measured
+/// on this box, `.p2align 30` dies on the 993 MiB tmpfs while the same
+/// directive succeeds on a 14 GiB runner disk — i.e. past this line the
+/// GAS verdict is free-disk state and no test row can pin it (the matrix
+/// never encodes such rows). Refusing deterministically is therefore the
+/// only *reproducible* verdict: every legitimate pad/fill — the largest
+/// alignments real objects use (huge pages, segment alignment) sit four
+/// orders of magnitude below this line — behaves identically to GAS on
+/// every machine, and pathological input gets a diagnostic instead of the
+/// OOM killer.
+///
+/// 256 MiB is chosen as the largest single allocation that cannot
+/// pressure-swap a 2 GiB host on its own while staying far above any real
+/// object's directive-driven fill.
+pub const MAX_DIRECTIVE_FILL: usize = 256 << 20;
+
 /// Shared ELF writer state used by both ARM and RISC-V assembler backends.
 ///
 /// This struct manages sections, symbols, labels, and relocations using the
@@ -115,6 +138,28 @@ impl ElfWriterBase {
         }
     }
 
+    /// Append `size` copies of `fill`, bounded by [`MAX_DIRECTIVE_FILL`].
+    ///
+    /// This is the `.zero` / `.space` / `.fill` choke point. The previous
+    /// path built an intermediate `Vec` and copied it into the section —
+    /// two allocations and two full touches per directive — and had no
+    /// ceiling at all: a six-byte source line could ask for 2^63 bytes
+    /// and take the assembler down with the OOM killer. One `resize`
+    /// writes once, and the ceiling turns the unbounded request into a
+    /// deterministic diagnostic.
+    pub fn emit_fill(&mut self, size: usize, fill: u8) -> Result<(), String> {
+        if size > MAX_DIRECTIVE_FILL {
+            return Err(format!(
+                "fill directive of {size} bytes exceeds the {MAX_DIRECTIVE_FILL}-byte limit"
+            ));
+        }
+        if let Some(section) = self.sections.get_mut(&self.current_section) {
+            let start = section.data.len();
+            section.data.resize(start + size, fill);
+        }
+        Ok(())
+    }
+
     /// Append a 16-bit little-endian value to the current section.
     pub fn emit_u16_le(&mut self, val: u16) {
         self.emit_bytes(&val.to_le_bytes());
@@ -143,8 +188,8 @@ impl ElfWriterBase {
     ///
     /// Code sections are NOP-padded using the architecture's NOP instruction;
     /// data sections are zero-padded.
-    pub fn align_to(&mut self, align: u64) {
-        self.align_to_capped(align, None);
+    pub fn align_to(&mut self, align: u64) -> Result<(), String> {
+        self.align_to_capped(align, None)
     }
 
     /// Align, but skip the padding entirely when it would exceed `max_pad`.
@@ -153,8 +198,8 @@ impl ElfWriterBase {
     /// more than M bytes, the location counter is left unchanged. The section
     /// `sh_addralign` is still raised so the ELF header reflects the
     /// programmer's requested alignment even when a particular site skipped.
-    pub fn align_to_capped(&mut self, align: u64, max_pad: Option<u64>) {
-        self.align_to_capped_ex(align, max_pad, None);
+    pub fn align_to_capped(&mut self, align: u64, max_pad: Option<u64>) -> Result<(), String> {
+        self.align_to_capped_ex(align, max_pad, None)
     }
 
     /// GAS `.p2align N[, fill[, max]]`.
@@ -164,17 +209,57 @@ impl ElfWriterBase {
     /// is `None`, executable sections emit the architecture NOP at NOP-sized
     /// boundaries and zeros in the unaligned prefix; other sections zero-fill.
     /// That is the GNU as 2.44/2.47 pattern for `.byte 1; .p2align 3`.
-    pub fn align_to_capped_ex(&mut self, align: u64, max_pad: Option<u64>, fill: Option<u8>) {
+    ///
+    /// Two refusal rules keep this function fail-closed without ever
+    /// touching an unbounded allocation (all verdicts measured on GNU as
+    /// 2.47.20260726):
+    ///
+    /// * The *signed-shift bucket* (`align >= 1<<63`, what `.p2align 63`,
+    ///   `.p2align 64`, `.p2align -1` and clamped forms all reach): GAS
+    ///   never pads from it and never records the alignment. A positive
+    ///   max-pad skips (the would-be padding is "infinite" and therefore
+    ///   exceeds any cap), a zero location counter is a no-op, and a
+    ///   nonzero location counter without a cap is an error — measured
+    ///   `p2align 63 @0` -> addralign 1, `byte 1; p2align 63` -> error,
+    ///   `byte 1; p2align 63,,5` -> skip, addralign 1.
+    /// * Materialized padding beyond [`MAX_DIRECTIVE_FILL`] is refused
+    ///   before a single byte is touched (see the constant for why the
+    ///   verdict beyond that point is not pinnable anyway).
+    pub fn align_to_capped_ex(
+        &mut self,
+        align: u64,
+        max_pad: Option<u64>,
+        fill: Option<u8>,
+    ) -> Result<(), String> {
         if align <= 1 {
-            return;
+            return Ok(());
         }
         let nop = self.nop_bytes.clone();
         if let Some(section) = self.sections.get_mut(&self.current_section) {
             let current = section.data.len() as u64;
+            if align >= 1u64 << 63 {
+                let cap_positive = max_pad.is_some_and(|m| m > 0);
+                if cap_positive || current == 0 {
+                    // Skip / no-op: GAS records neither padding nor an
+                    // alignment for this bucket (addralign stays 1).
+                    return Ok(());
+                }
+                return Err(format!(
+                    "alignment {align} would require padding at nonzero offset"
+                ));
+            }
             let aligned = (current + align - 1) & !(align - 1);
             let padding = (aligned - current) as usize;
-            let skip = max_pad.is_some_and(|m| (padding as u64) > m);
+            // GAS (2.47, measured): skip iff the cap is *positive* and
+            // padding would exceed it. `,,0` and a negative cap mean
+            // unlimited — `.p2align 4,,0` at offset 1 pads 15 bytes.
+            let skip = max_pad.is_some_and(|m| m > 0 && (padding as u64) > m);
             if !skip {
+                if padding > MAX_DIRECTIVE_FILL {
+                    return Err(format!(
+                        "alignment padding of {padding} bytes exceeds the {MAX_DIRECTIVE_FILL}-byte limit"
+                    ));
+                }
                 if let Some(b) = fill {
                     section.data.extend(std::iter::repeat_n(b, padding));
                 } else if section.sh_flags & SHF_EXECINSTR != 0 && align >= 4 {
@@ -192,6 +277,7 @@ impl ElfWriterBase {
                 section.sh_addralign = align;
             }
         }
+        Ok(())
     }
 
     /// Ensure we're in a text section, creating one if needed.

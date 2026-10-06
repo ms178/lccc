@@ -59,7 +59,8 @@ it.
 
 `scripts/aarch64_operand_legality_matrix.py` is the other instrument: a curated
 table of instruction texts whose every expectation is GNU as's own verdict,
-stored in `tests/aarch64/operand-legality.tsv` (423 rows: 251 accepted with
+stored in `tests/aarch64/operand-legality.tsv` (regenerated from the oracle;
+row counts in this document are the ones at adjudication time): 423 rows: 251 accepted with
 their exact encoding, 172 rejected). It runs in two directions:
 
 * `--check` re-derives every row from the cross assembler, so the table itself
@@ -78,15 +79,15 @@ the row counts so a regeneration that quietly drops coverage fails.
 
 Environment: rustc 1.99.0, fastbuild profile. The table was generated against
 Debian GNU as 2.44 and then re-verified unchanged against the pinned
-**GNU as 2.47.20260726** oracle (`scripts/ensure_gas_247.sh`): all 423 rows
+**GNU as 2.47.20260726** oracle (`scripts/ensure_gas_247.sh`): all generated rows
 agree with both, so the expectations are not an artifact of one binutils
 version. The 97-probe battery is likewise 0/97 against 2.47.
 
 | instrument | before | after |
 |---|---|---|
 | 97-probe audit battery vs GNU as | 38 mismatches | **0** |
-| 423-row matrix `--check` vs GNU as | agreed | agreed |
-| 423-row matrix `--check-lccc` vs LCCC | 135 disagreements | **0** |
+| generated matrix `--check` vs GNU as | agreed | agreed |
+| generated matrix `--check-lccc` vs LCCC | 135 disagreements | **0** |
 | positive controls (24 probes) | 0 mismatches | 0 |
 
 The probe battery is grouped by the finding it tests (register-31 roles,

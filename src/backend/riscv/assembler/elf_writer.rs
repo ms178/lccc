@@ -529,12 +529,12 @@ impl ElfWriter {
     /// sections (when relaxation is enabled). The linker needs these to know
     /// where alignment padding exists so it can re-align after relaxation
     /// changes code sizes.
-    fn emit_align_with_reloc(&mut self, align_bytes: u64) {
+    fn emit_align_with_reloc(&mut self, align_bytes: u64) -> Result<(), String> {
         if align_bytes <= 1 {
-            return;
+            return Ok(());
         }
         let offset_before = self.base.current_offset();
-        self.base.align_to(align_bytes);
+        self.base.align_to(align_bytes)?;
         let offset_after = self.base.current_offset();
         let padding = offset_after - offset_before;
         if padding > 0 && !self.no_relax {
@@ -551,6 +551,7 @@ impl ElfWriter {
                 }
             }
         }
+        Ok(())
     }
 
     /// Process all parsed assembly statements.
@@ -726,14 +727,15 @@ impl ElfWriter {
             }
 
             Directive::Align(val) => {
-                // RISC-V .align N means 2^N bytes (same as .p2align)
+                // RISC-V .align N means 2^N bytes (same as .p2align);
+                // the parser clamps N to 63 (GAS), so the shift is safe.
                 let bytes = 1u64 << val;
-                self.emit_align_with_reloc(bytes);
+                self.emit_align_with_reloc(bytes)?;
                 Ok(())
             }
 
             Directive::Balign(val) => {
-                self.emit_align_with_reloc(*val);
+                self.emit_align_with_reloc(*val)?;
                 Ok(())
             }
 
@@ -861,7 +863,11 @@ impl ElfWriter {
             }
 
             Directive::Zero { size, fill } => {
-                self.base.emit_bytes(&vec![*fill; *size]);
+                // emit_fill bounds the request (MAX_DIRECTIVE_FILL) and
+                // writes with a single resize — the old
+                // `emit_bytes(&vec![fill; size])` materialized the whole
+                // run before any ceiling could apply.
+                self.base.emit_fill(*size, *fill)?;
                 Ok(())
             }
 

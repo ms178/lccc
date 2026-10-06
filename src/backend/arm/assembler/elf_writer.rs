@@ -533,11 +533,11 @@ impl ElfWriter {
                 max_pad,
                 fill,
             } => {
-                self.base.align_to_capped_ex(*bytes, *max_pad, *fill);
+                self.base.align_to_capped_ex(*bytes, *max_pad, *fill)?;
                 Ok(())
             }
             AsmDirective::Balign(bytes) => {
-                self.base.align_to(*bytes);
+                self.base.align_to(*bytes)?;
                 Ok(())
             }
 
@@ -554,7 +554,7 @@ impl ElfWriter {
             AsmDirective::Quad(vals) => self.emit_data_values(vals, 8),
 
             AsmDirective::Zero(size, fill) => {
-                self.base.emit_bytes(&vec![*fill; *size]);
+                self.base.emit_fill(*size, *fill)?;
                 Ok(())
             }
             AsmDirective::Asciz(bytes) => {
@@ -636,6 +636,15 @@ impl ElfWriter {
             ));
         }
         let padding = (target - current) as usize;
+        // `.org` is the same constant-source / unbounded-output amplifier
+        // as `.zero`: refuse the materialization before touching memory
+        // (GAS dies writing it too — nonzero exit either way).
+        if padding > crate::backend::elf::MAX_DIRECTIVE_FILL {
+            return Err(format!(
+                ".org: {padding} bytes of fill exceed the {}-byte limit",
+                crate::backend::elf::MAX_DIRECTIVE_FILL
+            ));
+        }
         if padding > 0 {
             // `.org` pads with its fill byte (default ZERO), even in an
             // executable section — it is a positioning directive, not an
@@ -2161,17 +2170,11 @@ mod aarch64_encoder_tests {
         // cover the families it was written for.  A regeneration that silently
         // dropped rows would otherwise still pass.
         assert!(
-            checked >= 420,
-            "the matrix shrank to {checked} rows; it had 423"
+            checked >= 460,
+            "the matrix shrank to {checked} rows (ratchet is the generated table size)"
         );
-        assert!(
-            accepted >= 250,
-            "only {accepted} accepted rows remain; there were 251"
-        );
-        assert!(
-            rejected >= 170,
-            "only {rejected} rejected rows remain; there were 172"
-        );
+        assert!(accepted >= 265, "only {accepted} accepted rows remain");
+        assert!(rejected >= 190, "only {rejected} rejected rows remain");
         assert!(
             drift.is_empty(),
             "{} matrix row(s) disagree with this encoder:\n{}",
@@ -2321,6 +2324,11 @@ mod aarch64_encoder_tests {
                 n, 8,
                 "p2align 4,,10 at offset 4 must not pad (got {n} bytes)"
             );
+            // GAS raises sh_addralign even when the cap suppresses padding.
+            assert_eq!(
+                w.base.sections[".text"].sh_addralign, 16,
+                "skipped p2align still raises sh_addralign"
+            );
         }
         {
             // At offset 4, .p2align 3,,8 needs 4 bytes (<= 8) so it pads.
@@ -2328,6 +2336,44 @@ mod aarch64_encoder_tests {
             let w = assemble(asm).expect("p2align program");
             let n = w.base.sections[".text"].data.len();
             assert_eq!(n, 12, "p2align 3,,8 at offset 4 must pad 4 bytes (got {n})");
+            assert_eq!(
+                w.base.sections[".text"].sh_addralign, 8,
+                "skipped-or-applied cap still raises sh_addralign"
+            );
+        }
+        {
+            // GAS: max==0 is unlimited. `.byte 1; .p2align 4,,0; .byte 2`
+            // at offset 1 needs 15 bytes of pad → 17 total, not a skip.
+            let asm = ".data\n.byte 1\n.p2align 4,,0\n.byte 2\n";
+            let w = assemble(asm).expect("p2align max=0");
+            let d = &w.base.sections[".data"].data;
+            assert_eq!(d.len(), 17, "p2align 4,,0 must pad (got {} bytes)", d.len());
+            assert_eq!(d[0], 1);
+            assert_eq!(d[16], 2);
+            assert!(d[1..16].iter().all(|&b| b == 0));
+            assert_eq!(w.base.sections[".data"].sh_addralign, 16);
+            let asm = ".data\n.byte 1\n.p2align 4,,-1\n.byte 2\n";
+            let w = assemble(asm).expect("p2align negative max is unlimited");
+            assert_eq!(w.base.sections[".data"].data.len(), 17);
+            let asm = ".data\n.byte 1\n.balign 16,,0\n.byte 2\n";
+            let w = assemble(asm).expect("balign max=0");
+            assert_eq!(w.base.sections[".data"].data.len(), 17);
+            // GAS: fill is any integer, low byte stored (-1 == 0xff).
+            let asm = ".data\n.byte 1\n.p2align 4,-1\n.byte 2\n";
+            let w = assemble(asm).expect("p2align negative fill");
+            let d = &w.base.sections[".data"].data;
+            assert_eq!(d.len(), 17);
+            assert!(d[1..16].iter().all(|&b| b == 0xff));
+            // GAS: .balign 0 is a no-op; non-powers-of-two are errors.
+            let asm = ".data\n.byte 1\n.balign 0\n.byte 2\n";
+            let w = assemble(asm).expect("balign 0");
+            assert_eq!(w.base.sections[".data"].data.len(), 2);
+            for bad in [".data\n.balign 3\n", ".data\n.balign -8\n"] {
+                assert!(
+                    assemble(bad).is_err(),
+                    "{bad} must be rejected like GAS (not a power of 2)"
+                );
+            }
         }
         {
             // Fill is honoured in .data AND .text (GAS 2.44:
@@ -2349,5 +2395,151 @@ mod aarch64_encoder_tests {
                 "text p2align fill"
             );
         }
+    }
+
+    /// Every verdict here is pinned against GNU as 2.47 (red-team probe
+    /// log): the signed-shift bucket (`p2align 63`, clamps `64`/`-1`),
+    /// cap-skip BEFORE the bucket error, never-raise-in-bucket, and the
+    /// deterministic `MAX_DIRECTIVE_FILL` ceiling for `.zero`/`.fill`/
+    /// `.org` (beyond 256 MiB GAS's own answer is free-disk state).
+    #[test]
+    fn gas247_alignment_fill_org_matrix() {
+        // ---- signed-shift bucket (align >= 1<<63), clamp family ----
+        for exp in ["63", "64", "-1"] {
+            // @0: accepted, nothing padded, alignment stays 1 (GAS).
+            let w = assemble(&format!(".data\n.p2align {exp}\n.byte 3\n"))
+                .unwrap_or_else(|e| panic!("p2align {exp} @0 must assemble: {e}"));
+            assert_eq!(
+                w.base.sections[".data"].sh_addralign, 1,
+                "p2align {exp} @0 must not raise sh_addralign"
+            );
+            assert_eq!(
+                w.base.sections[".data"].data,
+                vec![3u8],
+                "p2align {exp} @0 must not pad"
+            );
+            // @1, no cap: error (GAS "jump over nop padding out of range").
+            assert!(
+                assemble(&format!(".data\n.byte 1\n.p2align {exp}\n")).is_err(),
+                "p2align {exp} @1 without cap must fail"
+            );
+            // @1, positive cap: SKIP — GAS assembles it with align 1.
+            let w = assemble(&format!(".data\n.byte 1\n.p2align {exp},,5\n.byte 2\n"))
+                .unwrap_or_else(|e| panic!("p2align {exp},,5 @1 must assemble (GAS skips): {e}"));
+            assert_eq!(
+                w.base.sections[".data"].data.len(),
+                2,
+                "p2align {exp},,5 @1 must skip the pad"
+            );
+            assert_eq!(
+                w.base.sections[".data"].sh_addralign, 1,
+                "the bucket never raises sh_addralign, even when skipped"
+            );
+        }
+
+        // ---- representable alignments: raise-on-skip, cap-skip, huge raise ----
+        let w = assemble(".data\n.byte 1\n.p2align 40,,5\n.byte 2\n")
+            .expect("p2align 40,,5 must skip at offset 1");
+        assert_eq!(
+            w.base.sections[".data"].data.len(),
+            2,
+            "cap 5 skips 2^40-1 pad"
+        );
+        assert_eq!(
+            w.base.sections[".data"].sh_addralign,
+            1u64 << 40,
+            "GAS raises sh_addralign even when the cap skips the pad"
+        );
+        let w = assemble(".data\n.p2align 62\n.byte 3\n").expect("p2align 62 @0");
+        assert_eq!(w.base.sections[".data"].sh_addralign, 1u64 << 62);
+        assert_eq!(w.base.sections[".data"].data, vec![3u8], "@0 needs no pad");
+
+        // ---- .balign byte-count form ----
+        let w = assemble(".data\n.balign 1099511627776\n.byte 3\n")
+            .expect("balign 2^40 @0 must assemble");
+        assert_eq!(w.base.sections[".data"].sh_addralign, 1u64 << 40);
+        assert!(
+            assemble(".data\n.byte 1\n.balign 1099511627776\n").is_err(),
+            "balign 2^40 @1 must fail (padding beyond the fill ceiling)"
+        );
+        for src in [".data\n.balign\n.byte 3\n", ".data\n.balign 0\n.byte 3\n"] {
+            assemble(src).unwrap_or_else(|e| panic!("{src:?} must assemble (GAS no-ops): {e}"));
+        }
+        assert!(
+            assemble(".data\n.balign 3\n").is_err(),
+            "balign 3 is not a power of 2"
+        );
+        assert!(
+            assemble(".data\n.balign -16\n").is_err(),
+            "balign -16 is negative"
+        );
+
+        // ---- .zero / .space ----
+        let w = assemble(".data\n.zero -1\n").expect(".zero -1 is a GAS no-op");
+        assert_eq!(
+            w.base.sections[".data"].data.len(),
+            0,
+            ".zero -1 emits nothing"
+        );
+        let w = assemble(".data\n.zero 64\n").expect(".zero 64");
+        assert_eq!(w.base.sections[".data"].data.len(), 64);
+        assert!(
+            assemble(".data\n.zero 268435457\n").is_err(),
+            "256 MiB + 1 must be refused"
+        );
+        let w = assemble(".data\n.space -5\n").expect(".space -5 is a no-op");
+        assert_eq!(w.base.sections[".data"].data.len(), 0);
+
+        // ---- .fill ----
+        let w = assemble(".data\n.fill -1\n").expect(".fill -1 is a GAS no-op");
+        assert_eq!(w.base.sections[".data"].data.len(), 0);
+        let w = assemble(".data\n.fill 4611686018427387904,4\n")
+            .expect("overflowing .fill is accepted and emits zero bytes");
+        assert_eq!(
+            w.base.sections[".data"].data.len(),
+            0,
+            ".fill 2^62,4 emits nothing"
+        );
+        let w = assemble(".data\n.fill 1,9\n").expect(".fill 1,9");
+        assert_eq!(
+            w.base.sections[".data"].data.len(),
+            8,
+            ".fill size clamps to 8 per copy"
+        );
+        // Out-of-i64-range literals: GAS reads them as their two's-complement
+        // pattern (all 2^63..2^64-1 are negative counts -> zero bytes, and
+        // 2^64 itself is an expression error).  Measured on 2.47.
+        let w = assemble(".data\n.fill 18446744073709551615,1,5\n")
+            .expect(".fill u64max,1,5 must assemble");
+        assert_eq!(
+            w.base.sections[".data"].data.len(),
+            0,
+            "u64max repeat is -1"
+        );
+        let w =
+            assemble(".data\n.zero 18446744073709551615\n").expect(".zero u64max must assemble");
+        assert_eq!(w.base.sections[".data"].data.len(), 0);
+        let w = assemble(".data\n.zero 9223372036854775808\n").expect(".zero 2^63 must assemble");
+        assert_eq!(w.base.sections[".data"].data.len(), 0);
+        assert!(
+            assemble(".data\n.fill 18446744073709551616,1,0\n").is_err(),
+            "a literal above u64::MAX is a GAS expression error"
+        );
+        assert!(
+            assemble(".data\n.fill 268435457,1,1\n").is_err(),
+            "256 MiB + 1 must be refused"
+        );
+
+        // ---- .org (same constant-source amplifier) ----
+        let w = assemble(".data\n.org 4\n").expect(".org 4");
+        assert_eq!(w.base.sections[".data"].data.len(), 4);
+        assert!(
+            assemble(".data\n.org 268435457\n").is_err(),
+            "org past the ceiling must fail"
+        );
+        assert!(
+            assemble(".data\n.byte 1\n.org 0\n").is_err(),
+            "backwards .org must fail"
+        );
     }
 }

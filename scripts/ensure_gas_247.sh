@@ -116,6 +116,20 @@ validate_pair() {
         echo "validate: pair mismatch — as says '$tok_as', objdump says '$tok_od'; both version tokens must be identical" >&2
         return 1
     }
+    if [[ -n "${oc:-}" ]]; then
+        [[ -x "$oc" ]] || { echo "validate: objcopy missing at $oc" >&2; return 1; }
+        local tok_oc
+        tok_oc=$(_version_token "$oc") \
+            || { echo "validate: $oc --version is unreadable" >&2; return 1; }
+        [[ "$tok_oc" =~ $pin_re ]] || {
+            echo "validate: $oc reports version '$tok_oc' — not the pinned 2.47" >&2
+            return 1
+        }
+        [[ "$tok_oc" == "$tok_as" ]] || {
+            echo "validate: objcopy token '$tok_oc' != as token '$tok_as'" >&2
+            return 1
+        }
+    fi
     _canary || return 1
 }
 
@@ -170,9 +184,9 @@ _tarball_matches_pin() {  # <tarball>: the pinned binutils-2.47 bytes?
 # and the caches are not. What the marker DOES close is every accidental
 # and environmental drift case that previously rode the fast path on a
 # self-reported version string alone.
-PROVENANCE_KEYS=(target tarball_version tarball_sha256 as_sha256 objdump_sha256)
+PROVENANCE_KEYS=(target tarball_version tarball_sha256 as_sha256 objdump_sha256 objcopy_sha256)
 
-_pair_provenance_ok() {  # requires $as/$od/$provenance/$target set
+_pair_provenance_ok() {  # requires $as/$od/$oc/$provenance/$target set
     [[ -f "$provenance" ]] || return 1
     local line key value
     local -A seen=()
@@ -197,14 +211,16 @@ _pair_provenance_ok() {  # requires $as/$od/$provenance/$target set
     [[ "${seen[tarball_sha256]}" == "$GAS_TARBALL_SHA256" ]] || return 1
     _sha256_is "$as" "${seen[as_sha256]}" || return 1
     _sha256_is "$od" "${seen[objdump_sha256]}" || return 1
+    _sha256_is "$oc" "${seen[objcopy_sha256]}" || return 1
 }
 
 _write_provenance() {  # after a verified-tarball build passed validation
-    local as_sum od_sum
+    local as_sum od_sum oc_sum
     as_sum=$(sha256sum "$as") && as_sum=${as_sum%% *}
     od_sum=$(sha256sum "$od") && od_sum=${od_sum%% *}
-    printf 'target=%s\ntarball_version=%s\ntarball_sha256=%s\nas_sha256=%s\nobjdump_sha256=%s\n' \
-        "$target" "$ver" "$GAS_TARBALL_SHA256" "$as_sum" "$od_sum" \
+    oc_sum=$(sha256sum "$oc") && oc_sum=${oc_sum%% *}
+    printf 'target=%s\ntarball_version=%s\ntarball_sha256=%s\nas_sha256=%s\nobjdump_sha256=%s\nobjcopy_sha256=%s\n' \
+        "$target" "$ver" "$GAS_TARBALL_SHA256" "$as_sum" "$od_sum" "$oc_sum" \
         > "$provenance.tmp"
     mv -f "$provenance.tmp" "$provenance"
 }
@@ -290,9 +306,23 @@ EOF
 
     target=x86_64-linux-gnu
 
-    as="$tmp/gas-247";  od="$tmp/od-247"
-    mkok "$as" "$V47"; mkok "$od" "$O47"
-    check "correct 2.47 pair (functional canary)" 0
+    # objcopy is a validated member of the triple now: a default fake is
+    # installed for every case, and the dedicated cases below prove the
+    # missing / wrong-token / mismatched variants reject on their own.
+    as="$tmp/gas-247";  od="$tmp/od-247"; oc="$tmp/oc-247"
+    mkok "$as" "$V47"; mkok "$od" "$O47"; mkok "$oc" "GNU objcopy (GNU Binutils) 2.47"
+    check "correct 2.47 triple (functional canary)" 0
+
+    oc="$tmp/oc-absent"
+    check "objcopy missing beside a valid pair" 1
+    oc="$tmp/oc-246"
+    mkok "$oc" "GNU objcopy (GNU Binutils) 2.46"
+    check "objcopy 2.46 beside a 2.47 pair" 1
+    oc="$tmp/oc-2470"
+    mkok "$oc" "GNU objcopy (GNU Binutils) 2.470"
+    check "objcopy lookalike 2.470" 1
+    oc="$tmp/oc-247"
+    mkok "$oc" "GNU objcopy (GNU Binutils) 2.47"
 
     as="$tmp/gas-246"; od="$tmp/od-246"
     mkok "$as" "GNU assembler (GNU Binutils) 2.46"
@@ -319,10 +349,11 @@ EOF
     mkok "$od" "GNU objdump (GNU Binutils) 2.47.20260726"
     check "mismatched tokens (2.47 vs 2.47.20260726)" 1
 
-    as="$tmp/gas-snap"; od="$tmp/od-snap"
+    as="$tmp/gas-snap"; od="$tmp/od-snap"; oc="$tmp/oc-snap"
     mkok "$as" "GNU assembler (GNU Binutils) 2.47.20260726"
     mkok "$od" "GNU objdump (GNU Binutils) 2.47.20260726"
-    check "dated snapshot 2.47.20260726, both halves" 0
+    mkok "$oc" "GNU objcopy (GNU Binutils) 2.47.20260726"
+    check "dated snapshot 2.47.20260726, all three" 0
 
     as="$tmp/gas-fail"; od="$tmp/od-fail"
     mkfail "$as"; mkfail "$od"
@@ -342,8 +373,8 @@ EOF
     check "version-correct, as refuses to assemble" 1
 
     target=riscv64-linux-gnu
-    as="$tmp/gas-rv"; od="$tmp/od-rv"
-    mkver "$as" "$V47"; mkver "$od" "$O47"
+    as="$tmp/gas-rv"; od="$tmp/od-rv"; oc="$tmp/oc-rv"
+    mkver "$as" "$V47"; mkver "$od" "$O47"; mkver "$oc" "GNU objcopy (GNU Binutils) 2.47"
     check "non-x86 target: version-only validation" 0
 
     # The supply-chain comparator, on real digests of a real file: the
@@ -387,15 +418,16 @@ EOF
     # markers — every drift case the fast path must refuse (a pair that
     # still passes layers 1+2: it self-reports 2.47 and decodes the
     # canary, but is NOT the pair the pinned tarball produced).
-    local marker sum_as sum_od
+    local marker sum_as sum_od sum_oc
     marker="$tmp/provenance"
     provenance="$marker"
     ver=2.47
     target=x86_64-linux-gnu
-    as="$tmp/gas-prov"; od="$tmp/od-prov"
-    mkok "$as" "$V47"; mkok "$od" "$O47"
+    as="$tmp/gas-prov"; od="$tmp/od-prov"; oc="$tmp/oc-prov"
+    mkok "$as" "$V47"; mkok "$od" "$O47"; mkok "$oc" "GNU objcopy (GNU Binutils) 2.47"
     sum_as=$(sha256sum "$as"); sum_as=${sum_as%% *}
     sum_od=$(sha256sum "$od"); sum_od=${sum_od%% *}
+    sum_oc=$(sha256sum "$oc"); sum_oc=${sum_oc%% *}
     prov_case() {  # prov_case <label> <want> <marker-text>
         local label=$1 want=$2 got
         printf '%s' "$3" >"$marker"
@@ -411,8 +443,8 @@ EOF
         fi
     }
     local good_marker no_objdump_marker rot_pin
-    good_marker=$(printf 'target=%s\ntarball_version=%s\ntarball_sha256=%s\nas_sha256=%s\nobjdump_sha256=%s\n' \
-        "$target" "$ver" "$GAS_TARBALL_SHA256" "$sum_as" "$sum_od")
+    good_marker=$(printf 'target=%s\ntarball_version=%s\ntarball_sha256=%s\nas_sha256=%s\nobjdump_sha256=%s\nobjcopy_sha256=%s\n' \
+        "$target" "$ver" "$GAS_TARBALL_SHA256" "$sum_as" "$sum_od" "$sum_oc")
     no_objdump_marker=$(printf 'target=%s\ntarball_version=%s\ntarball_sha256=%s\nas_sha256=%s\n' \
         "$target" "$ver" "$GAS_TARBALL_SHA256" "$sum_as")
     # A rotated pin, guaranteed different from the current one (same
@@ -443,6 +475,8 @@ EOF
         "${good_marker/$sum_as/$sum_od}"
     prov_case "provenance: objdump bytes drifted (tamper)" 1 \
         "${good_marker/$sum_od/$sum_as}"
+    prov_case "provenance: objcopy bytes drifted (tamper)" 1 \
+        "${good_marker/$sum_oc/$sum_as}"
     prov_case "provenance: missing key" 1 "$no_objdump_marker"
     prov_case "provenance: unknown extra key" 1 \
         "$good_marker
@@ -472,6 +506,7 @@ target=${1:-riscv64-linux-gnu}
 prefix=${2:-${HOME}/.cache/gas-2.47-${target}}
 as="$prefix/bin/as"
 od="$prefix/bin/objdump"
+oc="$prefix/bin/objcopy"
 provenance="$prefix/.lccc-binutils-provenance"
 
 # BOTH binaries, validated as a PAIR (pinned token, one build, functional
@@ -487,7 +522,7 @@ provenance="$prefix/.lccc-binutils-provenance"
 # else falls through to the rebuild, which reinstalls from one verified
 # source tree, must itself pass the same validation, and writes a fresh
 # marker.
-if [[ -x "$as" && -x "$od" ]] && validate_pair && _pair_provenance_ok; then
+if [[ -x "$as" && -x "$od" && -x "$oc" ]] && validate_pair && _pair_provenance_ok; then
     "$as" --version | sed -n '1,1p'
     "$od" --version | sed -n '1,1p'
     exit 0
@@ -558,11 +593,11 @@ make -j2 >make.log 2>&1
 mkdir -p "$prefix/bin"
 cp gas/as-new "$as"
 cp binutils/objdump "$od"
-# objcopy is the third half of the AArch64 matrix (read .text). Same
-# 2.47 build, same prefix.
-if [[ -x binutils/objcopy ]]; then
-    cp binutils/objcopy "$prefix/bin/objcopy"
-fi
+[[ -x binutils/objcopy ]] || {
+    echo "FATAL: binutils/objcopy was not produced; the matrix cannot read .text" >&2
+    exit 1
+}
+cp binutils/objcopy "$oc"
 # The freshly installed pair must pass the SAME validation the cache
 # fast path applies — an install that cannot justify itself is a failure,
 # not a print-and-hope.
