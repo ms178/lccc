@@ -1,0 +1,20 @@
+{
+  "flags": [
+    "-O2",
+    "-O2",
+    "-march=x86-64-v3"
+  ],
+  "totals": {
+    "alloca": 238,
+    "address": 0,
+    "wide": 19,
+    "spill": 128,
+    "nongpr": 42,
+    "temp": 262,
+    "csave": 589,
+    "argout": 1,
+    "incoming": 5,
+    "unknown": 14
+  },
+  "coverage_pct": 98.92141756548536
+}

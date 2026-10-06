@@ -26,8 +26,8 @@ WHAT IS TESTED
 2. `_stats` does NOT count plain jumps as calls. A tail jump to an out-of-line
    copy is precisely the shape that fakes a smaller function, and counting it
    as a call would hide the very rows this guard exists to expose.
-3. `_rank_markdown` marks a row non-comparable exactly when the call counts
-   differ, and leaves a genuine gap (equal call counts) marked comparable.
+3. Call mismatches flag BOTH wins and losses; equal counts are unproven,
+   never a claim of semantic equivalence.
 4. `_print_rank` says so on stdout, with the count and the pointer to
    `--all-functions`.
 
@@ -105,6 +105,36 @@ class CallCounting(unittest.TestCase):
         self.assertEqual(st.instructions, 1)
 
 
+class MemoryAccounting(unittest.TestCase):
+    def test_indexed_store_and_load(self):
+        for insn, reads, writes in [
+            ("movsd %xmm3, 24(%rax,%rcx,8)", 0, 1),
+            ("vmovupd 24(%rax,%rcx,8), %xmm3", 1, 0),
+            ("addl $1, 8(%rbp,%rcx,4)", 1, 1),
+            ("cmpl $1, 8(%rbp,%rcx,4)", 1, 0),
+            ("btsq $1, (%rax)", 1, 1),
+            ("btq $1, (%rax)", 1, 0),
+            ("idivq (%rax)", 1, 0),
+            ("cmpxchgq %rdx, (%rax)", 1, 1),
+            ("xchgq (%rax), %rcx", 1, 1),
+            ("leaq -8(%rbp), %rax", 0, 0),
+            ("nopl (%rax,%rax,1)", 0, 0),
+        ]:
+            st = CG._stats([insn], "x86")
+            self.assertEqual((st.loads, st.stores), (reads, writes), insn)
+
+    def test_explicit_stack_refs_are_not_inferred_spills(self):
+        st = CG._stats(["leaq -8(%rbp), %rax", "movq %rcx, -8(%rbp)",
+                        "movsd -16(%rsp), %xmm2"], "x86")
+        self.assertEqual(st.stack_refs, 2)
+        self.assertEqual(st.spills, st.stack_refs)  # legacy JSON alias
+
+    def test_register_moves_include_vex_but_not_memory(self):
+        st = CG._stats(["movsd %xmm2, %xmm3", "vmovsd %xmm1, %xmm2, %xmm3",
+                        "movsd (%rax), %xmm2", "vmovsd %xmm2, (%rax)"], "x86")
+        self.assertEqual(st.xmm_reg_moves, 2)
+
+
 class MarkdownComparability(unittest.TestCase):
     def _render(self, rows):
         with tempfile.TemporaryDirectory() as td:
@@ -116,7 +146,7 @@ class MarkdownComparability(unittest.TestCase):
         rows = _rows(
             # the real shape: ICC's stub `main` with 4 calls vs our inlined one
             (204, "zlib_ng_adler32", "main", 1, 4, 277, 73),
-            # a genuine gap: same call count, so the bodies are comparable
+            # same call count: possible gap, but equivalence is unproven
             (90, "moving_stats", "main", 1, 1, 221, 131),
         )
         md = self._render(rows)
@@ -124,9 +154,9 @@ class MarkdownComparability(unittest.TestCase):
         # adler32 row: 1 vs 4 -> not comparable
         adler = next(l for l in md.split("\n") if "zlib_ng_adler32" in l)
         self.assertIn("| 1 | 4 | **no** |", adler)
-        # moving_stats row: 1 vs 1 -> comparable, and must NOT be flagged
+        # moving_stats row: 1 vs 1 -> unproven, not a proven mismatch
         moving = next(l for l in md.split("\n") if "moving_stats" in l)
-        self.assertIn("| 1 | 1 | yes |", moving)
+        self.assertIn("| 1 | 1 | unproven |", moving)
         self.assertNotIn("**no**", moving)
 
     def test_summary_reports_the_share_of_the_deficit(self):
@@ -143,11 +173,14 @@ class MarkdownComparability(unittest.TestCase):
         md = self._render(_rows((90, "moving_stats", "main", 1, 1, 221, 131)))
         self.assertNotIn("not comparable", md)
 
-    def test_rows_we_are_ahead_on_are_never_flagged(self):
-        """A negative gap is a win; whether the call counts match is moot and
-        flagging it would train readers to ignore the marker."""
-        md = self._render(_rows((-40, "chacha20_block", "core", 3, 0, 63, 103)))
-        self.assertNotIn("not comparable", md)
+    def test_wins_are_not_exempt_from_scope_checks(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "report.md"
+            CG._rank_markdown(_rows((-40, "small_stub", "core", 3, 0, 63, 103)),
+                              True, p, "-O2")
+            md = p.read_text()
+        self.assertIn("| 3 | 0 | **no** |", md)
+        self.assertIn("not comparable", md)
 
 
 class StdoutWarning(unittest.TestCase):

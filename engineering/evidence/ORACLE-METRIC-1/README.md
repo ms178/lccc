@@ -1,3 +1,11 @@
+> **2026-10-06 erratum:** this is historical evidence, not a current ranking.
+> The `110 vs 14` nbody comparison did not establish matched loop scopes;
+> `.LBB7` is composite, not the innermost pair loop. The movsd census mixes
+> loads/stores and register moves, and equal call counts cannot prove equal
+> work. The oracle's old memory-operand parser also miscounted LEA and indexed
+> stores. See [the remeasurement](../../FOLLOWUP-2026-10-06-codegen-audit.md).
+> In particular, 1.17 is a median ratio (~17%), while 15.8% was a ratio of sums.
+
 # The oracle metric was ranking us against a mirage — measured correction
 
 **Date:** 2026-09-30 · branch base `71e3b1ae` (main, PR #686 merged)

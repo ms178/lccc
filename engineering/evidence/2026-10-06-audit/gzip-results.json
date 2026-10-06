@@ -1,0 +1,312 @@
+{
+  "schema": 2,
+  "date_utc": "2026-10-06T16:52:08.547921+00:00",
+  "evidence_class": "VM wall-clock screening; no PMU",
+  "archive": {
+    "url": "https://ftp.gnu.org/pub/gnu/gzip/gzip-1.14.tar.xz",
+    "path": "/var/tmp/lccc-session/lccc/target/upstream/gzip-1.14.tar.xz",
+    "sha256": "01a7b881bd220bfdf615f97b8718f80bdfd3f6add385b993dcf6efd14e8c0ac6",
+    "archpkgbuilds_selector": "packages/gzip/PKGBUILD pkgver=1.14",
+    "signature_verified": false
+  },
+  "corpora": {
+    "source": {
+      "bytes": 8388608,
+      "sha256": "420c2b0a3ade2664638f3c4597836511343971f6cb18c94835d9458c88280816"
+    },
+    "mixed": {
+      "bytes": 8388608,
+      "sha256": "db4bd04ec4a62f91184ee5e0380c30146a421930382772861d281a1ab3596d3b"
+    }
+  },
+  "builds": {
+    "lccc": {
+      "key": "lccc",
+      "cc": "/var/tmp/lccc-session/lccc/target/fastbuild/lccc",
+      "compiler_version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0",
+      "flags": "-O3 -march=x86-64-v3 -I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+      "environment": {},
+      "binary": "/var/tmp/lccc-session/lccc/target/audit-after/gzip-fixed/gzip-lccc",
+      "binary_sha256": "09023b4e3a858dba8515291eb2e3206db6739b1ea6a3b453a795710cfa91a24a",
+      "binary_bytes": 109808,
+      "check": {
+        "total": 30,
+        "pass": 30,
+        "skip": 0,
+        "xfail": 0,
+        "fail": 0,
+        "xpass": 0,
+        "error": 0
+      }
+    },
+    "gcc": {
+      "key": "gcc",
+      "cc": "/usr/bin/gcc",
+      "compiler_version": "gcc (Debian 14.2.0-19) 14.2.0",
+      "flags": "-O3 -march=x86-64-v3",
+      "environment": {},
+      "binary": "/var/tmp/lccc-session/lccc/target/audit-after/gzip-fixed/gzip-gcc",
+      "binary_sha256": "33167e4a6d8649e309f819f524a1b8fc70b56a9532f4bb29583a6d47886fb3bf",
+      "binary_bytes": 133616,
+      "check": {
+        "total": 30,
+        "pass": 30,
+        "skip": 0,
+        "xfail": 0,
+        "fail": 0,
+        "xpass": 0,
+        "error": 0
+      }
+    }
+  },
+  "correctness_streams": {
+    "compress-source-l1": {
+      "sha256": "dab476e8f606e0ec28d2fe930ae736d3a078262a880fcd637dbc43cbef28ae96",
+      "compiler_sha256": {
+        "lccc": "dab476e8f606e0ec28d2fe930ae736d3a078262a880fcd637dbc43cbef28ae96",
+        "gcc": "dab476e8f606e0ec28d2fe930ae736d3a078262a880fcd637dbc43cbef28ae96"
+      }
+    },
+    "compress-source-l6": {
+      "sha256": "e953a521b3660a177feb2ffe5c82a80d2990903dd016691a1e0a70289f7de7bb",
+      "compiler_sha256": {
+        "lccc": "e953a521b3660a177feb2ffe5c82a80d2990903dd016691a1e0a70289f7de7bb",
+        "gcc": "e953a521b3660a177feb2ffe5c82a80d2990903dd016691a1e0a70289f7de7bb"
+      }
+    },
+    "compress-source-l9": {
+      "sha256": "199e21ca65d73c3e28ee5ae64c9a920e3714eefd37769330d1826d7b5615fad5",
+      "compiler_sha256": {
+        "lccc": "199e21ca65d73c3e28ee5ae64c9a920e3714eefd37769330d1826d7b5615fad5",
+        "gcc": "199e21ca65d73c3e28ee5ae64c9a920e3714eefd37769330d1826d7b5615fad5"
+      }
+    },
+    "compress-mixed-l1": {
+      "sha256": "6857cc8c92415858a03e3b1ee01c6f6062f7ba86991bbad2db2a03db18c771a7",
+      "compiler_sha256": {
+        "lccc": "6857cc8c92415858a03e3b1ee01c6f6062f7ba86991bbad2db2a03db18c771a7",
+        "gcc": "6857cc8c92415858a03e3b1ee01c6f6062f7ba86991bbad2db2a03db18c771a7"
+      }
+    },
+    "compress-mixed-l6": {
+      "sha256": "44eccf32489afec07afe367d590603db73f269d5302c2f48a16a9db32cb40495",
+      "compiler_sha256": {
+        "lccc": "44eccf32489afec07afe367d590603db73f269d5302c2f48a16a9db32cb40495",
+        "gcc": "44eccf32489afec07afe367d590603db73f269d5302c2f48a16a9db32cb40495"
+      }
+    },
+    "compress-mixed-l9": {
+      "sha256": "c0b5119ea48277e31d781f5ca641ad10fef3920ab121eff58c7bdb5c14f3cdbb",
+      "compiler_sha256": {
+        "lccc": "c0b5119ea48277e31d781f5ca641ad10fef3920ab121eff58c7bdb5c14f3cdbb",
+        "gcc": "c0b5119ea48277e31d781f5ca641ad10fef3920ab121eff58c7bdb5c14f3cdbb"
+      }
+    }
+  },
+  "cpu": 0,
+  "rounds": 11,
+  "warmups": 2,
+  "summary": {
+    "compress-source-l1": {
+      "lccc": {
+        "samples_ns": [
+          73970325,
+          76543241,
+          73250396,
+          73911923,
+          73149064,
+          73067634,
+          84511319,
+          89779944,
+          81335331,
+          78591713,
+          78612977
+        ],
+        "median_ns": 76543241,
+        "best_ns": 73067634,
+        "worst_ns": 89779944,
+        "ratio_to_gcc": 1.2528804431597826
+      },
+      "gcc": {
+        "samples_ns": [
+          61093811,
+          60744580,
+          60145205,
+          59885611,
+          59143633,
+          58899873,
+          72930333,
+          77557441,
+          63602103,
+          63182036,
+          66684139
+        ],
+        "median_ns": 61093811,
+        "best_ns": 58899873,
+        "worst_ns": 77557441,
+        "ratio_to_gcc": 1.0
+      }
+    },
+    "compress-source-l6": {
+      "lccc": {
+        "samples_ns": [
+          222668515,
+          176348950,
+          184428313,
+          176074388,
+          217825136,
+          216710923,
+          194649387,
+          215776860,
+          216201551,
+          214138058,
+          210762924
+        ],
+        "median_ns": 214138058,
+        "best_ns": 176074388,
+        "worst_ns": 222668515,
+        "ratio_to_gcc": 1.1556224811225975
+      },
+      "gcc": {
+        "samples_ns": [
+          186830345,
+          163445566,
+          159875453,
+          157532769,
+          189727749,
+          214746315,
+          168948959,
+          186611566,
+          197218984,
+          178805041,
+          185301049
+        ],
+        "median_ns": 185301049,
+        "best_ns": 157532769,
+        "worst_ns": 214746315,
+        "ratio_to_gcc": 1.0
+      }
+    },
+    "compress-source-l9": {
+      "lccc": {
+        "samples_ns": [
+          525103349,
+          544979483,
+          543039406,
+          564971361,
+          577718808,
+          421401988,
+          520896595,
+          551114640,
+          489661887,
+          513555123,
+          462073523
+        ],
+        "median_ns": 525103349,
+        "best_ns": 421401988,
+        "worst_ns": 577718808,
+        "ratio_to_gcc": 1.1487438602099602
+      },
+      "gcc": {
+        "samples_ns": [
+          403851001,
+          502755070,
+          518775611,
+          512305263,
+          474889269,
+          414396952,
+          402972771,
+          416387896,
+          523391195,
+          457110908,
+          412210593
+        ],
+        "median_ns": 457110908,
+        "best_ns": 402972771,
+        "worst_ns": 523391195,
+        "ratio_to_gcc": 1.0
+      }
+    },
+    "compress-mixed-l6": {
+      "lccc": {
+        "samples_ns": [
+          154864934,
+          121633198,
+          132477566,
+          123281030,
+          122132804,
+          120625861,
+          148655335,
+          152066813,
+          155955277,
+          154589798,
+          157800424
+        ],
+        "median_ns": 148655335,
+        "best_ns": 120625861,
+        "worst_ns": 157800424,
+        "ratio_to_gcc": 1.269952163178443
+      },
+      "gcc": {
+        "samples_ns": [
+          116715809,
+          97796207,
+          121281291,
+          96390340,
+          93332987,
+          98119330,
+          117055854,
+          125495014,
+          117404138,
+          119145711,
+          122892473
+        ],
+        "median_ns": 117055854,
+        "best_ns": 93332987,
+        "worst_ns": 125495014,
+        "ratio_to_gcc": 1.0
+      }
+    },
+    "decompress-source-l6": {
+      "lccc": {
+        "samples_ns": [
+          21455508,
+          22833907,
+          23035432,
+          22176541,
+          24156368,
+          27016168,
+          28465404,
+          22756737,
+          22861072,
+          23179925,
+          22735852
+        ],
+        "median_ns": 22861072,
+        "best_ns": 21455508,
+        "worst_ns": 28465404,
+        "ratio_to_gcc": 1.072321906635912
+      },
+      "gcc": {
+        "samples_ns": [
+          19109787,
+          21421461,
+          20652654,
+          23370028,
+          20559767,
+          23407190,
+          27004830,
+          21406751,
+          21108159,
+          21124110,
+          21319225
+        ],
+        "median_ns": 21319225,
+        "best_ns": 19109787,
+        "worst_ns": 27004830,
+        "ratio_to_gcc": 1.0
+      }
+    }
+  },
+  "treatment_vs_control": null
+}

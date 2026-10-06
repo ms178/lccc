@@ -53,6 +53,18 @@ int main(void) {
     unsigned char a[256], b[256];
     for (int i = 0; i < 256; i++) { a[i] = (unsigned char)(i * 3); b[i] = (unsigned char)(i * 3); }
     b[7] ^= 0xFF; b[200] ^= 0x01;
-    printf("strings memcmp %d %d\n", memcmp_scan(a, b, 256), memcmp(a, b, 256));
+    /* ISO C specifies only the SIGN of a nonzero memcmp result. ICC's
+     * builtin returns -1 here; glibc/lccc return -213. Both are correct.
+     * Normalize this one semantic boundary, never stdout in the harness:
+     * wrong signs, false equality and other numeric defects must still fail.
+     */
+    int scan = memcmp_scan(a, b, 256), ab = memcmp(a, b, 256);
+    int ba = memcmp(b, a, 256);
+    if (ab >= 0 || ba <= 0 || memcmp(a, a, 256) != 0 || memcmp(a, b, 0) != 0)
+        return 1;
+    /* The hand-written scan DOES specify the exact byte difference; keep
+     * observing its full result so arithmetic defects cannot hide behind
+     * sign normalization intended only for the standard-library call. */
+    printf("strings memcmp %d %d\n", scan, (ab > 0) - (ab < 0));
     return 0;
 }

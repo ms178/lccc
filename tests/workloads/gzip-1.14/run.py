@@ -45,13 +45,20 @@ def sha256(path: Path) -> str:
 
 def run(command: list[str], *, cwd: Path | None = None,
         env: dict[str, str] | None = None, timeout: int = 600,
-        stdout=None, stdin=None) -> subprocess.CompletedProcess:
+        stdout=None, stdin=None, log: Path | None = None) -> subprocess.CompletedProcess:
     result = subprocess.run(
         command, cwd=str(cwd) if cwd else None, env=env,
         stdin=stdin, stdout=stdout if stdout is not None else subprocess.PIPE,
         stderr=subprocess.PIPE, text=stdout is None and stdin is None,
         timeout=timeout, check=False,
     )
+    # Preserve configure/build/test diagnostics even when a nonzero exit
+    # unwinds the temporary build directory (e.g. VAPACK-LEN-1).
+    if log is not None:
+        def text(value):
+            return value.decode(errors="replace") if isinstance(value, bytes) else (value or "")
+        log.write_text("$ " + " ".join(command) + "\n" +
+                       text(result.stdout) + text(result.stderr), errors="replace")
     if result.returncode:
         stderr = result.stderr if isinstance(result.stderr, str) else result.stderr.decode(errors="replace")
         raise RuntimeError(f"command failed ({result.returncode}): {' '.join(command)}\n{stderr[-4000:]}")
@@ -261,8 +268,10 @@ def build_one(key: str, cc: str, source: Path, root: Path,
     if extra_env:
         env.update(extra_env)
     configure = [str(source / "configure"), "--disable-dependency-tracking"]
-    configured = run(configure, cwd=build, env=env, timeout=600)
-    built = run(["make", "-j2"], cwd=build, env=env, timeout=900)
+    configured = run(configure, cwd=build, env=env, timeout=600,
+                     log=artifacts / f"configure-{key}.log")
+    built = run(["make", "-j2"], cwd=build, env=env, timeout=900,
+                log=artifacts / f"build-{key}.log")
     # The gzip test suite is NOT parallel-safe on constrained VMs: the
     # `timestamp`/`atime` tests assert mtime behavior with filesystem
     # granularity, and `make check -j2` lets them race against each other and
@@ -272,7 +281,8 @@ def build_one(key: str, cc: str, source: Path, root: Path,
     # gate is worse than no gate.
     check_text = ""
     for attempt in (1, 2):
-        checked = run(["make", "check"], cwd=build, env=env, timeout=1800)
+        checked = run(["make", "check"], cwd=build, env=env, timeout=1800,
+                      log=artifacts / f"check-{key}.log")
         check_text = (checked.stdout or "") + (checked.stderr or "")
         summary0 = parse_check_summary(check_text)
         if summary0.get("total") == 30 and summary0.get("pass") == 30 and not summary0.get("fail", 0):
