@@ -51,9 +51,13 @@
 //!    body entry `B`) and one outside (the exit `X`). A loop whose header does
 //!    not decide the exit is not a top-test loop.
 //! 2. Every instruction in `H` is **pure and duplicable** — no memory access,
-//!    no calls, no side effects. A load would be re-executed on a path the
-//!    guard used to protect, so loads are refused outright rather than
-//!    reasoned about.
+//!    no calls, no side effects. Memory duplication was implemented, reasoned
+//!    about and **rejected on measurement** (S24): a header load that feeds
+//!    the exit test is precisely the shape of a byte-walk loop, and rotating
+//!    such a loop costs 15.9% on this host against the top-tested form lccc
+//!    already emits — while GCC 14.2 emits the rotated form and is 15.9%
+//!    slower than lccc for it. See `docs/SESSION_FOLLOWUP_S21_LOOP_ROTATION.md`
+//!    §5 for the three experiments that localize it to the loop shape.
 //! 3. Every value defined in `H` is used **only inside `H`**. Otherwise the
 //!    body, once reached from `T`, would read the value `H` computed on its
 //!    single guard execution instead of this iteration's.
@@ -273,22 +277,33 @@ fn find_one(func: &IrFunction, debug: bool) -> Option<Plan> {
                 if bi == h {
                     continue;
                 }
-                let mut escapes = false;
+                let mut escaped = None;
                 for inst in &b.instructions {
                     inst.for_each_used_value(|v| {
-                        if defined.contains(&v) {
-                            escapes = true;
+                        if defined.contains(&v) && escaped.is_none() {
+                            escaped = Some(v);
                         }
                     });
                 }
                 terminator_uses(&b.terminator, &mut |v| {
-                    if defined.contains(&v) {
-                        escapes = true;
+                    if defined.contains(&v) && escaped.is_none() {
+                        escaped = Some(v);
                     }
                 });
-                if escapes {
+                if let Some(v) = escaped {
                     if debug {
-                        eprintln!("[INV] header {} defines a value used in block {}", h, bi);
+                        let used_in_loop = lp.body.contains(&bi);
+                        eprintln!(
+                            "[INV] header {} defines v{}, used in block {} ({})",
+                            h,
+                            v,
+                            bi,
+                            if used_in_loop {
+                                "in loop"
+                            } else {
+                                "outside loop"
+                            }
+                        );
                     }
                     continue 'next_loop;
                 }
@@ -621,14 +636,42 @@ mod tests {
 
     #[test]
     fn a_header_containing_a_load_is_not_inverted() {
-        // Duplicating a load re-executes it on a path the guard used to
-        // protect; refuse rather than reason about it.
+        // MEASURED DECISION, not a precaution. Duplicating a header load into
+        // the latch is sound (same count, same order, same addresses), and it
+        // was implemented; on a 4096-byte scan it then cost 15.9% against the
+        // top-tested loop this pass leaves alone (49.3 ms vs 59.2 ms, 31
+        // interleaved samples, checksums equal), and hand-reverting only the
+        // loop shape in the emitted assembly recovered 100% of the loss while
+        // leaving every other byte of the function identical.  The rotation is
+        // therefore refused for memory headers; the reverted change and the
+        // three experiments are recorded in
+        // docs/SESSION_FOLLOWUP_S21_LOOP_ROTATION.md §5.
         let mut f = counted_loop();
         f.blocks[1].instructions.insert(
             0,
             Instruction::Load {
                 dest: Value(30),
                 ptr: Value(20),
+                ty: IrType::I32,
+                seg_override: Default::default(),
+                volatile: false,
+            },
+        );
+        assert_eq!(invert_loops_with(&mut f, LoopInvertConfig::testing()), 0);
+    }
+
+    #[test]
+    fn a_header_containing_a_store_is_not_inverted() {
+        // Same measurement: `for (i = 0; (a[i] = b[i]) != 0; i++)` is a memory
+        // header, and the store's value is a header definition that would need
+        // fresh ids and a home. No corpus kernel reaches this shape with a
+        // rotation win, so it stays refused with the loads.
+        let mut f = counted_loop();
+        f.blocks[1].instructions.insert(
+            0,
+            Instruction::Store {
+                val: Operand::Value(Value(20)),
+                ptr: Value(21),
                 ty: IrType::I32,
                 seg_override: Default::default(),
                 volatile: false,

@@ -215,3 +215,103 @@ walks. The whole change in `k04_strlen` is one line:
    differ from GCC's `-O0` and from lccc's own `-O2` reference flags in
    differential harnesses. Decide explicitly: either document it next to the
    x86-64-v3 default policy, or gate contraction on `-O1`+.
+
+## 5. S24: memory-header rotation — implemented, measured, **rejected**
+
+### 5.1 What was built
+
+Rule 2 used to refuse any header containing a memory access. The S24 change
+replaced it with a two-licence rule (`CloneMode::{Pure,Memory}`): a non-volatile
+`Load`/`Store` in the header could be duplicated into the latch, clones taking
+fresh value ids from `sound_next_value_id()`, with `set_dest` extended to know
+about `Load` (without that, a cloned load re-defined the guard's `Value` — two
+non-`Copy` defs of one id, which is exactly what `verify.rs` check 7 /
+`validate_unique_defs` rejects after phi elimination).
+
+The soundness argument is short and it holds: the rotated loop executes the
+header `N + 1` times at the same program positions as the top-test form (the
+guard once, the latch copy once per iteration after the induction-variable
+update), nothing is inserted between a body and the copy, and rule 3 keeps a
+header-defined value from reaching the body. A duplicated non-volatile access
+therefore reads and writes exactly the state the next iteration's top test would
+have. Volatile accesses, atomics, calls, inline asm, `alloca`, `memcpy` and
+`PgoCounterInc` stay refused.
+
+### 5.2 What it measured, and why it is refused
+
+Corpus sweep (`tests/bench/k_*.c` + every `tests/benchmark/programs/*.c`,
+`CCC_DEBUG_LOOP_INVERT=1`, `-O2`). With the memory mode in: 242 rotations
+`mode=Pure`, **3 `mode=Memory`** — all three in
+`tests/benchmark/programs/strlen_bench.c` — and 25 rule-3 refusals, 0 for any
+other reason. So the memory mode's entire blast radius in the corpus was one
+kernel (1 of 64 TUs; `strlen_bench` `.text` 832 → 847 bytes, since reverted).
+On the shipped (pure-only) tree the same sweep over 65 TUs reports 242 pure
+rotations and 15 rule-3 refusals — 11 where the value escapes the loop
+entirely, 4 where it is used by the body — the count differing because a
+rotation changes the CFG the next attempt sees.
+
+On a purpose-built kernel that isolates the paying shape (`while (*p) p++;` over
+4095 bytes with no interior zero, `/tmp/harness/tests/bench/k_strlen_scan.c`),
+interleaved samples, checksums identical:
+
+| arm | min | median |
+|---|---|---|
+| S23 (top-tested loop; memory headers refused) | **49.28 ms** | 49.53 ms |
+| S24 (rotated by the memory mode) | 59.24 ms | 59.50 ms |
+| S24 with `CCC_NO_LOOP_INVERT=1` | 50.15 ms | 50.80 ms |
+
+**+15.9% for the rotation**, paired win rate 2/99 — i.e. not noise, and not the
+rest of the S24 delta: disabling the pass on the S24 binary lands within 1.4% of
+S23.
+
+Three experiments localize it to the loop *shape*, not to the change's
+incidental effects:
+
+1. **Alignment** — hand-stripping both `.p2align` directives from the S24
+   assembly changed nothing (59.80 ms vs 59.60 ms).
+2. **Hand-revert** — editing only the rotated loop in the S24 assembly
+   (`.LBB8: addq $1,%r8; cmpb $0,(%r8); jne .LBB8`) back into the top-tested
+   form (`cmpb; je; add; jmp`), leaving every other byte of the function
+   identical, recovered **100%** of the loss: 49.46 ms (+0.26% vs S23).
+3. **Generality** — a *word*-granularity scan (`while (*p) p++;` over `int*`,
+   which also rotates in `mode=Memory`) is neutral: 10.204 ms vs 10.211 ms
+   (+0.06%, 16/31 wins). The loss is specific to the byte-granularity walk,
+   where lccc's top-tested loop runs at ~1.0 cycle/byte and the rotated one at
+   ~1.18 — a 0.18-cycle/iteration constant, which is 18% of a loop that tight.
+
+### 5.3 The competitive reading, which is why this matters
+
+The same kernel, three builds, 31 interleaved samples, `-O2`:
+
+| build | min | vs GCC |
+|---|---|---|
+| **lccc S23 (top-tested)** | **49.28 ms** | **−15.92%** |
+| lccc S24 (rotated) | 59.24 ms | +1.07% |
+| GCC 14.2 `-O2` | 58.61 ms | — |
+
+GCC 14.2 emits exactly the shape the rotation would have produced —
+`.L7: addq $1, %rax; cmpb $0, (%rax); jne .L7`, guard in front — so lccc's
+un-rotated byte walk is **15.9% faster than GCC's** on this host, and rotating
+it would have traded that lead for a dead heat. That is the whole decision: the
+rotation is *sound* and on this hardware it is *slower*, and the project's rule
+is that a >5% regression needs a justification, not a rationale.
+
+So rule 2 is back to pure-only, the memory mode is **removed** (not gated),
+`set_dest` no longer needs `Load`, and the shape is pinned by tests that carry
+the measurement in their docstrings (`a_header_containing_a_load_is_not_inverted`,
+`a_header_containing_a_store_is_not_inverted`). What stays from S24 is the
+*diagnostic*: a rule-3 refusal now names the value, the block and whether that
+block is inside the loop, which is what turned "25 refusals" into a scoped list
+(16 of them are a test chain that starts in the header and decides the exit in
+the *next* block — a region-based rotation, not a block-based one, is the
+follow-up that would reach the byte loops).
+
+**Follow-up, in priority order.** (1) Rotate the *test region*, not the header
+block, so a chain like `B1: v5 = load [v27] -> v5 ? B4 : exit` /
+`B4: v11 = load [v28]; v13 = v5 == v11 -> v13 ? B2 : exit` becomes one
+duplicable unit; the shape question above says the duplicate must keep the
+*load* where the top test had it, so this needs the measurement repeated per
+shape, not assumed. (2) Unroll the byte walk (4 bytes per iteration, one branch
+per 4) before considering rotation again — that is what would move the 1.0
+cycle/byte floor, and it is a peephole on the same loop, not a CFG transform.
+

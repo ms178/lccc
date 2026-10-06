@@ -1137,6 +1137,7 @@ if [ -n "$A64_AS" ] && [ -n "$A64_OBJCOPY" ] && [ -x target/fastbuild/lccc ]; th
     gate "aarch64-oracle-selftest" fast \
         python3 scripts/aarch64_encoder_differential.py --self-test-only \
         --gas "$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/as" \
+        --objdump "$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/objdump" \
         --objcopy "$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/objcopy" \
         --lccc target/fastbuild/lccc
 else
@@ -1180,9 +1181,33 @@ if [ -n "$A64_OBJCOPY" ] && [ -x target/fastbuild/lccc ]; then
         python3 scripts/aarch64_operand_legality_matrix.py \
         --check-lccc target/fastbuild/lccc \
         --jobs 2 \
+        --as "$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/as" \
         --objcopy "$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/objcopy"
 else
     echo "SKIP  aarch64-operand-legality-encoder (aarch64-linux-gnu-objcopy or" \
+         "target/fastbuild/lccc not available)"
+    SKIPPED=$((SKIPPED + 1))
+fi
+
+# The fourth aarch64 instrument, and the one that exists because the matrix is
+# a table a HUMAN curated: it pins one row per slot shape, so it can only catch
+# a defect in a spelling somebody thought of.  Every family whose rules are
+# combinatorial needs the cross product as well, compared against the same
+# pinned `as`: the twelve scalar SIMD&FP conversions (both forms, every width,
+# every fixed-point bit count including both out-of-range ends), CASP's two
+# register pairs (successor halves, the zero-register spelling, base classes),
+# and add/sub's shifted and extended forms (kind x amount x width x extend
+# kind).  Each of the three produced a measured defect -- a refused encoding we
+# should accept, and an accepted spelling GNU as refuses -- and 2703 generated
+# spellings re-prove it in ~20 s.
+if [ -n "$A64_AS" ] && [ -n "$A64_OBJCOPY" ] && [ -x target/fastbuild/lccc ]; then
+    gate "aarch64-family-sweeps" fast \
+        python3 scripts/aarch64_family_sweeps.py \
+        --lccc target/fastbuild/lccc \
+        --as "$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/as" \
+        --objcopy "$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/objcopy"
+else
+    echo "SKIP  aarch64-family-sweeps (pinned aarch64 binutils or" \
          "target/fastbuild/lccc not available)"
     SKIPPED=$((SKIPPED + 1))
 fi

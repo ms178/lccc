@@ -404,6 +404,7 @@ PINNED_AS = "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"
 PINNED_OBJDUMP = "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump"
 PINNED_A64_AS = "$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/as"
 PINNED_A64_OBJCOPY = "$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/objcopy"
+PINNED_A64_OBJDUMP = "$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/objdump"
 
 
 @dataclass(frozen=True)
@@ -522,11 +523,25 @@ INVOCATION_CONTRACTS: tuple[InvocationContract, ...] = (
         name="aarch64-operand-legality-encoder",
         sides=_BOTH,
         option_spec={
+            "--as": (PINNED_A64_AS,),
             "--objcopy": (PINNED_A64_OBJCOPY,),
             "--jobs": ("2",),
         },
         rest_spec=("--check-lccc", "target/fastbuild/lccc"),
         local_gate=("aarch64-operand-legality-encoder", "fast"),
+    ),
+    InvocationContract(
+        program="scripts/aarch64_encoder_differential.py",
+        name="aarch64-oracle-selftest",
+        sides=_BOTH,
+        option_spec={
+            "--gas": (PINNED_A64_AS,),
+            "--objdump": (PINNED_A64_OBJDUMP,),
+            "--objcopy": (PINNED_A64_OBJCOPY,),
+            "--lccc": ("target/fastbuild/lccc",),
+        },
+        rest_spec=("--self-test-only",),
+        local_gate=("aarch64-oracle-selftest", "fast"),
     ),
     InvocationContract(
         program="scripts/aarch64_legality_probe_differ.py",
@@ -538,6 +553,17 @@ INVOCATION_CONTRACTS: tuple[InvocationContract, ...] = (
             "--objcopy": (PINNED_A64_OBJCOPY,),
         },
         local_gate=("aarch64-legality-probe", "fast"),
+    ),
+    InvocationContract(
+        program="scripts/aarch64_family_sweeps.py",
+        name="aarch64-family-sweeps",
+        sides=_BOTH,
+        option_spec={
+            "--lccc": ("target/fastbuild/lccc",),
+            "--as": (PINNED_A64_AS,),
+            "--objcopy": (PINNED_A64_OBJCOPY,),
+        },
+        local_gate=("aarch64-family-sweeps", "fast"),
     ),
     InvocationContract(
         program="scripts/aarch64_sysreg_table.py",

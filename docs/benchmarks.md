@@ -179,6 +179,28 @@ For bare-metal Raptor Lake decisions, retain the same JSON/assembly artifacts
 and add PMU evidence (`cycles`, `instructions`, IPC, branches, cache/TLB and
 Top-Down metrics) in a controlled affinity/governor/thermal environment.
 
+### Byte-walk scan (`tests/bench/k_strlen_scan.c`, added 2026-10-06)
+
+`while (*p) p++` over 4095 bytes with no interior zero -- the loop every
+`strlen`/`strchr`/scan in gzip, glibc and Expat compiles to. It is in the
+`tests/bench` corpus because it is the shape where the two plausible loop
+layouts differ by more than the harness noise floor, and where lccc is ahead:
+
+| build | min | LCCC/GCC |
+|---|---|---|
+| **LCCC (`-O2`, top-tested loop)** | **49.28 ms** | **0.84** |
+| GCC 14.2 (`-O2`, rotated loop) | 58.61 ms | 1.00 |
+| LCCC with a bottom-tested rotation (`-O2`) | 59.24 ms | 1.01 |
+
+31 interleaved samples per arm, one pinned vCPU, identical checksums.  The
+rotation arm is a **rejected** change, kept here as the reference point: lccc's
+un-rotated byte walk is 15.9% faster than GCC's, and the rotated form would have
+given that lead away (see
+[`SESSION_FOLLOWUP_S21_LOOP_ROTATION.md`](SESSION_FOLLOWUP_S21_LOOP_ROTATION.md)
+§5 for the three experiments that localize the loss to the loop shape).  The
+same kernel through the runtime harness at `-O3`, best-of-3, reads
+**lccc 9.86 ms vs GCC 11.75 ms (1.19×)**.
+
 ## Current results (screening)
 
 A fresh run of the canonical runner on the current `main`, `-O2`, paired

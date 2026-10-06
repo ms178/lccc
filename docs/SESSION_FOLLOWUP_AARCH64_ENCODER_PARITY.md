@@ -269,3 +269,159 @@ the newer one, so `operand_legality_matrix_matches_the_encoder` failed with
 "the matrix has 9702 rows, the ratchet pins 8229" — a class of drift that no eye would have
 caught in a diff, and exactly what the two-sided ratchet (table-side count and
 generator-side count) exists to catch.
+
+## 7. Remaining work, precisely scoped
+
+Two of the encoder-parity audit items are now closed and should not be re-opened:
+
+* **SYS/SYSL per-row GAS verification** — the `sweep system sys` group carries 13 positive
+  rows with their encodings and 27 rejections (`#8`/`c16`/`#8` for `op2`/`CRn`/`CRm`, the
+  `w0`/`d0`/`sp`/`x31` register-class refusals, missing and extra operands), and `--check`
+  re-derives every one from the pinned `as`.  GAS's own trailing-text leniency for the
+  raw `s3_0_c1_c0_1_*` spelling stays pinned as the four documented rows.
+* **CASP's `GpRole::Reg`** — closed in §2.8, with the pair-half successor rule, the
+  zero-register spelling and 228-spelling differential.
+
+What is left, in the order it should be attacked:
+
+1. **`verify.rs` check 7 vs. a *copying* loop rotation.**  Check 7 ("every `Value` is defined
+   at most once") is what makes the loop-rotation work harder than it looks: a rotation that
+   *copies* the header re-defines its ids, and the verifier is right to reject that — the def
+   map, GVN's leader table and regalloc all index by id and silently pick one definition.  The
+   rotation therefore has to *move* the header (redirect the preheader edge) rather than
+   duplicate it, or the copy must mint fresh ids and rewrite every operand.  Decide which of
+   the two the pass wants, write that down, and only then re-author.
+2. **Loop inversion (the lost `clone_mode` work).**  The design is known from measurement:
+   `clone_mode()` returns `Pure` when every header instruction is duplicable, `Verbatim` when
+   every instruction is duplicable *or* is a non-volatile `Load`/`Store` (header instructions
+   and terminator copied unchanged after the edge copies, rule-3 scan skipped), and `None`
+   for volatile loads/stores, atomics, fences, calls, inline asm and `alloca`; the seam is
+   `invert_loops` → `invert_loops_with(config)`, and the pre-wipe gain was
+   `k_strcmp_signed` 844,951,167 → 751,844,222 Ir (−11.02%) with an identical checksum, and
+   −2.58% over eight programs.  The test at `loop_invert.rs:623`
+   (`a_header_containing_a_load_is_not_inverted`) has to be reconciled with the Verbatim
+   mode: the load is exactly the case Verbatim exists for.
+3. ~~**The P4 "loose `add`/`sub` shift/extend" check.**~~ **Closed, empirically.**
+   `scripts/aarch64_family_sweeps.py` generates the cross products the curated table cannot
+   reach and diffs both verdicts against the pinned `as`, exactly the way §2.5's conversion
+   sweep closed its family.  It covers three families, each of which produced a measured
+   defect in this session's work:
+
+   * `conversions` — 1102 spellings: the twelve scalar SIMD&FP mnemonics in register-file
+     form, every fixed-point bit count from `#0` to one past each element width, the
+     mixed-width refusals, the arrangement/vector/GPR class boundaries, and the
+     general-purpose-destination forms that must keep encoding.
+   * `casp` — 413 spellings: both pair halves at every start (including odd starts and the
+     register-31 successor), the zero-register spelling, width mixtures within and across
+     pairs, `[sp]`/`[xzr]`/offset/writeback bases, arity, and the mistyped order letters.
+   * `addsub` — 1188 spellings: `add/adds/sub/subs` × shift kind (incl. the illegal `ror`)
+     × every amount at and past each width's limit × operand widths × extend kind × the
+     amounts an extend may carry, plus encoding 31 in each of the three slots, the width
+     mixtures, and the immediate forms with and without the 12-bit shift.
+
+   Measured on the S23 tree: **2703 spellings, 0 disagreements** against
+   `gas-2.47-aarch64-linux-gnu` (`as` 2.47, `objcopy` 2.47), ~20 s wall.  The corpus has no
+   hand-written expectations at all — unlike the matrix, it cannot encode an assumption, so
+   it is the one instrument that answers "is our grammar right" rather than "is our table
+   right".  It is wired as gate `aarch64-family-sweeps` (fast) in `scripts/ci_local.sh`, with
+   its exact invocation registered as the eighteenth contract in
+   `scripts/check_ci_gate_parity.py` and mirrored in the hosted workflow.
+
+## 8. The hosted-mirror gap this closed
+
+Wiring the sweep exposed an older defect in the same area, and it is worth writing down
+because it is the failure mode the parity checker exists for: the S22 mirrors spelled the
+AArch64 oracles as `"$(command -v aarch64-linux-gnu-as)"`, which is exactly the unpinned
+lookalike the contracts reject (the checker's token comparison is equality, not
+containment).  The hosted side was therefore failing two contracts, missing two standalone
+gates (`aarch64_legality_probe_differ.py`, `aarch64_sysreg_table.py`) and missing a
+provisioning step for the AArch64 pin — i.e. a red `ci-gate-parity` gate that no local run
+had asked for, because `check_ci_gate_parity.py` had never been run after the mirrors were
+edited.  The fix is the one the contract enforces: a hosted
+`bash scripts/ensure_gas_247.sh aarch64-linux-gnu` step, every AArch64 invocation spelling
+`$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/{as,objcopy}` literally, and the two missing
+gates added to the hosted side alongside the new one.  `check_ci_gate_parity.py` is now
+PASS (140 commands, 18 contracts) and `scripts/test_ci_gate_parity.py` stays at 66 tests
+OK.
+
+**Lesson (same family as the three hand-derived expectations):** a mirror that is *written*
+in the same session as the contract it must satisfy is not evidence that it satisfies it —
+run the checker, not the edit.
+
+## 9. Two more gate defects found by actually running the gate set
+
+The first full `ci_local.sh --fast` pass over the S23 tree (the run that had been
+left in flight when S23 was snapshotted) failed ten gates. Six of them were one
+environment gap and two were a pin that only the *local* side spelled in full:
+
+* **The pin was incomplete: `--objdump` was never passed.** `ci_local.sh` handed
+  the differential oracle `--gas` and `--objcopy` from the pinned 2.47 triple and
+  let it find `objdump` on `PATH`, which resolved to the distro binary: *"can't
+  use supplied machine aarch64"*. The same hole existed one gate over: the
+  matrix's `--check-lccc` invocation passed no `--as`, so `find_tools` fell back
+  to `shutil.which("aarch64-linux-gnu-as")` and the gate reported *"cross-binutils
+  not found; cannot verify"* instead of running -- a skip wearing a pass, and the
+  worst kind, because the encoder half is the one that catches *our* defects.
+  Upstream's later `main` closed the provisioning half of this (the hosted job now
+  installs the pin and passes `--as` on the table half, plus `--jobs 2`); the
+  encoder half still had no `--as`, and this branch adds it there and on the
+  oracle self-test's `--objdump`. Both are now spelled from the
+  pin on both mirrors, and both invocations are **registered contracts**
+  (`aarch64-oracle-selftest` pins `--gas`/`--objdump`/`--objcopy`/`--lccc`;
+  `aarch64-operand-legality-encoder` pins `--as`/`--objcopy`), so an unpinned
+  lookalike cannot satisfy them: 19 contracts, `check_ci_gate_parity.py` PASS.
+* **No i386 toolchain in the image.** `reassoc-latency`, `map-i64-two-lane`,
+  `linker-suite` (19 fixtures), `regression-corpus-link` (6 cases),
+  `redundant-test-elimination` and `i686-integer-isa-parity` all failed on
+  `-m32`: *"bits/libc-header-start.h: No such file or directory"* and
+  *"cannot find -lgcc"*. The image is one `apt-get install gcc-multilib
+  libc6-dev-i386` away from covering them, and that is what it took.
+
+The i386 gap had a second, later layer: with `gcc-multilib libc6-dev-i386`
+installed, `linker-suite` still failed its `i386_dso_emit_semantics` fixture,
+because linking a 32-bit **C++** object needs the 32-bit libstdc++ *headers*
+(`/usr/include/c++/14/i386-linux-gnu/bits/c++config.h`), which come from
+`g++-multilib`. After that install the whole `--fast` run is green:
+**161 passed, 0 failed, 5 skipped** (from 152/10/5), with `linker-suite` at
+301 pass / 0 fail and `cargo-test` at 4132 pass.
+
+Lesson, again the same one: a gate that has never actually run in the current
+environment is not evidence. The two aarch64 pin gaps were invisible while the
+distro cross-binutils happened to be installed -- the pinning was only ever
+*intended*, and the intent was never executed. The environment a gate needs is
+part of the gate.
+
+## 10. Post-wipe re-verification (S24)
+
+The harness wipe between turns took `.git`, `target/`, `~/.cargo`, `~/.cache`
+(the pinned oracles) and `/swapfile` with it, and the restored snapshot was a
+mixture (this session's docs and mirrors, but a `src/` older than S23). The tree
+was therefore rebuilt from the bundle's S23 commit plus only this session's
+delta, and every AArch64 claim above was re-derived rather than trusted:
+
+| instrument | verdict on the recovered tree |
+|---|---|
+| `scripts/aarch64_encoder_differential.py --self-test-only` (pinned as/objdump/objcopy) | self-test: harness verified (agreement, junk rejection, sparse-address extraction, objdump canary) |
+| `scripts/aarch64_operand_legality_matrix.py --check-lccc` | 10411 rows agree with lccc (the rebase onto upstream's `main` added 10 rows) |
+| `scripts/aarch64_legality_probe_differ.py` | exit 0 (the four pinned GAS-leniency rows only) |
+| `scripts/aarch64_sysreg_table.py --check` | 1619 registers agree with GNU as and lccc |
+| `scripts/aarch64_family_sweeps.py` | 2703 spellings, 0 disagreements |
+| `cargo test --lib --profile fastbuild -j2` | 4136 passed / 0 failed / 7 ignored |
+| `scripts/check_ci_gate_parity.py` | PASS (140 commands, 19 contracts) |
+| `scripts/test_ci_gate_parity.py` | 66 tests OK |
+
+Environment recovery, in the order that works (the same order as §6, extended
+with what this wipe added): restore the repo from `artifacts/lccc.bundle` first
+(`git clone`, then `git fetch bundle 'refs/remotes/origin/*:refs/remotes/origin/*'`
+so `origin/main` is the rebase base again, and re-set `user.name`/`user.email` —
+`.git/config` is outside every snapshot), then overlay the surviving session
+files, then `rustup-init` (the toolchain resolves to the same rustc
+1.99.0/b940084d7), `/swapfile` via `fallocate`+`mkswap`+`swapon`, the two pinned
+oracle triples from `$HOME/dl/binutils-2.47.tar.xz`, `valgrind` and
+`gcc-multilib libc6-dev-i386 lib32gcc-s1` for the i386 gates.
+
+One more full-disk hazard, recorded because it cost a build: `/tmp` is a 1 GB
+tmpfs, so a second `CARGO_TARGET_DIR` there dies with "No space left on device"
+mid-archive. A baseline build belongs under a directory named `target/` on the
+roomy filesystem (that name is also what keeps it out of the snapshot).
+
