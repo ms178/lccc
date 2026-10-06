@@ -153,6 +153,38 @@ formatting` step cannot parse the file — and the generator now prints the
 `("", N)` form the file actually holds, so the paste is safe by construction
 rather than by care.
 
+## 9b. The frozen group roster
+
+Every integrity check in the matrix is a comparison between two things that
+shrink together. `--check` compares the table to the generator; the Rust test
+compares the generator's per-group counts to the values pasted into
+`elf_writer.rs`. Delete a family from `GROUPS`/`SWEEPS`, regenerate, and both
+agree perfectly at the new, smaller size -- the table lost rows, the ratchets
+lost rows, nothing disagrees. The matrix would rather fail than lose a rule
+quietly, so the roster is now written down in `EXPECTED_GROUPS` (55 names, in
+generator order) and every mode checks it before doing anything else, including
+`--regenerate`, which is the mode that would otherwise write the loss down.
+
+The mutations below are applied to a copy in-tree (so `REPO` resolves), each
+expects exit 1, and the copy is deleted afterwards; `git status` is clean
+apart from the two intended edits.
+
+| mutation | exit | diagnosis (first line of stderr) |
+|---|---|---|
+| delete a family (`neon ext`) | 1 | `1 missing (first: 'neon ext'); 1 unexpected …` |
+| rename a group (`ldst prfm` → `ldst prefetch`) | 1 | `1 missing (first: 'ldst prfm'); 1 unexpected …` |
+| reorder the frozen roster only (generator untouched) | 1 | `same names in a new order (position 36: …)` |
+| add a group to `GROUPS` | 1 | `(56 groups, expected 55): 1 unexpected (first: 'zz added family')` |
+| delete a family and run `--regenerate` | 1 | same as the deletion above |
+| unmodified tree | 0 | -- |
+
+The last row matters because `--regenerate` never used to read the table at
+all: that is the one path where a silent shrink becomes permanent. With the
+roster check ahead of the mode dispatch, the write cannot happen. The
+unmodified tree still reports `10411 rows agree with GNU as` in 0.130 s and
+`--ratchets` is still textually identical to the block in `elf_writer.rs`
+(56 of 56 lines).
+
 ## 10. Rust syntax without a toolchain
 
 No Rust toolchain is reachable from the sandbox (§9), so every `.rs` file in the
@@ -169,6 +201,20 @@ borrow error, and it is not a substitute for `cargo check`.  It is what turned
 the mangled `GROUP_RATCHETS` declaration above from "found by CI eleven seconds
 later" into "found before the push" once it existed, and it is cheap enough to
 run on the whole tree on every pass.
+
+## 7b. Every other gate that runs without a compiler
+
+The gates hosted CI runs in the same step as the parity checker, plus the
+provisioner's own contract suite, all run in this sandbox:
+
+| gate | result |
+|---|---|
+| `check_ci_workflow_shell.py` (validates the edited `ci.yml`) | ok (2 workflow files) |
+| `check_script_imports.py` | ok (134 python helpers) |
+| `ensure_gas_247.sh --self-test` (the provisioner's validation matrix) | every case lands on its verdict |
+| `python3 -m unittest discover -s tests/fuzz -p "test_*.py"` | 4 tests OK |
+| `test_hot_loop_metric.py` (covers the new `tools/oracle/hot_instr.py`) | OK |
+| `test_differential_corpus_paths.py`, `test_oracle_delta_gate.py`, `test_godbolt_cache.py`, `test_glibc_check_triage.py` | OK / PASS |
 
 ## 8. Gate parity (the check that hosted CI runs)
 

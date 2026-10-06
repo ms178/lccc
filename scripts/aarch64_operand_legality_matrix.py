@@ -1494,6 +1494,115 @@ def find_tools(explicit_as: str | None, explicit_objcopy: str | None):
     return as_bin, objcopy
 
 
+# The generator's group roster, frozen.
+#
+# Every other integrity check in this file is *relative*: `--check` compares the
+# table to the generator, and the Rust test compares the generator's per-group
+# counts to the values pasted into `elf_writer.rs`.  A family deleted from
+# `GROUPS`/`SWEEPS` and then regenerated satisfies all of them -- the table
+# shrank, the ratchets shrank in step, and nothing disagrees about anything.
+# But a group is coverage of an architectural rule, and losing one silently is
+# the precise failure this matrix exists to catch, so the roster is written
+# down here instead of derived from the thing it is meant to check.
+#
+# Adding or removing a group stays possible; it just has to be a deliberate
+# edit to this tuple.  The table and the ratchets then have to follow, and
+# `--check` (table vs generator) and the Rust test (ratchets vs generator) are
+# what enforce that they did.  Order is significant: it is the generator's
+# iteration order, which is the order the table's rows carry.
+EXPECTED_GROUPS: tuple[str, ...] = (
+    "reg31 dp1src",
+    "reg31 mov",
+    "reg31 logical immediate",
+    "reg31 logical register",
+    "width add/sub",
+    "width extended add/sub",
+    "width logical",
+    "gp only logical siblings",
+    "mov immediate",
+    "extend aliases",
+    "fmov gp",
+    "gp only arithmetic",
+    "add/sub extended form reg31",
+    "add/sub extended form widths",
+    "add/sub explicit extend",
+    "shift legality add/sub",
+    "shift legality logical",
+    "movw halfword selector",
+    "system pstate",
+    "ldr/str byte forms",
+    "bic forms",
+    "add/sub immediate shift",
+    "mov immediate wide forms",
+    "immediate width overflow",
+    "cmp/cmn/tst aliases",
+    "neon movi imm8",
+    "neon movi shift",
+    "neon mvni",
+    "neon ext",
+    "neon addv maxv minv",
+    "neon tbl tbx",
+    "neon ld1r ld2r ld4r",
+    "neon by-element",
+    "ldst Rt class",
+    "ldst imm9 range",
+    "ldst exclusives",
+    "ldst prfm",
+    "system immediates",
+    "system Rt",
+    "system sys",
+    "dp wide immediates",
+    "dp bit test",
+    "branch operands",
+    "positive controls",
+    "sweep neon by-element",
+    "sweep neon elem-gp",
+    "sweep neon lane",
+    "sweep neon shift",
+    "sweep neon movi",
+    "sweep neon ld lane",
+    "sweep system sysreg",
+    "sweep load/store family",
+    "sweep register class",
+    "sweep system sys",
+    "sweep atomic arity",
+)
+
+
+def group_roster_error() -> str | None:
+    """None if the generator's roster is the frozen one, else the difference.
+
+    Returns a printable diagnosis rather than raising, so every mode can refuse
+    to run on a roster change with the same message and the same exit status.
+    """
+    got = list(dict.fromkeys(g for g, _ in _expand()))
+    want = list(EXPECTED_GROUPS)
+    if got == want:
+        return None
+    missing = [g for g in want if g not in set(got)]
+    extra = [g for g in got if g not in set(want)]
+    detail: list[str] = []
+    if missing:
+        detail.append(f"{len(missing)} missing (first: {missing[0]!r})")
+    if extra:
+        detail.append(f"{len(extra)} unexpected (first: {extra[0]!r})")
+    if not missing and not extra:
+        at = next(n for n, (a, b) in enumerate(zip(got, want)) if a != b)
+        detail.append(
+            f"same names in a new order (position {at}: {got[at]!r} where the "
+            f"frozen roster has {want[at]!r})"
+        )
+    return (
+        f"operand-legality matrix: the generator's group roster is not the "
+        f"frozen one ({len(got)} groups, expected {len(want)}): "
+        + "; ".join(detail)
+        + f". A deleted family lowers the table and the ratchets together, so "
+        f"nothing else can catch it. If the change is deliberate, edit "
+        f"EXPECTED_GROUPS in {Path(__file__).name}; the table and the ratchets "
+        f"then have to be regenerated too."
+    )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--check", action="store_true", help="verify the table vs GNU as")
@@ -1531,6 +1640,14 @@ def main() -> int:
         "(default 1; the table half is batched and ignores this)",
     )
     args = ap.parse_args()
+
+    # Before any mode, including the ones that never touch GNU as: the frozen
+    # roster is the only check that can see a family deletion, because every
+    # other one is a comparison between two things that shrink together.
+    roster = group_roster_error()
+    if roster:
+        print(roster, file=sys.stderr)
+        return 1
 
     if args.dump:
         for g, i, e in parse_table(TABLE):
