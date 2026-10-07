@@ -164,6 +164,16 @@ pub enum AsmDirective {
     Quad(Vec<DataValue>),
     /// Emit zero bytes: `.zero N[, fill]`
     Zero(usize, u8),
+    /// `.fill repeat, size, value` with a NON-ZERO value, kept symbolic
+    /// until apply: the NOBITS raw-value law (GAS 2.47 rejects
+    /// `.fill 4,1,256` in `.bss` although the element truncates to
+    /// zeros) and the assembly-wide fill budget both need the live
+    /// section — a parse-time `Vec` can see neither.
+    Fill {
+        total: usize,
+        elem: usize,
+        value: u64,
+    },
     /// NUL-terminated string: `.asciz "str"`
     Asciz(Vec<u8>),
     /// String without NUL: `.ascii "str"`
@@ -430,20 +440,32 @@ fn expand_rept_blocks(lines: &[&str]) -> Result<Vec<String>, String> {
     let mut label_positions: crate::common::fx_hash::FxHashMap<String, Vec<u64>> =
         crate::common::fx_hash::FxHashMap::default();
     let mut current_byte_pos: u64 = 0;
+    // Repetition-only growth totals (see asm_preprocess::check_expansion_growth).
+    let mut grown_lines: u64 = 0;
+    let mut grown_bytes: u64 = 0;
     while i < lines.len() {
         let trimmed = strip_comment(lines[i]).trim().to_string();
         if is_rept_start(&trimmed) {
             let prefix_len = if trimmed.starts_with(".rept") { 5 } else { 4 };
             let count_str = trimmed[prefix_len..].trim();
-            let count_val = resolve_rept_label_expr(count_str, &label_positions).unwrap_or(0);
-            // Treat negative counts as 0 (matches GNU as behavior)
-            let count = if count_val < 0 {
-                0usize
-            } else {
-                count_val as usize
-            };
+            // Propagate an unresolvable count as an error: the old
+            // `unwrap_or(0)` accepted `.rept <garbage>` as zero
+            // repetitions, which is fail-open (GAS reports "cannot
+            // evaluate .rept count" and fails the assembly).  Negative
+            // counts wrap to `size_t` like GAS (`.rept -1` -> rejected
+            // by the budget as count 18446744073709551615).
+            let count_val = resolve_rept_label_expr(count_str, &label_positions)
+                .map_err(|e| format!(".rept: bad count '{}': {}", count_str, e))?;
+            let count = count_val as u64;
             let body = collect_block_body(lines, &mut i)?;
+            // Bound the raw block before recursing — the same position in
+            // the flow as GAS's `do_repeat` check (pre-expansion).
+            asm_preprocess::check_rept_budget(count, &body)?;
             let expanded_body = expand_rept_blocks(&body)?;
+            let (add_lines, add_bytes) = asm_preprocess::expansion_size(&expanded_body);
+            grown_lines = grown_lines.saturating_add(count.saturating_mul(add_lines));
+            grown_bytes = grown_bytes.saturating_add(count.saturating_mul(add_bytes));
+            asm_preprocess::check_expansion_growth(".rept", grown_lines, grown_bytes)?;
             for _ in 0..count {
                 result.extend(expanded_body.iter().cloned());
             }
@@ -468,6 +490,10 @@ fn expand_rept_blocks(lines: &[&str]) -> Result<Vec<String>, String> {
                     .collect();
                 let subst_refs: Vec<&str> = subst_body.iter().map(|s| s.as_str()).collect();
                 let expanded = expand_rept_blocks(&subst_refs)?;
+                let (add_lines, add_bytes) = asm_preprocess::expansion_size(&expanded);
+                grown_lines = grown_lines.saturating_add(add_lines);
+                grown_bytes = grown_bytes.saturating_add(add_bytes);
+                asm_preprocess::check_expansion_growth(".irp", grown_lines, grown_bytes)?;
                 result.extend(expanded);
             }
         } else if is_irpc_start(&trimmed) {
@@ -494,6 +520,10 @@ fn expand_rept_blocks(lines: &[&str]) -> Result<Vec<String>, String> {
                     .collect();
                 let subst_refs: Vec<&str> = subst_body.iter().map(|s| s.as_str()).collect();
                 let expanded = expand_rept_blocks(&subst_refs)?;
+                let (add_lines, add_bytes) = asm_preprocess::expansion_size(&expanded);
+                grown_lines = grown_lines.saturating_add(add_lines);
+                grown_bytes = grown_bytes.saturating_add(add_bytes);
+                asm_preprocess::check_expansion_growth(".irpc", grown_lines, grown_bytes)?;
                 result.extend(expanded);
             }
         } else if trimmed == ".endr" {
@@ -854,8 +884,14 @@ fn expand_macros_impl(
     depth: usize,
     counter: &mut u64,
 ) -> Result<Vec<String>, String> {
-    if depth > 64 {
-        return Err("Macro expansion depth limit exceeded (>64)".to_string());
+    // GAS 2.47's macro-nesting wall, re-measured on the pinned oracle:
+    // a 101-frame chain of distinct macros assembles, the 102nd frame
+    // fatals with `macros nested too deeply`, and direct/mutual recursion
+    // lands on the same wall.  The old 64-frame cut rejected legal
+    // 65..101-frame chains GAS accepts (verdict divergence), so the cap
+    // and the wording both track the oracle now.
+    if depth > 101 {
+        return Err("macros nested too deeply".to_string());
     }
     let mut result = Vec::new();
     let mut i = 0;
@@ -1724,18 +1760,27 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
             // codegen corpus).
             let mut parts = args.trim().split(',');
             let align_tok = parts.next().map(str::trim).unwrap_or("");
-            let align_val: u64 = parse_int_literal(align_tok)
-                .map_err(|_| format!(".p2align: alignment `{align_tok}` is not an integer"))?
-                as u64;
+            let align_raw: i64 = parse_int_literal(align_tok)
+                .map_err(|_| format!(".p2align: alignment `{align_tok}` is not an integer"))?;
+            // GAS (read.c, measured 2.47): an out-of-range exponent —
+            // negative or > 63 — warns and clamps to 63 rather than
+            // erroring; 63 lands in the writer's signed-shift bucket
+            // (`p2align 63 @0` succeeds unraised, `@1` refuses to pad).
+            // Note a negative exponent clamps to 63, NOT to 0: measured
+            // `.p2align -1` behaves exactly like `.p2align 63`.
+            let align_exp: u64 = if (0..=63).contains(&align_raw) {
+                align_raw as u64
+            } else {
+                63
+            };
             let fill_tok = parts.next().map(str::trim);
             let fill = match fill_tok {
                 None | Some("") => None,
                 Some(tok) => {
                     let v = parse_int_literal(tok)
                         .map_err(|_| format!(".p2align: fill `{tok}` is not an integer"))?;
-                    if !(0..=255).contains(&v) {
-                        return Err(format!(".p2align: fill {v} is not a byte"));
-                    }
+                    // GAS takes any integer fill and stores the low byte
+                    // (measured: -1 -> ff, -129 -> 7f, 300 -> 2c, 256 -> 00).
                     Some(v as u8)
                 }
             };
@@ -1745,34 +1790,69 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
                 Some(tok) => {
                     let v = parse_int_literal(tok)
                         .map_err(|_| format!(".p2align: max-pad `{tok}` is not an integer"))?;
-                    if v < 0 {
-                        return Err(format!(".p2align: max-pad {v} is negative"));
-                    }
-                    Some(v as u64)
+                    // GAS treats a negative cap as unlimited (same as
+                    // omitted / zero). Do not turn it into a hard error.
+                    if v <= 0 { None } else { Some(v as u64) }
                 }
             };
             if parts.next().is_some() {
                 return Err(".p2align: extra operands after max-pad".to_string());
             }
-            if align_val > 63 {
-                return Err(format!(
-                    ".p2align: alignment exponent {align_val} is out of range"
-                ));
-            }
             AsmDirective::Align {
-                bytes: 1u64 << align_val,
+                bytes: 1u64 << align_exp,
                 max_pad,
                 fill,
             }
         }
         ".balign" => {
-            let align_val: u64 = args
-                .trim()
-                .split(',')
-                .next()
-                .and_then(|s| parse_int_literal(s.trim()).ok())
-                .unwrap_or(1) as u64;
-            AsmDirective::Balign(align_val)
+            // GAS: .balign bytes[, fill[, max]] — same fill/max rule as
+            // .p2align, but the first field is a byte count, not log2.
+            // Measured on GAS 2.47: 0 is a no-op, non-powers-of-two and
+            // negative values are "alignment not a power of 2".
+            let mut parts = args.trim().split(',');
+            let align_tok = parts.next().map(str::trim).unwrap_or("");
+            // A bare `.balign` (no operand) is a GAS-accepted no-op;
+            // parse it as align 1 instead of an integer-parse error.
+            let align_val: i64 = match align_tok {
+                "" => 1,
+                tok => parse_int_literal(tok)
+                    .map_err(|_| format!(".balign: alignment `{tok}` is not an integer"))?,
+            };
+            match align_val {
+                0 => {} // GAS no-op
+                n if n > 0 && (n as u64).is_power_of_two() => {}
+                n => {
+                    return Err(format!(".balign: alignment {n} is not a power of 2"));
+                }
+            }
+            let fill_tok = parts.next().map(str::trim);
+            let fill = match fill_tok {
+                None | Some("") => None,
+                Some(tok) => {
+                    let v = parse_int_literal(tok)
+                        .map_err(|_| format!(".balign: fill `{tok}` is not an integer"))?;
+                    Some(v as u8)
+                }
+            };
+            let max_tok = parts.next().map(str::trim);
+            let max_pad = match max_tok {
+                None | Some("") => None,
+                Some(tok) => {
+                    let v = parse_int_literal(tok)
+                        .map_err(|_| format!(".balign: max-pad `{tok}` is not an integer"))?;
+                    if v <= 0 { None } else { Some(v as u64) }
+                }
+            };
+            if parts.next().is_some() {
+                return Err(".balign: extra operands after max-pad".to_string());
+            }
+            AsmDirective::Align {
+                // 0 is GAS's no-op; 1 makes align_to_capped return early,
+                // which is exactly that.
+                bytes: if align_val == 0 { 1 } else { align_val as u64 },
+                max_pad,
+                fill,
+            }
         }
         ".byte" => {
             let vals = parse_data_values(args)?;
@@ -1796,9 +1876,12 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
         }
         ".zero" | ".space" => {
             let parts: Vec<&str> = args.trim().split(',').collect();
-            let size: usize = parse_int_literal(parts[0].trim())
-                .map_err(|_| format!("invalid .zero size: {}", args))?
-                as usize;
+            // GAS: a negative size emits nothing (`.zero -1` is accepted
+            // as a no-op, measured 2.47); the old `as usize` cast turned
+            // -1 into a request for 2^64 bytes.
+            let size_raw = parse_int_literal(parts[0].trim())
+                .map_err(|_| format!("invalid .zero size: {}", args))?;
+            let size: usize = if size_raw <= 0 { 0 } else { size_raw as usize };
             let fill: u8 = if parts.len() > 1 {
                 parse_data_value(parts[1].trim())? as u8
             } else {
@@ -1808,36 +1891,61 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
         }
         ".fill" => {
             // .fill repeat, size, value
+            //
+            // GAS verdicts (2.47 measured): a non-positive repeat or size
+            // emits nothing (`.fill 2^64-1,1,0` parses as repeat -1 ->
+            // zero bytes); a repeat*size product that overflows likewise
+            // emits nothing (`.fill 2^62,4,0` -> zero bytes, exit 0); the
+            // element is capped at 8 bytes (`.fill 1,9,0` -> 8 bytes);
+            // the value is truncated to the element (low bytes of its
+            // two's-complement form). The old path did all of this with
+            // wrapping `as u64` casts — `.fill -1,1,0xff` hit
+            // `Vec::with_capacity(u64::MAX)` and aborted, and a positive
+            // overflow silently produced a *different* byte count.
             let parts: Vec<&str> = args.splitn(3, ',').collect();
             let repeat = parse_int_literal(parts[0].trim())
-                .map_err(|_| format!("bad .fill repeat: {}", parts[0].trim()))?
-                as u64;
+                .map_err(|_| format!("bad .fill repeat: {}", parts[0].trim()))?;
             let size = if parts.len() > 1 {
                 parse_int_literal(parts[1].trim())
                     .map_err(|_| format!("bad .fill size: {}", parts[1].trim()))?
-                    as u64
             } else {
                 1
             };
-            let value = if parts.len() > 2 {
+            let value: u64 = if parts.len() > 2 {
                 parse_int_literal(parts[2].trim())
                     .map_err(|_| format!("bad .fill value: {}", parts[2].trim()))?
                     as u64
             } else {
                 0
             };
-            let total_bytes = (repeat * size.min(8)) as usize;
+            if repeat <= 0 || size <= 0 {
+                return Ok(AsmStatement::Directive(AsmDirective::Zero(0, 0)));
+            }
+            let elem = size.min(8) as u64;
+            let total_bytes = match (repeat as u64).checked_mul(elem) {
+                Some(t) => t as usize,
+                None => 0, // GAS: overflow -> zero bytes, no diagnostic
+            };
+            // The value≠0 branch materializes its Vec right here, before
+            // the writer's fill cap can intervene: refuse over-limit sizes
+            // at parse time (same verdict the apply-side cap would give).
+            if total_bytes > crate::backend::elf::MAX_DIRECTIVE_FILL {
+                return Err(format!(
+                    ".fill: {total_bytes} bytes exceed the {}-byte directive limit",
+                    crate::backend::elf::MAX_DIRECTIVE_FILL
+                ));
+            }
             if value == 0 {
                 AsmDirective::Zero(total_bytes, 0)
             } else {
-                let mut data = Vec::with_capacity(total_bytes);
-                let value_bytes = value.to_le_bytes();
-                for _ in 0..repeat {
-                    for j in 0..size.min(8) as usize {
-                        data.push(value_bytes[j]);
-                    }
+                // No parse-time Vec: see the `Fill` variant's doc — the
+                // writer charges the budget and applies the NOBITS law
+                // against the live section.
+                AsmDirective::Fill {
+                    total: total_bytes,
+                    elem: elem as usize,
+                    value,
                 }
-                AsmDirective::Ascii(data)
             }
         }
         ".asciz" | ".string" => {

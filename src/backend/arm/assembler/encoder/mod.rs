@@ -1232,7 +1232,8 @@ pub fn encode_instruction(
         "fmsub" => encode_fmadd_fmsub(operands, true),
         "fnmadd" => encode_fnmadd_fnmsub(operands, false),
         "fnmsub" => encode_fnmadd_fnmsub(operands, true),
-        "fcmp" => encode_fcmp(operands),
+        "fcmp" => encode_fcmp(operands, raw_operands, false),
+        "fcmpe" => encode_fcmp(operands, raw_operands, true),
         "fcvtzs" => {
             if matches!(operands.first(), Some(Operand::RegArrangement { .. })) {
                 if operands.get(2).is_some() {
@@ -1258,6 +1259,28 @@ pub fn encode_instruction(
             } else {
                 encode_fcvt_rounding(operands, 0b11, 0b001)
             }
+        }
+        // Vector forms of the eight rounding conversions (`fcvtns v0.4s,
+        // v1.4s` = 0x4e21a820, `fcvtps v0.4h, v1.4h` = 0x0ef9a820, all
+        // 5 arrangements x 8 ops measured under the matrix law).  Without
+        // this branch the vector spellings fell through to
+        // `encode_fcvt_rounding`, which demands a register-file pair and
+        // rejected them all.
+        "fcvtas" | "fcvtau" | "fcvtns" | "fcvtnu" | "fcvtms" | "fcvtmu" | "fcvtps"
+        | "fcvtpu"
+            if matches!(operands.first(), Some(Operand::RegArrangement { .. })) =>
+        {
+            let (u, size_hi, op) = match mn.as_str() {
+                "fcvtas" => (0, 0, 0b11100),
+                "fcvtau" => (1, 0, 0b11100),
+                "fcvtns" => (0, 0, 0b11010),
+                "fcvtnu" => (1, 0, 0b11010),
+                "fcvtms" => (0, 0, 0b11011),
+                "fcvtmu" => (1, 0, 0b11011),
+                "fcvtps" => (0, 1, 0b11010),
+                _ => (1, 1, 0b11010), // fcvtpu
+            };
+            encode_neon_float_two_misc(operands, u, size_hi, op)
         }
         // The remaining eight rounding conversions have no fixed-point form and
         // no general-purpose-destination *and* register-file ambiguity to
@@ -1328,27 +1351,27 @@ pub fn encode_instruction(
         "frsqrts" => encode_neon_float_three_same(operands, 0, 1, 0b11111),
         "fcmeq" => {
             if matches!(operands.get(2), Some(Operand::Imm(0))) {
-                encode_neon_float_cmp_zero(operands, 0, 0, 0b01101)
+                encode_neon_float_cmp_zero(operands, raw_operands, 0, 1, 0b01101)
             } else {
                 encode_neon_float_three_same(operands, 0, 0, 0b11100)
             }
         }
         "fcmge" => {
             if matches!(operands.get(2), Some(Operand::Imm(0))) {
-                encode_neon_float_cmp_zero(operands, 1, 0, 0b01100)
+                encode_neon_float_cmp_zero(operands, raw_operands, 1, 1, 0b01100)
             } else {
                 encode_neon_float_three_same(operands, 1, 0, 0b11100)
             }
         }
         "fcmgt" => {
             if matches!(operands.get(2), Some(Operand::Imm(0))) {
-                encode_neon_float_cmp_zero(operands, 0, 1, 0b01100)
+                encode_neon_float_cmp_zero(operands, raw_operands, 0, 1, 0b01100)
             } else {
                 encode_neon_float_three_same(operands, 1, 1, 0b11100)
             }
         }
-        "fcmle" => encode_neon_float_cmp_zero(operands, 1, 0, 0b01101),
-        "fcmlt" => encode_neon_float_cmp_zero(operands, 0, 1, 0b01101),
+        "fcmle" => encode_neon_float_cmp_zero(operands, raw_operands, 1, 1, 0b01101),
+        "fcmlt" => encode_neon_float_cmp_zero(operands, raw_operands, 0, 1, 0b01110),
         "facge" => encode_neon_float_three_same(operands, 1, 0, 0b11101),
         "facgt" => encode_neon_float_three_same(operands, 1, 1, 0b11101),
 
@@ -1477,11 +1500,15 @@ pub fn encode_instruction(
                 encode_neon_scalar_two_misc(operands, 0, 0b00111)
             }
         }
+        // SQNEG is SQABS with U=1 (same two-reg-misc opcode field): GAS
+        // emits `sqneg b16, b2` = 0x7e207850 / `sqneg v16.8b, v2.8b` =
+        // 0x2e207850.  Passing U=0 and opcode 0b01000 produced 0x5e208850
+        // (the unallocated 011110-class word).
         "sqneg" => {
             if matches!(operands.first(), Some(Operand::RegArrangement { .. })) {
-                encode_neon_two_misc(operands, 0, 0b01000)
+                encode_neon_two_misc(operands, 1, 0b00111)
             } else {
-                encode_neon_scalar_two_misc(operands, 0, 0b01000)
+                encode_neon_scalar_two_misc(operands, 1, 0b00111)
             }
         }
         // Compare to zero forms
@@ -1527,17 +1554,46 @@ pub fn encode_instruction(
             if matches!(operands.first(), Some(Operand::RegArrangement { .. })) {
                 encode_neon_qshrn(operands, 0, false, false)
             } else {
-                encode_neon_scalar_qshrn(operands, 0, false)
+                encode_neon_scalar_qshrn(operands, 0, 0b100101)
             }
         }
         "sqshrn2" => encode_neon_qshrn(operands, 0, false, true),
-        "uqshrn" => encode_neon_qshrn(operands, 1, false, false),
+        // Scalar forms (FP destination, no arrangement) share the 0x5f
+        // class with SQSHRN; sending them to the vector encoder rejected
+        // every scalar row.
+        "uqshrn" => {
+            if matches!(operands.first(), Some(Operand::RegArrangement { .. })) {
+                encode_neon_qshrn(operands, 1, false, false)
+            } else {
+                encode_neon_scalar_qshrn(operands, 1, 0b100101)
+            }
+        }
         "uqshrn2" => encode_neon_qshrn(operands, 1, false, true),
-        "sqrshrn" => encode_neon_qshrn(operands, 0, true, false),
+        "sqrshrn" => {
+            if matches!(operands.first(), Some(Operand::RegArrangement { .. })) {
+                encode_neon_qshrn(operands, 0, true, false)
+            } else {
+                encode_neon_scalar_qshrn(operands, 0, 0b100111)
+            }
+        }
         "sqrshrn2" => encode_neon_qshrn(operands, 0, true, true),
-        "uqrshrn" => encode_neon_qshrn(operands, 1, true, false),
+        "uqrshrn" => {
+            if matches!(operands.first(), Some(Operand::RegArrangement { .. })) {
+                encode_neon_qshrn(operands, 1, true, false)
+            } else {
+                encode_neon_scalar_qshrn(operands, 1, 0b100111)
+            }
+        }
         "uqrshrn2" => encode_neon_qshrn(operands, 1, true, true),
-        "sqrshrun" => encode_neon_sqshrun(operands, true, false),
+        "sqrshrun" => {
+            if matches!(operands.first(), Some(Operand::RegArrangement { .. })) {
+                encode_neon_sqshrun(operands, true, false)
+            } else {
+                // Scalar SQRSHRUN: 0x7f class, opcode 100011 (GAS
+                // `sqrshrun h7, s3, #9` = 0x7f178c67).
+                encode_neon_scalar_qshrn(operands, 1, 0b100011)
+            }
+        }
         "sqrshrun2" => encode_neon_sqshrun(operands, true, true),
         // NEON permute: TRN1/TRN2
         "trn1" => encode_neon_zip_uzp(operands, 0b010, false),
@@ -1760,7 +1816,15 @@ pub fn encode_instruction(
         }
 
         // NEON saturating shift right narrow
-        "sqshrun" => encode_neon_sqshrun(operands, false, false),
+        "sqshrun" => {
+            if matches!(operands.first(), Some(Operand::RegArrangement { .. })) {
+                encode_neon_sqshrun(operands, false, false)
+            } else {
+                // Scalar SQSHRUN: 0x7f class, opcode 100001 (GAS
+                // `sqshrun b31, h23, #2` = 0x7f0e86ff).
+                encode_neon_scalar_qshrn(operands, 1, 0b100001)
+            }
+        }
         "sqshrun2" => encode_neon_sqshrun(operands, false, true),
 
         // NEON extend long (aliases for USHLL/SSHLL #0)
@@ -1787,7 +1851,10 @@ pub fn encode_instruction(
         "sev" => Ok(EncodeResult::Word(0xd503209f)),
         "sevl" => Ok(EncodeResult::Word(0xd50320bf)),
         "eret" => Ok(EncodeResult::Word(0xd69f03e0)),
-        "clrex" => Ok(EncodeResult::Word(0xd503305f)),
+        // CLREX (CRm=0b1111 = SY): GAS 2.47 encodes `clrex` as 0xd5033f5f
+        // (bytes 5f3f03d5); the old 0xd503305f kept CRm=0 (a different
+        // synchronization domain) and mismatched every oracle row.
+        "clrex" => Ok(EncodeResult::Word(0xd5033f5f)),
         "dc" => encode_dc(operands, raw_operands),
         "tlbi" => encode_tlbi(operands, raw_operands),
         "ic" => encode_ic(raw_operands),
@@ -2191,6 +2258,672 @@ mod register_class_tests {
                 encode_instruction(mn, &ops, "").is_err(),
                 "{mn} {ops:?} has no encoding"
             );
+        }
+    }
+}
+
+// ── GAS 2.47 golden-word ratchet for encoder defect fixes ────────────────
+//
+// Every word below was produced by GAS 2.47 (`~/.cache/gas-2.47-…/bin/as`,
+// aarch64) from the exact instruction text; the failure modes were found by
+// `scripts/gen_aarch64_dispatcher_goldens.py` (differential over the aarch64
+// dispatcher arms).  Keep these rows literal: they are the regression locks
+// for silent-wrong-word bugs, not documentation.
+#[cfg(test)]
+mod gas247_golden_word_tests {
+    use super::super::parser::{AsmStatement, parse_asm};
+    use super::*;
+
+    fn encode1(text: &str) -> u32 {
+        encode1_impl(text, false)
+    }
+
+    /// Like `encode1`, but accepts a `WordWithReloc` and returns its base
+    /// word -- that is what the .o's `.text` bytes (and therefore the
+    /// dispatcher-goldens TSV) record for relocation-carrying forms such
+    /// as `adrp x0, foo`.  All other callers keep the strict
+    /// "no relocs in golden rows" assertion above.
+    fn encode1_base(text: &str) -> u32 {
+        encode1_impl(text, true)
+    }
+
+    fn encode1_impl(text: &str, allow_reloc: bool) -> u32 {
+        let stmts = parse_asm(text).unwrap_or_else(|e| panic!("parse {text:?}: {e}"));
+        let mut words = Vec::new();
+        for st in &stmts {
+            if let AsmStatement::Instruction {
+                mnemonic,
+                operands,
+                raw_operands,
+            } = st
+            {
+                match encode_instruction(mnemonic, operands, raw_operands) {
+                    Ok(EncodeResult::Word(w)) => words.push(w),
+                    Ok(EncodeResult::WordWithReloc { word, .. }) if allow_reloc => words.push(word),
+                    Ok(_) => panic!("unexpected reloc result for {text:?}"),
+                    Err(e) => panic!("encode {text:?}: {e}"),
+                }
+            }
+        }
+        assert_eq!(
+            words.len(),
+            1,
+            "expected exactly one instruction in {text:?}"
+        );
+        words[0]
+    }
+
+    fn encode1_err(text: &str) -> String {
+        let stmts = parse_asm(text).unwrap_or_else(|e| panic!("parse {text:?}: {e}"));
+        for st in &stmts {
+            if let AsmStatement::Instruction {
+                mnemonic,
+                operands,
+                raw_operands,
+            } = st
+            {
+                if let Err(e) = encode_instruction(mnemonic, operands, raw_operands) {
+                    return e;
+                }
+            }
+        }
+        panic!("expected an error for {text:?}, but it encoded")
+    }
+
+    fn le(bytes: [u8; 4]) -> u32 {
+        u32::from_le_bytes(bytes)
+    }
+
+    #[test]
+    fn widening_three_diff_takes_q_from_high_and_size_from_vm() {
+        // saddw/saddw2/ssubw/usubw/uaddw2 families: Q = "2"-suffix only,
+        // size = size(Vm).  Deriving both from Vn emitted swapped Q/size.
+        for (text, want) in [
+            ("saddw v8.8h, v16.8h, v26.8b", 0x0e3a1208u32),
+            ("saddw2 v20.4s, v13.4s, v2.8h", le([0xb4, 0x11, 0x62, 0x4e])),
+            ("ssubw v31.8h, v16.8h, v25.8b", le([0x1f, 0x32, 0x39, 0x0e])),
+            ("ssubw v27.2d, v9.2d, v6.2s", le([0x3b, 0x31, 0xa6, 0x0e])),
+            ("ssubw2 v2.8h, v2.8h, v18.16b", le([0x42, 0x30, 0x32, 0x4e])),
+            ("usubw v31.2d, v19.2d, v13.2s", le([0x7f, 0x32, 0xad, 0x2e])),
+            (
+                "uaddw2 v18.8h, v31.8h, v21.16b",
+                le([0xf2, 0x13, 0x35, 0x6e]),
+            ),
+            ("uaddw v11.4s, v9.4s, v7.4h", le([0x2b, 0x11, 0x67, 0x2e])),
+        ] {
+            assert_eq!(encode1(text), want, "{text}");
+        }
+    }
+
+    #[test]
+    fn pmull_size_follows_destination_arrangement() {
+        for (text, want) in [
+            ("pmull v16.8h, v15.8b, v10.8b", le([0xf0, 0xe1, 0x2a, 0x0e])),
+            ("pmull v17.8h, v27.8b, v18.8b", le([0x71, 0xe3, 0x32, 0x0e])),
+            (
+                "pmull2 v26.8h, v0.16b, v2.16b",
+                le([0x1a, 0xe0, 0x22, 0x4e]),
+            ),
+            ("pmull2 v7.8h, v4.16b, v1.16b", le([0x87, 0xe0, 0x21, 0x4e])),
+        ] {
+            assert_eq!(encode1(text), want, "{text}");
+        }
+    }
+
+    #[test]
+    fn clrex_uses_cr15_sy() {
+        assert_eq!(encode1("clrex"), 0xd5033f5f);
+    }
+
+    #[test]
+    fn ld1r_ld2r_ld3r_ld4r_register_post_index() {
+        for (text, want) in [
+            ("ld1r {v0.8b}, [x29], x12", 0x0dccc3a0u32),
+            ("ld1r {v11.2d}, [x13], x8", le([0xab, 0xcd, 0xc8, 0x4d])),
+            ("ld1r {v12.8b}, [x23], x24", le([0xec, 0xc2, 0xd8, 0x0d])),
+            (
+                "ld2r {v14.8b-v15.8b}, [x24], x14",
+                le([0x0e, 0xc3, 0xee, 0x0d]),
+            ),
+            (
+                "ld3r {v24.8b-v26.8b}, [sp], x7",
+                le([0xf8, 0xe3, 0xc7, 0x0d]),
+            ),
+            (
+                "ld3r {v3.2s-v5.2s}, [x6], x25",
+                le([0xc3, 0xe8, 0xd9, 0x0d]),
+            ),
+            (
+                "ld4r {v19.8b-v22.8b}, [x5], x12",
+                le([0xb3, 0xe0, 0xec, 0x0d]),
+            ),
+            (
+                "ld4r {v29.8b-v0.8b}, [x3], x23",
+                le([0x7d, 0xe0, 0xf7, 0x0d]),
+            ),
+            // No-writeback still matches GAS:
+            ("ld1r {v0.8b}, [x29]", 0x0d40c3a0),
+        ] {
+            assert_eq!(encode1(text), want, "{text}");
+        }
+    }
+
+    #[test]
+    fn ld_replicate_rejects_forms_gas_rejects() {
+        // GAS refuses an immediate post-index, SP/XZR Rm and extra operands
+        // for LD*R; dropping them silently would change the address mode.
+        for text in [
+            "ld1r {v0.8b}, [x29], #8",
+            "ld1r {v0.8b}, [x29], sp",
+            "ld1r {v0.8b}, [x29], xzr",
+            "ld2r {v0.8b-v1.8b}, [x29], #8",
+            "ld3r {v0.8b-v2.8b}, [x29], w12",
+        ] {
+            encode1_err(text);
+        }
+    }
+
+    #[test]
+    fn fcvt_scalar_fp_destination_class() {
+        for (text, want) in [
+            // fcvtzs/fcvtzu no-immediate (0x5e class, code 1011):
+            ("fcvtzs d8, d4", 0x5ee1b888u32),
+            ("fcvtzs s8, s4", 0x5ea1b888),
+            ("fcvtzu d7, d9", le([0x27, 0xb9, 0xe1, 0x7e])),
+            // fcvtzs/fcvtzu fixed-point (0x5f class, opcode 111111):
+            ("fcvtzs d18, d5, #11", le([0xb2, 0xfc, 0x75, 0x5f])),
+            ("fcvtzs s11, s8, #15", le([0x0b, 0xfd, 0x31, 0x5f])),
+            ("fcvtzs s19, s19, #15", le([0x73, 0xfe, 0x31, 0x5f])),
+            ("fcvtzu s9, s20, #1", le([0x89, 0xfe, 0x3f, 0x7f])),
+            ("fcvtzs s8, s4, #32", 0x5f20fc88),
+            // The eight rounding conversions (code table A=0100 N=0010
+            // P=1010 M=0011):
+            ("fcvtau s0, s1", le([0x20, 0xc8, 0x21, 0x7e])),
+            ("fcvtmu s10, s5", le([0xaa, 0xb8, 0x21, 0x7e])),
+            ("fcvtau d8, d4", 0x7e61c888),
+            ("fcvtns d8, d4", 0x5e61a888),
+            ("fcvtnu d8, d4", 0x7e61a888),
+            ("fcvtps d8, d4", 0x5ee1a888),
+            ("fcvtpu d8, d4", 0x7ee1a888),
+            ("fcvtms s8, s4", 0x5e21b888),
+            // SCVTF/UCVTF scalar (code 0101; fixed opcode 111001):
+            ("scvtf d8, d4", 0x5e61d888),
+            ("scvtf s8, s4", 0x5e21d888),
+            ("ucvtf d11, d3, #4", le([0x6b, 0xe4, 0x7c, 0x7f])),
+            ("ucvtf d8, d4, #5", 0x7f7be488),
+            ("scvtf d8, d4, #64", 0x5f40e488),
+        ] {
+            assert_eq!(encode1(text), want, "{text}");
+        }
+    }
+
+    #[test]
+    fn fcvt_scalar_fp_destination_rejects_what_gas_rejects() {
+        for text in [
+            // Cross-precision forms do not exist in this class.  (The H
+            // form `fcvtzs h8, h4` used to sit here, but bare GAS default
+            // arch (armv8-a) rejecting it is an arch artifact: on the
+            // pinned matrix law (`.arch armv9.4-a+sme`) the scalar FP16
+            // conversion exists -- see the batch-4 accept rows below.)
+            "fcvtzs d8, s4",
+            "fcvtzs s8, d4",
+            // fbits range: 1..=32 for S, 1..=64 for D.
+            "fcvtzs s8, s4, #33",
+            "fcvtzs d8, d4, #65",
+            "fcvtzs d8, d4, #0",
+            // Rounding-mode conversions have no fixed-point form.
+            "fcvtau s8, s4, #3",
+        ] {
+            encode1_err(text);
+        }
+    }
+
+    #[test]
+    fn sqneg_scalar_and_vector_set_u_bit() {
+        for (text, want) in [
+            ("sqneg b16, b2", le([0x50, 0x78, 0x20, 0x7e])),
+            ("sqneg d3, d9", 0x7ee07923),
+            ("sqneg h3, h9", 0x7e607923),
+            ("sqneg s3, s9", 0x7ea07923),
+            ("sqneg v16.8b, v2.8b", le([0x50, 0x78, 0x20, 0x2e])),
+            // SQABS keeps U=0 (guard against over-broad fix):
+            ("sqabs b16, b2", le([0x50, 0x78, 0x20, 0x5e])),
+            ("sqabs v16.8b, v2.8b", le([0x50, 0x78, 0x20, 0x0e])),
+        ] {
+            assert_eq!(encode1(text), want, "{text}");
+        }
+    }
+
+    #[test]
+    fn scalar_shift_right_narrow_uses_5f_class() {
+        for (text, want) in [
+            ("sqshrn b31, h23, #2", le([0xff, 0x96, 0x0e, 0x5f])),
+            ("sqshrn s8, d5, #10", le([0xa8, 0x94, 0x36, 0x5f])),
+            ("sqshrn h23, s9, #13", 0x5f139537),
+            ("sqshrn b31, h23, #8", 0x5f0896ff),
+            ("sqshrn s9, d10, #32", 0x5f209549),
+            ("uqshrn b1, h2, #3", 0x7f0d9441),
+        ] {
+            assert_eq!(encode1(text), want, "{text}");
+        }
+    }
+
+    #[test]
+    fn scalar_shift_right_narrow_rejects_out_of_range() {
+        for text in [
+            "sqshrn b31, h23, #16",
+            "sqshrn b31, h23, #0",
+            "sqshrn b31, h23, #9",
+        ] {
+            encode1_err(text);
+        }
+    }
+
+    #[test]
+    fn mov_element_routes_by_destination_register_file() {
+        for (text, want) in [
+            // SIMD&FP destination -> scalar element move (INS alias):
+            ("mov s15, v5.s[3]", le([0xaf, 0x04, 0x1c, 0x5e])),
+            ("mov d15, v5.d[0]", 0x5e0804af),
+            // General-purpose destination -> UMOV:
+            ("mov w15, v5.s[3]", le([0xaf, 0x3c, 0x1c, 0x0e])),
+            // Vector destination -> INS element/element:
+            ("mov v15.s[3], v5.s[3]", 0x6e1c64af),
+            ("mov v15.d[0], v5.d[0]", 0x6e0804af),
+            // GP-source INS unchanged:
+            ("ins v15.s[3], w7", 0x4e1c1cef),
+        ] {
+            assert_eq!(encode1(text), want, "{text}");
+        }
+    }
+
+    // ── Batch 4: dispatcher-golden campaign (post-rebase).
+    //    Every word below is a verbatim GAS 2.47 measurement under the
+    //    pinned matrix law (`.arch armv9.4-a+sme`) except where noted;
+    //    rejects are GAS-rejected spellings. ──────────────────────────
+
+    #[test]
+    fn batch4_scalar_fp16_conversions_follow_the_matrix_arch() {
+        for (text, want) in [
+            // GAS default arch (armv8-a) rejects the H form; the matrix
+            // pins armv9.4-a+sme where it exists.  Bare-default verdicts
+            // are arch artifacts (s/d words are identical either way).
+            ("fcvtzs h8, h4", 0x5ef9b888u32),
+            ("ucvtf h0, h0", 0x7e79d800u32),
+            ("fcvtzs h0, h0, #16", 0x5f10fc00u32),
+            // imm-form doubles (arch-independent, regressed from the
+            // pre-rebase goldens):
+            ("fcvtzs d18, d5, #11", 0x5f75fcb2u32),
+        ] {
+            assert_eq!(encode1(text), want, "{text}");
+        }
+    }
+
+    #[test]
+    fn batch4_ld1r_post_index_imm_matches_the_measured_law() {
+        // #imm iff imm == num_structs * (1 << size) -- the post-index
+        // immediate is the TOTAL structure size in bytes (measured set;
+        // `ld1r {v0.2d}, [x0], #16` stays rejected: total is 8, not 16).
+        for (text, want) in [
+            ("ld1r {v0.8b}, [x0], #1", 0x0ddfc000u32),
+            ("ld1r {v0.16b}, [x0], #1", 0x4ddfc000u32),
+            ("ld1r {v0.8h}, [x0], #2", 0x4ddfc400u32),
+            ("ld1r {v0.4s}, [x0], #4", 0x4ddfc800u32),
+            ("ld1r {v0.2d}, [x0], #8", 0x4ddfcc00u32),
+            ("ld3r {v0.8b, v1.8b, v2.8b}, [x0], #3", 0x0ddfe000u32),
+            ("ld4r {v0.8b, v1.8b, v2.8b, v3.8b}, [x0], #4", 0x0dffe000u32),
+        ] {
+            assert_eq!(encode1(text), want, "{text}");
+        }
+        for text in ["ld1r {v0.2d}, [x0], #16", "ld1r {v0.8b}, [x0], #8"] {
+            encode1_err(text);
+        }
+    }
+
+    #[test]
+    fn batch4_widening_arrangement_law() {
+        for (text, want) in [
+            // arr_d == arr_n, elem_d == 2 * elem_m, count preserved (base).
+            ("saddw v0.8h, v1.8h, v2.8b", 0x0e221020u32),
+            ("saddw v0.4s, v1.4s, v2.4h", 0x0e621020u32),
+            ("saddw v0.2d, v1.2d, v2.2s", 0x0ea21020u32),
+            // "2" form: Vm carries double the destination element count.
+            ("saddw2 v0.4s, v1.4s, v2.8h", 0x4e621020u32),
+            ("saddw2 v0.2d, v1.2d, v2.4s", 0x4ea21020u32),
+            ("usubw2 v0.4s, v1.4s, v2.8h", 0x6e623020u32),
+        ] {
+            assert_eq!(encode1(text), want, "{text}");
+        }
+        // Destination and Vn must spell the same arrangement (GAS REJ).
+        encode1_err("saddw v0.4h, v1.8h, v2.8b");
+    }
+
+    #[test]
+    fn batch4_scalar_saturating_narrow_family_completes() {
+        for (text, want) in [
+            // Scalar SQSHRUN/SQRSHRUN (0x7f class, ops 100001/100011) --
+            // residual (c): these had no scalar route at all before.
+            ("sqshrun b31, h23, #2", 0x7f0e86ffu32),
+            ("sqrshrun h7, s3, #9", 0x7f178c67u32),
+            // Rounding scalar narrow regressions (pre-existing route).
+            ("sqrshrn b1, h2, #3", 0x5f0d9c41u32),
+            ("uqrshrn b1, h2, #3", 0x7f0d9c41u32),
+        ] {
+            assert_eq!(encode1(text), want, "{text}");
+        }
+        for text in [
+            // Non-saturating narrow shifts have no scalar form (GAS REJ).
+            "shrn b31, h23, #2",
+            "rshrn b31, h23, #2",
+        ] {
+            encode1_err(text);
+        }
+    }
+
+    #[test]
+    fn batch4_fcmp_fcmpe_both_forms() {
+        for (text, want) in [
+            // Register form: Rt = 0b00000 (fcmpe adds bit 4 -> 0b01000).
+            ("fcmp s8, s9", 0x1e292100u32),
+            ("fcmpe s8, s9", 0x1e292110u32),
+            // #0.0 form: Rt = 0b01000 (fcmpe -> 0b11000).  Every
+            // positive-zero spelling GAS accepts maps here:
+            ("fcmp d30, #0.0", 0x1e6023c8u32),
+            ("fcmp s8, #0.0", 0x1e202108u32),
+            ("fcmp d0, #0", 0x1e602008u32),
+            ("fcmp d0, #+0.0", 0x1e602008u32),
+            ("fcmp d0, #0e0", 0x1e602008u32),
+            ("fcmpe d8, #0.0", 0x1e602118u32),
+        ] {
+            assert_eq!(encode1(text), want, "{text}");
+        }
+        for text in [
+            // Exactly two operands, +0.0 only (GAS-measured rejects).
+            "fcmp d0",
+            "fcmpe d0",
+            "fcmp d0, #1",
+            "fcmp d0, #1.0",
+            "fcmp d0, #-0",
+            "fcmp d0, #-0.0",
+            "fcmp d0, #(-0)",
+            "fcmp d0, #(0.0)",
+        ] {
+            encode1_err(text);
+        }
+    }
+
+    #[test]
+    fn batch4_fmov_immediate_grammar() {
+        for (text, want) in [
+            // D-form: word = 0x1e601000 | imm8 << 13 (imm8 values measured).
+            ("fmov d0, #1.0", 0x1e6e1000u32),
+            ("fmov d0, #2.0", 0x1e601000u32),
+            ("fmov d0, #4.0", 0x1e621000u32),
+            ("fmov d0, #8.0", 0x1e641000u32),
+            ("fmov d0, #16.0", 0x1e661000u32),
+            ("fmov d0, #0.5", 0x1e6c1000u32),
+            ("fmov d0, #0.25", 0x1e6a1000u32),
+            ("fmov d0, #0.125", 0x1e681000u32),
+            ("fmov d0, #1.5", 0x1e6f1000u32),
+            ("fmov d0, #1.25", 0x1e6e9000u32),
+            ("fmov d0, #1.75", 0x1e6f9000u32),
+            ("fmov d0, #1.875", 0x1e6fd000u32),
+            ("fmov d0, #1.9375", 0x1e6ff000u32),
+            ("fmov d0, #1.0625", 0x1e6e3000u32),
+            ("fmov d0, #3.0", 0x1e611000u32),
+            ("fmov d0, #5.0", 0x1e629000u32),
+            ("fmov d0, #7.0", 0x1e639000u32),
+            ("fmov d0, #10.0", 0x1e649000u32),
+            ("fmov d0, #12.0", 0x1e651000u32),
+            ("fmov d0, #15.5", 0x1e65f000u32),
+            ("fmov d0, #24.0", 0x1e671000u32),
+            ("fmov d0, #0.4375", 0x1e6b9000u32),
+            ("fmov d0, #-1.0", 0x1e7e1000u32),
+            ("fmov d0, #-0.5", 0x1e7c1000u32),
+            ("fmov d0, #-2.0", 0x1e701000u32),
+            // Integer and scientific spellings (all measured ACCEPT):
+            ("fmov d0, #1", 0x1e6e1000u32),
+            ("fmov d0, #1e1", 0x1e649000u32),
+            ("fmov d0, #1.0e0", 0x1e6e1000u32),
+            // S-form shares imm8 (measured): f32 rounds then matches.
+            ("fmov s0, #1.0", 0x1e2e1000u32),
+            ("fmov s0, #1.00000001", 0x1e2e1000u32),
+            // H-form (FEAT_FP16, armv9.4): measured words.
+            ("fmov h0, #1.0", 0x1eee1000u32),
+            ("fmov h0, #0.5", 0x1eec1000u32),
+            ("fmov h0, #1e1", 0x1ee49000u32),
+        ] {
+            assert_eq!(encode1(text), want, "{text}");
+        }
+        for text in [
+            // No imm8 decodes to these (all GAS-measured rejects):
+            "fmov d0, #0.0",
+            "fmov d0, #-0.0",
+            "fmov d0, #0.1",
+            "fmov d0, #1e-1",
+            "fmov d0, #0.0625",
+            "fmov d0, #0.09375",
+            "fmov d0, #0.03125",
+            "fmov d0, #256.0",
+            "fmov d0, #65504.0",
+            "fmov d0, #0.0009765625",
+            "fmov d0, #(-1.0)",
+            "fmov s0, #1.0000001",
+            "fmov s0, #0.1",
+            "fmov h0, #0.1",
+        ] {
+            encode1_err(text);
+        }
+    }
+
+    /// The dispatcher ratchet: `tests/aarch64/dispatcher-goldens.tsv`
+    /// carries exactly one GAS-verified instruction for EVERY
+    /// `encode_instruction` arm (both directions checked -- a new arm
+    /// without a row, a row for a deleted arm, or a drifted word all
+    /// fail), and every row is re-encoded through the full
+    /// parse -> dispatcher -> leaf path here, on a host with no cross
+    /// tools.  Regenerate with `scripts/gen_aarch64_dispatcher_goldens.py`
+    /// (exit 0 requires full coverage) and verify with `--check`.
+    #[test]
+    fn dispatcher_goldens_ratchet_one_row_per_arm() {
+        // Arm set: same mechanical rule as the generator -- mnemonic keys
+        // at line start inside the `encode_instruction` body.
+        let src = include_str!("mod.rs");
+        let a = src
+            .find("pub fn encode_instruction(")
+            .expect("encode_instruction found");
+        let body_end = src[a + 10..].find("\npub fn ").map(|i| a + 10 + i);
+        let body = &src[a..body_end.unwrap_or(src.len())];
+        let mut arms: Vec<String> = Vec::new();
+        for line in body.lines() {
+            let t = line.trim_start();
+            if let Some(rest) = t.strip_prefix('"') {
+                if let Some(end) = rest.find('"') {
+                    let mn = &rest[..end];
+                    let after = &rest[end + 1..];
+                    let key_ok = !mn.is_empty()
+                        && mn.chars().all(|c| {
+                            c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '.'
+                        });
+                    if key_ok
+                        && (after.trim_start().starts_with("=>")
+                            || after.trim_start().starts_with('|'))
+                    {
+                        if !arms.iter().any(|x| x == mn) {
+                            arms.push(mn.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        arms.sort();
+
+        let tsv_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/aarch64/dispatcher-goldens.tsv");
+        let tsv = std::fs::read_to_string(&tsv_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", tsv_path.display()));
+        let mut rows: Vec<(String, String, String)> = Vec::new();
+        for line in tsv.lines() {
+            if line.starts_with('#') || line.trim().is_empty() {
+                continue;
+            }
+            let mut it = line.split('\t');
+            let (mn, text, word) = (it.next(), it.next(), it.next());
+            match (mn, text, word) {
+                (Some(m), Some(t), Some(w)) if it.next().is_none() => {
+                    rows.push((m.to_string(), t.to_string(), w.to_string()));
+                }
+                _ => panic!("malformed TSV row: {line:?}"),
+            }
+        }
+
+        // Exact arm <-> row correspondence (>= 1 row per arm and no
+        // stale rows), because the generator only writes the file at
+        // full coverage and `--check` re-validates it.
+        let mut row_mns: Vec<String> = rows.iter().map(|r| r.0.clone()).collect();
+        row_mns.sort();
+        row_mns.dedup();
+        assert_eq!(
+            arms, row_mns,
+            "TSV arm set drifted from encode_instruction arms; \
+             regenerate with scripts/gen_aarch64_dispatcher_goldens.py"
+        );
+        assert_eq!(
+            rows.len(),
+            arms.len(),
+            "expected exactly one row per arm, got {} rows for {} arms",
+            rows.len(),
+            arms.len()
+        );
+
+        // Every row re-assembles to its recorded GAS word.
+        for (mn, text, word) in &rows {
+            // The TSV records the instruction's in-memory (little-endian)
+            // bytes as hex -- the same `gdata.hex()` the generator compares
+            // against lccc's output -- so unpack them LE.
+            let raw = (0..word.len())
+                .step_by(2)
+                .map(|i| {
+                    u8::from_str_radix(&word[i..i + 2], 16)
+                        .unwrap_or_else(|e| panic!("bad hex {word:?} for {mn}: {e}"))
+                })
+                .collect::<Vec<u8>>();
+            assert_eq!(raw.len(), 4, "{mn}: word {word:?} is not 4 bytes");
+            let want = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+            let got = encode1_base(text);
+            assert_eq!(got, want, "{mn}: `{text}` word drifted");
+        }
+    }
+
+    /// Full GAS 2.47-measured law for the FP zero-comparisons and the
+    /// vector rounding conversions (every (op, arrangement) cell probed
+    /// under the pinned matrix law, including the 16-bit arrangements'
+    /// bits 20:18 = 0b110 marker) plus the immediate grammar (`#-0`
+    /// rejected; `#0`, `#0.0`, `#0e0`, `#+0.0` accepted).
+    #[test]
+    fn batch4_fp_zero_cmp_and_vector_rounding_law() {
+        for (text, want) in [
+            ("fcvtas v0.2s, v1.2s", 0x0e21c820u32),
+            ("fcvtau v0.2s, v1.2s", 0x2e21c820u32),
+            ("fcvtns v0.2s, v1.2s", 0x0e21a820u32),
+            ("fcvtnu v0.2s, v1.2s", 0x2e21a820u32),
+            ("fcvtms v0.2s, v1.2s", 0x0e21b820u32),
+            ("fcvtmu v0.2s, v1.2s", 0x2e21b820u32),
+            ("fcvtps v0.2s, v1.2s", 0x0ea1a820u32),
+            ("fcvtpu v0.2s, v1.2s", 0x2ea1a820u32),
+            ("fcvtzs v0.2s, v1.2s", 0x0ea1b820u32),
+            ("fcvtzu v0.2s, v1.2s", 0x2ea1b820u32),
+            ("scvtf v0.2s, v1.2s", 0x0e21d820u32),
+            ("ucvtf v0.2s, v1.2s", 0x2e21d820u32),
+            ("fcvtas v0.4s, v1.4s", 0x4e21c820u32),
+            ("fcvtau v0.4s, v1.4s", 0x6e21c820u32),
+            ("fcvtns v0.4s, v1.4s", 0x4e21a820u32),
+            ("fcvtnu v0.4s, v1.4s", 0x6e21a820u32),
+            ("fcvtms v0.4s, v1.4s", 0x4e21b820u32),
+            ("fcvtmu v0.4s, v1.4s", 0x6e21b820u32),
+            ("fcvtps v0.4s, v1.4s", 0x4ea1a820u32),
+            ("fcvtpu v0.4s, v1.4s", 0x6ea1a820u32),
+            ("fcvtzs v0.4s, v1.4s", 0x4ea1b820u32),
+            ("fcvtzu v0.4s, v1.4s", 0x6ea1b820u32),
+            ("scvtf v0.4s, v1.4s", 0x4e21d820u32),
+            ("ucvtf v0.4s, v1.4s", 0x6e21d820u32),
+            ("fcvtas v0.2d, v1.2d", 0x4e61c820u32),
+            ("fcvtau v0.2d, v1.2d", 0x6e61c820u32),
+            ("fcvtns v0.2d, v1.2d", 0x4e61a820u32),
+            ("fcvtnu v0.2d, v1.2d", 0x6e61a820u32),
+            ("fcvtms v0.2d, v1.2d", 0x4e61b820u32),
+            ("fcvtmu v0.2d, v1.2d", 0x6e61b820u32),
+            ("fcvtps v0.2d, v1.2d", 0x4ee1a820u32),
+            ("fcvtpu v0.2d, v1.2d", 0x6ee1a820u32),
+            ("fcvtzs v0.2d, v1.2d", 0x4ee1b820u32),
+            ("fcvtzu v0.2d, v1.2d", 0x6ee1b820u32),
+            ("scvtf v0.2d, v1.2d", 0x4e61d820u32),
+            ("ucvtf v0.2d, v1.2d", 0x6e61d820u32),
+            ("fcvtas v0.4h, v1.4h", 0x0e79c820u32),
+            ("fcvtau v0.4h, v1.4h", 0x2e79c820u32),
+            ("fcvtns v0.4h, v1.4h", 0x0e79a820u32),
+            ("fcvtnu v0.4h, v1.4h", 0x2e79a820u32),
+            ("fcvtms v0.4h, v1.4h", 0x0e79b820u32),
+            ("fcvtmu v0.4h, v1.4h", 0x2e79b820u32),
+            ("fcvtps v0.4h, v1.4h", 0x0ef9a820u32),
+            ("fcvtpu v0.4h, v1.4h", 0x2ef9a820u32),
+            ("fcvtzs v0.4h, v1.4h", 0x0ef9b820u32),
+            ("fcvtzu v0.4h, v1.4h", 0x2ef9b820u32),
+            ("scvtf v0.4h, v1.4h", 0x0e79d820u32),
+            ("ucvtf v0.4h, v1.4h", 0x2e79d820u32),
+            ("fcvtas v0.8h, v1.8h", 0x4e79c820u32),
+            ("fcvtau v0.8h, v1.8h", 0x6e79c820u32),
+            ("fcvtns v0.8h, v1.8h", 0x4e79a820u32),
+            ("fcvtnu v0.8h, v1.8h", 0x6e79a820u32),
+            ("fcvtms v0.8h, v1.8h", 0x4e79b820u32),
+            ("fcvtmu v0.8h, v1.8h", 0x6e79b820u32),
+            ("fcvtps v0.8h, v1.8h", 0x4ef9a820u32),
+            ("fcvtpu v0.8h, v1.8h", 0x6ef9a820u32),
+            ("fcvtzs v0.8h, v1.8h", 0x4ef9b820u32),
+            ("fcvtzu v0.8h, v1.8h", 0x6ef9b820u32),
+            ("scvtf v0.8h, v1.8h", 0x4e79d820u32),
+            ("ucvtf v0.8h, v1.8h", 0x6e79d820u32),
+            ("fcmeq v0.2s, v1.2s, #0", 0x0ea0d820u32),
+            ("fcmge v0.2s, v1.2s, #0", 0x2ea0c820u32),
+            ("fcmgt v0.2s, v1.2s, #0", 0x0ea0c820u32),
+            ("fcmle v0.2s, v1.2s, #0", 0x2ea0d820u32),
+            ("fcmlt v0.2s, v1.2s, #0", 0x0ea0e820u32),
+            ("fcmeq v0.4s, v1.4s, #0", 0x4ea0d820u32),
+            ("fcmge v0.4s, v1.4s, #0", 0x6ea0c820u32),
+            ("fcmgt v0.4s, v1.4s, #0", 0x4ea0c820u32),
+            ("fcmle v0.4s, v1.4s, #0", 0x6ea0d820u32),
+            ("fcmlt v0.4s, v1.4s, #0", 0x4ea0e820u32),
+            ("fcmeq v0.2d, v1.2d, #0", 0x4ee0d820u32),
+            ("fcmge v0.2d, v1.2d, #0", 0x6ee0c820u32),
+            ("fcmgt v0.2d, v1.2d, #0", 0x4ee0c820u32),
+            ("fcmle v0.2d, v1.2d, #0", 0x6ee0d820u32),
+            ("fcmlt v0.2d, v1.2d, #0", 0x4ee0e820u32),
+            ("fcmeq v0.4h, v1.4h, #0", 0x0ef8d820u32),
+            ("fcmge v0.4h, v1.4h, #0", 0x2ef8c820u32),
+            ("fcmgt v0.4h, v1.4h, #0", 0x0ef8c820u32),
+            ("fcmle v0.4h, v1.4h, #0", 0x2ef8d820u32),
+            ("fcmlt v0.4h, v1.4h, #0", 0x0ef8e820u32),
+            ("fcmeq v0.8h, v1.8h, #0", 0x4ef8d820u32),
+            ("fcmge v0.8h, v1.8h, #0", 0x6ef8c820u32),
+            ("fcmgt v0.8h, v1.8h, #0", 0x4ef8c820u32),
+            ("fcmle v0.8h, v1.8h, #0", 0x6ef8d820u32),
+            ("fcmlt v0.8h, v1.8h, #0", 0x4ef8e820u32),
+            ("fcmle v0.4s, v1.4s, #0e0", 0x6ea0d820u32),
+            ("fcmle v0.4s, v1.4s, #+0.0", 0x6ea0d820u32),
+        ] {
+            assert_eq!(encode1(text), want, "{text}");
+        }
+        for text in [
+            "fcmle v0.4s, v1.4s, #-0",
+            // The only immediate is +0.0 and only in the 3-operand vector
+            // form: `#1` is not zero and the 2-operand scalar form does
+            // not exist (all GAS-measured).
+            "fcmle v0.4s, v1.4s, #1",
+            "fcmle s0, s1",
+            "fcmlt v0.4s, v1.4s, #1",
+            "fcmle v0.4s, v1.4s, #(0.0)",
+        ] {
+            encode1_err(text);
         }
     }
 }

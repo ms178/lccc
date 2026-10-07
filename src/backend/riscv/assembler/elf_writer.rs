@@ -529,12 +529,12 @@ impl ElfWriter {
     /// sections (when relaxation is enabled). The linker needs these to know
     /// where alignment padding exists so it can re-align after relaxation
     /// changes code sizes.
-    fn emit_align_with_reloc(&mut self, align_bytes: u64) {
+    fn emit_align_with_reloc(&mut self, align_bytes: u64) -> Result<(), String> {
         if align_bytes <= 1 {
-            return;
+            return Ok(());
         }
         let offset_before = self.base.current_offset();
-        self.base.align_to(align_bytes);
+        self.base.align_to(align_bytes)?;
         let offset_after = self.base.current_offset();
         let padding = offset_after - offset_before;
         if padding > 0 && !self.no_relax {
@@ -551,6 +551,7 @@ impl ElfWriter {
                 }
             }
         }
+        Ok(())
     }
 
     /// Process all parsed assembly statements.
@@ -726,21 +727,27 @@ impl ElfWriter {
             }
 
             Directive::Align(val) => {
-                // RISC-V .align N means 2^N bytes (same as .p2align)
+                // RISC-V .align N means 2^N bytes (same as .p2align);
+                // the parser clamps N to 63 (GAS), so the shift is safe.
                 let bytes = 1u64 << val;
-                self.emit_align_with_reloc(bytes);
+                self.emit_align_with_reloc(bytes)?;
                 Ok(())
             }
 
             Directive::Balign(val) => {
-                self.emit_align_with_reloc(*val);
+                self.emit_align_with_reloc(*val)?;
                 Ok(())
             }
 
             Directive::Byte(values) => {
                 for dv in values {
                     match dv {
-                        DataValue::Integer(v) => self.base.emit_bytes(&[*v as u8]),
+                        DataValue::Integer(v) => {
+                            // RAW-value NOBITS rule: `.byte 1` in .bss is a
+                            // GAS error even though one byte could be stored.
+                            self.base.nobits_guard(*v != 0)?;
+                            self.base.emit_bytes(&[*v as u8])?;
+                        }
                         DataValue::Symbol { name, addend } => {
                             // Try resolving as alias (.set/.equ) — may be a forward ref
                             let resolved = self.base.resolve_expr_aliases(name);
@@ -756,7 +763,8 @@ impl ElfWriter {
                             };
                             if let Ok(v) = crate::backend::asm_expr::parse_integer_expr(&eval_expr)
                             {
-                                self.base.emit_bytes(&[v as u8]);
+                                self.base.nobits_guard(v != 0)?;
+                                self.base.emit_bytes(&[v as u8])?;
                             } else {
                                 // Defer: alias not yet defined (forward reference)
                                 let section = self.base.current_section.clone();
@@ -767,10 +775,10 @@ impl ElfWriter {
                                     size: 1,
                                     expr: deferred_expr,
                                 });
-                                self.base.emit_placeholder(1);
+                                self.base.emit_placeholder(1)?;
                             }
                         }
-                        _ => self.base.emit_bytes(&[0u8]),
+                        _ => self.base.emit_bytes(&[0u8])?,
                     }
                 }
                 Ok(())
@@ -779,12 +787,21 @@ impl ElfWriter {
             Directive::Short(values) => {
                 for dv in values {
                     match dv {
-                        DataValue::Integer(v) => self.base.emit_bytes(&(*v as u16).to_le_bytes()),
+                        DataValue::Integer(v) => {
+                            self.base.nobits_guard(*v != 0)?;
+                            self.base.emit_bytes(&(*v as u16).to_le_bytes())?;
+                        }
                         DataValue::Expression(expr) => {
                             let resolved = self.base.resolve_expr_aliases(expr);
                             let resolved = self.base.resolve_expr_labels(&resolved);
                             match crate::backend::asm_expr::parse_integer_expr(&resolved) {
-                                Ok(v) => self.base.emit_bytes(&(v as u16).to_le_bytes()),
+                                Ok(v) => {
+                                    // Raw value, pre-truncation: `.short 256`
+                                    // stores zeros but GAS still rejects it
+                                    // in a NOBITS section.
+                                    self.base.nobits_guard(v != 0)?;
+                                    self.base.emit_bytes(&(v as u16).to_le_bytes())?;
+                                }
                                 Err(_) => {
                                     // Defer: expression contains forward references
                                     let section = self.base.current_section.clone();
@@ -795,7 +812,7 @@ impl ElfWriter {
                                         size: 2,
                                         expr: expr.clone(),
                                     });
-                                    self.base.emit_placeholder(2);
+                                    self.base.emit_placeholder(2)?;
                                 }
                             }
                         }
@@ -814,7 +831,8 @@ impl ElfWriter {
                             };
                             if let Ok(v) = crate::backend::asm_expr::parse_integer_expr(&eval_expr)
                             {
-                                self.base.emit_bytes(&(v as u16).to_le_bytes());
+                                self.base.nobits_guard(v != 0)?;
+                                self.base.emit_bytes(&(v as u16).to_le_bytes())?;
                             } else {
                                 // Defer: alias not yet defined (forward reference)
                                 let section = self.base.current_section.clone();
@@ -825,7 +843,7 @@ impl ElfWriter {
                                     size: 2,
                                     expr: deferred_expr,
                                 });
-                                self.base.emit_placeholder(2);
+                                self.base.emit_placeholder(2)?;
                             }
                         }
                         DataValue::SymbolDiff {
@@ -839,7 +857,7 @@ impl ElfWriter {
                             let (base_b, extra_b) = decompose_symbol_addend(sym_b);
                             self.base.add_reloc(add_type, base_a, *addend + extra_a);
                             self.base.add_reloc(sub_type, base_b, extra_b);
-                            self.base.emit_placeholder(2);
+                            self.base.emit_placeholder(2)?;
                         }
                     }
                 }
@@ -861,18 +879,29 @@ impl ElfWriter {
             }
 
             Directive::Zero { size, fill } => {
-                self.base.emit_bytes(&vec![*fill; *size]);
+                // emit_fill bounds the request (MAX_DIRECTIVE_FILL) and
+                // writes with a single resize — the old
+                // `emit_bytes(&vec![fill; size])` materialized the whole
+                // run before any ceiling could apply.
+                self.base.emit_fill(*size, *fill)?;
+                Ok(())
+            }
+
+            Directive::Fill { total, elem, value } => {
+                self.base.emit_fill_pattern(*total, *elem, *value)?;
                 Ok(())
             }
 
             Directive::Asciz(s) => {
-                self.base.emit_bytes(s);
-                self.base.emit_bytes(&[0]);
+                self.base.nobits_string_guard(s)?;
+                self.base.emit_bytes(s)?;
+                self.base.emit_bytes(&[0])?;
                 Ok(())
             }
 
             Directive::Ascii(s) => {
-                self.base.emit_bytes(s);
+                self.base.nobits_string_guard(s)?;
+                self.base.emit_bytes(s)?;
                 Ok(())
             }
 
@@ -922,13 +951,16 @@ impl ElfWriter {
 
             Directive::Insn(args) => {
                 self.base.ensure_text_section();
+                // `.insn` is an instruction: it raises sh_addralign like
+                // a statement-level insn (GAS 2.47 measured).
+                self.base.note_instruction();
                 match encode_insn_directive(args) {
                     Ok(EncodeResult::Word(word)) => {
-                        self.base.emit_u32_le(word);
+                        self.base.emit_u32_le(word)?;
                         Ok(())
                     }
                     Ok(EncodeResult::Half(half)) => {
-                        self.base.emit_u16_le(half);
+                        self.base.emit_u16_le(half)?;
                         Ok(())
                     }
                     Ok(_) => Ok(()),
@@ -952,7 +984,7 @@ impl ElfWriter {
                     }
                     None => data,
                 };
-                self.base.emit_bytes(data);
+                self.base.emit_bytes(data)?;
                 Ok(())
             }
 
@@ -994,14 +1026,14 @@ impl ElfWriter {
                 let (base_b, extra_b) = decompose_symbol_addend(sym_b);
                 self.base.add_reloc(add_type, base_a, *addend + extra_a);
                 self.base.add_reloc(sub_type, base_b, extra_b);
-                self.base.emit_placeholder(size);
+                self.base.emit_placeholder(size)?;
             }
             DataValue::Symbol { name, addend } => {
                 // Try resolving as alias (.set/.equ) first — the "symbol"
                 // may actually be a compile-time constant defined via .set.
                 let resolved = self.base.resolve_expr_aliases(name);
                 if let Ok(v) = crate::backend::asm_expr::parse_integer_expr(&resolved) {
-                    self.base.emit_data_integer(v + addend, size);
+                    self.base.emit_data_integer(v + addend, size)?;
                 } else {
                     let reloc_type = if size == 4 {
                         RelocType::Abs32.elf_type()
@@ -1009,18 +1041,18 @@ impl ElfWriter {
                         RelocType::Abs64.elf_type()
                     };
                     self.base
-                        .emit_data_symbol_ref(name, *addend, size, reloc_type);
+                        .emit_data_symbol_ref(name, *addend, size, reloc_type)?;
                 }
             }
             DataValue::Integer(v) => {
-                self.base.emit_data_integer(*v, size);
+                self.base.emit_data_integer(*v, size)?;
             }
             DataValue::Expression(expr) => {
                 let mut resolved = self.base.resolve_expr_aliases(expr);
                 // Resolve .Ldot_N synthetic labels to current offset
                 resolved = self.base.resolve_expr_labels(&resolved);
                 match crate::backend::asm_expr::parse_integer_expr(&resolved) {
-                    Ok(v) => self.base.emit_data_integer(v, size),
+                    Ok(v) => self.base.emit_data_integer(v, size)?,
                     Err(_) => {
                         // Expression contains unresolved symbols (e.g., forward references).
                         // Defer resolution until all labels are known.
@@ -1033,7 +1065,7 @@ impl ElfWriter {
                             expr: expr.clone(),
                         });
                         // Emit placeholder bytes that will be patched later
-                        self.base.emit_placeholder(size);
+                        self.base.emit_placeholder(size)?;
                     }
                 }
             }
@@ -1088,14 +1120,17 @@ impl ElfWriter {
         raw_operands: &str,
     ) -> Result<(), String> {
         self.base.ensure_text_section();
+        // GAS 2.47: instructions are what raise a fresh section's
+        // sh_addralign (data-only `.text` stays 1 — measured).
+        self.base.note_instruction();
 
         match encode_instruction(mnemonic, operands, raw_operands) {
             Ok(EncodeResult::Word(word)) => {
-                self.base.emit_u32_le(word);
+                self.base.emit_u32_le(word)?;
                 Ok(())
             }
             Ok(EncodeResult::Half(half)) => {
-                self.base.emit_u16_le(half);
+                self.base.emit_u16_le(half)?;
                 Ok(())
             }
             Ok(EncodeResult::WordWithReloc { word, reloc }) => {
@@ -1123,11 +1158,11 @@ impl ElfWriter {
                     if !self.no_relax {
                         self.base.add_reloc(Self::R_RISCV_RELAX, String::new(), 0);
                     }
-                    self.base.emit_u32_le(word);
+                    self.base.emit_u32_le(word)?;
                 } else if is_branch_or_jal {
                     self.base
                         .add_reloc(elf_type, reloc.symbol.clone(), reloc.addend);
-                    self.base.emit_u32_le(word);
+                    self.base.emit_u32_le(word)?;
                 } else {
                     let is_local = reloc.symbol.starts_with(".L")
                         || reloc.symbol.starts_with(".l")
@@ -1143,18 +1178,18 @@ impl ElfWriter {
                             addend: reloc.addend,
                             pcrel_hi_offset: None,
                         });
-                        self.base.emit_u32_le(word);
+                        self.base.emit_u32_le(word)?;
                     } else {
                         self.base
                             .add_reloc(elf_type, reloc.symbol.clone(), reloc.addend);
-                        self.base.emit_u32_le(word);
+                        self.base.emit_u32_le(word)?;
                     }
                 }
                 Ok(())
             }
             Ok(EncodeResult::Words(words)) => {
                 for word in words {
-                    self.base.emit_u32_le(word);
+                    self.base.emit_u32_le(word)?;
                 }
                 Ok(())
             }
@@ -1182,7 +1217,7 @@ impl ElfWriter {
                             if !self.no_relax {
                                 self.base.add_reloc(Self::R_RISCV_RELAX, String::new(), 0);
                             }
-                            self.base.emit_u32_le(*word);
+                            self.base.emit_u32_le(*word)?;
                             continue;
                         }
 
@@ -1198,7 +1233,7 @@ impl ElfWriter {
                             if !self.no_relax {
                                 self.base.add_reloc(Self::R_RISCV_RELAX, String::new(), 0);
                             }
-                            self.base.emit_u32_le(*word);
+                            self.base.emit_u32_le(*word)?;
                             continue;
                         }
 
@@ -1235,7 +1270,7 @@ impl ElfWriter {
                             }
                         }
                     }
-                    self.base.emit_u32_le(*word);
+                    self.base.emit_u32_le(*word)?;
                 }
                 Ok(())
             }
@@ -1619,6 +1654,73 @@ impl ElfWriter {
 //   * A branch whose target is a LITERAL immediate is encoded on the spot, and
 //     *that* is where a bad offset can be silently mangled -- which is why the
 //     validation lives in `encoder/base.rs`, not in the relocation resolver.
+#[cfg(test)]
+mod nobits_laws_tests {
+    use super::super::parser::parse_asm;
+    use super::*;
+
+    fn assemble(asm: &str) -> Result<ElfWriter, String> {
+        let statements = parse_asm(asm)?;
+        let mut writer = ElfWriter::new();
+        writer.process_statements(&statements)?;
+        Ok(writer)
+    }
+
+    /// P1 bare-input + instruction-raise law — same creation law as
+    /// aarch64/GAS (sections start at sh_addralign 1, instructions raise
+    /// to the target alignment: `ElfWriterBase::new(RISCV_NOP, 2)` so an
+    /// instruction raises to 2; data-only input stays 1).
+    #[test]
+    fn gas247_bare_input_default_section_and_align_law() {
+        let w = assemble(".byte 1\n").unwrap();
+        assert_eq!(w.base.sections[".text"].data, vec![1]);
+        assert_eq!(w.base.sections[".text"].sh_addralign, 1);
+
+        let w = assemble(".zero 4\n").unwrap();
+        assert_eq!(w.base.sections[".text"].sh_addralign, 1);
+
+        let w = assemble(".p2align 4\n").unwrap();
+        assert_eq!(w.base.sections[".text"].sh_addralign, 16);
+
+        let w = assemble(".text\nnop\n").unwrap();
+        assert_eq!(w.base.sections[".text"].sh_addralign, 2);
+    }
+
+    /// Same GAS 2.47 NOBITS rows as the x86/arm suites — riscv shares
+    /// `ElfWriterBase`'s guards plus its own raw-value pre-truncation
+    /// checks in the Byte/Short arms (`.short 256` stores zeros yet is
+    /// still rejected).  No budget row: riscv charges through the exact
+    /// same `ElfWriterBase::charge_fill` the ARM budget tests exercise.
+    #[test]
+    fn gas247_nobits_store_and_position_laws() {
+        for (src, needle) in [
+            (".bss\n.byte 1\n", "non-zero value"),
+            (".bss\n.short 256\n", "non-zero value"),
+            (".bss\n.fill 4,1,7\n", "fill section"),
+            (".bss\n.fill 4,1,256\n", "fill section"),
+            (".bss\n.ascii \"ab\"\n", "non-empty string"),
+            (".bss\n.asciz \"a\"\n", "non-empty string"),
+        ] {
+            // `ElfWriter` is not `Debug`, so `unwrap_err` is unavailable; match.
+            let err = match assemble(src) {
+                Ok(_) => panic!("{src:?}: expected {needle:?} error"),
+                Err(e) => e,
+            };
+            assert!(
+                err.contains(needle),
+                "{src:?}: expected {needle:?} in error, got: {err}"
+            );
+        }
+        for ok in [
+            ".bss\n.byte 0\n.short 0\n.long 0\n.ascii \"\"\n.fill 4,1,0\n",
+            ".bss\n.org 8,0xff\n.zero 4\n.space 4,1\n.p2align 4,0xff\n.byte 0\n",
+            ".data\n.byte 1\n.short 256\n.fill 4,1,7\n",
+        ] {
+            assemble(ok).unwrap_or_else(|e| panic!("{ok:?} must assemble, got: {e}"));
+        }
+    }
+}
+
 #[cfg(test)]
 mod branch_range_tests {
     use super::super::parser::parse_asm;

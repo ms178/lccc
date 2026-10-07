@@ -73,8 +73,21 @@ pub enum AsmItem {
     Sleb128(Vec<DataValue>),
     /// Emit 64-bit values: `.quad val, ...` (can be symbol references)
     Quad(Vec<DataValue>),
-    /// Emit zero bytes: `.zero N`
-    Zero(u32),
+    /// `.fill repeat, size, value` with a NON-ZERO value, kept symbolic
+    /// until apply: the NOBITS raw-value law (GAS 2.47 rejects
+    /// `.fill 4,1,256` in `.bss` although the element truncates to
+    /// zeros) and the assembly-wide fill budget both need the live
+    /// section — a parse-time `Vec` can see neither.
+    Fill {
+        total: usize,
+        elem: usize,
+        value: u64,
+    },
+    /// Emit zero bytes: `.zero N`.  `usize`, not `u32`: the old `as u32`
+    /// cast silently truncated (`.zero 2^32` → 0 bytes) and turned
+    /// `.zero -1` into a request for 4 GiB-1; negative counts now parse
+    /// to 0 (GAS accepts `.zero -1` as a no-op).
+    Zero(usize),
     /// Deferred `.skip` with expression: evaluated after all labels are known.
     /// Used by kernel alternatives framework for label-arithmetic expressions
     /// like `.skip -(((6651f-6641f)-(662b-661b)) > 0) * ((6651f-6641f)-(662b-661b)), 0x90`.
@@ -400,6 +413,9 @@ fn expand_rept_blocks(lines: &[&str]) -> Result<Vec<String>, String> {
     let mut result = Vec::new();
     let mut i = 0;
     let mut irp_depth = 0; // Track .irp nesting to avoid consuming their .endr
+    // Repetition-only growth totals (see asm_preprocess::check_expansion_growth).
+    let mut grown_lines: u64 = 0;
+    let mut grown_bytes: u64 = 0;
     while i < lines.len() {
         let trimmed = strip_comment(lines[i]).trim().to_string();
         if let Some(count_str) = directive_arg(&trimmed, ".rept") {
@@ -409,9 +425,14 @@ fn expand_rept_blocks(lines: &[&str]) -> Result<Vec<String>, String> {
                 i += 1;
                 continue;
             }
+            // GAS casts the count to `size_t` (read.c `s_rept`): negative
+            // wraps and is then rejected by the budget below with GAS's
+            // wording (measured `.rept -1` -> "excessive count
+            // 18446744073709551615 for REPT - ignored"); `as usize` on the
+            // i64 expression performs the same wrap on this target.
             let count = parse_integer_expr(count_str)
                 .map_err(|e| format!(".rept: bad count '{}': {}", count_str, e))?
-                as usize;
+                as u64;
             let mut depth = 1;
             let mut body = Vec::new();
             i += 1;
@@ -431,7 +452,14 @@ fn expand_rept_blocks(lines: &[&str]) -> Result<Vec<String>, String> {
             if depth != 0 {
                 return Err(".rept without matching .endr".to_string());
             }
+            // Bound the raw block before recursing — same position in the
+            // flow as GAS's `do_repeat` check (pre-expansion, raw body).
+            asm_preprocess::check_rept_budget(count, &body)?;
             let expanded_body = expand_rept_blocks(&body)?;
+            let (add_lines, add_bytes) = asm_preprocess::expansion_size(&expanded_body);
+            grown_lines = grown_lines.saturating_add(count.saturating_mul(add_lines));
+            grown_bytes = grown_bytes.saturating_add(count.saturating_mul(add_bytes));
+            asm_preprocess::check_expansion_growth(".rept", grown_lines, grown_bytes)?;
             for _ in 0..count {
                 result.extend(expanded_body.iter().cloned());
             }
@@ -721,6 +749,17 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
             // pads with 0x2c).
             let mut fields = args.split(',');
             let align_field = fields.next().unwrap_or("").trim();
+            // Bare byte-form directives (`.balign` / `.align` with no operand)
+            // are accepted by GAS as align-1 no-ops.  `.p2align` with no
+            // operand still requires an expression (GAS: "expected
+            // expression"), so it keeps the parse error below.
+            if align_field.is_empty() && directive != ".p2align" {
+                return Ok(AsmItem::Align {
+                    align: 1,
+                    fill: None,
+                    max_skip: None,
+                });
+            }
             let align_val: i64 =
                 parse_integer_expr(align_field).map_err(|_| format!("bad alignment: {args}"))?;
             let align: u64 = if directive == ".p2align" {
@@ -773,9 +812,12 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
             }
             let max_skip = match skip_val {
                 None => None,
-                Some(s) if s < 0 => {
-                    return Err(format!("alignment max-skip must be non-negative: {args}"));
-                }
+                // GAS: a max-skip of 0 or negative means NO skip threshold —
+                // the full pad is always emitted (measured on binutils 2.47:
+                // `.p2align 4,,0` and `.p2align 16,,-1` both pad at @1).  The
+                // old `s < 0 → Err` rejected `,,-1` and `s == 0 → Some(0)`
+                // made the writer skip exactly where GAS pads.
+                Some(s) if s <= 0 => None,
                 Some(s) => Some(s as u64),
             };
             Ok(AsmItem::Align {
@@ -893,7 +935,11 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
             let (expr_str, fill) = split_skip_args(args);
             if let Ok(val) = parse_integer_expr(expr_str) {
                 if fill == 0 {
-                    Ok(AsmItem::Zero(val as u32))
+                    // GAS: a negative count emits nothing (`.zero -1`
+                    // accepted as a no-op); keep the full positive range
+                    // (usize, no 32-bit truncation) — the writer's
+                    // directive-fill cap rejects runaway materializations.
+                    Ok(AsmItem::Zero(if val <= 0 { 0 } else { val as usize }))
                 } else {
                     Ok(AsmItem::SkipExpr(expr_str.to_string(), fill))
                 }
@@ -909,11 +955,9 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
             let repeat_str = parts[0].trim();
             match parse_integer_expr(repeat_str) {
                 Ok(repeat) => {
-                    let repeat = repeat as u64;
-                    let size = if parts.len() > 1 {
+                    let size: i64 = if parts.len() > 1 {
                         parse_integer_expr(parts[1].trim())
                             .map_err(|_| format!("bad .fill size: {}", parts[1].trim()))?
-                            as u64
                     } else {
                         1
                     };
@@ -924,18 +968,42 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
                     } else {
                         0
                     };
-                    let total_bytes = repeat * size.min(8);
+                    // GAS (read.c): non-positive repeat/size emit nothing —
+                    // `.fill -1` is accepted as a no-op — and a wrapping
+                    // repeat*size also emits zero bytes.  The old code
+                    // cast-then-multiply: `.fill -1,1,0xff` overflowed to
+                    // 4 GiB-1 and looped until OOM.
+                    if repeat <= 0 || size <= 0 {
+                        return Ok(AsmItem::Zero(0));
+                    }
+                    let repeat = repeat as u64;
+                    let size = size as u64;
+                    // A wrapping repeat*size is GAS's "out of memory" case,
+                    // measured as emitting ZERO bytes (`.fill 2^62,4`):
+                    // checked arithmetic → 0, never a silent wrap.
+                    let Some(total_bytes) = repeat.checked_mul(size.min(8)) else {
+                        return Ok(AsmItem::Zero(0));
+                    };
+                    // The materialized Vec lives before the writer's fill
+                    // cap can intervene — refuse over-limit requests here
+                    // (GAS's own verdict for >256 MiB depends on free disk
+                    // and is not pinnable).
+                    if total_bytes > crate::backend::elf::MAX_DIRECTIVE_FILL as u64 {
+                        return Err(format!(
+                            ".fill: {total_bytes} bytes exceed the {}-byte directive limit",
+                            crate::backend::elf::MAX_DIRECTIVE_FILL
+                        ));
+                    }
+                    let total_bytes = total_bytes as usize;
                     if value == 0 {
-                        Ok(AsmItem::Zero(total_bytes as u32))
+                        Ok(AsmItem::Zero(total_bytes))
                     } else {
-                        let mut data = Vec::with_capacity(total_bytes as usize);
-                        let value_bytes = value.to_le_bytes();
-                        for _ in 0..repeat {
-                            for j in 0..size.min(8) as usize {
-                                data.push(value_bytes[j]);
-                            }
-                        }
-                        Ok(AsmItem::Ascii(data))
+                        // No parse-time Vec — see the `Fill` variant's doc.
+                        Ok(AsmItem::Fill {
+                            total: total_bytes,
+                            elem: size.min(8) as usize,
+                            value,
+                        })
                     }
                 }
                 Err(_) => {
@@ -3302,6 +3370,57 @@ struct GasMacro {
 static MACRO_INVOCATION_COUNTER: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// GAS 2.47's macro-nesting wall, re-measured on the pinned oracle: a
+/// 101-frame chain of distinct macros (`m0 -> m1 -> ... -> m100`)
+/// assembles, the 102nd frame fatals with `macros nested too deeply`,
+/// and direct/mutual recursion hits the same wall with the same
+/// message.  Without a frame counter of our own, a self-referential
+/// macro (`m` whose body invokes `m`) overflows the native stack and
+/// aborts — and a crash is never a verdict.
+const MAX_MACRO_FRAMES: u32 = 101;
+
+/// Deterministic expansion law threaded through
+/// `expand_gas_macros_with_state`.
+///
+/// * `depth` — live macro frames; `> `[`MAX_MACRO_FRAMES`]` fails with
+///   GAS's exact `macros nested too deeply` wording (measured above).
+/// * `grown_lines` / `grown_bytes` — everything `.irp`, `.irpc` and
+///   macro invocation materialize *before* any parse can run.  An
+///   `items x body` product is quadratic in a linear input, so the
+///   shared [`asm_preprocess::check_expansion_growth`] ceilings
+///   (4194304 lines / 256 MiB of line text, each line counted as
+///   `len + 1` exactly like [`asm_preprocess::expansion_size`]) are
+///   charged incrementally and checked *before* the next block is
+///   appended: the same deterministic-stand-in law as
+///   `MAX_DIRECTIVE_FILL`, whose GAS-side verdict degrades into
+///   machine memory state at these sizes (FOLLOWUP deviation
+///   register).  One budget spans the whole recursive expansion, so
+///   nested constructs can never reset the totals.
+struct ExpansionBudget {
+    grown_lines: u64,
+    grown_bytes: u64,
+    depth: u32,
+}
+
+impl ExpansionBudget {
+    fn new() -> Self {
+        Self {
+            grown_lines: 0,
+            grown_bytes: 0,
+            depth: 0,
+        }
+    }
+
+    /// Charge `lines` freshly materialized lines (with their text) and
+    /// fail closed the moment either ceiling is crossed.
+    fn charge(&mut self, lines: &[String], kind: &str) -> Result<(), String> {
+        let (l, b) = asm_preprocess::expansion_size(lines);
+        self.grown_lines = self.grown_lines.saturating_add(l);
+        self.grown_bytes = self.grown_bytes.saturating_add(b);
+        asm_preprocess::check_expansion_growth(kind, self.grown_lines, self.grown_bytes)
+    }
+}
+
 /// Expand GAS macro directives: .macro/.endm, .purgem, .irp/.endr, .ifc/.endif, .if/.endif, .set
 ///
 /// This runs as a text-level expansion pass before instruction parsing.
@@ -3310,7 +3429,13 @@ fn expand_gas_macros(lines: &[String]) -> Result<Vec<String>, String> {
     let mut macros = crate::common::fx_hash::FxHashMap::default();
     let mut symbols = crate::common::fx_hash::FxHashMap::default();
     let mut labels = crate::common::fx_hash::FxHashSet::default();
-    let expanded = expand_gas_macros_with_state(lines, &mut macros, &mut symbols, &mut labels)?;
+    let expanded = expand_gas_macros_with_state(
+        lines,
+        &mut macros,
+        &mut symbols,
+        &mut labels,
+        &mut ExpansionBudget::new(),
+    )?;
     Ok(substitute_register_aliases(expanded))
 }
 
@@ -3439,6 +3564,7 @@ fn expand_gas_macros_with_state(
     macros: &mut crate::common::fx_hash::FxHashMap<String, GasMacro>,
     symbols: &mut crate::common::fx_hash::FxHashMap<String, i64>,
     labels: &mut crate::common::fx_hash::FxHashSet<String>,
+    budget: &mut ExpansionBudget,
 ) -> Result<Vec<String>, String> {
     let mut result = Vec::new();
     let mut i = 0;
@@ -3616,16 +3742,23 @@ fn expand_gas_macros_with_state(
                 i += 1;
             }
             let mut all_expanded = Vec::new();
+            let mut block: Vec<String> = Vec::with_capacity(body.len());
             for ch in chars_str.chars() {
                 let item = ch.to_string();
                 for bline in &body {
                     let mut expanded =
                         asm_preprocess::replace_macro_param(bline, &format!("\\{}", var), &item);
                     expanded = expanded.replace("\\()", "");
-                    all_expanded.push(expanded);
+                    block.push(expanded);
                 }
+                // Charge every character-block as it is materialized: an
+                // `.irpc` amplifies `len(string) x body` from linear input,
+                // and the ceiling must fire before the next block allocates.
+                budget.charge(&block, ".irpc")?;
+                all_expanded.append(&mut block);
             }
-            let processed = expand_gas_macros_with_state(&all_expanded, macros, symbols, labels)?;
+            let processed =
+                expand_gas_macros_with_state(&all_expanded, macros, symbols, labels, budget)?;
             result.extend(processed);
             i += 1;
             continue;
@@ -3654,16 +3787,24 @@ fn expand_gas_macros_with_state(
             }
             // Expand: for each item, substitute \var with the item, then recursively process
             let mut all_expanded = Vec::new();
+            let mut block: Vec<String> = Vec::with_capacity(body.len());
             for item in &items {
                 for bline in &body {
                     let mut expanded =
                         asm_preprocess::replace_macro_param(bline, &format!("\\{}", var), item);
                     // Strip GAS macro argument delimiters: \() resolves to empty string
                     expanded = expanded.replace("\\()", "");
-                    all_expanded.push(expanded);
+                    block.push(expanded);
                 }
+                // Same incremental charge as `.irpc`: the `items x body`
+                // product is quadratic in a linear input, so the shared
+                // ceilings must be tested between blocks, not after the
+                // whole (potentially unbounded) materialization.
+                budget.charge(&block, ".irp")?;
+                all_expanded.append(&mut block);
             }
-            let processed = expand_gas_macros_with_state(&all_expanded, macros, symbols, labels)?;
+            let processed =
+                expand_gas_macros_with_state(&all_expanded, macros, symbols, labels, budget)?;
             result.extend(processed);
             i += 1;
             continue;
@@ -3689,7 +3830,8 @@ fn expand_gas_macros_with_state(
                     .find(|(bcond, _)| *bcond)
                     .map(|(_, blines)| blines)
                     .unwrap_or(&empty);
-                let expanded = expand_gas_macros_with_state(chosen_lines, macros, symbols, labels)?;
+                let expanded =
+                    expand_gas_macros_with_state(chosen_lines, macros, symbols, labels, budget)?;
                 result.extend(expanded);
                 i += 1;
                 continue;
@@ -3786,6 +3928,16 @@ fn expand_gas_macros_with_state(
         // directive word (the kernel defines macros around `type`) could
         // capture the directive line and rewrite it into garbage.
         if macros.contains_key(macro_name) && !macro_name.starts_with('.') {
+            // Frame entry: GAS 2.47 fatals the 102nd nested frame with
+            // `macros nested too deeply` (chain of 101 distinct macros
+            // assembles; direct and mutual recursion land on the same
+            // wall).  Checked before any body materialization, so a
+            // self-referential macro fails deterministically instead of
+            // overflowing the native stack.
+            budget.depth += 1;
+            if budget.depth > MAX_MACRO_FRAMES {
+                return Err("macros nested too deeply".to_string());
+            }
             let mac = macros[macro_name].clone();
             let args_str = if label_prefix_end > 0 {
                 // Emit every stacked label first, each on its own line
@@ -3845,9 +3997,19 @@ fn expand_gas_macros_with_state(
                 }
             }
             expanded_body = split_body;
+            // Charge the substituted body as materialized text (one
+            // invocation's contribution; nested constructs charge again
+            // through their own sites on the shared budget).
+            budget.charge(&expanded_body, ".macro")?;
             // Recursively expand the body (handles nested .irp, .set, .if, etc.)
-            expanded_body = expand_gas_macros_with_state(&expanded_body, macros, symbols, labels)?;
+            expanded_body =
+                expand_gas_macros_with_state(&expanded_body, macros, symbols, labels, budget)?;
             result.extend(expanded_body);
+            // The frame ends with its body: sibling statements after the
+            // `;` on the same line are NOT inside the invocation (a
+            // thousand sequential top-level calls must not accumulate
+            // depth — measured: GAS assembles any number of them).
+            budget.depth -= 1;
             // Emit remaining semicolon-separated parts as separate lines.
             //
             // They must be re-expanded, not pushed raw: a macro invocation can
@@ -3866,7 +4028,7 @@ fn expand_gas_macros_with_state(
                 .collect();
             if !rest_parts.is_empty() {
                 let expanded_rest =
-                    expand_gas_macros_with_state(&rest_parts, macros, symbols, labels)?;
+                    expand_gas_macros_with_state(&rest_parts, macros, symbols, labels, budget)?;
                 result.extend(expanded_rest);
             }
             i += 1;
@@ -4649,6 +4811,108 @@ fn collect_conditional_branches(
 mod tests {
     use super::*;
 
+    #[test]
+    fn gas247_rept_budget_law_x86() {
+        let ok = |src: &str| {
+            let lines: Vec<&str> = src.lines().collect();
+            expand_rept_blocks(&lines)
+        };
+        let out = ok(".rept 2\n.byte 0\n.endr").unwrap();
+        assert_eq!(out, vec![".byte 0".to_string(), ".byte 0".to_string()]);
+        assert!(ok(".rept 0\n.byte 0\n.endr").unwrap().is_empty());
+        // GAS size_t cast on a negative count, GAS wording (PR768 M2:
+        // this path used to wrap to u64::MAX and exhaust memory).
+        let err = ok(".rept -1\n.byte 0\n.endr").unwrap_err();
+        assert!(
+            err.contains("excessive count 18446744073709551615 for REPT - ignored"),
+            "got: {err}"
+        );
+        let err = ok(".rept 1099511627776\n.byte 0\n.endr").unwrap_err();
+        assert!(
+            err.contains("excessive count 1099511627776 for REPT - ignored"),
+            "got: {err}"
+        );
+        // Growth line ceiling fires for counts inside the GAS budget.
+        let err = ok(".rept 5000000\n.byte 0\n.endr").unwrap_err();
+        assert!(err.contains("line limit"), "got: {err}");
+    }
+
+    /// GAS 2.47's macro-nesting wall on the pinned oracle: a 101-frame
+    /// chain of distinct macros assembles, the 102nd frame fatals with
+    /// `macros nested too deeply`, and direct/mutual recursion land on
+    /// the same wall.  Every one of these used to die as a native stack
+    /// overflow (SIGABRT) — a crash is never a verdict.
+    #[test]
+    fn gas247_macro_nesting_wall_x86() {
+        let run = |src: &str| {
+            let lines: Vec<String> = src.lines().map(str::to_string).collect();
+            expand_gas_macros(&lines)
+        };
+        let err = run(".macro m\n m\n.endm\n m\n").unwrap_err();
+        assert!(err.contains("macros nested too deeply"), "got: {err}");
+        let err = run(".macro a\n b\n.endm\n.macro b\n a\n.endm\n a\n").unwrap_err();
+        assert!(err.contains("macros nested too deeply"), "got: {err}");
+        let chain = |n: usize| {
+            let mut s = String::from(".data\n");
+            for i in 0..n {
+                let nxt = if i + 1 < n {
+                    format!("m{}", i + 1)
+                } else {
+                    ".byte 7".into()
+                };
+                s.push_str(&format!(".macro m{i}\n{nxt}\n.endm\n"));
+            }
+            s.push_str("m0\n");
+            s
+        };
+        run(&chain(101)).expect("101 frames assemble on GAS 2.47");
+        let err = run(&chain(102)).unwrap_err();
+        assert!(err.contains("macros nested too deeply"), "got: {err}");
+        // Sequential top-level invocations release their frame: any
+        // number assembles (GAS parity; depth must not accumulate).
+        let mut seq = String::from(".macro n\n.byte 7\n.endm\n");
+        for _ in 0..500 {
+            seq.push_str("n\n");
+        }
+        run(&seq).expect("sequential invocations never nest");
+    }
+
+    /// `.irp`/`.irpc` amplify `items x body` out of a linear input, and
+    /// the x86 expander materialized every line before anything could
+    /// object — a 41 KiB input ran until the harness killed it.  The
+    /// shared expansion ceilings must fire (deterministic Err, same
+    /// stand-in law as MAX_DIRECTIVE_FILL) while ordinary expansions
+    /// stay byte-exact.
+    #[test]
+    fn gas247_irp_expansion_ceiling_x86() {
+        let run = |src: &str| {
+            let lines: Vec<String> = src.lines().map(str::to_string).collect();
+            expand_gas_macros(&lines)
+        };
+        // Small expansion: three items x one body line, exact output.
+        let out = run(".data\n.irp v,1,2,3\n.byte \\v\n.endr\n").unwrap();
+        assert_eq!(
+            out,
+            vec![
+                ".data".to_string(),
+                ".byte 1".to_string(),
+                ".byte 2".to_string(),
+                ".byte 3".to_string()
+            ]
+        );
+        // 11000 items x 400 body lines = 4.4M lines > 4194304: the
+        // charge fires between blocks, before the full product exists.
+        let mut big = String::from(".irp v,0");
+        big.push_str(",0".repeat(10999).as_str());
+        big.push('\n');
+        for _ in 0..400 {
+            big.push_str(".byte 0\n");
+        }
+        big.push_str(".endr\n");
+        let err = run(&big).unwrap_err();
+        assert!(err.contains("line limit"), "got: {err}");
+    }
+
     /// `sym@MOD+N` must keep the relocation modifier AND carry N as an
     /// addend.  Parsing it as a plain `symbol+offset` names the symbol
     /// `sym@MOD` and degrades the access to an absolute `R_X86_64_32S`
@@ -5287,6 +5551,109 @@ main:
         assert!(m.index.is_some(), "scale-4 index must survive");
         assert_eq!(m.scale, Some(4));
         assert!(m.base.is_some(), "base must survive");
+    }
+
+    /// GNU as 2.47 operand semantics for the alignment directives:
+    /// max-skip <= 0 means UNLIMITED (the full pad is emitted), bare
+    /// byte-form directives default to align 1, exponents clamp to 63,
+    /// and the fill is truncated to its low byte.
+    #[test]
+    fn gas247_align_operand_semantics() {
+        for (src, want) in [
+            (".p2align 4,,0", None),
+            (".p2align 4,,-1", None),
+            (".p2align 4,,5", Some(5u64)),
+            (".p2align 4", None),
+            (".p2align 4,,", None),
+        ] {
+            match parse_directive(src).unwrap_or_else(|e| panic!("{src}: {e}")) {
+                AsmItem::Align { max_skip, .. } => assert_eq!(
+                    max_skip, want,
+                    "{src}: max_skip must be {want:?} (GAS: <=0 is unlimited)"
+                ),
+                other => panic!("{src}: parsed as {other:?}"),
+            }
+        }
+        // Bare byte-form directives are align-1 no-ops (GAS-accepted).
+        for src in [".balign", ".align"] {
+            match parse_directive(src).unwrap_or_else(|e| panic!("{src}: {e}")) {
+                AsmItem::Align { align, .. } => assert_eq!(align, 1, "{src}"),
+                other => panic!("{src}: parsed as {other:?}"),
+            }
+        }
+        // Bare `.p2align` still requires its exponent expression.
+        assert!(
+            parse_directive(".p2align").is_err(),
+            "bare .p2align is a GAS error"
+        );
+        // Exponent clamp family reaches the writer as 1<<63.
+        for src in [".p2align 63", ".p2align 64", ".p2align -1"] {
+            match parse_directive(src).unwrap_or_else(|e| panic!("{src}: {e}")) {
+                AsmItem::Align { align, .. } => assert_eq!(align, 1u64 << 63, "{src}"),
+                other => panic!("{src}: parsed as {other:?}"),
+            }
+        }
+        // Fill truncation pin: -129 keeps only the low byte (0x7f).
+        match parse_directive(".p2align 4,-129").expect("fill parse") {
+            AsmItem::Align { fill, .. } => assert_eq!(fill, Some(0x7f)),
+            other => panic!("parsed as {other:?}"),
+        }
+        // Non-power-of-two byte counts are errors (GAS: "alignment not a power of 2").
+        assert!(parse_directive(".balign 3").is_err(), ".balign 3");
+        assert!(parse_directive(".balign -16").is_err(), ".balign -16");
+    }
+
+    /// `.zero` / `.fill` operand law: negatives emit nothing, the full
+    /// positive range survives (the old `as u32` truncated 2^32+4 to 4
+    /// bytes), overflowing repeat*size collapses to 0 bytes, and
+    /// over-limit requests are refused at parse time.
+    #[test]
+    fn gas247_zero_fill_operand_semantics() {
+        match parse_directive(".zero -1").expect(".zero -1 is a no-op") {
+            AsmItem::Zero(n) => assert_eq!(n, 0, ".zero -1 must emit nothing"),
+            other => panic!("parsed as {other:?}"),
+        }
+        match parse_directive(".zero 4294967300").expect(".zero 2^32+4") {
+            AsmItem::Zero(n) => assert_eq!(
+                n, 4294967300,
+                "the 32-bit truncation must be gone (old code produced 4)"
+            ),
+            other => panic!("parsed as {other:?}"),
+        }
+        for (src, want) in [
+            (".fill -1,1,5", 0usize),
+            (".fill 2,0,7", 0),
+            (".fill 1,9", 8),
+            (".fill 4611686018427387904,4", 0),
+        ] {
+            match parse_directive(src).unwrap_or_else(|e| panic!("{src}: {e}")) {
+                AsmItem::Zero(n) => assert_eq!(n, want, "{src}"),
+                other => panic!("{src}: parsed as {other:?}"),
+            }
+        }
+        assert!(
+            parse_directive(".fill 268435457,1,1").is_err(),
+            "256 MiB + 1 must be refused before the Vec is built"
+        );
+        // Out-of-i64-range literals take their two's-complement pattern
+        // (GAS 2.47: every count in 2^63..2^64-1 is negative -> zero bytes;
+        // 2^64 is an expression error).
+        match parse_directive(".fill 18446744073709551615,1,5") {
+            Ok(AsmItem::Zero(n)) => assert_eq!(n, 0, "u64max repeat is -1"),
+            other => panic!(".fill u64max: {other:?}"),
+        }
+        match parse_directive(".zero 18446744073709551615") {
+            Ok(AsmItem::Zero(n)) => assert_eq!(n, 0),
+            other => panic!(".zero u64max: {other:?}"),
+        }
+        match parse_directive(".zero 9223372036854775808") {
+            Ok(AsmItem::Zero(n)) => assert_eq!(n, 0),
+            other => panic!(".zero 2^63: {other:?}"),
+        }
+        // NOTE: `.fill` DEFERS an unvalued repeat to the writer (by design,
+        // for label-valued repeats), so the >u64::MAX rejection for
+        // `18446744073709551616` is asserted at assemble level in
+        // `gas247_fill_ceiling_refuses_before_alloc`.
     }
 }
 

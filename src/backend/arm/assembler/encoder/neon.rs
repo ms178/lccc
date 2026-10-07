@@ -134,9 +134,70 @@ pub(crate) fn encode_neon_three_diff(
     if operands.len() < 3 {
         return Err("NEON three-different requires 3 operands".to_string());
     }
-    let (rd, _arr_d) = get_neon_reg(operands, 0)?;
+    let (rd, arr_d) = get_neon_reg(operands, 0)?;
     let (rn, arr_n) = get_neon_reg(operands, 1)?;
-    let (rm, _arr_m) = get_neon_reg(operands, 2)?;
+    let (rm, arr_m) = get_neon_reg(operands, 2)?;
+
+    // Widening adds/subtracts (SADDW/SSUBW/UADDW/USUBW and their "2"
+    // variants) encode Q purely from the "2" suffix and take `size` from
+    // the *narrow* source Vm -- deriving them from the wide Vn (which
+    // names the doubled destination arrangement) swaps Q/size into the
+    // SADW2 encoding: e.g. `saddw v8.8h, v16.8h, v26.8b` must be
+    // 0x0e3a1208 (Q=0, size=00 from .8b), not 0x4e7a1208.  Opcodes 0b0001
+    // (ADDW) and 0b0011 (SUBW) are unique to the widening family; every
+    // long/accumulate opcode keeps the narrow arrangement in Vn.
+    let widening = opcode == 0b0001 || opcode == 0b0011;
+
+    if widening {
+        // GAS 2.47 law (all forms probed): the wide destination and Vn must
+        // spell the SAME arrangement (`saddw v0.4h, v1.8h, v2.8b` is
+        // rejected), Vm must be exactly one element-width narrower than the
+        // destination (`saddw v0.8h,v1.8h,v2.8b`, `saddw v0.4s,v1.4s,v2.4h`,
+        // `saddw v0.2d,v1.2d,v2.2s` are the base triples), and the "2"
+        // variants carry double the element count in Vm (base keeps it:
+        // `saddw2 v0.4s,v1.4s,v2.8h`, `saddw2 v0.2d,v1.2d,v2.4s`).
+        let shape = |arr: &str| -> Option<(u32, u32)> {
+            Some(match arr {
+                "8b" => (8, 1),
+                "16b" => (16, 1),
+                "4h" => (4, 2),
+                "8h" => (8, 2),
+                "2s" => (2, 4),
+                "4s" => (4, 4),
+                "1d" => (1, 8),
+                "2d" => (2, 8),
+                _ => return None,
+            })
+        };
+        let (count_d, elem_d) = shape(&arr_d)
+            .ok_or_else(|| format!("widening: bad destination arrangement `{arr_d}`"))?;
+        if arr_d != arr_n {
+            return Err(format!(
+                "widening: destination `.{arr_d}` and Vn `.{arr_n}` must be the \
+                 same arrangement"
+            ));
+        }
+        let (count_m, elem_m) = shape(&arr_m)
+            .ok_or_else(|| format!("widening: bad narrow source arrangement `{arr_m}`"))?;
+        if elem_d != elem_m * 2 {
+            return Err(format!(
+                "widening: destination `.{arr_d}` must be one element width \
+                 wider than Vm `.{arr_m}`"
+            ));
+        }
+        let count_ok = if is_high {
+            count_d * 2 == count_m
+        } else {
+            count_d == count_m
+        };
+        if !count_ok {
+            return Err(format!(
+                "widening: the \"2\" form needs Vm to carry twice the \
+                 destination element count (Vd `.{arr_d}` vs Vm `.{arr_m}`), \
+                 the base form the same count"
+            ));
+        }
+    }
 
     // Size is determined from the source (narrow) arrangement
     let (q, size) = match arr_n.as_str() {
@@ -146,6 +207,10 @@ pub(crate) fn encode_neon_three_diff(
         "8h" => (1, 0b01),
         "2s" => (0, 0b10),
         "4s" => (1, 0b10),
+        // Only reachable as the wide destination of a widening op, whose
+        // Q/size are overridden below; keeps long ops strict.
+        "1d" => (0, 0b11),
+        "2d" => (1, 0b11),
         _ => {
             return Err(format!(
                 "unsupported source arrangement for three-diff: {}",
@@ -156,6 +221,24 @@ pub(crate) fn encode_neon_three_diff(
 
     // For the "2" variant, override Q
     let q = if is_high { 1 } else { q };
+
+    // Widening ops: Q = is_high, size = size(Vm) (validate Vm here).
+    let (q, size) = if widening {
+        let size_m = match arr_m.as_str() {
+            "8b" | "16b" => 0b00u32,
+            "4h" | "8h" => 0b01,
+            "2s" | "4s" => 0b10,
+            _ => {
+                return Err(format!(
+                    "widening three-diff: unsupported narrow source arrangement: {}",
+                    arr_m
+                ));
+            }
+        };
+        (is_high as u32, size_m)
+    } else {
+        (q, size)
+    };
 
     // 0 Q U 01110 size 1 Rm opcode 00 Rn Rd
     let word = (q << 30)
@@ -1541,6 +1624,20 @@ pub(crate) fn encode_neon_ld1r(operands: &[Operand]) -> Result<EncodeResult, Str
     encode_neon_ldnr(operands, 1)
 }
 
+/// Validate a post-index register operand: architectural post-index Rm is
+/// X0-X30 only (GAS rejects `sp` and `xzr` in this position).
+pub(crate) fn post_index_xreg(name: &str, ctx: &str) -> Result<u32, String> {
+    let lower = name.to_lowercase();
+    let num = parse_reg_num(&lower)
+        .ok_or_else(|| format!("{ctx}: invalid post-index register `{name}`"))?;
+    if !lower.starts_with('x') || num > 30 {
+        return Err(format!(
+            "{ctx}: post-index register must be X0-X30, got `{name}`"
+        ));
+    }
+    Ok(num)
+}
+
 /// Encode NEON LD1 (vector load, multiple structures)
 /// Dispatch LD/ST1-4: choose between "multiple structures" and "single structure (element)" encoding.
 pub(crate) fn encode_neon_ld_st_dispatch(
@@ -1921,16 +2018,33 @@ pub(crate) fn encode_neon_pmull(
     if operands.len() < 3 {
         return Err("pmull requires 3 operands".to_string());
     }
-    let (rd, _) = get_neon_reg(operands, 0)?;
+    let (rd, arr_d) = get_neon_reg(operands, 0)?;
     let (rn, _) = get_neon_reg(operands, 1)?;
     let (rm, _) = get_neon_reg(operands, 2)?;
 
     let q = if is_pmull2 { 1u32 } else { 0 };
 
-    // PMULL  Vd.1q, Vn.1d, Vm.1d: 0 0 00 1110 11 1 Rm 11100 0 Rn Rd  (size=11)
-    // PMULL2 Vd.1q, Vn.2d, Vm.2d: 0 1 00 1110 11 1 Rm 11100 0 Rn Rd
+    // PMULL/PMULL2 select size from the *destination* arrangement: the
+    // polynomial multiply over 8-bit elements is size=00 (dest .8h/.16h),
+    // while the 64-bit polynomial variant (dest .1q/.2q, 1d/2d sources)
+    // is size=11.  Hardwiring size=11 made `pmull v16.8h, v17.8b, v18.8b`
+    // assemble as the reserved `pmull v16.1q` word (GAS: 0x0e2ae1f0, LCCC
+    // used 0x0eeae1f0).
+    let size: u32 = match arr_d.as_str() {
+        "8h" | "16h" => 0b00,
+        "1q" | "2q" => 0b11,
+        _ => {
+            return Err(format!(
+                "pmull: unsupported destination arrangement: {}",
+                arr_d
+            ));
+        }
+    };
+
+    // PMULL  Vd.8h,  Vn.8b,  Vm.8b : 0 Q 001110 size 1 Rm 11100 0 Rn Rd
+    // PMULL  Vd.1q, Vn.1d, Vm.1d  (size=11); PMULL2 mirrors with Q=1.
     let word =
-        ((q << 30) | (0b001110 << 24) | (0b11 << 22) | (1 << 21) | (rm << 16) | (0b11100 << 11))
+        ((q << 30) | (0b001110 << 24) | (size << 22) | (1 << 21) | (rm << 16) | (0b11100 << 11))
             | (rn << 5)
             | rd;
     Ok(EncodeResult::Word(word))
@@ -2257,10 +2371,17 @@ pub(crate) fn encode_neon_float_two_misc(
 ) -> Result<EncodeResult, String> {
     let (rd, arr_d) = get_neon_reg(operands, 0)?;
     let (rn, _) = get_neon_reg(operands, 1)?;
-    let (q, sz) = match arr_d.as_str() {
-        "2s" => (0u32, 0u32),
-        "4s" => (1, 0),
-        "2d" => (1, 1),
+    // GAS 2.47-measured law (every (op, arrangement) cell probed):
+    // size = (size_hi << 1) | sz with sz = 0 for s and 1 for d AND h;
+    // the 16-bit arrangements additionally set bits 20:18 to 0b110
+    // (s/d carry 000 there) -- that is what separates `fcvtms v0.8h`
+    // (size 01, x 110) from `fcvtms v0.2d` (size 01, x 000).
+    let (q, sz, x) = match arr_d.as_str() {
+        "2s" => (0u32, 0u32, 0u32),
+        "4s" => (1, 0, 0),
+        "2d" => (1, 1, 0),
+        "4h" => (0, 1, 0b110),
+        "8h" => (1, 1, 0b110),
         _ => {
             return Err(format!(
                 "float two-misc: unsupported arrangement: {}",
@@ -2273,7 +2394,8 @@ pub(crate) fn encode_neon_float_two_misc(
         | (u_bit << 29)
         | (0b01110 << 24)
         | (size << 22)
-        | (0b10000 << 17)
+        | (1 << 21)
+        | (x << 18)
         | (opcode << 12)
         | (0b10 << 10)
         | (rn << 5)
@@ -2889,18 +3011,43 @@ fn base_gp_reg(name: &str, mn: &str) -> Result<u32, String> {
 // ── NEON float compare-to-zero ───────────────────────────────────────────
 /// FCMEQ/FCMLE/FCMLT/FCMGE/FCMGT to zero
 /// Format: 0 Q U 01110 size 10000 opcode 10 Rn Rd (float, size = 0sz)
+/// `FCMEQ/FCMGE/FCMGT/FCMLE/FCMLT <Vd>.<T>, <Vn>.<T>, #0` -- the only
+/// immediate form these take (GAS rejects `#1`, `#-0`; `#0`, `#0.0`,
+/// `#0e0`, `#+0.0` all assemble to the +0 word, measured).  Arrangement
+/// and extra-bit law matches `encode_neon_float_two_misc`; the `raw`
+/// text carries the sign of integer spellings (`#-0` parses to the same
+/// i64 as `#0`).
 pub(crate) fn encode_neon_float_cmp_zero(
     operands: &[Operand],
+    raw_operands: &str,
     u_bit: u32,
     size_hi: u32,
     opcode: u32,
 ) -> Result<EncodeResult, String> {
+    if operands.len() != 3 {
+        return Err(format!(
+            "float cmp zero requires 3 operands (Vd, Vn, #0), got {}",
+            operands.len()
+        ));
+    }
+    if !super::fp_scalar::fcmp_is_positive_zero(
+        operands.get(2),
+        super::fp_scalar::fcmp_raw_operand(raw_operands, 2),
+    ) {
+        return Err(format!(
+            "float cmp zero: the only allowed immediate is +0.0, got {:?} \
+             (GAS rejects `#1`, `#-0`, `#-0.0`)",
+            operands.get(2)
+        ));
+    }
     let (rd, arr_d) = get_neon_reg(operands, 0)?;
     let (rn, _) = get_neon_reg(operands, 1)?;
-    let (q, sz) = match arr_d.as_str() {
-        "2s" => (0u32, 0u32),
-        "4s" => (1, 0),
-        "2d" => (1, 1),
+    let (q, sz, x) = match arr_d.as_str() {
+        "2s" => (0u32, 0u32, 0u32),
+        "4s" => (1, 0, 0),
+        "2d" => (1, 1, 0),
+        "4h" => (0, 1, 0b110),
+        "8h" => (1, 1, 0b110),
         _ => return Err(format!("float cmp zero: unsupported: {}", arr_d)),
     };
     let size = (size_hi << 1) | sz;
@@ -2908,7 +3055,8 @@ pub(crate) fn encode_neon_float_cmp_zero(
         | (u_bit << 29)
         | (0b01110 << 24)
         | (size << 22)
-        | (0b10000 << 17)
+        | (1 << 21)
+        | (x << 18)
         | (opcode << 12)
         | (0b10 << 10)
         | (rn << 5)
@@ -3516,10 +3664,14 @@ pub(crate) fn encode_neon_scalar_two_misc(
 }
 
 // ── NEON scalar SQSHRN: sqshrn Hd,Sn,#shift / sqshrn Sd,Dn,#shift ────────
+/// `opcode6` is the bits15:10 field of the scalar class: 0b100101 /
+/// 0b100111 for the SQSHRN/UQSHRN family and 0b100001 / 0b100011 for the
+/// SQSHRUN/SQRSHRUN family (GAS: `sqshrun b31,h23,#2` = 0x7f0e86ff,
+/// `sqrshrun h7,s3,#9` = 0x7f178c67 -- U=1 with the 100001/100011 ops).
 pub(crate) fn encode_neon_scalar_qshrn(
     operands: &[Operand],
     u_bit: u32,
-    is_rounding: bool,
+    opcode6: u32,
 ) -> Result<EncodeResult, String> {
     if operands.len() < 3 {
         return Err("scalar qshrn requires 3 operands".to_string());
@@ -3553,11 +3705,14 @@ pub(crate) fn encode_neon_scalar_qshrn(
         return Err(format!("scalar qshrn: shift {} out of range", shift));
     }
     let immhb = (element_bits * 2) - shift; // source element bits - shift
-    let opcode_bits: u32 = if is_rounding { 0b100111 } else { 0b100101 };
-    // 01 U 11110 immh:immb opcode 1 Rn Rd
-    let word = (0b01 << 30)
+    let opcode_bits: u32 = opcode6;
+    // 0101 1111 U immh:immb opcode Rn Rd.  Bit 24 must be 1 (class
+    // 0x5f....): the old `0b011110 << 23` cleared it, producing the
+    // 0x4f...... unallocated word for every scalar SQSHRN (GAS
+    // `sqshrn b31, h23, #2` = 0x5f0e96ff, LCCC was 0x4f0e96ff).
+    let word = (0b01u32 << 30)
         | (u_bit << 29)
-        | (0b011110 << 23)
+        | (0b11111 << 24)
         | ((immhb >> 3) << 19)
         | ((immhb & 7) << 16)
         | (opcode_bits << 10)

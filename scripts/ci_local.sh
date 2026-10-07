@@ -699,6 +699,15 @@ gate "asm-diff-oracle-gas-2.47" fast \
 gate "a64-gas-provision" fast \
     bash scripts/ensure_gas_247.sh aarch64-linux-gnu
 
+# The Arm A64 ISA XML package the documentation cross-check reads, same
+# provisioning law as the GAS pair above: pinned SHA-256 tarball, only the
+# 2026-09 member extracted, manifest re-checked after every install.  It is
+# load-bearing for the aarch64-arm-doccheck gate far below, which validates
+# every dispatcher golden against ARM DDI 0487 M.d's machine-readable
+# encodings — older packages are NAK'd by the checker itself.
+gate "arm-a64-xml-provision" fast \
+    bash scripts/ensure_arm_a64_xml.sh
+
 # The differential oracle's OWN contract suites, compiler-free exactly
 # like the gates above but anchored to the REAL pinned pair: asmdiff's
 # parser/oracle unit tests (the mocked failure modes — failed disassembler,
@@ -1196,6 +1205,18 @@ else
     SKIPPED=$((SKIPPED + 1))
 fi
 
+# Documentation cross-check against the Arm source of truth: every golden
+# row of tests/aarch64/dispatcher-goldens.tsv must satisfy the fixed-bit
+# constraints of the 2026-09 A64 ISA XML (ARM DDI 0487 M.d).  The gate
+# fails on a word that matches no encoding variant, on any release whose
+# build-manifest is not 2026-09 (stale extracts cannot bless old
+# encodings), and on an unparsable candidate file — the provision gate
+# above guarantees the extract exists, so this never silently skips.
+gate "aarch64-arm-doccheck" fast \
+    python3 scripts/aarch64_doccheck_2026_09.py \
+    --xml-dir "$HOME/.cache/arm-isa-a64-2026-09/ISA_A64_xml_A_profile-2026-09_md" \
+    --goldens tests/aarch64/dispatcher-goldens.tsv
+
 # The fourth aarch64 instrument, and the one that exists because the matrix is
 # a table a HUMAN curated: it pins one row per slot shape, so it can only catch
 # a defect in a spelling somebody thought of.  Every family whose rules are
@@ -1236,6 +1257,38 @@ if [ -n "$A64_AS" ] && [ -x target/fastbuild/lccc ]; then
 else
     echo "SKIP  aarch64-legality-probe (pinned aarch64 binutils or"
     echo "      target/fastbuild/lccc not available)"
+    SKIPPED=$((SKIPPED + 1))
+fi
+
+# Directive-legality matrix, both halves.  The operand matrix above pins
+# instruction-level verdicts; this one pins DIRECTIVE-level verdicts across
+# the axes the word oracle is structurally blind to: section kind
+# (.text/.data/custom-ax/custom-wa -- both targets), absurd align caps
+# (1/5/100 pad bytes at @1 -- GAS 2.47 accepts them everywhere), the fill
+# ceiling (2^62 x 4 accepted as size 0, x17 clamped, negative/zero size 0,
+# oversized elements), the REPT count law (GAS's exact `excessive count`
+# wording, the count==0 and negative-wrap corners, the 4 GiB boundary,
+# `1<<64` evaluating to zero), and the x86-only jump-range reject class.
+# `--check` re-derives every row from the pinned GNU as 2.47 pair (the
+# table cannot rot silently); `--check-lccc` asserts the same rows against
+# our own two front ends (a correct table cannot hide a wrong assembler).
+# The pins are spelled literally at the invocation, like every gate here.
+if [ -x "$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/as" ] && \
+   [ -x "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" ]; then
+    gate "directive-legality" fast \
+        python3 scripts/directive_legality_matrix.py --check \
+        --gas-a64 "$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/as" \
+        --gas-x64 "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"
+else
+    echo "SKIP  directive-legality (pinned gas-2.47 pair not available)"
+    SKIPPED=$((SKIPPED + 1))
+fi
+if [ -x target/fastbuild/lccc ]; then
+    gate "directive-legality-lccc" fast \
+        python3 scripts/directive_legality_matrix.py \
+        --check-lccc target/fastbuild/lccc
+else
+    echo "SKIP  directive-legality-lccc (target/fastbuild/lccc not available)"
     SKIPPED=$((SKIPPED + 1))
 fi
 

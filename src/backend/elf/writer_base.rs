@@ -17,6 +17,52 @@ use super::object_writer::{ElfConfig, ObjReloc, ObjSection};
 use super::symbol_table::{ObjSymbol, SymbolTableInput, build_elf_symbol_table};
 use crate::common::fx_hash::FxHashMap;
 
+/// Single-directive materialization ceiling (bytes) for generated fill:
+/// alignment padding, `.zero`, `.space`, `.fill`.
+///
+/// These directives amplify: a constant-length source line requests an
+/// arbitrary amount of output, so without a bound the assembler's memory
+/// (not its correctness) is the first thing an input can exhaust — a 2 GiB
+/// VM plus swap dies on `.p2align 32` long before any oracle opinion
+/// matters. GNU as materializes against the *filesystem* instead: measured
+/// on this box, `.p2align 30` dies on the 993 MiB tmpfs while the same
+/// directive succeeds on a 14 GiB runner disk — i.e. past this line the
+/// GAS verdict is free-disk state and no test row can pin it (the matrix
+/// never encodes such rows). Refusing deterministically is therefore the
+/// only *reproducible* verdict: every legitimate pad/fill — the largest
+/// alignments real objects use (huge pages, segment alignment) sit four
+/// orders of magnitude below this line — behaves identically to GAS on
+/// every machine, and pathological input gets a diagnostic instead of the
+/// OOM killer.
+///
+/// 256 MiB is chosen as the largest single allocation that cannot
+/// pressure-swap a 2 GiB host on its own while staying far above any real
+/// object's directive-driven fill.
+pub const MAX_DIRECTIVE_FILL: usize = 256 << 20;
+
+/// Assembly-wide budget for ALL directive-generated fill combined
+/// (alignment padding, `.zero`, `.space`, `.fill`, `.org`) — both the
+/// ARM/RISC-V [`ElfWriterBase`] and the x86 `ElfWriterCore` enforce it.
+///
+/// The per-directive ceiling bounds ONE request; without a running
+/// budget an input could still spell `N × 256 MiB` across N directives
+/// and grow the assembler's RSS until the OOM killer intervenes.  The
+/// budget converts that unbounded sum into a deterministic diagnostic.
+///
+/// 512 MiB (= two maximum single directives) is deliberate: it is
+/// comfortably above any legitimate object's directive-driven fill —
+/// real padding totals are measured in bytes to low kilobytes across
+/// whole kernel-style translation units — while keeping the worst-case
+/// assembler RSS at roughly "budget + parsed source" on a 2 GiB/4 GiB
+/// (RAM/swap) host, which is the environment the gates run in.  Past
+/// this line GAS's own verdict for PROGBITS content is free-disk state
+/// anyway (see [`MAX_DIRECTIVE_FILL`]); for NOBITS content GAS would
+/// accept anything (no bytes are ever written), but unbounded
+/// acceptance here is exactly the memory-amplification hole this
+/// budget closes — see the length-only follow-up in
+/// `docs/FOLLOWUP-2026-10-05-pr762-fail-closed.md`.
+pub const MAX_TOTAL_DIRECTIVE_FILL: usize = 512 << 20;
+
 /// Shared ELF writer state used by both ARM and RISC-V assembler backends.
 ///
 /// This struct manages sections, symbols, labels, and relocations using the
@@ -58,6 +104,9 @@ pub struct ElfWriterBase {
     nop_bytes: [u8; 4],
     /// Default text section alignment (4 for ARM, 2 for RISC-V with compressed instructions)
     text_align: u64,
+    /// Bytes of directive-generated fill materialized so far by this
+    /// writer — bounded by [`MAX_TOTAL_DIRECTIVE_FILL`] (see there).
+    fill_budget_used: usize,
 }
 
 impl ElfWriterBase {
@@ -78,6 +127,7 @@ impl ElfWriterBase {
             previous_section: String::new(),
             nop_bytes,
             text_align,
+            fill_budget_used: 0,
         }
     }
 
@@ -108,21 +158,175 @@ impl ElfWriterBase {
             .unwrap_or(0)
     }
 
-    /// Append raw bytes to the current section.
-    pub fn emit_bytes(&mut self, bytes: &[u8]) {
-        if let Some(section) = self.sections.get_mut(&self.current_section) {
-            section.data.extend_from_slice(bytes);
+    /// GAS: content emitted before any section directive lands in `.text`
+    /// (measured: a leading `.zero 4` assembles into a 5-byte `.text`).
+    /// Every emitting entry point funnels through this so a missing
+    /// section silently drops bytes exactly once, here, into `.text`.
+    pub fn ensure_default_section(&mut self) {
+        if self.current_section.is_empty() {
+            self.ensure_text_section();
         }
     }
 
+    /// GAS 2.47 fail-closed rule for `SHT_NOBITS` sections (measured):
+    /// a *store* of a non-zero value — `.byte 1`, `.short 256`,
+    /// `.long 1<<32` (checked as the RAW value, before truncation), a
+    /// relocation placeholder, a non-zero encoded LEB — is rejected with
+    /// "attempt to store non-zero value in section `X'", because the
+    /// content would silently vanish from the NOBITS output.  Position
+    /// directives (`.zero`, `.space`, `.org`, `.p2align` — even with a
+    /// non-zero pad byte) and all-zero stores are legal and never reach
+    /// this guard.
+    pub fn nobits_guard(&self, raw_nonzero: bool) -> Result<(), String> {
+        if raw_nonzero {
+            if let Some(section) = self.sections.get(&self.current_section)
+                && section.sh_type == SHT_NOBITS
+            {
+                return Err(format!(
+                    "attempt to store non-zero value in section `{}`",
+                    section.name
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// GAS 2.47 string law inside NOBITS (measured): `.ascii "ab"` is
+    /// "attempt to store non-empty string in section `X'", while the
+    /// empty string and an all-zero byte string are legal (they change
+    /// nothing a NOBITS section will ever carry).
+    pub fn nobits_string_guard(&self, bytes: &[u8]) -> Result<(), String> {
+        // GAS gives string stores their own wording (measured on both
+        // targets): "attempt to store non-empty string in section `X'" —
+        // empty and all-zero strings remain legal.
+        if bytes.iter().any(|&b| b != 0)
+            && let Some(section) = self.sections.get(&self.current_section)
+            && section.sh_type == SHT_NOBITS
+        {
+            return Err(format!(
+                "attempt to store non-empty string in section `{}`",
+                section.name
+            ));
+        }
+        Ok(())
+    }
+
+    /// Charge `n` bytes of directive-generated fill against the
+    /// assembly-wide [`MAX_TOTAL_DIRECTIVE_FILL`] budget.  Every
+    /// materializing path (fill, alignment padding, `.org`) calls this
+    /// BEFORE touching memory, so the running sum — not just each
+    /// single directive — is bounded.
+    pub fn charge_fill(&mut self, n: usize) -> Result<(), String> {
+        let Some(total) = self.fill_budget_used.checked_add(n) else {
+            return Err(format!(
+                "directive fill budget of {MAX_TOTAL_DIRECTIVE_FILL} bytes exceeded ({n} more requested)"
+            ));
+        };
+        if total > MAX_TOTAL_DIRECTIVE_FILL {
+            return Err(format!(
+                "directive fill budget of {MAX_TOTAL_DIRECTIVE_FILL} bytes exceeded ({total} total, {n} more requested)"
+            ));
+        }
+        self.fill_budget_used = total;
+        Ok(())
+    }
+
+    /// Append raw bytes to the current section.
+    ///
+    /// Returns `Err` when the content stores non-zero bytes into a
+    /// `SHT_NOBITS` section (GAS 2.47 rejects that — see
+    /// [`Self::nobits_guard`]); every caller must propagate, which is
+    /// what makes the NOBITS rule impossible to bypass by accident.
+    pub fn emit_bytes(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.ensure_default_section();
+        self.nobits_guard(bytes.iter().any(|&b| b != 0))?;
+        if let Some(section) = self.sections.get_mut(&self.current_section) {
+            section.data.extend_from_slice(bytes);
+        }
+        Ok(())
+    }
+
+    /// Append `size` copies of `fill`, bounded by [`MAX_DIRECTIVE_FILL`].
+    ///
+    /// This is the `.zero` / `.space` / `.fill` choke point. The previous
+    /// path built an intermediate `Vec` and copied it into the section —
+    /// two allocations and two full touches per directive — and had no
+    /// ceiling at all: a six-byte source line could ask for 2^63 bytes
+    /// and take the assembler down with the OOM killer. One `resize`
+    /// writes once, and the ceiling turns the unbounded request into a
+    /// deterministic diagnostic.
+    pub fn emit_fill(&mut self, size: usize, fill: u8) -> Result<(), String> {
+        if size > MAX_DIRECTIVE_FILL {
+            return Err(format!(
+                "fill directive of {size} bytes exceeds the {MAX_DIRECTIVE_FILL}-byte limit"
+            ));
+        }
+        self.ensure_default_section();
+        // Budget first: an over-budget request dies BEFORE the resize.
+        self.charge_fill(size)?;
+        if let Some(section) = self.sections.get_mut(&self.current_section) {
+            let start = section.data.len();
+            section.data.resize(start + size, fill);
+        }
+        Ok(())
+    }
+
+    /// Materialize a `.fill` pattern with a NON-ZERO value — the single
+    /// choke point for the arm/riscv `.fill` non-zero branches.
+    ///
+    /// Enforces, in GAS 2.47 order:
+    /// 1. the per-directive ceiling (before any allocation),
+    /// 2. the NOBITS *raw-value* law (`.fill 4,1,256` in `.bss` is an
+    ///    error even though the truncated element stores zeros — the
+    ///    check sees `value`, not the encoded bytes),
+    /// 3. the assembly-wide fill budget,
+    /// 4. one allocation + a tight slice-copy loop.
+    pub fn emit_fill_pattern(
+        &mut self,
+        total: usize,
+        elem: usize,
+        value: u64,
+    ) -> Result<(), String> {
+        debug_assert!((1..=8).contains(&elem), "parser clamps elem to 1..=8");
+        if total > MAX_DIRECTIVE_FILL {
+            return Err(format!(
+                "fill directive of {total} bytes exceeds the {MAX_DIRECTIVE_FILL}-byte limit"
+            ));
+        }
+        self.ensure_default_section();
+        if value != 0 {
+            if let Some(section) = self.sections.get(&self.current_section)
+                && section.sh_type == SHT_NOBITS
+            {
+                return Err(format!(
+                    "attempt to fill section `{}` with non-zero value",
+                    section.name
+                ));
+            }
+        }
+        self.charge_fill(total)?;
+        if total == 0 {
+            return Ok(());
+        }
+        let pattern = value.to_le_bytes();
+        if let Some(section) = self.sections.get_mut(&self.current_section) {
+            let start = section.data.len();
+            section.data.resize(start + total, 0);
+            for off in (0..total).step_by(elem) {
+                section.data[start + off..start + off + elem].copy_from_slice(&pattern[..elem]);
+            }
+        }
+        Ok(())
+    }
+
     /// Append a 16-bit little-endian value to the current section.
-    pub fn emit_u16_le(&mut self, val: u16) {
-        self.emit_bytes(&val.to_le_bytes());
+    pub fn emit_u16_le(&mut self, val: u16) -> Result<(), String> {
+        self.emit_bytes(&val.to_le_bytes())
     }
 
     /// Append a 32-bit little-endian value to the current section.
-    pub fn emit_u32_le(&mut self, val: u32) {
-        self.emit_bytes(&val.to_le_bytes());
+    pub fn emit_u32_le(&mut self, val: u32) -> Result<(), String> {
+        self.emit_bytes(&val.to_le_bytes())
     }
 
     /// Record a relocation at the current offset in the current section.
@@ -143,8 +347,8 @@ impl ElfWriterBase {
     ///
     /// Code sections are NOP-padded using the architecture's NOP instruction;
     /// data sections are zero-padded.
-    pub fn align_to(&mut self, align: u64) {
-        self.align_to_capped(align, None);
+    pub fn align_to(&mut self, align: u64) -> Result<(), String> {
+        self.align_to_capped(align, None)
     }
 
     /// Align, but skip the padding entirely when it would exceed `max_pad`.
@@ -153,8 +357,8 @@ impl ElfWriterBase {
     /// more than M bytes, the location counter is left unchanged. The section
     /// `sh_addralign` is still raised so the ELF header reflects the
     /// programmer's requested alignment even when a particular site skipped.
-    pub fn align_to_capped(&mut self, align: u64, max_pad: Option<u64>) {
-        self.align_to_capped_ex(align, max_pad, None);
+    pub fn align_to_capped(&mut self, align: u64, max_pad: Option<u64>) -> Result<(), String> {
+        self.align_to_capped_ex(align, max_pad, None)
     }
 
     /// GAS `.p2align N[, fill[, max]]`.
@@ -164,17 +368,76 @@ impl ElfWriterBase {
     /// is `None`, executable sections emit the architecture NOP at NOP-sized
     /// boundaries and zeros in the unaligned prefix; other sections zero-fill.
     /// That is the GNU as 2.44/2.47 pattern for `.byte 1; .p2align 3`.
-    pub fn align_to_capped_ex(&mut self, align: u64, max_pad: Option<u64>, fill: Option<u8>) {
+    ///
+    /// Two refusal rules keep this function fail-closed without ever
+    /// touching an unbounded allocation (all verdicts measured on GNU as
+    /// 2.47.20260726):
+    ///
+    /// * The *signed-shift bucket* (`align >= 1<<63`, what `.p2align 63`,
+    ///   `.p2align 64`, `.p2align -1` and clamped forms all reach): GAS
+    ///   never pads from it and never records the alignment. A positive
+    ///   max-pad skips (the would-be padding is "infinite" and therefore
+    ///   exceeds any cap), a zero location counter is a no-op, and a
+    ///   nonzero location counter without a cap is an error — measured
+    ///   `p2align 63 @0` -> addralign 1, `byte 1; p2align 63` -> error,
+    ///   `byte 1; p2align 63,,5` -> skip, addralign 1.  Remeasured on
+    ///   GAS 2.47 across `.text`, `.data` and custom `ax`/`w` sections
+    ///   (both pinned targets): the verdict never depends on section
+    ///   kind — a positive-cap skip assembles everywhere, an uncapped
+    ///   pad at a nonzero offset errors everywhere (free-state on
+    ///   aarch64, semantic on x86-64 exec sections).
+    /// * Materialized padding beyond [`MAX_DIRECTIVE_FILL`] is refused
+    ///   before a single byte is touched (see the constant for why the
+    ///   verdict beyond that point is not pinnable anyway).
+    pub fn align_to_capped_ex(
+        &mut self,
+        align: u64,
+        max_pad: Option<u64>,
+        fill: Option<u8>,
+    ) -> Result<(), String> {
         if align <= 1 {
-            return;
+            return Ok(());
         }
+        self.ensure_default_section();
         let nop = self.nop_bytes.clone();
-        if let Some(section) = self.sections.get_mut(&self.current_section) {
+        // Phase 1 — decide under a single shared borrow (no allocation).
+        let decided = {
+            let Some(section) = self.sections.get(&self.current_section) else {
+                return Ok(());
+            };
             let current = section.data.len() as u64;
+            if align >= 1u64 << 63 {
+                let cap_positive = max_pad.is_some_and(|m| m > 0);
+                if cap_positive || current == 0 {
+                    // Skip / no-op: GAS records neither padding nor an
+                    // alignment for this bucket (addralign stays 1).
+                    return Ok(());
+                }
+                return Err(format!(
+                    "alignment {align} would require padding at nonzero offset"
+                ));
+            }
             let aligned = (current + align - 1) & !(align - 1);
             let padding = (aligned - current) as usize;
-            let skip = max_pad.is_some_and(|m| (padding as u64) > m);
-            if !skip {
+            // GAS (2.47, measured): skip iff the cap is *positive* and
+            // padding would exceed it. `,,0` and a negative cap mean
+            // unlimited — `.p2align 4,,0` at offset 1 pads 15 bytes.
+            let skip = max_pad.is_some_and(|m| m > 0 && (padding as u64) > m);
+            let padding = if skip { 0 } else { padding };
+            if padding > MAX_DIRECTIVE_FILL {
+                return Err(format!(
+                    "alignment padding of {padding} bytes exceeds the {MAX_DIRECTIVE_FILL}-byte limit"
+                ));
+            }
+            padding
+        };
+        // Phase 2 — budget BEFORE materialization (and before the
+        // sh_addralign raise, so an over-budget pad leaves no trace).
+        self.charge_fill(decided)?;
+        // Phase 3 — materialize + raise under an exclusive borrow.
+        if let Some(section) = self.sections.get_mut(&self.current_section) {
+            let padding = decided;
+            if padding > 0 {
                 if let Some(b) = fill {
                     section.data.extend(std::iter::repeat_n(b, padding));
                 } else if section.sh_flags & SHF_EXECINSTR != 0 && align >= 4 {
@@ -188,22 +451,39 @@ impl ElfWriterBase {
                     section.data.extend(std::iter::repeat_n(0u8, padding));
                 }
             }
+            // GAS records the alignment even when the pad was skipped.
             if align > section.sh_addralign {
                 section.sh_addralign = align;
             }
         }
+        Ok(())
     }
 
     /// Ensure we're in a text section, creating one if needed.
     pub fn ensure_text_section(&mut self) {
         if self.current_section.is_empty() {
-            self.ensure_section(
-                ".text",
-                SHT_PROGBITS,
-                SHF_ALLOC | SHF_EXECINSTR,
-                self.text_align,
-            );
+            // Created at alignment 1 (GAS 2.47 measured): `.text;.byte 1`
+            // has sh_addralign 1; the FIRST instruction raises it to the
+            // instruction alignment via [`Self::note_instruction`] —
+            // `.text;nop` has sh_addralign 4 on aarch64.
+            self.ensure_section(".text", SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR, 1);
             self.current_section = ".text".to_string();
+        }
+    }
+
+    /// GAS 2.47: an instruction raises the containing section's
+    /// `sh_addralign` to the target's instruction alignment (aarch64
+    /// `.text;nop` -> 4, `.byte 1;nop` -> 4, `.p2align 4;nop` -> 16;
+    /// data-only sections stay 1 — see the creation sites).  x86 does
+    /// not call this: GNU as keeps x86 `.text` at 1 for bare `nop`
+    /// (markers are the only source of x86 sh_addralign), which the x86
+    /// core enforces in `reconcile_section_alignments`.
+    pub fn note_instruction(&mut self) {
+        if self.current_section.is_empty() {
+            self.ensure_text_section();
+        }
+        if let Some(section) = self.sections.get_mut(&self.current_section) {
+            section.sh_addralign = section.sh_addralign.max(self.text_align);
         }
     }
 
@@ -261,23 +541,16 @@ impl ElfWriterBase {
             sh_flags = default_section_flags(sec_name);
         }
 
-        let align = if sh_flags & SHF_EXECINSTR != 0 {
-            self.text_align
-        } else {
-            1
-        };
-        self.ensure_section(sec_name, sh_type, sh_flags, align);
+        // Always created at 1: GAS raises AX sections only when an
+        // instruction actually lands in them (see `note_instruction`).
+        self.ensure_section(sec_name, sh_type, sh_flags, 1);
         self.previous_section = std::mem::replace(&mut self.current_section, sec_name.to_string());
     }
 
     /// Switch to a named standard section (.text, .data, .bss, .rodata).
     pub fn switch_to_standard_section(&mut self, name: &str, sh_type: u32, sh_flags: u64) {
-        let align = if sh_flags & SHF_EXECINSTR != 0 {
-            self.text_align
-        } else {
-            1
-        };
-        self.ensure_section(name, sh_type, sh_flags, align);
+        // Always created at 1 — instructions raise later (`note_instruction`).
+        self.ensure_section(name, sh_type, sh_flags, 1);
         self.previous_section = std::mem::replace(&mut self.current_section, name.to_string());
     }
 
@@ -339,8 +612,9 @@ impl ElfWriterBase {
                     let align = parent_sec.sh_addralign;
                     self.ensure_section(&sub_name, sh_type, sh_flags, align);
                 } else {
-                    // Parent doesn't exist yet; create subsection with code defaults
-                    self.ensure_section(&sub_name, 1, 0x6, self.text_align); // SHT_PROGBITS, AX
+                    // Parent doesn't exist yet; create subsection as AX at
+                    // alignment 1 (GAS — instructions raise it later).
+                    self.ensure_section(&sub_name, 1, 0x6, 1); // SHT_PROGBITS, AX
                 }
             }
             self.previous_section = std::mem::replace(&mut self.current_section, sub_name);
@@ -661,34 +935,55 @@ impl ElfWriterBase {
     }
 
     /// Emit a plain integer value for .byte (size=1), .short (size=2), .long (size=4) or .quad (size=8).
-    pub fn emit_data_integer(&mut self, val: i64, size: usize) {
+    pub fn emit_data_integer(&mut self, val: i64, size: usize) -> Result<(), String> {
+        // RAW-value check (GAS rejects `.long 1<<32` in .bss although the
+        // truncated store would be all zeros) — must run before encoding.
+        self.nobits_guard(val != 0)?;
         match size {
-            1 => self.emit_bytes(&[val as u8]),
-            2 => self.emit_bytes(&(val as u16).to_le_bytes()),
-            4 => self.emit_bytes(&(val as u32).to_le_bytes()),
-            _ => self.emit_bytes(&(val as u64).to_le_bytes()),
+            1 => self.emit_bytes(&[val as u8])?,
+            2 => self.emit_bytes(&(val as u16).to_le_bytes())?,
+            4 => self.emit_bytes(&(val as u32).to_le_bytes())?,
+            _ => self.emit_bytes(&(val as u64).to_le_bytes())?,
         }
+        Ok(())
     }
 
     /// Emit a symbol reference with a relocation.
-    pub fn emit_data_symbol_ref(&mut self, sym: &str, addend: i64, size: usize, reloc_type: u32) {
+    pub fn emit_data_symbol_ref(
+        &mut self,
+        sym: &str,
+        addend: i64,
+        size: usize,
+        reloc_type: u32,
+    ) -> Result<(), String> {
+        // A relocation is content: NOBITS sections cannot carry one
+        // (GAS: "attempt to store non-zero value").
+        self.nobits_guard(true)?;
         self.add_reloc(reloc_type, sym.to_string(), addend);
         match size {
-            1 => self.emit_bytes(&[0u8]),
-            2 => self.emit_bytes(&0u16.to_le_bytes()),
-            4 => self.emit_bytes(&0u32.to_le_bytes()),
-            _ => self.emit_bytes(&0u64.to_le_bytes()),
+            1 => self.emit_bytes(&[0u8])?,
+            2 => self.emit_bytes(&0u16.to_le_bytes())?,
+            4 => self.emit_bytes(&0u32.to_le_bytes())?,
+            _ => self.emit_bytes(&0u64.to_le_bytes())?,
         }
+        Ok(())
     }
 
     /// Emit placeholder bytes for a deferred value (symbol diff, etc.).
-    pub fn emit_placeholder(&mut self, size: usize) {
+    pub fn emit_placeholder(&mut self, size: usize) -> Result<(), String> {
+        // The deferred value is unknown here; treat it as non-zero until
+        // proven otherwise — a NOBITS section must not receive content
+        // whose value the guard cannot verify (conservative, fail-closed;
+        // a zero-valued symbol DIFF in .bss is rejected where GAS might
+        // accept it, which is the safe direction for this rule).
+        self.nobits_guard(true)?;
         match size {
-            1 => self.emit_bytes(&[0u8]),
-            2 => self.emit_bytes(&0u16.to_le_bytes()),
-            4 => self.emit_bytes(&0u32.to_le_bytes()),
-            _ => self.emit_bytes(&0u64.to_le_bytes()),
+            1 => self.emit_bytes(&[0u8])?,
+            2 => self.emit_bytes(&0u16.to_le_bytes())?,
+            4 => self.emit_bytes(&0u32.to_le_bytes())?,
+            _ => self.emit_bytes(&0u64.to_le_bytes())?,
         }
+        Ok(())
     }
 
     /// Resolve local label references in data relocations.

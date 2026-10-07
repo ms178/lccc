@@ -277,15 +277,39 @@ pub fn write_relocatable_object(
     }
 
     // Content section offsets
+    //
+    // GNU as 2.47 (measured, nine probes): `sh_offset` is the running
+    // file cursor aligned up to `min(sh_addralign, 8)` (4 on ELF32) --
+    // and that cap is the whole law in one number:
+    //   * full-alignment padding is what a `.p2align 62,,5` raise would
+    //     try to materialize (cursor 0x40 + align 2^62 stays 0x40 in a
+    //     552-byte object; padding to 2^62 died in `Vec::with_capacity`,
+    //     SIGABRT with no diagnostic, the first time it reached us);
+    //   * raw cursor is what the cap-less reading says, and it is wrong
+    //     too: PROGBITS `.foo` (align 16) after 3 dirty `.data` bytes
+    //     lands at 0x48, not 0x43; NOBITS stamps the same capped cursor
+    //     (align 16 -> 0x48, align 1 -> exact 0x43) while consuming no
+    //     bytes, so the next PROGBITS writer shares it.
+    // Misaligned-cursor probes: ELF64 cursor 0x41/0x43 + align 8/16/32
+    // -> 0x48; ELF32 cursor 0x39 + align 16 -> 0x3C (4-cap).
+    let cap = alignment_mask + 1; // 8 on ELF64, 4 on ELF32
     let mut section_offsets: Vec<usize> = Vec::new();
     for sec_name in content_sections {
         let section = sections.get(sec_name).unwrap();
-        let align = section.sh_addralign.max(1) as usize;
-        offset = (offset + align - 1) & !(align - 1);
-        section_offsets.push(offset);
+        let align = section.sh_addralign.max(1).min(cap as u64) as usize;
+        let stamp = (offset + align - 1) & !(align - 1);
+        section_offsets.push(stamp);
         if section.sh_type != SHT_NOBITS {
-            offset += section.data.len();
+            // The cursor must land AT the stamp before counting content,
+            // or the padding gap between stamp and raw cursor is never
+            // accounted and every later offset (relocs, symtab, shstrtab)
+            // rewinds into it -- a byte-shifted, unreadable object.
+            offset = stamp + section.data.len();
         }
+        // NOBITS stamps the (capped) cursor but consumes no bytes, so
+        // the next writer starts from the same place, exactly like GAS
+        // (align-16 .bss after cursor 0x43 and the following align-8
+        // NOTE both land on 0x48).
     }
 
     // Reloc section offsets
@@ -382,12 +406,22 @@ pub fn write_relocatable_object(
     // ── Write content section data ──
     for (i, sec_name) in content_sections.iter().enumerate() {
         let section = sections.get(sec_name).unwrap();
+        // NOBITS sections pad NOTHING in the file: the layout loop above
+        // stamps their `sh_offset` at the capped cursor but deliberately
+        // leaves the running cursor untouched (GAS consumes no bytes for
+        // .bss), so the next PROGBITS stamps from the raw cursor too.
+        // Padding to a NOBITS stamp here would inject orphan NULs, shift
+        // every later section +N in the file while the section headers
+        // keep the layout numbers, and make the shstrtab unresolvable
+        // (names read back as a previous section's tail — caught by the
+        // integrated linker's parser as `section '' data out of bounds`).
+        if section.sh_type == SHT_NOBITS {
+            continue;
+        }
         while elf.len() < section_offsets[i] {
             elf.push(0);
         }
-        if section.sh_type != SHT_NOBITS {
-            elf.extend_from_slice(&section.data);
-        }
+        elf.extend_from_slice(&section.data);
     }
 
     // ── Write relocation section data ──
@@ -511,11 +545,11 @@ pub fn write_relocatable_object(
         for (i, sec_name) in content_sections.iter().enumerate() {
             let section = sections.get(sec_name).unwrap();
             let sh_name = shstrtab.offset_of(sec_name);
-            let sh_offset = if section.sh_type == SHT_NOBITS {
-                0
-            } else {
-                section_offsets[i] as u32
-            };
+            // Both PROGBITS and NOBITS take the stamped cursor (the
+            // layout loop above already applies the measured min(align,
+            // 8/4) cap); NOBITS used to force 0 here, which no
+            // toolchain emits (GNU as stamps the capped cursor).
+            let sh_offset = section_offsets[i] as u32;
             write_shdr32(
                 &mut elf,
                 sh_name,
@@ -624,11 +658,7 @@ pub fn write_relocatable_object(
         for (i, sec_name) in content_sections.iter().enumerate() {
             let section = sections.get(sec_name).unwrap();
             let sh_name = shstrtab.offset_of(sec_name);
-            let sh_offset = if section.sh_type == SHT_NOBITS {
-                0
-            } else {
-                section_offsets[i] as u64
-            };
+            let sh_offset = section_offsets[i] as u64;
             write_shdr64(
                 &mut elf,
                 sh_name,
