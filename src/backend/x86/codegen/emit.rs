@@ -5046,15 +5046,16 @@ impl X86Codegen {
             if op == IrBinOp::Mul {
                 // Strength reduction through the CPU tuning model
                 // (`X86Tune::mul_const_plan`): a LEA/SHL/ADD/SUB/NEG chain
-                // replaces `imul $k` when its latency beats IMUL on this
-                // core (budget `imul_latency − 1`: 2 steps on every P-core
-                // and Zen, 4 on Gracemont whose IMUL is 5 cycles).  ×3/×5/×9
-                // stay a single LEA as before; ×10 becomes `lea (r,r,4); add
-                // r,r`, ×7 `lea (,r,8); sub src` (needs the multiplicand in
-                // a second register, so that shape is only taken when the
-                // lhs is register-homed elsewhere), ×12 `lea (r,r,2); shl 2`.
-                // Matches what GCC 16.2 / Clang 23.1 emit for these
-                // constants and goes further only on the E-core row.
+                // replaces `imul $k` when the chain's MEASURED latency
+                // (steps cost `lea_scaled_latency` for LEA — 2 ticks on
+                // Golden/Raptor Cove scaled-index LEA — and 1 for ALU/shs
+                // steps) is strictly below IMUL's: budget `imul_latency − 1`
+                // in cost units (2 on every P-core and Zen, 4 on Gracemont
+                // whose IMUL is 5 cycles).  ×3/×5/×9 stay a single LEA
+                // (2 < 3); 2-step LEA chains such as ×45's `lea (r,r,4); lea
+                // (r,r,8)` cost 4 and lose to `imull $45` (3) — as GCC
+                // 16.2 emits it — while LEA-free plans like `x15 = (x<<4)−x`
+                // (2) survive.  Gracemont still runs 3–4 step chains.
                 let plan_k = if use_32bit { imm as i32 as i64 } else { imm };
                 let plan = self.tune.mul_const_plan(plan_k);
                 let lhs_src_reg = self
