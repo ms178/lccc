@@ -745,7 +745,23 @@ impl Instruction {
                 | IntrinsicOp::RoundScalarF32(_)
                 // Scalar lane extracts report their REAL scalar type. This arm
                 // is unconditional (not behind `CCC_FP_EXTRACT_HOMES`), so every
-                // `result_type()` consumer sees the change; audited 2026-10-06:
+                // `result_type()` consumer sees it.
+                //
+                // PROVENANCE, because a squashed commit message once claimed this
+                // arm as a new behaviour: the F32/F64 returns shipped in
+                // `dd012799`; `c3259492` added only this audit (34 insertions,
+                // 0 deletions, no code change). Nothing about `result_type()`'s
+                // value changed in the later commit.
+                //
+                // CENSUS, re-verified 2026-10-07: `grep -RIn '\.result_type()' src`
+                // finds **18 call sites in 10 files** — 8 in
+                // backend/stack_layout/slot_assignment.rs, 2 in
+                // backend/regalloc.rs, and one each in backend/common.rs,
+                // backend/generation.rs, backend/i686/codegen/prologue.rs,
+                // ir/provenance.rs, passes/iv_widen.rs,
+                // passes/loop_carried_forward.rs, passes/reassoc_latency.rs (the
+                // nine production files itemised below) plus one TEST-ONLY site
+                // in passes/iv_strength_reduce.rs. Audited 2026-10-06:
                 //   backend/common.rs compute_value_type_map — seeds F32/F64;
                 //     wide_typed_values only keeps size>4, so F32 lanes stop
                 //     being "wide" and F64 lanes start being recorded as wide.

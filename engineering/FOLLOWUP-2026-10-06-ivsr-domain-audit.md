@@ -28,13 +28,26 @@ oracle. The fix costs **zero** instructions on the 55-program default corpus.
 | IVSR-DOMAIN-1 | `p[(int32_t)i]`, `uint32_t i` crossing `UINT32_MAX` | **SIGSEGV** | correct | correct |
 | IVSR-DOMAIN-2 | `p[i]`, `uint32_t i` crossing `UINT32_MAX`, no bound | **SIGSEGV** | correct | correct |
 
-Reproducers (each faults on the base, passes on the fix, `-O1`/`-O2`/`-O3`):
+These four files do two DIFFERENT jobs, and an earlier revision of this document
+called all four "reproducers", which is wrong for one of them. Measured on base
+`6051e873` at `-O1`/`-O2`/`-O3`:
+
+**Reproducers** — fault on the base, pass on the fix:
 
 ```
 tests/regression/ivsr_signedness_domain.c        # 32- and 64-bit signed views + affine form
 tests/regression/ivsr_unsigned_sparse_wrap.c     # 16 GiB sparse index space, guard pages
-tests/regression/ivsr_signed_wrap_impldef.c      # C17 6.3.1.3p3 implementation-defined wrap
 tests/oracle/programs/ivsr_index_domains.c       # four-vendor execution oracle program
+```
+
+**Pin** — passes on the base TOO (`ivsr_signed_wrap_impldef: OK` at all three
+levels), so it demonstrates nothing about the defect. Its job is different and
+still necessary: it freezes the C17 6.3.1.3p3 implementation-defined-wrap
+semantics so that a FUTURE change to the predicate is caught. Calling it a
+reproducer overstates the evidence, so it is listed separately.
+
+```
+tests/regression/ivsr_signed_wrap_impldef.c      # C17 6.3.1.3p3 implementation-defined wrap
 ```
 
 `ivsr_unsigned_sparse_wrap.c` and `ivsr_signed_wrap_impldef.c` reserve 16 GiB of
@@ -77,8 +90,11 @@ this tree, not by reading.
 The review scored correctness of the two headline fixes 9.5/10 and wrote that it
 "re-derived both bugs from the surrounding code and they check out". Re-deriving
 the *narrow* (`u8`/`u16`) case is not the same as auditing the *domain* of the
-recurrence. Two shipped benchmark shapes in this repository segfault at `-O2` on
-the merged base:
+recurrence. Two executable shapes segfault at `-O2` on the merged base. They are
+NOT pre-existing benchmark programs — they were written for this audit from the
+base's own predicate and are shipped here as new regression tests, so the honest
+claim is "two new reproducers fault on the base", not "two shipped benchmarks
+were broken":
 
 ```
 $ 6051e87-lccc -O2 tests/regression/ivsr_signedness_domain.c -o t && ./t      # SIGSEGV
@@ -520,9 +536,25 @@ Also not available, unchanged from the first round:
 
 ## 8. Reproducing this round
 
+Prerequisites that the earlier revision of this section left out, both of which
+produce failures that look like compiler bugs:
+
+* a **full** clone. `git clone --depth 1` cannot check out `6051e873`, because it
+  is not the tip; run `git fetch --unshallow` first if the clone was shallow.
+* **32-bit glibc headers** (`gcc-multilib`, `libc6-dev-i386` on Debian). Without
+  them every `-m32` leg of `check_ivsr_domains.sh` dies in the preprocessor with
+  `bits/libc-header-start.h: No such file or directory`, and the gate exits 1 for
+  a reason that has nothing to do with the change under test. This was hit for
+  real on 2026-10-07: a wiped workspace lost the packages and the gate failed
+  identically on the merged base and on the new tree, which is how it was
+  identified as environmental rather than a regression.
+
 ```bash
-git clone https://github.com/ms178/lccc.git && cd lccc
+git clone https://github.com/ms178/lccc.git && cd lccc   # NOT --depth 1
 git checkout 6051e87304c6b07a2ed1a9a516aa5744d8110955
+# This round is merged upstream as dd012799, so the patch below is historical:
+# the reproducible route is `git checkout dd012799` on a full clone. The
+# /home/user path is a sandbox-local artifact and will not exist elsewhere.
 git apply /home/user/ms178-1.patch          # or: git am the series in artifacts/
 
 ./scripts/build_lccc_fast.sh                 # fastbuild, Rust -O1, -j2

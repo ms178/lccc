@@ -2287,8 +2287,9 @@ impl IrType {
     /// direction: five programs in `tests/benchmark/programs` spell their 64-bit
     /// index `U64 -> I64`, and rejecting that cast cost `histogram` +5,
     /// `linux_rbtree` +12 instructions/+7 stack refs, `linux_find_bit` +1,
-    /// `i686_alu_chains` +2 and `zlib_ng_adler32_combine` +1 over the
-    /// 55-program default corpus (+15 total). Evidence:
+    /// `i686_alu_chains` +2 and `zlib_ng_adler32_combine` +1, partly offset by
+    /// `sqlite_varint` −6 — over the 55-program default corpus that is
+    /// +21 −6 = **+15 net** (8139 → 8154 instructions). Evidence:
     /// `engineering/evidence/2026-10-06-ivsr-domain/corpus-ab-value-only-predicate.json`.
     ///
     /// `src/passes/loop_carried_forward.rs` peels same-width integer/pointer

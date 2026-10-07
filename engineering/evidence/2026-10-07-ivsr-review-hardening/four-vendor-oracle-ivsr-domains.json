@@ -1,0 +1,62 @@
+[
+ {
+  "program": "ivsr_index_domains.c",
+  "lccc": {
+   "id": "lccc",
+   "vendor": "local",
+   "ok": true,
+   "asm_insns": 165,
+   "stdout": "ivsr_index_domains 2399416251494309360\n",
+   "exit": 0,
+   "reason": null
+  },
+  "oracles": [
+   {
+    "id": "cg162",
+    "vendor": "GNU",
+    "ok": true,
+    "asm_insns": 118,
+    "stdout": "ivsr_index_domains 2399416251494309360",
+    "exit": 0,
+    "reason": null,
+    "ce_semver": null,
+    "cached_at": 1791372427.981374
+   },
+   {
+    "id": "cclang2310",
+    "vendor": "LLVM",
+    "ok": true,
+    "asm_insns": 348,
+    "stdout": "ivsr_index_domains 2399416251494309360",
+    "exit": 0,
+    "reason": null,
+    "ce_semver": null,
+    "cached_at": 1791372427.993648
+   },
+   {
+    "id": "cicc2021100",
+    "vendor": "Intel (classic)",
+    "ok": true,
+    "asm_insns": 376,
+    "stdout": "ivsr_index_domains 2399416251494309360",
+    "exit": 0,
+    "reason": null,
+    "ce_semver": null,
+    "cached_at": 1791372427.9940338
+   },
+   {
+    "id": "cicxlatest",
+    "vendor": "Intel",
+    "ok": true,
+    "asm_insns": 458,
+    "stdout": "ivsr_index_domains 2399416251494309360",
+    "exit": 0,
+    "reason": null,
+    "ce_semver": null,
+    "cached_at": 1791372427.994793
+   }
+  ],
+  "status": "PASS",
+  "why": []
+ }
+]

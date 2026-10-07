@@ -1,0 +1,110 @@
+{
+ "date": "2026-10-07",
+ "round": "review-response hardening of merged PR #772 (upstream c3259492, merge 6a9690c3)",
+ "base_upstream": "6a9690c356efeda5b8bbfd496baee5d04f13e4c6",
+ "arms": {
+  "pre": "/tmp/lccc-merged-main - built from unmodified 6a9690c3",
+  "post": "/tmp/lccc-hardened - this round's tree"
+ },
+ "metric": "assembly byte-comparison plus instruction and stack-reference counts. Static; no PMU, no cycles, no Raptor Lake.",
+ "corpora": [
+  {
+   "name": "tests/benchmark/programs + tests/oracle/programs",
+   "configs": "-O1,-O2,-O3 x (x86-64, -m32 -msse2) = 6",
+   "sources": 67,
+   "comparisons": 402,
+   "skipped": 0,
+   "changed": 0,
+   "insns_pre": 98002,
+   "insns_post": 98002,
+   "stack_pre": 25745,
+   "stack_post": 25745
+  },
+  {
+   "name": "tests/regression (each file with its own .flags)",
+   "configs": "per-test .flags, else -O2",
+   "sources": 845,
+   "comparisons": 844,
+   "skipped": 1,
+   "changed": 0,
+   "insns_pre": 232712,
+   "insns_post": 232712,
+   "stack_pre": 39696,
+   "stack_post": 39696,
+   "note": "1 skip is a file whose .flags this host cannot satisfy. An earlier run reported compared=830 skipped=15; the 14 extra skips were the -m32 legs failing for want of 32-bit glibc headers (INF-M32HDRS-1), and installing gcc-multilib/libc6-dev-i386 raised coverage to 844 with the verdict unchanged. Four -fprofile-generate=@PROFDIR@ files initially reported as changed; a self-A/B of ONE binary against itself reproduced the difference, which is the PID baked into the .profraw name and the __lccc_pgo_dump_<hash>_<pid> symbol. Normalised in the harness."
+  },
+  {
+   "name": "tests/bench (12 k_*.c performance kernels) + tests/benchmark/kernel_corpus (24) + tests/benchmark/patterns (3)",
+   "configs": "-O1,-O2,-O3 x (x86-64, -m32 -msse2) = 6",
+   "sources": 39,
+   "comparisons": 234,
+   "skipped": 0,
+   "changed": 0,
+   "insns_pre": 35844,
+   "insns_post": 35844,
+   "stack_pre": 6978,
+   "stack_post": 6978,
+   "note": "Added last and is the most important row: it contains k_varint.c, the kernel the merged IVSR-PTRADD-1 win was measured on, plus the extracted real-workload files. Byte-identical assembly on all twelve kernels means the instruction stream is identical, so Callgrind Ir is identical and no dynamic re-run was needed - that is an inference from the static result, not a skipped measurement."
+  }
+ ],
+ "total": {
+  "comparisons": 1480,
+  "changed": 0
+ },
+ "pid_nondeterminism": {
+  "finding": "-fprofile-generate=@PROFDIR@ output is not reproducible run to run: the literal @PROFDIR@ template is replaced with a name containing the PID, emitted both as a .byte list and as __lccc_pgo_dump_<hash>_<pid>.",
+  "proof": "the SAME binary compiled the SAME source twice and produced different assembly (99551.profraw vs 99557.profraw).",
+  "consequence": "any assembly A/B over tests/regression reports 4 phantom changes unless it normalises them. ab_regression.py now does.",
+  "affected": [
+   "pgo_branchy.c",
+   "pgo_split_label.c",
+   "switch_table.c",
+   "value_profiling.c"
+  ]
+ },
+ "reverted_this_round": {
+  "A3_is_used_as_address_narrowing": {
+   "proposal": "replace IntrinsicOp::reads_pointer_arg() with may_read_memory() in is_used_as_address, on the grounds that the read-only allowlist over-approximates (it is true for pure vector arithmetic) and over-approximation is the unsafe direction for an address test.",
+   "measured": [
+    {
+     "file": "tests/regression/simd_crc_adler.c",
+     "flags": "-msse4.2 -mpclmul",
+     "insns": "711 -> 718",
+     "stack": "68 -> 72"
+    },
+    {
+     "file": "tests/regression/simd_vecreg.c",
+     "flags": "-msse2",
+     "insns": "153 -> 155",
+     "stack": "40 -> 42"
+    },
+    {
+     "file": "tests/regression/temp_promotion_window.c",
+     "flags": "-O2",
+     "insns": "90 -> 89",
+     "note": "one instruction smaller but structurally worse: lost the hoisted pointer recurrence and a 17-instruction unrolled byte-sum"
+    }
+   ],
+   "mechanism": "the hoisted recurrence `leaq 16(%r9), %r9` was replaced by a per-iteration `movslq %r8d,%r9; leaq -272(%rbp),%rdi; leaq (%rdi,%r9,4),%rdi` re-derivation, plus an xmm spill/reload pair where the value previously stayed in a register (`movdqa %xmm0,%xmm4` became `movdqu %xmm0,-304(%rbp)` + `movdqu -304(%rbp),%xmm1`).",
+   "verdict": "REVERTED. The soundness argument for the wide predicate is positive: the classification can only arm a recurrence on a value that try_lower_pointer_arithmetic already put in POINTER-width arithmetic, where the integer and pointer rings agree for every program without UB (a wrapping base+i*elem is UB in the source per C17 6.5.6p8). Narrow-ring products are guarded separately by offset_product_cannot_overflow.",
+   "pinned_by": "passes::iv_strength_reduce::tests::address_classification_deliberately_over_approximates_intrinsics"
+  }
+ },
+ "host": {
+  "os": "Debian 13",
+  "cpu": "Xeon VM (not the i7-14700KF target)",
+  "ram_mib": 1984,
+  "swap": "8 GiB /swapfile",
+  "pmu": "unavailable",
+  "gcc": "14.2",
+  "rust": "1.99.0",
+  "valgrind": "3.24.0"
+ },
+ "not_measured": [
+  "PMU counters",
+  "cycles",
+  "uops",
+  "Raptor Lake behaviour",
+  "any speedup claim"
+ ]
+}

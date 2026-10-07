@@ -284,8 +284,19 @@ fn reduce_loop(
         // sub-32-bit counter (whose C promotion makes the arithmetic 32-bit and
         // therefore already covered by IVSR-WRAP-1's backedge rule), are handled
         // by the other arms.
+        // EVERY modular unsigned IV below the pointer width needs the proof,
+        // including `U8`/`U16`. The previous `size >= 4` carve-out skipped them
+        // on the reasoning that they are "handled by the other arms" — they are
+        // not; they are handled by `find_basic_ivs` never *forming* them, because
+        // C promotes a sub-int counter to `int` and the backedge truncation is
+        // rejected by `look_through_casts` (IVSR-WRAP-1). That is an invariant of
+        // a DIFFERENT function, and relying on it here is fail-open: a `U8` IV
+        // built by any other means would recur with no no-wrap proof at all.
+        // Failing closed costs nothing — `unsigned_iv_bound` requires the header
+        // test to be in the IV's OWN type, and a promoted `U8` counter's test is
+        // `I32`, so it returns `None` and the recurrence is declined.
         let modular_iv = iv.ty.size() < crate::common::types::target_ptr_size();
-        let unsigned_bound = if modular_iv && (iv.ty.size() as usize) >= 4 && iv.ty.is_unsigned() {
+        let unsigned_bound = if modular_iv && iv.ty.is_unsigned() {
             let bound = unsigned_iv_bound(func, natural_loop, iv, &back_blocks);
             if bound.is_none() {
                 if dbg {
@@ -332,18 +343,19 @@ fn reduce_loop(
         let init_const = try_resolve_const(&iv.init, func);
         let init_offset = if let Some(v) = init_const {
             // IrConst's signed storage is not the IV's mathematical domain.
-            let v = match iv.ty {
-                IrType::U8 => i64::from(v as u8),
-                IrType::U16 => i64::from(v as u16),
-                IrType::U32 => i64::from(v as u32),
-                _ => v,
-            };
+            let v = const_in_iv_domain(v, iv.ty);
             let Some(off) = v
-                .checked_add(add_offset)
-                .and_then(|v| v.checked_mul(stride))
+                .checked_add(add_offset as i128)
+                .and_then(|v| v.checked_mul(stride as i128))
             else {
                 continue;
             };
+            // An exact offset that no `IrConst::I64` operand can hold cannot be
+            // folded into the GEP, so skip the transform rather than truncate
+            // it. (Reaching this needs `init * stride >= 2^63` bytes.)
+            if i64::try_from(off).is_err() {
+                continue;
+            }
             Some(off)
         } else {
             None
@@ -363,7 +375,7 @@ fn reduce_loop(
                 preheader_insts.push(Instruction::GetElementPtr {
                     dest: init_ptr_val,
                     base: gep_base,
-                    offset: Operand::Const(IrConst::I64(init_off)),
+                    offset: Operand::Const(IrConst::I64(init_off as i64)),
                     ty: IrType::I8,
                 });
             }
@@ -778,8 +790,19 @@ fn find_basic_ivs(
     // Scan phi nodes in the header
     for inst in &func.blocks[header].instructions {
         if let Instruction::Phi { dest, ty, incoming } = inst {
-            // Must be integer type (induction variables are integers)
+            // Must be integer type (induction variables are integers).
+            //
+            // 128-bit types are excluded STRUCTURALLY, not incidentally. Every
+            // constant in this pass travels through `IrConst::to_i64()`, so an
+            // `I128`/`U128` step or init would be silently truncated before the
+            // no-wrap and product-overflow proofs ever saw it. Today the cast
+            // gate already rejects the narrowing that a 128-bit IV would need,
+            // so no group can form — but that is a consequence of another
+            // function's rule, and this pass should not depend on it.
             if !ty.is_integer() && *ty != IrType::Ptr {
+                continue;
+            }
+            if ty.is_128bit() {
                 continue;
             }
 
@@ -866,6 +889,11 @@ fn find_derived_exprs(
     ptr_add: bool,
 ) -> Vec<DerivedExpr> {
     let mut derived = Vec::with_capacity(16);
+    // Read the debug switch ONCE per function, not once per instruction: this
+    // scan is O(instructions) and the old spelling did an environment lookup
+    // inside the hottest loop in the pass. It also frees two slots against the
+    // `check_env_test_hygiene` ratchet (155 -> 153).
+    let dbg = std::env::var_os("CCC_IVSR_DEBUG").is_some();
 
     // Build a set of IV phi values for quick lookup
     let mut iv_values: FxHashMap<u32, usize> = FxHashMap::default();
@@ -893,7 +921,7 @@ fn find_derived_exprs(
                         // Value preservation, not equal storage width. In
                         // particular U32 -> I32 -> I64 maps UINT_MAX to -1,
                         // whereas widening the original U32 maps it to 2^32-1.
-                        if cast_preserves_offset_value(*from_ty, *to_ty) {
+                        if from_ty.cast_preserves_offset_value(*to_ty) {
                             let idx = iv_values.get(&v.0).or_else(|| iv_derived.get(&v.0));
                             if let Some(&iv_idx) = idx {
                                 if !iv_derived.contains_key(&dest.0) {
@@ -969,7 +997,7 @@ fn find_derived_exprs(
         }
         None
     };
-    if std::env::var("CCC_IVSR_DEBUG").is_ok() {
+    if dbg {
         let mut d: Vec<u32> = iv_derived.keys().copied().collect();
         d.sort_unstable();
         eprintln!(
@@ -985,7 +1013,7 @@ fn find_derived_exprs(
             continue;
         }
         for inst in func.blocks[bi].instructions.iter() {
-            if std::env::var("CCC_IVSR_DEBUG").is_ok() {
+            if dbg {
                 eprintln!(
                     "[IVSR-DERIV] b{} label={} inst={:?}",
                     bi,
@@ -1130,7 +1158,7 @@ fn find_derived_exprs(
                     mul_ty,
                     has_uses: use_count > 0,
                 });
-            } else if std::env::var("CCC_IVSR_DEBUG").is_ok() {
+            } else if dbg {
                 eprintln!(
                     "[IVSR-DERIV] mul v{} stride {} has no GEP uses",
                     mul_dest.0, stride
@@ -1309,6 +1337,29 @@ fn is_used_as_address(func: &IrFunction, val_id: u32) -> bool {
                     if dest_ptr.is_some_and(|d| d.0 == val_id) {
                         return true;
                     }
+                    // `reads_pointer_arg()`, which is the allowlist for a
+                    // callee-READ-ONLY proof and is deliberately true for pure
+                    // vector arithmetic (`VecAddF64x4` and friends, via
+                    // `produces_vector_value`). A review of this code proposed
+                    // narrowing it to `may_read_memory()` on the grounds that
+                    // over-approximation is the unsafe direction HERE. Measured,
+                    // it is not: it removed the pointer induction from
+                    // `simd_vecreg`, `simd_crc_adler` and
+                    // `temp_promotion_window`, replacing a hoisted
+                    // `leaq 16(%r9), %r9` recurrence with a per-iteration
+                    // `movslq`/`leaq (%rdi,%r9,4)` re-derivation plus an xmm
+                    // spill/reload pair (+7 insns, +4 stack refs on
+                    // `simd_crc_adler`). And the soundness argument for keeping
+                    // the wide predicate is positive, not merely pragmatic: this
+                    // classification can only arm a recurrence on a value that
+                    // `try_lower_pointer_arithmetic` already put in POINTER-width
+                    // arithmetic, and for a program without UB the integer and
+                    // pointer rings agree at that width (a wrapping
+                    // `base + i*elem` is UB in the source per C17 6.5.6p8, so no
+                    // defined program can distinguish the two recurrences).
+                    // Over-approximation here costs nothing and buys the vector
+                    // induction; the narrow product ring is guarded separately,
+                    // by `offset_product_cannot_overflow`.
                     if (op.reads_pointer_arg() || op.writes_memory_via_args())
                         && args.iter().any(is_target)
                     {
@@ -1322,31 +1373,42 @@ fn is_used_as_address(func: &IrFunction, val_id: u32) -> bool {
     false
 }
 
-/// Cast legality for a derived address expression. Both predicates live on
-/// `IrType` next to the size/signedness facts they are stated in terms of, and
-/// are shared with `src/backend/generation.rs`'s SIB-index peel so the two
-/// cannot drift apart again (IVSR-DOMAIN-1 was exactly that drift). The
-/// exhaustive per-domain tests live with the predicates, in
-/// `src/common/types.rs::cast_predicate_tests`; the IVSR-specific consequences
-/// are pinned by `derived_cast_proof_is_about_values_not_storage_size` and
-/// `offset_cast_proof_adds_only_the_pointer_ring_reinterpretation` below.
-#[inline]
-fn cast_preserves_integer_value(from: IrType, to: IrType) -> bool {
-    from.cast_preserves_integer_value(to)
-}
-
-#[inline]
-fn cast_preserves_offset_value(from: IrType, to: IrType) -> bool {
-    from.cast_preserves_offset_value(to)
-}
-
-/// Proven execution range of a narrow UNSIGNED induction variable.
+/// The mathematical value of an IR integer constant **in the domain of `ty`**.
 ///
-/// `hi` bounds every value the loop body can observe. `exact` records whether
-/// that bound came from a compile-time constant; only an exact bound can also
-/// certify that a narrower product `iv * stride` cannot overflow its own ring
-/// (an invariant bound proves the IV is monotone but says nothing numeric).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `IrConst` carries every integer in a signed `i64` carrier, so a `U32` limit of
+/// `0xFFFFFFFF` can arrive as `I32(-1)` and `to_i64()` reads `-1`. The frontend's
+/// constant evaluator normalises unsigned constants to a non-negative `I64`, so
+/// this is unreachable from C source today — but a bound certificate built on the
+/// raw carrier would certify `hi = -2` for a limit of `0xFFFFFFFF` and then
+/// *wrongly admit* an overflowing product, because `-2 < 2^32` passes the check.
+///
+/// One helper, used by BOTH the initial-offset computation and the bound, so the
+/// two sites cannot disagree about what a constant means. That disagreement was
+/// real: `init_offset` reinterpreted by `iv.ty` while the bound used the raw
+/// carrier.
+fn const_in_iv_domain(raw: i64, ty: IrType) -> i128 {
+    let bits = (ty.size() * 8) as u32;
+    if bits == 0 || bits >= 128 {
+        return raw as i128;
+    }
+    let masked = (raw as i128) & ((1i128 << bits) - 1);
+    if ty.is_unsigned() {
+        masked
+    } else if masked >= 1i128 << (bits - 1) {
+        masked - (1i128 << bits)
+    } else {
+        masked
+    }
+}
+
+/// The exact closed interval a small unsigned IV takes on every iteration
+/// that the exit test does not reject.
+///
+/// * `lo..=hi` is the inclusive interval.
+/// * `exact` records whether the bound is the tight mathematical interval or
+///   only a sound over-approximation, and it must stay `false` for anything
+///   the caller may use as a no-wrap proof.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct UnsignedIvBound {
     lo: i128,
     hi: i128,
@@ -1447,18 +1509,57 @@ fn unsigned_iv_bound(
         if !matches!((op, iv.step), (C::Ult, 1) | (C::Ugt, -1)) {
             return None;
         }
-        let lo = if iv.step > 0 { 0 } else { 1 };
-        // A constant limit yields the exact body maximum `limit - 1`; an
-        // invariant limit proves monotonicity but no numeric maximum.
-        let hi = match other {
-            Operand::Const(c) => c.to_i64().map(|n| n as i128 - 1).unwrap_or(max),
-            Operand::Value(_) => max,
+        // ASCENDING (`i < limit`, step +1): the body's values are
+        // `[init, limit - 1]`, so a constant limit yields the exact maximum
+        // `limit - 1`, and `lo = 0` because an `init` above the limit simply
+        // never enters.
+        //
+        // DESCENDING (`i > limit`, step -1): the body's values are
+        // `[limit + 1, init]`, so the ceiling comes from the INIT and the floor
+        // from the limit. Deriving `hi` from the limit here — the ascending
+        // formula — was a real defect: `limit - 1` is not merely loose, it is
+        // BELOW the range, so a product certificate built on it checked `99 * 4`
+        // for a loop descending from 2^30 toward a limit of 100 whose executed
+        // maximum was `2^30 * 4`, admitting a narrow unsigned product that really
+        // does wrap.
+        //
+        // With the init available as a literal the interval IS exact, so the
+        // descending arm is certified rather than refused — a recovered
+        // optimization, not only a fix. Without one there is no provable numeric
+        // maximum, so `hi` degrades to the type maximum and `exact` goes false:
+        // that withdraws the numeric product certificate while keeping the IV
+        // *no-wrap* half of the proof, which never depended on the init (entry
+        // still requires `init > limit`, and the floor is still `limit + 1 >= 1`).
+        //
+        // `const_in_iv_domain` maps any constant into `[0, max]` for an unsigned
+        // `iv.ty`, so no further range check is needed on the init; an init at or
+        // below the limit never enters the body, and `init.max(floor)` is a sound
+        // over-approximation of that empty interval.
+        let (lo, hi, exact) = if iv.step > 0 {
+            let hi = match other {
+                Operand::Const(c) => const_in_iv_domain(c.to_i64().unwrap_or(i64::MAX), iv.ty)
+                    .checked_sub(1)
+                    .unwrap_or(max),
+                Operand::Value(_) => max,
+            };
+            (0i128, hi, exact)
+        } else {
+            let floor = match other {
+                Operand::Const(c) => const_in_iv_domain(c.to_i64().unwrap_or(i64::MAX), iv.ty)
+                    .checked_add(1)
+                    .filter(|v| *v >= 1)
+                    .unwrap_or(1i128),
+                Operand::Value(_) => 1i128,
+            };
+            match iv.init {
+                Operand::Const(c) => {
+                    let init = const_in_iv_domain(c.to_i64().unwrap_or(i64::MAX), iv.ty);
+                    (floor, init.max(floor), exact)
+                }
+                Operand::Value(_) => (floor, max, false),
+            }
         };
-        return Some(UnsignedIvBound {
-            lo: lo as i128,
-            hi,
-            exact,
-        });
+        return Some(UnsignedIvBound { lo, hi, exact });
     }
     None
 }
@@ -1706,6 +1807,45 @@ mod tests {
     }
 
     #[test]
+    fn const_in_iv_domain_reads_a_constant_in_the_ivs_own_domain() {
+        // The A4 disagreement: the bound used the raw carrier, the initial offset
+        // reinterpreted by type. One helper, both sites.
+        assert_eq!(const_in_iv_domain(-1, IrType::U32), 4294967295);
+        assert_eq!(const_in_iv_domain(-1, IrType::I32), -1);
+        assert_eq!(const_in_iv_domain(-1, IrType::U8), 255);
+        assert_eq!(const_in_iv_domain(-1, IrType::I8), -1);
+        assert_eq!(const_in_iv_domain(97, IrType::I8), 97);
+        assert_eq!(const_in_iv_domain(65535, IrType::U16), 65535);
+        assert_eq!(const_in_iv_domain(-1, IrType::U64), (1i128 << 64) - 1);
+        assert_eq!(const_in_iv_domain(-1, IrType::I64), -1);
+        // Round-trips: reinterpreting a value already in domain is the identity.
+        for ty in [
+            IrType::I8,
+            IrType::U8,
+            IrType::I16,
+            IrType::U16,
+            IrType::I32,
+            IrType::U32,
+            IrType::I64,
+            IrType::U64,
+        ] {
+            for raw in [
+                0i64,
+                1,
+                -1,
+                127,
+                -128,
+                65535,
+                i32::MAX as i64,
+                i32::MIN as i64,
+            ] {
+                let once = const_in_iv_domain(raw, ty);
+                assert_eq!(const_in_iv_domain(once as i64, ty), once, "{ty:?} {raw}");
+            }
+        }
+    }
+
+    #[test]
     fn offset_cast_proof_adds_only_the_pointer_ring_reinterpretation() {
         let ints = [
             IrType::I8,
@@ -1727,8 +1867,8 @@ mod tests {
                     && from.size() == to.size()
                     && (from.size() as usize) >= ptr;
                 assert_eq!(
-                    cast_preserves_offset_value(from, to),
-                    cast_preserves_integer_value(from, to) || ring,
+                    from.cast_preserves_offset_value(to),
+                    from.cast_preserves_integer_value(to) || ring,
                     "{from:?}->{to:?}"
                 );
             }
@@ -1742,16 +1882,16 @@ mod tests {
             (IrType::U8, IrType::I8),
             (IrType::I8, IrType::U8),
         ] {
-            assert!(!cast_preserves_offset_value(from, to), "{from:?}->{to:?}");
+            assert!(!from.cast_preserves_offset_value(to), "{from:?}->{to:?}");
         }
         // The pointer-ring reinterpretation is admitted only at pointer width,
         // which is what keeps the 64-bit `size_t`/`ptrdiff_t` spelling reducible.
         let wide = (IrType::U64.size() as usize) >= ptr;
-        assert_eq!(cast_preserves_offset_value(IrType::U64, IrType::I64), wide);
-        assert_eq!(cast_preserves_offset_value(IrType::I64, IrType::U64), wide);
-        assert!(!cast_preserves_offset_value(IrType::I32, IrType::F32));
-        assert!(!cast_preserves_offset_value(IrType::F64, IrType::I64));
-        assert!(!cast_preserves_offset_value(IrType::I64, IrType::Ptr));
+        assert_eq!(IrType::U64.cast_preserves_offset_value(IrType::I64), wide);
+        assert_eq!(IrType::I64.cast_preserves_offset_value(IrType::U64), wide);
+        assert!(!IrType::I32.cast_preserves_offset_value(IrType::F32));
+        assert!(!IrType::F64.cast_preserves_offset_value(IrType::I64));
+        assert!(!IrType::I64.cast_preserves_offset_value(IrType::Ptr));
     }
 
     #[test]
@@ -1868,14 +2008,14 @@ mod tests {
                 let (lo, hi) = range(from);
                 let (tl, th) = range(to);
                 assert_eq!(
-                    cast_preserves_integer_value(from, to),
+                    from.cast_preserves_integer_value(to),
                     lo >= tl && hi <= th,
                     "{from:?}->{to:?}"
                 );
             }
         }
-        assert!(!cast_preserves_integer_value(IrType::I32, IrType::F32));
-        assert!(!cast_preserves_integer_value(IrType::F64, IrType::I64));
+        assert!(!IrType::I32.cast_preserves_integer_value(IrType::F32));
+        assert!(!IrType::F64.cast_preserves_integer_value(IrType::I64));
     }
 
     #[test]
@@ -2193,12 +2333,532 @@ mod tests {
     }
 
     #[test]
-    fn address_add_arm_is_gated_by_the_kill_switch_and_ilp32() {
-        // LP64: the arm fires. This also pins that the gate reads the TARGET,
-        // not a hard-coded width, since the test suite runs on the host default.
+    fn address_add_arm_is_gated_by_ilp32() {
+        // LP64: the arm fires. This pins that the gate reads the TARGET rather
+        // than a hard-coded width, since the suite runs on the host default. It
+        // does NOT test the kill switch — `ivsr_function` hardcodes
+        // `ptr_add = true`, which is why the switch needs its own test below.
         let mut f = address_add_loop(true, false);
         let fired = ivsr_function(&mut f) > 0;
         assert_eq!(fired, !crate::common::types::target_is_32bit());
+    }
+
+    #[test]
+    fn ptr_add_parameter_is_a_real_kill_switch() {
+        // `CCC_NO_IVSR_PTR_ADD` is threaded from the pipeline as this parameter.
+        // Before this test existed the switch had ZERO automated coverage: both
+        // test wrappers pass `true`, so the only exercise of it was a manual
+        // gzip A/B. A dead kill switch is worse than none — it promises an
+        // escape hatch that may not work. This drives the parameter directly, so
+        // it needs no environment mutation (and therefore no serialisation
+        // against the rest of the suite).
+        let cfg = analysis::CfgAnalysis::build(&address_add_loop(true, false));
+        let mut on = address_add_loop(true, false);
+        assert!(
+            ivsr_with_analysis(&mut on, &cfg, false, true) > 0,
+            "ptr_add=true must reduce the address-forming Add"
+        );
+        let mut off = address_add_loop(true, false);
+        assert_eq!(
+            ivsr_with_analysis(&mut off, &cfg, false, false),
+            0,
+            "ptr_add=false must disable the arm entirely"
+        );
+        // And the address Add must survive untouched when the arm is off.
+        assert!(
+            off.blocks[2].instructions.iter().any(|i| matches!(
+                i,
+                Instruction::BinOp { dest, op: IrBinOp::Add, .. } if *dest == Value(5)
+            )),
+            "with the arm off the original Add must still compute the address"
+        );
+    }
+
+    #[test]
+    fn descending_unsigned_iv_bounds_come_from_the_init_not_the_limit() {
+        use crate::ir::reexports::IrCmpOp as C;
+        let lp = NaturalLoop {
+            header: 1,
+            body: [1, 2].into_iter().collect(),
+        };
+        // `while (i > limit) i += -1` over a U32. The body observes
+        // `[limit + 1, init]`, so the ceiling comes from the INIT and the floor
+        // from the limit. (LCCC's frontend currently emits `Sub` for `i--`,
+        // which `find_basic_ivs` does not accept, so no descending BasicIV is
+        // formed from C source yet — see FOLLOWUP-2026-10-07 §"descending IVs".
+        // The canonical `Add(i, -1)` spelling is what this pins, and it is what
+        // any future canonicalisation would produce.)
+        let fixture = |limit: i32| {
+            let mut f = cast_backedge(IrType::U32, IrType::U32);
+            if let Instruction::Cmp { op, rhs, .. } = &mut f.blocks[1].instructions[1] {
+                *op = C::Ugt;
+                *rhs = Operand::Const(IrConst::I32(limit));
+            }
+            if let Instruction::BinOp { rhs, .. } = &mut f.blocks[2].instructions[1] {
+                *rhs = Operand::Const(IrConst::I32(-1));
+            }
+            f
+        };
+        let bound_of = |f: &IrFunction, init: Operand| {
+            let iv = BasicIV {
+                phi_dest: Value(0),
+                ty: IrType::U32,
+                init,
+                step: -1,
+            };
+            unsigned_iv_bound(f, &lp, &iv, &[2])
+        };
+
+        // A1. `hi = limit - 1` — the ascending formula — is BELOW this range, so
+        // a product certificate built on it checked 100*4 while the executed
+        // maximum is 2^30*4, admitting a narrow product that really does wrap.
+        // The bound now comes from the init, and the certificate is declined for
+        // the right reason: 2^30 * 4 == 2^32 does not fit the U32 ring.
+        let wide = fixture(100);
+        let big = bound_of(&wide, Operand::Const(IrConst::I32(1 << 30))).expect("IV no-wrap holds");
+        assert!(
+            big.exact,
+            "a literal init makes the interval exact: {big:?}"
+        );
+        assert_eq!(big.lo, 101, "the floor is limit + 1");
+        assert_eq!(big.hi, 1i128 << 30, "the ceiling is the init");
+        assert!(
+            !offset_product_cannot_overflow(IrType::U32, 4, 0, Some(big)),
+            "2^30 * 4 overflows the U32 ring, so no certificate"
+        );
+
+        // The same shape with a small init IS certifiable, so the descending arm
+        // is recovered rather than refused wholesale: `for (unsigned i = 64;
+        // i-- > 0;) p[i]` has every value in [1, 64] and 64 * 4 fits U32.
+        let narrow = fixture(0);
+        let small = bound_of(&narrow, Operand::Const(IrConst::I32(64))).expect("bound");
+        assert!(small.exact, "{small:?}");
+        assert_eq!((small.lo, small.hi), (1, 64), "{small:?}");
+        assert!(
+            offset_product_cannot_overflow(IrType::U32, 4, 0, Some(small)),
+            "64 * 4 fits the U32 ring, so the descending arm is certified"
+        );
+
+        // An init at or below the limit never enters the body, so the interval
+        // is empty; `hi = max(init, floor)` is a sound over-approximation of it.
+        let empty = bound_of(&wide, Operand::Const(IrConst::I32(64))).expect("bound");
+        assert_eq!((empty.lo, empty.hi), (101, 101), "{empty:?}");
+
+        // A non-literal init (`for (unsigned i = n; i-- > 0;)`) has no provable
+        // numeric maximum, so the certificate is withdrawn and the loop keeps
+        // the modular index recurrence. The IV no-wrap half of the proof is
+        // unaffected: entry still requires init > limit and the floor is still
+        // limit + 1 >= 1.
+        let unknown = bound_of(&narrow, Operand::Value(Value(7))).expect("IV no-wrap still holds");
+        assert!(!unknown.exact, "{unknown:?}");
+        assert_eq!(unknown.hi, (1i128 << 32) - 1, "hi degrades to the type max");
+        assert!(!offset_product_cannot_overflow(
+            IrType::U32,
+            4,
+            0,
+            Some(unknown)
+        ));
+
+        // The ascending case is unchanged: hi = limit - 1 is its real maximum.
+        let mut g = cast_backedge(IrType::U32, IrType::U32);
+        if let Instruction::Cmp { rhs, .. } = &mut g.blocks[1].instructions[1] {
+            *rhs = Operand::Const(IrConst::I32(100));
+        }
+        let up = BasicIV {
+            phi_dest: Value(0),
+            ty: IrType::U32,
+            init: Operand::Const(IrConst::I32(0)),
+            step: 1,
+        };
+        let bg = unsigned_iv_bound(&g, &lp, &up, &[2]).expect("ascending bound");
+        assert!(bg.exact && bg.hi == 99, "ascending: {bg:?}");
+        assert!(offset_product_cannot_overflow(IrType::U32, 4, 0, Some(bg)));
+    }
+
+    #[test]
+    fn offset_product_certificate_decision_table() {
+        // Pins the whole decision table of `offset_product_cannot_overflow`, so
+        // a future edit cannot silently reopen a cell.
+        //
+        // TWO different guards, and confusing them produces a wrong audit either
+        // way. THIS function's exemption is pointer-width
+        // (`mul_ty.size() >= target_ptr_size()`), so on LP64 every unsigned IV
+        // narrower than 64 bits (U8, U16, U32) must present an exact bound. The
+        // `>= 4` carve-out a review flagged was in the CALLER's gate
+        // (`modular_iv && size >= 4 && is_unsigned()`), which let a U8/U16 IV
+        // skip `unsigned_iv_bound` entirely; that is now removed, so the proof is
+        // total. Only pointer-width IVs are exempt here, and that exemption is
+        // sound at any
+        // width: if `iv * stride` wrapped the POINTER ring then the source's own
+        // `p[iv]` would not point into or one past any object, which C17
+        // 6.5.6p8 already makes undefined — so a defined source program cannot
+        // reach the wrap. The same argument covers ILP32, where U32 is the
+        // pointer width and is therefore exempt there.
+        let b = |lo: i128, hi: i128, exact: bool| Some(UnsignedIvBound { lo, hi, exact });
+
+        // (1) Pointer-width and signed IVs: exempt, no bound needed.
+        for ty in [
+            IrType::I64,
+            IrType::U64,
+            IrType::Ptr,
+            IrType::I8,
+            IrType::I16,
+            IrType::I32,
+        ] {
+            assert!(
+                offset_product_cannot_overflow(ty, 4, 0, None),
+                "{ty:?} is exempt (pointer width, or signed where a wrapping \
+                 product is UB in the source: C17 6.5p5)"
+            );
+        }
+
+        // (2) Sub-pointer-width UNSIGNED IVs need an exact bound, and the
+        //     product must fit THEIR OWN ring — not merely u64.
+        //     U8, bound [0,255], stride 1: max 255 < 256 -> sound, admitted.
+        assert!(offset_product_cannot_overflow(
+            IrType::U8,
+            1,
+            0,
+            b(0, 255, true)
+        ));
+        //     U8, bound [0,255], stride 4: max 1020 >= 256 -> wraps, declined.
+        assert!(!offset_product_cannot_overflow(
+            IrType::U8,
+            4,
+            0,
+            b(0, 255, true)
+        ));
+        //     U16, bound [0,255], stride 4: max 1020 < 65536 -> admitted. This
+        //     is CORRECT, not a hole: the recurrence cannot wrap the U16 ring.
+        assert!(offset_product_cannot_overflow(
+            IrType::U16,
+            4,
+            0,
+            b(0, 255, true)
+        ));
+        //     U16, full range, stride 4: max 262140 >= 65536 -> declined.
+        assert!(!offset_product_cannot_overflow(
+            IrType::U16,
+            4,
+            0,
+            b(0, 65535, true)
+        ));
+        //     U32, exact bound, product inside the ring -> admitted.
+        assert!(offset_product_cannot_overflow(
+            IrType::U32,
+            4,
+            0,
+            b(0, (1i128 << 30) - 1, true)
+        ));
+        //     U32, exact bound, product one past the ring -> declined.
+        assert!(!offset_product_cannot_overflow(
+            IrType::U32,
+            4,
+            0,
+            b(0, 1i128 << 30, true)
+        ));
+
+        // (3) No bound, or an inexact one, certifies nothing below pointer width.
+        assert!(!offset_product_cannot_overflow(IrType::U32, 4, 0, None));
+        assert!(!offset_product_cannot_overflow(
+            IrType::U16,
+            1,
+            0,
+            b(0, 255, false)
+        ));
+
+        // (4) The affine `+ k` term is included in the certificate, so a bound
+        //     that only fits WITHOUT it is declined.
+        assert!(!offset_product_cannot_overflow(
+            IrType::U8,
+            1,
+            1,
+            b(0, 255, true)
+        ));
+        assert!(offset_product_cannot_overflow(
+            IrType::U8,
+            1,
+            1,
+            b(0, 254, true)
+        ));
+    }
+
+    /// A counting-down address loop: `for (unsigned i = n; i-- > 0;) p[i]`.
+    ///
+    /// Same body as [`address_add_loop`] but the IV descends from its initial
+    /// value to an exclusive zero limit, which is the shape A1 is about: the
+    /// values the body observes are `[limit, init - 1]`, NOT `[limit + 1, init]`
+    /// read backwards, so a bound derived from the limit alone is not the range.
+    fn descending_address_add_loop(
+        iv_ty: IrType,
+        literal_init: bool,
+        narrow_offset: bool,
+    ) -> IrFunction {
+        // A non-literal init has to be genuinely unresolvable, so it comes from a
+        // real parameter: IVSR resolves preheader copies, and a `Copy(Const(..))`
+        // would (correctly) be seen through and certified as a literal.
+        let params = if literal_init {
+            Vec::new()
+        } else {
+            vec![crate::ir::module::IrParam {
+                ty: IrType::U32,
+                noalias: false,
+                struct_size: None,
+                struct_align: None,
+                param_align: None,
+                struct_eightbyte_classes: Vec::new(),
+                is_f128_sse: false,
+                riscv_float_class: None,
+            }]
+        };
+        let mut f = IrFunction::new("desc_address_add".into(), IrType::I64, params, false);
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Copy {
+                    dest: Value(0),
+                    src: Operand::Const(IrConst::I64(0x4000)),
+                },
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Const(IrConst::I32(0)),
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: vec![],
+        });
+        // A non-literal init models `for (unsigned i = n; i-- > 0;)`: the phi
+        // takes its first value from a preheader definition rather than from a
+        // constant in the phi itself.
+        if !literal_init {
+            f.blocks[0].instructions.push(Instruction::ParamRef {
+                dest: Value(8),
+                param_idx: 0,
+                ty: IrType::U32,
+            });
+        }
+        let init_op = if literal_init {
+            Operand::Const(IrConst::I32(64))
+        } else {
+            Operand::Value(Value(8))
+        };
+        // header: i = phi(64, i_next); while (i > 0)
+        f.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                Instruction::Phi {
+                    dest: Value(2),
+                    ty: iv_ty,
+                    incoming: vec![
+                        (init_op, BlockId(0)),
+                        (Operand::Value(Value(9)), BlockId(2)),
+                    ],
+                },
+                Instruction::Cmp {
+                    dest: Value(3),
+                    op: IrCmpOp::Ugt,
+                    lhs: Operand::Value(Value(2)),
+                    rhs: Operand::Const(IrConst::I32(0)),
+                    ty: iv_ty,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(3)),
+                true_label: BlockId(2),
+                false_label: BlockId(3),
+            },
+            source_spans: vec![],
+        });
+        // body: off = (I64)i; addr = base + off; sum += *addr; i_next = i - 1
+        f.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: {
+                // `narrow_offset` scales the index INSIDE the IV's own ring
+                // before widening, so the derived offset's `mul_ty` is the narrow
+                // type and the numeric product certificate is the operative
+                // proof. Without it the index is widened first and the offset
+                // arithmetic happens at pointer width, where a product cannot
+                // wrap the address space (C17 6.5.6p8) and no certificate is
+                // needed. Same C source shape, two different proof obligations.
+                let mut v = Vec::new();
+                let scaled = if narrow_offset {
+                    v.push(Instruction::BinOp {
+                        dest: Value(4),
+                        op: IrBinOp::Shl,
+                        lhs: Operand::Value(Value(2)),
+                        rhs: Operand::Const(IrConst::I32(2)),
+                        ty: iv_ty,
+                    });
+                    v.push(Instruction::Cast {
+                        dest: Value(11),
+                        src: Operand::Value(Value(4)),
+                        from_ty: iv_ty,
+                        to_ty: IrType::I64,
+                    });
+                    Value(11)
+                } else {
+                    v.push(Instruction::Cast {
+                        dest: Value(4),
+                        src: Operand::Value(Value(2)),
+                        from_ty: iv_ty,
+                        to_ty: IrType::I64,
+                    });
+                    Value(4)
+                };
+                v.push(Instruction::BinOp {
+                    dest: Value(5),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Value(scaled),
+                    ty: IrType::I64,
+                });
+                v.push(Instruction::Load {
+                    volatile: false,
+                    dest: Value(6),
+                    ptr: Value(5),
+                    ty: IrType::I8,
+                    seg_override: AddressSpace::Default,
+                });
+                // Canonical `i += -1`: `find_basic_ivs` matches an Add with a
+                // constant step, which is the spelling a canonicalising frontend
+                // produces. LCCC's own frontend currently emits `Sub` here, so
+                // descending C loops form no BasicIV at all (recorded in
+                // FOLLOWUP-2026-10-07); this fixture pins the proof for the day
+                // they do.
+                v.push(Instruction::BinOp {
+                    dest: Value(9),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(2)),
+                    rhs: Operand::Const(IrConst::I32(-1)),
+                    ty: iv_ty,
+                });
+                v
+            },
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: vec![],
+        });
+        f.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: vec![Instruction::Copy {
+                dest: Value(7),
+                src: Operand::Value(Value(6)),
+            }],
+            terminator: Terminator::Return(Some(Operand::Value(Value(7)))),
+            source_spans: vec![],
+        });
+        f.next_value_id = 12;
+        f
+    }
+
+    #[test]
+    fn descending_unsigned_address_loop_end_to_end() {
+        // A1, end to end, and the two facts that bound its blast radius.
+        //
+        // (1) A DESCENDING unsigned counter whose offset is formed by widening
+        //     first (`addr = base + (I64)i`) does get the pointer recurrence, and
+        //     it needs the init-derived bound to get it: with the old
+        //     `hi = limit - 1` the bound was inexact, the numeric certificate was
+        //     withdrawn and the loop was declined outright. A runtime init fires
+        //     too, because that recurrence lives in the pointer ring, where a
+        //     product cannot wrap the address space (C17 6.5.6p8).
+        let fired = |literal_init: bool, narrow_offset: bool| {
+            let mut f = descending_address_add_loop(IrType::U32, literal_init, narrow_offset);
+            ivsr_function(&mut f) > 0
+        };
+        assert!(
+            fired(true, false),
+            "descending, literal init: recovered by A1"
+        );
+        assert!(
+            fired(false, false),
+            "descending, runtime init: pointer-ring recurrence needs no range"
+        );
+
+        // (2) The narrow-ring cell is declined in BOTH directions, so it says
+        //     nothing about A1: `find_derived_exprs` does not collect an offset
+        //     that is scaled INSIDE the narrow ring and widened afterwards
+        //     (`(I64)(i << 2)`). Verified by probe, ascending and descending
+        //     alike. That is a separate, pre-existing collection gap and it is
+        //     recorded in FOLLOWUP-2026-10-07 rather than papered over here.
+        assert!(!fired(true, true), "narrow-scaled offset: not collected");
+        assert!(!fired(false, true), "narrow-scaled offset: not collected");
+
+        // Direction alone never decides the outcome: the ascending spelling of
+        // the collected shape fires as before.
+        let mut up = address_add_loop(true, false);
+        assert!(ivsr_function(&mut up) > 0, "the ascending arm still fires");
+    }
+
+    #[test]
+    fn address_classification_deliberately_over_approximates_intrinsics() {
+        // `is_used_as_address` delegates to `IntrinsicOp::reads_pointer_arg()`,
+        // which is the allowlist for a callee-READ-ONLY proof and is therefore
+        // deliberately true for PURE vector arithmetic. That looks like the wrong
+        // predicate for this question, and narrowing it to `may_read_memory()`
+        // was tried: it removed the pointer induction from `simd_vecreg`,
+        // `simd_crc_adler` and `temp_promotion_window` (+7 insns and +4 stack
+        // references on `simd_crc_adler` alone). This test pins the divergence
+        // between the two predicates so the choice stays visible, and the
+        // soundness argument lives in the comment at the call site: only a
+        // pointer-width value can be armed here, where the integer and pointer
+        // rings agree for every program without UB.
+        use crate::ir::intrinsics::IntrinsicOp;
+        assert!(
+            IntrinsicOp::VecAddF64x4.reads_pointer_arg(),
+            "the read-only allowlist covers pure vector ops by design"
+        );
+        assert!(
+            !IntrinsicOp::VecAddF64x4.may_read_memory(),
+            "a pure vector op demonstrably reads no memory: the two predicates \\
+             really do differ, so the call site's choice is load-bearing"
+        );
+        assert!(IntrinsicOp::VecLoadF64x4.may_read_memory());
+
+        let build = |inst: Instruction| {
+            let mut f = IrFunction::new("addr_class".into(), IrType::I64, vec![], false);
+            f.blocks.push(BasicBlock {
+                label: BlockId(0),
+                instructions: vec![inst],
+                terminator: Terminator::Return(None),
+                source_spans: vec![],
+            });
+            f
+        };
+        // A vector load's pointer argument is an address.
+        let load = build(Instruction::Intrinsic {
+            dest: Some(Value(9)),
+            op: IntrinsicOp::VecLoadF64x4,
+            dest_ptr: None,
+            args: vec![Operand::Value(Value(5))],
+        });
+        assert!(is_used_as_address(&load, 5));
+        // A store's dest_ptr slot is an address even though nothing reads it.
+        let store = build(Instruction::Intrinsic {
+            dest: None,
+            op: IntrinsicOp::VecStoreF64x4,
+            dest_ptr: Some(Value(5)),
+            args: vec![Operand::Value(Value(6))],
+        });
+        assert!(is_used_as_address(&store, 5));
+        // And the over-approximation: a pure vector consumer also classifies as
+        // an address. That is INTENTIONAL — it is what keeps the SIMD pointer
+        // induction alive — and it is safe because the value is pointer-width.
+        let add = build(Instruction::Intrinsic {
+            dest: Some(Value(9)),
+            op: IntrinsicOp::VecAddF64x4,
+            dest_ptr: None,
+            args: vec![Operand::Value(Value(5)), Operand::Value(Value(6))],
+        });
+        assert!(
+            is_used_as_address(&add, 5),
+            "narrowing this to may_read_memory() is a measured regression"
+        );
+        // A value with no use at all is still not an address.
+        let unused = build(Instruction::Copy {
+            dest: Value(9),
+            src: Operand::Value(Value(6)),
+        });
+        assert!(!is_used_as_address(&unused, 5));
     }
 
     /// Test full IVSR transformation on a sum-array loop.
