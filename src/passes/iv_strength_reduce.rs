@@ -83,7 +83,7 @@ pub(crate) fn ivsr_function(func: &mut IrFunction) -> usize {
 
     // Build CFG and dominator tree
     let cfg = analysis::CfgAnalysis::build(func);
-    ivsr_with_analysis(func, &cfg, false)
+    ivsr_with_analysis(func, &cfg, false, true)
 }
 
 /// Run IVSR on a single function with the scalar derived-IV flavor armed
@@ -98,17 +98,24 @@ pub(crate) fn ivsr_function_scalar(func: &mut IrFunction) -> usize {
 
     // Build CFG and dominator tree
     let cfg = analysis::CfgAnalysis::build(func);
-    ivsr_with_analysis(func, &cfg, true)
+    ivsr_with_analysis(func, &cfg, true, true)
 }
 
 /// Run IVSR using pre-computed CFG analysis (avoids redundant analysis when
 /// called from a pipeline that shares analysis across GVN, LICM, IVSR).
 /// `scalar_derived` arms the scalar derived-IV flavor — off in production;
 /// the pipeline derives it from `CCC_IVSR_SCALAR_DERIVED=1` (opt-in).
+///
+/// `ptr_add` arms the address-forming-`Add` scan (IVSR-PTRADD-1) — ON in
+/// production. The pipeline derives it from `CCC_NO_IVSR_PTR_ADD` being absent
+/// and passes it in, so this file spends no environment read of its own:
+/// `check_env_test_hygiene.sh` ratchets env reads in `src/passes` and exempts
+/// only `mod.rs`, which is where a new knob is meant to be read.
 pub(crate) fn ivsr_with_analysis(
     func: &mut IrFunction,
     cfg: &analysis::CfgAnalysis,
     scalar_derived: bool,
+    ptr_add: bool,
 ) -> usize {
     if cfg.num_blocks < 2 {
         return 0;
@@ -153,7 +160,7 @@ pub(crate) fn ivsr_with_analysis(
             }
             continue;
         }
-        let changed = reduce_loop(func, natural_loop, &cfg.preds, scalar_derived);
+        let changed = reduce_loop(func, natural_loop, &cfg.preds, scalar_derived, ptr_add);
         if changed > 0 {
             kept_bodies.push(natural_loop.body.clone());
         }
@@ -169,6 +176,7 @@ fn reduce_loop(
     natural_loop: &NaturalLoop,
     preds: &analysis::FlatAdj,
     scalar_derived: bool,
+    ptr_add: bool,
 ) -> usize {
     let header = natural_loop.header;
     let dbg = std::env::var("CCC_IVSR_DEBUG").is_ok();
@@ -213,7 +221,7 @@ fn reduce_loop(
     }
 
     // Step 2: Find derived expressions (iv * const) used in GEPs.
-    let derived = find_derived_exprs(func, &basic_ivs, &natural_loop.body);
+    let derived = find_derived_exprs(func, &basic_ivs, &natural_loop.body, ptr_add);
     if derived.is_empty() {
         if dbg {
             eprintln!("[IVSR] header={} no derived exprs", header);
@@ -238,16 +246,18 @@ fn reduce_loop(
     // literally share the same multiply instruction. C frontends commonly
     // materialize `a[i]` twice as two independently numbered `i * stride`
     // expressions. The key is semantic: (basic IV, byte stride, invariant base).
-    let mut pointer_groups: Vec<(usize, i64, i64, Value, Vec<(usize, usize, Value)>)> = Vec::new();
+    let mut pointer_groups: Vec<(usize, i64, i64, IrType, Value, Vec<(usize, usize, Value)>)> =
+        Vec::new();
     for d in &derived {
         for &(gep_block_idx, gep_inst_idx, gep_dest, gep_base) in &d.gep_uses {
-            if let Some((_, _, _, _, uses)) =
+            if let Some((_, _, _, _, _, uses)) =
                 pointer_groups
                     .iter_mut()
-                    .find(|(iv_index, stride, off, base, _)| {
+                    .find(|(iv_index, stride, off, mty, base, _)| {
                         *iv_index == d.iv_index
                             && *stride == d.stride
                             && *off == d.add_offset
+                            && *mty == d.mul_ty
                             && *base == gep_base
                     })
             {
@@ -257,6 +267,7 @@ fn reduce_loop(
                     d.iv_index,
                     d.stride,
                     d.add_offset,
+                    d.mul_ty,
                     gep_base,
                     vec![(gep_block_idx, gep_inst_idx, gep_dest)],
                 ));
@@ -264,9 +275,43 @@ fn reduce_loop(
         }
     }
 
-    for (iv_index, stride, add_offset, gep_base, gep_uses) in pointer_groups {
+    for (iv_index, stride, add_offset, mul_ty, gep_base, gep_uses) in pointer_groups {
         let iv = &basic_ivs[iv_index];
-        let inc_bytes = iv.step * stride;
+        // A narrow unsigned counter is modular: zero-extending it into an
+        // address recurrence is linear only while the executed backedges cannot
+        // wrap. That is a proof obligation, not an inference from "there is a
+        // comparison somewhere". IVs at or above the pointer width, and every
+        // sub-32-bit counter (whose C promotion makes the arithmetic 32-bit and
+        // therefore already covered by IVSR-WRAP-1's backedge rule), are handled
+        // by the other arms.
+        let modular_iv = iv.ty.size() < crate::common::types::target_ptr_size();
+        let unsigned_bound = if modular_iv && (iv.ty.size() as usize) >= 4 && iv.ty.is_unsigned() {
+            let bound = unsigned_iv_bound(func, natural_loop, iv, &back_blocks);
+            if bound.is_none() {
+                if dbg {
+                    eprintln!(
+                        "[IVSR] header={} reject unproven modular iv v{} ty={:?} step={}",
+                        header, iv.phi_dest.0, iv.ty, iv.step
+                    );
+                }
+                continue;
+            }
+            bound
+        } else {
+            None
+        };
+        let Some(inc_bytes) = iv.step.checked_mul(stride) else {
+            continue;
+        };
+        if !offset_product_cannot_overflow(mul_ty, stride, add_offset, unsigned_bound) {
+            if dbg {
+                eprintln!(
+                    "[IVSR] header={} reject overflowing {:?} offset product (stride {stride})",
+                    header, mul_ty
+                );
+            }
+            continue;
+        }
 
         // Only reduce GEPs where the base is loop-invariant (skip loop-variant bases).
         if !is_loop_invariant(gep_base.0, &natural_loop.body, func) {
@@ -285,7 +330,24 @@ fn reduce_loop(
         // `(iv + k) * stride` pattern starts at `k * stride` bytes past the
         // base even when the IV starts at zero.
         let init_const = try_resolve_const(&iv.init, func);
-        let init_offset = init_const.map(|v| (v + add_offset) * stride);
+        let init_offset = if let Some(v) = init_const {
+            // IrConst's signed storage is not the IV's mathematical domain.
+            let v = match iv.ty {
+                IrType::U8 => i64::from(v as u8),
+                IrType::U16 => i64::from(v as u16),
+                IrType::U32 => i64::from(v as u32),
+                _ => v,
+            };
+            let Some(off) = v
+                .checked_add(add_offset)
+                .and_then(|v| v.checked_mul(stride))
+            else {
+                continue;
+            };
+            Some(off)
+        } else {
+            None
+        };
 
         // Build preheader instructions for computing the initial pointer
         let mut preheader_insts: Vec<Instruction> = Vec::new();
@@ -801,6 +863,7 @@ fn find_derived_exprs(
     func: &IrFunction,
     basic_ivs: &[BasicIV],
     loop_body: &FxHashSet<usize>,
+    ptr_add: bool,
 ) -> Vec<DerivedExpr> {
     let mut derived = Vec::with_capacity(16);
 
@@ -827,10 +890,10 @@ fn find_derived_exprs(
                         from_ty,
                         to_ty,
                     } => {
-                        // Only treat widening casts as IV-derived.
-                        // Truncating casts (e.g. I32->U8) change the value
-                        // and must not be strength-reduced as if linear.
-                        if to_ty.size() >= from_ty.size() {
+                        // Value preservation, not equal storage width. In
+                        // particular U32 -> I32 -> I64 maps UINT_MAX to -1,
+                        // whereas widening the original U32 maps it to 2^32-1.
+                        if cast_preserves_offset_value(*from_ty, *to_ty) {
                             let idx = iv_values.get(&v.0).or_else(|| iv_derived.get(&v.0));
                             if let Some(&iv_idx) = idx {
                                 if !iv_derived.contains_key(&dest.0) {
@@ -871,7 +934,7 @@ fn find_derived_exprs(
     };
     // Affine form: `add(iv, k)` (or `add(k, iv)`) — recognized so that
     // `(iv + k) * stride` strength-reduces with an initial offset of k*stride.
-    let find_affine = |val_id: u32| -> Option<(usize, i64)> {
+    let find_affine = |val_id: u32, result_ty: IrType| -> Option<(usize, i64)> {
         for &bi in loop_body {
             if bi >= func.blocks.len() {
                 continue;
@@ -884,9 +947,13 @@ fn find_derived_exprs(
                     op: IrBinOp::Add,
                     lhs,
                     rhs,
+                    ty,
                     ..
                 } = inst
                 {
+                    if *ty != result_ty {
+                        continue;
+                    }
                     if let (Operand::Value(v), Operand::Const(c)) = (lhs, rhs) {
                         if let (Some(idx), Some(k)) = (find_iv(v.0), c.to_i64()) {
                             return Some((idx, k));
@@ -950,7 +1017,7 @@ fn find_derived_exprs(
                         let s = c.to_i64();
                         if let (Some(idx), Some(s)) = (find_iv(v.0), s) {
                             (*dest, *ty, idx, s, 0)
-                        } else if let (Some((idx, k)), Some(s)) = (find_affine(v.0), s) {
+                        } else if let (Some((idx, k)), Some(s)) = (find_affine(v.0, *ty), s) {
                             (*dest, *ty, idx, s, k)
                         } else {
                             continue;
@@ -1023,6 +1090,11 @@ fn find_derived_exprs(
                         ..
                     } = ginst
                     {
+                        // The offset's own ring is checked once per group in
+                        // `reduce_loop` (`offset_product_cannot_overflow`),
+                        // not by vetoing every sub-pointer-width multiply:
+                        // a 32-bit `i * 4` whose bound is a compile-time
+                        // constant is exactly as linear as a 64-bit one.
                         if ov.0 == mul_dest_id {
                             gep_uses.push((gbi, gii, *gdest, *base));
                         }
@@ -1067,7 +1139,356 @@ fn find_derived_exprs(
         }
     }
 
+    // ── Address-forming Adds: `Add(ptr, byte_offset)` ──────────────────────
+    //
+    // LCCC lowers EVERY C subscript to pointer-width integer arithmetic rather
+    // than to `GetElementPtr`: `try_lower_pointer_arithmetic` in
+    // `src/ir/lowering/expr_ops.rs` emits `Add(ptr, scale_index(i, elem_size))`,
+    // where `scale_index` is the identity for `elem_size == 1` and a
+    // `Mul(i, elem_size)` otherwise. The scan above only collects
+    // `GetElementPtr` offsets, so on this IR the pointer recurrence never fired
+    // for the most common addressing idiom in C: byte-buffer walks got no
+    // recurrence at all, and wider-element arrays found the `Mul` but no GEP
+    // consuming it, so the whole group was dropped (`has_uses` alone only arms
+    // the opt-in scalar flavor, which is off by default).
+    //
+    // Measured on `tests/bench/k_varint.c` `-O3`, `bench_run`: the address was
+    // rebuilt every iteration as `movslq`/`leaq v(%rip)`/`addq` against GCC's
+    // single pointer bump — 52 vs 42 instructions, 66.5 ms vs 39.9 ms (0.60x,
+    // the worst kernel in `scripts/bench_kernels.py`).
+    //
+    // Two guards keep this from becoming the scalar-derived-IV net loss that
+    // `CCC_IVSR_SCALAR_DERIVED` documents:
+    //   * the Add must be in the POINTER ring — a narrower Add is ordinary
+    //     integer arithmetic; but a pointer-ring Add of two integers is not
+    //     distinguishable from an address by type alone, so additionally
+    //   * its result must actually be USED AS AN ADDRESS (`Load.ptr`,
+    //     `Store.ptr`, `GetElementPtr.base`, or a memory intrinsic's pointer
+    //     argument). An integer accumulation `invariant + iv` that nobody
+    //     dereferences is left exactly alone.
+    //
+    // The rewrite itself reuses the existing machinery: an address-forming Add
+    // is recorded just like a GEP use, so the transform replaces the Add's dest
+    // with a `Copy` of the shared pointer phi, and every constant-offset GEP
+    // reading it (`&p[i+1]`, `&p[i+2]`) keeps working untouched.
+    // ILP32 is excluded: the recurrence adds a loop-carried pointer web, and on
+    // a 6-GPR register file that web is parked in a slot at the latch — the
+    // documented cost that keeps `CCC_IVSR_SCALAR_DERIVED` opt-in. Measured on
+    // tests/regression/simd_crc_adler.c -O2 -m32 the frame grew 142 -> 191
+    // stack refs (+49) for 2 extra instructions, while the same source on
+    // x86-64 was +2 insns / -1 stack. LP64 has 15 usable GPRs and the exchange
+    // pays; ILP32 does not. `target_is_32bit()` is the same predicate
+    // slot_assignment uses to partition its own width classes.
+    //
+    // `ptr_add` arrives as a PARAMETER, read once in the pipeline, because
+    // tests/regression/check_env_test_hygiene.sh ratchets the number of
+    // environment reads in src/passes (mod.rs excepted) and the sanctioned way
+    // to add a knob is to thread it in like `scalar_derived` — not to spend
+    // another read here.
+    if ptr_add && !crate::common::types::target_is_32bit() {
+        // `mul_dest` -> index into `derived`, so an Add whose offset is an
+        // already-recognised scaled index JOINS that group instead of forming a
+        // second recurrence for the same address.
+        let mut by_mul_dest: FxHashMap<u32, usize> = FxHashMap::default();
+        for (i, d) in derived.iter().enumerate() {
+            by_mul_dest.entry(d.mul_dest.0).or_insert(i);
+        }
+        let ptr_ring = crate::common::types::target_ptr_size();
+        let mut attaches: Vec<(usize, usize, usize, Value, Value)> = Vec::new();
+        let mut fresh: Vec<DerivedExpr> = Vec::new();
+        for &bi in loop_body {
+            if bi >= func.blocks.len() {
+                continue;
+            }
+            for (ii, inst) in func.blocks[bi].instructions.iter().enumerate() {
+                let Instruction::BinOp {
+                    dest,
+                    op: IrBinOp::Add,
+                    lhs,
+                    rhs,
+                    ty,
+                } = inst
+                else {
+                    continue;
+                };
+                if ty.size() != ptr_ring {
+                    continue;
+                }
+                let (Operand::Value(a), Operand::Value(b)) = (lhs, rhs) else {
+                    continue;
+                };
+                if !is_used_as_address(func, dest.0) {
+                    continue;
+                }
+                // Exactly one side may be IV-derived. If both are, this is
+                // `iv1 + iv2` and there is no invariant base to bump; if the
+                // candidate base is loop-variant the address is not an
+                // induction of a single pointer either.
+                for (off, base) in [(a, b), (b, a)] {
+                    if !is_loop_invariant(base.0, loop_body, func) {
+                        continue;
+                    }
+                    if let Some(&di) = by_mul_dest.get(&off.0) {
+                        attaches.push((di, bi, ii, *dest, *base));
+                        break;
+                    }
+                    let (idx, add_off) = if let Some(i) = find_iv(off.0) {
+                        (i, 0)
+                    } else {
+                        match find_affine(off.0, *ty) {
+                            Some(pair) => pair,
+                            None => continue,
+                        }
+                    };
+                    fresh.push(DerivedExpr {
+                        stride: 1,
+                        iv_index: idx,
+                        add_offset: add_off,
+                        gep_uses: vec![(bi, ii, *dest, *base)],
+                        mul_dest: *dest,
+                        mul_ty: *ty,
+                        has_uses: true,
+                    });
+                    break;
+                }
+            }
+        }
+
+        for (di, bi, ii, dest, base) in attaches {
+            derived[di].gep_uses.push((bi, ii, dest, base));
+        }
+        derived.extend(fresh);
+    }
+
     derived
+}
+
+/// Whether `val_id` is dereferenced or used as an addressing base anywhere in
+/// the function — i.e. whether it is an ADDRESS and not merely an integer that
+/// happens to be pointer-width. Conservative by construction: anything not
+/// positively identified as a memory operand returns false. A value used both
+/// as an address and as an integer still qualifies (the rewrite preserves its
+/// value either way); a pure integer accumulation does not.
+fn is_used_as_address(func: &IrFunction, val_id: u32) -> bool {
+    let is_target = |o: &Operand| matches!(o, Operand::Value(v) if v.0 == val_id);
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                // `Load`/`Store` carry a `Value` pointer; the atomic forms
+                // carry an `Operand`, so they cannot share an arm.
+                Instruction::Load { ptr, .. } | Instruction::GetElementPtr { base: ptr, .. } => {
+                    if ptr.0 == val_id {
+                        return true;
+                    }
+                }
+                Instruction::Store { ptr, .. } => {
+                    if ptr.0 == val_id {
+                        return true;
+                    }
+                }
+                Instruction::AtomicLoad { ptr, .. } | Instruction::AtomicStore { ptr, .. } => {
+                    if is_target(ptr) {
+                        return true;
+                    }
+                }
+                Instruction::Memcpy { dest, src, .. } => {
+                    if dest.0 == val_id || src.0 == val_id {
+                        return true;
+                    }
+                }
+                // Vector/SSE loads and stores carry their pointer as a
+                // positional argument rather than in a dedicated slot; these
+                // are exactly the IVOPTS-1 shapes the backlog calls out as
+                // invisible to the GEP-only scan. The classification is
+                // delegated to `IntrinsicOp`'s own allowlists rather than
+                // hand-listed here, so a new vector memory opcode is picked up
+                // automatically instead of silently missing.
+                Instruction::Intrinsic {
+                    dest_ptr, args, op, ..
+                } => {
+                    if dest_ptr.is_some_and(|d| d.0 == val_id) {
+                        return true;
+                    }
+                    if (op.reads_pointer_arg() || op.writes_memory_via_args())
+                        && args.iter().any(is_target)
+                    {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
+/// Cast legality for a derived address expression. Both predicates live on
+/// `IrType` next to the size/signedness facts they are stated in terms of, and
+/// are shared with `src/backend/generation.rs`'s SIB-index peel so the two
+/// cannot drift apart again (IVSR-DOMAIN-1 was exactly that drift). The
+/// exhaustive per-domain tests live with the predicates, in
+/// `src/common/types.rs::cast_predicate_tests`; the IVSR-specific consequences
+/// are pinned by `derived_cast_proof_is_about_values_not_storage_size` and
+/// `offset_cast_proof_adds_only_the_pointer_ring_reinterpretation` below.
+#[inline]
+fn cast_preserves_integer_value(from: IrType, to: IrType) -> bool {
+    from.cast_preserves_integer_value(to)
+}
+
+#[inline]
+fn cast_preserves_offset_value(from: IrType, to: IrType) -> bool {
+    from.cast_preserves_offset_value(to)
+}
+
+/// Proven execution range of a narrow UNSIGNED induction variable.
+///
+/// `hi` bounds every value the loop body can observe. `exact` records whether
+/// that bound came from a compile-time constant; only an exact bound can also
+/// certify that a narrower product `iv * stride` cannot overflow its own ring
+/// (an invariant bound proves the IV is monotone but says nothing numeric).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UnsignedIvBound {
+    lo: i128,
+    hi: i128,
+    exact: bool,
+}
+
+/// Local no-wrap proof for a narrow unsigned IV.
+///
+/// The HEADER's exit test must guard every taken backedge, compare this exact
+/// phi in the phi's own unsigned type, have the polarity that matches the step
+/// sign, and step by exactly one. A self-loop header, an interior test, a
+/// non-unit step or an inclusive limit is not a proof — those shapes are left
+/// to the (already modular) index recurrence rather than a pointer recurrence.
+/// IVs that `iv_widen` promoted to the pointer width need no new proof here:
+/// their recurrence already lives in the pointer ring.
+fn unsigned_iv_bound(
+    func: &IrFunction,
+    lp: &NaturalLoop,
+    iv: &BasicIV,
+    back_blocks: &[usize],
+) -> Option<UnsignedIvBound> {
+    use crate::ir::reexports::{IrCmpOp as C, Terminator};
+    if back_blocks.contains(&lp.header) {
+        return None;
+    }
+    let width = (iv.ty.size() * 8) as u32;
+    let max = (1i128 << width) - 1;
+    let header = &func.blocks[lp.header];
+    let Terminator::CondBranch {
+        cond: Operand::Value(cond),
+        true_label,
+        false_label,
+    } = header.terminator
+    else {
+        return None;
+    };
+    let inside = |label| {
+        func.blocks
+            .iter()
+            .position(|b| b.label == label)
+            .is_some_and(|i| lp.body.contains(&i))
+    };
+    let true_inside = inside(true_label);
+    // Both targets on the same side of the loop boundary proves nothing about
+    // which edge is the backedge.
+    if true_inside == inside(false_label) {
+        return None;
+    }
+    for inst in &header.instructions {
+        let Instruction::Cmp {
+            dest,
+            op,
+            lhs,
+            rhs,
+            ty,
+        } = inst
+        else {
+            continue;
+        };
+        // The branch condition must be THIS comparison, in the IV's own
+        // unsigned type: a comparison of a cast copy says nothing about the
+        // phi's own domain.
+        if *dest != cond || *ty != iv.ty {
+            continue;
+        }
+        let (mut op, other) = if *lhs == Operand::Value(iv.phi_dest) {
+            (*op, rhs)
+        } else if *rhs == Operand::Value(iv.phi_dest) {
+            let reversed = match op {
+                C::Ult => C::Ugt,
+                C::Ugt => C::Ult,
+                C::Ule => C::Uge,
+                C::Uge => C::Ule,
+                _ => return None,
+            };
+            (reversed, lhs)
+        } else {
+            return None;
+        };
+        let exact = matches!(other, Operand::Const(_));
+        if let Operand::Value(v) = other
+            && !is_loop_invariant(v.0, &lp.body, func)
+        {
+            return None;
+        }
+        // Normalise to "the loop continues while <op> holds".
+        if !true_inside {
+            op = match op {
+                C::Ult => C::Uge,
+                C::Ugt => C::Ule,
+                C::Ule => C::Ugt,
+                C::Uge => C::Ult,
+                _ => return None,
+            };
+        }
+        // Strict limit, unit step, polarity matching the step sign. An
+        // inclusive limit (`<= max`) or a multi-unit step can still wrap.
+        if !matches!((op, iv.step), (C::Ult, 1) | (C::Ugt, -1)) {
+            return None;
+        }
+        let lo = if iv.step > 0 { 0 } else { 1 };
+        // A constant limit yields the exact body maximum `limit - 1`; an
+        // invariant limit proves monotonicity but no numeric maximum.
+        let hi = match other {
+            Operand::Const(c) => c.to_i64().map(|n| n as i128 - 1).unwrap_or(max),
+            Operand::Value(_) => max,
+        };
+        return Some(UnsignedIvBound {
+            lo: lo as i128,
+            hi,
+            exact,
+        });
+    }
+    None
+}
+
+/// Whether replacing `offset(iv) = (iv + add_offset) * stride`, evaluated in
+/// `mul_ty`, by the pointer recurrence `p += step * stride` can diverge.
+///
+/// Divergence needs the PRODUCT to wrap inside `mul_ty` while the pointer ring
+/// keeps counting linearly. A signed `mul_ty` cannot wrap in a defined program
+/// (C17 6.5/5 — the same UB theorem `iv_widen` uses), and a product at or above
+/// the pointer width wraps in exactly the ring the recurrence lives in, so both
+/// are equivalent by construction. Only an UNSIGNED product NARROWER than the
+/// pointer ring is a genuine hazard, and an exact constant bound discharges it.
+fn offset_product_cannot_overflow(
+    mul_ty: IrType,
+    stride: i64,
+    add_offset: i64,
+    bound: Option<UnsignedIvBound>,
+) -> bool {
+    let ptr = crate::common::types::target_ptr_size();
+    if !mul_ty.is_integer() || (mul_ty.size() as usize) >= ptr || !mul_ty.is_unsigned() {
+        return true;
+    }
+    let Some(b) = bound.filter(|b| b.exact) else {
+        return false;
+    };
+    let limit = 1i128 << ((mul_ty.size() * 8) as u32);
+    let lo = (b.lo + add_offset as i128).checked_mul(stride as i128);
+    let hi = (b.hi + add_offset as i128).checked_mul(stride as i128);
+    matches!((lo, hi), (Some(lo), Some(hi)) if lo >= 0 && hi < limit)
 }
 
 /// Look through Cast and Copy instructions to find the root value.
@@ -1176,6 +1597,377 @@ mod tests {
         assert!(!kept.iter().any(|b| !b.is_disjoint(&separate.body)));
     }
 
+    /// Exact promote/add/truncate backedge, including Copy wrappers. IDs are
+    /// deliberately independent of block numbers; detection must follow SSA.
+    fn cast_backedge(phi_ty: IrType, arithmetic_ty: IrType) -> IrFunction {
+        let mut f = IrFunction::new("cast_backedge".into(), IrType::I32, vec![], false);
+        f.blocks = vec![
+            BasicBlock {
+                label: BlockId(10),
+                instructions: vec![],
+                terminator: Terminator::Branch(BlockId(20)),
+                source_spans: vec![],
+            },
+            BasicBlock {
+                label: BlockId(20),
+                instructions: vec![
+                    Instruction::Phi {
+                        dest: Value(0),
+                        ty: phi_ty,
+                        incoming: vec![
+                            (Operand::Const(IrConst::I32(0)), BlockId(10)),
+                            (Operand::Value(Value(4)), BlockId(30)),
+                        ],
+                    },
+                    Instruction::Cmp {
+                        dest: Value(5),
+                        op: IrCmpOp::Ult,
+                        lhs: Operand::Value(Value(0)),
+                        rhs: Operand::Const(IrConst::I32(8)),
+                        ty: phi_ty,
+                    },
+                ],
+                terminator: Terminator::CondBranch {
+                    cond: Operand::Value(Value(5)),
+                    true_label: BlockId(30),
+                    false_label: BlockId(40),
+                },
+                source_spans: vec![],
+            },
+            BasicBlock {
+                label: BlockId(30),
+                instructions: vec![
+                    Instruction::Cast {
+                        dest: Value(1),
+                        src: Operand::Value(Value(0)),
+                        from_ty: phi_ty,
+                        to_ty: arithmetic_ty,
+                    },
+                    Instruction::BinOp {
+                        dest: Value(2),
+                        op: IrBinOp::Add,
+                        lhs: Operand::Value(Value(1)),
+                        rhs: Operand::Const(IrConst::I32(1)),
+                        ty: arithmetic_ty,
+                    },
+                    Instruction::Cast {
+                        dest: Value(3),
+                        src: Operand::Value(Value(2)),
+                        from_ty: arithmetic_ty,
+                        to_ty: phi_ty,
+                    },
+                    Instruction::Copy {
+                        dest: Value(4),
+                        src: Operand::Value(Value(3)),
+                    },
+                ],
+                terminator: Terminator::Branch(BlockId(20)),
+                source_spans: vec![],
+            },
+            BasicBlock {
+                label: BlockId(40),
+                instructions: vec![],
+                terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+                source_spans: vec![],
+            },
+        ];
+        f.next_value_id = 6;
+        f
+    }
+
+    #[test]
+    fn promoted_narrow_backedges_are_not_linear_ivs() {
+        for ty in [IrType::U8, IrType::U16, IrType::I8, IrType::I16] {
+            let f = cast_backedge(ty, IrType::I32);
+            assert!(
+                find_basic_ivs(&f, 1, &[1, 2].into_iter().collect(), 0, &[2]).is_empty(),
+                "{ty:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_casts_and_copies_keep_basic_ivs_but_signedness_needs_proof() {
+        for ty in [IrType::I32, IrType::U32, IrType::I64, IrType::U64] {
+            let f = cast_backedge(ty, ty);
+            let ivs = find_basic_ivs(&f, 1, &[1, 2].into_iter().collect(), 0, &[2]);
+            assert_eq!(ivs.len(), 1);
+            assert_eq!(ivs[0].step, 1);
+        }
+        for (from, to) in [
+            (IrType::I32, IrType::U32),
+            (IrType::U32, IrType::I32),
+            (IrType::I64, IrType::U64),
+            (IrType::U64, IrType::I64),
+        ] {
+            let f = cast_backedge(from, to);
+            assert!(find_basic_ivs(&f, 1, &[1, 2].into_iter().collect(), 0, &[2]).is_empty());
+        }
+    }
+
+    #[test]
+    fn offset_cast_proof_adds_only_the_pointer_ring_reinterpretation() {
+        let ints = [
+            IrType::I8,
+            IrType::U8,
+            IrType::I16,
+            IrType::U16,
+            IrType::I32,
+            IrType::U32,
+            IrType::I64,
+            IrType::U64,
+        ];
+        let ptr = crate::common::types::target_ptr_size();
+        for from in ints {
+            for to in ints {
+                // Model: value-preserving widening, or a reinterpretation that
+                // cannot change the pattern reaching the pointer ring.
+                let ring = from.is_integer()
+                    && to.is_integer()
+                    && from.size() == to.size()
+                    && (from.size() as usize) >= ptr;
+                assert_eq!(
+                    cast_preserves_offset_value(from, to),
+                    cast_preserves_integer_value(from, to) || ring,
+                    "{from:?}->{to:?}"
+                );
+            }
+        }
+        // The exact IVSR-DOMAIN-1 composition stays rejected at every width.
+        for (from, to) in [
+            (IrType::U32, IrType::I32),
+            (IrType::I32, IrType::U32),
+            (IrType::U16, IrType::I16),
+            (IrType::I16, IrType::U16),
+            (IrType::U8, IrType::I8),
+            (IrType::I8, IrType::U8),
+        ] {
+            assert!(!cast_preserves_offset_value(from, to), "{from:?}->{to:?}");
+        }
+        // The pointer-ring reinterpretation is admitted only at pointer width,
+        // which is what keeps the 64-bit `size_t`/`ptrdiff_t` spelling reducible.
+        let wide = (IrType::U64.size() as usize) >= ptr;
+        assert_eq!(cast_preserves_offset_value(IrType::U64, IrType::I64), wide);
+        assert_eq!(cast_preserves_offset_value(IrType::I64, IrType::U64), wide);
+        assert!(!cast_preserves_offset_value(IrType::I32, IrType::F32));
+        assert!(!cast_preserves_offset_value(IrType::F64, IrType::I64));
+        assert!(!cast_preserves_offset_value(IrType::I64, IrType::Ptr));
+    }
+
+    #[test]
+    fn offset_product_proof_needs_an_exact_bound_only_below_the_pointer_ring() {
+        let ptr = crate::common::types::target_ptr_size();
+        let exact = Some(UnsignedIvBound {
+            lo: 0,
+            hi: 1023,
+            exact: true,
+        });
+        let inexact = Some(UnsignedIvBound {
+            lo: 0,
+            hi: (1i128 << 32) - 1,
+            exact: false,
+        });
+        // Signed and pointer-ring products are UB/ring-equivalent: always OK.
+        for ty in [IrType::I32, IrType::I64, IrType::U64] {
+            if ty.size() >= ptr || !ty.is_unsigned() {
+                assert!(offset_product_cannot_overflow(ty, 4, 0, None), "{ty:?}");
+            }
+        }
+        // Unsigned 32-bit product: needs the exact bound, and must really fit.
+        assert!(offset_product_cannot_overflow(IrType::U32, 4, 0, exact));
+        assert!(!offset_product_cannot_overflow(IrType::U32, 4, 0, inexact));
+        assert!(!offset_product_cannot_overflow(IrType::U32, 4, 0, None));
+        let too_big = Some(UnsignedIvBound {
+            lo: 0,
+            hi: (1i128 << 31) - 1,
+            exact: true,
+        });
+        assert!(!offset_product_cannot_overflow(IrType::U32, 4, 0, too_big));
+        // An affine offset participates in the product bound.
+        assert!(offset_product_cannot_overflow(IrType::U32, 4, 8, exact));
+        let edge = Some(UnsignedIvBound {
+            lo: 0,
+            hi: (1i128 << 30) - 9,
+            exact: true,
+        });
+        assert!(offset_product_cannot_overflow(IrType::U32, 4, 8, edge));
+        let over = Some(UnsignedIvBound {
+            lo: 0,
+            hi: (1i128 << 30) - 8,
+            exact: true,
+        });
+        assert!(!offset_product_cannot_overflow(IrType::U32, 4, 8, over));
+        // The predicate only ever sees the integer type of a Mul/Shl/Add;
+        // a non-integer `mul_ty` is vacuously admitted and cannot arise.
+        assert!(offset_product_cannot_overflow(IrType::F32, 4, 0, exact));
+    }
+
+    #[test]
+    fn unsigned_bound_records_whether_the_limit_was_a_constant() {
+        use crate::ir::reexports::IrCmpOp as C;
+        let lp = NaturalLoop {
+            header: 1,
+            body: [1, 2].into_iter().collect(),
+        };
+        let iv = BasicIV {
+            phi_dest: Value(0),
+            ty: IrType::U32,
+            init: Operand::Const(IrConst::I32(0)),
+            step: 1,
+        };
+        let mut f = cast_backedge(IrType::U32, IrType::U32);
+        // Constant limit 8: body values are exactly 0..=7.
+        let b = unsigned_iv_bound(&f, &lp, &iv, &[2]).expect("constant bound");
+        assert!(b.exact && b.lo == 0 && b.hi == 7, "{b:?}");
+        // Replace the limit with a loop-invariant value: monotone but inexact.
+        f.blocks[0].instructions.push(Instruction::Copy {
+            dest: Value(7),
+            src: Operand::Const(IrConst::I32(8)),
+        });
+        if let Instruction::Cmp { rhs, .. } = &mut f.blocks[1].instructions[1] {
+            *rhs = Operand::Value(Value(7));
+        }
+        let b = unsigned_iv_bound(&f, &lp, &iv, &[2]).expect("invariant bound");
+        assert!(!b.exact && b.hi == (1i128 << 32) - 1, "{b:?}");
+        // A loop-VARIANT limit is no bound at all.
+        if let Instruction::Cmp { rhs, .. } = &mut f.blocks[1].instructions[1] {
+            *rhs = Operand::Value(Value(3));
+        }
+        assert!(unsigned_iv_bound(&f, &lp, &iv, &[2]).is_none());
+        // Inclusive limits and multi-unit steps can still wrap.
+        let mut g = cast_backedge(IrType::U32, IrType::U32);
+        if let Instruction::Cmp { op, .. } = &mut g.blocks[1].instructions[1] {
+            *op = C::Ule;
+        }
+        assert!(unsigned_iv_bound(&g, &lp, &iv, &[2]).is_none());
+    }
+
+    #[test]
+    fn derived_cast_proof_is_about_values_not_storage_size() {
+        let ints = [
+            IrType::I8,
+            IrType::U8,
+            IrType::I16,
+            IrType::U16,
+            IrType::I32,
+            IrType::U32,
+            IrType::I64,
+            IrType::U64,
+        ];
+        // Exhaust the extrema of every integer domain against every cast domain.
+        let range = |ty: IrType| {
+            let bits = ty.size() * 8;
+            if ty.is_unsigned() {
+                (0_i128, (1_i128 << bits) - 1)
+            } else {
+                (-(1_i128 << (bits - 1)), (1_i128 << (bits - 1)) - 1)
+            }
+        };
+        for from in ints {
+            for to in ints {
+                let (lo, hi) = range(from);
+                let (tl, th) = range(to);
+                assert_eq!(
+                    cast_preserves_integer_value(from, to),
+                    lo >= tl && hi <= th,
+                    "{from:?}->{to:?}"
+                );
+            }
+        }
+        assert!(!cast_preserves_integer_value(IrType::I32, IrType::F32));
+        assert!(!cast_preserves_integer_value(IrType::F64, IrType::I64));
+    }
+
+    #[test]
+    fn unsigned_no_wrap_requires_header_polarity_unit_step_and_unsigned_cmp() {
+        let lp = NaturalLoop {
+            header: 1,
+            body: [1, 2].into_iter().collect(),
+        };
+        for (op, truth_stays, step, expected) in [
+            (IrCmpOp::Ult, true, 1, true),
+            (IrCmpOp::Uge, false, 1, true),
+            (IrCmpOp::Ult, false, 1, false),
+            (IrCmpOp::Ule, true, 1, false),
+            (IrCmpOp::Slt, true, 1, false),
+            (IrCmpOp::Ult, true, 2, false),
+            (IrCmpOp::Ugt, true, -1, true),
+            (IrCmpOp::Uge, true, -1, false),
+        ] {
+            let mut f = cast_backedge(IrType::U32, IrType::U32);
+            if let Instruction::Cmp { op: cmp, .. } = &mut f.blocks[1].instructions[1] {
+                *cmp = op;
+            }
+            if !truth_stays {
+                f.blocks[1].terminator = Terminator::CondBranch {
+                    cond: Operand::Value(Value(5)),
+                    true_label: BlockId(40),
+                    false_label: BlockId(30),
+                };
+            }
+            let iv = BasicIV {
+                phi_dest: Value(0),
+                ty: IrType::U32,
+                init: Operand::Const(IrConst::I32(0)),
+                step,
+            };
+            assert_eq!(
+                unsigned_iv_bound(&f, &lp, &iv, &[2]).is_some(),
+                expected,
+                "{op:?} {truth_stays} {step}"
+            );
+            assert!(unsigned_iv_bound(&f, &lp, &iv, &[1]).is_none());
+        }
+    }
+
+    #[test]
+    fn derived_signedness_then_widening_is_not_a_pointer_iv() {
+        use crate::common::types::AddressSpace;
+        for (middle, expected) in [(IrType::I32, 0), (IrType::U32, 1)] {
+            let mut f = cast_backedge(IrType::U32, IrType::U32);
+            f.blocks[0].instructions.push(Instruction::Copy {
+                dest: Value(10),
+                src: Operand::Const(IrConst::I64(4096)),
+            });
+            f.blocks[2].instructions.extend([
+                Instruction::Cast {
+                    dest: Value(6),
+                    src: Operand::Value(Value(0)),
+                    from_ty: IrType::U32,
+                    to_ty: middle,
+                },
+                Instruction::Cast {
+                    dest: Value(7),
+                    src: Operand::Value(Value(6)),
+                    from_ty: middle,
+                    to_ty: IrType::I64,
+                },
+                Instruction::BinOp {
+                    dest: Value(8),
+                    op: IrBinOp::Mul,
+                    lhs: Operand::Value(Value(7)),
+                    rhs: Operand::Const(IrConst::I64(4)),
+                    ty: IrType::I64,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(9),
+                    base: Value(10),
+                    offset: Operand::Value(Value(8)),
+                    ty: IrType::I32,
+                },
+                Instruction::Load {
+                    dest: Value(11),
+                    ptr: Value(9),
+                    ty: IrType::I32,
+                    volatile: true,
+                    seg_override: AddressSpace::Default,
+                },
+            ]);
+            f.next_value_id = 12;
+            assert_eq!(ivsr_function(&mut f), expected);
+        }
+    }
+
     /// Test basic IV detection on a simple counting loop.
     #[test]
     fn test_find_basic_iv() {
@@ -1248,6 +2040,165 @@ mod tests {
         assert_eq!(ivs.len(), 1);
         assert_eq!(ivs[0].phi_dest, Value(1));
         assert_eq!(ivs[0].step, 1);
+    }
+
+    /// `Add(invariant_ptr, byte_offset)` used as a memory address — the shape
+    /// LCCC's own lowering emits for EVERY C subscript
+    /// (`try_lower_pointer_arithmetic`), and the shape the GEP-only scan was
+    /// blind to. `deref` selects whether the address is actually loaded
+    /// through, which is what `is_used_as_address` keys on.
+    fn address_add_loop(deref: bool, ptr_width_iv: bool) -> IrFunction {
+        let mut f = IrFunction::new("address_add".into(), IrType::I64, vec![], false);
+        let iv_ty = if ptr_width_iv {
+            IrType::I64
+        } else {
+            IrType::I32
+        };
+        // v0 = &buffer (invariant base), defined in the preheader.
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Copy {
+                    dest: Value(0),
+                    src: Operand::Const(IrConst::I64(0x4000)),
+                },
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Const(IrConst::I32(0)),
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: vec![],
+        });
+        // header: i = phi(0, i_next); while (i < 64)
+        f.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                Instruction::Phi {
+                    dest: Value(2),
+                    ty: iv_ty,
+                    incoming: vec![
+                        (Operand::Const(IrConst::I32(0)), BlockId(0)),
+                        (Operand::Value(Value(9)), BlockId(2)),
+                    ],
+                },
+                Instruction::Cmp {
+                    dest: Value(3),
+                    op: IrCmpOp::Slt,
+                    lhs: Operand::Value(Value(2)),
+                    rhs: Operand::Const(IrConst::I32(64)),
+                    ty: iv_ty,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(3)),
+                true_label: BlockId(2),
+                false_label: BlockId(3),
+            },
+            source_spans: vec![],
+        });
+        // body: off = (I64)i; addr = base + off; [sum += *addr]; i_next = i + 1
+        let mut body = vec![
+            Instruction::Cast {
+                dest: Value(4),
+                src: Operand::Value(Value(2)),
+                from_ty: iv_ty,
+                to_ty: IrType::I64,
+            },
+            Instruction::BinOp {
+                dest: Value(5),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(0)),
+                rhs: Operand::Value(Value(4)),
+                ty: IrType::I64,
+            },
+        ];
+        if deref {
+            body.push(Instruction::Load {
+                volatile: false,
+                dest: Value(6),
+                ptr: Value(5),
+                ty: IrType::I8,
+                seg_override: AddressSpace::Default,
+            });
+        } else {
+            // Same arithmetic, but nobody dereferences it: an integer
+            // accumulation that happens to be pointer-width.
+            body.push(Instruction::Copy {
+                dest: Value(6),
+                src: Operand::Value(Value(5)),
+            });
+        }
+        body.push(Instruction::BinOp {
+            dest: Value(9),
+            op: IrBinOp::Add,
+            lhs: Operand::Value(Value(2)),
+            rhs: Operand::Const(IrConst::I32(1)),
+            ty: iv_ty,
+        });
+        f.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: body,
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: vec![],
+        });
+        f.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: vec![Instruction::Copy {
+                dest: Value(7),
+                src: Operand::Value(Value(6)),
+            }],
+            terminator: Terminator::Return(Some(Operand::Value(Value(7)))),
+            source_spans: vec![],
+        });
+        f.next_value_id = 10;
+        f
+    }
+
+    #[test]
+    fn address_forming_add_becomes_a_pointer_recurrence() {
+        // The exact k_varint shape: a byte-offset Add feeding a Load, with a
+        // narrow signed IV. This is what the GEP-only scan could not see.
+        let mut f = address_add_loop(true, false);
+        assert!(
+            ivsr_function(&mut f) > 0,
+            "stride-1 address Add must reduce"
+        );
+        // The recurrence is a pointer phi bumped by the step, and the original
+        // Add is replaced by a Copy of it — not left computing the address.
+        let phis = f
+            .blocks
+            .iter()
+            .flat_map(|b| b.instructions.iter())
+            .filter(|i| {
+                matches!(i, Instruction::Phi { ty, .. } if *ty == IrType::Ptr
+                || i.result_type() == Some(IrType::I64))
+            })
+            .count();
+        assert!(phis >= 1, "expected an inserted pointer phi");
+        assert!(
+            f.blocks[2].instructions.iter().any(|i| matches!(i,
+            Instruction::Copy { dest, .. } if *dest == Value(5))),
+            "the address Add must be rewritten to a Copy of the pointer IV"
+        );
+    }
+
+    #[test]
+    fn pointer_width_add_that_nobody_dereferences_is_left_alone() {
+        // Same arithmetic, no memory operand: turning an integer accumulation
+        // into a loop-carried recurrence is the net loss that keeps
+        // CCC_IVSR_SCALAR_DERIVED opt-in, so is_used_as_address must refuse it.
+        let mut f = address_add_loop(false, true);
+        assert_eq!(ivsr_function(&mut f), 0);
+    }
+
+    #[test]
+    fn address_add_arm_is_gated_by_the_kill_switch_and_ilp32() {
+        // LP64: the arm fires. This also pins that the gate reads the TARGET,
+        // not a hard-coded width, since the test suite runs on the host default.
+        let mut f = address_add_loop(true, false);
+        let fired = ivsr_function(&mut f) > 0;
+        assert_eq!(fired, !crate::common::types::target_is_32bit());
     }
 
     /// Test full IVSR transformation on a sum-array loop.

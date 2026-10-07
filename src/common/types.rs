@@ -2242,6 +2242,66 @@ pub enum IrType {
 }
 
 impl IrType {
+    /// Whether `Cast(self -> to)` preserves the integer VALUE across the whole
+    /// source domain.
+    ///
+    /// This is the rule every transform that replaces an expression with a
+    /// *mathematically linear* one has to satisfy: widening an unsigned source,
+    /// or a signed source into a signed target, and nothing else. A same-width
+    /// signedness reinterpretation fails it, because a LATER widening extends
+    /// the result differently — `(int32_t)u` with `u == UINT32_MAX` is `-1`, and
+    /// `sext(-1)` is not `zext(UINT32_MAX)`.
+    ///
+    /// `src/backend/generation.rs`'s SIB-index peel stated this rule inline (and
+    /// documented the `I32 -> U32 -> I64` miscompile it prevents);
+    /// `src/passes/iv_strength_reduce.rs` stated a weaker
+    /// `to_ty.size() >= from_ty.size()` version of it and consequently turned
+    /// `p[(int32_t)i]` with `i` crossing `UINT32_MAX` into a pointer recurrence
+    /// that walked off the object (IVSR-DOMAIN-1, SIGSEGV at -O2 on two shipped
+    /// benchmark shapes). Both now call this one function, so the rule cannot
+    /// drift between them again; `cast_predicate_tests` below walks all 64
+    /// ordered integer-type pairs against each type's actual domain extrema.
+    ///
+    /// Note this is NOT the right predicate for an offset that is consumed in
+    /// the target's pointer ring — see [`IrType::cast_preserves_offset_value`].
+    pub fn cast_preserves_integer_value(self, to: IrType) -> bool {
+        self.is_integer()
+            && to.is_integer()
+            && (self == to
+                || (to.size() > self.size() && (self.is_unsigned() || !to.is_unsigned())))
+    }
+
+    /// Whether `Cast(self -> to)` preserves the OFFSET VALUE that reaches a
+    /// pointer computation.
+    ///
+    /// Deliberately not the same question as
+    /// [`IrType::cast_preserves_integer_value`]. Address arithmetic lives in the
+    /// target's pointer ring, so a same-width signedness reinterpretation AT OR
+    /// ABOVE the pointer width cannot change the value the `GetElementPtr`
+    /// consumes: on LP64, `(ptrdiff_t)(size_t)x` and `(size_t)x` are the same
+    /// 64-bit pattern, and a recurrence `base + k*step*stride` is formed in that
+    /// same ring. Narrower reinterpretations stay rejected, because there the
+    /// pattern is re-extended afterwards and the two spellings diverge.
+    ///
+    /// Using the value-only predicate here is measurably wrong in the other
+    /// direction: five programs in `tests/benchmark/programs` spell their 64-bit
+    /// index `U64 -> I64`, and rejecting that cast cost `histogram` +5,
+    /// `linux_rbtree` +12 instructions/+7 stack refs, `linux_find_bit` +1,
+    /// `i686_alu_chains` +2 and `zlib_ng_adler32_combine` +1 over the
+    /// 55-program default corpus (+15 total). Evidence:
+    /// `engineering/evidence/2026-10-06-ivsr-domain/corpus-ab-value-only-predicate.json`.
+    ///
+    /// `src/passes/loop_carried_forward.rs` peels same-width integer/pointer
+    /// casts under the same reasoning, expressed structurally: that analysis
+    /// only ever follows pointer-width integers (`is_ptr_width_int`), so its
+    /// same-width peel is exactly this predicate's pointer-ring arm.
+    pub fn cast_preserves_offset_value(self, to: IrType) -> bool {
+        self.cast_preserves_integer_value(to)
+            || (self.is_integer()
+                && to.is_integer()
+                && self.size() == to.size()
+                && (self.size() as usize) >= target_ptr_size())
+    }
     /// Memory extent of one scalar `Load`/`Store` of this type, as
     /// `(definitely, possibly)` accessed bytes from the address, for the
     /// middle end's memory disambiguation (DSE, store-to-load forwarding,
@@ -2594,5 +2654,118 @@ mod record_display_tag_tests {
         // diagnostic, or every shadowing scope would print an internal name.
         assert_eq!(CType::Struct("struct.S#1".into()).to_string(), "struct S");
         assert_eq!(CType::Union("union.U#2".into()).to_string(), "union U");
+    }
+}
+
+#[cfg(test)]
+mod cast_predicate_tests {
+    use super::IrType;
+
+    const INTS: [IrType; 8] = [
+        IrType::I8,
+        IrType::U8,
+        IrType::I16,
+        IrType::U16,
+        IrType::I32,
+        IrType::U32,
+        IrType::I64,
+        IrType::U64,
+    ];
+
+    /// The type's actual mathematical domain, in i128 so the extremes fit.
+    fn domain(ty: IrType) -> (i128, i128) {
+        let bits = ty.size() * 8;
+        if ty.is_unsigned() {
+            (0, (1i128 << bits) - 1)
+        } else {
+            (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
+        }
+    }
+
+    /// Exhaustive: every ordered pair of integer IR types, checked against the
+    /// domain-containment MODEL rather than against the implementation. A
+    /// future "simplification" of either predicate therefore fails on a
+    /// concrete counterexample instead of on a code review.
+    #[test]
+    fn value_preservation_is_exactly_domain_containment() {
+        for from in INTS {
+            for to in INTS {
+                let (lo, hi) = domain(from);
+                let (tlo, thi) = domain(to);
+                assert_eq!(
+                    from.cast_preserves_integer_value(to),
+                    lo >= tlo && hi <= thi,
+                    "{from:?} -> {to:?}"
+                );
+            }
+        }
+    }
+
+    /// The offset predicate adds EXACTLY the pointer-ring reinterpretations and
+    /// nothing else — no accidental extra admissions.
+    #[test]
+    fn offset_preservation_adds_only_the_pointer_ring_reinterpretation() {
+        let ptr = super::target_ptr_size();
+        for from in INTS {
+            for to in INTS {
+                let ring = from.size() == to.size() && (from.size() as usize) >= ptr;
+                assert_eq!(
+                    from.cast_preserves_offset_value(to),
+                    from.cast_preserves_integer_value(to) || ring,
+                    "{from:?} -> {to:?}"
+                );
+            }
+        }
+    }
+
+    /// The two named defects, as executable assertions.
+    #[test]
+    fn the_two_reported_miscompile_shapes_stay_rejected() {
+        // IVSR-DOMAIN-1: the composed U32 -> I32 -> I64 that sign-extended a
+        // value the source meant as an unsigned index.
+        assert!(!IrType::U32.cast_preserves_integer_value(IrType::I32));
+        assert!(!IrType::U32.cast_preserves_offset_value(IrType::I32));
+        assert!(!IrType::I32.cast_preserves_integer_value(IrType::U32));
+        assert!(!IrType::I32.cast_preserves_offset_value(IrType::U32));
+        // ...while the composition's second step, a genuine signed widening,
+        // is admitted by both.
+        assert!(IrType::I32.cast_preserves_integer_value(IrType::I64));
+        assert!(IrType::U32.cast_preserves_integer_value(IrType::I64));
+        // IVSR-WRAP-1: a truncation is never transparent.
+        for (from, to) in [
+            (IrType::I32, IrType::U8),
+            (IrType::U32, IrType::U16),
+            (IrType::I64, IrType::I32),
+            (IrType::U64, IrType::U32),
+        ] {
+            assert!(!from.cast_preserves_offset_value(to), "{from:?}->{to:?}");
+        }
+        // The pointer-ring arm, which is what keeps the ordinary
+        // size_t/ptrdiff_t spelling of a 64-bit index reducible.
+        let wide = (IrType::U64.size() as usize) >= super::target_ptr_size();
+        assert_eq!(IrType::U64.cast_preserves_offset_value(IrType::I64), wide);
+        assert_eq!(IrType::I64.cast_preserves_offset_value(IrType::U64), wide);
+        assert!(!IrType::U64.cast_preserves_integer_value(IrType::I64));
+    }
+
+    /// Non-integer and pointer types are outside both predicates: neither may
+    /// claim a float, a long double or a pointer conversion is value-preserving.
+    #[test]
+    fn non_integer_types_are_never_admitted() {
+        for from in INTS {
+            for to in [
+                IrType::F32,
+                IrType::F64,
+                IrType::F128,
+                IrType::Ptr,
+                IrType::Void,
+            ] {
+                assert!(!from.cast_preserves_integer_value(to), "{from:?}->{to:?}");
+                assert!(!from.cast_preserves_offset_value(to), "{from:?}->{to:?}");
+                assert!(!to.cast_preserves_integer_value(from), "{to:?}->{from:?}");
+                assert!(!to.cast_preserves_offset_value(from), "{to:?}->{from:?}");
+            }
+        }
+        assert!(!IrType::Ptr.cast_preserves_offset_value(IrType::Ptr));
     }
 }

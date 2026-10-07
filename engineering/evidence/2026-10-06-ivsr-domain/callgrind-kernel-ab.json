@@ -1,0 +1,146 @@
+{
+ "date": "2026-10-06",
+ "base_upstream": "66c2452838eedef2322fbad44d242e3b990e6c10",
+ "change": "IVSR-PTRADD-1: teach the pointer-recurrence scan the address-forming Add that LCCC's own lowering emits for every C subscript",
+ "metric": "Callgrind Ir for bench_run, per kernel. Deterministic and reproducible; NOT cycles, uops, PMU counters or a Raptor Lake measurement.",
+ "cache_geometry": "I1=32768,8,64 D1=32768,8,64 LL=33554432,16,64 (pinned, same for every arm)",
+ "why_not_wall_clock": "scripts/bench_kernels.py reported 7 of 11 kernels moving beyond its 3% tolerance with BYTE-IDENTICAL codegen on this host - a ~15% layout-noise floor. A runtime delta inside that band is unmeasurable here, so Ir is the decision metric.",
+ "arms": {
+  "pre": "rebased S17 tree, no change",
+  "post": "this change, ILP32-gated",
+  "gcc": "system GCC 14.2, same driver"
+ },
+ "correctness": "all 11 kernels: pre/post/gcc checksums identical (the driver's checksum is derived from the whole computation, so a different answer is a failure, not a win)",
+ "kernels": {
+  "adler32": {
+   "pre_ir": 1377795,
+   "post_ir": 1377795,
+   "gcc_ir": 1377459,
+   "delta_pct": 0.0,
+   "post_over_gcc": 1.0002
+  },
+  "adler32_do8": {
+   "pre_ir": 861587,
+   "post_ir": 861587,
+   "gcc_ir": 774955,
+   "delta_pct": 0.0,
+   "post_over_gcc": 1.1118
+  },
+  "classify": {
+   "pre_ir": 5962067,
+   "post_ir": 5962067,
+   "gcc_ir": 2897915,
+   "delta_pct": 0.0,
+   "post_over_gcc": 2.0574
+  },
+  "hashmix": {
+   "pre_ir": 760563,
+   "post_ir": 760563,
+   "gcc_ir": 746115,
+   "delta_pct": 0.0,
+   "post_over_gcc": 1.0194
+  },
+  "map64_sub": {
+   "pre_ir": 109059,
+   "post_ir": 109059,
+   "gcc_ir": 173067,
+   "delta_pct": 0.0,
+   "post_over_gcc": 0.6302
+  },
+  "matchlen": {
+   "pre_ir": 10340483,
+   "post_ir": 10333427,
+   "gcc_ir": 12019475,
+   "delta_pct": -0.0682,
+   "post_over_gcc": 0.8597
+  },
+  "memchr": {
+   "pre_ir": 2290091,
+   "post_ir": 2290091,
+   "gcc_ir": 2289643,
+   "delta_pct": 0.0,
+   "post_over_gcc": 1.0002
+  },
+  "namechars": {
+   "pre_ir": 4791611,
+   "post_ir": 4791611,
+   "gcc_ir": 2897915,
+   "delta_pct": 0.0,
+   "post_over_gcc": 1.6535
+  },
+  "strcmp_signed": {
+   "pre_ir": 11782455,
+   "post_ir": 11782448,
+   "gcc_ir": 11762435,
+   "delta_pct": -0.0001,
+   "post_over_gcc": 1.0017
+  },
+  "strlen_scan": {
+   "pre_ir": 29371411,
+   "post_ir": 29371411,
+   "gcc_ir": 22026115,
+   "delta_pct": 0.0,
+   "post_over_gcc": 1.3335
+  },
+  "varint": {
+   "pre_ir": 3578595,
+   "post_ir": 3235371,
+   "gcc_ir": 2533635,
+   "delta_pct": -9.591,
+   "post_over_gcc": 1.277
+  }
+ },
+ "totals": {
+  "pre": 71225717,
+  "post": 70875430,
+  "gcc": 59498729
+ },
+ "total_delta_pct": -0.4918,
+ "total_post_over_gcc": 1.1912,
+ "static_blast_radius": {
+  "benchmark_plus_oracle_corpus": {
+   "sources": 66,
+   "comparisons": 402,
+   "changed": 0,
+   "instructions": "87386 -> 87386",
+   "note": "byte-identical assembly, -O2/-O3/-O2 -march=x86-64-v3 x x86-64/i686"
+  },
+  "regression_corpus_x86_64_O2": {
+   "sources": 841,
+   "comparisons": 841,
+   "changed": 6,
+   "instructions": "212203 -> 212207 (+4)",
+   "stack_refs": "31001 -> 30998 (-3)",
+   "smaller": [
+    "simd_vecreg (-2 insns, -2 stack)",
+    "accumulator_pointer_load (-1)"
+   ],
+   "larger": [
+    "memcpy_unaligned_load_fwd (+1)",
+    "temp_promotion_window (+1)",
+    "simd_crc_adler (+2 insns, -1 stack)",
+    "simd_avx2_defer_chain (+3)"
+   ]
+  }
+ },
+ "ilp32_gate": {
+  "reason": "the recurrence adds a loop-carried pointer web; on a 6-GPR file it is parked in a slot at the latch - the documented cost that keeps CCC_IVSR_SCALAR_DERIVED opt-in",
+  "measured_without_gate": "tests/regression/simd_crc_adler.c -O2 -m32 grew 142 -> 191 stack refs (+49) for +2 instructions, while the same source on x86-64 was +2 insns / -1 stack",
+  "effect_of_gate": "every -m32 difference disappeared; 18 changed files fell to 6",
+  "correctness_on_ilp32": "unchanged - tests/regression/ivsr_address_add.c runs and passes on -m32 at -O0..-O3"
+ },
+ "rejected_this_round": {
+  "id": "SELECT-CHAIN-FOLD",
+  "proposal": "collapse c ? K : (c2 ? K : Y) to (c|c2) ? K : Y over boolean Select chains - the shape C's a||b||c takes after if-conversion",
+  "static": "k_classify bench_run 49 -> 48 instructions; the OR chain replaced two cmovs",
+  "measured": "classify Callgrind Ir 5,962,067 -> 6,118,811 (+2.63%); namechars unchanged; total suite -0.49% -> -0.27%",
+  "verdict": "REVERTED. Fewer static instructions, MORE executed instructions: the folded form makes every term unconditional. Reverted byte-identically (cmp against the pre-fold build).",
+  "remaining_gap_it_does_not_close": "k_classify is still 2.057x GCC and k_namechars 1.653x. The residual cost is backend boolean materialisation, not IR shape: each setcc is followed by a redundant movzbl AND a movsbq/movsbl of the same byte, and the surviving Select still costs movl $1 / movq / cmovneq. That is a register-allocation and copy-coalescing problem (RA-CSAVE-1 class), and folding at the IR level cannot reach it."
+ },
+ "host": "Debian 13 VM, Xeon, GCC 14.2, binutils 2.44, Rust 1.99.0, 8 GiB swap, valgrind 3.24.0",
+ "not_measured": [
+  "i7-14700KF / Raptor Lake (not this host)",
+  "PMU counters (unsupported in this VM)",
+  "the slow/benchmark CI gates (out of scope by explicit instruction)"
+ ]
+}

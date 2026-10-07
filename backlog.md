@@ -16,9 +16,17 @@ there, not here.
   negative-space, do-not-retry grounds), [`ideas/`](ideas/README.md).
 
 Current audit adjudication: **2026-10-06**, upstream
-`08f4e1a124d753e9eeddb1c43ce68b54d4d95f68`. See
+`66c2452838eedef2322fbad44d242e3b990e6c10` (PR #771; contains
+`6051e87304c6b07a2ed1a9a516aa5744d8110955`, `08f4e1a124d753e9eeddb1c43ce68b54d4d95f68`
+and the merged `dd0127998aae32a0a56626091bd9c93b597d2aff`). See
+[`engineering/FOLLOWUP-2026-10-07-perf-ivsr-ptradd.md`](engineering/FOLLOWUP-2026-10-07-perf-ivsr-ptradd.md)
+for the performance round (IVSR-PTRADD-1, the Callgrind kernel A/B, the two
+measured rejections and the metric-method findings), and
+[`engineering/FOLLOWUP-2026-10-06-ivsr-domain-audit.md`](engineering/FOLLOWUP-2026-10-06-ivsr-domain-audit.md)
+for the second-round adjudication of the external review of the external review, the two new
+miscompiles it did not find, and the four-vendor oracle table; see
 [`engineering/FOLLOWUP-2026-10-06-codegen-audit.md`](engineering/FOLLOWUP-2026-10-06-codegen-audit.md)
-for measured dispositions, regression commands, evidence and outstanding work.
+for the first round's measured dispositions, regression commands and evidence.
 The historical triage below is **not** a current compiler/runtime scoreboard.
 
 Last historical broad triage rebuild: **2026-09-16**, base recorded as `8ca2fd4`.
@@ -424,6 +432,151 @@ then replays the `shadowed` one, resurrecting an alias that belongs to a scope
 which no longer exists. The guard is in place even though the diagnostic is not;
 a unit test covers the double-set/pop round-trip.
 
+### IVSR-PTRADD-1 · **FIXED 2026-10-06** — the pointer scan never saw LCCC's own addressing form
+
+`try_lower_pointer_arithmetic` (`src/ir/lowering/expr_ops.rs`) lowers **every** C
+subscript to `Add(ptr, scale_index(i, elem_size))` in pointer-width integer
+arithmetic — `scale_index` is the identity for `elem_size == 1` and a
+`Mul(i, elem_size)` otherwise. It does not emit `GetElementPtr`. IVSR's
+`find_derived_exprs` collected only `GetElementPtr` offsets, so the pointer
+recurrence never fired on the most common addressing idiom in C: byte-buffer
+walks got no recurrence at all, and wider-element arrays found the `Mul` but no
+GEP consuming it, so the whole group was dropped.
+
+`tests/bench/k_varint.c` `-O3`, `bench_run`, before:
+
+```
+.LBB6:  movslq %esi, %rdx          # rebuild &v[i] from scratch
+        leaq   v(%rip), %r8        #   ... every single iteration,
+        addq   %rdx, %r8           #   ... including the invariant global
+        movzbl (%r8), %r9d
+```
+
+after: `leaq v(%rip), %rdi` is hoisted to the preheader and the three loads
+become `movzbl (%rdi,%rdx)`, `movzbl 1(%rdi,%rdx)`, `movzbl 2(%rdi,%rdx)`.
+
+Measured (Callgrind `Ir` for `bench_run`, deterministic; the pinned cache
+geometry is in the evidence file):
+
+| kernel | before | after | GCC 14.2 | after/GCC |
+|---|---|---|---|---|
+| `varint` | 3,578,595 | **3,235,371** (−9.59%) | 2,533,635 | 1.412 → **1.277** |
+| `matchlen` | 10,340,483 | **10,333,427** (−0.07%) | 12,019,475 | 0.860 |
+| suite total (11 kernels) | 71,225,717 | **70,875,430** (−0.49%) | 59,498,729 | 1.197 → **1.191** |
+
+All 11 kernels: pre/post/GCC **checksums identical**. Wall clock was NOT used as
+the decision metric — `scripts/bench_kernels.py` itself reported 7 of 11 kernels
+moving beyond its 3% tolerance with byte-identical codegen on this host, a ~15%
+layout-noise floor that swamps a 9.59% effect.
+
+Static blast radius, measured rather than assumed:
+
+- benchmark + oracle corpus, 66 sources × 6 configurations = **402 comparisons,
+  0 changed**, 87386 → 87386 instructions;
+- regression corpus x86-64 `-O2`, **841 comparisons, 6 changed**, 212203 →
+  212207 instructions (+4), 31001 → 30998 stack refs (−3): `simd_vecreg` −2/−2,
+  `accumulator_pointer_load` −1, `memcpy_unaligned_load_fwd` +1,
+  `temp_promotion_window` +1, `simd_crc_adler` +2/−1, `simd_avx2_defer_chain` +3.
+
+The +4 static / −350,287 dynamic trade is stated plainly: this is a runtime-shape
+win that costs a few instructions in four synthetic x86-64 regression files.
+
+**ILP32 is excluded**, on measurement not taste: without the gate,
+`simd_crc_adler.c` `-O2 -m32` grew **142 → 191 stack refs (+49)** for +2
+instructions, while the same source on x86-64 was +2/−1. The recurrence adds a
+loop-carried pointer web and a 6-GPR file parks it in a slot at the latch — the
+documented cost that keeps `CCC_IVSR_SCALAR_DERIVED` opt-in. With the gate every
+`-m32` difference disappeared (18 changed files → 6). Correctness on ILP32 is
+still covered: `tests/regression/ivsr_address_add.c` runs and passes on `-m32`
+at `-O0..-O3`.
+
+Guards beyond the ILP32 gate: the Add must be in the **pointer ring**, and its
+result must be **used as an address** (`Load.ptr`, `Store.ptr`,
+`GetElementPtr.base`, `Memcpy`/intrinsic pointer argument, delegated to
+`IntrinsicOp::reads_pointer_arg`/`writes_memory_via_args` so a new vector memory
+opcode is picked up automatically). An integer accumulation `invariant + iv` that
+nobody dereferences is left exactly alone — that is the scalar-derived net loss.
+Kill switch `CCC_NO_IVSR_PTR_ADD`.
+
+**Applicability is bounded, and the bound was measured on real code.** The win is
+on *index-spelled* byte walks. It does **not** generalise to every byte-buffer
+codebase, and claiming otherwise would be overclaiming:
+
+| corpus | comparisons | changed | net |
+|---|---|---|---|
+| **gzip 1.14** (136 real sources, `-O2` and `-O3`) | **238** | **0** | 44430 → 44430 insns, 7980 → 7980 stack refs |
+
+Verified per-file with `CCC_NO_IVSR_PTR_ADD=1` A/B on the six hot translation
+units — `deflate.c`, `inflate.c`, `zip.c`, `unzip.c`, `trees.c`, `bits.c` — all
+six produce **byte-identical assembly with the arm on and off**, i.e. the arm never
+fires there. The reason is in the source: gzip already spells its hot loops as
+pointer increments, so there is no `Add(ptr, iv)` left to fold —
+
+```c
+} while (*(ush*)(scan+=2) == *(ush*)(match+=2) && ...   /* deflate.c:436 */
+} while (*++scan == *++match && *++scan == *++match ... /* deflate.c:469 */
+do { putc(window[start++], stderr); } while (--length != 0);  /* deflate.c:515 */
+```
+
+The code is *already in the form this optimization produces*. So IVSR-PTRADD-1
+helps the `p[i]` spelling — which is what `k_varint.c` models, and that kernel is
+SQLite-derived, matching the `sqlite_varint` shape — and is exactly neutral on
+hand-written pointer-walking C. Both facts are the result: a real −9.59% on the
+shape it targets, and a measured zero on a real compressor that does not use that
+shape. Reproduce with `./configure` in an unpacked gzip 1.14 (archive SHA-256
+`01a7b881bd220bfdf615f97b8718f80bdfd3f6add385b993dcf6efd14e8c0ac6`, pinned in
+`artifacts/`) and compiling with `-I. -Ilib -include lib/config.h`.
+
+This also sharpens where the remaining `varint` gap lives: at 1.277× GCC after the
+fix, the residue is not addressing any more. Of 13 instructions in the common
+1-byte path, 4 are pure data movement (`movl %r9d,%r11d`, `movq %r11,%rbx`,
+`movl %r12d,%r8d`, and an unconditional `jmp` from block layout) — copy
+coalescing and block layout, i.e. RA-CSAVE-1 class, not IVSR.
+
+Tests: `tests/regression/ivsr_address_add.c` (byte stride 1, nonzero and
+affine starts, wide-element multiply, backward walk, `size_t` index; each checked
+against an independently computed reference), three unit tests
+(`address_forming_add_becomes_a_pointer_recurrence`,
+`pointer_width_add_that_nobody_dereferences_is_left_alone`,
+`address_add_arm_is_gated_by_the_kill_switch_and_ilp32`), wired into
+`check_ivsr_domains.sh` on x86-64 **and** i686.
+Evidence: `engineering/evidence/2026-10-06-ivsr-domain/callgrind-kernel-ab.json`.
+
+### SELECT-CHAIN-FOLD · **PROPOSAL REJECTED 2026-10-06** — fewer static instructions, more executed ones
+
+`k_classify` is 2.057× GCC and `k_namechars` 1.653×, the two worst ratios in the
+kernel suite. C's `a || b || c || d` if-converts to a chain
+`Select(c, 1, Select(c2, 1, Select(c3, 1, Y)))`, and `c ? K : (c2 ? K : Y)`
+collapses to `(c|c2) ? K : Y` by case analysis alone — no domain, range or
+no-wrap assumption. Implemented, with the OR formed in the *narrower* carrier
+after peeling integer casts off known-boolean conditions (widening measured
+worse: it sign-extended each byte term to 64 bits before an `orq`).
+
+Result: `bench_run` 49 → 48 instructions, **but Callgrind `Ir` 5,962,067 →
+6,118,811 (+2.63%)** on `classify`, `namechars` unchanged, suite total −0.49% →
+−0.27%. The folded form makes every term unconditional where the chain previously
+short-circuited through the branch. **Reverted byte-identically** (`cmp` against
+the pre-fold build).
+
+The gap it targeted is still open and is **not** an IR-shape problem. The
+residual cost is backend boolean materialisation: each `setcc` is followed by a
+redundant `movzbl` *and* a `movsbq`/`movsbl` of the same byte, and the surviving
+Select still costs `movl $1, %ecx; movq %rN, %rM; cmovneq %rcx, %rM`. That is
+register allocation and copy coalescing (RA-CSAVE-1 class). Do not retry this at
+the IR level.
+
+### IVOPTS-1 · **PARTIALLY CLOSED 2026-10-06** — shared scalar/SIMD address recurrences
+
+The scalar half of this item is now closed by IVSR-PTRADD-1 above: the
+address-forming `Add` that LCCC's lowering actually emits is recognised, so
+scalar GEP-free subscripts get a pointer recurrence. **Still open:** the vector
+half. `is_used_as_address` already recognises `VecLoad*`/`VecStore*` pointer
+arguments via `IntrinsicOp::reads_pointer_arg`/`writes_memory_via_args`, so the
+shapes are now *visible* to the scan, but SLP `VecLoadF64x2`/`VecStoreF64x2`
+carry base and byte offset as separate operands rather than as one `Add`, so
+there is still no single address value for the recurrence to attach to. That is
+the remaining boundary and it needs the intrinsic operand form, not the scan.
+
 ### IVOPTS-1 · **RE-SCOPED 2026-10-06** — shared scalar/SIMD address recurrences
 
 IVSR is **already implemented** in `src/passes/iv_strength_reduce.rs`, with
@@ -454,6 +607,452 @@ SSA dominance and nonzero-loop guards. Reject if the pressure cost exceeds
 the removed scaling. Do not enable scalar-derived IVs or GLA spill gaps globally.
 Before expansion, prove wrap/cast legality: IVSR-WRAP-1 below was real wrong code.
 
+### IVSR-DOMAIN-1 · **FIXED 2026-10-06** — a signedness reinterpretation was called "widening"
+
+`find_derived_exprs` admitted any cast with `to_ty.size() >= from_ty.size()` as
+IV-derived. Equal size therefore passed, so `U32 -> I32` was treated as a
+value-preserving step of the chain and a following `I32 -> I64` sign-extended
+it. `p[(int32_t)i]` with `i` crossing `UINT32_MAX` must visit subscripts
+`-2,-1,0,1`; the derived pointer recurrence instead walked forward from
+`+4294967294 * stride`. Two shipped benchmark shapes segfaulted at `-O2`/`-O3`
+on upstream `6051e87` and return the correct answer with GCC 14/16.2, Clang
+23.1, ICC 2021.10 and ICX latest.
+
+The predicate is now `cast_preserves_offset_value`, which separates two
+questions the old size comparison conflated:
+
+- **value preservation over the whole source domain** — widening an unsigned
+  source, or a signed source into a signed target. `U32 -> I32` fails this.
+- **preservation of the value that reaches the pointer ring** — a same-width
+  signedness reinterpretation *at or above* the pointer width (`U64 <-> I64` on
+  LP64, `U32 <-> I32` on ILP32) cannot change the pattern the GEP consumes, so
+  the ordinary `size_t`/`ptrdiff_t` spelling stays reducible.
+
+Getting this distinction wrong in either direction is measurable: the
+value-only predicate silently cost `histogram` +5, `linux_rbtree` +12
+instructions/+7 stack refs, `linux_find_bit` +1, `i686_alu_chains` +2 and
+`zlib_ng_adler32_combine` +1 over the 55-program default corpus, because their
+64-bit indices are spelled `U64 -> I64`. With the ring-aware predicate the
+corpus is byte-for-byte identical to baseline (8139 vs 8139 instructions) while
+both miscompiles are gone.
+
+Regression: `tests/regression/ivsr_signedness_domain.c` (32- and 64-bit signed
+views plus the affine `i + 0x80000000` form), and the four-vendor oracle program
+`tests/oracle/programs/ivsr_index_domains.c`. Gate: `check_ivsr_domains.sh`.
+Unit: `derived_signedness_then_widening_is_not_a_pointer_iv`,
+`offset_cast_proof_adds_only_the_pointer_ring_reinterpretation`,
+`derived_cast_proof_is_about_values_not_storage_size`.
+
+### IVSR-DOMAIN-2 · **FIXED 2026-10-06** — an unproven modular unsigned counter became a linear pointer
+
+IVSR-WRAP-1's own closing caveat ("this does **not** prove all unsigned 32-bit
+pointer recurrences sound") was the defect. A `uint32_t` counter with no
+provable bound is modular; zero-extending it into `p += step*stride` is linear
+only while the executed backedges cannot wrap. `p[i]` over a sparse 16 GiB
+`uint32_t` index space with `i` crossing `UINT32_MAX` segfaulted at `-O2`/`-O3`
+on `6051e87`.
+
+`unsigned_iv_bound` now discharges the obligation locally: the loop must be
+single-latch with the header *not* its own latch, the header's conditional
+terminator must branch on a `Cmp` of **this exact phi** in **the phi's own
+unsigned type**, the polarity must match the step sign after normalising for
+which target stays inside the loop, the other operand must be a constant or a
+loop-invariant value, and the step must be exactly ±1 with a strict limit. It
+returns the proven body range and whether the limit was a compile-time
+constant. No bound ⇒ no pointer recurrence; the modular index recurrence is
+still available and always correct.
+
+Regression: `tests/regression/ivsr_unsigned_sparse_wrap.c` (16 GiB virtual,
+four committed pages, guard pages everywhere else — a wrong recurrence faults
+instead of returning a plausible number).
+
+### IVSR-OFFSET-1 · **NEW 2026-10-06** — the offset product's own ring was never checked
+
+Even with a proven non-wrapping IV, `offset = (iv + k) * stride` is evaluated in
+`mul_ty`, and the recurrence is formed in the pointer ring. Those agree only if
+the product cannot wrap inside `mul_ty`. A signed `mul_ty` cannot wrap in a
+defined program (C17 6.5/5 — the theorem `iv_widen` already relies on) and a
+product at or above the pointer width wraps in the ring the recurrence lives
+in, so both are equivalent by construction. An **unsigned product narrower than
+the pointer ring** is a genuine hazard and is now discharged by
+`offset_product_cannot_overflow`, which needs the *exact* constant bound from
+`unsigned_iv_bound`. This replaces the blanket "veto every sub-pointer-width
+multiply" that a first attempt used and that would have silently forbidden the
+very common constant-trip `i * 4` in 32 bits. Unit:
+`offset_product_proof_needs_an_exact_bound_only_below_the_pointer_ring`,
+`unsigned_bound_records_whether_the_limit_was_a_constant`. No shipped workload
+currently reaches the narrow-unsigned-product arm; it is a proof, not a
+measurement.
+
+### IVSR-SAMEWIDTH-1 · **PROPOSAL REJECTED 2026-10-06** — relaxing the backedge cast peel to equal width
+
+An external review proposed widening `look_through_casts` from `from_ty == to_ty`
+to `from_ty.size() == to_ty.size()`, arguing that a phi's backedge cast is
+"unavoidably narrowing" for sub-int counters and that same-width
+signedness-only reinterpretation carries no wraparound risk.
+
+Measured: building the relaxation and re-running the 55-program default corpus
+gives **8139 vs 8139 instructions — zero difference, no program changed**. It
+recovers no optimization on this tree.
+
+It is also not free of soundness cost. The "signed overflow is UB" theorem that
+licenses a linear recurrence for a signed IV does not cover a signed counter
+*incremented in unsigned arithmetic*: C17 6.3.1.3p3 makes `INT_MAX -> INT_MIN`
+implementation-defined, not undefined, so the sequence
+`2147483646, 2147483647, -2147483648, -2147483647` is legal, is not linear, and
+has consecutive bit patterns — exactly the shape a same-width peel would accept.
+`tests/regression/ivsr_signed_wrap_impldef.c` pins the end-to-end behaviour over
+a 16 GiB sparse mapping. In practice LCCC's frontend lowers
+`i = (int)((unsigned)i + 1u)` straight to `Add(I32)`, so the shape does not
+currently arise from C source; that is an implementation detail of the frontend,
+not a theorem, and it is not a reason to weaken the pass.
+
+**Decision: keep `from_ty == to_ty`.** Zero measured benefit, a real (if
+currently unreachable) soundness cost, and a frontend lowering that already
+normalises the idiom away. Revisit only with a workload where it fires.
+
+### CAST-PREDICATE-1 · **DONE 2026-10-06** — one rule, three spellings, and the weakest one miscompiled
+
+The `to_ty.size() >= from_ty.size()` test that caused IVSR-DOMAIN-1 was not a
+novel mistake; it was a *third* copy of a rule the tree already had.
+`src/backend/generation.rs`'s SIB-index peel carried the correct whole-domain
+value-preservation condition inline, complete with a comment describing the
+`I32 -> U32 -> I64` miscompile it prevents; `src/passes/loop_carried_forward.rs`
+carried a same-width peel that is sound only because that analysis never follows
+a sub-pointer-width integer. Neither was stated as a predicate another pass could
+call, so `iv_strength_reduce.rs` grew its own and got it wrong.
+
+Both notions are now methods on `IrType` — `cast_preserves_integer_value` (value
+preserved over the whole source domain) and `cast_preserves_offset_value` (that,
+or a same-width reinterpretation inside the target's pointer ring) — with the
+exhaustive tests beside them in `src/common/types.rs::cast_predicate_tests`.
+`generation.rs` calls the first; `loop_carried_forward.rs` documents which arm of
+the second its structural invariant already implements.
+
+The replacement in `generation.rs` is provably equivalent, and that proof was
+measured rather than asserted: **5388 assembly byte-comparisons over 911 sources
+(`-O2`, `-O3`, `-O2 -march=x86-64-v3` × x86-64 and i686) are 5388 identical,
+0 differing**. Evidence:
+[`engineering/evidence/2026-10-06-ivsr-domain/refactor-neutrality.json`](engineering/evidence/2026-10-06-ivsr-domain/refactor-neutrality.json).
+
+Do not add a fourth spelling. If a new transform needs to know whether a cast may
+disappear into a linear address expression, it calls one of these two methods and
+says which one it means.
+
+### SETMEM-SHAPE-1 · **NEW 2026-10-06** — `set_membership` cannot see either shape the classifier kernels actually produce
+
+`classify` (2.057× GCC Ir, 1.208× wall) and `namechars` (1.653× Ir, 1.248× wall)
+are the two remaining GENUINE gaps in the `tests/bench` suite — worse on **both**
+metrics (see METRIC-TRAP-1 for why that conjunction is the filter). They are the
+same defect, and it is a **shape-recognition** gap in `src/passes/set_membership.rs`,
+not a backend codegen gap. `set_membership`'s own module doc names the target:
+GCC's `subl $45,%edi; cmpb $50,%dil; ja miss; btq %rdi,MASK` classify idiom,
+citing Expat `xml_name_continue` and SQLite varint — exactly these kernels.
+
+Both forms miss, for **different** verified reasons.
+
+**(a) `classify` — the value form never has the block chain at all.**
+`c += (unsigned)is_name_char(s[i])` returns `a || b || c || d` as a *value*, and
+the **frontend** lowers that straight into a three-link `Select` chain inside one
+block:
+
+```
+Select v80 = v65 ? 1 : v70        # v70 = (I64)('.' == ch)
+Select v81 = v61 ? 1 : v80        # v61 = '_' == ch
+Select v82 = v74 ? 1 : v81        # v74 = (I64)(digit range test)
+```
+
+`set_membership` requires `T_i: <pure tests>; CondBranch cond -> JOIN, T_{i+1}`
+with `JOIN: Phi [(Const(1), T_1), ...]`. That shape **does not exist at any point
+in the pipeline** for this kernel, so transformation #2 (BIT-MASK CLUSTER, the
+`btq` idiom) is unreachable. Verified: `Select` count in the final IR of
+`bench_run` is **3 under every one of** `CCC_DISABLE_PASSES=` (none), `ifconv`,
+`cfg`, `ifconv,cfg`, `boolthread`, and `ifconv,cfg,boolthread,set_membership`.
+
+> **Falsified hypothesis, recorded so it is not retried.** The obvious guess is
+> pass ordering — `if_convert` runs at `src/passes/mod.rs:2389` and
+> `set_membership` at `:2489`, so if-conversion would destroy the chain before the
+> membership pass could see it. It is **not** the cause: disabling `ifconv`
+> changes neither the Select count (3) nor the assembly (49 instructions both
+> ways). The Selects are produced by the frontend's lowering of `||` in a value
+> context, so no reordering of optimization passes can expose a chain that was
+> never built.
+
+`set_membership` still fires on the residual `Range` pair and performs
+transformation #1 (CASE-FOLD PAIR MERGE, the `andl $-33` ASCII letter fold):
+disabling it costs **+7 static instructions** (49 → 56). So the pass is doing
+real work here; it is blocked from the *bitmap* half, which is where GCC's
+25 instructions-per-byte against LCCC's 52 comes from. No `bt`/`movabsq` appears
+in `bench_run` under any of the six configurations.
+
+### RANGEFOLD-OR-1 · **NEW 2026-10-07** — the case-fold pair merge has no `Or`-spelling counterpart (this is the bounded form of SETMEM-SHAPE-1(b))
+
+SETMEM-SHAPE-1(b) recorded that `set_membership` does not fire on `namechars` and
+attributed it to the counting-form join Phi. That is true but it is **not the
+first blocker**, and the first one is much smaller and precisely located.
+
+`range_fold` (`src/passes/range_check.rs`, `run_function`) DOES fire — on each
+conjunct separately. The IR it leaves behind:
+
+```
+Load  v19 = *p                       ty I8
+Sub   v67 = v19 - 97                 # 'a'
+Cmp   v68 = Ule(v67, 25)             # [a-z]  folded to the unsigned-bias form
+Sub   v69 = v19 - 65                 # 'A'
+Cmp   v70 = Ule(v69, 25)             # [A-Z]  folded too
+Or    v73 = v68 | v70                # <-- NOT merged; 5 instructions, not 3
+CondBranch v73 -> JOIN, next_test
+```
+
+`try_fold_bool_op` is the function that merges an `And`/`Or` of two range tests,
+and it delegates to `extract_range(&bound1, &bound2, and_form, cast_defs)`, which
+requires **both bounds to compare the same value**. After `range_fold` has done
+its job the two operands are `v67 = ch-97` and `v69 = ch-65` — *different*
+values — so `extract_range` returns `None` and the `Or` survives. The pass that
+folds the ranges is the same pass that then cannot see through its own output.
+
+What is missing is `set_membership`'s transformation #1 (CASE-FOLD PAIR MERGE)
+applied to this spelling. Its exactness conditions are already written down and
+already tested there (`case_fold_requires_bit5_clear`):
+
+```
+a2 == a1 + 32  &&  b2 == b1 + 32  &&  (a1 & 32) == 0  &&  a1 >= 0
+                                   &&  (a1 >> 5) == (b1 >> 5)
+```
+
+which `[65,90]` / `[97,122]` satisfies (65&32==0, 65>>5 == 90>>5 == 2). Clearing
+bit 5 maps `[a+32,b+32]` onto `[a,b]` and maps nothing else into it, so the merge
+is exact for every input in the domain — for a byte classifier that is checkable
+by exhausting all 256 values, which is the test this should ship with.
+
+The rewrite is `Or(Ule(Sub(x,a2),s), Ule(Sub(x,a1),s))` →
+`Ule(Sub(And(x, ~32), a1), s)`: **5 instructions → 3** in the hottest part of the
+loop. On `k_namechars` that is ~41.8 → ~39.8 Ir per byte-iteration (**−4.8%**,
+1.653× GCC → ~1.57×); suite-wide ≈ −0.3%. It also removes an inconsistency rather
+than just chasing a number: `classify` gets this fold through `set_membership`'s
+block-chain path and `namechars` does not, from the *same* C source idiom
+(`isalpha`-style `(c>='a'&&c<='z') || (c>='A'&&c<='Z')`) spelled once as a value
+and once as a branch.
+
+### RANGEFOLD-OR-2 · **IMPLEMENTED, MEASURED, REVERTED 2026-10-07** — the case-fold `Or` merge is correct but does not fire where it was needed
+
+RANGEFOLD-OR-1 specified this transform and estimated **−4.8% Ir** on
+`k_namechars`. It was then implemented, to test that estimate rather than argue
+it. The estimate was wrong, and the reason is more useful than the number.
+
+**What was built.** `try_case_fold_or` in `src/passes/range_check.rs`, reached as
+a fall-through from `try_fold_bool_op` when `extract_range` declines (which it
+does whenever this pass has already folded each conjunct, because the two operands
+are then `x-97` and `x-65` rather than one shared value). It recognises
+`Cmp(Ule, Sub(x, lo), span)` on both sides of an `Or` via the `binop_defs` map
+`DefMaps` already collects, requires one shared value *and* one shared cast chain
+*and* equal spans, and applies `set_membership`'s exactness preconditions
+verbatim (`a2==a1+32`, `b2==b1+32`, `(a1&32)==0`, `a1>=0`, `a1>>5==b1>>5`).
+Bounds are normalised through the pass's own `domain_of`/`dom_value`/`fits_domain`
+so a constant arriving as a sign-extended bit pattern is refused rather than
+reinterpreted. Four unit tests, including one that violates each precondition
+separately and one that offers the same range constants over two *different*
+values. **4152 lib tests passed.** The transform is correct in isolation.
+
+**What it did end-to-end: nothing at all.** Differential over
+`tests/benchmark/programs` + `tests/oracle/programs` + `tests/bench`, `-O2`, both
+targets — **158 comparisons, 0 changed, 31619 → 31619 instructions, 8611 → 8611
+stack refs.** The transform is *provably inert*: it never fires anywhere in this
+corpus, on any target, at any of the flag sets tried. `k_namechars` and
+`k_classify` — the two kernels it was written for — are byte-identical with and
+without it.
+
+> **A measurement error made here, and how it was caught.** The first differential
+> was run against a compiler binary saved *before* the ILP32 gate was added to
+> IVSR-PTRADD-1, and reported "2 of 158 configurations changed, one better
+> (`k_matchlen -O2 -m32`, −2 insns / −5 stack) and one worse (`k_varint -O2 -m32`,
+> +4 / +3)". That was read as the case-fold firing incidentally with mixed sign.
+> It was not: both differing configurations are `-m32`, and re-running the same
+> differential between the *ungated* and *gated* IVSR builds reproduces exactly
+> those two rows and no others. The 2 diffs were the ILP32 gate doing its job,
+> and the case-fold contributed zero. The lesson is the one this repo's own
+> `differential_corpus.sh` header states — an A/B is only as good as the
+> provenance of its two arms, and "which build is the baseline" has to be checked,
+> not assumed. Every number in this entry is now from arms whose provenance is
+> pinned: (A) case-fold build vs reverted build = 0/158 changed; (B) gated
+> pre-fold build vs reverted build = 0/158 changed, so the revert is clean;
+> (C) ungated vs gated = exactly those 2 `-m32` rows.
+
+**Why it does not fire, and the correction this makes to RANGEFOLD-OR-1.** The
+blocking shape is real and appears in the *final* IR, but it does not exist while
+`range_fold` is running: the `Or` of two already-folded range tests is produced
+*after* that pass's last invocation, so the fall-through never sees it. This is
+**not** the `if_convert`-ordering hypothesis that SETMEM-SHAPE-1 already falsified
+for `classify`; it is a different and later ordering problem, between `range_fold`
+and whichever pass emits the boolean `Or`. Activating the transform therefore
+needs a pipeline change, not a pattern change — and a pipeline change is precisely
+what cannot be validated on a VM forbidden from running the benchmark-output gate.
+
+Two further corrections to the estimate in RANGEFOLD-OR-1:
+
+* The −4.8% figure assumed the fold would fire on `k_namechars`. It does not, so
+  the realised benefit there is **0%**, not −4.8%.
+* Because the transform fires on **zero** configurations, this corpus can say
+  nothing at all about its eventual value — not even its sign. A successful
+  pipeline change would have to be justified on the real-world `isalpha`-style
+  classifiers (Expat, SQLite, gzip, glibc parsers) that the kernel suite
+  under-represents, and measured on those, before shipping.
+
+**Reverted**, and the revert is verified by codegen differential, not by `cmp`:
+separate builds embed distinct build metadata, so binary identity is the wrong
+test and initially reported a spurious difference. The right test is assembly
+identity against the gated pre-fold build — **0 of 158 configurations changed** —
+so no codegen in this delivery is affected. The unit tests went with the revert. Recorded rather than kept, because a correct transform
+that does not fire is dead weight in a hot pass, and shipping it would have put an
+unexercised algebraic rewrite in front of every classifier in the corpus for zero
+measured gain.
+
+If this is picked up: the transform is small and its tests are written — the work
+is the ordering, and the first question is which pass emits the boolean `Or` and
+whether `range_fold` can be re-run after it (the `-O2` tier is already a fixpoint
+loop, so a placement change may be enough). Do not ship it without a measurement
+on a real classifier corpus; this one cannot even establish the sign, because the
+transform never fires on it.
+
+**Why it was not implemented here.** It needs a `sub_defs` map threaded into
+`try_fold_bool_op` (which currently receives only `cmp_defs` and `cast_defs`), and
+it is a correctness-critical algebraic rewrite on the classifier path every parser
+in the corpus exercises. The expected suite gain is ~0.3% with an unmeasured wall
+effect, and METRIC-SPLIT-1 is the demonstration that an instruction-count win with
+an unmeasured wall effect is not a win. The only validator for that pair is the
+benchmark-output gate, which this VM is instructed not to run. Bounded, specified,
+and deliberately not guessed at.
+
+**(b) `namechars` — the counting form has the chain but not the recognized join.**
+`if (pred) c++;` keeps a genuine block chain (verified in the IR: blocks 6/7/8/9
+each end in `CondBranch -> JOIN`), so the shape is *almost* right. But the pass
+does not fire at all: `CCC_DISABLE_PASSES=set_membership` yields
+**byte-identical assembly** (35 instructions either way). The reason is the join:
+the documented shape wants a Phi materializing the 0/1 predicate
+(`Phi [(Const(1), T_1), ...]`), whereas the counting form's join Phi selects the
+*accumulator* (`c` vs `c+1`). Static size is close (35 vs GCC's 30); the 1.653×
+is dynamic — 41.8 vs 25.3 Ir per byte-iteration — because every test block in the
+chain executes for every byte instead of one bitmap test.
+
+**What closing this needs** (neither attempted: both are pass surgery whose only
+validator is the benchmark-output gate, out of scope on this VM by instruction):
+
+1. teach `set_membership` a **value-form member kind** — a `Select` chain whose
+   `true_val` is a constant and whose conditions are pure tests of one value is
+   the same disjunction the block chain expresses, and can feed the same cluster
+   selection. The chain-collapse algebra is already proven in
+   SELECT-CHAIN-FOLD below; what that experiment showed is that collapsing the
+   chain *without* reaching a bitmap makes things **worse** (+2.63% Ir), so the
+   two must land together or not at all.
+2. accept a **counting-form join** — a Phi selecting `acc` vs `acc + 1` on the
+   same condition set is a predicate Phi with the increment hoisted out, and is
+   maskable by the identical cluster logic.
+
+Reproduce all of the above in under a minute:
+
+```bash
+L=target/fastbuild/lccc; INC=$(gcc -print-file-name=include)
+for cfg in "" ifconv cfg boolthread set_membership ifconv,cfg,boolthread,set_membership; do
+  CCC_DISABLE_PASSES="$cfg" $L -O3 -S tests/bench/k_classify.c -o /tmp/z.s -I tests/bench -I$INC
+  printf '%-46s %s\n' "${cfg:-<none>}" \
+    "$(sed -n '/^bench_run:/,/\.size.*bench_run/p' /tmp/z.s | grep -vc '^\s*\(\.\|#\|$\|.*:\)')"
+done   # -> 49 49 49 49 56 56 ; GCC 14.2 reference: 30
+```
+
+### METRIC-TRAP-1 · **NEW 2026-10-06** — `strlen_scan`'s 1.333x Ir ratio is not a defect; "fixing" it destroys a measured win
+
+Any future triage of the `tests/bench` kernel suite will rank `strlen_scan` as the
+worst absolute gap (29,371,411 Callgrind `Ir` vs GCC's 22,026,115, **+7.35M**) and
+be wrong. The entire ratio is **one instruction**: LCCC's inner loop is
+`cmpb $0,(%r8); je; addq $1,%r8; jmp` (4) against GCC's rotated
+`addq $1,%rax; cmpb $0,(%rax); jne` (3), and 4/3 = 1.333 exactly.
+
+LCCC keeps the **top-tested** form and hoists `leaq buf(%rip), %rdi` out of the
+32-iteration outer loop; GCC re-materialises `leaq buf(%rip), %rax` inside it. On
+wall clock LCCC is **faster** (ratio 0.984). The kernel header already records the
+measurement: 49.3 ms top-tested vs 59.2 ms rotated on this host — LCCC ~15.9%
+faster on a byte-at-a-time scan — and states that any transform which rotates it
+"has to beat that number, not merely be defensible". See
+`docs/SESSION_FOLLOWUP_S21_LOOP_ROTATION.md` §5.
+
+**Rule this establishes for the whole suite: neither metric may be used alone.**
+Cross-metric triage of all 11 kernels at `-O3` (`Ir` from Callgrind, wall from
+`scripts/bench_kernels.py`, both `lccc/gcc` so >1 is worse):
+
+| verdict | kernels |
+|---|---|
+| **GENUINE GAP** (both metrics worse) | `classify` 2.057 Ir / 1.208 wall; `namechars` 1.653 / 1.248; `varint` 1.277 / 1.577 |
+| wall-only (same Ir, slower → layout/branch) | `strcmp_signed` 1.002 Ir / **1.261** wall |
+| Ir-only (more Ir, wall equal or faster) | `strlen_scan` 1.333 / 0.984; `adler32_do8` 1.112 / 0.963 |
+| parity or better | `adler32`, `hashmix`, `map64_sub` (0.630 Ir), `matchlen` (0.860 Ir), `memchr` |
+
+`strcmp_signed` is the mirror-image trap: **1.002× Ir but 1.261× wall.** An
+identical instruction count running 26% slower is block layout and branch
+prediction, and no instruction-count work will move it.
+
+The two genuine targets that remain, `classify` and `namechars`, are the same
+defect — see SELECT-CHAIN-FOLD below for the measured proof that it is NOT
+reachable from the IR.
+
+### CONSTLOOP-FOLD-1 · **NEW 2026-10-06** — constant-trip-count loops are not evaluated at compile time
+
+Four-vendor oracle, `-O2`, `tests/oracle/programs/int_alu.c`: LCCC **92**
+instructions, GCC 16.2 **68**, Clang 23.1.0 **23**, ICC 2021.10 **81**, ICX
+latest **28**. Clang and ICX fold the entire 64-iteration FNV-1a chain to a
+single `movabsq` and strength-reduce the 256-iteration narrow-cast loop to an
+8-instruction closed form; LCCC and GCC execute both.
+
+LCCC's complete unroller caps trip at 16 with a 512-expanded-instruction budget
+(half for FP bodies) — see `src/passes/loop_unroll.rs`. Raising the cap blindly
+is code bloat, and this VM cannot run the slow/benchmark gates that would catch
+it. The self-limiting design worth building: speculatively complete-unroll a
+call-free, side-effect-free, constant-trip loop, run the constant folder, and
+**revert unless the folded result is smaller than the loop it replaced**. That
+makes the transform monotone by construction rather than tuned by a threshold.
+Reproducer: `python3 scripts/godbolt.py compile cclang2310
+tests/oracle/programs/int_alu.c --flags -O2`.
+
+### GATE-SPLIT-1 · **DONE 2026-10-06** — one CI step carried four unrelated fixes
+
+`tests/regression/check_audit_loop_contracts.sh` had accumulated the IVSR,
+FP-extract-home and `va_arg_pack_len` invocations, so a failure named none of
+them. Split into `check_ivsr_domains.sh`, `check_fp_extract_homes.sh` and
+`check_va_arg_pack_len.sh`, leaving the original script to the bottom-tested
+branch contracts it is named for. All four are wired into both
+`scripts/ci_local.sh` and `.github/workflows/ci.yml`;
+`scripts/check_ci_gate_parity.py` reports PASS (144 commands, 17 registered
+invocation contracts). The FP gate now also covers **i686**, because
+`result_type()` for scalar lane extracts is unconditional and drives
+`compact_i686_values`, `is_wide_on_32bit` and the i686 prologue's compaction
+veto — not just the x86-64 small-slot class.
+
+### RESULT-TYPE-BLAST-1 · **AUDITED 2026-10-06** — every unconditional consumer of the scalar lane type
+
+`dd01279` changed `result_type()` for `VecExtractLaneF32x4/x8` and
+`VecExtractLaneF64x2/x4` from `None` to `Some(F32)`/`Some(F64)`. That is
+**always-on**, not behind `CCC_FP_EXTRACT_HOMES`, and it has **17 call sites in
+9 files**, not the 8 consumers / 8 files an external review counted. Two of the
+files it named do not exist in this tree: its `src/passes/provenance.rs` was `src/ir/provenance.rs`,
+and its `src/backend/i686/prologue.rs` was `src/backend/i686/codegen/prologue.rs`.
+It also missed `src/backend/regalloc.rs`'s
+own two sites and counted 4 of `slot_assignment.rs`'s 8. Every site is now
+enumerated with its verdict in a comment at the changed arm in
+`src/ir/instruction.rs`.
+
+Net effects: an F32 lane result gets a width-partitioned **4-byte** slot instead
+of the 8-byte fallback (correct — F32 is 4 bytes, and slot sharing is
+partitioned by exact size class, so the stale-upper-half hazard cannot recur);
+F64 lane results become `wide_values` on i686 and now veto the prologue's 32-bit
+compaction they previously slipped through as `None`; `reassoc_latency`'s GPR
+residency weight for a lane result becomes 0 (an XMM value occupies no GPR)
+instead of the `None` default 1; `ir/provenance.rs`, `generation.rs` and
+`loop_carried_forward.rs` are provably unchanged. Pinned by the new
+`scalar_lane_slot_tests` (four simultaneously-live lanes, asserted
+non-overlapping spans, byte-exact reload across a real adjacent 4-byte boundary,
+with `fp_extract_homes` asserted **off**) and by
+`tests/regression/fp_extract_slot_boundary.c` on x86-64, x86-64-v3 and i686 ×
+`-O0..-O3` × default / `CCC_FP_EXTRACT_HOMES=1` / `CCC_NO_SMALL_SLOTS=1`.
+
 ### IVSR-WRAP-1 · **FIXED 2026-10-06** — truncating backedge was treated as a copy
 
 `unsigned char x=254; ... a[x]; ++x` must visit 254,255,0,1. Baseline returned
@@ -476,6 +1075,77 @@ remapped destination, preserve that destination and materialize count zero too.
 `va_arg_pack_len_inline.c` covers 0/1/4 extras, branches and distinct sites;
 `fortify_open_va_pack.c` covers the actual libc wrapper. Both pass O1–O3;
 baseline fails linking. Integrated into the audit contract gate.
+
+### METRIC-SPLIT-1 · **NEW 2026-10-07** — `Ir` and wall clock disagreed by 74 points, and `Ir` was the one that was wrong
+
+`CCC_FP_EXTRACT_HOMES=1` on `tests/benchmark/programs/nbody.c`, `-O2
+-march=x86-64-v3`, same compiler binary, output byte-identical between arms
+(`cmp` on stdout):
+
+| metric | homes OFF | homes ON | ON/OFF |
+|---|---|---|---|
+| Callgrind `Ir` (`scripts/callgrind_ab.py`, correctness-gated) | 2,700,122,542 | **2,400,122,541** | **0.8889 (−11.1%)** |
+| I1miss / D1miss / LLmiss / Bcm / Bim | 1378 / 1618 / 2739 / 2968 / 180 | 1380 / 1616 / 2740 / 2967 / 179 | unchanged |
+| wall clock, median of 15 interleaved CPU-pinned reps | 224.51 ms | **366.42 ms** | **1.6321 (+63.2%)** |
+| wall clock, min of 15 | 211.98 ms | 331.94 ms | 1.5659 (+56.6%) |
+| vs GCC 14.2 (median) | 1.076× | **1.756×** | — |
+
+**11.1% fewer executed instructions, 63% slower**, with every simulated
+cache and branch-misprediction metric flat. The regression is far outside this
+host's ~15% layout-noise floor (METRIC-TRAP-1) and reproduces on both median and
+min, so it is not measurement artifact.
+
+What this establishes, and why it is recorded as a method rule rather than a
+one-off number:
+
+* `Ir` counts **instructions retired**, not stalls. A change that removes stack
+  round-trips by keeping FP lanes in XMM registers removes instructions and can
+  simultaneously introduce a store-forwarding or dependency stall in the tightest
+  loop of the program. `Ir` is structurally blind to that, and no amount of
+  pinned cache geometry fixes the blindness — the geometry models misses, and the
+  misses did not move.
+* `scripts/bench_kernels.py`'s own docstring already said this ("a vectorised
+  loop with more instructions usually wins, and a shorter loop that spills does
+  not"). This is that sentence with a 74-point number attached.
+* **The acceptance rule this session should have stated up front and now does:**
+  a codegen change must pass *both* metrics to be promoted. `Ir` is the right
+  tool for detecting and *sizing* a shape change and for A/B-ing when wall clock
+  is inside the noise floor; wall clock is the only tool that can *accept* a
+  promotion. Either one alone is unsound — and this session used each alone at
+  least once before finding the pair that disagreed.
+* Both of this session's own decisions survive the paired test, which is why they
+  stand: IVSR-PTRADD-1 improves `Ir` (−9.59% on `varint`) **and** wall clock
+  (66.5 → 56.8 ms, −14.6%); SELECT-CHAIN-FOLD worsened `Ir` (+2.63%) with no
+  wall-clock win and was reverted. FP-LANE-1 is the third case and the one that
+  only the pair catches.
+
+**Consequence for FP-LANE-1: it stays opt-in, and the earlier evidence for that
+decision was understated.** The first round declined to promote it on wall-clock
+grounds that looked layout-dependent (+52.9% without `-lm`, −20.5% with it,
+−10.6% on matched data addresses) and therefore arguable. This measurement is
+not arguable: +63.2% on median and +56.6% on min, same binary, same flags,
+identical output, no `-lm` ambiguity. The instruction-count improvement is real
+and the promotion is still wrong. Do not re-propose enabling it on the strength
+of an instruction count, a `.text` size, or a static matrix.
+
+The mechanism is still **not proven** — the first round's page-split-store
+hypothesis (fifth velocity store crossing a 4 KiB boundary only in the losing
+candidate) is plausible and unconfirmed, and this VM has no PMU to confirm it.
+What is proven is the size and reproducibility of the effect. Establishing the
+mechanism needs a Raptor Lake host with working counters.
+
+Reproduce in about a minute:
+
+```bash
+L=target/fastbuild/lccc; INC=$(gcc -print-file-name=include)
+$L -O2 -march=x86-64-v3 -I$INC tests/benchmark/programs/nbody.c -o /tmp/nb-off
+CCC_FP_EXTRACT_HOMES=1 $L -O2 -march=x86-64-v3 -I$INC tests/benchmark/programs/nbody.c -o /tmp/nb-on
+cmp <(/tmp/nb-off) <(/tmp/nb-on)                       # identical output
+python3 scripts/callgrind_ab.py /tmp/cc-homes-on /tmp/cc-homes-off \
+    "-O2 -march=x86-64-v3" nbody                       # Ir 0.8889
+for i in $(seq 15); do for e in /tmp/nb-off /tmp/nb-on; do
+    /usr/bin/env taskset -c 0 $e >/dev/null; done; done  # interleave, then time
+```
 
 ### FP-LANE-1 · **TYPING FIXED; ALLOCATION OPT-IN 2026-10-06** — SLP scalar extract results lacked FP classification
 

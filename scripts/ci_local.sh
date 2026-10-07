@@ -179,6 +179,13 @@ gate "linker-oracle-versions" fast \
 gate "audit-loop-contracts" fast \
     env CCC="$LCCC" bash tests/regression/check_audit_loop_contracts.sh
 
+gate "ivsr-integer-domains" fast \
+    env CCC="$LCCC" bash tests/regression/check_ivsr_domains.sh
+gate "fp-extract-homes" fast \
+    env CCC="$LCCC" bash tests/regression/check_fp_extract_homes.sh
+gate "va-arg-pack-len" fast \
+    env CCC="$LCCC" bash tests/regression/check_va_arg_pack_len.sh
+
 # The unit-test gate is what GitHub's required check runs on every PR, so it
 # belongs in the fast set: a red PR has to be reproducible with --fast.
 #

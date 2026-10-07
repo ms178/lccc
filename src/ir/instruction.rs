@@ -743,6 +743,40 @@ impl Instruction {
                 | IntrinsicOp::FmaScalarF32
                 | IntrinsicOp::FmaScalarF32Signed(..)
                 | IntrinsicOp::RoundScalarF32(_)
+                // Scalar lane extracts report their REAL scalar type. This arm
+                // is unconditional (not behind `CCC_FP_EXTRACT_HOMES`), so every
+                // `result_type()` consumer sees the change; audited 2026-10-06:
+                //   backend/common.rs compute_value_type_map — seeds F32/F64;
+                //     wide_typed_values only keeps size>4, so F32 lanes stop
+                //     being "wide" and F64 lanes start being recorded as wide.
+                //   backend/generation.rs val_ty — SIB index peeling inspects
+                //     integer/pointer types only; a float entry is inert.
+                //   backend/i686/codegen/prologue.rs — `size()>4 => false`, so
+                //     F64 lanes now veto the 32-bit compaction they previously
+                //     slipped through as `None`; strictly more conservative.
+                //   stack_layout/slot_assignment.rs — (a) compact_i686_values
+                //     admits F32 (4-byte) lanes; (b) `is_small` gives an F32
+                //     lane a width-partitioned 4-byte slot instead of the
+                //     8-byte fallback; (c) is_wide_on_32bit / propagate_wide
+                //     mark F64 lanes wide so i686 uses the 8-byte path.
+                //     Pinned by `scalar_lane_slot_tests` (four overlapping live
+                //     lanes, non-overlapping spans, byte-exact reload across an
+                //     adjacent 4-byte boundary) and by
+                //     tests/regression/fp_extract_slot_boundary.c on x86-64,
+                //     x86-64-v3 and i686, with and without small slots.
+                //   ir/provenance.rs produces_pointer — compares against Ptr;
+                //     `None` and `Some(F32)` are both false. No change.
+                //   passes/iv_widen.rs defining_type — only reached for phi and
+                //     cmp operands of integer IVs; a float type selects Se/64
+                //     and is rejected by the widening candidate filter.
+                //   passes/loop_carried_forward.rs — the fallback arm maps
+                //     Ptr/pointer-width-int and everything else to `None`,
+                //     which is what `None` already produced. No change.
+                //   passes/reassoc_latency.rs gpr_weight — a float weighs 0
+                //     GPRs instead of the `None` default 1; that is the
+                //     correct residency weight for an XMM value.
+                //   backend/regalloc.rs collect_f64_values/collect_non_gpr —
+                //     the only two sites gated by `CCC_FP_EXTRACT_HOMES`.
                 | IntrinsicOp::CopysignF32
                 | IntrinsicOp::VecExtractLaneF32x4
                 | IntrinsicOp::VecExtractLaneF32x8 => Some(IrType::F32),

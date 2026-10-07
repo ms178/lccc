@@ -358,6 +358,15 @@ impl<'a> Ctx<'a> {
                     from_ty,
                     to_ty,
                     ..
+                // Same-width peel, and sound for the same reason
+                // `IrType::cast_preserves_offset_value` admits the pointer-ring
+                // reinterpretation: this whole analysis only ever follows
+                // pointer-width integers (`is_ptr_width_int` gates every BinOp
+                // arm and the fallback below), so a same-width integer/pointer
+                // cast here IS a cast inside the pointer ring and cannot change
+                // the value the address expression denotes. A sub-pointer-width
+                // chain terminates in the `_ =>` arm instead. Do not widen this
+                // condition without re-establishing that invariant.
                 } if from_ty.size() == to_ty.size()
                     && (to_ty.is_integer() || *to_ty == IrType::Ptr)
                     && (from_ty.is_integer() || *from_ty == IrType::Ptr) =>

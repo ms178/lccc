@@ -479,6 +479,7 @@ fn run_gvn_licm_ivsr_shared(
     run_licm: bool,
     run_ivsr: bool,
     run_ivsr_scalar: bool,
+    run_ivsr_ptr_add: bool,
     run_univsr: bool,
     time_passes: bool,
     iter: usize,
@@ -590,7 +591,12 @@ fn run_gvn_licm_ivsr_shared(
             // and phis but not CFG edges, so the shared analysis stays valid.
             let mut n = 0;
             for _ in 0..4 {
-                let round = iv_strength_reduce::ivsr_with_analysis(func, &cfg, run_ivsr_scalar);
+                let round = iv_strength_reduce::ivsr_with_analysis(
+                    func,
+                    &cfg,
+                    run_ivsr_scalar,
+                    run_ivsr_ptr_add,
+                );
                 verify::verify_after_func_pass(func, "ivsr");
                 n += round;
                 if round == 0 {
@@ -2326,6 +2332,10 @@ pub(crate) fn run_passes(
             // lives in the scalar section's comment in iv_strength_reduce.rs;
             // revisit after the Unit-4 allocator work.
             let run_ivsr_scalar = ivsr_scalar_derived_enabled(run_ivsr);
+            // IVSR-PTRADD-1: the address-forming-Add scan is ON by default and
+            // read HERE, once, rather than inside the pass — see the env-read
+            // ratchet in tests/regression/check_env_test_hygiene.sh.
+            let run_ivsr_ptr_add = run_ivsr && std::env::var_os("CCC_NO_IVSR_PTR_ADD").is_none();
             // Un-IVSR only pays off on targets with scaled-index addressing
             // (x86-64 SIB). Gated for diagnostics like the other loop passes.
             let run_univsr = run_ivsr
@@ -2342,6 +2352,7 @@ pub(crate) fn run_passes(
                     run_licm,
                     run_ivsr,
                     run_ivsr_scalar,
+                    run_ivsr_ptr_add,
                     run_univsr,
                     time_passes,
                     iter,
