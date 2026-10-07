@@ -337,13 +337,25 @@ block 6 (body):   ... ; v22 = Copy(v7)   ; backedge
 ```
 
 and `find_basic_ivs` matches **only** `IrBinOp::Add` with a constant step
-(`src/passes/iv_strength_reduce.rs`, the `if *op == IrBinOp::Add` arm). No phi is
-ever recognised, so no descending loop in any C program gets an IV recurrence —
-neither the pointer form nor the index form. This also bounds A1's practical
-severity: the descending branch of `unsigned_iv_bound` is unreachable from C source
-today, which is why the fix is a correctness-and-latent-win change rather than a
-live-miscompile fix. Stating that plainly matters; "1 high-severity finding" would
-have overstated it.
+(`src/passes/iv_strength_reduce.rs`, the `if *op == IrBinOp::Add` arm), so the `i--`
+and `i -= 1` spellings above form no phi at all.
+
+> **CORRECTION 2026-10-07, audit-response round (finding F1).** This section went
+> on to claim that *no descending loop in any C program gets an IV recurrence*,
+> generalising from the single `i-- > 0` spelling shown above. **That reason is
+> false.** A 16-program probe against the merged compiler shows the `i += -1`
+> family *does* form a `BasicIV`; the full table, the mechanism and the two
+> fail-closed gates that keep A1's descending arm unreachable anyway are in
+> [`FOLLOWUP-2026-10-07-ivsr-audit-response.md`](FOLLOWUP-2026-10-07-ivsr-audit-response.md)
+> §2, and the implementation consequences are filed under PERF-4 in
+> [`../backlog.md`](../backlog.md).
+>
+> What survives is a narrower claim: no descending **recurrence** fired in any of
+> the 16 probes — but because the derived-expression collector found no offset to
+> collect (a backwards byte walk is already SIB-indexed; where an offset does
+> exist it is scaled after a widening `Cast`, which is PERF-6), not because no phi
+> was recognised. The severity conclusion for A1 is unchanged and now rests on
+> measured ground instead of an assumed invariant.
 
 The generated code shows where the real cost is. LCCC vs GCC 14.2, `-O2`,
 `revvarint` (descending varint decode), per iteration:

@@ -1293,10 +1293,24 @@ fn find_derived_exprs(
 
 /// Whether `val_id` is dereferenced or used as an addressing base anywhere in
 /// the function — i.e. whether it is an ADDRESS and not merely an integer that
-/// happens to be pointer-width. Conservative by construction: anything not
-/// positively identified as a memory operand returns false. A value used both
-/// as an address and as an integer still qualifies (the rewrite preserves its
-/// value either way); a pure integer accumulation does not.
+/// happens to be pointer-width. A value used both as an address and as an
+/// integer still qualifies (the rewrite preserves its value either way); a pure
+/// integer accumulation does not.
+///
+/// This is DELIBERATELY an over-approximation, and the reverse of the
+/// "conservative by construction: anything not positively identified as a memory
+/// operand returns false" this comment used to claim. The intrinsic leg
+/// delegates to `IntrinsicOp::reads_pointer_arg`, which is the allowlist for a
+/// callee-READ-ONLY proof and is therefore true for pure vector arithmetic that
+/// never touches memory. Narrowing that leg to `may_read_memory()` was tried and
+/// measured, and it cost real code: `simd_crc_adler` +7 instructions and +4
+/// stack references per iteration, `simd_vecreg` +2 and +2, because a hoisted
+/// `leaq` and a register-resident `movdqa` degraded into a per-iteration
+/// `movslq`/`leaq` pair plus a spill/reload. Over-approximating is also SOUND
+/// here: only pointer-width values can be armed, and for those the integer and
+/// pointer rings agree in any defined program (C17 6.5.6p8). Pinned by
+/// `address_classification_deliberately_over_approximates_intrinsics`; do not
+/// "fix" this predicate without re-running that measurement.
 fn is_used_as_address(func: &IrFunction, val_id: u32) -> bool {
     let is_target = |o: &Operand| matches!(o, Operand::Value(v) if v.0 == val_id);
     for block in &func.blocks {
@@ -1386,6 +1400,17 @@ fn is_used_as_address(func: &IrFunction, val_id: u32) -> bool {
 /// two sites cannot disagree about what a constant means. That disagreement was
 /// real: `init_offset` reinterpreted by `iv.ty` while the bound used the raw
 /// carrier.
+///
+/// SCOPE OF "the single definition": narrow IV domains. The carrier is read with
+/// `to_i64()`, which truncates an `IrConst::I128` (`constants.rs`:
+/// `IrConst::I128(v) => Some(v as i64)`). That cannot reach a bound here — the
+/// bound is only consulted for a MODULAR IV, i.e. `iv.ty.size() <
+/// target_ptr_size()`, at most 32 bits on every supported target, and the exit
+/// test must compare in `iv.ty` — and `bits >= 128` returns the raw value
+/// unchanged, so a 128-bit domain never reaches the masking branch either.
+/// Documented rather than widened, because an `i128`-exact reader would be dead
+/// code with a worse failure mode: silently believing a truncated 128-bit
+/// constant is a narrow one.
 fn const_in_iv_domain(raw: i64, ty: IrType) -> i128 {
     let bits = (ty.size() * 8) as u32;
     if bits == 0 || bits >= 128 {
@@ -1401,18 +1426,31 @@ fn const_in_iv_domain(raw: i64, ty: IrType) -> i128 {
     }
 }
 
-/// The exact closed interval a small unsigned IV takes on every iteration
-/// that the exit test does not reject.
+/// The closed interval a small unsigned IV takes on every iteration that the
+/// exit test does not reject.
 ///
-/// * `lo..=hi` is the inclusive interval.
-/// * `exact` records whether the bound is the tight mathematical interval or
-///   only a sound over-approximation, and it must stay `false` for anything
-///   the caller may use as a no-wrap proof.
+/// * `lo..=hi` is inclusive and SOUND in both directions: `lo` is at or below
+///   the smallest value the body observes and `hi` is at or above the largest.
+///   An interval that UNDER-approximates is not a loose proof, it is a
+///   miscompile: that was A1, where the ascending formula `hi = limit - 1` was
+///   applied to a descending IV and landed BELOW the range, so a product
+///   certificate checked a product the loop never computes and passed.
+/// * `bounded` says whether `hi` is the exact body maximum, i.e. whether it was
+///   derived from a literal endpoint. When it is `false`, `hi` has degraded to
+///   the type maximum: still sound, but too loose to certify a product at any
+///   `stride >= 2`, so the numeric half of the proof is withdrawn and only the
+///   IV no-wrap half stands.
+///
+/// `bounded` is deliberately NOT "the limit was a constant", which is what it
+/// used to mean. The limit fixes the ascending ceiling and the descending
+/// FLOOR; the descending ceiling is the INIT. Inheriting the limit's constness
+/// withdrew a certificate the init had already earned whenever the limit was
+/// loop-invariant rather than literal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct UnsignedIvBound {
     lo: i128,
     hi: i128,
-    exact: bool,
+    bounded: bool,
 }
 
 /// Local no-wrap proof for a narrow unsigned IV.
@@ -1488,7 +1526,10 @@ fn unsigned_iv_bound(
         } else {
             return None;
         };
-        let exact = matches!(other, Operand::Const(_));
+        // Whether the LIMIT is a compile-time constant. It fixes the ascending
+        // ceiling and the descending floor, but it does not decide `bounded` on
+        // its own: each arm below names the endpoint that fixes ITS ceiling.
+        let limit_is_const = matches!(other, Operand::Const(_));
         if let Operand::Value(v) = other
             && !is_loop_invariant(v.0, &lp.body, func)
         {
@@ -1523,26 +1564,29 @@ fn unsigned_iv_bound(
         // maximum was `2^30 * 4`, admitting a narrow unsigned product that really
         // does wrap.
         //
-        // With the init available as a literal the interval IS exact, so the
-        // descending arm is certified rather than refused — a recovered
-        // optimization, not only a fix. Without one there is no provable numeric
-        // maximum, so `hi` degrades to the type maximum and `exact` goes false:
-        // that withdraws the numeric product certificate while keeping the IV
-        // *no-wrap* half of the proof, which never depended on the init (entry
-        // still requires `init > limit`, and the floor is still `limit + 1 >= 1`).
+        // With the init available as a literal the ceiling IS the body maximum,
+        // so the descending arm is certified rather than refused — a recovered
+        // optimization, not only a fix — and that holds whether or not the LIMIT
+        // is a literal too: a loop-invariant limit only moves the floor, and `1`
+        // is a sound floor for every descending unsigned IV. Without a literal
+        // init there is no provable numeric maximum, so `hi` degrades to the type
+        // maximum and `bounded` goes false: that withdraws the numeric product
+        // certificate while keeping the IV *no-wrap* half of the proof, which
+        // never depended on the init (entry still requires `init > limit`, and
+        // the floor is still `limit + 1 >= 1`).
         //
         // `const_in_iv_domain` maps any constant into `[0, max]` for an unsigned
         // `iv.ty`, so no further range check is needed on the init; an init at or
         // below the limit never enters the body, and `init.max(floor)` is a sound
         // over-approximation of that empty interval.
-        let (lo, hi, exact) = if iv.step > 0 {
+        let (lo, hi, bounded) = if iv.step > 0 {
             let hi = match other {
                 Operand::Const(c) => const_in_iv_domain(c.to_i64().unwrap_or(i64::MAX), iv.ty)
                     .checked_sub(1)
                     .unwrap_or(max),
                 Operand::Value(_) => max,
             };
-            (0i128, hi, exact)
+            (0i128, hi, limit_is_const)
         } else {
             let floor = match other {
                 Operand::Const(c) => const_in_iv_domain(c.to_i64().unwrap_or(i64::MAX), iv.ty)
@@ -1554,12 +1598,16 @@ fn unsigned_iv_bound(
             match iv.init {
                 Operand::Const(c) => {
                     let init = const_in_iv_domain(c.to_i64().unwrap_or(i64::MAX), iv.ty);
-                    (floor, init.max(floor), exact)
+                    // `init >= floor` is exactly the condition for `hi` to be the
+                    // body maximum. Below the floor the body never executes, so
+                    // there is no body maximum to be exact about and `hi` is only
+                    // a sound over-approximation of an empty interval.
+                    (floor, init.max(floor), init >= floor)
                 }
                 Operand::Value(_) => (floor, max, false),
             }
         };
-        return Some(UnsignedIvBound { lo, hi, exact });
+        return Some(UnsignedIvBound { lo, hi, bounded });
     }
     None
 }
@@ -1572,7 +1620,7 @@ fn unsigned_iv_bound(
 /// (C17 6.5/5 — the same UB theorem `iv_widen` uses), and a product at or above
 /// the pointer width wraps in exactly the ring the recurrence lives in, so both
 /// are equivalent by construction. Only an UNSIGNED product NARROWER than the
-/// pointer ring is a genuine hazard, and an exact constant bound discharges it.
+/// pointer ring is a genuine hazard, and a bounded interval discharges it.
 fn offset_product_cannot_overflow(
     mul_ty: IrType,
     stride: i64,
@@ -1583,7 +1631,7 @@ fn offset_product_cannot_overflow(
     if !mul_ty.is_integer() || (mul_ty.size() as usize) >= ptr || !mul_ty.is_unsigned() {
         return true;
     }
-    let Some(b) = bound.filter(|b| b.exact) else {
+    let Some(b) = bound.filter(|b| b.bounded) else {
         return false;
     };
     let limit = 1i128 << ((mul_ty.size() * 8) as u32);
@@ -1895,17 +1943,17 @@ mod tests {
     }
 
     #[test]
-    fn offset_product_proof_needs_an_exact_bound_only_below_the_pointer_ring() {
+    fn offset_product_proof_needs_a_bounded_interval_only_below_the_pointer_ring() {
         let ptr = crate::common::types::target_ptr_size();
-        let exact = Some(UnsignedIvBound {
+        let bounded = Some(UnsignedIvBound {
             lo: 0,
             hi: 1023,
-            exact: true,
+            bounded: true,
         });
-        let inexact = Some(UnsignedIvBound {
+        let unbounded = Some(UnsignedIvBound {
             lo: 0,
             hi: (1i128 << 32) - 1,
-            exact: false,
+            bounded: false,
         });
         // Signed and pointer-ring products are UB/ring-equivalent: always OK.
         for ty in [IrType::I32, IrType::I64, IrType::U64] {
@@ -1913,37 +1961,43 @@ mod tests {
                 assert!(offset_product_cannot_overflow(ty, 4, 0, None), "{ty:?}");
             }
         }
-        // Unsigned 32-bit product: needs the exact bound, and must really fit.
-        assert!(offset_product_cannot_overflow(IrType::U32, 4, 0, exact));
-        assert!(!offset_product_cannot_overflow(IrType::U32, 4, 0, inexact));
+        // Unsigned 32-bit product: needs a bounded interval, and the product
+        // must really fit.
+        assert!(offset_product_cannot_overflow(IrType::U32, 4, 0, bounded));
+        assert!(!offset_product_cannot_overflow(
+            IrType::U32,
+            4,
+            0,
+            unbounded
+        ));
         assert!(!offset_product_cannot_overflow(IrType::U32, 4, 0, None));
         let too_big = Some(UnsignedIvBound {
             lo: 0,
             hi: (1i128 << 31) - 1,
-            exact: true,
+            bounded: true,
         });
         assert!(!offset_product_cannot_overflow(IrType::U32, 4, 0, too_big));
         // An affine offset participates in the product bound.
-        assert!(offset_product_cannot_overflow(IrType::U32, 4, 8, exact));
+        assert!(offset_product_cannot_overflow(IrType::U32, 4, 8, bounded));
         let edge = Some(UnsignedIvBound {
             lo: 0,
             hi: (1i128 << 30) - 9,
-            exact: true,
+            bounded: true,
         });
         assert!(offset_product_cannot_overflow(IrType::U32, 4, 8, edge));
         let over = Some(UnsignedIvBound {
             lo: 0,
             hi: (1i128 << 30) - 8,
-            exact: true,
+            bounded: true,
         });
         assert!(!offset_product_cannot_overflow(IrType::U32, 4, 8, over));
         // The predicate only ever sees the integer type of a Mul/Shl/Add;
         // a non-integer `mul_ty` is vacuously admitted and cannot arise.
-        assert!(offset_product_cannot_overflow(IrType::F32, 4, 0, exact));
+        assert!(offset_product_cannot_overflow(IrType::F32, 4, 0, bounded));
     }
 
     #[test]
-    fn unsigned_bound_records_whether_the_limit_was_a_constant() {
+    fn unsigned_bound_is_bounded_by_whichever_endpoint_fixes_the_ceiling() {
         use crate::ir::reexports::IrCmpOp as C;
         let lp = NaturalLoop {
             header: 1,
@@ -1956,10 +2010,12 @@ mod tests {
             step: 1,
         };
         let mut f = cast_backedge(IrType::U32, IrType::U32);
-        // Constant limit 8: body values are exactly 0..=7.
+        // ASCENDING, constant limit 8: body values are exactly 0..=7, so the
+        // limit is the endpoint that fixes the ceiling.
         let b = unsigned_iv_bound(&f, &lp, &iv, &[2]).expect("constant bound");
-        assert!(b.exact && b.lo == 0 && b.hi == 7, "{b:?}");
-        // Replace the limit with a loop-invariant value: monotone but inexact.
+        assert!(b.bounded && b.lo == 0 && b.hi == 7, "{b:?}");
+        // Replace the limit with a loop-invariant value: still monotone, but the
+        // ceiling is no longer known, so `hi` degrades to the type max.
         f.blocks[0].instructions.push(Instruction::Copy {
             dest: Value(7),
             src: Operand::Const(IrConst::I32(8)),
@@ -1968,7 +2024,7 @@ mod tests {
             *rhs = Operand::Value(Value(7));
         }
         let b = unsigned_iv_bound(&f, &lp, &iv, &[2]).expect("invariant bound");
-        assert!(!b.exact && b.hi == (1i128 << 32) - 1, "{b:?}");
+        assert!(!b.bounded && b.hi == (1i128 << 32) - 1, "{b:?}");
         // A loop-VARIANT limit is no bound at all.
         if let Instruction::Cmp { rhs, .. } = &mut f.blocks[1].instructions[1] {
             *rhs = Operand::Value(Value(3));
@@ -2417,8 +2473,8 @@ mod tests {
         let wide = fixture(100);
         let big = bound_of(&wide, Operand::Const(IrConst::I32(1 << 30))).expect("IV no-wrap holds");
         assert!(
-            big.exact,
-            "a literal init makes the interval exact: {big:?}"
+            big.bounded,
+            "a literal init makes `hi` the exact body maximum: {big:?}"
         );
         assert_eq!(big.lo, 101, "the floor is limit + 1");
         assert_eq!(big.hi, 1i128 << 30, "the ceiling is the init");
@@ -2432,7 +2488,7 @@ mod tests {
         // i-- > 0;) p[i]` has every value in [1, 64] and 64 * 4 fits U32.
         let narrow = fixture(0);
         let small = bound_of(&narrow, Operand::Const(IrConst::I32(64))).expect("bound");
-        assert!(small.exact, "{small:?}");
+        assert!(small.bounded, "{small:?}");
         assert_eq!((small.lo, small.hi), (1, 64), "{small:?}");
         assert!(
             offset_product_cannot_overflow(IrType::U32, 4, 0, Some(small)),
@@ -2440,9 +2496,36 @@ mod tests {
         );
 
         // An init at or below the limit never enters the body, so the interval
-        // is empty; `hi = max(init, floor)` is a sound over-approximation of it.
+        // is empty; `hi = max(init, floor)` is a sound over-approximation of it
+        // and NOT an exact body maximum, so no numeric certificate is issued.
         let empty = bound_of(&wide, Operand::Const(IrConst::I32(64))).expect("bound");
         assert_eq!((empty.lo, empty.hi), (101, 101), "{empty:?}");
+        assert!(!empty.bounded, "an empty body has no maximum: {empty:?}");
+
+        // F2. `bounded` follows the endpoint that fixes the CEILING, not the
+        // limit's constness. With a loop-INVARIANT limit and a literal init the
+        // body maximum is still exactly the init; only the floor degrades, and
+        // `1` is a sound floor for every descending unsigned IV (the body runs
+        // while `i > limit_var` and `limit_var >= 0`, so every observed value is
+        // `>= 1`). Inheriting the limit's constness withdrew this certificate.
+        let mut var_limit = fixture(0);
+        var_limit.blocks[0].instructions.push(Instruction::Copy {
+            dest: Value(7),
+            src: Operand::Const(IrConst::I32(0)),
+        });
+        if let Instruction::Cmp { rhs, .. } = &mut var_limit.blocks[1].instructions[1] {
+            *rhs = Operand::Value(Value(7));
+        }
+        let vl = bound_of(&var_limit, Operand::Const(IrConst::I32(64))).expect("bound");
+        assert!(
+            vl.bounded,
+            "a literal init bounds the ceiling on its own: {vl:?}"
+        );
+        assert_eq!((vl.lo, vl.hi), (1, 64), "the floor degrades to 1: {vl:?}");
+        assert!(
+            offset_product_cannot_overflow(IrType::U32, 4, 0, Some(vl)),
+            "64 * 4 fits the U32 ring, so the certificate stands on the init"
+        );
 
         // A non-literal init (`for (unsigned i = n; i-- > 0;)`) has no provable
         // numeric maximum, so the certificate is withdrawn and the loop keeps
@@ -2450,7 +2533,7 @@ mod tests {
         // unaffected: entry still requires init > limit and the floor is still
         // limit + 1 >= 1.
         let unknown = bound_of(&narrow, Operand::Value(Value(7))).expect("IV no-wrap still holds");
-        assert!(!unknown.exact, "{unknown:?}");
+        assert!(!unknown.bounded, "{unknown:?}");
         assert_eq!(unknown.hi, (1i128 << 32) - 1, "hi degrades to the type max");
         assert!(!offset_product_cannot_overflow(
             IrType::U32,
@@ -2471,7 +2554,7 @@ mod tests {
             step: 1,
         };
         let bg = unsigned_iv_bound(&g, &lp, &up, &[2]).expect("ascending bound");
-        assert!(bg.exact && bg.hi == 99, "ascending: {bg:?}");
+        assert!(bg.bounded && bg.hi == 99, "ascending: {bg:?}");
         assert!(offset_product_cannot_overflow(IrType::U32, 4, 0, Some(bg)));
     }
 
@@ -2483,7 +2566,7 @@ mod tests {
         // TWO different guards, and confusing them produces a wrong audit either
         // way. THIS function's exemption is pointer-width
         // (`mul_ty.size() >= target_ptr_size()`), so on LP64 every unsigned IV
-        // narrower than 64 bits (U8, U16, U32) must present an exact bound. The
+        // narrower than 64 bits (U8, U16, U32) must present a bounded interval. The
         // `>= 4` carve-out a review flagged was in the CALLER's gate
         // (`modular_iv && size >= 4 && is_unsigned()`), which let a U8/U16 IV
         // skip `unsigned_iv_bound` entirely; that is now removed, so the proof is
@@ -2494,7 +2577,7 @@ mod tests {
         // 6.5.6p8 already makes undefined — so a defined source program cannot
         // reach the wrap. The same argument covers ILP32, where U32 is the
         // pointer width and is therefore exempt there.
-        let b = |lo: i128, hi: i128, exact: bool| Some(UnsignedIvBound { lo, hi, exact });
+        let b = |lo: i128, hi: i128, bounded: bool| Some(UnsignedIvBound { lo, hi, bounded });
 
         // (1) Pointer-width and signed IVs: exempt, no bound needed.
         for ty in [
@@ -2512,7 +2595,7 @@ mod tests {
             );
         }
 
-        // (2) Sub-pointer-width UNSIGNED IVs need an exact bound, and the
+        // (2) Sub-pointer-width UNSIGNED IVs need a bounded interval, and the
         //     product must fit THEIR OWN ring — not merely u64.
         //     U8, bound [0,255], stride 1: max 255 < 256 -> sound, admitted.
         assert!(offset_product_cannot_overflow(
@@ -2543,14 +2626,14 @@ mod tests {
             0,
             b(0, 65535, true)
         ));
-        //     U32, exact bound, product inside the ring -> admitted.
+        //     U32, bounded interval, product inside the ring -> admitted.
         assert!(offset_product_cannot_overflow(
             IrType::U32,
             4,
             0,
             b(0, (1i128 << 30) - 1, true)
         ));
-        //     U32, exact bound, product one past the ring -> declined.
+        //     U32, bounded interval, product one past the ring -> declined.
         assert!(!offset_product_cannot_overflow(
             IrType::U32,
             4,
@@ -2558,7 +2641,8 @@ mod tests {
             b(0, 1i128 << 30, true)
         ));
 
-        // (3) No bound, or an inexact one, certifies nothing below pointer width.
+        // (3) No bound, or an unbounded one, certifies nothing below pointer
+        //     width.
         assert!(!offset_product_cannot_overflow(IrType::U32, 4, 0, None));
         assert!(!offset_product_cannot_overflow(
             IrType::U16,
@@ -2756,11 +2840,24 @@ mod tests {
         //
         // (1) A DESCENDING unsigned counter whose offset is formed by widening
         //     first (`addr = base + (I64)i`) does get the pointer recurrence, and
-        //     it needs the init-derived bound to get it: with the old
-        //     `hi = limit - 1` the bound was inexact, the numeric certificate was
-        //     withdrawn and the loop was declined outright. A runtime init fires
-        //     too, because that recurrence lives in the pointer ring, where a
-        //     product cannot wrap the address space (C17 6.5.6p8).
+        //     the caller's `bound.is_none()` gate is what lets it through: a
+        //     descending modular unsigned IV still has to PRESENT a bound.
+        //
+        //     What this shape does NOT exercise is the bound's VALUES. The offset
+        //     is widened before the address Add, so the derived expression's
+        //     `mul_ty` is pointer width and `offset_product_cannot_overflow`
+        //     exempts that ring before reading `lo`/`hi` (C17 6.5.6p8: a product
+        //     at pointer width cannot wrap the address space). Every assertion
+        //     below therefore also held against the pre-fix bound
+        //     `{lo: 1, hi: limit - 1, bounded: true}`, which is why the numeric
+        //     certificate has its own end-to-end test:
+        //     `descending_narrow_offset_product_certificate_is_the_operative_proof`.
+        //     Claiming otherwise here — "the bound was inexact, the certificate
+        //     was withdrawn and the loop was declined" — was wrong on all three
+        //     counts: pre-fix `bounded` was inherited from the LIMIT's constness
+        //     and was `true` for this literal limit, nothing was withdrawn, and
+        //     `hi = limit - 1 = -1` sits BELOW the range, which is an admission,
+        //     not a refusal.
         let fired = |literal_init: bool, narrow_offset: bool| {
             let mut f = descending_address_add_loop(IrType::U32, literal_init, narrow_offset);
             ivsr_function(&mut f) > 0
@@ -2787,6 +2884,131 @@ mod tests {
         // the collected shape fires as before.
         let mut up = address_add_loop(true, false);
         assert!(ivsr_function(&mut up) > 0, "the ascending arm still fires");
+    }
+
+    /// A DESCENDING unsigned IV whose byte offset is scaled INSIDE the IV's own
+    /// ring and handed to a GEP: `for (unsigned i = init; i > 0; i += -1)
+    /// sum += base[i]` with the shift at U32 width. This is the shape for which
+    /// `offset_product_cannot_overflow` is the operative proof, because the
+    /// derived expression's `mul_ty` is the narrow ring instead of the pointer
+    /// ring. Compare `descending_address_add_loop`, which widens the index first
+    /// and therefore exempts the product check before it reads the bound.
+    fn descending_narrow_gep_loop(init: i32) -> IrFunction {
+        let mut f = IrFunction::new("desc_narrow_gep".into(), IrType::I64, Vec::new(), false);
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I64(0x4000)),
+            }],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: vec![],
+        });
+        // header: i = phi(init, i_next); while (i > 0)
+        f.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                Instruction::Phi {
+                    dest: Value(2),
+                    ty: IrType::U32,
+                    incoming: vec![
+                        (Operand::Const(IrConst::I32(init)), BlockId(0)),
+                        (Operand::Value(Value(9)), BlockId(2)),
+                    ],
+                },
+                Instruction::Cmp {
+                    dest: Value(3),
+                    op: IrCmpOp::Ugt,
+                    lhs: Operand::Value(Value(2)),
+                    rhs: Operand::Const(IrConst::I32(0)),
+                    ty: IrType::U32,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(3)),
+                true_label: BlockId(2),
+                false_label: BlockId(3),
+            },
+            source_spans: vec![],
+        });
+        // body: off = i << 2 in U32; p = GEP(base, off); v = *p; i_next = i + -1
+        f.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![
+                Instruction::BinOp {
+                    dest: Value(4),
+                    op: IrBinOp::Shl,
+                    lhs: Operand::Value(Value(2)),
+                    rhs: Operand::Const(IrConst::I32(2)),
+                    ty: IrType::U32,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(5),
+                    base: Value(0),
+                    offset: Operand::Value(Value(4)),
+                    ty: IrType::I64,
+                },
+                Instruction::Load {
+                    volatile: false,
+                    dest: Value(6),
+                    ptr: Value(5),
+                    ty: IrType::I8,
+                    seg_override: AddressSpace::Default,
+                },
+                Instruction::BinOp {
+                    dest: Value(9),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(2)),
+                    rhs: Operand::Const(IrConst::I32(-1)),
+                    ty: IrType::U32,
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: vec![],
+        });
+        f.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: vec![Instruction::Copy {
+                dest: Value(7),
+                src: Operand::Value(Value(6)),
+            }],
+            terminator: Terminator::Return(Some(Operand::Value(Value(7)))),
+            source_spans: vec![],
+        });
+        f.next_value_id = 12;
+        f
+    }
+
+    #[test]
+    fn descending_narrow_offset_product_certificate_is_the_operative_proof() {
+        // W1/F7. The end-to-end fixture above widens the index before the address
+        // Add, so its `mul_ty` is pointer width and `offset_product_cannot_overflow`
+        // exempts that ring before it ever reads `lo`/`hi`: every assertion there
+        // also holds against the pre-fix bound. THIS test scales inside the IV's
+        // own U32 ring, so the numeric certificate decides, and the second cell
+        // fails when the two A1 hunks are reverted.
+        let reduced = |init: i32| {
+            let mut f = descending_narrow_gep_loop(init);
+            ivsr_function(&mut f) > 0
+        };
+        // init = 64: the executed offsets are [4, 256], inside U32 on both arms,
+        // so the loop is reduced before and after the fix. This cell pins that the
+        // descending arm is certified rather than refused wholesale.
+        assert!(
+            reduced(64),
+            "a small descending index is certified in the U32 ring"
+        );
+        // init = 2^30 + 1: the executed maximum offset is (2^30 + 1) * 4 = 2^32 + 4,
+        // which WRAPS the U32 ring. Post-fix `hi` is the init, so the certificate
+        // is refused. Pre-fix `hi` was `limit - 1 = -1` — an interval BELOW the
+        // range — and `-4 < 2^32` passed, arming a pointer recurrence that bumps by
+        // -4 at 64-bit width for an offset the source computes modulo 2^32: the
+        // first address would have been `base + 2^32 + 4` where the source says
+        // `base + 4`. That is A1, and this is the cell that discriminates.
+        assert!(
+            !reduced(0x4000_0001),
+            "a descending offset that wraps its own ring must not be reduced"
+        );
     }
 
     #[test]

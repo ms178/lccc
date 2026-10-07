@@ -52,12 +52,16 @@ MARKER='FIX''ME'
 #   155  at the epic's base (920a2a78^)
 #   158  at the epic landing (920a2a78) -- the arm read its kill switch and
 #        its debug trace per candidate loop
-#   155  now (measured 2026-10-01 on the hardened tree): the policy is
-#        resolved once in `run_passes`, so three per-loop reads disappeared
+#   155  at 2026-10-01 on the hardened tree: the policy is resolved once in
+#        `run_passes`, so three per-loop reads disappeared
+#   153  now (measured 2026-10-07 on the review-hardened tree): IVSR reads
+#        `CCC_IVSR_DEBUG` once per invocation instead of once per trace site
+#        (5 reads -> 3 in iv_strength_reduce.rs)
 #
-# The pre-epic baseline is restored exactly, which is the property this
+# Lower this number whenever a measurement comes in below it; never raise it.
+# The pre-epic baseline is more than restored, which is the property this
 # ratchet exists to protect.
-ENV_READ_BUDGET=155
+ENV_READ_BUDGET=153
 
 fail=0
 report() { # report <label> <offending lines>

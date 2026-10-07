@@ -1,0 +1,17 @@
+SPELLING               BASIC_IV  RECURRENCE / HEADER TEST                                       DERIVED
+s01_u32_postdec        no        Sub Const(I64(1)) U32;cmp Ne U32;                              -
+s02_u32_minuseq        no        Sub Const(I64(1)) U32;cmp Ne U32;                              -
+s03_u32_pluseq_neg     yes       Add Const(I64(4294967295)) U32;cmp Ne U32;                     no derived exprs
+s04_u32_plus_neg       yes       Add Const(I64(4294967295)) U32;cmp Ne U32;                     no derived exprs
+s05_u32_plus_umax      yes       Add Const(I64(4294967295)) U32;cmp Ne U32;                     no derived exprs
+s06_u32_plus_lit       yes       Add Const(I64(4294967295)) U32;cmp Ne U32;                     no derived exprs
+s07_u32_zero_min1      yes       Add Const(I64(4294967295)) U32;cmp Ne U32;                     no derived exprs
+s08_u32_neg_cast       yes       Add Const(I64(4294967295)) U32;cmp Ne U32;                     no derived exprs
+s09_u32_lit_init       yes       Add Const(I64(4294967295)) U32;cmp Ne U32;                     no derived exprs
+s10_i32_postdec        no        Sub Const(I32(1)) I32;cmp Sgt I32;                             -
+s11_i32_pluseq_neg     yes       Add Const(I64(-1)) I64;cmp Sgt I64;                            no derived exprs
+s12_u64_pluseq         yes       Add Const(I64(-1)) U64;cmp Ne U64;                             no derived exprs
+s13_u16_pluseq         no        Add Const(I32(65535)) I32;cmp Sgt I32;                         -
+s14_u8_pluseq          no        Add Const(I32(255)) I32;cmp Sgt I32;                           -
+s15_u64_walk_back      yes       Add Const(I64(-1)) U64;Add Const(I64(-2)) U64;cmp Ne U64;      no derived exprs
+s16_u8_stride1         no        Add Const(I32(255)) I32;cmp Sgt I32;                           -
