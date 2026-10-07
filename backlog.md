@@ -539,10 +539,13 @@ coalescing and block layout, i.e. RA-CSAVE-1 class, not IVSR.
 
 Tests: `tests/regression/ivsr_address_add.c` (byte stride 1, nonzero and
 affine starts, wide-element multiply, backward walk, `size_t` index; each checked
-against an independently computed reference), three unit tests
+against an independently computed reference), four unit tests
 (`address_forming_add_becomes_a_pointer_recurrence`,
 `pointer_width_add_that_nobody_dereferences_is_left_alone`,
-`address_add_arm_is_gated_by_the_kill_switch_and_ilp32`), wired into
+`ptr_add_parameter_is_a_real_kill_switch`,
+`address_add_arm_is_gated_by_ilp32` — the last two were split out of
+`address_add_arm_is_gated_by_the_kill_switch_and_ilp32` by the review-hardening
+round, which is why an older revision of this entry names one test), wired into
 `check_ivsr_domains.sh` on x86-64 **and** i686.
 Evidence: `engineering/evidence/2026-10-07-perf-ivsr-ptradd/callgrind-kernel-ab.json`.
 
@@ -1831,9 +1834,9 @@ spend a day on it: it is a size defect on a kernel that already wins.
 
 ### PERF-4 · **NEW 2026-10-07** — descending loops get no IV strength reduction at all
 
-`find_basic_ivs` matches only `IrBinOp::Add` with a constant step. LCCC's frontend
-emits `i--` as `Sub`, so a descending counter never becomes a `BasicIV` and no
-descending C loop gets either the pointer recurrence or the index recurrence:
+`find_basic_ivs` matches only `IrBinOp::Add` with a constant step, and LCCC's
+frontend emits `i--` as `Sub`, so the two most common descending spellings never
+become a `BasicIV` at all:
 
 ```
 $ CCC_IVSR_DEBUG=1 lccc -O2 -S -o /dev/null desc.c
@@ -1841,9 +1844,40 @@ $ CCC_IVSR_DEBUG=1 lccc -O2 -S -o /dev/null desc.c
 block 5: v7 = Sub(v22, 1) : U32 ; v11 = Cmp Ne (v22, 0) : U32
 ```
 
-Also note the header test for `i-- > 0` is `Ne`, which `unsigned_iv_bound` declines
-by design (it requires `Ult`/`Ugt`/`Ule`/`Uge`), so accepting `Sub` needs the
-post-decrement polarity handled too, not just the opcode.
+**But "no descending loop forms a `BasicIV`" is wrong**, and the distinction
+matters for any future work here. A 16-program probe against the merged compiler
+(`CCC_IVSR_DEBUG=1`, `-O2`; table in
+[`engineering/FOLLOWUP-2026-10-07-ivsr-audit-response.md`](engineering/FOLLOWUP-2026-10-07-ivsr-audit-response.md)
+§2) shows the `i += -1` family DOES form one — `i += -1`, `i = i + -1`,
+`i = i + (unsigned)-1`, `i = i + 0xFFFFFFFFu`, `i = i + (0u - 1u)`, `i += -(u32)1`,
+and the `i32`/`u64` equivalents — because the frontend renders the decrement as an
+`Add` of a zero-extended constant:
+
+```
+BinOp v17 op=Add lhs=Value(28) rhs=Const(I64(4294967295)) ty=U32   ; step reads as +2^32-1
+Cmp   v29 op=Ne  lhs=Value(28) rhs=Const(I64(0))          ty=U32   ; `i > 0` canonicalises to Ne
+```
+
+Two consequences:
+
+1. **A step misrecording.** `find_basic_ivs` takes the step from the raw carrier,
+   so a modular decrement is recorded as `step = +2^32 - 1` — a huge positive
+   increment. No firing path can carry it (a narrow unsigned IV must present an
+   `unsigned_iv_bound`, whose polarity gate admits only `(Ult, +1)` and
+   `(Ugt, -1)`), so this is latent rather than live, but it is the first thing a
+   descending-loop implementation must fix: reading the step through
+   `const_in_iv_domain` turns `+2^32 - 1` into `-1` and makes the descending arm
+   of the bound live.
+2. **The exit test is `Ne`, not `Ugt`.** `unsigned_iv_bound` declines `Ne` by
+   design, so accepting descending loops needs the `Ne`-against-zero polarity
+   handled too (sound for a unit decrement: `i != 0` and `i > 0` agree on every
+   value a descending unsigned IV takes), not just the opcode and the step.
+
+No descending recurrence fired in any of the 16 probes, for a third reason that is
+independent of both: the derived-expression collector found no offset instruction
+at all (`[IVSR] no derived exprs`) — a backwards byte walk is already SIB-indexed
+(`movzbl (%rdi,%rsi)`), and where an offset does exist it is scaled after a
+widening `Cast`, which is PERF-6.
 
 **Do not expect a large win from this alone**: the load in these shapes is already
 SIB-indexed (`movzbl (%rdi,%r8)`), so the address is not being recomputed. Measured

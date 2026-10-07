@@ -753,8 +753,12 @@ impl Instruction {
                 // 0 deletions, no code change). Nothing about `result_type()`'s
                 // value changed in the later commit.
                 //
-                // CENSUS, re-verified 2026-10-07: `grep -RIn '\.result_type()' src`
-                // finds **18 call sites in 10 files** — 8 in
+                // CENSUS, re-verified 2026-10-07. The command filters its own
+                // line, because a comment that quotes a grep pattern matches it —
+                // without the filter this line is the 19th hit in the 11th file
+                // and the census contradicts itself:
+                //   grep -RIn '\.result_type()' src | grep -v CENSUS
+                // -> **18 call sites in 10 files** — 8 in
                 // backend/stack_layout/slot_assignment.rs, 2 in
                 // backend/regalloc.rs, and one each in backend/common.rs,
                 // backend/generation.rs, backend/i686/codegen/prologue.rs,
