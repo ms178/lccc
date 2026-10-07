@@ -229,7 +229,8 @@ def compiler_fingerprint(compiler_id: str, *, now: float | None = None) -> str:
 
 def compile_on_godbolt(compiler_id: str, source: str, flags: str,
                         *, intel: bool = False, timeout: int = 120,
-                        keep_directives: bool = False) -> dict[str, Any] | None:
+                        keep_directives: bool = False,
+                        execute: bool = False) -> dict[str, Any] | None:
     """Compile C source on CE and return its JSON result.
 
     ``None`` is retained for backward compatibility with the original helper;
@@ -239,6 +240,11 @@ def compile_on_godbolt(compiler_id: str, source: str, flags: str,
     ``keep_directives`` keeps assembler directives (``.p2align``/``.p2alignr``
     and friends) in the returned ``asm`` lines; the default follows the
     research-UI convention and filters them out.
+
+    ``execute`` asks the same endpoint to RUN the program; the result then also
+    carries ``execResult`` (``code``/``stdout``/``stderr``) from the executor
+    pool.  The executor is a shared, sandboxed VM: it is a correctness oracle,
+    never a performance one.
     """
     cid = resolve_compiler(compiler_id)
     body = {
@@ -250,7 +256,11 @@ def compile_on_godbolt(compiler_id: str, source: str, flags: str,
             "filters": {
                 "binary": False,
                 "binaryObject": False,
-                "execute": False,
+                # `execute` makes CE run the program and return `execResult`
+                # (stdout/stderr/exit code).  It is the only way to compare
+                # SEMANTICS on a vendor whose instruction shape merely looks
+                # consistent -- see engineering/FOLLOWUP-2026-10-07-scale-ring-wrap-audit.md.
+                "execute": execute,
                 "intel": intel,
                 "demangle": True,
                 # CE filter booleans are REMOVE switches: true hides the
@@ -390,9 +400,26 @@ def command_list(args: argparse.Namespace) -> int:
 
 def command_compile(args: argparse.Namespace) -> int:
     result = compile_on_godbolt(args.compiler, args.source.read_text(), args.flags,
-                                intel=args.intel)
+                                intel=args.intel, execute=args.execute)
     if result is None:
         return 1
+    if args.execute:
+        ex = result.get("execResult") or {}
+        print(f"exit {ex.get('code')}")
+
+        def _text(chunks) -> str:
+            # CE returns each stream as a list of {"text": ...} objects (older
+            # API revisions used bare strings); accept both.
+            return "".join(
+                (c.get("text") or "") if isinstance(c, dict) else str(c) for c in chunks or []
+            )
+
+        stdout = _text(ex.get("stdout"))
+        stderr = _text(ex.get("stderr"))
+        if stdout:
+            print(stdout, end="" if stdout.endswith("\n") else "\n")
+        if stderr:
+            print(stderr, file=sys.stderr, end="" if stderr.endswith("\n") else "\n")
     lines = _function_body(assembly_lines(result), args.function)
     if lines is None:
         print(f"godbolt: function '{args.function}' was not emitted (likely inlined or removed)",
@@ -567,6 +594,8 @@ def build_parser() -> argparse.ArgumentParser:
     compile_p.add_argument("--flags", default="-O3 -march=x86-64-v3")
     compile_p.add_argument("--function")
     compile_p.add_argument("--intel", action="store_true")
+    compile_p.add_argument("--execute", action="store_true",
+                           help="run the program on CE and report stdout/exit")
     compile_p.set_defaults(func=command_compile)
 
     compare_p = sub.add_parser("compare", help="compare local LCCC with all competition oracles")

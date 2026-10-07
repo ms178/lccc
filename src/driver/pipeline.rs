@@ -2182,9 +2182,19 @@ impl Driver {
         // changes the CFG (the back edge moves from the latch to the body
         // entry), and the layout pass recomputes loops from scratch, so it
         // sees and lays out the rotated shape.
+        // The pass's switches are resolved HERE, once per pipeline run, and
+        // handed down as a value: reading them inside the pass meant three
+        // environment lookups per function and put ambient configuration in a
+        // codegen decision (see the config's own docs, and the env-read ratchet
+        // in tests/regression/check_env_test_hygiene.sh).
+        let loop_invert = crate::passes::loop_invert::LoopInvertConfig::new(
+            std::env::var("CCC_NO_LOOP_INVERT").is_err(),
+            std::env::var("CCC_LOOP_INVERT_MEMORY").is_ok_and(|v| v != "0"),
+            std::env::var("CCC_DEBUG_LOOP_INVERT").is_ok(),
+        );
         for func in &mut module.functions {
             if !func.is_declaration {
-                crate::passes::loop_invert::invert_loops(func);
+                crate::passes::loop_invert::invert_loops_with(func, loop_invert);
             }
         }
 

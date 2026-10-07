@@ -197,6 +197,28 @@ fn foldable_const_disp(c: &IrConst, allow_u32_wrap: bool) -> Option<i64> {
     None
 }
 
+/// Whether an instruction's own arithmetic ring makes peeling it into the SIB
+/// form value-preserving (IVSR-WRAP-2's backend half).
+///
+/// `resolve_index` builds `disp(base, index, scale)`, which the CPU evaluates
+/// as `base + extend(index, index's own type) * scale + disp` in the POINTER
+/// ring. A scaling instruction (`shl`, `mul`, `add(v, v)`) or a displacement
+/// `add`/`sub` may therefore only be peeled away when its ring IS the pointer
+/// ring or wider -- there the two rings coincide -- or when it is a narrower
+/// SIGNED ring, which cannot wrap in a defined program (C17 6.5/5, the same
+/// theorem `iv_strength_reduce::offset_product_cannot_overflow` rests on).
+/// An UNSIGNED narrower ring wraps by definition, and peeling it reinterprets
+/// that wrap as pointer arithmetic: `buf[i*2]` with `uint32_t i` reached
+/// `buf[0x100000000]` instead of `buf[0]` once `2*i` exceeded 2^32, because the
+/// `add(i,i)` that the canonicalizer makes of the multiply was folded into
+/// `scale = 2` of a zero-extended index (live miscompile at -O1..-O3, pinned by
+/// `tests/regression/ivsr_scale_ring_wrap.c`).
+#[inline]
+fn scale_ring_is_linear(ty: IrType) -> bool {
+    ty.is_integer()
+        && ((ty.size() as usize) >= crate::common::types::target_ptr_size() || !ty.is_unsigned())
+}
+
 fn is_i32_disp(off: i64) -> bool {
     (i32::MIN as i64..=i32::MAX as i64).contains(&off)
 }
@@ -1189,8 +1211,12 @@ fn build_indexed_gep_map(
                     op: IrBinOp::Shl,
                     lhs: Operand::Value(idx),
                     rhs: Operand::Const(c),
+                    ty,
                     ..
                 } => {
+                    if !scale_ring_is_linear(*ty) {
+                        break;
+                    }
                     let k = c.to_i64()?;
                     if k < 0 || (shift as i64) + k > 3 {
                         break;
@@ -1207,14 +1233,19 @@ fn build_indexed_gep_map(
                     op: IrBinOp::Mul,
                     lhs: Operand::Value(idx),
                     rhs: Operand::Const(c),
+                    ty,
                     ..
                 }
                 | Instruction::BinOp {
                     op: IrBinOp::Mul,
                     lhs: Operand::Const(c),
                     rhs: Operand::Value(idx),
+                    ty,
                     ..
                 } => {
+                    if !scale_ring_is_linear(*ty) {
+                        break;
+                    }
                     let n = c.to_i64()?;
                     if n <= 0 || !(n as u64).is_power_of_two() {
                         break;
@@ -1235,8 +1266,12 @@ fn build_indexed_gep_map(
                     op: IrBinOp::Add,
                     lhs: Operand::Value(a),
                     rhs: Operand::Value(b),
+                    ty,
                     ..
                 } if a == b && shift < 3 => {
+                    if !scale_ring_is_linear(*ty) {
+                        break;
+                    }
                     shift += 1;
                     // Same: do NOT scale `disp`.
                     id = a.0;
@@ -1274,14 +1309,19 @@ fn build_indexed_gep_map(
                     op: IrBinOp::Add,
                     lhs: Operand::Value(idx),
                     rhs: Operand::Const(c),
+                    ty,
                     ..
                 }
                 | Instruction::BinOp {
                     op: IrBinOp::Add,
                     lhs: Operand::Const(c),
                     rhs: Operand::Value(idx),
+                    ty,
                     ..
                 } => {
+                    if !scale_ring_is_linear(*ty) {
+                        break;
+                    }
                     // Already saw an add(iv, const) — refuse nested adds.
                     if iv_in_add.is_some() {
                         break;
@@ -1322,8 +1362,12 @@ fn build_indexed_gep_map(
                     op: IrBinOp::Sub,
                     lhs: Operand::Value(idx),
                     rhs: Operand::Const(c),
+                    ty,
                     ..
                 } => {
+                    if !scale_ring_is_linear(*ty) {
+                        break;
+                    }
                     if pf06_add_peel_disabled {
                         break;
                     }
@@ -6655,6 +6699,53 @@ mod conditional_increment_tests {
         }
         instructions.push(select());
         assert!(detect(&function_with(instructions)).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod scale_ring_tests {
+    use super::*;
+
+    /// The SIB peel is value-preserving only for rings the CPU's address
+    /// arithmetic can reproduce: the pointer ring itself, anything wider, and
+    /// narrower SIGNED rings (no wrap in a defined program). An unsigned
+    /// narrower ring wraps by definition -- `add(uint32 i, uint32 i)` peeled to
+    /// `scale = 2` of a zero-extended index read `buf[0x100000000]` instead of
+    /// `buf[0]`, a live miscompile at -O1..-O3 (IVSR-WRAP-2, pinned by
+    /// tests/regression/ivsr_scale_ring_wrap.c).
+    #[test]
+    fn peel_requires_a_ring_the_address_arithmetic_can_reproduce() {
+        let ptr = crate::common::types::target_ptr_size();
+        for ty in [
+            IrType::U8,
+            IrType::U16,
+            IrType::U32,
+            IrType::I8,
+            IrType::I16,
+            IrType::I32,
+        ] {
+            let narrow = (ty.size() as usize) < ptr;
+            assert_eq!(
+                scale_ring_is_linear(ty),
+                !narrow || !ty.is_unsigned(),
+                "{ty:?}"
+            );
+        }
+        // At or above the pointer width both spellings share one ring.
+        for ty in [IrType::I64, IrType::U64] {
+            assert!(scale_ring_is_linear(ty), "{ty:?}");
+        }
+        // Non-integer rings are never a scaling instruction's ring, and are
+        // refused rather than trusted.
+        for ty in [
+            IrType::F32,
+            IrType::F64,
+            IrType::F128,
+            IrType::Ptr,
+            IrType::Void,
+        ] {
+            assert!(!scale_ring_is_linear(ty), "{ty:?}");
+        }
     }
 }
 
