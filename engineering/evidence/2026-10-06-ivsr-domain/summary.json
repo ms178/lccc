@@ -1,0 +1,113 @@
+{
+ "date": "2026-10-06",
+ "base_upstream": "6051e87304c6b07a2ed1a9a516aa5744d8110955",
+ "first_round_commit": "dd0127998aae32a0a56626091bd9c93b597d2aff",
+ "host": "Debian 13 VM, Xeon, GCC 14.2, binutils 2.44, Rust 1.99.0, 8 GiB swap",
+ "build_policy": "scripts/build_lccc_fast.sh (fastbuild, Rust -O1, -j2)",
+ "target_hardware_i7_14700kf_measured": false,
+ "pmu_available": false,
+ "slow_ci_run_this_round": false,
+ "defects_fixed": [
+  {
+   "id": "IVSR-DOMAIN-1",
+   "symptom": "SIGSEGV at -O2/-O3 on merged base",
+   "reproducer": "tests/regression/ivsr_signedness_domain.c",
+   "cause": "find_derived_exprs admitted any cast with to_ty.size() >= from_ty.size(), so U32->I32 counted as a widening and a later I32->I64 sign-extended it"
+  },
+  {
+   "id": "IVSR-DOMAIN-2",
+   "symptom": "SIGSEGV at -O2/-O3 on merged base",
+   "reproducer": "tests/regression/ivsr_unsigned_sparse_wrap.c",
+   "cause": "an unbounded modular uint32_t counter was turned into a linear pointer recurrence"
+  },
+  {
+   "id": "IVSR-OFFSET-1",
+   "symptom": "latent (no shipped workload reaches it)",
+   "reproducer": "unit: offset_product_proof_needs_an_exact_bound_only_below_the_pointer_ring",
+   "cause": "the offset product's own ring was never checked against the pointer ring"
+  },
+  {
+   "id": "IVSR-INIT-1",
+   "symptom": "latent",
+   "reproducer": "unit + corpus neutrality",
+   "cause": "the initial constant was scaled in IrConst's signed storage rather than the IV's own domain; unchecked multiply"
+  }
+ ],
+ "proposals_rejected": [
+  {
+   "id": "IVSR-SAMEWIDTH-1",
+   "proposal": "relax look_through_casts from from_ty==to_ty to equal size",
+   "measured_corpus_delta_instructions": 0,
+   "soundness": "C17 6.3.1.3p3 makes INT_MAX->INT_MIN implementation-defined, not UB",
+   "reproducer": "tests/regression/ivsr_signed_wrap_impldef.c"
+  }
+ ],
+ "corpus_static_ab": {
+  "programs": 55,
+  "flags": "-O2 -march=x86-64-v3",
+  "base_6051e87_instructions": 8139,
+  "value_only_predicate_instructions": 8154,
+  "ring_aware_predicate_instructions": 8139,
+  "relaxed_same_width_backedge_instructions": 8139,
+  "value_only_regressions": {
+   "histogram": [
+    59,
+    64
+   ],
+   "linux_rbtree": [
+    237,
+    249
+   ],
+   "linux_find_bit": [
+    147,
+    148
+   ],
+   "i686_alu_chains": [
+    492,
+    494
+   ],
+   "zlib_ng_adler32_combine": [
+    293,
+    294
+   ]
+  },
+  "value_only_improvement": {
+   "sqlite_varint": [
+    398,
+    392
+   ]
+  },
+  "ring_aware_differences_vs_base": []
+ },
+ "result_type_consumers": {
+  "call_sites": 17,
+  "files": 9,
+  "review_claimed_consumers": 8,
+  "review_paths_that_do_not_exist": [
+   "src/passes/provenance.rs",
+   "src/backend/i686/prologue.rs"
+  ]
+ },
+ "open_gaps": [
+  {
+   "id": "CONSTLOOP-FOLD-1",
+   "program": "int_alu",
+   "lccc": 92,
+   "gcc162": 68,
+   "clang2310": 23,
+   "icc2021100": 81,
+   "icxlatest": 28,
+   "note": "Clang folds the whole 64-iteration FNV-1a chain to one movabsq; LCCC's complete unroller caps trip at 16 / 512-instruction budget"
+  },
+  {
+   "id": "sqlite_varint-profitability",
+   "note": "an unprofitable U64->I64 reduction; no cost model, same root cause as the opt-in scalar-derived flavor"
+  },
+  {
+   "id": "control",
+   "lccc": 168,
+   "gcc162": 116,
+   "note": "only program where LCCC is larger than GCC in the oracle table"
+  }
+ ]
+}

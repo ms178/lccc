@@ -1,0 +1,112 @@
+{
+ "date": "2026-10-06",
+ "flags": "-O2 -march=x86-64-v3",
+ "scope": "static instruction and stack-reference counts over tests/benchmark/programs; NOT runtime",
+ "compilers": {
+  "base": "upstream 6051e87, unpatched fastbuild (target/review-audit/baseline)",
+  "value_only": "this patch with cast_preserves_offset_value temporarily reduced to cast_preserves_integer_value; MEASUREMENT-ONLY build variant, the knob is NOT shipped",
+  "ring_aware": "this patch as shipped: cast_preserves_offset_value (default arm)"
+ },
+ "rows": [
+  {
+   "workload": "histogram",
+   "base": {
+    "instructions": 59,
+    "stack_refs": 0
+   },
+   "value_only": {
+    "instructions": 64,
+    "stack_refs": 0
+   },
+   "ring_aware": {
+    "instructions": 59,
+    "stack_refs": 0
+   }
+  },
+  {
+   "workload": "i686_alu_chains",
+   "base": {
+    "instructions": 492,
+    "stack_refs": 75
+   },
+   "value_only": {
+    "instructions": 494,
+    "stack_refs": 75
+   },
+   "ring_aware": {
+    "instructions": 492,
+    "stack_refs": 75
+   }
+  },
+  {
+   "workload": "linux_find_bit",
+   "base": {
+    "instructions": 147,
+    "stack_refs": 0
+   },
+   "value_only": {
+    "instructions": 148,
+    "stack_refs": 0
+   },
+   "ring_aware": {
+    "instructions": 147,
+    "stack_refs": 0
+   }
+  },
+  {
+   "workload": "linux_rbtree",
+   "base": {
+    "instructions": 237,
+    "stack_refs": 10
+   },
+   "value_only": {
+    "instructions": 249,
+    "stack_refs": 17
+   },
+   "ring_aware": {
+    "instructions": 237,
+    "stack_refs": 10
+   }
+  },
+  {
+   "workload": "sqlite_varint",
+   "base": {
+    "instructions": 398,
+    "stack_refs": 24
+   },
+   "value_only": {
+    "instructions": 392,
+    "stack_refs": 24
+   },
+   "ring_aware": {
+    "instructions": 398,
+    "stack_refs": 24
+   }
+  },
+  {
+   "workload": "zlib_ng_adler32_combine",
+   "base": {
+    "instructions": 293,
+    "stack_refs": 5
+   },
+   "value_only": {
+    "instructions": 294,
+    "stack_refs": 5
+   },
+   "ring_aware": {
+    "instructions": 293,
+    "stack_refs": 5
+   }
+  }
+ ],
+ "totals": {
+  "programs": 55,
+  "base_instructions": 8139,
+  "value_only_instructions": 8154,
+  "ring_aware_instructions": 8139,
+  "value_only_delta": 15,
+  "ring_aware_delta": 0
+ },
+ "reproduce_value_only_arm": "in src/passes/iv_strength_reduce.rs, make cast_preserves_offset_value return cast_preserves_integer_value(from, to) unconditionally, rebuild with scripts/build_lccc_fast.sh, re-run the same -O2 -march=x86-64-v3 sweep",
+ "conclusion": "the ring-aware arm is byte-for-byte neutral against the base over all 55 programs; the value-only arm costs +15 instructions across 5 programs and gains 6 on one (sqlite_varint, an unprofitable reduction accidentally suppressed)"
+}

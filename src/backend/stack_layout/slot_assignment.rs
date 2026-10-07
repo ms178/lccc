@@ -1782,3 +1782,139 @@ pub(super) fn propagate_wide_values(
         }
     }
 }
+
+#[cfg(test)]
+mod scalar_lane_slot_tests {
+    use super::*;
+    use crate::common::types::{self, AddressSpace};
+    use crate::ir::reexports::{BasicBlock, BlockId, IntrinsicOp};
+
+    struct TargetGuard(usize, bool);
+    impl Drop for TargetGuard {
+        fn drop(&mut self) {
+            types::set_target_ptr_size(self.0);
+            types::set_target_small_slots(self.1);
+        }
+    }
+
+    #[test]
+    fn scalar_lane_slots_are_width_partitioned_even_without_fp_homes() {
+        let _restore = TargetGuard(types::target_ptr_size(), types::target_small_slots());
+        types::set_target_ptr_size(8);
+        types::set_target_small_slots(true);
+        let mut f = IrFunction::new("lane_slots".into(), IrType::Void, vec![], false);
+        let mut ins = vec![Instruction::Copy {
+            dest: Value(99),
+            src: Operand::Const(IrConst::I64(4096)),
+        }];
+        let ops = [
+            (
+                IntrinsicOp::VecZeroF32x4,
+                IntrinsicOp::VecExtractLaneF32x4,
+                IrType::F32,
+            ),
+            (
+                IntrinsicOp::VecZeroF32x8,
+                IntrinsicOp::VecExtractLaneF32x8,
+                IrType::F32,
+            ),
+            (
+                IntrinsicOp::VecZeroF64x2,
+                IntrinsicOp::VecExtractLaneF64x2,
+                IrType::F64,
+            ),
+            (
+                IntrinsicOp::VecZeroF64x4,
+                IntrinsicOp::VecExtractLaneF64x4,
+                IrType::F64,
+            ),
+        ];
+        for (i, (zero, _, _)) in ops.iter().enumerate() {
+            ins.push(Instruction::Intrinsic {
+                dest: Some(Value(100 + i as u32)),
+                op: zero.clone(),
+                dest_ptr: None,
+                args: vec![],
+            });
+        }
+        for (i, (_, extract, _)) in ops.iter().enumerate() {
+            ins.push(Instruction::Intrinsic {
+                dest: Some(Value(i as u32)),
+                op: extract.clone(),
+                dest_ptr: None,
+                args: vec![
+                    Operand::Value(Value(100 + i as u32)),
+                    Operand::Const(IrConst::I32(1)),
+                ],
+            });
+        }
+        // All four results overlap in liveness. No adjacent-use deferral can
+        // replace their slots; each store also supplies an independent width.
+        for (i, (_, _, ty)) in ops.iter().enumerate() {
+            ins.push(Instruction::Store {
+                ptr: Value(99),
+                val: Operand::Value(Value(i as u32)),
+                ty: *ty,
+                volatile: true,
+                seg_override: AddressSpace::Default,
+            });
+        }
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: ins,
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+        });
+        f.next_value_id = 104;
+        let mut state = crate::backend::state::CodegenState::new_with_ra_config(
+            std::sync::Arc::new(crate::backend::regalloc::RaConfig::default()),
+        );
+        assert!(!state.ra_config.fp_extract_homes);
+        let total = super::super::calculate_stack_space_common(
+            &mut state,
+            &f,
+            0,
+            |space, size, align| {
+                // align=0 means natural alignment in the allocator API.
+                let align = if align == 0 { size.min(8) } else { align };
+                let start = (space + align - 1) & -align;
+                (start, start + size)
+            },
+            &FxHashMap::default(),
+            &[],
+            None,
+        );
+        let mut spans = Vec::new();
+        for (i, (_, _, ty)) in ops.iter().enumerate() {
+            assert_eq!(state.small_slot_values.contains(&(i as u32)), i < 2);
+            let start = state.value_locations[&(i as u32)].0 as usize;
+            spans.push((start, start + ty.size()));
+        }
+        for i in 0..4 {
+            for j in i + 1..4 {
+                assert!(
+                    spans[i].1 <= spans[j].0 || spans[j].1 <= spans[i].0,
+                    "overlapping live scalar lanes"
+                );
+            }
+        }
+        assert_eq!(
+            spans[0].0.abs_diff(spans[1].0),
+            4,
+            "exercise an actual adjacent four-byte boundary"
+        );
+        let patterns: [u64; 4] = [
+            0x80000000,
+            0x3fa00000,
+            0x400921fb54442d18,
+            0xbff0000000000000,
+        ];
+        let mut memory = vec![0xa5; total as usize];
+        for (i, (lo, hi)) in spans.iter().copied().enumerate() {
+            memory[lo..hi].copy_from_slice(&patterns[i].to_le_bytes()[..hi - lo]);
+        }
+        for (i, (lo, hi)) in spans.iter().copied().enumerate() {
+            assert_eq!(&memory[lo..hi], &patterns[i].to_le_bytes()[..hi - lo]);
+        }
+    }
+}

@@ -102,6 +102,15 @@ jobs:
       - name: Audit loop branch and must-execute contracts
         run: env CCC=target/fastbuild/lccc bash tests/regression/check_audit_loop_contracts.sh
 
+      - name: IVSR integer-domain contracts
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_ivsr_domains.sh
+
+      - name: Scalar lane types, stack boundaries and opt-in homes
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_fp_extract_homes.sh
+
+      - name: Variadic pack count inlining contracts
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_va_arg_pack_len.sh
+
       - name: Run tests
         env:
           CARGO_BUILD_JOBS: "2"

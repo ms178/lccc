@@ -1169,12 +1169,19 @@ fn build_indexed_gep_map(
                     from_ty,
                     to_ty,
                     ..
-                } if from_ty.is_integer()
-                    && to_ty.is_integer()
-                    && to_ty.size() >= from_ty.size()
-                    && val_ty.get(&v.0) == Some(&from_ty)
-                    && (from_ty.is_unsigned() == to_ty.is_unsigned()
-                        || (from_ty.is_unsigned() && to_ty.size() > from_ty.size())) =>
+                // The type relation is the shared
+                // `IrType::cast_preserves_integer_value`, provably identical to
+                // the inline restatement it replaces (both reduce to: identity,
+                // or a widening whose extension domain is unchanged). It is
+                // shared with `iv_strength_reduce`, which used to carry a
+                // weaker `to_ty.size() >= from_ty.size()` version of this same
+                // rule and miscompiled `p[(int32_t)i]` across a `uint32_t` wrap
+                // (IVSR-DOMAIN-1). `val_ty` is this peel's own extra obligation
+                // and stays here: a cast whose `from_ty` disagrees with the
+                // source value's real type is a width lie the peel must not
+                // trust.
+                } if val_ty.get(&v.0) == Some(&from_ty)
+                    && from_ty.cast_preserves_integer_value(*to_ty) =>
                 {
                     id = v.0;
                 }

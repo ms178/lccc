@@ -14836,5 +14836,11 @@ mod scalar_lane_class_tests {
         for id in [4, 5, 20] {
             assert!(!scalars.contains(&id), "v{id}");
         }
+        for id in [4, 5] {
+            assert!(
+                !non_gpr.contains(&id),
+                "integer lane v{id} must remain GPR-eligible"
+            );
+        }
     }
 }
