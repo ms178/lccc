@@ -16,5 +16,13 @@ for opt in -O0 -O1 -O2 -O3; do
         # is not a gate.
         "$ccc" "$opt" -m32 -msse2 -I"$inc" tests/regression/"$test".c -o "$td/test32"
         "$td/test32"
+        # Correctness UNDER THE KILL SWITCH. A gate that only ever runs the
+        # default configuration cannot tell you whether the escape hatch still
+        # produces a correct program, and an escape hatch nobody exercises is
+        # how a switch rots into a no-op or a crash. The unit test
+        # `ptr_add_parameter_is_a_real_kill_switch` covers the parameter; this
+        # covers the environment spelling a user would actually type.
+        CCC_NO_IVSR_PTR_ADD=1 "$ccc" "$opt" tests/regression/"$test".c -o "$td/test-off"
+        "$td/test-off"
     done
 done

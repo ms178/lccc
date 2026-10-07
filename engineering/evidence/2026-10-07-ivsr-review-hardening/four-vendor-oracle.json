@@ -1,0 +1,542 @@
+[
+ {
+  "program": "bitops.c",
+  "lccc": {
+   "id": "lccc",
+   "vendor": "local",
+   "ok": true,
+   "asm_insns": 122,
+   "stdout": "bitops 6c2706411b3f28d9\nbitops crc 4905c741\n",
+   "exit": 0,
+   "reason": null
+  },
+  "oracles": [
+   {
+    "id": "cg162",
+    "vendor": "GNU",
+    "ok": true,
+    "asm_insns": 128,
+    "stdout": "bitops 6c2706411b3f28d9\nbitops crc 4905c741",
+    "exit": 0,
+    "reason": null,
+    "ce_semver": null,
+    "cached_at": 1791372445.392456
+   },
+   {
+    "id": "cclang2310",
+    "vendor": "LLVM",
+    "ok": true,
+    "asm_insns": 130,
+    "stdout": "bitops 6c2706411b3f28d9\nbitops crc 4905c741",
+    "exit": 0,
+    "reason": null,
+    "ce_semver": null,
+    "cached_at": 1791372445.4085376
+   },
+   {
+    "id": "cicc2021100",
+    "vendor": "Intel (classic)",
+    "ok": true,
+    "asm_insns": 189,
+    "stdout": "bitops 6c2706411b3f28d9\nbitops crc 4905c741",
+    "exit": 0,
+    "reason": null,
+    "ce_semver": null,
+    "cached_at": 1791372445.412479
+   },
+   {
+    "id": "cicxlatest",
+    "vendor": "Intel",
+    "ok": true,
+    "asm_insns": 213,
+    "stdout": "bitops 6c2706411b3f28d9\nbitops crc 4905c741",
+    "exit": 0,
+    "reason": null,
+    "ce_semver": null,
+    "cached_at": 1791372445.4167948
+   }
+  ],
+  "status": "PASS",
+  "why": []
+ },
+ {
+  "program": "control.c",
+  "lccc": {
+   "id": "lccc",
+   "vendor": "local",
+   "ok": true,
+   "asm_insns": 168,
+   "stdout": "control 1c27d188\ncontrol search 174933\n",
+   "exit": 0,
+   "reason": null
+  },
+  "oracles": [
+   {
+    "id": "cg162",
+    "vendor": "GNU",
+    "ok": true,
+    "asm_insns": 116,
+    "stdout": "control 1c27d188\ncontrol search 174933",
+    "exit": 0,
+    "reason": null,
+    "ce_semver": null,
+    "cached_at": 1791372445.4498909
+   },
+   {
+    "id": "cclang2310",
+    "vendor": "LLVM",
+    "ok": true,
+    "asm_insns": 211,
+    "stdout": "control 1c27d188\ncontrol search 174933",
+    "exit": 0,
+    "reason": null,
+    "ce_semver": null,
+    "cached_at": 1791372445.4502296
+   },
+   {
+    "id": "cicc2021100",
+    "vendor": "Intel (classic)",
+    "ok": true,
+    "asm_insns": 153,
+    "stdout": "control 1c27d188\ncontrol search 174933",
+    "exit": 0,
+    "reason": null,
+    "ce_semver": null,
+    "cached_at": 1791372445.4505038
+   },
+   {
+    "id": "cicxlatest",
+    "vendor": "Intel",
+    "ok": true,
+    "asm_insns": 148,
+    "stdout": "control 1c27d188\ncontrol search 174933",
+    "exit": 0,
+    "reason": null,
+    "ce_semver": null,
+    "cached_at": 1791372445.451135
+   }
+  ],
+  "status": "PASS",
+  "why": []
+ },
+ {
+  "program": "float.c",
+  "lccc": {
+   "id": "lccc",
+   "vendor": "local",
+   "ok": true,
+   "asm_insns": 155,
+   "stdout": "float 000000042d5042ef\nfloat conv 8c2b02849657f995\n",
+   "exit": 0,
+   "reason": null
+  },
+  "oracles": [
+   {
+    "id": "cg162",
+    "vendor": "GNU",
+    "ok": true,
+    "asm_insns": 123,
+    "stdout": "float 000000042d5042ef\nfloat conv 8c2b02849657f995",
+    "exit": 0,
+    "reason": null,
+    "ce_semver": null,
+    "cached_at": 1791372446.5858488
+   },
+   {
+    "id": "cclang2310",
+    "vendor": "LLVM",
+    "ok": true,
+    "asm_insns": 154,
+    "stdout": "float 000000042d5042ef\nfloat conv 8c2b02849657f995",
+    "exit": 0,
+    "reason": null,
+    "ce_semver": null,
+    "cached_at": 1791372446.5862484
+   },
+   {
+    "id": "cicc2021100",
+    "vendor": "Intel (classic)",
+    "ok": true,
+    "asm_insns": 329,
+    "stdout": "float 000000042d5042ef\nfloat conv 8c2b02849657f995",
+    "exit": 0,
+    "reason": null,
+    "ce_semver": null,
+    "cached_at": 1791372446.5865605
+   },
+   {
+    "id": "cicxlatest",
+    "vendor": "Intel",
+    "ok": true,
+    "asm_insns": 162,
+    "stdout": "float 000000042d5042ef\nfloat conv 8c2b02849657f995",
+    "exit": 0,
+    "reason": null,
+    "ce_semver": null,
+    "cached_at": 1791372446.5868418
+   }
+  ],
+  "status": "PASS",
+  "why": []
+ },
+ {
+  "program": "int_alu.c",
+  "lccc": {
+   "id": "lccc",
+   "vendor": "local",
+   "ok": true,
+   "asm_insns": 92,
+   "stdout": "int_alu 5a25b257f4163d49\nint_narrow 29f70080\n",
+   "exit": 0,
+   "reason": null
+  },
+  "oracles": [
+   {
+    "id": "cg162",
+    "vendor": "GNU",
+    "ok": true,
+    "asm_insns": 68,
+    "stdout": "int_alu 5a25b257f4163d49\nint_narrow 29f70080",
+    "exit": 0,
+    "reason": null,
+    "ce_semver": null,
+    "cached_at": 1791372446.528364
+   },
+   {
+    "id": "cclang2310",
+    "vendor": "LLVM",
+    "ok": true,
+    "asm_insns": 23,
+    "stdout": "int_alu 5a25b257f4163d49\nint_narrow 29f70080",
+    "exit": 0,
+    "reason": null,
+    "ce_semver": null,
+    "cached_at": 1791372446.5338082
+   },
+   {
+    "id": "cicc2021100",
+    "vendor": "Intel (classic)",
+    "ok": true,
+    "asm_insns": 81,
+    "stdout": "int_alu 5a25b257f4163d49\nint_narrow 29f70080",
+    "exit": 0,
+    "reason": null,
+    "ce_semver": null,
+    "cached_at": 1791372446.54435
+   },
+   {
+    "id": "cicxlatest",
+    "vendor": "Intel",
+    "ok": true,
+    "asm_insns": 28,
+    "stdout": "int_alu 5a25b257f4163d49\nint_narrow 29f70080",
+    "exit": 0,
+    "reason": null,
+    "ce_semver": null,
+    "cached_at": 1791372446.5506217
+   }
+  ],
+  "status": "PASS",
+  "why": []
+ },
+ {
+  "program": "ivsr_index_domains.c",
+  "lccc": {
+   "id": "lccc",
+   "vendor": "local",
+   "ok": true,
+   "asm_insns": 165,
+   "stdout": "ivsr_index_domains 2399416251494309360\n",
+   "exit": 0,
+   "reason": null
+  },
+  "oracles": [
+   {
+    "id": "cg162",
+    "vendor": "GNU",
+    "ok": true,
+    "asm_insns": 118,
+    "stdout": "ivsr_index_domains 2399416251494309360",
+    "exit": 0,
+    "reason": null,
+    "ce_semver": null,
+    "cached_at": 1791372427.981374
+   },
+   {
+    "id": "cclang2310",
+    "vendor": "LLVM",
+    "ok": true,
+    "asm_insns": 348,
+    "stdout": "ivsr_index_domains 2399416251494309360",
+    "exit": 0,
+    "reason": null,
+    "ce_semver": null,
+    "cached_at": 1791372427.993648
+   },
+   {
+    "id": "cicc2021100",
+    "vendor": "Intel (classic)",
+    "ok": true,
+    "asm_insns": 376,
+    "stdout": "ivsr_index_domains 2399416251494309360",
+    "exit": 0,
+    "reason": null,
+    "ce_semver": null,
+    "cached_at": 1791372427.9940338
+   },
+   {
+    "id": "cicxlatest",
+    "vendor": "Intel",
+    "ok": true,
+    "asm_insns": 458,
+    "stdout": "ivsr_index_domains 2399416251494309360",
+    "exit": 0,
+    "reason": null,
+    "ce_semver": null,
+    "cached_at": 1791372427.994793
+   }
+  ],
+  "status": "PASS",
+  "why": []
+ },
+ {
+  "program": "loops.c",
+  "lccc": {
+   "id": "lccc",
+   "vendor": "local",
+   "ok": true,
+   "asm_insns": 128,
+   "stdout": "loops stride 32607\nloops fp ffffffffffffde80\nloops serial f517ff66df0cbea9\nloops nested 95232\n",
+   "exit": 0,
+   "reason": null
+  },
+  "oracles": [
+   {
+    "id": "cg162",
+    "vendor": "GNU",
+    "ok": true,
+    "asm_insns": 229,
+    "stdout": "loops stride 32607\nloops fp ffffffffffffde80\nloops serial f517ff66df0cbea9\nloops nested 95232",
+    "exit": 0,
+    "reason": null,
+    "ce_semver": null,
+    "cached_at": 1791372447.7084131
+   },
+   {
+    "id": "cclang2310",
+    "vendor": "LLVM",
+    "ok": true,
+    "asm_insns": 282,
+    "stdout": "loops stride 32607\nloops fp ffffffffffffde80\nloops serial f517ff66df0cbea9\nloops nested 95232",
+    "exit": 0,
+    "reason": null,
+    "ce_semver": null,
+    "cached_at": 1791372447.7163806
+   },
+   {
+    "id": "cicc2021100",
+    "vendor": "Intel (classic)",
+    "ok": true,
+    "asm_insns": 268,
+    "stdout": "loops stride 32607\nloops fp ffffffffffffde80\nloops serial f517ff66df0cbea9\nloops nested 95232",
+    "exit": 0,
+    "reason": null,
+    "ce_semver": null,
+    "cached_at": 1791372447.7283535
+   },
+   {
+    "id": "cicxlatest",
+    "vendor": "Intel",
+    "ok": true,
+    "asm_insns": 229,
+    "stdout": "loops stride 32607\nloops fp ffffffffffffde80\nloops serial f517ff66df0cbea9\nloops nested 95232",
+    "exit": 0,
+    "reason": null,
+    "ce_semver": null,
+    "cached_at": 1791372447.7360058
+   }
+  ],
+  "status": "PASS",
+  "why": []
+ },
+ {
+  "program": "memory.c",
+  "lccc": {
+   "id": "lccc",
+   "vendor": "local",
+   "ok": true,
+   "asm_insns": 242,
+   "stdout": "memory b979279b42f87649\nmemory fib 6765 ack 9\nmemory va 36\n",
+   "exit": 0,
+   "reason": null
+  },
+  "oracles": [
+   {
+    "id": "cg162",
+    "vendor": "GNU",
+    "ok": true,
+    "asm_insns": 579,
+    "stdout": "memory b979279b42f87649\nmemory fib 6765 ack 9\nmemory va 36",
+    "exit": 0,
+    "reason": null,
+    "ce_semver": null,
+    "cached_at": 1791372447.8522875
+   },
+   {
+    "id": "cclang2310",
+    "vendor": "LLVM",
+    "ok": true,
+    "asm_insns": 296,
+    "stdout": "memory b979279b42f87649\nmemory fib 6765 ack 9\nmemory va 36",
+    "exit": 0,
+    "reason": null,
+    "ce_semver": null,
+    "cached_at": 1791372447.8527703
+   },
+   {
+    "id": "cicc2021100",
+    "vendor": "Intel (classic)",
+    "ok": true,
+    "asm_insns": 622,
+    "stdout": "memory b979279b42f87649\nmemory fib 6765 ack 9\nmemory va 36",
+    "exit": 0,
+    "reason": null,
+    "ce_semver": null,
+    "cached_at": 1791372447.8530905
+   },
+   {
+    "id": "cicxlatest",
+    "vendor": "Intel",
+    "ok": true,
+    "asm_insns": 449,
+    "stdout": "memory b979279b42f87649\nmemory fib 6765 ack 9\nmemory va 36",
+    "exit": 0,
+    "reason": null,
+    "ce_semver": null,
+    "cached_at": 1791372447.8534214
+   }
+  ],
+  "status": "PASS",
+  "why": []
+ },
+ {
+  "program": "pixmap.c",
+  "lccc": {
+   "id": "lccc",
+   "vendor": "local",
+   "ok": true,
+   "asm_insns": 256,
+   "stdout": "pixmap 29bd78d2c4a7dfc0\n",
+   "exit": 0,
+   "reason": null
+  },
+  "oracles": [
+   {
+    "id": "cg162",
+    "vendor": "GNU",
+    "ok": true,
+    "asm_insns": 283,
+    "stdout": "pixmap 29bd78d2c4a7dfc0",
+    "exit": 0,
+    "reason": null,
+    "ce_semver": null,
+    "cached_at": 1791372448.7023997
+   },
+   {
+    "id": "cclang2310",
+    "vendor": "LLVM",
+    "ok": true,
+    "asm_insns": 467,
+    "stdout": "pixmap 29bd78d2c4a7dfc0",
+    "exit": 0,
+    "reason": null,
+    "ce_semver": null,
+    "cached_at": 1791372448.702812
+   },
+   {
+    "id": "cicc2021100",
+    "vendor": "Intel (classic)",
+    "ok": true,
+    "asm_insns": 1402,
+    "stdout": "pixmap 29bd78d2c4a7dfc0",
+    "exit": 0,
+    "reason": null,
+    "ce_semver": null,
+    "cached_at": 1791372448.7031393
+   },
+   {
+    "id": "cicxlatest",
+    "vendor": "Intel",
+    "ok": true,
+    "asm_insns": 524,
+    "stdout": "pixmap 29bd78d2c4a7dfc0",
+    "exit": 0,
+    "reason": null,
+    "ce_semver": null,
+    "cached_at": 1791372448.7034702
+   }
+  ],
+  "status": "PASS",
+  "why": []
+ },
+ {
+  "program": "strings.c",
+  "lccc": {
+   "id": "lccc",
+   "vendor": "local",
+   "ok": true,
+   "asm_insns": 184,
+   "stdout": "strings 0000000076bc0140\nstrings memcmp -213 -1\n",
+   "exit": 0,
+   "reason": null
+  },
+  "oracles": [
+   {
+    "id": "cg162",
+    "vendor": "GNU",
+    "ok": true,
+    "asm_insns": 208,
+    "stdout": "strings 0000000076bc0140\nstrings memcmp -213 -1",
+    "exit": 0,
+    "reason": null,
+    "ce_semver": null,
+    "cached_at": 1791372449.0112343
+   },
+   {
+    "id": "cclang2310",
+    "vendor": "LLVM",
+    "ok": true,
+    "asm_insns": 363,
+    "stdout": "strings 0000000076bc0140\nstrings memcmp -213 -1",
+    "exit": 0,
+    "reason": null,
+    "ce_semver": null,
+    "cached_at": 1791372449.0117297
+   },
+   {
+    "id": "cicc2021100",
+    "vendor": "Intel (classic)",
+    "ok": true,
+    "asm_insns": 294,
+    "stdout": "strings 0000000076bc0140\nstrings memcmp -213 -1",
+    "exit": 0,
+    "reason": null,
+    "ce_semver": null,
+    "cached_at": 1791372449.012033
+   },
+   {
+    "id": "cicxlatest",
+    "vendor": "Intel",
+    "ok": true,
+    "asm_insns": 230,
+    "stdout": "strings 0000000076bc0140\nstrings memcmp -213 -1",
+    "exit": 0,
+    "reason": null,
+    "ce_semver": null,
+    "cached_at": 1791372449.0123196
+   }
+  ],
+  "status": "PASS",
+  "why": []
+ }
+]

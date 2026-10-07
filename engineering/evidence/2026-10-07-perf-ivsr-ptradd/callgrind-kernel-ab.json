@@ -1,10 +1,10 @@
 {
- "date": "2026-10-06",
+ "date": "2026-10-07",
  "base_upstream": "66c2452838eedef2322fbad44d242e3b990e6c10",
  "change": "IVSR-PTRADD-1: teach the pointer-recurrence scan the address-forming Add that LCCC's own lowering emits for every C subscript",
  "metric": "Callgrind Ir for bench_run, per kernel. Deterministic and reproducible; NOT cycles, uops, PMU counters or a Raptor Lake measurement.",
  "cache_geometry": "I1=32768,8,64 D1=32768,8,64 LL=33554432,16,64 (pinned, same for every arm)",
- "why_not_wall_clock": "scripts/bench_kernels.py reported 7 of 11 kernels moving beyond its 3% tolerance with BYTE-IDENTICAL codegen on this host - a ~15% layout-noise floor. A runtime delta inside that band is unmeasurable here, so Ir is the decision metric.",
+ "why_not_wall_clock": "Wall clock WAS measured and is reported next to Ir - see `wall_clock_ms` in the varint entry and METRIC-SPLIT-1 in FOLLOWUP-2026-10-07-perf-ivsr-ptradd.md section 5. What is NOT true, and what an earlier revision of this field claimed, is that runtime is unmeasurable here. The real rule is two-metric: scripts/bench_kernels.py showed 7 of 11 kernels moving beyond its 3% tolerance with BYTE-IDENTICAL codegen on this host, a ~15% layout-noise floor, so a wall delta INSIDE that band is never accepted on its own. Ir is the primary metric because it is deterministic; wall clock is the confirmation metric. varint was accepted because -9.59% Ir and -14.6% wall agree in sign and magnitude on the same kernel with identical checksums, not because either alone was believed. nbody (METRIC-SPLIT-1) is the counter-example that made the rule: -11.1% Ir but +63.2% wall, so the change stayed opt-in.",
  "arms": {
   "pre": "rebased S17 tree, no change",
   "post": "this change, ILP32-gated",
@@ -142,5 +142,7 @@
   "i7-14700KF / Raptor Lake (not this host)",
   "PMU counters (unsupported in this VM)",
   "the slow/benchmark CI gates (out of scope by explicit instruction)"
- ]
+ ],
+ "refiled_from": "engineering/evidence/2026-10-06-ivsr-domain/callgrind-kernel-ab.json",
+ "refile_reason": "Misfiled: this record measures IVSR-PTRADD-1 (the 2026-10-07 performance round, base 66c24528) but sat in the 2026-10-06 correctness-round directory and carried that date. The measurement is unchanged; only its filing and this field changed."
 }

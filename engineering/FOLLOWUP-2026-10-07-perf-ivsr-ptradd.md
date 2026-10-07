@@ -152,7 +152,7 @@ Callgrind A/B was measured on.
 
 | corpus | comparisons | changed | net |
 |---|---|---|---|
-| benchmark + oracle (66 sources × 6 configs) | 402 | **0** | 87386 → 87386 insns |
+| benchmark + oracle (67 sources — 55 `tests/benchmark/programs` + 12 `tests/oracle/programs` — × 6 configs) | 402 | **0** | 87386 → 87386 insns |
 | regression, x86-64 `-O2` | 841 | 6 | **+4** insns, **−3** stack refs |
 | knob-threading refactor (benchmark+oracle+bench) | 237 | **0** | identical |
 | reverted case-fold experiment | 158 | **0** | identical |
@@ -404,7 +404,9 @@ benchmark outputs.
 ## 11. A latent defect in the previous round's own tests
 
 Adding i686 coverage to `check_ivsr_domains.sh` immediately exposed that
-`ivsr_signed_wrap_impldef.c` and `ivsr_unsigned_sparse_wrap.c` — shipped in the
+`ivsr_signed_wrap_impldef.c` (a pin, not a reproducer — see
+[FOLLOWUP-2026-10-06-ivsr-domain-audit.md](FOLLOWUP-2026-10-06-ivsr-domain-audit.md)
+§1) and `ivsr_unsigned_sparse_wrap.c` (a reproducer) — both shipped in the
 previous delivery — are LP64-only by construction. On ILP32
 `(size_t)UINT32_MAX + 1` wraps to **0**, the span collapses, and the writes go
 through a wild pointer: both **segfaulted** rather than reporting anything. GCC's

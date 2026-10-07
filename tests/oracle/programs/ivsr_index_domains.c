@@ -71,13 +71,20 @@ __attribute__((noinline)) static uint64_t unsigned_step(int32_t i, int32_t n) {
     return s;
 }
 
-/* (4) affine offset with the same signed/unsigned discontinuity. */
+/* (4) affine offset `(iv + k0) + 0x80000000` with the same signed/unsigned
+ * discontinuity. The induction variable MUST be the loop counter: an earlier
+ * version indexed `p[i + 0x80000000]` with `i` a loop-invariant parameter, so it
+ * read ONE element n times and exercised nothing about IVSR's affine path
+ * however the header described it. With `i = 0x80000000` the subscript is
+ * `(0x80000000 + k) + 0x80000000 == k` modulo 2^32, so the caller's n <= 6 keeps
+ * every access inside the 8-element array while the compiler still sees the full
+ * affine unsigned form. */
 __attribute__((noinline)) static uint64_t affine_view(const unsigned *p,
                                                       uint32_t i,
                                                       uint32_t n) {
     uint64_t s = 0;
-    for (uint32_t k = 0; k < n; ++k) s += (uint64_t)p[i + UINT32_C(0x80000000)] * (k + 1u);
-    (void)i;
+    for (uint32_t k = 0; k < n; ++k)
+        s += (uint64_t)p[(i + k) + UINT32_C(0x80000000)] * (k + 1u);
     return s;
 }
 

@@ -19,6 +19,10 @@ Current audit adjudication: **2026-10-06**, upstream
 `66c2452838eedef2322fbad44d242e3b990e6c10` (PR #771; contains
 `6051e87304c6b07a2ed1a9a516aa5744d8110955`, `08f4e1a124d753e9eeddb1c43ce68b54d4d95f68`
 and the merged `dd0127998aae32a0a56626091bd9c93b597d2aff`). See
+[`engineering/FOLLOWUP-2026-10-07-ivsr-review-hardening.md`](engineering/FOLLOWUP-2026-10-07-ivsr-review-hardening.md)
+for the review-response round on merged PR #772 (18 findings adjudicated, one
+review recommendation measured and **reverted**, the descending-loop gap
+discovered),
 [`engineering/FOLLOWUP-2026-10-07-perf-ivsr-ptradd.md`](engineering/FOLLOWUP-2026-10-07-perf-ivsr-ptradd.md)
 for the performance round (IVSR-PTRADD-1, the Callgrind kernel A/B, the two
 measured rejections and the metric-method findings), and
@@ -540,7 +544,7 @@ against an independently computed reference), three unit tests
 `pointer_width_add_that_nobody_dereferences_is_left_alone`,
 `address_add_arm_is_gated_by_the_kill_switch_and_ilp32`), wired into
 `check_ivsr_domains.sh` on x86-64 **and** i686.
-Evidence: `engineering/evidence/2026-10-06-ivsr-domain/callgrind-kernel-ab.json`.
+Evidence: `engineering/evidence/2026-10-07-perf-ivsr-ptradd/callgrind-kernel-ab.json`.
 
 ### SELECT-CHAIN-FOLD · **PROPOSAL REJECTED 2026-10-06** — fewer static instructions, more executed ones
 
@@ -614,9 +618,11 @@ IV-derived. Equal size therefore passed, so `U32 -> I32` was treated as a
 value-preserving step of the chain and a following `I32 -> I64` sign-extended
 it. `p[(int32_t)i]` with `i` crossing `UINT32_MAX` must visit subscripts
 `-2,-1,0,1`; the derived pointer recurrence instead walked forward from
-`+4294967294 * stride`. Two shipped benchmark shapes segfaulted at `-O2`/`-O3`
-on upstream `6051e87` and return the correct answer with GCC 14/16.2, Clang
-23.1, ICC 2021.10 and ICX latest.
+`+4294967294 * stride`. Two new reproducer programs (`ivsr_signedness_domain.c`,
+`ivsr_unsigned_sparse_wrap.c`) segfaulted at `-O2`/`-O3` on upstream `6051e87`
+and return the correct answer with GCC 14/16.2, Clang 23.1, ICC 2021.10 and ICX
+latest. No pre-existing shipped benchmark was affected: the defect needed an
+index that crosses `UINT32_MAX`, which none of the 55 corpus programs has.
 
 The predicate is now `cast_preserves_offset_value`, which separates two
 questions the old size comparison conflated:
@@ -1822,6 +1828,111 @@ per block: the moves are spread across cold blocks, and the hot inner loop
 (`.LBB13`, 29 instructions) contains only **2** of them. The kernel already
 runs **faster** than GCC (0.930x). Recorded so the next engineer does not
 spend a day on it: it is a size defect on a kernel that already wins.
+
+### PERF-4 · **NEW 2026-10-07** — descending loops get no IV strength reduction at all
+
+`find_basic_ivs` matches only `IrBinOp::Add` with a constant step. LCCC's frontend
+emits `i--` as `Sub`, so a descending counter never becomes a `BasicIV` and no
+descending C loop gets either the pointer recurrence or the index recurrence:
+
+```
+$ CCC_IVSR_DEBUG=1 lccc -O2 -S -o /dev/null desc.c
+[IVSR] header=1 no basic ivs          # for (unsigned i = 64; i-- > 0;) s += p[i];
+block 5: v7 = Sub(v22, 1) : U32 ; v11 = Cmp Ne (v22, 0) : U32
+```
+
+Also note the header test for `i-- > 0` is `Ne`, which `unsigned_iv_bound` declines
+by design (it requires `Ult`/`Ugt`/`Ule`/`Uge`), so accepting `Sub` needs the
+post-decrement polarity handled too, not just the opcode.
+
+**Do not expect a large win from this alone**: the load in these shapes is already
+SIB-indexed (`movzbl (%rdi,%r8)`), so the address is not being recomputed. Measured
+against GCC 14.2 on `revvarint` (`-O2`), LCCC is 11 instructions/iteration to GCC's
+7, and the decomposition is: no loop rotation (2 branches vs 1), two redundant
+extensions (`movl %r8d,%r8d` after `leal`, `movslq %r11d` after `andq $127`), three
+instructions of copy around a shift GCC does in place, and no vectorization (GCC's
+`g` is 4-wide SSE at ~1.75 insns/element). Ranked: PERF-6 > PERF-5 > rotation >
+this. Evidence and full assembly:
+[`engineering/FOLLOWUP-2026-10-07-ivsr-review-hardening.md`](engineering/FOLLOWUP-2026-10-07-ivsr-review-hardening.md)
+§4.1.
+
+### PERF-5 · **NEW 2026-10-07** — no redundant-extension elimination (`nonzero_bits`)
+
+LCCC emits `movl %r8d, %r8d` to zero-extend a value that `leal -1(%rsi), %r8d`
+already zero-extended (every 32-bit x86-64 op does, by definition), and
+`movslq %r11d, %r10` to sign-extend a value that `andq $127, %r11` already made
+non-negative. The IR carries the first one literally as `Cast { from_ty: U32,
+to_ty: U32 }` — an identity cast that survives to codegen because it is load-bearing
+for the register allocator's "upper 32 bits are zero" invariant.
+
+GCC tracks `nonzero_bits`/`sign_mask` through `combine`/`fwprop` and deletes both.
+LCCC has no such tracking, so the invariant can only be re-established by emitting
+the extension.
+
+This is very likely the same root cause as the two worst benchmark kernels against
+GCC — `classify` 2.057x `Ir` and `namechars` 1.653x — previously diagnosed as
+"backend boolean materialisation, RA/copy-coalescing class" (a redundant `movzbl`
+plus `movsbq`/`movsbl` of the same 0/1 byte). `revvarint` is a far crisper
+reproducer than either kernel: two extensions, four lines of assembly, no
+vectorization or register pressure to confound it. Fixing this is the highest-value
+item in the descending-loop decomposition that does not require a vectorizer.
+
+### PERF-6 · **NEW 2026-10-07** — narrow-scaled offsets are not collected by `find_derived_exprs`
+
+`(I64)(i << 2)` — scale inside the narrow ring, then widen — is not collected,
+while `(I64)i * 4` — widen, then scale — is. Probed in both loop directions rather
+than assumed:
+
+```
+PROBE descending=false narrow_shl fired=0     PROBE descending=false wide_cast fired=1
+PROBE descending=true  narrow_shl fired=0     PROBE descending=true  wide_cast fired=1
+```
+
+Direction is irrelevant, so this is independent of PERF-4. No corpus shape currently
+needs it (402 comparisons, 0 changed either way), so the benefit is unmeasured; it
+is filed because it is a hole in the collector's pattern set and the next person to
+look will otherwise re-derive it from a failing test.
+
+### INF-PGOPID-1 · **NEW 2026-10-07** — `-fprofile-generate` output is not reproducible
+
+The `.profraw` name bakes in the PID, emitted both as a `.byte` list and as
+`__lccc_pgo_dump_<hash>_<pid>`. The same binary compiled twice differs from itself:
+
+```
+< .hidden __lccc_pgo_dump_3028b24e91f41319_99551
+> .hidden __lccc_pgo_dump_3028b24e91f41319_99557
+```
+
+Consequence: any assembly A/B over `tests/regression` reports **four** phantom
+changes (`pgo_branchy`, `pgo_split_label`, `switch_table`, `value_profiling`) as
+"same size, different code". `ab_regression.py` normalises both forms and proves the
+normalisation by a self-A/B of one binary against itself. Worth a deterministic-name
+option, or at least a comment where the name is formed.
+
+### INF-M32HDRS-1 · **NEW 2026-10-07** — missing 32-bit headers silently disable every `-m32` gate
+
+Three separate package groups, three separate failure modes, all of them looking
+like compiler bugs, all of them caused by a wiped workspace losing installed
+packages while keeping the repository:
+
+| missing | symptom | gate affected |
+|---|---|---|
+| `gcc-multilib`, `libc6-dev-i386` | `bits/libc-header-start.h: No such file or directory`, exit 1 | `check_ivsr_domains.sh`; every `-m32` leg of a static A/B **silently skips** |
+| `g++-multilib` (`libstdc++-14-dev:i386`) | `bits/c++config.h: No such file or directory` in `i386_dso_emit_semantics` | `linker-suite`: 301 pass / **1 fail** → 302 / 0 after installing |
+| `libstdc++-14-dev-i386-cross` | *not* a substitute for the above: it installs under `/usr/i686-linux-gnu/include/c++/14`, which `g++ -m32` does not search | — |
+
+The silent-skip one is the dangerous case: the benchmark + oracle A/B reported
+`compared=284 skipped=252` while broken and `compared=402 skipped=0` once the
+packages were installed — the same verdict, on 70% of the evidence. Two lessons
+recorded:
+
+* a gate that fails identically on both arms of an A/B is not evidence about the
+  change — compare the arms against each other first;
+* **skip counts are part of a result**, not metadata. 284 comparisons out of a
+  possible 402 is not coverage.
+
+This hit because a wiped workspace loses installed packages while keeping the
+repository.
 
 ### EDG-TRANSPLANT · **NEW 2026-10-01** — mined the open-sourced EDG front end
 
