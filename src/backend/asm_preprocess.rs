@@ -394,6 +394,82 @@ fn resolve_rept_label_expr(
     }
 }
 
+// ── .rept expansion budget (GAS read.c `do_repeat` law) ────────────────
+
+/// Single-block `.rept` bound, mirroring GAS 2.47 `gas/read.c::do_repeat`:
+/// the count is rejected when `count * effective_body_len` overflows or
+/// exceeds `0xffffffff`.  Measured on both pinned targets:
+/// `.rept -1` reports `excessive count 18446744073709551615 for REPT -
+/// ignored` (the expression is cast to an unsigned `size_t`), `.rept 613566757`
+/// over a `.byte 0` body reports the same wording, `.rept 0` and `.rept 1`
+/// assemble, and `.rept 1<<64` only warns (shift range) and expands nothing.
+///
+/// GAS's body length includes a source-position `linefile` prefix whose
+/// size tracks the input file name (27-40 bytes in the probe fixtures),
+/// so the fixed 64-byte margin below stands in for it.  The margin keeps
+/// our verdict on the *strict* side of GAS's for any path shorter than
+/// ~49 bytes: we may reject a count slightly below GAS's threshold, but
+/// never accept one GAS rejects — which is the side where the expansion
+/// is attempted and the process dies allocating.
+pub fn check_rept_budget(count: u64, body: &[&str]) -> Result<(), String> {
+    if count == 0 {
+        return Ok(());
+    }
+    // effective length = Σ (content + newline + eol byte) + header newline
+    // + linefile margin, i.e. the measured GAS formula with the path term
+    // replaced by 64.
+    let mut eff: u64 = 1 + 64;
+    for line in body {
+        eff = eff.saturating_add(line.len() as u64 + 2);
+    }
+    match count.checked_mul(eff) {
+        Some(total) if total <= u64::from(u32::MAX) => Ok(()),
+        _ => Err(format!("excessive count {count} for REPT - ignored")),
+    }
+}
+
+/// What repetition may ADD to the expanded output before the writer ever
+/// sees it.  GAS's own bound hands back free-memory state once the
+/// expanded text stops fitting (a `.rept` that passes `do_repeat` still
+/// materializes up to ~4 GiB of text), and our line-vector representation
+/// costs several times the raw text, so both numbers are deterministic
+/// ceilings in the same class as [`crate::backend::elf::MAX_DIRECTIVE_FILL`]:
+/// verdicts beyond them are not pinnable anyway, and refusing before the
+/// allocation is the only reproducible answer.
+pub const MAX_EXPANSION_TEXT: usize = crate::backend::elf::MAX_DIRECTIVE_FILL;
+
+/// Line-count half of the expansion ceiling: a 4 MiB body of single-byte
+/// lines is far cheaper as text than as a `Vec<String>`, so text bytes
+/// alone do not bound the allocation the repetition makes.
+pub const MAX_EXPANSION_LINES: usize = 4 << 20;
+
+/// Gate a repetition's cumulative growth (running totals for the whole
+/// expansion call, so nested and sequential blocks cannot add up past the
+/// ceilings between them).
+pub fn check_expansion_growth(
+    kind: &str,
+    grown_lines: u64,
+    grown_bytes: u64,
+) -> Result<(), String> {
+    if grown_bytes > MAX_EXPANSION_TEXT as u64 {
+        return Err(format!(
+            "{kind}: expansion exceeds the {MAX_EXPANSION_TEXT}-byte limit"
+        ));
+    }
+    if grown_lines > MAX_EXPANSION_LINES as u64 {
+        return Err(format!(
+            "{kind}: expansion exceeds the {MAX_EXPANSION_LINES}-line limit"
+        ));
+    }
+    Ok(())
+}
+
+/// Lines and text bytes a finished expansion adds, for the growth totals.
+pub fn expansion_size(lines: &[String]) -> (u64, u64) {
+    let bytes: u64 = lines.iter().map(|l| l.len() as u64 + 1).sum();
+    (lines.len() as u64, bytes)
+}
+
 /// Expand `.rept`/`.endr` and `.irp`/`.endr` blocks by repeating or
 /// substituting contained lines.
 ///
@@ -421,25 +497,37 @@ pub(crate) fn expand_rept_blocks_with_insn_size(
     let mut label_positions: crate::common::fx_hash::FxHashMap<String, Vec<u64>> =
         crate::common::fx_hash::FxHashMap::default();
     let mut current_byte_pos: u64 = 0;
+    // Cumulative growth (repetition-only; plain input lines are bounded by
+    // the input the caller already holds in memory).
+    let mut grown_lines: u64 = 0;
+    let mut grown_bytes: u64 = 0;
     while i < lines.len() {
         let trimmed = strip_comment(lines[i], comment_style).trim().to_string();
         if is_rept_start(&trimmed) {
             let count_str = trimmed[".rept".len()..].trim();
             let count_val = resolve_rept_label_expr(count_str, &label_positions, parse_int)
                 .map_err(|e| format!(".rept: bad count '{}': {}", count_str, e))?;
-            // Treat negative counts as 0 (matches GNU as behavior)
-            let count = if count_val < 0 {
-                0usize
-            } else {
-                count_val as usize
-            };
+            // GAS casts the count expression to `size_t` (read.c `s_rept`):
+            // a negative count wraps to a huge unsigned value and is then
+            // rejected by `check_rept_budget` with GAS's own wording — not
+            // silently collapsed to zero repetitions (measured: `.rept -1`
+            // -> "excessive count 18446744073709551615 for REPT - ignored").
+            let count = count_val as u64;
             let body = collect_block_body(lines, &mut i, comment_style)?;
+            // Bound the raw block BEFORE recursing, exactly where GAS
+            // checks it: an astronomic count fails in O(body) time instead
+            // of allocating.
+            check_rept_budget(count, &body)?;
             let expanded_body = expand_rept_blocks_with_insn_size(
                 &body,
                 comment_style,
                 parse_int,
                 default_insn_size,
             )?;
+            let (add_lines, add_bytes) = expansion_size(&expanded_body);
+            grown_lines = grown_lines.saturating_add(count.saturating_mul(add_lines));
+            grown_bytes = grown_bytes.saturating_add(count.saturating_mul(add_bytes));
+            check_expansion_growth(".rept", grown_lines, grown_bytes)?;
             for _ in 0..count {
                 result.extend(expanded_body.iter().cloned());
             }
@@ -469,6 +557,10 @@ pub(crate) fn expand_rept_blocks_with_insn_size(
                     parse_int,
                     default_insn_size,
                 )?;
+                let (add_lines, add_bytes) = expansion_size(&expanded);
+                grown_lines = grown_lines.saturating_add(add_lines);
+                grown_bytes = grown_bytes.saturating_add(add_bytes);
+                check_expansion_growth(".irp", grown_lines, grown_bytes)?;
                 result.extend(expanded);
             }
         } else if trimmed == ".endr" {
@@ -1402,6 +1494,51 @@ pub fn find_symbol_diff_minus(expr: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gas247_rept_budget_law() {
+        use crate::backend::asm_expr::parse_integer_expr;
+        let style = CommentStyle::Hash;
+        let ok = |src: &str| {
+            let lines: Vec<&str> = src.lines().collect();
+            expand_rept_blocks(&lines, &style, parse_integer_expr)
+        };
+        // Small counts assemble; the body repeats verbatim.
+        let out = ok(".rept 2\n.byte 0\n.endr").unwrap();
+        assert_eq!(out, vec![".byte 0".to_string(), ".byte 0".to_string()]);
+        assert!(ok(".rept 0\n.byte 0\n.endr").unwrap().is_empty());
+        // Negative counts wrap to size_t and are rejected with GAS's own
+        // wording (measured on GAS 2.47: "excessive count
+        // 18446744073709551615 for REPT - ignored").
+        let err = ok(".rept -1\n.byte 0\n.endr").unwrap_err();
+        assert!(
+            err.contains("excessive count 18446744073709551615 for REPT - ignored"),
+            "got: {err}"
+        );
+        // Astronomic counts die on the budget in O(body) time (PR768 M2:
+        // this used to exhaust memory materializing the repetitions).
+        let err = ok(".rept 1099511627776\n.byte 0\n.endr").unwrap_err();
+        assert!(
+            err.contains("excessive count 1099511627776 for REPT - ignored"),
+            "got: {err}"
+        );
+        // Pure-function threshold: eff = 65 + (7 + 2) = 74 for a
+        // `.byte 0` body; 58040098 * 74 <= 0xffffffff < 58040099 * 74.
+        let body = [".byte 0"];
+        assert!(check_rept_budget(58_040_098, &body).is_ok());
+        let err = check_rept_budget(58_040_099, &body).unwrap_err();
+        assert!(err.contains("excessive count 58040099"), "got: {err}");
+        // count * eff overflow rejects regardless of magnitude.
+        assert!(check_rept_budget(u64::MAX, &body).is_err());
+        // Growth ceilings: counts inside the GAS budget that would blow
+        // the deterministic line/text caps are refused BEFORE the loop
+        // runs (the counters gate the extend, not the aftermath).
+        let err = ok(".rept 5000000\n.byte 0\n.endr").unwrap_err();
+        assert!(err.contains("line limit"), "got: {err}");
+        let long = "x".repeat(100);
+        let err = ok(&format!(".rept 3000000\n{long}\n.endr")).unwrap_err();
+        assert!(err.contains("byte limit"), "got: {err}");
+    }
 
     #[test]
     fn test_strip_c_comments() {

@@ -277,11 +277,19 @@ pub fn write_relocatable_object(
     }
 
     // Content section offsets
+    //
+    // GNU as 2.47 (measured): section content sits at the running file
+    // cursor -- `sh_offset` is NEVER padded up to `sh_addralign`.
+    // `.data: byte, .p2align 20, byte` produces sh_offset 0x40 with
+    // sh_addralign 2^20 (the pad lives *inside* the section, size
+    // 2^20+1), and a capped-skip `.p2align 62,,5` keeps sh_offset 0x40
+    // with sh_addralign 2^62 in a 552-byte object.  Padding the offset
+    // here tried to materialize a 2^62-byte file gap and died in
+    // `Vec::with_capacity` (SIGABRT with no diagnostic) the first time a
+    // capped absurd-alignment raise reached the writer.
     let mut section_offsets: Vec<usize> = Vec::new();
     for sec_name in content_sections {
         let section = sections.get(sec_name).unwrap();
-        let align = section.sh_addralign.max(1) as usize;
-        offset = (offset + align - 1) & !(align - 1);
         section_offsets.push(offset);
         if section.sh_type != SHT_NOBITS {
             offset += section.data.len();

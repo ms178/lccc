@@ -1232,6 +1232,38 @@ else
     SKIPPED=$((SKIPPED + 1))
 fi
 
+# Directive-legality matrix, both halves.  The operand matrix above pins
+# instruction-level verdicts; this one pins DIRECTIVE-level verdicts across
+# the axes the word oracle is structurally blind to: section kind
+# (.text/.data/custom-ax/custom-wa -- both targets), absurd align caps
+# (1/5/100 pad bytes at @1 -- GAS 2.47 accepts them everywhere), the fill
+# ceiling (2^62 x 4 accepted as size 0, x17 clamped, negative/zero size 0,
+# oversized elements), the REPT count law (GAS's exact `excessive count`
+# wording, the count==0 and negative-wrap corners, the 4 GiB boundary,
+# `1<<64` evaluating to zero), and the x86-only jump-range reject class.
+# `--check` re-derives every row from the pinned GNU as 2.47 pair (the
+# table cannot rot silently); `--check-lccc` asserts the same rows against
+# our own two front ends (a correct table cannot hide a wrong assembler).
+# The pins are spelled literally at the invocation, like every gate here.
+if [ -x "$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/as" ] && \
+   [ -x "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" ]; then
+    gate "directive-legality" fast \
+        python3 scripts/directive_legality_matrix.py --check \
+        --gas-a64 "$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/as" \
+        --gas-x64 "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"
+else
+    echo "SKIP  directive-legality (pinned gas-2.47 pair not available)"
+    SKIPPED=$((SKIPPED + 1))
+fi
+if [ -x target/fastbuild/lccc ]; then
+    gate "directive-legality-lccc" fast \
+        python3 scripts/directive_legality_matrix.py \
+        --check-lccc target/fastbuild/lccc
+else
+    echo "SKIP  directive-legality-lccc (target/fastbuild/lccc not available)"
+    SKIPPED=$((SKIPPED + 1))
+fi
+
 # Layout / directive bugs (`.p2align N,,M`) are invisible to the word oracle.
 # Compile every tests/regression/arm_*.c to assembly, assemble it with the
 # integrated assembler, and byte-compare .text against GNU as when present.

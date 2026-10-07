@@ -533,11 +533,11 @@ impl ElfWriter {
                 max_pad,
                 fill,
             } => {
-                self.base.align_to_capped_ex(*bytes, *max_pad, *fill);
+                self.base.align_to_capped_ex(*bytes, *max_pad, *fill)?;
                 Ok(())
             }
             AsmDirective::Balign(bytes) => {
-                self.base.align_to(*bytes);
+                self.base.align_to(*bytes)?;
                 Ok(())
             }
 
@@ -545,7 +545,10 @@ impl ElfWriter {
 
             AsmDirective::Short(vals) => {
                 for val in vals {
-                    self.base.emit_bytes(&(*val as u16).to_le_bytes());
+                    // RAW-value NOBITS rule: `.short 256` stores two zero
+                    // bytes but GAS still rejects the non-zero value.
+                    self.base.nobits_guard(*val != 0)?;
+                    self.base.emit_bytes(&(*val as u16).to_le_bytes())?;
                 }
                 Ok(())
             }
@@ -554,15 +557,21 @@ impl ElfWriter {
             AsmDirective::Quad(vals) => self.emit_data_values(vals, 8),
 
             AsmDirective::Zero(size, fill) => {
-                self.base.emit_bytes(&vec![*fill; *size]);
+                self.base.emit_fill(*size, *fill)?;
+                Ok(())
+            }
+            AsmDirective::Fill { total, elem, value } => {
+                self.base.emit_fill_pattern(*total, *elem, *value)?;
                 Ok(())
             }
             AsmDirective::Asciz(bytes) => {
-                self.base.emit_bytes(bytes);
+                self.base.nobits_string_guard(bytes)?;
+                self.base.emit_bytes(bytes)?;
                 Ok(())
             }
             AsmDirective::Ascii(bytes) => {
-                self.base.emit_bytes(bytes);
+                self.base.nobits_string_guard(bytes)?;
+                self.base.emit_bytes(bytes)?;
                 Ok(())
             }
 
@@ -594,12 +603,12 @@ impl ElfWriter {
                     }
                     None => data,
                 };
-                self.base.emit_bytes(data);
+                self.base.emit_bytes(data)?;
                 Ok(())
             }
 
             AsmDirective::RawBytes(bytes) => {
-                self.base.emit_bytes(bytes);
+                self.base.emit_bytes(bytes)?;
                 Ok(())
             }
 
@@ -636,6 +645,17 @@ impl ElfWriter {
             ));
         }
         let padding = (target - current) as usize;
+        // `.org` is the same constant-source / unbounded-output amplifier
+        // as `.zero`: refuse the materialization before touching memory
+        // (GAS dies writing it too — nonzero exit either way).
+        if padding > crate::backend::elf::MAX_DIRECTIVE_FILL {
+            return Err(format!(
+                ".org: {padding} bytes of fill exceed the {}-byte limit",
+                crate::backend::elf::MAX_DIRECTIVE_FILL
+            ));
+        }
+        self.base.ensure_default_section();
+        self.base.charge_fill(padding)?;
         if padding > 0 {
             // `.org` pads with its fill byte (default ZERO), even in an
             // executable section — it is a positioning directive, not an
@@ -712,7 +732,7 @@ impl ElfWriter {
         for val in vals {
             match val {
                 DataValue::Integer(v) => {
-                    self.base.emit_data_integer(*v, size);
+                    self.base.emit_data_integer(*v, size)?;
                 }
                 DataValue::Symbol(sym) => {
                     let reloc_type = if size == 4 {
@@ -720,7 +740,7 @@ impl ElfWriter {
                     } else {
                         RelocType::Abs64.elf_type()
                     };
-                    self.base.emit_data_symbol_ref(sym, 0, size, reloc_type);
+                    self.base.emit_data_symbol_ref(sym, 0, size, reloc_type)?;
                 }
                 DataValue::SymbolOffset(sym, addend) => {
                     let reloc_type = if size == 4 {
@@ -729,13 +749,13 @@ impl ElfWriter {
                         RelocType::Abs64.elf_type()
                     };
                     self.base
-                        .emit_data_symbol_ref(sym, *addend, size, reloc_type);
+                        .emit_data_symbol_ref(sym, *addend, size, reloc_type)?;
                 }
                 DataValue::SymbolDiff(sym_a, sym_b) => {
-                    self.record_sym_diff(sym_a, sym_b, 0, size);
+                    self.record_sym_diff(sym_a, sym_b, 0, size)?;
                 }
                 DataValue::SymbolDiffAddend(sym_a, sym_b, addend) => {
-                    self.record_sym_diff(sym_a, sym_b, *addend, size);
+                    self.record_sym_diff(sym_a, sym_b, *addend, size)?;
                 }
                 DataValue::Expr(expr) => {
                     let section = self.base.current_section.clone();
@@ -746,7 +766,7 @@ impl ElfWriter {
                         expr: expr.clone(),
                         size,
                     });
-                    self.base.emit_placeholder(size);
+                    self.base.emit_placeholder(size)?;
                 }
             }
         }
@@ -754,7 +774,13 @@ impl ElfWriter {
     }
 
     /// Record a pending symbol difference for deferred resolution.
-    fn record_sym_diff(&mut self, sym_a: &str, sym_b: &str, extra_addend: i64, size: usize) {
+    fn record_sym_diff(
+        &mut self,
+        sym_a: &str,
+        sym_b: &str,
+        extra_addend: i64,
+        size: usize,
+    ) -> Result<(), String> {
         let section = self.base.current_section.clone();
         let offset = self.base.current_offset();
         self.pending_sym_diffs.push(PendingSymDiff {
@@ -765,7 +791,8 @@ impl ElfWriter {
             extra_addend,
             size,
         });
-        self.base.emit_placeholder(size);
+        self.base.emit_placeholder(size)?;
+        Ok(())
     }
 
     /// Check if any operand contains a deferred symbolic expression.
@@ -782,6 +809,9 @@ impl ElfWriter {
         raw_operands: &str,
     ) -> Result<(), String> {
         self.base.ensure_text_section();
+        // GAS 2.47: instructions are what raise a fresh section's
+        // sh_addralign (data-only `.text` stays 1 — measured).
+        self.base.note_instruction();
 
         // movz/movk with :abs_g*: modifiers resolve here, at write time
         // (GAS parity): known local values encode inline; preemption-
@@ -811,13 +841,13 @@ impl ElfWriter {
                 raw_operands: raw_operands.to_string(),
             });
             // Emit NOP placeholder (will be patched during resolution)
-            self.base.emit_u32_le(u32::from_le_bytes(AARCH64_NOP));
+            self.base.emit_u32_le(u32::from_le_bytes(AARCH64_NOP))?;
             return Ok(());
         }
 
         match encode_instruction(mnemonic, operands, raw_operands) {
             Ok(EncodeResult::Word(word)) => {
-                self.base.emit_u32_le(word);
+                self.base.emit_u32_le(word)?;
                 Ok(())
             }
             Ok(EncodeResult::WordWithReloc { word, reloc }) => {
@@ -835,16 +865,16 @@ impl ElfWriter {
                         symbol: reloc.symbol.clone(),
                         addend: reloc.addend,
                     });
-                    self.base.emit_u32_le(word);
+                    self.base.emit_u32_le(word)?;
                 } else {
                     self.base.add_reloc(elf_type, reloc.symbol, reloc.addend);
-                    self.base.emit_u32_le(word);
+                    self.base.emit_u32_le(word)?;
                 }
                 Ok(())
             }
             Ok(EncodeResult::Words(words)) => {
                 for word in words {
-                    self.base.emit_u32_le(word);
+                    self.base.emit_u32_le(word)?;
                 }
                 Ok(())
             }
@@ -920,7 +950,7 @@ impl ElfWriter {
                 }
                 let imm16 = ((value as u64) >> spec.shift) as u32 & 0xFFFF;
                 let word = super::encoder::movw_word(is_movz, rd, is_64, hw, imm16);
-                self.base.emit_u32_le(word);
+                self.base.emit_u32_le(word)?;
                 return Ok(());
             }
         }
@@ -941,7 +971,7 @@ impl ElfWriter {
         let word = super::encoder::movw_word(is_movz, rd, is_64, hw, 0);
         self.base
             .add_reloc(reloc_type.elf_type(), symbol.to_string(), 0);
-        self.base.emit_u32_le(word);
+        self.base.emit_u32_le(word)?;
         Ok(())
     }
 
@@ -1457,6 +1487,117 @@ mod branch_range_tests {
 //
 // The pinned values are therefore "what GAS does", and the assertions are
 // "lccc must match it", including the cases where GAS *rejects* the input.
+#[cfg(test)]
+mod nobits_laws_tests {
+    use super::super::parser::parse_asm;
+    use super::*;
+
+    fn assemble(asm: &str) -> Result<ElfWriter, String> {
+        let statements = parse_asm(asm)?;
+        let mut writer = ElfWriter::new();
+        writer.process_statements(&statements)?;
+        Ok(writer)
+    }
+
+    /// GAS 2.47 NOBITS verdict law, aarch64 rows — same table as the x86
+    /// `gas247_nobits_store_and_position_laws`: numeric stores use the RAW
+    /// value before truncation, `.fill` uses the fill wording on the raw
+    /// value, position directives with any fill byte are legal.  ARM and
+    /// riscv share `ElfWriterBase`'s guards; these rows pin the aarch64
+    /// wiring (Byte/Short inline guards, Ascii/Asciz string guards, Fill).
+    #[test]
+    fn gas247_nobits_store_and_position_laws() {
+        for (src, needle) in [
+            (".bss\n.byte 1\n", "non-zero value"),
+            (".bss\n.short 256\n", "non-zero value"),
+            (".bss\n.long 4294967296\n", "non-zero value"),
+            (".bss\n.fill 4,1,7\n", "fill section"),
+            (".bss\n.fill 4,1,256\n", "fill section"),
+            (".bss\n.ascii \"ab\"\n", "non-empty string"),
+            (".bss\n.asciz \"a\"\n", "non-empty string"),
+        ] {
+            // `ElfWriter` is not `Debug`, so `unwrap_err` is unavailable; match.
+            let err = match assemble(src) {
+                Ok(_) => panic!("{src:?}: expected {needle:?} error"),
+                Err(e) => e,
+            };
+            assert!(
+                err.contains(needle),
+                "{src:?}: expected {needle:?} in error, got: {err}"
+            );
+        }
+        for ok in [
+            ".bss\n.byte 0\n.short 0\n.long 0\n.ascii \"\"\n.fill 4,1,0\n",
+            ".bss\n.org 8,0xff\n.zero 4\n.space 4,1\n.p2align 4,0xff\n.byte 0\n",
+            ".data\n.byte 1\n.short 256\n.fill 4,1,7\n",
+        ] {
+            assemble(ok).unwrap_or_else(|e| panic!("{ok:?} must assemble, got: {e}"));
+        }
+    }
+
+    /// P1 bare-input + instruction-raise law (GAS 2.47 measured on
+    /// aarch64): content before any section directive lands in `.text`;
+    /// sections are CREATED at sh_addralign 1 (`.text;.byte 1` -> 1,
+    /// `.section .foo,"ax";.byte 1` -> 1); the FIRST instruction raises
+    /// the containing section to the instruction alignment (`.text;nop`
+    /// -> 4, `.byte 1;nop` -> 4); an align directive raises as usual
+    /// (bare `.p2align 4` -> `.text` algn 16, size 0).
+    #[test]
+    fn gas247_bare_input_default_section_and_align_law() {
+        let w = assemble(".byte 1\n").unwrap();
+        assert_eq!(w.base.sections[".text"].data, vec![1]);
+        assert_eq!(w.base.sections[".text"].sh_addralign, 1);
+
+        let w = assemble(".zero 4\n").unwrap();
+        assert_eq!(w.base.sections[".text"].data, vec![0; 4]);
+        assert_eq!(w.base.sections[".text"].sh_addralign, 1);
+
+        let w = assemble(".p2align 4\n").unwrap();
+        assert_eq!(w.base.sections[".text"].sh_addralign, 16);
+
+        let w = assemble(".text\n.byte 1\n").unwrap();
+        assert_eq!(w.base.sections[".text"].sh_addralign, 1);
+
+        let w = assemble(".data\n.byte 1\n").unwrap();
+        assert_eq!(w.base.sections[".data"].sh_addralign, 1);
+
+        let w = assemble(".text\nnop\n").unwrap();
+        assert_eq!(w.base.sections[".text"].sh_addralign, 4);
+
+        let w = assemble(".byte 1\nnop\n").unwrap();
+        assert_eq!(w.base.sections[".text"].sh_addralign, 4);
+
+        let w = assemble(".text\n.p2align 4\n").unwrap();
+        assert_eq!(w.base.sections[".text"].sh_addralign, 16);
+
+        let w = assemble(".section .foo,\"ax\"\n.byte 1\n").unwrap();
+        assert_eq!(w.base.sections[".foo"].sh_addralign, 1);
+    }
+
+    /// The assembly-wide directive-fill budget on the `ElfWriterBase`
+    /// implementation: two maximum-size directives exactly fill
+    /// `MAX_TOTAL_DIRECTIVE_FILL` (accepted), the next byte is refused
+    /// BEFORE its allocation.  Materializes ~512 MiB of zeros — bounded
+    /// by the standing 4 GiB swap policy.
+    #[test]
+    fn fill_budget_bounds_resident_fill() {
+        let err = match assemble(".data\n.zero 268435456\n.zero 268435456\n.zero 1\n") {
+            Ok(_) => panic!("budget must refuse the third directive"),
+            Err(e) => e,
+        };
+        assert!(err.contains("budget"), "got: {err}");
+    }
+
+    /// Exactly at the budget: both maximum directives are accepted
+    /// (charge == MAX_TOTAL_DIRECTIVE_FILL edge).  Separate from the
+    /// refusal row so the successful object is built and dropped alone.
+    #[test]
+    fn fill_budget_exact_boundary_accepted() {
+        assemble(".data\n.zero 268435456\n.zero 268435456\n")
+            .unwrap_or_else(|e| panic!("exact-budget fill must assemble, got: {e}"));
+    }
+}
+
 #[cfg(test)]
 mod aarch64_encoder_tests {
     use super::super::parser::parse_asm;
@@ -2263,6 +2404,8 @@ mod aarch64_encoder_tests {
             unpinned.is_empty(),
             "the table has group(s) with no ratchet entry: {unpinned:?}"
         );
+        assert!(accepted >= 265, "only {accepted} accepted rows remain");
+        assert!(rejected >= 190, "only {rejected} rejected rows remain");
         assert!(
             drift.is_empty(),
             "{} matrix row(s) disagree with this encoder:\n{}",
@@ -2412,6 +2555,11 @@ mod aarch64_encoder_tests {
                 n, 8,
                 "p2align 4,,10 at offset 4 must not pad (got {n} bytes)"
             );
+            // GAS raises sh_addralign even when the cap suppresses padding.
+            assert_eq!(
+                w.base.sections[".text"].sh_addralign, 16,
+                "skipped p2align still raises sh_addralign"
+            );
         }
         {
             // At offset 4, .p2align 3,,8 needs 4 bytes (<= 8) so it pads.
@@ -2419,6 +2567,44 @@ mod aarch64_encoder_tests {
             let w = assemble(asm).expect("p2align program");
             let n = w.base.sections[".text"].data.len();
             assert_eq!(n, 12, "p2align 3,,8 at offset 4 must pad 4 bytes (got {n})");
+            assert_eq!(
+                w.base.sections[".text"].sh_addralign, 8,
+                "skipped-or-applied cap still raises sh_addralign"
+            );
+        }
+        {
+            // GAS: max==0 is unlimited. `.byte 1; .p2align 4,,0; .byte 2`
+            // at offset 1 needs 15 bytes of pad → 17 total, not a skip.
+            let asm = ".data\n.byte 1\n.p2align 4,,0\n.byte 2\n";
+            let w = assemble(asm).expect("p2align max=0");
+            let d = &w.base.sections[".data"].data;
+            assert_eq!(d.len(), 17, "p2align 4,,0 must pad (got {} bytes)", d.len());
+            assert_eq!(d[0], 1);
+            assert_eq!(d[16], 2);
+            assert!(d[1..16].iter().all(|&b| b == 0));
+            assert_eq!(w.base.sections[".data"].sh_addralign, 16);
+            let asm = ".data\n.byte 1\n.p2align 4,,-1\n.byte 2\n";
+            let w = assemble(asm).expect("p2align negative max is unlimited");
+            assert_eq!(w.base.sections[".data"].data.len(), 17);
+            let asm = ".data\n.byte 1\n.balign 16,,0\n.byte 2\n";
+            let w = assemble(asm).expect("balign max=0");
+            assert_eq!(w.base.sections[".data"].data.len(), 17);
+            // GAS: fill is any integer, low byte stored (-1 == 0xff).
+            let asm = ".data\n.byte 1\n.p2align 4,-1\n.byte 2\n";
+            let w = assemble(asm).expect("p2align negative fill");
+            let d = &w.base.sections[".data"].data;
+            assert_eq!(d.len(), 17);
+            assert!(d[1..16].iter().all(|&b| b == 0xff));
+            // GAS: .balign 0 is a no-op; non-powers-of-two are errors.
+            let asm = ".data\n.byte 1\n.balign 0\n.byte 2\n";
+            let w = assemble(asm).expect("balign 0");
+            assert_eq!(w.base.sections[".data"].data.len(), 2);
+            for bad in [".data\n.balign 3\n", ".data\n.balign -8\n"] {
+                assert!(
+                    assemble(bad).is_err(),
+                    "{bad} must be rejected like GAS (not a power of 2)"
+                );
+            }
         }
         {
             // Fill is honoured in .data AND .text (GAS 2.44:
@@ -2440,5 +2626,232 @@ mod aarch64_encoder_tests {
                 "text p2align fill"
             );
         }
+    }
+
+    /// PR768 M2: the GAS 2.47 `read.c::do_repeat` budget, as observed
+    /// through the ARM driver (both pinned targets measured identical
+    /// verdicts): negative counts wrap to `size_t` and report GAS's
+    /// wording, astronomic counts fail in O(body) time instead of
+    /// exhausting memory, an unresolvable count is an error instead of
+    /// the old silent zero repetitions, and counts inside the GAS budget
+    /// still hit the deterministic expansion ceilings before any loop
+    /// runs.
+    #[test]
+    fn gas247_rept_budget_law_arm() {
+        // Small counts assemble and repeat.
+        let w = assemble(".data\n.rept 2\n.byte 7\n.endr\n").expect("rept 2");
+        assert_eq!(w.base.sections[".data"].data, vec![7u8, 7u8]);
+        // Negative count -> size_t wrap -> GAS's "excessive count".
+        let err = match assemble(".data\n.rept -1\n.byte 0\n.endr\n") {
+            Err(e) => e,
+            Ok(_) => panic!("rept -1 must fail"),
+        };
+        assert!(
+            err.contains("excessive count 18446744073709551615 for REPT - ignored"),
+            "got: {err}"
+        );
+        // Astronomic count (the PR768 OOM repro) -> deterministic error.
+        let err = match assemble(".data\n.rept 1099511627776\n.byte 0\n.endr\n") {
+            Err(e) => e,
+            Ok(_) => panic!("rept 2^40 must fail"),
+        };
+        assert!(
+            err.contains("excessive count 1099511627776 for REPT - ignored"),
+            "got: {err}"
+        );
+        // Unresolvable count: fail-closed (was `unwrap_or(0)` — accept).
+        let err = match assemble(".data\n.rept garbage\n.byte 0\n.endr\n") {
+            Err(e) => e,
+            Ok(_) => panic!("rept garbage must fail"),
+        };
+        assert!(
+            err.contains("bad count") || err.contains("cannot evaluate"),
+            "got: {err}"
+        );
+        // Growth line ceiling for a count that passes the GAS budget.
+        let err = match assemble(".data\n.rept 5000000\n.byte 0\n.endr\n") {
+            Err(e) => e,
+            Ok(_) => panic!("rept line-cap must fail"),
+        };
+        assert!(err.contains("line limit"), "got: {err}");
+    }
+
+    /// Every verdict here is pinned against GNU as 2.47 (red-team probe
+    /// log): the signed-shift bucket (`p2align 63`, clamps `64`/`-1`),
+    /// cap-skip BEFORE the bucket error, never-raise-in-bucket, and the
+    /// deterministic `MAX_DIRECTIVE_FILL` ceiling for `.zero`/`.fill`/
+    /// `.org` (beyond 256 MiB GAS's own answer is free-disk state).
+    #[test]
+    fn gas247_alignment_fill_org_matrix() {
+        // ---- signed-shift bucket (align >= 1<<63), clamp family ----
+        for exp in ["63", "64", "-1"] {
+            // @0: accepted, nothing padded, alignment stays 1 (GAS).
+            let w = assemble(&format!(".data\n.p2align {exp}\n.byte 3\n"))
+                .unwrap_or_else(|e| panic!("p2align {exp} @0 must assemble: {e}"));
+            assert_eq!(
+                w.base.sections[".data"].sh_addralign, 1,
+                "p2align {exp} @0 must not raise sh_addralign"
+            );
+            assert_eq!(
+                w.base.sections[".data"].data,
+                vec![3u8],
+                "p2align {exp} @0 must not pad"
+            );
+            // @1, no cap: error (GAS "jump over nop padding out of range").
+            assert!(
+                assemble(&format!(".data\n.byte 1\n.p2align {exp}\n")).is_err(),
+                "p2align {exp} @1 without cap must fail"
+            );
+            // @1, positive cap: SKIP — GAS assembles it with align 1.
+            let w = assemble(&format!(".data\n.byte 1\n.p2align {exp},,5\n.byte 2\n"))
+                .unwrap_or_else(|e| panic!("p2align {exp},,5 @1 must assemble (GAS skips): {e}"));
+            assert_eq!(
+                w.base.sections[".data"].data.len(),
+                2,
+                "p2align {exp},,5 @1 must skip the pad"
+            );
+            assert_eq!(
+                w.base.sections[".data"].sh_addralign, 1,
+                "the bucket never raises sh_addralign, even when skipped"
+            );
+        }
+
+        // ---- section-kind axis (PR768 H1): the bucket verdict is
+        // section-kind independent on GAS 2.47 — `.text` and custom
+        // `ax`/`w` sections accept a positive-cap skip exactly like
+        // `.data`, and reject the uncapped pad exactly like `.data`.
+        // (The review's ".text rejects caps 0/1/5/100" was measured on
+        // binutils 2.40, not the pinned oracle.)
+        for sec in [".text", ".section .cax,\"ax\"", ".section .cw,\"w\""] {
+            let sname = if let Some(rest) = sec.strip_prefix(".section ") {
+                rest.split(',').next().unwrap().trim()
+            } else {
+                sec
+            };
+            let w = assemble(&format!("{sec}\n.byte 1\n.p2align 63,,5\n.byte 2\n"))
+                .unwrap_or_else(|e| panic!("{sec} capped skip must assemble (GAS 2.47): {e}"));
+            assert_eq!(
+                w.base.sections[sname].data.len(),
+                2,
+                "{sec} p2align 63,,5 @1 must skip the pad"
+            );
+            assert_eq!(
+                w.base.sections[sname].sh_addralign, 1,
+                "{sec} bucket never raises"
+            );
+            assert!(
+                assemble(&format!("{sec}\n.byte 1\n.p2align 63\n")).is_err(),
+                "{sec} uncapped p2align 63 @1 must fail (deterministic stand-in)"
+            );
+            let w = assemble(&format!("{sec}\n.p2align 63,,5\n.byte 3\n"))
+                .unwrap_or_else(|e| panic!("{sec} @0 no-op must assemble: {e}"));
+            assert_eq!(w.base.sections[sname].data, vec![3u8], "{sec} @0 no pad");
+            assert_eq!(w.base.sections[sname].sh_addralign, 1, "{sec} @0 no raise");
+        }
+
+        // ---- representable alignments: raise-on-skip, cap-skip, huge raise ----
+        let w = assemble(".data\n.byte 1\n.p2align 40,,5\n.byte 2\n")
+            .expect("p2align 40,,5 must skip at offset 1");
+        assert_eq!(
+            w.base.sections[".data"].data.len(),
+            2,
+            "cap 5 skips 2^40-1 pad"
+        );
+        assert_eq!(
+            w.base.sections[".data"].sh_addralign,
+            1u64 << 40,
+            "GAS raises sh_addralign even when the cap skips the pad"
+        );
+        let w = assemble(".data\n.p2align 62\n.byte 3\n").expect("p2align 62 @0");
+        assert_eq!(w.base.sections[".data"].sh_addralign, 1u64 << 62);
+        assert_eq!(w.base.sections[".data"].data, vec![3u8], "@0 needs no pad");
+
+        // ---- .balign byte-count form ----
+        let w = assemble(".data\n.balign 1099511627776\n.byte 3\n")
+            .expect("balign 2^40 @0 must assemble");
+        assert_eq!(w.base.sections[".data"].sh_addralign, 1u64 << 40);
+        assert!(
+            assemble(".data\n.byte 1\n.balign 1099511627776\n").is_err(),
+            "balign 2^40 @1 must fail (padding beyond the fill ceiling)"
+        );
+        for src in [".data\n.balign\n.byte 3\n", ".data\n.balign 0\n.byte 3\n"] {
+            assemble(src).unwrap_or_else(|e| panic!("{src:?} must assemble (GAS no-ops): {e}"));
+        }
+        assert!(
+            assemble(".data\n.balign 3\n").is_err(),
+            "balign 3 is not a power of 2"
+        );
+        assert!(
+            assemble(".data\n.balign -16\n").is_err(),
+            "balign -16 is negative"
+        );
+
+        // ---- .zero / .space ----
+        let w = assemble(".data\n.zero -1\n").expect(".zero -1 is a GAS no-op");
+        assert_eq!(
+            w.base.sections[".data"].data.len(),
+            0,
+            ".zero -1 emits nothing"
+        );
+        let w = assemble(".data\n.zero 64\n").expect(".zero 64");
+        assert_eq!(w.base.sections[".data"].data.len(), 64);
+        assert!(
+            assemble(".data\n.zero 268435457\n").is_err(),
+            "256 MiB + 1 must be refused"
+        );
+        let w = assemble(".data\n.space -5\n").expect(".space -5 is a no-op");
+        assert_eq!(w.base.sections[".data"].data.len(), 0);
+
+        // ---- .fill ----
+        let w = assemble(".data\n.fill -1\n").expect(".fill -1 is a GAS no-op");
+        assert_eq!(w.base.sections[".data"].data.len(), 0);
+        let w = assemble(".data\n.fill 4611686018427387904,4\n")
+            .expect("overflowing .fill is accepted and emits zero bytes");
+        assert_eq!(
+            w.base.sections[".data"].data.len(),
+            0,
+            ".fill 2^62,4 emits nothing"
+        );
+        let w = assemble(".data\n.fill 1,9\n").expect(".fill 1,9");
+        assert_eq!(
+            w.base.sections[".data"].data.len(),
+            8,
+            ".fill size clamps to 8 per copy"
+        );
+        // Out-of-i64-range literals: GAS reads them as their two's-complement
+        // pattern (all 2^63..2^64-1 are negative counts -> zero bytes, and
+        // 2^64 itself is an expression error).  Measured on 2.47.
+        let w = assemble(".data\n.fill 18446744073709551615,1,5\n")
+            .expect(".fill u64max,1,5 must assemble");
+        assert_eq!(
+            w.base.sections[".data"].data.len(),
+            0,
+            "u64max repeat is -1"
+        );
+        let w =
+            assemble(".data\n.zero 18446744073709551615\n").expect(".zero u64max must assemble");
+        assert_eq!(w.base.sections[".data"].data.len(), 0);
+        let w = assemble(".data\n.zero 9223372036854775808\n").expect(".zero 2^63 must assemble");
+        assert_eq!(w.base.sections[".data"].data.len(), 0);
+        assert!(
+            assemble(".data\n.fill 18446744073709551616,1,0\n").is_err(),
+            "a literal above u64::MAX is a GAS expression error"
+        );
+        assert!(
+            assemble(".data\n.fill 268435457,1,1\n").is_err(),
+            "256 MiB + 1 must be refused"
+        );
+
+        // ---- .org (same constant-source amplifier) ----
+        let w = assemble(".data\n.org 4\n").expect(".org 4");
+        assert_eq!(w.base.sections[".data"].data.len(), 4);
+        assert!(
+            assemble(".data\n.org 268435457\n").is_err(),
+            "org past the ceiling must fail"
+        );
+        assert!(
+            assemble(".data\n.byte 1\n.org 0\n").is_err(),
+            "backwards .org must fail"
+        );
     }
 }

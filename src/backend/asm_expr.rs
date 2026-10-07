@@ -303,11 +303,28 @@ fn eval_shift(tokens: &[ExprToken], pos: &mut usize) -> Result<i64, String> {
         match &tokens[*pos] {
             ExprToken::Op2("<<") => {
                 *pos += 1;
-                val <<= eval_add(tokens, pos)?;
+                let rhs = eval_add(tokens, pos)?;
+                // GNU as 2.47 (measured): a shift count outside 0..64
+                // warns ("shift count out of range (64 is not between 0
+                // and 63)") and yields 0.  Letting Rust mask the count
+                // (1 << 64 -> 1 << 0 -> 1) made `.rept 1<<64` expand
+                // once instead of zero times, and a negative count
+                // panicked the assembler instead of erroring.
+                val = if (0..64).contains(&rhs) {
+                    val << rhs
+                } else {
+                    0
+                };
             }
             ExprToken::Op2(">>") => {
                 *pos += 1;
-                val = ((val as u64) >> eval_add(tokens, pos)?) as i64;
+                let rhs = eval_add(tokens, pos)?;
+                // Same out-of-range law as `<<` (GAS warns and yields 0).
+                val = if (0..64).contains(&rhs) {
+                    ((val as u64) >> rhs) as i64
+                } else {
+                    0
+                };
             }
             _ => break,
         }
@@ -674,6 +691,33 @@ pub fn parse_integer_expr(s: &str) -> Result<i64, String> {
 mod tests {
     use super::*;
 
+    /// GNU as 2.47 (measured): a decimal literal in 2^63..2^64-1 is the
+    /// two's-complement pattern (negative as i64); anything ABOVE u64::MAX
+    /// is an expression error, not a wrap to some other value.
+    #[test]
+    fn gas247_literal_range_edges() {
+        assert_eq!(
+            parse_integer_expr("18446744073709551615").ok(),
+            Some(-1),
+            "u64max is the all-ones pattern"
+        );
+        assert_eq!(
+            parse_integer_expr("9223372036854775808").ok(),
+            Some(i64::MIN),
+            "2^63 is its two's-complement pattern"
+        );
+        assert_eq!(
+            parse_integer_expr("0xffffffffffffffff").ok(),
+            Some(-1),
+            "hex u64max likewise"
+        );
+        assert!(
+            parse_integer_expr("18446744073709551616").is_err(),
+            "2^64 must be an expression error, got {:?}",
+            parse_integer_expr("18446744073709551616")
+        );
+    }
+
     /// test the GAS comparison semantics
     #[test]
     fn test_gas_comparisons() {
@@ -703,6 +747,24 @@ mod tests {
         // A shift still beats a comparison: 1 < (2 << 3).
         assert_eq!(parse_integer_expr("1 < 2 << 3").unwrap(), -1);
         assert_eq!(parse_integer_expr("16 < 1 << 3").unwrap(), 0);
+    }
+
+    #[test]
+    fn gas247_shift_out_of_range_is_zero() {
+        // GNU as 2.47 (measured): a shift count outside 0..64 warns
+        // ("shift count out of range (64 is not between 0 and 63)") and
+        // yields 0.  Rust's masked shift (1 << 64 == 1) made `.rept
+        // 1<<64` expand once instead of zero times, and `1 << -1`
+        // panicked the assembler instead of yielding a value.
+        assert_eq!(parse_integer_expr("1 << 64").unwrap(), 0);
+        assert_eq!(parse_integer_expr("1 << 65").unwrap(), 0);
+        assert_eq!(parse_integer_expr("1 << -1").unwrap(), 0);
+        assert_eq!(parse_integer_expr("1 >> 64").unwrap(), 0);
+        assert_eq!(parse_integer_expr("8 >> -2").unwrap(), 0);
+        // In-range counts keep the hardware result.
+        assert_eq!(parse_integer_expr("1 << 63").unwrap(), i64::MIN);
+        assert_eq!(parse_integer_expr("(1 << 62) >> 62").unwrap(), 1);
+        assert_eq!(parse_integer_expr("255 >> 4").unwrap(), 15);
     }
 
     #[test]
