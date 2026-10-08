@@ -220,7 +220,7 @@ index ring is exactly the shape this change stops linearising, and the kernel
 PR #772 itself targeted — *gains* 8.1% of its retired instructions: keeping the
 product in `uint32_t` lets the same address be re-formed in 32-bit arithmetic
 instead of a 64-bit recurrence, and the checksum is unchanged. Absolute `Ir`
-here is not comparable to `engineering/evidence/2026-10-06-ivsr-domain/callgrind-kernel-ab.json`
+here is not comparable to `engineering/evidence/2026-10-07-perf-ivsr-ptradd/callgrind-kernel-ab.json`
 (different inner count and driver linkage); the *delta* is the measurement.
 
 ### 5.0b What the fix costs (measured, not hidden)
