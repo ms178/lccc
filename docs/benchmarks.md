@@ -182,24 +182,28 @@ Top-Down metrics) in a controlled affinity/governor/thermal environment.
 ### Byte-walk scan (`tests/bench/k_strlen_scan.c`, added 2026-10-06)
 
 `while (*p) p++` over 4095 bytes with no interior zero -- the loop every
-`strlen`/`strchr`/scan in gzip, glibc and Expat compiles to. It is in the
-`tests/bench` corpus because it is the shape where the two plausible loop
-layouts differ by more than the harness noise floor, and where lccc is ahead:
+`strlen`/`strchr`/scan in gzip, glibc and Expat compiles to.  lccc top-tests it
+and GCC 14.2 rotates it, so it is the corpus's one place where those two loop
+layouts meet head to head on real work:
 
-| build | min | LCCC/GCC |
+| build | time | LCCC/GCC |
 |---|---|---|
-| **LCCC (`-O2`, top-tested loop)** | **49.28 ms** | **0.84** |
-| GCC 14.2 (`-O2`, rotated loop) | 58.61 ms | 1.00 |
-| LCCC with a bottom-tested rotation (`-O2`) | 59.24 ms | 1.01 |
+| **LCCC (top-tested loop)** | **45.77 ms** | **1.00** |
+| GCC 14.2 (`-O2`, rotated loop) | 46.12 ms | 1.01 |
+| **LCCC (`-O3`, top-tested loop)** | **45.40 ms** | **1.00** |
+| GCC 14.2 (`-O3`) | 45.40 ms | 1.00 |
 
-31 interleaved samples per arm, one pinned vCPU, identical checksums.  The
-rotation arm is a **rejected** change, kept here as the reference point: lccc's
-un-rotated byte walk is 15.9% faster than GCC's, and the rotated form would have
-given that lead away (see
+61 interleaved samples per arm on one pinned vCPU, identical checksums, median
+as the statistic.  The two layouts are **level** -- re-measured in S26 after the
+`min`-statistic numbers this row used to carry (49.28 / 58.61 / 59.24 ms, and
+"1.19× at `-O3`") failed to reproduce; `min` on this host invents 5-25% effects
+at sample counts below ~100, see
 [`SESSION_FOLLOWUP_S21_LOOP_ROTATION.md`](SESSION_FOLLOWUP_S21_LOOP_ROTATION.md)
-§5 for the three experiments that localize the loss to the loop shape).  The
-same kernel through the runtime harness at `-O3`, best-of-3, reads
-**lccc 9.86 ms vs GCC 11.75 ms (1.19×)**.
+§6.4.  What the kernel still shows is that lccc's *top-tested* walk costs
+nothing against a rotated one, and that the byte walk is not where either
+compiler is ahead of the other: it runs at ~1 cycle/byte for both, and the
+transform that moves that floor is the 4-byte SWAR walk in §6.7 of that
+document, not a loop layout.
 
 ## Current results (screening)
 

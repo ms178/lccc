@@ -1,0 +1,52 @@
+{
+ "date": "2026-10-07",
+ "base_upstream": "6a9690c3",
+ "what": "Runtime adjudication of the uint32_t product-wrap differential (IVSR-WRAP-2) across the four oracle vendors and both lccc builds.",
+ "program": "wrap_probe.c (same file in this directory). 4 GiB + 16 bytes of index space, MAP_NORESERVE, three committed pages, all accesses in bounds, all index arithmetic unsigned: a defined C program whose correct sum is the WRAPPED one (110); a compiler that linearises i*2 into pointer-ring arithmetic prints 264/209-style linear sums.",
+ "oracle_surface": "Compiler Explorer, executor pool, 'execute': true through scripts/godbolt.py's new --execute flag; -O2 -march=x86-64-v3; AT&T asm in the same request.",
+ "vendor_runs": {
+  "gcc16.2": {
+   "exit": 0,
+   "stdout": "sum 110  (wrapped=110, linear=264)",
+   "verdict": "wrap preserved"
+  },
+  "clang-23.1.0": {
+   "exit": 0,
+   "stdout": "sum 110  (wrapped=110, linear=264)",
+   "verdict": "wrap preserved"
+  },
+  "icc-2021.10.0": {
+   "exit": 0,
+   "stdout": "sum 110  (wrapped=110, linear=264)",
+   "verdict": "wrap preserved"
+  },
+  "icx-latest": {
+   "exit": 0,
+   "stdout": "sum 110  (wrapped=110, linear=264)",
+   "verdict": "wrap preserved, and it VECTORISES this shape (vpbroadcastq/vpaddq/vpand) with wrap-correct arithmetic"
+  }
+ },
+ "local_runs": {
+  "lccc_prefix_6a9690c3_s26": {
+   "binary_sha256_recorded_in_ledger": true,
+   "result": 209,
+   "verdict": "MISCOMPILE (linear), both halves of the defect - fixed in this change"
+  },
+  "lccc_postfix_6a9690c3_s26": {
+   "result": 110,
+   "verdict": "matches all four vendors"
+  },
+  "gcc-14.2.0-local": {
+   "result": 110,
+   "verdict": "reference"
+  }
+ },
+ "instruction_shapes": {
+  "lccc_postfix": "leal (%r8,%r8),%r9d + movzbl (%rdi,%r9)  [32-bit product, then extend]",
+  "gcc16.2": "addl %esi,%esi + movzbl (%rdi,%rcx)     [32-bit doubling]",
+  "icc2021.10": "addl $2,%edx + movzbl (%rdx,%rdi)        [32-bit offset counter]",
+  "clang23.1": "trip-count restructure (r8 = lim - 0x7FFFFFFF), 8-way tail mask, 61 insns",
+  "icx_latest": "vectorised main loop + scalar remainder, 62 insns, 27 vector ops"
+ },
+ "note": "The executor VM accepted the 4 GiB sparse mapping, so the differential ran rather than skipping. Instruction counts are from scripts/oracle_asm.py over the same cached requests (no extra network calls)."
+}

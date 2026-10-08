@@ -218,6 +218,17 @@ walks. The whole change in `k04_strlen` is one line:
 
 ## 5. S24: memory-header rotation — implemented, measured, **rejected**
 
+> **Superseded by §6 (S26).** The 15.9% regression this section is built on does
+> not reproduce: re-measured on the same host with the same licence, as a
+> 61-sample interleaved A/B of one binary (`CCC_LOOP_INVERT_MEMORY=1` vs `0`),
+> the byte walk moves **+0.57%** (41-61 wins) — noise. §5's number was a
+> `min`-of-31 statistic, and §6.4 measures that statistic inventing 5-25%
+> effects on four kernels of this corpus when the two arms are the *same code*.
+> §5's mechanical record (what was built, the hand-revert experiment, the
+> alignment and generality probes) stands as the history of the decision; its
+> magnitude does not, and the licence is off by default for a different reason
+> than the one recorded here (it is neutral, not harmful).
+
 ### 5.1 What was built
 
 Rule 2 used to refuse any header containing a memory access. The S24 change
@@ -315,3 +326,182 @@ shape, not assumed. (2) Unroll the byte walk (4 bytes per iteration, one branch
 per 4) before considering rotation again — that is what would move the 1.0
 cycle/byte floor, and it is a peephole on the same loop, not a CFG transform.
 
+
+## 6. S26: the census instrument, the refusal landscape, and a re-measurement
+
+`loop_invert` had no instrument. `CCC_DEBUG_LOOP_INVERT=1` printed a rotation
+line and one refusal reason, and every census in §§1-5 was hand-rolled shell.
+This stretch added the missing half -- a reason for *every* decision the pass
+makes -- and used it to price the pass per kernel, which is what turned the
+memory-licence question from a verdict into a number.
+
+### 6.1 What was added
+
+* `scripts/loop_invert_census.py` -- whole-corpus census. Compiles every TU in
+  the tree's own corpus (`tests/bench/k_*.c`, `tests/benchmark/programs/*.c`,
+  `tests/benchmark/kernel_corpus/*.c`, 90 TUs) with the debug flag and folds the
+  pass's stderr into per-TU counters: rotations (split by licence), and refusals
+  by rule -- non-duplicable, value escapes (in-loop / outside-loop), multi-latch,
+  oversized header, header that does not decide the exit.
+* The pass now reports all of those reasons, and every rotation carries its
+  **shape** (`header=N insn/L ld/S st, loop=M insn/K mem`), so a decision can be
+  correlated with the loop it was made on.
+* The memory licence (§5) is wired to `CCC_LOOP_INVERT_MEMORY=1`, off by
+  default, so the §5 experiment is reproducible on a built binary. With the
+  switch off the pass's codegen is **byte-identical** to the pre-S26 tree:
+  `scripts/census_full_delta.sh` (5 optimisation levels, whole corpus, two
+  binaries) reports zero differing TUs.
+* The pass's three switches (this one, `CCC_NO_LOOP_INVERT`, and
+  `CCC_DEBUG_LOOP_INVERT`) are now resolved **once, in the driver's pipeline**,
+  and handed down as a value, instead of being read out of the environment
+  inside the pass -- where the read happened **once per function**. The
+  env-read ratchet in `tests/regression/check_env_test_hygiene.sh` moved down
+  with them, 155 -> 153, which is the only direction its policy allows; adding
+  a switch at the call site instead would have failed that gate, which is how
+  the per-function reads were found.
+
+### 6.2 The refusal landscape (90 TUs, -O2, licence on)
+
+| decision | shipped (licence off) | licence on |
+|---|---|---|
+| rotations | 278 | 283 (5 licensed) |
+| refused: a header value escapes `H` | **16** (5 in-loop, 11 outside) | **27** (16 in-loop, 11 outside) |
+| refused: header walks memory, licence off | 22 | -- |
+| refused: non-duplicable instruction | 0 | 0 |
+| refused: multi-latch loop | 0 | 0 |
+| refused: header over `MAX_DUP_INSTS` | 2 | 2 |
+| refused: header does not decide the exit | 1 | 1 |
+
+(The 17-loop difference in the escape row is the licensed-but-escaping memory
+headers: turning the licence on does not rotate them, it moves the reason they
+are refused from "memory" to "the loaded value is used outside `H`".)
+
+Two things follow. First, the pass's reach is not limited by size or by latches
+in this corpus -- it is limited by **rule 3** (27 loops) and secondarily by
+memory (22, of which the licence reaches 5 and rule 3 then refuses the other
+17). Second, the memory licence's entire reach is *five* loops in 90 TUs, and
+all five are the same 3-4 instruction `while (*p) p++;` walk:
+
+```text
+[INV] rotating header=3 latch=4  (memory: header=1 insn/1 ld/0 st, loop=3 insn/0 mem)   k_strlen_scan
+[INV] rotating header=20 latch=22 (memory: header=1 insn/1 ld/0 st, loop=3 insn/0 mem)  strlen_bench
+[INV] rotating header=23 latch=32 (memory: header=1 insn/1 ld/0 st, loop=14 insn/4 mem) strlen_bench
+[INV] rotating header=26 latch=29 (memory: header=1 insn/1 ld/0 st, loop=8 insn/2 mem)  strlen_bench
+[INV] rotating header=3 latch=4  (memory: header=1 insn/1 ld/0 st, loop=3 insn/0 mem)   k04_strlen
+```
+
+### 6.3 Red-team finding: a header store is not licensed by "the header runs n+1 times"
+
+§5 licensed stores on the argument that the header executes `n + 1` times at the
+same program positions in both forms. The count is right only while every
+iteration reaches the latch. With a side exit -- `for (i = 0; (a[i] = b[i]) != 0;
+i++) { if (x) break; }` -- the top-tested form executes the header once more than
+the rotated form (at the top of the iteration that breaks, before the body
+decides to leave), so the two forms leave **different bytes** at the loop exit.
+A *load* is different: the dropped execution's value is used only inside `H`
+(rule 3), so it is unobservable. Stores are therefore gated on
+[`loop_exits_only_through_header`] -- "no block of the loop except the header and
+the latch branches out of it" -- which is exactly the condition under which the
+count is equal. Two tests pin it: `a_header_store_is_rotated_when_the_loop_exits_only_through_the_header`
+and `a_header_store_is_refused_while_the_loop_has_a_side_exit` (which also
+asserts the asymmetry: the same side exit does not stop a load).
+
+### 6.4 The statistics, which is where §5 went wrong
+
+An A/B on this host has to survive a sample distribution with a heavy *fast*
+tail: the same binary, sampled 41 times a few minutes apart, reports minima of
+1.38 ms and 2.29 ms for the same kernel. `min` picks whichever arm happened to
+catch a fast tail sample, so on this box it manufactures effects. Measured
+directly -- both arms the *same* machine code, 101 samples, `min` next to the two
+statistics that do not read the tail:
+
+| kernel | delta on min | delta on median | paired wins (B faster) |
+|---|---|---|---|
+| k_strcmp_signed | **+25.72%** | +0.06% | 55/101 |
+| k_adler32 | **+7.18%** | -32.37% | 72/101 |
+| k_varint | -1.14% | -2.31% | 57/101 |
+| k_hashmix | +0.09% | -1.70% | 61/101 |
+
+The `min` column is a phantom at *every* sample count: here it turns a 0.06%
+non-effect into a 25.72% regression and a 32% improvement into a 7% regression,
+while the median and the paired win rate agree with each other on all four. It
+also moves with the sample count in both directions -- the first sweep of these
+kernels at 31 samples reported `min` deltas of +7.29% (hashmix), +3.52%
+(varint), +1.52% (strcmp_signed) and +1.42% (adler32), i.e. four phantoms whose
+signs are uncorrelated with the 101-sample ones. §5's 15.9% was a `min`-of-31 comparison, and its hand-revert
+"recovery" reproduced on the same statistic; re-measured as an interleaved A/B of
+one binary with the licence on and off, 61 samples:
+
+| kernel | licence off | licence on | delta on min | wins (on faster) |
+|---|---|---|---|---|
+| k_strlen_scan | 44.0 ms | 44.5 ms | +0.57% | 41/61 |
+| k_strlen_scan (repeat, 121 samples) | -- | -- | within +/-1% | ~50/50 |
+
+A shape-isolating 2x2 on `k_hashmix` (hand-built arms: {top-tested, rotated} x
+{header aligned, body aligned}, identical otherwise, `driver.o` linked from GCC
+so only the kernel TU differs) puts the rotation at +4.16% on min and +0.11% on
+min for the alignment factor, with the win rates 26/41 and 21/41 -- i.e. the same
+"effect" and the same statistic, moving in the opposite direction the moment the
+two arms are prepared by hand instead of by a rebuild. That is the whole
+argument for the median/win-rate pair in this document from here on.
+
+### 6.5 What the pass is actually worth, per kernel
+
+Interleaved A/B of one binary: `CCC_NO_LOOP_INVERT=1` (base) against the shipped
+configuration (`CCC_LOOP_INVERT_MEMORY=0`, i.e. pure rotations only), 101
+samples, `-O3 -march=x86-64-v3`:
+
+| kernel | median | paired wins |
+|---|---|---|
+| k_matchlen | **-44.21%** | 101/101 |
+| k_memchr | **-32.78%** | 100/101 |
+| k_adler32 | -32.37% | 72/101 |
+| k_namechars | -8.29% | 71/101 |
+| k_adler32_do8 | -4.28% | 92/101 |
+| k_classify | -3.37% | 83/101 |
+| k_map64_sub | -3.07% | 56/101 |
+| k_varint | -2.31% | 57/101 |
+| k_hashmix | -1.70% | 61/101 |
+| k_strlen_scan | +0.13% | 44/101 |
+| k_strcmp_signed | +0.06% | 55/101 |
+
+Two kernels carry the pass (a 2-3x on scan loops); the rest are single digits,
+and the two non-wins are +0.13% and +0.06% -- inside the noise band this host
+cannot resolve. (An earlier version of this table carried 31-sample `min`
+numbers for the middle rows, e.g. -11.17% for classify; the medians above are
+from the same 101-sample runs as the rest.)
+
+### 6.6 The escape pool, measured before it is built
+
+27 loops are refused only because a value defined in the header is used
+elsewhere. Rotating them requires the sound form of §5's "verbatim" idea: the
+copy may not re-define the guard's value (`verify.rs` check 7 rejects a second
+definition of a value id -- consumers index def sites by id), so each escaping
+use needs a **merge value** fed by edge copies: one on the entry edge (cold,
+splitting `H -> B`), one at the end of the latch (hot, one `mov` per iteration
+that the allocator may coalesce), plus splits on the `-> X` edges for values the
+exit block reads. The one instance measured by hand first -- the shape §2.2
+records as S21's -32% wall win -- is `k_strcmp_signed`'s loop, whose header loads
+`*a` and whose next block tests it: rotating that loop's latch in the emitted
+assembly (61 interleaved samples, checksums equal) gives **+0.79%**, 9/61 wins.
+Neutral. So the machinery is not built: the pool is real, the prize is not, and
+the measurements that would have to come first are the two shapes above, both
+already neutral.
+
+### 6.7 What the numbers say is left
+
+* **The byte walk is level with GCC, not 16% ahead.** Re-measured with the same
+  driver (`-O3 -march=x86-64-v3` for lccc against `-O2` and `-O3` for GCC 14.2,
+  61 interleaved samples): lccc 45.765 ms vs GCC -O2 46.122 ms (+0.78% for GCC)
+  and lccc 45.399 ms vs GCC -O3 45.402 ms (+0.01%). The 1.18x recorded in
+  `docs/benchmarks.md` was a `min`-of-5 sample. The loop shapes differ (lccc
+  top-tests, GCC rotates) and the shapes are worth ~0 in either direction.
+* **The lever that is left is the loop's trip structure, not its shape.** The
+  byte walk runs at ~1.0 cycle/byte because the address recurrence is one
+  `add`; nothing done to the test moves that. Unrolling the walk 4 bytes per
+  iteration with the SWAR zero test (`(w - 0x01010101) & ~w & 0x80808080`) is
+  the transform that moves the floor, and it needs an alignment prologue (a
+  4-byte load from an unaligned tail can cross into an unmapped page, so the
+  wide loads must start at an aligned address and the tail be finished
+  byte-wise) -- that is a codegen transform with a correctness surface, not a
+  peephole, and it is the next session's piece of work.

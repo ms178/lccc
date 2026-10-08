@@ -50,14 +50,41 @@
 //! 1. `H` ends in a `CondBranch` with exactly one target inside the loop (the
 //!    body entry `B`) and one outside (the exit `X`). A loop whose header does
 //!    not decide the exit is not a top-test loop.
-//! 2. Every instruction in `H` is **pure and duplicable** — no memory access,
-//!    no calls, no side effects. Memory duplication was implemented, reasoned
-//!    about and **rejected on measurement** (S24): a header load that feeds
-//!    the exit test is precisely the shape of a byte-walk loop, and rotating
-//!    such a loop costs 15.9% on this host against the top-tested form lccc
-//!    already emits — while GCC 14.2 emits the rotated form and is 15.9%
-//!    slower than lccc for it. See `docs/SESSION_FOLLOWUP_S21_LOOP_ROTATION.md`
-//!    §5 for the three experiments that localize it to the loop shape.
+//! 2. Every instruction in `H` is **pure and duplicable** — no calls, no
+//!    side effects, no stack allocation — or belongs to the *memory licence*
+//!    below, which admits non-volatile loads and (when the loop's only exit is
+//!    the header's own test) non-volatile stores. Volatile traffic, atomics,
+//!    calls, inline asm, `alloca`, `memcpy` and `PgoCounterInc` are refused
+//!    under both licences.
+//!
+//! # The memory licence: implemented, measurable, **not shipped**
+//!
+//! Duplicating a non-volatile access is *sound*. The header executes `n + 1`
+//! times at the same program positions in both forms, the copy is renamed
+//! (`set_dest` knows `Load` for exactly this reason) so the latch defines its
+//! own values, and rule 3 keeps a header value from reaching the body. Two
+//! store-specific hazards are handled: a store is licensed **only** when the
+//! loop has no side exit (see [`loop_exits_only_through_header`]), and volatile
+//! traffic, atomics, calls, inline asm, `alloca`, `memcpy` and `PgoCounterInc`
+//! are refused under both licences.
+//!
+//! It is nevertheless off by default, and that is a measurement. Licensed, the
+//! pass reaches **five** loops in the 90-TU corpus, all of them a 3-4
+//! instruction `while (*p) p++;` walk, and rotating them is neutral:
+//! 61-sample interleaved A/B on the same binary with the licence on and off,
+//! `k_strlen_scan` +0.57% on min / 41-61 wins, `strlen_bench` the same. An
+//! earlier record rejected the licence on a 15.9% regression for exactly that
+//! kernel; that number does not reproduce here — it was a `min`-of-31 sample on
+//! a host whose sample distribution has a heavy fast tail, and the same
+//! statistic produces phantom 5-25% effects on four other kernels of this
+//! corpus when the two arms are the *same* code. The re-measurement, the
+//! instrument that produced it (`scripts/loop_invert_census.py`) and the
+//! statistics are in `docs/SESSION_FOLLOWUP_S21_LOOP_ROTATION.md` §6.
+//!
+//! So the switch stays — `CCC_LOOP_INVERT_MEMORY=1` turns the licence on so the
+//! experiment is reproducible on a built binary — and the default is pure-only,
+//! which keeps this pass's codegen byte-identical to what it produced before
+//! the licence existed.
 //! 3. Every value defined in `H` is used **only inside `H`**. Otherwise the
 //!    body, once reached from `T`, would read the value `H` computed on its
 //!    single guard execution instead of this iteration's.
@@ -94,36 +121,184 @@ fn is_duplicable(inst: &Instruction) -> bool {
     )
 }
 
-/// Whether loop inversion runs at all.
+/// Which licence a header qualifies for. Determines nothing about *how* the
+/// copy is made (both licences rename every destination) — it exists so the
+/// pass, its diagnostics and its tests can distinguish a header that computes
+/// from one that walks memory.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Licence {
+    Pure,
+    Memory,
+}
+
+impl Licence {
+    fn label(self) -> &'static str {
+        match self {
+            Licence::Pure => "pure",
+            Licence::Memory => "memory",
+        }
+    }
+}
+
+/// Classify a header under the two licences, or `None` when it can never be
+/// duplicated.
 ///
-/// The kill switch is resolved **once**, by the driver, and then passed down
-/// explicitly. It used to be read out of the process environment deep inside
-/// the pass; because `std::env::set_var` is process-global, a test that
-/// toggled it raced with every test running in parallel on the other threads
-/// of the test binary, and those tests observed the wrong value (the symptom
-/// was a ~1-in-10 flake in this module). Configuration a caller can supply
-/// belongs in a parameter, not in ambient global state.
+/// `stores_ok` is [`loop_exits_only_through_header`] for this loop; a store
+/// that fails it is not licensed (see that function for why a store and a load
+/// differ).
+fn header_licence(insts: &[Instruction], stores_ok: bool) -> Option<Licence> {
+    let mut licence = Licence::Pure;
+    for inst in insts {
+        match inst {
+            Instruction::Load { volatile, .. } if !volatile => licence = Licence::Memory,
+            Instruction::Store { volatile, .. } if !volatile && stores_ok => {
+                licence = Licence::Memory
+            }
+            _ if is_duplicable(inst) => {}
+            _ => return None,
+        }
+    }
+    Some(licence)
+}
+
+/// The shape summary the pass prints for every rotation.
+///
+/// Deliberately a small, pre-computed summary rather than the IR itself: the
+/// census (`scripts/loop_invert_census.py`) correlates a loop's decision with
+/// these numbers, and a diagnostic whose inputs are cheap to print is one whose
+/// decisions can be audited from a build log.
+#[derive(Clone, Copy, Debug)]
+struct LoopShape {
+    /// Instructions in the header, including the licensed accesses.
+    header_insts: usize,
+    header_loads: usize,
+    header_stores: usize,
+    /// Instructions in the whole loop: header + body blocks + latch.
+    loop_insts: usize,
+    /// Memory instructions outside the header (the per-iteration work the
+    /// rotation's removed taken branch is amortised against).
+    loop_memory: usize,
+}
+
+impl LoopShape {
+    fn of(
+        func: &IrFunction,
+        lp: &crate::passes::loop_analysis::NaturalLoop,
+        header: usize,
+    ) -> Self {
+        let mut shape = LoopShape {
+            header_insts: func.blocks[header].instructions.len(),
+            header_loads: 0,
+            header_stores: 0,
+            loop_insts: 0,
+            loop_memory: 0,
+        };
+        for &b in &lp.body {
+            for inst in &func.blocks[b].instructions {
+                shape.loop_insts += 1;
+                let (load, store) = match inst {
+                    Instruction::Load { .. } => (1, 0),
+                    Instruction::Store { .. } => (0, 1),
+                    _ => (0, 0),
+                };
+                if b == header {
+                    shape.header_loads += load;
+                    shape.header_stores += store;
+                } else {
+                    shape.loop_memory += load + store;
+                }
+            }
+        }
+        shape
+    }
+}
+
+/// True when every exit from the loop leaves through the header's own test:
+/// no block of the loop other than the header and the latch branches out of it.
+///
+/// This is what makes duplicating a header *store* exact. The header executes
+/// `n + 1` times in both forms only while every iteration runs to the latch.
+/// With a `break` in the body the top-tested form executes it once more than
+/// the rotated form does (at the top of the iteration that breaks), so at the
+/// loop exit the two forms have written different bytes. A dropped *load* is
+/// unobservable — rule 3 keeps its value inside `H` — which is why only stores
+/// are gated on this.
+fn loop_exits_only_through_header(
+    lp: &crate::passes::loop_analysis::NaturalLoop,
+    cfg: &crate::ir::analysis::CfgAnalysis,
+    header: usize,
+    latch: usize,
+) -> bool {
+    lp.body
+        .iter()
+        .filter(|&&b| b != header && b != latch)
+        .all(|&b| {
+            cfg.succs
+                .row(b)
+                .iter()
+                .all(|&s| lp.body.contains(&(s as usize)))
+        })
+}
+
+/// How the pass is configured for one pipeline run.
+///
+/// The three switches are resolved **once**, by the driver's pipeline, and then
+/// passed down explicitly (`src/driver/pipeline.rs`).  They used to be read out
+/// of the process environment deep inside the pass -- once per function, and,
+/// because `std::env::set_var` is process-global, in a way that raced with
+/// every test running in parallel on the other threads of the test binary,
+/// where those tests observed the wrong value (the symptom was a ~1-in-10 flake
+/// in this module).  Configuration a caller can supply belongs in a parameter,
+/// not in ambient global state, and the env-read ratchet in
+/// `tests/regression/check_env_test_hygiene.sh` counts reads here for exactly
+/// that reason.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct LoopInvertConfig {
     pub enabled: bool,
+    /// Whether the memory licence is available (opt-in, **off by default**).
+    ///
+    /// Off is a measurement, not a precaution: licensed, the pass reaches five
+    /// loops in the 90-TU corpus and every one of them is neutral (61-sample
+    /// interleaved A/B, +0.57% on min, 41/61 wins), so the licence is not worth
+    /// shipping -- but it stays a switch because `CCC_LOOP_INVERT_MEMORY=1`
+    /// makes the experiment reproducible on a built binary instead of living in
+    /// a document. See `docs/SESSION_FOLLOWUP_S21_LOOP_ROTATION.md` §6.
+    pub memory_licence: bool,
     pub debug: bool,
 }
 
 impl LoopInvertConfig {
-    /// The driver's configuration: the documented `CCC_NO_LOOP_INVERT` /
-    /// `CCC_DEBUG_LOOP_INVERT` escape hatches, read at most once per run.
-    pub fn from_env() -> Self {
+    /// The driver's configuration, built from the documented
+    /// `CCC_NO_LOOP_INVERT` / `CCC_LOOP_INVERT_MEMORY` /
+    /// `CCC_DEBUG_LOOP_INVERT` escape hatches at the pipeline's start.
+    ///
+    /// Takes already-resolved values rather than reading the environment: the
+    /// reads belong to the driver, once per run, not to the pass.
+    pub const fn new(enabled: bool, memory_licence: bool, debug: bool) -> Self {
         Self {
-            enabled: std::env::var("CCC_NO_LOOP_INVERT").is_err(),
-            debug: std::env::var("CCC_DEBUG_LOOP_INVERT").is_ok(),
+            enabled,
+            memory_licence,
+            debug,
         }
     }
 
     /// Configuration used by the unit tests: no environment access at all.
+    /// The shipped defaults: the pass runs, the memory licence does not.
     #[cfg(test)]
     const fn testing() -> Self {
         Self {
             enabled: true,
+            memory_licence: false,
+            debug: false,
+        }
+    }
+
+    /// The opt-in memory licence (`CCC_LOOP_INVERT_MEMORY=1`).
+    #[cfg(test)]
+    const fn testing_memory() -> Self {
+        Self {
+            enabled: true,
+            memory_licence: true,
             debug: false,
         }
     }
@@ -132,20 +307,14 @@ impl LoopInvertConfig {
     const fn disabled() -> Self {
         Self {
             enabled: false,
+            memory_licence: true,
             debug: false,
         }
     }
 }
 
-/// Invert every eligible top-test loop in `func`. Returns the number rotated.
-pub(crate) fn invert_loops(func: &mut IrFunction) -> usize {
-    let cfg = LoopInvertConfig::from_env();
-    invert_loops_with(func, cfg)
-}
-
 /// The pass itself, parameterised by [`LoopInvertConfig`].
 pub(crate) fn invert_loops_with(func: &mut IrFunction, cfg: LoopInvertConfig) -> usize {
-    let debug = cfg.debug;
     if func.blocks.len() < 3 {
         return 0;
     }
@@ -167,7 +336,7 @@ pub(crate) fn invert_loops_with(func: &mut IrFunction, cfg: LoopInvertConfig) ->
     let mut rotated = 0;
     // One rotation per call per loop: the CFG changes, so re-derive it.
     loop {
-        let Some(plan) = find_one(func, debug) else {
+        let Some(plan) = find_one(func, &cfg) else {
             break;
         };
         apply(func, &plan);
@@ -184,7 +353,8 @@ struct Plan {
     latch: usize,
 }
 
-fn find_one(func: &IrFunction, debug: bool) -> Option<Plan> {
+fn find_one(func: &IrFunction, lic: &LoopInvertConfig) -> Option<Plan> {
+    let debug = lic.debug;
     let cfg = crate::ir::analysis::CfgAnalysis::build(func);
     // MERGE BY HEADER. `find_natural_loops` returns one loop per BACK EDGE,
     // so a loop with two latches arrives as two single-latch loops and the
@@ -214,14 +384,19 @@ fn find_one(func: &IrFunction, debug: bool) -> Option<Plan> {
 
         // A single latch, branching unconditionally to the header.
         let mut latch = None;
+        let mut latches = 0usize;
         for &p32 in cfg.preds.row(h) {
             let p = p32 as usize;
             if lp.body.contains(&p) {
+                latches += 1;
                 if latch.is_some() {
                     continue 'next_loop; // more than one latch
                 }
                 latch = Some(p);
             }
+        }
+        if latches > 1 && debug {
+            eprintln!("[INV] header {} has {} latches", h, latches);
         }
         let Some(t) = latch else { continue };
         if t == h {
@@ -250,17 +425,52 @@ fn find_one(func: &IrFunction, debug: bool) -> Option<Plan> {
         let t_in = lp.body.contains(&tb);
         let f_in = lp.body.contains(&fb);
         if t_in == f_in {
+            if debug {
+                eprintln!(
+                    "[INV] header {} does not decide the exit ({} successor(s) {})",
+                    h,
+                    if t_in { "both" } else { "neither" },
+                    if t_in { "inside" } else { "outside" }
+                );
+            }
             continue; // both inside (not an exit test) or both outside
         }
 
-        // Guard 5 + 2: small, and every instruction pure.
+        // Guard 5 + 2: small, and every instruction pure -- or memory under
+        // the opt-in licence (`CCC_LOOP_INVERT_MEMORY=1`).
         let hb = &func.blocks[h];
         if hb.instructions.len() > MAX_DUP_INSTS {
+            if debug {
+                eprintln!(
+                    "[INV] header {} is oversized ({} insns > {})",
+                    h,
+                    hb.instructions.len(),
+                    MAX_DUP_INSTS
+                );
+            }
             continue;
         }
-        if !hb.instructions.iter().all(is_duplicable) {
+        let stores_ok = lic.memory_licence && loop_exits_only_through_header(lp, &cfg, h, t);
+        let Some(licence) = header_licence(&hb.instructions, stores_ok) else {
             if debug {
                 eprintln!("[INV] header {} has a non-duplicable instruction", h);
+            }
+            continue;
+        };
+        let shape = LoopShape::of(func, lp, h);
+        if licence == Licence::Memory && !lic.memory_licence {
+            if debug {
+                eprintln!(
+                    "[INV] header {} walks memory, licence not taken (enabled={}, \
+                     header={} insn/{} ld/{} st, loop={} insn/{} mem)",
+                    h,
+                    lic.memory_licence,
+                    shape.header_insts,
+                    shape.header_loads,
+                    shape.header_stores,
+                    shape.loop_insts,
+                    shape.loop_memory,
+                );
             }
             continue;
         }
@@ -321,7 +531,18 @@ fn find_one(func: &IrFunction, debug: bool) -> Option<Plan> {
         }
 
         if debug {
-            eprintln!("[INV] rotating header={} latch={}", h, t);
+            eprintln!(
+                "[INV] rotating header={} latch={} ({}: header={} insn/{} ld/{} st, \
+                 loop={} insn/{} mem)",
+                h,
+                t,
+                licence.label(),
+                shape.header_insts,
+                shape.header_loads,
+                shape.header_stores,
+                shape.loop_insts,
+                shape.loop_memory
+            );
         }
         return Some(Plan {
             header: h,
@@ -421,7 +642,13 @@ fn set_dest(inst: &mut Instruction, new: Value) {
         Cast,
         Select,
         GetElementPtr,
-        GlobalAddr
+        GlobalAddr,
+        // A licensed header load is a definition like any other: without this
+        // the clone re-defines the guard's value, which is what verify.rs
+        // check 7 rejects ("defined more than once" -- consumers index def
+        // sites by value id) and what makes the body read the guard's byte
+        // forever.
+        Load
     );
 }
 
@@ -634,50 +861,169 @@ mod tests {
 
     // ── negative controls ───────────────────────────────────────────────────
 
-    #[test]
-    fn a_header_containing_a_load_is_not_inverted() {
-        // MEASURED DECISION, not a precaution. Duplicating a header load into
-        // the latch is sound (same count, same order, same addresses), and it
-        // was implemented; on a 4096-byte scan it then cost 15.9% against the
-        // top-tested loop this pass leaves alone (49.3 ms vs 59.2 ms, 31
-        // interleaved samples, checksums equal), and hand-reverting only the
-        // loop shape in the emitted assembly recovered 100% of the loss while
-        // leaving every other byte of the function identical.  The rotation is
-        // therefore refused for memory headers; the reverted change and the
-        // three experiments are recorded in
-        // docs/SESSION_FOLLOWUP_S21_LOOP_ROTATION.md §5.
+    fn load(dest: u32, ptr: u32) -> Instruction {
+        Instruction::Load {
+            dest: Value(dest),
+            ptr: Value(ptr),
+            ty: IrType::I32,
+            seg_override: Default::default(),
+            volatile: false,
+        }
+    }
+
+    fn store(val: u32, ptr: u32) -> Instruction {
+        Instruction::Store {
+            val: Operand::Value(Value(val)),
+            ptr: Value(ptr),
+            ty: IrType::I32,
+            seg_override: Default::default(),
+            volatile: false,
+        }
+    }
+
+    /// The `while (*p) p++;` shape: a header that walks memory, decides the
+    /// exit from what it loaded, and defines both the loaded value and the test.
+    ///   1 header : inst ; v10 = cmp v`cmp_lhs`, 100 -> 2 : 4
+    fn walk_loop(inst: Instruction, cmp_lhs: u32) -> IrFunction {
         let mut f = counted_loop();
-        f.blocks[1].instructions.insert(
-            0,
+        f.blocks[1].instructions = vec![inst, cmp(10, cmp_lhs)];
+        f
+    }
+
+    /// `counted_loop` whose body can leave the loop:
+    ///   2 body : if v50 -> 3 (latch) else 4 (exit)
+    /// The header is still the loop's own exit test, but the body has one too.
+    fn loop_with_side_exit() -> IrFunction {
+        let mut f = counted_loop();
+        f.blocks[2].terminator = cond(50, 3, 4);
+        f
+    }
+
+    #[test]
+    fn a_header_load_is_licensed_and_renamed() {
+        // The byte-walk shape under the memory licence. Sound because the copy
+        // is renamed: `set_dest` knows `Load`, so the latch defines its own
+        // value instead of re-defining the guard's (which verify.rs check 7
+        // refuses and which would make the body read the guard's byte forever).
+        let mut f = walk_loop(load(30, 20), 30);
+        assert_eq!(
+            invert_loops_with(&mut f, LoopInvertConfig::testing_memory()),
+            1
+        );
+
+        assert_eq!(f.blocks[1].instructions.len(), 2, "guard keeps its load");
+        let Instruction::Load { dest, .. } = &f.blocks[1].instructions[0] else {
+            panic!("the guard's first instruction is its load");
+        };
+        assert_eq!(dest.0, 30, "the guard keeps the original value id");
+
+        let latch = &f.blocks[3];
+        assert_eq!(
+            latch.instructions.len(),
+            3,
+            "increment + duplicated load + duplicated compare"
+        );
+        let Instruction::Load { dest: ldest, .. } = &latch.instructions[1] else {
+            panic!("the duplicated load must land after the increment");
+        };
+        assert_ne!(ldest.0, 30, "the copy must not re-define the guard's value");
+        let Instruction::Cmp { lhs, .. } = &latch.instructions[2] else {
+            panic!("the duplicated compare follows the duplicated load");
+        };
+        assert!(
+            matches!(lhs, Operand::Value(v) if v.0 == ldest.0),
+            "the duplicated test must read the copy, not the guard's byte"
+        );
+    }
+
+    #[test]
+    fn a_header_load_is_refused_by_default() {
+        // The shipped configuration. The licence is off because it does not
+        // pay, not because it is unsound: licensed, the pass reaches five
+        // loops in the 90-TU corpus, all `while (*p) p++;` walks, and rotating
+        // them is neutral (61 interleaved samples on one binary with the
+        // licence on and off: +0.57%, 41-61 wins). The 15.9% regression an
+        // earlier session recorded for this kernel does not reproduce; it was
+        // a min-of-31 statistic, and min on this host invents 5-25% effects on
+        // four other kernels when both arms are the same code.
+        // docs/SESSION_FOLLOWUP_S21_LOOP_ROTATION.md §5-§6.
+        let mut f = walk_loop(load(30, 20), 30);
+        assert_eq!(invert_loops_with(&mut f, LoopInvertConfig::testing()), 0);
+    }
+
+    #[test]
+    fn a_volatile_header_load_is_refused_under_both_licences() {
+        let mut f = walk_loop(
             Instruction::Load {
                 dest: Value(30),
                 ptr: Value(20),
                 ty: IrType::I32,
                 seg_override: Default::default(),
-                volatile: false,
+                volatile: true,
             },
+            30,
         );
         assert_eq!(invert_loops_with(&mut f, LoopInvertConfig::testing()), 0);
+        assert_eq!(
+            invert_loops_with(&mut f, LoopInvertConfig::testing_memory()),
+            0
+        );
     }
 
     #[test]
-    fn a_header_containing_a_store_is_not_inverted() {
-        // Same measurement: `for (i = 0; (a[i] = b[i]) != 0; i++)` is a memory
-        // header, and the store's value is a header definition that would need
-        // fresh ids and a home. No corpus kernel reaches this shape with a
-        // rotation win, so it stays refused with the loads.
-        let mut f = counted_loop();
-        f.blocks[1].instructions.insert(
-            0,
-            Instruction::Store {
-                val: Operand::Value(Value(20)),
-                ptr: Value(21),
-                ty: IrType::I32,
-                seg_override: Default::default(),
-                volatile: false,
-            },
+    fn a_header_store_is_rotated_when_the_loop_exits_only_through_the_header() {
+        // With no side exit the header executes `n + 1` times in both forms, at
+        // the same positions, so the store is duplicated verbatim: same value,
+        // same pointer.
+        let mut f = walk_loop(store(20, 21), 20);
+        assert_eq!(
+            invert_loops_with(&mut f, LoopInvertConfig::testing_memory()),
+            1
         );
+
+        let latch = &f.blocks[3];
+        assert_eq!(latch.instructions.len(), 3, "increment + store + compare");
+        let Instruction::Store { val, ptr, .. } = &latch.instructions[1] else {
+            panic!("the duplicated store must land after the increment");
+        };
+        assert!(matches!(val, Operand::Value(v) if v.0 == 20));
+        assert_eq!(ptr.0, 21);
+    }
+
+    #[test]
+    fn a_header_store_is_refused_while_the_loop_has_a_side_exit() {
+        // `for (i = 0; (a[i] = b[i]) != 0; i++) { if (x) break; }`: the
+        // top-tested form stores once more than the rotated form (at the top of
+        // the iteration that breaks) and leaves different bytes behind, so the
+        // store is not licensed. The side exit does not affect a *load*.
+        let mut f = loop_with_side_exit();
+        f.blocks[1].instructions.insert(0, store(20, 21));
         assert_eq!(invert_loops_with(&mut f, LoopInvertConfig::testing()), 0);
+        assert_eq!(
+            invert_loops_with(&mut f, LoopInvertConfig::testing_memory()),
+            0
+        );
+
+        let mut g = loop_with_side_exit();
+        g.blocks[1].instructions.insert(0, load(30, 20));
+        assert_eq!(
+            invert_loops_with(&mut g, LoopInvertConfig::testing_memory()),
+            1,
+            "a dropped load is unobservable"
+        );
+    }
+
+    #[test]
+    fn a_licensed_header_value_escaping_into_the_body_is_still_refused() {
+        // What makes the renaming sound: the body may not read a value the
+        // header defined, because the latch copy defines a *fresh* id and the
+        // body would otherwise see the guard's value on every later iteration.
+        let mut f = walk_loop(load(30, 20), 30);
+        f.blocks[2].instructions.push(cmp(40, 30));
+        assert_eq!(
+            invert_loops_with(&mut f, LoopInvertConfig::testing_memory()),
+            0
+        );
     }
 
     #[test]
